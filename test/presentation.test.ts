@@ -281,46 +281,15 @@ describe('the presentation module', () => {
     assert.equal(r.mira.has(arrival2), false);
   });
 
-  // context-manager's CM-9 writes a presentRows call as one record where the
-  // store has chronicle's batched append (appendManyToStateJsonWithIdentity),
-  // so a write that fails enters none of its rows; a store without it writes
-  // one record per row, and a write cut short there enters a prefix. The
-  // case below was the per-row one alone; it runs on that store now, with
-  // the batched store's beside it.
-  it('a presentation cut short hears only the bodies that entered whole', async () => {
-    const r = await rig();
-    r.adoptAll();
-    r.alive.add('mira');
-    const ids = ['one', 'two', 'three'].map((t) => r.write(r.oren, 'someone', text(t), ['mira']));
-    const store = r.store as unknown as { appendManyToStateJsonWithIdentity?: unknown };
-    const batched = store.appendManyToStateJsonWithIdentity;
-    // A store without the batched append: each row its own record.
-    store.appendManyToStateJsonWithIdentity = undefined;
-    const append = r.store.appendToStateJsonWithIdentity;
-    let n = 0;
-    r.store.appendToStateJsonWithIdentity = function (this: JsStore, id: string, item: unknown, by: string, at: string) {
-      if (id === 'agents/mira/window' && ++n === 2) throw new Error('the store failed partway');
-      return append.call(this, id, item, by, at);
-    } as typeof append;
-    const error = console.error;
-    console.error = () => {};
-    let heard;
-    try {
-      heard = r.presentation.presentAtBoundary(r.mira, [], { injects: true }).heard;
-    } finally {
-      console.error = error;
-      r.store.appendToStateJsonWithIdentity = append;
-      delete store.appendManyToStateJsonWithIdentity;
-    }
-    assert.equal(store.appendManyToStateJsonWithIdentity, batched, "the store's own batched append is back");
-    assert.deepEqual(heard.map((h) => h.id), [ids[0]], 'the prefix that entered');
-    assert.deepEqual(ids.map((id) => r.mira.has(id)), [true, false, false]);
-    assert.deepEqual(ofType(r.traces, 'presentation:failed').map((t) => [t.agentName, t.occasion]), [['mira', 'tool-boundary']]);
-    r.alive.delete('mira');
-    assert.deepEqual(r.presentation.presentAtEnd(r.mira).map((m) => m.id), ids.slice(1), 'the rest at the next point');
-  });
-
-  it('a batched presentation that fails hears nothing, and its rows wait whole for the next point', { skip: typeof (JsStore.prototype as { appendManyToStateJsonWithIdentity?: unknown }).appendManyToStateJsonWithIdentity !== 'function' && 'chronicle has no batched append' }, async () => {
+  // context-manager writes a presentRows call of several rows as one record,
+  // through chronicle's batched append, so a write that fails, or a batch a
+  // crash tears, enters none of its rows: chronicle keeps or drops a record
+  // whole. The per-row case that stood here (a store handle without the
+  // batched append, a write cut short entering a prefix) has no counterpart
+  // now: context-manager has no one-record-per-row path, and create()
+  // refuses such a handle (presentation-mandatory's refusal case). The
+  // batched failure below is what the presentation module meets instead.
+  it('a batched presentation that fails hears nothing, and its rows wait whole for the next point', async () => {
     const r = await rig();
     r.adoptAll();
     r.alive.add('mira');

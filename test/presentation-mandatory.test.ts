@@ -5,8 +5,8 @@
  * turn's requests are its window, which with no other agent's turn
  * overlapping it is the record, and a write stamped only for agents that
  * can't read its slot is traced once. A context-manager that keeps no
- * window index is refused, and a store handle without chronicle's batched
- * identity append is warned of once.
+ * window index is refused, and so is a store handle without chronicle's
+ * batched identity append, with which context-manager writes a window.
  */
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -106,65 +106,76 @@ describe('presentation is mandatory (#291)', () => {
     }
   });
 
-  // On a chronicle without the identity-stamped batched append (before
-  // 0.5.0), every window write is one record per row: a host runs, and an
-  // operator hears of the cost once, at create(), before any write-down.
-  for (const batched of [false, true]) {
-    it(batched
-      ? 'says nothing of the store when its handle has the batched identity append'
-      : 'warns once at create() when the store handle has no batched identity append, naming the chronicle and the cost', async () => {
-      const dir = mkdtempSync(join(tmpdir(), 'af-presentation-mandatory-'));
-      dirs.push(dir);
-      const store = JsStore.openOrCreate({ path: join(dir, 'store.chronicle') });
-      // A handle without the method, as chronicle 0.4 gives one.
-      if (!batched) (store as unknown as { appendManyToStateJsonWithIdentity?: unknown }).appendManyToStateJsonWithIdentity = undefined;
-      const warnings: string[] = [];
-      const warn = console.warn;
-      console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
-      const membrane = new MockMembrane();
-      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }] as ContentBlock[]));
-      let framework: AgentFramework | undefined;
-      try {
-        framework = await AgentFramework.create({
-          store,
-          membrane: membrane.asMembrane(),
-          agents: [
-            { name: 'mira', model: 'test-model', systemPrompt: 'You are mira.', proseRouting: 'disabled' },
-            { name: 'oren', model: 'test-model', systemPrompt: 'You are oren.', proseRouting: 'disabled' },
-          ],
-          modules: [new Tools()],
-          syncIntervalMs: 0,
-          operatorLogPath: false,
-        });
-        const alerts: Array<Extract<TraceEvent, { type: 'ops:alert' }>> = [];
-        framework.onTrace((event) => { if (event.type === 'ops:alert') alerts.push(event); }, { replay: true });
-        framework.start();
-        framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
-        await framework.runUntilIdle();
-        assert.equal(framework.getAgent('mira')!.getContextManager().windowMode(), 'presented', 'the host runs either way');
-        const said = warnings.filter((line) => line.includes('appendManyToStateJsonWithIdentity'));
-        const raised = alerts.filter((alert) => alert.kind === 'chronicle-per-row-window-writes');
-        if (batched) {
-          assert.deepEqual(said, []);
-          assert.deepEqual(raised, []);
-          return;
-        }
-        assert.equal(said.length, 1, 'one warning for the process');
-        assert.equal(raised.length, 1, 'and one ops alert');
-        const version = (JSON.parse(readFileSync(join(import.meta.dirname, '../../node_modules/@animalabs/chronicle/package.json'), 'utf8')) as { version: string }).version;
-        assert.match(said[0]!, new RegExp(`chronicle ${version.replace(/\./g, '\\.')} is loaded`), 'naming the chronicle it loads');
-        assert.match(said[0]!, /one record per row/);
-        assert.match(said[0]!, /23 s and 63 MB/, 'and the cost');
-        assert.match(said[0]!, /\^0\.5\.0/);
-        assert.equal(raised[0]!.agentName, 'framework');
-        assert.deepEqual(raised[0]!.data, { chronicle: version, missing: 'appendManyToStateJsonWithIdentity' });
-      } finally {
-        console.warn = warn;
-        await framework?.stop();
-        store.close();
+  // Context-manager writes a window write of several rows as one record,
+  // through chronicle's identity-stamped batched append (chronicle 0.6.0 on),
+  // and has no one-record-per-row path: on a handle without it, the first
+  // write-down of a record that holds a row throws. create() refuses such a
+  // handle before any agent is registered, naming the chronicle and the range.
+  it('is refused at create() where the store handle has no batched identity append, naming the chronicle and the range', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-presentation-mandatory-'));
+    dirs.push(dir);
+    const store = JsStore.openOrCreate({ path: join(dir, 'store.chronicle') });
+    // A handle without the method, as chronicle 0.5.0 gives one.
+    (store as unknown as { appendManyToStateJsonWithIdentity?: unknown }).appendManyToStateJsonWithIdentity = undefined;
+    const manifestOf = (path: string) => JSON.parse(readFileSync(join(import.meta.dirname, path), 'utf8')) as {
+      version: string; dependencies: Record<string, string>;
+    };
+    const version = manifestOf('../../node_modules/@animalabs/chronicle/package.json').version;
+    const declared = manifestOf('../../package.json').dependencies['@animalabs/chronicle']!;
+    try {
+      await assert.rejects(AgentFramework.create({
+        store,
+        membrane: new MockMembrane().asMembrane(),
+        agents: [
+          { name: 'mira', model: 'test-model', systemPrompt: 'You are mira.', proseRouting: 'disabled' },
+          { name: 'oren', model: 'test-model', systemPrompt: 'You are oren.', proseRouting: 'disabled' },
+        ],
+        modules: [new Tools()],
+        syncIntervalMs: 0,
+        operatorLogPath: false,
+      }), (error: Error) => {
+        assert.match(error.message, /^agent-framework needs a store handle with JsStore\.appendManyToStateJsonWithIdentity/);
+        assert.ok(error.message.includes(`this package loads @animalabs/chronicle ${version}`), `naming the chronicle it loads: ${error.message}`);
+        assert.ok(error.message.includes(`Install @animalabs/chronicle ${declared}, which this package declares`), error.message);
+        return true;
+      });
+      for (const name of ['mira', 'oren']) {
+        assert.equal(store.getStateLen(`agents/${name}/window`) ?? 0, 0, `nothing written to ${name}'s window`);
       }
-    });
-  }
+    } finally {
+      store.close();
+    }
+  });
+
+  it("runs on a host's own store handle that has the batched identity append", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-presentation-mandatory-'));
+    dirs.push(dir);
+    const store = JsStore.openOrCreate({ path: join(dir, 'store.chronicle') });
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }] as ContentBlock[]));
+    let framework: AgentFramework | undefined;
+    try {
+      framework = await AgentFramework.create({
+        store,
+        membrane: membrane.asMembrane(),
+        agents: [
+          { name: 'mira', model: 'test-model', systemPrompt: 'You are mira.', proseRouting: 'disabled' },
+          { name: 'oren', model: 'test-model', systemPrompt: 'You are oren.', proseRouting: 'disabled' },
+        ],
+        modules: [new Tools()],
+        syncIntervalMs: 0,
+        operatorLogPath: false,
+      });
+      framework.start();
+      framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
+      await framework.runUntilIdle();
+      assert.equal(framework.getAgent('mira')!.getContextManager().windowMode(), 'presented');
+      assert.ok((store.getStateLen('agents/mira/window') ?? 0) > 0, "mira's window is written down");
+    } finally {
+      await framework?.stop();
+      store.close();
+    }
+  });
 
   it("is refused where context-manager doesn't keep a window index", async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-presentation-mandatory-'));

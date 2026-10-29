@@ -2506,9 +2506,6 @@ const MAINTENANCE_TICKS_PER_PASS = 8;
  *  startup's delivery. */
 const FAILED_CREATE_TEARDOWN_TIMEOUT_MS = 30_000;
 
-/** The ops alert kind create() raises for a store handle with no batched identity append (perRowWindowWrites). */
-const PER_ROW_WINDOW_WRITES_KIND = 'chronicle-per-row-window-writes';
-
 /** The version of @animalabs/chronicle this package loads, as its package.json says, or undefined where that can't be read. */
 function chronicleVersion(): string | undefined {
   try {
@@ -2520,22 +2517,20 @@ function chronicleVersion(): string | undefined {
 }
 
 /**
- * What an operator is told when the store handle has no
+ * Why create() refuses the store handle, or undefined when it has
  * appendManyToStateJsonWithIdentity, chronicle's identity-stamped batched
- * append (chronicle 0.5.0), or undefined when it has it. Context-manager
- * then writes each window write one record per row: every agent's
- * write-down at its registration (#291) takes one record for each row of
- * its record, and a presentation of several rows that fails partway leaves
- * the rows before the failure presented, where one record is kept or lost
- * whole.
+ * append (chronicle 0.6.0 on). Context-manager writes a window write of
+ * several rows as one record with it and has no one-record-per-row path: on
+ * a handle without it, every agent's write-down at its registration (#291)
+ * of a record that holds a row, and every presentation of two or more rows,
+ * throws before it writes anything.
  */
-function perRowWindowWrites(store: JsStore): string | undefined {
+function unbatchedStoreRefusal(store: JsStore): string | undefined {
   if (typeof (store as { appendManyToStateJsonWithIdentity?: unknown }).appendManyToStateJsonWithIdentity === 'function') return undefined;
-  return `the store handle has no appendManyToStateJsonWithIdentity (chronicle ${chronicleVersion() ?? 'of a version it does not say'} is loaded; ` +
-    'the batched form is in chronicle 0.5.0), so every window write is one record per row: each agent\'s window is ' +
-    'written down at its registration one record for each stored row, about 23 s and 63 MB of log for a 200,000-row ' +
-    'namespace on one synthetic store, against a quarter of a second as one record, and a presentation of several rows ' +
-    'that fails partway leaves the rows before it presented. Install @animalabs/chronicle ^0.5.0, which this package declares';
+  return 'agent-framework needs a store handle with JsStore.appendManyToStateJsonWithIdentity, the identity-stamped batched append ' +
+    'with which context-manager writes each agent\'s window, several rows as one record. The store handle has none ' +
+    `(this package loads @animalabs/chronicle ${chronicleVersion() ?? 'of a version it does not say'}). ` +
+    'Install @animalabs/chronicle ^0.6.0, which this package declares (0.5.0 and earlier have no batched append), and open the store with it';
 }
 
 /** Local per-residence provider admission (AF #114 bounded first slice). */
@@ -4680,25 +4675,19 @@ export class AgentFramework {
     framework.providerHoldHook = config.providerHold;
     // The presentation index (#291), before any agent exists. It needs a
     // context-manager that keeps a window index per agent (presentRows):
-    // 0.24.0 on, since 0.23.0 was published without one.
+    // 0.25.0 on, since 0.23.x and 0.24.0 were published without one.
     if (typeof (ContextManager.prototype as { presentRows?: unknown }).presentRows !== 'function') {
       throw new Error(
         'agent-framework needs @animalabs/context-manager with ContextManager.presentRows: a context-manager that keeps a window index per agent. ' +
-          'Install @animalabs/context-manager ^0.24.0, which this package declares (0.23.0 has no window index)',
+          'Install @animalabs/context-manager ^0.25.0, which this package declares (0.23.x and 0.24.0 have no window index)',
       );
     }
-    // A store handle without the batched identity append (a chronicle
-    // before 0.5.0, or a host's handle from one) still works, one record per
-    // row: an operator hears of its cost once, before any agent's window is
-    // written down.
-    const perRow = perRowWindowWrites(store);
-    if (perRow !== undefined) {
-      console.warn(`[presentation] ${perRow}`);
-      const version = chronicleVersion();
-      framework.opsAlert(PER_ROW_WINDOW_WRITES_KIND, 'framework', perRow, {
-        data: { ...(version !== undefined ? { chronicle: version } : {}), missing: 'appendManyToStateJsonWithIdentity' },
-      });
-    }
+    // And a store handle with chronicle's batched identity append (0.6.0
+    // on): context-manager writes a window of several rows with it alone,
+    // so on a handle without it (chronicle 0.5.0 or earlier, or a host's
+    // handle from one) the first agent's write-down would throw.
+    const unbatched = unbatchedStoreRefusal(store);
+    if (unbatched !== undefined) throw new Error(unbatched);
     framework.presentation = new AgentPresentation({
       liveAgents: () => framework.agents.values(),
       registry: framework.registry,

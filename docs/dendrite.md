@@ -386,8 +386,10 @@ Two costs are not removed:
 |---|---|---|
 | `@animalabs/chronicle` with `JsStore.view` and `createBranchWithStates` | Shared inheritance, live snapshots | `deriveAgent` shared mode and live `inspectAgentContext` throw; everything else works |
 | `@animalabs/context-manager` with `ContextManager.derive` and `reopenDerived` | The same, plus resuming a fork | The same |
+| `@animalabs/context-manager` `^0.25.0`, with `ContextManager.presentRows` | Every agent's window (#291) | `create()` refuses to start; 0.23.x and 0.24.0 have no window index |
+| `@animalabs/chronicle` `^0.6.0`, with `JsStore.appendManyToStateJsonWithIdentity` | Each window write of several rows as one record | `create()` refuses the store handle; 0.5.0 and earlier have no batched append |
 
-The framework detects these at run time.
+The framework detects these at run time. The last two are the floors this package declares: below them nothing runs.
 
 ## What is not implemented
 
