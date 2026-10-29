@@ -167,7 +167,8 @@ test("over a gate.json the gate doesn't use, the rules a refusal lists are those
   const dms = { name: 'dms', match: { tagsAny: ['chat:dm'] }, behavior: 'always' };
   const ambient = { name: 'quiet-ambient', match: { tagsAny: ['chat:ambient'] }, behavior: { debounce: '60000' } };
   writeFileSync(join(dir, 'gate.json'), JSON.stringify({ default: 'defer', policies: [dms, ambient] }));
-  const mends = / isn't in force, and a change is saved only if it brings it into force\. Replacing or removing "quiet-ambient" by name would bring gate\.json into force\.$/;
+  const mends = new RegExp(`gate\\.json, at ${literally(join(dir, 'gate.json'))}, isn't in force, and a change is saved only if it brings it into force\\. `
+    + 'Replacing or removing "quiet-ambient" by name would bring gate\\.json into force\\.$');
   const removal = await refusal({}, 'wake_remove_rule');
   assertParts(removal, { notDone: /nothing was removed/, field: /name is missing/, next: /The rules a change edits are "dms", "quiet-ambient"\./ });
   assert.match(removal, mends);
@@ -179,13 +180,22 @@ test("over a gate.json the gate doesn't use, the rules a refusal lists are those
       next: new RegExp(`The other rules a change edits are "dms", "quiet-ambient"\\. Give ${field} one of them`),
     });
     assert.match(placement, mends);
+    const itself = await refusal({ name: 'dms', behavior: 'defer', [field]: 'dms' });
+    assertParts(itself, {
+      notDone: /^Rule "dms" wasn't saved/,
+      field: new RegExp(`${field} is "dms", the rule being saved, and a rule can't be placed beside itself`),
+      next: /The other rules are "quiet-ambient"\./,
+    });
+    assert.match(itself, mends);
     const missing = await refusal({ behavior: 'defer', [field]: 'missing' });
     assertParts(missing, { notDone: /wasn't saved/, field: new RegExp(`${field} is "missing", and no rule has that name`), next: /The other rules are "dms" and "quiet-ambient"\./ });
     assert.match(missing, mends);
   }
 
   writeFileSync(join(dir, 'gate.json'), JSON.stringify({ default: 'wake', policies: [dms] }));
-  assert.match(await refusal({}, 'wake_remove_rule'), /The rules a change edits are "dms"\. gate\.json, at .*, isn't in force, and a change is saved only if it brings it into force\. No change through the gate can bring it into force/);
+  assert.match(await refusal({}, 'wake_remove_rule'), new RegExp(`The rules a change edits are "dms"\\. gate\\.json, at ${literally(join(dir, 'gate.json'))}, `
+    + "isn't in force, and a change is saved only if it brings it into force\\. No change through the gate can bring it into force, so gate\\.json "
+    + 'has to be fixed by an edit of its own; until then, a change is refused the same way\\.$'));
 
   writeFileSync(join(dir, 'gate.json'), JSON.stringify({ default: 'always', policies: [] }));
   assertParts(await refusal({}, 'wake_remove_rule'), { notDone: /nothing was removed/, field: /name is missing/, next: /There is no rule to remove\./ });
@@ -422,11 +432,12 @@ test("text from either file reaches the agent, gate_status and the log with its 
 
 test("a start's recipe line names each rule escaped once", () => {
   const lists = ['added', 'removed', 'updated', 'restored', 'moved', 'keptEdited', 'differsFromRecipe', 'outsideRecipe'] as const;
-  const named = Object.fromEntries(lists.map((list) => [list, [`${list}\u0000[b"`]]));
+  const named = Object.fromEntries(lists.map((list) => [list, [`${list}\u0000[tuned out]"`]]));
   const line = reconcileLine({ ...named, orderKept: false } as unknown as Parameters<typeof reconcileLine>[0])!;
   assert.doesNotMatch(line, CONTROL, line);
   assert.doesNotMatch(line, ESCAPED_TWICE, line);
-  for (const list of lists) assert.equal(line.split(quotedValue(`${list}\u0000[b"`)).length - 1, 1, `${list}: ${line}`);
+  assert.doesNotMatch(line, /\[tuned out/, 'no notice opening, raw');
+  for (const list of lists) assert.equal(line.split(quotedValue(`${list}\u0000[tuned out]"`)).length - 1, 1, `${list}: ${line}`);
 });
 
 test("the gate:config-error trace and a shadow warning carry supplied text escaped once", (t) => {
