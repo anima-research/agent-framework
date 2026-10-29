@@ -57,6 +57,7 @@ type Internals = {
   lastConversationSweep: number;
   closingConversationAgents: Set<string>;
   pendingRequests: unknown[];
+  processInferenceRequests(): Promise<void>;
   activeTurnTokens: Map<string, number>;
   presentAtEndOf(agent: Agent | undefined): void;
   noteArrival(agentName: string, metadata: MessageMetadata | undefined, messageId: MessageId): void;
@@ -353,6 +354,35 @@ describe('presentation points (#291)', () => {
     assert.ok(landed.every((m) => !(m.metadata && 'deferredWriteId' in m.metadata)), 'never queued, so no durable queue id');
     assert.deepEqual(['one', 'two', 'three'].map((t) => h.inWindow('mira', t)), [true, false, true], "in mira's window: what's for her");
     assert.deepEqual(['one', 'two', 'three'].map((t) => h.inWindow('oren', t)), [true, true, false], "in oren's: what's for him");
+  });
+
+  // B5: frozen() reads the quiesce alone. A surgery's hold freezes every
+  // window by its own refusals: its reservation holds a turn token for each
+  // agent, so each is turn-alive and a point at rest presents it nothing, and
+  // the scheduler starts no turn under it, so no turn start or tool boundary
+  // presents either. Its release presents what was stored meanwhile.
+  it("a surgery's hold freezes the windows though the host isn't quiesced: a point at rest presents nothing, no wake starts a turn, and the release presents what was stored", async () => {
+    const h = await boot();
+    h.membrane.script('mira', final([text('read')]));
+    h.framework.start();
+    const release = h.internals.reserveStoreForSurgery('test-surgery', 'mira');
+    try {
+      assert.equal(h.framework.getHostModeStatus().quiesced, false, 'not quiesced: the hold alone freezes');
+      // A writer the hold doesn't keep in memory, as one past the framework,
+      // stores at once.
+      h.cm('mira').addMessage('user', [text('stored under the hold')]);
+      h.internals.presentAtEndOf(h.agent('mira'));
+      assert.equal(h.inWindow('mira', 'stored under the hold'), false, "a point at rest presents nothing: the hold's token keeps her turn-alive");
+      h.internals.pendingRequests.push({ agentName: 'mira', reason: 'test-wake', source: 'test', timestamp: Date.now() });
+      await h.internals.processInferenceRequests();
+      assert.deepEqual(h.membrane.callsFor('mira'), [], 'no turn starts under the hold');
+      assert.equal(h.inWindow('mira', 'stored under the hold'), false, 'still out of her window');
+    } finally {
+      release();
+    }
+    assert.equal(h.inWindow('mira', 'stored under the hold'), true, 'the release presents it, as at a turn\'s end');
+    await until(() => h.membrane.callsFor('mira').length === 1, 'the wake to start its turn once the hold is released');
+    assert.ok(JSON.stringify(h.membrane.callsFor('mira')[0]!.messages).includes('stored under the hold'), "the turn's request carries it");
   });
 
   it('a quiesce freezes the windows: a write is stored and not presented, a draining turn\'s boundary hears nothing, and resume presents both', async () => {

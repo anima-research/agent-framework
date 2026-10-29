@@ -4765,7 +4765,23 @@ export class AgentFramework {
         const agent = framework.agents.get(name);
         return !!agent && framework.logicalTurnAlive(agent);
       },
-      frozen: () => framework.quiesced || framework.surgeryHold !== null,
+      // Quiesced, every window is frozen but for each agent's own rows. A
+      // surgery's hold needs no term here (B5): its own refusals keep every
+      // point that reads this from being reached under it. Its reservation
+      // holds a turn token for every registered agent, so each is
+      // turn-alive, and a point at rest (a turn's end, a row stored for a
+      // reader at rest, the pass at rest) presents nothing to it: those
+      // return on turnAlive before they read this. No agent registers under
+      // it: a derived or ephemeral one is refused, a conversation fork's
+      // spawn waits it out (and the reservation refuses while one is being
+      // created), and the rest register in create(). No turn starts or
+      // streams under it: the scheduler requeues every wake while it holds,
+      // a parked admission finds the token and requeues, and the reservation
+      // refuses while any turn, continuation, retry or puppet call is alive,
+      // so no turn start and no tool boundary is reached. Its release clears
+      // the hold before it gives the tokens back, replays the writes it kept
+      // and presents each agent what it is owed (reserveStoreForSurgery).
+      frozen: () => framework.quiesced,
       emitTrace: (event) => framework.emitTrace(event),
     });
     framework.turnRearmMs = turnRearmDelays(config.exhaustedTurnRearmMs);

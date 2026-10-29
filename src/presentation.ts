@@ -24,8 +24,10 @@
  * - another writer's rows meant for it (arrivals) at its turn start, at its
  *   tool boundary as a prefix the live stream can carry, at its turn's end,
  *   and at once while it has no turn alive (present at rest);
- * - nothing of others' while the host is quiesced or under a surgery hold,
- *   which freeze every window but for an agent's own rows;
+ * - nothing of others' while the host is quiesced (frozen) or under a
+ *   surgery hold, which freeze every window but for an agent's own rows (a
+ *   hold by its own refusals: under it every agent is turn-alive and no
+ *   turn starts);
  * - the arrivals a rollback's cut took out of an agent's window only at its
  *   next turn start (holdUntilStart), so the cut holds until it speaks.
  *
@@ -362,7 +364,12 @@ export interface PresentationHost {
    * its own rows and its boundary's arrivals is presented to it then.
    */
   turnAlive(name: AgentName): boolean;
-  /** Whether others' rows are frozen out of every window (quiesced, or a surgery hold): own rows still present. */
+  /**
+   * Whether others' rows are frozen out of every window: the host
+   * quiesced. Own rows still present. A surgery's hold isn't asked here: its
+   * own refusals keep every point that reads this from being reached under
+   * it (the framework's `frozen`, where the host is built).
+   */
   frozen(): boolean;
   emitTrace(event: PresentationTrace): void;
 }
