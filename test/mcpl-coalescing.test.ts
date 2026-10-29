@@ -1454,6 +1454,7 @@ test("a render stored for a live turn, out of its window, isn't read by the resi
     assert.equal(f.membrane.calls.length, 0, "'other' read nothing, so its turn started no inference");
     assert.deepEqual(withdrawn, ['other']);
     assert.deepEqual(internals.pendingRequests.map((r) => r.agentName), ['agent'], 'the primary is woken for the render');
+    assert(f.context().includes('document_diff'), 'the render is stored while the turn is alive');
     assert(!f.window().includes('document_diff'), "which its window doesn't hold yet");
   } finally {
     endStandInTurn(internals);
