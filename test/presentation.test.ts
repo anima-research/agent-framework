@@ -4,7 +4,8 @@
  * residents over the shared slot (mira, the primary, and oren), the
  * subconscious serving mira, which reads the residents' slot through its
  * observe edge, and a shared fork of mira on its own branch: its decisions
- * on their own, apart from the framework that calls it.
+ * on their own, apart from the framework that calls it. Then readers whose
+ * contexts merge two slots each.
  */
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -15,7 +16,7 @@ import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, PassthroughStrategy, type MessageId, type MessageMetadata, type StoredMessage } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import {
-  AgentRegistry, audienceOf, residentSpec, storeOwnRow, subconsciousSpec, taskForkSpec, withAudience,
+  AgentRegistry, audienceOf, residentSpec, storeOwnRow, subconsciousSpec, taskForkSpec, withAudience, workerSpec,
 } from '../src/index.js';
 import { isAnotherAgentsInjection } from '../src/stored-injections.js';
 import {
@@ -654,6 +655,103 @@ describe('the presentation module', () => {
     r.presentation.forget(r.mira);
     r.presentation.adopt(r.mira);
     assert.deepEqual(r.presentation.presentAtEnd(r.mira).map((m) => m.id), [returned], 'the hold went with the forget');
+  });
+});
+
+describe('the presentation module for a reader that observes more than one slot', () => {
+  /**
+   * The residents (mira and oren), two workers in slots of their own (clerk
+   * and scribe), and two readers whose contexts merge two slots each, as the
+   * framework opens an observer's context (one auxiliary view per slot it
+   * observes): Both reads the residents' slot, held traffic shown, and
+   * clerk's, held traffic not shown; Auditor reads clerk's and scribe's.
+   */
+  async function twoSlotRig() {
+    const dir = mkdtempSync(join(tmpdir(), 'af-presentation-two-slots-'));
+    dirs.push(dir);
+    const store = JsStore.openOrCreate({ path: join(dir, 'store.chronicle') });
+    closers.unshift(() => store.close());
+    const registry = new AgentRegistry();
+    registry.register(residentSpec('mira', { primary: true }));
+    registry.register(residentSpec('oren', { primary: false }));
+    registry.register(workerSpec('clerk'));
+    registry.register(workerSpec('scribe'));
+    registry.register({ ...subconsciousSpec('Both', 'mira'), observes: [{ includeHeld: true }, { agent: 'clerk' }], ownSlot: { namespace: 'both/mira' }, namespace: 'both/mira' });
+    registry.register({ ...workerSpec('Auditor'), observes: [{ agent: 'clerk' }, { agent: 'scribe' }] });
+    const open = async (namespace: string, auxiliaryMessageViews?: Array<{ namespace?: string }>) => {
+      const cm = await ContextManager.open({
+        store, namespace, isolate: true, strategy: new PassthroughStrategy(), ...(auxiliaryMessageViews ? { auxiliaryMessageViews } : {}),
+      });
+      closers.push(() => cm.close());
+      return cm;
+    };
+    const mira = new TestAgent('mira', await openResident(store, 'mira'));
+    const oren = new TestAgent('oren', await openResident(store, 'oren'));
+    const clerk = new TestAgent('clerk', await open('subagent/clerk'));
+    const scribe = new TestAgent('scribe', await open('subagent/scribe'));
+    const both = new TestAgent('Both', await open('both/mira', [{}, { namespace: 'subagent/clerk' }]));
+    const auditor = new TestAgent('Auditor', await open('subagent/Auditor', [{ namespace: 'subagent/clerk' }, { namespace: 'subagent/scribe' }]));
+    const live = new Map<string, TestAgent>([mira, oren, clerk, scribe, both, auditor].map((a) => [a.name, a]));
+    const alive = new Set<string>();
+    const traces: PresentationTrace[] = [];
+    const presentation = new AgentPresentation({
+      liveAgents: () => live.values(), registry, turnAlive: (name) => alive.has(name), frozen: () => false, emitTrace: (e) => { traces.push(e); },
+    });
+    const write = (writer: TestAgent, participant: string, content: ContentBlock[], audience: string[], metadata: MessageMetadata = {}): MessageId => {
+      const id = writer.cm.addMessage(participant, content, withAudience(metadata, audience));
+      presentation.afterStore(writer, [id]);
+      return id;
+    };
+    return { mira, oren, clerk, scribe, both, auditor, live, alive, traces, presentation, write, adoptAll: () => { for (const a of live.values()) presentation.adopt(a); } };
+  }
+  const HELD = { tuneOut: { epochId: 'e-1' } } as MessageMetadata;
+
+  it("a reader of the residents' slot and a second slot is presented each slot's rows by the edge on it", async () => {
+    const r = await twoSlotRig();
+    r.adoptAll();
+    const miraRound = storeOwnRow(r.mira, 'mira', text("mira's round"));
+    const clerkRound = storeOwnRow(r.clerk, 'clerk', text("clerk's round"));
+    const heldForResidents = r.write(r.mira, 'someone', text("held in the residents' slot"), [], HELD);
+    const heldInClerks = r.write(r.clerk, 'someone', text("held in clerk's slot"), [], HELD);
+    assert.equal(r.both.has(miraRound), true, "mira owns the residents' slot");
+    assert.equal(r.both.has(clerkRound), true, "clerk's round, through the edge on clerk's slot, whose owner is clerk");
+    assert.equal(r.both.has(heldForResidents), true, "the residents' edge shows held traffic");
+    assert.equal(r.both.has(heldInClerks), false, "clerk's edge doesn't");
+    assert.deepEqual(r.presentation.arrivalsOf(r.both), [], 'and nothing else is owed');
+    assert.equal(r.mira.has(clerkRound), false, "clerk's slot is no resident's");
+  });
+
+  it('a reader of two slots, neither the residents\', is presented arrivals from both', async () => {
+    const r = await twoSlotRig();
+    r.adoptAll();
+    r.alive.add('Auditor');
+    const clerkRound = storeOwnRow(r.clerk, 'clerk', text("clerk's round"));
+    const scribeRound = storeOwnRow(r.scribe, 'scribe', text("scribe's round"));
+    const forScribe = r.write(r.scribe, 'someone', text('a row for scribe'), ['scribe']);
+    const miraRound = storeOwnRow(r.mira, 'mira', text("mira's round"));
+    assert.deepEqual(r.presentation.arrivalsOf(r.auditor).map((m) => m.id), [clerkRound, scribeRound, forScribe], 'owed while its turn is alive');
+    r.alive.delete('Auditor');
+    assert.deepEqual(r.presentation.presentAtEnd(r.auditor).map((m) => m.id), [clerkRound, scribeRound, forScribe]);
+    assert.deepEqual(r.auditor.window(), ["clerk's round", "scribe's round", 'a row for scribe']);
+    assert.equal(r.auditor.has(miraRound), false, "it has no edge on the residents' slot");
+    const later = storeOwnRow(r.scribe, 'scribe', text("scribe's next round"));
+    assert.equal(r.auditor.has(later), true, 'idle, it is presented a write at once (present at rest)');
+  });
+
+  it("a window written down at adopt keeps each slot's rows its edge shows, and takes out the rest", async () => {
+    const r = await twoSlotRig();
+    // Stored before the readers are taken on: their windows are still the whole record.
+    const clerkRound = storeOwnRow(r.clerk, 'clerk', text("clerk's round"));
+    const heldInClerks = r.clerk.cm.addMessage('someone', text("held in clerk's slot"), withAudience(HELD, []));
+    const heldForResidents = r.mira.cm.addMessage('someone', text("held in the residents' slot"), withAudience(HELD, []));
+    for (const name of ['mira', 'oren', 'clerk', 'scribe']) r.presentation.adopt(r.live.get(name)!);
+    assert.equal(r.both.cm.windowMode(), 'legacy');
+    r.presentation.adopt(r.both);
+    assert.equal(r.both.has(clerkRound), true);
+    assert.equal(r.both.has(heldForResidents), true, "the residents' edge shows held traffic");
+    assert.equal(r.both.has(heldInClerks), false, "clerk's edge doesn't: taken out (retractForeign)");
+    const retracted = ofType(r.traces, 'presentation:retracted').filter((t) => t.agentName === 'Both');
+    assert.deepEqual(retracted.map((t) => t.messageIds), [[heldInClerks]]);
   });
 });
 

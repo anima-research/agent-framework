@@ -15,8 +15,8 @@
  *
  * This module decides who each stored row is presented to and when, through
  * each live agent's own context manager. It reads the row's audience stamp
- * (dendrite/audience.ts) and the registry's slots and observe edges
- * (bearingOf), and presents:
+ * (dendrite/audience.ts), the slot the row is stored in, and the registry's
+ * slots and observe edges (bearingOf), and presents:
  *
  * - an agent's own rows as they are written, through the own-row sink
  *   (storeOwnRow, Agent and ToolResultGuard call it once the row is stored),
@@ -54,9 +54,9 @@
  * It never imports framework.ts, which imports it.
  */
 import type { ContentBlock } from '@animalabs/membrane';
-import { continuesBody, type ContextManager, type MessageId, type MessageMetadata, type StoredMessage } from '@animalabs/context-manager';
+import { continuesBody, MessageStore, type ContextManager, type MessageId, type MessageMetadata, type StoredMessage } from '@animalabs/context-manager';
 import { audienceOf, heldFromResidents, observedRowFor } from './dendrite/audience.js';
-import { RESIDENTS_SLOT, sameSlot, type AgentRegistry } from './dendrite/registry.js';
+import { sameSlot, type AgentRegistry } from './dendrite/registry.js';
 import type { AgentName, AgentRecord, MessageSlotRef, ObserveEdge } from './dendrite/types.js';
 import type { WindowOrdinal } from './read-marks.js';
 import { isAnotherAgentsInjection } from './stored-injections.js';
@@ -206,9 +206,19 @@ function factsOf(
 }
 
 /**
- * What one row is to one reader, from the row's stamp and the reader's
- * facts. `inOwnSlot` says whether the row is stored in the reader's own slot
- * (else it is in a slot the reader observes).
+ * Where a row bearingOf weighs is stored, as its caller read it: `'own'`,
+ * the reader's own slot (the own message store of its context, which
+ * getMessage and getAllMessages read), or another slot by its ref (an
+ * auxiliary view of its context, by namespace, or the own slot of the
+ * agent that wrote the row: slotOfRow, afterStore).
+ */
+export type RowSlot = 'own' | MessageSlotRef;
+
+/**
+ * What one row is to one reader, from the row's stamp, the reader's facts,
+ * and `slot`, the slot the row is stored in: the reader's own (`'own'`, or
+ * a ref sameSlot as its `ownSlot`), else a slot it may observe. undefined,
+ * a slot its caller couldn't name, is elsewhere.
  *
  * In its own slot, with `stamp = audienceOf(metadata)`:
  * - its own row (`ownRowOf` names it): own;
@@ -225,21 +235,23 @@ function factsOf(
  *   derivation's inheritance (at or before `derivedAt`), held for a reader
  *   that leaves held rows out, or another agent's stored injection.
  *
- * In an observed slot: through the edge that reads it (the only edge, or
- * the one on the residents' slot), what observedRowFor says.
+ * In another slot: an arrival when an edge of the reader's that reads that
+ * slot shows it, by that edge's rules and that slot's owners
+ * (observedRowFor); elsewhere when none does, or the reader has no edge on
+ * the slot. A pure function of its arguments: it runs for a released agent,
+ * which has no live manager, too.
  */
 export function bearingOf(
   row: Pick<StoredMessage, 'sequence' | 'participant' | 'metadata'>,
   reader: ReaderFacts,
-  inOwnSlot: boolean,
+  slot: RowSlot | undefined,
 ): Bearing {
   const metadata = row.metadata as Record<string, unknown> | undefined;
-  if (!inOwnSlot) {
-    const seen = reader.observed.length === 1
-      ? reader.observed[0]
-      : reader.observed.find((o) => sameSlot(o.slot, RESIDENTS_SLOT));
-    if (!seen) return 'elsewhere';
-    return observedRowFor(seen.edge, row, { observer: reader.name, owners: seen.owners }) ? 'arrival' : 'elsewhere';
+  if (slot === undefined) return 'elsewhere';
+  if (slot !== 'own' && !sameSlot(slot, reader.ownSlot)) {
+    const shown = reader.observed.some((seen) => sameSlot(seen.slot, slot)
+      && observedRowFor(seen.edge, row, { observer: reader.name, owners: seen.owners }));
+    return shown ? 'arrival' : 'elsewhere';
   }
   const stamp = audienceOf(metadata);
   if (stamp) {
@@ -252,6 +264,22 @@ export function bearingOf(
   if (reader.hidesHeld && heldFromResidents(metadata)) return 'elsewhere';
   if (isAnotherAgentsInjection(metadata, reader.name)) return 'elsewhere';
   return 'arrival';
+}
+
+/**
+ * The slots besides its own a reader's context merges into its record: the
+ * slots its edges read on its context's branch (no `branch` of their own),
+ * each once. The framework opens an observer's context with one auxiliary
+ * view per such slot (createSubconsciousAgent, reopenAgentContext); a slot
+ * on a branch of its own (a shared fork's) can't be merged so.
+ */
+function mergedSlotsOf(reader: ReaderFacts): MessageSlotRef[] {
+  const slots: MessageSlotRef[] = [];
+  for (const { slot } of reader.observed) {
+    if (slot.branch !== undefined || sameSlot(slot, reader.ownSlot)) continue;
+    if (!slots.some((s) => sameSlot(s, slot))) slots.push(slot);
+  }
+  return slots;
 }
 
 /**
@@ -308,7 +336,7 @@ export type PresentationOccasion =
 /** A context manager as the module uses it. */
 export type WindowManager = Pick<ContextManager,
   'presentRows' | 'retractRows' | 'getUnpresentedMessages' | 'getPresentedMessages' | 'ordinalOf' | 'indexLength' | 'windowStatusOf'
-  | 'windowMode' | 'getMessage' | 'currentBranch' | 'isClosed' | 'retractRemoved' | 'retractAbsentRows'>;
+  | 'windowMode' | 'getMessage' | 'currentBranch' | 'isClosed' | 'retractRemoved' | 'retractAbsentRows' | 'getStore'>;
 
 /** An agent as the module presents to it. The framework's Agent is one. */
 export interface PresentedAgent {
@@ -415,6 +443,8 @@ export class AgentPresentation {
   private readonly failedOwn = new WeakMap<WindowManager, Set<MessageId>>();
   /** Arrivals a rollback took out of each manager's window, kept out of it at rest until the agent's next turn start (holdUntilStart). */
   private readonly heldUntilStart = new WeakMap<WindowManager, Set<MessageId>>();
+  /** Read-only handles on the slots a manager merges, by namespace (slotOfRow): made only for a reader whose context merges more than one. */
+  private readonly slotReaders = new WeakMap<WindowManager, Map<string | null, MessageStore>>();
 
   constructor(private readonly host: PresentationHost) {}
 
@@ -589,7 +619,7 @@ export class AgentPresentation {
         if (i > 0 && continuesBody(window[i - 1], row)) continue;
         if (audienceOf(row.metadata) === undefined || framed?.has(row.id)) continue;
         if (facts.derivedAt !== undefined && row.sequence <= facts.derivedAt) continue;
-        if (bearingOf(row, facts, cm.getMessage(row.id) !== null) === 'elsewhere') foreign.push(row.id);
+        if (bearingOf(row, facts, this.slotOfRow(cm, facts, row.id)) === 'elsewhere') foreign.push(row.id);
       }
       if (foreign.length === 0) return;
       cm.retractRows(foreign);
@@ -608,6 +638,7 @@ export class AgentPresentation {
     this.memos.delete(cm);
     this.failedOwn.delete(cm);
     this.heldUntilStart.delete(cm);
+    this.slotReaders.delete(cm);
     this.framed.delete(agent.name);
     this.generation++;
   }
@@ -694,10 +725,13 @@ export class AgentPresentation {
       for (const reader of this.host.liveAgents()) {
         if (!readers.has(reader.name) || !this.presenting(reader) || this.host.turnAlive(reader.name)) continue;
         const facts = readerFacts(this.host.registry, reader.name);
-        const inOwnSlot = reader === writer || sameSlot(facts.ownSlot, slot);
+        // The rows are in the writer's own slot: the reader's own when it
+        // is the writer or shares that slot (bearingOf compares the ref),
+        // else a slot it observes, weighed by its edges on that slot.
+        const from: RowSlot | undefined = reader === writer ? 'own' : slot;
         // A row the writer's own slot doesn't hold (none found) can't be
         // weighed here; the reader's own scan weighs it.
-        const owed = rows.length < stored.length || rows.some((row) => bearingOf(row, facts, inOwnSlot) !== 'elsewhere');
+        const owed = rows.length < stored.length || rows.some((row) => bearingOf(row, facts, from) !== 'elsewhere');
         if (owed) this.presentAtRest(reader, 'at-rest');
       }
     } catch (error) {
@@ -1171,8 +1205,7 @@ export class AgentPresentation {
       const head = unpresented[start]!;
       newest = Math.max(newest, unpresented[i - 1]!.sequence);
       if (head.sequence <= memo.scanFrom) continue;
-      const inOwnSlot = cm.getMessage(head.id) !== null;
-      const bearing = bearingOf(head, facts, inOwnSlot);
+      const bearing = bearingOf(head, facts, this.slotOfRow(cm, facts, head.id));
       if (bearing === 'elsewhere') continue;
       firstOwed ??= head.sequence;
       if (bearing === 'arrival' && !arrivals) continue;
@@ -1183,6 +1216,36 @@ export class AgentPresentation {
     }
     memo.scanFrom = firstOwed !== undefined ? Math.max(memo.scanFrom, firstOwed - 1) : newest;
     return bodies;
+  }
+
+  /**
+   * The slot of `cm`'s record a row is stored in, for bearingOf: its own
+   * (`'own'`, which getMessage reads), else the merged slot that holds it
+   * (mergedSlotsOf). The record holds the context's own slot and one
+   * auxiliary view per merged slot, so a row not in its own is in the one
+   * merged slot when there is one; when there are more, each is asked, by
+   * a read-only handle on it over the manager's store, which follows its
+   * branch and its writes as the manager's own views do. undefined for a
+   * row in none of them (a slot the reader has no edge on).
+   */
+  private slotOfRow(cm: WindowManager, facts: ReaderFacts, id: MessageId): RowSlot | undefined {
+    if (cm.getMessage(id) !== null) return 'own';
+    const merged = mergedSlotsOf(facts);
+    if (merged.length <= 1) return merged[0];
+    let readers = this.slotReaders.get(cm);
+    if (!readers) {
+      readers = new Map();
+      this.slotReaders.set(cm, readers);
+    }
+    for (const slot of merged) {
+      let reader = readers.get(slot.namespace);
+      if (!reader) {
+        reader = new MessageStore(cm.getStore(), slot.namespace === null ? {} : { namespace: slot.namespace });
+        readers.set(slot.namespace, reader);
+      }
+      if (reader.sequenceOf(id) !== undefined) return slot;
+    }
+    return undefined;
   }
 
   /**

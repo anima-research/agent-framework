@@ -31036,7 +31036,7 @@ export class AgentFramework {
       // Only what was meant for it: every row its store's walk reads is in
       // its own slot (getAllMessages reads no merged view).
       const reader = this.releasedReaders.get(agent) ?? recordedReaderFacts(this.registry, agent.name);
-      const forIt = (m: StoredMessage): boolean => bearingOf(m, reader, true) !== 'elsewhere';
+      const forIt = (m: StoredMessage): boolean => bearingOf(m, reader, 'own') !== 'elsewhere';
       // A body the store took as more than one message (a sharded body)
       // carries the same metadata on each of its shards, and is one notice,
       // so a shard that continues the body before it isn't taken again: its

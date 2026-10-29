@@ -12,7 +12,9 @@
   only through an edge with `includeHeld`; a row with no audience stamp, an owner's own row, a row whose audience
   names an owner, and one that is nobody's own row and whose audience names the observer itself (an operator's
   message or a module's write addressed to the subconscious alone, stored in the residents' slot, which the merged
-  view showed it), yes; anything else, no.
+  view showed it), yes; anything else, no. An agent that observes more than one slot has each row weighed by its
+  edges on the slot the row is stored in, with that slot's owners, and a row of another slot it has no edge on is
+  never its arrival.
 - The own-row sink the presentation index presents an agent's own rows through, as they are written:
   `Agent.setOwnRowSink(sink)` and `Agent.ownRowsStored(ids)`, `OwnRowWriter.ownRowsStored?(ids)`, and a `present`
   argument on `storeOwnRow` (default true; `false` stores the row without telling the sink, for a row written where
