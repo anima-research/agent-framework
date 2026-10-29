@@ -129,12 +129,12 @@ test('a gate.json that is JSON the gate refuses whole, for a default other than 
   assert.throws(
     () => gate.addPolicy({ name: 'ambient', match: { tagsAny: ['chat:ambient'] }, behavior: 'defer' }),
     {
-      message: 'Nothing was saved: with this change, gate.json wouldn\'t be used. gate.json "default" must be "always", "defer", or "skip", '
+      message: `Nothing was saved: with this change, gate.json, at ${configPath}, wouldn't be used. gate.json "default" must be "always", "defer", or "skip", `
         + 'got: "sometimes". No change through the gate can bring it into force, so gate.json has to be fixed by an edit of its own; '
         + 'until then, a change is refused the same way.',
     },
   );
-  assert.throws(() => gate.removePolicy('quick'), { message: /^Nothing was saved: with this change, gate\.json wouldn't be used\. gate\.json "default" must be/ });
+  assert.throws(() => gate.removePolicy('quick'), { message: /^Nothing was saved: with this change, gate\.json, at .*, wouldn't be used\. gate\.json "default" must be/ });
   assert.equal(readFileSync(configPath, 'utf-8'), refused, 'gate.json is as the operator wrote it');
   assert.deepEqual(readdirSync(dir), ['gate.json'], 'nothing is written beside it');
   assert.deepEqual(gate.listPolicyNames(), ['mentions'], 'the rules in force stay');
@@ -533,7 +533,7 @@ test('a privileged-users list loads entry by entry: what is not a user id is ski
   assert.deepEqual(gate.getStatus().errors, [
     `3 entries in the privileged-users file, at ${privilegedUsersPath}, aren't user ids, so they were skipped: "", ${rounded} (a number this large can't `
     + 'be read exactly: write the id as a string, in quotes), {"id":"u3"}. A user id is a non-empty string, or a safe integer '
-    + '(a whole number within 2^53 - 1 of zero); the 2 ids that did load are privileged. Once they are user ids, the gate reads the file '
+    + '(a whole number within 2^53 - 1 of zero); the 2 ids that did load are privileged. Once those entries are user ids, the gate reads the file '
     + 'again at its next check for changes.',
   ]);
 });
@@ -549,8 +549,8 @@ test('a skipped privileged-users entry is quoted cut at 39 UTF-16 units, here at
   // As JSON the entry is 54 units, and its 39th is the first half of the 19th pair, so the quote keeps 38.
   assert.deepEqual(gate.getStatus().errors, [
     `1 entry in the privileged-users file, at ${privilegedUsersPath}, isn't a user id, so it was skipped: ["${GRIN.repeat(18)}…. A user id is a `
-    + 'non-empty string, or a safe integer (a whole number within 2^53 - 1 of zero); the one id that did load is privileged. Once it is a '
-    + 'user id, the gate reads the file again at its next check for changes.',
+    + 'non-empty string, or a safe integer (a whole number within 2^53 - 1 of zero); the one id that did load is privileged. Once that entry '
+    + 'is a user id, the gate reads the file again at its next check for changes.',
   ]);
 });
 

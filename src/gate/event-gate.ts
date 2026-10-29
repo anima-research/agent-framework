@@ -483,10 +483,10 @@ function beforeWriting(err: unknown): boolean {
  * "policies" that isn't a list and holds something. `runs` is what the gate
  * runs meanwhile (rulesRun).
  */
-function noListRefusal(noList: string, runs: string): string {
+function noListRefusal(noList: string, runs: string, path: string): string {
   return `${noList}, so it has no list of rules a change could edit without writing over what it holds, and nothing `
-    + `was saved. Meanwhile the gate runs ${runs}. Until gate.json is an object whose "policies" is a list holding its `
-    + 'rules, a change is refused the same way.';
+    + `was saved. Meanwhile the gate runs ${runs}. Until gate.json, at ${path}, is an object whose "policies" is a list `
+    + 'holding its rules, a change is refused the same way.';
 }
 
 /**
@@ -2027,7 +2027,7 @@ function skippedPrivilegedIds(skipped: unknown[], loaded: number, path: string):
     : `the ${loaded === 1 ? 'one id that did load is' : `${loaded} ids that did load are`} privileged`;
   return `${skipped.length} ${one ? 'entry' : 'entries'} in the privileged-users file, at ${path}, ${one ? "isn't a user id" : "aren't user ids"}, `
     + `so ${one ? 'it was' : 'they were'} skipped: ${shown.join(', ')}${more}. A user id is a non-empty string, or a safe integer `
-    + `(a whole number within 2^53 - 1 of zero); ${rest}. Once ${one ? 'it is a user id' : 'they are user ids'}, the gate `
+    + `(a whole number within 2^53 - 1 of zero); ${rest}. Once ${one ? 'that entry is a user id' : 'those entries are user ids'}, the gate `
     + 'reads the file again at its next check for changes.';
 }
 
@@ -2709,7 +2709,7 @@ export class EventGate {
     const read = this.readConfigFile();
     if (read.state === 'unreadable') return { refused: unusableRefusal(read, this.rulesRun(), this.configPath) };
     if (read.state === 'loaded' || read.state === 'refused') {
-      if ('noList' in read.listed) return { refused: noListRefusal(read.listed.noList, this.rulesRun()) };
+      if ('noList' in read.listed) return { refused: noListRefusal(read.listed.noList, this.rulesRun(), this.configPath) };
       // Rules not gate.json's in force while it holds the text in force: what a
       // start ran in place of one with no rules of its own, until it changes.
       if (read.state === 'loaded' && read.text === this.configText && this.configSource !== 'file') {
@@ -2944,7 +2944,7 @@ export class EventGate {
               `${reading.where} wasn't saved: ${field} is ${quotedValue(anchorName)}, the rule being saved, and a rule can't be `
               + 'placed beside itself. '
               + (others.length > 0
-                ? `The other rules are ${quotedList(others)}. Give ${field} one of those, or leave it out`
+                ? `The other rules are ${quotedList(others)}. Give ${field} one of those to place the rule beside it, or leave it out`
                 : `There are no other rules, so leave ${field} out`)
               + ' to replace the rule where it is.',
             );
@@ -2952,7 +2952,7 @@ export class EventGate {
           throw new Error(
             `${reading.where} wasn't saved: ${field} is ${quotedValue(anchorName)}, and no rule has that name. `
             + (others.length > 0
-              ? `The other rules are ${quotedList(others)}. Give ${field} one of those, or leave it out`
+              ? `The other rules are ${quotedList(others)}. Give ${field} one of those to place the rule beside it, or leave it out`
               : `There are no other rules, so leave ${field} out`)
             + ' to add the rule at the end, or, where a rule already has its name, to replace that rule where it is.',
           );
@@ -3055,7 +3055,8 @@ export class EventGate {
     const read = readConfig(JSON.parse(text), 'gate.json');
     if ('refused' in read) {
       throw new Error(
-        `Nothing was saved: with this change, gate.json wouldn't be used. ${sentence(read.refused)}${remedy ? ` ${remedy}` : ''}`,
+        `Nothing was saved: with this change, gate.json, at ${this.configPath}, wouldn't be used. ${sentence(read.refused)}`
+          + (remedy ? ` ${remedy}` : ''),
       );
     }
     // One the gate doesn't use, and that a change can mend, holds back what a
@@ -4503,8 +4504,8 @@ export class EventGate {
    * each a non-empty string or a safe integer (a whole number within 2^53 - 1 of zero). An absent file
    * means no one is privileged. A file that can't be read, isn't JSON, or
    * holds no list leaves the list that last loaded in this process in effect
-   * (none, at startup), with its error in gate_status until its text
-   * changes. In a list, an entry that isn't a user id is skipped, and named
+   * (none, at startup), with its error in gate_status until a later read
+   * loads it or fails another way. In a list, an entry that isn't a user id is skipped, and named
    * in the file's error, and the rest load. With `unlessUnchanged`, a file whose
    * text is the text last read isn't parsed again.
    */

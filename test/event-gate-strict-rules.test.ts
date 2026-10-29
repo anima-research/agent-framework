@@ -456,7 +456,7 @@ test("a change over a gate.json that's JSON the gate doesn't use edits it as wri
   const mends = 'Replacing or removing "quiet-ambient" by name would bring gate.json into force.';
   const hostOnly = 'No change through the gate can bring it into force, so gate.json has to be fixed by an edit of its own; until '
     + 'then, a change is refused the same way.';
-  const notSaved = (said: string, remedy = mends): string => 'Nothing was saved: with this change, gate.json wouldn\'t be used. gate.json '
+  const notSaved = (path: string, said: string, remedy = mends): string => `Nothing was saved: with this change, gate.json, at ${path}, wouldn't be used. gate.json `
     + `leaves out a rule that could wake the agent, and under its default, "defer", what it was written to wake it on would be held back. ${said} ${remedy}`;
   const dir = tempDir(t);
   const { gate, configPath } = makeGate(dir, { file: operators });
@@ -464,8 +464,8 @@ test("a change over a gate.json that's JSON the gate doesn't use edits it as wri
   assert.equal(gate.getStatus().configSource, 'default');
 
   // A change that doesn't mend it is refused, naming what keeps it out: nothing is written over the file, or kept.
-  assert.throws(() => gate.addPolicy({ name: 'added', match: { source: 'x' }, behavior: 'skip' }), { message: notSaved(ambientSaid) });
-  assert.throws(() => gate.removePolicy('dms'), { message: notSaved(ambientSaid) });
+  assert.throws(() => gate.addPolicy({ name: 'added', match: { source: 'x' }, behavior: 'skip' }), { message: notSaved(configPath, ambientSaid) });
+  assert.throws(() => gate.removePolicy('dms'), { message: notSaved(configPath, ambientSaid) });
   assert.equal(gate.removePolicy('absent'), false, 'a removal of a rule it lacks writes nothing');
   assert.equal(readFileSync(configPath, 'utf-8'), written, 'gate.json is as the operator wrote it');
   assert.deepEqual(readdirSync(dir), ['gate.json'], 'nothing is written beside it');
@@ -494,7 +494,7 @@ test("a change over a gate.json that's JSON the gate doesn't use edits it as wri
   const twoWritten = readFileSync(two.configPath, 'utf-8');
   assert.throws(
     () => two.gate.addPolicy({ ...ambient, behavior: { debounce: 60000 } }),
-    { message: notSaved(`Rule "mentions" is left out: behavior is [], where ${BEHAVIORS} is needed.`, hostOnly) },
+    { message: notSaved(two.configPath, `Rule "mentions" is left out: behavior is [], where ${BEHAVIORS} is needed.`, hostOnly) },
   );
   assert.equal(readFileSync(two.configPath, 'utf-8'), twoWritten);
   two.gate.dispose();
@@ -502,7 +502,7 @@ test("a change over a gate.json that's JSON the gate doesn't use edits it as wri
   const unnamed = makeGate(tempDir(t), { file: { ...operators, policies: [dms, { match: {}, behavior: 'always' }] } });
   assert.throws(
     () => unnamed.gate.addPolicy({ name: 'added', behavior: 'always' }),
-    { message: notSaved('The 2nd rule is left out: it has no "name".', hostOnly) },
+    { message: notSaved(unnamed.configPath, 'The 2nd rule is left out: it has no "name".', hostOnly) },
   );
   unnamed.gate.dispose();
   // Where another rule has its name, the refusal says what a change by that
@@ -511,6 +511,7 @@ test("a change over a gate.json that's JSON the gate doesn't use edits it as wri
   const shared = makeGate(tempDir(t), { file: { ...operators, policies: [dms, { ...ambient, behavior: 'always' }, ambient] } });
   const sharedWritten = readFileSync(shared.configPath, 'utf-8');
   const sharedSaid = notSaved(
+    shared.configPath,
     ambientSaid,
     'gate.json has 2 rules named "quiet-ambient", and a change by that name replaces the first of them or removes them all.',
   );
@@ -527,8 +528,8 @@ test("a change over a gate.json that's JSON the gate doesn't use edits it as wri
     const before = readFileSync(path, 'utf-8');
     assert.throws(() => g.addPolicy({ name: 'added', behavior: 'always' }), {
       message: `${what}, so it has no list of rules a change could edit without writing over what it holds, and nothing was `
-        + `saved. Meanwhile the gate runs ${runs}. Until gate.json is an object whose "policies" is a list holding its rules, a `
-        + 'change is refused the same way.',
+        + `saved. Meanwhile the gate runs ${runs}. Until gate.json, at ${path}, is an object whose "policies" is a list holding `
+        + 'its rules, a change is refused the same way.',
     });
     assert.equal(readFileSync(path, 'utf-8'), before);
     assert.deepEqual(readdirSync(d), ['gate.json']);
@@ -1088,8 +1089,8 @@ test('a change refuses, writing nothing, where gate.json has no rule list it cou
     const before = readFileSync(configPath, 'utf-8');
     // It loads with no rules, so the refusal says every event gets its default.
     const message = `${what}, so it has no list of rules a change could edit without writing over what it holds, and nothing `
-      + `was saved. Meanwhile the gate runs no rules: every event gets the default, "${defaultBehavior}". Until gate.json is an `
-      + 'object whose "policies" is a list holding its rules, a change is refused the same way.';
+      + `was saved. Meanwhile the gate runs no rules: every event gets the default, "${defaultBehavior}". Until gate.json, at `
+      + `${configPath}, is an object whose "policies" is a list holding its rules, a change is refused the same way.`;
     assert.throws(() => gate.addPolicy({ name: 'later', behavior: 'defer' }), { message }, JSON.stringify(file));
     // A removal is a change: the file holds "dm", in a form no change can edit,
     // and a name it may not hold is refused the same way, since that can't be told.
@@ -1987,7 +1988,7 @@ test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its
   for (const field of ['insertBefore', 'insertAfter']) {
     const anchor = await call({ name: 'watch', behavior: 'defer', [field]: 3 });
     assert.equal(anchor.isError, true);
-    assert.match(anchor.content, new RegExp(`wake_add_rule: ${field} must be the name of a rule, and it's 3, so nothing was saved\\. The rules are "mentions"\\. Give ${field} one of them`));
+    assert.match(anchor.content, new RegExp(`wake_add_rule: ${field} must be the name of a rule, and it's 3, so nothing was saved\\. The other rules in force are "mentions"\\. Give ${field} one of them`));
   }
   // A name no rule has was refused before this change too, by the gate.
   const absent = await call({ name: 'watch', behavior: 'defer', insertAfter: 'nope' });
