@@ -217,6 +217,91 @@ describe('the deferred-write importer (#291, AF-6)', () => {
     } finally { h.close(); }
   });
 
+  describe("a write whose landing is unknown, looked up while context-manager's query throws, as a blob missing from another message makes it throw", () => {
+    type Window = { messages: unknown[] };
+    type Cm = {
+      queryMessages(...args: unknown[]): unknown;
+      getMessageWindow(offset: number, limit: number, opts?: { resolveBlobs?: boolean }): Window;
+    };
+    async function bootWithLookupFailing(h: Host, short: boolean): Promise<AgentFramework> {
+      const proto = AgentFramework.prototype as unknown as { landedCopiesById(agent: { getContextManager(): unknown }, id: string): unknown };
+      const original = proto.landedCopiesById;
+      proto.landedCopiesById = function (agent, id) {
+        const cm = agent.getContextManager() as Cm;
+        const query = cm.queryMessages;
+        const read = cm.getMessageWindow;
+        cm.queryMessages = () => { throw new Error('Blob not found: 0123'); };
+        if (short) {
+          cm.getMessageWindow = function (this: unknown, offset, limit, opts) {
+            const window = read.call(this, offset, limit, opts);
+            return opts?.resolveBlobs === false ? { ...window, messages: window.messages.slice(1) } : window;
+          };
+        }
+        try {
+          return original.call(this, agent, id);
+        } finally {
+          cm.queryMessages = query;
+          cm.getMessageWindow = read;
+        }
+      };
+      try { return await h.boot(); } finally { proto.landedCopiesById = original; }
+    }
+
+    async function storedEarlier(h: Host): Promise<number> {
+      const framework = await h.boot();
+      try {
+        const cm = framework.getAgent('agent')!.getContextManager();
+        cm.addMessage('user', text('found earlier'), { deferredWriteId: 'u1' } as never);
+        return cm.getMessageCount();
+      } finally { await framework.stop(); }
+    }
+
+    it('is found by a blob-free scan of the branch, and not stored again', async () => {
+      const h = await host();
+      try {
+        const count = await storedEarlier(h);
+        h.writeQueue([
+          entry('u1', 1, 'found earlier', { landing: 'unknown' }),
+          entry('u2', 2, 'behind it'),
+        ], { agent: count });
+        const framework = await bootWithLookupFailing(h, false);
+        try {
+          assert.equal(withText(framework, 'found earlier').length, 1, 'not stored again');
+          assert.equal(withText(framework, 'behind it').length, 1, 'what follows it is stored');
+          assert.deepEqual(h.readQueue().pending, []);
+        } finally { await framework.stop(); }
+      } finally { h.close(); }
+    });
+
+    it("whose blob-free scan comes back short, is kept with what follows it for the next boot, as a store that can't be searched, and not stored again", async () => {
+      const h = await host();
+      try {
+        const count = await storedEarlier(h);
+        h.writeQueue([
+          entry('u1', 1, 'found earlier', { landing: 'unknown' }),
+          entry('u2', 2, 'behind it'),
+        ], { agent: count });
+        const errors: string[] = [];
+        const quiet = console.error;
+        console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+        let framework: AgentFramework;
+        try { framework = await bootWithLookupFailing(h, true); } finally { console.error = quiet; }
+        try {
+          assert.equal(withText(framework, 'found earlier').length, 1, 'not taken as absent and stored again');
+          assert.equal(withText(framework, 'behind it').length, 0, 'held behind it');
+          assert.deepEqual(h.readQueue().pending.map((m) => m.id), ['u1', 'u2'], 'left for the next boot, in order');
+          assert.ok(errors.some((e) => e.includes("could not search agent's store for deferred write u1") && e.includes('Blob not found: 0123')), errors.join('\n'));
+        } finally { await framework.stop(); }
+        framework = await h.boot();
+        try {
+          assert.equal(withText(framework, 'found earlier').length, 1, 'once, when the next boot can search');
+          assert.equal(withText(framework, 'behind it').length, 1);
+          assert.deepEqual(h.readQueue().pending, []);
+        } finally { await framework.stop(); }
+      } finally { h.close(); }
+    });
+  });
+
   it("keeps a write whose store can't be searched, and what follows it for that agent, for the next boot, and stores the other agents'", async () => {
     const h = await host([{ name: 'mira' }, { name: 'oren' }]);
     const proto = AgentFramework.prototype as unknown as { landedCopiesById(agent: { name: string }, id: string): unknown };

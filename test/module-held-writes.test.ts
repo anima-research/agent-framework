@@ -235,6 +235,49 @@ test('for one release, the held: handle an earlier release answered reaches the 
   }
 });
 
+async function withImportedW1(run: (probe: Probe, cm: {
+  queryMessages(...args: unknown[]): unknown;
+  getMessageWindow(offset: number, limit: number, opts?: { resolveBlobs?: boolean }): { messages: unknown[] };
+}) => void): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'module-held-writes-'));
+  const storePath = join(dir, 'store');
+  await (await open(storePath)).framework.stop();
+  writeEarlierQueue(storePath, [{ id: 'w1', seq: 1, participant: 'user', content: text('queued before the upgrade') }]);
+  const probe = await open(storePath);
+  const cm = probe.framework.getAgent('assistant')!.getContextManager() as unknown as Parameters<typeof run>[1];
+  const query = cm.queryMessages;
+  const read = cm.getMessageWindow;
+  cm.queryMessages = () => { throw new Error('Blob not found: 0123'); };
+  try {
+    run(probe, cm);
+  } finally {
+    cm.queryMessages = query;
+    cm.getMessageWindow = read;
+    await probe.framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("a held: handle reaches the row its write landed as by a blob-free scan when context-manager's query throws, as a blob missing from another message makes it throw", async () => {
+  await withImportedW1(({ ctx }) => {
+    const row = ctx.getMessage('held:w1');
+    assert.ok(row && !row.id.startsWith('held:'), 'the stored row');
+    assert.equal(textOf(row), 'queued before the upgrade');
+  });
+});
+
+test("a held: handle whose blob-free scan comes back short throws that the store can't be searched, rather than naming nothing", async () => {
+  await withImportedW1(({ ctx }, cm) => {
+    const read = cm.getMessageWindow;
+    cm.getMessageWindow = function (this: unknown, offset, limit, opts) {
+      const window = read.call(this, offset, limit, opts);
+      return opts?.resolveBlobs === false ? { ...window, messages: window.messages.slice(1) } : window;
+    };
+    assert.throws(() => ctx.getMessage('held:w1'),
+      /couldn't be searched for deferred write w1: its query threw \(Blob not found: 0123\), and then the store gave/);
+  });
+});
+
 test("a write whose metadata a module copied from an imported row doesn't carry the framework's deferredWriteId, so a handle never names the copy", async () => {
   const dir = mkdtempSync(join(tmpdir(), 'module-held-writes-'));
   const storePath = join(dir, 'store');
