@@ -321,31 +321,42 @@ describe('after a branch move, every agent on the store compiles without a resta
 
   it("the API server's undo and redo tell clients of the window's change (window:undone), and a client that reads an agent's context then gets it", async () => {
     await checkpointTurn();
-    const api = new ApiServer(framework) as unknown as {
-      cmdUndo(params: { agentName: string }): Promise<Record<string, unknown>>;
-      cmdRedo(params: { agentName: string }): Promise<Record<string, unknown>>;
+    const api = new ApiServer(framework, { port: 0, host: '127.0.0.1' }) as unknown as {
+      start(): Promise<void>;
+      stop(): Promise<void>;
+      cmdUndo(params: { agentName: string }): Promise<Record<string, unknown> & { window?: { retracted: number; represented?: number } }>;
+      cmdRedo(params: { agentName: string }): Promise<Record<string, unknown> & { window?: { retracted: number; represented: number } }>;
       cmdAgentContext(params: { agentName: string }): Promise<{ context: unknown[] }>;
       broadcast(event: string, data: unknown): void;
-      handleTraceEvent(event: unknown): void;
     };
-    framework.onTrace((event) => api.handleTraceEvent(event));
-    // b's rows were written past the framework, so they enter its window at
-    // its next point (#291): present them, as a turn of b's would.
-    (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent('b'));
-    const reads: Array<Promise<{ context: unknown[] }>> = [];
-    api.broadcast = (event) => {
-      if (event !== 'window:undone') return;
-      reads.push(api.cmdAgentContext({ agentName: 'b' }));
-    };
-    const undone = await api.cmdUndo({ agentName: 'a' });
-    assert.equal(undone.undone, true);
-    assert.ok(!('settled' in undone), `the answer carries no promise: ${Object.keys(undone).join(', ')}`);
-    const redone = await api.cmdRedo({ agentName: 'a' });
-    assert.equal(redone.redone, true);
-    assert.ok(!('settled' in redone), `the answer carries no promise: ${Object.keys(redone).join(', ')}`);
-    assert.equal(reads.length, 2, 'one event for each change');
-    for (const read of await Promise.all(reads)) assert.ok(read.context.length > 0, "b's context compiled");
-    assert.deepEqual(reinitAlerts(), []);
+    await api.start();
+    try {
+      // b's rows were written past the framework, so they enter its window at
+      // its next point (#291): present them, as a turn of b's would.
+      (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent('b'));
+      const events: Array<Record<string, unknown>> = [];
+      const reads: Array<Promise<{ context: unknown[] }>> = [];
+      api.broadcast = (event, data) => {
+        if (event !== 'window:undone') return;
+        events.push(data as Record<string, unknown>);
+        reads.push(api.cmdAgentContext({ agentName: 'b' }));
+      };
+      const undone = await api.cmdUndo({ agentName: 'a' });
+      assert.equal(undone.undone, true);
+      assert.ok(!('settled' in undone), `the answer carries no promise: ${Object.keys(undone).join(', ')}`);
+      const redone = await api.cmdRedo({ agentName: 'a' });
+      assert.equal(redone.redone, true);
+      assert.ok(!('settled' in redone), `the answer carries no promise: ${Object.keys(redone).join(', ')}`);
+      assert.equal(events.length, 2, 'one event for each change');
+      const [ofUndo, ofRedo] = events;
+      assert.deepEqual([ofUndo!.agentName, ofUndo!.retracted, 'represented' in ofUndo!], ['a', undone.window!.retracted, false], 'the undo says what left');
+      assert.deepEqual([ofRedo!.agentName, ofRedo!.retracted, ofRedo!.represented], ['a', redone.window!.retracted, redone.window!.represented], 'the redo says what left and what came back');
+      assert.ok(undone.window!.retracted > 0 && redone.window!.represented > 0, 'the turn left and came back');
+      for (const read of await Promise.all(reads)) assert.ok(read.context.length > 0, "b's context compiled");
+      assert.deepEqual(reinitAlerts(), []);
+    } finally {
+      await api.stop();
+    }
   });
 
   it('a host/command turn undo answers with the preview, compiled once the managers are current', async () => {
