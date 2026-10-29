@@ -17,6 +17,7 @@ import { assertServerConfigBooleans } from '../src/mcpl/transport.js';
 import type { McplHostCapabilities, McplServerConfig } from '../src/mcpl/types.js';
 
 const WHAT_TRUE_DOES = {
+  credentialRequired: 'true requires a provider credential on every WebSocket dial without fallback; false or leaving it out keeps legacy behavior',
   inheritEnv: "true passes the server the host's whole environment, and false or leaving it out passes only the allowlisted and LC_* host variables",
   reconnect: "true retries in the background when the server can't be reached or its connection drops, and false or leaving it out doesn't",
   allowHostCommands: "true lets the server run the host's admin commands, such as undo, hide, unstick and quiesce, and false or leaving it out refuses them",

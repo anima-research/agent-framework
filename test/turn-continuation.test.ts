@@ -18,6 +18,7 @@ import { join } from 'node:path';
 import type { NormalizedRequest, NormalizedResponse, YieldingStream } from '@animalabs/membrane';
 import type { EventResponse, InferenceRequest, Module, ProcessEvent, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { AgentFramework, OperatorActionError } from '../src/index.js';
+import { setAbandonGraceForTests } from '../src/framework.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
 import { forkAgentName } from '../src/mcpl/conversation-router.js';
 import type { StreamEvent } from '@animalabs/membrane';
@@ -1275,6 +1276,7 @@ describe('a framework cancel that throws', () => {
     const h = await restartTurn({ wait: false, cancelThrows: true, gate: true, blockFirstTool: blocked, until: () => true });
     try {
       await waitFor('the tool to start', () => h.module.firstToolStarted);
+      setAbandonGraceForTests(h.framework, 50);
       const status = await h.framework.quiesce({ timeoutMs: 200, abandon: true });
       assert.deepEqual(status.unabandonable, ['prime']);
       assert.equal(status.drained, false);

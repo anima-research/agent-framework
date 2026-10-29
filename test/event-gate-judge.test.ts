@@ -16,6 +16,7 @@ function writeConfig(name: string, config: unknown): string {
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const LONGER_THAN_ANY_START_MS = 60_000;
 async function until(done: () => boolean, what: string, withinMs = 5_000): Promise<void> {
   const by = Date.now() + withinMs;
   while (!done()) {
@@ -237,7 +238,7 @@ describe('judge rules: verdicts', () => {
     console.error = () => {};
     try {
       gate.evaluate(chat('hello'));
-      await sleep(200);
+      await until(() => judge.requests[0]?.signal.aborted === true && wakes.length === 1, 'the judge to be timed out and the agent woken', LONGER_THAN_ANY_START_MS);
     } finally {
       console.error = original;
     }

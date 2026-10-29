@@ -22,11 +22,13 @@ import type {
   SpeechContext,
   SpeechHandlerOptions,
   ProcessEvent,
+  ToolResultEvent,
   TraceEventListener,
   ModuleMessage,
   ModuleContextInjection,
   MessageQueryResult,
 } from './types/index.js';
+import { boundedErrorMessage } from './error-message.js';
 import type { Agent } from './agent.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from './shutdown.js';
 import { logValue } from './mcpl/log-value.js';
@@ -39,6 +41,19 @@ export interface ModuleQueue {
 }
 
 const MODULE_STATE_PREFIX = 'modules/';
+
+export function droppedToolResultLine(event: ToolResultEvent, when: string): string {
+  const outcome = event.result.success && !event.result.isError
+    ? 'succeeded'
+    : `failed${event.result.error ? `: ${boundedErrorMessage(event.result.error)}` : ''}`;
+  return `[framework] ${event.agentName}: result of tool call ${event.callId} (${event.toolName ? `${event.toolName}, ` : ''}${event.moduleName}) arrived ${when} — dropped; the tool ${outcome}`;
+}
+
+export function retiredPushLine(event: ProcessEvent, moduleName: string): string {
+  return event.type === 'tool-result'
+    ? droppedToolResultLine(event, `after module ${moduleName} stopped`)
+    : `[framework] a '${event.type}' event from module ${moduleName} arrived after that module stopped — dropped`;
+}
 
 /**
  * True when a registerState failure means "this state id already exists" —
@@ -122,6 +137,11 @@ export class ModuleRegistry {
   private pushEventFn: (event: ProcessEvent, moduleName?: string) => void;
   private onTraceFn: (listener: TraceEventListener) => () => void;
   private callToolFn: (call: ToolCall) => Promise<ToolResult>;
+  /**
+   * The constructor's `dropRetiredPush` option.
+   * @internal For the framework's drop lines; not a host API.
+   */
+  readonly dropRetiredPushFn?: (event: ProcessEvent, moduleName: string) => void;
   /** Framework ops-alert channel, surfaced to modules via
    *  ModuleContext.notifyOps. Readonly-public so ModuleContextImpl can
    *  delegate without another positional constructor parameter. */
@@ -151,6 +171,10 @@ export class ModuleRegistry {
       queryMessages: (filter: MessageQuery, opts?: { forAgent?: string }) => MessageQueryResult;
       /** Called with the pushing module's name. */
       pushEvent: (event: ProcessEvent, moduleName?: string) => void;
+      /** Logs a push a module made after its stop() completed, which is
+       *  dropped, not queued. Without it, the registry logs a line of its own.
+       *  @internal For the framework's drop lines; not a host API. */
+      dropRetiredPush?: (event: ProcessEvent, moduleName: string) => void;
       onTrace: (listener: TraceEventListener) => () => void;
       callTool: (call: ToolCall) => Promise<ToolResult>;
       notifyOps?: (kind: string, agentName: string, message: string, data?: Record<string, unknown>) => void;
@@ -180,6 +204,7 @@ export class ModuleRegistry {
     this.observesFn = options.observes;
     this.viewKeepsFn = options.viewKeeps;
     this.agentNameOfFn = options.agentNameOf;
+    this.dropRetiredPushFn = options.dropRetiredPush;
   }
 
   /**
@@ -248,6 +273,17 @@ export class ModuleRegistry {
    */
   getAllModules(): Module[] {
     return Array.from(this.modules.values());
+  }
+
+  /**
+   * The current registration of the module of this name: a value that
+   * changes each time a module of that name is added, the same module object
+   * included, and that stays the same until its stop() completes;
+   * `undefined` while none is registered.
+   * @internal For the framework's registration checks; not a host API.
+   */
+  registrationOf(moduleName: string): object | undefined {
+    return this.moduleContexts.get(moduleName);
   }
 
   /**
@@ -420,9 +456,14 @@ export class ModuleRegistry {
     if (existing) return existing;
     const attempt = Promise.resolve().then(() => module.stop()).then(() => {
       if (this.modules.get(module.name) === module) {
+        const context = this.moduleContexts.get(module.name);
         this.modules.delete(module.name);
         this.moduleContexts.delete(module.name);
         this.speechHandlers = this.speechHandlers.filter(handler => handler.moduleName !== module.name);
+        this.batchHooksRunning.delete(module.name);
+        this.stopping.delete(module);
+        context?.retire();
+        return;
       }
       this.stopping.delete(module);
     }, error => {
@@ -474,7 +515,12 @@ export class ModuleRegistry {
    * something that isn't an array of objects, or with a `system` entry whose
    * content isn't an array of objects, every block of which the agent's
    * buildSystemPrompt reads, and one that answers after its timeout adds
-   * nothing. An array returned without a promise is taken as the module's
+   * nothing. Once every answer is in, the answers are merged, and an answer
+   * from a module whose registration has ended by then (its stop()
+   * completed, whether or not a module of its name has been added since) is
+   * left out, with a line if it held injections; a stop that completes after
+   * the merge doesn't change what this returned. An array returned without a
+   * promise is taken as the module's
    * answer. An entry's other fields are the module's to get right. Each
    * module's budget starts once its call returns, after its own synchronous
    * work and every earlier module's; a later module's synchronous work still
@@ -494,6 +540,7 @@ export class ModuleRegistry {
     // that answers after its timeout adds nothing (it's skipped, fail-open).
     const results: ModuleContextInjection[][] = [];
     const promises: Promise<void>[] = [];
+    const asked: { slot: number; moduleName: string; registration: object | undefined }[] = [];
 
     for (const module of this.modules.values()) {
       const gather = module.gatherContext;
@@ -512,6 +559,7 @@ export class ModuleRegistry {
       let timedOut = false;
       const slot = results.length;
       results.push([]);
+      asked.push({ slot, moduleName: module.name, registration: this.moduleContexts.get(module.name) });
       // Called here, before its timer is set, so its budget starts after its
       // synchronous work; a call that throws is skipped as a rejection is.
       let call: Promise<ModuleContextInjection[]>;
@@ -537,7 +585,6 @@ export class ModuleRegistry {
           if (unreadable) {
             throw new TypeError(`gatherContext answered with a system injection in namespace ${logValue(unreadable.namespace)} whose content isn't an array of objects`);
           }
-          this.noteBlocksNotShown(module.name, r);
           results[slot] = [...r];
         }),
         new Promise<void>((_, rej) => {
@@ -557,6 +604,19 @@ export class ModuleRegistry {
     }
 
     await Promise.all(promises);
+    for (const { slot, moduleName, registration } of asked) {
+      if (this.moduleContexts.get(moduleName) === registration) {
+        this.noteBlocksNotShown(moduleName, results[slot]);
+        continue;
+      }
+      if (results[slot].length > 0) {
+        console.error(
+          `[framework] module ${moduleName} stopped before its gatherContext answer for ${agentName} was used, ` +
+          `so its ${results[slot].length} injection(s) were left out`,
+        );
+      }
+      results[slot] = [];
+    }
     return results.flat();
   }
 
@@ -586,7 +646,8 @@ export class ModuleRegistry {
    * Tell modules an agent's tool batch completed (see
    * Module.onToolBatchComplete). Hooks run in parallel, each awaited up to
    * `timeoutMs`; a hook that throws or times out is logged and skipped, so a
-   * wedged module can't hold the round. Returns the modules that didn't
+   * wedged module can't hold the round. A module whose `stop()` completes
+   * before its hook is called isn't called. Returns the modules that didn't
    * finish, for the caller's trace.
    */
   async notifyToolBatchComplete(
@@ -604,10 +665,14 @@ export class ModuleRegistry {
         failures.push({ module: module.name, error: 'still running from an earlier batch' });
         continue;
       }
+      const registration = this.moduleContexts.get(module.name);
       // Called from a promise, so a hook that throws synchronously, before
       // returning its promise, is caught below like any other failure
       // instead of escaping the round (the result would never be provided).
-      const call = Promise.resolve().then(() => module.onToolBatchComplete!(agentName));
+      const call = Promise.resolve().then(() => {
+        if (this.moduleContexts.get(module.name) !== registration) return;
+        return module.onToolBatchComplete!(agentName);
+      });
       this.batchHooksRunning.set(module.name, call);
       const settled = (): void => {
         if (this.batchHooksRunning.get(module.name) === call) this.batchHooksRunning.delete(module.name);
@@ -644,10 +709,11 @@ export class ModuleRegistry {
     // Find handlers that match this agent
     const handlers = this.speechHandlers.filter(
       (h) => h.agents === '*' || h.agents.includes(agentName)
-    );
+    ).map((handler) => ({ handler, registration: this.moduleContexts.get(handler.moduleName) }));
 
     // Call each handler
-    for (const handler of handlers) {
+    for (const { handler, registration } of handlers) {
+      if (this.moduleContexts.get(handler.moduleName) !== registration) continue;
       const module = this.modules.get(handler.moduleName);
       if (module?.onAgentSpeech) {
         try {
@@ -696,6 +762,10 @@ class ModuleContextImpl implements ModuleContext {
   // External ID mapping stored in module state
   private externalIdMap: Map<string, MessageId> = new Map();
 
+  private retired = false;
+  private readonly saidRetired = new Set<string>();
+  private readonly traceSubscriptions = new Set<() => void>();
+
   constructor(
     moduleName: string,
     store: JsStore,
@@ -717,7 +787,12 @@ class ModuleContextImpl implements ModuleContext {
     this.store = store;
     this.stateId = stateId;
     // The deprecated handle: a push names this module, as pushEvent() does.
-    this.queue = { push: (event) => queue.push(event, moduleName) };
+    this.queue = {
+      push: (event) => {
+        if (this.retired) this.dropPush(event);
+        else queue.push(event, moduleName);
+      },
+    };
     this.registry = registry;
     this.isRestart = isRestart;
     this.getAgentsFn = getAgents;
@@ -745,12 +820,38 @@ class ModuleContextImpl implements ModuleContext {
     }
   }
 
+  retire(): void {
+    this.retired = true;
+    const subscriptions = [...this.traceSubscriptions];
+    this.traceSubscriptions.clear();
+    for (const unsubscribe of subscriptions) {
+      try {
+        unsubscribe();
+      } catch (error) {
+        console.error(`[framework] module ${JSON.stringify(this.moduleName)} has stopped, and ending one of its trace subscriptions threw: ${boundedErrorMessage(error)}`);
+      }
+    }
+  }
+
+  private refused(method: string): boolean {
+    if (!this.retired) return false;
+    if (!this.saidRetired.has(method)) {
+      this.saidRetired.add(method);
+      console.error(
+        `[framework] module ${JSON.stringify(this.moduleName)} has stopped, so its ${method}() call had no effect; ` +
+        `later ${method}() calls from it aren't logged`,
+      );
+    }
+    return true;
+  }
+
   getState<T>(): T | null {
     const state = this.store.getStateJson(this.stateId);
     return state as T | null;
   }
 
   setState<T>(state: T): void {
+    if (this.refused('setState')) return;
     // Merge external ID map into state
     const fullState = {
       ...(state as object),
@@ -793,6 +894,7 @@ class ModuleContextImpl implements ModuleContext {
     name: string,
     opts?: { deltaSnapshotEvery?: number; fullSnapshotEvery?: number }
   ): void {
+    if (this.refused('registerLogState')) return;
     ensureStateRegistered(this.store, {
       id: this.logStateId(name),
       strategy: 'append_log',
@@ -803,10 +905,12 @@ class ModuleContextImpl implements ModuleContext {
   }
 
   appendToLog<T>(name: string, item: T): void {
+    if (this.refused('appendToLog')) return;
     this.store.appendToStateJson(this.registeredLogStateId(name), item);
   }
 
   editLogItem<T>(name: string, index: number, item: T): void {
+    if (this.refused('editLogItem')) return;
     this.store.editStateItem(this.registeredLogStateId(name), index, Buffer.from(JSON.stringify(item)));
   }
 
@@ -820,18 +924,34 @@ class ModuleContextImpl implements ModuleContext {
   }
 
   getModule<T extends Module>(name: string): T | null {
+    if (this.refused('getModule')) return null;
     return this.registry.getModule<T>(name);
   }
 
   onTrace(listener: TraceEventListener): () => void {
-    return this.onTraceFn(listener);
+    if (this.refused('onTrace')) return () => {};
+    const unsubscribe = this.onTraceFn((event) => {
+      if (!this.retired) listener(event);
+    });
+    this.traceSubscriptions.add(unsubscribe);
+    return () => {
+      if (this.traceSubscriptions.delete(unsubscribe)) unsubscribe();
+    };
   }
 
   callTool(call: ToolCall): Promise<ToolResult> {
+    if (this.refused('callTool')) {
+      return Promise.resolve({
+        success: false,
+        isError: true,
+        error: `module ${JSON.stringify(this.moduleName)} has stopped, so its call of ${call.name} wasn't made`,
+      });
+    }
     return this.callToolFn(call);
   }
 
   notifyOps(kind: string, agentName: string, message: string, data?: Record<string, unknown>): void {
+    if (this.refused('notifyOps')) return;
     this.registry.notifyOpsFn?.(kind, agentName, message, data);
   }
 
@@ -841,6 +961,7 @@ class ModuleContextImpl implements ModuleContext {
     metadata?: MessageMetadata & { external?: ExternalIdRef },
     opts?: { forAgent?: string },
   ): MessageId {
+    if (this.refused('addMessage')) return '';
     // The external id map is read in the primary's store
     // (findMessageByExternalId), so a mapping into another window would
     // answer wrong.
@@ -867,10 +988,12 @@ class ModuleContextImpl implements ModuleContext {
   }
 
   editMessage(id: MessageId, content: ContentBlock[]): void {
+    if (this.refused('editMessage')) return;
     this.editMessageFn(id, content);
   }
 
   removeMessage(id: MessageId): void {
+    if (this.refused('removeMessage')) return;
     this.removeMessageFn(id);
     // Clean up external ID mapping
     for (const [key, msgId] of this.externalIdMap) {
@@ -887,26 +1010,31 @@ class ModuleContextImpl implements ModuleContext {
     const entry = this.externalIdMap.get(key);
     if (entry === undefined) return null;
     // A stored id answers while the store holds its row, and once the row is
-    // gone the entry goes, as removeMessage drops it. A '' here names no row:
-    // a write kept in memory (a surgery's hold, or the wait for its agent's
-    // recovery), or one an earlier release held, whose
-    // map it persisted with ''. So the message is looked up in the store by
-    // its external id, and the first row found is taken, as
-    // context-manager's findByExternalId takes it, and its id becomes the
-    // entry. With nothing found, '' stays: in a module's start(), a write an
-    // earlier release left queued isn't stored yet, since create() imports
-    // those after the modules start, and a write that shows later finds its
-    // entry.
+    // gone the entry goes, as removeMessage drops it, except from a context
+    // whose module has stopped, which keeps its mapping as it was. A '' here
+    // names no row: a write kept in memory (a surgery's hold, or the wait for
+    // its agent's recovery), or one an earlier release held, whose map it
+    // persisted with ''. So the message is looked up in the store by its
+    // external id, and the first row found is taken, as context-manager's
+    // findByExternalId takes it, and its id becomes the entry (but in a
+    // stopped module's context). With nothing found, '' stays: in a module's
+    // start(), a write an earlier release left queued isn't stored yet, since
+    // create() imports those after the modules start, and a write that shows
+    // later finds its entry.
     if (entry !== '') {
       if (this.getMessageFn(entry)) return entry;
-      this.externalIdMap.delete(key);
-      this.persistExternalIdMap();
+      if (!this.retired) {
+        this.externalIdMap.delete(key);
+        this.persistExternalIdMap();
+      }
       return null;
     }
     const row = this.queryMessagesFn({ source, externalIds: [externalId] }).messages[0];
     if (!row) return null;
-    this.externalIdMap.set(key, row.id);
-    this.persistExternalIdMap();
+    if (!this.retired) {
+      this.externalIdMap.set(key, row.id);
+      this.persistExternalIdMap();
+    }
     return row.id;
   }
 
@@ -930,15 +1058,23 @@ class ModuleContextImpl implements ModuleContext {
     agents: '*' | string[],
     options?: SpeechHandlerOptions
   ): void {
+    if (this.refused('registerSpeechHandler')) return;
     this.registry.registerSpeechHandler(this.moduleName, agents, options);
   }
 
   unregisterSpeechHandler(): void {
+    if (this.refused('unregisterSpeechHandler')) return;
     this.registry.unregisterSpeechHandler(this.moduleName);
   }
 
   pushEvent(event: ProcessEvent): void {
-    this.pushEventFn(event, this.moduleName);
+    if (this.retired) this.dropPush(event);
+    else this.pushEventFn(event, this.moduleName);
+  }
+
+  private dropPush(event: ProcessEvent): void {
+    if (this.registry.dropRetiredPushFn) this.registry.dropRetiredPushFn(event, this.moduleName);
+    else console.error(retiredPushLine(event, this.moduleName));
   }
 
   private persistExternalIdMap(): void {

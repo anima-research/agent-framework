@@ -862,7 +862,7 @@ describe('stop() with work still in flight', () => {
       };
       fw.pushHandler = { handlePushEvent: handler };
       fw.channelRegistry = { handleIncoming: handler, handleRegister: handler, handleChanged: handler, stopAll: () => {} };
-      fw.inferenceRouter = { handleInferenceRequest: handler };
+      fw.inferenceRouter = { handleInferenceRequest: handler, stopAll: () => [] };
       fw.handleHostCommand = handler;
     }
 
