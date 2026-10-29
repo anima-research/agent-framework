@@ -606,7 +606,7 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
-  it("the addressed-from-elsewhere notice a boundary injects is noted by its stored id, so the stream's later thinking is kept", async () => {
+  it("the addressed-from-elsewhere notice a boundary injects is noted by its stored id, last, with no row of the round noted unstored", async () => {
     // #785's notes: noteRoundSent names each row the stream's next request
     // carries by its stored id. The notice is stored as the agent's own row
     // and injected with the round; it was returned without its id, so its
