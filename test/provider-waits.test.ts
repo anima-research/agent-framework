@@ -344,11 +344,12 @@ describe('ProviderWaits: durable and pending acts (room-225 #46276)', () => {
       const recorded = () => store.getRecordIdsByType(PROVIDER_WAIT_RECORD_TYPE).length;
       fail.checkpoint = 1; // the 64th entry's flush checkpoints, and the store's append of it throws
       for (let i = 0; i < 64; i++) waits.set(`zz-agent-${i}`, 'zz-model', 600_000, 'zz 429');
+      const atCheckpoint = recorded();
       assert.deepEqual(waits.release('zz-nobody', 'zz-model', 'operator'), [], 'an act with nothing to record tries no checkpoint again');
       waits.set('ada', 'zz-model', 600_000, 'zz after');
       time.advance(30_000);
       assert.ok(waits.active('ada', 'zz-model'), 'a later wait binds in this process');
-      assert.equal(recorded(), 64, 'the entries before the checkpoint are recorded, and nothing after it');
+      assert.equal(recorded(), atCheckpoint, 'nothing is recorded after the checkpoint');
       assert.equal(lines.filter((line) => line.includes('until the store is reopened')).length, 1, 'said once');
       assert.equal(lines.filter((line) => line.includes('could not')).length, 0, 'not as a failed checkpoint or once per act');
       store.close();
@@ -631,6 +632,11 @@ type Internal = {
   providerAccelerationJitterMs: number;
 };
 
+/** The resident's provider admission, as healthSnapshot() reports it. */
+type Admission = { cooldownUntil: number | null; cooldownReason: string | null; hostHold: boolean; heldRequests: number; providerWaits: Array<{ model: string }> };
+const admission = (fw: AgentFramework): Admission => (fw.healthSnapshot() as { agents: Array<{ name: string; providerAdmission: Admission }> })
+  .agents.find((agent) => agent.name === 'resident')!.providerAdmission;
+
 async function framework(path: string, membrane: WaitingMembrane) {
   const fw = await AgentFramework.create({
     storePath: path, membrane: membrane.asMembrane(),
@@ -724,9 +730,9 @@ test('a stated wait past the framework cap is honoured in full, until an operato
       const before = Date.now();
       fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
       await fw.runUntilIdle();
-      const cooldown = internal.providerAccelerationCooldowns.get('resident')!;
-      assert.ok(cooldown.until >= before + twentyMinutes, 'not shortened to the 10-minute cap');
-      assert.equal(cooldown.waitModel, 'zz-model');
+      const held = admission(fw);
+      assert.ok(held.cooldownUntil !== null && held.cooldownUntil >= before + twentyMinutes, 'not shortened to the 10-minute cap');
+      assert.deepEqual(held.providerWaits.map((w) => w.model), ['zz-model'], "the model's stated wait binds it");
 
       const released = await internal.handleHostCommand('zz-surface', { command: 'release-provider-wait', agentName: 'resident', model: 'zz-model', requesterName: 'zz-operator' });
       assert.equal(released.ok, true);
@@ -1318,15 +1324,15 @@ test("releasing a provider wait leaves a host hold the host's", async () => {
     try {
       fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
       await fw.runUntilIdle();
-      const hold = internal.providerAccelerationCooldowns.get('resident')!;
-      assert.ok(hold.hostHoldError, 'a host hold');
-      const until = hold.until;
+      const hold = admission(fw);
+      assert.equal(hold.hostHold, true, 'a host hold');
+      const until = hold.cooldownUntil;
       assert.deepEqual(fw.providerWaitSnapshot('resident').map((w) => w.model), ['zz-model'], 'the stated wait is recorded beside it');
 
       const released = await internal.handleHostCommand('zz-surface', { command: 'release-provider-wait', agentName: 'resident', model: 'zz-model', requesterName: 'zz-operator' });
       assert.deepEqual((released.released as Array<{ model: string }>).map((w) => w.model), ['zz-model']);
       assert.deepEqual(fw.providerWaitSnapshot('resident'), [], 'the stated wait is released');
-      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.until, until, 'the host hold stands, unchanged');
+      assert.deepEqual([admission(fw).hostHold, admission(fw).cooldownUntil], [true, until], 'the host hold stands, unchanged');
       await fw.runUntilIdle();
       assert.equal(membrane.primary, 1, 'and still holds the turn');
     } finally { await fw.stop(); log.restore(); }
@@ -1414,18 +1420,19 @@ test('a release whose context strategy throws still releases the hold it lifted 
   await withStoreDir(async (path) => {
     const log = silence();
     const membrane = new WaitingMembrane(1, 60_000);
-    const { fw, internal } = await framework(path, membrane);
+    const { fw } = await framework(path, membrane);
     const cm = fw.getAgent('resident')!.getContextManager() as unknown as { getStrategy(): unknown };
     const getStrategy = cm.getStrategy;
     try {
       fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
       await fw.runUntilIdle();
-      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.waitModel, 'zz-model');
+      assert.deepEqual(admission(fw).providerWaits.map((w) => w.model), ['zz-model'], 'held for the stated wait');
+      assert.notEqual(admission(fw).cooldownReason, null);
       cm.getStrategy = () => { throw new Error('zz strategy unavailable'); };
       const released = fw.releaseProviderWait('resident', 'zz-model', 'zz-operator');
       cm.getStrategy = getStrategy;
       assert.deepEqual(released.map((w) => w.model), ['zz-model']);
-      assert.equal(internal.providerAccelerationCooldowns.has('resident'), false, 'the hold is released');
+      assert.equal(admission(fw).cooldownReason, null, 'the hold is released');
       await waitFor(fw, () => membrane.primary >= 2, 'the held turn after the release');
     } finally { cm.getStrategy = getStrategy; await fw.stop(); log.restore(); }
   });
@@ -1483,11 +1490,11 @@ test('a primary 429 stating a negative retry-after is retried, not held until re
   await withStoreDir(async (path) => {
     const log = silence();
     const membrane = new WaitingMembrane(1, -1_000);
-    const { fw, internal } = await framework(path, membrane);
+    const { fw } = await framework(path, membrane);
     try {
       fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
       await fw.runUntilIdle();
-      assert.equal(internal.providerAccelerationCooldowns.has('resident'), false, 'no hold');
+      assert.equal(admission(fw).cooldownReason, null, 'no hold');
       assert.deepEqual(fw.providerWaitSnapshot('resident'), [], 'no wait binds');
       assert.equal(membrane.primary, 2, 'the error policy retried, and the retry recovered');
       assert.ok(!log.lines.some((line) => /\[provider-wait\].* holds /.test(line)), 'and nothing is logged as held');
@@ -1758,15 +1765,15 @@ test("a conversation agent's non-retryable failure that states a wait records it
       await conversationTurn(fw, nonOwning, 'zz-first');
       await waitFor(fw, () => fw.providerWaitSnapshot('resident').length > 0, 'the recorded wait');
       await drive(fw);
-      assert.equal(internal.providerAccelerationCooldowns.has('resident'), false, 'a terminal failure is not held');
+      assert.equal(admission(fw).cooldownReason, null, 'a terminal failure is not held');
       assert.equal(membrane.primary, 1, 'nor retried');
 
       // Real time passes the wait before the next wake, as on a loaded host.
       await clock.outlast(wait);
       nonOwning.pendingRequests.push({ agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
       await drive(fw);
-      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.waitModel, 'zz-model', 'the next wake is held by the recorded wait');
-      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 1, 'the hold has the wake');
+      assert.deepEqual(admission(fw).providerWaits.map((w) => w.model), ['zz-model'], 'the next wake is held by the recorded wait');
+      assert.equal(admission(fw).heldRequests, 1, 'the hold has the wake');
       assert.equal(membrane.primary, 1);
       clock.pass(wait);
       await waitFor(fw, () => membrane.primary >= 2, 'the held wake after the wait');
