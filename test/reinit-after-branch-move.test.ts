@@ -595,6 +595,69 @@ describe('after a branch move, every agent on the store compiles without a resta
   // (current, behind) have no counterpart: no queue, persisted or not, holds
   // a write here (#291). The test above checks stop() names none.
 
+  // AF-B-3: what stop() drops, it names. The writes kept for an agent whose
+  // manager refuses its work go with the process: one line and one ops alert
+  // for the agent, with the count and the kinds; the mail among them stays
+  // held in the registry for the next boot.
+  it("stop() names the writes kept in memory for an agent whose manager refuses its work, once for the agent, with an ops alert", async () => {
+    const strategy = cmOf('b').getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
+    strategy.initialize = async () => { throw new Error('injected initialization failure'); };
+    const logged: string[] = [];
+    const quiet = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    let mail: { mailId: string; delivered: boolean };
+    try {
+      const pass = gatedSwitch('a');
+      await pass.reached;
+      holdFor('b', 'for b, during the hold');
+      pass.open();
+      await pass.switched;
+      assert.equal(courier.addMessage('courier', text('for b, while it refuses its work'), undefined, { forAgent: 'b' }), '');
+      mail = framework.sendAgentMessage('a', 'b', text('mail for b'), { wake: false });
+      assert.equal(mail.delivered, true, 'answered as a held write is');
+      assert.equal(framework.getHostModeStatus().deferredWrites, 3, 'setup: three writes wait in memory for b');
+      await framework.stop();
+    } finally {
+      console.error = quiet;
+    }
+    const lines = logged.filter((line) => line.startsWith('[stop] '));
+    assert.equal(lines.length, 1, `one line, for b: ${lines.join('\n')}`);
+    says(lines[0]!, '[stop] agent=b: 3 writes for b kept in memory are not stored by this stop',
+      '3 kept while its context manager refuses its work, which are lost', 'Kinds: 2 message, 1 agent-message.',
+      'The mail among them (1) stays held in the registry, and the next boot delivers it.');
+    const lost = traces.filter((t): t is Extract<TraceEvent, { type: 'ops:alert' }> => t.type === 'ops:alert' && t.kind === 'store-held-lost');
+    assert.deepEqual(lost.map((alert) => [alert.agentName, alert.data]), [
+      ['b', { count: 3, keptForRecovery: 3, heldBySurgery: 0, kinds: { message: 2, 'agent-message': 1 }, mail: 1 }],
+    ]);
+    assert.ok(framework.listHeldMail().some((held) => held.id === mail.mailId), 'the mail stays held for the next boot');
+  });
+
+  it("stop() names the writes a surgery's hold still keeps when the surgery outlives its wait", async () => {
+    const logged: string[] = [];
+    const quiet = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    const pass = gatedSwitch('a');
+    try {
+      await pass.reached;
+      holdFor('b', 'for b, during the hold');
+      holdFor('b', 'for b, also during the hold');
+      await assert.rejects(framework.stop(50), 'the wait for the switch runs out');
+    } finally {
+      console.error = quiet;
+      pass.open();
+      await pass.switched.catch(() => {});
+    }
+    const lines = logged.filter((line) => line.startsWith('[stop] '));
+    assert.equal(lines.length, 1, `one line, for b: ${lines.join('\n')}`);
+    says(lines[0]!, '[stop] agent=b: 2 writes for b kept in memory are not stored by this stop',
+      "2 a branch switch's hold still keeps, its operation having outlived stop()'s wait, which are stored only if it releases before the process exits",
+      'Kinds: 2 message.');
+    const lost = traces.filter((t): t is Extract<TraceEvent, { type: 'ops:alert' }> => t.type === 'ops:alert' && t.kind === 'store-held-lost');
+    assert.deepEqual(lost.map((alert) => [alert.agentName, alert.data]), [
+      ['b', { count: 2, keptForRecovery: 0, heldBySurgery: 2, kinds: { message: 2 }, mail: 0 }],
+    ]);
+  });
+
   it('an undo or redo makes no branch and moves none: a store whose createBranchAt and switchBranch throw stops neither', async () => {
     await checkpointTurn();
     const store = framework.getStore() as unknown as { createBranchAt: (...args: unknown[]) => unknown; switchBranch: (name: string) => void };

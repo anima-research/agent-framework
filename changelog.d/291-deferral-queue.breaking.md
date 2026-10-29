@@ -9,7 +9,11 @@
   crash during the surgery, or before the recovery, loses such a write; earlier releases kept a quiesced host's queue
   on disk. The `store-held-long` alert says so: a restart loses the writes the hold keeps in memory and those kept
   for a manager refusing its work, where 0.28.0's said writes still queued at exit survive in a persisted deferral
-  queue. The `context-reinit-failed` alert for a conversation agent a move disposes counts the writes held for it, by
+  queue. `stop()` names what it leaves unstored: for each agent with writes still kept in memory, those kept while
+  its manager refuses its work (lost) and those a surgery whose operation outlived `stop()`'s wait still holds, it
+  logs one `[stop] agent=<name>: …` line and raises an `ops:alert` of kind `store-held-lost` with the counts and
+  kinds (`data`: `count`, `keptForRecovery`, `heldBySurgery`, `kinds`, `mail`); mail among them stays held in the
+  registry, and the next boot delivers it. The `context-reinit-failed` alert for a conversation agent a move disposes counts the writes held for it, by
   the move's hold or while its manager refused its work, and how many of them went to the primary, stored at the
   release; the rest, such as its channel's messages, are dropped, logged. A write made while quiesced is on the
   branch the store was on when it was made: a rollback or a branch switch later in the same quiesce leaves it there,

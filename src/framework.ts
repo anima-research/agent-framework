@@ -5887,6 +5887,11 @@ export class AgentFramework {
     // notices name a channel by its bare id.
     passPostponedReleases();
 
+    // The writes still kept in memory go with the process, unstored (#291:
+    // no queue persists them): one line, and an ops alert, per agent they
+    // are for, before the final sync (reportHeldWritesAtStop).
+    step(() => this.reportHeldWritesAtStop());
+
     // Final sync before closing
     try {
       this.store.sync();
@@ -15101,6 +15106,59 @@ export class AgentFramework {
   private waitsForRecovery(agentName: string): boolean {
     // Read defensively, as releaseSurgeryHeldWrites is.
     return (this.heldForRecovery?.get(agentName)?.length ?? 0) > 0;
+  }
+
+  /**
+   * At stop(), before its final sync: the writes still kept in memory, which
+   * no queue persists (#291), told of once per agent they are for, by a log
+   * line and an ops alert of kind `store-held-lost` naming how many and of
+   * what kinds. Those kept for an agent whose context manager refuses its
+   * work (heldForRecovery) are lost: no switchBranch() follows a stop. Those
+   * a surgery's hold still keeps (surgeryHeldWrites, a hold whose operation
+   * outlived stop()'s wait for it) are stored only if it releases before the
+   * process exits. Mail among them stays held in the registry, and the next
+   * boot delivers it. Says nothing when none is kept.
+   */
+  private reportHeldWritesAtStop(): void {
+    // Read defensively, as releaseSurgeryHeldWrites is.
+    const kept = new Map<string, { recovery: SurgeryHeldWrite[]; hold: SurgeryHeldWrite[] }>();
+    const entry = (agentName: string) => {
+      let found = kept.get(agentName);
+      if (!found) kept.set(agentName, found = { recovery: [], hold: [] });
+      return found;
+    };
+    for (const [agentName, writes] of this.heldForRecovery ?? []) entry(agentName).recovery.push(...writes);
+    for (const write of this.surgeryHeldWrites ?? []) {
+      entry(write.direct?.agentName ?? write.opts?.forAgent ?? this.primaryAgentName ?? 'the primary').hold.push(write);
+    }
+    const verb = this.surgeryHold ? MOVE_NOUNS[this.surgeryHold.verb] ?? this.surgeryHold.verb : 'surgery';
+    for (const [agentName, { recovery, hold }] of kept) {
+      const writes = [...recovery, ...hold];
+      if (writes.length === 0) continue;
+      const kinds: Record<string, number> = {};
+      for (const write of writes) {
+        const kind = (write.metadata as { kind?: unknown } | undefined)?.kind;
+        const name = typeof kind === 'string' ? kind : 'message';
+        kinds[name] = (kinds[name] ?? 0) + 1;
+      }
+      const mail = writes.filter((write) => typeof (write.metadata as { dendrite?: { mailId?: unknown } } | undefined)?.dendrite?.mailId === 'string').length;
+      const parts = [
+        ...(recovery.length > 0
+          ? [`${recovery.length} kept while its context manager refuses its work, which are lost: no switchBranch() re-initializes it after a stop`]
+          : []),
+        ...(hold.length > 0
+          ? [`${hold.length} a ${verb}'s hold still keeps, its operation having outlived stop()'s wait, which are stored only if it releases before the process exits`]
+          : []),
+      ];
+      const message = `${writes.length === 1 ? '1 write' : `${writes.length} writes`} for ${agentName} kept in memory ` +
+        `${writes.length === 1 ? 'is' : 'are'} not stored by this stop (${parts.join('; ')}). Kinds: ` +
+        Object.entries(kinds).map(([kind, count]) => `${count} ${kind}`).join(', ') + '.' +
+        (mail > 0 ? ` The mail among them (${mail}) stays held in the registry, and the next boot delivers it.` : '');
+      console.error(`[stop] agent=${agentName}: ${message}`);
+      this.opsAlert('store-held-lost', agentName, message, {
+        data: { count: writes.length, keptForRecovery: recovery.length, heldBySurgery: hold.length, kinds, mail },
+      });
+    }
   }
 
   /** How many writes wait in memory for an agent's recovery (heldForRecovery), every agent's. */
