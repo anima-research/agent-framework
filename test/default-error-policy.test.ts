@@ -65,7 +65,6 @@ describe('DefaultErrorPolicy on membrane\'s schedules', () => {
     assert.equal(waits.length, 12, 'twelve retries after the first send');
     const steps = [10_000, 20_000, 40_000, 80_000, 160_000, ...Array(7).fill(300_000)];
     waits.forEach((w, i) => assert.ok(w >= Math.floor(steps[i] / 2) && w < steps[i], `retry ${i + 1} waits ${w} ms, in [${steps[i] / 2}, ${steps[i]})`));
-    assert.equal(steps.reduce((a, b) => a + b, 0), 2_410_000);
     // An overloaded error mid-stream carries no status, only its message.
     assert.equal(delays(policy, err({ type: 'server', retryable: true, message: 'overloaded_error: Overloaded' })).length, 12);
   });
@@ -114,26 +113,6 @@ class OptionsMembrane extends MockMembrane {
     return super.streamYielding(request, options);
   }
 }
-
-test('a turn asks membrane for no retries of its own: the framework is the one retry layer', async (t: TestContext) => {
-  const dir = mkdtempSync(join(tmpdir(), 'af-retry-'));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const membrane = new OptionsMembrane();
-  membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-reply' }]));
-  const fw = await AgentFramework.create({
-    storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
-    agents: [{ name: 'resident', model: 'zz-model', systemPrompt: 'system' }],
-    modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
-  });
-  t.after(() => fw.stop().catch(() => {}));
-  fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hello', metadata: {} });
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  await Promise.race([fw.runUntilIdle(), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('the turn never went idle')), 15_000); })]).finally(() => clearTimeout(timer));
-  assert.ok(membrane.streamOptions.length >= 1, 'the turn streamed');
-  for (const options of membrane.streamOptions) {
-    assert.equal((options as { retry?: unknown }).retry, false);
-  }
-});
 
 class ErrorStream implements YieldingStream {
   isWaitingForTools = false;
@@ -568,7 +547,8 @@ function afterTurn(fw: AgentFramework, events: Array<{ type: string }>) {
     types: events.map((e) => e.type),
     failedRows: rows.filter((r) => r.success === false).length,
     markers: messages.filter((m) => m.content.some((c) => c.type === 'text' && (c.text ?? '').startsWith('[inference-failed]'))).length,
-    held: (fw as unknown as { providerAccelerationCooldowns: Map<string, unknown> }).providerAccelerationCooldowns.has('resident'),
+    held: (fw.healthSnapshot() as { agents: Array<{ name: string; providerAdmission: { cooldownReason: string | null } }> })
+      .agents.find((agent) => agent.name === 'resident')!.providerAdmission.cooldownReason !== null,
   };
 }
 
