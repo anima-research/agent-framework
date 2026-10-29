@@ -19591,7 +19591,7 @@ export class AgentFramework {
         : {};
     if (occ.event.lane === 'channel') {
       const event = { ...occ.event.event, coalescingSubject, ...narrowing, ...firstViewMark, ...(assemblingFor ? { assemblingFor } : {}) };
-      const placement = await this.handleMcplChannelIncoming(event);
+      const placement = await this.storeCoalesced(coalescingSubject, occ.eventId, () => this.handleMcplChannelIncoming(event));
       await this.dispatchAfterDelivery(event as unknown as ProcessEvent);
       return placement;
     }
@@ -19624,7 +19624,7 @@ export class AgentFramework {
         ...(assemblingFor ? { assemblingFor } : {}),
         ...frozenSource(push.inboundSource),
       };
-      const placement = await this.handleMcplChannelIncoming(event);
+      const placement = await this.storeCoalesced(coalescingSubject, occ.eventId, () => this.handleMcplChannelIncoming(event));
       await this.dispatchAfterDelivery(event as unknown as ProcessEvent);
       return placement;
     }
@@ -19641,9 +19641,30 @@ export class AgentFramework {
       ...firstViewMark,
       ...frozenSource(occ.event.event.inboundSource),
     };
-    const placement = this.handleMcplPushEvent(event);
+    const placement = await this.storeCoalesced(coalescingSubject, occ.eventId, () => this.handleMcplPushEvent(event));
     await this.dispatchAfterDelivery(event as unknown as ProcessEvent);
     return placement;
+  }
+
+  private async storeCoalesced(
+    subject: string,
+    eventId: string,
+    store: () => CoalescingPlacement | undefined | Promise<CoalescingPlacement | undefined>,
+  ): Promise<CoalescingPlacement | undefined> {
+    const before = [...this.agents.values()].map((agent) => ({ agent, from: this.storedCountOf(agent) }));
+    try {
+      return await store();
+    } catch (error) {
+      for (const { agent, from } of before) {
+        if (from === undefined) continue;
+        const landed = this.storedSince(agent, from, (m) => (m.metadata as { coalescingSubject?: unknown } | undefined)?.coalescingSubject === subject,
+          'coalescing', `the occurrence ${eventId}`);
+        if (!landed?.length) continue;
+        console.error(`[coalescing] storing the occurrence ${eventId} threw, but a row of it landed in ${agent.name}'s store, possibly only in part; it's taken as stored, and its fallback isn't stored beside it:`, error);
+        return { agent: agent.name };
+      }
+      throw error;
+    }
   }
 
   private async dispatchAfterDelivery(event: ProcessEvent): Promise<void> {
