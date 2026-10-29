@@ -331,6 +331,18 @@ test('a module whose stop() fails keeps a working context, and a retry that succ
   });
 });
 
+test('a module object removed, added again and removed again is stopped and removed the second time', async () => {
+  let stops = 0;
+  const gone = probe('gone', { stop: async () => { stops++; } });
+  await withFramework([gone.module], async (framework) => {
+    await framework.removeModule('gone');
+    await framework.addModule(gone.module);
+    await framework.removeModule('gone');
+    assert.equal(stops, 2);
+    assert.ok(!framework.getAllModules().some((m) => m.name === 'gone'), 'removed the second time');
+  });
+});
+
 const laterOfItsName: [string, (gone: Probe) => Probe][] = [
   ['a new module of its name', () => probe('gone')],
   ['the same module object', (gone) => gone],
