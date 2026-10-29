@@ -39,7 +39,7 @@ async function waitFor(label: string, predicate: () => boolean, timeoutMs = 10_0
 
 interface Internals {
   providerWaits: { set(agent: string, model: string, ms: number, reason: string): unknown };
-  providerAccelerationCooldowns: Map<string, { heldRequests: InferenceRequest[]; emptiedByDrop?: boolean }>;
+  providerAccelerationCooldowns: Map<string, { heldRequests: InferenceRequest[]; emptiedBy?: 'drop' | 'withdrawal' }>;
   deferredMessages: unknown[];
   processInferenceRequests(): Promise<void>;
   activeTurnTokens: Map<string, number>;
