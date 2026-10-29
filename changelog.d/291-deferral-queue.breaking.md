@@ -64,6 +64,7 @@
   **Migration:** a module that kept a `held:` handle across the upgrade can keep using it for one release, and
   should store the id `addMessage` answers from now on. A module that filtered `held` rows out of a query as not
   stored yet keeps working: they are now the rows the agent hasn't been shown. A host that read `deferredWrites` to
-  know whether a quiesce held anything compares each agent's record with its window instead: a write stored during
-  the quiesce is in the record (`getAllMessages()`) and not in the window (`getPresentedMessages()`) until resume
-  presents it, as are rows the window never takes in (another agent's own, a tune-out's held traffic).
+  know whether a quiesce held anything finds nothing held by it: a write made during a quiesce is stored at once
+  (unless one of the two holds above keeps it), an agent's own rows enter its window as they are written, and the
+  rest enter the window of each agent with no turn alive at resume, and a draining turn's agent's at that turn's
+  next presentation point.
