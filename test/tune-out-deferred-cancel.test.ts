@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { fixture } from './helpers/coalescing-fixture.js';
 import type { FrameworkConfig } from '../src/types/framework.js';
-import { SUB, internals, textOf, has, find, registerOpen, enter } from './helpers/admission.js';
+import { SUB, internals, textOf, stored, has, find, registerOpen, enter } from './helpers/admission.js';
 
 type Answer = { success: boolean; data?: unknown; error?: string };
 type Framework = {
@@ -134,5 +134,44 @@ describe('a later cancel of a tune-out whose cancel already waits', () => {
       assert.ok(has(f, 'The first note.'), "the waiting cancel's note is delivered");
       assert.ok(!has(f, 'The second note.'), 'and the second, as its caller was told, is not');
     } finally { release(); await f.close(); }
+  });
+});
+
+describe("a cancel while the primary's context manager refuses its work", () => {
+  it('waits, the tune-out in force, though nothing is kept for its recovery yet, and runs once a switch re-initializes it', async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enter(f, 'noisy', { backlogCap: 10 });
+      const registry = internals(f).channelRegistry;
+      const coordinator = internals(f).tuneOutCoordinator!;
+      const epochId = registry.getTuneOutState('editor', 'noisy')!.params.epochId;
+      (f.framework as unknown as Framework).addMessage('antra', [{ type: 'text', text: 'held before the failure' }], {
+        tuneOut: { epochId }, channelId: 'noisy', serverId: 'editor', author: { id: 'U1', name: 'antra' },
+      });
+      const strategy = f.framework.getAgent('agent')!.getContextManager().getStrategy() as unknown as {
+        initialize?: (...args: unknown[]) => Promise<void>;
+      };
+      const initialize = strategy.initialize?.bind(strategy);
+      let failNext = true;
+      strategy.initialize = async (...args: unknown[]) => {
+        if (failNext) { failNext = false; throw new Error('injected initialization failure'); }
+        await initialize?.(...args);
+      };
+      const branch = f.framework.getStore().currentBranch().name;
+      await f.framework.switchBranch(branch);
+      const kept = (f.framework as unknown as { heldForRecovery: Map<string, unknown[]> }).heldForRecovery;
+      assert.equal(kept.get('agent')?.length ?? 0, 0, 'premise: nothing is kept for its recovery yet');
+
+      assert.deepEqual(coordinator.cancel('editor', 'noisy', 'duration', 'duration elapsed'), { ok: true, deferred: true },
+        'the cancel waits');
+      assert.ok(registry.getTuneOutState('editor', 'noisy'), 'the tune-out stays in force');
+      assert.equal(kept.get('agent')?.length ?? 0, 0, 'and no release is kept in memory behind an end on disk');
+
+      await f.framework.switchBranch(branch);
+      assert.equal(registry.getTuneOutState('editor', 'noisy'), null, 'it ends once a switch re-initializes the manager');
+      assert.equal(stored(f).filter((m) => textOf(m).includes('<tuned-out-backlog')).length, 1, 'its release stored once');
+      assert.match(textOf(find(f, '<tuned-out-backlog')), /held before the failure/);
+    } finally { await f.close(); }
   });
 });

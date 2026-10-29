@@ -4196,6 +4196,7 @@ export class AgentFramework {
    * passes on the ones the primary takes in its place (passHeldWritesOn).
    */
   private readonly heldForRecovery = new Map<string, SurgeryHeldWrite[]>();
+  private readonly managersRefusingWork = new WeakSet<ContextManager>();
   /** Tell the first adoption candidate when task work is orphaned (config.dendrite.announceOrphans). */
   private announceOrphans = true;
   /**
@@ -5243,7 +5244,7 @@ export class AgentFramework {
           // waits (releaseSurgeryHeldWrites runs it).
           writesHeld: () => framework.surgeryHold !== null
             || [framework.primaryAgentName, framework.subconsciousAgentName]
-              .some((name) => name != null && framework.waitsForRecovery(name)),
+              .some((name) => name != null && (framework.waitsForRecovery(name) || framework.refusesItsWork(name))),
           historyTool: () => framework.residentHistoryTool(),
           // Every reader of the shared slot compiles the dump with its own
           // strategy, so the dump fits the smallest of their bounds.
@@ -15118,10 +15119,13 @@ export class AgentFramework {
       if (agentName === except) continue;
       await new Promise<void>((resolve) => setImmediate(resolve));
       if (hold) hold.reinitializing = agentName;
+      let cm: ContextManager | undefined;
       try {
-        const cm = agent.getContextManager();
+        cm = agent.getContextManager();
         await cm.setStrategy(cm.getStrategy());
+        this.managersRefusingWork?.delete(cm);
       } catch (error) {
+        if (cm) this.managersRefusingWork?.add(cm);
         if (this.agents.get(agentName) === agent) {
           failures.push({ agentName, error: failureDescription(error) });
         }
@@ -15184,6 +15188,11 @@ export class AgentFramework {
       'waits in memory until switchBranch() re-initializes it and stores them (a restart loses them)' +
       (refusal === undefined ? '' : `: ${errorMessage(refusal)}`),
     );
+  }
+
+  private refusesItsWork(agentName: string): boolean {
+    const cm = this.agents.get(agentName)?.getContextManager();
+    return cm !== undefined && this.managersRefusingWork?.has(cm) === true;
   }
 
   /** Whether writes for `agentName` wait in memory for its context manager's recovery (heldForRecovery). */
