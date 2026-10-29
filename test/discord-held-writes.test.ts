@@ -427,6 +427,7 @@ test("edits made while a create is kept in memory apply in turn at the release, 
 });
 
 test("an edit kept while its create is held that fails at the release leaves the edits after it to apply, as their own events would", async () => {
+  let refused = 0;
   const s = await withKeptCreate('a branch move holding the store', async ({ framework, discord, processed, kept, texts }) => {
     const created = processed('discord:message', 'k11');
     await discord.onMessageHandler!(live('k11', 'before'));
@@ -435,7 +436,10 @@ test("an edit kept while its create is held that fails at the release leaves the
     const internals = framework as unknown as { editMessage(id: string, content: unknown): void };
     const edit = internals.editMessage.bind(framework);
     internals.editMessage = (id, content) => {
-      if (JSON.stringify(content).includes('first edit')) throw new Error('zz-edit-refused');
+      if (JSON.stringify(content).includes('first edit')) {
+        refused++;
+        throw new Error('zz-edit-refused');
+      }
       return edit(id, content);
     };
     const first = processed('discord:edit', 'k11');
@@ -447,6 +451,7 @@ test("an edit kept while its create is held that fails at the release leaves the
   });
   try {
     await drained(s.framework);
+    assert.equal(refused, 1, 'premise: the store refused the first edit at the release');
     assert.deepEqual(s.texts('k11'), ['second edit'], 'the later edit is stored');
   } finally {
     await s.cleanup();
