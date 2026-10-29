@@ -68,6 +68,7 @@ import {
   type ReferenceTestimony,
 } from '../src/mcpl/references.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
+import { until } from './helpers/dendrite.js';
 
 /** Give the framework MCPL server configs for its fetcher to resolve, without
  *  connecting to them: a ws:// or wss:// url for one the host connects to over
@@ -133,6 +134,8 @@ class SnapModule implements Module {
   quotedRef = 'img_zzzzzz_1';
   /** Delay before `snap` resolves — proves the same-batch barrier waits. */
   snapDelayMs = 0;
+  /** Called as `snap` starts, and awaited, before its delay. */
+  onSnap?: () => unknown;
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] {
@@ -233,6 +236,7 @@ class SnapModule implements Module {
           data: [png, { type: 'image', uri: 'https://cam.example/sri-named.png', name: `${'n'.repeat(200)}.png`, mimeType: 'image/png', sizeBytes: 1200 }],
         };
       default:
+        await this.onSnap?.();
         if (this.snapDelayMs > 0) await new Promise((r) => setTimeout(r, this.snapDelayMs));
         return { success: true, data: [{ type: 'text', text: 'watchtower, facing north' }, png] };
     }
@@ -481,6 +485,59 @@ describe('save_recent_image provenance (issue #104)', () => {
       assert.strictEqual(first[0]!.sha256, sha(GIF));
       assert.ok((await fileBytes(h, 'files/avatar.gif'))?.equals(GIF), "index 0 is the attachment, not oren's image");
       assert.strictEqual(h.framework.getAgent('prime')!.getContextManager().windowStatusOf(orens as never), 'out', "prime's window never held oren's row");
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("an image that arrives while a tool runs enters the window after that round, so index 0 is it and index 1 the snapshot (#291)", async () => {
+    const SENT = Buffer.from('a picture someone sent while the snapshot ran');
+    let framework: AgentFramework | undefined;
+    const h = await startTurn({
+      prefix: 'sri-mid-round-',
+      responses: [
+        [snapCall('call_snap')],
+        [saveCall('call_save0', { path: 'files/sent.png', index: 0 })],
+        [saveCall('call_save1', { path: 'files/watchtower.png', index: 1 })],
+        done,
+        done,
+      ],
+      seedHistory: (f) => { framework = f; },
+      world: (m) => {
+        m.onSnap = async () => {
+          framework!.pushEvent({
+            type: 'external-message',
+            source: 'test',
+            content: [
+              { type: 'text', text: 'look at this' },
+              { type: 'image', source: { type: 'base64', data: SENT.toString('base64'), mediaType: 'image/png' } },
+            ],
+            metadata: {},
+            triggerInference: true,
+          } as unknown as ProcessEvent);
+          const cm = framework!.getAgent('prime')!.getContextManager();
+          await until(() => cm.queryMessages({}).messages.some((m) => JSON.stringify(m.content).includes(SENT.toString('base64'))),
+            'the sent picture to be stored');
+        };
+      },
+    });
+    try {
+      const first = saved(await waitForToolResult(h.framework, 'call_save0'));
+      const second = saved(await waitForToolResult(h.framework, 'call_save1'));
+      const cm = h.framework.getAgent('prime')!.getContextManager();
+      const isSent = (m: { content: unknown }): boolean => JSON.stringify(m.content).includes(SENT.toString('base64'));
+      const isSnapResult = (m: { content: unknown }): boolean => JSON.stringify(m.content).includes('"toolUseId":"call_snap"');
+      const record = cm.queryMessages({}).messages;
+      const window = cm.getPresentedMessages();
+      const [sentStored, roundStored] = [record.findIndex(isSent), record.findIndex(isSnapResult)];
+      const [sentShown, roundShown] = [window.findIndex(isSent), window.findIndex(isSnapResult)];
+      assert.ok(sentStored >= 0 && roundStored >= 0 && sentStored < roundStored, `stored before the round (${sentStored}, ${roundStored})`);
+      assert.ok(sentShown >= 0 && roundShown >= 0 && sentShown > roundShown, `presented after the round (${sentShown}, ${roundShown})`);
+      assert.strictEqual(first[0]!.source, 'attachment');
+      assert.strictEqual(first[0]!.sha256, sha(SENT));
+      assert.strictEqual(second[0]!.source, 'tool-result');
+      assert.strictEqual(second[0]!.sha256, sha(PNG));
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });

@@ -38046,22 +38046,22 @@ export class AgentFramework {
         const MAX_SCAN = 500;
         const WINDOW = 25;
         const cm = agent.getContextManager();
-        const total = cm.getMessageCount();
         // On a presented window (#291) only the rows the agent's window
         // holds are its context: another agent's round, a row not presented
         // to it yet, or one undone or shed, isn't, so its images aren't
-        // either, and messagesBack counts the rows it holds.
-        const windowed = this.presents(agent);
-        let held = 0;
+        // either. They are walked in the window's order, and messagesBack
+        // and the scan count the rows it holds.
+        const presented = this.presents(agent) ? cm.getPresentedMessages() : undefined;
+        const total = presented ? presented.length : cm.getMessageCount();
         let scanned = 0;
         for (let end = total; end > 0 && scanned < MAX_SCAN && collecting(); end -= WINDOW) {
           const start = Math.max(0, end - WINDOW);
           // By ref, attachment bytes are never needed — skip blob resolution.
-          const { messages } = cm.getMessageWindow(start, end - start, { resolveBlobs: wantedRef === null });
+          const messages = presented
+            ? presented.slice(start, end)
+            : cm.getMessageWindow(start, end - start, { resolveBlobs: wantedRef === null }).messages;
           scanned += end - start;
           for (let i = messages.length - 1; i >= 0 && collecting(); i--) {
-            if (windowed && (!messages[i] || cm.windowStatusOf(messages[i]!.id) !== 'in')) continue;
-            held++;
             const content = messages[i]?.content;
             if (!Array.isArray(content)) continue;
             // A row the agent's own view leaves out, such as another agent's
@@ -38069,7 +38069,7 @@ export class AgentFramework {
             // compiled view (agentSees, main's #853), so its images aren't
             // either.
             if (!this.agentSees(agent, messages[i]?.metadata)) continue;
-            const messagesBack = windowed ? held : total - (start + i);
+            const messagesBack = total - (start + i);
             for (let b = content.length - 1; b >= 0 && collecting(); b--) {
               const block = content[b] as {
                 type?: string;
