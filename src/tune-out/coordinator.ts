@@ -98,6 +98,73 @@ function writeIdOf(m: Pick<StoredMessage, 'metadata'>): string | undefined {
   return typeof writeId === 'string' ? writeId : undefined;
 }
 
+type HeldRow = Pick<StoredMessage, 'participant' | 'content' | 'metadata'> & { id?: string; writeId?: string };
+
+interface RowKeys {
+  ids: string[];
+  writeIds: string[];
+}
+
+interface ReleaseRecord extends RowKeys {
+  total: number;
+  truncated: number;
+  report: RowKeys;
+}
+
+function keysOf(rows: readonly HeldRow[]): RowKeys {
+  const keys: RowKeys = { ids: [], writeIds: [] };
+  for (const m of rows) {
+    const writeId = m.writeId ?? writeIdOf(m);
+    if (writeId !== undefined) keys.writeIds.push(writeId);
+    else if (m.id !== undefined) keys.ids.push(m.id);
+  }
+  return keys;
+}
+
+function keyedBy(keys: readonly RowKeys[]): (m: HeldRow) => boolean {
+  const ids = new Set(keys.flatMap((k) => k.ids));
+  const writeIds = new Set(keys.flatMap((k) => k.writeIds));
+  return (m) => {
+    const writeId = m.writeId ?? writeIdOf(m);
+    return writeId !== undefined ? writeIds.has(writeId) : m.id !== undefined && ids.has(m.id);
+  };
+}
+
+const isStrings = (value: unknown): value is string[] => Array.isArray(value) && value.every((v) => typeof v === 'string');
+const isRowKeys = (value: unknown): value is RowKeys =>
+  typeof value === 'object' && value !== null && isStrings((value as RowKeys).ids) && isStrings((value as RowKeys).writeIds);
+
+function isReleaseRecord(value: unknown): value is ReleaseRecord {
+  if (!isRowKeys(value)) return false;
+  const record = value as Partial<ReleaseRecord>;
+  return typeof record.total === 'number' && typeof record.truncated === 'number' && isRowKeys(record.report);
+}
+
+function releaseRecordsOf(rows: readonly HeldRow[], epochId: string): ReleaseRecord[] {
+  const records: ReleaseRecord[] = [];
+  for (const m of rows) {
+    const meta = m.metadata as { kind?: unknown; epochId?: unknown; released?: unknown } | undefined;
+    if (meta?.kind !== 'tune-out-cancel' || meta.epochId !== epochId) continue;
+    if (isReleaseRecord(meta.released) && !records.some((r) => JSON.stringify(r) === JSON.stringify(meta.released))) {
+      records.push(meta.released);
+    }
+  }
+  return records;
+}
+
+function truncationNote(records: readonly ReleaseRecord[]): string {
+  const cut = records.flatMap((r, i) => (r.truncated > 0 ? [{ ...r, dump: i + 1 }] : []));
+  if (cut.length === 0) return '';
+  if (records.length === 1) {
+    return ` ${cut[0]!.truncated} of ${cut[0]!.total} diverted messages, the oldest, weren't delivered raw to the resident.`;
+  }
+  const each = cut.map((r) => `${r.truncated} of ${r.total} in dump ${r.dump}`).join(' and ');
+  const oldest = cut.length === 1
+    ? `the oldest of dump ${cut[0]!.dump}`
+    : cut.length === records.length ? 'the oldest of each' : 'the oldest of each dump named';
+  return ` Of the ${records.length} dumps' diverted messages, ${each}, ${oldest}, weren't delivered raw to the resident.`;
+}
+
 /**
  * Whether a held message is one of this channel's: by its channel id, and by
  * its server where it records one, since two servers can register the same
@@ -215,12 +282,7 @@ export interface TuneOutFrameworkHooks {
    * message held mid-turn is in the backlog it belongs to (#232 gap 7).
    */
   getDeferredMessages?: () => Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'> & { writeId?: string; heldAt?: number }>;
-  /**
-   * Make what was just delivered durable, including anything the delivery
-   * left in the deferred queue: a release flips durable epoch state, so its
-   * dump must survive a crash in the same window (#232 gap 6).
-   */
-  commitDeliveries?: () => void;
+  commitDeliveries?: () => boolean;
   /**
    * The history-reading tool the resident actually has (e.g. a server's
    * `fetch_history`), or null. A truncation note names it only when it exists
@@ -321,8 +383,7 @@ export class TuneOutCoordinator {
   private lateForks = new WeakSet<object>();
   /** The all-except scope's durable record, cached (undefined = not read yet). */
   private scopeCache: AllExceptState | null | undefined;
-  /** The epoch whose release this process delivered and whose hold is not yet recorded as cleared. */
-  private scopeReleased: string | undefined;
+  private readonly cancelling = new Set<string>();
   /** Timer key for the scope's cadence and expiry. */
   private static readonly SCOPE_KEY = '\0all-except';
 
@@ -378,25 +439,53 @@ export class TuneOutCoordinator {
       // An epoch whose deadline passed while the process was down cancels
       // immediately — the resident gets their backlog on the schedule they
       // committed to, not whenever the host happened to restart.
-      if (params.expiresAtMs !== undefined && params.expiresAtMs <= Date.now()) {
-        this.cancel(serverId, channelId, 'duration', 'duration elapsed');
-        continue;
+      const inForce = (): boolean => this.channelRegistry.getTuneOutState(serverId, channelId)?.params.epochId === params.epochId;
+      const expired = params.expiresAtMs !== undefined && params.expiresAtMs <= Date.now();
+      if (expired) {
+        try {
+          this.cancel(serverId, channelId, 'duration', 'duration elapsed');
+          continue;
+        } catch (err) {
+          if (!inForce()) {
+            console.error(`[tune-out] ${this.shown(serverId, channelId)} reached its end time while the process was down and its cancel ended it, but a step after the end failed:`, err);
+            continue;
+          }
+          console.error(`[tune-out] ${this.shown(serverId, channelId)} reached its end time while the process was down, and its cancel failed, so it stays tuned out and its cancel is tried again in ${EXPIRY_RETRY_MS / 1000} s:`, err);
+        }
       }
       this.startCadence(serverId, channelId, params.cadenceSeconds);
-      this.armExpiry(serverId, channelId, params);
+      const wakeCount = this.channelRegistry.getTuneOutState(serverId, channelId)?.wakeCount ?? 0;
+      if (wakeCount > params.maxWakes) {
+        this.cancelPastBudget(serverId, channelId, params.maxWakes, 'start');
+        if (!inForce()) continue;
+      } else {
+        this.armExpiry(serverId, channelId, expired ? { ...params, expiresAtMs: Date.now() + EXPIRY_RETRY_MS } : params);
+      }
       if (oldestAnchor === null || params.startedAtSequence < oldestAnchor) {
         oldestAnchor = params.startedAtSequence;
       }
     }
     const scope = this.getAllExcept();
     if (scope) {
+      let inForce = true;
       if (scope.params.expiresAtMs <= Date.now()) {
-        this.cancelAllExcept('duration', 'duration elapsed');
+        try {
+          this.cancelAllExcept('duration', 'duration elapsed');
+          inForce = false;
+        } catch (err) {
+          if (this.getAllExcept()?.params.epochId !== scope.params.epochId) {
+            console.error('[tune-out] the all-except hold reached its end time while the process was down and its release ended it, but a step after the end failed:', err);
+            inForce = false;
+          } else {
+            console.error(`[tune-out] the all-except hold reached its end time while the process was down, and its release failed, so it stays in force and its release is tried again in ${EXPIRY_RETRY_MS / 1000} s:`, err);
+            this.armScopeTimers({ ...scope.params, expiresAtMs: Date.now() + EXPIRY_RETRY_MS });
+          }
+        }
       } else {
         this.armScopeTimers(scope.params);
-        if (oldestAnchor === null || scope.params.startedAtSequence < oldestAnchor) {
-          oldestAnchor = scope.params.startedAtSequence;
-        }
+      }
+      if (inForce && (oldestAnchor === null || scope.params.startedAtSequence < oldestAnchor)) {
+        oldestAnchor = scope.params.startedAtSequence;
       }
     }
     if (oldestAnchor !== null) {
@@ -600,13 +689,6 @@ export class TuneOutCoordinator {
     return this.readerAvailable();
   }
 
-  /**
-   * End a tune-out: durable flip, system-framed backlog dump into the
-   * resident's window (capped), lifecycle notice, one wake for the
-   * resident. `subconsciousNote` is the subconscious's own text (from its
-   * cancel_tuneout call) — delivered verbatim under its name, never
-   * synthesized here.
-   */
   cancel(
     serverId: string,
     channelId: string,
@@ -618,31 +700,46 @@ export class TuneOutCoordinator {
     /** The lifecycle state the channel returns to (a tool close ends in 'closed'). */
     nextState: 'open' | 'closed' = 'open',
   ): { ok: true } | { ok: false; error: string } {
-    const ended = this.channelRegistry.cancelTuneOut(serverId, channelId, nextState, source);
-    if (!ended) {
+    const key = this.key(serverId, channelId);
+    if (this.cancelling.has(key)) {
+      return { ok: false, error: `a cancel of ${this.quotedShown(serverId, channelId)} is already in progress` };
+    }
+    this.cancelling.add(key);
+    try {
+      return this.cancelChannel(serverId, channelId, source, reason, subconsciousNote, noteAuthor, nextState);
+    } finally {
+      this.cancelling.delete(key);
+    }
+  }
+
+  private cancelChannel(
+    serverId: string,
+    channelId: string,
+    source: string,
+    reason: string,
+    subconsciousNote: string | undefined,
+    noteAuthor: string | undefined,
+    nextState: 'open' | 'closed',
+  ): { ok: true } | { ok: false; error: string } {
+    const ending = this.channelRegistry.getTuneOutState(serverId, channelId);
+    if (!ending) {
       // Its reader is the resident's tune_out: cancel_tuneout finds the channel first.
       return { ok: false, error: this.notTunedOut(this.quotedShown(serverId, channelId), 'you') };
     }
-    this.clearTimers(serverId, channelId);
-    this.divertedSinceInvocation.delete(this.key(serverId, channelId));
 
-    // Backlog: every message held under this epoch. The stored ones come in
-    // store order, then those still in the deferred queue (held mid-turn,
-    // not yet written), oldest first. That's arrival order, except when a
-    // held message stays queued while a later one is stored: a store write
-    // refused at a turn-start flush leaves it queued, and that turn's
-    // assembly can then store later coalesced messages directly.
-    const epochId = ended.params.epochId;
+    const epochId = ending.params.epochId;
     const ofEpoch = (m: Pick<StoredMessage, 'metadata'>): boolean =>
       (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId;
-    const held = (this.hooks.getDeferredMessages?.() ?? []).filter(ofEpoch);
-    const backlog: Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'>> = [
-      ...this.hooks.getStoredMessages().filter(ofEpoch),
-      ...held,
-    ];
+    const storedRows: HeldRow[] = this.hooks.getStoredMessages();
+    const queuedRows: HeldRow[] = this.hooks.getDeferredMessages?.() ?? [];
+    const earlier = releaseRecordsOf([...storedRows, ...queuedRows], epochId);
+    const dumpedEarlier = keyedBy(earlier);
+    const unreleased = (m: HeldRow): boolean => ofEpoch(m) && !dumpedEarlier(m);
+    const held = queuedRows.filter(unreleased);
+    const backlog: HeldRow[] = [...storedRows.filter(unreleased), ...held];
     // Whole messages: a cap below one shows none, where slice(-0.5) would
     // start at 0 and take them all.
-    const cap = Math.floor(ended.params.backlogCap);
+    const cap = Math.floor(ending.params.backlogCap);
     const authorOf = (m: Pick<StoredMessage, 'participant' | 'metadata'>): string =>
       suppliedValue((m.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? m.participant);
     // A line names its author as the resident knows them and marks what a
@@ -653,7 +750,7 @@ export class TuneOutCoordinator {
     const historyTool = this.hooks.historyTool ? this.hooks.historyTool() : 'fetch_history';
     // The channel as the resident and the subconscious are shown it.
     const name = this.shown(serverId, channelId);
-    const lifecycle = `[${NOTICE_TAG.tuneOut}: ${name} cancelled — ${reason}, ${ended.wakeCount} wake${ended.wakeCount === 1 ? '' : 's'}]`;
+    const lifecycle = `[${NOTICE_TAG.tuneOut}: ${name} cancelled — ${reason}, ${ending.wakeCount} wake${ending.wakeCount === 1 ? '' : 's'}]`;
     const render = (lines: string[], truncated: number): string => {
       const attrs = [
         `channel=${this.quotedShown(serverId, channelId)}`,
@@ -725,14 +822,32 @@ export class TuneOutCoordinator {
         m.content.some((b) => b.type !== 'text') || (newestCut && m === shown[0])),
     ];
 
-    // Host-framed system artifacts — never voiced as anyone.
-    this.hooks.addMessage(
-      'user',
-      [{ type: 'text', text: render(lines, truncated) }],
-      { system: true, kind: 'tune-out-cancel', channelId, epochId },
-    );
-    // The epoch is already ended durably; the release must be as durable.
-    this.hooks.commitDeliveries?.();
+    const records = [...earlier];
+    if (earlier.length === 0 || backlog.length > 0) {
+      const record: ReleaseRecord = { ...keysOf(backlog), total: backlog.length, truncated, report: keysOf(heldForReport) };
+      this.hooks.addMessage(
+        'user',
+        [{ type: 'text', text: render(lines, truncated) }],
+        { system: true, kind: 'tune-out-cancel', channelId, epochId, released: record },
+      );
+      records.push(record);
+    }
+    if (this.hooks.commitDeliveries?.() === false) {
+      throw new Error(`the backlog of ${this.quotedShown(serverId, channelId)} could not be made durable, so its tune-out stays in force`);
+    }
+    if (this.channelRegistry.getTuneOutState(serverId, channelId)?.params.epochId === epochId) {
+      this.channelRegistry.cancelTuneOut(serverId, channelId, nextState, source);
+      this.clearTimers(serverId, channelId);
+      this.divertedSinceInvocation.delete(this.key(serverId, channelId));
+    }
+    const reportedEarlier = keyedBy(earlier.map((r) => r.report));
+    const release = {
+      truncated: records.reduce((n, r) => n + r.truncated, 0),
+      heldForReport: [
+        ...[...storedRows, ...queuedRows].filter((m) => ofEpoch(m) && reportedEarlier(m)),
+        ...(records.length > earlier.length ? heldForReport : []),
+      ],
+    };
     // The subconscious's own words, under its own name, verbatim.
     const subName = this.hooks.subconsciousName();
     if (subconsciousNote && subName) {
@@ -766,12 +881,10 @@ export class TuneOutCoordinator {
     // and when it wrote no note and the dump left any message out, since
     // nothing else then covers it. Otherwise its note speaks for what it saw.
     const selfCancel = source === 'subconscious';
-    if (subName && (!selfCancel || heldForReport.length > 0 || (!subconsciousNote && truncated > 0))) {
-      const truncNote = truncated > 0
-        ? ` ${truncated} of ${backlog.length} diverted messages, the oldest, weren't delivered raw to the resident.`
-        : '';
-      const heldNote = heldForReport.length > 0
-        ? ` Still held at the cancel, so your view may not have them yet: the ${heldForReport.length} message${heldForReport.length === 1 ? '' : 's'} after this one.`
+    if (subName && (!selfCancel || release.heldForReport.length > 0 || (!subconsciousNote && release.truncated > 0))) {
+      const truncNote = truncationNote(records);
+      const heldNote = release.heldForReport.length > 0
+        ? ` Still held at the cancel, so your view may not have them yet: the ${release.heldForReport.length} message${release.heldForReport.length === 1 ? '' : 's'} after this one.`
         : '';
       this.hooks.addMessage(
         'user',
@@ -781,7 +894,7 @@ export class TuneOutCoordinator {
       );
       // Each held message is a row of its own, so a per-message cap cuts each
       // one on its own, its author's label included, not the batch's newest.
-      for (const m of heldForReport) {
+      for (const m of release.heldForReport) {
         this.hooks.addMessage(
           'user',
           [{ type: 'text', text: `${authorOf(m)}:` }, ...m.content],
@@ -803,9 +916,7 @@ export class TuneOutCoordinator {
       const rest = this.unhandedBacklog(this.handOffKey(epochId, serverId, channelId), stored, queued);
       const unread = rest.backlog.length + rest.queued.length;
       if (!selfCancel || unread > 0) {
-        const truncNote = truncated > 0
-          ? ` ${truncated} of ${backlog.length} diverted messages, the oldest, weren't delivered raw to the resident.`
-          : '';
+        const truncNote = truncationNote(records);
         const lateNote = selfCancel
           ? ` ${unread === 1 ? 'This message' : `These ${unread} messages`} arrived after the reader that cancelled was handed its own.`
           : '';
@@ -818,7 +929,7 @@ export class TuneOutCoordinator {
     // there that its reader hasn't looked at are counted again, as the
     // channel's own tune-out's count stood in for theirs.
     this.rebuildTally(serverId, channelId);
-    this.hooks.emitTrace({ type: 'tune-out:cancelled', serverId, channelId, epochId, reason, wakeCount: ended.wakeCount });
+    this.hooks.emitTrace({ type: 'tune-out:cancelled', serverId, channelId, epochId, reason, wakeCount: ending.wakeCount });
     return { ok: true };
   }
 
@@ -1043,16 +1154,26 @@ export class TuneOutCoordinator {
     return counts;
   }
 
-  /**
-   * End the all-except hold: durable flip, one release notice with a
-   * per-channel backlog (each capped), the reader's note if any, one wake
-   * for the resident, and the reader's own look at what it had not seen.
-   */
   cancelAllExcept(
     source: string,
     reason: string,
     note?: string,
     noteAuthor?: string,
+  ): { ok: true } | { ok: false; error: string } {
+    if (this.cancelling.has(TuneOutCoordinator.SCOPE_KEY)) return { ok: false, error: 'a cancel of the all-except hold is already in progress' };
+    this.cancelling.add(TuneOutCoordinator.SCOPE_KEY);
+    try {
+      return this.releaseAllExcept(source, reason, note, noteAuthor);
+    } finally {
+      this.cancelling.delete(TuneOutCoordinator.SCOPE_KEY);
+    }
+  }
+
+  private releaseAllExcept(
+    source: string,
+    reason: string,
+    note: string | undefined,
+    noteAuthor: string | undefined,
   ): { ok: true } | { ok: false; error: string } {
     const scope = this.getAllExcept();
     if (!scope) return { ok: false, error: 'no all-except hold is active' };
@@ -1060,9 +1181,14 @@ export class TuneOutCoordinator {
 
     const ofEpoch = (m: Pick<StoredMessage, 'metadata'>): boolean =>
       (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId;
-    const all = [...this.hooks.getStoredMessages().filter(ofEpoch), ...(this.hooks.getDeferredMessages?.() ?? []).filter(ofEpoch)];
-    const byChannel = new Map<string, { serverId: string; channelId: string; backlog: Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'>> }>();
-    for (const m of all) {
+    const storedRows: HeldRow[] = this.hooks.getStoredMessages();
+    const queuedRows: HeldRow[] = this.hooks.getDeferredMessages?.() ?? [];
+    const all: HeldRow[] = [...storedRows.filter(ofEpoch), ...queuedRows.filter(ofEpoch)];
+    const earlier = releaseRecordsOf([...storedRows, ...queuedRows], epochId);
+    const releasedEarlier = keyedBy(earlier);
+    const fresh = all.filter((m) => !releasedEarlier(m));
+    const byChannel = new Map<string, { serverId: string; channelId: string; backlog: HeldRow[] }>();
+    for (const m of fresh) {
       const meta = m.metadata as { channelId?: string; serverId?: string } | undefined;
       const serverId = meta?.serverId ?? '';
       const channelId = meta?.channelId ?? '(unknown channel)';
@@ -1072,12 +1198,14 @@ export class TuneOutCoordinator {
       byChannel.set(k, entry);
     }
     const historyTool = this.hooks.historyTool?.() ?? null;
+    let truncatedInAll = 0;
     const dumps = [...byChannel.values()].map(({ serverId, channelId, backlog }) => {
       // Floored here too: a hold stored before entry floored its cap can hold
       // a fraction.
       const cap = Math.floor(backlogCap);
       const shown = cap > 0 ? backlog.slice(-cap) : [];
       const truncated = backlog.length - shown.length;
+      truncatedInAll += truncated;
       const attrs = [
         `channel=${quotedValue(this.shown(serverId, channelId))}`,
         `messages=${backlog.length}`,
@@ -1087,28 +1215,27 @@ export class TuneOutCoordinator {
     });
     const summary = byChannel.size === 0
       ? 'Nothing was held.'
-      : `${all.length} message${all.length === 1 ? '' : 's'} held in ${byChannel.size} channel${byChannel.size === 1 ? '' : 's'}.`;
-    if (this.scopeReleased !== epochId) {
+      : `${fresh.length} message${fresh.length === 1 ? '' : 's'} held in ${byChannel.size} channel${byChannel.size === 1 ? '' : 's'}.`;
+    if (earlier.length === 0 || fresh.length > 0) {
+      const record: ReleaseRecord = { ...keysOf(fresh), total: fresh.length, truncated: truncatedInAll, report: { ids: [], writeIds: [] } };
       this.hooks.addMessage(
         'user',
         [{ type: 'text', text: `[${NOTICE_TAG.tuneOut}: all channels except ${this.shown(except.serverId, except.channelId)} released — ${reason}, ${scope.wakeCount} wake${scope.wakeCount === 1 ? '' : 's'}]\n\n${summary}${dumps.length > 0 ? '\n\n' + dumps.join('\n\n') : ''}` }],
-        { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId },
+        { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId, released: record },
       );
-      this.hooks.commitDeliveries?.();
-      this.scopeReleased = epochId;
     }
-    // The release is recorded before the hold is: a failure past this point
-    // leaves the hold in force with its release already delivered. A retry in
-    // this process records only the hold's end; a restart between the two
-    // delivers the release again, where the other order lost it outright.
-    this.writeScope(null);
-    this.scopeReleased = undefined;
-    this.clearScopeTimers();
-    for (const [key, pending] of this.pendingWakes) {
-      const [serverId, channelId] = key.split('\0') as [string, string];
-      if (this.channelRegistry.getTuneOutState(serverId, channelId)) continue;
-      clearTimeout(pending.timer);
-      this.pendingWakes.delete(key);
+    if (this.hooks.commitDeliveries?.() === false) {
+      throw new Error('the all-except release could not be made durable, so the hold stays in force');
+    }
+    if (this.getAllExcept()?.params.epochId === epochId) {
+      this.writeScope(null);
+      this.clearScopeTimers();
+      for (const [key, pending] of this.pendingWakes) {
+        const [serverId, channelId] = key.split('\0') as [string, string];
+        if (this.channelRegistry.getTuneOutState(serverId, channelId)) continue;
+        clearTimeout(pending.timer);
+        this.pendingWakes.delete(key);
+      }
     }
     const subName = this.hooks.subconsciousName();
     if (note && subName) {
@@ -1335,6 +1462,31 @@ export class TuneOutCoordinator {
     this.pendingWakes.set(key, { count: 1, timer });
   }
 
+  private cancelPastBudget(serverId: string, channelId: string, maxWakes: number, from: 'wake' | 'start' = 'wake'): void {
+    const key = this.key(serverId, channelId);
+    const existing = this.expiryTimers.get(key);
+    if (existing) clearTimeout(existing);
+    const end = (first: boolean): void => {
+      try {
+        this.expiryTimers.set(key, setTimeout(() => end(false), EXPIRY_RETRY_MS));
+        if (!this.cancel(serverId, channelId, 'tune-out-max-wakes', `wake budget exhausted (${maxWakes})`).ok) {
+          this.clearTimers(serverId, channelId);
+        }
+      } catch (err) {
+        if (first && from === 'start') {
+          if (this.channelRegistry.getTuneOutState(serverId, channelId)) {
+            console.error(`[tune-out] ${this.shown(serverId, channelId)} was past its wake budget at start, and its cancel failed, so it stays tuned out and its cancel is tried again in ${EXPIRY_RETRY_MS / 1000} s:`, err);
+          } else {
+            console.error(`[tune-out] ${this.shown(serverId, channelId)} was past its wake budget at start and its cancel ended it, but a step after the end failed:`, err);
+          }
+        } else {
+          this.timerFailed('wake', serverId, channelId, err);
+        }
+      }
+    };
+    end(true);
+  }
+
   /** One coalesced wake: counted durably against the epoch that holds the channel. */
   private fireWake(serverId: string, channelId: string, count: number): void {
     if (this.channelRegistry.getTuneOutState(serverId, channelId)) {
@@ -1342,12 +1494,7 @@ export class TuneOutCoordinator {
       const counted = this.channelRegistry.recordTuneOutWake(serverId, channelId);
       if (!counted) return; // cancelled inside the window
       if (counted.wakeCount > counted.params.maxWakes) {
-        this.cancel(
-          serverId,
-          channelId,
-          'tune-out-max-wakes',
-          `wake budget exhausted (${counted.params.maxWakes})`,
-        );
+        this.cancelPastBudget(serverId, channelId, counted.params.maxWakes);
         return;
       }
       this.invokeSubconscious(serverId, channelId, 'wake', count);
