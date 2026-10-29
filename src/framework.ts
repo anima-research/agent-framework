@@ -26926,7 +26926,11 @@ export class AgentFramework {
 
   /**
    * Execute a tool call and return the result.
-   * Routes to the appropriate handler (module registry or MCPL).
+   * Routes it where the agent's own call of the name goes: to the
+   * framework's own tools (agent_settings, the workspace and gate tools,
+   * think, journal, prose_help and the rest), the channel tools, MCPL or the
+   * module registry. skip_reply, which ends the turn it's called in, is
+   * refused, since this call isn't made in one.
    * Its one caller in the framework is the operator's puppet
    * (puppetToolCall), which puts the agent's inline cap on the call as
    * resultMaxChars; a host may call it as well.
