@@ -167,6 +167,23 @@ const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
 const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
 
+export function assertThinkingBinding(setting: string, value: AgentConfig['thinkingBinding']): void {
+  if (holdsSettings(setting, value, '{ binds: true, dropBlock: true }')) {
+    assertBooleanSetting(
+      `${setting}.dropBlock`,
+      value.dropBlock,
+      'true asks the provider to drop a signed thinking block whose earlier conversation changed rather than refuse the request, ' +
+        'and false or leaving it out sends nothing, so the account\'s default applies',
+    );
+    assertBooleanSetting(
+      `${setting}.binds`,
+      value.binds,
+      'true says the model binds its signed thinking to the conversation before it, so each compile tells the context manager so, ' +
+        'and false or leaving it out compiles as before',
+    );
+  }
+}
+
 /**
  * Refuse an agent config whose `promptCaching`, `toolResultGuard`,
  * `toolWrapperProseGuard`, `thinking.enabled`, `thinkingBinding.dropBlock`,
@@ -194,20 +211,7 @@ export function assertAgentSwitches(config: AgentConfig): void {
       'true asks the provider for extended thinking, and false or leaving it out doesn\'t',
     );
   }
-  if (holdsSettings(`${agent} thinkingBinding`, config.thinkingBinding, '{ binds: true, dropBlock: true }')) {
-    assertBooleanSetting(
-      `${agent} thinkingBinding.dropBlock`,
-      config.thinkingBinding.dropBlock,
-      'true asks the provider to drop a signed thinking block whose earlier conversation changed rather than refuse the request, ' +
-        'and false or leaving it out sends nothing, so the account\'s default applies',
-    );
-    assertBooleanSetting(
-      `${agent} thinkingBinding.binds`,
-      config.thinkingBinding.binds,
-      'true says the model binds its signed thinking to the conversation before it, so each compile tells the context manager so, ' +
-        'and false or leaving it out compiles as before',
-    );
-  }
+  assertThinkingBinding(`${agent} thinkingBinding`, config.thinkingBinding);
   if (holdsSettings(`${agent} refusalHandling`, config.refusalHandling, '{ autoRewind: true }')) {
     assertBooleanSetting(
       `${agent} refusalHandling.autoRewind`,
