@@ -1513,7 +1513,7 @@ test('a close that lands while the coalescer holds a message stands', async () =
   assert.equal(f.isOpen(), false, 'the close receipt stands');
 });
 
-test("a coalesced message the coalescer admits after its server was removed sets no default, so another server's default stands", async () => {
+test("a coalesced message admitted after its server was removed sets no default, so another server's default stands", async () => {
   let admit!: () => void;
   const f = fixture(undefined, undefined, async (_serverId, held) => {
     await new Promise<void>((resolve) => { admit = resolve; });
@@ -1531,6 +1531,11 @@ test("a coalesced message the coalescer admits after its server was removed sets
   f.registry.removeServer('test');
   admit();
   await incoming;
+  // The anchor is recorded at admission (noteDelivered), as the framework
+  // records a message it delivers: the removed server's message is admitted
+  // here, after its removal, and sets nothing, since its server no longer
+  // registers the channel.
+  f.registry.noteDelivered({ serverId: 'test', channelId: 'x' }, 'm1');
   assert.deepEqual(f.registry.getDefaultPublishChannel(), { serverId: 'other', channelId: 'z' }, "the other server's default stands");
   assert.deepEqual(f.registry.incomingFor(), { channel: { serverId: 'other', channelId: 'z' }, messageId: 'm-other', threadId: undefined },
     "no message on the removed server is given as the one replied to");
@@ -2510,7 +2515,8 @@ async function replyOpenFailedNotices(opts: {
   framework.agents = new Map((opts.live ?? [agentName]).map((name) => [name, { canUseTool: (tool: string) => !(opts.denied ?? []).includes(tool) }]));
   framework.usedEphemeralAgentNames = new Set();
   // A fork's home is a channel on the send's server.
-  framework.conversationAgentHomes = new Map((opts.homes ?? []).map(([name, id]) => [name, { serverId: 'chat-server', channelId: id }]));
+  framework.registry = { homeChannel: (name: string) => new Map((opts.homes ?? []).map(([n, id]) => [n, { serverId: 'chat-server', channelId: id }])).get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
+  framework.sharedSlotAgents = new Set();
   framework.primaryAgentName = opts.primary;
   framework.emitTrace = () => {};
   framework.addMessage = (_participant: string, content: Array<{ text: string }>, metadata: unknown, routed?: { forAgent?: string }) => {
@@ -2668,7 +2674,8 @@ test("a reply notice with no agent named, or an empty name, goes out unrouted, w
     framework.agents = new Map(c.agents.map(([name, denied]) => [name, { name, canUseTool: (tool: string) => !denied.includes(tool) }]));
     framework.primaryAgentName = c.primary;
     framework.usedEphemeralAgentNames = new Set();
-    framework.conversationAgentHomes = new Map();
+    framework.registry = { homeChannel: (name: string) => new Map().get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
+    framework.sharedSlotAgents = new Set();
     framework.addMessage = (_participant: string, content: Array<{ text: string }>, _metadata: unknown, routed?: { forAgent?: string }) => {
       told.push({ text: content[0]!.text, ...(routed ? { forAgent: routed.forAgent } : {}) });
       return 'm';
@@ -2746,7 +2753,8 @@ test("where a reply's reader can't close a channel selected for opening, the pri
     framework.agents = new Map(c.agents.map(([name, denied]) => [name, { name, canUseTool: (tool: string) => !denied.includes(tool) }]));
     framework.primaryAgentName = c.primary;
     framework.usedEphemeralAgentNames = new Set();
-    framework.conversationAgentHomes = new Map((c.homes ?? []).map(([name, id]) => [name, { serverId: 'srv', channelId: id }]));
+    framework.registry = { homeChannel: (name: string) => new Map((c.homes ?? []).map(([n, id]) => [n, { serverId: 'srv', channelId: id }])).get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
+    framework.sharedSlotAgents = new Set();
     // Forks are made where conversations are routed, here from the primary.
     framework.conversationRouter = c.homes ? { templateAgent: 'primary' } : undefined;
     framework.addMessage = (_participant: string, content: Array<{ text: string }>, metadata: unknown, routed?: { forAgent?: string }) => {
@@ -2871,7 +2879,8 @@ test('the opened notice names channel_close only where the agent it\'s addressed
     framework.agents = new Map(c.agents.map(([name, denied]) => [name, { name, canUseTool: (tool: string) => !denied.includes(tool) }]));
     framework.primaryAgentName = c.primary;
     framework.usedEphemeralAgentNames = new Set();
-    framework.conversationAgentHomes = new Map((c.homes ?? []).map(([name, id]) => [name, { serverId: 'srv', channelId: id }]));
+    framework.registry = { homeChannel: (name: string) => new Map((c.homes ?? []).map(([n, id]) => [n, { serverId: 'srv', channelId: id }])).get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
+    framework.sharedSlotAgents = new Set();
     // Each fork is bound to its home, unless the sweep has ended its binding;
     // of two forks with one home, the router binds the later.
     const bound = new Map((c.homes ?? []).filter(([fork]) => !(c.expired ?? []).includes(fork)).map(([fork, home]) => [home, fork]));
@@ -2882,7 +2891,7 @@ test('the opened notice names channel_close only where the agent it\'s addressed
     // Residents, and the subconscious through its merged view, read one shared
     // slot; a fork's store, or a run's, is its own.
     framework.sharedSlotAgents = new Set([...framework.agents.values()]
-      .filter((a: { name: string }) => !framework.conversationAgentHomes.has(a.name) && !(c.isolated ?? []).includes(a.name)));
+      .filter((a: { name: string }) => framework.registry.homeChannel(a.name) === undefined && !(c.isolated ?? []).includes(a.name)));
     const labels = new Map(c.labels ?? []);
     framework.channelRegistry = {
       getDescriptor: (ref: { channelId: string }) => (labels.has(ref.channelId) ? { id: ref.channelId, label: labels.get(ref.channelId) } : undefined),
@@ -2918,7 +2927,8 @@ test("each channel notice is written on its own, and the reader's says the prima
       framework.agents = new Map([['fork', { name: 'fork', canUseTool: () => true }], ['primary', { name: 'primary', canUseTool: () => true }]]);
       framework.primaryAgentName = 'primary';
       framework.usedEphemeralAgentNames = new Set();
-      framework.conversationAgentHomes = new Map([['fork', { serverId: 'srv', channelId: 'y' }]]);
+      framework.registry = { homeChannel: (name: string) => new Map([['fork', { serverId: 'srv', channelId: 'y' }]]).get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
+      framework.sharedSlotAgents = new Set();
       framework.conversationRouter = { templateAgent: 'primary' };
       framework.addMessage = (_participant: string, content: Array<{ text: string }>, _metadata: unknown, routed?: { forAgent?: string }) => {
         // The reader's notice is addressed to the fork; the primary's to no one.
@@ -2961,7 +2971,8 @@ test("a channel notice's inputs give the primary's by-name notice once its reade
   framework.agents = new Map([['primary', { name: 'primary', canUseTool: (tool: string) => tool !== 'channel_open' }]]);
   framework.primaryAgentName = 'primary';
   framework.usedEphemeralAgentNames = new Set();
-  framework.conversationAgentHomes = new Map();
+  framework.registry = { homeChannel: (name: string) => new Map().get(name), readsSharedSlot: (name: string) => [...(framework.sharedSlotAgents ?? [])].some((a: { name: string }) => a.name === name) };
+  framework.sharedSlotAgents = new Set();
   // Every channel still as the notice says: open, or still waiting to open.
   framework.channelRegistry = { getDesiredState: () => 'open', isChannelOpen: () => false, nameShown: (ref: { channelId: string }) => ref.channelId };
   const error = console.error;

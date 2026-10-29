@@ -202,8 +202,12 @@ test("with no agent registered, the refusal says so, rather than offering a wind
     (err: Error) => err.message === `Unknown agent: "prime". No agent is registered yet, so there's no window to read.`);
 });
 
-test("the empty name is refused even when an agent is registered under it, since a write can't be routed to it", async () => {
-  const x = await make(['prime', '']);
+test("the empty name is refused, since a write can't be routed to it", async () => {
+  // On this branch the Dendrite registry refuses a nameless agent at create
+  // ("a name is required"), so no agent can be registered under '': the
+  // refusal is tested with prime alone registered. main's version registers
+  // an agent under '' and checks the write is refused even so.
+  const x = await make(['prime']);
   // The refused empty name isn't offered among the registered agents.
   assert.throws(() => x.reader.ctx!.addMessage('user', [text('FOR EMPTY')], undefined, { forAgent: '' }),
     (err: Error) => err.message === 'Unknown agent: "". A write names a registered agent: "prime" (ModuleContext.getAgents() lists them), '

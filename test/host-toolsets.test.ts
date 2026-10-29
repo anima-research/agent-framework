@@ -414,6 +414,30 @@ async function pingServer() {
 
 const isOpenSocket = (ws: { readyState: number }) => ws.readyState === 1;
 
+describe("a server's tool description in the host toolsets' listings", () => {
+  it('reads on one line, as the tool lists everywhere else show it', async () => {
+    const server = await startScriptedServer({
+      advert: { featureSets: { 'srv.tools': { description: 'tools', uses: ['tools'] } } },
+      tools: [{ name: 'ping', description: 'Pings the server.\u0085 It answers pong.', inputSchema: { type: 'object' } }],
+      on: (msg, peer) => { if (msg.id !== undefined) peer.error(msg.id, -32601, 'Method not found'); },
+    });
+    const h = await makeFramework({ servers: [{ id: 'srv', url: server.url, toolPrefix: 'srv' }] });
+    try {
+      await h.framework.start();
+      await waitFor(() => h.framework.getAllTools().some((t) => t.name === 'srv--ping'), 'srv connected');
+      await call(h.framework, 'toolsets--close', { server: 'srv' });
+      const opened = resultText(await call(h.framework, 'toolsets--open', { server: 'srv' }));
+      const looked = resultText(await call(h.framework, 'toolsets--look', { server: 'srv' }));
+      for (const text of [opened, looked]) {
+        const line = text.split('\n').find((l) => l.includes('srv--ping('));
+        assert.ok(line !== undefined, text);
+        assert.ok(!/[\u000b\u000c\u0085\u2028\u2029]/.test(line!), JSON.stringify(line));
+        assert.ok(line!.endsWith(' — Pings the server.  It answers pong.'), JSON.stringify(line));
+      }
+    } finally { await h.stop(); await server.close(); }
+  });
+});
+
 describe('server tabs', () => {
   it('switch full → hidden tab → open → closed tab → open (reconnected) → full', async () => {
     const { server, calls } = await pingServer();

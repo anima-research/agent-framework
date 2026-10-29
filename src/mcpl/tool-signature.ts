@@ -94,20 +94,23 @@ const schemaOf = (tool: HintedTool): JsonSchema => (isObj(tool.inputSchema) ? to
 
 /** `play(point: string)`, `move(forward?: int -10..10 =0, turn?: int)` */
 export function signature(tool: HintedTool): string {
-  const s = schemaOf(tool);
-  const props = (isObj(s.properties) ? s.properties : {}) as Record<string, JsonSchema>;
-  const req = new Set(Array.isArray(s.required) ? (s.required as string[]) : []);
-  const params = Object.entries(props).map(([k, v]) => {
-    const def = isObj(v) && v.default !== undefined ? ` =${literal(v.default)}` : '';
-    return `${nameToTypeBack(k)}${req.has(k) ? '' : '?'}: ${typeSig(v, 1)}${def}`;
-  });
-  return `${nameToTypeBack(String(tool.name))}(${params.join(', ')})`;
+  return `${nameToTypeBack(String(tool.name))}(${paramsOf(schemaOf(tool))})`;
 }
 
 /** An options schema as `{size?: 9|13|19 =9, …}` (a toolset's options). */
 export function objectSignature(schema: unknown): string {
-  const inner = signature({ name: '', inputSchema: schema }).slice(1, -1);
+  const inner = paramsOf(isObj(schema) ? schema : {});
   return inner ? `{${inner}}` : '{}';
+}
+
+/** A schema's properties as `name?: type =default`, joined with commas. */
+function paramsOf(s: JsonSchema): string {
+  const props = (isObj(s.properties) ? s.properties : {}) as Record<string, JsonSchema>;
+  const req = new Set(Array.isArray(s.required) ? (s.required as string[]) : []);
+  return Object.entries(props).map(([k, v]) => {
+    const def = isObj(v) && v.default !== undefined ? ` =${literal(v.default)}` : '';
+    return `${nameToTypeBack(k)}${req.has(k) ? '' : '?'}: ${typeSig(v, 1)}${def}`;
+  }).join(', ');
 }
 
 /** First sentence of a description, bounded. */
@@ -153,9 +156,13 @@ export function renderToolLines(tools: HintedTool[], shown: Shown, opts: { descr
     const d = toolDigest(t);
     const describe = opts.describeAll || !shown.has(d);
     shown.add(d);
-    const sentence = describe ? firstSentence(t.description) : '';
-    return `${indent}${signature(t)}${sentence ? ` — ${suppliedValue(sentence)}` : ''}`;
+    return toolLine(t, describe, indent);
   });
+}
+
+export function toolLine(tool: HintedTool, describe = true, indent = '  '): string {
+  const sentence = describe ? firstSentence(tool.description) : '';
+  return `${indent}${signature(tool)}${sentence ? ` — ${suppliedValue(sentence)}` : ''}`;
 }
 
 /** A server's value as JSON, or a note where it's nested too deeply, or too long, to show. */
