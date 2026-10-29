@@ -1131,7 +1131,7 @@ test('a change refuses, writing nothing, where gate.json has no rule list it cou
 test("the host's starting rules are read rule by rule: a first start writes them as given and runs each as read, leaving out only what it must", (t) => {
   const usable: GateConfig = { default: 'skip', policies: [{ name: 'user-input', match: { scope: ['user:message'] }, behavior: 'always' }] };
   const clean = makeGate(tempDir(t), { initialConfig: usable });
-  assert.equal(readFileSync(clean.configPath, 'utf-8'), JSON.stringify(usable, null, 2) + '\n', 'verbatim');
+  assert.deepEqual(onDisk(clean.configPath), usable, 'as given');
   assert.deepEqual(clean.gate.getStatus().errors, []);
   assert.equal(clean.gate.getStatus().configSource, 'file');
 
@@ -1940,12 +1940,13 @@ test('a gate.json saved with a BOM reads as the same file without one: at a late
     'tool_use',
   ));
   membrane.pushResponse(createMockResponse([]));
+  const before = readdirSync(dir).sort();
   assert.equal(framework.nudgeAgent('scout').ok, true);
   await framework.runUntilIdle();
   const [round] = membrane.lastStream!.receivedToolResults as Array<Array<{ content: string; isError: boolean }>>;
   assert.equal(round![0]!.isError, false, round![0]!.content);
   assert.deepEqual(onDisk(configPath).policies.map((p) => p.name), ['mentions', 'by-hand', 'watch']);
-  assert.deepEqual(readdirSync(dir).filter((f) => f.startsWith('gate.json.unreadable-')), []);
+  assert.deepEqual(readdirSync(dir).sort(), before, 'the file is written in place; nothing is moved aside');
 });
 
 test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its own terms, names fields it left out, and keeps the rules it didn\'t change', async (t) => {
