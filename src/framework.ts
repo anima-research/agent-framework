@@ -11807,6 +11807,7 @@ export class AgentFramework {
     this.eventGate?.agentGone(name);
     this.agents.delete(name);
     this.agentConfigs.delete(name);
+    this.deadlineCuts.delete(name);
     this.thinkingLossIncidents.forget(name);
     this.reasoningLoss.forget(name);
     // main's manager release: the context manager an ephemeral run or a fork
@@ -17720,7 +17721,6 @@ export class AgentFramework {
   private disposeConversationAgent(agentName: string, reason: AgentEndReason = 'idle-ttl'): void {
     const home = this.homeOf(agentName);
     const agent = this.agents.get(agentName);
-    this.deadlineCuts.delete(agentName);
     // The one release every ended agent gets (releaseAgentRuntime), then the
     // registry's end, whose outcome settles what the fork spawned.
     if (agent) {
@@ -17728,6 +17728,7 @@ export class AgentFramework {
     } else {
       // Nothing live under the name: only what the process keeps by name.
       this.closingConversationAgents.delete(agentName);
+      this.deadlineCuts.delete(agentName);
       this.thinkingLossIncidents.forget(agentName);
       this.reasoningLoss.forget(agentName);
       // A continuation of its turn still on its way goes with it.

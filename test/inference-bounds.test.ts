@@ -765,4 +765,28 @@ describe('inference bounds: the deadline class', () => {
     assert.deepEqual(delays(new DefaultErrorPolicy(settings as RetrySettings), marked), [1_000, 2_000]);
     assert.deepEqual(delays(new DefaultErrorPolicy(settings as RetrySettings), new MembraneError({ type: 'server', retryable: true, message: 'x', rawError: undefined })), [1_000, 2_000]);
   });
+
+  it('an agent ended through the registry takes its count of deadline cuts with it', async () => {
+    const stand = await provider([]);
+    const agent = { model: 'claude-opus-5-5', systemPrompt: 'You are a resident.', maxTokens: 4096 };
+    const fw = await AgentFramework.create({
+      storePath: join(mkdtempSync(join(tmpdir(), 'af-bounds-')), 'store.chronicle'),
+      membrane: new Membrane(adapterFor(stand)),
+      agents: [{ name: 'resident', ...agent } as never, { name: 'second', ...agent } as never],
+      modules: [new Asker()],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+      inferenceBounds: SHORT,
+    });
+    try {
+      const counts = (fw as unknown as { deadlineCuts: Map<string, number> }).deadlineCuts;
+      // Set as a cut that gets its fresh call sets it, so the release's clear is pinned.
+      counts.set('second', 1);
+      fw.stopAgent('second', { by: 'test' });
+      assert.equal(counts.has('second'), false);
+    } finally {
+      await fw.stop();
+      await stand.close();
+    }
+  });
 });
