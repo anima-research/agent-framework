@@ -6,6 +6,7 @@
  */
 
 import { NOTICE_TAG } from '../../notice-tags.js';
+import { nameToTypeBack } from '../../supplied-text.js';
 import { constants as fsConstants } from 'node:fs';
 import type { BigIntStats, Stats } from 'node:fs';
 import { open, readdir, readlink, stat, lstat, realpath } from 'node:fs/promises';
@@ -2317,13 +2318,13 @@ export class WorkspaceModule implements Module {
 
     let text: string;
     if (paths.length === 1) {
-      text = `[${NOTICE_TAG.workspaceEvent} · ${op} · ${paths[0]}]`;
+      text = `[${NOTICE_TAG.workspaceEvent} · ${op} · ${nameToTypeBack(paths[0]!)}]`;
     } else {
-      const list = paths.map(p => `- ${p}`).join('\n');
+      const list = paths.map(p => `- ${nameToTypeBack(p)}`).join('\n');
       text = `[${NOTICE_TAG.workspaceEvent} · ${op} · ${paths.length} files in ${mountName}/]\n${list}`;
     }
     if (conflicts && conflicts.length > 0) {
-      text += `\n[${NOTICE_TAG.conflictsWithDisk}: ${conflicts.join(', ')}; reading each shows how to settle it]`;
+      text += `\n[${NOTICE_TAG.conflictsWithDisk}: ${conflicts.map(nameToTypeBack).join(', ')}; reading each shows how to settle it]`;
     }
 
     return {

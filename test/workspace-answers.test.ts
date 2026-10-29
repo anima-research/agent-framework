@@ -725,6 +725,21 @@ describe('what the answers say elsewhere', () => {
     assert.equal(text, '[workspace event · modified · auto/a.txt]\n[conflicts with disk: auto/a.txt; reading each shows how to settle it]');
   });
 
+  test("the wake notice writes a path that doesn't show as itself as one line of JSON, which gives it back", async (t) => {
+    const env = new Env(t);
+    const m = await env.open([{ name: 'auto', wakeOnChange: true }]);
+    const textOf = async (event: object) =>
+      ((await m.onProcess(event as unknown as ProcessEvent, {} as never)).addMessages![0]!.content[0] as { text: string }).text;
+    assert.equal(
+      await textOf({ type: 'workspace:modified', mount: 'auto', paths: ['auto/two\nlines.txt'], conflicts: ['auto/two\nlines.txt'] }),
+      '[workspace event · modified · "auto/two\\nlines.txt"]\n[conflicts with disk: "auto/two\\nlines.txt"; reading each shows how to settle it]',
+    );
+    assert.equal(
+      await textOf({ type: 'workspace:created', mount: 'auto', paths: ['auto/a.txt', 'auto/b\u2028c.txt'] }),
+      '[workspace event · created · 2 files in auto/]\n- auto/a.txt\n- "auto/b\\u2028c.txt"',
+    );
+  });
+
   test('ls of a missing path or of a file, and materialize or sync of a path held nowhere, say so in a note', async (t) => {
     const env = new Env(t);
     const m = await env.open();
