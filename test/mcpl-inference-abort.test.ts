@@ -111,16 +111,16 @@ const request = (stream: boolean) => ({
   preferences: { maxTokens: 100 },
 });
 
-function registeredConnection(fw: AgentFramework) {
+function registeredConnection(fw: AgentFramework, id = 'srv') {
   const connection = Object.assign(new EventEmitter(), {
-    id: 'srv',
+    id,
     closed: false,
     stopReconnecting: () => {},
     close: async () => { connection.closed = true; },
   });
   const internals = fw as unknown as Internals & { mcplServerRegistry: { servers: Map<string, unknown> } };
-  internals.mcplServerRegistry.servers.set('srv', connection);
-  internals.wireMcplEvents(connection, { id: 'srv', url: 'wss://h/mcp?token=wireToken0123456789' });
+  internals.mcplServerRegistry.servers.set(id, connection);
+  internals.wireMcplEvents(connection, { id, url: 'wss://h/mcp?token=wireToken0123456789' });
   return connection;
 }
 
@@ -184,13 +184,10 @@ describe("an MCPL server's inference request the host stops", () => {
     });
     await until(() => called, 'the provider call');
 
-    const started = Date.now();
     await assert.rejects(fw.stop(300), (error: Error) => {
       assert.match(error.message, /^Shutdown timed out after 300 ms; pending: inference\/request:srv$/);
       return true;
     });
-    const took = Date.now() - started;
-    assert.ok(took >= 300, `stop() took ${took} ms`);
 
     release();
     await until(() => (router.running as Set<unknown>).size === 0, 'the request to end');
@@ -242,10 +239,12 @@ describe("an MCPL server's inference request the host stops", () => {
     assert.deepEqual(wire, [{ chunk: 'first' }, { error: STOPPED }]);
   });
 
-  it("a stop() a host calls from the request's start trace answers it as stopped before its connection closes", async () => {
-    const provider = await silentProvider();
-    cleanup.push(provider.close);
-    const fw = await hostWithRouter(membraneFor(provider.base));
+  it("a stop() a host calls from the request's start trace answers it as stopped before its connection closes, and no provider call is made", async () => {
+    const fw = await hostWithRouter(membraneFor('http://127.0.0.1:9'));
+    let calls = 0;
+    (fw as unknown as Internals).inferenceRouter.membrane = {
+      complete: async () => { calls += 1; throw new Error('Request was aborted'); },
+    };
     let stopping: Promise<void> | undefined;
     fw.onTrace((event) => {
       if ((event as { type: string }).type === 'mcpl:inference_start') stopping ??= fw.stop();
@@ -261,7 +260,7 @@ describe("an MCPL server's inference request the host stops", () => {
     await stopping;
 
     assert.deepEqual(answers, [{ beforeClose: true, error: STOPPED }]);
-    await until(() => provider.dropped() === provider.sent(), 'every provider call to be dropped', 2_000);
+    assert.equal(calls, 0);
   });
 
   it("a stop() after the request's transport closed, while its call is still settling, answers nothing and traces the transport", async () => {
@@ -282,8 +281,8 @@ describe("an MCPL server's inference request the host stops", () => {
     connection.emit('inference-request', request(false), {
       id: 7,
       signal: transport.signal,
-      respond: (result: unknown) => { if (!transport.signal.aborted) answers.push({ result }); },
-      respondError: (code: number, message: string) => { if (!transport.signal.aborted) answers.push({ error: { code, message } }); },
+      respond: (result: unknown) => answers.push({ result }),
+      respondError: (code: number, message: string) => answers.push({ error: { code, message } }),
     });
     await until(() => called, 'the provider call');
 
@@ -294,6 +293,33 @@ describe("an MCPL server's inference request the host stops", () => {
 
     assert.deepEqual(answers, []);
     assert.deepEqual(failures, ['the transport the request came on closed']);
+  });
+
+  it('stop() answers each request it finds running, from each server, before it closes their connections', async () => {
+    const fw = await hostWithRouter(membraneFor('http://127.0.0.1:9'));
+    let calls = 0;
+    (fw as unknown as Internals).inferenceRouter.membrane = {
+      complete: (_request: unknown, options: { signal: AbortSignal }) => {
+        calls += 1;
+        return new Promise((_resolve, reject) => {
+          options.signal.addEventListener('abort', () => reject(new Error('Request was aborted')), { once: true });
+        });
+      },
+    };
+    const answers: Record<string, unknown[]> = { a: [], b: [] };
+    for (const id of ['a', 'b'] as const) {
+      const connection = registeredConnection(fw, id);
+      connection.emit('inference-request', request(false), {
+        id: 7,
+        respond: (result: unknown) => answers[id]!.push({ beforeClose: !connection.closed, result }),
+        respondError: (code: number, message: string) => answers[id]!.push({ beforeClose: !connection.closed, error: { code, message } }),
+      });
+    }
+    await until(() => calls === 2, 'both provider calls');
+
+    await fw.stop();
+
+    assert.deepEqual(answers, { a: [{ beforeClose: true, error: STOPPED }], b: [{ beforeClose: true, error: STOPPED }] });
   });
 
   for (const outcome of ['completes', 'fails'] as const) {

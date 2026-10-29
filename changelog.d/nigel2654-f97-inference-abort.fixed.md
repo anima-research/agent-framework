@@ -23,5 +23,6 @@
   closes while its inference runs (the server's process exits, its connection
   drops, or the host closes or removes the server), the provider call is
   aborted, rather than running to its end for an answer nothing can receive.
-  Nothing reaches the server, and the request's `mcpl:inference_fail` trace
-  says the transport the request came on closed.
+  The host answers nothing, and when the abort ends the call, the request's
+  `mcpl:inference_fail` trace says the transport the request came on closed;
+  a call that completed before the abort reached it is traced as completed.

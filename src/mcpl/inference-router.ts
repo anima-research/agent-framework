@@ -332,8 +332,7 @@ export class InferenceRouter {
       stopAnswered = true;
       const answer = hostStoppedWhileHandling();
       this.emitTraceFn({ type: 'mcpl:inference_fail', serverId, model, error: answer.message, streamed });
-      // A throw from an abort listener would be uncaught. A write that throws
-      // is reported by the inbound handler that wraps this responder.
+      // A throw from an abort listener would be uncaught.
       try {
         responder.respondError(answer.code, answer.message);
       } catch {}
@@ -368,6 +367,7 @@ export class InferenceRouter {
       },
     };
 
+    if (stopAnswered) return;
     try {
       // 5. Run inference. Both modes end in membrane's response, and one
       // builder makes the result from it.
@@ -399,15 +399,18 @@ export class InferenceRouter {
       // membrane's error, a stream that stopped early, a tool call, or a
       // stop FinishReason can't name. The answer is the JSON-RPC error, never
       // a result carrying what arrived.
+      const transportClosed = responder.signal?.aborted === true;
       this.emitTraceFn({
         type: 'mcpl:inference_fail',
         serverId,
         model,
-        error: responder.signal?.aborted ? 'the transport the request came on closed' : err instanceof Error ? err.message : String(err),
+        error: transportClosed ? 'the transport the request came on closed' : err instanceof Error ? err.message : String(err),
         streamed,
       });
 
-      responder.respondError(-32603, err instanceof Error ? err.message : 'Inference failed');
+      if (!transportClosed) {
+        responder.respondError(-32603, err instanceof Error ? err.message : 'Inference failed');
+      }
     }
   }
 
