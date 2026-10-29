@@ -12,7 +12,7 @@
  * (held-turn-retry.test.ts, turn-continuation.test.ts).
  */
 
-import { describe, it } from 'node:test';
+import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -1270,6 +1270,11 @@ const postThenRead = () => createMockResponse([
   { type: 'tool_use', id: 'one', name: 'gated--read', input: {} },
 ] as ContentBlock[], 'tool_use');
 
+const unscripted: string[] = [];
+afterEach(() => {
+  assert.deepEqual(unscripted.splice(0), [], 'every stream the framework opened was one the test scripted');
+});
+
 /** Scripted streams; `requests` counts the streams made, one per request. */
 class ScriptMembrane {
   readonly requests: NormalizedRequest[] = [];
@@ -1277,7 +1282,11 @@ class ScriptMembrane {
   streamYielding(request: NormalizedRequest, _options: YieldingStreamOptions = {}) {
     this.requests.push(request);
     const script = this.scripts.shift();
-    if (!script) throw new Error('unexpected extra inference');
+    if (!script) {
+      const last = request.messages.at(-1)?.content.map((b) => (b as { text?: string }).text ?? `[${b.type}]`).join(' ') ?? '';
+      unscripted.push(`stream ${this.requests.length}, after: ${last.slice(0, 120)}`);
+      throw new Error('unexpected extra inference');
+    }
     return new MockYieldingStream(script);
   }
   asMembrane(): Membrane { return this as unknown as Membrane; }

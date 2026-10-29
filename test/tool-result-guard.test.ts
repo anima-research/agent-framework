@@ -48,7 +48,11 @@ const contentById = (blocks: Array<{ toolUseId?: string; content?: unknown }>) =
   Object.fromEntries(blocks.map((block) => [block.toolUseId, block.content]));
 
 const dirs: string[] = [];
-afterEach(() => { while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true }); });
+const unscripted: string[] = [];
+afterEach(() => {
+  while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
+  assert.deepEqual(unscripted.splice(0), [], 'every stream the framework opened was one the test scripted');
+});
 const answer = () => createMockResponse([{ type: 'text', text: 'continued' }]);
 const refused = () => ({
   ...createMockResponse([{ type: 'text', text: 'discard-this-partial-output' }], 'refusal'),
@@ -70,7 +74,11 @@ class ScriptMembrane {
   streamYielding(request: NormalizedRequest, options: YieldingStreamOptions = {}) {
     this.requests.push(structuredClone({ ...request, onCacheWireReceipt: undefined }));
     const script = this.scripts.shift();
-    assert.ok(script, 'unexpected extra inference');
+    if (!script) {
+      const last = request.messages.at(-1)?.content.map((b) => (b as { text?: string }).text ?? `[${b.type}]`).join(' ') ?? '';
+      unscripted.push(`stream ${this.requests.length}, after: ${last.slice(0, 120)}`);
+      throw new Error('unexpected extra inference');
+    }
     const stream = new MockYieldingStream(script);
     const provide = stream.provideToolResults.bind(stream);
     stream.provideToolResults = (...args) => {
