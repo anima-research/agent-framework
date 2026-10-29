@@ -368,6 +368,25 @@ describe('toolDeclarations in the framework', () => {
       });
     });
 
+    for (const [how, config] of [['on the head', { toolDeclarations: 'head' }], ['at a move of its head', { systemPrompt: 'You are the child.' }]] as const) {
+      it(`a shared child that removes its own change rows ${how} takes its parent's from its own branch, and leaves its parent's context as it was`, async () => {
+        await withFramework([resident('alpha')], async (framework) => {
+          const alpha = framework.getAgent('alpha')!;
+          say(alpha, 'user', 'hello');
+          await alpha.buildActivationRequest([tool('a')]);
+          await alpha.buildActivationRequest([tool('a'), tool('b')]);
+          const dry = (agent: Agent) => agent.getContextManager().compile(undefined, undefined, { dryRun: true }).then((c) => c.messages);
+          const rowsBefore = alpha.getContextManager().getAllMessages().map((m) => m.id);
+          const compiledBefore = await dry(alpha);
+          const { agent: child } = await framework.deriveAgent({ name: 'alpha-child', from: 'alpha', config });
+          await child.buildActivationRequest([tool('a'), tool('b')]);
+          assert.deepEqual(changesIn(await dry(child)), [], "the premise: the child's context holds no change row now, its parent's own taken as its own");
+          assert.deepEqual(alpha.getContextManager().getAllMessages().map((m) => m.id), rowsBefore, "the parent's stored rows as they were");
+          assert.deepEqual(await dry(alpha), compiledBefore, 'and its compile');
+        });
+      });
+    }
+
     for (const mode of ['shared', 'copy'] as const) {
       it(`starts a child deriveAgent makes (${mode}) on its parent's head, so its first request carries the parent's prefix and declares nothing`, async () => {
         await withFramework([resident('alpha')], async (framework) => {

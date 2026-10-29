@@ -2638,7 +2638,7 @@ export class Agent {
     compile: (head: HeadDeclaration) => Promise<CompileResult>,
   ): Promise<{ compiled: CompileResult; head: HeadDeclaration; declared?: NormalizedMessage }> {
     const current = this.currentHead(availableTools, compiled.systemInjections);
-    const own = ownSystemChanges(compiled, this.name);
+    const own = ownSystemChanges(compiled, (name) => this.ownParticipants.has(name));
     if (!entries) {
       // A record left from an earlier 'entries' period goes, on whichever
       // branch is current: a switch can bring one back. The store deletes
@@ -2747,7 +2747,7 @@ export class Agent {
   ): Promise<{ compiled: CompileResult; head: HeadDeclaration }> {
     if (dryRun) {
       const shown = compiledWith !== null && headHash(compiledWith) !== headHash(current) ? await compile(current) : compiled;
-      const own = ownSystemChanges(shown, this.name);
+      const own = ownSystemChanges(shown, (name) => this.ownParticipants.has(name));
       const kept = (_: unknown, index: number) => !own.has(index);
       // Its sources stay index for index with its messages.
       const provenance = shown.provenance && { ...shown.provenance, messages: shown.provenance.messages.filter(kept) };
@@ -2807,11 +2807,12 @@ export class Agent {
   }
 
   /** Remove this agent's change rows from its context: rows holding a
-   *  change, stored with the agent's change metadata, which in the residents'
-   *  shared slot names the agent they declare for, as ownSystemChanges reads
-   *  them in a compile. */
+   *  change, stored with the change metadata of the agent or of a participant
+   *  whose turns are its own, which in the residents' shared slot names the
+   *  agent they declare for, as ownSystemChanges reads them in a compile. */
   private removeOwnChanges(): number {
-    const rows = this.contextManager.queryMessages({ metadata: { kind: 'system-change', agent: this.name } }).messages
+    const rows = [...this.ownParticipants]
+      .flatMap((agent) => this.contextManager.queryMessages({ metadata: { kind: 'system-change', agent } }).messages)
       .filter((row) => isSystemChangeMessage(row as { content: readonly ContentBlock[] }));
     for (const row of rows) this.contextManager.removeMessage(row.id);
     return rows.length;

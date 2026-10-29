@@ -197,18 +197,18 @@ export function isSystemChangeMessage(message: { content: readonly ContentBlock[
   return message.content.some(isSystemChangeContent);
 }
 
-/** Whether a stored row carries `agentName`'s change metadata
- *  (systemChangeMetadata), as each change the agent declares is stored: the
- *  rows its removal takes. */
-function isOwnChangeRow(row: { metadata?: unknown }, agentName: string): boolean {
+/** Whether a stored row carries the change metadata (systemChangeMetadata)
+ *  of a name `isOwn` accepts, as each change an agent declares is stored. */
+function isOwnChangeRow(row: { metadata?: unknown }, isOwn: (agentName: string) => boolean): boolean {
   const metadata = row.metadata as { kind?: unknown; agent?: unknown } | undefined;
-  return metadata?.kind === 'system-change' && metadata.agent === agentName;
+  return metadata?.kind === 'system-change' && typeof metadata.agent === 'string' && isOwn(metadata.agent);
 }
 
 /**
- * The positions, in order, of `agentName`'s own change rows among a compile's
+ * The positions, in order, of an agent's own change rows among a compile's
  * messages: a change by its block, compiled from stored rows that each carry
- * the agent's change metadata. A compile's messages carry no metadata, so it's
+ * the change metadata of a name `isOwn` accepts, the agent's own and those of
+ * the participants whose turns are its own (selfParticipants). A compile's messages carry no metadata, so it's
  * read from the stored rows the compile names as each message's sources
  * (`provenance` and `rawBodies`); a compile that names none has none of the
  * agent's own. The head's folding, a consolidation's price and place, and the
@@ -217,7 +217,7 @@ function isOwnChangeRow(row: { metadata?: unknown }, agentName: string): boolean
  * them: under 'entries' it goes out as stored, the agent declares its own
  * difference without counting it, and no consolidation takes it.
  */
-export function ownSystemChanges(compiled: Pick<CompileResult, 'messages' | 'provenance' | 'rawBodies'>, agentName: string): Set<number> {
+export function ownSystemChanges(compiled: Pick<CompileResult, 'messages' | 'provenance' | 'rawBodies'>, isOwn: (agentName: string) => boolean): Set<number> {
   const own = new Set<number>();
   const sources = compiled.provenance?.messages;
   compiled.messages.forEach((message, index) => {
@@ -225,7 +225,7 @@ export function ownSystemChanges(compiled: Pick<CompileResult, 'messages' | 'pro
     const source = sources?.[index];
     if (source?.kind !== 'raw') return;
     const rows = source.bodies.flatMap((body) => compiled.rawBodies?.get(body.messageId) ?? []);
-    if (rows.length > 0 && rows.every((row) => isOwnChangeRow(row, agentName))) own.add(index);
+    if (rows.length > 0 && rows.every((row) => isOwnChangeRow(row, isOwn))) own.add(index);
   });
   return own;
 }

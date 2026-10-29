@@ -168,8 +168,8 @@ describe("a shared fork's view", () => {
     framework.start();
     membrane.script('fork-1', say('fork-1 done'));
     assert.equal((await framework.runEphemeralToCompletion(fork.agent, fork.contextManager)).speech, 'fork-1 done');
-    assert.deepEqual(await changeTools(await framework.inspectAgentContext('fork-1')), ['mira-tool'],
-      "the reopened fork: its source's change, not another resident's (its own went at its first request, as an agent on its head removes its own)");
+    assert.deepEqual(await changeTools(await framework.inspectAgentContext('fork-1')), [],
+      "the reopened fork: another resident's change out of its view, and its source's and its own gone from its branch at its first request, as an agent on its head removes its own");
   });
 });
 

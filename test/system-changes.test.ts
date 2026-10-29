@@ -65,10 +65,10 @@ describe('system changes', () => {
         ['host', [row('host')]],
       ]),
     } as unknown as Parameters<typeof ownSystemChanges>[0];
-    assert.deepEqual([...ownSystemChanges(compiled, 'agent')], [1, 6],
+    assert.deepEqual([...ownSystemChanges(compiled, (name) => name === 'agent')], [1, 6],
       "a change from the agent's own rows alone: not a message that isn't a change, another agent's, a host's without metadata, a summary, one with a host's row among its sources, one whose row the compile didn't read, or one whose row names the agent but isn't marked a change");
-    assert.deepEqual([...ownSystemChanges(compiled, 'other')], [2]);
-    assert.deepEqual([...ownSystemChanges({ messages: compiled.messages }, 'agent')], [], 'a compile that names no sources has none');
+    assert.deepEqual([...ownSystemChanges(compiled, (name) => name === 'other')], [2]);
+    assert.deepEqual([...ownSystemChanges({ messages: compiled.messages }, (name) => name === 'agent')], [], 'a compile that names no sources has none');
   });
 
   it('joins the head\'s system blocks as buildSystemPrompt does', () => {
