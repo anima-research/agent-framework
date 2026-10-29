@@ -278,6 +278,8 @@ describe('a context manager the framework is done with makes no further provider
       await run;
       assert.equal(contextManager.isReady(), false, 'compression is still queued when the run ends');
       const sent = membrane.compressions.length;
+      // The premise of the rest: the run itself started the derived manager's compression.
+      assert.ok(sent >= 1, `a compression ran during the run (${sent})`);
       await sleep(1_000);
       assert.equal(membrane.compressions.length, sent, 'no compression call reached the provider after the run ended');
       // Before the tenth round the derived manager was on the framework's
