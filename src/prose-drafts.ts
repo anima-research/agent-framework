@@ -406,13 +406,13 @@ export class ProseDraftStore {
   }
 
   /**
-   * Open drafts, newest first, that no notice on the current branch names:
-   * none was recorded (a crash before the notice), or a rollback or branch
-   * move took away every message that named them. `onBranch` says whether a
-   * message, by id, is on the current branch.
+   * Open drafts, newest first, that no standing notice names: none was
+   * recorded (a crash before the notice), or a rollback, a branch move or an
+   * undo took away every message that named them. `stands` says whether a
+   * message, by id, still names them to the agent.
    */
-  unnoticed(agent: string, onBranch: (messageId: string) => boolean): Draft[] {
-    return this.open(agent).filter((d) => !d.noticedIn?.some(onBranch));
+  unnoticed(agent: string, stands: (messageId: string) => boolean): Draft[] {
+    return this.open(agent).filter((d) => !d.noticedIn?.some(stands));
   }
 
   /**

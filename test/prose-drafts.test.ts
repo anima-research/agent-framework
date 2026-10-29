@@ -2058,6 +2058,61 @@ describe('draft notices and turn-end settlement', () => {
   });
 });
 
+describe('a draft whose notice an undo takes out of the window', () => {
+  type Harness = Awaited<ReturnType<typeof harness>>;
+  const undo = async (h: Harness): Promise<void> => {
+    const undone = h.framework.undoLastTurn('scout');
+    assert.equal(undone.undone, true, 'the turn is undone');
+    await undone.settled;
+    await (h.framework as unknown as { runUntilIdle(): Promise<void> }).runUntilIdle();
+  };
+  const windowNames = (h: Harness, id: string): boolean =>
+    JSON.stringify(h.framework.getAgent('scout')!.getContextManager().getPresentedMessages()).includes(id);
+  const catchUpsNaming = (h: Harness, id: string): string[] =>
+    h.texts().filter((t) => t.includes('that no recent notice on this branch names') && t.includes(id));
+
+  it("is named again at the next start when the undone turn's receipt was its only notice, and only once", async () => {
+    const h = await harness({ xml: true });
+    try {
+      await h.turn([createMockResponse([text('hello')])]);
+      await h.turn([
+        createMockResponse([text('Narration before the send.'), explicitSend('s1')], 'tool_use'),
+        { ...createMockResponse([text('Narration before the send.'), explicitSend('s1'), text('And after it.')]), toolCalls: [] },
+      ]);
+      const [draft] = h.drafts();
+      assert.ok(windowNames(h, draft!.id), "the turn's receipt names it");
+      await undo(h);
+      assert.ok(!windowNames(h, draft!.id), 'the undo took the receipt out of the window');
+      await h.turn([createMockResponse([])]);
+      assert.equal(catchUpsNaming(h, draft!.id).length, 1, 'the next start names it');
+      await h.turn([createMockResponse([])]);
+      assert.equal(catchUpsNaming(h, draft!.id).length, 1, 'a later start does not name it again');
+      assert.ok(h.drafts().some((d) => d.id === draft!.id), 'it is still open');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('is not named again when a notice the undo gives back to the window still names it', async () => {
+    const h = await harness();
+    try {
+      await h.turn([createMockResponse([text('hello')])]);
+      await h.turn([
+        createMockResponse([text('words a send held back'), explicitSend('s1')], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      const [draft] = h.drafts();
+      await undo(h);
+      assert.ok(!windowNames(h, draft!.id), 'the undo took its notices out of the window');
+      await h.turn([createMockResponse([])]);
+      assert.ok(windowNames(h, draft!.id), "the mid-turn notice is back in the window");
+      assert.deepEqual(catchUpsNaming(h, draft!.id), [], 'no catch-up names it');
+    } finally {
+      await h.close();
+    }
+  });
+});
+
 describe('draft identity and risk evidence', () => {
   const setupFramework = async () => {
     const dir = mkdtempSync(join(tmpdir(), 'prose-drafts-ident-'));

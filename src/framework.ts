@@ -21155,22 +21155,24 @@ export class AgentFramework {
    * Turn start (or after a crash): name, privately and before the turn's
    * compile, any open drafts no notice on the current branch names: none
    * reached the history (a crash, an aborted turn), or a rollback or branch
-   * move took the notices away. Every draft it marks is named by id, newest
-   * first: the newest eight with their state and why each was held, the rest
-   * by id. Like every notice, it quotes none of their words; the drafts tool
-   * shows them. A draft a recent message already names is recorded as
-   * noticed rather than named again: its notice landed after its turn ended,
-   * as a bounce does when a delivery runs after a tool ends an explicit turn.
-   * It reads only the recent history (draftsNamedInHistory), so its notice
-   * claims no more than that, a notice stored and not yet presented to the
-   * agent among it, which its next start presents. Left out are the open
-   * logical turn's own drafts, which its receipt names and its settlement
-   * records (settleTurnDrafts).
+   * move took the notices away, or, once the agent's context presents rows
+   * (#291), an undo took them out of its window as an undone turn's. Every
+   * draft it marks is named by id, newest first: the newest eight with their
+   * state and why each was held, the rest by id. Like every notice, it quotes
+   * none of their words; the drafts tool shows them. A draft a recent message
+   * already names is recorded as noticed rather than named again: its notice
+   * landed after its turn ended, as a bounce does when a delivery runs after
+   * a tool ends an explicit turn. It reads only the recent history
+   * (draftsNamedInHistory), so its notice claims no more than that, a notice
+   * stored and not yet presented to the agent among it, which its next start
+   * presents. Left out are the open logical turn's own drafts, which its
+   * receipt names and its settlement records (settleTurnDrafts).
    */
   private noticeUnnoticedDrafts(agent: Agent): void {
     const cm = agent.getContextManager();
     const leftOut = new Set(this.openLogical.get(agent.name)?.drafts.map((d) => d.id));
-    const unnoticed = this.proseDrafts.unnoticed(agent.name, (id) => cm.getMessage(id as MessageId) !== null)
+    const unnoticed = this.proseDrafts.unnoticed(agent.name,
+      (id) => cm.getMessage(id as MessageId) !== null && !AgentFramework.undoneInWindow(cm, id as MessageId))
       .filter((d) => !leftOut.has(d.id));
     if (unnoticed.length === 0) return;
     const named = this.draftsNamedInHistory(agent, unnoticed.map((d) => d.id));
@@ -21301,16 +21303,19 @@ export class AgentFramework {
     const total = cm.getMessageCount();
     const start = Math.max(0, total - AgentFramework.DRAFT_NOTICE_SCAN);
     const { messages } = cm.getMessageWindow(start, total - start, { resolveBlobs: false });
-    const presented = cm.windowMode() === 'presented';
     for (let i = messages.length - 1; i >= 0 && named.size < wanted.size; i--) {
       const meta = messages[i]!.metadata as { draftIds?: unknown; draftOwner?: unknown } | undefined;
       if (meta?.draftOwner !== agent.name || !Array.isArray(meta.draftIds)) continue;
-      if (presented && cm.windowStatusOf(messages[i]!.id) === 'undone') continue;
+      if (AgentFramework.undoneInWindow(cm, messages[i]!.id)) continue;
       for (const id of meta.draftIds) {
         if (typeof id === 'string' && wanted.has(id) && !named.has(id)) named.set(id, String(messages[i]!.id));
       }
     }
     return new Map(ids.filter((id) => named.has(id)).map((id) => [id, named.get(id)!]));
+  }
+
+  private static undoneInWindow(cm: ContextManager, id: MessageId): boolean {
+    return cm.windowMode() === 'presented' && cm.windowStatusOf(id) === 'undone';
   }
 
   /** Page size for drafts(action: "list"). */
