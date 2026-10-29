@@ -348,3 +348,31 @@ for (const [change, kept, gone] of [['deleted', [], 'taken back'], ['edited', ['
     }
   });
 }
+
+test("a message deleted while its create is kept in memory, whose delete is still queued at the release, reaches no turn's request", async () => {
+  const holder = new Holder();
+  const membrane = new MockMembrane();
+  membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+  let requested!: () => void;
+  const firstRequest = new Promise<void>((resolve) => { requested = resolve; });
+  const stream = membrane.streamYielding.bind(membrane);
+  membrane.streamYielding = (request, options) => { requested(); return stream(request, options); };
+  const s = await withKeptCreate('a branch move holding the store', async ({ framework, discord, processed, kept: held, texts }) => {
+    const created = processed('discord:message', 'k9');
+    await discord.onMessageHandler!(live('k9', 'taken back'));
+    await created;
+    assert.deepEqual([held(), texts('k9')], [1, []], 'the create is kept in memory, not stored');
+    framework.pushEvent({ type: 'zz-hold' } as never);
+    await holder.entered;
+    discord.onDeleteHandler!('k9');
+  }, { triggerOn: 'all', modules: [holder], membrane });
+  try {
+    holder.release();
+    await firstRequest;
+    assert.ok(!JSON.stringify(membrane.calls[0]!.messages).includes('taken back'), "the turn's request doesn't carry the deleted text");
+    await drained(s.framework);
+    assert.deepEqual(s.texts('k9'), []);
+  } finally {
+    await s.cleanup();
+  }
+});

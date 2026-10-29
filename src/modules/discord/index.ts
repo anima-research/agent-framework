@@ -1487,15 +1487,11 @@ export class DiscordModule implements Module {
     // framework takes out the body a shard belongs to. The message is the
     // live path's even when no row is found, so a running sync doesn't
     // store what its fetch may still hold, and that ends its entry, but for
-    // an answered create with no row, which keeps the delete
-    // (LiveCreate.unapplied).
+    // an answered create with no row, whose entry keeps the delete
+    // (LiveCreate.unapplied) for the release.
     this.noteLive(del.discordMessageId);
     const rows = this.storedRows(del.discordMessageId);
-    const live = this.creating.get(del.discordMessageId);
-    if (rows.length === 0 && live?.phase === 'writing') {
-      live.unapplied = 'delete';
-      return {};
-    }
+    if (rows.length === 0 && this.creating.get(del.discordMessageId)?.phase === 'writing') return {};
     this.creating.delete(del.discordMessageId);
     if (rows.length === 0) {
       return {};
@@ -1523,10 +1519,15 @@ export class DiscordModule implements Module {
   private handleDiscordMessageDelete(messageId: string): void {
     if (!this.ctx) return;
 
-    // A delete before the message's create is handled drops that create.
-    // Its event still goes, for a row a history sync stored first.
+    // A delete before the message's create is handled drops that create,
+    // and one after it was answered is kept on its entry for the release
+    // that stores it (LiveCreate.unapplied). Its event still goes, for a row
+    // a history sync stored first.
     const live = this.creating.get(messageId);
-    if (live) live.deleted = true;
+    if (live) {
+      live.deleted = true;
+      if (live.phase === 'writing') live.unapplied = 'delete';
+    }
 
     // Only queue the event - state writes happen in onProcess()
     this.ctx.pushEvent({
