@@ -3382,8 +3382,9 @@ function firstViewProbe(state: { shown: boolean; read: boolean; shownEvents?: Se
   };
 }
 
-/** n1's render lands in 'other''s deferred queue as a first view, after n2
- *  opened a batch of the same subject during that render. */
+/** n1's render is stored for 'other' and not presented to it (`presented:
+ *  false`) as a first view, after n2 opened a batch of the same subject
+ *  during that render. */
 async function firstViewQueuedWithBatchPending(p: ReturnType<typeof firstViewProbe>): Promise<void> {
   await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
   const first = p.coalescer.assemble('agent');
@@ -3458,8 +3459,8 @@ test('#157: a plain edit that takes the place of a pending first-view batch afte
   assert.deepEqual(p.delivered.at(-1), { eventId: 'e1' });
 });
 
-/** n1's render lands in 'other''s deferred queue as the agent's first view,
- *  and `shown` says whether the agent is then shown it. n2 opens a batch
+/** n1's render is stored for 'other' and not presented to it as the agent's
+ *  first view, and `shown` says whether the agent is then shown it. n2 opens a batch
  *  beside it, which follows the run's agent and is no first view, since the
  *  run holds it; that batch starts rendering for 'other'; n3 opens a new
  *  batch during that render. Returns the held assembly, wrapped, since an
@@ -3504,11 +3505,8 @@ for (const shown of [false, true]) test(`#157: beside a queued first-view render
   assert.deepEqual(p.delivered.at(-1), { eventId: 'e1', ...(shown ? {} : { firstView: true as const }) });
 });
 
-/** n1's render lands in 'other''s deferred queue as the agent's first view;
- *  `shown` says whether the agent is then shown it, and a retraction
- *  withdraws it. */
 /** A run of n1, the agent's first view, and n3's render, which joined it
- *  unmarked, both queued for 'other'. */
+ *  unmarked, both stored for 'other' and not presented to it. */
 async function firstViewRunOfTwo(p: ReturnType<typeof firstViewProbe>): Promise<void> {
   await firstViewQueuedWithBatchPending(p);
   await p.coalescer.accept(p.occurrence('n3', { deferred: true, tags: ['chat:edited'] }));
@@ -3547,6 +3545,9 @@ for (const [mix, seen] of Object.entries(runMixes)) for (const [ending, end] of 
   assert.deepEqual(p.delivered.at(-1), { eventId: next }, 'something of the run may have been shown');
 });
 
+/** n1's render is stored for 'other' and not presented to it as the agent's
+ *  first view; `shown` says whether the agent is then shown it, and a
+ *  retraction withdraws it. */
 async function firstViewRetracted(p: ReturnType<typeof firstViewProbe>, state: { shown: boolean }, shown: boolean) {
   await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
   await p.coalescer.assemble('agent');
@@ -3609,9 +3610,9 @@ test("#157: a snapshot keeps a subject's ended first view, so a restored coalesc
   assert.deepEqual(p.delivered.at(-1), { eventId: 'n2' });
 });
 
-/** n1's render lands in 'other''s deferred queue as the agent's first view;
- *  `shown` says whether the agent is then shown it, and a plain edit
- *  displaces it. */
+/** n1's render is stored for 'other' and not presented to it as the agent's
+ *  first view; `shown` says whether the agent is then shown it, and a plain
+ *  edit displaces it. */
 async function firstViewDisplacedByPlain(p: ReturnType<typeof firstViewProbe>, state: { shown: boolean }, shown: boolean) {
   await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
   await p.coalescer.assemble('agent');
