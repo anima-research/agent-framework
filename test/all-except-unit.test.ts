@@ -15,7 +15,8 @@ function harness(stored: Array<{ participant: string; content: Array<{ type: str
   const wakes: string[] = [];
   const messages: Array<{ participant: string; text: string; forAgent?: string }> = [];
   const traces: string[] = [];
-  const fail = { read: false, write: false, addMessage: false, commit: false };
+  const fail = { read: false, write: false, addMessage: false, commit: false, wake: false };
+  const anchors: number[] = [];
   const registry = {
     getTuneOutState: () => null,
     // Each channel is shown by its id where no other server registers it,
@@ -43,19 +44,22 @@ function harness(stored: Array<{ participant: string; content: Array<{ type: str
       return 'id';
     },
     commitDeliveries: () => !fail.commit,
-    requestInference: (agentName: string) => { wakes.push(agentName); },
+    requestInference: (agentName: string) => {
+      if (fail.wake) throw new Error('the wake request failed');
+      wakes.push(agentName);
+    },
     subconsciousName: () => 'Subconscious',
     primaryName: () => 'scout',
     getStoredMessages: () => stored,
     currentSequence: () => 1,
-    setSubconsciousAnchor: () => {},
+    setSubconsciousAnchor: (sequence: number) => { anchors.push(sequence); },
     isForkBound: () => false,
     isPrivilegedAuthor: () => false,
     allowChannelSpeech: () => false,
     emitTrace: (e: { type: string }) => { traces.push(e.type); },
   } as unknown as TuneOutFrameworkHooks;
   const make = () => new TuneOutCoordinator(registry, servers, hooks);
-  return { make, state, wakes, messages, traces, fail, stored };
+  return { make, state, wakes, messages, traces, fail, stored, anchors };
 }
 
 describe('all-except scope on the coordinator', () => {
@@ -118,6 +122,34 @@ describe('all-except scope on the coordinator', () => {
     const releases = h.messages.filter((m) => /all channels except work released — duration elapsed/.test(m.text));
     assert.equal(releases.length, 1, 'the resident got the release once');
     second.stop();
+  });
+
+  it('a scope whose deadline passed while the process was down and whose release ends it at the start but then fails a later step is treated as ended, with no retry, and the start goes on', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+    const errors = t.mock.method(console, 'error', () => {});
+    const h = harness();
+    const first = h.make();
+    assert.ok(first.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool').ok);
+    first.stop();
+    const id = [...h.state.keys()].find((k) => k.endsWith('/all-except'))!;
+    const record = h.state.get(id) as { params: { expiresAtMs: number } };
+    record.params.expiresAtMs = Date.now() - 1000;
+    h.fail.wake = true;
+    h.anchors.length = 0;
+    const second = h.make();
+    let releases = 0;
+    const release = second.cancelAllExcept.bind(second);
+    second.cancelAllExcept = (...args: Parameters<TuneOutCoordinator['cancelAllExcept']>) => { releases++; return release(...args); };
+    assert.doesNotThrow(() => second.resumeActiveEpochs());
+    assert.equal(second.getAllExcept(), null, 'its end was recorded');
+    assert.deepEqual(h.anchors, [], 'no hold in force anchors the subconscious');
+    const said = errors.mock.calls.map((c) => String(c.arguments[0])).join('\n');
+    assert.match(said, /its release ended it, but a step after the end failed/);
+    assert.ok(!/stays in force/.test(said), said);
+    h.fail.wake = false;
+    t.mock.timers.tick(10 * 60_000);
+    second.stop();
+    assert.equal(releases, 1, 'nothing tries to release it again');
   });
 
   it('a scope whose deadline passed while the process was down is released at resume', () => {

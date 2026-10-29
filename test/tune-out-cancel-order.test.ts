@@ -87,6 +87,13 @@ function coordinatorOn(
   return new TuneOutCoordinator(registry, {} as never, hooks as never);
 }
 
+function countCancels(coordinator: TuneOutCoordinator): { count: number } {
+  const calls = { count: 0 };
+  const cancel = coordinator.cancel.bind(coordinator);
+  coordinator.cancel = (...args: Parameters<TuneOutCoordinator['cancel']>) => { calls.count++; return cancel(...args); };
+  return calls;
+}
+
 function failingEnd(registry: ChannelRegistry, failures = 1): void {
   const end = registry.cancelTuneOut.bind(registry);
   let left = failures;
@@ -251,7 +258,7 @@ test('a message queued at a dump whose end record failed, which lands before the
   });
 });
 
-test("the subconscious's report after a retry says how many of the held messages the dumps left out, counting a dump stored in shards once", () => {
+test("the subconscious's report after a retry sums what the dumps left out, counting a dump stored in shards once and one that left nothing out", () => {
   withStore((store) => {
     const window = windowWith(1, 2, 3);
     const reports: string[] = [];
@@ -262,13 +269,14 @@ test("the subconscious's report after a retry says how many of the held messages
     assert.throws(() => coordinator.cancel('disc', CHANNEL, 'agent-tool', 'test'), /the lifecycle write failed/);
     const dump = window.find((m) => m.metadata?.kind === 'tune-out-cancel')!;
     window.push({ ...dump, id: 'dump-1-shard-2' });
-    window.push(heldRow(4), heldRow(5), heldRow(6));
+    window.push(heldRow(4), heldRow(5));
     assert.deepEqual(coordinator.cancel('disc', CHANNEL, 'agent-tool', 'test'), { ok: true });
     coordinator.stop();
     assert.equal(reports.length, 1, reports.join('\n'));
     const second = dumpsIn(window).at(-1)!;
     assert.ok(['held 1', 'held 2', 'held 3'].every((line) => !second.includes(line)), `the second dump leaves out what the first covered, its cap's cut included: ${second}`);
-    assert.match(reports[0]!, / 2 of 6 diverted messages across 2 dumps, the oldest in each dump that left any out, weren't delivered raw to the resident\./);
+    assert.ok(['held 4', 'held 5'].every((line) => second.includes(line)), `the second dump, under its cap, leaves nothing out: ${second}`);
+    assert.match(reports[0]!, / 1 of 5 diverted messages across 2 dumps, the oldest in each dump that left any out, weren't delivered raw to the resident\./);
   });
 });
 
@@ -327,20 +335,19 @@ test('a start whose expired tune-out ends but then fails a step after the end go
     first.enterTuneOut('disc', CHANNEL, { ...PARAMS, expiresAtMs: 1_000_000 - 1 }, 'agent-tool');
     const registry = registryOn(store);
     registry.listChannelsRaw = (() => [{ serverId: 'disc', descriptor: { id: CHANNEL } }]) as never;
-    let ends = 0;
-    const end = registry.cancelTuneOut.bind(registry);
-    registry.cancelTuneOut = (...args: Parameters<ChannelRegistry['cancelTuneOut']>) => { ends++; return end(...args); };
     const anchors: number[] = [];
     const coordinator = coordinatorOn(registry, window, { failWake: true, anchors });
+    const cancels = countCancels(coordinator);
     const errors = t.mock.method(console, 'error', () => {});
     assert.doesNotThrow(() => coordinator.resumeActiveEpochs());
     assert.equal(registry.getTuneOutState('disc', CHANNEL), null, 'its end was recorded');
     assert.deepEqual(anchors, [], 'no tune-out in force anchors the subconscious');
     const said = errors.mock.calls.map((c) => String(c.arguments[0])).join('\n');
+    assert.match(said, /reached its end time while the process was down and its cancel ended it, but a step after the end failed/);
     assert.ok(!/stays tuned out/.test(said), said);
     t.mock.timers.tick(10 * 60_000);
     coordinator.stop();
-    assert.equal(ends, 1, 'nothing tries to end it again');
+    assert.equal(cancels.count, 1, 'nothing tries to cancel it again');
     assert.equal(dumpsIn(window).length, 1);
   });
 });
@@ -383,6 +390,7 @@ test('a tune-out past its wake budget whose cancel ends it at the start and then
     const registry = registryOn(store);
     registry.listChannelsRaw = (() => [{ serverId: 'disc', descriptor: { id: CHANNEL } }]) as never;
     const coordinator = coordinatorOn(registry, window, { failWake: true });
+    const cancels = countCancels(coordinator);
     const errors = t.mock.method(console, 'error', () => {});
     assert.doesNotThrow(() => coordinator.resumeActiveEpochs());
     assert.equal(registry.getTuneOutState('disc', CHANNEL), null, 'its end was recorded');
@@ -391,6 +399,7 @@ test('a tune-out past its wake budget whose cancel ends it at the start and then
     assert.ok(!/stays tuned out/.test(said), said);
     t.mock.timers.tick(10 * 60_000);
     coordinator.stop();
+    assert.equal(cancels.count, 1, 'nothing tries to cancel it again');
     assert.equal(dumpsIn(window).length, 1);
   });
 });
