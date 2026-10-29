@@ -507,22 +507,22 @@ test('a message said while a turn runs its tools starts the count again when the
   assert.equal(r.admission().providerAdmission.heldRequests, 1, 'its re-arm waits: the message the boundary stored started the count again');
 });
 
-test('a framework stopped and started again re-arms from its first delay', async (t) => {
+test("a new framework on a stopped one's store re-arms from its first delay", async (t) => {
   const membrane = new ScriptedMembrane(() => serverError);
   const storeDir = mkdtempSync(join(tmpdir(), 'turn-rearm-store-'));
   const store = JsStore.openOrCreate({ path: join(storeDir, 'store') });
-  const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 100], store });
+  const first = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 100], store });
+  first.say('zz-question');
+  await waitFor(() => first.count('inference:exhausted') === 3, 'the window and its two re-arms to end exhausted');
+  assert.equal(first.admission().providerAdmission.heldRequests, 0, 'the re-arms are spent');
+  await stepping(first.fw.stop(), 'the framework to stop');
+  const next = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 100], store });
   t.after(() => { store.close(); rmSync(storeDir, { recursive: true, force: true }); });
-  r.say('zz-question');
-  await waitFor(() => r.count('inference:exhausted') === 3, 'the window and its two re-arms to end exhausted');
-  assert.equal(r.admission().providerAdmission.heldRequests, 0, 'the re-arms are spent');
-  await stepping(r.fw.stop(), 'the framework to stop');
-  r.fw.start();
-  queue(r, { reason: 'zz-wake' });
-  await waitFor(() => r.count('inference:exhausted') === 4, "the next lifecycle's turn to end exhausted");
-  assert.equal(r.admission().providerAdmission.heldRequests, 1, 'its re-arm waits: the count started again');
-  assert.match(r.admission().providerAdmission.cooldownReason ?? '', /\(1 of 2\)/, 'at the first delay');
-  await stepping(r.fw.stop(), 'the framework to stop before its store closes');
+  queue(next, { reason: 'zz-wake' });
+  await waitFor(() => next.count('inference:exhausted') === 1, "the new framework's turn to end exhausted");
+  assert.equal(next.admission().providerAdmission.heldRequests, 1, 'its re-arm waits: the count started again');
+  assert.match(next.admission().providerAdmission.cooldownReason ?? '', /\(1 of 2\)/, 'at the first delay');
+  await stepping(next.fw.stop(), 'the framework to stop before its store closes');
 });
 
 test('with exhaustedTurnRearmMs false, a turn whose retries ran out is not sent again', async (t) => {
@@ -926,4 +926,66 @@ test("a silent turn's held retries keep one run", async (t) => {
   await waitFor(() => r.count('inference:completed') === 1, 'the silent turn to end');
   assert.equal(alerts().length, 1);
   assert.equal(alerts()[0]!.data?.holds, 4);
+});
+
+// The branch's (feat/dendrite): releaseAgentRuntime, the one release of an
+// ended agent that isn't a run (stopAgent, a cascaded end, a fork's dispose),
+// drops this per-name turn state, so a new agent under the name starts clean.
+test("a resident stopped mid-turn takes its turn state with it: its run of stated waits ends at the stop, and a new agent under its name re-arms from the first delay with a plain marker", async (t) => {
+  const { workerSpec } = await import('../src/index.js');
+  // `second`'s window ends exhausted on server errors (sends 1 to 3); its
+  // re-arm's send and the next are held by stated waits (4 and 5), and the
+  // one after that is in flight when it is stopped (6), so no held turn is
+  // left for the stop to drop. The new agent's window ends exhausted on
+  // server errors (7 on).
+  const membrane = new ScriptedMembrane((n) => (n === 4 || n === 5 ? statedWait(40 * 60_000) : n === 6 ? 'held open' : serverError));
+  const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 100], agents: [
+    { name: 'resident', model: 'zz-model', systemPrompt: 'system' }, { name: 'second', model: 'zz-model', systemPrompt: 'system' }] });
+  const state = r.fw as unknown as {
+    turnRearms: Map<string, number>; exhaustingRearms: Set<string>; exhaustedTurns: Map<string, unknown>; statedWaitRuns: Map<string, unknown>;
+  };
+  const kept = () => ({
+    rearms: state.turnRearms.has('second'), exhaustingRearm: state.exhaustingRearms.has('second'),
+    exhaustedTurn: state.exhaustedTurns.has('second'), statedWaits: state.statedWaitRuns.has('second'),
+  });
+  const alerts = () => r.traces.filter((tr) => tr.type === 'ops:alert' && tr.kind === 'provider-wait');
+  const held = () => ((r.fw.healthSnapshot() as { agents: Array<{ name: string; providerAdmission: { heldRequests: number } }> })
+    .agents.find((a) => a.name === 'second')!).providerAdmission.heldRequests;
+  queue(r, { agentName: 'second', reason: 'zz-wake' });
+  await waitFor(() => r.count('inference:exhausted') === 1 && held() === 1, "second's window to end exhausted, its re-arm held");
+  await waitFor(() => membrane.sends.length === 4 && held() === 1, "the re-arm's send to be held by a stated wait");
+  t.mock.timers.tick(40 * 60_000);
+  await waitFor(() => membrane.sends.length === 5 && held() === 1, 'the next send to be held, 40 minutes on');
+  t.mock.timers.tick(40 * 60_000);
+  await waitFor(() => membrane.sends.length === 6 && held() === 0, 'the send after it to be in flight, 80 minutes from the first hold');
+  // Neither of these outlives a turn by itself: a failure sets each and the
+  // exhaustion it raises reads it at once. Set here as such a failure sets
+  // them, so the release's clear of each is pinned too.
+  state.exhaustingRearms.add('second');
+  state.exhaustedTurns.set('second', { roundsRan: true, callsCutOff: false, liveSpeech: false, speechRouting: false });
+  assert.deepEqual(kept(), { rearms: true, exhaustingRearm: true, exhaustedTurn: true, statedWaits: true }, 'the premise: each is held for second');
+  assert.equal(alerts().length, 0, 'the premise: no hold came past the hour');
+
+  r.fw.stopAgent('second', { by: 'zz-operator' });
+  assert.deepEqual(kept(), { rearms: false, exhaustingRearm: false, exhaustedTurn: false, statedWaits: false }, 'the release drops each');
+  assert.equal(alerts().length, 1, 'the run of stated waits ends at the stop, alerted as it spanned past the hour');
+  assert.equal(alerts()[0]!.data?.holds, 2);
+
+  t.mock.timers.tick(60_000);
+  stderr.length = 0;
+  const spec = workerSpec('second');
+  const { name: _name, ...body } = { ...spec, roles: { ...spec.roles, ownsProviderScheduling: true } };
+  const fresh = await r.fw.createEphemeralAgent({ name: 'second', model: 'zz-model', systemPrompt: 'system' }, body);
+  fresh.contextManager.addMessage('User', [{ type: 'text', text: 'zz-fresh' }]);
+  const ended = await stepping(r.fw.runEphemeralToCompletion(fresh.agent, fresh.contextManager).then(() => null, (error: unknown) => error),
+    "the new agent's run to end");
+  assert.ok(ended instanceof Error, 'its window ended exhausted');
+  assert.equal(membrane.sends.length, 9, "the new agent's window made its three sends");
+  assert.ok(stderr.includes('[inference-rearm] agent=second turn sent again in 100ms (1 of 2)'),
+    `its re-arm is the first: ${stderr.filter((line) => line.includes('[inference-rearm]')).join(' | ')}`);
+  const markers = fresh.contextManager.getAllMessages().flatMap((m) => m.content)
+    .map((b) => (b as { text?: string }).text ?? '').filter((text) => text.startsWith('[inference-failed]'));
+  assert.equal(markers.length, 1, 'it meets its outage with a marker');
+  assert.match(markers[0]!, /the model call failed \(server, HTTP 502\) and produced no response, so nothing was sent/, 'one that says its own turn got nowhere');
+  assert.equal(alerts().length, 1, 'and no run of stated waits is ended with it but its own');
 });

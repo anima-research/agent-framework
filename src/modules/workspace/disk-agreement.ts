@@ -42,7 +42,15 @@ import { Refusal, onlyTheHost } from './answers.js';
 const UNTIL_REOPENED = "the workspace can't check its files against disk until its store is reopened";
 const REOPEN = onlyTheHost('reopen it with a restart');
 
-export class EvidenceUnavailable extends Refusal {}
+export class EvidenceUnavailable extends Refusal {
+  constructor(readonly why: string) {
+    super(`${UNTIL_REOPENED}: ${why}. ${REOPEN}`);
+  }
+}
+
+export function rootUnreadable(err: EvidenceUnavailable): string {
+  return `the root disk last agreed with can't be read until the store is reopened: ${err.why}. ${REOPEN}`;
+}
 
 export const callGate = new AsyncLocalStorage<{ passed: boolean }>();
 
@@ -105,8 +113,8 @@ export type Physical = Agreed | Pending | Interrupted;
 
 /**
  * Which directory a mount root is: its device and inode, and its birth time
- * in nanoseconds as the runtime reports it, where that is above zero, as decimal
- * strings.
+ * in nanoseconds as the runtime reports it, where that is above zero and isn't
+ * its ctime, as decimal strings.
  */
 export interface RootIdentity {
   dev: string;
@@ -121,16 +129,32 @@ function sameRootPath(a: string, b: string): boolean {
 }
 
 /**
- * Whether two identities name the same directory: the same device and inode,
- * or the same inode and birth time on another device, since macOS can give a
- * volume another device number after a reboot. A birth time in whole seconds
- * doesn't count across devices: filesystems made in the same second can give
- * their roots one inode (2 on ext4) and one birth time.
+ * Whether the directory seen `now` is the one `recorded`: the same inode, and
+ * not born after the recorded one where `now`'s filesystem keeps a birth time
+ * fixed (`bornFixed`), since ext4 gives a directory made where one was removed
+ * its inode again, while overlayfs gives a directory copied up from a lower
+ * layer a later birth time under the same inode; and the same device, or the
+ * same birth time on another device, since macOS can give a volume another
+ * device number after a reboot. A birth time in whole seconds doesn't count
+ * across devices: filesystems made in the same second can give their roots
+ * one inode (2 on ext4) and one birth time.
  */
-export function sameRootIdentity(a: RootIdentity, b: RootIdentity): boolean {
-  if (a.ino !== b.ino) return false;
-  if (a.dev === b.dev) return true;
-  return a.born !== undefined && a.born === b.born && !a.born.endsWith('000000000');
+export function sameRootIdentity(recorded: RootIdentity, now: RootIdentity, bornFixed: boolean): boolean {
+  if (recorded.ino !== now.ino || (bornFixed && bornLater(recorded, now))) return false;
+  if (recorded.dev === now.dev) return true;
+  return fractional(recorded.born) && recorded.born === now.born;
+}
+
+export function onlyDeviceDiffers(recorded: RootIdentity, now: RootIdentity, bornFixed: boolean): boolean {
+  return !sameRootIdentity(recorded, now, bornFixed) && recorded.ino === now.ino && recorded.dev !== now.dev && !(bornFixed && bornLater(recorded, now));
+}
+
+function bornLater(recorded: RootIdentity, now: RootIdentity): boolean {
+  return recorded.born !== undefined && now.born !== undefined && BigInt(now.born) > BigInt(recorded.born);
+}
+
+function fractional(born: string | undefined): boolean {
+  return born !== undefined && !born.endsWith('000000000');
 }
 
 type JournalEntry =
@@ -242,10 +266,10 @@ export class DiskAgreement {
    */
   ensureReconciled(): void {
     if (this.journal.needsReopen) {
-      throw new EvidenceUnavailable(`${UNTIL_REOPENED}: an append to its record of what disk last agreed with failed inside the store, so that record may lack what the append held. ${REOPEN}`);
+      throw new EvidenceUnavailable('an append to its record of what disk last agreed with failed inside the store, so that record may lack what the append held');
     }
     if (!this.whole) {
-      throw new EvidenceUnavailable(`${UNTIL_REOPENED}: reading back its record of what disk last agreed with failed. ${REOPEN}`);
+      throw new EvidenceUnavailable('reading back its record of what disk last agreed with failed');
     }
     if (this.journal.needsReconcile) this.rebuild();
     const gate = callGate.getStore();
@@ -345,7 +369,7 @@ export class DiskAgreement {
   recordRootIdentity(mount: string, identity: RootIdentity): void {
     const recorded = this.rootIdentity(mount);
     if (recorded !== undefined) {
-      if (!sameRootIdentity(recorded, identity)) return;
+      if (!sameRootIdentity(recorded, identity, false)) return;
       const renumbered = recorded.dev !== identity.dev;
       const bornLearned = recorded.born === undefined && identity.born !== undefined;
       if (!renumbered && !bornLearned) return;
