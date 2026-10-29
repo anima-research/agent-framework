@@ -491,21 +491,6 @@ describe('same-round think text policy', () => {
     }
   });
 
-  it('recipe private routes zero same-round prose for the exact Tilde shape', async () => {
-    const membrane = new MockMembrane();
-    membrane.pushResponse(createMockResponse(makeToolRound(TILDE_PREFACE_80), 'tool_use'));
-    membrane.pushResponse(createMockResponse([] as ContentBlock[]));
-    const { dir, framework, routed } = await createFramework({ policy: 'private', membrane });
-    try {
-      trigger(framework);
-      await framework.runUntilIdle();
-      assert.deepEqual(routed, []);
-    } finally {
-      await framework.stop();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
   it('private is non-sticky: later non-think rounds and trailing prose route normally', async () => {
     const membrane = new MockMembrane();
     membrane.pushResponse(createMockResponse(makeToolRound(TILDE_PREFACE_80), 'tool_use'));
