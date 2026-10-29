@@ -30591,10 +30591,10 @@ export class AgentFramework {
     // round), as the presentation index reads it, but for a fresh tool_result
     // (a draining turn's continuation depends on it) and a write while the
     // agent's start is assembling, which that start presents before its
-    // compile.
+    // compile unless the host is quiesced.
     const freshToolResult = content.some(b => b.type === 'tool_result');
     const turnLive = this.logicalTurnAlive(agent);
-    const midTurn = !freshToolResult && !this.assembling.has(agent.name) && (this.quiesced || turnLive);
+    const midTurn = !freshToolResult && (this.quiesced || (turnLive && !this.assembling.has(agent.name)));
     // A clock row due goes first (storeDueClock), when no logical turn of the
     // agent's is alive or its turn is assembling before its compile: the
     // clock is in whatever request comes next. A write stored while a turn of
@@ -30628,7 +30628,8 @@ export class AgentFramework {
       // Stored mid-turn: not in that agent's window until the turn's next
       // point, so a wake for it reads it (readsRowFor), and a render placed
       // for that turn isn't materialized by it. Never for a write a start
-      // assembled for itself, which its start presents before its compile.
+      // assembled for itself, which its start presents before its compile,
+      // but while the host is quiesced, when it doesn't.
       if (midTurn && this.presents(agent)) opts.placement.presented = false;
     }
     this.releaseLandedMail(metadata, agent.name);

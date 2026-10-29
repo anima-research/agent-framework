@@ -2307,6 +2307,34 @@ test("a write for an agent while its assembly awaits a render is stored at once,
   }
 });
 
+test("a render that lands while the host is quiesced, for the agent whose assembly awaits it, is read by a turn of the agent's once the host resumes", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.alwaysRespond();
+  let release!: (value: unknown) => void;
+  let began!: () => void;
+  const started = new Promise<void>((resolve) => { began = resolve; });
+  f.renderer(() => {
+    began();
+    return new Promise((resolve) => { release = resolve; });
+  });
+  const internals = f.framework as unknown as TurnInternals & { quiesced: boolean };
+  const carried = () => f.membrane.calls.some((call) => JSON.stringify(call).includes('rendered_in_quiesce'));
+  await f.send('push/event', f.params('1', 'first_fallback', { deferred: true, initial: true }));
+  await eventually(() => internals.pendingRequests.length > 0, 'the batch wake');
+  const turn = f.framework.runUntilIdle();
+  await settles(started, 'the render');
+  internals.quiesced = true;
+  try {
+    release({ content: [{ type: 'text', text: 'rendered_in_quiesce' }] });
+    await settles(turn, 'the pass while quiesced');
+    assert(!carried(), 'no request carried it while the host was quiesced');
+  } finally {
+    internals.quiesced = false;
+  }
+  await settles(f.framework.runUntilIdle(), 'the pass after the resume');
+  assert(carried(), "a turn of the agent's read the render once the host resumed");
+});
+
 test("a render queued for one resident isn't another resident's to read once its flush has stored it", async (t) => {
   const f = await fixture({ agents: [...TWO_RESIDENTS, { name: 'third', model: 'test', systemPrompt: 'test' }] }); t.after(f.close);
   f.alwaysRespond();
