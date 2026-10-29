@@ -17703,6 +17703,7 @@ export class AgentFramework {
     }, { suppressible: !this.conversationRouter, ...(event.suppressionDecision !== undefined ? { decided: event.suppressionDecision } : {}) });
     // Modules answering this event read the same decision (applyProcessResponse).
     this.eventSuppression.set(event, decision.suppressed?.rule ?? null);
+    if (admittedEnvelope in event && !decision.wake) event.triggerInference = false;
     metadata.triggered = decision.wake;
     if (decision.held) {
       // The admission record rides the message; the hold's own bookkeeping
@@ -35835,9 +35836,14 @@ export class AgentFramework {
         this.refuseServerItem('channels/incoming', connection.id, responder);
         return;
       }
-      // Required delivery stays closed until the channel admission adapter is installed.
       if (connection.requiredAdmission) {
-        responder?.respond({ results: Array.isArray(params.messages) ? params.messages.map(message => ({ messageId: message.messageId, accepted: false, reason: 'admission_unsupported' })) : [] });
+        const original = connection.admissionFor(params);
+        const admission: RequiredIngress = {
+          ...original,
+          check: () => this.queue?.isClosed ? 'admission_not_ready' :
+            this.mcplServerRegistry?.getServer(connection.id) !== connection ? 'admission_stale' : original.check(),
+        };
+        await this.channelRegistry?.handleIncoming(connection.id, params, responder as never, admission);
         return;
       }
       await this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
