@@ -322,7 +322,7 @@ describe('admission: the hold is decided once, before any side effect', () => {
   // writes as it reads a surgery's hold, so a check counts the message and a
   // peek shows it while it waits, and it is stored once, with its hold
   // record, when the switch recovers the primary.
-  it('gap 7 (recovery) — a held message kept in memory for a primary whose manager refuses its work is counted while kept, and stored once, with its hold record, when a switch recovers it', async () => {
+  it('gap 7 (recovery) — a held message kept in memory for a primary whose manager refuses its work is counted while kept, and stored once, with its hold record, when a switch recovers it; a cancel asked for meanwhile waits, the tune-out in force, and its release then lists it', async () => {
     const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
     try {
       await registerOpen(f, 'work', 'noisy');
@@ -351,9 +351,17 @@ describe('admission: the hold is decided once, before any side effect', () => {
       assert.equal(coordinator.check().channels.find((c) => c.channelId === 'noisy')?.held, 2, 'a check counts it while kept');
       const peek = coordinator.check({ peek: { serverId: 'editor', channelId: 'noisy' } }).peek ?? [];
       assert.ok(peek.some((line) => line.includes('kept for the recovery')), 'and peeks it');
+      assert.deepEqual(coordinator.cancel('editor', 'noisy', 'duration', 'duration elapsed'), { ok: true, deferred: true });
+      assert.ok(internals(f).channelRegistry.getTuneOutState('editor', 'noisy'), 'the tune-out stays in force while the write waits in memory');
+      assert.equal(has(f, '<tuned-out-backlog'), false, 'no release is stored yet');
       await f.framework.switchBranch(branch);
-      assert.equal(stored(f).filter((m) => textOf(m).includes('kept for the recovery')).length, 1, 'stored once, at the recovery');
-      assert.ok(held(find(f, 'kept for the recovery')), 'with its hold record');
+      const copies = stored(f).filter((m) => textOf(m).includes('kept for the recovery') && !textOf(m).includes('<tuned-out-backlog'));
+      assert.equal(copies.length, 1, 'stored once, at the recovery');
+      assert.ok(held(copies[0]!), 'with its hold record');
+      assert.equal(internals(f).channelRegistry.getTuneOutState('editor', 'noisy'), null, 'the cancel ran once the recovery stored the write');
+      const dump = textOf(find(f, '<tuned-out-backlog'));
+      assert.match(dump, /messages=2/, 'its release counts the write the recovery stored');
+      assert.match(dump, /antra: stored before the failure\nantra: kept for the recovery/, 'and lists it, in arrival order');
     } finally { await f.close(); }
   });
 
