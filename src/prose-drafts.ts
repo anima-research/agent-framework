@@ -11,21 +11,24 @@
  * the exact words until the resident resends or dismisses them, or the
  * retention below lets it go.
  *
- * The boundary is publication and agency, not visibility: a draft is never
+ * The boundary is publication and agency: a draft is never
  * published except by its resident's explicit resend (or `{{unsent}}`), and
  * only that resident can list or act on it. Its notices go into the
- * resident's own history — which residents that share one message slot
- * (#197) share, as they already share the assistant turn the words came
- * from.
+ * resident's own history: residents that share one message slot (#197)
+ * store them in that slot, but each is stamped for its resident and enters
+ * no other resident's window (#291), as the assistant turn the words came
+ * from doesn't.
  *
  * Durability is outside the conversation. Drafts live in a RecordJournal of
  * typed Chronicle records, which do not follow branch switches: undo,
  * rollback, suppression and branch moves never touch them. A draft written
  * in a turn that is later undone stays usable (the words were genuinely
  * written and held back), and a delivered draft stays delivered. The
- * notices that name a draft are conversation, so they do follow the branch: a draft counts as
- * named while a message naming it is on the current branch, and one a
- * rollback or branch move has left unnamed is named again.
+ * notices that name a draft are conversation, so they do follow the branch
+ * and the window: a draft counts as named while a notice of its resident
+ * naming it is on the current branch and hasn't been taken out of that
+ * resident's window as an undone turn's, and one a rollback, a branch move
+ * or an undo has left unnamed is named again.
  *
  * Drafts are kept, not hoarded. Each resident's KEEP_NEWEST newest drafts
  * are always kept; an older one, in any state, is let go at the journal's
