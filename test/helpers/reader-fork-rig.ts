@@ -15,13 +15,6 @@ import type { TraceEvent } from '../../src/index.js';
 import type { Module } from '../../src/types/index.js';
 import { MockYieldingStream, createMockResponse } from './mock-membrane.js';
 import type { TuneOutCoordinator } from '../../src/tune-out/coordinator.js';
-import { JsStore } from '@animalabs/chronicle';
-import { ContextManager } from '@animalabs/context-manager';
-
-export const supported =
-  typeof (JsStore.prototype as unknown as { view?: unknown }).view === 'function' &&
-  typeof (ContextManager.prototype as unknown as { derive?: unknown }).derive === 'function';
-export const skip = supported ? false : 'installed @animalabs/chronicle / context-manager lack branch-bound handles or ContextManager.derive';
 
 const FIXTURE = join(import.meta.dirname, '..', 'fixtures/tune-out-mcpl-server.mjs');
 export const CHANNEL = 'disc:guild:noisy';

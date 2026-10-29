@@ -13,18 +13,10 @@ import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, type ContextInjection } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import { AgentFramework, type Agent } from '../src/index.js';
 import { GateModule, RoutedMembrane, say, until, waitCall } from './helpers/dendrite.js';
-
-const supported =
-  typeof (JsStore.prototype as unknown as { view?: unknown }).view === 'function' &&
-  typeof (ContextManager.prototype as unknown as { derive?: unknown }).derive === 'function';
-const skip = supported
-  ? false
-  : 'installed @animalabs/chronicle / context-manager lack branch-bound handles or ContextManager.derive';
 
 type Internals = {
   storeInjections(agent: Agent, injections: ContextInjection[] | undefined): ContextInjection[] | undefined;
@@ -88,7 +80,7 @@ describe("a shared fork's view", () => {
   /** agentSees takes an agent; an inspected context has none, so this stands in for it. */
   const readerOf = (cm: ContextManager): Agent => ({ getContextManager: () => cm }) as unknown as Agent;
 
-  it('sees its source\'s view and its own stored injections: in its compile, in agentSees, and reopened after it ends', { skip }, async () => {
+  it('sees its source\'s view and its own stored injections: in its compile, in agentSees, and reopened after it ends', async () => {
     const mira = framework.getAgent('mira')!;
     const oren = framework.getAgent('oren')!;
     mira.getContextManager().addMessage('user', [text('Please look into the open issues.')]);
