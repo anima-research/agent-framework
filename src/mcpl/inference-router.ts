@@ -25,6 +25,7 @@ import type {
 } from './types.js';
 import type { FeatureSetManager } from './feature-set-manager.js';
 import { McplFeatureSetError } from './feature-set-manager.js';
+import { hostStoppedWhileHandling } from './errors.js';
 import type { HookOrchestrator } from './hook-orchestrator.js';
 import { logValue } from './log-value.js';
 import { streamBounds, wholeCallMs, withHostSetting, type InferenceBounds } from '../inference-bounds.js';
@@ -42,6 +43,7 @@ interface Responder {
   /** Sends a streamed chunk on the transport the request came on, as its
    *  answer is sent. */
   sendChunk?(params: InferenceChunkParams): void;
+  signal?: AbortSignal;
 }
 
 // ============================================================================
@@ -187,6 +189,7 @@ export class InferenceRouter {
    *  server with no policy, and per server and feature set with one, so a
    *  server that keeps asking doesn't flood the operator's log. */
   private loggedRefusals = new Set<string>();
+  private running = new Set<{ serverId: string; stop: AbortController; answered: Promise<void> }>();
 
   constructor(
     membrane: Membrane,
@@ -218,6 +221,31 @@ export class InferenceRouter {
     serverId: string,
     params: McplInferenceRequestParams,
     responder: Responder,
+  ): Promise<void> {
+    const stop = new AbortController();
+    let ended!: () => void;
+    const entry = { serverId, stop, answered: new Promise<void>((resolve) => { ended = resolve; }) };
+    this.running.add(entry);
+    try {
+      await this.answer(serverId, params, responder, stop.signal);
+    } finally {
+      this.running.delete(entry);
+      ended();
+    }
+  }
+
+  stopAll(): Array<{ label: string; promise: Promise<void> }> {
+    return [...this.running].map(({ serverId, stop, answered }) => {
+      stop.abort();
+      return { label: `inference/request:${serverId}`, promise: answered };
+    });
+  }
+
+  private async answer(
+    serverId: string,
+    params: McplInferenceRequestParams,
+    responder: Responder,
+    stopped: AbortSignal,
   ): Promise<void> {
     // 1. Validate feature set
     try {
@@ -297,6 +325,24 @@ export class InferenceRouter {
       return;
     }
 
+    const signal = responder.signal ? AbortSignal.any([stopped, responder.signal]) : stopped;
+    let stopAnswered = false;
+    const answerStop = () => {
+      if (responder.signal?.aborted) return;
+      stopAnswered = true;
+      const answer = hostStoppedWhileHandling();
+      this.emitTraceFn({ type: 'mcpl:inference_fail', serverId, model, error: answer.message, streamed });
+      // A throw from an abort listener would be uncaught.
+      try {
+        responder.respondError(answer.code, answer.message);
+      } catch {}
+    };
+    stopped.addEventListener('abort', answerStop, { once: true });
+    const settled = (): boolean => {
+      stopped.removeEventListener('abort', answerStop);
+      return stopAnswered;
+    };
+
     // Emit trace: inference start
     this.emitTraceFn({
       type: 'mcpl:inference_start',
@@ -321,12 +367,14 @@ export class InferenceRouter {
       },
     };
 
+    if (stopAnswered) return;
     try {
       // 5. Run inference. Both modes end in membrane's response, and one
       // builder makes the result from it.
       const response = chunkRequestId != null
-        ? await this.streamResponse(request, chunkRequestId, sendChunk!)
-        : await this.membrane.complete(request, this.wholeCallBound(request));
+        ? await this.streamResponse(request, chunkRequestId, sendChunk!, signal)
+        : await this.membrane.complete(request, { ...this.wholeCallBound(request), signal });
+      if (settled()) return;
 
       // 6. Answer
       const result = resultFrom(response, model);
@@ -346,22 +394,23 @@ export class InferenceRouter {
 
       responder.respond(result);
     } catch (err) {
+      if (settled()) return;
       // Every ending that isn't a completion lands here, in either mode:
       // membrane's error, a stream that stopped early, a tool call, or a
       // stop FinishReason can't name. The answer is the JSON-RPC error, never
       // a result carrying what arrived.
+      const transportClosed = responder.signal?.aborted === true;
       this.emitTraceFn({
         type: 'mcpl:inference_fail',
         serverId,
         model,
-        error: err instanceof Error ? err.message : String(err),
+        error: transportClosed ? 'the transport the request came on closed' : err instanceof Error ? err.message : String(err),
         streamed,
       });
 
-      responder.respondError(
-        -32603,
-        err instanceof Error ? err.message : 'Inference failed',
-      );
+      if (!transportClosed) {
+        responder.respondError(-32603, err instanceof Error ? err.message : 'Inference failed');
+      }
     }
   }
 
@@ -431,8 +480,9 @@ export class InferenceRouter {
     request: NormalizedRequest,
     requestId: string | number,
     sendChunk: (params: InferenceChunkParams) => void,
+    signal: AbortSignal,
   ): Promise<NormalizedResponse> {
-    const stream = this.membrane.streamYielding(request, streamBounds(this.inferenceBounds(), request.config.maxTokens));
+    const stream = this.membrane.streamYielding(request, { ...streamBounds(this.inferenceBounds(), request.config.maxTokens), signal });
     let index = 0;
 
     for await (const event of stream) {
@@ -444,7 +494,7 @@ export class InferenceRouter {
           // XML tool mode the chunks can miss text the content holds: prose
           // naming a tag the stream parser opens a block for, or a thinking
           // block cut off before its close tag.
-          if (event.meta.visible) {
+          if (event.meta.visible && !signal.aborted) {
             sendChunk({ requestId, index: index++, delta: event.content });
           }
           break;

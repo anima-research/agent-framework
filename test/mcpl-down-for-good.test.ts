@@ -64,7 +64,7 @@ async function start(t: TestContext, server: McplServerConfig, hold?: Promise<vo
     agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }],
     modules: [{
       name: 'watcher',
-      async start(ctx: { onTrace(listener: (event: unknown) => void): void }) { ctx.onTrace((event) => traces.push(event as Trace)); },
+      async start() {},
       async stop() {},
       getTools: () => [],
       async handleToolCall() { return { success: false }; },
@@ -77,6 +77,7 @@ async function start(t: TestContext, server: McplServerConfig, hold?: Promise<vo
     maintenanceIntervalMs: 0,
     mcplServers: [server],
   });
+  framework.onTrace((event) => traces.push(event as Trace), { replay: true });
   t.after(async () => {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
@@ -512,31 +513,35 @@ test('a server whose child exits on its own, code 1, after stop() has begun and 
   ]);
 });
 
-/** On SIGUSR1 the child dies by its own SIGTERM while the host is writing to
- *  it, as a stop's signal can reach a busy server: the legacy child stops
- *  reading its stdin and sends a burst of pings whose answers can't all fit
- *  in its pipe, so one of the host's writes is still waiting when it dies
- *  (while it went on reading, a host that had answered every ping before the
- *  signal landed wrote nothing that failed, as on macOS it sometimes did),
- *  and the modern child dies at the first line the test's tool calls bring. */
-const DIES_WHILE_WRITTEN_TO = {
-  legacy: 'process.on("SIGUSR1", () => { process.stdin.pause(); let burst = ""; for (let i = 0; i < 5000; i++) burst += JSON.stringify({ jsonrpc: "2.0", id: "burst-" + i, method: "ping" }) + "\\n"; process.stdout.write(burst, () => process.kill(process.pid, "SIGTERM")); });',
-  modern: 'process.on("SIGUSR1", () => { process.stdin.once("data", () => process.kill(process.pid, "SIGTERM")); process.stderr.write("armed\\n"); });',
-};
+function pipeFailureOf(framework: AgentFramework, engine: 'legacy' | 'modern', id: string): Error | undefined {
+  if (engine === 'modern') {
+    type Modern = { session: { stdio: { pipeFailure?: Error } | null } | null };
+    return (framework as unknown as { modernServers(): Map<string, Modern> }).modernServers().get(id)?.session?.stdio?.pipeFailure;
+  }
+  type Legacy = { transport: { pipeFailure?: Error } | null };
+  const registry = (framework as unknown as { mcplServerRegistry: { getServer(id: string): unknown } | null }).mcplServerRegistry;
+  return (registry?.getServer(id) as Legacy | undefined)?.transport?.pipeFailure;
+}
 
-test('a server that dies by SIGTERM while the host is writing to it raises no alert, though the host\'s write failed, in either engine', { timeout: 60_000 }, async (t) => {
+/** The close names the pipe only if the host has its write's failure before
+ *  it handles the child's exit, so the test sends the SIGTERM itself, once the
+ *  host has recorded that failure. The exit must then be handled within
+ *  STDIO_EXIT_GRACE_MS of the failure, or the transport ends the child itself
+ *  and the close raises an alert. */
+test('a server whose child dies by SIGTERM after the host\'s write to it failed raises no alert, in either engine', { timeout: 60_000 }, async (t) => {
   const seen = [];
   for (const engine of ['legacy', 'modern'] as const) {
     const dir = mkdtempSync(join(tmpdir(), 'mcpl-down-written-'));
     t.after(() => rmSync(dir, { recursive: true, force: true }));
     const id = `written-${engine}`;
-    const server = connectedServer(engine, id, dir, undefined, DIES_WHILE_WRITTEN_TO[engine]);
+    const server = connectedServer(engine, id, dir, undefined, DEAF_ON_USR1);
     const { framework, traces, posted } = await start(t, server.config);
-    process.kill(await server.pid(), 'SIGUSR1');
-    if (engine === 'modern') {
-      await waitFor('the child armed', () => traces.some((event) => event.type === 'mcpl:server-stderr' && event.line === 'armed'));
-      for (let i = 0; i < 200; i++) void framework.executeToolCall({ id: `write-${i}`, name: `mcpl--${id}--echo`, input: { text: 'x' } }).catch(() => {});
-    }
+    const pid = await server.pid();
+    process.kill(pid, 'SIGUSR1');
+    await waitFor(`its stdin closed: ${engine}`, () => traces.some((event) => event.type === 'mcpl:server-stderr' && event.line === 'deaf'));
+    if (engine === 'modern') void framework.executeToolCall({ id: 'write', name: `mcpl--${id}--echo`, input: { text: 'x' } }).catch(() => {});
+    await waitFor(`the host's failed write: ${engine}`, () => pipeFailureOf(framework, engine, id) !== undefined);
+    process.kill(pid, 'SIGTERM');
     await waitFor(`the loss: ${engine}`, () => traces.some((event) => event.type === 'mcpl:server-closed'));
     if (engine === 'modern') {
       const servers = (framework as unknown as { modernServers(): Map<string, unknown> }).modernServers();
