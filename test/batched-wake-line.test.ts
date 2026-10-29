@@ -997,6 +997,67 @@ describe('a debounced batch of targeted messages', () => {
     }
   });
 
+  const ROOM_A = 'discord:g1:room-a';
+  const ROOM_B = 'discord:g1:room-b';
+  const inRoom = (channelId: string, messageId: string, text: string, extra: Record<string, unknown>) => ({
+    type: 'mcpl:channel-incoming', serverId: 'discord', channelId, messageId,
+    author: { id: 'u-1', name: 'antra' }, content: [{ type: 'text', text }],
+    timestamp: new Date().toISOString(), tags: ['chat:addressed'], triggerInference: true, ...extra,
+  });
+  const wakeRoutes = (internals: Internals) => (batchWakes(internals) as Array<{ agentName: string; wakeChannelId?: string }>)
+    .map((r) => [r.agentName, r.wakeChannelId]).sort();
+  const gateLinesIn = (framework: AgentFramework, name: string) => windowTexts(framework, name).filter((t) => t.includes('[Gate:'));
+
+  it("messages for two co-residents in one batch: each is woken for her own, routed to her own channel, and her line names only her channel", async () => {
+    const { framework, internals, dir } = await boot();
+    try {
+      await internals.handleMcplChannelIncoming(inRoom(ROOM_A, 'm-a1', 'scout, a word', { targetAgents: ['scout'] }));
+      await internals.handleMcplChannelIncoming(inRoom(ROOM_B, 'm-b1', 'mira, a word', { targetAgents: ['mira'] }));
+      await internals.handleMcplChannelIncoming(inRoom(ROOM_A, 'm-a2', 'scout, another', { targetAgents: ['scout'] }));
+      await internals.handleMcplChannelIncoming(inRoom(ROOM_B, 'm-b2', 'mira, another', { targetAgents: ['mira'] }));
+      await waitFor(() => batchWakes(internals).length >= 2, 'the batch to fire');
+      assert.deepEqual(wakeRoutes(internals), [['mira', ROOM_B], ['scout', ROOM_A]], "each wake is routed to her own message's channel");
+      const scout = gateLinesIn(framework, 'scout');
+      const mira = gateLinesIn(framework, 'mira');
+      assert.equal(scout.length, 1, "scout's window holds one line");
+      assert.ok(scout[0]!.includes('room-a') && !scout[0]!.includes('room-b'), `scout's line names his channel alone: ${scout[0]}`);
+      assert.equal(mira.length, 1, "mira's window holds one line");
+      assert.ok(mira[0]!.includes('room-b') && !mira[0]!.includes('room-a'), `mira's line names her channel alone: ${mira[0]}`);
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a batch with a message for no one in particular and one for mira: scout is told and routed by the first alone, mira by both', async () => {
+    const { framework, internals, dir } = await boot();
+    try {
+      await internals.handleMcplChannelIncoming(inRoom(ROOM_A, 'm-u1', 'hello, all', {}));
+      await internals.handleMcplChannelIncoming(inRoom(ROOM_B, 'm-b1', 'mira, a word', { targetAgents: ['mira'] }));
+      await waitFor(() => batchWakes(internals).length >= 2, 'the batch to fire');
+      assert.deepEqual(wakeRoutes(internals), [['mira', ROOM_B], ['scout', ROOM_A]], 'scout is routed to the message he may see');
+      assert.ok(!gateLinesIn(framework, 'scout').some((t) => t.includes('room-b')), "no line in scout's window names mira's channel");
+      const mira = gateLinesIn(framework, 'mira');
+      assert.equal(mira.length, 1, "mira's window holds one line");
+      assert.ok(mira[0]!.includes('room-a') && mira[0]!.includes('room-b'), `mira's line names both: ${mira[0]}`);
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a debounced correction delivered to mira wakes mira, not the agents its original message named", async () => {
+    const { framework, internals, dir } = await boot();
+    try {
+      await internals.handleMcplChannelIncoming(inRoom(ROOM_A, 'm-c1', 'an edit', { targetAgents: ['scout'], deliverTo: 'mira' }));
+      await waitFor(() => batchWakes(internals).length > 0, 'the batch to fire');
+      assert.deepEqual(batchWakes(internals).map((r) => r.agentName), ['mira'], 'mira, who holds it, is woken');
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('two messages for a co-resident wake her alone, and the line the batch writes is for her: it enters no other window', async () => {
     const { framework, internals, dir } = await boot();
     try {

@@ -3725,7 +3725,24 @@ export class EventGate {
       });
     }
     if (events.length === 0) return;
+    if (events.every((e) => e.recipients === undefined)) {
+      this.deliverBatch(events, this.getAgentNamesFn());
+      return;
+    }
+    const woken = new Set(events.flatMap((e) => e.recipients ?? []));
+    if (events.some((e) => e.recipients === undefined)) for (const name of this.getAgentNamesFn()) woken.add(name);
+    const groups = new Map<string, { agents: string[]; events: PendingEvent[] }>();
+    for (const agentName of woken) {
+      const seen = events.filter((e) => e.recipients === undefined || e.recipients.includes(agentName));
+      const key = seen.map((e) => events.indexOf(e)).join(',');
+      const group = groups.get(key) ?? { agents: [], events: seen };
+      group.agents.push(agentName);
+      groups.set(key, group);
+    }
+    for (const group of groups.values()) this.deliverBatch(group.events, group.agents, group.agents);
+  }
 
+  private deliverBatch(events: PendingEvent[], woken: readonly string[], audience?: readonly string[]): void {
     const policyNames = [...new Set(events.map(e => e.policyName))];
 
     // Events whose content the framework already stored at arrival (MCPL
@@ -3782,11 +3799,9 @@ export class EventGate {
     // of the wake's turn decides it (WakeLine). Several messages, one with
     // anything after it, or content the line quotes, keep the line now.
     const text = `[${NOTICE_TAG.gate}: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
-    const targeted = events.every((e) => e.recipients !== undefined);
-    const woken = targeted ? [...new Set(events.flatMap((e) => e.recipients!))] : this.getAgentNamesFn();
     const only = events.length === 1 && events[0].inContext ? events[0] : undefined;
     let line: WakeLine | undefined;
-    if (only && this.newestEntry(only)) {
+    if (only && this.newestEntry(only, audience)) {
       const shownChannel = only.routeChannelId ?? only.channelId;
       line = {
         entry: entryRef(only),
@@ -3799,7 +3814,7 @@ export class EventGate {
       this.addMessageFn('user', [{ type: 'text', text }], {
         source: 'gate:debounce',
         policies: policyNames,
-      }, undefined, undefined, targeted ? woken : undefined);
+      }, undefined, undefined, audience);
     }
 
     // Provenance of the batched wake (who/where woke the agent): the newest
@@ -3819,10 +3834,10 @@ export class EventGate {
   }
 
   /** isNewestEntry for one event; a callback fault keeps the line. */
-  private newestEntry(event: PendingEvent): boolean {
+  private newestEntry(event: PendingEvent, recipients?: readonly string[]): boolean {
     if (!this.isNewestEntryFn) return false;
     try {
-      return this.isNewestEntryFn(entryRef(event), event.recipients) === true;
+      return this.isNewestEntryFn(entryRef(event), recipients) === true;
     } catch {
       return false;
     }

@@ -18078,7 +18078,7 @@ export class AgentFramework {
       tags: event.tags,
       addressed,
       vetoed: event.triggerInference === false,
-      targetAgents: event.targetAgents,
+      targetAgents: event.deliverTo ? [event.deliverTo] : event.targetAgents,
       gateContent: event.content
         .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
         .map((b) => b.text)

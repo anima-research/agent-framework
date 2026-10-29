@@ -17,9 +17,11 @@
   request starts with the one before it and their rounds' signed thinking is sent again. A wake for a row stored where it would have been queued reads
   that row (`WritePlacement.presented` false); a write stored during a turn, the gap before a budget restart's
   continuation or a held retry included, takes no clock row, which the turn's boundary or next start takes; a
-  debounced batch whose messages all name their agents (`targetAgents`) wakes those agents alone, and a line it
-  writes is for them; a batched wake for one message that is still newest, with no turn alive, in the window of each
-  agent such a batch wakes, or of the delivery agent for any other batch, hands its line to the wake, and each agent
+  debounced batch with a message that names its agents (`targetAgents`, or the one agent a correction is delivered to)
+  wakes each agent with the messages it may see, those naming it and those naming no agent, and agents that may see the
+  same messages share one line, written for them, and the route of their wake; a batched wake for one message that is
+  still newest, with no turn alive, in the window of each agent it's for, or of the delivery agent for a batch naming
+  no agent, hands its line to the wake, and each agent
   it wakes writes it at its start as its own row, or leaves it out while the message is still newest there, while
   any other batch writes one line when it fires; and
   another reader's live turn no longer holds back an agent's clock rows, `[continue]` rows or stored injections.
