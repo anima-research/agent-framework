@@ -19671,7 +19671,9 @@ export class AgentFramework {
     try {
       await this.dispatchProcessEventToModules(event);
     } catch (error) {
-      console.error("[coalescing] the modules' handling of a delivered occurrence threw; its message stays stored, and it isn't delivered again:", error);
+      const { serverId, eventId, messageId } = event as { serverId?: unknown; eventId?: unknown; messageId?: unknown };
+      const id = eventId !== undefined ? `eventId=${logValue(eventId)}` : `messageId=${logValue(messageId ?? '')}`;
+      console.error(`[coalescing] server=${logValue(serverId ?? '')} ${id}: the modules' handling of a delivered occurrence threw; its message stays stored, and it isn't delivered again:`, error);
     }
   }
 
