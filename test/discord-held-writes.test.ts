@@ -236,6 +236,7 @@ async function withKeptCreate(
     await within(released, 'the release');
   } catch (error) {
     open?.();
+    for (const extra of options.modules ?? []) (extra as { release?: () => void }).release?.();
     await cleanup().catch(() => {});
     throw error;
   } finally {
