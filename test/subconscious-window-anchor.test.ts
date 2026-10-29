@@ -436,15 +436,17 @@ describe("the persistent subconscious's window start whose keeping failed, acros
 });
 
 describe("the persistent subconscious's window start set while its window is the record", () => {
-  it('(n) is fixed at the next enter once a branch move recovers the window', { timeout: 120_000 }, async () => {
-    const h = await boot(place());
+  it('(n) is fixed at the next enter once a branch move recovers the window, a restart before it setting the start kept in force', { timeout: 120_000 }, async () => {
+    const dir = place();
+    const h = await boot(dir);
     h.residentRow('PRE-1 before the tune-outs');
     h.bump();
     const t1 = h.internals.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5 }, 'agent-tool');
     assert.ok(t1.ok);
     h.residentRow('T1-HELD-1 chatter', { tuneOut: { epochId: t1.params.epochId } });
     await h.framework.runUntilIdle();
-    assert.notEqual(h.windowStarts()?.[t1.params.epochId], undefined, "premise: T1's start is fixed and kept");
+    const t1Start = h.windowStarts()?.[t1.params.epochId];
+    assert.notEqual(t1Start, undefined, "premise: T1's start is fixed and kept");
 
     const strategy = h.subCm().getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
     const initialize = strategy.initialize.bind(strategy);
@@ -466,14 +468,23 @@ describe("the persistent subconscious's window start set while its window is the
 
     assert.ok(h.internals.tuneOutCoordinator.cancel('disc', CHANNEL, 'agent-tool', 'test').ok);
     await h.framework.runUntilIdle();
-    h.bump();
-    const t3 = h.internals.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5 }, 'agent-tool');
+    const kept = h.internals.channelRegistry.readCoordinatorState(STARTS) as { starts: Record<string, number>; inForce?: number };
+    assert.equal(kept.inForce, t1Start, "premise: T1's start is kept in force at its cancel, T2 still active");
+    await h.framework.stop();
+    frameworks.splice(frameworks.indexOf(h.framework), 1);
+
+    const after = await boot(dir);
+    await after.framework.runUntilIdle();
+    assert.equal(after.strategy().getAnchorOrdinal(), t1Start, 'a restart sets the start kept in force');
+    assert.equal(after.windowStarts()?.[t2.params.epochId], undefined, "and T2's start, the oldest active and not kept, waits");
+    after.bump();
+    const t3 = after.internals.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5 }, 'agent-tool');
     assert.ok(t3.ok, (t3 as { error?: string }).error);
-    await h.framework.runUntilIdle();
-    const cm = h.subCm();
+    await after.framework.runUntilIdle();
+    const cm = after.subCm();
     const t2Start = t2.params.startedAtSequence;
     const pastBefore = Math.max(0, ...cm.getPresentedMessages().filter((m) => m.sequence < t2Start).map((m) => cm.ordinalOf(m.id)! + 1));
-    assert.equal(h.windowStarts()?.[t2.params.epochId], pastBefore,
+    assert.equal(after.windowStarts()?.[t2.params.epochId], pastBefore,
       "the next enter fixes T2's start, just past the last row in the window stored before it");
   });
 });
