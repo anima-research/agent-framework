@@ -118,6 +118,10 @@ export class SubconsciousWindowAnchor {
     }
   }
 
+  branchMoved(): void {
+    this.pending = this.pending.filter((p) => p.ordinal === undefined);
+  }
+
   /** Rows entered the subconscious's window (the presentation index's onPresented): a start waiting to be fixed may be fixable now. */
   presented(): void {
     if (this.pending.length === 0) return;
