@@ -1512,7 +1512,7 @@ export class DiscordModule implements Module {
         try {
           step();
         } catch (error) {
-          console.error(`Discord: ${what} of message ${discordMessageId}, made while its create was kept in memory, wasn't applied when the release stored it:`, error);
+          console.error(`Discord: ${what} of message ${discordMessageId}, made while its create was kept in memory, threw as the release applied it, and may not have been applied:`, error);
         }
       };
       if (unapplied === 'delete') {
