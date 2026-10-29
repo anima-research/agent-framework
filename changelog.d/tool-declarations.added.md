@@ -48,8 +48,9 @@
   definitions carry one, built as objects rather than parsed from JSON, gets
   one fresh layout at the upgrade, on `'head'` too.
 - A system change row is never a message said to an agent: it restarts no
-  re-send count, counts as nothing heard, and moves no turn to a channel,
-  whatever its metadata, so it joins what 0.29.0's re-arm entry
+  re-send count, clears no earlier deadline cut of a re-armed turn
+  (agent-framework#871), counts as nothing heard, and moves no turn to a
+  channel, whatever its metadata, so it joins what 0.29.0's re-arm entry
   (agent-framework#838) lists as not a message said to the agent. A row the
   agent's own view leaves out, such as another resident's change, or for the
   subconscious any change not its own, is stored but not injected into its
