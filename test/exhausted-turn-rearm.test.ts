@@ -54,6 +54,7 @@ class ErrorStream implements YieldingStream {
 }
 
 class DeadlineStream implements YieldingStream {
+  constructor(private readonly reason = 'timeout') {}
   isWaitingForTools = false;
   pendingToolCallIds: string[] = [];
   toolDepth = 0;
@@ -61,7 +62,7 @@ class DeadlineStream implements YieldingStream {
   provideToolResults(): void { throw new Error('not waiting'); }
   cancel(): void { this.isCancelled = true; }
   async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
-    yield { type: 'aborted', reason: 'timeout' } as StreamEvent;
+    yield { type: 'aborted', reason: this.reason } as StreamEvent;
   }
 }
 
@@ -146,7 +147,7 @@ class ScriptedMembrane extends MockMembrane {
   letGo: () => void = () => {};
   private readonly heldOpen = new Promise<void>((resolve) => { this.letGo = resolve; });
   constructor(private readonly script: (send: number) => (() => Error) | { toolRoundThen: Error } | 'tool round, then a server error' | 'tool calls cut off by a server error'
-    | 'tool round, then a stated wait' | 'a deadline' | 'held open' | undefined, private readonly failsAt: FailsAt = 'event') { super(); }
+    | 'tool round, then a stated wait' | 'a deadline' | 'aborted' | 'held open' | undefined, private readonly failsAt: FailsAt = 'event') { super(); }
   override streamYielding(request: NormalizedRequest): YieldingStream {
     const texts = request.messages.flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '')
       .filter((t) => t.startsWith('zz-')).join(' | ');
@@ -156,6 +157,7 @@ class ScriptedMembrane extends MockMembrane {
     if (fail === 'tool round, then a server error') return new ToolRoundThenErrorStream(serverError());
     if (fail === 'tool calls cut off by a server error') return new ToolRoundThenErrorStream(serverError(), true);
     if (fail === 'a deadline') return new DeadlineStream();
+    if (fail === 'aborted') return new DeadlineStream('error');
     if (fail === 'tool round, then a stated wait') return new ToolRoundThenErrorStream(statedWait(250)());
     if (fail === 'held open') return new HeldOpenStream(this.heldOpen, new MockYieldingStream([createMockResponse([{ type: 'text', text: 'zz-answer-late' }])]));
     if (fail && this.failsAt === 'setup') throw fail();
@@ -320,7 +322,7 @@ test('each transient failure is re-armed: a server error, a network failure, a t
   }
 });
 
-test('a failure that is not transient is not re-armed: one the provider refuses or says not to retry, one membrane could not classify, one with no provider error, or a deadline', async (t) => {
+test('a failure that is not transient is not re-armed: one the provider refuses or says not to retry, one membrane could not classify, one with no provider error, or, in a turn that is not itself a re-arm, a deadline', async (t) => {
   const stalled = await stalledByMembrane(t);
   assert.ok(stalled instanceof MembraneError && stalled.type === 'timeout' && stalled.retryable, 'membrane throws a stalled stream as a retryable timeout');
   stderr.length = 0;
@@ -360,7 +362,7 @@ test("a re-armed turn's send is not retried, whatever its failure: an overload a
 
 for (const [name, fail, failsAt] of [['refused by the provider, at its start', invalidRequest, 'setup'], ['refused by the provider, by its stream', invalidRequest, 'event'],
   ['with no provider error, at its start', () => new Error('zz not a provider error'), 'setup'], ['with no provider error, by its stream', () => new Error('zz not a provider error'), 'event'],
-  ['with no provider error, thrown by its stream', () => new Error('zz not a provider error'), 'throw']] as const) {
+  ['with no provider error, thrown by its stream', () => new Error('zz not a provider error'), 'throw'], ['aborted by its stream', 'aborted', 'event']] as const) {
   test(`a re-armed turn that fails in a way that is not transient (${name}) makes its one send, writes a marker, and ends the re-arming`, async (t) => {
     const membrane = new ScriptedMembrane((n) => (n <= 3 ? serverError : fail), failsAt);
     const r = await resident(t, membrane);
@@ -473,6 +475,22 @@ test("a round answered between two cuts is an answer from the provider, so the c
     "the second re-armed turn, which answers a round and is then cut, to end");
   assert.equal(r.count('inference:completed'), 1, "its cut is a first again, so the error policy retries it and the retry answers");
   assert.equal(membrane.sends.length, 6, "the window, the first re-armed send, cut, then the second's round, cut, and its retry");
+});
+
+test("under a host's policy that makes no fresh call for a deadline, a re-armed turn that got partway and ends on its chain's first deadline cut is re-armed, and writes the marker a partway turn does", async (t) => {
+  const stalled = await stalledByMembrane(t);
+  const membrane = new ScriptedMembrane((n) => (n <= 3 || n === 5 ? serverError : n === 4 ? 'tool round, then a server error' : () => stalled));
+  const noFreshCall: ErrorPolicy = {
+    maxRetries: 2,
+    onInferenceError: (error, agent, attempt) => ((error as unknown as Record<symbol, unknown>)[Symbol.for('membrane.deadlineExpiry')] === true
+      ? { retry: false } : fastPolicy.onInferenceError(error, agent, attempt)),
+  };
+  const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 100, 100], errorPolicy: noFreshCall });
+  r.say('zz-question');
+  await waitFor(() => r.count('inference:exhausted') === 2, 'the re-armed turn to end exhausted on its first cut');
+  assert.equal(membrane.sends.length, 6, "the window, then the re-armed turn's send and the error policy's two retries");
+  assert.equal(r.admission().providerAdmission.heldRequests, 1, "its first cut is taken as a transient failure, so it is re-armed");
+  assert.equal(r.markers(), 2, "the window's marker, and the one a re-armed turn that got partway writes");
 });
 
 test("a deadline cut a host's provider hold takes in a re-armed turn counts, so the held send's next cut ends the re-arming", async (t) => {
@@ -978,7 +996,7 @@ test("a re-armed continuation keeps its channel when an ambient wake from anothe
   assert.deepEqual(routingOf(r)?.triggerChannel, { serverId: 'zz-srv', channelId: 'zz-chan' });
 });
 
-test('an agent ended through the registry takes its re-armed deadline cut with it, so its name bound again starts its chain afresh', async (t) => {
+test('an agent ended through the registry takes its re-armed deadline cut with it', async (t) => {
   const r = await resident(t, new ScriptedMembrane(() => undefined), {
     agents: [{ name: 'resident', model: 'zz-model', systemPrompt: 'system' }, { name: 'second', model: 'zz-model', systemPrompt: 'system' }],
   });
