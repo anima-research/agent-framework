@@ -539,7 +539,9 @@ describe('a start that continues the turn keeps a hold an explicit send set, unt
   it('a message removed unread before the held retry starts leaves the line held', async () => {
     const run = await turn({
       proseRouting: 'locus', residents: true, hold: { error: 'provider unavailable', during: async (h) => {
-        h.remove(h.storeFor('other', CHATTER));
+        const id = h.storeForResidents(CHATTER);
+        assert.ok(id, 'premise: stored for both residents');
+        h.remove(id);
       } },
       stream: (n) => (n === 1 ? new ErrorsAfter([SEND, HELD], 2) : final()),
     });
