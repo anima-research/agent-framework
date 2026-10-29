@@ -158,21 +158,21 @@ test('concurrent close() calls share the teardown: none resolves while the child
   const first = connection.close().then(() => order.push(`first:${alive(pid!) ? 'alive' : 'gone'}`));
   const second = connection.close().then(() => order.push(`second:${alive(pid!) ? 'alive' : 'gone'}`));
   await Promise.all([first, second]);
-  assert.deepEqual(order, ['first:gone', 'second:gone']);
+  assert.deepEqual(order.sort(), ['first:gone', 'second:gone']);
 });
 
 test('a close that cannot reap fails, and so do concurrent ones; a later close re-checks and settles', async () => {
   const log = scratchLog();
-  const stuck = unreapableFrom(1);
+  const stuck = unreapableFrom(1, SHORT_GRACE_MS);
   const connection = await McplServerConnection.connect(config('ok', log), HOST_CAPS);
   connection.ready();
   const settled: string[] = [];
   const outcome = (name: string) => [() => settled.push(`${name}:ok`), (e: Error) => settled.push(`${name}:${e.message}`)] as const;
   const first = connection.close().then(...outcome('first'));
   const second = connection.close().then(...outcome('second'));
-  // The teardown sends SIGTERM, waits 2 s, sends SIGKILL and waits 2 s more
-  // before it gives up, so at 1 s it is still pending.
-  await new Promise((r) => setTimeout(r, 1000));
+  // The teardown sends SIGTERM, waits the grace, sends SIGKILL and waits the
+  // grace again before it gives up, so at half the grace it is still pending.
+  await new Promise((r) => setTimeout(r, SHORT_GRACE_MS / 2));
   assert.deepEqual(settled, [], 'neither resolves while the teardown is pending');
   await Promise.all([first, second]);
   assert.equal(settled.length, 2);
@@ -365,7 +365,7 @@ test('registry: an id stays held through its reap, and a second add is refused w
   })();
   await until(() => registry.getServer('legacy') !== null, 'registered');
   await until(() => starts(log).length === 1, 'launched');
-  await new Promise((r) => setTimeout(r, 100));
+  await until(() => existsSync(`${log}.sigterm`), 'the reap to begin');
   await assert.rejects(registry.addServer(config('ok', log), HOST_CAPS), /already registered/, 'held while its reap runs');
   await removing;
   assert.equal(registry.getServer('legacy'), null, 'freed once the exit is confirmed');

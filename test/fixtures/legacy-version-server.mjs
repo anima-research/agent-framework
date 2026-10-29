@@ -19,7 +19,8 @@
 //                 reads both in one callback
 //   ok-then-<mode>  `ok` on the first start recorded in startLog, <mode> after
 //
-// IGNORE_SIGTERM=1 makes the process survive SIGTERM (only SIGKILL ends it).
+// IGNORE_SIGTERM=1 makes the process survive SIGTERM (only SIGKILL ends it),
+// noting each SIGTERM it gets in <startLog>.sigterm.
 //
 // tools/list pages: by default three pages (cursors p2, p3). MODE_LIST picks
 // an edge case: loop (always nextCursor "same"), empty (nextCursor "" then a
@@ -36,7 +37,9 @@ if (startLog) {
   appendFileSync(startLog, `start ${process.pid}\n`);
   if (mode.startsWith('ok-then-')) mode = priorStarts === 0 ? 'ok' : mode.slice('ok-then-'.length);
 }
-if (process.env.IGNORE_SIGTERM === '1') process.on('SIGTERM', () => {});
+if (process.env.IGNORE_SIGTERM === '1') {
+  process.on('SIGTERM', () => { if (startLog) appendFileSync(`${startLog}.sigterm`, `sigterm ${process.pid}\n`); });
+}
 const listMode = process.env.MODE_LIST ?? 'pages';
 
 const send = (m) => process.stdout.write(JSON.stringify(m) + '\n');
