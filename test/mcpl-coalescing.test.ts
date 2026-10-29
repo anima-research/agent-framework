@@ -513,9 +513,13 @@ test('#196 finding 5, on the window: undo of a turn keeps the coalesced input th
   await f.send('push/event', f.params('b', 'unread_before_undo', { key: 'b', initial: true }));
   await f.turn();
   assert(f.lastRequest().includes('unread_before_undo'));
+  const cm = f.framework.getAgent('agent')!.getContextManager();
+  const before = cm.getPresentedMessages().length;
   const undone = f.framework.undoLastTurn('agent');
+  assert.equal(undone.undone, true, 'the undo undid a turn');
+  assert.ok(cm.getPresentedMessages().length < before, "the undone turn's own rows left the window");
   assert.equal(undone.fromBranch, undone.toBranch, 'no branch moved');
-  const window = JSON.stringify(f.framework.getAgent('agent')!.getContextManager().getPresentedMessages());
+  const window = JSON.stringify(cm.getPresentedMessages());
   assert(window.includes('unread_before_undo'), "the input stays in the window the undone turn's start presented it to");
   const r = await f.send('push/event', f.params('c', 'after_undo', { key: 'b' }));
   assert.equal(r.result.coalesce.outcome, 'appended', 'the request that carried it read it');
@@ -1656,7 +1660,10 @@ test("a render an assembly joins reaches the joining agent's request when it lan
     .getTurnCheckpoints('agent').find((c) => c.indexLengthBefore !== undefined && c.indexLengthBefore > (cm.ordinalOf(render.id) ?? Infinity));
   assert.ok(checkpoint, "the render entered the primary's window before a turn's checkpoint: that turn's input");
   // As the turn's input, undoing the turn keeps it.
-  f.framework.undoLastTurn('agent');
+  const before = cm.getPresentedMessages().length;
+  const undone = f.framework.undoLastTurn('agent');
+  assert.equal(undone.undone, true, 'the undo undid a turn');
+  assert.ok(cm.getPresentedMessages().length < before, "the undone turn's own rows left the window");
   assert(f.window().includes('first_render'), 'the undo of the turn that read it keeps it');
 });
 
