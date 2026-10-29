@@ -17,7 +17,8 @@ const STOP_FAILED = (verb: Verb) =>
   `${verb} refused: this framework's stop() failed, and a stopped framework doesn't start again. ` +
   'A failed stop() may have left its cleanup or final persistence unfinished. ' +
   "Call stop() again: once a stop() of this one resolves, they're done, and only then should a new " +
-  'AgentFramework use its store, or another instance use anything this one shares.';
+  'AgentFramework use its store, with its storePath if this one opened the store itself, ' +
+  'or another instance use anything this one shares.';
 const STOP_FAILED_CLOSED = (verb: Verb, failure: string) =>
   `${verb} refused: this framework's stop() failed and its owned store is closed, so stop() can't be tried again: ` +
   `it rejects with that same failure, this error's cause: ${failure}. ` +
