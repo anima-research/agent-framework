@@ -2156,6 +2156,8 @@ export class EventGate {
   ) => unknown;
   private requestInferenceFn: (agentName: string, reason: string, source: string, provenance?: WakeProvenance, after?: WritePlacement) => void;
   private getAgentNamesFn: () => string[];
+  /** Delivery-time re-check: is this channel held from the recipients now? */
+  private isHeldFn: (serverId: string | undefined, channelId: string | undefined) => boolean;
   private resolveRouteChannelFn: (info: GateEventInfo) => string | undefined;
   private channelShownFn?: (channel: { serverId: string; channelId: string }) => string;
   private isNewestEntryFn?: (entry: GateEntryRef) => boolean;
@@ -2180,6 +2182,13 @@ export class EventGate {
      *  message is answered. */
     requestInference: (agentName: string, reason: string, source: string, provenance?: WakeProvenance, after?: WritePlacement) => void;
     getAgentNames: () => string[];
+    /**
+     * Whether a channel is held from the recipients (a tune-out epoch in
+     * force). A held event never enters a batch — admission runs before the
+     * gate — but a hold can begin after an event was batched; at delivery
+     * the batch is re-checked and held events are dropped (#232 H3).
+     */
+    isHeld?: (serverId: string | undefined, channelId: string | undefined) => boolean;
     /** Optional clock — defaults to Date.now. Tests inject for deterministic time. */
     now?: () => number;
     /** Per-event timeout (ms) for the optional gate.js script. Default 50. */
@@ -2228,6 +2237,7 @@ export class EventGate {
     this.addMessageFn = opts.addMessage;
     this.requestInferenceFn = opts.requestInference;
     this.getAgentNamesFn = opts.getAgentNames;
+    this.isHeldFn = opts.isHeld ?? (() => false);
     this.resolveRouteChannelFn = opts.resolveRouteChannel ?? defaultRouteChannel;
     this.channelShownFn = opts.channelShown;
     this.isNewestEntryFn = opts.isNewestEntry;
@@ -3687,7 +3697,23 @@ export class EventGate {
   // Event delivery
   // =========================================================================
 
-  private deliverEvents(events: PendingEvent[]): void {
+  private deliverEvents(batched: PendingEvent[]): void {
+    // Delivery-time re-check: a channel tuned out after its events were
+    // batched is held now, and "already shown above at arrival" would be
+    // untrue of them. They are dropped; the hold's own reader has them.
+    const heldAt = (e: PendingEvent): string | undefined => e.routeChannelId ?? e.channelId;
+    const events = batched.filter((e) => {
+      const channel = heldAt(e);
+      return !(channel && this.isHeldFn(e.serverId, channel));
+    });
+    if (events.length < batched.length) {
+      this.emitTrace({
+        type: 'gate:held-dropped',
+        dropped: batched.length - events.length,
+        channels: [...new Set(batched.filter((e) => !events.includes(e)).map(heldAt))],
+        timestamp: this.now(),
+      });
+    }
     if (events.length === 0) return;
 
     const policyNames = [...new Set(events.map(e => e.policyName))];
@@ -4255,10 +4281,9 @@ export class EventGate {
   }
 
   /**
-   * `agentName` is gone, as a conversation fork's end or an ephemeral run's
-   * removes one: its pending self-wake is cancelled, rather than wake a name
-   * that no longer exists. It holds no sleep: neither can set one (the
-   * framework refuses their `sleep`).
+   * `agentName` is gone, as an agent's end removes one: its pending
+   * self-wake is cancelled, and a sleep it set ends, rather than go on
+   * quieting every agent and then wake a name that no longer exists.
    */
   agentGone(agentName: string): void {
     const selfWake = this.selfWakeTimers.get(agentName);
@@ -4266,6 +4291,7 @@ export class EventGate {
       clearTimeout(selfWake);
       this.selfWakeTimers.delete(agentName);
     }
+    if (this.sleepAgent === agentName) this.clearSleep();
   }
 
   // =========================================================================

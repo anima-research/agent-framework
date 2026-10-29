@@ -106,6 +106,9 @@ describe('notices about an agent\'s own action', () => {
       ],
       modules: [],
       conversations: { templateAgent: 'primary' },
+      // These rows route an ephemeral run's reply by the registry's default
+      // locus (its latest accepted inbound), which only the legacy rule has.
+      speech: { locus: 'latest-inbound' },
     });
     // Install the real framework callback and registry without a live connector.
     await internals(created).initializeMcpl([]);
@@ -393,7 +396,7 @@ describe('notices about an agent\'s own action', () => {
     it('tells no one, logged, when there is no primary to tell', async (t) => {
       const dir = mkdtempSync(join(tmpdir(), 'route-failure-no-primary-'));
       const bare = await AgentFramework.create({
-        storePath: join(dir, 'test.chronicle'), membrane: membrane.asMembrane(), agents: [], modules: [],
+        storePath: join(dir, 'test.chronicle'), membrane: membrane.asMembrane(), agents: [], modules: [], speech: { locus: 'latest-inbound' },
       });
       try {
         await internals(bare).initializeMcpl([]);
