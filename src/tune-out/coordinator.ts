@@ -534,9 +534,7 @@ export class TuneOutCoordinator {
     const sequence = Math.min(...active.map((e) => e.sequence));
     const epochIds = active.filter((e) => e.sequence === sequence).map((e) => e.epochId);
     const kept = this.ordinalsKept();
-    // Read while the window is the record too, so a start kept before it was
-    // goes to the anchor at its ordinal, for the window's next presentation.
-    const state: WindowStartsState = this.hooks.subconsciousName() != null ? this.readWindowState() : { starts: {} };
+    const state: WindowStartsState = kept ? this.readWindowState() : { starts: {} };
     let ordinal = epochIds.map((id) => state.starts[id]).find((o) => o !== undefined);
     // At a resume, the start in force before the restart (a cancelled
     // tune-out's, say), and never past the oldest active one's own start
@@ -551,12 +549,14 @@ export class TuneOutCoordinator {
       this.writeWindowState(ordinal !== undefined ? { ...rest, inForce: ordinal } : rest);
     }
     const others: SubconsciousWindowStart[] = [];
-    const bySequence = new Map<number, string[]>();
-    for (const e of active) {
-      if (e.sequence === sequence || state.starts[e.epochId] !== undefined) continue;
-      bySequence.set(e.sequence, [...(bySequence.get(e.sequence) ?? []), e.epochId]);
+    if (kept) {
+      const bySequence = new Map<number, string[]>();
+      for (const e of active) {
+        if (e.sequence === sequence || state.starts[e.epochId] !== undefined) continue;
+        bySequence.set(e.sequence, [...(bySequence.get(e.sequence) ?? []), e.epochId]);
+      }
+      for (const [at, ids] of bySequence) others.push({ sequence: at, epochIds: ids });
     }
-    for (const [at, ids] of bySequence) others.push({ sequence: at, epochIds: ids });
     this.hooks.setSubconsciousAnchor({ sequence, ...(ordinal !== undefined ? { ordinal } : {}), epochIds }, others);
   }
 
@@ -624,18 +624,6 @@ export class TuneOutCoordinator {
       console.error(`[tune-out] the subconscious's window starts (${this.windowStartsStateId}) couldn't be written, so a restart fixes them again:`, err);
       return false;
     }
-  }
-
-  /**
-   * The framework set the subconscious's window start at `ordinal`, an
-   * ordinal it was given (a kept start's, or the start in force at a
-   * resume) and didn't fix: kept as the start in force while any tune-out
-   * is active, as anchorSubconscious keeps it while the window presents,
-   * and nothing kept for a tune-out. Answers whether
-   * it is kept, as subconsciousWindowFixed does.
-   */
-  subconsciousWindowInForce(ordinal: number): boolean {
-    return this.subconsciousWindowFixed([], ordinal, true);
   }
 
   /**
