@@ -66,18 +66,21 @@ export class SubconsciousWindowAnchor {
    * (`inForce`) first if it is among them: the window doesn't present yet,
    * some row older than a start is still out of the window, or setting or
    * keeping the ordinal it was fixed at (`ordinal`) failed, which the next
-   * presentation tries again.
+   * presentation tries again. A start given its ordinal (`given`: kept, or
+   * the one in force at a resume) while the window was the record waits to
+   * be set at it, as a set() while the window presents sets it, and nothing
+   * is kept for it.
    */
-  private pending: Array<{ start: SubconsciousWindowStart; ordinal?: number; inForce: boolean }> = [];
+  private pending: Array<{ start: SubconsciousWindowStart; ordinal?: number; given?: true; inForce: boolean }> = [];
 
   constructor(private readonly host: SubconsciousWindowAnchorHost) {}
 
   /**
    * Set the window start (the coordinator's setSubconsciousAnchor). In
-   * legacy mode by its sequence, as before the index, and every active start
-   * waits for the window's next presentation (presented): one kept before
-   * the window was the record is set and kept at its kept ordinal then, and
-   * one not kept yet is fixed then, as below. In presented mode by
+   * legacy mode by its sequence, as before the index, and every start it is
+   * given waits for the window's next presentation (presented): one given
+   * its ordinal is set at it then, and one not kept yet is fixed then, as
+   * below. In presented mode by
    * its ordinal when one was fixed, clamped to the window's index length
    * and traced when past it; else by its sequence for now, converted as the
    * strategy converts one, and the ordinal is fixed (see the module doc) as
@@ -95,7 +98,8 @@ export class SubconsciousWindowAnchor {
       // couldn't set or keep, which the next presentation tries again.
       const was = this.pending;
       const carried = (wanted: SubconsciousWindowStart, inForce: boolean) => {
-        const ordinal = wanted.ordinal ?? was.find((p) => sameStart(p.start, wanted))?.ordinal;
+        if (wanted.ordinal !== undefined) return { start: wanted, ordinal: wanted.ordinal, given: true as const, inForce };
+        const ordinal = was.find((p) => sameStart(p.start, wanted))?.ordinal;
         return { start: wanted, ...(ordinal !== undefined ? { ordinal } : {}), inForce };
       };
       if (!this.host.presents()) {
@@ -151,6 +155,10 @@ export class SubconsciousWindowAnchor {
       }
       const ordinal = entry.ordinal;
       if (entry.inForce) this.setInForce(strategy, ordinal, entry.start.epochIds);
+      if (entry.given) {
+        this.pending = this.pending.filter((p) => p !== entry);
+        continue;
+      }
       if (!this.host.fixed(entry.start.epochIds, ordinal, entry.inForce)) continue;
       this.pending = this.pending.filter((p) => p !== entry);
       this.host.emitTrace({

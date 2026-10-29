@@ -407,7 +407,10 @@ describe("the persistent subconscious's window start across a branch move its wi
     await h.framework.switchBranch(branch());
     assert.equal(h.strategy().getAnchorOrdinal(), kept, "the window starts at T1's kept ordinal at the recovering move");
     assert.equal(h.windowStarts()?.[t1.params.epochId], kept, "and T1's start is kept as it was");
-    assert.notEqual(h.windowStarts()?.[t2.params.epochId], undefined, "T2's start, entered while the window was the record, is fixed and kept at the move");
+    const t2Start = t2.params.startedAtSequence;
+    const pastBefore = Math.max(0, ...cm.getPresentedMessages().filter((m) => m.sequence < t2Start).map((m) => cm.ordinalOf(m.id)! + 1));
+    assert.equal(h.windowStarts()?.[t2.params.epochId], pastBefore,
+      "T2's start, entered while the window was the record, is fixed and kept at the move, just past the last row in the window stored before it");
     await h.framework.runUntilIdle();
     h.residentRow('AFTER-1 the move');
     await h.framework.runUntilIdle();
@@ -493,7 +496,7 @@ describe('SubconsciousWindowAnchor', () => {
     assert.deepEqual(h.calls, ['setAnchor(50)', 'setAnchorOrdinal(1)'], 'and only the start in force moves the window');
   });
 
-  it('a start kept before the window was the record is set at its kept ordinal at the first presentation, clamped to the window, and not fixed again', () => {
+  it('a start given its ordinal while the window was the record is set at it at the first presentation, clamped to the window, and nothing is kept for it', () => {
     const options = { presents: false };
     const h = host(options);
     h.anchor.set({ sequence: 50, ordinal: 9, epochIds: ['t1'] }, [{ sequence: 70, epochIds: ['t2'] }]);
@@ -504,8 +507,8 @@ describe('SubconsciousWindowAnchor', () => {
     assert.deepEqual(h.calls, ['setAnchor(50)', 'setAnchorOrdinal(3)'], 'at its kept ordinal, clamped to the window');
     assert.deepEqual(h.traces.filter((e) => (e as { how?: string }).how === 'clamped'),
       [{ type: 'tune-out:subconscious-window', agentName: SUB, epochIds: ['t1'], how: 'clamped', ordinal: 3, kept: 9 }]);
-    assert.deepEqual(h.fixed, [{ epochIds: ['t1'], ordinal: 9 }, { epochIds: ['t2'], ordinal: 3 }],
-      'kept as it was, and the other start fixed past the last row stored before it');
+    assert.deepEqual(h.fixed, [{ epochIds: ['t2'], ordinal: 3 }],
+      'nothing kept for the start given its ordinal, which stays kept as it was, and the other start fixed past the last row stored before it');
   });
 
   it('a start fixed and not kept keeps that ordinal through a set while the window is the record', () => {
