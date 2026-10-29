@@ -2661,10 +2661,11 @@ test("a render cancelled while it runs leaves the recovery wake of a batch opene
   const gate = new Promise<void>((resolve) => { releaseRender = resolve; });
   let renderStarted!: () => void;
   const started = new Promise<void>((resolve) => { renderStarted = resolve; });
+  const wakes: string[] = [];
   const host: CoalescerHost<null> = {
     isUnread: () => true, isUnshown: () => true, remove: () => true,
     deliver: async (occ) => ({ agent: 'agent', messageId: `row-${occ.eventId}` }),
-    wakeForBatch: async () => {}, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
+    wakeForBatch: async (occ) => { wakes.push(occ.eventId); }, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
     audience: async () => ['agent'],
     render: async (occ) => {
       if (occ.eventId === 'n1') { renderStarted(); await gate; }
@@ -2691,8 +2692,9 @@ test("a render cancelled while it runs leaves the recovery wake of a batch opene
   assert(audits.some((a) => a.kind === 'persist-failed' && a.eventId === 'n2'), "premise: n2's render-start couldn't be made durable");
   releaseRender();
   await first;
+  const woken = wakes.length;
   const deadline = performance.now() + 5_000;
-  while (!audits.some((a) => a.kind === 'recovery-wake' && a.eventId === 'n2')) {
+  while (!wakes.slice(woken).includes('n2')) {
     assert(performance.now() < deadline, "n2's recovery wake came within 5 s");
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
