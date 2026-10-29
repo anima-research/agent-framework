@@ -372,7 +372,7 @@ export class StdioTransport extends McplTransport {
     // The child's stdin and stdout carry the protocol, so after an error on
     // either, a write's EPIPE or a read error, this transport can't reach the
     // child even if it's still running. Nothing more is written (pipeFailure),
-    // and the handler first gives the child STDIO_EXIT_GRACE_MS to exit on its
+    // and the handler first gives the child its exit grace to exit on its
     // own: a child already dead when the write failed, as one a stop's signal
     // reached first, exits within it, and its close carries its own code and
     // signal. One still running then is ended as close() ends it, SIGTERM and
@@ -392,7 +392,7 @@ export class StdioTransport extends McplTransport {
     const endOnPipeError = (err: Error) => {
       if (this.pipeError) return;
       this.pipeError = err;
-      void this.exitWithin(STDIO_EXIT_GRACE_MS).then((gone) => {
+      void this.exitWithin(this.exitGrace()).then((gone) => {
         if (gone || this.terminating) return;
         this.endedForPipe = true;
         return this.terminate();
@@ -509,6 +509,12 @@ export class StdioTransport extends McplTransport {
     await this.terminate();
   }
 
+  /** How long the child gets to exit after a pipe error, after SIGTERM and
+   *  after SIGKILL: {@link STDIO_EXIT_GRACE_MS}, or a test's grace for it. */
+  private exitGrace(): number {
+    return testExitGraces.get(this.child) ?? STDIO_EXIT_GRACE_MS;
+  }
+
   /** Whether the child exits within `ms`: true at once if it has. */
   private exitWithin(ms: number): Promise<boolean> {
     if (this.exited()) return Promise.resolve(true);
@@ -544,7 +550,7 @@ export class StdioTransport extends McplTransport {
   private async escalate(): Promise<void> {
     const child = this.child;
     if (this.exited()) return;
-    const grace = testExitGraces.get(child) ?? STDIO_EXIT_GRACE_MS;
+    const grace = this.exitGrace();
     const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
     const exitWithin = (ms: number) => new Promise<boolean>((resolve) => {
       const timer = setTimeout(() => resolve(false), ms);
@@ -562,7 +568,8 @@ export class StdioTransport extends McplTransport {
   }
 }
 
-/** How long a stdio child gets to exit after SIGTERM, and again after SIGKILL. */
+/** How long a stdio child gets to exit on its own after a pipe error, after
+ *  SIGTERM, and again after SIGKILL. */
 const STDIO_EXIT_GRACE_MS = 2_000;
 
 const testExitGraces = new WeakMap<ChildProcess, number>();
