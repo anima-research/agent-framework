@@ -4865,8 +4865,12 @@ export class AgentFramework {
         privilegedUsersPath: config.gate.privilegedUsersPath,
         ...(judge ? {
           judge: judge.judge,
-          // The residents share one message slot, which the judge reads; a
-          // fork's or the subconscious's store is its own.
+          // The judge reads the primary's window. Another resident's own
+          // rounds aren't in it (an agent's rounds reach another only through
+          // an observe edge), but its turn can store rows the window takes
+          // in, such as mail for the primary, so holding the judge while an
+          // ordinary resident's turn runs is conservative. A fork's or the
+          // subconscious's turn writes in its own slot.
           changesJudgedContext: (agentName: string) => {
             const agent = framework.agents.get(agentName);
             return agent !== undefined && framework.isOrdinaryResident(agent);
