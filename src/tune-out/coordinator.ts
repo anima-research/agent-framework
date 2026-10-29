@@ -111,8 +111,8 @@ interface WindowStartsState {
 }
 
 export function cancelWaitsNote(what: string, noteDropped = false): string {
-  return 'Not cancelled yet: writes are being kept in memory (an operator\'s change to the store is in progress, or a '
-    + 'context the cancel writes to waits to be re-initialized), so the cancel waits until they are stored. '
+  return 'Not cancelled yet: an operator\'s change to the store is in progress, or a context the cancel writes to '
+    + 'refuses writes until a branch move re-initializes it, so the cancel waits until that is over. '
     + `${what} stays in force until then, and what it held is delivered when it ends. If the host stops before then, `
     + 'the cancel is lost and it is still in force after the restart, unless its end time has passed by then.'
     + (noteDropped ? ' Your note isn\'t delivered with it: the cancel already waiting carries a note of its own.' : '');
@@ -880,7 +880,7 @@ export class TuneOutCoordinator {
     const waiting = this.deferredCancels.get(key);
     if (!waiting) {
       this.deferredCancels.set(key, { run, ...(note !== undefined ? { note } : {}), ...(noteAuthor !== undefined ? { noteAuthor } : {}) });
-      console.error(`[tune-out] the cancel of ${what} waits until the writes held in memory are stored, so that its release is stored before the tune-out's end is recorded`);
+      console.error(`[tune-out] the cancel of ${what} waits until the store takes writes again (an operator's change to it is in progress, or a context it writes to refuses writes until it is re-initialized), so that its release is stored before the tune-out's end is recorded`);
       return 'waits';
     }
     if (note === undefined) return 'waits';
