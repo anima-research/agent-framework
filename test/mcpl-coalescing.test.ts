@@ -2654,6 +2654,50 @@ test("a render whose store write is refused keeps its batch, which its recovery 
   assert.equal(coalescer.pendingBatches(), 0);
 });
 
+test("a render cancelled while it runs leaves the recovery wake of a batch opened after it", async () => {
+  let failPersist = false;
+  const audits: Array<{ kind?: unknown; eventId?: unknown }> = [];
+  let releaseRender!: () => void;
+  const gate = new Promise<void>((resolve) => { releaseRender = resolve; });
+  let renderStarted!: () => void;
+  const started = new Promise<void>((resolve) => { renderStarted = resolve; });
+  const host: CoalescerHost<null> = {
+    isUnread: () => true, isUnshown: () => true, remove: () => true,
+    deliver: async (occ) => ({ agent: 'agent', messageId: `row-${occ.eventId}` }),
+    wakeForBatch: async () => {}, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
+    audience: async () => ['agent'],
+    render: async (occ) => {
+      if (occ.eventId === 'n1') { renderStarted(); await gate; }
+      return { content: [{ type: 'text', text: `diff_${occ.eventId}` }] };
+    },
+    audit: (record) => { audits.push(record); },
+    save: () => {},
+    saveNow: () => { if (failPersist) throw new Error('EIO simulated'); },
+  };
+  const coalescer = new PushCoalescer<null>(host, { recoveryBackoffMs: 200 });
+  const occurrence = (eventId: string, flags: Partial<CoalescedOccurrence<null>>): CoalescedOccurrence<null> => ({
+    serverId: 'editor', binding: 'binding', scope: { kind: 'featureSet', id: 'doc' }, key: 'document', eventId, timestamp: TS,
+    retract: false, deferred: false, initial: false, content: [{ type: 'text', text: eventId }], event: null, ...flags,
+  });
+  await coalescer.accept(occurrence('n1', { deferred: true, initial: true }));
+  const first = coalescer.assemble('agent');
+  await started;
+  await coalescer.accept(occurrence('p1', {}));
+  assert(audits.some((a) => a.kind === 'render-cancelled' && a.eventId === 'n1'), "premise: the plain occurrence cancelled n1's render");
+  await coalescer.accept(occurrence('n2', { deferred: true }));
+  failPersist = true;
+  await coalescer.assemble('agent');
+  failPersist = false;
+  assert(audits.some((a) => a.kind === 'persist-failed' && a.eventId === 'n2'), "premise: n2's render-start couldn't be made durable");
+  releaseRender();
+  await first;
+  const deadline = performance.now() + 5_000;
+  while (!audits.some((a) => a.kind === 'recovery-wake' && a.eventId === 'n2')) {
+    assert(performance.now() < deadline, "n2's recovery wake came within 5 s");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+});
+
 test("a render whose store write keeps being refused waits longer before each recovery wake", { timeout: 120_000 }, async (t) => {
   const f = await fixture(); t.after(f.close);
   const coalescer = (f.framework as unknown as { pushCoalescer: { options: { recoveryBackoffMs?: number } } }).pushCoalescer;

@@ -1153,9 +1153,11 @@ export class PushCoalescer<E = unknown> {
     // Settlement runs under the lock: between the RPC's return and the state
     // update no admission can withdraw or replace what is being published.
     let failed = false;
+    let current = false;
     await this.locked(async () => {
       try {
         if (rendering.cancelled || state.rendering !== rendering || this.suspended) return;
+        current = true;
         // Rule 4: authority is re-checked at response.
         if (!this.host.authorized(occurrence)) { this.host.audit({ kind: 'revoked', subject, eventId: occurrence.eventId }); return; }
         const empty = isVisiblyEmptyContent(content);
@@ -1222,7 +1224,7 @@ export class PushCoalescer<E = unknown> {
         if (placement) state.audienceAgent = placement.agent;
       } finally {
         if (state.rendering === rendering) state.rendering = undefined;
-        if (!failed) this.clearRecovery(subject);
+        if (current && !failed) this.clearRecovery(subject);
       }
     });
   }
