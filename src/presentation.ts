@@ -87,7 +87,7 @@ export function isInjectableMidTurn(msg: { participant: string; content: Content
  *  shards on ingest) joins a body's consecutive shards: their non-text
  *  blocks, then one text block of their joined text. The join is that
  *  strategy's `mergeAdjacentBodyGroupRaw`, which context-manager doesn't
- *  export, so the rule is copied here, and a test compares the two. */
+ *  export, so the rule is copied here. */
 export function asCompiled(landed: ReadonlyArray<{ content: ContentBlock[] }>): ContentBlock[] {
   if (landed.length === 1) return landed[0]!.content;
   const blocks = landed.flatMap((m) => m.content);
