@@ -382,6 +382,8 @@ export class AgentRegistry {
    * the records in memory: live, awaiting re-declaration, or ended. A shared
    * fork's record names its parent's namespace, where it owns only a branch,
    * so it holds none.
+   * @internal For the framework's namespace check in
+   * `createEphemeralAgent()`; not a host API.
    */
   namespaceHolder(namespace: string, except: AgentName): AgentName | undefined {
     const pending = [...this.interruptedPending.values()].map((entry) => entry.asWas);
@@ -638,6 +640,7 @@ export class AgentRegistry {
    * for a recipient that is gone (a result or a message, as `reparent`
    * moves for a live agent) is re-addressed to `newParent` and returned for
    * delivery. Its record stays as it ended, since history isn't reparented.
+   * @internal For the framework's `reparentAgent()` of an ended agent; not a host API.
    */
   readdressHeldMail(name: AgentName, newParent: AgentName): { record: AgentRecord; deliverable: HeldMail[] } {
     return this.requested(() => {
@@ -799,6 +802,8 @@ export class AgentRegistry {
    * the newest `endedRetention`. An end whose write fails is reported and
    * stays pending, so the snapshot still lists it and a later settlement (the
    * next boot's) writes it; a failed snapshot write is reported too.
+   * @internal For the framework's boot, once the interrupted jobs'
+   * recipients are told; not a host API.
    */
   settleInterrupted(): void {
     if (this.interruptedPending.size === 0) return;
