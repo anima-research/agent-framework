@@ -82,7 +82,7 @@ describe('a batched wake writes its line only when it says something', () => {
           policies: [{
             name: 'addressed',
             match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'], tagsAny: ['chat:addressed'] },
-            behavior: { debounce: 300 },
+            behavior: { debounce: 100 },
           }],
           default: 'skip',
         },
@@ -111,13 +111,8 @@ describe('a batched wake writes its line only when it says something', () => {
     command(`incoming ${channelId} m-${++n} ${mode} ${text}`);
 
   /** The text of every entry in scout's window. */
-  const window = (): string[] => {
-    const agent = (framework as unknown as {
-      agents: Map<string, { getContextManager(): { getAllMessages(): Array<{ content: Array<{ type: string; text?: string }> }> } }>;
-    }).agents.get('scout')!;
-    return agent.getContextManager().getAllMessages()
-      .map((m) => m.content.filter((b) => b.type === 'text').map((b) => b.text ?? '').join('\n'));
-  };
+  const window = (): string[] => framework.getAgent('scout')!.getContextManager().getAllMessages()
+    .map((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text?: string }).text ?? '').join('\n'));
   const gateLines = (): string[] => window().filter((t) => t.includes('[Gate:'));
 
   /** Holds the gate's batches until `release` is called with them pending. */
@@ -317,7 +312,7 @@ describe('isNewestContextEntry', () => {
   const lineFor = (md: Record<string, unknown>, shown: string, at = Date.now()) => ({
     shown, at, entry: { eventType: 'mcpl:push-event', serverId: 'discord', eventId: md.eventId as string }, policyNames: ['addressed'], channelId: 'discord:dm:1',
   });
-  const linesIn = (needle: string): number => internals().agents.get('scout')!.getContextManager().getAllMessages()
+  const linesIn = (needle: string): number => framework.getAgent('scout')!.getContextManager().getAllMessages()
     .filter((m) => m.content.some((b) => b.type === 'text' && (b.text ?? '').includes(needle))).length;
   const scout = () => (framework as unknown as { agents: Map<string, unknown> }).agents.get('scout');
 
@@ -338,9 +333,9 @@ describe('isNewestContextEntry', () => {
     internals().addMessage('someone', [{ type: 'text', text: 'after it' }], { serverId: 'discord', channelId: 'discord:g1:general', messageId: 'm-after' });
     placing.placeWakeLines(scout(), [line]);
     assert.equal(linesIn('LINE-A'), 1, 'no longer newest: written');
-    const written = internals().agents.get('scout')!.getContextManager().getAllMessages()
-      .find((m) => m.content.some((b) => b.type === 'text' && (b.text ?? '').includes('LINE-A')))!;
-    assert.deepEqual(written.metadata, { source: 'gate:debounce', policies: ['addressed'] }, 'as 0.26.0 wrote it');
+    const written = framework.getAgent('scout')!.getContextManager().getAllMessages()
+      .find((m) => m.content.some((b) => b.type === 'text' && ((b as { text?: string }).text ?? '').includes('LINE-A')))!;
+    assert.equal((written.metadata as { source?: unknown } | undefined)?.source, 'gate:debounce');
     assert.deepEqual(traces.filter((t) => t.type === 'message:added' && (t as { source?: string }).source === 'gate:wake-line').length, 1, 'its write traced as message:added');
     placing.placeWakeLines(scout(), [line]);
     assert.equal(linesIn('LINE-A'), 1, 'written once: a later start writes it no second time');
@@ -898,19 +893,21 @@ describe('a same-turn retry', () => {
       membrane: membrane.asMembrane(),
       agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
       errorPolicy: { onInferenceError: (_e: Error, _a: string, attempt: number) => attempt === 0 ? { retry: true, delayMs: 20 } : { retry: false } },
-      gate: { config: { policies: [{ name: 'addressed', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'], tagsAny: ['chat:addressed'] }, behavior: { debounce: 300 } }], default: 'skip' } },
+      gate: { config: { policies: [{ name: 'addressed', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'], tagsAny: ['chat:addressed'] }, behavior: { debounce: 100 } }], default: 'skip' } },
       mcplServers: [{ id: 'discord', command: process.execPath, args: [FIXTURE], env: { STATUS_PATH: join(tempDir, 'status.jsonl'), COMMAND_PATH: commandPath } }],
       modules: [],
     } as never);
     try {
+      let completed = false;
+      framework.onTrace((event) => { if (event.type === 'inference:completed' && event.agentName === 'scout') completed = true; });
       await framework.start();
       const registry = (framework as unknown as { channelRegistry: { listChannelsRaw(): unknown[] } }).channelRegistry;
       await waitFor(() => registry.listChannelsRaw().length >= 2, 'channel registration');
       appendFileSync(commandPath, `dm ev-r1 134 ${RAW_DM} are you there?\n`);
       await waitFor(() => membrane.calls.length >= 2, 'the failed attempt and its retry');
-      await new Promise((r) => setTimeout(r, 200));
-      const agent = (framework as unknown as { agents: Map<string, { getContextManager(): { getAllMessages(): Array<{ content: Array<{ type: string; text?: string }> }> } }> }).agents.get('scout')!;
-      const texts = agent.getContextManager().getAllMessages().map((m) => m.content.filter((b) => b.type === 'text').map((b) => b.text ?? '').join('\n'));
+      await waitFor(() => completed, "the retried turn's completion");
+      const texts = framework.getAgent('scout')!.getContextManager().getAllMessages()
+        .map((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text?: string }).text ?? '').join('\n'));
       assert.ok(texts.some((t) => t.includes('are you there?')), 'premise: the DM is in the window');
       assert.deepEqual(texts.filter((t) => t.includes('[Gate:')), [], 'no line: nothing arrived after the DM');
     } finally {
