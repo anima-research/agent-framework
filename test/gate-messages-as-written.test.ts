@@ -167,19 +167,40 @@ test("over a gate.json the gate doesn't use, the rules a refusal lists are those
   const dms = { name: 'dms', match: { tagsAny: ['chat:dm'] }, behavior: 'always' };
   const ambient = { name: 'quiet-ambient', match: { tagsAny: ['chat:ambient'] }, behavior: { debounce: '60000' } };
   writeFileSync(join(dir, 'gate.json'), JSON.stringify({ default: 'defer', policies: [dms, ambient] }));
-  assertParts(await refusal({}, 'wake_remove_rule'), {
-    notDone: /nothing was removed/, field: /name is missing/, next: /The rules a change edits are "dms", "quiet-ambient"\./,
-  });
+  const mends = / isn't in force, and a change is saved only if it brings it into force\. Replacing or removing "quiet-ambient" by name would bring gate\.json into force\.$/;
+  const removal = await refusal({}, 'wake_remove_rule');
+  assertParts(removal, { notDone: /nothing was removed/, field: /name is missing/, next: /The rules a change edits are "dms", "quiet-ambient"\./ });
+  assert.match(removal, mends);
   for (const field of ['insertBefore', 'insertAfter']) {
-    assertParts(await refusal({ behavior: 'defer', [field]: 3 }), {
+    const placement = await refusal({ behavior: 'defer', [field]: 3 });
+    assertParts(placement, {
       notDone: /nothing was saved/,
       field: new RegExp(`${field} must be the name of a rule, and it's 3`),
       next: new RegExp(`The other rules a change edits are "dms", "quiet-ambient"\\. Give ${field} one of them`),
     });
+    assert.match(placement, mends);
+    const missing = await refusal({ behavior: 'defer', [field]: 'missing' });
+    assertParts(missing, { notDone: /wasn't saved/, field: new RegExp(`${field} is "missing", and no rule has that name`), next: /The other rules are "dms" and "quiet-ambient"\./ });
+    assert.match(missing, mends);
   }
+
+  writeFileSync(join(dir, 'gate.json'), JSON.stringify({ default: 'wake', policies: [dms] }));
+  assert.match(await refusal({}, 'wake_remove_rule'), /The rules a change edits are "dms"\. gate\.json, at .*, isn't in force, and a change is saved only if it brings it into force\. No change through the gate can bring it into force/);
 
   writeFileSync(join(dir, 'gate.json'), JSON.stringify({ default: 'always', policies: [] }));
   assertParts(await refusal({}, 'wake_remove_rule'), { notDone: /nothing was removed/, field: /name is missing/, next: /There is no rule to remove\./ });
+});
+
+test('a placement naming the rule being replaced, beside other rules, names them and the way on', async (t) => {
+  const { call, refusal } = await agent(t);
+  assert.equal((await call({ name: 'other', behavior: 'defer' })).isError, false);
+  for (const field of ['insertBefore', 'insertAfter']) {
+    assertParts(await refusal({ name: 'mentions', behavior: 'defer', [field]: 'mentions' }), {
+      notDone: /^Rule "mentions" wasn't saved/,
+      field: new RegExp(`${field} is "mentions", the rule being saved, and a rule can't be placed beside itself`),
+      next: new RegExp(`The other rules are "other"\\. Give ${field} one of those to place the rule beside it, or leave it out to replace the rule where it is\\.$`),
+    });
+  }
 });
 
 test("where a change is refused, a refusal that would list the rules gives the change's refusal instead", async (t) => {
@@ -400,14 +421,12 @@ test("text from either file reaches the agent, gate_status and the log with its 
 });
 
 test("a start's recipe line names each rule escaped once", () => {
-  const name = 'a\u0000[b"';
-  const line = reconcileLine({
-    added: [name], removed: [name], updated: [], restored: [], moved: [],
-    keptEdited: [name], differsFromRecipe: [name], outsideRecipe: [name], orderKept: false,
-  })!;
+  const lists = ['added', 'removed', 'updated', 'restored', 'moved', 'keptEdited', 'differsFromRecipe', 'outsideRecipe'] as const;
+  const named = Object.fromEntries(lists.map((list) => [list, [`${list}\u0000[b"`]]));
+  const line = reconcileLine({ ...named, orderKept: false } as unknown as Parameters<typeof reconcileLine>[0])!;
   assert.doesNotMatch(line, CONTROL, line);
   assert.doesNotMatch(line, ESCAPED_TWICE, line);
-  assert.equal(line.split(quotedValue(name)).length - 1, 5, line);
+  for (const list of lists) assert.equal(line.split(quotedValue(`${list}\u0000[b"`)).length - 1, 1, `${list}: ${line}`);
 });
 
 test("the gate:config-error trace and a shadow warning carry supplied text escaped once", (t) => {

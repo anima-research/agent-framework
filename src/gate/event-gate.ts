@@ -514,11 +514,17 @@ function unusableRefusal(unusable: { error: string; notJson?: true }, runs: stri
  * (notUsedClause, describeStart) say which rules keep gate.json out of use
  * and each fix.
  */
-function notUsedRefusal(runs: string): string {
-  return "gate.json isn't used at this start, which runs as one without it does, and a change would put gate.json's rules in "
+function notUsedRefusal(runs: string, path: string): string {
+  return `gate.json, at ${path}, isn't used at this start, which runs as one without it does, and a change would put gate.json's rules in `
     + `force in place of what that runs, so nothing was saved. Meanwhile the gate runs ${runs}. gate_status says what keeps `
     + 'gate.json out of use and what would put it in use, such as giving it rules under "policies", or fixing the starting '
     + 'rules, which whoever runs this host can do, for the next start; until then, a change is refused the same way.';
+}
+
+function savedOnlyInForce(path: string, remedy: string | undefined): string {
+  return remedy === undefined
+    ? ''
+    : ` gate.json, at ${path}, isn't in force, and a change is saved only if it brings it into force. ${remedy}`;
 }
 
 /**
@@ -2713,7 +2719,7 @@ export class EventGate {
       // Rules not gate.json's in force while it holds the text in force: what a
       // start ran in place of one with no rules of its own, until it changes.
       if (read.state === 'loaded' && read.text === this.configText && this.configSource !== 'file') {
-        return { refused: notUsedRefusal(this.rulesRun()) };
+        return { refused: notUsedRefusal(this.rulesRun(), this.configPath) };
       }
       const edit = { top: read.listed.top, rules: [...read.listed.rules] };
       if (read.state === 'loaded') return edit;
@@ -2946,7 +2952,8 @@ export class EventGate {
               + (others.length > 0
                 ? `The other rules are ${quotedList(others)}. Give ${field} one of those to place the rule beside it, or leave it out`
                 : `There are no other rules, so leave ${field} out`)
-              + ' to replace the rule where it is.',
+              + ' to replace the rule where it is.'
+              + savedOnlyInForce(this.configPath, remedy),
             );
           }
           throw new Error(
@@ -2954,7 +2961,8 @@ export class EventGate {
             + (others.length > 0
               ? `The other rules are ${quotedList(others)}. Give ${field} one of those to place the rule beside it, or leave it out`
               : `There are no other rules, so leave ${field} out`)
-            + ' to add the rule at the end, or, where a rule already has its name, to replace that rule where it is.',
+            + ' to add the rule at the end, or, where a rule already has its name, to replace that rule where it is.'
+            + savedOnlyInForce(this.configPath, remedy),
           );
         }
         rules.splice('before' in position ? anchorIdx : anchorIdx + 1, 0, policy);
@@ -3030,10 +3038,13 @@ export class EventGate {
   }
 
   /** @internal For `wake_add_rule`'s and `wake_remove_rule`'s refusals; not a host API. */
-  ruleNamesForChange(): { names: string[] } | { refused: string } {
+  ruleNamesForChange(): { names: string[]; note: string } | { refused: string } {
     const edit = this.rulesForChange();
     if ('refused' in edit) return { refused: edit.refused };
-    return { names: [...new Set(edit.rules.map(nameOf).filter((name): name is string => name !== undefined))] };
+    return {
+      names: [...new Set(edit.rules.map(nameOf).filter((name): name is string => name !== undefined))],
+      note: savedOnlyInForce(this.configPath, edit.remedy),
+    };
   }
 
   /**
@@ -3070,8 +3081,8 @@ export class EventGate {
     // rule it leaves out would wake on, so its default holds events back.
     if (remedy !== undefined && read.config.policies.length === 0) {
       throw new Error(
-        'Nothing was saved: with this change, gate.json would have no rules the gate reads, and its default would hold back every '
-        + `event. Meanwhile the gate runs ${this.rulesRun()}. ${remedy}`,
+        `Nothing was saved: with this change, gate.json, at ${this.configPath}, would have no rules the gate reads, and its default `
+        + `would hold back every event. Meanwhile the gate runs ${this.rulesRun()}. ${remedy}`,
       );
     }
     try {
@@ -4512,7 +4523,7 @@ export class EventGate {
    * means no one is privileged. A file that can't be read, isn't JSON, or
    * holds no list leaves the list that last loaded in this process in effect
    * (none, at startup), with its error in gate_status until a later read
-   * loads it or fails another way. In a list, an entry that isn't a user id is skipped, and named
+   * loads it, finds it gone, or fails another way. In a list, an entry that isn't a user id is skipped, and named
    * in the file's error, and the rest load. With `unlessUnchanged`, a file whose
    * text is the text last read isn't parsed again.
    */

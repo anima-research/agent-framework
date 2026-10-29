@@ -1502,12 +1502,12 @@ test("a later start over a gate.json with a rule list but no rules of its own, w
   const limitedOut = 'the host\'s starting rules would leave out "limited", which could wake the agent';
   const notUsed = notUsedFor(limitedOut, 'fixing "limited" in the starting rules');
   const startSaid = startSaidFor(limitedOut, 'fixing "limited" in the starting rules');
-  const refusedRunning = (runs: string): string => 'gate.json isn\'t used at this start, which runs as one without it does, and '
+  const refusedRunning = (runs: string, path: string): string => `gate.json, at ${path}, isn't used at this start, which runs as one without it does, and `
     + `a change would put gate.json's rules in force in place of what that runs, so nothing was saved. Meanwhile the gate runs ${runs}. `
     + 'gate_status says what keeps gate.json out of use and what would put it in use, such as giving it rules under "policies", or '
     + 'fixing the starting rules, which whoever runs this host can do, for the next start; until then, a change is refused the same way.';
   // Where the start runs the host's starting rules in gate.json's place.
-  const refused = refusedRunning("the host's starting rules");
+  const refused = (path: string): string => refusedRunning("the host's starting rules", path);
 
   // An empty list, a "policies" left out, "" or holding nothing, and a list holding only a rule the gate leaves out: none
   // has rules of its own, so under its "skip", beside starting rules under "always" with one left out that could wake the
@@ -1536,8 +1536,8 @@ test("a later start over a gate.json with a rule list but no rules of its own, w
     assert.equal(gate.evaluate(event(['chat:ambient'])).trigger, true, 'and the rest gets their default, "always"');
     // A change is refused, as it would put gate.json's rules in force in place of the starting rules, and gate.json, its
     // entry and the rules in force stay as they were.
-    assert.throws(() => gate.addPolicy({ name: 'dm', behavior: 'always' }), { message: refused });
-    assert.throws(() => gate.removePolicy('mentions'), { message: refused });
+    assert.throws(() => gate.addPolicy({ name: 'dm', behavior: 'always' }), { message: refused(configPath) });
+    assert.throws(() => gate.removePolicy('mentions'), { message: refused(configPath) });
     assert.equal(readFileSync(configPath, 'utf-8'), written, 'gate.json is as it was');
     assert.deepEqual(gate.getStatus().errors, errors);
     assert.deepEqual(gate.listPolicyNames(), ['mentions']);
@@ -1545,7 +1545,7 @@ test("a later start over a gate.json with a rule list but no rules of its own, w
     (gate as unknown as { lastReloadCheck: number }).lastReloadCheck = 0;
     assert.equal(gate.evaluate(event(['chat:ambient'])).trigger, true);
     assert.deepEqual(gate.getStatus().errors, errors);
-    assert.throws(() => gate.addPolicy({ name: 'dm', behavior: 'always' }), { message: refused });
+    assert.throws(() => gate.addPolicy({ name: 'dm', behavior: 'always' }), { message: refused(configPath) });
   }
 
   // Once gate.json changes, a change edits what it holds, and what it writes is in force, before a reload has applied it too.
@@ -1657,7 +1657,7 @@ test("a later start over a gate.json with a rule list but no rules of its own, w
   assert.equal(neither.gate.getStatus().configSource, 'default');
   assert.equal(neither.gate.evaluate(event(['chat:ambient'])).trigger, true, 'every event wakes the agent');
   assert.throws(() => neither.gate.addPolicy({ name: 'dm', behavior: 'always' }), {
-    message: refusedRunning('no rules: every event gets the default, "always"'),
+    message: refusedRunning('no rules: every event gets the default, "always"', neither.configPath),
   });
 
   // With a rule of its own, gate.json's rules stay in force, without the starting rules a write would leave it unused with.
@@ -2575,14 +2575,14 @@ test("a change that would leave a gate.json the gate doesn't use with no rules i
   t.mock.method(console, 'error', () => {});
   // Its one rule names no kind, so the gate leaves it out, and under "skip" doesn't use the file.
   const deafening = { default: 'skip', policies: [{ name: 'x', match: {}, behavior: {} }] };
-  const refused = (runs: string): string => 'Nothing was saved: with this change, gate.json would have no rules the gate reads, and its '
-    + `default would hold back every event. Meanwhile the gate runs ${runs}. Replacing "x" by name would bring gate.json into force.`;
+  const refused = (runs: string, path: string): string => `Nothing was saved: with this change, gate.json, at ${path}, would have no rules the gate `
+    + `reads, and its default would hold back every event. Meanwhile the gate runs ${runs}. Replacing "x" by name would bring gate.json into force.`;
   const starting = { default: 'skip', policies: [MENTIONS] };
 
   // At a later start, which runs the host's starting rules in its place.
   const later = makeGate(tempDir(t), { file: deafening, initialConfig: starting });
   const written = readFileSync(later.configPath, 'utf-8');
-  assert.throws(() => later.gate.removePolicy('x'), { message: refused("the host's starting rules") });
+  assert.throws(() => later.gate.removePolicy('x'), { message: refused("the host's starting rules", later.configPath) });
   assert.equal(readFileSync(later.configPath, 'utf-8'), written, 'nothing was written');
   assert.equal(later.gate.evaluate(MENTION).trigger, true, 'the starting rules still wake the agent');
   // A replacement that leaves it a rule in force brings it into force.
@@ -2596,21 +2596,21 @@ test("a change that would leave a gate.json the gate doesn't use with no rules i
   assert.equal(reload.gate.evaluate(MENTION).trigger, true);
   assert.match(reload.gate.getStatus().errors.join(' '), /isn't in force/, 'the reload read it');
   assert.deepEqual(names(reload.gate), ['mentions'], 'and kept the rules in force');
-  assert.throws(() => reload.gate.removePolicy('x'), { message: refused(RUNS_LAST) });
+  assert.throws(() => reload.gate.removePolicy('x'), { message: refused(RUNS_LAST, reload.configPath) });
   assert.equal(reload.gate.evaluate(MENTION).trigger, true);
 
   // A removal that leaves only a rule the gate leaves out leaves no rules in force, though the list holds one: a rate
   // limit with no tokens, which wakes on nothing, so it doesn't keep the file out.
   const quietOut = { name: 'q', match: {}, behavior: { rate_limit: { tokens: 0, refillIntervalMs: 60000 } } };
   const leftOnly = makeGate(tempDir(t), { file: { default: 'skip', policies: [deafening.policies[0], quietOut] }, initialConfig: starting });
-  assert.throws(() => leftOnly.gate.removePolicy('x'), { message: refused("the host's starting rules") });
+  assert.throws(() => leftOnly.gate.removePolicy('x'), { message: refused("the host's starting rules", leftOnly.configPath) });
   assert.deepEqual(onDisk(leftOnly.configPath).policies.map((rule) => rule.name), ['x', 'q'], 'nothing was written');
 
   // Of two rules of one name, a removal takes both, so it isn't offered either.
   const twice = makeGate(tempDir(t), { file: { default: 'skip', policies: [deafening.policies[0], deafening.policies[0]] }, initialConfig: starting });
   assert.throws(() => twice.gate.removePolicy('x'), {
-    message: 'Nothing was saved: with this change, gate.json would have no rules the gate reads, and its default would hold back '
-      + 'every event. Meanwhile the gate runs the host\'s starting rules. gate.json has 2 rules named "x", and a change by that '
+    message: `Nothing was saved: with this change, gate.json, at ${twice.configPath}, would have no rules the gate reads, and its default `
+      + 'would hold back every event. Meanwhile the gate runs the host\'s starting rules. gate.json has 2 rules named "x", and a change by that '
       + 'name replaces the first of them.',
   });
 
