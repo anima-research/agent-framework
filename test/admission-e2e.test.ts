@@ -264,7 +264,7 @@ describe('admission: the hold is decided once, before any side effect', () => {
   // the tune-out in force, until the release stores them; then it runs. A
   // crash during the hold leaves the tune-out in force, its stored messages
   // held for the next boot's cancel.
-  it('gap 6 (surgery) — a cancel under a surgery hold waits for its release; a crash during the hold leaves the tune-out in force, and the next boot releases its backlog', async () => {
+  it('gap 6 (surgery) — a cancel under a surgery hold waits for its release; a crash during the hold leaves the tune-out in force, and a cancel at the next boot releases its backlog', async () => {
     const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
     const crashed = mkdtempSync(join(tmpdir(), 'admission-reboot-'));
     try {
