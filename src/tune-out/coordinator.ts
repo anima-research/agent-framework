@@ -597,16 +597,18 @@ export class TuneOutCoordinator {
     return { starts, ...(isOrdinal(state.inForce) ? { inForce: state.inForce } : {}) };
   }
 
-  /** Keep `state`; a write that fails is logged, and the anchor the strategy holds stays as it is. */
-  private writeWindowState(state: WindowStartsState): void {
+  /** Keep `state`, answering whether it was written; a write that fails is logged, and the anchor the strategy holds stays as it is. */
+  private writeWindowState(state: WindowStartsState): boolean {
     try {
       this.channelRegistry.writeCoordinatorState(this.windowStartsStateId, {
         v: 1,
         starts: state.starts,
         ...(state.inForce !== undefined ? { inForce: state.inForce } : {}),
       });
+      return true;
     } catch (err) {
       console.error(`[tune-out] the subconscious's window starts (${this.windowStartsStateId}) couldn't be written, so a restart fixes them again:`, err);
+      return false;
     }
   }
 
@@ -616,10 +618,11 @@ export class TuneOutCoordinator {
    * so a later anchor (another tune-out's enter, a restart) sets that
    * ordinal again rather than converting the tune-out's sequence anew, and
    * kept as the start in force while any tune-out is active, which a
-   * restart sets again (anchorSubconscious).
+   * restart sets again (anchorSubconscious). Answers whether it is kept, so
+   * that the anchor tries again at its next presentation when it isn't.
    */
-  subconsciousWindowFixed(epochIds: readonly string[], ordinal: number): void {
-    if (!this.ordinalsKept()) return;
+  subconsciousWindowFixed(epochIds: readonly string[], ordinal: number): boolean {
+    if (!this.ordinalsKept()) return true;
     const active = new Set(this.activeStarts().map((e) => e.epochId));
     const state = this.readWindowState();
     let changed = false;
@@ -635,7 +638,7 @@ export class TuneOutCoordinator {
       state.inForce = ordinal;
       changed = true;
     }
-    if (changed) this.writeWindowState(state);
+    return changed ? this.writeWindowState(state) : true;
   }
 
   /**

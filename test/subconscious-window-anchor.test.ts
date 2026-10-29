@@ -325,10 +325,13 @@ describe('SubconsciousWindowAnchor', () => {
     const calls: string[] = [];
     const fixed: Array<{ epochIds: readonly string[]; ordinal: number }> = [];
     const traces: unknown[] = [];
-    const state = { owed: options.owed ?? [], rows: options.rows ?? [] };
+    const state = { owed: options.owed ?? [], rows: options.rows ?? [], setFails: 0, keepFails: 0 };
     const strategy: AnchoredStrategy = {
       setAnchor: (sequence) => { calls.push(`setAnchor(${sequence})`); },
-      setAnchorOrdinal: (ordinal) => { calls.push(`setAnchorOrdinal(${ordinal})`); },
+      setAnchorOrdinal: (ordinal) => {
+        calls.push(`setAnchorOrdinal(${ordinal})`);
+        if (state.setFails > 0) { state.setFails--; throw new Error('the slot refused it'); }
+      },
       getAnchorOrdinal: () => undefined,
     };
     const anchor = new SubconsciousWindowAnchor({
@@ -341,7 +344,11 @@ describe('SubconsciousWindowAnchor', () => {
       strategy: () => strategy,
       presents: () => options.presents ?? true,
       owed: () => state.owed.map((sequence) => ({ sequence })),
-      fixed: (epochIds, ordinal) => { fixed.push({ epochIds, ordinal }); },
+      fixed: (epochIds, ordinal) => {
+        fixed.push({ epochIds, ordinal });
+        if (state.keepFails > 0) { state.keepFails--; return false; }
+        return true;
+      },
       emitTrace: (event) => { traces.push(event); },
     });
     return { anchor, calls, fixed, traces, state };
@@ -373,5 +380,30 @@ describe('SubconsciousWindowAnchor', () => {
     assert.deepEqual(h.calls, ['setAnchor(50)', 'setAnchorOrdinal(4)']);
     h.anchor.presented();
     assert.equal(h.fixed.length, 1, 'once');
+  });
+
+  it('a start whose setting or keeping fails is set and kept at the next presentation, at the ordinal it was fixed at', () => {
+    const failedSet = host({ rows: [{ sequence: 10, ordinal: 0 }] });
+    failedSet.state.setFails = 1;
+    const errors = console.error;
+    console.error = () => {};
+    try {
+      failedSet.anchor.set({ sequence: 50, epochIds: ['t1'] });
+    } finally { console.error = errors; }
+    assert.deepEqual(failedSet.fixed, [], 'premise: the set failed, so nothing is kept');
+    failedSet.state.rows.push({ sequence: 20, ordinal: 1 });
+    failedSet.anchor.presented();
+    assert.deepEqual(failedSet.calls, ['setAnchor(50)', 'setAnchorOrdinal(1)', 'setAnchorOrdinal(1)'], 'set again at the ordinal it was fixed at');
+    assert.deepEqual(failedSet.fixed, [{ epochIds: ['t1'], ordinal: 1 }], 'and kept');
+
+    const failedKeep = host({ rows: [{ sequence: 10, ordinal: 0 }] });
+    failedKeep.state.keepFails = 1;
+    failedKeep.anchor.set({ sequence: 50, epochIds: ['t1'] });
+    assert.deepEqual(failedKeep.fixed, [{ epochIds: ['t1'], ordinal: 1 }], 'premise: its keeping failed once');
+    failedKeep.state.rows.push({ sequence: 20, ordinal: 1 });
+    failedKeep.anchor.presented();
+    assert.deepEqual(failedKeep.fixed, [{ epochIds: ['t1'], ordinal: 1 }, { epochIds: ['t1'], ordinal: 1 }], 'kept at the next presentation, at the same ordinal');
+    failedKeep.anchor.presented();
+    assert.equal(failedKeep.fixed.length, 2, 'and then no more');
   });
 });

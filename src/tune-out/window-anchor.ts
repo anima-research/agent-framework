@@ -51,15 +51,19 @@ export interface SubconsciousWindowAnchorHost {
   presents(): boolean;
   /** The rows it is owed that its window doesn't hold yet, one per body (AgentPresentation.owedOf). */
   owed(): readonly Pick<StoredMessage, 'sequence'>[];
-  /** Keep a start fixed for `epochIds` (TuneOutCoordinator.subconsciousWindowFixed). */
-  fixed(epochIds: readonly string[], ordinal: number): void;
+  /** Keep a start fixed for `epochIds` (TuneOutCoordinator.subconsciousWindowFixed); false when it couldn't be kept. */
+  fixed(epochIds: readonly string[], ordinal: number): boolean;
   emitTrace(event: Omit<Extract<TraceEvent, { type: 'tune-out:subconscious-window' }>, 'timestamp' | 'traceId'>): void;
 }
 
 /** The subconscious's window start, set by sequence in legacy mode and by a fixed ordinal once its window is presented. */
 export class SubconsciousWindowAnchor {
-  /** A start whose ordinal isn't fixed yet: some row older than it is still out of the window. */
-  private pending: SubconsciousWindowStart | null = null;
+  /**
+   * A start whose ordinal isn't set and kept yet: some row older than it is
+   * still out of the window, or setting or keeping the ordinal it was fixed
+   * at (`ordinal`) failed, which the next presentation tries again.
+   */
+  private pending: { start: SubconsciousWindowStart; ordinal?: number } | null = null;
 
   constructor(private readonly host: SubconsciousWindowAnchorHost) {}
 
@@ -95,7 +99,7 @@ export class SubconsciousWindowAnchor {
         }
         return;
       }
-      this.pending = start;
+      this.pending = { start };
       strategy.setAnchor(start.sequence);
       this.tryFix();
     } catch (error) {
@@ -113,27 +117,35 @@ export class SubconsciousWindowAnchor {
     }
   }
 
-  /** Fix the pending start's ordinal, once no row owed and stored before it is out of the window. */
+  /**
+   * Fix the pending start's ordinal, once no row owed and stored before it
+   * is out of the window, then set and keep it; until both succeed the start
+   * stays pending at that ordinal.
+   */
   private tryFix(): void {
     const pending = this.pending;
     if (!pending || !this.host.presents()) return;
-    if (this.host.owed().some((row) => row.sequence < pending.sequence)) return;
     const cm = this.host.cm();
     const strategy = this.host.strategy();
     if (!cm || !strategy) return;
-    // Just past the last row in the window stored before the start.
-    let ordinal = 0;
-    for (const row of cm.getPresentedMessages()) {
-      if (row.sequence >= pending.sequence) continue;
-      const at = cm.ordinalOf(row.id);
-      if (at !== undefined && at + 1 > ordinal) ordinal = at + 1;
+    if (pending.ordinal === undefined) {
+      if (this.host.owed().some((row) => row.sequence < pending.start.sequence)) return;
+      // Just past the last row in the window stored before the start.
+      let ordinal = 0;
+      for (const row of cm.getPresentedMessages()) {
+        if (row.sequence >= pending.start.sequence) continue;
+        const at = cm.ordinalOf(row.id);
+        if (at !== undefined && at + 1 > ordinal) ordinal = at + 1;
+      }
+      pending.ordinal = ordinal;
     }
-    this.pending = null;
+    const ordinal = pending.ordinal;
     strategy.setAnchorOrdinal(ordinal);
-    this.host.fixed(pending.epochIds, ordinal);
+    if (!this.host.fixed(pending.start.epochIds, ordinal)) return;
+    this.pending = null;
     this.host.emitTrace({
       type: 'tune-out:subconscious-window', agentName: this.host.agentName,
-      epochIds: [...pending.epochIds], how: 'fixed', ordinal,
+      epochIds: [...pending.start.epochIds], how: 'fixed', ordinal,
     });
   }
 }
