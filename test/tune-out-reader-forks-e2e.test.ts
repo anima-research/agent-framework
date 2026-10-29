@@ -65,7 +65,9 @@ async function waitFor(cond: () => boolean | Promise<boolean>, what: string, tim
  * A fork presents as the resident, so a per-participant mock cannot tell
  * them apart — and `MockMembrane` hands its whole queue to whichever
  * stream starts first. This one keeps two queues and routes by the one
- * thing that distinguishes a reader's request: its framing message.
+ * thing that distinguishes a reader's request: its framing message. Each
+ * stream takes one turn's worth of its queue: the responses up to and
+ * including the first that calls no tool.
  */
 class RoutedMembrane {
   calls: NormalizedRequest[] = [];
@@ -79,7 +81,9 @@ class RoutedMembrane {
   streamYielding(request: NormalizedRequest): MockYieldingStream {
     this.calls.push(request);
     const who = JSON.stringify(request.messages).includes('[Tune-out reader') ? 'reader' : 'resident';
-    const stream = new MockYieldingStream(this.queues[who].splice(0));
+    const queue = this.queues[who];
+    const turnEnd = queue.findIndex((response) => response.toolCalls.length === 0);
+    const stream = new MockYieldingStream(queue.splice(0, turnEnd === -1 ? queue.length : turnEnd + 1));
     this.lastStream = stream;
     return stream;
   }
@@ -245,7 +249,11 @@ describe('tune-out with reader forks', { skip }, () => {
     await framework.runUntilIdle(); // scout's wake for the mail
 
     // ---- a second wake exceeds maxWakes=1: auto-cancel -------------------
-    membrane.push('resident', createMockResponse([{ type: 'text', text: 'ack' }]));
+    membrane.push(
+      'resident',
+      createMockResponse([{ type: 'text', text: 'ack' }]),
+      createMockResponse([{ type: 'text', text: 'ack the prose report' }]),
+    );
     membrane.push('reader', createMockResponse([{ type: 'text', text: 'final look' }]));
     emit('addressed', 'm2', 'scout are you there?');
     await waitFor(() => i.channelRegistry!.getDesiredState('disc', CHANNEL) === 'open', 'auto-cancel returns the channel to open', 20_000);
@@ -261,7 +269,6 @@ describe('tune-out with reader forks', { skip }, () => {
     // finding A): the report is the fork's whole job, so its final prose
     // reaches scout as its report, under its own name — not lost to
     // proseRouting=disabled.
-    membrane.push('resident', createMockResponse([{ type: 'text', text: 'ack the prose report' }]));
     await waitFor(() => scoutMessages().some((m) => m.participant === last.agentName && textOf(m).includes('final look')), 'the prose report reaches scout as mail');
     const proseReport = scoutMessages().find((m) => m.participant === last.agentName && textOf(m).includes('final look'))!;
     assert.equal(proseReport.metadata?.kind, 'agent-result');
