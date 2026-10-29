@@ -11611,7 +11611,7 @@ export class AgentFramework {
       });
       return false;
     }
-    const placement: { agent?: string; messageId?: MessageId } = {};
+    const placement: WritePlacement = {};
     this.addMessage(
       // The sender's own name: its words stay its own.
       recipient.isOwnParticipant(mail.from.agent) && mail.from.agent !== recipient.name
@@ -11657,6 +11657,7 @@ export class AgentFramework {
         reason: `agent-${mail.kind}:${mail.from.agent}`,
         source: 'dendrite',
         timestamp: Date.now(),
+        ...this.readsRowFor(placement, mail.to),
       });
     }
     return true;
