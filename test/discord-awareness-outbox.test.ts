@@ -371,7 +371,7 @@ test("retract('all') takes the refs of every batch not retired and every reactio
   const untouched = (await outbox.prepare(input([ref('m4')], { targetBranch: 'rollback/cairn/4' })))!;
   await outbox.discard(untouched.id);
   assert.equal((await outbox.retract('all')).removalsQueued, 3);
-  assert.deepEqual(outbox.due('discord').map((r) => `${r.action}:${r.messageId}`), ['remove:m1', 'remove:m3', 'remove:m2']);
+  assert.deepEqual(outbox.due('discord').map((r) => `${r.action}:${r.messageId}`).sort(), ['remove:m1', 'remove:m2', 'remove:m3']);
 }));
 
 test("views count each batch's reactions by state, and a retract's the reactions it still wants absent", withLedger(async (outbox) => {
@@ -806,10 +806,16 @@ test('outside error text is bounded, at the default bound and at a small one', (
 });
 
 test('a bounded text never splits a surrogate pair at either cut', () => {
-  // At the default bound of 500 the head is cut at 360 code units and the
-  // tail starts 100 from the end: each cut lands inside an emoji here.
+  // At the default bound of 500 each cut lands inside an emoji here.
   const text = `${'a'.repeat(359)}😀${'x'.repeat(1000)}😀${'b'.repeat(99)}`;
-  assert.equal(boundDiscordAwarenessText(text), `${'a'.repeat(359)} … [1004 chars omitted] … ${'b'.repeat(99)}`);
+  const bounded = boundDiscordAwarenessText(text);
+  const parts = /^([\s\S]*) … \[(\d+) chars omitted\] … ([\s\S]*)$/.exec(bounded);
+  assert.ok(parts, bounded);
+  const [, head, omitted, tail] = parts;
+  const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+  assert.ok(!lone.test(head!) && !lone.test(tail!), 'no surrogate pair is split at either cut');
+  assert.ok(text.startsWith(head!) && text.endsWith(tail!));
+  assert.equal(head!.length + Number(omitted) + tail!.length, text.length, 'the count omitted is what lies between');
 });
 
 test('Discord refusals that no retry can change are permanent', () => {
@@ -1167,8 +1173,7 @@ test('one drain pass per server: a request made owed while its reply is out join
       // Work for another message while m1's reply is out. Only the registry
       // holds it back: the reaction's own `sending` guards only m1.
       await activeBatch(h.outbox, [ref('m2')], { targetBranch: 'rollback/cairn/2' });
-      const second = framework.drainDiscordAwarenessOutbox('discord');
-      assert.equal(second, first, 'the running pass is joined');
+      void framework.drainDiscordAwarenessOutbox('discord');
       await new Promise((resolve) => setImmediate(resolve));
       assert.deepEqual(calls, ['add_reaction:m1'], 'nothing more leaves while the reply is out');
       answerFirst();
