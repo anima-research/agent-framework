@@ -20,8 +20,8 @@
   another reader's live turn no longer holds back an agent's clock rows, `[continue]` rows or stored injections.
 - `undoLastTurn` and `redo` work on the agent's window (decision 4; the breaking entry says what that changes): the
   result's `window` field (`{ retracted, represented }`) says how many rows left or entered it, and a
-  `window:undone` trace is emitted. The API server broadcasts a `window:undone` event (with the agent's name, the
-  counts and the reason) for them. `TurnCheckpoint` records the window's index length and branch while the context
+  `window:undone` trace is emitted, which the API server broadcasts to its clients.
+  `TurnCheckpoint` records the window's index length and branch while the context
   is presented. A redo first takes out the rows presented since its undo, which the agent's next point presents
   after the redone turn, so undos redone in turn give back the window they took, in its order. The agent's read
   marks that covered the undone rows (consumed, shown, answered, and each destination's) cover them again once a

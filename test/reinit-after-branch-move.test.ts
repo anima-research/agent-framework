@@ -326,7 +326,9 @@ describe('after a branch move, every agent on the store compiles without a resta
       cmdRedo(params: { agentName: string }): Promise<Record<string, unknown>>;
       cmdAgentContext(params: { agentName: string }): Promise<{ context: unknown[] }>;
       broadcast(event: string, data: unknown): void;
+      handleTraceEvent(event: unknown): void;
     };
+    framework.onTrace((event) => api.handleTraceEvent(event));
     // b's rows were written past the framework, so they enter its window at
     // its next point (#291): present them, as a turn of b's would.
     (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent('b'));
