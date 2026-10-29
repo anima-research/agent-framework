@@ -1990,10 +1990,11 @@ class PartialDelivery extends Error {
   }
 }
 
-function deliveredInPart(err: unknown, it: string): string | undefined {
+function deliveredInPart(err: unknown, it: 'it' | 'them'): string | undefined {
   if (!(err instanceof PartialDelivery)) return undefined;
   const one = err.notWoken.length === 1;
-  return `woke ${err.woke.join(', ')}; ${err.notWoken.join(', ')} ${one ? "isn't" : "aren't"} woken, since delivering ${it} threw (${err.message})`;
+  return `${it === 'it' ? 'was' : 'were'} delivered to ${joinedList(err.woke)} alone: delivering ${it} threw (${err.message}), `
+    + `so ${it === 'it' ? "it's" : "they're"} dropped for ${joinedList(err.notWoken)}, who ${one ? "isn't" : "aren't"} woken`;
 }
 
 /**
