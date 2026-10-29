@@ -6,7 +6,7 @@ import { once } from 'node:events';
 import { WebSocketServer } from 'ws';
 import type { AddressInfo } from 'node:net';
 import { openTransport, WebSocketTransport } from '../src/mcpl/transport.js';
-import { serverConfigProblems } from '../src/mcpl/protocol-family.js';
+import { redactServerText, serverConfigProblems } from '../src/mcpl/protocol-family.js';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 
@@ -190,22 +190,26 @@ test('abort during pending provider cannot create a late dial', async () => {
   } finally { await s.close(); }
 });
 
-test('strict connection reconnect fetches a rotated credential', async () => {
+test('strict connection reconnect fetches and redacts a rotated credential', async () => {
   const s = await mock(); let token = canary(); let calls = 0; let conn: McplServerConnection | undefined;
+  const c = config(s.url, { reconnect: true, reconnectIntervalMs: 40, accessProvider: async () => { calls++; return token; } });
+  const first = token;
   try {
-    conn = await McplServerConnection.connect(config(s.url, { reconnect: true, reconnectIntervalMs: 40, accessProvider: async () => { calls++; return token; } }) as McplServerConfig,
+    conn = await McplServerConnection.connect(c as McplServerConfig,
       { version: '0.4', pushEvents: true, featureSets: true });
     assert.equal(s.requests[0].headers.authorization, `Bearer ${token}`);
+    assert.equal(redactServerText(`sent Bearer ${token}`, c), 'sent Bearer redacted');
     conn.ready();
     token = canary(); for (const ws of s.wss.clients) ws.terminate();
     const deadline = Date.now() + 7000;
     while (s.requests.length < 2 && Date.now() < deadline) await sleep(20);
     assert.equal(s.requests.length, 2); assert.equal(calls, 2);
     assert.equal(s.requests[1].headers.authorization, `Bearer ${token}`); assert.equal(s.requests[1].url, '/mcpl');
+    assert.equal(redactServerText(`previous ${first}; current ${token}`, c), 'previous redacted; current redacted');
   } finally { await conn?.close(); await s.close(); }
 });
 
-test('strict successful header dial stores no provider result on configuration', async () => {
+test('strict header dial redacts server text without storing the provider result on configuration', async () => {
   const s = await mock(); const token = canary(); const c = config(s.url, { accessProvider: async () => token });
   const before = Object.getOwnPropertyDescriptors(c); let t: WebSocketTransport | undefined;
   try {
@@ -213,6 +217,11 @@ test('strict successful header dial stores no provider result on configuration',
     assert.equal(s.requests[0].headers.authorization, `Bearer ${token}`); assert.equal(s.requests[0].url, '/mcpl');
     assert.deepEqual(Object.getOwnPropertyDescriptors(c), before);
     assert.ok(!JSON.stringify(c).includes(token));
+    // Server text is redacted with the caller's original config, not the dial's
+    // policy snapshot: the bounded dial history is keyed by object identity.
+    const text = `sent Bearer ${token}`;
+    assert.equal(redactServerText(text, c), 'sent Bearer redacted');
+    assert.equal(redactServerText(text, { ...c }), text);
   } finally { await t?.close(); await s.close(); }
 });
 
