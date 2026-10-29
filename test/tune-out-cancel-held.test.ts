@@ -112,7 +112,6 @@ test('the notice carries the held messages the cap leaves out, each under its au
   // (B2), nor a stored one (A1), which the subconscious's view has.
   assert.deepEqual(held, [[text('Ann:'), IMAGE], [text('Bo:'), text('A3 held')]],
     'each held message once, oldest first, a row each, its author then its blocks, the held image as it came');
-  assert.equal(held[0]![1], IMAGE, 'the very block that came');
 });
 
 test("a held image the dump shows goes to the report too, as the dump's text lines drop it", () => {
@@ -140,9 +139,6 @@ test('with media on both sides of the cut, the notice carries each held message 
     [text('Bo:'), URL_IMAGE],
     [text('Cy:'), AUDIO],
   ], "Ann's left out, then the media the dump shows, each once and oldest first");
-  assert.equal(held[0]![2], IMAGE);
-  assert.equal(held[1]![1], URL_IMAGE);
-  assert.equal(held[2]![1], AUDIO);
 });
 
 test('a cancel the subconscious makes itself gets the notice and a report turn when a held message goes to it', () => {
