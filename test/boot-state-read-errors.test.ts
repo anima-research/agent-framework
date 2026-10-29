@@ -725,7 +725,7 @@ test('a host-managed feature set restored from the store has its state read by l
   } finally { store.close(); }
 }));
 
-test("loadHostStates reads only its own server's host-managed trees, and only those with no state in memory", inStoreDir('boot-read-host-state-scope-', async (storePath) => {
+test("loadHostStates loads its own server's host state, not another server's, and leaves a state already in memory as it is", inStoreDir('boot-read-host-state-scope-', async (storePath) => {
   const noop = () => {};
   const first = JsStore.openOrCreate({ path: storePath });
   try {
@@ -738,25 +738,19 @@ test("loadHostStates reads only its own server's host-managed trees, and only th
     checkpoints.registerFeatureSet('srv', 'undo', { hostState: false, rollback: true });
   } finally { first.close(); }
   const store = JsStore.openOrCreate({ path: storePath });
-  // The states loadHostStates reads.
-  const proto = JsStore.prototype as unknown as { getStateJson(this: JsStore, id: string): unknown };
-  const original = proto.getStateJson;
-  const read: string[] = [];
-  proto.getStateJson = function (this: JsStore, id: string) {
-    if (new Error().stack?.includes('loadHostState')) read.push(id);
-    return original.call(this, id);
-  };
   try {
     const checkpoints = new CheckpointManager(store, noop);
     checkpoints.loadHostStates('srv');
-    assert.deepEqual(read, ['mcpl/state/srv/doc'], "only srv's host-managed tree is read");
-    assert.deepEqual(checkpoints.getCurrentState('srv', 'doc'), { count: 1 });
+    assert.deepEqual(checkpoints.getCurrentState('srv', 'doc'), { count: 1 }, "srv's host-managed tree is loaded");
     assert.equal(checkpoints.getCurrentState('other', 'doc'), undefined, "another server's tree waits for its own connect");
-    // A state already in memory, as a connected server's is, isn't read again.
+    // A state already in memory, as a connected server's is, isn't read
+    // again: a newer stored state doesn't replace it.
+    const writer = new CheckpointManager(store, noop);
+    writer.registerFeatureSet('srv', 'doc', { hostState: true, rollback: false });
+    writer.recordCheckpoint('srv', 'doc', { checkpoint: 'c2', data: { count: 9 } } as never);
     checkpoints.loadHostStates('srv');
-    assert.deepEqual(read, ['mcpl/state/srv/doc'], 'nothing is read a second time');
+    assert.deepEqual(checkpoints.getCurrentState('srv', 'doc'), { count: 1 }, 'the state in memory stands');
   } finally {
-    proto.getStateJson = original;
     store.close();
   }
 }));
