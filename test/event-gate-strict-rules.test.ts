@@ -1988,7 +1988,7 @@ test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its
   for (const field of ['insertBefore', 'insertAfter']) {
     const anchor = await call({ name: 'watch', behavior: 'defer', [field]: 3 });
     assert.equal(anchor.isError, true);
-    assert.match(anchor.content, new RegExp(`wake_add_rule: ${field} must be the name of a rule, and it's 3, so nothing was saved\\. The other rules in force are "mentions"\\. Give ${field} one of them`));
+    assert.match(anchor.content, new RegExp(`wake_add_rule: ${field} must be the name of a rule, and it's 3, so nothing was saved\\. The other rules a change edits are "mentions"\\. Give ${field} one of them`));
   }
   // A name no rule has was refused before this change too, by the gate.
   const absent = await call({ name: 'watch', behavior: 'defer', insertAfter: 'nope' });

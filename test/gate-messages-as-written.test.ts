@@ -151,13 +151,49 @@ test("a placement naming the rule being replaced, or one that isn't a rule's nam
     assertParts(await refusal({ behavior: 'defer', [field]: 3 }), {
       notDone: /nothing was saved/,
       field: new RegExp(`${field} must be the name of a rule, and it's 3`),
-      next: new RegExp(`The other rules in force are "mentions"\\. Give ${field} one of them to place the rule beside it, or leave it out to add the rule at the end`),
+      next: new RegExp(`The other rules a change edits are "mentions"\\. Give ${field} one of them to place the rule beside it, or leave it out to add the rule at the end`),
     });
     assertParts(await refusal({ name: 'mentions', behavior: 'defer', [field]: 3 }), {
       notDone: /nothing was saved/,
       field: new RegExp(`${field} must be the name of a rule, and it's 3`),
-      next: new RegExp(`No other rule is in force, so leave ${field} out to add the rule at the end`),
+      next: new RegExp(`There is no other rule to place it beside, so leave ${field} out to add the rule at the end`),
     });
+  }
+});
+
+test("over a gate.json the gate doesn't use, the rules a refusal lists are those a change edits, the one left out included", async (t) => {
+  const { refusal, dir } = await agent(t);
+  t.mock.method(console, 'error', () => {});
+  const dms = { name: 'dms', match: { tagsAny: ['chat:dm'] }, behavior: 'always' };
+  const ambient = { name: 'quiet-ambient', match: { tagsAny: ['chat:ambient'] }, behavior: { debounce: '60000' } };
+  writeFileSync(join(dir, 'gate.json'), JSON.stringify({ default: 'defer', policies: [dms, ambient] }));
+  assertParts(await refusal({}, 'wake_remove_rule'), {
+    notDone: /nothing was removed/, field: /name is missing/, next: /The rules a change edits are "dms", "quiet-ambient"\./,
+  });
+  for (const field of ['insertBefore', 'insertAfter']) {
+    assertParts(await refusal({ behavior: 'defer', [field]: 3 }), {
+      notDone: /nothing was saved/,
+      field: new RegExp(`${field} must be the name of a rule, and it's 3`),
+      next: new RegExp(`The other rules a change edits are "dms", "quiet-ambient"\\. Give ${field} one of them`),
+    });
+  }
+
+  writeFileSync(join(dir, 'gate.json'), JSON.stringify({ default: 'always', policies: [] }));
+  assertParts(await refusal({}, 'wake_remove_rule'), { notDone: /nothing was removed/, field: /name is missing/, next: /There is no rule to remove\./ });
+});
+
+test("where a change is refused, a refusal that would list the rules gives the change's refusal instead", async (t) => {
+  const { refusal, dir } = await agent(t);
+  t.mock.method(console, 'error', () => {});
+  writeFileSync(join(dir, 'gate.json'), '{"policies": [');
+  const changeRefused = /gate\.json, at .*, isn't JSON the gate can read .*Until gate\.json is JSON, a change is refused the same way\.$/;
+  const removal = await refusal({}, 'wake_remove_rule');
+  assertParts(removal, { notDone: /nothing was removed/, field: /name is missing/, next: changeRefused });
+  assert.doesNotMatch(removal, /The rules/);
+  for (const field of ['insertBefore', 'insertAfter']) {
+    const placement = await refusal({ behavior: 'defer', [field]: 3 });
+    assertParts(placement, { notDone: /nothing was saved/, field: new RegExp(`${field} must be the name of a rule, and it's 3`), next: changeRefused });
+    assert.doesNotMatch(placement, /other rules/);
   }
 });
 
@@ -173,7 +209,7 @@ test("the wake-rule tools' own refusals say nothing was saved or removed, with t
     notDone: /nothing was saved/, field: /more than one placement \(position, insertBefore\)/, next: /Give only one of them/,
   });
   assertParts(await refusal({}, 'wake_remove_rule'), {
-    notDone: /nothing was removed/, field: /name is missing/, next: /the name of a rule is needed, so nothing was removed\. The rules in force are "mentions"\./,
+    notDone: /nothing was removed/, field: /name is missing/, next: /the name of a rule is needed, so nothing was removed\. The rules a change edits are "mentions"\./,
   });
 });
 

@@ -36421,11 +36421,14 @@ export class AgentFramework {
       if (call.name === 'wake_remove_rule') {
         const input = (call.input ?? {}) as { name?: unknown };
         if (typeof input.name !== 'string' || !input.name) {
-          const names = [...new Set(this.getGatePolicyNames())].map((name) => quotedValue(name));
+          const edit = this.eventGate!.ruleNamesForChange();
+          const names = 'names' in edit ? edit.names.map((name) => quotedValue(name)) : [];
           finish({
             success: false,
             error: `wake_remove_rule: name is ${shownValue(input.name)}, where the name of a rule is needed, so nothing was removed. `
-              + (names.length > 0 ? `The rules in force are ${names.join(', ')}.` : 'No rule is in force.'),
+              + ('refused' in edit
+                ? edit.refused
+                : names.length > 0 ? `The rules a change edits are ${names.join(', ')}.` : 'There is no rule to remove.'),
             isError: true,
           });
           return;
@@ -36536,14 +36539,17 @@ export class AgentFramework {
       for (const field of ['insertBefore', 'insertAfter'] as const) {
         const anchor = input[field];
         if (anchor !== undefined && (typeof anchor !== 'string' || anchor.length === 0)) {
-          const names = [...new Set(this.getGatePolicyNames())].filter((name) => name !== input.name).map((name) => quotedValue(name));
+          const edit = this.eventGate!.ruleNamesForChange();
+          const names = 'names' in edit ? edit.names.filter((name) => name !== input.name).map((name) => quotedValue(name)) : [];
           finish({
             success: false,
             error: `wake_add_rule: ${field} must be the name of a rule, and it's ${shownValue(anchor)}, so nothing was saved. `
-              + (names.length > 0
-                ? `The other rules in force are ${names.join(', ')}. Give ${field} one of them to place the rule beside it, or leave it out`
-                : `No other rule is in force, so leave ${field} out`)
-              + ' to add the rule at the end, or, where a rule already has its name, to replace that rule where it is.',
+              + ('refused' in edit
+                ? edit.refused
+                : (names.length > 0
+                  ? `The other rules a change edits are ${names.join(', ')}. Give ${field} one of them to place the rule beside it, or leave it out`
+                  : `There is no other rule to place it beside, so leave ${field} out`)
+                  + ' to add the rule at the end, or, where a rule already has its name, to replace that rule where it is.'),
             isError: true,
           });
           return;

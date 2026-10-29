@@ -3029,6 +3029,13 @@ export class EventGate {
     return current.policies.map((p) => p.name);
   }
 
+  /** @internal For `wake_add_rule`'s and `wake_remove_rule`'s refusals; not a host API. */
+  ruleNamesForChange(): { names: string[] } | { refused: string } {
+    const edit = this.rulesForChange();
+    if ('refused' in edit) return { refused: edit.refused };
+    return { names: [...new Set(edit.rules.map(nameOf).filter((name): name is string => name !== undefined))] };
+  }
+
   /**
    * Persist gate.json and apply it in memory together: `top`, its own fields,
    * with `rules` as its rule list. Only what loads is written: a change to a
