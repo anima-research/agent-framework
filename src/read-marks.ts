@@ -22,11 +22,9 @@
  *
  * The mark is opaque: its fields are keyed by symbols this module keeps, so
  * a `mark.sequence` read or a hand-built `{ branch, sequence }` doesn't
- * compile, and an ordinal or a length is branded, so a plain number, such
- * as a sequence, isn't taken where one is asked for. Every compare goes
- * through `covers` (or `coverTest` for many rows) and `markAtOrAfter`. The
- * keys are symbols rather than `#private` fields so two marks taken at the
- * same place are deep-equal.
+ * compile. Every compare goes through `covers` (or `coverTest` for many
+ * rows) and `markAtOrAfter`. The keys are symbols rather than `#private`
+ * fields so two marks taken at the same place are deep-equal.
  */
 import type { ContextManager, StoredMessage } from '@animalabs/context-manager';
 
