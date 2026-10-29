@@ -14,6 +14,14 @@ type Framework = {
 const waiting = (answer: Answer): { waiting?: unknown; note?: string; cancelled?: unknown } =>
   (answer.data ?? {}) as { waiting?: unknown; note?: string; cancelled?: unknown };
 
+function saysWhatItWaitsFor(note: string): void {
+  assert.match(note, /an operator's change to the store/, `names a surgery's hold: ${note}`);
+  assert.match(note, /refuses writes until the host re-initializes it/, `names a refusing context: ${note}`);
+  assert.doesNotMatch(note, /writes (are |kept |held )?(in memory|stored)/, `doesn't say it waits for writes: ${note}`);
+  assert.match(note, /Nothing you can do ends the wait sooner, cancelling again included/, `says it isn't the caller's to end: ${note}`);
+  assert.match(note, /If the host stops before then, the cancel is lost/, `says a stop loses it: ${note}`);
+}
+
 async function heldDuringSurgery() {
   const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
   await registerOpen(f, 'work', 'noisy');
@@ -37,6 +45,7 @@ describe("a cancel that waits for the held writes says so to its caller", () => 
       assert.equal(waiting(answer).cancelled, undefined, `not answered as cancelled: ${JSON.stringify(answer.data)}`);
       assert.equal(waiting(answer).waiting, 'noisy', 'answered as waiting, naming the channel');
       assert.match(waiting(answer).note ?? '', /stays in force/, 'and saying the tune-out stays in force until then');
+      saysWhatItWaitsFor(waiting(answer).note ?? '');
       assert.ok(registry.getTuneOutState('editor', 'noisy'), 'premise: the tune-out is still in force');
       release();
       assert.equal(registry.getTuneOutState('editor', 'noisy'), null, 'ended at the release');
@@ -58,6 +67,7 @@ describe("a cancel that waits for the held writes says so to its caller", () => 
       assert.equal(waiting(answer).cancelled, undefined, `not answered as cancelled: ${JSON.stringify(answer.data)}`);
       assert.equal(waiting(answer).waiting, 'all-except');
       assert.match(waiting(answer).note ?? '', /stays in force/);
+      saysWhatItWaitsFor(waiting(answer).note ?? '');
       assert.ok(coordinator.getAllExcept(), 'premise: the hold is still in force');
       again();
       assert.equal(coordinator.getAllExcept(), null, 'ended at the release');
@@ -72,6 +82,7 @@ describe("a cancel that waits for the held writes says so to its caller", () => 
       assert.equal(waiting(answer).cancelled, undefined, `not answered as cancelled: ${JSON.stringify(answer.data)}`);
       assert.equal(waiting(answer).waiting, true);
       assert.match(waiting(answer).note ?? '', /stays in force/);
+      saysWhatItWaitsFor(waiting(answer).note ?? '');
       assert.ok(registry.getTuneOutState('editor', 'noisy'), 'premise: the tune-out is still in force');
       release();
       assert.equal(registry.getTuneOutState('editor', 'noisy'), null, 'ended at the release');
@@ -97,7 +108,8 @@ describe("a cancel that waits for the held writes says so to its caller", () => 
       assert.equal(result.success, false);
       assert.ok(coordinator.getAllExcept(), 'premise: the hold is still in force');
       assert.doesNotMatch(result.error ?? '', /ended all the same|was delivered/, result.error);
-      assert.match(result.error ?? '', /The focus on it ends once/, result.error);
+      assert.match(result.error ?? '', /The focus on it ends once an operator's change to the store is over, or a context that refuses writes is re-initialized by the host/, result.error);
+      assert.match(result.error ?? '', /Nothing you can do ends it sooner/, result.error);
       again();
       assert.equal(coordinator.getAllExcept(), null, 'ended at the release');
     } finally { release(); again(); await f.close(); }

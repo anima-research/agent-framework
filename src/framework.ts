@@ -32586,7 +32586,7 @@ export class AgentFramework {
           if (!scope || scope.params.except.serverId !== serverId || scope.params.except.channelId !== channelId) return undefined;
           const ended = coordinator.cancelAllExcept('channel-close', 'the excepted channel was closed');
           return ended.ok && ended.deferred
-            ? 'The focus on it ends once an operator\'s change to the store is over, or a context that refuses writes is re-initialized, and what the other channels held is delivered then.'
+            ? 'The focus on it ends once an operator\'s change to the store is over, or a context that refuses writes is re-initialized by the host, and what the other channels held is delivered then. Nothing you can do ends it sooner.'
             : 'The focus on it ended all the same, and what the other channels held was delivered.';
         },
         focusChannelResolver: () => this.tuneOutCoordinator?.focusChannel() ?? null,
