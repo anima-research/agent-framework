@@ -6057,7 +6057,7 @@ export class AgentFramework {
       (typeof until === 'number' && Number.isFinite(until) ? { until } : {});
     const model = this.agents.get(agentName)?.model;
     const cooldown = this.providerAccelerationCooldowns.get(agentName);
-    if (cooldown) {
+    if (cooldown && !(cooldown.rearm && queued.length > 0)) {
       const releaseWakes = cooldown.heldRequests.length > 0 || !(cooldown.auxiliaryOrigin || cooldown.emptiedBy);
       if (releaseWakes || queued.length > 0) {
         return { queued: [], held: { ...ends(cooldown.until), ...(cooldown.rearm ? { rearm: cooldown.rearm } : {}) } };
@@ -12821,8 +12821,6 @@ export class AgentFramework {
     },
   ];
 
-  /** wake_remove_rule's description after its first sentence, the same for
-   *  every agent. */
   private static readonly WAKE_REMOVE_RULE_REST =
     'Any pending debounce batch for that rule is still delivered, held while your turn runs, as ' +
     'its timer would deliver it. Returns whether a rule was removed (false if no ' +
@@ -12969,8 +12967,6 @@ export class AgentFramework {
   private static readonly JUDGED_WAKE_RULE_TOOLS: import('./types/index.js').ToolDefinition[] =
     AgentFramework.WAKE_RULE_TOOLS.map((tool) => {
       if (tool.name === 'wake_remove_rule') {
-        // The settings toolset shows a tool by its first sentence alone
-        // (firstSentence), so what a removal leaves to the judge is said there.
         return {
           ...tool,
           description: 'Remove a wake rule (gate.json policy) by name at runtime; a judge rule\'s pending ' +

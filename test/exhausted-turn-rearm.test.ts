@@ -425,6 +425,24 @@ test('a wake while the agent waits starts its turn at once, with the re-armed tr
   assert.equal(r.admission().providerAdmission.heldRequests, 0, 'nothing is left held');
 });
 
+test("a wake queued while the agent waits for a re-arm is what the judge is told of, not the re-arm's end, since the wake starts the turn at once", async (t) => {
+  const membrane = new ScriptedMembrane((n) => (n <= 3 ? serverError : undefined));
+  const r = await resident(t, membrane, { exhaustedTurnRearmMs: [60_000] });
+  const internal = r.fw as unknown as {
+    upcomingWakesFor(agentName: string): Array<{ at?: number; when?: string; certain: boolean; what: string }>;
+    failedLastTurnFor(agentName: string): { again: { kind: string } } | undefined;
+  };
+  r.say('zz-question');
+  await waitFor(() => r.count('inference:exhausted') === 1, 'the window to end exhausted');
+  assert.equal(r.admission().providerAdmission.heldRequests, 1, 'premise: the re-armed turn is held');
+  queue(r, { reason: 'zz-wake' });
+  assert.deepEqual(internal.upcomingWakesFor('resident').map((w) => w.what), ['a wake already queued (zz-wake)']);
+  assert.equal(internal.failedLastTurnFor('resident')?.again.kind, 'queued');
+  await waitFor(() => r.count('inference:completed') === 1, 'premise: the queued wake starts the turn');
+  assert.equal(membrane.sends.length, 4, 'premise: at once, with no fourth delay of 60 s');
+  assert.equal(r.admission().providerAdmission.heldRequests, 0, 'premise: the re-arm went with the wake');
+});
+
 for (const said of [false, true]) {
   test(`the turn a wake starts while the agent waits is the wake's own, with the error policy's retries; the next re-arm ${said ? 'starts the count again, since a message was said' : 'follows it'}`, async (t) => {
     const membrane = new ScriptedMembrane((n) => (n <= 6 ? serverError : undefined));
