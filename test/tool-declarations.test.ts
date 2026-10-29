@@ -472,14 +472,14 @@ describe('toolDeclarations', () => {
     assert.deepEqual(events, [{ type: 'head:moved', why: 'replaced', changesRemoved: 1 }]);
   });
 
-  it("declares again a change a host's row already says, since it counts only its own", async () => {
+  it("doesn't declare again a change a host's row already carries, though the row isn't its own", async () => {
     const host: Row = { id: 'host', participant: 'system', content: [{ type: 'system_change', defineTools: [tool('b')] } as never] };
     const context = fakeContext([said('user', 'hello'), host]);
     const heads = memoryHeadDeclarations();
     heads.write('agent', { tools: [tool('a')], system: ['You are an agent.'] });
     const request = await agentOn(context, { toolDeclarations: 'entries' }, heads).buildActivationRequest([tool('a'), tool('b')]);
-    assert.deepEqual(changesIn(request.messages), [host.content, [{ type: 'system_change', defineTools: [tool('b')] }]]);
-    assert.deepEqual(changeRows(context.rows).map((r) => r.metadata), [undefined, { system: true, kind: 'system-change', agent: 'agent' }]);
+    assert.deepEqual(changesIn(request.messages), [host.content]);
+    assert.deepEqual(changeRows(context.rows).map((r) => r.metadata), [undefined]);
   });
 
   it("traces nothing on the head for a change row a host stored without the agent's metadata, and leaves it out of the request", async () => {

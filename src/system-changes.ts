@@ -136,7 +136,6 @@ export function changeWriteCheck(): { visit(row: TailRow): boolean; splits(): bo
   };
 }
 
-/** The agent a stored row's change metadata (systemChangeMetadata) names, if it carries any. */
 function changeStampOf(row: { metadata?: unknown }): string | undefined {
   const metadata = row.metadata as { kind?: unknown; agent?: unknown } | undefined;
   return metadata?.kind === 'system-change' && typeof metadata.agent === 'string' ? metadata.agent : undefined;
@@ -293,6 +292,39 @@ export function declarationDifference(
   });
 
   if (removeTools.length === 0 && defineTools.length === 0 && addSystem.length === 0) return { kind: 'none' };
+  return {
+    kind: 'change',
+    block: {
+      type: 'system_change',
+      ...(removeTools.length > 0 ? { removeTools } : {}),
+      ...(defineTools.length > 0 ? { defineTools } : {}),
+      ...(addSystem.length > 0 ? { addSystem } : {}),
+    },
+  };
+}
+
+export function withoutCarried(
+  difference: DeclarationDifference,
+  own: { tools: ReadonlyMap<string, ToolDefinition>; system: readonly string[] },
+  carried: { tools: ReadonlyMap<string, ToolDefinition>; system: readonly string[] },
+): DeclarationDifference {
+  if (difference.kind !== 'change') return difference;
+  const { block } = difference;
+  const defineTools = (block.defineTools ?? []).filter((tool) => {
+    const held = carried.tools.get(tool.name);
+    return !held || canonicalJson(held) !== canonicalJson(tool);
+  });
+  const removeTools = (block.removeTools ?? []).filter((name) => carried.tools.has(name));
+  const othersAdded = new Map<string, number>();
+  for (const text of carried.system) othersAdded.set(text, (othersAdded.get(text) ?? 0) + 1);
+  for (const text of own.system) othersAdded.set(text, (othersAdded.get(text) ?? 0) - 1);
+  const addSystem = (block.addSystem ?? []).filter((text) => {
+    const left = othersAdded.get(text) ?? 0;
+    if (left <= 0) return true;
+    othersAdded.set(text, left - 1);
+    return false;
+  });
+  if (defineTools.length === 0 && removeTools.length === 0 && addSystem.length === 0) return { kind: 'none' };
   return {
     kind: 'change',
     block: {

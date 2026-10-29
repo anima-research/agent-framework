@@ -404,10 +404,9 @@ export interface AgentConfig {
    * name: their turns are presented to the model as this agent's assistant
    * turns. A derived agent sets this to the agent it inherited from, so the
    * parent's turns read as its own history. Stored authorship is never
-   * rewritten. Under `toolDeclarations: 'entries'`, a system change stored
-   * with one of these names' change metadata is this agent's own too: its
-   * view keeps it, its head counts it as declared, and a move of its head or
-   * a request on the head takes it out of the agent's own context.
+   * rewritten. A system change stored with one of these names' change
+   * metadata is this agent's own too: its view keeps it, and a move of its
+   * head, or a request on the head, takes it out of the agent's own context.
    */
   selfParticipants?: string[];
 

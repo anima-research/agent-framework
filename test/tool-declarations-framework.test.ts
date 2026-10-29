@@ -334,6 +334,40 @@ describe('toolDeclarations in the framework', () => {
       });
     });
 
+    it("carries its parent's change once in a host's shared child, whose own participants don't include its parent", async () => {
+      await withFramework([resident('alpha')], async (framework) => {
+        const traces: TraceEvent[] = [];
+        framework.onTrace((event) => { traces.push(event); });
+        const alpha = framework.getAgent('alpha')!;
+        say(alpha, 'user', 'hello');
+        await alpha.buildActivationRequest([tool('a')]);
+        await alpha.buildActivationRequest([tool('a'), tool('b')]);
+        const { name: _name, ...spec } = taskForkSpec('host-child', { parent: 'alpha', inherit: { mode: 'shared' } });
+        const { agent: child } = await framework.createEphemeralAgent({ ...resident('host-child'), systemPrompt: 'You are alpha.' } as never, spec);
+        const request = await child.buildActivationRequest([tool('a'), tool('b')]);
+        assert.deepEqual(request.tools, [tool('a')], "the parent's recorded head");
+        assert.deepEqual(changesIn(request.messages), [[{ type: 'system_change', defineTools: [tool('b')] }]], "and the parent's change, once");
+        assert.deepEqual(traces.filter((t) => (t as { agentName?: string }).agentName === 'host-child' && t.type === 'head:declared'), [], 'nothing declared again');
+      });
+    });
+
+    it("carries a change the host copied without stamping it once: the copy is in the request, so the child doesn't declare it again", async () => {
+      await withFramework([resident('alpha')], async (framework) => {
+        const traces: TraceEvent[] = [];
+        framework.onTrace((event) => { traces.push(event); });
+        const alpha = framework.getAgent('alpha')!;
+        say(alpha, 'user', 'hello');
+        await alpha.buildActivationRequest([tool('a')]);
+        await alpha.buildActivationRequest([tool('a'), tool('b')]);
+        const { messages } = await alpha.getContextManager().compile(undefined, undefined, { dryRun: true });
+        const { agent: child } = await framework.createEphemeralAgent({ ...resident('copy-child'), systemPrompt: 'You are alpha.' } as never, inheriting('copy-child', 'alpha'));
+        for (const m of messages) child.getContextManager().addMessage(m.participant, m.content);
+        const request = await child.buildActivationRequest([tool('a'), tool('b')]);
+        assert.deepEqual(changesIn(request.messages), [[{ type: 'system_change', defineTools: [tool('b')] }]], "the copied change, once");
+        assert.deepEqual(traces.filter((t) => (t as { agentName?: string }).agentName === 'copy-child' && t.type === 'head:declared'), [], 'nothing declared again');
+      });
+    });
+
     it("keeps the child's head its own: neither one's moves reach the other's record", async () => {
       await withFramework([resident('alpha')], async (framework) => {
         const { alpha, child } = await forked(framework, {}, inheriting('alpha-child', 'alpha'), 'alpha-child');
@@ -495,6 +529,21 @@ describe('toolDeclarations in the framework', () => {
       assert.equal(heads.headDeclarationCache?.heads.has('alpha-fork'), false, "a closed fork's head leaves memory");
       assert.notEqual(heads.headDeclarations.read('alpha-fork'), null, "and stays in the store, as the rest of its data does");
       assert.notEqual(heads.headDeclarations.read('alpha'), null);
+    }, undefined, { conversations: { templateAgent: 'alpha' } });
+  });
+
+  it("reads the template's head as a fork's creation begins, so a head the template moves meanwhile costs the fork one declaration, never a change carried twice", async () => {
+    await withFramework([resident('alpha')], async (framework) => {
+      const alpha = framework.getAgent('alpha')!;
+      say(alpha, 'user', 'hello');
+      await alpha.buildActivationRequest([tool('a')]);
+      const internals = framework as unknown as { createConversationAgent(name: string, channelId: string): Promise<Agent>; headDeclarations: { write(name: string, head: unknown): void } };
+      const pending = internals.createConversationAgent('alpha-fork', 'chanA');
+      internals.headDeclarations.write('alpha', { tools: [tool('a'), tool('b')], system: ['You are alpha.'] });
+      const fork = await pending;
+      const request = await fork.buildActivationRequest([tool('a'), tool('b')]);
+      assert.deepEqual(request.tools, [tool('a')], "the template's head as creation began");
+      assert.deepEqual(changesIn(request.messages), [[{ type: 'system_change', defineTools: [tool('b')] }]], 'and the difference declared once');
     }, undefined, { conversations: { templateAgent: 'alpha' } });
   });
 
@@ -852,6 +901,24 @@ describe('toolDeclarations in the framework', () => {
       assert.deepEqual(owners(), ['host'], "alpha's move took its own change and left the host's");
       assert.deepEqual(changesIn((await alpha.buildActivationRequest([tool('a'), tool('b')], system('v2'))).messages), [hostChange], 'which still goes out as stored');
     }, undefined, { subconscious: { enabled: true, systemPrompt: 'You attend.' } });
+  });
+
+  it("lets a host's row that adds system text a resident doesn't hold cause no move and no declaration, request after request", async () => {
+    await withFramework([resident('alpha')], async (framework) => {
+      const traces: TraceEvent[] = [];
+      framework.onTrace((event) => { traces.push(event); });
+      const alpha = framework.getAgent('alpha')!;
+      say(alpha, 'user', 'hello');
+      await alpha.buildActivationRequest([tool('a')]);
+      const hostChange = [{ type: 'system_change', addSystem: ['HOST TEXT'] }] as unknown as ContentBlock[];
+      alpha.getContextManager().addMessage('system', hostChange);
+      const before = traces.length;
+      for (const n of [1, 2]) {
+        const request = await alpha.buildActivationRequest([tool('a')]);
+        assert.deepEqual(changesIn(request.messages), [hostChange], `request ${n} carries the host's row as stored`);
+      }
+      assert.deepEqual(traces.slice(before).filter((t) => t.type.startsWith('head:')), [], 'no move and no declaration');
+    });
   });
 
   for (const order of ['a change, then a stored injection', 'a stored injection, then a change', 'a stored injection, then a change a dry run shows'] as const) {

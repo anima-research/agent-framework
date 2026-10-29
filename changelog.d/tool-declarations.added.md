@@ -21,15 +21,27 @@
   `'head'`, sends requests as before, leaving any system changes out. New
   trace events: `head:declared`, `head:moved` and `head:resend`.
 - An agent that continues another's context starts on that agent's head:
-  `deriveAgent`, and `createEphemeralAgent` with a spec whose `inherit`
-  sets no `atSequence` and names a running agent that declares entries,
-  start the new agent with that agent's recorded head. `deriveAgent`'s
-  copy stamps the parent's own system changes as the child's, and a host
-  that copies the messages itself stamps them with `systemChangeMetadata`
-  (exported beside `isSystemChangeMessage`), so the new agent reads the
-  parent's cache and declares only its own difference. That pays for a
-  fork with its parent's system text; a subagent with its own system
-  prompt moves to its own head at its first request, as without it.
+  `deriveAgent`, and `createEphemeralAgent` with a spec whose `inherit` sets
+  no `atSequence` and names a running agent that declares entries, start the
+  new agent with that agent's recorded head, read as its creation begins. A
+  change the request already carries, whoever's row holds it, isn't declared
+  again, so the new agent reads the parent's cache and declares only its own
+  difference. `deriveAgent`'s copy stamps the parent's own system changes as
+  the child's, and a host that copies the messages itself, once
+  `createEphemeralAgent` returns, stamps them with `systemChangeMetadata`
+  (exported beside `isSystemChangeMessage`), so they are the new agent's
+  own, which a move of its head takes out of its context. That pays for a
+  fork with its parent's system text; a subagent with its own system prompt
+  moves to its own head at its first request, as without it.
+- An agent's own system changes are those stored with the change metadata
+  (`systemChangeMetadata`) of its name or one of its `selfParticipants`, in
+  every mode: its view keeps them where it leaves out another's, and its
+  head's moves take them out of its context. A resident's registry record
+  now states its `selfParticipants` and `presentAs`, as a derived agent's
+  does, so `inspect` shows them and a context reopened from records reads
+  the mapping that ran. The subconscious no longer copies its resident's
+  `selfParticipants` and `presentAs`: its resident's former-name turns read
+  as another's, as its current ones already did.
 - kv-unified's immutable-prefix hash takes an agent's tools as the wire
   carries them, leaving out a field whose value is undefined, as membrane's
   request does, where it wrote such a field as null. A host whose tool

@@ -19,6 +19,7 @@ import {
   SYSTEM_CHANGE_PARTICIPANT,
   declarationDifference,
   effectiveDeclaration,
+  withoutCarried,
   endsOnUnansweredCalls,
   changeWriteCheck,
   type TailRow,
@@ -2660,7 +2661,9 @@ export class Agent {
     }
     if (!recorded) return this.moveHead(compiled, compiledWith, current, 'adopted', dryRun, compile);
     const blocks = compiled.messages.flatMap((message, index) => (own.has(index) ? message.content.filter(isSystemChangeContent) : []));
-    const difference = declarationDifference(effectiveDeclaration(recorded, blocks), current);
+    const ownDeclaration = effectiveDeclaration(recorded, blocks);
+    const sent = compiled.messages.flatMap((message) => message.content.filter(isSystemChangeContent));
+    const difference = withoutCarried(declarationDifference(ownDeclaration, current), ownDeclaration, effectiveDeclaration(recorded, sent));
     if (difference.kind === 'replace') return this.moveHead(compiled, compiledWith, current, 'replaced', dryRun, compile);
     const consolidation = this.consolidation(compiled, own, blocks);
     if (consolidation) return this.moveHead(compiled, compiledWith, current, 'consolidated', dryRun, compile, consolidation);

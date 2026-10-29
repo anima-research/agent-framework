@@ -10738,11 +10738,12 @@ export class AgentFramework {
    * agent starts with that agent's recorded head, as its own record: the same
    * head object at first, since a record is never changed in place, and each
    * of the new agent's moves records its own. Its context then continues
-   * that agent's, shared, or copied by the host with that agent's system
-   * changes stamped with `systemChangeMetadata(config.name)`, and it sends the
-   * same prefix, so it reads that agent's cache and declares only its own
-   * difference. A change copied unstamped is the host's own row to the new
-   * agent, which then declares that change again.
+   * that agent's, shared, or copied by the host once this returns, and it
+   * sends the same prefix, so it reads that agent's cache and declares only
+   * its own difference: a change its request already carries, whoever's row
+   * holds it, isn't declared again. A host that copies stamps that agent's
+   * system changes with `systemChangeMetadata(config.name)`, so they are the
+   * new agent's own, which a move of its head takes out of its context.
    * That holds for a fork of the same self: system text that is that agent's
    * head's blocks, plus additions. A new agent with its own system prompt,
    * or other system injections, meets a replacement at its first request and
@@ -11183,7 +11184,11 @@ export class AgentFramework {
     const release: ManagerRelease = { released: false, calls: new Set() };
     let contextManager: ContextManager;
     try {
-      contextManager = await this.reopenAgentContext(record, config.strategy, this.ephemeralAuxiliaryMembraneFor(name, release));
+      contextManager = await this.reopenAgentContext(
+        { ...record, ...(fullConfig.selfParticipants !== undefined ? { selfParticipants: fullConfig.selfParticipants } : {}) },
+        config.strategy,
+        this.ephemeralAuxiliaryMembraneFor(name, release),
+      );
     } catch (error) {
       this.resumesPending.delete(name);
       throw error;
@@ -16723,7 +16728,9 @@ export class AgentFramework {
 
           // A live stream handed these messages after the results follows
           // them in its next round, not the tool loop of a reply to
-          // [Continue]: that round's rows carry no prompt. One that doesn't
+          // [Continue]: that round's rows carry no prompt. System changes
+          // aside: they aren't a turn, so a round handed only changes
+          // follows the prompt, as the assembly reads it. One that doesn't
           // say whether it carries them (membrane 0.5.x, whose native path
           // carries them and whose XML path drops them) counts as carrying
           // them here, as at the drain above. A boundary that ends the turn,
@@ -17705,6 +17712,7 @@ export class AgentFramework {
     if (this.usedEphemeralAgentNames.has(name) || this.agents.has(name)) {
       throw new Error(`Conversation agent name "${name}" is already registered or reserved`);
     }
+    const templateHead = this.headDeclarations.read(template.name);
     this.usedEphemeralAgentNames.set(name, 'conversation');
     this.conversationSpawnsInFlight.add(name);
     const release: ManagerRelease = { released: false, calls: new Set() };
@@ -17812,7 +17820,6 @@ export class AgentFramework {
             contextManager.addMessage(participant, msg.content, systemChangeMetadata(name) as never);
           } else contextManager.addMessage(participant, msg.content);
         }
-        const templateHead = this.headDeclarations.read(template.name);
         if (templateHead) this.headDeclarations.write(name, templateHead);
       }
 
