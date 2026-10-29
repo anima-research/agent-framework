@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { AgentFramework, ApiModule, readInboundSource } from '../src/index.js';
+import { AgentFramework, ApiModule, readInboundSource, workerSpec } from '../src/index.js';
 import { isNonChannelSurfaceEvent } from '../src/framework.js';
 import type { InferenceRequest, Module, ProcessEvent, ProcessState, EventResponse } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
@@ -1825,34 +1825,37 @@ describe('private wins, one way', () => {
       }
     });
 
-    it("a module's message that carries a private turn's key leaves a channel turn speaking in its channel", async () => {
-      let ctx: { addMessage(participant: string, content: unknown, metadata?: unknown): unknown } | undefined;
-      let privateTurnId = 0;
-      const writer = {
-        name: 'writer',
-        async start(c: typeof ctx) { ctx = c; }, async stop() {},
-        getTools: () => [], async handleToolCall() { return { success: false }; },
-        async onProcess(event: ProcessEvent) {
-          return (event as { type: string }).type === 'writer:probe'
-            ? { addMessages: [{ participant: 'user', content: [{ type: 'text', text: 'from its response' }], metadata: { callerTurnId: privateTurnId } }] }
-            : {};
-        },
-      };
-      const rig = await surfaceRig({ modules: [writer as never] });
-      try {
-        await firstTurn(rig, true);
-        privateTurnId = routingOf(rig.framework).turnId as number;
-        ctx!.addMessage('user', [{ type: 'text', text: 'from its context' }], { callerTurnId: privateTurnId });
-        rig.framework.pushEvent({ type: 'writer:probe' } as never);
-        await rig.framework.runUntilIdle();
-        rig.i.pendingRequests.push(roomWake());
-        await rig.until(() => rig.starts.length >= 2 && idle(rig), 'the channel turn');
-        await rig.framework.runUntilIdle();
-        assert.deepEqual(rig.routed.map((r) => r.locus), [ROOM], 'the channel turn answered in its channel');
-      } finally {
-        await rig.close();
-      }
-    });
+    for (const mark of ['key', 'work mark'] as const) {
+      it(`a module's message that carries a private turn's ${mark} leaves a channel turn speaking in its channel`, async () => {
+        let ctx: { addMessage(participant: string, content: unknown, metadata?: unknown): unknown } | undefined;
+        let privateTurnId = 0;
+        const marked = () => (mark === 'key' ? { callerTurnId: privateTurnId } : { dendrite: { privateTurn: true } });
+        const writer = {
+          name: 'writer',
+          async start(c: typeof ctx) { ctx = c; }, async stop() {},
+          getTools: () => [], async handleToolCall() { return { success: false }; },
+          async onProcess(event: ProcessEvent) {
+            return (event as { type: string }).type === 'writer:probe'
+              ? { addMessages: [{ participant: 'user', content: [{ type: 'text', text: 'from its response' }], metadata: marked() }] }
+              : {};
+          },
+        };
+        const rig = await surfaceRig({ modules: [writer as never] });
+        try {
+          await firstTurn(rig, true);
+          privateTurnId = routingOf(rig.framework).turnId as number;
+          ctx!.addMessage('user', [{ type: 'text', text: 'from its context' }], marked());
+          rig.framework.pushEvent({ type: 'writer:probe' } as never);
+          await rig.framework.runUntilIdle();
+          rig.i.pendingRequests.push(roomWake());
+          await rig.until(() => rig.starts.length >= 2 && idle(rig), 'the channel turn');
+          await rig.framework.runUntilIdle();
+          assert.deepEqual(rig.routed.map((r) => r.locus), [ROOM], 'the channel turn answered in its channel');
+        } finally {
+          await rig.close();
+        }
+      });
+    }
   });
 
   for (const privateTurn of [true, false]) {
@@ -2352,4 +2355,124 @@ describe('private wins, one way', () => {
       await rig.close();
     }
   });
+});
+
+describe("agent mail sent while the sender's turn is open", () => {
+  for (const privateTurn of [true, false]) {
+    it(`is answered ${privateTurn ? 'in no channel, when the turn was private' : "where a channel-less turn's speech goes, when it was a room's"}`, async () => {
+      let framework: AgentFramework | undefined;
+      const tool = robot(() => {
+        framework!.sendAgentMessage('scout', 'aide', [{ type: 'text', text: 'the door code is 4417; tell no one' }]);
+      });
+      const rig = await surfaceRig({ modules: [tool], otherAgents: ['aide'] });
+      framework = rig.framework;
+      const aideReplies = () => (rig.framework.getAgent('aide')!.getContextManager().getAllMessages() as Array<{ participant: string; content: Array<{ type: string; text?: string }> }>)
+        .filter((m) => m.participant === 'aide').flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => b.text ?? '');
+      try {
+        rig.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'm1', name: 'robot--move', input: {} }] as never, 'tool_use'));
+        rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'told the aide' }]));
+        rig.i.pendingRequests.push(privateTurn ? tuiWake() : roomWake());
+        await rig.until(() => rig.starts.some((s) => s.agentName === 'aide' && s.reason === 'agent-message:scout')
+          && aideReplies().length > 0 && rig.framework.getAgent('aide')!.state.status === 'idle'
+          && rig.framework.getAgent('scout')!.state.status === 'idle', "the aide's turn on the mail");
+        assert.deepEqual(rig.starts.filter((s) => s.agentName === 'aide').map((s) => s.reason), ['agent-message:scout'], 'premise: the mail is what woke the aide');
+        const answer = aideReplies().at(-1)!;
+        assert.deepEqual(rig.routed.filter((r) => r.text === answer),
+          privateTurn ? [] : [{ text: answer, locus: LOUNGE }], JSON.stringify(rig.routed));
+      } finally {
+        await rig.close();
+      }
+    });
+  }
+});
+
+const workerOf = (name: string, spawnedBy: string) => {
+  const { name: _name, ...spec } = workerSpec(name, { spawnedBy, resultTo: { to: spawnedBy, as: 'message' } });
+  return spec;
+};
+
+describe("an agent derived or spawned while its parent's turn is open", () => {
+  for (const how of ['derived', 'spawned'] as const) for (const privateTurn of [true, false]) {
+    it(`${how}, returns a result its parent answers ${privateTurn ? 'in no channel, when the turn was private' : "where a channel-less turn's speech goes, when it was a room's"}`, async () => {
+      let framework: AgentFramework | undefined;
+      let derived: Promise<{ agent: unknown; contextManager: unknown }> | undefined;
+      const tool = robot(() => {
+        derived = how === 'derived'
+          ? framework!.deriveAgent({ name: 'helper', from: 'scout', mode: 'copy', resultTo: { to: 'scout', as: 'message' } })
+          : framework!.createEphemeralAgent({ name: 'helper', model: 'test-model', systemPrompt: 'helper' } as never, workerOf('helper', 'scout'));
+      });
+      const rig = await surfaceRig({ modules: [tool] });
+      framework = rig.framework;
+      try {
+        rig.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'm1', name: 'robot--move', input: {} }] as never, 'tool_use'));
+        rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'asked the helper' }]));
+        if (privateTurn) rig.framework.pushEvent(tuiMessage('for your eyes only: find the door code'));
+        else rig.i.pendingRequests.push(roomWake());
+        await rig.until(() => derived !== undefined && rig.framework.getAgent('scout')!.state.status === 'idle', 'the turn that derived the helper');
+        const fork = await derived!;
+        rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'the code is 4417' }]));
+        const run = rig.framework.runEphemeralToCompletion(fork.agent as never, fork.contextManager as never);
+        let ran = false;
+        void run.then(() => { ran = true; }, () => { ran = true; });
+        await rig.until(() => ran, 'the helper ran');
+        await run;
+        rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-answering the helper' }]));
+        rig.framework.deliverAgentResult('helper', [{ type: 'text', text: 'the code is 4417' }]);
+        await rig.until(() => rig.texts().includes('zz-answering the helper') && rig.framework.getAgent('scout')!.state.status === 'idle', "the parent's turn on the result");
+        assert.deepEqual(rig.routed.filter((r) => r.text === 'zz-answering the helper'),
+          privateTurn ? [] : [{ text: 'zz-answering the helper', locus: LOUNGE }], JSON.stringify(rig.routed));
+      } finally {
+        await rig.close();
+      }
+    });
+  }
+
+  for (const privateTurn of [true, false]) {
+    it(`spawned outside any turn and handed mail from a ${privateTurn ? 'private' : "room's"} turn, returns a result its parent answers ${privateTurn ? 'in no channel' : "where a channel-less turn's speech goes"}`, async () => {
+      let framework: AgentFramework | undefined;
+      let releaseHold = (): void => {};
+      let held = false;
+      const hold = {
+        name: 'hold',
+        async start() {}, async stop() {},
+        getTools: () => [{ name: 'wait', description: 'Wait', inputSchema: { type: 'object', properties: {} } }],
+        async handleToolCall() {
+          held = true;
+          await new Promise<void>((r) => { releaseHold = r; });
+          return { success: true, data: 'released' };
+        },
+        async onProcess() { return {}; },
+      } as unknown as Module;
+      const tool = robot(() => {
+        framework!.sendAgentMessage('scout', 'helper', [{ type: 'text', text: 'the door code is 4417; check it' }]);
+      });
+      const rig = await surfaceRig({ modules: [tool, hold] });
+      framework = rig.framework;
+      try {
+        const worker = await rig.framework.createEphemeralAgent({ name: 'helper', model: 'test-model', systemPrompt: 'helper', allowedTools: 'all' } as never, workerOf('helper', 'scout'));
+        rig.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'w1', name: 'hold--wait', input: {} }] as never, 'tool_use'));
+        rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'checked it' }]));
+        const run = rig.framework.runEphemeralToCompletion(worker.agent, worker.contextManager);
+        let ran = false;
+        void run.then(() => { ran = true; }, () => { ran = true; });
+        await rig.whileRunning(() => held, 'the helper waits in a tool');
+        rig.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'm1', name: 'robot--move', input: {} }] as never, 'tool_use'));
+        rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'sent it on' }]));
+        if (privateTurn) rig.framework.pushEvent(tuiMessage('for your eyes only: have the helper check the code'));
+        else rig.i.pendingRequests.push(roomWake());
+        await rig.whileRunning(() => rig.texts().includes('sent it on') && rig.framework.getAgent('scout')!.state.status === 'idle', 'the turn that sent the mail');
+        releaseHold();
+        await rig.until(() => ran, 'the helper ran');
+        await run;
+        rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-answering the helper' }]));
+        rig.framework.deliverAgentResult('helper', [{ type: 'text', text: 'the code checks out' }]);
+        await rig.until(() => rig.texts().includes('zz-answering the helper') && rig.framework.getAgent('scout')!.state.status === 'idle', "the parent's turn on the result");
+        assert.deepEqual(rig.routed.filter((r) => r.text === 'zz-answering the helper'),
+          privateTurn ? [] : [{ text: 'zz-answering the helper', locus: LOUNGE }], JSON.stringify(rig.routed));
+      } finally {
+        releaseHold();
+        await rig.close();
+      }
+    });
+  }
 });

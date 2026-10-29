@@ -420,10 +420,19 @@ const HOST_METADATA_KEYS = [
 
 const CALLER_TURN_KEY = 'callerTurnId';
 
-function withoutCallerTurn<M extends object>(metadata: M | undefined): M | undefined {
-  if (!metadata || !(CALLER_TURN_KEY in metadata)) return metadata;
-  const { [CALLER_TURN_KEY]: _dropped, ...rest } = metadata as M & { [CALLER_TURN_KEY]?: unknown };
-  return rest as M;
+function withoutPrivateWorkMarks<M extends object>(metadata: M | undefined): M | undefined {
+  if (!metadata) return metadata;
+  let kept = metadata as M & { [CALLER_TURN_KEY]?: unknown; dendrite?: unknown };
+  if (CALLER_TURN_KEY in kept) {
+    const { [CALLER_TURN_KEY]: _dropped, ...rest } = kept;
+    kept = rest as typeof kept;
+  }
+  const dendrite = kept.dendrite;
+  if (dendrite && typeof dendrite === 'object' && 'privateTurn' in dendrite) {
+    const { privateTurn: _dropped, ...rest } = dendrite as { privateTurn?: unknown };
+    kept = { ...kept, dendrite: rest };
+  }
+  return kept as M;
 }
 
 /**
@@ -10744,6 +10753,8 @@ export class AgentFramework {
         }
       }
       let inherit = spec?.inherit;
+      const fromPrivateTurn = (inherit !== undefined && this.privateTurnOpen(inherit.from))
+        || (spec?.spawnedBy !== undefined && this.privateTurnOpen(spec.spawnedBy));
 
       if (inherit?.mode === 'shared') {
         // Shared reads, separate writes: the child's context is the parent's
@@ -10797,6 +10808,7 @@ export class AgentFramework {
               // on the fork's own branch — not in a namespace of its own.
               namespace: inherit?.mode === 'shared' ? namespace : spec.namespace ?? namespace,
               ...(inherit ? { inherit } : {}),
+              ...(fromPrivateTurn ? { privateTurn: true as const } : {}),
             }
           : { ...workerSpec(config.name, { namespace }), model: config.model },
       });
@@ -11096,6 +11108,7 @@ export class AgentFramework {
       ...(fullConfig.presentAs && fullConfig.presentAs !== name ? { presentAs: fullConfig.presentAs } : {}),
       ...(record.namespace ? { namespace: record.namespace } : {}),
       ...(record.metadata ? { metadata: record.metadata } : {}),
+      ...(record.privateTurn ? { privateTurn: true as const } : {}),
     };
     if (this.beforeDerive) {
       const verdict = this.beforeDerive(spec);
@@ -11520,6 +11533,7 @@ export class AgentFramework {
       to,
       content,
       ...(options.causedBy?.length ? { causedBy: options.causedBy } : {}),
+      ...(this.sentFromPrivateWork(from) ? { privateTurn: true as const } : {}),
     });
     return { mailId: mail.id, delivered: this.attemptMailDelivery(mail, options.wake ?? true) };
   }
@@ -11554,6 +11568,7 @@ export class AgentFramework {
       to: route.to,
       content,
       ...(options.causedBy?.length ? { causedBy: options.causedBy } : {}),
+      ...(this.sentFromPrivateWork(from) ? { privateTurn: true as const } : {}),
     });
     // A finished job's output survives a hard exit from here on: the hold is
     // in the registry's recovery file as it is written (persistAgentRegistry),
@@ -11573,6 +11588,16 @@ export class AgentFramework {
    * because nobody can receive it. The held copy is released by
    * `addMessage` at the moment the message enters the store.
    */
+  private sentFromPrivateWork(from: string): boolean {
+    return this.registry.inspect(from)?.privateTurn === true || this.privateTurnOpen(from);
+  }
+
+  private privateTurnOpen(agentName: string): boolean {
+    const agent = this.agents.get(agentName);
+    return agent !== undefined && this.turnAlive(agent)
+      && (this.openLogical.get(agentName) ?? this.turnRouting.get(agentName))?.nonChannelOrigin === true;
+  }
+
   private attemptMailDelivery(mail: HeldMail, wake = true): boolean {
     const recipient = this.registry.has(mail.to) ? this.agents.get(mail.to) : undefined;
     if (!recipient) {
@@ -11593,6 +11618,8 @@ export class AgentFramework {
       return false;
     }
     const placement: { agent?: string; messageId?: MessageId; deferredId?: string } = {};
+    const privateWork = mail.privateTurn === true;
+    if (privateWork && this.usedEphemeralAgentNames.get(mail.to) === 'run') this.registry.markPrivateTurn(mail.to);
     this.addMessage(
       // The sender's own name: its words stay its own.
       recipient.isOwnParticipant(mail.from.agent) && mail.from.agent !== recipient.name
@@ -11610,6 +11637,7 @@ export class AgentFramework {
           // and the reader should be able to tell.
           producedAt: mail.createdAt,
           ...(mail.causedBy?.length ? { causedBy: mail.causedBy } : {}),
+          ...(privateWork ? { privateTurn: true } : {}),
         },
       } as MessageMetadata,
       { forAgent: mail.to, placement },
@@ -12202,12 +12230,13 @@ export class AgentFramework {
       const records = all.filter((record) => !toldKeys.has(keyOf(record)));
       if (records.length === 0) continue;
       const noticeKey = records.map(keyOf).sort().join(',');
+      const privateWork = records.some((record) => record.privateTurn === true);
       const names = records.map((record) => `"${record.name}"`).join(', ');
       this.lifecycleNotice(
         recipient,
         `[${NOTICE_TAG.agentLifecycle}: the host restarted while ${names} ${records.length === 1 ? 'was' : 'were'} ` +
           `still working for you. ${records.length === 1 ? 'It was' : 'They were'} ended without a result.]`,
-        { event: 'interrupted', agents: records.map((record) => record.name), reason: 'host-restart', noticeKey },
+        { event: 'interrupted', agents: records.map((record) => record.name), reason: 'host-restart', noticeKey, ...(privateWork ? { privateTurn: true } : {}) },
       );
       this.pendingRequests.push({
         agentName: recipient,
@@ -16114,6 +16143,7 @@ export class AgentFramework {
         from: this.registry.ref(reader),
         to: route.to,
         content,
+        ...(this.sentFromPrivateWork(reader) ? { privateTurn: true as const } : {}),
       });
       this.attemptMailDelivery(mail);
       return;
@@ -17016,7 +17046,7 @@ export class AgentFramework {
     if (response.addMessages) {
       for (const [i, msg] of response.addMessages.entries()) {
         step.at = `adding message ${i + 1} of ${response.addMessages.length}`;
-        let metadata = withoutCallerTurn(msg.metadata);
+        let metadata = withoutPrivateWorkMarks(msg.metadata);
         if (metadata && INBOUND_SOURCE_KEY in metadata) {
           const { [INBOUND_SOURCE_KEY]: _dropped, ...rest } = metadata;
           metadata = rest;
@@ -29832,6 +29862,7 @@ export class AgentFramework {
 
   private isPrivateInput(metadata: MessageMetadata | undefined): boolean {
     if (readInboundSource(metadata)?.kind === 'surface') return true;
+    if ((metadata as { dendrite?: { privateTurn?: unknown } } | undefined)?.dendrite?.privateTurn === true) return true;
     const turn = (metadata as Record<string, unknown> | undefined)?.[CALLER_TURN_KEY];
     return typeof turn === 'number' && this.isPrivateTurn(turn);
   }
@@ -30908,7 +30939,7 @@ export class AgentFramework {
     const forRun = opts?.forAgent !== undefined
       && (this.ephemeralRuns.has(opts.forAgent) || this.registry.homeChannel(opts.forAgent) !== undefined);
     const placement: { deferredId?: string } = {};
-    const kept = withoutCallerTurn(metadata);
+    const kept = withoutPrivateWorkMarks(metadata);
     const id = this.addMessage(participant, content, forRun ? { ...kept, [PRIMARY_IF_UNREAD_KEY]: true } as MessageMetadata : kept, {
       placement, ...(opts?.forAgent !== undefined ? { forAgent: opts.forAgent } : {}), ...(forRun ? { markedForRun: true as const } : {}),
     });
