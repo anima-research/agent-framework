@@ -3712,15 +3712,17 @@ export class EventGate {
   // Event delivery
   // =========================================================================
 
+  private heldNow(e: PendingEvent): boolean {
+    const channel = e.routeChannelId ?? e.channelId;
+    return channel ? this.isHeldFn(e.serverId, channel) : false;
+  }
+
   private deliverEvents(batched: PendingEvent[]): void {
     // Delivery-time re-check: a channel tuned out after its events were
     // batched is held now, and "already shown above at arrival" would be
     // untrue of them. They are dropped; the hold's own reader has them.
     const heldAt = (e: PendingEvent): string | undefined => e.routeChannelId ?? e.channelId;
-    const events = batched.filter((e) => {
-      const channel = heldAt(e);
-      return !(channel && this.isHeldFn(e.serverId, channel));
-    });
+    const events = batched.filter((e) => !this.heldNow(e));
     if (events.length < batched.length) {
       this.emitTrace({
         type: 'gate:held-dropped',
@@ -4003,7 +4005,7 @@ export class EventGate {
           ? { certain: false, when: "right after the judge's next verdict, or once the hold on its calls is released", what: `${batch}, held for the judge` }
           : { certain: false, when: 'once no turn or quiesce holds it', what: `${batch}, held for the judge` });
     }
-    const buffered = this.inferenceBuffer.filter((e) => e.policyName !== leftOut.policy).length;
+    const buffered = this.inferenceBuffer.filter((e) => e.policyName !== leftOut.policy && !this.heldNow(e)).length;
     if (buffered > 0) {
       wakes.push({ certain: true, when: "once no turn runs and the host isn't quiesced", what: `${count(buffered)} buffered for delivery` });
     }

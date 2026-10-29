@@ -103,6 +103,7 @@ function scriptedJudge() {
 
 function makeGate(configPath: string, opts: {
   judge?: JudgeFn; judgeTimeoutMs?: number; judgeOnError?: 'wake' | 'skip'; now?: () => number; residents?: string[];
+  isHeld?: (serverId: string | undefined, channelId: string | undefined) => boolean;
   /** Called with each trace as it's emitted, after it's recorded. */
   onTrace?: (trace: { type: string; [k: string]: unknown }) => void;
 } = {}) {
@@ -123,6 +124,7 @@ function makeGate(configPath: string, opts: {
     ...(opts.judgeOnError ? { judgeOnError: opts.judgeOnError } : {}),
     ...(opts.now ? { now: opts.now } : {}),
     ...(opts.residents ? { changesJudgedContext: (name: string) => opts.residents!.includes(name) } : {}),
+    ...(opts.isHeld ? { isHeld: opts.isHeld } : {}),
   });
   return { gate, traces, messages, wakes };
 }
@@ -1362,6 +1364,21 @@ describe('judge rules: what waiting leaves the agent with', () => {
     gate.setQuiesced(true);
     gate.evaluate({ content: 'notes.md', eventType: 'workspace:modified', serverId: '', channelId: '' });
     await until(() => gate.inferenceDiagnostics().bufferedEvents === 1, 'the fired batch buffered while the host is quiesced');
+    assert.deepStrictEqual(gate.upcomingWakes(['agent']), [{ certain: true, when: "once no turn runs and the host isn't quiesced", what: '1 event buffered for delivery' }]);
+    gate.dispose();
+  });
+
+  it('leaves out of the buffered count an event whose channel is held now, which delivery would drop', async () => {
+    let tunedOut = false;
+    const { gate } = makeGate(writeConfig('upcoming-buffered-held.json', {
+      policies: [{ name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 30 } }],
+    }), { isHeld: (serverId, channelId) => tunedOut && serverId === 'discord' && channelId === 'c-held' });
+    gate.setQuiesced(true);
+    gate.evaluate({ content: 'hello', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c-held' });
+    gate.evaluate({ content: 'hi', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c-open' });
+    await until(() => gate.inferenceDiagnostics().bufferedEvents === 2, 'both events buffered while the host is quiesced');
+    assert.strictEqual(gate.upcomingWakes(['agent'])[0]?.what, '2 events buffered for delivery', 'premise: both are listed before the tune-out');
+    tunedOut = true;
     assert.deepStrictEqual(gate.upcomingWakes(['agent']), [{ certain: true, when: "once no turn runs and the host isn't quiesced", what: '1 event buffered for delivery' }]);
     gate.dispose();
   });
