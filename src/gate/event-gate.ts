@@ -146,6 +146,8 @@ interface PendingEvent {
    *  a channel message's id, a push event's event id (isNewestEntry). */
   messageId?: string;
   eventId?: string;
+  /** GateEventInfo.recipients. */
+  recipients?: readonly string[];
 }
 
 /** Where the host put a message the gate wrote: the agent whose window it
@@ -2155,6 +2157,8 @@ export class EventGate {
     forAgent?: string,
     /** Out-param: where the message landed, for the wake that goes with it. */
     placement?: WritePlacement,
+    /** The agents the row is for; absent: the host's default for the write. */
+    audience?: readonly string[],
   ) => unknown;
   private requestInferenceFn: (agentName: string, reason: string, source: string, provenance?: WakeProvenance, after?: WritePlacement) => void;
   private getAgentNamesFn: () => string[];
@@ -2162,7 +2166,7 @@ export class EventGate {
   private isHeldFn: (serverId: string | undefined, channelId: string | undefined) => boolean;
   private resolveRouteChannelFn: (info: GateEventInfo) => string | undefined;
   private channelShownFn?: (channel: { serverId: string; channelId: string }) => string;
-  private isNewestEntryFn?: (entry: GateEntryRef) => boolean;
+  private isNewestEntryFn?: (entry: GateEntryRef, recipients?: readonly string[]) => boolean;
   /** Clock injection — keeps the new rate_limit / passive_sample paths
    *  testable without monkey-patching Date.now globally. */
   private now: () => number;
@@ -2178,6 +2182,7 @@ export class EventGate {
       metadata?: Record<string, unknown>,
       forAgent?: string,
       placement?: WritePlacement,
+      audience?: readonly string[],
     ) => unknown;
     /** `after`: the placement of the message the wake is for, when it has
      *  one, so the host can drop the wake once a request that carried the
@@ -2225,8 +2230,10 @@ export class EventGate {
      *  waiting to be written there. A batched wake for that one message
      *  doesn't write its line when it fires: it hands the line to the wake
      *  (WakeProvenance.line), for a fresh start of the wake's turn to decide
-     *  (WakeLine). Absent: every batched wake writes its line, as before. */
-    isNewestEntry?: (entry: GateEntryRef) => boolean;
+     *  (WakeLine). With `recipients`, the windows are those agents', each of
+     *  which the event must be newest in. Absent: every batched wake writes
+     *  its line, as before. */
+    isNewestEntry?: (entry: GateEntryRef, recipients?: readonly string[]) => boolean;
     /** The event types the gate can see from a source, when the host knows
      *  them (an MCPL server's id: MCPL_GATE_EVENT_TYPES), else undefined.
      *  The rule-order notes (findShadowedPolicies) leave out types a rule's
@@ -3622,6 +3629,7 @@ export class EventGate {
       routeChannelId: this.routeChannelFor(info),
       ...(typeof info.metadata?.messageId === 'string' ? { messageId: info.metadata.messageId } : {}),
       ...(typeof info.metadata?.eventId === 'string' ? { eventId: info.metadata.eventId } : {}),
+      ...(info.recipients !== undefined ? { recipients: [...info.recipients] } : {}),
     };
 
     const existing = this.debounceTimers.get(policy.name);
@@ -3774,6 +3782,8 @@ export class EventGate {
     // of the wake's turn decides it (WakeLine). Several messages, one with
     // anything after it, or content the line quotes, keep the line now.
     const text = `[${NOTICE_TAG.gate}: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
+    const targeted = events.every((e) => e.recipients !== undefined);
+    const woken = targeted ? [...new Set(events.flatMap((e) => e.recipients!))] : this.getAgentNamesFn();
     const only = events.length === 1 && events[0].inContext ? events[0] : undefined;
     let line: WakeLine | undefined;
     if (only && this.newestEntry(only)) {
@@ -3789,7 +3799,7 @@ export class EventGate {
       this.addMessageFn('user', [{ type: 'text', text }], {
         source: 'gate:debounce',
         policies: policyNames,
-      });
+      }, undefined, undefined, targeted ? woken : undefined);
     }
 
     // Provenance of the batched wake (who/where woke the agent): the newest
@@ -3803,7 +3813,7 @@ export class EventGate {
     // shared by every agent the batch wakes, so it is written once.
     const chosen = wakeProvenance(events);
     const provenance = line ? { ...chosen, line } : chosen;
-    for (const agentName of this.getAgentNamesFn()) {
+    for (const agentName of woken) {
       this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
     }
   }
@@ -3812,7 +3822,7 @@ export class EventGate {
   private newestEntry(event: PendingEvent): boolean {
     if (!this.isNewestEntryFn) return false;
     try {
-      return this.isNewestEntryFn(entryRef(event)) === true;
+      return this.isNewestEntryFn(entryRef(event), event.recipients) === true;
     } catch {
       return false;
     }

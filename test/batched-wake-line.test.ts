@@ -929,3 +929,87 @@ describe('a same-turn retry', () => {
     }
   });
 });
+
+describe('a debounced batch of targeted messages', () => {
+  type Internals = {
+    handleMcplChannelIncoming(event: Record<string, unknown>): Promise<unknown>;
+    pendingRequests: Array<{ agentName: string; reason: string; wakeLines?: unknown[] }>;
+  };
+  const boot = async (): Promise<{ framework: AgentFramework; internals: Internals; dir: string }> => {
+    const dir = mkdtempSync(join(tmpdir(), 'wake-line-targeted-'));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'test.chronicle'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [
+        { name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' },
+        { name: 'mira', model: 'test-model', systemPrompt: 'You are mira.' },
+      ],
+      gate: {
+        config: {
+          policies: [{
+            name: 'addressed',
+            match: { scope: ['mcpl:channel-incoming'], tagsAny: ['chat:addressed'] },
+            behavior: { debounce: 300 },
+          }],
+          default: 'skip',
+        },
+      },
+      modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+    });
+    return { framework, internals: framework as unknown as Internals, dir };
+  };
+  const forMira = (messageId: string, text: string, targetAgents = ['mira']) => ({
+    type: 'mcpl:channel-incoming', serverId: 'discord', channelId: ROOM, messageId,
+    author: { id: 'u-1', name: 'antra' }, content: [{ type: 'text', text }],
+    timestamp: new Date().toISOString(), tags: ['chat:addressed'], triggerInference: true, targetAgents,
+  });
+  const batchWakes = (internals: Internals) => internals.pendingRequests.filter((r) => r.reason === 'gate:debounce');
+  const gateRows = (framework: AgentFramework) => framework.getAgent('scout')!.getContextManager().getAllMessages()
+    .filter((m) => JSON.stringify(m.content).includes('[Gate:'));
+  const windowTexts = (framework: AgentFramework, name: string) => framework.getAgent(name)!.getContextManager()
+    .getPresentedMessages().map((m) => JSON.stringify(m.content));
+
+  it('one message for a co-resident wakes her alone, and its line goes to her wake, newest in her window: no line is stored', async () => {
+    const { framework, internals, dir } = await boot();
+    try {
+      await internals.handleMcplChannelIncoming(forMira('m-t1', 'mira, a word'));
+      await waitFor(() => batchWakes(internals).length > 0, 'the batch to fire');
+      assert.deepEqual(batchWakes(internals).map((r) => r.agentName), ['mira'], 'mira alone is woken');
+      assert.equal(batchWakes(internals)[0]!.wakeLines?.length, 1, 'the line goes to her wake');
+      assert.deepEqual(gateRows(framework), [], 'no line is stored in the slot');
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('one message for a co-resident and a name that is no agent\'s wakes her alone, and its line goes to her wake: no line is stored', async () => {
+    const { framework, internals, dir } = await boot();
+    try {
+      await internals.handleMcplChannelIncoming(forMira('m-t1', 'mira, a word', ['mira', 'ghost']));
+      await waitFor(() => batchWakes(internals).length > 0, 'the batch to fire');
+      assert.deepEqual(batchWakes(internals).map((r) => r.agentName), ['mira'], 'mira alone is woken');
+      assert.equal(batchWakes(internals)[0]!.wakeLines?.length, 1, 'the line goes to her wake');
+      assert.deepEqual(gateRows(framework), [], 'no line is stored in the slot');
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('two messages for a co-resident wake her alone, and the line the batch writes is for her: it enters no other window', async () => {
+    const { framework, internals, dir } = await boot();
+    try {
+      await internals.handleMcplChannelIncoming(forMira('m-t1', 'mira, a word'));
+      await internals.handleMcplChannelIncoming(forMira('m-t2', 'mira, another'));
+      await waitFor(() => batchWakes(internals).length > 0, 'the batch to fire');
+      assert.deepEqual(batchWakes(internals).map((r) => r.agentName), ['mira'], 'mira alone is woken');
+      assert.equal(gateRows(framework).length, 1, 'the batch writes its line');
+      assert.ok(windowTexts(framework, 'mira').some((t) => t.includes('[Gate:')), "in mira's window");
+      assert.ok(!windowTexts(framework, 'scout').some((t) => t.includes('[Gate:')), "and not in scout's");
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

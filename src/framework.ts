@@ -4920,8 +4920,10 @@ export class AgentFramework {
         ...(judge && judgeOptions?.timeoutMs !== undefined ? { judgeTimeoutMs: judgeOptions.timeoutMs } : {}),
         ...(judge && judgeOptions?.onError !== undefined ? { judgeOnError: judgeOptions.onError } : {}),
         emitTrace: (e) => framework.emitTrace(e as { type: TraceEvent['type']; [key: string]: unknown }),
-        addMessage: (p, c, m, forAgent, placement) => framework.addMessage(p, c, m as MessageMetadata,
-          forAgent || placement ? { ...(forAgent ? { forAgent } : {}), ...(placement ? { placement } : {}) } : undefined),
+        addMessage: (p, c, m, forAgent, placement, audience) => framework.addMessage(p, c, m as MessageMetadata,
+          forAgent || placement || audience
+            ? { ...(forAgent ? { forAgent } : {}), ...(placement ? { placement } : {}), ...(audience ? { audience } : {}) }
+            : undefined),
         requestInference: (agentName, reason, source, provenance, after) => {
           framework.pendingRequests.push({
             agentName, reason, source, timestamp: Date.now(),
@@ -4942,8 +4944,8 @@ export class AgentFramework {
             // the debounce firing (2026-09-30). Ambient-only batches set no
             // locus and keep the legacy fallback.
             //
-            // The wake is broadcast to every agent, conversation forks
-            // included, and a fork speaks only in its home channel: the
+            // An untargeted batch's wake goes to every agent, conversation
+            // forks included, and a fork speaks only in its home channel: the
             // route applies to a fork only when it IS that home, and never to
             // another agent when a fork owns that channel. Otherwise a fork
             // bound elsewhere would show typing where it isn't replying.
@@ -4970,7 +4972,7 @@ export class AgentFramework {
         // A batched wake for one message still newest in the window hands its
         // `[Gate: …]` line to the wake, for a fresh start of the wake's turn
         // to decide (placeWakeLines).
-        isNewestEntry: (entry) => framework.isNewestContextEntry(entry),
+        isNewestEntry: (entry, recipients) => framework.isNewestContextEntry(entry, recipients),
         // What a source can send, for the rule-order notes: an MCPL server's
         // events reach the gate as its pushes and channel messages only (a
         // module's events carry a source of the module's own, such as "cli"
@@ -30643,21 +30645,21 @@ export class AgentFramework {
 
   /**
    * Whether an MCPL event's own stored entry is the newest entry in the window
-   * a batched wake's line is written to (deliveryAgent(): the primary's), with
-   * no turn alive there (turnAlive: started, streaming, or waiting on its
-   * tools). The gate then hands the line to the wake (WakeLine) instead of
-   * writing it, and the turn's start decides it (placeWakeLines). A channel
-   * message is found by its server, channel and message id, a push event by
-   * its server and event id. A message a tune-out holds from the residents
-   * is never "newest" here.
+   * a batched wake's line is written to, with no turn alive there (turnAlive:
+   * started, streaming, or waiting on its tools): the window of each agent a
+   * targeted event was delivered to (`recipients`), else the delivery
+   * agent's (deliveryAgent(): the primary's). The gate then hands the line to
+   * the wake (WakeLine) instead of writing it, and the turn's start decides
+   * it (placeWakeLines). A channel message is found by its server, channel
+   * and message id, a push event by its server and event id. A message a
+   * tune-out holds from the residents is never "newest" here.
    */
-  private isNewestContextEntry(entry: GateEntryRef): boolean {
-    const agent = this.deliveryAgent();
-    if (!agent) return false;
+  private isNewestContextEntry(entry: GateEntryRef, recipients?: readonly string[]): boolean {
+    const agents = recipients !== undefined ? recipients.map((name) => this.agents.get(name)) : [this.deliveryAgent()];
+    if (agents.length === 0) return false;
     // A turn starting, streaming or waiting on its tools writes after the
     // message, and the line says which message the wake is for.
-    if (this.turnAlive(agent)) return false;
-    return this.isNewestIn(agent, entry);
+    return agents.every((agent) => agent !== undefined && !this.turnAlive(agent) && this.isNewestIn(agent, entry));
   }
 
   /**
@@ -30675,7 +30677,8 @@ export class AgentFramework {
    *   the window at a later point, after its request. (The start's own
    *   notices, written after this, aren't messages a reply could be meant
    *   for.)
-   * - Every resident gets every batched wake, and each resident's start
+   * - Each resident a batched wake is for (every resident, or a targeted
+   *   batch's recipients) gets it, and each one's start
    *   decides and writes its own line: a co-resident's line, and her reply,
    *   are her own rows and enter no other window, so neither can land under
    *   the message or after another resident's answer. For an agent whose
@@ -37394,6 +37397,7 @@ export class AgentFramework {
       channelId: typeof e.gateMetadata.channelId === 'string' ? e.gateMetadata.channelId : '',
       metadata: e.gateMetadata,
       tags: Array.isArray(e.gateMetadata.tags) ? (e.gateMetadata.tags as string[]) : undefined,
+      ...(e.targetAgents !== undefined ? { recipients: e.targetAgents.filter((name) => this.agents.has(name)) } : {}),
     });
     const decision = admit(env, {
       untargetedRecipients: () => this.registry.untargetedRecipients(),
