@@ -1010,4 +1010,34 @@ describe('Dendrite restart', () => {
     assert.deepEqual(wakesOf(second), [], 'no second wake for it');
     assert.equal(textsIn(second, 'mira').filter((m) => m.metadata.kind === 'agent-result').length, 1);
   });
+
+  it("passes to the primary, once, a module's write for a job that the crash ended before its window held it", async () => {
+    const gates1 = new GateModule();
+    const first = await process(gates1);
+    first.start();
+    membrane.script('job', waitCall('job-1'), waitCall('job-2'), say('job done'));
+    const { agent, contextManager } = await first.createEphemeralAgent(
+      { name: 'job', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all' },
+      workerSpec('job', { spawnedBy: 'mira', resultTo: { to: 'mira', as: 'tool-result' } }),
+    );
+    contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+    first.runEphemeralToCompletion(agent, contextManager).catch(() => { /* abandoned */ });
+    const write = (text: string) => (first as unknown as {
+      addModuleMessage(participant: string, content: Array<{ type: 'text'; text: string }>, metadata?: Record<string, unknown>, opts?: { forAgent?: string }): string;
+    }).addModuleMessage('user', [{ type: 'text', text }], { kind: 'test-note' }, { forAgent: 'job' });
+    await until(() => gates1.entered.has('job-1'), 'the job to block in its first call');
+    const read = write('READ-BY-THE-JOB');
+    gates1.release('job-1');
+    await until(() => gates1.entered.has('job-2'), 'the job to block in its second call');
+    const unread = write('NEVER-READ-BY-THE-JOB');
+    assert.equal(contextManager.windowStatusOf(read), 'in', 'the first write entered the window at the tool boundary');
+    assert.equal(contextManager.windowStatusOf(unread), 'out', 'the second is stored and out of the window');
+
+    const told = (framework: AgentFramework, text: string) => textsIn(framework, 'mira').filter((m) => m.text === text).length;
+    const second = await process(new GateModule());
+    assert.equal(told(second, 'NEVER-READ-BY-THE-JOB'), 1, 'the write its window never held goes to the primary');
+    assert.equal(told(second, 'READ-BY-THE-JOB'), 0, 'one its window held stays with it');
+    const third = await process(new GateModule());
+    assert.equal(told(third, 'NEVER-READ-BY-THE-JOB'), 1, 'and goes once');
+  });
 });

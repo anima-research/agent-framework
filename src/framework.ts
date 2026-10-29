@@ -1053,6 +1053,31 @@ type ReleasedWindow = {
   unread: Array<{ participant: string; content: ContentBlock[]; metadata: MessageMetadata }>;
 };
 
+function passedOnBodies(messages: readonly StoredMessage[], takes: (m: StoredMessage) => boolean): ReleasedWindow['unread'] {
+  // A body the store took as more than one message (a sharded body)
+  // carries the same metadata on each of its shards, and is one notice,
+  // so a shard that continues the body before it isn't taken again: its
+  // content joins the body's, which a module's write passes on. Which
+  // messages make up a body is context-manager's rule (continuesBody,
+  // pairwise in store order): a group id names the text, so the same text
+  // stored twice is two bodies under one id.
+  const bodies: Array<{ participant: string; metadata: MessageMetadata; shards: Array<{ content: ContentBlock[] }> }> = [];
+  let lastTaken = -1;
+  messages.forEach((m, i) => {
+    if (!takes(m)) return;
+    if (!continuesBody(messages[i - 1], m)) {
+      bodies.push({ participant: m.participant, metadata: m.metadata as MessageMetadata, shards: [m] });
+      lastTaken = i;
+    } else if (lastTaken === i - 1) {
+      bodies.at(-1)!.shards.push(m);
+      lastTaken = i;
+    }
+  });
+  // A body's shards joined into one text, as the strategy joins them
+  // (asCompiled), whole: a compile may also cut each shard to its cap.
+  return bodies.map(({ shards, ...body }) => ({ ...body, content: asCompiled(shards) }));
+}
+
 /** Stamp a queued write's durable id into the metadata it is stored with:
  *  the importer stores an earlier release's queued write under it, and a
  *  later boot's dedup finds it by it (importPersistedDeferredWrites).
@@ -5109,6 +5134,7 @@ export class AgentFramework {
     framework.bootFreeze = false;
     framework.presentation?.repairAndRest();
     framework.presentation?.retractAbsentRows();
+    await framework.passOnInterruptedNotices(interruptedAgents);
     framework.reconcileAgentRegistry(interruptedAgents);
 
     if (config.mcplServers && config.mcplServers.length > 0) {
@@ -12139,6 +12165,29 @@ export class AgentFramework {
     if (!Array.isArray(ended)) throw refuse(endedFrom, 'has an ended log that reads as something other than a list of records');
     this.endedRecovery = (ended as AgentRecord[]).slice(-AGENT_REGISTRY_ENDED_RELOAD);
     return this.registry.restore(snapshot as RegistrySnapshot | null, ended as AgentRecord[]).interrupted;
+  }
+
+  private async passOnInterruptedNotices(interrupted: readonly AgentRecord[]): Promise<void> {
+    for (const record of interrupted) {
+      let cm: ContextManager | undefined;
+      try {
+        cm = await this.reopenAgentContext(record, new PassthroughStrategy());
+        const opened = cm;
+        const reader = recordedReaderFacts(this.registry, record.name);
+        const notices = passedOnBodies(opened.getAllMessages(), (m) => passesToPrimary(m.metadata)
+          && bearingOf(m, reader, 'own') !== 'elsewhere'
+          && opened.windowStatusOf(m.id) === 'out');
+        for (const { metadata, ...written } of notices) this.passNoticeToPrimary(record.name, metadata, written);
+      } catch (err) {
+        console.error(`[route-failure] ${record.name}: could not read the context the restart interrupted for notices the primary would take; none is passed:`, err);
+      } finally {
+        try {
+          cm?.close();
+        } catch (err) {
+          console.error(`[route-failure] ${record.name}: closing the context read for its notices failed:`, err);
+        }
+      }
+    }
   }
 
   /**
@@ -31052,29 +31101,7 @@ export class AgentFramework {
       // its own slot (getAllMessages reads no merged view).
       const reader = this.releasedReaders.get(agent) ?? recordedReaderFacts(this.registry, agent.name);
       const forIt = (m: StoredMessage): boolean => bearingOf(m, reader, 'own') !== 'elsewhere';
-      // A body the store took as more than one message (a sharded body)
-      // carries the same metadata on each of its shards, and is one notice,
-      // so a shard that continues the body before it isn't taken again: its
-      // content joins the body's, which a module's write passes on. Which
-      // messages make up a body is context-manager's rule (continuesBody,
-      // pairwise in store order): a group id names the text, so the same text
-      // stored twice is two bodies under one id.
-      const messages = cm.getAllMessages();
-      const bodies: Array<{ participant: string; metadata: MessageMetadata; shards: Array<{ content: ContentBlock[] }> }> = [];
-      let lastUnread = -1;
-      messages.forEach((m, i) => {
-        if (!passesToPrimary(m.metadata) || !forIt(m) || !unread(m)) return;
-        if (!continuesBody(messages[i - 1], m)) {
-          bodies.push({ participant: m.participant, metadata: m.metadata as MessageMetadata, shards: [m] });
-          lastUnread = i;
-        } else if (lastUnread === i - 1) {
-          bodies.at(-1)!.shards.push(m);
-          lastUnread = i;
-        }
-      });
-      // A body's shards joined into one text, as the strategy joins them
-      // (asCompiled), whole: a compile may also cut each shard to its cap.
-      return { unread: bodies.map(({ shards, ...body }) => ({ ...body, content: asCompiled(shards) })) };
+      return { unread: passedOnBodies(cm.getAllMessages(), (m) => passesToPrimary(m.metadata) && forIt(m) && unread(m)) };
     } catch (err) {
       // A release must complete whatever its window's read meets.
       console.error(`[route-failure] ${agent.name}: could not read its window for unread notices the primary would take:`, err);
