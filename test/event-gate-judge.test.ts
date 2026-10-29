@@ -790,7 +790,7 @@ describe('judge rules: timing', () => {
     gate.evaluate(elsewhere('hi'));
     await until(() => judge.waiting() === 1, "second's call");
     assert.deepStrictEqual(judge.requests.at(-1)!.upcomingWakes, [{
-      certain: false, when: "right after the judge's next verdict, or once the hold on its calls is released", what: 'rule "first"\'s batch of 1 event, held for the judge',
+      certain: false, when: 'once a later judge call gets a REPLY or WAIT, or the hold on its calls is released, and no turn or quiesce holds it', what: 'rule "first"\'s batch of 1 event, held for the judge',
     }]);
     judge.answer({ reply: false, reason: 'chatter' });
     gate.dispose();
@@ -1368,7 +1368,7 @@ describe('judge rules: what waiting leaves the agent with', () => {
     gate.dispose();
   });
 
-  it('leaves out of the buffered count an event whose channel is held now, which delivery would drop', async () => {
+  it('leaves out of the buffered count an event whose channel is held now', async () => {
     let tunedOut = false;
     const { gate } = makeGate(writeConfig('upcoming-buffered-held.json', {
       policies: [{ name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 30 } }],
@@ -1936,8 +1936,6 @@ describe('the framework wires the reply judge', () => {
       modules: [],
       gate: { configPath: join(dir, 'gate.json'), config: JUDGED },
       errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false as const }) },
-      // A failed turn nothing sends again: a re-armed one is held, as
-      // exhausted-turn-rearm's judge test has it.
       exhaustedTurnRearmMs: false,
     });
     t.after(async () => {
@@ -2132,6 +2130,27 @@ describe('the framework wires the reply judge', () => {
     const hold = internal.providerAccelerationCooldowns.get('scout');
     assert.deepStrictEqual([hold?.heldRequests.length, hold?.emptiedBy], [0, 'withdrawal'], 'premise: the hold stays, emptied by the withdrawal');
     assert.deepStrictEqual(internal.upcomingWakesFor('scout'), []);
+  });
+
+  it('lists a wake queued behind a hold that holds nothing yet as held until the hold ends, since a scheduler pass holds it there', async (t) => {
+    const { MembraneError } = await import('@animalabs/membrane');
+    const { framework } = await judgeFramework(t, {}, { providerHold: () => ({ holdMs: 60_000, reason: 'weekly quota spent' }) });
+    const internal = framework as unknown as {
+      withAuxiliaryAdmission<T>(agentName: string, run: () => Promise<T>, model?: string): Promise<T>;
+      pendingRequests: Array<Record<string, unknown>>;
+      processInferenceRequests(): Promise<void>;
+      providerAccelerationCooldowns: Map<string, { heldRequests: unknown[]; auxiliaryOrigin?: boolean }>;
+      upcomingWakesFor(agentName: string): Array<{ at?: number; when?: string; certain: boolean; what: string }>;
+    };
+    await assert.rejects(internal.withAuxiliaryAdmission('scout', async () => {
+      throw new MembraneError({ type: 'rate_limit', retryable: true, message: 'quota spent', rawError: { status: 429 } });
+    }), /quota spent/);
+    const hold = internal.providerAccelerationCooldowns.get('scout');
+    assert.deepStrictEqual([hold?.auxiliaryOrigin, hold?.heldRequests.length], [true, 0], 'premise: the auxiliary call armed a hold that holds nothing');
+    internal.pendingRequests.push({ agentName: 'scout', reason: 'a later wake', source: 'test', timestamp: Date.now() });
+    assert.deepStrictEqual(internal.upcomingWakesFor('scout').map((w) => w.what), ['a wake held by a provider hold, when it ends']);
+    await internal.processInferenceRequests();
+    assert.strictEqual(internal.providerAccelerationCooldowns.get('scout')?.heldRequests.length, 1, 'premise: a scheduler pass holds the wake until the hold ends');
   });
 
   it('lists a start that waits behind an auxiliary call, with nothing else queued, as a wake on its way', async (t) => {
