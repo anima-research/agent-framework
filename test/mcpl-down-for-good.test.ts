@@ -513,11 +513,14 @@ test('a server whose child exits on its own, code 1, after stop() has begun and 
 });
 
 /** On SIGUSR1 the child dies by its own SIGTERM while the host is writing to
- *  it, as a stop's signal can reach a busy server: the legacy child first
- *  sends a burst of pings for the host to answer, and the modern child dies
- *  at the first line the test's tool calls bring. */
+ *  it, as a stop's signal can reach a busy server: the legacy child stops
+ *  reading its stdin and sends a burst of pings whose answers can't all fit
+ *  in its pipe, so one of the host's writes is still waiting when it dies
+ *  (while it went on reading, a host that had answered every ping before the
+ *  signal landed wrote nothing that failed, as on macOS it sometimes did),
+ *  and the modern child dies at the first line the test's tool calls bring. */
 const DIES_WHILE_WRITTEN_TO = {
-  legacy: 'process.on("SIGUSR1", () => { let burst = ""; for (let i = 0; i < 500; i++) burst += JSON.stringify({ jsonrpc: "2.0", id: "burst-" + i, method: "ping" }) + "\\n"; process.stdout.write(burst, () => process.kill(process.pid, "SIGTERM")); });',
+  legacy: 'process.on("SIGUSR1", () => { process.stdin.pause(); let burst = ""; for (let i = 0; i < 5000; i++) burst += JSON.stringify({ jsonrpc: "2.0", id: "burst-" + i, method: "ping" }) + "\\n"; process.stdout.write(burst, () => process.kill(process.pid, "SIGTERM")); });',
   modern: 'process.on("SIGUSR1", () => { process.stdin.once("data", () => process.kill(process.pid, "SIGTERM")); process.stderr.write("armed\\n"); });',
 };
 
