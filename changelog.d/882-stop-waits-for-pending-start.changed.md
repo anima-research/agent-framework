@@ -12,5 +12,6 @@
   `removeModule()` has no budget and waits for the `start()` as long as it
   runs. So a module's `start()` mustn't await its own removal or the
   framework's `stop()`: both now wait for it, where before its `stop()` ran
-  beside it. A `removeModule()` made during a `start()` now announces the
-  module added, then removed; before, it was announced removed, then added.
+  beside it. A `removeModule()` made during a `start()` that then fulfils,
+  with no framework `stop()` admitted meanwhile, now announces the module
+  added, then removed; before, it was announced removed, then added.
