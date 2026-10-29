@@ -1379,7 +1379,7 @@ describe("another mount's directory, to the outer mount's file tools and pushes"
     // Named, the caller is told whose it is, forced or not.
     const forced = await call(m, 'materialize', { path: 'work/a/b/inner.txt', force: true });
     assert.deepEqual(reasons(forced), [SKIPPED]);
-    // An undo's or a branch switch's push, forced over every tree path.
+    // A branch switch's, a rollback's or a suppression's push, forced over every tree path.
     const written = await m.materializeMount('work');
     assert.equal(written.some((p) => p.endsWith('a/b/inner.txt')), false);
     assert.equal(env.readDisk('a/b/inner.txt'), 'inner', "the inner mount's file is as it was");
@@ -7931,7 +7931,7 @@ describe('a bare materialize after a restart', () => {
     const m = await env.open();
     env.legacyEntry('settings.json', '{"restored": true}');
     env.writeDisk('settings.json', '{"restored": false}');
-    // materializeMount is the deliberate restore that follows an undo or branch switch: its scope is named.
+    // materializeMount is the deliberate restore that follows a branch switch, a rollback or a suppression: its scope is named.
     assert.deepEqual(await m.materializeMount('work'), ['settings.json']);
     assert.equal(env.readDisk('settings.json'), '{"restored": true}');
   });

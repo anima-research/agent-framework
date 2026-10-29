@@ -6226,10 +6226,11 @@ export class WorkspaceModule implements Module {
     mount.lastMaterializedBranchId = null;
     mount.lastMaterializedSeq = 0;
 
-    // force: this path only runs after a deliberate undo/redo/branch switch
-    // on the framework's own _config mount — restoring disk to the branch
-    // state IS the operator intent, so the freshness guard yields. named:
-    // the whole tree is that deliberate scope, entries without evidence too.
+    // force: this path only runs after a deliberate branch switch, rollback
+    // or suppression on the framework's own _config mount — restoring disk
+    // to the branch state IS the operator intent, so the freshness guard
+    // yields. named: the whole tree is that deliberate scope, entries
+    // without evidence too.
     const pushed = await this.withMount(mount, () => {
       const branchId = store.currentBranch().id;
       return this.pushUnlocked(mount, store.treeList(mount.treeStateId).map((e) => e.path), { force: true, named: true, branchId });

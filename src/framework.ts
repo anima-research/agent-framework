@@ -13556,8 +13556,10 @@ export class AgentFramework {
    * Handle a `host/command` request from an MCPL surface server (e.g. a
    * Discord slash command). Currently supports:
    *
-   *   undo — revert the last N inference turns (branch-based, see
-   *   `undoLastTurn`). The response includes the last message the agent
+   *   undo — revert the last N inference turns on the agent's window (see
+   *   `undoLastTurn`; no branch moves), or with `messages`, the last N rows
+   *   of the agent's own slot, by a rollback onto a new branch (see
+   *   `rollbackToMessage`). The response includes the last message the agent
    *   would see in its context after the undo, obtained via the transparent
    *   `previewActivation` render (no inference, no Chronicle writes).
    *

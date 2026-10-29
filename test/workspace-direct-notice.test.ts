@@ -1,7 +1,7 @@
 /**
- * The head-move notice on a writable direct mount: after the store's head
- * moves away from an agent's latest direct write, through undoLastTurn or a
- * context-manager branch switch as connectome-host's /undo makes one, the
+ * The head-move notice on a writable direct mount: after an agent's latest
+ * direct write leaves its context, through undoLastTurn taking its turn out
+ * of the agent's window or a context-manager branch switch away from it, the
  * framework stores, at the agent's next start, one notice that those writes
  * are still on disk, and that start's request carries it. Whether it was
  * given is judged by the notice's own presence in the history.
@@ -162,7 +162,7 @@ class Harness {
     return this.cm(agent).getAllMessages().at(-1)!.id;
   }
 
-  /** A context-manager branch at `id`, switched to, as connectome-host's /undo makes one. */
+  /** A context-manager branch at `id`, switched to. */
   async branchBack(id: string, agent = 'scout'): Promise<void> {
     const name = this.cm(agent).branchAt(id, `zz-back-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`);
     await this.cm(agent).switchBranch(name);
@@ -308,7 +308,7 @@ test("the notice's text is the one sentence, naming the mount", async (t) => {
   assert.deepEqual(h.workspace.headMoveNotice('scout'), { text: TEXT, mounts: ['ref'] });
 });
 
-test("a context-manager branch switch away from the agent's latest direct write, as connectome-host's /undo makes one, gives the notice", async (t) => {
+test("a context-manager branch switch away from the agent's latest direct write gives the notice", async (t) => {
   const h = await harness(t);
   await h.turn([say('hello')]);
   const before = h.newest();
