@@ -1136,6 +1136,11 @@ export type TraceEvent =
        * heard, found at boot (`boot`). `shed` is a refusal rewind's or an
        * inference failure's shed on a presented window: the rows leave the
        * agent's own window as an undone turn's do, and stay in the record.
+       * `elsewhere` is a window written down from the shared record when the
+       * agent was taken on, or after a branch move: the rows it took in that
+       * carry an audience stamp and aren't the agent's (another agent's own
+       * rows, mail stamped for others, a held row) leave it, and stay in the
+       * record (decision 1).
        */
       type: 'presentation:retracted';
       agentName: string;
@@ -1177,7 +1182,7 @@ export type TraceEvent =
     });
 
 /** Why rows left an agent's window (`presentation:retracted`). */
-export type PresentationRetractReason = 'hide' | 'suppress' | 'coalescer' | 'module' | 'resume' | 'rewind' | 'shed' | 'boot';
+export type PresentationRetractReason = 'hide' | 'suppress' | 'coalescer' | 'module' | 'resume' | 'rewind' | 'shed' | 'boot' | 'elsewhere';
 
 /**
  * Listener for trace events.

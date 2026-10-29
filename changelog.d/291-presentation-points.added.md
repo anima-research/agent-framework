@@ -1,5 +1,8 @@
 - Each agent's context follows its own window (#291): every agent is taken on as it is registered (its window
-  written down from the record, its own rows stored and not in it presented), and a write is stored at once instead
+  written down from the record, then the rows it took in that carry an audience stamp and are elsewhere to the agent,
+  such as another agent's own rows, mail stamped for a co-resident and a held row, taken out, traced as
+  `presentation:retracted` with reason `elsewhere`, and its own rows stored and not in it presented; a row stored
+  before the stamp stays), and a write is stored at once instead
   of queued for a live turn. A row enters each reader's window at
   that reader's presentation points, never inside its turn: an agent's own rows as they are written; another
   writer's rows meant for it at its turn's start, at its tool boundary as a prefix its stream can carry (each body

@@ -128,6 +128,59 @@ describe('the presentation module', () => {
     assert.deepEqual(ofType(r.traces, 'presentation:repaired'), [], 'nothing to repair: the write-down took every row in');
   });
 
+  // AF-A-1: a write-down takes the whole record, so a resident taken on
+  // after another's window was presented (one added to a host's
+  // configuration later) would hold that resident's own rows and its mail.
+  // The stamped rows elsewhere to it leave its window at once; the rows an
+  // earlier release stored unstamped stay, the write-down's migration.
+  it("a resident taken on after another's window was presented holds none of that resident's own rows or mail (decision 1)", async () => {
+    const r = await rig();
+    const unstamped = r.mira.cm.addMessage('someone', text('from before the stamp'), {});
+    r.presentation.adopt(r.mira);
+    const dm = r.write(r.mira, 'alice', text('a DM for mira alone'), ['mira']);
+    const reply = storeOwnRow(r.mira, 'mira', text("mira's private reply"));
+    const both = r.write(r.mira, 'someone', text('for both'), ['mira', 'oren']);
+    const held = r.write(r.mira, 'someone', text('held'), ['mira', 'oren'], { tuneOut: { epochId: 'e' } } as MessageMetadata);
+    assert.deepEqual(r.mira.window(), ['from before the stamp', 'a DM for mira alone', "mira's private reply", 'for both'], 'setup');
+
+    r.presentation.adopt(r.oren);
+    assert.equal(r.oren.cm.windowMode(), 'presented');
+    assert.deepEqual(r.oren.window(), ['from before the stamp', 'for both'], 'its arrivals and the unstamped row, nothing of mira\'s');
+    for (const id of [dm, reply, held]) assert.equal(r.oren.cm.windowStatusOf(id), 'out', 'taken out as arrived, not undone');
+    assert.equal(r.oren.has(unstamped), true);
+    assert.deepEqual(ofType(r.traces, 'presentation:retracted').map((t) => [t.agentName, t.reason, t.messageIds]),
+      [['oren', 'elsewhere', [dm, reply, held]]]);
+    assert.deepEqual(r.presentation.presentAtEnd(r.oren), [], 'no later point presents them');
+    assert.deepEqual(r.oren.window(), ['from before the stamp', 'for both']);
+    const compiled = (await r.oren.cm.compile(undefined, undefined, { dryRun: true })).messages;
+    assert.ok(!JSON.stringify(compiled).includes('mira'), "oren's compile sends nothing of mira's");
+    // Taken on again (a restart), its window is left as it is.
+    const before = ofType(r.traces, 'presentation:retracted').length;
+    const reopened = new TestAgent('oren', await openResident(r.store, 'oren'));
+    r.presentation.adopt(reopened);
+    assert.deepEqual(reopened.window(), ['from before the stamp', 'for both']);
+    assert.equal(ofType(r.traces, 'presentation:retracted').length, before, 'nothing more to take out');
+  });
+
+  it("a rebase onto a branch made before a resident's write-down takes in none of another resident's own rows there", async () => {
+    const r = await rig();
+    r.presentation.adopt(r.mira);
+    const reply = storeOwnRow(r.mira, 'mira', text("mira's reply"));
+    const both = r.write(r.mira, 'someone', text('for both'), ['mira', 'oren']);
+    const main = r.store.currentBranch().name;
+    r.store.createBranchAt('early', main, r.store.currentSequence());
+    r.presentation.adopt(r.oren);
+    assert.deepEqual(r.oren.window(), ['for both'], 'setup: written down on main without mira\'s reply');
+    r.store.switchBranch('early');
+    assert.equal(r.oren.cm.windowMode(), 'legacy', 'setup: no window index for oren on the early branch');
+    r.presentation.rebase(r.oren);
+    assert.equal(r.oren.cm.windowMode(), 'presented');
+    assert.deepEqual(r.oren.window(), ['for both'], "the rebase's write-down took mira's reply in, and it left");
+    assert.equal(r.oren.cm.windowStatusOf(reply), 'out');
+    assert.equal(r.oren.has(both), true);
+    assert.deepEqual(ofType(r.traces, 'presentation:retracted').at(-1), { type: 'presentation:retracted', agentName: 'oren', messageIds: [reply], reason: 'elsewhere' });
+  });
+
   it("an own row stored through the sink enters its owner's window at its write, and no co-resident's", async () => {
     const r = await rig();
     r.adoptAll();

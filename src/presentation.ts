@@ -42,6 +42,12 @@
  * rebase after the store's branch moved to a branch whose window index for
  * that manager was never written (one made before the write-down), since
  * any presentRows there writes the whole record down and switches the mode.
+ * The rows of the record the write-down took in that carry an audience
+ * stamp and are elsewhere to the agent (another agent's own rows, mail
+ * stamped for others, a held row) are then taken out (retractForeign), so a
+ * window written down after other agents' windows holds only the rows an
+ * earlier release stored unstamped and the agent's own and its arrivals
+ * (decision 1).
  * Nothing in it throws into a writer: a failed presentation is traced and
  * its rows stay out of the window for the next point.
  *
@@ -301,7 +307,7 @@ export type PresentationOccasion =
 
 /** A context manager as the module uses it. */
 export type WindowManager = Pick<ContextManager,
-  'presentRows' | 'getUnpresentedMessages' | 'getPresentedMessages' | 'ordinalOf' | 'indexLength' | 'windowStatusOf'
+  'presentRows' | 'retractRows' | 'getUnpresentedMessages' | 'getPresentedMessages' | 'ordinalOf' | 'indexLength' | 'windowStatusOf'
   | 'windowMode' | 'getMessage' | 'currentBranch' | 'isClosed' | 'retractRemoved' | 'retractAbsentRows'>;
 
 /** An agent as the module presents to it. The framework's Agent is one. */
@@ -425,9 +431,11 @@ export class AgentPresentation {
   /**
    * Take an agent on. Once per manager object: a manager in legacy mode has
    * its window written down (presentRows([]), which also finishes a
-   * write-down cut short), and the agent's own rows stored and not in its
-   * window are presented to it, in record order (an undone turn's rows are
-   * not: getUnpresentedMessages leaves them out). A window that can't be
+   * write-down cut short), the stamped rows it took in that are elsewhere to
+   * the agent are taken out (retractForeign), and the agent's own rows
+   * stored and not in its window are presented to it, in record order (an
+   * undone turn's rows are not: getUnpresentedMessages leaves them out). A
+   * window that can't be
    * written down (another version's index format, or a failed write; not a
    * write-down that threw once its record was written, which reads as
    * presented: writeDown) leaves the agent in legacy mode, traced once,
@@ -445,6 +453,7 @@ export class AgentPresentation {
       this.adopted.set(cm, state);
       this.writeDown(agent, state, 'adopt');
       if (!state.pinnedLegacy) {
+        this.retractForeign(agent, 'adopt');
         this.repair(agent);
         // A reader fork is framed before it is taken on (noteFramed at its
         // derivation, adopt at its run's registration): the held rows it was
@@ -464,8 +473,10 @@ export class AgentPresentation {
    * at their own sequence) there is none, and the window would be the
    * whole record for the rest of the process. So, as at adopt, such a
    * window is written down (presentRows([]), traced as presented at
-   * `'rebase'`), and the agent's own rows stored and not in its window are
-   * presented to it (the own-row sweep). A window that is presented on the
+   * `'rebase'`), the stamped rows it took in that are elsewhere to the
+   * agent, a co-resident's own rows presented on the old branch among them,
+   * are taken out (retractForeign), and the agent's own rows stored and not
+   * in its window are presented to it (the own-row sweep). A window that is presented on the
    * new branch is presented again for an agent left in legacy mode by an
    * earlier branch, its own-row sink installed. A window that can't be
    * written down, or a manager whose strategy couldn't follow the move
@@ -491,6 +502,7 @@ export class AgentPresentation {
       delete state.pinnedLegacy;
       if (!this.writeDown(agent, state, 'rebase')) return;
       agent.setOwnRowSink?.((ids) => this.presentOwn(agent, ids));
+      this.retractForeign(agent, 'rebase');
       this.repair(agent, 'rebase');
     } catch (error) {
       state.pinnedLegacy = describe(error);
@@ -538,6 +550,54 @@ export class AgentPresentation {
       if (count > 0) this.host.emitTrace({ type: 'presentation:presented', agentName: agent.name, occasion, count });
     }
     return true;
+  }
+
+  /**
+   * Take out of the agent's window the rows a write-down from the record
+   * took in that aren't its (decision 1): each row that carries an audience
+   * stamp and that bearingOf reads as elsewhere to the agent, such as
+   * another agent's own row, mail stamped for a co-resident, or a held row
+   * for a window that leaves held rows out. Each leaves its place as a plain
+   * retraction does, so it reads as arrived, and it stays elsewhere, so no
+   * later point presents it. Two kinds of row stay: an unstamped row, which
+   * a release before the stamp stored and the write-down migrates whole,
+   * and a shared derivation's inheritance (at or before its checkpoint),
+   * which is the child's history. Nothing is taken out for an agent the
+   * registry has no slot for. Run at every adopt and rebase, not only
+   * after a write-down this process made, so a window whose write-down
+   * landed and whose retraction didn't (a crash between the two records, a
+   * failed write) is repaired the next time it is taken on. No row the
+   * module presents is taken out here: it presents own rows and arrivals
+   * only, and a reader fork's framing, which is passed over. Traced as
+   * presentation:retracted, reason `elsewhere`; a failure is traced as
+   * presentation:failed at `occasion` and leaves the rows for the next
+   * adopt or rebase. Never throws.
+   */
+  private retractForeign(agent: PresentedAgent, occasion: 'adopt' | 'rebase'): void {
+    try {
+      const cm = agent.getContextManager();
+      if (!this.presenting(agent)) return;
+      const facts = readerFacts(this.host.registry, agent.name);
+      // An agent the registry doesn't know has no slot to weigh a row by.
+      if (facts.ownSlot === undefined) return;
+      const framed = this.framed.get(agent.name);
+      const window = cm.getPresentedMessages();
+      const foreign: MessageId[] = [];
+      for (let i = 0; i < window.length; i++) {
+        const row = window[i]!;
+        // A body is taken out whole by its first shard.
+        if (i > 0 && continuesBody(window[i - 1], row)) continue;
+        if (audienceOf(row.metadata) === undefined || framed?.has(row.id)) continue;
+        if (facts.derivedAt !== undefined && row.sequence <= facts.derivedAt) continue;
+        if (bearingOf(row, facts, cm.getMessage(row.id) !== null) === 'elsewhere') foreign.push(row.id);
+      }
+      if (foreign.length === 0) return;
+      cm.retractRows(foreign);
+      this.memos.delete(cm);
+      this.host.emitTrace({ type: 'presentation:retracted', agentName: agent.name, messageIds: foreign, reason: 'elsewhere' });
+    } catch (error) {
+      this.failed(agent, occasion, error);
+    }
   }
 
   /** Let an agent go: its sink off, and what the module kept for it (its memo, its framing, its held arrivals) dropped. */

@@ -90,6 +90,55 @@ describe('presentation is mandatory (#291)', () => {
     });
   }
 
+  // AF-A-1: a host that ran with mira alone, restarted with oren added. oren's
+  // window is written down at its registration from the shared record, and
+  // takes in none of mira's own rows or her mail (decision 1).
+  it("a resident added after a host ran without it holds none of the other resident's own rows or mail", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-presentation-mandatory-'));
+    dirs.push(dir);
+    const storePath = join(dir, 'store.chronicle');
+    const agent = (name: string) => ({ name, model: 'test-model', systemPrompt: `You are ${name}.`, proseRouting: 'disabled' as const });
+    const textOf = (m: { content: ContentBlock[] }) => m.content.map((b) => (b.type === 'text' ? (b as { text: string }).text : '')).join('');
+    {
+      const membrane = new MockMembrane();
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: "mira's private reply" }] as ContentBlock[]));
+      const framework = await AgentFramework.create({
+        storePath, membrane: membrane.asMembrane(), agents: [agent('mira')], modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+      });
+      try {
+        framework.start();
+        const internals = framework as unknown as { addMessage(p: string, c: ContentBlock[], m?: MessageMetadata, o?: { forAgent?: string }): MessageId };
+        internals.addMessage('alice', [{ type: 'text', text: 'a DM for mira alone' }] as ContentBlock[], undefined, { forAgent: 'mira' });
+        assert.equal(framework.nudgeAgent('mira', 'zz-op').ok, true);
+        await framework.runUntilIdle();
+        const window = framework.getAgent('mira')!.getContextManager().getPresentedMessages().map(textOf);
+        assert.ok(window.includes('a DM for mira alone') && window.includes("mira's private reply"), `setup: ${JSON.stringify(window)}`);
+      } finally {
+        await framework.stop();
+      }
+    }
+    const framework = await AgentFramework.create({
+      storePath, membrane: new MockMembrane().asMembrane(), agents: [agent('mira'), agent('oren')], modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+    });
+    try {
+      const traces: TraceEvent[] = [];
+      framework.onTrace((event) => { traces.push(event); }, { replay: true });
+      const oren = framework.getAgent('oren')!.getContextManager();
+      assert.equal(oren.windowMode(), 'presented');
+      const window = oren.getPresentedMessages().map(textOf);
+      assert.ok(!window.includes('a DM for mira alone'), `mira's mail isn't in oren's window: ${JSON.stringify(window)}`);
+      assert.ok(!window.includes("mira's private reply"), `nor mira's reply: ${JSON.stringify(window)}`);
+      const compiled = JSON.stringify((await oren.compile(undefined, undefined, { dryRun: true })).messages);
+      assert.ok(!compiled.includes('a DM for mira alone') && !compiled.includes("mira's private reply"), "nor oren's compile");
+      const retracted = traces.filter((t): t is Extract<TraceEvent, { type: 'presentation:retracted' }> => t.type === 'presentation:retracted');
+      assert.deepEqual(retracted.map((t) => [t.agentName, t.reason]), [['oren', 'elsewhere']]);
+      const mira = framework.getAgent('mira')!.getContextManager().getPresentedMessages().map(textOf);
+      assert.ok(mira.includes('a DM for mira alone') && mira.includes("mira's private reply"), "mira's window keeps both");
+    } finally {
+      await framework.stop();
+    }
+  });
+
   it("a write stamped only for agents that can't read its slot is traced once, and stored as named", async () => {
     const r = await run();
     try {
