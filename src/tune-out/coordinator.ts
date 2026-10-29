@@ -110,6 +110,13 @@ interface WindowStartsState {
   inForce?: number;
 }
 
+export function cancelWaitsNote(what: string): string {
+  return 'Not cancelled yet: writes are being kept in memory (an operator\'s change to the store is in progress, or a '
+    + 'context the cancel writes to waits to be re-initialized), so the cancel waits until they are stored. '
+    + `${what} stays in force until then, and what it held is delivered when it ends. If the host stops before then, `
+    + 'the cancel is lost and it is still in force after the restart, unless its end time has passed by then.';
+}
+
 /**
  * Whether a held message is one of this channel's: by its channel id, and by
  * its server where it records one, since two servers can register the same
@@ -2068,9 +2075,10 @@ export class TuneOutCoordinator {
             : undefined;
           if (refused) return { success: false, error: refused, isError: true };
           const result = this.cancelAllExcept('subconscious', 'subconscious judgment', note, caller);
-          return result.ok
-            ? { success: true, data: { cancelled: true, scope: 'all-except' } }
-            : { success: false, error: result.error, isError: true };
+          if (!result.ok) return { success: false, error: result.error, isError: true };
+          return result.deferred
+            ? { success: true, data: { waiting: true, scope: 'all-except', note: cancelWaitsNote('The all-except hold') } }
+            : { success: true, data: { cancelled: true, scope: 'all-except' } };
         };
         // A call naming the all-except scope ends that hold outright, as the
         // tool describes it and as the resident's tune_out cancel does: the
@@ -2120,9 +2128,10 @@ export class TuneOutCoordinator {
           `the tune-out on ${this.quotedShown(channel.serverId, channel.channelId)} isn't the hold you were started to read`);
         if (refused) return { success: false, error: refused, isError: true };
         const result = this.cancel(channel.serverId, channel.channelId, 'subconscious', 'subconscious judgment', note, caller);
-        return result.ok
-          ? { success: true, data: { cancelled: true } }
-          : { success: false, error: result.error, isError: true };
+        if (!result.ok) return { success: false, error: result.error, isError: true };
+        return result.deferred
+          ? { success: true, data: { waiting: true, note: cancelWaitsNote('The tune-out') } }
+          : { success: true, data: { cancelled: true } };
       }
       case 'note_disposition': {
         const key = String(input.key ?? '').trim();

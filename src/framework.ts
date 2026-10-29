@@ -23,7 +23,7 @@ import {
   type PersistentReaderConfig,
   type ForkReaderConfig,
 } from './tune-out/tools.js';
-import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, alreadyTunedOutText, type ReaderInvocation } from './tune-out/coordinator.js';
+import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, alreadyTunedOutText, cancelWaitsNote, type ReaderInvocation } from './tune-out/coordinator.js';
 import { SubconsciousWindowAnchor } from './tune-out/window-anchor.js';
 import { residentContextOptions, residentViewFilter, subconsciousContextOptions, subconsciousViewFilter } from './context-options.js';
 import { admit, type InboundEnvelope, type AdmissionDecision } from './admission/admit.js';
@@ -32511,8 +32511,10 @@ export class AgentFramework {
           if (!coordinator) return undefined;
           const scope = coordinator.getAllExcept();
           if (!scope || scope.params.except.serverId !== serverId || scope.params.except.channelId !== channelId) return undefined;
-          coordinator.cancelAllExcept('channel-close', 'the excepted channel was closed');
-          return 'The focus on it ended all the same, and what the other channels held was delivered.';
+          const ended = coordinator.cancelAllExcept('channel-close', 'the excepted channel was closed');
+          return ended.ok && ended.deferred
+            ? 'The focus on it ends once the writes being kept in memory are stored, and what the other channels held is delivered then.'
+            : 'The focus on it ended all the same, and what the other channels held was delivered.';
         },
         focusChannelResolver: () => this.tuneOutCoordinator?.focusChannel() ?? null,
         // Route a conversation fork's plain-text speech to its HOME channel, not
@@ -37209,7 +37211,10 @@ export class AgentFramework {
     }
     if (input.mode === 'cancel' && (allExcept || (!input.channelId && coordinator.getAllExcept()))) {
       const r = coordinator.cancelAllExcept('agent-tool', 'agent request');
-      return r.ok ? { success: true, data: { cancelled: 'all-except' } } : { success: false, error: r.error, isError: true };
+      if (!r.ok) return { success: false, error: r.error, isError: true };
+      return r.deferred
+        ? { success: true, data: { waiting: 'all-except', note: cancelWaitsNote('The all-except hold') } }
+        : { success: true, data: { cancelled: 'all-except' } };
     }
 
     const channelId = String(input.channelId ?? '');
@@ -37222,9 +37227,10 @@ export class AgentFramework {
     const shownNow = (): string => channelRegistry.nameShown(resolved);
     if (input.mode === 'cancel') {
       const r = coordinator.cancel(resolved.serverId, resolved.channelId, 'agent-tool', 'agent request');
-      return r.ok
-        ? { success: true, data: { cancelled: shownNow() } }
-        : { success: false, error: r.error, isError: true };
+      if (!r.ok) return { success: false, error: r.error, isError: true };
+      return r.deferred
+        ? { success: true, data: { waiting: shownNow(), note: cancelWaitsNote('The tune-out') } }
+        : { success: true, data: { cancelled: shownNow() } };
     }
     if (allExcept) {
       const r = coordinator.enterAllExcept(resolved, {
