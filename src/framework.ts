@@ -11015,10 +11015,20 @@ export class AgentFramework {
    * - A live agent: a snapshot derived from its context — at the head, or
    *   at `atSequence` for an earlier state. The snapshot is its own branch;
    *   the agent keeps running and is not affected by anything done to it.
+   *   `atSequence` is a sequence on the store's branch that follows a
+   *   presentation into the agent's window (#291), such as
+   *   `getStore().currentSequence()` read after one, not a row's own
+   *   sequence: a row enters the window at a write after its own, so a cut
+   *   at the row's own sequence holds it in the snapshot's record
+   *   (getAllMessages) and not in its window (getPresentedMessages), where
+   *   it reads as arrived (context-manager's derive).
    * - An ended agent: the context it left, reopened where it lives.
    *
-   * The returned manager uses a passthrough strategy: it shows what is
-   * stored, raw. An ended agent's context is the real one — treat it as
+   * The returned manager uses a passthrough strategy, so nothing is
+   * folded: its compile is the agent's window as the agent's view shows it
+   * (the rows the window holds, through its view filter), and in legacy
+   * mode, where the window is the record, the record so. getAllMessages()
+   * lists the record. An ended agent's context is the real one — treat it as
    * read-only unless you mean to change what a later resume starts from.
    */
   async inspectAgentContext(name: string, options: { atSequence?: number } = {}): Promise<ContextManager> {

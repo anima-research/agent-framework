@@ -201,7 +201,15 @@ export interface ContextInheritance {
    *   (requires store support; refused when unavailable).
    */
   mode: 'copy' | 'shared';
-  /** The parent checkpoint (sequence on the parent's branch). Filled at creation. */
+  /**
+   * The parent checkpoint: a sequence on the parent's branch. Filled at
+   * creation, from the derived context (its derivation's checkpoint). One a
+   * host sets, for a resume or a derive from an earlier state, is a
+   * presentation boundary (#291), such as `currentSequence()` read after a
+   * presentation into the parent's window, not a row's own sequence: a row
+   * enters the window at a write after its own, so a cut at its own
+   * sequence holds the row in the child's record and not in its window.
+   */
   atSequence?: number;
   /** The parent branch the checkpoint is on. Filled at creation. */
   branch?: string;
