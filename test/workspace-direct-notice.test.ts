@@ -553,7 +553,7 @@ test('a history lookup that throws decides nothing at a start, and leaves the po
   const logged: string[] = [];
   const error = console.error;
   console.error = (...args: unknown[]) => { logged.push(String(args[0])); };
-  const frameworks = (h.workspace as unknown as { historyLookup: (agentName: string, messageId: string) => boolean }).historyLookup;
+  const handedOver = (h.workspace as unknown as { historyLookup: (agentName: string, messageId: string) => boolean }).historyLookup;
   try {
     h.workspace.useHistory(() => { throw new Error('zz-lookup-failed'); });
     // At a start, no notice.
@@ -569,7 +569,7 @@ test('a history lookup that throws decides nothing at a start, and leaves the po
   } finally {
     console.error = error;
     // The framework's own lookup again.
-    h.workspace.useHistory(frameworks);
+    h.workspace.useHistory(handedOver);
   }
   // The next start whose lookup answers decides: exactly one notice.
   const [second] = await h.turn([say('readable')]);

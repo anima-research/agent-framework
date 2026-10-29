@@ -165,6 +165,16 @@ test("a create whose write hasn't landed ends its record once its held row shows
 
 type Hold = 'a branch move holding the store' | "the primary's recovery wait";
 
+async function within<T>(promise: Promise<T>, what: string, ms = 10_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`Timed out waiting for ${what}`)), ms); });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function withKeptCreate(
   hold: Hold,
   run: (s: { framework: AgentFramework; discord: FakeDiscord; processed: (type: string, id: string) => Promise<void>; kept: () => number; texts: (id: string) => string[] }) => Promise<void>,
@@ -188,7 +198,7 @@ async function withKeptCreate(
       if (w.type === done.type && w.id === done.discordMessageId) w.done(); else waiters.push(w);
     }
   });
-  const processed = (type: string, id: string) => new Promise<void>((done) => { waiters.push({ type, id, done }); });
+  const processed = (type: string, id: string) => within(new Promise<void>((done) => { waiters.push({ type, id, done }); }), `${type} for ${id} to be processed`);
   const released = new Promise<void>((done) => framework.onTrace((event) => {
     if (event.type === 'message:added' && event.source === 'surgery-release') done();
   }));
@@ -202,18 +212,18 @@ async function withKeptCreate(
   const initialize = strategy.initialize;
   const restore = () => { if (initialize) strategy.initialize = initialize; else delete strategy.initialize; };
   const quiet = console.error;
+  let open: (() => void) | undefined;
   try {
     if (hold === 'a branch move holding the store') {
-      let open!: () => void;
       const gate = new Promise<void>((resolve) => { open = resolve; });
       let reached!: () => void;
       const inMove = new Promise<void>((resolve) => { reached = resolve; });
       strategy.initialize = async function (this: unknown, ...args: unknown[]) { reached(); await gate; return initialize?.apply(this, args); };
       const move = framework.switchBranch(branch);
-      await inMove;
+      await within(inMove, 'the move to reach its initialization');
       await run({ framework, discord, processed, kept, texts });
-      open();
-      await move;
+      open!();
+      await within(move, 'the move');
     } else {
       strategy.initialize = async () => { throw new Error('zz-injected initialization failure'); };
       console.error = () => {};
@@ -223,11 +233,15 @@ async function withKeptCreate(
       console.error = quiet;
       await framework.switchBranch(branch);
     }
+    await within(released, 'the release');
+  } catch (error) {
+    open?.();
+    await cleanup().catch(() => {});
+    throw error;
   } finally {
     console.error = quiet;
     restore();
   }
-  await released;
   return { framework, texts, cleanup };
 }
 
@@ -237,7 +251,7 @@ async function drained(framework: AgentFramework): Promise<void> {
     if (event.type === 'process:completed' && (event.processEvent as { marker?: string }).marker === marker) done();
   }));
   (framework as unknown as { pushEvent(event: unknown): void }).pushEvent({ type: 'zz-drained', marker });
-  await seen;
+  await within(seen, 'the queue to drain');
 }
 
 for (const hold of ['a branch move holding the store', "the primary's recovery wait"] as const) {
@@ -334,13 +348,14 @@ for (const [change, kept, gone] of [['deleted', [], 'taken back'], ['edited', ['
       if (change === 'deleted') discord.onDeleteHandler!('k5'); else discord.onEditHandler!('k5', 'as edited');
       await changed;
       framework.pushEvent({ type: 'zz-hold' } as never);
-      await holder.entered;
+      await within(holder.entered, 'the held event');
     }, { triggerOn: 'all', modules: [holder], membrane });
     try {
       holder.release();
-      await firstRequest;
+      await within(firstRequest, "the turn's first request");
       const messages = JSON.stringify(membrane.calls[0]!.messages);
       assert.ok(!messages.includes(gone), `the turn's request doesn't carry "${gone}"`);
+      if (change === 'edited') assert.ok(messages.includes('as edited'), "the turn's request carries the edited text");
       await drained(s.framework);
       assert.deepEqual(s.texts('k5'), kept);
     } finally {
@@ -363,12 +378,12 @@ test("a message deleted while its create is kept in memory, whose delete is stil
     await created;
     assert.deepEqual([held(), texts('k9')], [1, []], 'the create is kept in memory, not stored');
     framework.pushEvent({ type: 'zz-hold' } as never);
-    await holder.entered;
+    await within(holder.entered, 'the held event');
     discord.onDeleteHandler!('k9');
   }, { triggerOn: 'all', modules: [holder], membrane });
   try {
     holder.release();
-    await firstRequest;
+    await within(firstRequest, "the turn's first request");
     assert.ok(!JSON.stringify(membrane.calls[0]!.messages).includes('taken back'), "the turn's request doesn't carry the deleted text");
     await drained(s.framework);
     assert.deepEqual(s.texts('k9'), []);
