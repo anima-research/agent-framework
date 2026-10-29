@@ -3,13 +3,15 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { AutobiographicalStrategy, PassthroughStrategy } from '@animalabs/context-manager';
+import { JsStore } from '@animalabs/chronicle';
+import { AutobiographicalStrategy, ContextManager as ContextManagerClass, PassthroughStrategy } from '@animalabs/context-manager';
 import type { ContextManager } from '@animalabs/context-manager';
 import { MembraneError } from '@animalabs/membrane';
 import type { ContentBlock, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import type { AgentConfig, EventResponse, Module, ProcessEvent, ToolDefinition, ToolResult } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
+import { GateModule, RoutedMembrane, say, until, waitCall } from './helpers/dendrite.js';
 
 const PIN = 'agent-framework:turn-inputs';
 type ProtectedRange = ReturnType<ContextManager['listPins']>[number];
@@ -587,4 +589,62 @@ test("a pin starts at the first row the agent sees, past rows it never sees unde
     });
     assert.ok(!logged.some((line) => line.includes('[turn-inputs]')), 'the pin was never dropped for the budget');
   });
+});
+
+// A shared fork reads its parent's context at a checkpoint and writes on a
+// branch of its own (deriveAgent). Its own turn's pin housekeeping clears and
+// sets pins of the turn's name; none of that may reach its parent's branch, or
+// the parent's opening request could fold mid-turn.
+const derives =
+  typeof (JsStore.prototype as unknown as { view?: unknown }).view === 'function' &&
+  typeof (ContextManagerClass.prototype as unknown as { derive?: unknown }).derive === 'function';
+
+test("a shared fork's opening and its end leave its parent's turn-inputs pin in place, and the parent's own end still releases it", {
+  skip: derives ? false : 'installed @animalabs/chronicle / context-manager lack branch-bound handles or ContextManager.derive',
+}, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'turn-inputs-pin-'));
+  const membrane = new RoutedMembrane();
+  membrane.identify = (request) => (JSON.stringify(request.messages).includes('[FORK-FRAMING]') ? 'fork-1' : request.assistantParticipant ?? '');
+  const gates = new GateModule();
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: membrane.asMembrane(),
+    agents: [{ name: 'mira', model: 'test-model', systemPrompt: 'You are mira.', strategy: strategy(), contextBudgetTokens: 60_000, maxTokens: 200 }],
+    modules: [gates],
+    syncIntervalMs: 0,
+    maintenanceIntervalMs: 0,
+  });
+  const pinsOf = (cm: ContextManager) => cm.listPins().filter((pin) => pin.name === PIN).map((pin) => ({ id: pin.id }));
+  const mira = framework.getAgent('mira')!;
+  try {
+    mira.getContextManager().addMessage('user', text('Please look into the open issues.'));
+    membrane.script('mira', waitCall('g-mira'), say('mira done'));
+    framework.start();
+    (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({ agentName: 'mira', reason: 'test', source: 'test', timestamp: Date.now() });
+    await until(() => gates.entered.has('g-mira'), 'mira to block mid-turn');
+    const miraPin = pinsOf(mira.getContextManager());
+    assert.equal(miraPin.length, 1, "mira's turn holds its pin while it runs");
+
+    membrane.script('fork-1', say('fork done'));
+    const fork = await framework.deriveAgent({
+      name: 'fork-1',
+      from: 'mira',
+      strategy: strategy() as never,
+      framing: [{ participant: 'user', content: text('[FORK-FRAMING] You are the fork. Count the open issues.') }],
+    });
+    const run = await framework.runEphemeralToCompletion(fork.agent, fork.contextManager);
+    assert.equal(run.speech, 'fork done', 'the fork ran its turn to its end');
+    assert.ok(membrane.callsFor('fork-1').length > 0, "the fork's turn opened a stream");
+    assert.deepEqual(pinsOf(mira.getContextManager()), miraPin, "the fork's opening and its end left mira's pin");
+
+    // Her one stream yields at the tool call and goes on to her answer once the gate opens.
+    gates.release('g-mira');
+    const miraSaid = () => mira.getContextManager().getAllMessages()
+      .some((m) => m.participant === 'mira' && m.content.some((block) => block.type === 'text' && block.text === 'mira done'));
+    await until(miraSaid, "mira's turn to reach its answer", 10_000);
+    await until(() => pinsOf(mira.getContextManager()).length === 0, "mira's own end to release her pin", 5_000);
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
