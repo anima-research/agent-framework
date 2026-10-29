@@ -190,7 +190,7 @@ describe('admission: the hold is decided once, before any side effect', () => {
 
   // Ported for #291: a write while quiesced is stored at once, where this
   // test once had the quiesce queue it and the release read the queue.
-  it('gap 7 (quiesce) — a held message stored while quiesced is in a release made during it', async () => {
+  it('gap 7 (quiesce) — a held message stored while quiesced is in a release made during it, stored before the cancel returns, which enters the window at resume', async () => {
     const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
     try {
       await registerOpen(f, 'work', 'noisy');
@@ -204,13 +204,15 @@ describe('admission: the hold is decided once, before any side effect', () => {
           tuneOut: { epochId }, channelId: 'noisy', serverId: 'editor', author: { id: 'U1', name: 'antra' },
         });
       assert.ok(has(f, 'stored while quiesced'), 'premise: stored at once');
-      assert.ok(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test').ok);
-      f.alwaysRespond();
-      await f.framework.resume();
-      await eventually(() => has(f, '<tuned-out-backlog'), 'the release lands at resume');
+      assert.deepEqual(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test'), { ok: true });
+      assert.ok(has(f, '<tuned-out-backlog'), 'the release is stored before the cancel returns, while quiesced');
+      assert.equal(inWindow(f, '<tuned-out-backlog'), false, 'and is in no window while quiesced');
       const release = textOf(find(f, '<tuned-out-backlog'));
       assert.match(release, /messages=1/, 'the message is counted');
       assert.match(release, /antra: stored while quiesced/, 'and listed');
+      f.alwaysRespond();
+      await f.framework.resume();
+      await eventually(() => inWindow(f, '<tuned-out-backlog'), 'the release enters the window at resume');
     } finally { await f.close(); }
   });
 
