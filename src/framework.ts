@@ -2758,6 +2758,25 @@ export const heldFromResidents = (metadata: Record<string, unknown> | undefined)
 const RESIDENT_VIEW_FILTER = (message: StoredMessage): boolean =>
   !heldFromResidents(message.metadata as Record<string, unknown> | undefined);
 
+type StoreView = { sees: (metadata: unknown) => boolean; keeps: (row: ViewedRow) => boolean };
+
+const residentView = (name: string): StoreView => {
+  const sees = (metadata: unknown): boolean =>
+    RESIDENT_VIEW_FILTER({ metadata } as StoredMessage) && !isAnotherAgentsInjection(metadata, name);
+  return { sees, keeps: (row) => sees(row.metadata) && !isOthersSystemChange(row, name) };
+};
+
+const observerView = (name: string, includeHeld: boolean): StoreView => {
+  const sees = (metadata: unknown): boolean =>
+    (includeHeld || RESIDENT_VIEW_FILTER({ metadata } as StoredMessage)) && !isAnotherAgentsInjection(metadata, name);
+  return { sees, keeps: (row) => sees(row.metadata) && !isSystemChangeNotOwn(row, name) };
+};
+
+const derivedView = (source: StoreView, name: string): StoreView => ({
+  sees: (metadata) => source.sees(metadata) || isOwnInjection(metadata, name),
+  keeps: (row) => source.keeps(row) || isOwnInjection(row.metadata, name) || (isSystemChangeMessage(row) && !isSystemChangeNotOwn(row, name)),
+});
+
 /** The context-manager surface shared inheritance needs; absent on versions without derivation. */
 interface DerivingContextManager {
   derive(options: {
@@ -4147,7 +4166,7 @@ export class AgentFramework {
   // closes, before an owned store, each one alive.
   private readonly openManagers = new Set<WeakRef<ContextManager>>();
   private readonly openManagerRefs = new WeakMap<ContextManager, WeakRef<ContextManager>>();
-  private readonly storeViews = new WeakMap<ContextManager, { sees: (metadata: unknown) => boolean; keeps: (row: ViewedRow) => boolean }>();
+  private readonly storeViews = new WeakMap<ContextManager, StoreView>();
   private readonly collectedManagers = new FinalizationRegistry<WeakRef<ContextManager>>((ref) => this.openManagers.delete(ref));
   /** The coalescing commit in flight, if any (see commitCoalescingDurable). */
   private coalescingCommit: Promise<void> | null = null;
@@ -11241,29 +11260,20 @@ export class AgentFramework {
 
   /** Open the context an ended agent left, wherever it lives. */
   private async reopenAgentContext(record: AgentRecord, strategy?: ContextStrategy, membrane: Membrane = this.membrane): Promise<ContextManager> {
-    // The residents' view as createAgent gives it: held rows out, and another
-    // agent's stored context injections out, since those are that agent's
-    // context, not conversation (Weft's ninth-round probe: an ended reader
-    // reopened for inspection showed a co-resident's injection it never saw live).
-    const residentSees = (name: string) => (metadata: unknown): boolean =>
-      RESIDENT_VIEW_FILTER({ metadata } as StoredMessage) && !isAnotherAgentsInjection(metadata, name);
-    // A context derived from a reader of the shared slot sees, as it did live
-    // (deriveSharedContext, #291), what its source saw and its own stored
-    // injections; its source's view is composed the same way, up the shared
-    // sources the registry names, to the reader the first was derived from.
-    const derivedSees = (from: AgentRecord, walked = new Set<string>()): ((metadata: unknown) => boolean) => {
+    const viewOf = (from: AgentRecord, walked = new Set<string>()): StoreView | undefined => {
       const source = from.inherit?.mode === 'shared' ? from.inherit.from : undefined;
-      if (source === undefined || walked.has(from.name)) return residentSees(from.name);
-      walked.add(from.name);
-      const sourceRecord = this.registry.inspect(source);
-      const sourceSees = sourceRecord ? derivedSees(sourceRecord, walked) : residentSees(source);
-      return (metadata) => sourceSees(metadata) || isOwnInjection(metadata, from.name);
+      if (source !== undefined && !walked.has(from.name)) {
+        walked.add(from.name);
+        const sourceRecord = this.registry.inspect(source);
+        const sourceView = sourceRecord ? viewOf(sourceRecord, walked) : residentView(source);
+        return sourceView && derivedView(sourceView, from.name);
+      }
+      const observed = from.relationships.observes.find((edge) => edge.agent === undefined && edge.slot === undefined);
+      if (observed) return observerView(from.name, observed.includeHeld === true);
+      return from.readsSharedSlot === true ? residentView(from.name) : undefined;
     };
-    // The predicate is the manager's view filter, and is recorded beside it,
-    // so main's checks of whether an agent sees a row (agentSees) ask what its
-    // view holds when the reopened context is live.
-    const seen = (contextManager: ContextManager, sees: (metadata: unknown) => boolean): ContextManager => {
-      this.storeViews.set(contextManager, { sees, keeps: (row) => sees(row.metadata) });
+    const seen = (contextManager: ContextManager, view: StoreView): ContextManager => {
+      this.storeViews.set(contextManager, view);
       return contextManager;
     };
     if (record.inherit?.mode === 'shared') {
@@ -11275,17 +11285,16 @@ export class AgentFramework {
             '@animalabs/context-manager cannot reopen (ContextManager.reopenDerived)',
         );
       }
-      // A context derived from a reader of the shared slot keeps the view it had.
-      const sees = derivation.slots?.messageNamespace === null ? derivedSees(record) : undefined;
+      const view = viewOf(record);
       const reopened = await reopen.call(ContextManager, {
         store: this.store,
         derivation,
         strategy: strategy ?? new PassthroughStrategy(),
         membrane,
-        ...(sees ? { viewFilter: (message: StoredMessage) => sees(message.metadata) } : {}),
+        ...(view ? { viewFilter: view.keeps } : {}),
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
-      return sees ? seen(reopened, sees) : reopened;
+      return view ? seen(reopened, view) : reopened;
     }
     if (!record.namespace) {
       throw new Error(`Agent "${record.name}": its record names no context to reopen`);
@@ -11294,16 +11303,16 @@ export class AgentFramework {
     // configuration, say) is reopened as createAgent opened it: on the
     // shared slot, through the residents' view. Isolated, its namespace
     // holds none of what it read (nissa's #546 review, round 2).
-    const sees = record.readsSharedSlot === true ? residentSees(record.name) : undefined;
+    const view = record.readsSharedSlot === true ? viewOf(record) : undefined;
     const opened = await ContextManager.open({
       store: this.store,
       namespace: record.namespace,
-      ...(sees ? { viewFilter: (message: StoredMessage) => sees(message.metadata) } : { isolate: true }),
+      ...(view ? { viewFilter: view.keeps } : { isolate: true }),
       strategy: strategy ?? new PassthroughStrategy(),
       membrane,
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
-    return sees ? seen(opened, sees) : opened;
+    return view ? seen(opened, view) : opened;
   }
 
   /** Open a derived agent's context on a branch of its own (see deriveAgent). */
@@ -11347,10 +11356,8 @@ export class AgentFramework {
     // what its compile shows. A source with no view recorded has no filter
     // (an isolated run's): it sees every row, so its fork keeps none, and
     // sees its own.
-    const sourceSees = this.storeViews.get(source)?.sees;
-    const sees = sourceSees
-      ? (metadata: unknown): boolean => sourceSees(metadata) || isOwnInjection(metadata, config.name)
-      : undefined;
+    const sourceView = this.storeViews.get(source);
+    const view = sourceView && derivedView(sourceView, config.name);
     const contextManager = await source.derive({
       branch: ownBranch,
       strategy: config.strategy ?? new PassthroughStrategy(),
@@ -11360,10 +11367,10 @@ export class AgentFramework {
       solve: inherit.solve ?? 'reuse',
       inherit: { refusals: inherit.refusals === true },
       ...(inherit.atSequence !== undefined ? { atSequence: inherit.atSequence } : {}),
-      ...(sees ? { viewFilter: (message: StoredMessage) => sees(message.metadata) } : {}),
+      ...(view ? { viewFilter: view.keeps } : {}),
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
-    if (sees) this.storeViews.set(contextManager, { sees, keeps: (row) => sees(row.metadata) });
+    if (view) this.storeViews.set(contextManager, view);
     const derivation = (contextManager as ContextManager & Partial<DerivingContextManager>).getDerivation?.();
     return {
       contextManager,
@@ -15968,10 +15975,7 @@ export class AgentFramework {
     // stored context injections out. Main's boundary and arrival checks read
     // the same predicate (storeViews, agentSees), so they and the compiled
     // view agree.
-    const sees = (metadata: unknown): boolean =>
-      !heldFromResidents(metadata as Record<string, unknown> | undefined)
-      && !isAnotherAgentsInjection(metadata, config.name);
-    const keeps = (message: ViewedRow): boolean => sees(message.metadata) && !isOthersSystemChange(message, config.name);
+    const view = residentView(config.name);
     // Create context manager for this agent
     const contextManager = await ContextManager.open({
       store: this.store,
@@ -15995,10 +15999,10 @@ export class AgentFramework {
       // resident filter keeps held (tuned-out) rows out as before (`sees`).
       // So does a system change stamped as another resident's (it declares
       // another's tools), which only its content marks.
-      viewFilter: keeps,
+      viewFilter: view.keeps,
     });
     this.trackManager(contextManager);
-    this.storeViews.set(contextManager, { sees, keeps });
+    this.storeViews.set(contextManager, view);
 
     const agent = new Agent(config, contextManager, this.membrane);
     this.attachHeads(agent);
@@ -16071,8 +16075,7 @@ export class AgentFramework {
       // oversized tool results / attachments under the same policy.
       maxMessageTokens: primaryConfig.strategy?.maxMessageTokens,
     });
-    const sees = (metadata: unknown): boolean => !isAnotherAgentsInjection(metadata, name);
-    const keeps = (message: ViewedRow): boolean => sees(message.metadata) && !isSystemChangeNotOwn(message, name);
+    const view = observerView(name, true);
     const contextManager = await ContextManager.open({
       store: this.store,
       namespace: `subconscious/${primaryName}`,
@@ -16085,13 +16088,13 @@ export class AgentFramework {
       // context injections (stored-injections.ts), their context, which this
       // agent never saw while they were placed unstored.
       auxiliaryMessageViews: [{}],
-      viewFilter: keeps,
+      viewFilter: view.keeps,
       strategy,
       membrane: this.membrane,
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
     this.trackManager(contextManager);
-    this.storeViews.set(contextManager, { sees, keeps });
+    this.storeViews.set(contextManager, view);
 
     // Inherit the principal's inference settings wholesale (fork-template
     // idiom): reasoning effort (thinking), provider params, token ceilings,

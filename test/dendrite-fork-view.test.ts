@@ -16,7 +16,7 @@ import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, type ContextInjection } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
-import { AgentFramework, type Agent } from '../src/index.js';
+import { AgentFramework, systemChangeMetadata, type Agent } from '../src/index.js';
 import { GateModule, RoutedMembrane, say, until, waitCall } from './helpers/dendrite.js';
 
 const supported =
@@ -145,5 +145,87 @@ describe("a shared fork's view", () => {
     const leftBelow = await framework.inspectAgentContext('fork-2');
     assert.deepEqual(await shown(leftBelow), ['MIRA-OWN', 'FORK-OWN', 'FORK2-OWN'], "the reopened fork of a fork, as live: its source's source's view too");
     assert.deepEqual(seenBy(readerOf(leftBelow), leftBelow), ['MIRA-OWN', 'FORK-OWN', 'FORK2-OWN']);
+  });
+
+  it("keeps its source's system changes and its own, and leaves out another resident's, in its compile and reopened after it ends", { skip }, async () => {
+    const change = (name: string) => [{ type: 'system_change', defineTools: [{ name, description: name, inputSchema: { type: 'object', properties: {} } }] }] as never;
+    const changeTools = async (cm: ContextManager): Promise<string[]> =>
+      (await cm.compile(undefined, undefined, { dryRun: true })).messages.flatMap((m) =>
+        (m.content as Array<{ type: string; defineTools?: Array<{ name: string }> }>)
+          .filter((b) => b.type === 'system_change').flatMap((b) => (b.defineTools ?? []).map((t) => t.name)));
+    const mira = framework.getAgent('mira')!;
+    mira.getContextManager().addMessage('user', [text('Please look into the open issues.')]);
+    mira.getContextManager().addMessage('system', change('mira-tool'), systemChangeMetadata('mira') as never);
+    framework.getAgent('oren')!.getContextManager().addMessage('system', change('oren-tool'), systemChangeMetadata('oren') as never);
+    assert.deepEqual(await changeTools(mira.getContextManager()), ['mira-tool'], "the premise: the source's view keeps its own change and leaves out another resident's");
+    const fork = await framework.deriveAgent({
+      name: 'fork-1',
+      from: 'mira',
+      framing: [{ participant: 'user', content: [text(FRAMING)] }],
+    });
+    fork.contextManager.addMessage('system', change('fork-tool'), systemChangeMetadata('fork-1') as never);
+    assert.deepEqual(await changeTools(fork.contextManager), ['mira-tool', 'fork-tool'], "the fork's compile: its source's change and its own, not another resident's");
+    framework.start();
+    membrane.script('fork-1', say('fork-1 done'));
+    assert.equal((await framework.runEphemeralToCompletion(fork.agent, fork.contextManager)).speech, 'fork-1 done');
+    assert.deepEqual(await changeTools(await framework.inspectAgentContext('fork-1')), ['mira-tool'],
+      "the reopened fork: its source's change, not another resident's (its own went at its first request, as an agent on its head removes its own)");
+  });
+});
+
+describe("a shared fork of an isolated-slot reader's view", () => {
+  let tempDir: string;
+  let membrane: RoutedMembrane;
+  let framework: AgentFramework;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'dendrite-fork-view-isolated-'));
+    membrane = new RoutedMembrane();
+    // The fork presents itself under its source's name; its framing tells it apart.
+    membrane.identify = (request) =>
+      JSON.stringify(request.messages).includes('[FORK-FRAMING]') ? 'fork-1' : request.assistantParticipant ?? '';
+    framework = await AgentFramework.create({
+      storePath: join(tempDir, 'store.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'mira', model: 'test-model', systemPrompt: 'You are mira.' }],
+      subconscious: { enabled: true, systemPrompt: 'notice' },
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    });
+  });
+
+  afterEach(async () => {
+    try { await framework.stop(); } catch { /* already stopped */ }
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  const compiled = async (cm: ContextManager): Promise<string[]> =>
+    (await cm.compile(undefined, undefined, { dryRun: true })).messages.map(textOf);
+
+  it("a fork of the subconscious, reopened after it ends, shows what its live compile showed", { skip }, async () => {
+    const mira = framework.getAgent('mira')!;
+    const sub = framework.getAgent('Subconscious')!;
+    mira.getContextManager().addMessage('user', [text('MIRA-SAID')]);
+    mira.getContextManager().addMessage('Antra', [text('HELD-ROW')], { tuneOut: { epochId: 'e1' } } as never);
+    internals(framework).storeInjections(mira, [injection('MIRA-OWN')]);
+    const fork = await framework.deriveAgent({
+      name: 'fork-1',
+      from: sub.name,
+      framing: [{ participant: 'user', content: [text(FRAMING)] }],
+    });
+    internals(framework).storeInjections(fork.agent, [injection('FORK-OWN')]);
+    const live = await compiled(fork.contextManager);
+    assert.ok(live.includes('FORK-OWN'), "the premise: the fork's compile shows its own injection");
+    assert.ok(live.includes('MIRA-SAID'), "the premise: like its source's, the fork's compile reads the residents' slot");
+    assert.ok(!live.includes('MIRA-OWN'), "like its source's, the fork's compile leaves out a resident's stored injection");
+    assert.ok(live.includes('HELD-ROW'), "and, like its source's, shows a row a tune-out holds from the residents");
+    membrane.script('fork-1', say('fork-1 done'));
+    framework.start();
+    assert.equal((await framework.runEphemeralToCompletion(fork.agent, fork.contextManager)).speech, 'fork-1 done');
+    const left = await framework.inspectAgentContext('fork-1');
+    const reopened = await compiled(left);
+    assert.ok(!reopened.includes('MIRA-OWN'), "the reopened fork, as live, leaves out the resident's stored injection");
+    assert.ok(reopened.includes('HELD-ROW'), 'and shows the held row');
   });
 });
