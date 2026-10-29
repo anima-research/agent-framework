@@ -447,6 +447,101 @@ describe('HistoryModule', () => {
     });
   });
 
+  describe("an agent's words sent through a speech tool (#524)", () => {
+    const sent: StoredMessage[] = [
+      msg('s1', 1000, 'Glassy', [{ type: 'tool_use', id: 'a', name: 'telegram--send_message', input: { chat_id: 42, message: 'the meeting moved to Thursday' } }], 'c1'),
+      msg('s2', 2000, 'Glassy', [{ type: 'tool_use', id: 'b', name: 'telegram--reply_to_message', input: { chat_id: 42, message_id: 7, text: 'yes, Thursday at noon' } }], 'c1'),
+      msg('s3', 3000, 'Glassy', [{ type: 'tool_use', id: 'c', name: 'telegram--send_file', input: { chat_id: 42, file_path: '/tmp/minutes-0612.pdf', caption: 'the minutes from today' } }], 'c1'),
+      msg('s4', 4000, 'Glassy', [{ type: 'tool_use', id: 'd', name: 'telegram--edit_message', input: { chat_id: 42, message_id: 8, new_text: 'Thursday at one, not noon' } }], 'c1'),
+      msg('s5', 5000, 'Glassy', [{ type: 'tool_use', id: 'e', name: 'discord--send_message', input: { channelId: 'room', content: 'posted in the room' } }], 'c1'),
+      msg('s6', 6000, 'Glassy', [{ type: 'tool_use', id: 'f', name: 'channel_publish', input: { channelId: 'room', content: 'published to the room' } }], 'c1'),
+      msg('s7', 7000, 'Glassy', [{ type: 'tool_use', id: 'g', name: 'think', input: { content: 'a private note about Thursday' } }], 'c1'),
+      msg('s8', 8000, 'Glassy', [{ type: 'tool_use', id: 'h', name: 'telegram--send_scheduled_message', input: { chat_id: 42, message: 'a reminder that the report is due', schedule_date: '2026-11-02T09:00:00Z' } }], 'c1'),
+      msg('s9', 9000, 'Glassy', [{ type: 'tool_use', id: 'i', name: 'telegram--create_poll', input: { chat_id: 42, question: 'which room suits everyone?', options: ['the library', 'the hall'] } }], 'c1'),
+      msg('s10', 10000, 'Glassy', [{ type: 'tool_use', id: 'j', name: 'slack--reply_message', input: { channelId: 'C1', messageId: '1.2', content: 'replying in the thread' } }], 'c1'),
+      msg('s11', 11000, 'Glassy', [{ type: 'tool_use', id: 'k', name: 'slack--send_dm', input: { userId: 'U1', content: 'a word to one person' } }], 'c1'),
+      msg('s12', 12000, 'Glassy', [{ type: 'tool_use', id: 'l', name: 'slack--edit_message', input: { channelId: 'C1', messageId: '1.3', content: 'corrected in place' } }], 'c1'),
+      msg('s13', 13000, 'Glassy', [{ type: 'tool_use', id: 'm', name: 'channel_publish', input: { channelId: 'room', content: '  ', text: 'never posted' } }], 'c1'),
+      msg('s14', 14000, 'Glassy', [{ type: 'tool_use', id: 'n', name: 'discord--send_message' } as unknown as ContentBlock], 'c1'),
+      msg('s15', 15000, 'Glassy', [{ type: 'tool_use', id: 'o', input: { content: 'a call with no name' } } as unknown as ContentBlock], 'c1'),
+      msg('s16', 16000, 'Glassy', [{ type: 'tool_use', id: 'p', name: 'channel_publish', input: { channelId: 'room', content: null, text: 'a null content falls through to text' } }], 'c1'),
+      msg('s17', 17000, 'Glassy', [{ type: 'tool_use', id: 'q', name: 'world--say', input: { text: 'hello from the plaza', spoken: false } }], 'c1'),
+      msg('s18', 18000, 'Glassy', [{ type: 'tool_use', id: 'r', name: 'world--whisper', input: { to: 'p-7', text: 'meet me by the fountain' } }], 'c1'),
+      msg('s19', 19000, 'Glassy', [{ type: 'tool_use', id: 's', name: 'telegram--send_file', input: { chat_id: 42, file_path: '/tmp/agenda-0613.pdf' } }], 'c1'),
+      msg('s20', 20000, 'Glassy', [{ type: 'tool_use', id: 't', name: 'channel_publish', input: { channelId: 'room', content: '', text: 'never posted either' } }], 'c1'),
+    ];
+    const bound = () => {
+      const { cm } = buildStub(sent);
+      const h = new HistoryModule();
+      h.bind(cm);
+      return h;
+    };
+    const ids = async (h: HistoryModule, input: Record<string, unknown>) => {
+      const result = await h.handleToolCall(call('search', input));
+      assert.equal(result.success, true, result.error);
+      return (result.data as { matches: Array<{ id: string }> }).matches.map((m) => m.id);
+    };
+
+    it('search finds what was said through each one, under its own argument name', async () => {
+      const h = bound();
+      assert.deepEqual(await ids(h, { query: 'moved to Thursday' }), ['s1']);
+      assert.deepEqual(await ids(h, { query: 'Thursday at noon' }), ['s2']);
+      assert.deepEqual(await ids(h, { query: 'minutes from today' }), ['s3']);
+      assert.deepEqual(await ids(h, { query: 'at one, not noon' }), ['s4']);
+      assert.deepEqual(await ids(h, { query: 'posted in the room' }), ['s5']);
+      assert.deepEqual(await ids(h, { query: 'published to the room' }), ['s6']);
+      assert.deepEqual(await ids(h, { query: 'report is due' }), ['s8']);
+      assert.deepEqual(await ids(h, { query: 'suits everyone' }), ['s9']);
+      assert.deepEqual(await ids(h, { query: 'in the thread' }), ['s10']);
+      assert.deepEqual(await ids(h, { query: 'to one person' }), ['s11']);
+      assert.deepEqual(await ids(h, { query: 'corrected in place' }), ['s12']);
+      assert.deepEqual(await ids(h, { query: 'falls through to text' }), ['s16']);
+      assert.deepEqual(await ids(h, { query: 'from the plaza' }), ['s17']);
+      assert.deepEqual(await ids(h, { query: 'by the fountain' }), ['s18']);
+      assert.deepEqual(await ids(h, { query: 'minutes-0612' }), [], "a send's file path isn't searched");
+      assert.deepEqual(await ids(h, { query: 'agenda-0613' }), [], "a file sent alone isn't searched by its path");
+      assert.deepEqual(await ids(h, { query: 'private note' }), [], "a private tool's words aren't searched");
+      assert.deepEqual(await ids(h, { query: 'Thursday at (noon|one)', regex: true }), ['s2', 's4']);
+    });
+
+    it("search finds a send by its server's name for the tool", async () => {
+      assert.deepEqual(await ids(bound(), { query: 'telegram--send_message' }), ['s1']);
+      assert.deepEqual(await ids(bound(), { query: 'slack--send_dm' }), ['s11']);
+    });
+
+    it('search finds them under the agent as author', async () => {
+      assert.deepEqual(await ids(bound(), { query: 'Thursday', author: ['Glassy'] }), ['s1', 's2', 's4']);
+    });
+
+    it('extract shows each one as its name and its words, and a call with no words, no input or no name as before', async () => {
+      const result = await bound().handleToolCall(call('extract', { channelId: 'c1', format: 'text' }));
+      assert.equal(result.success, true, result.error);
+      const shown = (result.data as { messages: Array<{ content: string }> }).messages.map((m) => m.content);
+      assert.deepEqual(shown, [
+        '[telegram--send_message] the meeting moved to Thursday',
+        '[telegram--reply_to_message] yes, Thursday at noon',
+        '[telegram--send_file] the minutes from today',
+        '[telegram--edit_message] Thursday at one, not noon',
+        '[discord--send_message] posted in the room',
+        '[channel_publish] published to the room',
+        '[tool_use: think]',
+        '[telegram--send_scheduled_message] a reminder that the report is due',
+        '[telegram--create_poll] which room suits everyone?',
+        '[slack--reply_message] replying in the thread',
+        '[slack--send_dm] a word to one person',
+        '[slack--edit_message] corrected in place',
+        '[tool_use: channel_publish]',
+        '[tool_use: discord--send_message]',
+        '[tool_use: undefined]',
+        '[channel_publish] a null content falls through to text',
+        '[world--say] hello from the plaza',
+        '[world--whisper] meet me by the fountain',
+        '[tool_use: telegram--send_file]',
+        '[tool_use: channel_publish]',
+      ]);
+    });
+  });
+
   describe('pagination input validation', () => {
     // Math.min(value, max) alone only enforces an UPPER bound —
     // Math.min(-1, 200) is -1, not clamped up to anything — so a negative

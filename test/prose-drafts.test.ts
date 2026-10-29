@@ -422,6 +422,7 @@ async function harness(opts: {
   /** The fixture server's requestTimeoutMs (the framework's default when unset). */
   requestTimeoutMs?: number;
   sendTool?: boolean;
+  sendToolName?: string;
   codeExecution?: boolean;
   serverConfig?: Record<string, unknown>;
   channels?: Array<{ id: string; label: string; direction?: 'inbound' | 'outbound' | 'bidirectional' }>;
@@ -464,6 +465,7 @@ async function harness(opts: {
         env: {
           STATUS_PATH: statusPath, COMMAND_PATH: commandPath,
           ...(opts.sendTool ? { SEND_TOOL: '1' } : {}),
+          ...(opts.sendToolName ? { SEND_TOOL_NAME: opts.sendToolName } : {}),
           ...(opts.channels ? { CHANNELS: JSON.stringify(opts.channels) } : {}),
         },
         ...(opts.sendTool ? { toolPrefix: 'discord' } : {}),
@@ -746,6 +748,39 @@ describe('held prose drafts, end to end', () => {
       await h.close();
     }
   });
+
+  it("a send through reply_to_message, telegram-mcpl's reply, whose answer names no channel, holds the prose beside it and after it (#524)", async () => {
+    const h = await harness({ sendTool: true, sendToolName: 'reply_to_message' });
+    await h.sendMode('no-channel');
+    try {
+      await h.turn([
+        createMockResponse([text('Here it is.'), call('s1', 'discord--reply_to_message', { channelId: ROOM, text: 'the explicit words' })], 'tool_use'),
+        createMockResponse([text('Sent it.')]),
+      ]);
+      assert.deepEqual(h.sends().map((s) => s.channelId), [ROOM], 'the send went out');
+      assert.deepEqual(h.publishes(), [], 'no plain speech went out beside it');
+      assert.deepEqual(h.drafts().map((d) => [d.text, d.reason]).reverse(), [['Here it is.', 'explicit-send'], ['Sent it.', 'explicit-send']]);
+    } finally {
+      await h.close();
+    }
+  });
+
+  for (const name of ['edit_message', 'send_file', 'send_scheduled_message', 'create_poll']) {
+    it(`a call of ${name} doesn't hold the round's prose: it still goes out (#524)`, async () => {
+      const h = await harness({ sendTool: true, sendToolName: name });
+      try {
+        await h.turn([
+          createMockResponse([text('Beside it.'), call('s1', `discord--${name}`, { channelId: ROOM, text: 'the words it carries' })], 'tool_use'),
+          createMockResponse([text('After it.')]),
+        ]);
+        assert.deepEqual(h.sends().map((s) => s.channelId), [ROOM], 'the call reached the server');
+        assert.deepEqual(h.publishes().map((p) => [p.channelId, p.text]), [[ROOM, 'Beside it.'], [ROOM, 'After it.']]);
+        assert.deepEqual(h.drafts(), []);
+      } finally {
+        await h.close();
+      }
+    });
+  }
 
   it('disabled mode stays draft-free: its narration is private by configuration', async () => {
     const h = await harness({ agents: [{ name: 'scout', proseRouting: 'disabled' }] });

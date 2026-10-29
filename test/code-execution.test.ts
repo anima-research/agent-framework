@@ -2309,6 +2309,10 @@ describe('a round whose run or wait call watches a script that can change its ro
     await heldUntilScriptReturns('await tools["test--slow"]({});\nif (false) await tools["world--whisper"]({});');
   });
 
+  it("a script whose code names reply_to_message, telegram-mcpl's reply, holds its round until it returns (#524)", async () => {
+    await heldUntilScriptReturns('await tools["test--slow"]({});\nif (false) await tools["telegram--reply_to_message"]({});');
+  });
+
   it("a script that makes many calls of one kind keeps one entry for them in its round's count", async () => {
     const h = await scriptRound('locus', [
       createMockResponse([

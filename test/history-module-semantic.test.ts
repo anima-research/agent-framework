@@ -131,6 +131,43 @@ describe('HistoryModule semantic_search', () => {
     assert.equal(messageIndexText(sent, false), expected);
   });
 
+  it("messageIndexText keeps what the resident sent through telegram-mcpl's tools, under their own argument names (#524)", () => {
+    const sent = msg('m10', T0 + 10000, [
+      { type: 'tool_use', id: 'a', name: 'telegram--send_message', input: { chat_id: 42, message: 'the meeting moved to Thursday' } },
+      { type: 'tool_use', id: 'b', name: 'telegram--reply_to_message', input: { chat_id: 42, message_id: 7, text: 'yes, Thursday at noon' } },
+      { type: 'tool_use', id: 'c', name: 'telegram--send_file', input: { chat_id: 42, file_path: '/tmp/minutes-0612.pdf', caption: 'the minutes from today' } },
+      { type: 'tool_use', id: 'd', name: 'telegram--edit_message', input: { chat_id: 42, message_id: 8, new_text: 'Thursday at one, not noon' } },
+      { type: 'tool_use', id: 'e', name: 'telegram--send_scheduled_message', input: { chat_id: 42, message: 'a reminder that the report is due', schedule_date: '2026-11-02T09:00:00Z' } },
+      { type: 'tool_use', id: 'f', name: 'telegram--create_poll', input: { chat_id: 42, question: 'which room suits everyone?', options: ['the library', 'the hall'] } },
+    ] as ContentBlock[]);
+    assert.equal(messageIndexText(sent, false), [
+      '[send_message] the meeting moved to Thursday',
+      '[reply_to_message] yes, Thursday at noon',
+      '[send_file] the minutes from today',
+      '[edit_message] Thursday at one, not noon',
+      '[send_scheduled_message] a reminder that the report is due',
+      '[create_poll] which room suits everyone?',
+    ].join('\n'));
+  });
+
+  it("messageIndexText keeps what the resident said in a world through Eidoverse's say and whisper (#524)", () => {
+    const said = msg('m11', T0 + 11000, [
+      { type: 'tool_use', id: 'a', name: 'world--say', input: { text: 'hello from the plaza', spoken: false } },
+      { type: 'tool_use', id: 'b', name: 'world--whisper', input: { to: 'p-7', text: 'meet me by the fountain' } },
+    ] as ContentBlock[]);
+    assert.equal(messageIndexText(said, false), '[say] hello from the plaza\n[whisper] meet me by the fountain');
+  });
+
+  it("messageIndexText doesn't read a `text` argument of send_message, reply_message, send_dm or edit_message, which servers send `content` (#524)", () => {
+    const sent = msg('m12', T0 + 12000, [
+      { type: 'tool_use', id: 'a', name: 'send_message', input: { channelId: 'C1', text: 'not read from text' } },
+      { type: 'tool_use', id: 'b', name: 'reply_message', input: { channelId: 'C1', messageId: '1.2', text: 'not read from text' } },
+      { type: 'tool_use', id: 'c', name: 'send_dm', input: { userId: 'U1', text: 'not read from text' } },
+      { type: 'tool_use', id: 'd', name: 'edit_message', input: { channelId: 'C1', messageId: '1.3', text: 'not read from text' } },
+    ] as ContentBlock[]);
+    assert.equal(messageIndexText(sent, false), '');
+  });
+
   it('syncs messages and summaries incrementally with cursors, then searches with mapped filters', async () => {
     const mod = new HistoryModule({ semantic: { url: svc.url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0, syncBatch: 2 } });
     mod.bind(stubCm(messages, summaries));

@@ -139,7 +139,7 @@ import { markNoticeOpenings, nameToTypeBack, quotedValue, showsAsItself, supplie
 import { NOTICE_TAG } from './notice-tags.js';
 import type { IncomingMessageFacts, RoutingDecision } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
-import { SEND_TOOLS, bareToolName } from './send-tools.js';
+import { SILENCING_SENDS, bareToolName } from './send-tools.js';
 import { boundedErrorMessage, errorMessage } from './error-message.js';
 import { ProviderWaits, EVERY_MODEL, isReleaseModel, withoutControls, type ProviderWait } from './provider-waits.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
@@ -271,9 +271,9 @@ function sniffImageMediaType(data: Buffer): string | undefined {
  * for two distinct reasons:
  *   - `skip_reply` — the agent EXPLICITLY chose not to reply (the deliberate
  *     "stay silent" signal).
- *   - explicit delivery tools (channel_publish / *send_message /
- *     *reply_message / *send_dm) — already sent the message, so routing the
- *     prose again would double-post.
+ *   - explicit delivery tools (send-tools.ts's silencing sends, such as
+ *     channel_publish and *send_message) — already sent the message, so
+ *     routing the prose again would double-post.
  * `think` is deliberately NOT here: it is silent *reasoning*, and same-round
  * prose beside it is governed separately by same_round_think_text_policy.
  *
@@ -288,26 +288,14 @@ function sniffImageMediaType(data: Buffer): string | undefined {
  * isn't a number of seconds): then the turn goes on, and only its own round
  * stays silent.
  */
-const SILENCING_TOOLS = new Set(['skip_reply', ...SEND_TOOLS]);
-
-/**
- * World-surface publication tools (Eidoverse `say` / `whisper`). An explicit
- * world utterance is the resident's chosen public speech for that round, so
- * it silences adjacent auto-routed prose exactly like a channel send — in
- * EVERY prose-routing mode. Until 2026-09-01 this set was consulted only in
- * hybrid mode; in locus mode a round of ordinary text + `say` published twice
- * (Cairn world seq 15146 = the say text, 15147 = the adjacent prose,
- * byte-for-byte). Hybrid additionally lets these outrank a same-round
- * `>>>destination` envelope.
- */
-const WORLD_PUBLICATION_TOOLS = new Set(['say', 'whisper']);
+const SILENCING_TOOLS = new Set(['skip_reply', ...SILENCING_SENDS]);
 
 /** True when a tool call (possibly MCPL-prefixed) is an explicit delivery
  *  that silences the round's auto-routed prose where it may have posted,
  *  regardless of mode. */
 const isSilencingTool = (name: string): boolean => {
   const bare = bareToolName(name);
-  return SILENCING_TOOLS.has(bare) || WORLD_PUBLICATION_TOOLS.has(bare);
+  return SILENCING_TOOLS.has(bare);
 };
 
 /** True when a model-issued call silences the round's auto-routed prose: a
@@ -344,8 +332,8 @@ const silenceCauseOf = (calls: Array<{ name: string; input?: unknown }>): 'send'
 
 /**
  * Whether a call of one of these tools can change a round's routing
- * (routeRound): in locus and hybrid mode a silencing or world-publication
- * tool, or `drafts`, whose resend is an explicit send (isSilencingCall); in
+ * (routeRound): in locus and hybrid mode a silencing tool, or `drafts`,
+ * whose resend is an explicit send (isSilencingCall); in
  * explicit mode, where sends don't silence, `skip_reply`, which keeps the
  * round private, and `drafts`; in either, `think` under the private same-round
  * policy, which holds the round back. Disabled mode routes nothing.
@@ -363,7 +351,7 @@ const changesRouting = (
 };
 
 /** The tools whose call can change a round's routing in some mode or policy (changesRouting). */
-const ROUTING_TOOLS = [...SILENCING_TOOLS, ...WORLD_PUBLICATION_TOOLS, 'drafts', 'think'];
+const ROUTING_TOOLS = [...SILENCING_TOOLS, 'drafts', 'think'];
 
 /** A routing tool's name standing as a whole identifier, as JavaScript reads one: no identifier character, `$` or joiner on either side. */
 const ROUTING_TOOL_NAMED = new RegExp(
