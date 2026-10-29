@@ -30,11 +30,13 @@
  *   next turn start (holdUntilStart), so the cut holds until it speaks.
  *
  * Arrivals are read from the index itself (getUnpresentedMessages filtered
- * by bearingOf), never from the store's head: a crashed turn's arrivals, a
- * derived agent's inheritance and rows imported at boot are arrivals by
- * construction. The one scalar kept is a memo of where a scan may start,
- * reset whenever the branch, the index length or the reader's facts moved
- * under it.
+ * by bearingOf), never from the store's head: a crashed turn's arrivals and
+ * rows imported at boot are arrivals by construction. A shared derivation's
+ * inheritance isn't an arrival: it reaches the child through the window it
+ * was derived with, and bearingOf reads an unstamped row at or before the
+ * derivation's checkpoint (derivedAt) as elsewhere. The one scalar kept is
+ * a memo of where a scan may start, reset whenever the branch, the index
+ * length or the reader's facts moved under it.
  *
  * The module presents only for an agent it has taken on (adopt) whose
  * manager is in presented mode: it never calls presentRows on a manager in
