@@ -12,8 +12,8 @@
   `store-held-lost` for the agent, with the counts and kinds as at a stop, where earlier releases kept such a write
   queued for the next drain. One whose row landed though its store threw counts as stored.
   A tune-out's cancel asked for meanwhile (its end time passing, a
-  wake past its budget, a tool's or a host's cancel) waits, the tune-out in force, until the writes are stored, then
-  runs, so its release is never kept in memory behind an end already on disk; `cancel()` and `cancelAllExcept()`
+  wake past its budget, a tool's or a host's cancel) waits, the tune-out in force, until the release has stored the writes,
+  or told of those it couldn't, then runs, so its release is never kept in memory behind an end already on disk; `cancel()` and `cancelAllExcept()`
   answer `{ ok: true, deferred: true }` then. A crash before that leaves the tune-out in force for the next boot,
   which cancels one whose end time passed. The `store-held-long` alert says so: a restart loses the writes the hold keeps in memory and those kept
   for a manager refusing its work, where 0.28.0's said writes still queued at exit survive in a persisted deferral

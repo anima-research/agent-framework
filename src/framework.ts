@@ -22317,8 +22317,9 @@ export class AgentFramework {
     }
     for (const [agentName, { writes, unknown, reason }] of lost) this.tellHeldWritesLost(agentName, writes, unknown, reason);
     // A tune-out's cancel asked for while the writes were held waited for
-    // them (writesHeld): with them stored, its release is stored too, before
-    // the epoch's end is recorded.
+    // them (writesHeld): with them stored, or told of where storing one
+    // failed, its release is stored too, before the epoch's end is
+    // recorded.
     try {
       this.tuneOutCoordinator?.runDeferredCancels();
     } catch (error) {

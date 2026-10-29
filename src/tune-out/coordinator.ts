@@ -897,7 +897,8 @@ export class TuneOutCoordinator {
   /**
    * Run the cancels asked for while writes were kept in memory (deferCancel),
    * in the order asked, now that the framework stores them again: it calls
-   * this once a surgery's hold has stored what it kept. One whose writes are
+   * this once a surgery's release has stored what its hold kept, or told of
+   * what it couldn't store. One whose writes are
    * still held waits on; one whose hold has ended meanwhile ends nothing.
    * Never throws.
    */
