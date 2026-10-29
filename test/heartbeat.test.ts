@@ -556,6 +556,41 @@ describe('the framework\'s heartbeat', () => {
     assert.ok(internals.upcomingWakesFor('scout').some((w) => w.what.startsWith('its heartbeat') && w.certain));
   });
 
+  // AF-A-5: a tick a surgery's hold keeps in memory was traced at its arrival
+  // with an empty id, then again at the release.
+  it("a tick a surgery's hold keeps in memory is traced once, as its release stores it", async (t) => {
+    mock.timers.reset();
+    const { AgentFramework } = await import('../src/index.js');
+    const { MockMembrane } = await import('./helpers/mock-membrane.js');
+    const own = mkdtempSync(join(tmpdir(), 'heartbeat-fw-'));
+    const framework = await AgentFramework.create({
+      storePath: join(own, 'store'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 's', proseRouting: 'disabled' }],
+      modules: [],
+      heartbeat: true,
+      gate: { configPath: join(own, 'gate.json'), config: { policies: [] } },
+    });
+    t.after(async () => { await framework.stop(); rmSync(own, { recursive: true, force: true }); });
+    const internals = framework as unknown as {
+      heartbeat: { start(): void; handleToolCall(name: string, input: unknown): { success: boolean } };
+      reserveStoreForSurgery(verb: string, agentName: string): () => void;
+    };
+    internals.heartbeat.start();
+    const added: Array<{ messageId: string; source: string }> = [];
+    framework.onTrace((event) => { if (event.type === 'message:added') added.push({ messageId: event.messageId, source: event.source }); });
+    const release = internals.reserveStoreForSurgery('roll back', 'scout');
+    try {
+      internals.heartbeat.handleToolCall('heartbeat--heartbeat_trigger', {});
+      assert.equal(added.length, 0, `not traced at its arrival: it has no id yet: ${JSON.stringify(added)}`);
+    } finally {
+      release();
+    }
+    assert.equal(added.length, 1, JSON.stringify(added));
+    assert.equal(added[0]!.source, 'surgery-release');
+    assert.ok(added[0]!.messageId, 'with its stored id');
+  });
+
   it('a defer default holds the tick back, as it held a heartbeat push', async (t) => {
     mock.timers.reset();
     const { AgentFramework } = await import('../src/index.js');

@@ -6174,7 +6174,9 @@ export class AgentFramework {
       ? { source: 'reminder', serverId: 'heartbeat', reminderId: wake.reminderId, recurring: wake.recurring, eventId: wake.eventId }
       : { source: 'heartbeat', serverId: 'heartbeat', reason: wake.reason, eventId: wake.eventId };
     const id = this.addMessage('user', [{ type: 'text', text: wake.text }], metadata as MessageMetadata, { placement });
-    this.emitTrace({ type: 'message:added', messageId: id, source: wake.kind === 'reminder' ? 'heartbeat:reminder' : 'heartbeat' });
+    // A write a surgery's hold, or a manager's recovery, keeps in memory has no
+    // id yet, and is traced once, as its release stores it (surgery-release).
+    if (id) this.emitTrace({ type: 'message:added', messageId: id, source: wake.kind === 'reminder' ? 'heartbeat:reminder' : 'heartbeat' });
     // The text is in context whatever the rules decide, as a push's is.
     if (!triggers()) return;
     for (const agentName of targets) {
