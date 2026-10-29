@@ -336,6 +336,35 @@ stdio server; `'header'` is refused with a url that carries a `token`
 parameter or userinfo of its own, since whenever the Bearer header carries a
 credential it replaces the userinfo's Basic one.
 
+Set `credentialRequired: true` for a fail-closed WebSocket dial. This requires
+`tokenTransport: 'header'` and a host-attached `accessProvider`, called on every
+dial including reconnects. A missing or throwing provider, or an empty or
+non-sendable result, stops the dial without connecting or falling back. Credentials
+must be printable ASCII with no space at either end; there is no minimum length.
+The server's authentication scheme decides which credentials it accepts.
+
+This mode forbids a static `token` (even empty), a URL `token` query parameter,
+userinfo and fragments. It supports only WebSocket servers, not HTTP, stdio or
+modern MCP. Cleartext `ws://` is refused outside loopback; use `wss://` for remote
+servers. These configuration mistakes are reported descriptively when the server
+is configured, and checked again before the provider runs at dial time.
+
+Strict dial errors have the fixed form `MCPL server "<id>": <code>`:
+
+| Code | Meaning |
+| --- | --- |
+| `provider-failed` | The provider is absent, throws, or returns an empty or non-sendable value. No connection is made. |
+| `credential-rejected` | The server answers the WebSocket upgrade with HTTP 401 or 403. |
+| `engine-unsupported` | A refused upgrade has no finite numeric status available from the client runtime. |
+| `connection-failed` | Any other upgrade status, socket/TLS error, open timeout, cancellation, or strict configuration refusal at dial time. |
+
+Redirects are not followed. Refused upgrades are classified only by the
+`unexpected-response` event's numeric `statusCode`, never by error text or response
+bodies; runtime support is determined by that capability, not a version list.
+Leaving `credentialRequired` out, or setting it to `false` or `null`, keeps optional
+credential behavior. Diagnostic filtering and credential retention are unchanged;
+this option controls dialing, not a guarantee that all diagnostics hide secrets.
+
 A modern server's tools get the same prefix, `enabledTools`/`disabledTools`,
 class overrides and dispatch as an MCPL server's, and `listMcplServers()`
 shows its `family`, `protocolVersion` and `transport`. Its config differs in

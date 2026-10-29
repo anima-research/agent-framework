@@ -314,6 +314,21 @@ export interface McplServerConfig {
   tokenTransport?: 'query' | 'header';
 
   /**
+   * Require a provider credential on every WebSocket dial, including reconnect.
+   * Only true enables this; false, null and omission preserve optional credentials.
+   * Requires tokenTransport 'header', no static token (even empty), and no URL
+   * token parameter, userinfo or fragment. HTTP, stdio and modern servers cannot
+   * use this option. Cleartext ws:// is allowed only on loopback hosts.
+   * Missing, throwing, empty or non-sendable providers fail without connecting;
+   * printable ASCII credentials with no space at either end have no length floor.
+   * Redirects are never followed. Refused upgrades need a finite numeric status:
+   * 401/403 yield credential-rejected; missing status yields engine-unsupported.
+   * Provider failures yield provider-failed; other dial failures yield
+   * connection-failed. Diagnostic redaction is unchanged.
+   */
+  credentialRequired?: boolean;
+
+  /**
    * Lazily resolves the connection credential at EVERY dial — first connect
    * and each background reconnect — overriding `token` when it returns a
    * value (null/throw falls back to `token`). Host-attached plumbing, never

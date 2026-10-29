@@ -695,7 +695,7 @@ export function serverConfigProblems(config: McplServerConfig): string[] {
   } catch (error) {
     return [(error as Error).message];
   }
-  const problems: string[] = [];
+  const problems: string[] = credentialRequiredProblems(config);
   if (binding.transport === 'http') {
     // fetch refuses a url with userinfo, and its error quotes the whole url,
     // password included, into the connect failure's log line, trace and
@@ -758,6 +758,30 @@ export function serverConfigProblems(config: McplServerConfig): string[] {
     );
   }
   return problems;
+}
+
+/** Strict-only admission, also applied to a captured policy at dial time.
+ * Nothing supplied in an invalid setting is quoted. Runtime providers are
+ * host-attached, so their presence is checked by the dial, not here. */
+export function credentialRequiredProblems(config: McplServerConfig): string[] {
+  const flag: unknown = config.credentialRequired;
+  if (flag === undefined || flag === null || flag === false) return [];
+  const problem = (why: string) => [`MCP server "${config.id}": credentialRequired ${why}`];
+  if (flag !== true) return problem('must be a boolean');
+  let binding: ServerBinding;
+  try { binding = resolveServerBinding(config); }
+  catch { return problem('requires a valid WebSocket binding'); }
+  if (binding.transport !== 'websocket' || binding.family !== 'legacy' || config.protocol !== undefined) {
+    return problem('applies only to a legacy ws(s):// server, not HTTP, stdio or modern servers');
+  }
+  if (config.token !== undefined) return problem('forbids a static token, including an empty token');
+  if (config.tokenTransport !== 'header') return problem("requires tokenTransport 'header'");
+  const url = new URL(config.url!);
+  const transportProblem = tokenTransportProblem(config, url);
+  if (transportProblem) return [transportProblem];
+  if (url.hash) return problem('forbids a URL fragment');
+  if (url.protocol === 'ws:' && !isLoopbackHost(url.hostname)) return problem('requires TLS outside loopback');
+  return [];
 }
 
 /**

@@ -26,7 +26,7 @@ import { escapeLineSeparators, readLines } from '../line-reader.js';
 import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
-import { WITHHELD_TEXT, describeCredentialError, headerCarries, maskedError, noteDialSent, redactServerText, redactUrl, resolveServerBinding, serverTextRedactor, tokenTransportProblem, urlAsDialed, type Redaction } from './protocol-family.js';
+import { WITHHELD_TEXT, credentialRequiredProblems, describeCredentialError, headerCarries, maskedError, noteDialSent, redactServerText, redactUrl, resolveServerBinding, serverTextRedactor, tokenTransportProblem, urlAsDialed, type Redaction } from './protocol-family.js';
 import { assertBooleanSetting } from '../config-checks.js';
 import { logDetail } from './log-value.js';
 
@@ -620,6 +620,8 @@ export class WebSocketTransport extends McplTransport {
    * at the open timeout.
    */
   static async open(config: McplServerConfig, signal?: AbortSignal): Promise<WebSocketTransport> {
+    const credentialRequired = checkedCredentialRequired(config);
+    if (credentialRequired === true) return WebSocketTransport.openStrict(config, signal);
     // Resolve the per-dial credential first: the provider runs on every
     // connect AND reconnect, so rotation happens at the transport layer and
     // nothing above it ever holds a credential.
@@ -714,6 +716,94 @@ export class WebSocketTransport extends McplTransport {
       ws.once('error', (err: Error) => {
         abandon(new Error(`MCPL server "${config.id}" WebSocket connect failed: ${clientErrorText(err, config, url)} (${redacted})`));
       });
+    });
+  }
+
+  /** Separate opt-in path: the legacy dial above keeps its objects, reads,
+   * receivers and error behavior. Capture policy before calling host code;
+   * only noteDialSent uses the original config after awaiting (as a WeakMap
+   * key, without reading it). No provider result is stored on either config. */
+  private static async openStrict(config: McplServerConfig, signal?: AbortSignal): Promise<WebSocketTransport> {
+    const captured: McplServerConfig = {
+      id: config.id, url: config.url, tokenTransport: config.tokenTransport,
+      credentialRequired: true, token: config.token, accessProvider: config.accessProvider,
+      command: config.command, transport: config.transport, protocol: config.protocol,
+    };
+    const id = captured.id;
+    const fail = (reason: 'provider-failed' | 'credential-rejected' | 'engine-unsupported' | 'connection-failed') =>
+      new Error(`MCPL server "${id}": ${reason}`);
+    if (credentialRequiredProblems(captured).length) throw fail('connection-failed');
+    const provider = captured.accessProvider;
+    if (typeof provider !== 'function') throw fail('provider-failed');
+    const followRedirects = false;
+    let url: string;
+    try { url = buildWebSocketUrl(captured, null); }
+    catch { throw fail('connection-failed'); }
+    if (signal?.aborted) throw fail('connection-failed');
+    let token: unknown;
+    try {
+      // Preserve the provider's receiver, without re-reading any config input.
+      const provided = Promise.resolve(provider.call(config));
+      provided.catch(() => { /* ignored after abandonment */ });
+      token = signal ? await raceAbort(provided, signal) : await provided;
+    } catch {
+      if (signal?.aborted) throw fail('connection-failed');
+      throw fail('provider-failed');
+    }
+    if (signal?.aborted) throw fail('connection-failed');
+    if (typeof token !== 'string' || !headerCarries(token)) throw fail('provider-failed');
+    noteDialSent(config, { url, token });
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(url, { headers: { Authorization: `Bearer ${token}` }, followRedirects });
+    } catch { throw fail('connection-failed'); }
+    const swallowLateErrors = () => { /* settled; retry loop owns recovery */ };
+    return new Promise<WebSocketTransport>((resolve, reject) => {
+      let settled = false;
+      const abandon = (reason: 'connection-failed' | 'credential-rejected' | 'engine-unsupported' = 'connection-failed',
+        request?: { destroy?: () => void; abort?: () => void }, response?: { destroy: () => void }): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+        ws.removeAllListeners();
+        ws.on('error', swallowLateErrors);
+        // The status listener suppresses ws's default abort. Discard the body
+        // without inspecting it, and use the request API this engine offers.
+        try { response?.destroy(); } catch { /* already gone */ }
+        try {
+          if (typeof request?.destroy === 'function') request.destroy();
+          else request?.abort?.(); // Some clients expose abort(), not destroy().
+        } catch { /* already gone */ }
+        try { ws.terminate(); } catch { /* already gone */ }
+        reject(fail(reason));
+      };
+      const timer = setTimeout(() => abandon(), WS_OPEN_TIMEOUT_MS);
+      const onAbort = (): void => abandon();
+      if (signal?.aborted) { onAbort(); return; }
+      else signal?.addEventListener('abort', onAbort, { once: true });
+      // Installed only on this explicit strict path. No peer text is a status.
+      ws.once('unexpected-response', (request, response) => {
+        const status = response?.statusCode;
+        // A refused upgrade without structured status cannot classify auth.
+        // Generic socket errors still mean connection-failed, never parsed text.
+        abandon(typeof status !== 'number' || !Number.isFinite(status) ? 'engine-unsupported'
+          : status === 401 || status === 403 ? 'credential-rejected' : 'connection-failed', request, response);
+      });
+      ws.once('open', () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+        ws.removeAllListeners('unexpected-response');
+        const transport = new WebSocketTransport(ws, captured, url);
+        // Strict transport-created errors carry only id and a fixed code;
+        // don't project a native error or its cause into them.
+        ws.removeAllListeners('error');
+        ws.on('error', () => transport.reportError(fail('connection-failed')));
+        resolve(transport);
+      });
+      ws.once('error', () => abandon());
     });
   }
 
@@ -850,15 +940,25 @@ type BooleanSetting = {
  *  boolean setting added to McplServerConfig doesn't compile until it has
  *  an entry here, so the check below covers it too. */
 const SERVER_CONFIG_BOOLEANS: Record<BooleanSetting, string> = {
+  credentialRequired: 'true requires a provider credential on every WebSocket dial without fallback; false or leaving it out keeps legacy behavior',
   inheritEnv: 'true passes the server the host\'s whole environment, and false or leaving it out passes only the allowlisted and LC_* host variables',
   reconnect: 'true retries in the background when the server can\'t be reached or its connection drops, and false or leaving it out doesn\'t',
   allowHostCommands: 'true lets the server run the host\'s admin commands, such as undo, hide, unstick and quiesce, and false or leaving it out refuses them',
   toolHints: 'true advertises MCPL tool hints (RFC-014) to an MCPL server, so its dynamic tools are announced in the conversation and called through toolsets--act; leaving it out does the same wherever the name toolsets is free; false lists every tool as before and advertises none',
 };
 
+/** Direct transport callers bypass config validation, but not this check. */
+function checkedCredentialRequired(config: McplServerConfig): boolean | undefined {
+  const value = config.credentialRequired;
+  if (value !== undefined && value !== null && typeof value !== 'boolean') {
+    assertBooleanSetting(`MCPL server "${config.id}" credentialRequired`, value, SERVER_CONFIG_BOOLEANS.credentialRequired);
+  }
+  return value;
+}
+
 /**
- * Refuse a server config whose `inheritEnv`, `reconnect`, `allowHostCommands`
- * or `toolHints` holds anything but true or false. A config read from JSON can carry a quoted
+ * Refuse a server config whose `inheritEnv`, `reconnect`, `allowHostCommands`,
+ * `credentialRequired` or `toolHints` holds anything but true or false. A config read from JSON can carry a quoted
  * "false" where the type says boolean, and every reader of these settings takes
  * only `true` as on, so the quotes would hide what the value does. null counts
  * as not set, so a generated config that writes an unset setting as null
@@ -890,6 +990,7 @@ export function assertServerConfigBooleans(config: McplServerConfig): void {
  * performed the MCPL handshake.
  */
 export async function openTransport(config: McplServerConfig, signal?: AbortSignal): Promise<McplTransport> {
+  if (checkedCredentialRequired(config) === true) return WebSocketTransport.open(config, signal);
   const binding = resolveServerBinding(config);
   if (binding.family !== 'legacy') {
     throw new Error(`MCP server "${config.id}" is configured for modern MCP; the legacy transports can't open it`);
