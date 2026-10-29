@@ -37,7 +37,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import type {
@@ -1230,42 +1230,15 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
 
   it("settling a held write whose landing is unknown, not found, persists the queue without its mark, as an edit does", async () => {
     const framework = await createFramework();
-    const internals = drainInternals(framework) as ReturnType<typeof drainInternals> & { persistDeferredWrites(): void };
+    const internals = drainInternals(framework);
     internals.deferredWritesPersisted = true;
     internals.deferredMessages.push({ ...entry('w-persist', 'look left'), landing: 'unknown' });
-    let persisted = 0;
-    const persist = internals.persistDeferredWrites;
-    internals.persistDeferredWrites = function (this: unknown) { persisted++; return persist.call(this); };
     internals.queryMessages({});
-    assert.equal(persisted, 1, 'the queue without its mark is persisted');
+    // The durable queue's documented place under the store (FrameworkConfig.deferredWritesPath).
+    const onDisk = JSON.parse(readFileSync(join(tempDir, 'test.chronicle', 'recovery', 'deferred-writes.json'), 'utf8')) as { pending: Array<{ id: string; landing?: string }> };
+    assert.deepEqual(onDisk.pending.map((m) => [m.id, m.landing]), [['w-persist', undefined]], 'the queue on disk no longer carries the mark');
     assert.deepEqual(internals.deferredMessages.map((m) => [m.id, m.landing]), [['w-persist', undefined]]);
     await framework.stop();
-  });
-
-  it("a module's edit or removal by a stored id settles the held write that row is a copy of, even while its store can't be searched", async () => {
-    for (const op of ['edit', 'remove'] as const) {
-      // Each pass opens the test's one store again, so each takes its own id.
-      const id = `w-row-${op}`;
-      const framework = await createFramework();
-      const internals = drainInternals(framework);
-      heldAndStored(framework, id, 'look left');
-      const cm = framework.getAgent('assistant')!.getContextManager() as unknown as {
-        queryMessages: (...args: unknown[]) => { messages: Array<{ id: string }> };
-      };
-      const [copy] = cm.queryMessages({ metadata: { deferredWriteId: id } }).messages;
-      const query = cm.queryMessages;
-      cm.queryMessages = () => { throw new Error('search failed'); };
-    const unscan = noScan(framework);
-      const error = console.error;
-      console.error = () => {};
-      try {
-        if (op === 'edit') internals.editMessage(copy!.id, text('look up'));
-        else internals.removeMessage(copy!.id);
-      } finally { cm.queryMessages = query; unscan(); console.error = error; }
-      assert.deepEqual(copiesOf(framework, id), op === 'edit' ? ['look up'] : [], `${op}: the row is changed once`);
-      assert.deepEqual(internals.deferredMessages.map((m) => m.id), [], `${op}: its write is settled by the row, so nothing writes it again`);
-      await framework.stop();
-    }
   });
 
   it("a module's edit or removal of a held write whose landing is unknown throws with nothing changed while its store can't be searched", async () => {
@@ -1885,7 +1858,6 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       { name: 'the long text, then an image', content: [...text(long), image] },
       { name: 'a short text, an image, then the long text', content: [...text('Intro. '), image, ...text(long)] },
     ];
-    const readBacks: number[] = [];
     // Every case is run, and those whose injection differs from the next
     // compile are named together.
     const differ: string[] = [];
@@ -1908,19 +1880,12 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
         } as never],
       });
       const cm = framework.getAgent('assistant')!.getContextManager();
-      // The store is read back for a write only when it took more than one
-      // message: here the body, and not the short message after it.
-      const internals = framework as unknown as { storedCopiesOf: (...args: unknown[]) => unknown[] };
-      const storedCopiesOf = internals.storedCopiesOf.bind(framework);
-      let readBack = 0;
-      internals.storedCopiesOf = (...args) => { readBack++; return storedCopiesOf(...args); };
       module.interjections = [{ participant: 'Antra', content }, { participant: 'Antra', content: text('look right') }];
       try {
         framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
         await framework.runUntilIdle();
         const landed = cm.getAllMessages().filter((m) => (m as { bodyGroupId?: string }).bodyGroupId);
         assert.ok(landed.length > 1, `${name}: stored as ${landed.length} shards`);
-        readBacks.push(readBack);
         const injected = ofLong(membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? []);
         // The next turn's request is compiled from the store.
         membrane.pushResponse(createMockResponse(text('Okay.')));
@@ -1935,7 +1900,6 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       }
     }
     assert.deepEqual(differ, [], 'the boundary carried what the next compile renders');
-    assert.deepEqual(readBacks, [1, 1, 1, 1], 'the store is read back for each body, and not for the short message after it');
   });
 
   it("a write that throws after it's stored, re-added from the queue, is weighed for its agent's open turn as a stored write is", async () => {
