@@ -2134,6 +2134,89 @@ describe('the framework wires the reply judge', () => {
     assert.deepStrictEqual(internal.upcomingWakesFor('scout'), []);
   });
 
+  it('lists a start that waits behind an auxiliary call, with nothing else queued, as a wake on its way', async (t) => {
+    const { createMockResponse } = await import('./helpers/mock-membrane.js');
+    const { framework, membrane } = await frameworkWith(t, { config: JUDGED, judge: {} });
+    const internal = framework as unknown as {
+      withAuxiliaryAdmission<T>(agentName: string, run: () => Promise<T>, model?: string): Promise<T>;
+      pendingRequests: Array<Record<string, unknown>>;
+      processInferenceRequests(): Promise<void>;
+      providerGates: Map<string, { primaryDepth: number; auxiliaryInFlight: number }>;
+      activeTurnTokens: Map<string, unknown>;
+      upcomingWakesFor(agentName: string): Array<{ at?: number; when?: string; certain: boolean; what: string }>;
+    };
+    let finish!: () => void;
+    const auxiliary = internal.withAuxiliaryAdmission('scout', () => new Promise<void>((resolve) => { finish = resolve; }));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    internal.pendingRequests.push({ agentName: 'scout', reason: 'a test wake', source: 'test', timestamp: Date.now() });
+    await internal.processInferenceRequests();
+    const gate = internal.providerGates.get('scout')!;
+    assert.deepStrictEqual(
+      [gate.auxiliaryInFlight, gate.primaryDepth, internal.pendingRequests.length, internal.activeTurnTokens.has('scout')],
+      [1, 1, 0, false],
+      'premise: the start waits behind the auxiliary call, with nothing queued and no turn running');
+    assert.deepStrictEqual(internal.upcomingWakesFor('scout').map((w) => w.what), ['a wake already queued (a start waiting for an auxiliary call to finish)']);
+    finish();
+    await auxiliary;
+  });
+
+  it("lists another agent's wake that a scheduler pass holds while it awaits an earlier agent's start", async (t) => {
+    const { AgentFramework } = await import('../src/index.js');
+    const { MockMembrane, createMockResponse } = await import('./helpers/mock-membrane.js');
+    const { mkdtempSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const dir = mkdtempSync(join(tmpdir(), 'gate-judge-pass-'));
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    let aideGathering = false;
+    const slowGather = {
+      name: 'slow-gather',
+      async start() {},
+      async stop() {},
+      getTools: () => [],
+      async onProcess() { return {}; },
+      async handleToolCall() { return { success: true }; },
+      async gatherContext(agentName: string) {
+        if (agentName === 'aide') { aideGathering = true; await released; }
+        return [];
+      },
+    };
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: membrane.asMembrane(),
+      agents: [
+        { name: 'aide', model: 'test-model', systemPrompt: 'You are aide.', proseRouting: 'disabled' },
+        { name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', proseRouting: 'disabled' },
+      ],
+      modules: [slowGather as never],
+      gate: { configPath: join(dir, 'gate.json'), config: JUDGED, judge: {} },
+    });
+    t.after(async () => {
+      release();
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    });
+    const internal = framework as unknown as {
+      pendingRequests: Array<Record<string, unknown>>;
+      processInferenceRequests(): Promise<void>;
+      passRequests: Set<Map<string, unknown[]>>;
+      upcomingWakesFor(agentName: string): Array<{ at?: number; when?: string; certain: boolean; what: string }>;
+    };
+    internal.pendingRequests.push(
+      { agentName: 'aide', reason: 'aide wake', source: 'test', timestamp: Date.now() },
+      { agentName: 'scout', reason: 'scout wake', source: 'test', timestamp: Date.now() },
+    );
+    const pass = internal.processInferenceRequests();
+    await until(() => aideGathering, "aide's start to wait on its module's context");
+    assert.ok([...internal.passRequests].some((m) => m.has('scout')), "premise: the pass still holds scout's wake while it awaits aide's start");
+    assert.deepStrictEqual(internal.upcomingWakesFor('scout').map((w) => w.what), ['a wake already queued (scout wake)']);
+    release();
+    await pass;
+  });
+
   it('enabled: false leaves the judge unwired, and judge rules run as debounces', async (t) => {
     const { membrane, eventGate } = await frameworkWith(t, { config: JUDGED, judge: { enabled: false } });
     assert.ok(eventGate.getStatus().errors.some((e) => e.includes('wires no reply judge')));
