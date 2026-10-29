@@ -285,18 +285,15 @@ export interface AgentSettingsExtension {
  * `gatherContext` answer out of a turn whose answers it hadn't merged by
  * then, with a line if it held injections. After `removeModule()`, the
  * result its `handleToolCall` returns for a call it was running when its
- * `stop()` completed is still delivered while the framework runs: the agent
- * asked while the module was registered, and the result is the answer to
- * what ran, whereas a response is something the framework would apply for
- * the module after it's gone. The framework's `stop()` closes its event
- * queue before it stops any module, so through the framework's `stop()` that
- * result is dropped, with the line any tool result arriving after the
- * framework's `stop()` gets. A result it pushes through its context after
- * its `stop()` completes is dropped, as its other pushes are. A
- * module whose `stop()` fails stays registered, and its context keeps
- * working.
+ * `stop()` completed is still delivered while the framework runs. The
+ * framework's `stop()` closes its event queue before it stops any module, so
+ * through the framework's `stop()` that result is dropped, with the line any
+ * tool result arriving after the framework's `stop()` gets. A result it
+ * pushes through its context after its `stop()` completes is dropped, as its
+ * other pushes are. A module whose `stop()` fails stays registered, and its
+ * context keeps working.
  * References the module already holds, to other modules or to its own
- * timers, aren't the context's, and stay as they are.
+ * timers, stay as they are.
  */
 export interface ModuleContext {
   /**
