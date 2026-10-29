@@ -1,1 +1,0 @@
-- **agent-framework now depends on `@animalabs/context-manager` `^0.24.0` and `@animalabs/chronicle` `^0.5.0`**, where it depended on `^0.23.1` and `^0.4.0`. Derived agents and reader forks need context-manager 0.24.0's derived contexts and chronicle 0.5.0's branch views, so a fresh install now takes both.
