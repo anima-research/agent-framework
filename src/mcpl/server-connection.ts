@@ -456,6 +456,8 @@ export class McplServerConnection extends EventEmitter {
    *  the epoch their opening went to, never across a reconnect. */
   transportEpoch = 0;
 
+  private transportEnded = new AbortController();
+
   /**
    * RFC-014: the server's `toolHints`, `toolsets` and `surface` members as it
    * advertised them at the last handshake (toolsetDeclarationsOf), or null.
@@ -533,6 +535,8 @@ export class McplServerConnection extends EventEmitter {
     this.grant = CapabilityGrant.empty();
     this.policyEstablished = false;
     this.transportEpoch++;
+    this.transportEnded.abort();
+    this.transportEnded = new AbortController();
     // What the server sent that is still held came on the transport that is
     // now gone. What it said about its own process is dropped: its requests
     // wait on answers that can no longer reach whoever asked (an inference
@@ -2508,6 +2512,7 @@ export class McplServerConnection extends EventEmitter {
   private responderFor(id: string | number, epoch: number) {
     return {
       id,
+      signal: epoch === this.transportEpoch ? this.transportEnded.signal : AbortSignal.abort(),
       respond: (result: unknown) => this.sendResponse(id, result, epoch),
       respondError: (code: number, message: string, data?: unknown) =>
         this.sendErrorResponse(id, code, message, data, epoch),

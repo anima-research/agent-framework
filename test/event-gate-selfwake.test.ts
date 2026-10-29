@@ -36,8 +36,6 @@ function makeGate() {
   return { gate, inferenceRequests, messages };
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
 describe('EventGate self-wake', () => {
   beforeEach(() => {
     if (existsSync(TMP_DIR)) rmSync(TMP_DIR, { recursive: true });
@@ -47,12 +45,13 @@ describe('EventGate self-wake', () => {
     if (existsSync(TMP_DIR)) rmSync(TMP_DIR, { recursive: true });
   });
 
-  it('fires an inference request after the delay', async () => {
+  it('fires an inference request after the delay', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const { gate, inferenceRequests } = makeGate();
     const { inMs } = gate.armSelfWake('agent', 1, 'skip_reply');
     assert.strictEqual(inMs, 1000);
     assert.strictEqual(inferenceRequests.length, 0, 'must not fire synchronously');
-    await sleep(1150);
+    t.mock.timers.tick(1150);
     assert.strictEqual(inferenceRequests.length, 1);
     assert.strictEqual(inferenceRequests[0]!.agentName, 'agent');
     assert.strictEqual(inferenceRequests[0]!.source, 'self-wake');
@@ -60,11 +59,12 @@ describe('EventGate self-wake', () => {
     gate.dispose();
   });
 
-  it('drops a compact timestamped notice into the window when it fires', async () => {
+  it('drops a compact timestamped notice into the window when it fires', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const { gate, messages } = makeGate();
     gate.armSelfWake('agent', 1, 'skip_reply');
     assert.strictEqual(messages.length, 0, 'arming must not add a message');
-    await sleep(1150);
+    t.mock.timers.tick(1150);
     assert.strictEqual(messages.length, 1);
     const msg = messages[0]!;
     assert.strictEqual(msg.participant, 'user');
@@ -75,39 +75,43 @@ describe('EventGate self-wake', () => {
     gate.dispose();
   });
 
-  it('a superseded self-wake adds no notice', async () => {
+  it('a superseded self-wake adds no notice', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const { gate, messages } = makeGate();
     gate.armSelfWake('agent', 1);
     gate.onInferenceStarted('agent');
     gate.onInferenceEnded('agent');
-    await sleep(1150);
+    t.mock.timers.tick(1150);
     assert.strictEqual(messages.length, 0);
     gate.dispose();
   });
 
-  it('is cancelled by a turn start (external wake supersedes)', async () => {
+  it('is cancelled by a turn start (external wake supersedes)', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const { gate, inferenceRequests } = makeGate();
     gate.armSelfWake('agent', 1);
     // Something else woke the agent first.
     gate.onInferenceStarted('agent');
     gate.onInferenceEnded('agent');
-    await sleep(1150);
+    t.mock.timers.tick(1150);
     assert.strictEqual(inferenceRequests.length, 0, 'superseded self-wake must not fire');
     gate.dispose();
   });
 
-  it('survives a turn that continues another (onInferenceResumed)', async () => {
+  it('survives a turn that continues another (onInferenceResumed)', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const { gate, inferenceRequests } = makeGate();
     gate.armSelfWake('agent', 1);
     // A budget restart or a guard retry takes up the turn that armed it.
     gate.onInferenceResumed('agent');
     gate.onInferenceEnded('agent');
-    await sleep(1150);
+    t.mock.timers.tick(1150);
     assert.strictEqual(inferenceRequests.length, 1, 'the continuing turn leaves the self-wake armed');
     gate.dispose();
   });
 
-  it('survives the arming turn itself (arm mid-turn, fire after end)', async () => {
+  it('survives the arming turn itself (arm mid-turn, fire after end)', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const { gate, inferenceRequests } = makeGate();
     // Turn starts, THEN skip_reply arms the wake mid-turn, then the turn ends
     // — exactly the production sequence. The arm must not be eaten by its
@@ -115,16 +119,17 @@ describe('EventGate self-wake', () => {
     gate.onInferenceStarted('agent');
     gate.armSelfWake('agent', 1);
     gate.onInferenceEnded('agent');
-    await sleep(1150);
+    t.mock.timers.tick(1150);
     assert.strictEqual(inferenceRequests.length, 1);
     gate.dispose();
   });
 
-  it('re-arming replaces the pending timer; only one wake fires', async () => {
+  it('re-arming replaces the pending timer; only one wake fires', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const { gate, inferenceRequests } = makeGate();
     gate.armSelfWake('agent', 1);
     gate.armSelfWake('agent', 1);
-    await sleep(1200);
+    t.mock.timers.tick(1200);
     assert.strictEqual(inferenceRequests.length, 1);
     gate.dispose();
   });
@@ -136,11 +141,12 @@ describe('EventGate self-wake', () => {
     gate.dispose();
   });
 
-  it('dispose clears pending timers', async () => {
+  it('dispose clears pending timers', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const { gate, inferenceRequests } = makeGate();
     gate.armSelfWake('agent', 1);
     gate.dispose();
-    await sleep(1150);
+    t.mock.timers.tick(1150);
     assert.strictEqual(inferenceRequests.length, 0);
   });
 });
