@@ -1157,14 +1157,15 @@ describe('private wins, one way', () => {
       assert.match(results[0]!.error!, /private/, 'it says why');
       assert.match(results[0]!.error!, /channelId/, 'it says what to give');
       assert.match(results[0]!.error!, /channel_list/, 'and where to find an id, for an agent that may list them');
-      (rig.framework as unknown as { conversationAgentHomes: Map<string, Ref> }).conversationAgentHomes.set('scout', ref(ROOM));
+      const record = (rig.framework as unknown as { registry: { live: Map<string, { homeChannel?: Ref }> } }).registry.live.get('scout')!;
+      record.homeChannel = ref(ROOM);
       (rig.state.channelRegistry as Record<string, unknown>).handleChannelToolCall = async () => ({ success: true, data: { published: true } });
       results.length = 0;
       internalsOf.dispatchChannelToolCall('scout', { id: 'c-fork', name: 'channel_publish', input: { content: 'hello' } });
       await new Promise((r) => setImmediate(r));
       assert.equal(results[0]?.success, false, "a fork's: refused too");
       assert.match(results[0]!.error!, /private/, "for the turn's privacy");
-      (rig.framework as unknown as { conversationAgentHomes: Map<string, Ref> }).conversationAgentHomes.delete('scout');
+      delete record.homeChannel;
       const canUse = (rig.framework as unknown as { canAgentUseTool(a: string, t: string): boolean }).canAgentUseTool;
       (rig.framework as unknown as { canAgentUseTool(a: string, t: string): boolean }).canAgentUseTool = (a, t) => t !== 'channel_list' && canUse.call(rig.framework, a, t);
       results.length = 0;
@@ -1959,7 +1960,7 @@ describe('private wins, one way', () => {
       assert.equal(internalsOf.noticeChannelMessages(agent, routing, [{ channelId: ROOM, serverId: 'discord' }]), undefined, 'named already');
       assert.ok(internalsOf.noticeChannelMessages(agent, routing, [{ channelId: ROOM, serverId: 'discord' }, { channelId: LOUNGE, serverId: 'discord' }]));
       assert.deepEqual(named(rig), [[ROOM], [LOUNGE]]);
-      const fresh: Routing = { nonChannelOrigin: true };
+      const fresh: Routing = { nonChannelOrigin: true, addressedElsewhere: new Set() };
       const cm = agent!.getContextManager() as unknown as { addMessage: (...a: unknown[]) => unknown };
       const addMessage = cm.addMessage;
       cm.addMessage = () => { throw new Error('the store is full'); };
@@ -2074,8 +2075,10 @@ describe('private wins, one way', () => {
       const wired = rig.streams[0]!.receivedToolResultOptions
         .flatMap((o) => o?.injectedMessages ?? []).map((m) => JSON.stringify(m.content));
       assert.ok(wired.some((w) => w.includes('over here')), `control: the room's message was injected: ${JSON.stringify(wired)}`);
-      assert.deepEqual(named(rig), [[ROOM]], JSON.stringify(rig.texts()));
-      assert.ok(wired.some((w) => w.includes('This private turn also holds') && w.includes(ROOM)), `the notice rode the injections: ${JSON.stringify(wired)}`);
+      assert.deepEqual(named(rig), [], JSON.stringify(rig.texts()));
+      const told = wired.filter((w) => w.includes('[routing]') && w.includes(ROOM));
+      assert.equal(told.length, 1, `the room is named once, with the injections: ${JSON.stringify(wired)}`);
+      assert.match(told[0]!, /addressed you from discord:g:room while you were busy\. Your plain speech stays in your archive \(no channel\)/);
       assert.deepEqual(rig.routed, []);
     } finally {
       await rig.close();
@@ -2083,7 +2086,7 @@ describe('private wins, one way', () => {
   });
 
   for (const privateTurn of [true, false]) {
-    it(`a ${privateTurn ? 'private' : "room's"} turn's boundary over budget ${privateTurn ? 'names an addressed message it took in, for the restart to read' : 'leaves an addressed message to move the restart, naming nothing'}`, async () => {
+    it(`a ${privateTurn ? 'private' : "room's"} turn's boundary over budget ${privateTurn ? 'names an addressed message it took in, for the restart to read' : 'leaves an addressed message to its restart, which stays in its channel'}`, async () => {
       const OTHER = 'discord:g:other';
       let framework: AgentFramework | undefined;
       const tool = robot(() => {
@@ -2111,7 +2114,7 @@ describe('private wins, one way', () => {
           assert.deepEqual(rig.routed, []);
         } else {
           assert.deepEqual(channelNotices(rig), [], "a room's turn names nothing");
-          assert.deepEqual(rig.routed, [{ text: 'reply 1', locus: OTHER }], 'the message moved the restart to its channel');
+          assert.deepEqual(rig.routed, [{ text: 'reply 1', locus: ROOM }], "under 'delivery' the message moves nothing");
         }
       } finally {
         await rig.close();

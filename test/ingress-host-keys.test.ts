@@ -32,6 +32,7 @@ const HOST_KEYS: Record<string, unknown> = {
   contextInjection: { agent: 'scout', namespace: 'lessons', contentHash: 'h', part: 0, parts: 1 },
   primaryIfUnread: true,
   callerTurnId: 1,
+  dendrite: { mailId: 'mail-1', kind: 'result', from: { agent: 'scout', incarnation: 1 } },
 };
 
 async function waitFor(cond: () => boolean, what: string, timeoutMs = 15_000): Promise<void> {

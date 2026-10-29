@@ -3081,7 +3081,7 @@ async function heldTurnSpeaksInto(f: Fixture, during: () => Promise<void>, midSt
 }
 
 test("#157: an edit that addresses the agent, of a follow-up stored while the turn waits out a capacity hold and not yet seen, moves the turn to the follow-up's channel", async (t) => {
-  const f = await fixture(); t.after(f.close); await f.register(); await f.register('other');
+  const f = await fixture({ framework: { speech: { locus: 'latest-inbound' } } }); /* the re-pin is the legacy rule */ t.after(f.close); await f.register(); await f.register('other');
   let outcome: string | undefined;
   const channel = await heldTurnSpeaksInto(f, async () => {
     await f.send('channels/incoming', { messages: [{ ...f.channel('q1', 'follow_up_wiht_typo', { initial: true }, 'other', 'mq'), tags: ['chat:ambient', 'chat:from-human'] }] });
@@ -3187,7 +3187,7 @@ test("#157: another resident's compile that assembles a message stored at once i
 });
 
 test("#157: an edit that addresses the agent, of a follow-up that arrived during the turn and was flushed when the turn was held, moves the turn to the follow-up's channel", async (t) => {
-  const f = await fixture(); t.after(f.close); await f.register(); await f.register('other');
+  const f = await fixture({ framework: { speech: { locus: 'latest-inbound' } } }); /* the re-pin is the legacy rule */ t.after(f.close); await f.register(); await f.register('other');
   let outcome: string | undefined;
   const channel = await heldTurnSpeaksInto(f, async () => {
     assert(storedWith(f, 'follow_up_wiht_typo'), 'the hold flushed the follow-up into the store');

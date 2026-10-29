@@ -10,6 +10,7 @@ import { HealthModule } from '../src/modules/health/index.js';
 import { EPHEMERAL_USAGE_NAME } from '../src/usage/usage-tracker.js';
 import type { EventResponse, Module, ProcessEvent, ToolCall, TraceEvent } from '../src/index.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
+import { bindAsConversationFork } from './helpers/dendrite.js';
 
 class TurnTools implements Module {
   readonly name = 'test';
@@ -717,12 +718,11 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
     // cooldown. Its turns aren't an external message's default target, so
     // the turn is started directly.
     const internal = r.framework as unknown as {
-      conversationAgentHomes: Map<string, { serverId: string; channelId: string }>;
       startAgentStream(agent: unknown, trigger: unknown): Promise<void>;
     };
     r.framework.start();
     try {
-      internal.conversationAgentHomes.set('resident', { serverId: 'stub', channelId: 'world:zz' });
+      bindAsConversationFork(r.framework, 'resident', { serverId: 'stub', channelId: 'world:zz' });
       r.framework.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text: 'first' }]);
       await internal.startAgentStream(r.framework.getAgent('resident'),
         { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
