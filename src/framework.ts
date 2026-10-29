@@ -86,7 +86,7 @@ import { asModuleRow, heldHandle, heldWriteId, matchesMessageQuery } from './hel
 import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
-import { Agent, assertAgentSwitches, dryCompileStatsOf, type RenderStats } from './agent.js';
+import { Agent, assertAgentSwitches, assertThinkingBinding, dryCompileStatsOf, type RenderStats } from './agent.js';
 import { assertBooleanSetting, holdsSettings, kindOf } from './config-checks.js';
 import { ModuleRegistry, checkedToolResult, ensureStateRegistered, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
@@ -1826,9 +1826,10 @@ function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
 /**
  * Refuse a config whose `subconscious`, `watchdog` or `processLogging` is
  * anything but an object, null or false (holdsSettings), or whose switch in
- * one holds anything but true or false (assertBooleanSetting). A subconscious
- * that isn't on has its `allowChannelSpeech` left unchecked, since nothing
- * reads it then.
+ * one holds anything but true or false (assertBooleanSetting), or whose
+ * subconscious's `thinkingBinding` assertThinkingBinding refuses, whichever
+ * its reader. A subconscious that isn't on has its `allowChannelSpeech` and
+ * `thinkingBinding` left unchecked, since nothing reads them then.
  */
 function assertFrameworkSwitches(config: FrameworkConfig): void {
   if (holdsSettings('subconscious', config.subconscious, '{ enabled: true }')) {
@@ -1844,6 +1845,7 @@ function assertFrameworkSwitches(config: FrameworkConfig): void {
         config.subconscious.allowChannelSpeech,
         'true lets the subconscious speak in channels with speak_in_channel, and false or leaving it out refuses it',
       );
+      assertThinkingBinding('subconscious.thinkingBinding', config.subconscious.thinkingBinding);
     }
   }
   if (holdsSettings('watchdog', config.watchdog, '{ enabled: true }')) {
@@ -2711,6 +2713,7 @@ interface EphemeralRun {
   endReason?: AgentEndReason;
   /** Who ended it, when it was stopped from outside. */
   endedBy?: string;
+  endedFromOutside?: true;
 }
 
 /**
@@ -3475,6 +3478,13 @@ interface StreamRequestNotes {
 
 const SUBCONSCIOUS_MODEL_FIELDS = ['physicalWindowTokens', 'thinkingBinding'] as const satisfies ReadonlyArray<keyof AgentConfig>;
 
+function readerModelFields(cfg: SubconsciousConfig): Pick<AgentConfig, (typeof SUBCONSCIOUS_MODEL_FIELDS)[number]> {
+  return {
+    ...(cfg.physicalWindowTokens != null ? { physicalWindowTokens: cfg.physicalWindowTokens } : {}),
+    ...(holdsSettings('subconscious.thinkingBinding', cfg.thinkingBinding, '{ binds: true, dropBlock: true }') ? { thinkingBinding: cfg.thinkingBinding } : {}),
+  };
+}
+
 const JUDGE_PARAMETER: ToolParameter = {
   type: 'object',
   description:
@@ -3790,6 +3800,7 @@ export class AgentFramework {
   private turnRearmMs: readonly number[] = DEFAULT_TURN_REARM_MS;
   private turnRearms: Map<string, number> = new Map();
   private exhaustingRearms: Set<string> = new Set();
+  private rearmDeadlineCuts: Set<string> = new Set();
   private statedWaitRuns: Map<string, StatedWaitRun> = new Map();
   /** N consecutive failed inferences ⇒ the agent is treated as hard-down and
    *  escalated loudly to stderr. */
@@ -6479,11 +6490,22 @@ export class AgentFramework {
     if (wait && trigger && (wait.until === null || wait.until > now)) this.noteStatedWaitRun(agent.name, wait, now);
     return true;
   }
-  private rearmExhaustedTurn(agent: Agent, error: Error, trigger: InferenceRequest | undefined, ownsProviderGate: boolean, routing: TurnRouting | undefined): void {
+  private takeAsTransient(agentName: string, error: Error, trigger: InferenceRequest | undefined): boolean {
+    if (isTransientFailure(error)) {
+      this.rearmDeadlineCuts.delete(agentName);
+      return true;
+    }
+    if (!isRearmed(trigger) || !isDeadlineExpiry(error)) return false;
+    const first = !this.rearmDeadlineCuts.has(agentName);
+    this.rearmDeadlineCuts.add(agentName);
+    return first;
+  }
+
+  private rearmExhaustedTurn(agent: Agent, error: Error, trigger: InferenceRequest | undefined, ownsProviderGate: boolean, routing: TurnRouting | undefined, asTransient: boolean): void {
     if (!ownsProviderGate || trigger === undefined || this.providerAdmissionClosed || this.turnRearmMs.length === 0) return;
     const done = this.turnRearms.get(agent.name) ?? 0;
     const notSent = (why: string) => console.error(`[inference-rearm] agent=${agent.name} turn not re-armed: ${why}`);
-    if (!isTransientFailure(error)) {
+    if (!asTransient) {
       if (done > 0) notSent(`its failure isn't transient (${isMembraneError(error) ? error.type : boundFailureText(error.message, FAILURE_SUMMARY_MAX_CHARS)})`);
       return;
     }
@@ -11419,6 +11441,7 @@ export class AgentFramework {
     if (run) {
       run.endReason ??= 'stopped';
       run.endedBy ??= options.by;
+      run.endedFromOutside = true;
       // The awaiting caller is told who stopped the job and why, whether or
       // not a stream was in flight: settled first, so the aborted stream's own
       // settle ('Stream cancelled') finds the run already settled. The caller's
@@ -11797,12 +11820,22 @@ export class AgentFramework {
     if (run) {
       run.endReason = reason;
       run.endedBy = record.ended?.by;
+      run.endedFromOutside = true;
       run.settle.reject(new AgentStoppedError(name, reason, record.ended?.by, detail));
       return;
     }
     const agent = this.agents.get(name);
     if (!agent) return;
     this.releaseAgentRuntime(agent, this.channelOfHome(record.homeChannel), undefined, record.lifetime.kind === 'persistent');
+  }
+
+  private forgetFailureAccounting(name: string): void {
+    this.consecutiveInferenceFailures.delete(name);
+    this.exhaustionRewinds.delete(name);
+    this.refusalStreak.delete(name);
+    this.refusalRewinds.delete(name);
+    this.rewindEpisode.delete(name);
+    if (this.forcedRewind.delete(name)) console.error(`[unstick] agent=${name} its /unstick session ended with its agent`);
   }
 
   /**
@@ -11849,6 +11882,8 @@ export class AgentFramework {
     this.agents.delete(name);
     this.agentConfigs.delete(name);
     this.deadlineCuts.delete(name);
+    this.freshCallsCut.delete(name);
+    this.forgetFailureAccounting(name);
     this.thinkingLossIncidents.forget(name);
     this.reasoningLoss.forget(name);
     // main's manager release: the context manager an ephemeral run or a fork
@@ -11890,6 +11925,7 @@ export class AgentFramework {
     // waits ends here as at a turn's end, alerted if it ran long
     // (endStatedWaitRun).
     this.turnRearms.delete(name);
+    this.rearmDeadlineCuts.delete(name);
     this.exhaustingRearms.delete(name);
     this.exhaustedTurns.delete(name);
     this.endStatedWaitRun(name);
@@ -12616,6 +12652,8 @@ export class AgentFramework {
         this.eventGate?.onInferenceEnded(agent.name);
         this.agents.delete(agent.name);
         this.deadlineCuts.delete(agent.name);
+        this.freshCallsCut.delete(agent.name);
+        if (run.endedFromOutside) this.forgetFailureAccounting(agent.name);
         this.thinkingLossIncidents.forget(agent.name);
         this.reasoningLoss.forget(agent.name);
         // Its pending self-wake ends with it, as a fork's does.
@@ -15881,8 +15919,9 @@ export class AgentFramework {
     // idiom): reasoning effort (thinking), provider params, token ceilings,
     // caching, refusal handling, timezone — a same-model side-process must
     // not silently run under different inference conditions than the
-    // resident it serves. Only identity- and surface-defining fields are
-    // overridden below.
+    // resident it serves. Below, identity- and surface-defining fields are
+    // overridden, and the window and thinking binding where the
+    // subconscious's config sets its own.
     const model = cfg.model ?? primaryConfig.model;
     const inherited: AgentConfig = { ...primaryConfig };
     if (model !== primaryConfig.model) {
@@ -15890,6 +15929,7 @@ export class AgentFramework {
     }
     const agentConfig: AgentConfig = {
       ...inherited,
+      ...readerModelFields(cfg),
       name,
       model,
       systemPrompt: cfg.systemPrompt,
@@ -15997,6 +16037,7 @@ export class AgentFramework {
           config: {
             model: cfg.model,
             proseRouting: 'disabled',
+            ...readerModelFields(cfg),
           },
           inheritRefusals: true,
           onParentEnd: 'end',
@@ -17763,6 +17804,8 @@ export class AgentFramework {
       // Nothing live under the name: only what the process keeps by name.
       this.closingConversationAgents.delete(agentName);
       this.deadlineCuts.delete(agentName);
+      this.freshCallsCut.delete(agentName);
+      this.forgetFailureAccounting(agentName);
       this.thinkingLossIncidents.forget(agentName);
       this.reasoningLoss.forget(agentName);
       // A continuation of its turn still on its way goes with it.
@@ -24229,6 +24272,7 @@ export class AgentFramework {
       }
 
       const retry = trigger && withTurnCarry(trigger, carry);
+      const asTransient = this.takeAsTransient(agent.name, err, trigger);
       if (ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
         // Capacity scheduling is not poisoned history. The cooldown timer owns
         // one later fresh compile; no immediate retry or exhaustion marker.
@@ -24246,7 +24290,7 @@ export class AgentFramework {
       }
 
       const cuts = isDeadlineExpiry(err) ? this.deadlineCuts.get(agent.name) ?? 0 : undefined;
-      const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && !gotPartway(routing))
+      const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && (!gotPartway(routing) || (isDeadlineExpiry(err) && !asTransient)))
         ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, cuts ?? attempt);
       if (action.retry && cuts !== undefined) this.deadlineCuts.set(agent.name, cuts + 1);
       else this.deadlineCuts.delete(agent.name);
@@ -24307,7 +24351,7 @@ export class AgentFramework {
           speech: '',
           ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
         }, routing);
-        if (isRearmed(trigger) && isTransientFailure(err)) this.exhaustingRearms.add(agent.name);
+        if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
         this.emitTrace({
           type: 'inference:exhausted',
           agentName: agent.name,
@@ -24327,7 +24371,7 @@ export class AgentFramework {
         if (action.emit) {
           this.pushEvent(action.emit);
         }
-        this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, routing);
+        this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, routing, asTransient);
       }
       // No handoff on either failure branch: the terminal branch deleted the
       // token above; the retry branch's recursive startAgentStream replaced
@@ -26075,6 +26119,7 @@ export class AgentFramework {
 
             this.abandonAgentScripts(agent.name, 'stream error', streamRouting);
             const retry = retryOf(trigger);
+            const asTransient = this.takeAsTransient(agent.name, err, trigger);
 
             // A hold takes the turn's retry, or, once stop() has closed
             // admission, the turn ends here (endFailureAtStop).
@@ -26091,7 +26136,7 @@ export class AgentFramework {
             }
 
             const cuts = isDeadlineExpiry(err) ? this.deadlineCuts.get(agent.name) ?? 0 : undefined;
-            const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && !gotPartway(streamRouting))
+            const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && (!gotPartway(streamRouting) || (isDeadlineExpiry(err) && !asTransient)))
               ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, cuts ?? attempt);
             if (action.retry && cuts !== undefined) this.deadlineCuts.set(agent.name, cuts + 1);
             else this.deadlineCuts.delete(agent.name);
@@ -26152,7 +26197,7 @@ export class AgentFramework {
                 speech: '',
                 ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
               }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined, streamRouting);
-              if (isRearmed(trigger) && isTransientFailure(err)) this.exhaustingRearms.add(agent.name);
+              if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
               this.emitTrace({
                 type: 'inference:exhausted',
                 agentName: agent.name,
@@ -26170,7 +26215,7 @@ export class AgentFramework {
               if (action.emit) {
                 this.pushEvent(action.emit);
               }
-              this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting);
+              this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting, asTransient);
             }
             break;
           }
@@ -26245,7 +26290,7 @@ export class AgentFramework {
                   agentName: agent.name,
                   error: terminal,
                 });
-                this.rearmExhaustedTurn(agent, new Error(terminal), trigger, ownsProviderGate, streamRouting);
+                this.rearmExhaustedTurn(agent, new Error(terminal), trigger, ownsProviderGate, streamRouting, false);
                 // Postmortem 2026-05-28 P2 #7: persist the abort to the
                 // inference log so future investigations can attribute the
                 // terminal cause without relying on live in-memory reducer
@@ -26263,6 +26308,7 @@ export class AgentFramework {
           }
 
           case 'usage': {
+            this.rearmDeadlineCuts.delete(agent.name);
             this.deadlineCuts.delete(agent.name);
             // Cumulative across the stream's rounds: replace, never sum.
             latestUsage = event.usage;
@@ -26506,6 +26552,7 @@ export class AgentFramework {
       agent.reset();
       this.emitTrace({ type: 'inference:failed', agentName: agent.name, error: err.message, stack: err.stack });
       const retry = retryOf(trigger);
+      const asTransient = this.takeAsTransient(agent.name, err, trigger);
       if (ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
         // Once stop() has closed admission, nothing is held, and the turn
         // ends here (endFailureAtStop).
@@ -26537,14 +26584,14 @@ export class AgentFramework {
         speech: '',
         ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
       }, streamRouting);
-      if (isRearmed(trigger) && isTransientFailure(err)) this.exhaustingRearms.add(agent.name);
+      if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
       this.emitTrace({
         type: 'inference:exhausted',
         agentName: agent.name,
         error: err.message,
         ...this.classifyInferenceError(err),
       });
-      this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting);
+      this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting, asTransient);
       // Postmortem 2026-05-28 P2 #7: catch-path failures (stream itself
       // threw) were previously only visible via in-memory trace listeners.
       // Persist to inference log for forensic attribution.
@@ -29597,6 +29644,7 @@ export class AgentFramework {
   private noteSpokenTo(agentName: string, metadata: MessageMetadata | undefined): void {
     const agent = this.agents.get(agentName);
     if ((agent && !this.agentSees(agent, metadata)) || isOwnScheduleWrite(metadata) || !isConversationalInjection(metadata)) return;
+    this.rearmDeadlineCuts?.delete(agentName);
     if (this.turnRearms?.delete(agentName)) console.error(`[inference-rearm] agent=${agentName} re-send count started again: a message was said to it`);
   }
 
