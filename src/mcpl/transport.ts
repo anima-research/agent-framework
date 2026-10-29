@@ -39,6 +39,10 @@ export interface TransportCloseInfo {
   /** True when `reason` is the peer's own text, a WebSocket server's close
    *  reason, rather than the transport's words. */
   reasonFromPeer?: boolean;
+  /** True when a stdio transport ended its child itself, after an error on
+   *  the child's stdin or stdout: the exit's signal or code is then this
+   *  transport's doing, not a stop asked of the server. */
+  pipeFailed?: boolean;
 }
 
 /**
@@ -279,6 +283,9 @@ export class StdioTransport extends McplTransport {
   readonly kind = 'stdio' as const;
   /** The first error on the child's stdin or stdout, named in the close reason. */
   private pipeError: Error | undefined;
+  /** Set when this transport ended the child after a pipe error, rather
+   *  than the child exiting on its own first. */
+  private endedForPipe = false;
   /** The stream's last STDERR_WINDOW_CHARS, raw. */
   private stderrWindow = '';
   /** True once the child's stderr has ended or closed. */
@@ -364,13 +371,17 @@ export class StdioTransport extends McplTransport {
     this.child.on('error', (err) => this.reportError(err));
     // The child's stdin and stdout carry the protocol, so after an error on
     // either, a write's EPIPE or a read error, this transport can't reach the
-    // child even if it's still running. The handler ends the child as close()
-    // does, SIGTERM and then SIGKILL, in the one attempt close() shares, and
-    // the exit's close names the error, so the connection handles it as any
-    // other exit. The close is the report: no 'error' is emitted, nothing is
-    // thrown, and nothing more is written meanwhile (pipeFailure). The first
-    // error starts that one attempt, and a later one, from either pipe, adds
-    // nothing to it. A child that outlives SIGKILL too stays this
+    // child even if it's still running. Nothing more is written (pipeFailure),
+    // and the handler first gives the child STDIO_EXIT_GRACE_MS to exit on its
+    // own: a child already dead when the write failed, as one a stop's signal
+    // reached first, exits within it, and its close carries its own code and
+    // signal. One still running then is ended as close() ends it, SIGTERM and
+    // then SIGKILL, in the one attempt close() shares, and only that close is
+    // pipeFailed, since its signal is this transport's. Either way the exit's
+    // close names the error, so the connection handles it as any other exit.
+    // The close is the report: no 'error' is emitted and nothing is thrown.
+    // The first error starts the wait, and a later one, from either pipe,
+    // adds nothing to it. A child that outlives SIGKILL too stays this
     // transport's: 'unreaped' says so, unless the host is closing it, whose
     // close() reports the failure itself. A child that stops reading without
     // closing its stdin raises no error: the writes are buffered, and only
@@ -381,7 +392,11 @@ export class StdioTransport extends McplTransport {
     const endOnPipeError = (err: Error) => {
       if (this.pipeError) return;
       this.pipeError = err;
-      void this.terminate().catch((failure: unknown) => {
+      void this.exitWithin(STDIO_EXIT_GRACE_MS).then((gone) => {
+        if (gone || this.terminating) return;
+        this.endedForPipe = true;
+        return this.terminate();
+      }).catch((failure: unknown) => {
         if (!this.closed) this.emit('unreaped', failure instanceof Error ? failure : new Error(String(failure)));
       });
     };
@@ -396,6 +411,7 @@ export class StdioTransport extends McplTransport {
       code,
       signal,
       reason: this.pipeError ? `child process exited, and its pipe failed with ${this.pipeError.message}` : 'child process exited',
+      ...(this.endedForPipe ? { pipeFailed: true } : {}),
     }));
   }
 
@@ -491,6 +507,16 @@ export class StdioTransport extends McplTransport {
     this.markClosed({ reason: 'closed by host' });
     this.stopLines();
     await this.terminate();
+  }
+
+  /** Whether the child exits within `ms`: true at once if it has. */
+  private exitWithin(ms: number): Promise<boolean> {
+    if (this.exited()) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const onExit = () => { clearTimeout(timer); resolve(true); };
+      const timer = setTimeout(() => { this.child.off('exit', onExit); resolve(false); }, ms);
+      this.child.once('exit', onExit);
+    });
   }
 
   /** Whether the child has exited, or never started (a spawn error). */
@@ -845,6 +871,13 @@ export function assertServerConfigBooleans(config: McplServerConfig): void {
   for (const [setting, whatTrueDoes] of Object.entries(SERVER_CONFIG_BOOLEANS) as Array<[BooleanSetting, string]>) {
     if (setting === 'inheritEnv' && dialsNetwork(config)) continue;
     assertBooleanSetting(`MCPL server "${config.id}" ${setting}`, config[setting], whatTrueDoes);
+  }
+  // Not a boolean, but read the same way: a value that isn't one of the
+  // three would otherwise be taken for the default.
+  const presentation = (config as { presentation?: unknown }).presentation;
+  if (presentation !== undefined && presentation !== null && presentation !== 'full' && presentation !== 'tab' && presentation !== 'closed-tab') {
+    const kind = typeof presentation === 'string' ? 'another string' : Array.isArray(presentation) ? 'a list' : typeof presentation;
+    throw new Error(`MCPL server "${config.id}" presentation must be "full", "tab" or "closed-tab" (or left out for full), not ${kind}`);
   }
 }
 

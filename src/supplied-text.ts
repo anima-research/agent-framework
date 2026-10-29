@@ -54,13 +54,20 @@ export function markedTexts(texts: readonly string[], marks: readonly boolean[] 
     at += text.length + 1;
   }
   const offsets: number[][] = texts.map(() => []);
-  for (const match of texts.join('\n').matchAll(NOTICE_OPENING)) {
-    let holder = texts.length - 1;
-    while (starts[holder]! > match.index) holder--;
-    const offset = match.index - starts[holder]!;
+  const found = Array.from(texts.join('\n').matchAll(NOTICE_OPENING), (match) => match.index);
+  holdersOf(starts, found).forEach((holder, i) => {
+    const offset = found[i]! - starts[holder]!;
     if (marks[holder] !== false && texts[holder]![offset - 1] !== '\\') offsets[holder]!.push(offset);
-  }
+  });
   return texts.map((text, i) => withMarks(text, offsets[i]!));
+}
+
+export function holdersOf(starts: readonly number[], places: readonly number[]): number[] {
+  let holder = 0;
+  return places.map((place) => {
+    while (holder + 1 < starts.length && starts[holder + 1]! <= place) holder++;
+    return holder;
+  });
 }
 
 function withMarks(text: string, offsets: readonly number[]): string {
@@ -132,7 +139,11 @@ export function showsAsItself(value: string): boolean {
 const EDGE_OR_QUOTE = /^\s|\s$|["\\]/;
 
 export function quotedValue(value: unknown, space?: number): string {
-  return (JSON.stringify(value, null, space) ?? 'null').replace(/"(?:[^"\\]|\\.)*"/g, (literal) => quotedString(JSON.parse(literal)));
+  return quotedJson(JSON.stringify(value, null, space) ?? 'null');
+}
+
+export function quotedJson(json: string): string {
+  return json.replace(/"(?:[^"\\]|\\.)*"/g, (literal) => quotedString(JSON.parse(literal)));
 }
 
 function quotedString(text: string): string {
