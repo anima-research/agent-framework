@@ -1626,44 +1626,50 @@ describe('present while acting', () => {
     });
   }
 
-  it('the start that continues the turn weighs what entered the window since its last stream: a delivery assembled for it, and a newer message', async () => {
-    // Ported for #291: the deferral queue this test once filled by hand, for
-    // the start's own flush to land, is gone. A delivery assembled while a
-    // start of the turn holds it, and a message stored once that start has
-    // let go, are stored at once and are arrivals as they enter the window;
-    // the turn's next start re-pins to the newest.
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Carrying on.' }] as ContentBlock[]));
-    const framework = await createFramework(LEGACY);
-    const routed = stubChannelRegistry(framework);
-    type Routing = { locus?: Ref; engaged: Set<string>; arrivals: Array<{ messageId: string; channel: Ref }>; [field: string]: unknown };
-    const internals = framework as unknown as {
-      turnRouting: Map<string, Routing>; openLogical: Map<string, Routing>; pendingRequests: InferenceRequest[];
-      activeTurnTokens: Map<string, number>;
-      assembling: Set<string>;
-      addMessage(participant: string, content: ContentBlock[], metadata: Record<string, unknown>): string;
-    };
-    const open: Routing = {
-      locus: stub('chan-turn'), triggerChannel: stub('chan-turn'), engaged: new Set(), wasIn: [],
-      continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
-    };
-    internals.turnRouting.set('assistant', open);
-    internals.openLogical.set('assistant', open);
-    try {
-      internals.activeTurnTokens.set('assistant', -1);
-      internals.assembling.add('assistant');
-      internals.addMessage('Antra', [{ type: 'text', text: 'batched' }] as ContentBlock[], addressed('discord:dm:q'));
-      internals.assembling.delete('assistant');
-      internals.activeTurnTokens.delete('assistant');
-      internals.addMessage('Antra', [{ type: 'text', text: 'quick question for you' }] as ContentBlock[], addressed('discord:dm:antra'));
-      internals.pendingRequests.push({ agentName: 'assistant', reason: 'tool_results_ready', source: 'framework', timestamp: Date.now() } as InferenceRequest);
-      await framework.runUntilIdle();
+  for (const { newer, title } of [
+    { newer: true, title: 'the start that continues the turn weighs what entered the window since its last stream: a delivery assembled for it, and a newer message' },
+    { newer: false, title: 'the start that continues the turn weighs a delivery assembled for it while a start of the turn held it, which re-pins the turn when nothing newer came' },
+  ]) {
+    it(title, async () => {
+      // Ported for #291: the deferral queue this test once filled by hand, for
+      // the start's own flush to land, is gone. A delivery assembled while a
+      // start of the turn holds it, and a message stored once that start has
+      // let go, are stored at once and are arrivals as they enter the window;
+      // the turn's next start re-pins to the newest.
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Carrying on.' }] as ContentBlock[]));
+      const framework = await createFramework(LEGACY);
+      const routed = stubChannelRegistry(framework);
+      type Routing = { locus?: Ref; engaged: Set<string>; arrivals: Array<{ messageId: string; channel: Ref }>; [field: string]: unknown };
+      const internals = framework as unknown as {
+        turnRouting: Map<string, Routing>; openLogical: Map<string, Routing>; pendingRequests: InferenceRequest[];
+        activeTurnTokens: Map<string, number>;
+        assembling: Set<string>;
+        addMessage(participant: string, content: ContentBlock[], metadata: Record<string, unknown>): string;
+      };
+      const open: Routing = {
+        locus: stub('chan-turn'), triggerChannel: stub('chan-turn'), engaged: new Set(), wasIn: [],
+        continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
+      };
+      internals.turnRouting.set('assistant', open);
+      internals.openLogical.set('assistant', open);
+      try {
+        internals.activeTurnTokens.set('assistant', -1);
+        internals.assembling.add('assistant');
+        internals.addMessage('Antra', [{ type: 'text', text: 'batched' }] as ContentBlock[], addressed('discord:dm:q'));
+        internals.assembling.delete('assistant');
+        internals.activeTurnTokens.delete('assistant');
+        if (newer) internals.addMessage('Antra', [{ type: 'text', text: 'quick question for you' }] as ContentBlock[], addressed('discord:dm:antra'));
+        internals.pendingRequests.push({ agentName: 'assistant', reason: 'tool_results_ready', source: 'framework', timestamp: Date.now() } as InferenceRequest);
+        await framework.runUntilIdle();
 
-      assert.deepEqual(routed, [{ text: 'Carrying on.', locus: 'discord:dm:antra' }]);
-      assert.deepEqual(movedTo(framework), ['discord:dm:antra']);
-    } finally {
-      await framework.stop();
-    }
-  });
+        const expected = newer ? 'discord:dm:antra' : 'discord:dm:q';
+        assert.deepEqual(routed, [{ text: 'Carrying on.', locus: expected }]);
+        assert.deepEqual(movedTo(framework), [expected]);
+      } finally {
+        await framework.stop();
+      }
+    });
+  }
 
   it('a start that throws before its stream ends its logical turn, so the next start opens its own', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hello there.' }] as ContentBlock[]));
