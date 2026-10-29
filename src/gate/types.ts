@@ -404,9 +404,10 @@ export interface GateEventInfo {
   /** Event tags (MCPL RFC-001), already implication-expanded by the host. */
   tags?: string[];
   /** The agents admission delivered a targeted event to (its targetAgents).
-   *  A debounced batch whose events all name theirs wakes those agents alone,
-   *  and its line is for them alone. Absent for an untargeted event, whose
-   *  batch wakes every agent getAgentNames lists. */
+   *  A debounced batch wakes each agent with the events it may see, those
+   *  naming it and those naming no agent, and agents that may see the same
+   *  events share one line. Absent for an untargeted event, whose batch wakes
+   *  every agent getAgentNames lists. */
   recipients?: readonly string[];
 }
 

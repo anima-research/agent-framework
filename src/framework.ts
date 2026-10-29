@@ -20116,9 +20116,9 @@ export class AgentFramework {
 
   /**
    * Whether a batched gate wake's addressed route may become `agentName`'s
-   * speech locus. The gate broadcasts to every agent, conversation forks
-   * included. A fork speaks only in its home channel, and a channel bound to
-   * a fork is that fork's conversation, so no other agent takes it.
+   * speech locus. A batch naming no agent wakes every agent, conversation
+   * forks included. A fork speaks only in its home channel, and a channel
+   * bound to a fork is that fork's conversation, so no other agent takes it.
    */
   private mayTakeGateRoute(agentName: string, route: ChannelRef): boolean {
     const home = this.homeOf(agentName);
