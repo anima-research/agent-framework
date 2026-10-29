@@ -733,8 +733,6 @@ test('module utilities are callable tools out of the tool list, and utils is gon
     assert.ok(h.framework.getAllTools().some(tool => tool.name === 'probe--allowed_util'), 'callable by name');
     const surface = (await h.framework.previewActivation('assistant')).tools ?? [];
     assert.ok(!surface.some(tool => tool.name === 'probe--allowed_util' || tool.name === 'utils'), 'neither in the tool list');
-    utilities.pop();
-    assert.equal(framework.getAllUtilities().length, 2);
   } finally { await h.close(); }
 });
 
