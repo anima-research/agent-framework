@@ -2700,6 +2700,7 @@ interface EphemeralRun {
   endReason?: AgentEndReason;
   /** Who ended it, when it was stopped from outside. */
   endedBy?: string;
+  endedFromOutside?: true;
 }
 
 /**
@@ -11427,6 +11428,7 @@ export class AgentFramework {
     if (run) {
       run.endReason ??= 'stopped';
       run.endedBy ??= options.by;
+      run.endedFromOutside = true;
       // The awaiting caller is told who stopped the job and why, whether or
       // not a stream was in flight: settled first, so the aborted stream's own
       // settle ('Stream cancelled') finds the run already settled. The caller's
@@ -11805,12 +11807,22 @@ export class AgentFramework {
     if (run) {
       run.endReason = reason;
       run.endedBy = record.ended?.by;
+      run.endedFromOutside = true;
       run.settle.reject(new AgentStoppedError(name, reason, record.ended?.by, detail));
       return;
     }
     const agent = this.agents.get(name);
     if (!agent) return;
     this.releaseAgentRuntime(agent, this.channelOfHome(record.homeChannel), undefined, record.lifetime.kind === 'persistent');
+  }
+
+  private forgetFailureAccounting(name: string): void {
+    this.consecutiveInferenceFailures.delete(name);
+    this.exhaustionRewinds.delete(name);
+    this.refusalStreak.delete(name);
+    this.refusalRewinds.delete(name);
+    this.rewindEpisode.delete(name);
+    if (this.forcedRewind.delete(name)) console.error(`[unstick] agent=${name} its /unstick session ended with its agent`);
   }
 
   /**
@@ -11857,6 +11869,8 @@ export class AgentFramework {
     this.agents.delete(name);
     this.agentConfigs.delete(name);
     this.deadlineCuts.delete(name);
+    this.freshCallsCut.delete(name);
+    this.forgetFailureAccounting(name);
     this.thinkingLossIncidents.forget(name);
     this.reasoningLoss.forget(name);
     // main's manager release: the context manager an ephemeral run or a fork
@@ -12625,6 +12639,8 @@ export class AgentFramework {
         this.eventGate?.onInferenceEnded(agent.name);
         this.agents.delete(agent.name);
         this.deadlineCuts.delete(agent.name);
+        this.freshCallsCut.delete(agent.name);
+        if (run.endedFromOutside) this.forgetFailureAccounting(agent.name);
         this.thinkingLossIncidents.forget(agent.name);
         this.reasoningLoss.forget(agent.name);
         // Its pending self-wake ends with it, as a fork's does.
@@ -17775,6 +17791,8 @@ export class AgentFramework {
       // Nothing live under the name: only what the process keeps by name.
       this.closingConversationAgents.delete(agentName);
       this.deadlineCuts.delete(agentName);
+      this.freshCallsCut.delete(agentName);
+      this.forgetFailureAccounting(agentName);
       this.thinkingLossIncidents.forget(agentName);
       this.reasoningLoss.forget(agentName);
       // A continuation of its turn still on its way goes with it.
