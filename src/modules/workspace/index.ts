@@ -5199,9 +5199,10 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * How the module asks whether an agent's history holds a message, as the
-   * framework judges its own notices (`cm.getMessage(id) !== null`): handed
-   * over once, when the module is added. Without it, no notice is held.
+   * How the module asks whether an agent's history holds a message: its
+   * record holds it, and, on a window the framework presents, no undo has
+   * taken it out of the window. Handed over once, when the module is added.
+   * Without it, no notice is held.
    */
   useHistory(lookup: (agentName: string, messageId: string) => boolean): void {
     this.historyLookup = lookup;

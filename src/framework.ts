@@ -7462,15 +7462,19 @@ export class AgentFramework {
     }
     this.resetCompletedStop('addModule()');
     await this.moduleRegistry.addModule(module);
-    // The workspace judges whether an agent's history holds a message as the
-    // framework judges its own notices, for its head-move notice
-    // (noticeHeadMoves) and the writes it weighs against it. A module taken
-    // for the workspace by its writeBinary (getWorkspaceModule) may have no
-    // such call, as a host's own or a test's stand-in hasn't.
+    // The workspace asks whether an agent's history holds a message for its
+    // head-move notice (noticeHeadMoves) and the writes it weighs against it.
+    // A module taken for the workspace by its writeBinary (getWorkspaceModule)
+    // may have no such call, as a host's own or a test's stand-in hasn't.
     const workspace = this.getWorkspaceModule();
     if (workspace === module && typeof workspace.useHistory === 'function') {
-      workspace.useHistory((agentName, messageId) =>
-        this.agents.get(agentName)?.getContextManager().getMessage(messageId as MessageId) != null);
+      workspace.useHistory((agentName, messageId) => {
+        const agent = this.agents.get(agentName);
+        if (!agent) return false;
+        const cm = agent.getContextManager();
+        if (cm.getMessage(messageId as MessageId) == null) return false;
+        return !this.presents(agent) || cm.windowStatusOf(messageId as MessageId) !== 'undone';
+      });
     }
     // With the presentation index an undo moves no branch: the workspace asks
     // the window whether the turn that wrote is still in it.

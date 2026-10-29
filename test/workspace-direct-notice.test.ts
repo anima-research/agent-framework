@@ -86,6 +86,7 @@ type Cm = {
   getAllMessages(): Array<{ id: string; metadata?: Record<string, unknown> }>;
   branchAt(id: string, name: string): string;
   switchBranch(name: string): Promise<void>;
+  windowStatusOf(id: string): string;
 };
 
 class Harness {
@@ -365,6 +366,23 @@ test('a write after a notice advances the position and clears the notice, so an 
   assert.equal(h.notices().length, 2);
 });
 
+test("on the window, an undo of the turn that carried the notice gives the notice again at the next start, since the window holds neither the write nor the notice", async (t) => {
+  const h = await harness(t);
+  await h.turn([write('a.txt', 'one\n'), say('wrote it')]);
+  assert.equal(h.framework.undoLastTurn('scout').undone, true, "the writing turn's undo");
+  const [told] = await h.turn([say('back')]);
+  assert.equal(carries(told), true, 'the next start gave the notice');
+  const [first] = h.notices();
+  assert.equal(h.framework.undoLastTurn('scout').undone, true, "the undo of the turn that carried it");
+  assert.equal(h.cm().windowStatusOf(first!), 'undone', 'the notice left the window with its turn');
+  const [again] = await h.turn([say('back once more')]);
+  assert.equal(carries(again), true, 'the next start gives the notice again');
+  assert.equal(h.notices().length, 2, 'as a notice of its own');
+  const [later] = await h.turn([say('still here')]);
+  assert.equal(carries(later), true, 'later starts carry it');
+  assert.equal(h.notices().length, 2, 'and store no other');
+});
+
 test('a head moved under a running turn gives the notice at that turn\'s continuing start, and that start\'s request carries it', async (t) => {
   const h = await harness(t);
   await h.turn([say('hello')]);
@@ -535,7 +553,7 @@ test('a history lookup that throws decides nothing at a start, and leaves the po
   const logged: string[] = [];
   const error = console.error;
   console.error = (...args: unknown[]) => { logged.push(String(args[0])); };
-  const lookup = (h.framework as unknown as { agents: Map<string, { getContextManager(): { getMessage(id: string): unknown } }> }).agents;
+  const frameworks = (h.workspace as unknown as { historyLookup: (agentName: string, messageId: string) => boolean }).historyLookup;
   try {
     h.workspace.useHistory(() => { throw new Error('zz-lookup-failed'); });
     // At a start, no notice.
@@ -551,7 +569,7 @@ test('a history lookup that throws decides nothing at a start, and leaves the po
   } finally {
     console.error = error;
     // The framework's own lookup again.
-    h.workspace.useHistory((agent, id) => lookup.get(agent)?.getContextManager().getMessage(id) != null);
+    h.workspace.useHistory(frameworks);
   }
   // The next start whose lookup answers decides: exactly one notice.
   const [second] = await h.turn([say('readable')]);
