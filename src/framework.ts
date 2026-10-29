@@ -3351,8 +3351,9 @@ function boundFailureFields(record: Record<string, unknown>): Record<string, unk
  * the shed doesn't help, and the breaker stops at its rewind cap. The 413 arm
  * takes both labels membranes have given a 413, invalid_request and
  * context_length (see the notes below). Other statuses keep the history,
- * since a shed takes the exchange out of the agent's context, which only an
- * operator's undo brings back, and the status gives no sign that a shed
+ * since a shed takes the exchange out of the agent's context for good (the
+ * record keeps it, and no later start, restart or redo of another turn
+ * presents it again), and the status gives no sign that a shed
  * would help: a 404 is a model or an endpoint that doesn't exist, and 405,
  * 409, 410 and 415 are about the HTTP request or the resource, as a rule,
  * rather than the conversation.
