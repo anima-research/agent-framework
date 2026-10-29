@@ -19592,7 +19592,7 @@ export class AgentFramework {
     if (occ.event.lane === 'channel') {
       const event = { ...occ.event.event, coalescingSubject, ...narrowing, ...firstViewMark, ...(assemblingFor ? { assemblingFor } : {}) };
       const placement = await this.handleMcplChannelIncoming(event);
-      await this.dispatchAfterDelivery(event as unknown as ProcessEvent);
+      await this.dispatchAfterDelivery(event as unknown as ProcessEvent, occ);
       return placement;
     }
     if (occ.scope.kind === 'channel') {
@@ -19625,7 +19625,7 @@ export class AgentFramework {
         ...frozenSource(push.inboundSource),
       };
       const placement = await this.handleMcplChannelIncoming(event);
-      await this.dispatchAfterDelivery(event as unknown as ProcessEvent);
+      await this.dispatchAfterDelivery(event as unknown as ProcessEvent, occ);
       return placement;
     }
     const event: McplPushEvent = {
@@ -19642,17 +19642,15 @@ export class AgentFramework {
       ...frozenSource(occ.event.event.inboundSource),
     };
     const placement = this.handleMcplPushEvent(event);
-    await this.dispatchAfterDelivery(event as unknown as ProcessEvent);
+    await this.dispatchAfterDelivery(event as unknown as ProcessEvent, occ);
     return placement;
   }
 
-  private async dispatchAfterDelivery(event: ProcessEvent): Promise<void> {
+  private async dispatchAfterDelivery(event: ProcessEvent, occurrence: { serverId: string; eventId: string }): Promise<void> {
     try {
       await this.dispatchProcessEventToModules(event);
     } catch (error) {
-      const { serverId, eventId, messageId } = event as { serverId?: unknown; eventId?: unknown; messageId?: unknown };
-      const id = eventId !== undefined ? `eventId=${logValue(eventId)}` : `messageId=${logValue(messageId ?? '')}`;
-      console.error(`[coalescing] server=${logValue(serverId ?? '')} ${id}: the modules' handling of a delivered occurrence threw; its message stays stored, and it isn't delivered again:`, error);
+      console.error(`[coalescing] server=${logValue(occurrence.serverId)} eventId=${logValue(occurrence.eventId)}: the modules' handling of a delivered occurrence threw; the occurrence isn't delivered again:`, error);
     }
   }
 

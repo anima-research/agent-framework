@@ -2808,7 +2808,7 @@ test("a render stored whose modules' handling then throws is stored once and not
   assert(!kinds.includes('deliver-failed'), 'the delivery is not taken as failed');
   const coalescer = (f.framework as unknown as { pushCoalescer: { pendingBatches(): number } }).pushCoalescer;
   assert.equal(coalescer.pendingBatches(), 0, 'no batch is left for a recovery wake');
-  assert(logged.some((line) => /server=\S+ eventId=1: the modules' handling/.test(line)), `the failure's line names its server and event: ${logged.join(' | ')}`);
+  assert(logged.some((line) => /server=editor eventId=1: the modules' handling/.test(line)), `the failure's line names its server and event: ${logged.join(' | ')}`);
 });
 
 test('R16b: a producer retry re-wakes a batch left asleep by a failed freeze', async (t) => {
