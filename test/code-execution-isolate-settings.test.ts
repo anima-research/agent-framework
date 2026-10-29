@@ -2,7 +2,7 @@
 
 import { test } from 'node:test';
 import { strict as assert } from 'node:assert';
-import { buildCodeExecutionToolDefinition, bunVersionProblem, DEFAULT_SETTINGS, describeCodeExecution, isolateSettings, validateCodeExecutionConfig } from '../src/code-execution/tool-definition.js';
+import { buildCodeExecutionToolDefinition, bunVersionProblem, DEFAULT_SETTINGS, isolateSettings, validateCodeExecutionConfig } from '../src/code-execution/tool-definition.js';
 
 test('an empty configuration takes every default, each the value the docs give', () => {
   assert.deepEqual(isolateSettings({ enabled: true }), DEFAULT_SETTINGS);
@@ -65,8 +65,12 @@ test("the description says the settings' values", () => {
 });
 
 test("the definition takes create()'s settings, each left out at its default, and refuses the Python runner's by name", () => {
-  assert.equal(buildCodeExecutionToolDefinition().description, describeCodeExecution(DEFAULT_SETTINGS).description);
-  assert.equal(buildCodeExecutionToolDefinition({ enabled: true, yieldMs: 5_000 }).description, describeCodeExecution({ ...DEFAULT_SETTINGS, yieldMs: 5_000 }).description);
+  const documentedDefaults = {
+    enabled: true, yieldMs: 30_000, maxYieldMs: 600_000, scriptLifetimeMs: 86_400_000, maxRunningScripts: 3, maxScriptChildren: 16,
+    toolCallTimeoutMs: 270_000, wakeMinIntervalMs: 60_000, maxWakesPerScript: 100, memoryMaxBytes: 128 * 1024 * 1024,
+  };
+  assert.equal(buildCodeExecutionToolDefinition().description, buildCodeExecutionToolDefinition(documentedDefaults).description);
+  assert.equal(buildCodeExecutionToolDefinition({ enabled: true, yieldMs: 5_000 }).description, buildCodeExecutionToolDefinition({ ...documentedDefaults, yieldMs: 5_000 }).description);
   assert.throws(() => buildCodeExecutionToolDefinition({ scriptTimeoutMs: 1_000 } as never), /codeExecution\.scriptTimeoutMs is no longer read: .*yieldMs/);
 });
 
