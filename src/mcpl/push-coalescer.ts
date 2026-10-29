@@ -1096,7 +1096,7 @@ export class PushCoalescer<E = unknown> {
       this.scheduleRecovery(subject, state);
       return 'declined';
     }
-    this.clearRecovery(subject);
+    this.disarmRecovery(subject);
     if (this.suspended) { state.rendering = undefined; state.batch = batch; return undefined; }
     // Authority (grant, registration, binding) is re-checked immediately
     // before dispatch: a server id reassigned to another endpoint during the
@@ -1152,6 +1152,7 @@ export class PushCoalescer<E = unknown> {
     }
     // Settlement runs under the lock: between the RPC's return and the state
     // update no admission can withdraw or replace what is being published.
+    let failed = false;
     await this.locked(async () => {
       try {
         if (rendering.cancelled || state.rendering !== rendering || this.suspended) return;
@@ -1173,6 +1174,7 @@ export class PushCoalescer<E = unknown> {
         try {
           placement = await this.deliver({ ...occurrence, timestamp, content, ...(firstView ? { firstView: true } : {}) }, content, assemblingFor);
         } catch (error) {
+          failed = true;
           this.host.audit({ kind: 'deliver-failed', subject, eventId: occurrence.eventId, error: String(error) });
           if (state.batch) state.batch.noRender = true;
           else {
@@ -1220,6 +1222,7 @@ export class PushCoalescer<E = unknown> {
         if (placement) state.audienceAgent = placement.agent;
       } finally {
         if (state.rendering === rendering) state.rendering = undefined;
+        if (!failed) this.clearRecovery(subject);
       }
     });
   }

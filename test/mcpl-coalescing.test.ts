@@ -2654,6 +2654,40 @@ test("a render whose store write is refused keeps its batch, which its recovery 
   assert.equal(coalescer.pendingBatches(), 0);
 });
 
+test("a render whose store write keeps being refused waits longer before each recovery wake", { timeout: 120_000 }, async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const coalescer = (f.framework as unknown as { pushCoalescer: { options: { recoveryBackoffMs?: number } } }).pushCoalescer;
+  coalescer.options.recoveryBackoffMs = 20;
+  const internals = f.framework as unknown as { pendingRequests: unknown[] };
+  f.renderer(async () => ({ content: [{ type: 'text', text: 'backoff_render' }] }));
+  const cm = f.framework.getAgent('agent')!.getContextManager();
+  const add = cm.addMessage.bind(cm);
+  let refused = 0;
+  (cm as unknown as { addMessage: typeof add }).addMessage = (...args) => {
+    if (refused < 3 && JSON.stringify(args[1]).includes('backoff_')) {
+      refused++;
+      throw new Error('zz-store-refused');
+    }
+    return add(...args);
+  };
+  const wakes: Array<{ attempt: number; delayMs: number }> = [];
+  f.framework.onTrace((e) => {
+    if (e.type === 'mcpl:coalescing' && (e as { kind?: string }).kind === 'recovery-wake') wakes.push(e as unknown as { attempt: number; delayMs: number });
+  });
+  f.alwaysRespond();
+  await f.send('push/event', f.params('1', 'backoff_fallback', { deferred: true, initial: true }));
+  await settles(f.framework.runUntilIdle(), 'the first drain');
+  for (let pass = 0; !f.context().includes('backoff_fallback'); pass++) {
+    assert(pass < 10, 'the batch was stored within ten wakes');
+    await eventually(() => internals.pendingRequests.length > 0, 'a recovery wake');
+    await settles(f.framework.runUntilIdle(), `the drain after wake ${pass + 1}`);
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(refused, 3, 'the store refused three writes');
+  assert.deepEqual(wakes.map((w) => w.attempt), [1, 2, 3], 'each recovery wake counts the failures before it');
+  assert(wakes[1]!.delayMs > wakes[0]!.delayMs && wakes[2]!.delayMs > wakes[1]!.delayMs, 'and waits longer than the one before');
+});
+
 test("a render whose store write is refused leaves a batch opened while it rendered to be delivered as its fallback, not rendered on top of the render the agent never got", { timeout: 120_000 }, async (t) => {
   const f = await fixture(); t.after(f.close);
   f.alwaysRespond();
