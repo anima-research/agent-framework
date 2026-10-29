@@ -1837,6 +1837,26 @@ interface DiscordAwarenessDrainPass {
   drain?: Promise<DiscordAwarenessDrainOutcome>;
 }
 
+/** Whether a synthesized tool's nullable field is in use: omission, null and
+ *  the empty string all mean it isn't, so a caller whose provider presents
+ *  every property as required can still leave one unset. Any other value is
+ *  in use, and its field checks it. */
+function fieldInUse(value: unknown): boolean {
+  return value !== undefined && value !== null && value !== '';
+}
+
+/** A synthesized tool's integer field: an integer number, or a string of ASCII
+ *  digits once trimmed (a model may write an integer as a string), within the
+ *  integers a number holds exactly; NaN for anything else. Number() would read
+ *  " ", false and [] as 0, and "2.0" or "+2" as 2, and a longer run of digits
+ *  as a different, rounded number. */
+function integerField(value: unknown): number {
+  const n = typeof value === 'number' ? value
+    : typeof value === 'string' && /^[0-9]+$/.test(value.trim()) ? Number(value.trim())
+    : Number.NaN;
+  return Number.isSafeInteger(n) ? n : Number.NaN;
+}
+
 function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
   if (value === undefined || !Number.isFinite(value) || value <= 0) {
     return DEFAULT_DISCORD_AWARENESS_DEADLINE_MS;
@@ -7827,7 +7847,7 @@ export class AgentFramework {
     ];
   }
 
-  /** The registered workspace module, if any (used by save_image). */
+  /** The registered workspace module, if any (used by save_recent_image). */
   private getWorkspaceModule(): WorkspaceModule | undefined {
     const module = this.moduleRegistry.getAllModules().find((m) => m.name === 'workspace');
     return module && typeof (module as WorkspaceModule).writeBinary === 'function'
@@ -13093,10 +13113,10 @@ export class AgentFramework {
   /** Synthesized drafts tool — present whenever MCPL channels are
    *  configured. A resident's held drafts (src/prose-drafts.ts): plain speech
    *  that was not sent, never published except by its resident's resend, and
-   *  kept as that module's retention says. Nullable
-   *  fields, cast like save_recent_image's: a caller whose provider presents
-   *  every property as required can still say "not in use". */
-  private static readonly DRAFTS_TOOL = {
+   *  kept as that module's retention says. Its optional fields are nullable,
+   *  as save_recent_image's selectors are: a caller whose provider presents
+   *  every property as required can still say "not in use" (fieldInUse). */
+  private static readonly DRAFTS_TOOL: import('./types/index.js').ToolDefinition = {
     name: 'drafts',
     description:
       'Your held drafts: plain speech of yours that was NOT sent — held back because an explicit send in its turn ' +
@@ -13135,12 +13155,12 @@ export class AgentFramework {
       },
       required: ['action'],
     },
-  } as unknown as import('./types/index.js').ToolDefinition;
+  };
 
-  /** Synthesized save_image tool — present when a workspace module is
+  /** Synthesized save_recent_image tool — present when a workspace module is
    *  registered. Lets the agent persist an image it has already seen in its
    *  own context (Discord attachments arrive inlined as base64 and are
-   *  otherwise unreachable as files). */
+   *  otherwise unreachable as files). Its three selectors are nullable. */
   private static readonly SAVE_IMAGE_TOOL: import('./types/index.js').ToolDefinition = {
     name: 'save_recent_image',
     description:
@@ -13156,7 +13176,8 @@ export class AgentFramework {
       'restart) the call fails and writes nothing — it never substitutes an older ' +
       'image. When other tool calls in the same batch are still running, the save ' +
       'waits for them so their images are counted. Receipts carry source tool call, MIME, byte size and SHA-256. Saved ' +
-      'files are visible via workspace tools.',
+      'files are visible via workspace tools. Select by `ref` or by ' +
+      '`index`/`count`; a selector you are not using may be omitted or passed as null.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -13164,19 +13185,27 @@ export class AgentFramework {
           type: 'string',
           description: 'Mount-prefixed destination path, e.g. "project/photos/name.png".',
         },
+        // Nullable selectors: a caller whose provider presents every property
+        // as required must still be able to say "not this selector". Omission,
+        // null and "" all mean it isn't used (fieldInUse); any other value is
+        // checked. The descriptions name null, the form to ask for.
         index: {
-          type: 'number',
-          description: 'Which image, counting back from the most recent (0 = most recent). Default 0.',
+          type: ['integer', 'null'],
+          description:
+            'Which image, counting back from the most recent (0 = most recent). Default 0. ' +
+            'null, like omitting it, means the default.',
         },
         count: {
-          type: 'number',
-          description: 'How many images to save, starting at `index` and going further back. Default 1.',
+          type: ['integer', 'null'],
+          description:
+            'How many images to save, starting at `index` and going further back. Default 1. ' +
+            'null, like omitting it, means the default.',
         },
         ref: {
-          type: 'string',
+          type: ['string', 'null'],
           description:
             'Save a specific tool-result image by its history ref (e.g. "img_k7x3q2_7", as shown in its placeholder in your context) instead of by position. ' +
-            'Mutually exclusive with `index`/`count`.',
+            'Mutually exclusive with `index`/`count`: pass null for the selector you are not using. null, like omitting it, means no ref.',
         },
       },
       required: ['path'],
@@ -20567,8 +20596,6 @@ export class AgentFramework {
     const refuse = (error: string): ToolResult => ({ success: false, error, isError: true });
     // Plain text, not a JSON-quoted string: draft text must read exactly as held.
     const ok = (text: string): ToolResult => ({ success: true, data: [{ type: 'text', text }] });
-    // null and omission mean the same thing: the field is not in use.
-    const present = (v: unknown): boolean => v !== undefined && v !== null;
     const action = input.action;
     if (action !== 'list' && action !== 'read' && action !== 'resend' && action !== 'dismiss') {
       return refuse('action must be one of "list", "read", "resend" or "dismiss".');
@@ -20577,7 +20604,7 @@ export class AgentFramework {
       refuse(`${field} is not used by action "${action}" — pass null or omit it.`);
 
     let ids: string[] = [];
-    if (present(input.draftIds)) {
+    if (fieldInUse(input.draftIds)) {
       if (action === 'list') return unused('draftIds');
       if (!Array.isArray(input.draftIds) || input.draftIds.some((id) => typeof id !== 'string' || !id.trim())) {
         return refuse('draftIds must be a list of draft ids such as "d-k7x3qm2", or null.');
@@ -20586,15 +20613,19 @@ export class AgentFramework {
       if (new Set(ids).size !== ids.length) return refuse('draftIds names a draft more than once.');
       if (ids.length > 20) return refuse('draftIds names more than 20 drafts; act on them in smaller groups.');
     }
-    if (present(input.destination) && action !== 'resend') return unused('destination');
-    if (present(input.confirmDuplicate) && action !== 'resend') return unused('confirmDuplicate');
-    if (present(input.offset) && action !== 'list') return unused('offset');
+    if (fieldInUse(input.destination) && action !== 'resend') return unused('destination');
+    // false is "don't confirm", which every other action already does, so only
+    // true is a confirmDuplicate those actions refuse.
+    if (fieldInUse(input.confirmDuplicate) && input.confirmDuplicate !== false && action !== 'resend') {
+      return unused('confirmDuplicate');
+    }
+    if (fieldInUse(input.offset) && action !== 'list') return unused('offset');
 
     if (action === 'list') {
       let offset = 0;
-      if (present(input.offset)) {
+      if (fieldInUse(input.offset)) {
         const raw = input.offset;
-        const n = typeof raw === 'number' ? raw : typeof raw === 'string' && /^\d+$/.test(raw.trim()) ? Number(raw) : NaN;
+        const n = integerField(raw);
         if (!Number.isInteger(n) || n < 0) return refuse('offset must be a whole number of drafts to skip (0 or more), or null.');
         offset = n;
       }
@@ -20711,12 +20742,12 @@ export class AgentFramework {
     if (!registry) return refuse('No channels are configured, so there is nowhere to resend to.');
     const home = this.homeOf(agentName);
     let spec = typeof input.destination === 'string' ? input.destination.trim() : '';
-    if (present(input.destination) && typeof input.destination !== 'string') {
+    if (fieldInUse(input.destination) && typeof input.destination !== 'string') {
       return refuse('destination must be "#channel", "@person" or a channel id.');
     }
     if (!spec && !home) return refuse('resend needs a destination: "#channel", "@person" or a channel id.');
     let confirmDuplicate = false;
-    if (present(input.confirmDuplicate)) {
+    if (fieldInUse(input.confirmDuplicate)) {
       if (typeof input.confirmDuplicate !== 'boolean') return refuse('confirmDuplicate must be true, false or null.');
       confirmDuplicate = input.confirmDuplicate;
     }
@@ -37388,20 +37419,39 @@ export class AgentFramework {
         let count = 1;
         /** Direct-ref mode: the one ref to find in the scannable context. */
         let wantedRef: string | null = null;
-        if (input.ref !== undefined) {
+        // A selector is in use only when it carries a value (fieldInUse), so a
+        // caller whose provider presents every property as required can still
+        // choose one, whichever of the two it fills the other selector with.
+        // Any other value is checked, never read as absent: a whitespace or
+        // malformed ref, or an index that isn't an integer, is refused rather
+        // than turned into a different image than the one the caller named.
+        // A malformed ref beside an index or count in use says how to leave a
+        // selector unused, since the caller may have meant the positional one, as
+        // the conflict refusal below does for a well-formed ref. No refusal of one
+        // selector on its own says it: a ref alone is the caller's one selector,
+        // and dropping it would save the newest image; an index and a count are
+        // one selector, and dropping either changes which images are saved.
+        if (fieldInUse(input.ref)) {
           if (typeof input.ref !== 'string' || !TOOL_IMAGE_REF_RE.test(input.ref)) {
-            throw new Error('save_recent_image: `ref` must look like "img_k7x3q2_7" (copy it from the image placeholder in your context)');
+            const positionalInUse = fieldInUse(input.index) || fieldInUse(input.count);
+            throw new Error(
+              'save_recent_image: `ref` must look like "img_k7x3q2_7" (copy it from the image placeholder in your context)' +
+              (positionalInUse ? ' (pass null, or leave it out, for a selector you are not using)' : ''),
+            );
           }
-          if (input.index !== undefined || input.count !== undefined) {
-            throw new Error('save_recent_image: `ref` is mutually exclusive with `index`/`count`');
+          if (fieldInUse(input.index) || fieldInUse(input.count)) {
+            throw new Error(
+              'save_recent_image: `ref` is mutually exclusive with `index`/`count` — pass null (or omit) ' +
+              'for the selector you are not using',
+            );
           }
           wantedRef = input.ref;
         } else {
-          index = input.index === undefined ? 0 : Number(input.index);
+          index = fieldInUse(input.index) ? integerField(input.index) : 0;
           if (!Number.isInteger(index) || index < 0) {
             throw new Error('save_recent_image: `index` must be a non-negative integer');
           }
-          count = input.count === undefined ? 1 : Number(input.count);
+          count = fieldInUse(input.count) ? integerField(input.count) : 1;
           const MAX_COUNT = 20;
           if (!Number.isInteger(count) || count < 1 || count > MAX_COUNT) {
             throw new Error(`save_recent_image: \`count\` must be an integer in 1..${MAX_COUNT}`);
