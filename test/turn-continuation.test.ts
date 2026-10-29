@@ -1675,13 +1675,13 @@ describe("a conversation agent's disposal while its turn's continuation is held"
     framework.onTrace((e) => { traces.push(e); });
     const internal = framework as unknown as Internals & {
       spawnConversationAgent(channel: { serverId: string; channelId: string }, decision: { agentName: string; generation: number }): Promise<unknown>;
-      conversationAgentHomes: Map<string, unknown>;
     };
     try {
       framework.start();
       // The channel's fork, spawned as a routing spawns it, takes a turn whose tool round restarts it.
       await internal.spawnConversationAgent({ serverId: 'zz-server', channelId: 'zz-chat' }, { agentName: fork, generation: 1 });
-      assert.ok(internal.conversationAgentHomes.has(fork), 'a conversation agent');
+      // On this branch a fork's home is the registry's (homeChannel), not a framework map.
+      assert.ok(framework.getAgentRecord(fork)?.kind === 'conversation-fork', 'a conversation agent');
       framework.getAgent(fork)!.getContextManager().addMessage('User', [{ type: 'text', text: 'fetch it' }]);
       internal.pendingRequests.push({ agentName: fork, reason: 'conversation', source: 'test', timestamp: Date.now() });
       await waitFor("the fork's continuation to be held, its frame gone", () =>

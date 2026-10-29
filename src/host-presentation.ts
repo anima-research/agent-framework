@@ -72,6 +72,8 @@ export interface HostPresentationDeps {
   isUtility(toolName: string): boolean;
   /** The resident agents of this host (no forks, ephemeral runs or the subconscious). */
   residents(): string[];
+  /** The agent whose presentation this one is shown: a derived agent that shows its parent's tool list, its parent; anyone else, itself. */
+  ownerOf?(agentName: string): string;
 }
 
 interface AgentState {
@@ -198,10 +200,15 @@ export class HostPresentation {
     return server?.configured === 'closed-tab' && !server.connected;
   }
 
+  /** The agent whose presentation `agentName` is shown (HostPresentationDeps.ownerOf). */
+  ownerOf(agentName: string): string {
+    return this.deps.ownerOf?.(agentName) ?? agentName;
+  }
+
   /** How a server is presented to an agent now. */
   presentation(agentName: string, serverId: string): ServerPresentation {
     if (this.isClosedTab(serverId)) return 'closed-tab';
-    const chosen = this.doc.agents[agentName]?.servers[serverId];
+    const chosen = this.doc.agents[this.ownerOf(agentName)]?.servers[serverId];
     if (chosen) return chosen;
     const configured = this.server(serverId)?.configured ?? 'full';
     return configured === 'closed-tab' ? 'tab' : configured;
@@ -218,7 +225,7 @@ export class HostPresentation {
   }
 
   isOpen(agentName: string, key: string): boolean {
-    return this.doc.agents[agentName]?.open.includes(key) ?? false;
+    return this.doc.agents[this.ownerOf(agentName)]?.open.includes(key) ?? false;
   }
 
   private setOpen(agentName: string, key: string, open: boolean): void {
@@ -578,7 +585,7 @@ export class HostPresentation {
   openMarkers(agentName: string): Array<{ marker: string; reminder: () => string; dueWhenAbsent: true }> {
     if (!this.active(agentName)) return [];
     const out: Array<{ marker: string; reminder: () => string; dueWhenAbsent: true }> = [];
-    for (const key of this.doc.agents[agentName]?.open ?? []) {
+    for (const key of this.doc.agents[this.ownerOf(agentName)]?.open ?? []) {
       if (key === BUILTIN_TOOLSET) {
         out.push({
           marker: `${this.builtinLabel} open`,

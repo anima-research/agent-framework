@@ -20,7 +20,10 @@ async function withSubconscious(resident: Partial<AgentConfig>, subconscious: Pa
     membrane: new MockMembrane().asMembrane(),
     agents: [residentConfig],
     modules: [],
-    subconscious: { enabled: true, systemPrompt: 'notice', ...subconscious },
+    // On this branch SubconsciousConfig is a union by `reader`; the persistent
+    // reader is the one that is an agent at create, named 'Subconscious' by
+    // default and on the primary's model unless told otherwise, as main's is.
+    subconscious: { reader: 'persistent', enabled: true, systemPrompt: 'notice', ...subconscious } as SubconsciousConfig,
   });
   return { framework, residentConfig };
 }
