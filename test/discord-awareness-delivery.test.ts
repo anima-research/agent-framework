@@ -223,8 +223,6 @@ test('an unreadable ledger stops startup, since it may hold a suppression the bo
 
 test('a start that gives up on operations raises the delivery alert a pass would', async () => {
   const { dir, storePath, ledgerPath, queueMarks, config } = setup();
-  const proto = AgentFramework.prototype as unknown as { opsAlert(...args: unknown[]): void };
-  const opsAlert = proto.opsAlert;
   const alerts: Array<{ kind: string; message: string }> = [];
   let framework: AgentFramework | undefined;
   try {
@@ -239,17 +237,16 @@ test('a start that gives up on operations raises the delivery alert a pass would
     } finally {
       store.close();
     }
-    proto.opsAlert = function (this: unknown, ...args: unknown[]) {
-      alerts.push({ kind: String(args[0]), message: String(args[2]) });
-      return opsAlert.apply(this, args);
-    };
     framework = await AgentFramework.create(config({ discord: false }));
+    // The alert create() raised, replayed as a host's sink attached after it gets it.
+    framework.onTrace((event) => {
+      if (event.type === 'ops:alert') alerts.push({ kind: event.kind, message: event.message });
+    }, { replay: true });
     assert.deepEqual(alerts.map((alert) => alert.kind), ['discord-awareness-delivery']);
     assert.equal(alerts[0].message, 'Nothing more is sent for 1 awareness mark(s): their third unconfirmed attempt '
       + 'was still unanswered when the previous process ended');
     assert.deepEqual(new DiscordAwarenessOutbox(ledgerPath).due(), [], 'and it is not sent again');
   } finally {
-    proto.opsAlert = opsAlert;
     await framework?.stop();
     rmSync(dir, { recursive: true, force: true });
   }
