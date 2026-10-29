@@ -22,14 +22,14 @@
   trace events: `head:declared`, `head:moved` and `head:resend`.
 - An agent that continues another's context starts on that agent's head:
   `deriveAgent`, and `createEphemeralAgent` with a spec whose `inherit`
-  names a running agent that declares entries, start the new agent with
-  that agent's recorded head. `deriveAgent`'s copy stamps the parent's own
-  system changes as the child's, and a host that copies the messages itself
-  stamps them with `systemChangeMetadata` (exported beside
-  `isSystemChangeMessage`), so the new agent reads the parent's cache and
-  declares only its own difference. That pays for a fork with its parent's
-  system text; a subagent with its own system prompt moves to its own head
-  at its first request, as without it.
+  sets no `atSequence` and names a running agent that declares entries,
+  start the new agent with that agent's recorded head. `deriveAgent`'s
+  copy stamps the parent's own system changes as the child's, and a host
+  that copies the messages itself stamps them with `systemChangeMetadata`
+  (exported beside `isSystemChangeMessage`), so the new agent reads the
+  parent's cache and declares only its own difference. That pays for a
+  fork with its parent's system text; a subagent with its own system
+  prompt moves to its own head at its first request, as without it.
 - kv-unified's immutable-prefix hash takes an agent's tools as the wire
   carries them, leaving out a field whose value is undefined, as membrane's
   request does, where it wrote such a field as null. A host whose tool

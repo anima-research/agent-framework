@@ -10747,8 +10747,9 @@ export class AgentFramework {
    * head's blocks, plus additions. A new agent with its own system prompt,
    * or other system injections, meets a replacement at its first request and
    * moves to its own head, as an agent without it would. An agent on its
-   * head, with nothing recorded, or not running gives nothing: the new agent
-   * adopts at its first request, as without it.
+   * head, with nothing recorded, or not running gives nothing, and so does an
+   * inherit at a checkpoint the caller names (`atSequence`), whose head isn't
+   * recorded: the new agent adopts at its first request, as without it.
    *
    * Used by SubagentModule (and similar) to prepare short-lived agents.
    * Call runEphemeralToCompletion(agent, contextManager) to register and run
@@ -15995,7 +15996,12 @@ export class AgentFramework {
     this.sharedSlotAgents.add(agent);
     // The first resident declared owns default delivery.
     this.announceAgentCreated(
-      this.registry.register({ ...residentSpec(config.name, { primary: !this.primaryAgentName }), model: config.model }),
+      this.registry.register({
+        ...residentSpec(config.name, { primary: !this.primaryAgentName }),
+        model: config.model,
+        ...(config.selfParticipants?.length ? { selfParticipants: config.selfParticipants } : {}),
+        ...(config.presentAs && config.presentAs !== config.name ? { presentAs: config.presentAs } : {}),
+      }),
     );
     let restoredSettings: AgentRuntimeSettingsOverrides | null;
     try {

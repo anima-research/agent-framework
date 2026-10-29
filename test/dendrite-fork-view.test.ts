@@ -16,7 +16,7 @@ import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, type ContextInjection } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
-import { AgentFramework, systemChangeMetadata, type Agent } from '../src/index.js';
+import { AgentFramework, systemChangeMetadata, taskForkSpec, type Agent } from '../src/index.js';
 import { GateModule, RoutedMembrane, say, until, waitCall } from './helpers/dendrite.js';
 
 const supported =
@@ -227,5 +227,53 @@ describe("a shared fork of an isolated-slot reader's view", () => {
     assert.ok(!reopened.includes('MIRA-OWN'), "the reopened fork, as live, leaves out the resident's stored injection");
     assert.ok(reopened.includes('HELD-ROW'), 'and shows the held row');
     assert.ok(reopened.includes('FORK-OWN') && reopened.includes('MIRA-SAID'), "and its own injection and the residents' row");
+  });
+});
+
+describe("a shared child of a resident with former names", () => {
+  let tempDir: string;
+  let membrane: RoutedMembrane;
+  let framework: AgentFramework;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'dendrite-fork-view-former-'));
+    membrane = new RoutedMembrane();
+    framework = await AgentFramework.create({
+      storePath: join(tempDir, 'store.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [
+        { name: 'mira', model: 'test-model', systemPrompt: 'You are mira.', selfParticipants: ['mira-old'] },
+        { name: 'oren', model: 'test-model', systemPrompt: 'You are oren.' },
+      ],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    });
+  });
+
+  afterEach(async () => {
+    await framework.stop();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("keeps, reopened after it ends, a change its source counts as its own under a former name, as it did live", { skip }, async () => {
+    const changeTools = async (cm: ContextManager): Promise<string[]> =>
+      (await cm.compile(undefined, undefined, { dryRun: true })).messages.flatMap((m) =>
+        (m.content as Array<{ type: string; defineTools?: Array<{ name: string }> }>)
+          .filter((b) => b.type === 'system_change').flatMap((b) => (b.defineTools ?? []).map((t) => t.name)));
+    const mira = framework.getAgent('mira')!;
+    mira.getContextManager().addMessage('user', [text('Please look into the open issues.')]);
+    mira.getContextManager().addMessage('system',
+      [{ type: 'system_change', defineTools: [{ name: 'old-tool', description: 'old', inputSchema: { type: 'object', properties: {} } }] }] as never,
+      systemChangeMetadata('mira-old') as never);
+    const { name: _name, ...spec } = taskForkSpec('job-1', { parent: 'mira', inherit: { mode: 'shared' } });
+    const job = await framework.createEphemeralAgent({ name: 'job-1', model: 'test-model', systemPrompt: 'Do the task.' }, spec);
+    job.contextManager.addMessage('user', [text('Run once.')]);
+    assert.deepEqual(await changeTools(job.contextManager), ['old-tool'], "live, the child keeps the change its source keeps");
+    framework.start();
+    membrane.script('job-1', say('job-1 done'));
+    assert.equal((await framework.runEphemeralToCompletion(job.agent, job.contextManager)).speech, 'job-1 done');
+    assert.deepEqual(await changeTools(job.contextManager), ['old-tool'], 'and still at its end');
+    assert.deepEqual(await changeTools(await framework.inspectAgentContext('job-1')), ['old-tool'], 'reopened, as at its end');
   });
 });
