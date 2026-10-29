@@ -987,3 +987,226 @@ test("a resident stopped mid-turn takes its turn state with it: its run of state
   assert.match(markers[0]!, /the model call failed \(server, HTTP 502\) and produced no response, so nothing was sent/, 'one that says its own turn got nowhere');
   assert.equal(alerts().length, 1, 'and no run of stated waits is ended with it but its own');
 });
+
+test('a resident stopped with a failure streak takes its failure accounting with it: a new agent under its name meets its first refused request as its first', async (t) => {
+  const { workerSpec } = await import('../src/index.js');
+  const membrane = new ScriptedMembrane(() => invalidRequest);
+  const r = await resident(t, membrane, { exhaustedTurnRearmMs: false, agents: [
+    { name: 'resident', model: 'zz-model', systemPrompt: 'system' }, { name: 'second', model: 'zz-model', systemPrompt: 'system' }] });
+  const streak = () => ((r.fw.healthSnapshot() as { agents: Array<{ name: string; consecutiveInferenceFailures: number }> })
+    .agents.find((a) => a.name === 'second')!).consecutiveInferenceFailures;
+  for (const n of [1, 2]) {
+    queue(r, { agentName: 'second', reason: 'zz-wake' });
+    await waitFor(() => r.count('inference:exhausted') === n, `second's turn ${n} to end exhausted`);
+  }
+  assert.equal(streak(), 2, 'the premise: second has failed two turns running');
+  const state = r.fw as unknown as {
+    exhaustionRewinds: Map<string, number>; refusalStreak: Map<string, number>; refusalRewinds: Map<string, number>; rewindEpisode: Map<string, unknown>;
+    freshCallsCut: Set<string>; forcedRewind: Map<string, unknown>;
+  };
+  state.exhaustionRewinds.set('second', 3);
+  state.freshCallsCut.add('second');
+  state.forcedRewind.set('second', { remaining: 2, removed: [] });
+  state.refusalStreak.set('second', 1);
+  state.refusalRewinds.set('second', 1);
+  state.rewindEpisode.set('second', { markerId: 'zz-marker', count: 1, category: 'zz-category' });
+  r.fw.stopAgent('second', { by: 'zz-operator' });
+  assert.deepEqual({
+    rewinds: state.exhaustionRewinds.has('second'), refusalStreak: state.refusalStreak.has('second'),
+    refusalRewinds: state.refusalRewinds.has('second'), episode: state.rewindEpisode.has('second'), freshCall: state.freshCallsCut.has('second'),
+    unstick: state.forcedRewind.has('second'),
+  }, { rewinds: false, refusalStreak: false, refusalRewinds: false, episode: false, freshCall: false, unstick: false }, 'the release drops each');
+  assert.ok(stderr.some((line) => line.startsWith('[unstick] agent=second') && line.includes('ended with its agent')), 'and says the /unstick session ended with it');
+
+  stderr.length = 0;
+  const spec = workerSpec('second');
+  const { name: _name, ...body } = { ...spec, roles: { ...spec.roles, ownsProviderScheduling: true } };
+  const fresh = await r.fw.createEphemeralAgent({ name: 'second', model: 'zz-model', systemPrompt: 'system' }, body);
+  fresh.contextManager.addMessage('User', [{ type: 'text', text: 'zz-fresh' }]);
+  const ended = await stepping(r.fw.runEphemeralToCompletion(fresh.agent, fresh.contextManager).then(() => null, (error: unknown) => error),
+    "the new agent's run to end");
+  assert.ok(ended instanceof Error, 'its request is refused');
+  assert.ok(stderr.includes('[inference-failed] agent=second consecutive=1 type=invalid_request status=400: zz invalid_request failure'),
+    `its first failure is its first: ${stderr.filter((line) => line.includes('agent=second')).join(' | ')}`);
+  assert.ok(!stderr.some((line) => line.startsWith('[inference-hard-down] agent=second')), 'it is not hard-down');
+  assert.equal(r.traces.filter((tr) => tr.type === 'ops:alert' && tr.kind === 'hard-down').length, 0, 'and no hard-down alert is raised');
+  const kept = fresh.contextManager.getAllMessages().flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '');
+  assert.ok(kept.includes('zz-fresh'), 'and its own message is kept');
+  assert.ok(kept.some((text) => text.startsWith('[inference-failed]')) && !kept.some((text) => text.includes('The call was made again')),
+    'and its failure note says nothing of a call made again');
+});
+
+test("a job its own run ended keeps its failure streak when it is resumed under its name, with the same history", async (t) => {
+  const membrane = new ScriptedMembrane(() => invalidRequest);
+  const r = await resident(t, membrane, { exhaustedTurnRearmMs: false });
+  stderr.length = 0;
+  const config = { model: 'zz-model', systemPrompt: 'system' };
+  const first = await r.fw.createEphemeralAgent({ name: 'job', ...config });
+  first.contextManager.addMessage('User', [{ type: 'text', text: 'zz-task' }]);
+  await stepping(r.fw.runEphemeralToCompletion(first.agent, first.contextManager).then(() => null, (error: unknown) => error), "the job's run to end");
+  const resumed = await r.fw.resumeAgent('job', config);
+  resumed.contextManager.addMessage('User', [{ type: 'text', text: 'zz-again' }]);
+  await stepping(r.fw.runEphemeralToCompletion(resumed.agent, resumed.contextManager).then(() => null, (error: unknown) => error), "the resume's run to end");
+  const failed = stderr.filter((line) => line.startsWith('[inference-failed] agent=job consecutive='));
+  assert.deepEqual(failed.map((line) => line.match(/consecutive=(\d+)/)![1]), ['1', '2'], 'its resume counts on from its run');
+  const history = resumed.contextManager.getAllMessages().flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '');
+  assert.ok(history.includes('zz-task'), "over the run's own history");
+});
+
+for (const end of ['stopped', 'cancelled'] as const) test(`a job ${end} while its run is in flight takes its failure accounting and its /unstick session with it: a resume meets its first refused request as its first`, async (t) => {
+  const membrane = new ScriptedMembrane((n) => (n === 1 ? 'held open' : invalidRequest));
+  const r = await resident(t, membrane, { exhaustedTurnRearmMs: false });
+  const config = { model: 'zz-model', systemPrompt: 'system' };
+  const first = await r.fw.createEphemeralAgent({ name: 'job', ...config });
+  first.contextManager.addMessage('User', [{ type: 'text', text: 'zz-task' }]);
+  const run = r.fw.runEphemeralToCompletion(first.agent, first.contextManager).then(() => null, (error: unknown) => error);
+  await waitFor(() => membrane.sends.length === 1, "the job's call to be in flight");
+  const state = r.fw as unknown as {
+    consecutiveInferenceFailures: Map<string, number>; exhaustionRewinds: Map<string, number>; refusalStreak: Map<string, number>;
+    refusalRewinds: Map<string, number>; rewindEpisode: Map<string, unknown>; forcedRewind: Map<string, unknown>;
+  };
+  state.consecutiveInferenceFailures.set('job', 2);
+  state.exhaustionRewinds.set('job', 3);
+  state.refusalStreak.set('job', 1);
+  state.refusalRewinds.set('job', 1);
+  state.rewindEpisode.set('job', { markerId: 'zz-marker', count: 1, category: 'zz-category' });
+  state.forcedRewind.set('job', { remaining: 2, removed: [] });
+  if (end === 'stopped') r.fw.stopAgent('job', { by: 'zz-operator' });
+  else r.fw.cancelActivation('job', { by: 'zz-operator' });
+  await stepping(run, `the ${end} job's run to end`);
+  assert.deepEqual({
+    streak: state.consecutiveInferenceFailures.has('job'), rewinds: state.exhaustionRewinds.has('job'), refusalStreak: state.refusalStreak.has('job'),
+    refusalRewinds: state.refusalRewinds.has('job'), episode: state.rewindEpisode.has('job'), unstick: state.forcedRewind.has('job'),
+  }, { streak: false, rewinds: false, refusalStreak: false, refusalRewinds: false, episode: false, unstick: false }, "the run's end drops each, as the release does");
+  assert.ok(stderr.some((line) => line.startsWith('[unstick] agent=job') && line.includes('ended with its agent')), 'and says the /unstick session ended with it');
+  stderr.length = 0;
+  const resumed = await r.fw.resumeAgent('job', config);
+  resumed.contextManager.addMessage('User', [{ type: 'text', text: 'zz-again' }]);
+  await stepping(r.fw.runEphemeralToCompletion(resumed.agent, resumed.contextManager).then(() => null, (error: unknown) => error), "the resume's run to end");
+  assert.ok(stderr.includes('[inference-failed] agent=job consecutive=1 type=invalid_request status=400: zz invalid_request failure'),
+    `its first failure is its first: ${stderr.filter((line) => line.includes('agent=job')).join(' | ')}`);
+});
+
+function refusal(): NormalizedResponse {
+  return {
+    ...createMockResponse([], 'refusal'),
+    content: [], stopReason: 'refusal', toolCalls: [], rawAssistantText: '',
+    usage: { inputTokens: 40, outputTokens: 0 },
+    details: {
+      stop: { reason: 'refusal', wasTruncated: false },
+      usage: { inputTokens: 40, outputTokens: 0 },
+      timing: { totalDurationMs: 100, attempts: 1 },
+      model: { requested: 'zz-model', actual: 'zz-model', provider: 'mock' },
+      cache: { markersInRequest: 0, tokensCreated: 0, tokensRead: 0, hitRatio: 0 },
+    },
+    raw: { request: {}, response: { stop_details: { category: 'reasoning_extraction' } } },
+  } as unknown as NormalizedResponse;
+}
+
+class RefusingMembrane extends ScriptedMembrane {
+  constructor() { super(() => undefined); }
+  override streamYielding(request: NormalizedRequest): YieldingStream {
+    super.streamYielding(request);
+    return new MockYieldingStream([refusal()]);
+  }
+}
+
+test("a resident stopped after a refusal takes its refusal streak with it: a new agent's first refusal raises no refusal-streak alert", async (t) => {
+  const { workerSpec } = await import('../src/index.js');
+  const membrane = new RefusingMembrane();
+  const r = await resident(t, membrane, { exhaustedTurnRearmMs: false, agents: [
+    { name: 'resident', model: 'zz-model', systemPrompt: 'system' }, { name: 'second', model: 'zz-model', systemPrompt: 'system' }] });
+  const streakAlerts = () => r.traces.filter((tr) => tr.type === 'ops:alert' && String(tr.message ?? '').startsWith('refusal streak'));
+  queue(r, { agentName: 'second', reason: 'zz-wake' });
+  await waitFor(() => stderr.some((line) => line.startsWith('[inference-refusal] agent=second')), "second's refusal");
+  assert.equal(streakAlerts().length, 0, 'the premise: one refusal raises no streak alert');
+  assert.equal((r.fw as unknown as { refusalStreak: Map<string, number> }).refusalStreak.get('second'), 1, 'and leaves a streak of 1');
+  r.fw.stopAgent('second', { by: 'zz-operator' });
+  stderr.length = 0;
+  const spec = workerSpec('second');
+  const { name: _name, ...body } = { ...spec, roles: { ...spec.roles, ownsProviderScheduling: true } };
+  const fresh = await r.fw.createEphemeralAgent({ name: 'second', model: 'zz-model', systemPrompt: 'system' }, body);
+  fresh.contextManager.addMessage('User', [{ type: 'text', text: 'zz-fresh' }]);
+  await stepping(r.fw.runEphemeralToCompletion(fresh.agent, fresh.contextManager).then(() => null, (error: unknown) => error), "the new agent's run to end");
+  assert.ok(stderr.some((line) => line.startsWith('[inference-refusal] agent=second')), 'the new agent is refused');
+  assert.equal(streakAlerts().length, 0, 'and its first refusal raises no streak alert');
+});
+
+test("a job's own run's end takes its fresh-call mark with it, so a resume's first failure note says nothing of a call made again", async (t) => {
+  const membrane = new ScriptedMembrane((n) => (n === 1 ? undefined : invalidRequest));
+  const r = await resident(t, membrane, { exhaustedTurnRearmMs: false });
+  const config = { model: 'zz-model', systemPrompt: 'system' };
+  const first = await r.fw.createEphemeralAgent({ name: 'job', ...config });
+  first.contextManager.addMessage('User', [{ type: 'text', text: 'zz-task' }]);
+  (r.fw as unknown as { freshCallsCut: Set<string> }).freshCallsCut.add('job');
+  await stepping(r.fw.runEphemeralToCompletion(first.agent, first.contextManager), "the job's run to answer and end");
+  const resumed = await r.fw.resumeAgent('job', config);
+  resumed.contextManager.addMessage('User', [{ type: 'text', text: 'zz-again' }]);
+  await stepping(r.fw.runEphemeralToCompletion(resumed.agent, resumed.contextManager).then(() => null, (error: unknown) => error), "the resume's run to end");
+  const notes = resumed.contextManager.getAllMessages().flatMap((m) => m.content)
+    .map((b) => (b as { text?: string }).text ?? '').filter((text) => text.startsWith('[inference-failed]'));
+  assert.equal(notes.length, 1, "the resume's refused request gets its note");
+  assert.ok(!notes[0]!.includes('The call was made again'), `which says nothing of a call made again: ${notes[0]}`);
+});
+
+test('a job whose own run ended on a refusal keeps its refusal streak when it is resumed: its next refusal is its second', async (t) => {
+  const { workerSpec } = await import('../src/index.js');
+  const membrane = new RefusingMembrane();
+  const r = await resident(t, membrane, { exhaustedTurnRearmMs: false });
+  const streakAlerts = () => r.traces.filter((tr) => tr.type === 'ops:alert' && String(tr.message ?? '').startsWith('refusal streak 2'));
+  const config = { model: 'zz-model', systemPrompt: 'system' };
+  const { name: _name, ...body } = workerSpec('job');
+  const first = await r.fw.createEphemeralAgent({ name: 'job', ...config }, body);
+  first.contextManager.addMessage('User', [{ type: 'text', text: 'zz-task' }]);
+  await stepping(r.fw.runEphemeralToCompletion(first.agent, first.contextManager).then(() => null, (error: unknown) => error), "the job's run to end");
+  assert.ok(stderr.some((line) => line.startsWith('[inference-refusal] agent=job')), 'the premise: its run ended on a refusal');
+  assert.equal(streakAlerts().length, 0, 'which raised no streak alert');
+  const resumed = await r.fw.resumeAgent('job', config);
+  resumed.contextManager.addMessage('User', [{ type: 'text', text: 'zz-again' }]);
+  await stepping(r.fw.runEphemeralToCompletion(resumed.agent, resumed.contextManager).then(() => null, (error: unknown) => error), "the resume's run to end");
+  assert.equal(streakAlerts().length, 1, "the resume's refusal is its second");
+});
+
+test('a job whose own run its deadline ended keeps its failure streak when it is resumed', async (t) => {
+  const { workerSpec } = await import('../src/index.js');
+  const membrane = new ScriptedMembrane((n) => (n === 1 ? 'held open' : invalidRequest));
+  const r = await resident(t, membrane, { exhaustedTurnRearmMs: false });
+  const config = { model: 'zz-model', systemPrompt: 'system' };
+  const { name: _name, ...body } = workerSpec('job', { deadlineMs: 1_000 });
+  const first = await r.fw.createEphemeralAgent({ name: 'job', ...config }, body);
+  first.contextManager.addMessage('User', [{ type: 'text', text: 'zz-task' }]);
+  const run = r.fw.runEphemeralToCompletion(first.agent, first.contextManager).then(() => null, (error: unknown) => error);
+  await waitFor(() => membrane.sends.length === 1, "the job's call to be in flight");
+  (r.fw as unknown as { consecutiveInferenceFailures: Map<string, number> }).consecutiveInferenceFailures.set('job', 2);
+  const ended = await stepping(run, "the job's deadline to end its run");
+  assert.match(String((ended as Error | null)?.message ?? ''), /deadline/, 'the premise: its deadline ended it');
+  stderr.length = 0;
+  const resumed = await r.fw.resumeAgent('job', config);
+  resumed.contextManager.addMessage('User', [{ type: 'text', text: 'zz-again' }]);
+  await stepping(r.fw.runEphemeralToCompletion(resumed.agent, resumed.contextManager).then(() => null, (error: unknown) => error), "the resume's run to end");
+  assert.ok(stderr.some((line) => line.startsWith('[inference-failed] agent=job consecutive=3 ')),
+    `its resume counts on from its run: ${stderr.filter((line) => line.includes('agent=job')).join(' | ')}`);
+});
+
+test("a job's turn aborted from outside ends its run without clearing its failure accounting or adding to its streak: its resume counts on from its own failures", async (t) => {
+  const membrane = new ScriptedMembrane((n) => (n === 2 ? 'held open' : invalidRequest));
+  const r = await resident(t, membrane, { exhaustedTurnRearmMs: false });
+  stderr.length = 0;
+  const config = { model: 'zz-model', systemPrompt: 'system' };
+  const ran = async (agent: { agent: Parameters<typeof r.fw.runEphemeralToCompletion>[0]; contextManager: Parameters<typeof r.fw.runEphemeralToCompletion>[1] }, what: string) =>
+    stepping(r.fw.runEphemeralToCompletion(agent.agent, agent.contextManager).then(() => null, (error: unknown) => error), what);
+  const first = await r.fw.createEphemeralAgent({ name: 'job', ...config });
+  first.contextManager.addMessage('User', [{ type: 'text', text: 'zz-task' }]);
+  await ran(first, "the job's first run to fail");
+  const second = await r.fw.resumeAgent('job', config);
+  second.contextManager.addMessage('User', [{ type: 'text', text: 'zz-again' }]);
+  const aborted = ran(second, "the aborted run to end");
+  await waitFor(() => membrane.sends.length === 2, "the resumed job's call to be in flight");
+  assert.equal(r.fw.abortInference('job', 'zz-operator abort'), true, 'the abort finds the call');
+  await aborted;
+  const third = await r.fw.resumeAgent('job', config);
+  third.contextManager.addMessage('User', [{ type: 'text', text: 'zz-once-more' }]);
+  await ran(third, "the third run to fail");
+  const failed = stderr.filter((line) => line.startsWith('[inference-failed] agent=job consecutive='));
+  assert.deepEqual(failed.map((line) => line.match(/consecutive=(\d+)/)![1]), ['1', '2'], 'the abort is neither an end from outside nor a failure');
+});
