@@ -14780,11 +14780,16 @@ export class AgentFramework {
       }
     }
     this.retakeMarks(agent, cm, entry, back, below);
+    const ordinals = back.map((id) => cm.ordinalOf(id)).filter((ordinal): ordinal is number => ordinal !== undefined);
+    const boundary = {
+      indexLengthBefore: ordinals.length > 0 ? Math.min(...ordinals) : cm.indexLength(),
+      windowBranch: cm.currentBranch().name,
+    };
     const checkpoints = this.getTurnCheckpoints(agentName);
-    if (!checkpoints.some((checkpoint) => sameCheckpoint(checkpoint, entry.checkpoint))) {
-      checkpoints.push(entry.checkpoint);
-      this.saveTurnCheckpoints(agentName, checkpoints);
-    }
+    const at = checkpoints.findIndex((checkpoint) => sameCheckpoint(checkpoint, entry.checkpoint));
+    if (at === -1) checkpoints.push({ ...entry.checkpoint, ...boundary });
+    else checkpoints[at] = { ...checkpoints[at]!, ...boundary };
+    this.saveTurnCheckpoints(agentName, checkpoints);
     const branch = this.store.currentBranch().name;
     const window = { retracted: since.length, represented: back.length };
     this.emitTrace({ type: 'window:undone', agentName, retracted: since.length, represented: back.length });
