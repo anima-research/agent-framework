@@ -83,9 +83,11 @@ function parseError(text: string): string {
   return '(it parsed)';
 }
 /** A change's refusal over a gate.json that isn't JSON, where the gate runs `runs`. */
-const notJson = (error: string, runs = 'the rules of the last gate.json it used'): string =>
-  `gate.json isn't JSON the gate can read (${error}), so a change can't edit its rules without writing over what it holds, and `
-  + `nothing was saved. Meanwhile the gate runs ${runs}. Until gate.json is JSON, a change is refused the same way.`;
+const notJson = (error: string, runs = 'the rules of the last gate.json it used'): RegExp => new RegExp(
+  `^gate\\.json, at .*, isn't JSON the gate can read \\(${error.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&')}\\), so a change can't edit its rules `
+  + `without writing over what it holds, and nothing was saved\\. Meanwhile the gate runs ${runs.replace(/[.]/g, '\\.')}\\. Until gate\\.json is `
+  + 'JSON, a change is refused the same way\\.$',
+);
 
 test("a change over a gate.json that isn't JSON is refused, naming the parse error and what runs, and nothing is written over it", (t) => {
   const dir = tempDir(t);
@@ -105,7 +107,8 @@ test("a change over a gate.json that isn't JSON is refused, naming the parse err
   assert.deepEqual(traces.filter((e) => e.type.startsWith('gate:policy-')), [], 'no change is traced');
   assert.deepEqual(
     logged.mock.calls.map((c) => c.arguments[0]),
-    [`[gate] ${configPath} couldn't be used (${parseError(BROKEN)}), so what it holds isn't in force`],
+    [`[gate] ${configPath} couldn't be used (${parseError(BROKEN)}), so what it holds isn't in force. Once it's JSON, the gate reads it `
+      + 'again at its next check for changes.'],
     'the failed load is logged once, though it was read four times',
   );
 
@@ -137,7 +140,7 @@ test('a gate.json that is JSON the gate refuses whole, for a default other than 
   assert.deepEqual(gate.listPolicyNames(), ['mentions'], 'the rules in force stay');
   assert.deepEqual(logged.mock.calls.map((c) => c.arguments[0]), [
     `[gate] ${configPath} couldn't be used (gate.json "default" must be "always", "defer", or "skip", got: "sometimes"), so what it holds `
-    + 'isn\'t in force',
+    + 'isn\'t in force. Once gate.json is mended, the gate reads it again at its next check for changes.',
   ], 'once, though it was read three times');
 });
 
@@ -184,7 +187,7 @@ test("over a gate.json that isn't JSON, a change is refused before an anchor or 
   t.mock.method(console, 'error', () => {});
   writeFileSync(configPath, BROKEN);
 
-  // Not "no policy named": the operator's half-made rule may be the anchor.
+  // Not "no rule has that name": the operator's half-made rule may be the anchor.
   assert.throws(() => gate.addPolicy({ name: 'ambient', behavior: 'defer' }, { position: { before: 'half-made' } }), { message: notJson(parseError(BROKEN)) });
   // Not false: the file may hold the rule.
   assert.throws(() => gate.removePolicy('half-made'), { message: notJson(parseError(BROKEN)) });
@@ -216,7 +219,7 @@ test('a gate.json the gate cannot read at all refuses a change, naming what runs
 
   assert.match(
     thrown,
-    /^gate\.json couldn't be read \("EACCES: .*"\), so a change can't edit it, and nothing was written over it\. Meanwhile the gate runs the rules of the last gate\.json it used\. Whoever runs this host can make gate\.json readable; until then, a change is refused the same way\.$/,
+    /^gate\.json, at .*, couldn't be read \("EACCES: .*"\), so a change can't edit it, and nothing was written over it\. Meanwhile the gate runs the rules of the last gate\.json it used\. Whoever runs this host can make gate\.json a file the gate can read; until then, a change is refused the same way\.$/,
   );
   assert.equal(readFileSync(configPath, 'utf-8'), BROKEN);
   assert.deepEqual(readdirSync(dir), ['gate.json']);
@@ -230,7 +233,7 @@ test('a directory at gate.json\'s path is a gate.json the gate cannot read, so a
   rmSync(configPath);
   mkdirSync(configPath);
   assert.throws(() => gate.addPolicy({ name: 'ambient', behavior: 'defer' }), {
-    message: /^gate\.json couldn't be read \("EISDIR: [^"]*"\), so a change can't edit it, and nothing was written over it\. Meanwhile the gate runs the rules of the last gate\.json it used\. Whoever runs this host can make gate\.json readable; until then, a change is refused the same way\.$/,
+    message: /^gate\.json, at .*, couldn't be read \("EISDIR: [^"]*"\), so a change can't edit it, and nothing was written over it\. Meanwhile the gate runs the rules of the last gate\.json it used\. Whoever runs this host can make gate\.json a file the gate can read; until then, a change is refused the same way\.$/,
   });
   assert.ok(statSync(configPath).isDirectory(), 'nothing was written in its place');
   assert.deepEqual(gate.listPolicyNames(), ['mentions'], 'the rules in force stay');
@@ -478,7 +481,7 @@ test('an unreadable gate.json read again unchanged is traced and logged once, an
   for (let i = 0; i < 3; i++) gate.listPolicyNames();
   assert.equal(traces.filter((e) => e.type === 'gate:config-error').length, 1);
   assert.equal(loadLines().length, 1);
-  assert.match(loadLines()[0]!, /JSON.*\), so what it holds isn't in force$/);
+  assert.match(loadLines()[0]!, /JSON.*\), so what it holds isn't in force\. Once it's JSON, the gate reads it again at its next check for changes\.$/);
 
   writeFileSync(configPath, '[1,');
   for (let i = 0; i < 3; i++) gate.listPolicyNames();
@@ -503,7 +506,8 @@ test('a privileged-users file that parses but holds no list is its error, and th
       [
         `The privileged-users file, at ${privilegedUsersPath}, holds no list of user ids, where one is needed, such as ["123"] or `
         + '{"userIds": ["123"]}, so the one id of the list that last loaded stays privileged. Once it holds a list of user ids, the '
-        + 'gate loads it at its next check for changes. Writing [] to it, or removing it, makes no one privileged.',
+        + 'gate loads it at its next check for changes. Replacing it with a file holding [], or removing it, makes no one privileged at '
+        + 'the gate\'s next check for changes.',
       ],
       shape,
     );
@@ -529,7 +533,8 @@ test('a privileged-users list loads entry by entry: what is not a user id is ski
   assert.deepEqual(gate.getStatus().errors, [
     `3 entries in the privileged-users file, at ${privilegedUsersPath}, aren't user ids, so they were skipped: "", ${rounded} (a number this large can't `
     + 'be read exactly: write the id as a string, in quotes), {"id":"u3"}. A user id is a non-empty string, or a safe integer '
-    + '(a whole number within 2^53 - 1 of zero); 2 ids did load.',
+    + '(a whole number within 2^53 - 1 of zero); the 2 ids that did load are privileged. Once they are user ids, the gate reads the file '
+    + 'again at its next check for changes.',
   ]);
 });
 
@@ -544,7 +549,8 @@ test('a skipped privileged-users entry is quoted cut at 39 UTF-16 units, here at
   // As JSON the entry is 54 units, and its 39th is the first half of the 19th pair, so the quote keeps 38.
   assert.deepEqual(gate.getStatus().errors, [
     `1 entry in the privileged-users file, at ${privilegedUsersPath}, isn't a user id, so it was skipped: ["${GRIN.repeat(18)}…. A user id is a `
-    + 'non-empty string, or a safe integer (a whole number within 2^53 - 1 of zero); 1 id did load.',
+    + 'non-empty string, or a safe integer (a whole number within 2^53 - 1 of zero); the one id that did load is privileged. Once it is a '
+    + 'user id, the gate reads the file again at its next check for changes.',
   ]);
 });
 
@@ -715,7 +721,7 @@ test("wake_add_rule and wake_remove_rule over a gate.json that isn't JSON tell t
 
   for (const result of [added, removed]) {
     assert.equal(result.isError, true);
-    assert.equal(result.content, notJson(parseError(BROKEN)));
+    assert.match(String(result.content), notJson(parseError(BROKEN)));
   }
   assert.equal(readFileSync(configPath, 'utf-8'), BROKEN);
   assert.deepEqual(readdirSync(dir).filter((f) => f.startsWith('gate.json')), ['gate.json']);

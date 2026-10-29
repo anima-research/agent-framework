@@ -1,1 +1,0 @@
-- **`EventGate.addPolicy()` takes a `fieldNames` option:** the caller's own name for each field a refusal names, keyed by gate.json's name for it, such as `behavior.debounce`, or by `position.before` and `position.after` for a placement. A key names the fields under it too. `wake_add_rule` passes its parameters' names this way.

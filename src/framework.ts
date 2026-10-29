@@ -36421,9 +36421,11 @@ export class AgentFramework {
       if (call.name === 'wake_remove_rule') {
         const input = (call.input ?? {}) as { name?: unknown };
         if (typeof input.name !== 'string' || !input.name) {
+          const names = [...new Set(this.getGatePolicyNames())].map((name) => quotedValue(name));
           finish({
             success: false,
-            error: `wake_remove_rule: name is ${shownValue(input.name)}, where the name of a rule is needed, so nothing was removed.`,
+            error: `wake_remove_rule: name is ${shownValue(input.name)}, where the name of a rule is needed, so nothing was removed. `
+              + (names.length > 0 ? `The rules are ${names.join(', ')}.` : 'There are no rules to remove.'),
             isError: true,
           });
           return;
@@ -36534,10 +36536,14 @@ export class AgentFramework {
       for (const field of ['insertBefore', 'insertAfter'] as const) {
         const anchor = input[field];
         if (anchor !== undefined && (typeof anchor !== 'string' || anchor.length === 0)) {
+          const names = [...new Set(this.getGatePolicyNames())].map((name) => quotedValue(name));
           finish({
             success: false,
-            error: `wake_add_rule: ${field} must be the name of a rule, and it's ${shownValue(anchor)}, so nothing `
-              + `was saved. The rules are: [${this.getGatePolicyNames().map((name) => quotedValue(name)).join(', ')}].`,
+            error: `wake_add_rule: ${field} must be the name of a rule, and it's ${shownValue(anchor)}, so nothing was saved. `
+              + (names.length > 0
+                ? `The rules are ${names.join(', ')}. Give ${field} one of them, or leave it out`
+                : `There are no rules, so leave ${field} out`)
+              + ' to add the rule at the end, or, where a rule already has its name, to replace that rule where it is.',
             isError: true,
           });
           return;

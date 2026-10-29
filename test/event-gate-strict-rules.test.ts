@@ -72,8 +72,9 @@ const event = (tags: string[], eventType = 'mcpl:channel-incoming'): GateEventIn
   ({ content: 'release notes', eventType, serverId: 'discord', channelId: 'c1', tags });
 const MENTION = event(['chat:mention']);
 /** gate_status's entry for a gate.json that isn't used: its error, with what's in force instead. */
-const unused = (error: string, runs: string): string =>
-  `${/[.?!]$/.test(error) ? error : `${error}.`} So what gate.json holds isn't in force, and the gate runs ${runs}.`;
+const unused = (configPath: string, error: string, runs: string): string =>
+  `gate.json, at ${configPath},${error.slice('gate.json'.length)}${/[.?!]$/.test(error) ? '' : '.'} So what gate.json holds isn't in force, `
+  + `and the gate runs ${runs}. Once gate.json is mended, the gate reads it again at its next check for changes.`;
 const notJsonShown = (configPath: string, parsed: string, runs: string): string =>
   `gate.json, at ${configPath}, isn't JSON: ${JSON.stringify(parsed)}. So what gate.json holds isn't in force, and the gate runs ${runs}. `
   + "Once it's JSON, the gate reads it again at its next check for changes.";
@@ -388,7 +389,7 @@ test("under a default that holds events back, a file that leaves out a rule that
   // At a start, the host's starting rules run in its place, as before.
   const recipe = { default: 'skip', policies: [{ ...MENTIONS, name: 'recipe-mentions' }] };
   const started = makeGate(tempDir(t), { file: { default: 'skip', policies: [broken, dms] }, initialConfig: recipe });
-  assert.deepEqual(started.gate.getStatus().errors, [unused(notUsed, "the host's starting rules")]);
+  assert.deepEqual(started.gate.getStatus().errors, [unused(started.configPath, notUsed, "the host's starting rules")]);
   assert.equal(started.gate.getStatus().configSource, 'initial');
   assert.equal(started.gate.evaluate(MENTION).trigger, true);
   started.gate.dispose();
@@ -406,12 +407,13 @@ test("under a default that holds events back, a file that leaves out a rule that
   reload({ default: 'skip', policies: [broken, dms] });
   assert.deepEqual(names(bare.gate), ['mentions', 'dms']);
   assert.equal(bare.gate.evaluate(MENTION).trigger, true, 'the mentions rule in force still wakes');
-  assert.deepEqual(bare.gate.getStatus().errors, [unused(notUsed, RUNS_LAST)]);
+  assert.deepEqual(bare.gate.getStatus().errors, [unused(bare.configPath, notUsed, RUNS_LAST)]);
   bare.gate.dispose();
 
   // Under "defer" too, naming each such rule.
   const two = makeGate(tempDir(t), { file: { default: 'defer', policies: [broken, { name: 'fast', behavior: { debounce: 'soon' } }] } });
   assert.deepEqual(two.gate.getStatus().errors, [unused(
+    two.configPath,
     'gate.json leaves out rules that could wake the agent, and under its default, "defer", what they were written to wake it on would '
     + `be held back. Rule "mentions" is left out: behavior is [], where ${BEHAVIORS} is needed. `
     + 'Rule "fast" is left out: behavior.debounce is "soon", where a number of milliseconds is needed, such as 60000.',
@@ -583,7 +585,7 @@ test("gate.json's own problems: a list, a policies that isn't one, a slip of it,
   for (const [file, error] of refused) {
     const { gate, configPath } = makeGate(tempDir(t), { file });
     // gate_status says what's in force instead.
-    assert.deepEqual(gate.getStatus().errors, [unused(error, RUNS_DEFAULT)], JSON.stringify(file));
+    assert.deepEqual(gate.getStatus().errors, [unused(configPath, error, RUNS_DEFAULT)], JSON.stringify(file));
     assert.equal(gate.getStatus().configSource, 'default', 'the gate runs its default, not the file');
     assert.equal(gate.getStatus().default, 'always');
     // At a reload, the rules in force stay.
@@ -593,7 +595,7 @@ test("gate.json's own problems: a list, a policies that isn't one, a slip of it,
     (gate as unknown as { lastReloadCheck: number }).lastReloadCheck = 0;
     gate.evaluate(MENTION);
     assert.deepEqual(names(gate), ['mentions'], JSON.stringify(file));
-    assert.deepEqual(gate.getStatus().errors, [unused(error, RUNS_LAST)]);
+    assert.deepEqual(gate.getStatus().errors, [unused(configPath, error, RUNS_LAST)]);
   }
 
   // Beside "policies", a list under a name the gate doesn't read is a name like any other.
@@ -726,7 +728,7 @@ test("gate_status's entry for a gate.json the gate can't use says what's in forc
   assert.deepEqual(gate.getStatus().errors, [said('why')], 'new text that loads');
   notUsed();
   // A change isn't written over a file that isn't JSON, so the entry stays, and so do the rules in force.
-  assert.throws(() => gate.addPolicy({ name: 'dms', match: { tagsAny: ['chat:dm'] }, behavior: 'always' }), { message: /^gate\.json isn't JSON the gate can read \(/ });
+  assert.throws(() => gate.addPolicy({ name: 'dms', match: { tagsAny: ['chat:dm'] }, behavior: 'always' }), { message: /^gate\.json, at .*, isn't JSON the gate can read \(/ });
   assert.deepEqual(gate.getStatus().errors, [notJsonShown(configPath, parsed, RUNS_LAST)]);
   assert.equal(readFileSync(configPath, 'utf-8'), broken);
   assert.deepEqual(names(gate), ['mentions']);
@@ -1306,7 +1308,7 @@ test("a rule gate.json holds keeps its name from the host's starting rules, read
   // A change over a gate.json that won't load, mid-edit, is refused, and the edit stays as it is.
   const midEdit = '{"default": "always", "policies": [';
   writeFileSync(configPath, midEdit);
-  assert.throws(() => restarted.addPolicy({ name: 'dms', match: { tagsAny: ['chat:dm'] }, behavior: 'always' }), { message: /^gate\.json isn't JSON the gate can read \(/ });
+  assert.throws(() => restarted.addPolicy({ name: 'dms', match: { tagsAny: ['chat:dm'] }, behavior: 'always' }), { message: /^gate\.json, at .*, isn't JSON the gate can read \(/ });
   assert.equal(readFileSync(configPath, 'utf-8'), midEdit);
   // Once gate.json is gone, a change edits the text whose rules are in force, as written, so the operator's rule keeps its name.
   rmSync(configPath);
@@ -1844,11 +1846,11 @@ test('a reconcile whose write leaves gate.json unable to load runs what it read 
   // what runs, writes nothing, and the rules in force keep running. A removal of a rule in force is refused the same way.
   const left = readFileSync(configPath);
   assert.throws(() => gate.addPolicy({ name: 'later', behavior: 'defer' }), {
-    message: `gate.json isn't JSON the gate can read (${JSON.stringify(parsed)}), so a change can't edit its rules without writing over what it `
-      + 'holds, and nothing was saved. Meanwhile the gate runs the rules it read from gate.json at start and the ones it was '
-      + 'adding. Until gate.json is JSON, a change is refused the same way.',
+    message: `gate.json, at ${configPath}, isn't JSON the gate can read (${JSON.stringify(parsed)}), so a change can't edit its rules without `
+      + 'writing over what it holds, and nothing was saved. Meanwhile the gate runs the rules it read from gate.json at start and the ones '
+      + 'it was adding. Until gate.json is JSON, a change is refused the same way.',
   });
-  assert.throws(() => gate.removePolicy('mine'), { message: /^gate\.json isn't JSON the gate can read \(/ });
+  assert.throws(() => gate.removePolicy('mine'), { message: /^gate\.json, at .*, isn't JSON the gate can read \(/ });
   assert.deepEqual(readFileSync(configPath), left);
   assert.deepEqual(names(gate), ['user-input', 'tickets', 'mine']);
   // Once gate.json is gone, a change edits the text that write was writing, so gate.json's own fields and the rule the
@@ -1985,7 +1987,7 @@ test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its
   for (const field of ['insertBefore', 'insertAfter']) {
     const anchor = await call({ name: 'watch', behavior: 'defer', [field]: 3 });
     assert.equal(anchor.isError, true);
-    assert.match(anchor.content, new RegExp(`wake_add_rule: ${field} must be the name of a rule, and it's 3, so nothing was saved\\. The rules are: \\["mentions"\\]\\.`));
+    assert.match(anchor.content, new RegExp(`wake_add_rule: ${field} must be the name of a rule, and it's 3, so nothing was saved\\. The rules are "mentions"\\. Give ${field} one of them`));
   }
   // A name no rule has was refused before this change too, by the gate.
   const absent = await call({ name: 'watch', behavior: 'defer', insertAfter: 'nope' });

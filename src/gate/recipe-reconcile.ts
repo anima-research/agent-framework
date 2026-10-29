@@ -324,7 +324,7 @@ export function reconcileLine(changes: RecipeChanges): string | null {
     parts.push(`the recorded recipe couldn't be read (${changes.recordUnreadable}), so this start removed and redefined nothing`);
   }
   const list = (label: string, names: string[]) => {
-    if (names.length > 0) parts.push(`${label} ${names.join(', ')}`);
+    if (names.length > 0) parts.push(`${label} ${names.map((name) => quotedValue(name)).join(', ')}`);
   };
   list('added', changes.added);
   list('removed', changes.removed);
@@ -334,13 +334,13 @@ export function reconcileLine(changes: RecipeChanges): string | null {
   list('kept as edited, though the recipe changed or dropped it:', changes.keptEdited);
   if (changes.differsFromRecipe.length > 0) {
     parts.push(
-      `kept, though the recipe defines it otherwise: ${changes.differsFromRecipe.join(', ')} `
+      `kept, though the recipe defines it otherwise: ${changes.differsFromRecipe.map((name) => quotedValue(name)).join(', ')} `
         + '(remove such a rule, and the next start restores it from the recipe)',
     );
   }
   if (changes.outsideRecipe.length > 0) {
     parts.push(
-      `kept, not in the recipe: ${changes.outsideRecipe.join(', ')} `
+      `kept, not in the recipe: ${changes.outsideRecipe.map((name) => quotedValue(name)).join(', ')} `
         + "(a stale one can be removed, and no start brings it back)",
     );
   }

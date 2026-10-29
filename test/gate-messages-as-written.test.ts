@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { AgentFramework } from '../src/index.js';
-import { EventGate } from '../src/gate/event-gate.js';
+import { EventGate, formatShadowWarning } from '../src/gate/event-gate.js';
 import type { GateConfig } from '../src/gate/types.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
@@ -14,6 +14,7 @@ const RULES: GateConfig = {
   policies: [{ name: 'mentions', match: { tagsAny: ['chat:addressed'] }, behavior: 'always' }],
 };
 const CONTROL = /[\u0000-\u001f\u0085\u2028\u2029]/;
+const ESCAPED_TWICE = /\\\\u/;
 const UTF16 = Buffer.from(`\ufeff${JSON.stringify(RULES)}`, 'utf16le');
 
 function tempDir(t: TestContext): string {
@@ -22,14 +23,14 @@ function tempDir(t: TestContext): string {
   return dir;
 }
 
-function makeGate(dir: string, privileged?: string | Buffer) {
+function makeGate(dir: string, privileged?: string | Buffer, traces: Array<{ type: string; error?: string }> = []) {
   const configPath = join(dir, 'gate.json');
   const privilegedUsersPath = join(dir, 'privileged.json');
   if (privileged !== undefined) writeFileSync(privilegedUsersPath, privileged);
   const gate = new EventGate({
     configPath,
     privilegedUsersPath,
-    emitTrace: () => {},
+    emitTrace: (event) => { traces.push(event as { type: string; error?: string }); },
     addMessage: () => '',
     requestInference: () => {},
     getAgentNames: () => ['agent'],
@@ -61,7 +62,12 @@ async function agent(t: TestContext) {
     const { content, isError } = results[results.length - 1]![0] as { content: unknown; isError?: boolean };
     return { isError: isError === true, text: typeof content === 'string' ? content : JSON.stringify(content) };
   };
-  return { call, dir };
+  const refusal = async (input: Record<string, unknown>, tool?: string): Promise<string> => {
+    const { isError, text } = await call(input, tool);
+    assert.ok(isError, text);
+    return text;
+  };
+  return { call, refusal, dir };
 }
 
 function assertParts(text: string, parts: { notDone: RegExp; field: RegExp; next: RegExp }): void {
@@ -92,14 +98,14 @@ test("wake_add_rule's refusals name the parameters the agent sent, not gate.json
 });
 
 test('a passthrough the behavior can\'t use names both as the caller wrote them, and to leave it out', async (t) => {
-  const { call } = await agent(t);
-  const debounced = await call({ debounceMs: 60000, passthrough: true });
-  assertParts(debounced.text, {
+  const { refusal } = await agent(t);
+  const debounced = await refusal({ debounceMs: 60000, passthrough: true });
+  assertParts(debounced, {
     notDone: /wasn't saved/, field: /passthrough is true, .*rateLimit or passiveSample.*with debounceMs/, next: /leave passthrough out/,
   });
-  assert.doesNotMatch(debounced.text, /debounce:60000|rate_limit|passive_sample/);
-  const always = await call({ behavior: 'always', passthrough: true });
-  assertParts(always.text, { notDone: /wasn't saved/, field: /with behavior "always"/, next: /leave passthrough out/ });
+  assert.doesNotMatch(debounced, /debounce:60000|rate_limit|passive_sample/);
+  const always = await refusal({ behavior: 'always', passthrough: true });
+  assertParts(always, { notDone: /wasn't saved/, field: /with behavior "always"/, next: /leave passthrough out/ });
 
   const gate = makeGate(tempDir(t)).gate;
   const inFile = (() => {
@@ -131,26 +137,46 @@ test('a placement that names no rule says nothing was saved, names insertBefore 
   assertParts(alone.text, { notDone: /wasn't saved/, field: /insertAfter is "missing"/, next: /There are no other rules, so leave insertAfter out/ });
 });
 
-test("the wake-rule tools' own refusals say nothing was saved or removed, with the parameters as sent", async (t) => {
+test("a placement naming the rule being saved, or one that isn't a rule's name, says nothing was saved and the way on", async (t) => {
   const { call } = await agent(t);
-  assertParts((await call({})).text, {
+  const itself = await call({ name: 'mentions', behavior: 'defer', insertBefore: 'mentions' });
+  assert.ok(itself.isError);
+  assertParts(itself.text, {
+    notDone: /^Rule "mentions" wasn't saved/,
+    field: /insertBefore is "mentions", the rule being saved, and a rule can't be placed beside itself/,
+    next: /There are no other rules, so leave insertBefore out to replace the rule where it is\./,
+  });
+
+  for (const field of ['insertBefore', 'insertAfter']) {
+    const { isError, text } = await call({ behavior: 'defer', [field]: 3 });
+    assert.ok(isError);
+    assertParts(text, {
+      notDone: /nothing was saved/,
+      field: new RegExp(`${field} must be the name of a rule, and it's 3`),
+      next: new RegExp(`The rules are "mentions"\\. Give ${field} one of them, or leave it out to add the rule at the end`),
+    });
+  }
+});
+
+test("the wake-rule tools' own refusals say nothing was saved or removed, with the parameters as sent", async (t) => {
+  const { refusal } = await agent(t);
+  assertParts(await refusal({}), {
     notDone: /nothing was saved/, field: /got no behavior/, next: /Give one of behavior \("always", "defer" or "skip"\), debounceMs, rateLimit, passiveSample or judge\./,
   });
-  assertParts((await call({ debounceMs: 60000, rateLimit: { tokens: 1, refillIntervalMs: 1000 } })).text, {
+  assertParts(await refusal({ debounceMs: 60000, rateLimit: { tokens: 1, refillIntervalMs: 1000 } }), {
     notDone: /nothing was saved/, field: /more than one behavior \(debounceMs, rateLimit\)/, next: /Give only one of them/,
   });
-  assertParts((await call({ behavior: 'defer', position: 'prepend', insertBefore: 'mentions' })).text, {
+  assertParts(await refusal({ behavior: 'defer', position: 'prepend', insertBefore: 'mentions' }), {
     notDone: /nothing was saved/, field: /more than one placement \(position, insertBefore\)/, next: /Give only one of them/,
   });
-  assertParts((await call({}, 'wake_remove_rule')).text, {
-    notDone: /nothing was removed/, field: /name is missing/, next: /the name of a rule is needed/,
+  assertParts(await refusal({}, 'wake_remove_rule'), {
+    notDone: /nothing was removed/, field: /name is missing/, next: /the name of a rule is needed, so nothing was removed\. The rules are "mentions"\./,
   });
 });
 
 test('a regular expression the gate can\'t read is refused with the way on', async (t) => {
-  const { call } = await agent(t);
-  const { text } = await call({ behavior: 'defer', match: { filter: { type: 'regex', pattern: '(' } } });
-  assertParts(text, {
+  const { refusal } = await agent(t);
+  assertParts(await refusal({ behavior: 'defer', match: { filter: { type: 'regex', pattern: '(' } } }), {
     notDone: /wasn't saved/,
     field: /match\.filter\.pattern isn't a regular expression the gate can read/,
     next: /fix it, or give match\.filter\.type "text"/,
@@ -179,13 +205,17 @@ test("gate.json that won't load names gate.json and its path, what runs meanwhil
   const later = () => t.mock.timers.tick(2000);
   const { gate, configPath } = makeGate(dir);
   t.mock.method(console, 'error', () => {});
-  writeFileSync(configPath, '{"policies": [');
-  later();
-  gate.evaluate({ content: 'x', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c1', tags: [] });
-  const notJson = gate.getStatus().errors[0]!;
+  const at = configPath.replace(/[.\\]/g, '\\$&');
+  const errorAfter = (text: string): string => {
+    writeFileSync(configPath, text);
+    later();
+    gate.evaluate({ content: 'x', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c1', tags: [] });
+    return gate.getStatus().errors[0]!;
+  };
+  const notJson = errorAfter('{"policies": [');
   assertParts(notJson, {
     notDone: /So what gate\.json holds isn't in force, and the gate runs the rules of the last gate\.json it used\./,
-    field: new RegExp(`^gate\\.json, at ${configPath.replace(/[.\\]/g, '\\$&')}, isn't JSON: "`),
+    field: new RegExp(`^gate\\.json, at ${at}, isn't JSON: "`),
     next: /Once it's JSON, the gate reads it again/,
   });
 
@@ -197,7 +227,41 @@ test("gate.json that won't load names gate.json and its path, what runs meanwhil
   assertParts(unreadable, {
     notDone: /So what gate\.json holds isn't in force/,
     field: /^gate\.json, at .*gate\.json, can't be read: "EISDIR/,
-    next: /Whoever runs this host can make it readable/,
+    next: /Whoever runs this host can make it a file the gate can read/,
+  });
+});
+
+test("the [gate] line and a refused change name what to do over a gate.json that isn't JSON, and the change names its path", (t) => {
+  const dir = tempDir(t);
+  writeFileSync(join(dir, 'gate.json'), JSON.stringify(RULES));
+  const { gate, configPath } = makeGate(dir);
+  const logged = t.mock.method(console, 'error', () => {});
+  const at = configPath.replace(/[.\\]/g, '\\$&');
+  writeFileSync(configPath, '{"policies": [');
+  const thrown = (() => {
+    try {
+      gate.addPolicy({ name: 'r', behavior: 'defer' });
+    } catch (err) {
+      return (err as Error).message;
+    }
+    return '(saved)';
+  })();
+  const line = String(logged.mock.calls.at(-1)!.arguments[0]);
+  assertParts(line, { notDone: /so what it holds isn't in force/, field: /^\[gate\] .*gate\.json couldn't be used \("/, next: /Once it's JSON, the gate reads it again/ });
+  assertParts(thrown, { notDone: /nothing was saved/, field: new RegExp(`^gate\\.json, at ${at}, isn't JSON the gate can read`), next: /Until gate\.json is JSON/ });
+});
+
+test('a gate.json the gate refuses names its path, what runs meanwhile, and that a mended file is read again', (t) => {
+  const dir = tempDir(t);
+  writeFileSync(join(dir, 'gate.json'), JSON.stringify({ default: 'wake' }));
+  const { gate, configPath } = makeGate(dir);
+  t.mock.method(console, 'error', () => {});
+  const at = configPath.replace(/[.\\]/g, '\\$&');
+  const refused = gate.getStatus().errors[0]!;
+  assertParts(refused, {
+    notDone: /So what gate\.json holds isn't in force/,
+    field: new RegExp(`^gate\\.json, at ${at}, "default" must be "always", "defer", or "skip", got: "wake"`),
+    next: /Once gate\.json is mended, the gate reads it again at its next check for changes\./,
   });
 });
 
@@ -210,7 +274,7 @@ test('the privileged-users file says its path, who is privileged meanwhile, and 
   assertParts(atStart, {
     notDone: /so no one is privileged/,
     field: new RegExp(`^The privileged-users file, at ${privilegedUsersPath.replace(/[.\\]/g, '\\$&')}, isn't JSON: "`),
-    next: /Once it holds a list of user ids, the gate loads it.*Writing \[\] to it, or removing it, makes no one privileged\./,
+    next: /Once it holds a list of user ids, the gate loads it.*Replacing it with a file holding \[\], or removing it, makes no one privileged at the gate's next check for changes\./,
   });
 
   const current = (): string => {
@@ -225,21 +289,30 @@ test('the privileged-users file says its path, who is privileged meanwhile, and 
   assert.equal(errorAfter('["u1", "u2"]'), '(none)');
   const broken = errorAfter('["u1"');
   assertParts(broken, {
-    notDone: /so the 2 ids of the list that last loaded stay privileged/, field: /isn't JSON/, next: /Writing \[\] to it, or removing it/,
+    notDone: /so the 2 ids of the list that last loaded stay privileged/, field: /isn't JSON/, next: /Replacing it with a file holding \[\], or removing it/,
   });
   assert.ok(gate.isPrivilegedUser('u1'), 'as they do');
-  const empty = errorAfter('');
-  assertParts(empty, {
-    notDone: /is empty, which the gate takes for a save in progress, so the 2 ids of the list that last loaded stay privileged/,
-    field: /^The privileged-users file, at /,
-    next: /Once the save ends, the gate loads its list\. Writing \[\] to it, or removing it, makes no one privileged\./,
-  });
   const noList = errorAfter('{"users": ["u1"]}');
   assertParts(noList, { notDone: /stay privileged/, field: /holds no list of user ids/, next: /Once it holds a list of user ids/ });
 
   rmSync(privilegedUsersPath);
   mkdirSync(privilegedUsersPath);
-  assertParts(current(), { notDone: /stay privileged/, field: /can't be read: "EISDIR/, next: /Whoever runs this host can make it readable/ });
+  assertParts(current(), {
+    notDone: /the 2 ids of the list that last loaded stay privileged/,
+    field: /can't be read: "EISDIR/,
+    next: /Whoever runs this host can make it a file the gate can read.*Replacing it with a file holding \[\], or removing it/,
+  });
+});
+
+test("a privileged-users list with an entry that isn't a user id says which ids are privileged, and that the file is read again once it is", (t) => {
+  const { gate, privilegedUsersPath } = makeGate(tempDir(t), '["u1", {"id": 2}]');
+  const skipped = gate.getStatus().errors.find((e) => e.includes('privileged-users'))!;
+  assertParts(skipped, {
+    notDone: /the one id that did load is privileged/,
+    field: new RegExp(`^1 entry in the privileged-users file, at ${privilegedUsersPath.replace(/[.\\]/g, '\\$&')}, isn't a user id`),
+    next: /Once it is a user id, the gate reads the file again at its next check for changes\./,
+  });
+  assert.ok(gate.isPrivilegedUser('u1') && !gate.isPrivilegedUser('2'), 'as it is');
 });
 
 test("text from either file reaches the agent, gate_status and the log with its control characters escaped", async (t) => {
@@ -250,13 +323,17 @@ test("text from either file reaches the agent, gate_status and the log with its 
   assert.match(refused, /nothing was saved/);
   assert.doesNotMatch(refused, CONTROL, 'the refusal the agent gets');
   assert.match(refused, /\\u0000/, 'its NULs written as escapes');
+  assert.doesNotMatch(refused, ESCAPED_TWICE, 'once');
 
   const files = tempDir(t);
   writeFileSync(join(files, 'gate.json'), UTF16);
   const { gate } = makeGate(files, Buffer.from('\ufeff["u1"]', 'utf16le'));
   const errors = gate.getStatus().errors;
   assert.equal(errors.length >= 2, true);
-  for (const error of errors) assert.doesNotMatch(error, CONTROL, error);
+  for (const error of errors) {
+    assert.doesNotMatch(error, CONTROL, error);
+    assert.doesNotMatch(error, ESCAPED_TWICE, error);
+  }
   assert.ok(errors.some((e) => e.startsWith('gate.json, at ') && e.includes('\\u0000')));
   assert.ok(errors.some((e) => e.startsWith('The privileged-users file, at ') && e.includes('\\u0000')));
   const lines = logged.mock.calls.map((c) => String(c.arguments[0])).filter((line) => line.startsWith('[gate]'));
@@ -272,4 +349,23 @@ test("text from either file reaches the agent, gate_status and the log with its 
   assert.match(notes, /Rule "a\\u0007b"/);
   assert.match(notes, /"wh\\u0000y"/);
   assert.match(notes, /\\u2028/);
+});
+
+test("the gate:config-error trace and a shadow warning carry supplied text escaped once", (t) => {
+  t.mock.method(console, 'error', () => {});
+  const files = tempDir(t);
+  writeFileSync(join(files, 'gate.json'), UTF16);
+  const traces: Array<{ type: string; error?: string }> = [];
+  makeGate(files, undefined, traces);
+  const configErrors = traces.filter((trace) => trace.type === 'gate:config-error');
+  assert.ok(configErrors.length > 0, 'gate.json\'s error is traced');
+  for (const { error } of configErrors) {
+    assert.match(error!, /\\u0000/);
+    assert.doesNotMatch(error!, CONTROL, error);
+    assert.doesNotMatch(error!, ESCAPED_TWICE, error);
+  }
+
+  const shadow = formatShadowWarning({ earlier: 'a', later: 'b', eventTypes: ['t\u0000y'], whole: false, known: true });
+  assert.doesNotMatch(shadow, CONTROL, shadow);
+  assert.match(shadow, /takes "b"'s t\\u0000y events/);
 });
