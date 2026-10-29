@@ -14,7 +14,14 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { ContextManager, PassthroughStrategy } from '@animalabs/context-manager';
-import { fixture, eventually, settles, TS } from './helpers/coalescing-fixture.js';
+import { fixture as baseFixture, eventually, settles, TS } from './helpers/coalescing-fixture.js';
+
+// These tests are about the global fallback itself — the latest delivered
+// inbound channel — so they run under the rule that has one. Dendrite's
+// default (`speech.locus: 'delivery'`) gives a resident with no delivery no
+// locus at all, which is a different case (admission-e2e covers it).
+const fixture: typeof baseFixture = (options = {}) =>
+  baseFixture({ ...options, framework: { speech: { locus: 'latest-inbound' }, ...options.framework } });
 import { createMockResponse } from './helpers/mock-membrane.js';
 import { gateToolCalls } from './helpers/gate-tool-calls.js';
 

@@ -875,7 +875,7 @@ export class ReferenceRegistry {
    *  entry for the id, if any, is in force again; with none, a stub reads the
    *  id's references as an unknown server's. After a removal, that framework's
    *  fetch refuses them too. A stopped framework keeps its configs, so its
-   *  fetcher, called before it starts again, can still dial them. */
+   *  fetcher can still dial them. */
   forgetServerAddress(serverId: string, owner: object): void {
     const entries = (this.addresses.get(serverId) ?? []).filter((e) => e.owner !== owner);
     if (entries.length > 0) this.addresses.set(serverId, entries);
