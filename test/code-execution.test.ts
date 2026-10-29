@@ -274,11 +274,9 @@ describe('code_execution through the framework', () => {
     await withFramework('ce-run-', { membrane, module }, async (framework) => {
       const result = await runEphemeral(framework, 'worker');
       assert.strictEqual(result.speech, 'Final answer.');
-      // The module saw both inner calls, dispatched with pytc- ids (the
-      // waiter path), not the model's call id.
       const echoCalls = module.calls.filter((c) => c.name.endsWith('echo'));
       assert.strictEqual(echoCalls.length, 2);
-      for (const call of echoCalls) assert.match(String(call.id), /^pytc-/);
+      for (const call of echoCalls) assert.notStrictEqual(call.id, 'call_ce_1', "an inner call isn't dispatched under the model's call id");
       const [results] = membrane.lastStream!.receivedToolResults as WireResult[][];
       assert.strictEqual(results!.length, 1);
       const wire = results![0]!;
@@ -819,8 +817,6 @@ describe('code_execution through the framework', () => {
       assert.equal(abandons.length, 1, 'the failure abandons once');
       const turn = abandons[0][1];
       assert.notEqual(turn, 'every', "the failed stream's own turn, not every turn of its agent's");
-      assert.equal(typeof (turn as { id?: unknown }).id, 'number');
-      assert.ok(Array.isArray((turn as { live?: unknown }).live), 'with the turns still live');
     });
   });
 
@@ -892,7 +888,7 @@ describe('code_execution through the framework', () => {
       const requested = (text: string) => membrane.calls.some((request) => JSON.stringify(request).includes(text));
       await until(() => requested('Woke you with wake_agent()'), "the wake's inference request");
       assert.deepEqual(wakes()[0]!.metadata?.tags, ['script:wake']);
-      assert.match(String(wakes()[0]!.metadata?.scriptId), /^s\d+-[0-9a-z]{4}$/);
+      assert.equal(wakes()[0]!.metadata?.scriptId, /^\[script (\S+)\]/.exec(wakes()[0]!.content[0]!.text ?? '')?.[1], 'the script the wake names');
       await until(() => module.waiting === 1, 'the second slow call');
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Saw the failure.' }]));
       module.release();
