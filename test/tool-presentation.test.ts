@@ -78,7 +78,9 @@ test('framework preview, generated workspace read and both edit dispatch paths a
   } finally {agent.cancelStream();agent.membrane=membrane;}
 
 
-  assert.deepEqual(preview.tools,snapshot.advertised);
+  // The tool list is the advertised definitions less the host's built-in toolset.
+  assert.deepEqual(preview.tools,(framework as any).headerTools('ada',snapshot.advertised));
+  assert.ok(!preview.tools?.some(t=>t.name==='set_tool_visibility'),'the editing tools are in the built-in toolset');
   assert.ok((framework as any).getToolsForAgent('ada').some((t:any)=>t.name===target),'execution surface unchanged');
   assert.ok(!(await framework.previewActivation('other')).tools?.some(t=>t.name==='set_tool_visibility'));
   const read=await call('workspace--read',{path:'board/tools.md'});
@@ -265,7 +267,7 @@ test('an edit refusal names every problem with its arguments, the call that work
    'Nothing was changed: "description" is 5, not a string or null. '
    +'set_tool_description takes {"name": a tool\'s exact name, "description": the new text, or null to restore the default}.');
   for (const name of ['workspace--read','set_tool_visibility','set_tool_description']) assert.equal(refusal('set_tool_visibility',{name,visible:false}),
-   `Nothing was changed: ${name} can't be hidden, since workspace--read, set_tool_visibility and set_tool_description are how you read the catalogue and undo these changes. Calling this again won't change that.`);
+   `Nothing was changed: ${name} can't be hidden, since workspace--read, set_tool_visibility, set_tool_description and the toolsets-- tools are how you read the catalogue, reach hidden tools and undo these changes. Calling this again won't change that.`);
   assert.equal(existsSync(path),false,'no refusal wrote the file');
   assert.equal(p.edit('set_tool_description',{name:'example',description:'\u{1F600}'.repeat(32768)},tools).success,true,'at the limit in characters, though twice it in UTF-16 units');
  } finally {rmSync(dir,{recursive:true,force:true});}

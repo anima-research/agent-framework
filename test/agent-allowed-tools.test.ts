@@ -303,6 +303,22 @@ function asXmlTurn(membrane: MockMembrane, call: { type: 'tool_use'; id: string;
 }
 
 for (const fallback of [false, true]) {
+  test(`${fallback ? 'fallback' : 'native'}: a skip_reply refused at dispatch silences nothing after its round, as one allowedTools refuses`, async () => {
+    const h = await harness({ allowedTools: ['skip_reply'], denyToolsAtDispatch: ['skip_reply'], sameRoundThinkTextPolicy: 'private' });
+    try {
+      const routed = captureRouting(h.framework);
+      const call = { type: 'tool_use' as const, id: 'disposition', name: 'skip_reply', input: { reason: 'test' } };
+      if (fallback) asXmlTurn(h.membrane, call);
+      h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public round prose' }, call], 'tool_use'));
+      h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public trailing prose' }]));
+      h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run probe', metadata: {} });
+      await h.framework.runUntilIdle();
+      assert.ok(routed.includes('Public trailing prose'), 'a refused call silences nothing after its round');
+    } finally { await h.close(); }
+  });
+}
+
+for (const fallback of [false, true]) {
   for (const name of ['skip_reply', 'think', 'channel_publish']) {
     for (const permitted of [false, true]) {
       test(`${fallback ? 'fallback' : 'native'} prose disposition ${permitted ? 'honors permitted' : 'of a refused'} ${name}`, async () => {
@@ -488,32 +504,39 @@ for (const name of ['set_tool_visibility', 'set_tool_description']) {
   });
 }
 
+/** Opens the host's built-in toolset, where module utilities are, for the agent. */
+async function openSettings(h: Awaited<ReturnType<typeof harness>>): Promise<void> {
+  const opened = await h.framework.executeToolCall({ id: 'open-settings', name: 'toolsets--open', input: { toolset: 'settings' }, callerAgentName: 'assistant' });
+  assert.equal(opened.success, true, opened.error);
+}
+
 for (const route of ['model', 'public', 'script'] as const) {
-  test(`utility run checks the utility name on the ${route} route`, async () => {
-    const h = await harness({ allowedTools: ['utils', 'probe--allowed_util'] });
-    const input = { action: 'run', name: 'probe--denied_util', args: {} };
+  test(`act checks the called utility's own name on the ${route} route`, async () => {
+    const h = await harness({ allowedTools: ['toolsets--open', 'toolsets--act', 'toolsets--look', 'toolsets--close', 'probe--allowed_util'] });
+    const input = { tool: 'probe--denied_util', args: {} };
     try {
+      await openSettings(h);
       if (route === 'model') {
-        const [result] = await h.turn([{ id: 'utility-denied', name: 'utils', input }]);
+        const [result] = await h.turn([{ id: 'utility-denied', name: 'toolsets--act', input }]);
         assert.equal(result.isError, true); assert.match(result.content, /not permitted.*allowedTools/);
+        // Refused at dispatch as a direct call of the utility is: traced as
+        // that tool's failure, and never opened, so no RFC-007 event.
         const terminals = h.traces.filter(event => event.callId === 'utility-denied' &&
           ['tool:failed', 'tool:completed'].includes(event.type as string));
-        assert.deepEqual(terminals.map(event => event.tool), ['utils']);
-        assert.deepEqual(h.lifecycle.map(event => [event.tool, event.phase]), [['utils', 'started'], ['utils', 'completed']]);
+        assert.deepEqual(terminals.map(event => [event.type, event.tool]), [['tool:failed', 'probe--denied_util']]);
+        assert.deepEqual(h.lifecycle, []);
         assert.equal(h.emitter.openCount, 0);
         assert.equal((h.emitter as unknown as { calls: Map<string, unknown> }).calls.size, 0);
         assert.equal((h.framework as unknown as { scriptToolWaiters: Map<string, unknown> }).scriptToolWaiters.size, 0);
       } else if (route === 'public') {
-        const result = await h.framework.executeToolCall({ id: 'utility-denied', name: 'utils', input, callerAgentName: 'assistant' });
+        const result = await h.framework.executeToolCall({ id: 'utility-denied', name: 'toolsets--act', input, callerAgentName: 'assistant' });
         assert.equal(result.isError, true); assert.match(result.error!, /not permitted.*allowedTools/);
-        assert.equal(result.refused, undefined, 'its utils call has opened, so the utility\'s refusal is a failure');
       } else {
-        const pending = h.internal.dispatchScriptToolCall('assistant', 'utils', input);
+        const pending = h.internal.dispatchScriptToolCall('assistant', 'toolsets--act', input);
         const processing = setInterval(() => { void h.framework.runUntilIdle(); }, 5);
         try {
           const result = await pending;
           assert.equal(result.isError, true); assert.match(result.error!, /not permitted.*allowedTools/);
-          assert.equal(result.refused, undefined, 'its utils call has opened, so the utility\'s refusal is a failure');
         } finally { clearInterval(processing); }
       }
       assert.deepEqual(h.effects, []);
@@ -521,18 +544,18 @@ for (const route of ['model', 'public', 'script'] as const) {
   });
 }
 
-for (const allowedTools of [['utils', 'probe--allowed_util'], 'all'] as AgentConfig['allowedTools'][]) {
-  test(`utility list and describe expose only executable names: ${JSON.stringify(allowedTools)}`, async () => {
+for (const allowedTools of [['toolsets--open', 'toolsets--act', 'toolsets--look', 'toolsets--close', 'probe--allowed_util'], 'all'] as AgentConfig['allowedTools'][]) {
+  test(`the built-in toolset lists and calls only the utilities the agent may call: ${JSON.stringify(allowedTools)}`, async () => {
     const h = await harness({ allowedTools });
-    const call = (input: unknown) => h.framework.executeToolCall({ id: 'utility', name: 'utils', input, callerAgentName: 'assistant' });
+    const call = (name: string, input: unknown) => h.framework.executeToolCall({ id: 'utility', name, input: input as Record<string, unknown>, callerAgentName: 'assistant' });
     try {
-      const listed = await call({ action: 'list' }); assert.equal(listed.success, true);
-      const expected = allowedTools === 'all' ? ['probe--allowed_util', 'probe--denied_util'] : (allowedTools as string[]).filter(n => n !== 'utils');
-      assert.deepEqual((listed.data as Array<{ name: string }>).map(v => v.name), expected);
-      const described = await call({ action: 'describe', name: 'probe--denied_util' });
-      assert.equal(described.success, allowedTools === 'all');
-      if (allowedTools !== 'all') assert.ok(!JSON.stringify(described).includes('Inert utility counter'));
-      for (const name of expected) assert.equal((await call({ action: 'run', name, args: {} })).success, true);
+      const looked = await call('toolsets--look', { toolset: 'settings' }); assert.equal(looked.success, true, looked.error);
+      const expected = allowedTools === 'all' ? ['probe--allowed_util', 'probe--denied_util'] : ['probe--allowed_util'];
+      for (const name of ['probe--allowed_util', 'probe--denied_util']) {
+        assert.equal(String(looked.data).includes(`${name}(`), expected.includes(name), `${name} listed only where callable`);
+      }
+      await openSettings(h);
+      for (const name of expected) assert.equal((await call('toolsets--act', { tool: name, args: {} })).success, true);
       assert.deepEqual(h.effects.map(c => 'probe--' + c.name), expected);
     } finally { await h.close(); }
   });
@@ -541,7 +564,7 @@ for (const allowedTools of [['utils', 'probe--allowed_util'], 'all'] as AgentCon
 test('trusted module utility call retains its authority with a restricted caller name', async () => {
   const h = await harness({ allowedTools: [] });
   try {
-    const result = await h.moduleCall({ id: 'trusted-utility', name: 'utils', input: { action: 'run', name: 'probe--denied_util', args: {} }, callerAgentName: 'assistant' });
+    const result = await h.moduleCall({ id: 'trusted-utility', name: 'probe--denied_util', input: {}, callerAgentName: 'assistant' });
     assert.equal(result.success, true); assert.deepEqual(h.effects.map(c => c.name), ['denied_util']);
   } finally { await h.close(); }
 });
@@ -700,150 +723,33 @@ test('disposed conversation fork cannot regain legacy tool permissions', async (
   } finally { await h.close(); }
 });
 
-test('public utility catalogue preserves names and the collapsed model surface', async () => {
+test('module utilities are callable tools out of the tool list, and utils is gone', async () => {
   const h = await harness({ allowedTools: 'all' });
   try {
     const framework = h.framework as typeof h.framework & {getAllUtilities(): ReturnType<typeof h.framework.getAllTools>};
     const utilities = framework.getAllUtilities();
     assert.deepEqual(utilities.map(tool => tool.name), ['probe--allowed_util', 'probe--denied_util']);
-    assert.ok(h.framework.getAllTools().some(tool => tool.name === 'utils'));
-    assert.ok(!h.framework.getAllTools().some(tool => tool.name === 'probe--allowed_util'));
+    assert.ok(!h.framework.getAllTools().some(tool => tool.name === 'utils'));
+    assert.ok(h.framework.getAllTools().some(tool => tool.name === 'probe--allowed_util'), 'callable by name');
+    const surface = (await h.framework.previewActivation('assistant')).tools ?? [];
+    assert.ok(!surface.some(tool => tool.name === 'probe--allowed_util' || tool.name === 'utils'), 'neither in the tool list');
     utilities.pop();
     assert.equal(framework.getAllUtilities().length, 2);
   } finally { await h.close(); }
 });
 
-
-for (const allowedTools of [['utils'], ['utils', 'probe--allowed']]) {
-  test(`empty permitted utility surface reports migration once: ${JSON.stringify(allowedTools)}`, async () => {
-    const warnings: string[] = [];
-    const warn = console.warn;
-    console.warn = (...args) => {
-      const line = args.join(' ');
-      if (!line.startsWith('[deprecated]')) warnings.push(line);
-    };
-    const h = await harness({ allowedTools });
-    try {
-      assert.equal(warnings.length, 1, 'resident warns after initial modules register');
-      assert.match(warnings[0], /assistant.*2 registered.*none permitted.*allowedTools.*module--utility/);
-      assert.ok(h.framework.getAllTools().some(tool => tool.name === 'utils'), 'global catalogue is unchanged');
-      for (let i = 0; i < 2; i++) {
-        assert.ok(!h.internal.getToolsForAgent('assistant').some(tool => tool.name === 'utils'));
-        assert.ok(!(await h.framework.previewActivation('assistant')).tools?.some(tool => tool.name === 'utils'));
-      }
-      const call = (input: unknown) => h.framework.executeToolCall({ id: 'empty-utilities', name: 'utils', input, callerAgentName: 'assistant' });
-      const listed = await call({ action: 'list' });
-      assert.equal(listed.success, false); assert.equal(listed.isError, true);
-      assert.match(listed.error!, /2 registered.*0 permitted.*none permitted.*allowedTools.*module--utility/);
-      assert.equal(listed.data, undefined, 'empty permission diagnostic uses existing failure shape');
-      const unknown = await call({ action: 'describe', name: 'missing' });
-      assert.equal(unknown.isError, true);
-      assert.match(unknown.error!, /2 registered.*0 permitted.*none permitted.*allowedTools/);
-      assert.ok(!JSON.stringify(unknown).includes('probe--denied_util'), 'unknown diagnostics reveal no denied names');
-      assert.ok(!JSON.stringify(unknown).includes('Inert utility counter'));
-      assert.equal(warnings.length, 1, 'repeat surfaces do not repeat the warning');
-      assert.deepEqual(h.effects, []);
-    } finally { await h.close(); console.warn = warn; }
-  });
-}
-
-test('zero-module snapshots do not consume the later utility migration warning', async () => {
-  const warnings: string[] = [];
-  const warn = console.warn;
-  console.warn = (...args) => {
-      const line = args.join(' ');
-      if (!line.startsWith('[deprecated]')) warnings.push(line);
-    };
-  const h = await harness({ allowedTools: ['utils'] }, undefined, true);
+test('an agent that may not call the meta-tools keeps every tool it may call in its list, a utility aside', async () => {
+  const h = await harness({ allowedTools: ['probe--allowed', 'probe--allowed_util', 'agent_settings'] });
   try {
-    assert.ok(!h.internal.getToolsForAgent('assistant').some(tool => tool.name === 'utils'));
-    assert.deepEqual(warnings, []);
-    const empty = await h.framework.executeToolCall({ id: 'no-utilities', name: 'utils', input: { action: 'list' }, callerAgentName: 'assistant' });
-    assert.equal(empty.success, true); assert.deepEqual(empty.data, []);
-    await h.framework.addModule(h.module);
-    assert.ok(!h.internal.getToolsForAgent('assistant').some(tool => tool.name === 'utils'));
-    h.internal.getToolsForAgent('assistant');
-    assert.equal(warnings.length, 1); assert.match(warnings[0], /assistant.*2 registered/);
-  } finally { await h.close(); console.warn = warn; }
+    const surface = ((await h.framework.previewActivation('assistant')).tools ?? []).map(tool => tool.name);
+    assert.ok(surface.includes('probe--allowed') && surface.includes('agent_settings'), 'its tools, built-in ones included, stay');
+    assert.ok(!surface.includes('probe--allowed_util'), 'a utility is never a tool-list tool; it can still be called by name');
+    const called = await h.framework.executeToolCall({ id: 'by-name', name: 'probe--allowed_util', input: {}, callerAgentName: 'assistant' });
+    assert.equal(called.success, true, called.error);
+  } finally { await h.close(); }
 });
-
-test('one registered utility is counted as one utility', async () => {
-  const warnings: string[] = [];
-  const warn = console.warn;
-  console.warn = (...args) => {
-    const line = args.join(' ');
-    if (!line.startsWith('[deprecated]')) warnings.push(line);
-  };
-  const h = await harness({ allowedTools: ['utils'] }, undefined, true);
-  try {
-    await h.framework.addModule({
-      name: 'single',
-      async start() {}, async stop() {},
-      getTools: () => [],
-      getUtilities: () => [{ name: 'only', description: 'Inert utility', inputSchema: { type: 'object', properties: {} } }],
-      async handleToolCall() { return { success: true, data: 'executed' }; },
-      async onProcess() { return {}; },
-    });
-    h.internal.getToolsForAgent('assistant');
-    assert.equal(warnings.length, 1);
-    assert.match(warnings[0], /: 1 registered utility, 0 permitted;/);
-    const listed = await h.framework.executeToolCall({ id: 'one-utility', name: 'utils', input: { action: 'list' }, callerAgentName: 'assistant' });
-    assert.equal(listed.isError, true);
-    assert.match(listed.error!, /\b1 registered utility, 0 permitted;/);
-  } finally { await h.close(); console.warn = warn; }
-});
-
-for (const allowedTools of [['utils', 'probe--allowed_util'], ['probe--allowed_util'], 'all'] as AgentConfig['allowedTools'][]) {
-  test(`permitted utilities retain surface without migration warnings: ${JSON.stringify(allowedTools)}`, async () => {
-    const warnings: string[] = [];
-    const warn = console.warn;
-    console.warn = (...args) => {
-      const line = args.join(' ');
-      if (!line.startsWith('[deprecated]')) warnings.push(line);
-    };
-    const h = await harness({ allowedTools });
-    try {
-      const surface = (await h.framework.previewActivation('assistant')).tools ?? [];
-      assert.equal(surface.some(tool => tool.name === 'utils'), allowedTools === 'all' || allowedTools!.includes('utils'));
-      assert.deepEqual(warnings, []);
-    } finally { await h.close(); console.warn = warn; }
-  });
-}
 
 for (const route of ['model', 'public', 'script'] as const) {
-  test(`denied utility describe matches run refusal on ${route}`, async () => {
-    const h = await harness({ allowedTools: ['utils', 'probe--allowed_util'] });
-    try {
-      const errors: string[] = [];
-      for (const action of ['describe', 'run']) {
-        const input = { action, name: 'probe--denied_util', args: {} };
-        const id = `denied-${action}`;
-        if (route === 'model') {
-          const [result] = await h.turn([{ id, name: 'utils', input }]);
-          assert.equal(result.isError, true); errors.push(result.content);
-          const terminals = h.traces.filter(event => event.callId === id && ['tool:failed', 'tool:completed'].includes(event.type as string));
-          assert.deepEqual(terminals.map(event => event.tool), ['utils']);
-        } else {
-          const pending = route === 'public'
-            ? h.framework.executeToolCall({ id, name: 'utils', input, callerAgentName: 'assistant' })
-            : h.internal.dispatchScriptToolCall('assistant', 'utils', input);
-          const processing = setInterval(() => { void h.framework.runUntilIdle(); }, 5);
-          try {
-            const result = await pending;
-            assert.equal(result.isError, true); errors.push(result.error!);
-          } finally { clearInterval(processing); }
-        }
-      }
-      assert.equal(errors[0], errors[1]);
-      assert.match(errors[0], /not permitted.*allowedTools/);
-      assert.ok(!errors[0].includes('Inert utility counter'));
-      assert.equal(h.emitter.openCount, 0); assert.deepEqual(h.effects, []);
-      const unknown = await h.framework.executeToolCall({ id: 'unknown', name: 'utils', input: { action: 'describe', name: 'missing' }, callerAgentName: 'assistant' });
-      assert.match(unknown.error!, /2 registered.*1 permitted/);
-      assert.ok(!unknown.error!.includes('probe--denied_util'));
-    } finally { await h.close(); }
-  });
-
   test(`named utility grant alone executes on ${route}`, async () => {
     const h = await harness({ allowedTools: ['probe--allowed_util'] });
     const call = { id: 'direct-utility', name: 'probe--allowed_util', input: {}, callerAgentName: 'assistant' };
@@ -861,13 +767,13 @@ for (const route of ['model', 'public', 'script'] as const) {
   });
 }
 
-test('never-run and retired ephemerals report missing registration before utility migration advice', async () => {
+test('never-run and retired ephemerals report missing registration, not allowlist advice', async () => {
   const h = await harness({ allowedTools: 'all' });
   try {
-    const created = await h.framework.createEphemeralAgent({ name: 'identity-worker', model: 'test', systemPrompt: 'Test', allowedTools: ['utils', 'probe--allowed_util'] });
+    const created = await h.framework.createEphemeralAgent({ name: 'identity-worker', model: 'test', systemPrompt: 'Test', allowedTools: ['toolsets--open', 'toolsets--act', 'toolsets--look', 'toolsets--close', 'probe--allowed_util'] });
     const check = async () => {
       const before = h.effects.length;
-      for (const [name, input] of [['probe--allowed_util', {}], ['utils', { action: 'list' }], ['utils', { action: 'describe', name: 'missing' }]] as const) {
+      for (const [name, input] of [['probe--allowed_util', {}], ['toolsets--act', { tool: 'probe--allowed_util', args: {} }], ['toolsets--look', {}]] as const) {
         const result = await h.framework.executeToolCall({ id: `unregistered-${name}`, name, input, callerAgentName: created.agent.name });
         assert.equal(result.success, false); assert.equal(result.isError, true);
         assert.match(result.error!, /identity-worker.*not a running agent.*only while registered, so the call didn't run\.$/);
@@ -885,28 +791,31 @@ test('never-run and retired ephemerals report missing registration before utilit
   } finally { await h.close(); }
 });
 
-test('ephemeral and conversation fork first surfaces warn once per Agent instance', async () => {
-  const h = await harness({ allowedTools: ['utils'] });
-  const warnings: string[] = [];
-  const warn = console.warn;
-  console.warn = (...args) => {
-      const line = args.join(' ');
-      if (!line.startsWith('[deprecated]')) warnings.push(line);
-    };
+test('a call denied at dispatch is refused, so a script is told it never ran', async () => {
+  const h = await harness({ denyToolsAtDispatch: ['probe--denied'] });
   try {
-    const internals = h.framework as unknown as { createConversationAgent(name: string, home: { serverId: string; channelId: string }): Promise<{name: string}>; disposeConversationAgent(name: string): void };
-    const fork = await internals.createConversationAgent('utility-fork-g1', { serverId: 'stub', channelId: 'world:probe' });
-    const created = await h.framework.createEphemeralAgent({ name: 'utility-worker', model: 'test', systemPrompt: 'Test', allowedTools: ['utils'] });
-    created.contextManager.addMessage('user', [{ type: 'text', text: 'Complete.' }]);
-    h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Completed' }]));
-    const run = h.framework.runEphemeralToCompletion(created.agent, created.contextManager);
-    for (const name of [fork.name, created.agent.name]) {
-      assert.ok(!h.internal.getToolsForAgent(name).some(tool => tool.name === 'utils'));
-      h.internal.getToolsForAgent(name);
-      assert.equal(warnings.filter(line => line.includes(name)).length, 1);
-    }
-    await h.framework.runUntilIdle(); await run;
-    assert.equal(warnings.length, 2);
-    internals.disposeConversationAgent(fork.name); created.cleanup();
-  } finally { await h.close(); console.warn = warn; }
+    const pending = scriptCall(h.framework, 'assistant', 'probe--denied', {});
+    await h.framework.runUntilIdle();
+    const answer = await pending;
+    assert.equal(answer.refused, true);
+    assert.match(answer.refused ? answer.message : '', /probe--denied is not available to assistant/);
+    assert.equal(h.effects.length, 0);
+  } finally { await h.close(); }
+});
+
+test("a resident's call of its reader's tool is refused, so a script is told it never ran", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-allowed-tools-reader-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store.chronicle'), membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'scout', model: 'test', systemPrompt: 'Test' }],
+    modules: [], syncIntervalMs: 0, codeExecution: { enabled: true },
+    subconscious: { enabled: true, reader: 'forks', model: 'test', voice: 'Read for scout.' },
+  });
+  try {
+    const pending = scriptCall(framework, 'scout', 'deliver_summary', { text: 'me?', channelId: 'somewhere' });
+    await framework.runUntilIdle();
+    const answer = await pending;
+    assert.equal(answer.refused, true);
+    assert.match(answer.refused ? answer.message : '', /available to the resident's reader, not to scout/);
+  } finally { await framework.stop(); rmSync(dir, { recursive: true, force: true }); }
 });

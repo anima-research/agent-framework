@@ -473,7 +473,7 @@ test('a thrown non-Error, and an error whose projection throws, still log bounde
 
 test('a provider hold keeps a bounded reason, and a failed resume logs the bounded projection', async () => {
   const providerState = (fw: any) => Object.assign(fw, {
-    ephemeralRuns: new Map(), conversationAgentHomes: new Map(), providerGates: new Map(),
+    ephemeralRuns: new Map(), registry: { ownsProviderScheduling: () => true, homeChannel: () => undefined }, providerGates: new Map(),
     providerAccelerationCooldowns: new Map(), providerAccelerationRecoveries: new Map(),
     providerAdmissionClosed: false, activeTurnTokens: new Map(), quiesced: false, deadlineCuts: new Map(),
   });
@@ -983,7 +983,7 @@ test('a MembraneError from another copy of membrane is recognised by its name', 
   // The organization acceleration limit is recognised too, and held.
   const harness = makeHarness();
   Object.assign(harness.fw, {
-    ephemeralRuns: new Map(), conversationAgentHomes: new Map(), providerGates: new Map(),
+    ephemeralRuns: new Map(), registry: { ownsProviderScheduling: () => true, homeChannel: () => undefined }, providerGates: new Map(),
     providerAccelerationCooldowns: new Map(), providerAccelerationRecoveries: new Map(),
     providerAccelerationDefaultCooldownMs: 30_000, providerAccelerationJitterMs: 0,
   });

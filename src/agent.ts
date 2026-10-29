@@ -325,6 +325,11 @@ export class Agent {
   /** Provider-specific request parameters forwarded unchanged by Membrane. */
   readonly providerParams?: Record<string, unknown>;
   readonly sameRoundThinkTextPolicy: AgentConfig['sameRoundThinkTextPolicy'];
+  /** The participant name this agent's turns are presented under (see AgentConfig.presentAs). */
+  readonly presentAs: string;
+  /** Stored participants presented as this agent's own turns: its name plus AgentConfig.selfParticipants. */
+  private readonly ownParticipants: ReadonlySet<string>;
+  private readonly deniedAtDispatch: ReadonlySet<string>;
 
   private _state: AgentState = { status: 'idle' };
   private _inferenceStartedAt = 0;
@@ -454,6 +459,9 @@ export class Agent {
     this.prefillUserMessage = config.prefillUserMessage;
     this.providerParams = config.providerParams;
     this.sameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
+    this.presentAs = config.presentAs ?? config.name;
+    this.ownParticipants = new Set([config.name, ...(config.selfParticipants ?? [])]);
+    this.deniedAtDispatch = new Set(config.denyToolsAtDispatch ?? []);
     this.maxStreamTokens = config.maxStreamTokens ?? 150_000;
     // The window size converted as the projection's comparison (`projected > window`) converts it, so a string such
     // as "200000" from a JSON or YAML config is its number, for every rule that reads it. A value whose number isn't
@@ -511,6 +519,36 @@ export class Agent {
     // offered, since the framework refuses the server beside its heartbeat.
     const alias = heartbeatToolAlias(toolName);
     return alias !== undefined && this.allowedTools.includes(alias);
+  }
+
+  /**
+   * Whether a call to an advertised tool is refused at dispatch
+   * (see AgentConfig.denyToolsAtDispatch).
+   */
+  deniesAtDispatch(toolName: string): boolean {
+    return this.deniedAtDispatch.has(toolName);
+  }
+
+  /** Whether a stored participant is this agent's own voice. */
+  isOwnParticipant(participant: string): boolean {
+    return this.ownParticipants.has(participant);
+  }
+
+  /**
+   * Role assignment for a request: every participant that is this agent's
+   * own voice — its name, and for a derived agent the agent it inherited
+   * from — is presented under one name, which the formatter maps to the
+   * assistant role. Stored authorship is untouched; this shapes the request
+   * only. For a plain agent (no selfParticipants, presentAs = name) the
+   * input is returned as is.
+   */
+  private presentOwnTurns(messages: NormalizedMessage[]): NormalizedMessage[] {
+    if (this.ownParticipants.size === 1 && this.presentAs === this.name) return messages;
+    return messages.map((m) =>
+      this.ownParticipants.has(m.participant) && m.participant !== this.presentAs
+        ? { ...m, participant: this.presentAs }
+        : m,
+    );
   }
 
   /**
@@ -1647,8 +1685,9 @@ export class Agent {
       // What it holds of the stored injections is what the agent last saw.
       this.noteRenderedInjections(compiled);
       const { systemInjections } = compiled;
-      // The framework's own pricing stamp never goes out (thinking-token-stamp.ts).
-      const messages = withoutTokenEstimates(compiled.messages);
+      // The framework's own pricing stamp never goes out (thinking-token-stamp.ts);
+      // the agent's own turns are then presented under its name (presentOwnTurns).
+      const messages = this.presentOwnTurns(withoutTokenEstimates(compiled.messages));
       // Read once, after the first compile, since results may have become
       // ready while it ran; the refusal retry, assembled while the agent is
       // inferring, sends the same ones.
@@ -1660,6 +1699,7 @@ export class Agent {
         system: this.buildSystemPrompt(systemInjections),
         tools: tools.length > 0 ? tools : undefined,
         ...this.requestSettings(),
+        assistantParticipant: this.presentAs,
       };
     };
     const request = await assemble();
@@ -1895,6 +1935,8 @@ export class Agent {
     // The framework's own pricing stamp never goes out (thinking-token-stamp.ts).
     messages = withoutTokenEstimates(messages);
 
+    messages = this.presentOwnTurns(messages);
+
     // Silent heartbeat ticks and replies to a [Continue] turn store no
     // prompt row. Render each request-only turn before its response's first
     // surviving row, so the wire formatter cannot merge the response into the
@@ -1905,7 +1947,7 @@ export class Agent {
     // renders. "First" is per agent: a broadcast tick shares its eventId with
     // every resident.
     const index = this.indexRequestOnlyRows();
-    const rendered = renderRequestOnlyRows(messages, index, this.name);
+    const rendered = renderRequestOnlyRows(messages, index, this.presentAs);
     messages = rendered.messages;
     // A tick opens wherever its separator isn't already rendered: on its first
     // request, and on a restart whose compile left none of the tick's rows,
@@ -1924,7 +1966,7 @@ export class Agent {
     let continuePrompt: RequestOnlyPrompt | undefined;
     if (openingTick) {
       messages = [...messages, silentHeartbeatSeparatorTurn()];
-    } else if (endsOnOwnMessage(messages, this.name, injectionTail)) {
+    } else if (endsOnOwnMessage(messages, this.presentAs, injectionTail)) {
       // Safety: ensure messages don't end with an assistant message.
       // Some models reject trailing assistant messages ("prefill not supported"),
       // and after context compression a stale assistant turn can end up last.
@@ -1974,7 +2016,7 @@ export class Agent {
       cacheTtl: this.cacheTtl,
       ...(this.prefillUserMessage && { prefillUserMessage: this.prefillUserMessage }),
       ...(this.providerParams && { providerParams: this.providerParams }),
-      assistantParticipant: this.name,
+      assistantParticipant: this.presentAs,
     };
   }
 
@@ -2067,7 +2109,7 @@ export class Agent {
     try {
       const stored = cm.getAllMessages() as unknown as readonly StoredRowLike[];
       if (this.requestOnlyIndex?.source === stored) return this.requestOnlyIndex.index;
-      const index = indexRequestOnlyRows(stored, this.name);
+      const index = indexRequestOnlyRows(stored, this.ownParticipants);
       this.requestOnlyIndex = { source: stored, index };
       return index;
     } catch (error) {

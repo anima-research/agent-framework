@@ -118,11 +118,93 @@ export type ProviderHoldHook = (
 
 export interface FrameworkConfig {
   /**
+   * Dendrite agent lifecycle options.
+   */
+  dendrite?: {
+    /**
+     * When an agent ends while task work it spawned is still running, the
+     * orphan is always told. With this on (the default), the first agent
+     * that could adopt it — its nearest live ancestor, else the primary —
+     * also receives a factual notice, which is what makes the reparenting
+     * offer visible to a model. Turn it off when the host makes adoption
+     * decisions itself from the `dendrite:agent-orphaned` trace.
+     */
+    announceOrphans?: boolean;
+    /**
+     * By default every derivation tells the agent it was made from, in one
+     * host-framed line. After this many derivations of one kind from one
+     * agent, that agent hears a count line every so many instead of a line
+     * per fork, so a reader loop that forks a hundred times a session doesn't
+     * fill its source's context with stamps; every derivation still emits its
+     * `dendrite:agent-created` trace. Default 10; 0 never collapses.
+     */
+    collapseDerivationNoticesAfter?: number;
+    /**
+     * A host's say over each derivation, ephemeral spawn and resume, before the
+     * agent or its new incarnation exists, given the spec of what is about to
+     * exist (name, kind, spawner, route, inheritance, metadata). A shared
+     * derivation's record then adds the child's branch, and names the
+     * parent's namespace as its own. Return nothing to allow, or `{ refuse }`
+     * with the reason, which the caller gets as the error. The framework
+     * attaches no meaning to the decision: consent, budget, hours, a mind's
+     * standing instruction, a use not yet imagined are all the host's.
+     */
+    beforeDerive?: (spec: import('../dendrite/types.js').AgentSpec) => void | { refuse: string };
+    /**
+     * What an agent is told when something is derived from it. Given the
+     * record, the agent it was derived from and the framework's default line,
+     * return the text to add, or null to add nothing. Absent, the default
+     * line is used. The `dendrite:agent-created` trace is emitted either way.
+     */
+    derivationNotice?: (record: import('../dendrite/types.js').AgentRecord, from: string, defaultText: string) => string | null;
+  };
+
+  /**
    * The subconscious resident (issue #77): a persistent side-agent that
    * receives diverted traffic from tuned-out channels and reports to the
    * resident in its own voice. See src/tune-out/tools.ts.
    */
   subconscious?: import('../tune-out/tools.js').SubconsciousConfig;
+
+  /**
+   * Tune-out without a reader (issue #232 §3.3). The hold machinery always
+   * runs when MCPL channels exist, so a persisted epoch is resumed and
+   * released whatever the configuration; this switch only decides whether
+   * residents are offered `tune_out` when no reader is configured. Without
+   * a reader a tune-out is a silent hold: no cadence, no wake budget,
+   * mentions are acknowledged, the backlog is released on cancel.
+   */
+  tuneOut?: {
+    /** Offer `tune_out` without a subconscious. Default: only with one. */
+    enabled?: boolean;
+    /**
+     * Announce the all-except scope in the excepted channel: one bracketed
+     * line under the resident's name when it opens (who, for how long) and
+     * one when it closes. Default true — a hold the room cannot see is the
+     * failure the scope exists to prevent. `false` keeps both quiet.
+     */
+    announce?: boolean;
+  };
+
+  /**
+   * Where a turn's plain prose lands when nothing names a destination
+   * (architecture channel, 2026-10-06: the §3 carve-out accepted by the
+   * residents).
+   *
+   * - `'delivery'` (default): the locus comes only from the delivery that
+   *   woke the turn, a conversation fork's home channel, or a channel the
+   *   agent opened during the turn. Incoming traffic never moves it — not
+   *   between turns, not mid-turn. A turn with no such locus keeps its
+   *   prose private, and says so in a `[routing]` notice.
+   * - `'latest-inbound'`: the previous rule. The most recent delivered
+   *   inbound message is a global fallback locus for turns without one, and
+   *   an addressed message injected mid-turn re-pins the turn's locus.
+   *
+   * Held traffic never moves the locus under either rule.
+   */
+  speech?: {
+    locus?: 'delivery' | 'latest-inbound';
+  };
 
   /**
    * IANA zone of the agent's wall clock: it renders wall-clock times for the
@@ -160,6 +242,26 @@ export interface FrameworkConfig {
    * rationale and fallback as `hostModePath`.
    */
   deferredWritesPath?: string;
+
+  /**
+   * The Dendrite agent registry's recovery file: its live records and the
+   * results it holds for delivery, written atomically and fsynced, and read
+   * first at boot. Defaults to `<storePath>/recovery/dendrite-registry.json`.
+   * Outside the chronicle for the reason `hostModePath` is: a branch switch
+   * or historical rollback would otherwise take back held results. Set
+   * explicitly when providing an app-owned `store` without `storePath`;
+   * without either, the registry persists only in the branch-local store,
+   * with a warning at create.
+   */
+  agentRegistryPath?: string;
+
+  /**
+   * The registry's ended-record log recovery file (its newest records, as
+   * many as a restart reads). Defaults to
+   * `<storePath>/recovery/dendrite-ended.json`; same rationale and fallback
+   * as `agentRegistryPath`.
+   */
+  agentRegistryEndedPath?: string;
 
   /** Emoji used for branch-awareness markers (default: 💤). */
   discordAwarenessEmoji?: string;
