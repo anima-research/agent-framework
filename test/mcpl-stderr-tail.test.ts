@@ -22,7 +22,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ChildProcess } from 'node:child_process';
 
-import { STDERR_TAIL_CHARS, StdioTransport } from '../src/mcpl/transport.js';
+import { STDERR_TAIL_CHARS, StdioTransport, setStdioExitGraceForTests } from '../src/mcpl/transport.js';
 import { McplServerConnection, McplUnreapedLaunchError, stderrTailOf, withStderr } from '../src/mcpl/server-connection.js';
 import { AgentFramework } from '../src/framework.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
@@ -341,6 +341,7 @@ test("at startup, a failed connect whose launch can't be reaped still traces and
     const child = (transport as unknown as { child: ChildProcess }).child;
     const realKill = child.kill.bind(child);
     child.kill = () => true;
+    setStdioExitGraceForTests(child, 50);
     const exited = new Promise<void>((resolve) => {
       if (child.exitCode !== null || child.signalCode !== null) resolve();
       else child.once('exit', () => resolve());

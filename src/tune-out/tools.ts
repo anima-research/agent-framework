@@ -14,7 +14,7 @@ import type { StoredMessage } from '@animalabs/context-manager';
  * never leak bare prose to the default locus.
  */
 
-import type { ToolDefinition } from '../types/index.js';
+import type { AgentConfig, ToolDefinition } from '../types/index.js';
 
 export const SUBCONSCIOUS_TOOL_NAMES = [
   'deliver_summary',
@@ -143,6 +143,17 @@ interface SubconsciousConfigBase {
    * shared prefix).
    */
   allowChannelSpeech?: boolean;
+  /** The reader's model's context window, as AgentConfig.physicalWindowTokens,
+   *  in place of the primary's. Left out or null, a reader on the primary's
+   *  model has the primary's; on another model, the persistent reader has
+   *  none and a fork has the primary's. */
+  physicalWindowTokens?: AgentConfig['physicalWindowTokens'];
+  /** The reader's model's thinking binding, as AgentConfig.thinkingBinding,
+   *  in place of the primary's. Left out, null or false, a reader on the
+   *  primary's model has the primary's; on another model, the persistent
+   *  reader has none and a fork has the primary's. `{ binds: false }` gives
+   *  a reader none. */
+  thinkingBinding?: AgentConfig['thinkingBinding'];
 }
 
 export interface PersistentReaderConfig extends SubconsciousConfigBase {
@@ -156,7 +167,8 @@ export interface PersistentReaderConfig extends SubconsciousConfigBase {
   /** Model id; defaults to the primary agent's (same-model side-process).
    *  Another id, compared exactly, makes the subconscious leave out the
    *  fields that describe the primary's model, its window and its thinking
-   *  binding (SUBCONSCIOUS_MODEL_FIELDS); nothing here sets its own. */
+   *  binding (SUBCONSCIOUS_MODEL_FIELDS); `physicalWindowTokens` and
+   *  `thinkingBinding` set its own. */
   model?: string;
   /**
    * The voice/criteria mode block — recipe-side and co-authored with the

@@ -664,6 +664,7 @@ describe('inference bounds: an MCPL server\'s inference request', () => {
     const router = (fw as unknown as { inferenceRouter: InferenceRouter }).inferenceRouter;
     (router as unknown as { featureSetManager: unknown }).featureSetManager = { validateInbound: () => {} };
     let answered: { result?: unknown; error?: string } = {};
+    let waiting = true;
     const sentAt = Date.now();
     let answeredAfterMs = -1;
     try {
@@ -674,12 +675,13 @@ describe('inference bounds: an MCPL server\'s inference request', () => {
         preferences: { maxTokens: 4096 },
       } as never, {
         requestId: 1,
-        respond: (result: unknown) => { answered = { result }; },
-        respondError: (_code: number, message: string) => { answered = { error: message }; answeredAfterMs = Date.now() - sentAt; },
+        respond: (result: unknown) => { if (waiting) answered = { result }; },
+        respondError: (_code: number, message: string) => { if (waiting) { answered = { error: message }; answeredAfterMs = Date.now() - sentAt; } },
         sendChunk: () => {},
       } as never), 8_000);
       if (ended === NOT_ENDED) answered = { error: 'still waiting' };
     } finally {
+      waiting = false;
       await fw.stop();
       await stand.close();
     }

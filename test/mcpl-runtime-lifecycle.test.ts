@@ -684,8 +684,9 @@ test('connectMcplServer hot-connects a network-only (WebSocket) MCPL server', as
       let msg: { id?: unknown; method?: string; params?: { arguments?: Record<string, unknown> } };
       try { msg = JSON.parse(String(data)); } catch { return; }
       const reply = (result: unknown) => ws.send(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }));
-      if (msg.method === 'initialize') reply({ protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.4', pushEvents: true } } } });
+      if (msg.method === 'initialize') reply({ protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.5', pushEvents: true } } } });
       else if (msg.method === 'tools/list') reply({ tools: [{ name: 'echo', description: 'e', inputSchema: { type: 'object' } }] });
+      else if (msg.method === 'featureSets/update') reply({ accepted: true });
     });
   });
   await new Promise<void>((resolve) => (wss.address() ? resolve() : wss.once('listening', () => resolve())));
