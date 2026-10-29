@@ -153,16 +153,12 @@ function releaseRecordsOf(rows: readonly HeldRow[], epochId: string): ReleaseRec
 }
 
 function truncationNote(records: readonly ReleaseRecord[]): string {
-  const cut = records.flatMap((r, i) => (r.truncated > 0 ? [{ ...r, dump: i + 1 }] : []));
-  if (cut.length === 0) return '';
-  if (records.length === 1) {
-    return ` ${cut[0]!.truncated} of ${cut[0]!.total} diverted messages, the oldest, weren't delivered raw to the resident.`;
-  }
-  const each = cut.map((r) => `${r.truncated} of ${r.total} in dump ${r.dump}`).join(' and ');
-  const oldest = cut.length === 1
-    ? `the oldest of dump ${cut[0]!.dump}`
-    : cut.length === records.length ? 'the oldest of each' : 'the oldest of each dump named';
-  return ` Of the ${records.length} dumps' diverted messages, ${each}, ${oldest}, weren't delivered raw to the resident.`;
+  const truncated = records.reduce((n, r) => n + r.truncated, 0);
+  if (truncated === 0) return '';
+  const total = records.reduce((n, r) => n + r.total, 0);
+  return records.length === 1
+    ? ` ${truncated} of ${total} diverted messages, the oldest, weren't delivered raw to the resident.`
+    : ` ${truncated} of ${total} diverted messages across ${records.length} dumps, the oldest in each dump that left any out, weren't delivered raw to the resident.`;
 }
 
 /**
@@ -383,7 +379,6 @@ export class TuneOutCoordinator {
   private lateForks = new WeakSet<object>();
   /** The all-except scope's durable record, cached (undefined = not read yet). */
   private scopeCache: AllExceptState | null | undefined;
-  private readonly cancelling = new Set<string>();
   /** Timer key for the scope's cadence and expiry. */
   private static readonly SCOPE_KEY = '\0all-except';
 
@@ -700,27 +695,6 @@ export class TuneOutCoordinator {
     /** The lifecycle state the channel returns to (a tool close ends in 'closed'). */
     nextState: 'open' | 'closed' = 'open',
   ): { ok: true } | { ok: false; error: string } {
-    const key = this.key(serverId, channelId);
-    if (this.cancelling.has(key)) {
-      return { ok: false, error: `a cancel of ${this.quotedShown(serverId, channelId)} is already in progress` };
-    }
-    this.cancelling.add(key);
-    try {
-      return this.cancelChannel(serverId, channelId, source, reason, subconsciousNote, noteAuthor, nextState);
-    } finally {
-      this.cancelling.delete(key);
-    }
-  }
-
-  private cancelChannel(
-    serverId: string,
-    channelId: string,
-    source: string,
-    reason: string,
-    subconsciousNote: string | undefined,
-    noteAuthor: string | undefined,
-    nextState: 'open' | 'closed',
-  ): { ok: true } | { ok: false; error: string } {
     const ending = this.channelRegistry.getTuneOutState(serverId, channelId);
     if (!ending) {
       // Its reader is the resident's tune_out: cancel_tuneout finds the channel first.
@@ -835,11 +809,9 @@ export class TuneOutCoordinator {
     if (this.hooks.commitDeliveries?.() === false) {
       throw new Error(`the backlog of ${this.quotedShown(serverId, channelId)} could not be made durable, so its tune-out stays in force`);
     }
-    if (this.channelRegistry.getTuneOutState(serverId, channelId)?.params.epochId === epochId) {
-      this.channelRegistry.cancelTuneOut(serverId, channelId, nextState, source);
-      this.clearTimers(serverId, channelId);
-      this.divertedSinceInvocation.delete(this.key(serverId, channelId));
-    }
+    this.channelRegistry.cancelTuneOut(serverId, channelId, nextState, source);
+    this.clearTimers(serverId, channelId);
+    this.divertedSinceInvocation.delete(this.key(serverId, channelId));
     const reportedEarlier = keyedBy(earlier.map((r) => r.report));
     const release = {
       truncated: records.reduce((n, r) => n + r.truncated, 0),
@@ -1160,21 +1132,6 @@ export class TuneOutCoordinator {
     note?: string,
     noteAuthor?: string,
   ): { ok: true } | { ok: false; error: string } {
-    if (this.cancelling.has(TuneOutCoordinator.SCOPE_KEY)) return { ok: false, error: 'a cancel of the all-except hold is already in progress' };
-    this.cancelling.add(TuneOutCoordinator.SCOPE_KEY);
-    try {
-      return this.releaseAllExcept(source, reason, note, noteAuthor);
-    } finally {
-      this.cancelling.delete(TuneOutCoordinator.SCOPE_KEY);
-    }
-  }
-
-  private releaseAllExcept(
-    source: string,
-    reason: string,
-    note: string | undefined,
-    noteAuthor: string | undefined,
-  ): { ok: true } | { ok: false; error: string } {
     const scope = this.getAllExcept();
     if (!scope) return { ok: false, error: 'no all-except hold is active' };
     const { epochId, except, backlogCap } = scope.params;
@@ -1227,15 +1184,13 @@ export class TuneOutCoordinator {
     if (this.hooks.commitDeliveries?.() === false) {
       throw new Error('the all-except release could not be made durable, so the hold stays in force');
     }
-    if (this.getAllExcept()?.params.epochId === epochId) {
-      this.writeScope(null);
-      this.clearScopeTimers();
-      for (const [key, pending] of this.pendingWakes) {
-        const [serverId, channelId] = key.split('\0') as [string, string];
-        if (this.channelRegistry.getTuneOutState(serverId, channelId)) continue;
-        clearTimeout(pending.timer);
-        this.pendingWakes.delete(key);
-      }
+    this.writeScope(null);
+    this.clearScopeTimers();
+    for (const [key, pending] of this.pendingWakes) {
+      const [serverId, channelId] = key.split('\0') as [string, string];
+      if (this.channelRegistry.getTuneOutState(serverId, channelId)) continue;
+      clearTimeout(pending.timer);
+      this.pendingWakes.delete(key);
     }
     const subName = this.hooks.subconsciousName();
     if (note && subName) {

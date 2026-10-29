@@ -16,7 +16,6 @@ function harness(stored: Array<{ participant: string; content: Array<{ type: str
   const messages: Array<{ participant: string; text: string; forAgent?: string }> = [];
   const traces: string[] = [];
   const fail = { read: false, write: false, addMessage: false, commit: false };
-  const on = { add: undefined as undefined | (() => void) };
   const registry = {
     getTuneOutState: () => null,
     // Each channel is shown by its id where no other server registers it,
@@ -41,7 +40,6 @@ function harness(stored: Array<{ participant: string; content: Array<{ type: str
       if (fail.addMessage) throw new Error('context write failed');
       messages.push({ participant, text: content.map((b) => b.text ?? '').join(''), forAgent });
       if (!forAgent && metadata) stored.push({ participant, content, metadata });
-      on.add?.();
       return 'id';
     },
     commitDeliveries: () => !fail.commit,
@@ -57,7 +55,7 @@ function harness(stored: Array<{ participant: string; content: Array<{ type: str
     emitTrace: (e: { type: string }) => { traces.push(e.type); },
   } as unknown as TuneOutFrameworkHooks;
   const make = () => new TuneOutCoordinator(registry, servers, hooks);
-  return { make, state, wakes, messages, traces, fail, stored, on };
+  return { make, state, wakes, messages, traces, fail, stored };
 }
 
 describe('all-except scope on the coordinator', () => {
@@ -278,22 +276,6 @@ describe('all-except scope on the coordinator', () => {
     const release = stored.find((m) => m.metadata.kind === 'tune-out-cancel');
     const record = release?.metadata.released as { total: number; truncated: number } | undefined;
     assert.deepEqual({ total: record?.total, truncated: record?.truncated }, { total: 4, truncated: 2 });
-    c.stop();
-  });
-
-  it('a cancel of the hold made while its release is being written is refused, and the release is written once', () => {
-    const h = harness();
-    const c = h.make();
-    assert.ok(c.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool').ok);
-    const nested: Array<{ ok: boolean; error?: string }> = [];
-    h.on.add = () => { h.on.add = undefined; nested.push(c.cancelAllExcept('agent-tool', 'nested')); };
-    assert.ok(c.cancelAllExcept('duration', 'duration elapsed').ok);
-    assert.equal(nested.length, 1);
-    assert.equal(nested[0]!.ok, false);
-    assert.match(nested[0]!.error ?? '', /already in progress/);
-    assert.equal(c.getAllExcept(), null);
-    const releases = h.messages.filter((m) => /all channels except work released/.test(m.text));
-    assert.equal(releases.length, 1, 'the resident got the release once');
     c.stop();
   });
 

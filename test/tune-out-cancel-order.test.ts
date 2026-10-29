@@ -48,7 +48,6 @@ function coordinatorOn(
   opts: {
     failDump?: boolean;
     durable?: () => boolean;
-    onDump?: (c: TuneOutCoordinator) => void;
     queued?: Array<Row & { writeId: string }>;
     reports?: string[];
     inferences?: string[];
@@ -60,13 +59,11 @@ function coordinatorOn(
   let failDump = opts.failDump === true;
   let failWake = opts.failWake === true;
   let rows = 0;
-  let coordinator!: TuneOutCoordinator;
   const hooks = {
     addMessage: (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>) => {
       if (metadata?.kind === 'tune-out-cancel') {
         if (failDump) { failDump = false; throw new Error('the store refused the write'); }
         window.push({ id: `dump-${++rows}`, participant, content, metadata });
-        opts.onDump?.(coordinator);
       } else if (metadata?.kind === 'tune-out-cancel-report') {
         opts.reports?.push(content.map((b) => (b as { text?: string }).text ?? '').join(''));
       }
@@ -87,8 +84,7 @@ function coordinatorOn(
     isPrivilegedAuthor: () => false,
     allowChannelSpeech: () => false,
   };
-  coordinator = new TuneOutCoordinator(registry, {} as never, hooks as never);
-  return coordinator;
+  return new TuneOutCoordinator(registry, {} as never, hooks as never);
 }
 
 function failingEnd(registry: ChannelRegistry, failures = 1): void {
@@ -189,7 +185,7 @@ test('after a restart between a written dump and its failed end record, the next
   });
 });
 
-test('a rollback that takes away a written dump before the tune-out ends leaves its messages to the next cancel', () => {
+test('a dump row taken away before the tune-out ends, as a rollback, an undo of the turn or a surgery can, leaves its messages to the next cancel', () => {
   withStore((store) => {
     const window = windowWith(1, 2, 3);
     const registry = registryOn(store);
@@ -217,30 +213,6 @@ test('a cancel whose dump could not be made durable leaves the tune-out in force
     durable = true;
     assert.deepEqual(coordinator.cancel('disc', CHANNEL, 'agent-tool', 'test'), { ok: true });
     coordinator.stop();
-    assert.deepEqual(timesShown(window, HELD), once(HELD));
-    assert.equal(registry.getTuneOutState('disc', CHANNEL), null);
-  });
-});
-
-test('a cancel of the same channel made while its dump is being written is refused, and the dump is written once', () => {
-  withStore((store) => {
-    const window = windowWith(1, 2, 3);
-    const registry = registryOn(store);
-    registry.enterTuneOut('disc', CHANNEL, PARAMS, 'agent-tool');
-    const nested: Array<{ ok: boolean; error?: string }> = [];
-    let reentered = false;
-    const coordinator = coordinatorOn(registry, window, {
-      onDump: (c) => {
-        if (reentered) return;
-        reentered = true;
-        nested.push(c.cancel('disc', CHANNEL, 'agent-tool', 'nested'));
-      },
-    });
-    assert.deepEqual(coordinator.cancel('disc', CHANNEL, 'agent-tool', 'test'), { ok: true });
-    coordinator.stop();
-    assert.equal(nested.length, 1);
-    assert.equal(nested[0]!.ok, false);
-    assert.match(nested[0]!.error ?? '', /already in progress/);
     assert.deepEqual(timesShown(window, HELD), once(HELD));
     assert.equal(registry.getTuneOutState('disc', CHANNEL), null);
   });
@@ -279,7 +251,7 @@ test('a message queued at a dump whose end record failed, which lands before the
   });
 });
 
-test("the subconscious's report after a retry says what each dump left out, counting a dump stored in shards once", () => {
+test("the subconscious's report after a retry says how many of the held messages the dumps left out, counting a dump stored in shards once", () => {
   withStore((store) => {
     const window = windowWith(1, 2, 3);
     const reports: string[] = [];
@@ -296,7 +268,7 @@ test("the subconscious's report after a retry says what each dump left out, coun
     assert.equal(reports.length, 1, reports.join('\n'));
     const second = dumpsIn(window).at(-1)!;
     assert.ok(['held 1', 'held 2', 'held 3'].every((line) => !second.includes(line)), `the second dump leaves out what the first covered, its cap's cut included: ${second}`);
-    assert.match(reports[0]!, /Of the 2 dumps' diverted messages, 1 of 3 in dump 1 and 1 of 3 in dump 2, the oldest of each, weren't delivered raw to the resident\./);
+    assert.match(reports[0]!, / 2 of 6 diverted messages across 2 dumps, the oldest in each dump that left any out, weren't delivered raw to the resident\./);
   });
 });
 
