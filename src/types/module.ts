@@ -62,7 +62,12 @@ export type ModuleMessage = StoredMessage & {
    * alive, or while the host was quiesced, and enters the window at the
    * agent's next presentation point (a turn's start, a tool boundary that
    * can carry it, a turn's end, or at once while no turn of it is alive);
-   * or it was taken out of the window as an undone turn's. Its `id`,
+   * or it was taken out of the window as an undone turn's; or it is never
+   * presented to that agent, as a held message is to a resident. Set only
+   * once that agent's window is written down (presented mode); a held
+   * message an earlier release stored is in a resident's window written
+   * down from the record, so it reads without `held`, and
+   * `heldFromResidents` is what marks it. Its `id`,
    * `sequence` and `timestamp` are the store's, as for any row: since #291
    * every write is stored at once, so no row is a handle and nothing
    * changes when it enters the window. Before #291 the same name marked a

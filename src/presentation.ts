@@ -898,7 +898,9 @@ export class AgentPresentation {
   /**
    * Every live agent holding a row: each whose window has it at a place,
    * leaving out one whose window leaves held rows out when the row is held
-   * (a window written down from the record took them in); each whose window
+   * (a window written down from the record took in those an earlier release
+   * stored, before the audience stamp; retractForeign takes out the rest);
+   * each whose window
    * is still the whole record and whose record holds it; and each reader fork
    * handed it as framing.
    */

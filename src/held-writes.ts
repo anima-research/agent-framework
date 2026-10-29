@@ -36,8 +36,12 @@ export type ModuleRowWindow = Pick<ContextManager, 'windowMode' | 'ordinalOf'>;
  *   reach one).
  * - `held` when that agent's window (`window`) presents rows and doesn't
  *   hold it (#291): stored and not yet presented to the agent, which its
- *   next presentation point does, or taken out of it as an undone turn's.
- *   Never in legacy mode, where the window is the record.
+ *   next presentation point does, or taken out of it as an undone turn's,
+ *   or one it is never presented, as a held row is for a resident. Never in
+ *   legacy mode, where the window is the record. A resident's window
+ *   written down from the record holds the held rows an earlier release
+ *   stored, unstamped, so those read without `held`: `heldFromResidents`
+ *   marks every held row.
  *
  * Any other row comes back as it is.
  */
