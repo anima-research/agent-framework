@@ -190,14 +190,17 @@ export interface RequestOnlyRowIndex {
 /** Index the agent's own rows that follow request-only turns: the rows of its
  * silent ticks, and the rows of each reply to a `[Continue]`. The two are
  * independent, so a row can be both. Only stamped rows are keyed, so an
- * agent's history walk costs a metadata read per row. */
-export function indexRequestOnlyRows(stored: readonly StoredRowLike[], agentName: string): RequestOnlyRowIndex {
+ * agent's history walk costs a metadata read per row. `own` is the agent's
+ * name, or every participant that is its own voice, as a derived agent's
+ * inherited rows are. */
+export function indexRequestOnlyRows(stored: readonly StoredRowLike[], own: string | ReadonlySet<string>): RequestOnlyRowIndex {
+  const ownNames = typeof own === 'string' ? new Set([own]) : own;
   const ticks = new Map<string, { tick: string; text: string }>();
   const prompts = new Map<string, RequestOnlyPrompt>();
   for (const row of stored) {
-    if (row.participant !== agentName) continue;
+    if (!ownNames.has(row.participant)) continue;
     const stamp = silentHeartbeatOf(row.metadata);
-    const ownTick = stamp !== undefined && stamp.agentName === agentName;
+    const ownTick = stamp !== undefined && stamp.agentName === row.participant;
     const prompt = promptedByOf(row.metadata);
     if (!ownTick && !prompt) continue;
     const keys = identityKeys(row.content);

@@ -371,6 +371,34 @@ export interface AgentConfig {
   proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled';
 
   /**
+   * Stored participants that are this agent's own voice, in addition to its
+   * name: their turns are presented to the model as this agent's assistant
+   * turns. A derived agent sets this to the agent it inherited from, so the
+   * parent's turns read as its own history. Model-facing role assignment
+   * only, applied at request assembly — stored authorship is never rewritten.
+   */
+  selfParticipants?: string[];
+
+  /**
+   * The participant name this agent's own turns are presented under at
+   * request assembly. Defaults to `name`. A derived agent that should share
+   * its parent's provider prefix sets the parent's name, so the two
+   * requests are identical in formatters that render participant names as
+   * well as in those that only assign roles. New turns are still STORED
+   * under the agent's own name.
+   */
+  presentAs?: string;
+
+  /**
+   * Tools refused when this agent calls them, although they stay advertised.
+   * Restricts a derived agent without changing the tool block at the front
+   * of its request — removing a tool from `allowedTools` instead would
+   * change those bytes and forfeit the provider prefix it shares with its
+   * parent.
+   */
+  denyToolsAtDispatch?: string[];
+
+  /**
    * Fail-closed containment for a text response whose entire visible prose is
    * an invocation-shaped wrapper naming a tool registered on that exact turn.
    * The wrapper is neither executed nor stored as assistant continuity; a
@@ -612,8 +640,9 @@ export interface InferenceRequest {
    * the turn's auto-published plain-text speech here so a single TRUNK agent
    * replies in the channel it is answering — not the process-global most-recent-
    * inbound locus, which a concurrent message elsewhere can hijack (item-3
-   * redux). Undefined for non-channel wakes (heartbeat, timers, module events),
-   * which correctly fall back to the global default channel, except an
+   * redux). Undefined for non-channel wakes (heartbeat, timers, module events).
+   * A heartbeat's turn takes no channel at all, and holds its plain speech as
+   * drafts; any other falls back to the global default channel, except an
    * ephemeral run's (a subagent's), which takes no global fallback.
    */
   channelId?: string;
@@ -636,6 +665,17 @@ export interface InferenceRequest {
    * it starts. Hosts don't set it.
    */
   autoContinueRun?: AutoContinueRun;
+  /**
+   * Framework-set: whether this wake's turn is a heartbeat's, which has no
+   * channel and holds its plain speech as drafts. True on a wake that
+   * continues a heartbeat's turn with no channel of its own (an autoContinue
+   * continuation, a bounce's resend wake, a ` !` continuation, and a re-arm,
+   * which copies its trigger), and on a merged batch whose causes include a
+   * heartbeat's wake and name no channel; false on a merged batch with none,
+   * so the batch's first request doesn't decide it. Unset, a wake is a
+   * heartbeat's when its `source` is `heartbeat`. Hosts don't set it.
+   */
+  heartbeatTurn?: boolean;
   /**
    * True when the triggering message explicitly addressed the agent (mention,
    * reply-to-bot, DM — `chat:addressed` in MCPL RFC-001 terms). When a wake

@@ -27,6 +27,7 @@ import type { FeatureSetManager } from './feature-set-manager.js';
 import { McplFeatureSetError } from './feature-set-manager.js';
 import type { HookOrchestrator } from './hook-orchestrator.js';
 import { logValue } from './log-value.js';
+import { streamBounds, wholeCallMs, withHostSetting, type InferenceBounds } from '../inference-bounds.js';
 
 // ============================================================================
 // Responder interface
@@ -193,6 +194,7 @@ export class InferenceRouter {
     featureSetManager: FeatureSetManager,
     routingPolicy: InferenceRoutingPolicy | null,
     emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
+    private readonly inferenceBounds: () => InferenceBounds | null = () => null,
   ) {
     this.membrane = membrane;
     this.hookOrchestrator = hookOrchestrator;
@@ -324,7 +326,7 @@ export class InferenceRouter {
       // builder makes the result from it.
       const response = chunkRequestId != null
         ? await this.streamResponse(request, chunkRequestId, sendChunk!)
-        : await this.membrane.complete(request);
+        : await this.membrane.complete(request, this.wholeCallBound(request));
 
       // 6. Answer
       const result = resultFrom(response, model);
@@ -407,6 +409,11 @@ export class InferenceRouter {
   // Private: Streaming
   // ==========================================================================
 
+  private wholeCallBound(request: NormalizedRequest): { progressTimeoutMs?: number } {
+    const bounds = this.inferenceBounds();
+    return bounds === null ? {} : { progressTimeoutMs: wholeCallMs(bounds, request.config.maxTokens) };
+  }
+
   /**
    * Run the inference as a stream, sending each visible text delta to the
    * server as an inference/chunk, and return membrane's response once the
@@ -425,7 +432,7 @@ export class InferenceRouter {
     requestId: string | number,
     sendChunk: (params: InferenceChunkParams) => void,
   ): Promise<NormalizedResponse> {
-    const stream = this.membrane.streamYielding(request);
+    const stream = this.membrane.streamYielding(request, streamBounds(this.inferenceBounds(), request.config.maxTokens));
     let index = 0;
 
     for await (const event of stream) {
@@ -448,7 +455,7 @@ export class InferenceRouter {
         case 'error':
           throw event.error;
         case 'aborted':
-          throw new Error(`The inference stopped before it finished (${event.reason})`);
+          throw new Error(`The inference stopped before it finished (${event.reason}${event.message ? `: ${event.reason === 'timeout' ? withHostSetting(event.message) : event.message}` : ''})`);
       }
     }
     throw new Error('The inference stream ended without a result');
