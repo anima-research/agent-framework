@@ -169,7 +169,11 @@ test('HTTP: a request the server answers with HTTP 500 is reported once, to its 
   // With no listener of the host's, the connection logs an 'error' itself,
   // so a second report would be a second line.
   await assert.rejects(connection.callTool('echo', { text: 'x' }), failed);
-  assert.deepEqual(lines.filter((line) => line.includes('boom')), ['MCP server "remote" tools/call echo failed with HTTP 500: "Error POSTing to endpoint: boom"']);
+  // The quoted reason is the MCP SDK's own text around the server's body,
+  // so the line is checked for what the framework says and the body alone.
+  const said = lines.filter((line) => line.includes('boom'));
+  assert.equal(said.length, 1, `one log line: ${JSON.stringify(lines)}`);
+  assert.match(said[0]!, /^MCP server "remote" tools\/call echo failed with HTTP 500: ".*boom"$/);
   const errors: string[] = [];
   connection.on('error', (error: Error) => errors.push(error.message));
   await assert.rejects(connection.callTool('echo', { text: 'x' }), failed);
