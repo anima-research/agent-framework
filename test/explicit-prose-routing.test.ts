@@ -2859,7 +2859,7 @@ describe('explicit prose routing', () => {
   });
 
   for (const bouncingPrivate of [true, false]) {
-    it(`a late bounce from a ${bouncingPrivate ? 'private turn, landing while a channel turn is live, wakes a turn whose plain words stay private' : 'channel turn, landing while a private turn is live, wakes a turn that speaks as on main'}`, async () => {
+    it(`a late bounce from a ${bouncingPrivate ? 'private turn, landing while a channel turn is live, wakes a turn whose plain words stay private, even where a fallback exists (a focus hold or \'latest-inbound\')' : 'channel turn, landing while a private turn is live, wakes a turn that speaks as on main'}`, async () => {
       await withHeldHybridCallback('>>>#nowhere Where does this go?', async ({ framework, routed, earlier, next, pending, release }) => {
         const internalsOf = framework as unknown as { notePrivateTurn(turnId: number): void };
         const base = Date.now() * 1000 + 1_000_000_000;
@@ -2880,7 +2880,7 @@ describe('explicit prose routing', () => {
     });
   }
 
-  it("a private turn's bounce wakes a turn whose plain words stay private", async () => {
+  it("a private turn's bounce wakes a turn whose plain words stay private, even where a fallback exists (a focus hold or 'latest-inbound')", async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>#nowhere Where does this go?' }] as ContentBlock[]));
     const framework = await createFramework('explicit');
     stubRegistry(framework);
@@ -2903,7 +2903,7 @@ describe('explicit prose routing', () => {
     ['hybrid', 'names a channel whose delivery fails', '>>>#alpha The plan is X.', ['false']],
     ['explicit', 'names a channel whose delivery fails', '>>#alpha The plan is X.', ['false']],
   ] as const) {
-    it(`a private ${mode} turn's envelope that ${label} keeps its words private, with no draft`, async () => {
+    it(`a private ${mode} turn's envelope that ${label} keeps its words private, with no draft, even where a fallback exists (a focus hold or 'latest-inbound')`, async () => {
       membrane.pushResponse(createMockResponse([{ type: 'text', text }] as ContentBlock[]));
       const framework = await createFramework(mode);
       const routed = stubRegistry(framework, [...plan]);

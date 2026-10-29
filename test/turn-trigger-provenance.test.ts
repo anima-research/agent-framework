@@ -1340,7 +1340,7 @@ describe('private wins, one way', () => {
     }
   });
 
-  it("a private turn's refusal rewind retries privately, and its record names no channel", async () => {
+  it("a private turn's refusal rewind retries privately, and its record names no channel, even where a fallback exists (a focus hold or 'latest-inbound')", async () => {
     const rig = await surfaceRig({ agent: { refusalHandling: { autoRewind: true, maxRewinds: 1 } } });
     try {
       const records: Array<Record<string, unknown>> = [];
@@ -1431,7 +1431,7 @@ describe('private wins, one way', () => {
       }
     };
 
-    it("a nudge after a private turn speaks in no channel", async () => {
+    it("a nudge after a private turn speaks in no channel, even where a fallback exists (a focus hold or 'latest-inbound')", async () => {
       const rig = await surfaceRig();
       try {
         await privateTurn(rig);
@@ -1451,7 +1451,7 @@ describe('private wins, one way', () => {
       }
     });
 
-    it("an unstick after a private turn speaks in no channel", async () => {
+    it("an unstick after a private turn speaks in no channel, even where a fallback exists (a focus hold or 'latest-inbound')", async () => {
       const rig = await surfaceRig();
       try {
         await privateTurn(rig);
@@ -1461,7 +1461,7 @@ describe('private wins, one way', () => {
       }
     });
 
-    it("an inference request through the API after a private turn speaks in no channel", async () => {
+    it("an inference request through the API after a private turn speaks in no channel, even where a fallback exists (a focus hold or 'latest-inbound')", async () => {
       const rig = await surfaceRig({ modules: [new ApiModule()] });
       try {
         await privateTurn(rig);
@@ -1481,7 +1481,7 @@ describe('private wins, one way', () => {
       }
     });
 
-    it("a nudge asked for while a channel turn runs, which then takes in private input, speaks in no channel", async () => {
+    it("a nudge asked for while a channel turn runs, which then takes in private input, speaks in no channel, even where a fallback exists (a focus hold or 'latest-inbound')", async () => {
       let framework: AgentFramework | undefined;
       const tool = robot(() => {
         assert.ok(framework!.nudgeAgent('scout', 'host-console').ok);
@@ -1505,7 +1505,7 @@ describe('private wins, one way', () => {
       }
     });
 
-    it("a nudge after the host's own undo, twice, back to a private question speaks in no channel", async () => {
+    it("a nudge after the host's own undo, twice, back to a private question speaks in no channel, even where a fallback exists (a focus hold or 'latest-inbound')", async () => {
       const rig = await surfaceRig();
       try {
         await privateTurn(rig);
@@ -1520,7 +1520,7 @@ describe('private wins, one way', () => {
       }
     });
 
-    it("a nudge after a channel turn that followed a private exchange speaks in no channel: its context still holds the private input", async () => {
+    it("a nudge after a channel turn that followed a private exchange speaks in no channel, even where a fallback exists (a focus hold or 'latest-inbound'): its context still holds the private input", async () => {
       const rig = await surfaceRig();
       try {
         await privateTurn(rig);
@@ -1571,7 +1571,7 @@ describe('private wins, one way', () => {
       });
     });
 
-    it("after a restart, a nudge following a private turn speaks in no channel", async () => {
+    it("after a restart, a nudge following a private turn speaks in no channel, even where a fallback exists (a focus hold or 'latest-inbound')", async () => {
       await acrossRestart(privateTurn, async (rig) => {
         assert.deepEqual(await nudge(rig), []);
       });
@@ -1620,7 +1620,7 @@ describe('private wins, one way', () => {
       }
     });
 
-    it("a nudge merged with a channel's wake after a private turn speaks in no channel", async () => {
+    it("a nudge merged with a channel's wake after a private turn speaks in no channel, even where a fallback exists (a focus hold or 'latest-inbound')", async () => {
       const rig = await surfaceRig();
       try {
         await privateTurn(rig);
@@ -1655,7 +1655,7 @@ describe('private wins, one way', () => {
     };
 
     for (const fromPrivate of [true, false]) {
-      it(`a ' !' continuation of a ${fromPrivate ? 'private turn speaks in no channel' : 'channel turn speaks as on main, in the fallback channel'}`, async () => {
+      it(`a ' !' continuation of a ${fromPrivate ? 'private turn speaks in no channel, even where a fallback exists (a focus hold or \'latest-inbound\')' : 'channel turn speaks as on main, in the fallback channel'}`, async () => {
         const rig = await surfaceRig({ agent: { proseRouting: 'hybrid' } });
         try {
           rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>>#elsewhere ! on it' }]));
@@ -1675,7 +1675,7 @@ describe('private wins, one way', () => {
     ];
     for (const [what, call] of toolTurns) {
       for (const fromPrivate of [true, false]) {
-        it(`${what}, armed by the model in a ${fromPrivate ? 'private turn, speaks in no channel' : 'channel turn, speaks as on main'}`, async () => {
+        it(`${what}, armed by the model in a ${fromPrivate ? 'private turn, speaks in no channel, even where a fallback exists (a focus hold or \'latest-inbound\')' : 'channel turn, speaks as on main'}`, async () => {
           const rig = await surfaceRig({ gate: { config: { policies: [], default: 'always' } } });
           try {
             rig.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'arm', ...(call as object) } as never], 'tool_use'));
@@ -1717,7 +1717,7 @@ describe('private wins, one way', () => {
     }
 
     for (const fromPrivate of [true, false]) {
-      it(`a retry after inference failures shed history, from a ${fromPrivate ? 'private turn, speaks in no channel' : 'channel turn, speaks as on main'}`, async () => {
+      it(`a retry after inference failures shed history, from a ${fromPrivate ? 'private turn, speaks in no channel, even where a fallback exists (a focus hold or \'latest-inbound\')' : 'channel turn, speaks as on main'}`, async () => {
         const rig = await surfaceRig();
         try {
           await firstTurn(rig, fromPrivate);
@@ -1733,7 +1733,7 @@ describe('private wins, one way', () => {
       });
     }
 
-    it("a script's wake queued while its turn was a channel's speaks in no channel once that turn turns private first", async () => {
+    it("a script's wake queued while its turn was a channel's speaks in no channel once that turn turns private first, even where a fallback exists (a focus hold or 'latest-inbound')", async () => {
       const rig = await surfaceRig();
       try {
         await firstTurn(rig, false);
