@@ -4886,8 +4886,9 @@ export class AgentFramework {
             : undefined);
           framework.persistUsageState();
         },
-        // A batch naming no agent wakes every agent but the subconscious; the
-        // judge reads the primary's context, the resident the gate's wakes are for.
+        // A batch naming no agent wakes every resident and conversation fork;
+        // the judge reads the primary's context, the resident the gate's wakes
+        // are for.
         chooseAgent: (names) => (framework.primaryAgentName && names.includes(framework.primaryAgentName)
           ? framework.primaryAgentName
           : names[0]),
@@ -4944,10 +4945,10 @@ export class AgentFramework {
             // the debounce firing (2026-09-30). Ambient-only batches set no
             // locus and keep the legacy fallback.
             //
-            // An untargeted batch's wake goes to every agent, conversation
-            // forks included, and a fork speaks only in its home channel: the
-            // route applies to a fork only when it IS that home, and never to
-            // another agent when a fork owns that channel. Otherwise a fork
+            // An untargeted batch's wake goes to every resident and
+            // conversation fork, and a fork speaks only in its home channel:
+            // the route applies to a fork only when it IS that home, and never
+            // to another agent when a fork owns that channel. Otherwise a fork
             // bound elsewhere would show typing where it isn't replying.
             ...((): Partial<InferenceRequest> => {
               const route = provenance?.routeChannelId !== undefined
@@ -20087,8 +20088,8 @@ export class AgentFramework {
 
   /**
    * Whether a batched gate wake's addressed route may become `agentName`'s
-   * speech locus. A batch naming no agent wakes every agent, conversation
-   * forks included. A fork speaks only in its home channel, and a channel
+   * speech locus. A batch naming no agent wakes every resident and
+   * conversation fork. A fork speaks only in its home channel, and a channel
    * bound to a fork is that fork's conversation, so no other agent takes it.
    */
   private mayTakeGateRoute(agentName: string, route: ChannelRef): boolean {
