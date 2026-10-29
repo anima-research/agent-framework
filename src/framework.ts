@@ -876,7 +876,7 @@ import { ToolsetsModule, resolveAct, withLookHint, type TakenChange } from './mc
 import { ModernMcpConnection } from './mcpl/modern-connection.js';
 import { MAX_TIMER_MS, WITHHELD_TEXT, asText, credentialRedactor, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverCredentialPatterns, serverTextRedactor, type CredentialPattern } from './mcpl/protocol-family.js';
 import { MALFORMED_CONTENT_NOTICE, normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
-import { boundedForLog, describeCause } from './mcpl/errors.js';
+import { boundedForLog, describeCause, hostStoppedWhileHandling } from './mcpl/errors.js';
 import { assertServerConfigBooleans, buildWebSocketUrl, isWebSocketTransport } from './mcpl/transport.js';
 import type {
   McplServerConfig,
@@ -5234,7 +5234,8 @@ export class AgentFramework {
    * @param teardownTimeoutMs Optional budget for each of stop()'s waits, in
    * turn: on the streams it cancels, on maintenance in flight (a pass or an
    * over-budget drain kick), on the event loop, on an operator's operations
-   * already running, on modules and MCPL together, then on Discord awareness
+   * already running, on modules and MCPL (its servers and the inference
+   * requests they made) together, then on Discord awareness
    * drains, which send nothing once stop() has begun, recording the call the
    * close ended. With a budget, a stop() can take up to six of them, besides
    * the withheld-spill deadline of a guard's write still under way. Omit to
@@ -5460,6 +5461,8 @@ export class AgentFramework {
     for (const wake of [...this.retryWaitWakers]) step(wake);
     this.guardSpillsClosed = false;
     step(() => this.queue.close());
+    let inferences: Array<{ label: string; promise: Promise<void> }> = [];
+    step(() => { inferences = this.inferenceRouter?.stopAll() ?? []; });
     step(() => this.tuneOutCoordinator?.stop());
 
     // Stop running code_execution scripts before cancelling streams: a
@@ -5729,7 +5732,7 @@ export class AgentFramework {
     this.guardSpillsClosed = true;
 
     // Stop modules and both engines' MCP servers in parallel
-    const shutdownPromises: Promise<void>[] = [this.moduleRegistry.stopAll(teardownTimeoutMs)];
+    const shutdownPromises: Promise<void>[] = [this.moduleRegistry.stopAll(teardownTimeoutMs), waitFor(inferences)];
     if (this.mcplServerRegistry) {
       shutdownPromises.push(this.mcplServerRegistry.closeAll(teardownTimeoutMs));
     }
@@ -34508,12 +34511,9 @@ export class AgentFramework {
           // request turned away at stop gets, so it can send it again to
           // the host's next run. Optional chaining: prototype-built
           // harnesses leave the queue unset.
-          const stopping = !!this.queue?.isClosed;
+          const answer = this.queue?.isClosed ? hostStoppedWhileHandling() : { code: -32603, message: 'Internal error' };
           try {
-            tracked.respondError?.(
-              stopping ? -32000 : -32603,
-              stopping ? 'the host stopped while handling this request' : 'Internal error',
-            );
+            tracked.respondError?.(answer.code, answer.message);
           } catch (sendError) {
             responseError = recorded(describeCause(sendError));
           }
@@ -34670,6 +34670,7 @@ export class AgentFramework {
         respond: (result: unknown) => void;
         respondError: (code: number, message: string) => void;
         sendChunk?: (chunk: InferenceChunkParams) => void;
+        signal?: AbortSignal;
       },
     ) => {
       // RFC-006 §5.3 / SPEC §10.7: no inference from inside a render.
@@ -34695,6 +34696,7 @@ export class AgentFramework {
           // Chunks go out on the transport the request came on, as its
           // answer does.
           ...(responder.sendChunk ? { sendChunk: responder.sendChunk } : {}),
+          ...(responder.signal ? { signal: responder.signal } : {}),
         });
       }
     });
