@@ -10954,8 +10954,9 @@ export class AgentFramework {
    * **Inheritance.** `mode: 'shared'` (the default) gives the child the
    * parent's messages and fold state through shared storage: nothing is
    * copied, the child folds with the parent's memory tree, and neither can
-   * alter what the other reads. It needs branch-bound store handles and is
-   * refused, not silently downgraded, where they are missing. `mode: 'copy'`
+   * alter what the other reads. It needs a store that supports derivation
+   * (`ContextManager.supportsDerivation`), and is refused, not silently
+   * downgraded, without one. `mode: 'copy'`
    * is the historical mechanism — the parent's compiled context re-added as
    * the child's own messages — and works everywhere.
    *
@@ -25176,7 +25177,7 @@ export class AgentFramework {
                 (b) => b.type !== 'tool_result'
               );
             } else {
-              // Fallback (older membrane / XML tool mode): preamble + calls.
+              // XML tool mode: this round's text and its calls.
               // XML mode: persist the verbatim generation on each tool_use
               // (membrane#36 round-trip fidelity). context.rawText is the
               // parser's fullMatch — the exact <function_calls> block the
@@ -25188,15 +25189,12 @@ export class AgentFramework {
               const rawXml = rawText && /^<(antml:)?function_calls>/.test(rawText)
                 ? rawText
                 : undefined;
-              // Persist THIS round's text only. `roundPreamble` (membrane
-              // ≥0.5.79) is the per-round delta; the legacy `preamble` is
-              // CUMULATIVE in XML mode — persisting it per round stored each
-              // round's text N times and re-persisted injected
-              // <function_results> as the agent's own words (the Evander
-              // 2026-08-08 scaffold-leak pyramid: r1 ×3, r2 ×2).
-              const roundText =
-                (event.context as { roundPreamble?: string }).roundPreamble ??
-                event.context.preamble;
+              // Persist THIS round's text only: `roundPreamble` is the
+              // per-round delta. The `preamble` beside it is CUMULATIVE in XML
+              // mode: persisting it per round would store each round's text N
+              // times and re-persist injected <function_results> as the
+              // agent's own words.
+              const roundText = (event.context as { roundPreamble?: string }).roundPreamble;
               assistantBlocks = [];
               if (roundText) {
                 assistantBlocks.push({ type: 'text', text: roundText });
@@ -26049,14 +26047,14 @@ export class AgentFramework {
               // active (native roundContent), each mid-turn round's prose was
               // already delivered when that round yielded — only the TRAILING
               // prose (blocks after the last tool round) remains here. On the
-              // fallback path (XML tool mode / older membrane: no roundContent,
-              // so nothing was live-routed) the historical behavior applies:
+              // XML tool path (no roundContent, so nothing was live-routed)
+              // the historical behavior applies:
               // route the whole turn's parsed segments, once, now. The global
               // speech/thoughts split is left untouched (module/TUI rendering
               // unaffected) — this only governs what reaches the channel.
               //
               // Native round routing uses the live sticky flag, which a fresh
-              // injected message can reset. The legacy/fallback path has no
+              // injected message can reset. The XML tool path has no
               // reliable round boundaries, so retain its historical turn-wide
               // scan to avoid double-posting.
               const toolCalls = response.content

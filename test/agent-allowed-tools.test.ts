@@ -278,10 +278,10 @@ function captureRouting(framework: AgentFramework) {
 }
 
 /**
- * XML tool mode, as an older membrane streams it: no round carries its
- * verbatim roundContent, so none is routed live, and the turn-end completion
- * holds the cumulative tool round, its prose, its call and its result, as
- * XML mode parses them, before the final text.
+ * XML tool mode: no round carries its verbatim roundContent, so none is
+ * routed live, and the turn-end completion holds the cumulative tool round,
+ * its prose, its call and its result, as XML mode parses them, before the
+ * final text.
  */
 function asXmlTurn(membrane: MockMembrane, call: { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }): void {
   const streamYielding = membrane.streamYielding.bind(membrane);

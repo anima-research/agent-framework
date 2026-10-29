@@ -2467,7 +2467,6 @@ describe('ToolImageLedger', () => {
       mimeType: `image/${'p'.repeat(240)}`,
       sizeBytes: Number.MAX_SAFE_INTEGER,
       rejectedFields: [],
-      truncatedFields: [],
       ...extra,
     });
     // The longest stub buildReferenceStub writes: every label at its bound,

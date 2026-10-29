@@ -858,8 +858,8 @@ retract of a batch takes off the mark of its emoji from each of its messages,
 whichever batch placed it. 0.22.x reads only versions 1 and 2, and its start
 stops on a version 3 file: to go back to 0.22.x, move the file aside first,
 and 0.22.x then starts with no marks history. A version 1 ledger, which only
-an unreleased commit wrote, is refused until it is moved away, and its error
-says what that gives up.
+an unreleased commit wrote, is refused as any version but 2 and 3 is, until it
+is moved away.
 
 ## Observability
 

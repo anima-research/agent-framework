@@ -512,25 +512,6 @@ test("retract('all') after a rewrite takes off every key 0.22.x attempted, each 
   assert.equal(receipt.removalsQueued, 6);
 }));
 
-test('a version 1 ledger is refused, naming its file, the one commit that wrote it, and what moving it away gives up', withLedger(async (_outbox, h) => {
-  writeLedger(h, {
-    version: 1,
-    batches: [{ id: 'v1-batch', status: 'pending', agentName: 'resident', sourceBranch: 'main', targetBranch: 'rollback/resident/1', emoji: '💤', createdAt: 1, refs: [ref('a1')] }],
-  });
-  const words = `Discord awareness ledger ${h.path} is version 1, which only agent-framework commit b16731b2 wrote `
-    + '(2026-07-15, before any release). Every release rewrites it as version 2 at its next write, and this build reads '
-    + 'versions 2 and 3. Nothing is read from it until the file is moved away. Moving it gives up only work it still '
-    + 'had to send, which this build would retire unsent anyway, since that commit took each mark out of the file once '
-    + 'Discord confirmed it. A mark added just before that process ended, before its confirmation was written, stays on '
-    + 'Discord, and retract can\'t find it';
-  const outbox = h.open();
-  assert.throws(() => outbox.batches(), (error: Error) => error.message === words);
-  await assert.rejects(outbox.recoverAtStartup(), (error: Error) => error.message === words, 'an act refuses it too');
-  assert.equal(h.file().version, 1, 'the file stays as it was');
-  rmSync(h.path);
-  assert.deepEqual(h.open().batches(), [], 'moved away, the ledger is empty');
-}));
-
 test('a file of another version, or not the shape version 3 promises, is refused, and stays to be read again', withLedger(async (_outbox, h) => {
   const batch = {
     id: 'b', status: 'active', agentName: 'cairn', sourceBranch: 'main', targetBranch: 't', emoji: '💤', createdAt: 1,
