@@ -706,6 +706,27 @@ export class ToolLifecycleEmitter {
   }
 
   /**
+   * A call the host routes to another tool before it executes it: RFC-014's
+   * `toolsets--act`, which calls a server's dynamic tool. Until it opens, the
+   * call is described as that tool, with that tool's arguments, class and
+   * provider, so observers see (and narrowing, filters and class rules apply
+   * to) what actually runs, as for a direct call of it. Its ids stay.
+   */
+  retarget(agentName: string, callId: string, call: { name: string; input: unknown }): void {
+    const tracked = this.calls.get(callKey(agentName, callId));
+    if (!tracked || tracked.opened) return;
+    const described = this.host.describe(call.name);
+    const { serverId: _serverId, serverTool: _serverTool, ...kept } = tracked.call;
+    tracked.call = {
+      ...kept,
+      tool: call.name,
+      class: described.class,
+      ...(described.serverId !== undefined ? { serverId: described.serverId, serverTool: described.serverTool } : {}),
+      input: call.input,
+    };
+  }
+
+  /**
    * The host refused the call before executing it — its provider is gone,
    * host tool policy denies it, a conversation-bound agent reached outside
    * its channel. Called from the refusal site itself, synchronously within

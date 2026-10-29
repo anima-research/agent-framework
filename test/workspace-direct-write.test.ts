@@ -117,7 +117,7 @@ test('write, edit, edit_many and delete on a direct mount with no mode land on d
   assert.equal(env.text('src/a.ts'), 'alpha\nBETA\n');
   await data(m, 'edit_many', { edits: [{ path: 'ref/src/a.ts', oldString: 'alpha', newString: 'ALPHA' }, { path: 'ref/src/b.ts', oldString: 'two', newString: 'TWO' }] });
   assert.deepEqual([env.text('src/a.ts'), env.text('src/b.ts')], ['ALPHA\nBETA\n', 'one\nTWO\n']);
-  assert.deepEqual(await data(m, 'delete', { path: 'ref/old.txt' }), { path: 'ref/old.txt', deleted: true });
+  assert.deepEqual(await data(m, 'delete', { path: 'ref/old.txt' }), { path: 'ref/old.txt', deleted: true, disk: 'done' });
   assert.throws(() => statSync(join(env.ref, 'old.txt')), { code: 'ENOENT' });
 
   // A new file takes the mode a shell's would.
@@ -174,14 +174,14 @@ test('an edited 0755 script stays 0755 and runnable, and an edited file keeps it
   if (!IS_ROOT) {
     env.file('locked.txt', 'locked\n');
     chmodSync(join(env.ref, 'locked.txt'), 0o444);
-    assert.equal(await failure(m, 'write', { path: 'ref/locked.txt', content: 'no\n' }), "The write did nothing to ref/locked.txt: a file the host's process may not write (EACCES): its mode or owner keeps that process out, and calling again is refused until the file's owner, or whoever runs the host, changes that.");
-    assert.match(await failure(m, 'edit', { path: 'ref/locked.txt', oldString: 'locked', newString: 'no' }), /a file the host's process may not write \(EACCES\)/);
+    assert.equal(await failure(m, 'write', { path: 'ref/locked.txt', content: 'no\n' }), `The write did nothing to "ref/locked.txt": a file the host's process may not write (permission denied): its mode or owner keeps that process out, and calling again is refused until the file's owner, or whoever runs the host, changes that.`);
+    assert.match(await failure(m, 'edit', { path: 'ref/locked.txt', oldString: 'locked', newString: 'no' }), /a file the host's process may not write \(permission denied\)/);
     assert.equal(env.text('locked.txt'), 'locked\n');
     assert.equal(mode(join(env.ref, 'locked.txt')), 0o444);
     // And one made read-only after the call staged its bytes, just before the rename.
     env.file('late.txt', 'late\n');
     directWriteTestSeam.afterStage = () => chmodSync(join(env.ref, 'late.txt'), 0o444);
-    assert.match(await failure(m, 'write', { path: 'ref/late.txt', content: 'no\n' }), /a file the host's process may not write \(EACCES\)/);
+    assert.match(await failure(m, 'write', { path: 'ref/late.txt', content: 'no\n' }), /a file the host's process may not write \(permission denied\)/);
     directWriteTestSeam.afterStage = undefined;
     assert.equal(env.text('late.txt'), 'late\n');
     assert.deepEqual(env.staged(), []);
@@ -335,7 +335,7 @@ test('a symlink swapped in for the file while an edit or a write is applied is r
   assert.equal(readFileSync(outside, 'utf8'), 'outside\n');
   unlinkSync(join(env.ref, 'f.txt'));
   env.file('f.txt', 'middle\n');
-  assert.equal(await failure(m, 'write', { path: 'ref/f.txt', content: 'new\n' }), 'The write did nothing to ref/f.txt: it became a symlink while this call was being applied.');
+  assert.equal(await failure(m, 'write', { path: 'ref/f.txt', content: 'new\n' }), 'The write did nothing to "ref/f.txt": it became a symlink while this call was being applied. Calling again checks it afresh.');
   assert.equal(readFileSync(outside, 'utf8'), 'outside\n');
   assert.deepEqual(env.staged(), []);
 });
@@ -396,10 +396,12 @@ test("a deletion whose unlink fails after reaching the file says the file may be
   const position = () => (m as unknown as { directHeads: Map<string, Map<string, unknown>> }).directHeads.get('ref')?.has('scout') ?? false;
   try {
     failWith('EACCES');
-    assert.equal(await failure(m, 'delete', { path: 'ref/f.txt' }), 'The delete did nothing to ref/f.txt: could not unlink the file: EACCES: failed.');
+    assert.equal(await failure(m, 'delete', { path: 'ref/f.txt' }),
+      'The delete did nothing to "ref/f.txt": could not unlink the file: permission denied. Calling again won\'t change that; whoever runs this host can change the permissions.');
     assert.equal(position(), false, 'a deletion disk refused outright is no write of the agent\'s');
     failWith('EIO');
-    assert.equal(await failure(m, 'delete', { path: 'ref/f.txt' }), 'The delete of ref/f.txt failed after it reached the file, so the file may be gone: could not unlink the file: EIO: failed. ls shows whether it is.');
+    assert.equal(await failure(m, 'delete', { path: 'ref/f.txt' }),
+      'The delete of "ref/f.txt" failed after it reached the file, so the file may be gone: could not unlink the file: an input/output error on the disk. ls shows whether it is.');
     assert.equal(position(), true, 'one that may have landed is taken as the agent\'s write');
   } finally {
     fsp.unlink = original;
@@ -419,7 +421,7 @@ test('a staged file swapped for a link before the rename is refused, and the lin
     unlinkSync(join(env.ref, temp!));
     symlinkSync(outside, join(env.ref, temp!));
   };
-  assert.equal(await failure(m, 'write', { path: 'ref/f.txt', content: 'new\n' }), 'The write did nothing to ref/f.txt: another writer replaced the staged copy of the new text before it could be renamed over the file, which is as it was.');
+  assert.equal(await failure(m, 'write', { path: 'ref/f.txt', content: 'new\n' }), 'The write did nothing to "ref/f.txt": another writer replaced the staged copy of the new text before it could be renamed over the file, which is as it was. Calling again writes it afresh.');
   assert.equal(env.text('f.txt'), 'old\n');
   assert.equal(readFileSync(outside, 'utf8'), 'outside\n');
   // What the other writer put at the staged name is theirs, and stays.
@@ -432,7 +434,7 @@ test('a staged file swapped for a link before the rename is refused, and the lin
     unlinkSync(join(env.ref, temp!));
     writeFileSync(join(env.ref, temp!), 'theirs\n');
   };
-  assert.equal(await failure(m, 'write', { path: 'ref/f.txt', content: 'new\n' }), 'The write did nothing to ref/f.txt: another writer replaced the staged copy of the new text before it could be renamed over the file, which is as it was.');
+  assert.equal(await failure(m, 'write', { path: 'ref/f.txt', content: 'new\n' }), 'The write did nothing to "ref/f.txt": another writer replaced the staged copy of the new text before it could be renamed over the file, which is as it was. Calling again writes it afresh.');
   assert.equal(env.text('f.txt'), 'old\n');
   const [theirs] = env.staged();
   assert.equal(theirs && env.text(theirs), 'theirs\n');
@@ -445,7 +447,7 @@ test('a staged file swapped for a link before the rename is refused, and the lin
     const [temp] = env.staged();
     writeFileSync(join(env.ref, temp!), 'rewritten\n');
   };
-  assert.equal(await failure(m, 'write', { path: 'ref/f.txt', content: 'new\n' }), 'The write did nothing to ref/f.txt: another writer replaced the staged copy of the new text before it could be renamed over the file, which is as it was.');
+  assert.equal(await failure(m, 'write', { path: 'ref/f.txt', content: 'new\n' }), 'The write did nothing to "ref/f.txt": another writer replaced the staged copy of the new text before it could be renamed over the file, which is as it was. Calling again writes it afresh.');
   assert.equal(env.text('f.txt'), 'old\n');
 });
 
@@ -493,7 +495,7 @@ test("the staged file is moded through its own handle, so a file swapped in at i
     return chmod.call(this, mode);
   };
   try {
-    assert.equal(await failure(m, 'write', { path: 'ref/f.txt', content: 'new\n' }), 'The write did nothing to ref/f.txt: another writer replaced the staged copy of the new text before it could be renamed over the file, which is as it was.');
+    assert.equal(await failure(m, 'write', { path: 'ref/f.txt', content: 'new\n' }), 'The write did nothing to "ref/f.txt": another writer replaced the staged copy of the new text before it could be renamed over the file, which is as it was. Calling again writes it afresh.');
   } finally {
     proto.chmod = chmod;
   }
@@ -515,7 +517,7 @@ test('a staged file whose write fails once made is removed, and says why', async
     throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
   };
   try {
-    assert.equal(await failure(m, 'write', { path: 'ref/f.txt', content: 'new\n' }), 'The write did nothing to ref/f.txt: cannot write the staged file beside it (ENOSPC).');
+    assert.equal(await failure(m, 'write', { path: 'ref/f.txt', content: 'new\n' }), `The write did nothing to "ref/f.txt": cannot write the staged file beside it (no space left on the disk). Calling again won't change that; whoever runs this host can free space on its disk.`);
   } finally {
     proto.writeFile = writeFile;
   }
@@ -529,7 +531,7 @@ test('a staged file whose write fails once made is removed, and says why', async
     throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
   };
   try {
-    assert.equal(await failure(m, 'write', { path: 'ref/f.txt', content: 'new\n' }), 'The write did nothing to ref/f.txt: cannot write the staged file beside it (ENOSPC).');
+    assert.equal(await failure(m, 'write', { path: 'ref/f.txt', content: 'new\n' }), `The write did nothing to "ref/f.txt": cannot write the staged file beside it (no space left on the disk). Calling again won't change that; whoever runs this host can free space on its disk.`);
   } finally {
     proto.writeFile = writeFile;
   }
@@ -566,7 +568,7 @@ test('a write whose file\'s directory is replaced after staging does nothing, an
     renameSync(join(env.ref, 'd'), join(env.ref, 'd-moved'));
     mkdirSync(join(env.ref, 'd'));
   };
-  assert.equal(await failure(m, 'write', { path: 'ref/d/f.txt', content: 'new\n' }), 'The write did nothing to ref/d/f.txt: the directory changed since it was checked.');
+  assert.equal(await failure(m, 'write', { path: 'ref/d/f.txt', content: 'new\n' }), 'The write did nothing to "ref/d/f.txt": the directory changed since it was checked. Calling again checks it afresh.');
   assert.equal(env.text('d-moved/f.txt'), 'old\n');
   assert.throws(() => statSync(join(env.ref, 'd/f.txt')), { code: 'ENOENT' });
 });
@@ -598,7 +600,7 @@ test('a deletion whose mount root is replaced after its open is refused, and the
   };
   syncBuiltinESMExports();
   try {
-    assert.equal(await failure(m, 'delete', { path: 'ref/f.txt' }), `The delete did nothing to ref/f.txt: ${ROOT_MOVED}.`);
+    assert.equal(await failure(m, 'delete', { path: 'ref/f.txt' }), `The delete did nothing to "ref/f.txt": ${ROOT_MOVED}.`);
   } finally {
     fsp.open = originalOpen;
     syncBuiltinESMExports();
@@ -620,7 +622,7 @@ test('a deletion whose mount root is replaced after its open is refused, and the
   };
   syncBuiltinESMExports();
   try {
-    assert.equal(await failure(m, 'delete', { path: 'ref/f.txt' }), `The delete did nothing to ref/f.txt: ${ROOT_MOVED}.`);
+    assert.equal(await failure(m, 'delete', { path: 'ref/f.txt' }), `The delete did nothing to "ref/f.txt": ${ROOT_MOVED}.`);
   } finally {
     fsp.open = originalOpen;
     syncBuiltinESMExports();
@@ -638,7 +640,7 @@ test('a write refuses a pipe swapped in for its file before the rename, and leav
     unlinkSync(join(env.ref, 'f.txt'));
     assert.equal(spawnSync('mkfifo', [join(env.ref, 'f.txt')]).status, 0);
   };
-  assert.equal(await failure(m, 'write', { path: 'ref/f.txt', content: 'new\n' }), 'The write did nothing to ref/f.txt: not a regular file.');
+  assert.equal(await failure(m, 'write', { path: 'ref/f.txt', content: 'new\n' }), `The write did nothing to "ref/f.txt": not a regular file. Calling again won't change that; whoever runs this host can put a regular file there.`);
   assert.ok(lstatSync(join(env.ref, 'f.txt')).isFIFO());
   assert.deepEqual(env.staged(), []);
 });
@@ -648,10 +650,10 @@ test('a write or an edit whose rename fails leaves the file as it was and no sta
   env.file('f.txt', 'old\n');
   const m = await env.open();
   directWriteTestSeam.beforeRename = () => { throw Object.assign(new Error('EIO: i/o error'), { code: 'EIO' }); };
-  assert.equal(await failure(m, 'write', { path: 'ref/f.txt', content: 'new\n' }), 'The write did nothing to ref/f.txt: cannot rename the staged file over it (EIO).');
+  assert.equal(await failure(m, 'write', { path: 'ref/f.txt', content: 'new\n' }), 'The write did nothing to "ref/f.txt": cannot rename the staged file over it (an input/output error on the disk). Calling again may work; if it fails the same way, whoever runs this host can check the disk.');
   assert.equal(
     await failure(m, 'edit', { path: 'ref/f.txt', oldString: 'old', newString: 'new' }),
-    'ref/f.txt: cannot rename the staged file over it (EIO), so the edit changed nothing.',
+    'ref/f.txt: cannot rename the staged file over it (an input/output error on the disk), so the edit changed nothing. Calling again may work; if it fails the same way, whoever runs this host can check the disk.',
   );
   assert.equal(env.text('f.txt'), 'old\n');
   assert.deepEqual(env.staged(), []);
@@ -693,7 +695,7 @@ test('edit_many on a direct mount whose staging fails writes no file', { skip: I
   } finally {
     chmodSync(join(env.ref, 'locked'), 0o755);
   }
-  assert.match(error, /^The edit_many call wrote none of its edits: 1 problem\.\n\nedit 2: ref\/locked\/b\.txt: cannot make the staged file in its directory \(EACCES\): a direct write needs to write the file's directory as well as the file, so edit 2 changed nothing\. No file was written\.$/);
+  assert.match(error, /^The edit_many call wrote none of its edits: 1 problem\.\n\nedit 2: ref\/locked\/b\.txt: cannot make the staged file in its directory \(permission denied\): a direct write needs to write the file's directory as well as the file, so edit 2 changed nothing\. No file was written\. Calling again won't change that; whoever runs this host can change the permissions\.$/);
   assert.deepEqual([env.text('a.txt'), env.text('locked/b.txt')], ['a1\n', 'b1\n']);
   assert.deepEqual(env.staged(), []);
 });
@@ -707,7 +709,8 @@ test('edit_many on a direct mount whose rename fails partway names each file\'s 
   };
   const error = await failure(m, 'edit_many', { edits: ['a', 'b', 'c'].map((name) => ({ path: `ref/${name}.txt`, oldString: `${name}1`, newString: `${name.toUpperCase()}1` })) });
   assert.equal(error, [
-    "The edit_many call wrote 1 of its 3 files before the next one's write failed: cannot rename the staged file over it (ENOSPC). "
+    "The edit_many call wrote 1 of its 3 files before the next one's write failed: cannot rename the staged file over it (no space left on the disk). "
+      + 'Whoever runs this host can free space on its disk. '
       + "Nothing puts the written files back, so finish or revert them: in each written file, each of its edits replaced its oldString with its newString. Each file's outcome:",
     'ref/a.txt: written',
     'ref/b.txt: not written, as it was (its write failed)',
@@ -757,7 +760,7 @@ test('a write whose mount root is replaced after staging does nothing, and says 
     renameSync(env.ref, `${env.ref}-moved`);
     mkdirSync(env.ref);
   };
-  assert.equal(await failure(m, 'write', { path: 'ref/f.txt', content: 'new\n' }), `The write did nothing to ref/f.txt: ${ROOT_MOVED}.`);
+  assert.equal(await failure(m, 'write', { path: 'ref/f.txt', content: 'new\n' }), `The write did nothing to "ref/f.txt": ${ROOT_MOVED}.`);
   assert.equal(readFileSync(join(`${env.ref}-moved`, 'f.txt'), 'utf8'), 'old\n');
 });
 
@@ -1042,9 +1045,9 @@ test("the check before a rename tells a file gone from one this process may not 
     assert.doesNotThrow(() => checkUnchanged(staged, null), 'a write makes the file anew');
     assert.throws(() => checkUnchanged(staged, expected), FileChanged);
     code = 'EPERM';
-    assert.throws(() => checkUnchanged(staged, null), (err: unknown) => err instanceof WriteRefused && /^a file the host's process may not write \(EPERM\)/.test(err.message));
+    assert.throws(() => checkUnchanged(staged, null), (err: unknown) => err instanceof WriteRefused && /^a file the host's process may not write \(not permitted\)/.test(err.message));
     code = 'EIO';
-    assert.throws(() => checkUnchanged(staged, null), (err: unknown) => err instanceof WriteRefused && err.message === "cannot check that the host's process may write it (EIO)");
+    assert.throws(() => checkUnchanged(staged, null), (err: unknown) => err instanceof WriteRefused && err.message === "cannot check that the host's process may write it (an input/output error on the disk)");
   } finally {
     fs.accessSync = accessSync;
     syncBuiltinESMExports();
@@ -1071,7 +1074,7 @@ test("a staged file whose handle fails to close is removed, and the write says w
   };
   syncBuiltinESMExports();
   try {
-    assert.equal(await failure(m, 'write', { path: 'ref/f.txt', content: 'new\n' }), 'The write did nothing to ref/f.txt: cannot write the staged file beside it (EIO).');
+    assert.equal(await failure(m, 'write', { path: 'ref/f.txt', content: 'new\n' }), 'The write did nothing to "ref/f.txt": cannot write the staged file beside it (an input/output error on the disk). Calling again may work; if it fails the same way, whoever runs this host can check the disk.');
   } finally {
     fsp.open = originalOpen;
     syncBuiltinESMExports();
@@ -1080,7 +1083,7 @@ test("a staged file whose handle fails to close is removed, and the write says w
   assert.equal(env.text('f.txt'), 'old\n');
 });
 
-test("a deletion whose mount root can't be read says so, with its code", async (t) => {
+test("a deletion whose mount root can't be read says so, with its errno in plain words", async (t) => {
   const env = new Env(t);
   env.file('f.txt', 'old\n');
   const m = await env.open();
@@ -1094,15 +1097,15 @@ test("a deletion whose mount root can't be read says so, with its code", async (
   };
   syncBuiltinESMExports();
   try {
-    assert.equal(await failure(m, 'delete', { path: 'ref/f.txt' }), "The delete did nothing to ref/f.txt: the mount root can't be read (EACCES), and calling again is refused the same way until whoever runs the host makes it readable.");
+    assert.equal(await failure(m, 'delete', { path: 'ref/f.txt' }), `The delete did nothing to "ref/f.txt": the mount root can't be read: permission denied. Calling again won't change that; whoever runs this host can change the permissions.`);
     code = 'EPERM';
-    assert.equal(await failure(m, 'delete', { path: 'ref/f.txt' }), "The delete did nothing to ref/f.txt: the mount root can't be read (EPERM), and calling again is refused the same way until whoever runs the host makes it readable.");
+    assert.equal(await failure(m, 'delete', { path: 'ref/f.txt' }), `The delete did nothing to "ref/f.txt": the mount root can't be read: not permitted. Calling again won't change that; whoever runs this host can change the permissions.`);
     for (const gone of ['ENOENT', 'ENOTDIR']) {
       code = gone;
-      assert.equal(await failure(m, 'delete', { path: 'ref/f.txt' }), `The delete did nothing to ref/f.txt: the mount root is gone (${gone}), and calling again is refused the same way until whoever runs the host puts a directory back at the mount's path.`);
+      assert.equal(await failure(m, 'delete', { path: 'ref/f.txt' }), `The delete did nothing to "ref/f.txt": the mount root isn't on disk. Calling again won't change that; whoever runs this host can put the mount's directory back at its path.`);
     }
     code = 'EIO';
-    assert.equal(await failure(m, 'delete', { path: 'ref/f.txt' }), "The delete did nothing to ref/f.txt: the mount root can't be read (EIO).");
+    assert.equal(await failure(m, 'delete', { path: 'ref/f.txt' }), `The delete did nothing to "ref/f.txt": the mount root can't be read: an input/output error on the disk. Calling again may work; if it fails the same way, whoever runs this host can check the disk.`);
   } finally {
     fsp.stat = stat;
     syncBuiltinESMExports();
@@ -1118,7 +1121,7 @@ test("a deletion while the mount root is gone is refused, and one once it's back
   renameSync(env.ref, away);
   try {
     const refused = await failure(m, 'delete', { path: 'ref/f.txt' });
-    assert.match(refused, /^The delete did nothing to ref\/f\.txt: /);
+    assert.match(refused, /^The delete did nothing to "ref\/f\.txt": /);
   } finally {
     renameSync(away, env.ref);
   }
@@ -1127,7 +1130,7 @@ test("a deletion while the mount root is gone is refused, and one once it's back
   assert.equal(existsSync(join(env.ref, 'f.txt')), false);
 });
 
-test("a followed link whose file can't be looked at is refused with its code, and one whose file went is a change", { skip: process.platform === 'win32' ? 'symlinks need privileges' : false }, async (t) => {
+test("a followed link whose file can't be looked at is refused with its errno in plain words, and one whose file went is a change", { skip: process.platform === 'win32' ? 'symlinks need privileges' : false }, async (t) => {
   const env = new Env(t);
   env.file('real.txt', 'old\n');
   symlinkSync('real.txt', join(env.ref, 'link.txt'));
@@ -1142,7 +1145,7 @@ test("a followed link whose file can't be looked at is refused with its code, an
   };
   syncBuiltinESMExports();
   try {
-    assert.equal(await failure(m, 'write', { path: 'ref/link.txt', content: 'new\n' }), 'The write did nothing to ref/link.txt: cannot stat the file the symlink leads to (EIO).');
+    assert.equal(await failure(m, 'write', { path: 'ref/link.txt', content: 'new\n' }), 'The write did nothing to "ref/link.txt": cannot stat the file the symlink leads to (an input/output error on the disk). Calling again may work; if it fails the same way, whoever runs this host can check the disk.');
     code = 'ENOENT';
     assert.match(await failure(m, 'write', { path: 'ref/link.txt', content: 'new\n' }), /changed/);
   } finally {
@@ -1297,11 +1300,13 @@ test("a direct edit refuses what read doesn't show as text, and a file that isn'
   env.file('bin.dat', Buffer.from([0x61, 0, 0x62]));
   env.file('big.txt', 'x'.repeat(20));
   const m = await env.open({ maxFileSize: 10 });
-  assert.equal(await failure(m, 'edit', { path: 'ref/bin.dat', oldString: 'a', newString: 'b' }), "ref/bin.dat is binary, so the workspace doesn't edit it as text.");
-  assert.equal(await failure(m, 'edit', { path: 'ref/big.txt', oldString: 'x', newString: 'y', replaceAll: true }), "ref/big.txt is over the size limit (10 bytes), so the workspace doesn't edit it.");
-  assert.equal(await failure(m, 'edit', { path: 'ref/none.txt', oldString: 'a', newString: 'b' }), 'File not found: ref/none.txt');
-  assert.equal(await failure(m, 'delete', { path: 'ref/none.txt' }), 'File not found: ref/none.txt');
-  assert.equal(await failure(m, 'write', { path: 'ref/big.txt', content: 'y'.repeat(11) }), 'Content exceeds max file size (10 bytes)');
+  assert.equal(await failure(m, 'edit', { path: 'ref/bin.dat', oldString: 'a', newString: 'b' }), `The edit did nothing: "ref/bin.dat" is binary, so the workspace doesn't edit it as text. A write replaces the whole file, if that's what you mean to do.`);
+  assert.equal(await failure(m, 'edit', { path: 'ref/big.txt', oldString: 'x', newString: 'y', replaceAll: true }), `The edit did nothing: "ref/big.txt" is 20 bytes, past the 10-byte limit this mount sets on a file, so the workspace doesn't edit it. The limit is the mount's maxFileSize setting, which only whoever runs the host can change.`);
+  assert.equal(await failure(m, 'edit', { path: 'ref/none.txt', oldString: 'a', newString: 'b' }), 'The edit did nothing: there\'s no file at "ref/none.txt". ls or glob lists the files that exist.');
+  assert.equal(await failure(m, 'delete', { path: 'ref/none.txt' }), 'The delete did nothing: there\'s no file at "ref/none.txt". ls or glob lists the files that exist.');
+  assert.equal(await failure(m, 'write', { path: 'ref/big.txt', content: 'y'.repeat(11) }),
+    'The write did nothing: "ref/big.txt" would be 11 bytes, past the 10-byte limit this mount sets on a file, so the workspace couldn\'t keep it. Content within the limit is written. '
+    + "The limit is the mount's maxFileSize setting, which only whoever runs the host can change.");
 });
 
 test("a direct mount that doesn't follow links refuses a write, an edit or a deletion at a link, and one that follows them writes the file a link leads to inside the mount, leaving the link", { skip: process.platform === 'win32' ? 'symlinks need privileges' : false }, async (t) => {
@@ -1312,9 +1317,10 @@ test("a direct mount that doesn't follow links refuses a write, an edit or a del
   writeFileSync(outside, 'outside\n');
   symlinkSync(outside, join(env.ref, 'out.txt'));
   const strict = await env.open();
-  assert.equal(await failure(strict, 'write', { path: 'ref/link.txt', content: 'new\n' }), 'The write did nothing to ref/link.txt: a symlink, which this mount does not follow.');
-  assert.equal(await failure(strict, 'edit', { path: 'ref/link.txt', oldString: 'real', newString: 'new' }), 'Symlinks are not allowed: ref/link.txt');
-  assert.equal(await failure(strict, 'delete', { path: 'ref/link.txt' }), 'Symlinks are not allowed: ref/link.txt');
+  assert.equal(await failure(strict, 'write', { path: 'ref/link.txt', content: 'new\n' }), `The write did nothing to "ref/link.txt": a symlink, which this mount does not follow. Calling again won't change that; whoever runs this host can set followSymlinks: true on this mount if it leads inside the mount, mount what it leads to, or a directory that holds it, if it leads outside, or remove it if it leads nowhere.`);
+  const notFollowed = `"ref/link.txt" is a symlink, and its mount doesn't follow symlinks, so the workspace's tools don't go through it. Calling again won't change that; whoever runs this host can set followSymlinks: true on this mount if it leads inside the mount, mount what it leads to, or a directory that holds it, if it leads outside, or remove it if it leads nowhere.`;
+  assert.equal(await failure(strict, 'edit', { path: 'ref/link.txt', oldString: 'real', newString: 'new' }), `The edit did nothing: ${notFollowed}`);
+  assert.equal(await failure(strict, 'delete', { path: 'ref/link.txt' }), `The delete did nothing: ${notFollowed}`);
 
   const following = await env.open({ followSymlinks: true });
   await data(following, 'edit', { path: 'ref/link.txt', oldString: 'real', newString: 'edited' });
@@ -1323,8 +1329,13 @@ test("a direct mount that doesn't follow links refuses a write, an edit or a del
   await data(following, 'write', { path: 'ref/link.txt', content: 'written\n' });
   assert.equal(readlinkSync(join(env.ref, 'link.txt')), 'real.txt');
   assert.equal(env.text('real.txt'), 'written\n');
-  assert.equal(await failure(following, 'write', { path: 'ref/out.txt', content: 'new\n' }), 'The write did nothing to ref/out.txt: a symlink that leaves the mount.');
+  assert.equal(await failure(following, 'write', { path: 'ref/out.txt', content: 'new\n' }), `The write did nothing to "ref/out.txt": a symlink that leaves the mount. Calling again won't change that; nothing done through this mount reaches what it leads to, and whoever runs this host can mount it, or a directory that holds it.`);
   assert.equal(readFileSync(outside, 'utf8'), 'outside\n');
+  const outsideDir = join(env.root, 'outside-dir');
+  mkdirSync(outsideDir);
+  symlinkSync(outsideDir, join(env.ref, 'outdir'));
+  assert.equal(await failure(following, 'write', { path: 'ref/outdir/new.txt', content: 'new\n' }), `The write did nothing to "ref/outdir/new.txt": a parent directory resolves outside the mount. Calling again won't change that; nothing done through this mount reaches where it resolves, and whoever runs this host can mount that place.`);
+  assert.equal(existsSync(join(outsideDir, 'new.txt')), false);
   // Two paths to one file in one edit_many would rename over each other, so
   // they're refused, with nothing written.
   const aliased = await failure(following, 'edit_many', {
@@ -1394,7 +1405,7 @@ test('writeBinary writes a direct mount\'s disk, whole, as a write does', async 
   const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 1, 2]);
   assert.deepEqual(await m.writeBinary('ref/img/dot.png', bytes, 'image/png', { agentName: 'scout' }), {
     success: true,
-    data: { path: 'ref/img/dot.png', size: 7, mimeType: 'image/png' },
+    data: { path: 'ref/img/dot.png', size: 7, mimeType: 'image/png', disk: 'done' },
   });
   assert.deepEqual(readFileSync(join(env.ref, 'img/dot.png')), bytes);
   assert.deepEqual(env.staged(), []);

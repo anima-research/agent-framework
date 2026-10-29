@@ -96,6 +96,9 @@ export interface McplAudioContent {
   disposition?: 'never' | 'ref';
 }
 
+/** MCPL's reference block (RFC-005 §3). A `resource` block with no `uri` of
+ *  its own may be MCP's embedded resource instead, its contents under
+ *  `resource`, which classifyBlock tells apart and shows as its contents. */
 export interface McplResourceContent {
   type: 'resource';
   /** Resource URI (e.g., "memory://facts/12345") */
@@ -190,6 +193,9 @@ export interface McplHostCapabilities {
   modelInfo?: boolean;
   featureSets?: boolean;
   channels?: boolean | McplChannelCapabilities;
+  /** RFC-014 §6.3: this host presents tool hints. Sent to every server
+   *  with hints (McplServerConfig.toolHints: on unless false). */
+  toolHints?: boolean;
 }
 
 /** Channel capability leaves (§14.1). `observe` was the pre-0.5 name for
@@ -308,9 +314,26 @@ export interface McplServerConfig {
   tokenTransport?: 'query' | 'header';
 
   /**
+   * Require a provider credential on every WebSocket dial, including reconnect.
+   * Only true enables this; false, null and omission preserve optional credentials.
+   * Requires tokenTransport 'header', no static token (even empty), and no URL
+   * token parameter, userinfo or fragment. HTTP, stdio and modern servers cannot
+   * use this option. Cleartext ws:// is allowed only to localhost or a literal
+   * loopback address.
+   * Missing, throwing, empty or non-sendable providers fail without connecting;
+   * printable ASCII credentials with no space at either end have no length floor.
+   * Redirects are never followed. Refused upgrades need a finite numeric status:
+   * 401/403 yield credential-rejected; missing status yields engine-unsupported.
+   * Provider failures yield provider-failed; other dial failures yield
+   * connection-failed. Diagnostic redaction is unchanged.
+   */
+  credentialRequired?: boolean;
+
+  /**
    * Lazily resolves the connection credential at EVERY dial — first connect
    * and each background reconnect — overriding `token` when it returns a
-   * value (null/throw falls back to `token`). Host-attached plumbing, never
+   * value (null/throw falls back to `token`, except under `credentialRequired`,
+   * where they fail the dial). Host-attached plumbing, never
    * serialized: the point is that credentials stay out of the agent's
    * context entirely (the agent asks for access by name; the host fetches
    * something fresh each redial, which also makes short-lived credentials
@@ -378,7 +401,9 @@ export interface McplServerConfig {
    *
    * `disabledCapabilities` takes precedence on conflict. `version` and
    * `featureSets` are not maskable here — feature sets have their own
-   * enable/disable knobs above.
+   * enable/disable knobs above — and neither are RFC-014's `toolHints`,
+   * `toolsets` and `surface`, which a server's own `toolHints` config turns
+   * off.
    */
   enabledCapabilities?: string[];
 
@@ -498,6 +523,37 @@ export interface McplServerConfig {
    * See src/mcpl/tool-lifecycle.ts.
    */
   toolLifecycle?: import('./tool-lifecycle.js').ToolLifecycleConfig;
+
+  /**
+   * MCPL RFC-014 (tool presence, toolsets and surfaces). On unless set to
+   * `false`: the host advertises `experimental.mcpl.toolHints` and honours
+   * hints (through the `toolsets` meta-tools) only from a server that
+   * advertised `toolHints` too. Such a server's static tools stay in the tool
+   * list as before, and its dynamic tools (toolset tools, `mcpl/presence:
+   * "dynamic"`) leave it: they are announced in the conversation as they
+   * become visible and invisible, and called through `toolsets--act`, opened
+   * with `toolsets--open`, inspected with `toolsets--look` and closed with
+   * `toolsets--close`. A server that doesn't advertise `toolHints` lists every
+   * tool as before. `false` advertises nothing and treats every tool as
+   * static. Omitted and null are on unless a module given to `create()`
+   * holds the name `toolsets` (or a restart is moving a server to that
+   * prefix, which is refused); `true` with such a module is refused.
+   */
+  toolHints?: boolean;
+
+  /**
+   * How this server is presented to agents at first (the host's own
+   * toolsets, src/host-presentation.ts): `'full'` (the default) puts its
+   * tools in the tool list, as before; `'tab'` keeps it connected, its events
+   * still arriving, with none of its tools in the tool list until an agent
+   * opens its tab (`toolsets--open {server}`) and calls them through
+   * `toolsets--act`; `'closed-tab'` leaves it disconnected until an agent
+   * opens it. Each agent can switch it later (`toolsets--close {server}`,
+   * with `disconnect: true` for a closed tab; `toolsets--open {server,
+   * full: true}` back into the tool list), and that choice is kept across
+   * restarts beside the store, over this default.
+   */
+  presentation?: 'full' | 'tab' | 'closed-tab';
 }
 
 // ============================================================================

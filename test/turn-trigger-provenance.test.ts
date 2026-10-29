@@ -12,6 +12,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
 import type { InferenceRequest } from '../src/index.js';
+import { MembraneError } from '@animalabs/membrane';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 function internals(framework: AgentFramework) {
@@ -144,11 +145,19 @@ describe('Turn trigger provenance', () => {
     await framework.stop();
   });
 
-  it('a context-budget restart keeps the channel for routing but names no author', async () => {
+  it('a context-budget restart batched with an addressed wake starts alone, naming no author, and the wake then starts a turn of its own', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'continuing' }]));
     const framework = await makeFramework();
     const i = internals(framework);
-    const captured = spy(framework);
+    const handed: Array<InferenceRequest | undefined> = [];
+    const orig = i.startAgentStream.bind(framework);
+    i.startAgentStream = async (agent: unknown, trigger?: InferenceRequest) => {
+      handed.push(trigger);
+      // The mock hands a stream every response queued when it's made, so the
+      // second turn's answer is queued as that turn starts.
+      if (handed.length === 2) membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi alice' }]));
+      return orig(agent, trigger);
+    };
     const t = Date.now();
     i.pendingRequests.push(
       { agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: t,
@@ -158,9 +167,54 @@ describe('Turn trigger provenance', () => {
     await i.processInferenceRequests();
     await framework.runUntilIdle();
 
-    assert.equal(captured.handed?.reason, 'context_budget_restart');
-    assert.equal(captured.handed?.channelId, 'discord:g:alice-room', 'routing channel is kept');
-    assert.equal(captured.handed?.counterparty, undefined, 'a restart is its own cause — no borrowed author');
+    assert.deepEqual(handed.map((r) => r?.reason), ['context_budget_restart', 'mcpl:channel-incoming'],
+      'the restart starts alone, and the wake starts a turn of its own after it');
+    assert.equal(handed[0]?.counterparty, undefined, 'a restart is its own cause: no borrowed author');
+    assert.equal(handed[0]?.channelId, undefined, "nor the wake's channel");
+    assert.equal(handed[1]?.channelId, 'discord:g:alice-room');
+    assert.equal(handed[1]?.counterparty, 'discord:user:alice', "the wake's turn names its own author");
+    await framework.stop();
+  });
+  it('a wake merged again after a stated wait held it answers the newest addressed message, as one merge of its wakes does', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi bob' }]));
+    const framework = await makeFramework();
+    const i = internals(framework) as ReturnType<typeof internals> & {
+      withAuxiliaryAdmission<T>(agentName: string, run: () => Promise<T>, model?: string): Promise<T>;
+      providerAccelerationCooldowns: Map<string, { heldRequests: InferenceRequest[] }>;
+    };
+    const handed: Array<InferenceRequest | undefined> = [];
+    const orig = i.startAgentStream.bind(framework) as (...args: unknown[]) => Promise<void>;
+    (i as unknown as { startAgentStream: (...args: unknown[]) => Promise<void> }).startAgentStream = (...args) => {
+      handed.push(args[1] as InferenceRequest | undefined);
+      return orig(...args);
+    };
+    const t = Date.now();
+    let fail!: (error: Error) => void;
+    const auxiliary = i.withAuxiliaryAdmission('scout', () => new Promise<void>((_, reject) => { fail = reject; }), 'test-model').catch(() => {});
+    i.pendingRequests.push(
+      { agentName: 'scout', reason: 'timer', source: 'clock', timestamp: t - 3_000 },
+      { agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: t - 1_000,
+        channelId: 'discord:g:bob-room', counterparty: 'discord:user:bob', addressed: true },
+    );
+    await i.processInferenceRequests();
+    fail(new MembraneError({ type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 60_000,
+      message: 'rate limit reached', rawError: { status: 429 } } as ConstructorParameters<typeof MembraneError>[0]));
+    await auxiliary;
+    const deadline = performance.now() + 10_000;
+    while ((i.providerAccelerationCooldowns.get('scout')?.heldRequests.length ?? 0) === 0) {
+      assert.ok(performance.now() < deadline, 'the merged wake held by the wait');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    i.pendingRequests.push(
+      { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: t,
+        channelId: 'discord:dm:alice', addressed: true, counterparty: 'discord:user:alice', wakeAt: t - 2_000 },
+    );
+    await i.processInferenceRequests();
+    framework.releaseProviderWait('scout');
+    await i.processInferenceRequests();
+    await framework.runUntilIdle();
+    assert.equal(handed.at(-1)?.channelId, 'discord:g:bob-room', 'the newer addressed event wins');
+    assert.equal(handed.at(-1)?.counterparty, 'discord:user:bob');
     await framework.stop();
   });
 });

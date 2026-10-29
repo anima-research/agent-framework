@@ -22,7 +22,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WebSocketServer } from 'ws';
 
-import { McplTransport, StdioTransport, type TransportCloseInfo } from '../src/mcpl/transport.js';
+import { McplTransport, StdioTransport, setStdioExitGraceForTests, type TransportCloseInfo } from '../src/mcpl/transport.js';
 import { McplRequestError, McplServerConnection } from '../src/mcpl/server-connection.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 import { AgentFramework } from '../src/framework.js';
@@ -314,8 +314,7 @@ test("a read error on a child's stderr reaches the transport's 'error' listener 
 test("a read error on a child's stdout that arrives while close() runs is not thrown", { timeout: 10_000 }, async (t) => {
   const transport = await spawnDeafChild(t, 'pipes-closing');
   const child = (transport as unknown as { child: ChildProcess }).child;
-  // destroy() emits the error on the next tick, after close() has closed
-  // readline, which takes readline's own listener off the stream.
+  // destroy() emits the error on the next tick, so it arrives while close() runs.
   child.stdout!.destroy(new Error('injected stdout read failure'));
   const closed = new Promise<TransportCloseInfo>((resolve) => { transport.once('close', resolve); });
   await transport.close();
@@ -566,6 +565,41 @@ test("a failed write to a child that ignores SIGTERM ends it with SIGKILL 2 s la
   assert.equal(info.reason, 'child process exited, and its pipe failed with write EPIPE');
   assert.equal(received(signals), 1, 'one SIGTERM, then SIGKILL');
   assert.equal(logged.filter((line) => line.includes('ignored SIGTERM for 2000ms')).length, 1, logged.join('\n'));
+});
+
+test("a child given a test's exit grace waits only that grace after a pipe failure, as after SIGTERM and SIGKILL", { timeout: 15_000 }, async (t) => {
+  // Hooks run in the order they're added, and the mocked clock lasts into them, so
+  // this one goes first: when a failed assertion leaves the escalation partway, it
+  // puts back real timers and kill() and ends the child, so the helper's close() ends.
+  let restore = () => {};
+  t.after(() => restore());
+  const signals = signalsFile(t);
+  const transport = await spawnDeafStubbornChild(t, 'deaf-short-grace', signals);
+  captureConsoleError(t);
+  const child = (transport as unknown as { child: ChildProcess & { kill: (signal?: number | string) => boolean } }).child;
+  const realKill = child.kill.bind(child);
+  const sent: string[] = [];
+  child.kill = (signal?: number | string) => { sent.push(String(signal ?? 'SIGTERM')); return true; }; // it can exit by no means
+  setStdioExitGraceForTests(child, 50);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  restore = () => { t.mock.timers.reset(); child.kill = realKill; realKill('SIGKILL'); };
+  const settle = () => new Promise<void>((done) => { setImmediate(done); });
+  transport.writeLine('{}');
+  for (const deadline = Date.now() + 5000; transport.pipeFailure === undefined; await settle()) {
+    if (Date.now() > deadline) throw new Error('timed out waiting for the write to fail');
+  }
+  t.mock.timers.tick(49);
+  await settle();
+  assert.deepEqual(sent, [], 'nothing is sent within the 50 ms the child has to exit after the pipe error');
+  t.mock.timers.tick(1);
+  await settle();
+  assert.deepEqual(sent, ['SIGTERM'], 'SIGTERM once those 50 ms end');
+  t.mock.timers.tick(50);
+  await settle();
+  assert.deepEqual(sent, ['SIGTERM', 'SIGKILL'], 'SIGKILL 50 ms later');
+  const unreaped = new Promise<Error>((resolve) => { transport.once('unreaped', resolve); });
+  t.mock.timers.tick(50);
+  assert.match((await unreaped).message, /did not exit within 50ms of SIGKILL; it could not be reaped$/);
 });
 
 test("close() during a pipe failure's escalation shares its attempt: one SIGTERM, one SIGKILL", { timeout: 15_000 }, async (t) => {

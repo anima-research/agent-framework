@@ -20,10 +20,12 @@ import { WebSocketServer } from 'ws';
 // The compiled test sits in dist/test/, beside dist/src/.
 const BIN = fileURLToPath(new URL('../src/api/mcp-server.js', import.meta.url));
 const CORE = fileURLToPath(new URL('../src/api/mcp-server-core.js', import.meta.url));
+const LINE_READER = fileURLToPath(new URL('../src/line-reader.js', import.meta.url));
 const ROOT_MODULE = fileURLToPath(new URL('../src/index.js', import.meta.url));
 // The repository root, from which mcp-wrapper.sh runs the built file.
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 
+const LONGER_THAN_ANY_START_MS = 60_000;
 const made: string[] = [];
 after(() => {
   for (const dir of made) rmSync(dir, { recursive: true, force: true });
@@ -58,10 +60,11 @@ function start(file: string, args: string[], env: Record<string, string>, cwd?: 
   return { endStdin: () => child.stdin.end(), kill: () => child.kill(), exited };
 }
 
-function within<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+function within<T>(promise: Promise<T>, what: string): Promise<T> {
   return Promise.race([
     promise,
-    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${what} within ${ms} ms`)), ms).unref()),
+    new Promise<T>((_, reject) => setTimeout(
+      () => reject(new Error(`${what} within ${LONGER_THAN_ANY_START_MS} ms`)), LONGER_THAN_ANY_START_MS).unref()),
   ]);
 }
 
@@ -85,13 +88,13 @@ test("run through npm's link, or by its own path, the command starts the server,
     const run = start(file, args, { AGENT_FRAMEWORK_WS_URL: api.url }, cwd);
     try {
       try {
-        await within(api.connected, 10_000, `${how}: the server connected to the stand-in API`);
+        await within(api.connected, `${how}: the server connected to the stand-in API`);
       } catch (error) {
         run.kill();
         throw new Error(`${(error as Error).message}; stderr: ${(await run.exited).stderr}`);
       }
       run.endStdin();
-      const { code } = await within(run.exited, 10_000, `${how}: the server exited after stdin closed`);
+      const { code } = await within(run.exited, `${how}: the server exited after stdin closed`);
       assert.equal(code, 0, how);
       assert.equal(api.connections(), 1, how);
     } finally {
@@ -108,14 +111,16 @@ test('importing the package, or running its server module under the command\'s n
   const entry = join(dir, 'entry.mjs');
   writeFileSync(entry, `const { McpServer } = await import(${rootUrl});\nif (typeof McpServer !== 'function') process.exit(2);\n`);
   // An application bundling the package carries the server's module, never
-  // the command: this copy, under the command's file name and beside the
-  // original so it resolves 'ws' as the module does, is that bundle run as
-  // the entry point. It used to start the server.
-  const bundleDir = join(dirname(CORE), `bundle-${process.pid}`);
-  mkdirSync(bundleDir);
+  // the command: this copy, under the command's file name, with the module it
+  // imports at the path it imports it from, and inside the package so it
+  // resolves 'ws' as the module does, is that bundle run as the entry point.
+  // It used to start the server.
+  const bundleDir = join(dirname(CORE), '..', `bundle-${process.pid}`);
+  mkdirSync(join(bundleDir, 'api'), { recursive: true });
   made.push(bundleDir);
-  const bundle = join(bundleDir, 'mcp-server.js');
+  const bundle = join(bundleDir, 'api', 'mcp-server.js');
   copyFileSync(CORE, bundle);
+  copyFileSync(LINE_READER, join(bundleDir, 'line-reader.js'));
   const cases: Array<[string, string[], string | undefined]> = [
     ['a host that imports the package root, from an entry script of its own', [entry], undefined],
     ['the package root imported under `node -e`', ['--input-type=module', '-e', `await import(${rootUrl});`], undefined],
@@ -126,7 +131,7 @@ test('importing the package, or running its server module under the command\'s n
     const run = start(process.execPath, args, { AGENT_FRAMEWORK_WS_URL: api.url }, cwd);
     try {
       run.endStdin();
-      const { code, stderr } = await within(run.exited, 30_000, `${what}: the run finished`);
+      const { code, stderr } = await within(run.exited, `${what}: the run finished`);
       assert.equal(code, 0, `${what}: ${stderr}`);
       assert.equal(stderr, '', what);
       assert.equal(api.connections(), 0, `${what}: nothing connected to the API`);
@@ -139,7 +144,51 @@ test('importing the package, or running its server module under the command\'s n
   // `exports` names only the root, so Node refuses it before loading anything.
   const deep = start(process.execPath, ['--input-type=module', '-e', "await import('@animalabs/agent-framework/dist/src/api/mcp-server.js');"], {}, ROOT);
   deep.endStdin();
-  const refused = await within(deep.exited, 30_000, 'the deep import finished');
+  const refused = await within(deep.exited, 'the deep import finished');
   assert.notEqual(refused.code, 0);
   assert.match(refused.stderr, /ERR_PACKAGE_PATH_NOT_EXPORTED/);
+});
+
+test('a request on stdin holding U+2028 or U+2029 inside a string gets its answer, and no parse error', async () => {
+  const api = await standInApi();
+  const child = spawn(process.execPath, [BIN], { env: { PATH: process.env.PATH ?? '', AGENT_FRAMEWORK_WS_URL: api.url }, stdio: ['pipe', 'pipe', 'pipe'] });
+  try {
+    await within(api.connected, 'the server connected to the stand-in API');
+    let out = '';
+    const lastAnswered = new Promise<void>((resolve) => child.stdout.on('data', (chunk) => {
+      out += String(chunk);
+      if (out.endsWith('\n') && out.includes('"id":9')) resolve();
+    }));
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'ping', params: { note: 'one\u2028two' } }) + '\n');
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 8, method: 'ping', params: { note: 'one\u2029two' } }) + '\n');
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'ping' }) + '\n');
+    await within(lastAnswered, 'the server answered the last ping');
+    const answers = out.split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    assert.deepEqual(answers, [7, 8, 9].map((id) => ({ jsonrpc: '2.0', id, result: {} })));
+  } finally {
+    child.kill();
+    await api.close();
+  }
+});
+
+test("the command's answers on stdout carry U+2028 and U+2029 escaped, and parse back to the same text", async () => {
+  const api = await standInApi();
+  const child = spawn(process.execPath, [BIN], { env: { PATH: process.env.PATH ?? '', AGENT_FRAMEWORK_WS_URL: api.url }, stdio: ['pipe', 'pipe', 'pipe'] });
+  try {
+    await within(api.connected, 'the server connected to the stand-in API');
+    let out = '';
+    const answered = new Promise<void>((resolve) => child.stdout.on('data', (chunk) => {
+      out += String(chunk);
+      if (out.endsWith('\n') && out.includes('"id":9')) resolve();
+    }));
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'no\u2028such\u2029method' }) + '\n');
+    await within(answered, 'the server answered');
+    assert.equal(/[\u2028\u2029]/.test(out), false, out);
+    const answer = JSON.parse(out.trim());
+    assert.equal(answer.id, 9);
+    assert.equal(answer.error.message, 'Method not found: no\u2028such\u2029method');
+  } finally {
+    child.kill();
+    await api.close();
+  }
 });

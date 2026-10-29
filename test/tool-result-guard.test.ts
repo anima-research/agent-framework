@@ -34,6 +34,18 @@ const AUDIT_STUB = 'Tool result withheld by the guard. The tool has already exec
 const UNSAVED_STUB = 'Tool result withheld by the guard. The tool has already executed. Its result went to ' +
   "the guard's audit record (framework/tool-result-guard), for an operator, though saving that record had failed " +
   'when the result arrived.';
+const REFUSED_AUDIT_STUB = "Tool result withheld by the guard. The tool didn't run. Its result is kept in " +
+  "the guard's audit record (framework/tool-result-guard), for an operator.";
+const REFUSED_UNSAVED_STUB = "Tool result withheld by the guard. The tool didn't run. Its result went to " +
+  "the guard's audit record (framework/tool-result-guard), for an operator, though saving that record had failed " +
+  'when the result arrived.';
+const ERROR_AUDIT_STUB = "Tool result withheld by the guard. The call returned an error, and this notice can't say " +
+  "whether the tool ran. Its result is kept in the guard's audit record (framework/tool-result-guard), for an operator.";
+const ERROR_UNSAVED_STUB = "Tool result withheld by the guard. The call returned an error, and this notice can't say " +
+  "whether the tool ran. Its result went to the guard's audit record (framework/tool-result-guard), for an operator, " +
+  'though saving that record had failed when the result arrived.';
+const contentById = (blocks: Array<{ toolUseId?: string; content?: unknown }>) =>
+  Object.fromEntries(blocks.map((block) => [block.toolUseId, block.content]));
 
 const dirs: string[] = [];
 afterEach(() => { while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true }); });
@@ -51,6 +63,9 @@ class ScriptMembrane {
   streams: MockYieldingStream[] = [];
   retriesAtSubmission: number[] = [];
   onSubmit?: () => void;
+  /** A provider that hasn't answered the next round: a submission is taken
+   *  and the stream stays live with nothing to read, until it's cancelled. */
+  nextRoundUnanswered = false;
   constructor(readonly scripts: NormalizedResponse[][]) {}
   streamYielding(request: NormalizedRequest, options: YieldingStreamOptions = {}) {
     this.requests.push(structuredClone({ ...request, onCacheWireReceipt: undefined }));
@@ -61,7 +76,7 @@ class ScriptMembrane {
     stream.provideToolResults = (...args) => {
       this.retriesAtSubmission.push(options.refusalRetries ?? 0);
       this.onSubmit?.();
-      provide(...args);
+      if (!this.nextRoundUnanswered) provide(...args);
     };
     this.streams.push(stream);
     return stream;
@@ -201,11 +216,12 @@ test('withholds the entire latest batch, retries inference once, and keeps origi
     assert.ok(!JSON.stringify(retry).includes(image));
     assert.equal(retry.messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_use').length, 3);
     const retried = retry.messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_result');
-    assert.ok(retried.length === 3 && retried.every((b) => b.content === AUDIT_STUB),
+    const stubs = { text: AUDIT_STUB, image: AUDIT_STUB, error: ERROR_AUDIT_STUB };
+    assert.deepEqual(contentById(retried as Array<{ toolUseId?: string; content?: unknown }>), stubs,
       'the retry already says where each original is');
     const guarded = toolResults(h.framework);
     assert.equal(guarded.length, 3);
-    assert.ok(guarded.every((block) => block.content === AUDIT_STUB));
+    assert.deepEqual(contentById(guarded as Array<{ toolUseId?: string; content?: unknown }>), stubs);
     assert.equal(guarded.find((b) => b.toolUseId === 'error')?.isError, true);
     assert.deepEqual(h.module.speeches, ['continued']);
     assert.ok(strategy.snapshots.every((s) => !s.includes('original-text-payload') && !s.includes(image)),
@@ -220,18 +236,72 @@ test('withholds the entire latest batch, retries inference once, and keeps origi
     assert.deepEqual(audit[0], historical[0], 'redaction only appends; original Chronicle record is unchanged');
     const original = structuredClone(audit[0]);
     extension(h.framework).update('assistant', { tool_result_guard: false });
-    assert.ok(toolResults(h.framework).every((block) => block.content === AUDIT_STUB));
+    assert.deepEqual(contentById(toolResults(h.framework) as Array<{ toolUseId?: string; content?: unknown }>), stubs);
     await h.framework.stop();
     originalStopped = true;
     const restarted = await AgentFramework.create(h.base);
     try {
       assert.equal(extension(restarted).get('assistant').tool_result_guard, false, 'explicit disable persists');
-      assert.ok(toolResults(restarted).every((block) => block.content === AUDIT_STUB));
+      assert.deepEqual(contentById(toolResults(restarted) as Array<{ toolUseId?: string; content?: unknown }>), stubs);
       assert.deepEqual((restarted.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as unknown[])[0], original);
       const preview = await restarted.previewActivation('assistant');
       assert.doesNotMatch(JSON.stringify(preview), /original-text-payload|original-error-payload/);
     } finally { await restarted.stop(); }
   } finally { if (!originalStopped) await h.framework.stop(); }
+});
+
+const ranBarredFailed = () => createMockResponse([
+  { type: 'tool_use', id: 'ran', name: 'test--read', input: {} },
+  { type: 'tool_use', id: 'barred', name: 'test--send_message', input: {} },
+  { type: 'tool_use', id: 'failed', name: 'test--read', input: {} },
+  { type: 'tool_use', id: 'unflagged', name: 'test--read', input: {} },
+], 'tool_use');
+const failedResult = {
+  failed: { success: false, isError: true, error: 'the read failed' },
+  unflagged: { success: false, isError: false, error: 'nothing matched' },
+};
+
+test("a withheld batch says a refused call's tool didn't run, an error result's may not have, and one that ran did", async () => {
+  const h = await harness([[ranBarredFailed(), refused()], [answer()]],
+    { toolResultGuard: true, allowedTools: ['test--read'] }, failedResult);
+  let staged: Record<string, unknown> | undefined;
+  h.membrane.onSubmit = () => { staged = contentById(toolResults(h.framework) as Array<{ toolUseId?: string; content?: unknown }>); };
+  try {
+    await h.run();
+    assert.deepEqual(h.module.calls.sort(), ['failed', 'ran', 'unflagged'], 'the refused call never reached its tool');
+    assert.deepEqual(staged, {
+      ran: 'Tool result withheld by the guard. The tool has already executed.',
+      barred: "Tool result withheld by the guard. The tool didn't run.",
+      failed: "Tool result withheld by the guard. The call returned an error, and this notice can't say whether the tool ran.",
+      unflagged: 'Tool result withheld by the guard. The tool has already executed.',
+    }, 'the history reads the same while the batch is staged');
+    const expected = { ran: AUDIT_STUB, barred: REFUSED_AUDIT_STUB, failed: ERROR_AUDIT_STUB, unflagged: AUDIT_STUB };
+    const retried = h.membrane.requests[1].messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_result');
+    assert.deepEqual(contentById(retried as Array<{ toolUseId?: string; content?: unknown }>), expected, 'the retry reads them');
+    assert.deepEqual(contentById(toolResults(h.framework) as Array<{ toolUseId?: string; content?: unknown }>), expected,
+      'and so does the history');
+  } finally { await h.framework.stop(); }
+});
+
+test("when the audit can't be saved, each placeholder sent says what its stub says of whether the tool ran", async () => {
+  const h = await harness([[ranBarredFailed(), answer()]], { toolResultGuard: true, allowedTools: ['test--read'] }, failedResult);
+  const store = h.framework.getStore();
+  const sync = store.sync.bind(store);
+  (store as { sync: () => void }).sync = () => {
+    if (h.framework.getAgent('assistant')!.toolResultGuard.hasPending) throw new Error('disk full');
+    sync();
+  };
+  try {
+    await h.run();
+    assert.deepEqual(contentById(h.membrane.streams[0].receivedToolResults[0] as Array<{ toolUseId?: string; content?: unknown }>), {
+      ran: 'Tool result withheld by the guard. The tool has already executed.',
+      barred: "Tool result withheld by the guard. The tool didn't run.",
+      failed: "Tool result withheld by the guard. The call returned an error, and this notice can't say whether the tool ran.",
+      unflagged: 'Tool result withheld by the guard. The tool has already executed.',
+    });
+    assert.deepEqual(contentById(toolResults(h.framework) as Array<{ toolUseId?: string; content?: unknown }>),
+      { ran: UNSAVED_STUB, barred: REFUSED_UNSAVED_STUB, failed: ERROR_UNSAVED_STUB, unflagged: UNSAVED_STUB });
+  } finally { (store as { sync: () => void }).sync = sync; await h.framework.stop(); }
 });
 
 test('successful physical rounds admit results; refusal affects only the newest batch', async () => {
@@ -266,9 +336,13 @@ test('durable typed agent setting can be enabled, disabled, and explicitly reset
   let originalStopped = false;
   try {
     const ext = extension(h.framework);
-    for (const value of ['true', 1, null, {}]) {
-      assert.throws(() => ext.update('assistant', { tool_result_guard: value }), /must be a boolean/);
+    for (const value of ['yes', 1, null, {}]) {
+      assert.throws(() => ext.update('assistant', { tool_result_guard: value }), /tool_result_guard must be true or false, not /);
     }
+    ext.update('assistant', { tool_result_guard: 'true' });
+    assert.equal(ext.get('assistant').tool_result_guard, true, 'the text "true" reads as true');
+    ext.update('assistant', { tool_result_guard: 'false' });
+    assert.equal(ext.get('assistant').tool_result_guard, false, 'the text "false" reads as false');
     ext.update('assistant', { tool_result_guard: true });
     assert.equal(ext.get('assistant').tool_result_guard, true);
     await h.framework.stop();
@@ -1937,6 +2011,17 @@ test('#277: a withheld original is written to the workspace, and its stub names 
   } finally { await h.framework.stop(); }
 });
 
+test('an error result whose original is in a workspace file tells the agent to read it before calling again', async () => {
+  const h = await workspaceHarness([[calls('one'), refused()], [answer()]]);
+  (h.module.results as Record<string, ToolResult>).one = { success: false, isError: true, error: 'the read failed' };
+  try {
+    await h.run();
+    const stub = String(toolResults(h.framework)[0].content);
+    assert.match(stub, /^Tool result withheld by the guard\. The call returned an error, and this notice can't say whether the tool ran\. Its result is in workspace file work\/tool-results\/\S+-0-one\.txt\. Read it before calling again\.$/);
+    assert.doesNotMatch(stub, /refus|test-category/, "#159's line: no refusal or category in the context");
+  } finally { await h.framework.stop(); }
+});
+
 test('#281: a withheld result over the inline cap is written as stored, and its own note names the whole output', async () => {
   const h = await workspaceHarness([[calls('one'), refused()], [answer()]]);
   (h.module.results as Record<string, ToolResult>).one = { success: true, data: `long-${'x'.repeat(400)}` };
@@ -2099,6 +2184,22 @@ test('#277: the stub has the same text for each place the original can be', () =
   }
 });
 
+test("an error result's stub says to read its original only where the file is known written", () => {
+  const error = "Tool result withheld by the guard. The call returned an error, and this notice can't say whether the tool ran.";
+  const audit = "the guard's audit record (framework/tool-result-guard), for an operator";
+  assert.equal(withheldResultNotice({ path: 'work/tool-results/a.txt' }, true, undefined, 'error'),
+    `${error} Its result is in workspace file work/tool-results/a.txt. Read it before calling again.`);
+  assert.equal(withheldResultNotice({ path: 'work/tool-results/x.txt', error: 'disk full' }, true, undefined, 'error'),
+    `${error} Writing its result to workspace file work/tool-results/x.txt failed, so it is kept only in ${audit}.`);
+  assert.equal(withheldResultNotice({ path: 'work/tool-results/y.txt', unfinished: true }, true, undefined, 'error'),
+    `${error} Its result was still being written to workspace file work/tool-results/y.txt when this note ` +
+    `was made; if that file is missing, it is kept in ${audit}.`);
+  assert.equal(withheldResultNotice(null, true, undefined, 'error'), ERROR_AUDIT_STUB);
+  assert.equal(withheldResultNotice({ skipped: 'branch_changed' }, true, undefined, 'error'), ERROR_AUDIT_STUB);
+  assert.equal(withheldResultNotice({ path: 'work/tool-results/a.txt' }, true, undefined, 'refused'),
+    "Tool result withheld by the guard. The tool didn't run. Its result is in workspace file work/tool-results/a.txt.");
+});
+
 test('#277: direct API: a request after an aborted batch is compiled once its stub is annotated', async () => {
   const h = await harness([], { toolResultGuard: true });
   const responses: unknown[] = [calls('one'), { aborted: true, reason: 'test-abort' }, answer()];
@@ -2191,6 +2292,47 @@ test("stop() over a running ephemeral run settles the run's pending batch before
     await bounded(completion, 'the run settling');
   } finally { await h.framework.stop(); }
   assert.match(outcome, /^rejected: Framework shutting down/, 'the run ends through the shutdown terminal');
+  assert.equal(spills, 1, "the aborted batch's original is written out for its stub");
+  const restarted = await AgentFramework.create(h.base);
+  try {
+    const audit = restarted.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
+    const settled = audit.filter((r) => r.agentName === 'ephemeral' && r.type === 'withheld').map((r) => r.reason);
+    assert.deepEqual(settled, ['aborted'], 'the batch is settled once, as aborted');
+  } finally { await restarted.stop(); }
+});
+
+test("a quiesce's abandon of an ephemeral run whose batch was just submitted rejects the run with the abandon and settles the batch", async () => {
+  // A host's stop-now is quiesce({ abandon: true }) and then stop(). The
+  // provider hasn't answered the round after the batch, so the stream is live
+  // when the drain gives up, and the abandon cancels it: the framework's own
+  // terminal settles the run, before the stop() that would otherwise end it.
+  const h = await harness([[calls('one'), answer()]]);
+  h.membrane.nextRoundUnanswered = true;
+  let spills = 0;
+  slowSpill(h.framework, async () => { spills++; });
+  const quiesces: Array<ReturnType<AgentFramework['quiesce']>> = [];
+  h.membrane.onSubmit = () => { queueMicrotask(() => { quiesces.push(h.framework.quiesce({ timeoutMs: 50, abandon: true })); }); };
+  const aborted: string[] = [];
+  h.framework.onTrace((event) => {
+    const { type, agentName, reason } = event as { type: string; agentName?: string; reason?: unknown };
+    if (type === 'inference:aborted' && agentName === 'ephemeral') aborted.push(String(reason));
+  });
+  let outcome = 'pending';
+  try {
+    const created = await h.framework.createEphemeralAgent({
+      name: 'ephemeral', model: 'test', systemPrompt: 'system', toolResultGuard: true,
+    });
+    created.contextManager.addMessage('user', [{ type: 'text', text: 'read' }]);
+    const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager)
+      .then(() => { outcome = 'resolved'; }, (e) => { outcome = `rejected: ${(e as Error).message}`; });
+    h.framework.start();
+    await bounded(completion, 'the run settling');
+    assert.equal(quiesces.length, 1, 'the quiesce was called at the submission');
+    const status = await bounded(quiesces[0]!, 'the quiesce resolving');
+    assert.equal(status.drained, true, 'the abandon drained the turn');
+    assert.deepEqual(aborted, ['quiesce_abandoned'], "one aborted terminal, the abandon's");
+  } finally { await h.framework.stop(); }
+  assert.equal(outcome, 'rejected: Turn abandoned by operator quiesce', 'the run rejects with the abandon');
   assert.equal(spills, 1, "the aborted batch's original is written out for its stub");
   const restarted = await AgentFramework.create(h.base);
   try {
@@ -2305,7 +2447,7 @@ const SETTLED_AS_IT_LEFT = ['staged', 'linked', 'withheld', 'annotated', 'stub_u
 // gone with it. Pinned for a failure whose stream ends only after the run's
 // caller has deregistered the agent, in both shapes, and for a run the
 // completion watchdog ends while its stream says nothing.
-for (const how of ['an uncaused error', 'an abort whose reason is timeout', 'the completion watchdog'] as const) {
+for (const how of ['an uncaused error', 'an abort whose reason is error', 'the completion watchdog'] as const) {
   test(`an ephemeral run that ends by ${how} with its batch pending settles the batch as it leaves`, async () => {
     const h = await harness([[calls('one')]]);
     if (how !== 'the completion watchdog') waitAfterTerminal(h.membrane, () => h.framework.getAgent('ephemeral') === null);
@@ -2318,8 +2460,8 @@ for (const how of ['an uncaused error', 'an abort whose reason is timeout', 'the
       stream.processResponse = () => {};
       if (how === 'an uncaused error') {
         stream.events.push({ type: 'error', error: new MembraneError({ type: 'auth', retryable: false, message: 'key revoked', rawError: { status: 401 } }) });
-      } else if (how === 'an abort whose reason is timeout') {
-        stream.events.push({ type: 'aborted', reason: 'timeout' });
+      } else if (how === 'an abort whose reason is error') {
+        stream.events.push({ type: 'aborted', reason: 'error' });
       }
     };
     let outcome = 'pending';
@@ -2340,7 +2482,7 @@ for (const how of ['an uncaused error', 'an abort whose reason is timeout', 'the
       assert.equal(created.agent.toolResultGuard.hasPending, false, 'the run left no batch pending');
     } finally { await h.framework.stop(); }
     assert.match(outcome, how === 'the completion watchdog' ? /^rejected: Ephemeral agent "ephemeral" stalled/
-      : how === 'an uncaused error' ? /^rejected: key revoked/ : /^rejected: Stream aborted: timeout/, 'the run ends as expected');
+      : how === 'an uncaused error' ? /^rejected: key revoked/ : /^rejected: Stream aborted: error/, 'the run ends as expected');
     assert.equal(spills, 1, "the batch's original is offered to the host's spill once");
     const audit = await ephemeralBatchAudit(h.base);
     assert.deepEqual(audit.types, SETTLED_AS_IT_LEFT, 'the batch is settled once, and its stub says where its original is');
@@ -3527,7 +3669,7 @@ test('#277: withheld materialize, sync and delete keep the files they acted on i
     assert.deepEqual(keptLists(materialize), { materialized: [{ mount: 'work', path: 'LOG.md' }] }, materialize);
     const synced = keptLists(sync) as { results: Array<{ mount: string; synced: string[] }> };
     assert.deepEqual(synced.results.map((r) => [r.mount, r.synced]), [['work', ['disk.txt']]], sync);
-    assert.deepEqual(keptLists(del), { path: 'work/LOG.md', deleted: true }, del);
+    assert.deepEqual(keptLists(del), { path: 'work/LOG.md', deleted: true, disk: 'waits for materialize with applyDeletions' }, del);
     for (const stub of [materialize, sync, del]) assert.match(stub, /^Tool result withheld by the guard\. The tool has already executed\. Its result is in workspace file /);
   } finally { await h.framework.stop(); }
 });
@@ -3720,12 +3862,16 @@ test('unguarded results are read after the direct compile', async () => {
   } finally { await h.framework.stop(); }
 });
 
-test('stop then start reopens withheld spills', async () => {
+test("a new framework on a stopped one's store spills withheld results: its spill gate is its own", async () => {
   const dir = mkdtempSync(join(tmpdir(), 'guard-restart-')); dirs.push(dir);
   const store = JsStore.openOrCreate({ path: join(dir, 'store') });
-  const framework = await AgentFramework.create({ store, membrane: new ScriptMembrane([]).asMembrane(),
+  const create = () => AgentFramework.create({ store, membrane: new ScriptMembrane([]).asMembrane(),
     agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system', toolResultGuard: true }],
     modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0 });
+  const first = await create();
+  first.start();
+  await first.stop();
+  const framework = await create();
   const f = framework as unknown as {
     toolResultFilePlace: () => unknown;
     writeToolResultFile: () => Promise<unknown>;
@@ -3734,8 +3880,6 @@ test('stop then start reopens withheld spills', async () => {
   let writes = 0;
   f.writeToolResultFile = async () => { writes++; return { path: 'work/original.txt' }; };
   try {
-    framework.start();
-    await framework.stop();
     framework.start();
     const guard = framework.getAgent('assistant')!.toolResultGuard;
     guard.storeResults([{ type: 'tool_result', toolUseId: 'one', content: 'original' }],
@@ -3747,11 +3891,61 @@ test('stop then start reopens withheld spills', async () => {
   } finally { await framework.stop(); store.close(); }
 });
 
-test('a framework compile from before stop cannot drive after restart', async () => {
+test('a stop() tried again lets withheld spills write until its own drain, as the first stop did until its own', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'guard-retried-stop-')); dirs.push(dir);
+  const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+  let entered!: () => void;
+  const inCall = new Promise<void>((resolve) => { entered = resolve; });
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => { release = resolve; });
+  const holder: Module = {
+    name: 'holder',
+    async start() {},
+    async stop() {},
+    async onProcess(event) { if (event.type === 'module-event') { entered(); await released; } return {}; },
+    getTools: () => [],
+    async handleToolCall(): Promise<never> { throw new Error('No tool calls expected'); },
+  };
+  const framework = await AgentFramework.create({ store, membrane: new ScriptMembrane([]).asMembrane(),
+    agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system', toolResultGuard: true }],
+    modules: [holder], syncIntervalMs: 0, maintenanceIntervalMs: 0 });
+  const f = framework as unknown as {
+    toolResultFilePlace: () => unknown;
+    writeToolResultFile: () => Promise<unknown>;
+  };
+  f.toolResultFilePlace = () => ({ path: 'work/original.txt', safeLabel: 'original' });
+  let writes = 0;
+  f.writeToolResultFile = async () => { writes++; return { path: 'work/original.txt' }; };
+  const guard = framework.getAgent('assistant')!.toolResultGuard;
+  const withhold = async (id: string) => {
+    guard.storeResults([{ type: 'tool_result', toolUseId: id, content: 'original' }],
+      [{ toolUseId: id, content: 'original' }], [], undefined, undefined);
+    guard.abandon('test');
+    await guard.whenAnnotated();
+  };
+  try {
+    framework.start();
+    framework.pushEvent({ type: 'module-event', source: 'holder', eventType: 'hold', payload: null } as ProcessEvent);
+    await inCall;
+    await assert.rejects(framework.stop(20), (error: unknown) => error instanceof Error && /pending: event loop/.test(error.message));
+    await withhold('after-first');
+    assert.equal(writes, 0, 'closed after the first stop drained');
+    const retry = framework.stop();
+    await withhold('during-retry');
+    assert.equal(writes, 1, 'open again while the retry waits');
+    assert.match(String(toolResults(framework).at(-1)!.content), /is in workspace file work\/original.txt/);
+    release();
+    await retry;
+    await withhold('after-retry');
+    assert.equal(writes, 1, 'closed again after the retry drained');
+  } finally { release(); await framework.stop().catch(() => {}); store.close(); }
+});
+
+test('a framework compile from before stop cannot drive once stop() has begun', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'guard-generation-')); dirs.push(dir);
   const store = JsStore.openOrCreate({ path: join(dir, 'store') });
-  // One scripted answer for the turn compiled before the stop, one for the turn begun after the restart.
-  const membrane = new ScriptMembrane([[answer()], [answer()]]);
+  // One scripted answer for the turn compiled before the stop.
+  const membrane = new ScriptMembrane([[answer()]]);
   const framework = await AgentFramework.create({ store, membrane: membrane.asMembrane(),
     agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system' }],
     modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0 });
@@ -3783,73 +3977,56 @@ test('a framework compile from before stop cannot drive after restart', async ()
       starting = (framework as unknown as { startAgentStream(a: typeof agent): Promise<void> }).startAgentStream(agent);
       await entered.opened;
       await framework.stop();
-      framework.start();
       compile.open();
       await starting;
     } finally { console.error = error; }
     assert.equal(driven, 0);
-    assert.ok(lines.some((line) => /stopped and started again/.test(line) && /dropped before it sends anything/.test(line)), lines.join('\n'));
+    assert.ok(lines.some((line) => /the framework was stopping/.test(line) && /dropped before it sends anything/.test(line)), lines.join('\n'));
     // The turn emitted inference:started before its compile, so it gets one
     // terminal event: a listener's bracket (a typing loop) closes.
     assert.deepEqual(turnEvents.map((event) => event.type), ['inference:started', 'inference:aborted']);
-    assert.match(turnEvents[1]?.reason ?? '', /stopped and started again.*dropped before it sends anything/);
+    assert.match(turnEvents[1]?.reason ?? '', /the framework was stopping.*dropped before it sends anything/);
     unsubscribe();
-    // A turn begun after the restart is admitted and drives its stream.
-    await (framework as unknown as { startAgentStream(a: typeof agent): Promise<void> }).startAgentStream(agent);
-    await until(() => driven === 1, 'the turn begun after the restart drives');
   } finally { compile.open(); await starting; await framework.stop(); store.close(); }
 });
 
-test("a dropped turn's cancel record is not read by the next turn's stream: its own error stays a failure", async () => {
-  // The dropped turn calls agent.cancelStream() on a stream no driver iterates,
-  // so the cancel record it leaves is never collected. The next stream's start
-  // clears it; were it left, that stream's genuine error would read it and end
-  // as a deliberate stop instead of a failure.
-  const dir = mkdtempSync(join(tmpdir(), 'guard-dropped-record-')); dirs.push(dir);
+test("a cancel record no driver collects is cleared by the next stream's start: that stream's own error stays a failure", async () => {
+  // agent.cancelStream() of a stream nobody iterates leaves a record no
+  // driver collects. The next stream's start clears it; were it left, that
+  // stream's genuine error would read it and end as a deliberate stop.
+  const dir = mkdtempSync(join(tmpdir(), 'guard-uncollected-record-')); dirs.push(dir);
   const store = JsStore.openOrCreate({ path: join(dir, 'store') });
-  // The dropped turn's answer, then the next turn's (made to error), then a retry's.
+  // The stream nobody iterates, then the next turn's (made to error), then a retry's.
   const membrane = new ScriptMembrane([[answer()], [answer()], [answer()]]);
   const framework = await AgentFramework.create({ store, membrane: membrane.asMembrane(),
     agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system' }],
     modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0 });
   const agent = framework.getAgent('assistant')!;
-  const compile = gate();
-  const entered = gate();
-  // The stream path compiles through the agent's own assembler
-  // (buildActivationRequest is only its wrapper for previews).
-  const hooked = agent as unknown as { assembleActivationRequest: (...args: unknown[]) => Promise<unknown> };
-  const assemble = hooked.assembleActivationRequest.bind(agent);
-  hooked.assembleActivationRequest = async (...args) => { entered.open(); await compile.opened; return assemble(...args); };
   const stream = membrane.streamYielding.bind(membrane);
   membrane.streamYielding = (...args) => {
     const result = stream(...args);
-    // The first stream iterated is the next turn's: it fails on its own.
     if (membrane.streams.length === 2) {
       (result as unknown as { events: unknown[] }).events.unshift({ type: 'error', error: new Error('provider failed') });
     }
     return result;
   };
-  let starting: Promise<void> | undefined;
   try {
-    const error = console.error;
-    console.error = () => {};
-    try {
-      starting = (framework as unknown as { startAgentStream(a: typeof agent): Promise<void> }).startAgentStream(agent);
-      await entered.opened;
-      await framework.stop();
-      framework.start();
-      compile.open();
-      await starting;
-    } finally { console.error = error; }
+    framework.start();
+    await agent.startStreamWithInjections([]);
+    agent.cancelStream();
     const events: string[] = [];
     framework.onTrace((event) => {
       if (event.type.startsWith('inference:') && (event as { agentName?: string }).agentName === 'assistant') events.push(event.type);
     });
-    await (framework as unknown as { startAgentStream(a: typeof agent): Promise<void> }).startAgentStream(agent);
-    await until(() => events.includes('inference:failed') || events.includes('inference:aborted'), "the next turn's stream ends");
+    const error = console.error;
+    console.error = () => {};
+    try {
+      await (framework as unknown as { startAgentStream(a: typeof agent): Promise<void> }).startAgentStream(agent);
+      await until(() => events.includes('inference:failed') || events.includes('inference:aborted'), "the next turn's stream ends");
+    } finally { console.error = error; }
     assert.ok(events.includes('inference:failed'), `its error takes the failure path: ${JSON.stringify(events)}`);
     assert.ok(!events.includes('inference:aborted'), `not a deliberate stop: ${JSON.stringify(events)}`);
-  } finally { compile.open(); await starting; await framework.stop(); store.close(); }
+  } finally { await framework.stop(); store.close(); }
 });
 
 // A turn dropped before it sends anything, at either check: before its

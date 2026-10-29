@@ -53,9 +53,27 @@ import {
   sameRootIdentity,
 } from './disk-agreement.js';
 import type { BranchIntent, BranchIntents, ConflictKind, ConflictRecord, DiskCounterpart } from './branch-intent.js';
+import { storedBytes, type StoredBytes } from './sync.js';
 import {
+  BENEATH_SYMLINK,
+  type Cause,
+  CHANGED,
+  CHANGED_WALK,
+  DIRECTORY,
+  EDITOR_FILE_REASON,
+  FILE_CHANGED,
   IGNORED,
+  LEAVES_MOUNT,
+  LINK_NOT_WALKED,
+  LINK_TO_DIRECTORY,
   type MountView,
+  NOT_A_DIRECTORY,
+  type NotShown,
+  NOT_FOLLOWED,
+  NOT_REGULAR,
+  OUTSIDE_PARENT,
+  RESOLVES_OUTSIDE,
+  ROOT_UNAVAILABLE,
   OTHER_MOUNT,
   ROOT_REPLACED,
   type Walk,
@@ -74,7 +92,8 @@ import {
   walkScope,
   withinIncludes,
 } from './observe.js';
-import { EffectFailed, type Expect, chainOf, chmodContained, narrowedTo, syncDirectories, unlinkContained, writeContained } from './effects.js';
+import { EffectFailed, type Expect, callFailed, chainOf, chmodContained, narrowedTo, syncDirectories, unlinkContained, writeContained } from './effects.js';
+import { OUTSIDE_STEP, RESOLVED_OUTSIDE_STEP, UNFOLLOWED_STEP, errnoClause, errnoWords } from './answers.js';
 
 export type EntryState =
   | 'synced'
@@ -103,6 +122,7 @@ export interface PathReport {
   mimeType?: string;
   conflict?: ConflictReport;
   note?: string;
+  noteCause?: Cause;
   /**
    * For a conflict, what this pass found on disk at the path: grep's account
    * of a conflict's disk side needs it. Listings don't show it.
@@ -147,6 +167,10 @@ export interface PassResult {
    * still the selected branch, synchronously, before it reads.
    */
   branchId?: string;
+  /** Why it decided nothing, where it didn't. */
+  undecided?: string;
+  /** The words it listed for a root it couldn't use, or null where it used it, from its last look at the root. */
+  rootListed?: string | null;
 }
 
 export interface MountRuntime {
@@ -222,7 +246,7 @@ export const WALK_CAP = 5000;
 /** What a pass learned about D for one path. */
 type DiskFact =
   | { kind: 'absent' }
-  | { kind: 'unobserved'; reason: string }
+  | ({ kind: 'unobserved' } & NotShown)
   | {
       kind: 'file';
       hash: string;
@@ -376,6 +400,7 @@ interface Verdict {
   conflict?: ConflictKind;
   op?: TreeOp;
   note?: string;
+  noteCause?: Cause;
   /**
    * Disk shows what a pending push of ours intended, unconfirmed: the state
    * is decided from it, and nothing at all is recorded (see module doc).
@@ -464,21 +489,22 @@ function settleAdoption(p: Pending, s: StoreSide | null): Agreed | 'forget' {
 /**
  * What's in the way, and the way out, when disk's shape keeps a push from a
  * path: no push writes a file over a directory or unlinks one, unlinks
- * anything but a regular file or a followed symlink to one, or writes below
- * a file or a symlink the walk won't take (`writeContained`,
- * `unlinkContained`), forced or not. Null for any other reason, which is
- * passed on as it is.
+ * anything but a regular file or a followed symlink to one, writes below a
+ * file or a symlink the walk won't take, or writes or unlinks through a
+ * symlink the mount doesn't follow or one that leads out of the mount
+ * (`writeContained`, `unlinkContained`), forced or not. Null for any other
+ * reason.
  */
 function inTheWay(reason: string | undefined, deletion: boolean): string | null {
   // Observation's words for what a deletion never unlinks, which the unlink
   // refuses in the same words.
-  if (deletion && (reason === 'not a regular file' || reason === 'a symlink to a directory, not walked')) {
-    const what = reason === 'not a regular file'
+  if (deletion && (reason === NOT_REGULAR || reason === LINK_TO_DIRECTORY)) {
+    const what = reason === NOT_REGULAR
       ? 'a pipe, socket or device at this path, or a symlink to one'
       : 'a symlink to a directory at this path';
     return `disk has ${what}, and no push unlinks it, forced or not — ask whoever runs this host if it should go`;
   }
-  if (reason === 'a directory') {
+  if (reason === DIRECTORY) {
     return deletion
       ? 'disk has a directory at this path, and no push unlinks one, forced or not — if it should go, move or remove it on disk'
       : 'disk has a directory at this path, and no push writes a file over one, forced or not — ' +
@@ -486,11 +512,97 @@ function inTheWay(reason: string | undefined, deletion: boolean): string | null 
   }
   // A deletion below a file finds nothing there to unlink, so only a write
   // meets this one.
-  if (reason === 'a parent path is not a directory') {
+  if (reason === NOT_A_DIRECTORY) {
     return 'disk has a file or a symlink where this path needs a directory, and no push writes below one, forced or not — ' +
       'move or remove it on disk and materialize again, or write the file under another path';
   }
+  const link = reason === NOT_FOLLOWED ? 'disk has a symlink at this path, which this mount does not follow'
+    : reason === LEAVES_MOUNT ? 'this path leads out of the mount through a symlink on it'
+      : null;
+  if (link !== null) {
+    return deletion
+      ? `${link}, and no push unlinks ${reason === NOT_FOLLOWED ? 'one' : 'through one'}, forced or not — ask whoever runs this host if it should go`
+      : `${link}, and no push writes through one, forced or not — write the file under another path, ` +
+        `or whoever runs this host can remove the link, and ${THEN.write}`;
+  }
+  if (deletion && reason === BENEATH_SYMLINK) {
+    return 'a symlink on this path does not lead to a directory inside the mount, so nothing beneath it is in this mount, and no push unlinks beneath one, '
+      + `forced or not — whoever runs this host can remove the link or make it lead to a directory inside the mount, and ${THEN.unlink}`;
+  }
+  if (reason === OUTSIDE_PARENT) {
+    return `a directory on this path leads out of the mount, and no push ${deletion ? 'unlinks' : 'writes'} beneath one, forced or not — ` +
+      (deletion ? 'ask whoever runs this host if what is there should go' : 'write the file under another path');
+  }
+  if (reason === NOT_REGULAR || reason === LINK_TO_DIRECTORY) {
+    const what = reason === NOT_REGULAR ? 'a pipe, socket or device at this path, or a symlink to one' : 'a symlink to a directory at this path';
+    return `disk has ${what}, and no push writes a file over it, forced or not — write the file under another path, ` +
+      `or whoever runs this host can remove it, and ${THEN.write}`;
+  }
   return null;
+}
+
+export type Meets = 'write' | 'unlink' | 'sync' | 'list' | 'read';
+
+const AGAIN: Record<Meets, string> = {
+  write: 'materializing again',
+  unlink: 'materializing again with applyDeletions',
+  sync: 'syncing this path again',
+  list: 'listing it',
+  read: 'calling again',
+};
+
+const THEN: Record<Meets, string> = {
+  write: 'materializing again then gets past it',
+  unlink: 'materializing again with applyDeletions then gets past it',
+  sync: 'a sync of this path then takes it in',
+  list: 'the workspace then reaches it',
+  read: 'a read then reaches it',
+};
+
+const CHANGED_WHILE: ReadonlySet<string> = new Set([CHANGED, CHANGED_WALK, FILE_CHANGED]);
+
+const WALKED_PAST: ReadonlySet<string> = new Set([IGNORED, EDITOR_FILE_REASON, LINK_NOT_WALKED]);
+
+export function explained(reason: string, cause: Cause, meets: Meets): string {
+  if (meets === 'write' || meets === 'unlink') {
+    const shaped = inTheWay(reason, meets === 'unlink');
+    if (shaped !== null) return shaped;
+  }
+  return withWayOn(reason, cause, meets);
+}
+
+function withWayOn(reason: string, cause: Cause, meets: Meets): string {
+  const on = wayOn(reason, cause, meets);
+  return on === null ? reason : `${reason} — ${on}`;
+}
+
+export function wayOn(reason: string, cause: Cause, meets: Meets): string | null {
+  const lasting = `${AGAIN[meets]} won't change that; `;
+  if (reason === ROOT_UNAVAILABLE) {
+    if (cause.errno === 'ENOENT' || cause.errno === 'ENOTDIR') return `${lasting}whoever runs this host can put the mount's directory back at its path, and ${THEN[meets]}`;
+    if (cause.errno === undefined) return `${AGAIN[meets]} checks it afresh; if it's still unavailable, whoever runs this host can check the mount's directory and its path`;
+  }
+  if (cause.errno !== undefined) return errnoClause(cause.errno, AGAIN[meets], THEN[meets]);
+  if (cause.again === true || CHANGED_WHILE.has(reason)) return `${AGAIN[meets]} checks it afresh`;
+  switch (reason) {
+    case NOT_FOLLOWED:
+      return lasting + UNFOLLOWED_STEP;
+    case LEAVES_MOUNT:
+      return lasting + OUTSIDE_STEP;
+    case BENEATH_SYMLINK:
+      return `${lasting}nothing beneath it is in this mount, and whoever runs this host can make it lead to a directory inside the mount, or, where it leads to a directory outside, mount that directory`;
+    case OUTSIDE_PARENT:
+    case RESOLVES_OUTSIDE:
+      return lasting + RESOLVED_OUTSIDE_STEP;
+    case NOT_REGULAR:
+      return `${lasting}whoever runs this host can put a regular file there, and ${THEN[meets]}`;
+    case DIRECTORY:
+      return `${lasting}ls of this path lists what's in it`;
+    case LINK_TO_DIRECTORY:
+      return `${lasting}ls of the directory it leads to lists what's in it`;
+    default:
+      return meets === 'sync' && WALKED_PAST.has(reason) ? 'a sync of this path checks it' : null;
+  }
 }
 
 /**
@@ -506,8 +618,16 @@ function inTheWay(reason: string | undefined, deletion: boolean): string | null 
  * to pass.
  */
 function forcedWay(note: string | undefined, deletion: boolean, forced: string): string {
-  if (note === 'cannot open (EACCES)') return `, or, if disk lets the workspace ${deletion ? 'unlink' : 'write'} the file, ${forced}`;
+  if (note === `cannot open (${errnoWords('EACCES')})`) return `, or, if disk lets the workspace ${deletion ? 'unlink' : 'write'} the file, ${forced}`;
   return '';
+}
+
+const UNSETTLED = "whether disk holds the change isn't known until it's checked: a materialize of this path checks it and says how it ended";
+
+function unverifiedCopy(v: Verdict, meets: 'write' | 'unlink', forced: string): string {
+  const note = v.note ?? 'not observed';
+  const on = wayOn(note, v.noteCause ?? {}, meets);
+  return `cannot verify disk copy (${note})${on !== null ? ` — ${on}` : ''}${forcedWay(v.note, meets === 'unlink', forced)}`;
 }
 
 /**
@@ -635,6 +755,10 @@ function adoptDisk(d: Extract<DiskFact, { kind: 'absent' | 'file' }>, s: StoreSi
   return { state: 'disk-only', ...(s ? { adopt: 'drop' as const, op: 'deleted' as const } : {}), p: 'forget', intent: {} };
 }
 
+function causeOf({ errno, ownStep }: NotShown): Cause {
+  return { ...(errno !== undefined ? { errno } : {}), ...(ownStep ? { ownStep } : {}) };
+}
+
 /** The rule (see module doc). Pure. */
 function decide(
   d: DiskFact,
@@ -650,9 +774,9 @@ function decide(
   if (d.kind === 'unobserved') {
     // Disk proves nothing, but an adoption on this branch settles by the tree.
     if (pIn?.kind === 'pending' && pIn.effect === 'adopt' && pIn.branchId === branchId && !adopt) {
-      return { state: 'unverified', note: d.reason, p: settleAdoption(pIn, s) };
+      return { state: 'unverified', note: d.reason, noteCause: causeOf(d), p: settleAdoption(pIn, s) };
     }
-    return { state: 'unverified', note: d.reason };
+    return { state: 'unverified', note: d.reason, noteCause: causeOf(d) };
   }
   if (d.kind === 'unhashed') {
     // Observed this way only when nothing tracks the path, which is then a
@@ -820,6 +944,7 @@ interface Gathered {
   branchId: string;
   /** The root the facts were gathered under, when it was available. */
   rootIdentity: RootIdentity | null;
+  rootListed: string | null;
   walk: Walk | null;
   facts: Map<string, DiskFact>;
   dirs: string[];
@@ -829,6 +954,13 @@ interface Gathered {
 /** How often a pass gathers again when the branch changes under it. */
 const GATHER_ATTEMPTS = 3;
 
+export async function passRoot(mount: Pick<MountRuntime, 'view' | 'rootReal'>): Promise<{ identity: RootIdentity; bornFixed: boolean } | { unavailable: string; cause: Cause; listed: string }> {
+  const root = await locateRoot(mount.view, mount.rootReal);
+  if ('identity' in root) return root;
+  const cause: Cause = root.errno !== undefined ? { errno: root.errno } : {};
+  return { unavailable: root.reason, cause, listed: explained(root.reason, cause, 'list') };
+}
+
 async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRuntime, scope: Scope, opts: PassOptions): Promise<Gathered> {
   // A missing mount root is an unavailable mount (an unmounted drive, a root
   // being replaced), not proof that every file in it was deleted, and so is a
@@ -836,8 +968,10 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
   // directory a watcher makes where a drive's mountpoint was. The root is
   // the operator's choice and may itself be a symlink to a directory, so it
   // is followed, as `rootReal` is: `followSymlinks` governs links within it.
-  const root = await locateRoot(mount.view, mount.rootReal);
-  const rootUnavailable = 'reason' in root ? root.reason : null;
+  const root = await passRoot(mount);
+  const rootUnavailable = 'unavailable' in root ? root.unavailable : null;
+  const rootCause = 'unavailable' in root ? root.cause : {};
+  const rootListed = 'unavailable' in root ? root.listed : null;
 
   // The branch is labelled where the tracked candidates are read, with no
   // await between: the decision is checked against this label.
@@ -845,15 +979,16 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
   const gathered: Gathered = {
     branchId,
     rootIdentity: 'identity' in root ? root.identity : null,
+    rootListed,
     walk: null,
     facts: new Map(),
     dirs: [],
     incomplete: [],
   };
-  if (rootUnavailable !== null) {
+  if (rootListed !== null) {
     // Said whether or not anything is tracked: an unavailable mount must not
     // read as a verified empty directory.
-    gathered.incomplete.push({ path: scope.kind === 'dir' ? scope.dir : '', reason: rootUnavailable });
+    gathered.incomplete.push({ path: scope.kind === 'dir' ? scope.dir : '', reason: rootListed });
   }
 
   // Which paths to decide: what disk shows, and what the store, P and intent
@@ -892,7 +1027,7 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
   // Observe. Tracked facts are read again, synchronously, when deciding.
   for (const path of candidates) {
     if (rootUnavailable !== null) {
-      gathered.facts.set(path, { kind: 'unobserved', reason: rootUnavailable });
+      gathered.facts.set(path, { kind: 'unobserved', reason: rootUnavailable, ...rootCause });
       continue;
     }
     // What the mount passes over by design stays unobserved by a pass that
@@ -914,8 +1049,8 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
       byDesign = OTHER_MOUNT;
     } else if (!opts.named) {
       const slash = path.lastIndexOf('/');
-      const above = slash < 0 ? undefined : passedOverAt(path.slice(0, slash), mount.view.ignore, mount.view.others);
-      const own = above === undefined && !walk ? passedOverAt(path, mount.view.ignore, mount.view.others) : undefined;
+      const above = slash < 0 ? undefined : passedOverAt(path.slice(0, slash), mount.view.ignore, mount.view.others, true);
+      const own = above === undefined && !walk ? passedOverAt(path, mount.view.ignore, mount.view.others, false) : undefined;
       byDesign = above ?? own;
     } else if (scope.kind === 'dir') {
       byDesign = passedOverBetween(scope.dir, path, ignoreBeneath(scope.dir, mount.view.ignore), mount.view.others);
@@ -942,7 +1077,9 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
         if (r.kind === 'symlink' && r.path === path) continue;
         if (region === undefined || r.path.length > region.path.length) region = r;
       }
-      gathered.facts.set(path, { kind: 'unobserved', reason: region ? region.reason : 'not reached by the walk' });
+      gathered.facts.set(path, region
+        ? { kind: 'unobserved', reason: region.reason, ...(region.errno !== undefined ? { errno: region.errno } : {}) }
+        : { kind: 'unobserved', reason: 'not reached by the walk' });
       continue;
     }
     const p = agreement.get(mount.name, path);
@@ -957,13 +1094,15 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
   // now, nothing observed counts and nothing is decided from it.
   if (gathered.rootIdentity !== null) {
     const after = await locateRoot(mount.view, mount.rootReal);
-    if (!('identity' in after) || !sameRootIdentity(after.identity, gathered.rootIdentity)) {
+    if (!('identity' in after) || !sameRootIdentity(gathered.rootIdentity, after.identity, after.bornFixed)) {
       const reason = 'reason' in after ? after.reason : ROOT_REPLACED;
-      for (const path of gathered.facts.keys()) gathered.facts.set(path, { kind: 'unobserved', reason });
+      const errno = 'errno' in after ? after.errno : undefined;
+      for (const path of gathered.facts.keys()) gathered.facts.set(path, { kind: 'unobserved', reason, ...(errno !== undefined ? { errno } : {}) });
       gathered.rootIdentity = null;
+      gathered.rootListed = explained(reason, errno !== undefined ? { errno } : {}, 'list');
       gathered.walk = null;
       gathered.dirs = [];
-      gathered.incomplete.push({ path: scope.kind === 'dir' ? scope.dir : '', reason });
+      gathered.incomplete.push({ path: scope.kind === 'dir' ? scope.dir : '', reason: gathered.rootListed });
     }
   }
   return gathered;
@@ -994,20 +1133,20 @@ export async function reconcilePass(
   let gathered: Gathered | null = null;
   for (let attempt = 0; attempt < GATHER_ATTEMPTS; attempt++) {
     const next = await gather(store, agreement, mount, scope, opts);
+    result.rootListed = next.rootListed;
     if (store.currentBranch().id === next.branchId) {
       gathered = next;
       break;
     }
   }
   if (gathered === null) {
-    result.incomplete.push({ path: scope.kind === 'dir' ? scope.dir : '', reason: 'the selected branch kept changing while the scan ran' });
+    result.undecided = 'the selected branch kept changing while the scan ran';
+    result.incomplete.push({ path: scope.kind === 'dir' ? scope.dir : '', reason: explained(result.undecided, { again: true }, 'list') });
     return result;
   }
   if (opts.branchId !== undefined && gathered.branchId !== opts.branchId) {
-    result.incomplete.push({
-      path: scope.kind === 'dir' ? scope.dir : scope.paths.join(', '),
-      reason: 'the selected branch changed before this sync ran; nothing was taken from disk — sync again on this branch to take it',
-    });
+    result.undecided = 'the selected branch changed before this sync ran; nothing was taken from disk — sync again on this branch to take it';
+    result.incomplete.push({ path: scope.kind === 'dir' ? scope.dir : scope.paths.join(', '), reason: result.undecided });
     return result;
   }
   const { walk, facts } = gathered;
@@ -1028,9 +1167,13 @@ export async function reconcilePass(
   }
 
   // The evidence about to be recorded describes the root it was gathered
-  // under, which is recorded first (once per mount), so no crash can leave
-  // evidence without its root.
-  if (gathered.rootIdentity && planned.some((x) => x.verdict.adopt !== undefined || x.verdict.p !== undefined)) {
+  // under, which is recorded first, so no crash can leave evidence without
+  // its root. Once a root is recorded, every pass that found it offers it,
+  // evidence or none: the same root on a new device, or with its first
+  // birth time, is recorded again (recordRootIdentity writes nothing
+  // otherwise), and a quiet mount's passes are where an old record learns
+  // its birth time.
+  if (gathered.rootIdentity && (agreement.rootIdentity(mount.name) !== undefined || planned.some((x) => x.verdict.adopt !== undefined || x.verdict.p !== undefined))) {
     agreement.recordRootIdentity(mount.name, gathered.rootIdentity);
   }
 
@@ -1128,6 +1271,7 @@ export async function reconcilePass(
       if (x.d.kind === 'file' || x.d.kind === 'absent') report.diskNow = x.d.kind;
     }
     if (x.verdict.note) report.note = x.verdict.note;
+    if (x.verdict.noteCause !== undefined) report.noteCause = x.verdict.noteCause;
     if (!(x.verdict.state === 'synced' && !entry)) result.reports.set(x.path, report);
   }
   if (walk) {
@@ -1157,7 +1301,9 @@ export async function reconcilePass(
       // holder), so naming the directory as unreached would never clear.
       const wholeScope = scope.kind === 'dir' && scope.dir !== '' && region.path === scope.dir;
       const unreached = hides && region.reason !== OTHER_MOUNT;
-      if (region.kind === 'error' || region.kind === 'cap' || unreached || wholeScope) result.incomplete.push({ path: region.path, reason: region.reason });
+      if (region.kind === 'error' || region.kind === 'cap' || unreached || wholeScope) {
+        result.incomplete.push({ path: region.path, reason: explained(region.reason, region.errno !== undefined ? { errno: region.errno } : {}, 'list') });
+      }
       // A name passed over by design that hides nothing tracked is reported nowhere else:
       // counted, so a sync that says 0 also says what it didn't look at
       // (agent-framework #276). A symlink region isn't counted: a link the
@@ -1264,7 +1410,8 @@ export async function pushPaths(
   // unmounted from. The push plans nothing, so it reports no branch.
   const root = await locateRoot(mount.view, mount.rootReal);
   if ('reason' in root) {
-    for (const path of paths) result.skipped.push({ path, reason: root.reason });
+    const why = explained(root.reason, root.errno !== undefined ? { errno: root.errno } : {}, 'write');
+    for (const path of paths) result.skipped.push({ path, reason: why });
     return result;
   }
   // Another mount's directory nested in this one is that mount's: no push
@@ -1336,8 +1483,8 @@ export async function pushPaths(
   // replaced meanwhile they describe the replacement, so, as a pass does,
   // nothing is decided or recorded from them.
   const after = await locateRoot(mount.view, mount.rootReal);
-  if (!('identity' in after) || !sameRootIdentity(after.identity, root.identity)) {
-    const reason = 'reason' in after ? after.reason : ROOT_REPLACED;
+  if (!('identity' in after) || !sameRootIdentity(root.identity, after.identity, after.bornFixed)) {
+    const reason = 'reason' in after ? explained(after.reason, after.errno !== undefined ? { errno: after.errno } : {}, 'write') : ROOT_REPLACED;
     for (const path of paths) result.skipped.push({ path, reason });
     return result;
   }
@@ -1358,9 +1505,6 @@ export async function pushPaths(
     const p = agreement.get(mount.name, path);
     const bi = mount.intents.get(path);
     const v = decide(d, s, p, bi, branchId, false);
-    // The ways out a refusal names, as materialize takes them: a deletion
-    // reaches disk only with applyDeletions.
-    const again = s ? 'materialize again' : 'materialize again with applyDeletions';
     // Where disk has deleted a file the workspace holds, a sync takes the
     // deletion, which removes the workspace's copy, and a forced push writes
     // the workspace's copy back: there is no disk copy to adopt or overwrite.
@@ -1386,12 +1530,12 @@ export async function pushPaths(
         continue;
       }
       const priorP = p && (p.kind === 'absent' || p.kind === 'content') ? p : null;
-      const blob = store.getBlob(s.hash);
+      const stored = storedBytes(store, s.hash);
       const forcedMode = mount.modesObserved && s.mode !== undefined && s.mode !== (d.kind === 'file' ? d.mode : undefined) ? s.mode : undefined;
       const agreedMode = priorP?.kind === 'content' ? priorP.mode : undefined;
-      if (blob) {
+      if ('bytes' in stored) {
         plans.push({
-          path, kind: 'write', blob, hash: s.hash, prior: priorP, before: agreement.get(mount.name, path), expect,
+          path, kind: 'write', blob: stored.bytes, hash: s.hash, prior: priorP, before: agreement.get(mount.name, path), expect,
           ...(forcedMode !== undefined ? { apply: forcedMode } : {}),
           ...(forcedMode !== undefined && d.kind === 'file' && agreedMode !== d.mode ? { overDisk: true as const } : {}),
           ...(s.mode !== undefined ? { storeMode: s.mode } : {}),
@@ -1400,7 +1544,7 @@ export async function pushPaths(
           ...(agreedMode !== undefined ? { priorMode: agreedMode } : {}),
           ...(d.kind === 'file' && d.mode !== undefined ? { seenMode: d.mode } : {}),
         });
-      } else result.skipped.push({ path, reason: 'the workspace copy is missing from the store' });
+      } else result.skipped.push({ path, reason: unstoredCopy(stored) });
       continue;
     }
     if (v.mode === 'adopt' && s && d.kind === 'file') {
@@ -1426,7 +1570,7 @@ export async function pushPaths(
     }
     // Whatever the verdict learned about disk (an agreement, a resolved
     // intent) is recorded before anything is pushed over it, and the root it
-    // was learned under before that (once per mount), as a pass does.
+    // was learned under before that, as a pass does.
     if (v.p !== undefined) agreement.recordRootIdentity(mount.name, root.identity);
     if (v.p === 'forget') agreement.forget(mount.name, path);
     else if (v.p !== undefined) agreement.set(mount.name, path, v.p, { afterCommittedState: true });
@@ -1476,8 +1620,7 @@ export async function pushPaths(
             ? d.kind === 'absent' || d.kind === 'file'
               ? `${v.note} — ${sync}`
               : `${v.note}, and disk's copy can't be verified (${d.kind === 'unobserved' ? d.reason : 'not hashed'}) — once it can be, ${sync}`
-            : inTheWay(v.note, !s) ??
-              `cannot verify disk copy (${v.note ?? 'not observed'}) — fix it and ${again}${forcedWay(v.note, !s, forced)}`,
+            : inTheWay(v.note, !s) ?? unverifiedCopy(v, s ? 'write' : 'unlink', forced),
         });
         continue;
       }
@@ -1542,7 +1685,7 @@ export async function pushPaths(
         // A deletion no push makes, forced or not (inTheWay), is refused for
         // that, as an unforced push refuses it, rather than left for
         // applyDeletions, which couldn't make it either.
-        const lasting = inTheWay(v.note, true);
+        const lasting = inTheWay(v.note, true) ?? (v.noteCause?.ownStep === true ? v.note ?? null : null);
         if (lasting !== null) result.skipped.push({ path, reason: lasting });
         else result.pendingDeletions.push(path);
         continue;
@@ -1551,11 +1694,12 @@ export async function pushPaths(
       plans.push({ path, kind: 'unlink', prior, before: agreement.get(mount.name, path), expect });
       continue;
     }
-    const blob = store.getBlob(s.hash);
-    if (!blob) {
-      result.skipped.push({ path, reason: 'the workspace copy is missing from the store' });
+    const stored = storedBytes(store, s.hash);
+    if (!('bytes' in stored)) {
+      result.skipped.push({ path, reason: unstoredCopy(stored) });
       continue;
     }
+    const blob = stored.bytes;
     // The store's mode goes to disk with its bytes where the file is new,
     // the push is forced, or disk still has the mode they last agreed on. A
     // push that completes our own unconfirmed one, whose bytes landed, is a
@@ -1671,18 +1815,18 @@ export async function pushPaths(
         effected.push({ step, dirs: [await unlinkContained(mount.view, mount.rootReal, step.path, step.expect)] });
       }
     } catch (err) {
-      const failure = err instanceof EffectFailed ? err : new EffectFailed(err instanceof Error ? err.message : String(err), true);
+      const failure = err instanceof EffectFailed ? err : callFailed('the push failed', err, true, 'colon');
       if (!failure.touched) {
         // Disk at this path is as planning saw it: its evidence goes back to
         // exactly what it was, whatever kind that was.
         agreement.restore(mount.name, step.path, step.before);
         recorded = true;
-        const why = inTheWay(failure.message, step.kind === 'unlink') ?? failure.message;
+        const why = step.kind === 'chmod' ? withWayOn(failure.message, failure.detail, 'write') : explained(failure.message, failure.detail, step.kind);
         result.skipped.push({ path: step.path, reason: `not ${step.kind === 'unlink' ? 'unlinked' : step.kind === 'chmod' ? 'given the workspace\'s mode' : 'written'}: ${why}` });
       } else {
         // No completion: the intent stays pending, and the next observation
         // resolves it from whatever disk then holds.
-        result.skipped.push({ path: step.path, reason: `${failure.message}; the outcome is checked at the next observation` });
+        result.skipped.push({ path: step.path, reason: `${failure.message} — ${UNSETTLED}` });
       }
     }
   }
@@ -1702,7 +1846,7 @@ export async function pushPaths(
       result.skipped.push({
         path: step.path,
         reason: `could not make the ${step.kind === 'write' ? 'write' : 'unlink'} durable (directory fsync of ${failed === '' ? 'the mount root' : failed}): ` +
-          `${unsynced.get(failed)}; the outcome is checked at the next observation`,
+          `${unsynced.get(failed)} — ${UNSETTLED}`,
       });
       continue;
     }
@@ -1773,4 +1917,9 @@ export async function pushPaths(
   if (recorded || agreement.needsBarrier) agreement.barrier();
   agreement.maybeCheckpoint();
   return result;
+}
+
+function unstoredCopy(stored: Exclude<StoredBytes, { bytes: Buffer }>): string {
+  return `${'missing' in stored ? 'the workspace copy is missing from the store' : `the workspace copy is unreadable in the store (${stored.unreadable})`}`
+    + " — a read of this path takes disk's copy where it can, and otherwise says what can be done";
 }

@@ -62,7 +62,7 @@ const refusal = (gate: EventGate, fields: Record<string, unknown>): string | nul
 };
 const permissionsHold = process.platform !== 'win32' && process.getuid?.() !== 0;
 
-const BEHAVIORS = '"always", "defer" or "skip", or an object holding one of "debounce", "rate_limit" and "passive_sample"';
+const BEHAVIORS = '"always", "defer" or "skip", or an object holding one of "debounce", "rate_limit", "passive_sample" and "judge"';
 /** A character outside the Basic Multilingual Plane: one code point, two UTF-16 units. */
 const GRIN = '\u{1F600}';
 const POLICY_FIELDS = '"name", "match", "behavior", "resets" and "passthrough"';
@@ -163,7 +163,7 @@ test('a field name one slip from one the gate reads is a problem at every level,
     ],
     [
       { behavior: { debounc: 1000 } },
-      'behavior has "debounc" (did you mean "debounce"?), which the gate doesn\'t read; behavior holds none of "debounce", "rate_limit" and "passive_sample"',
+      'behavior has "debounc" (did you mean "debounce"?), which the gate doesn\'t read; behavior holds none of "debounce", "rate_limit", "passive_sample" and "judge"',
     ],
     [{ behavior: { rate_limit: { tokens: 1, refillIntervalMs: 1000, keyby: 'channelId' } } }, 'behavior.rate_limit has "keyby" (did you mean "keyBy"?), which the gate doesn\'t read'],
     [
@@ -184,7 +184,7 @@ test('a field name one slip from one the gate reads is a problem at every level,
     [{ match: { channelId: 'discord:*:1' } }, 'match has "channelId" (did you mean "channel"?), which the gate doesn\'t read', all],
     [
       { behavior: { debounceMs: 60000 } },
-      'behavior has "debounceMs" (did you mean "debounce"?), which the gate doesn\'t read; behavior holds none of "debounce", "rate_limit" and "passive_sample"',
+      'behavior has "debounceMs" (did you mean "debounce"?), which the gate doesn\'t read; behavior holds none of "debounce", "rate_limit", "passive_sample" and "judge"',
     ],
     [
       { behavior: { rate_limit: { tokensPerHour: 5, refillIntervalMs: 60000 } } },
@@ -299,7 +299,7 @@ test("in gate.json, a rule earlier releases refused is left out, and the rest of
     ['every-mention', 'The 1st policy is left out: it\'s "every-mention", where a rule is an object, such as {"name": "my-rule", "behavior": "always"}.'],
     [{ match: {}, behavior: 'always' }, 'The 1st policy is left out: it has no "name".'],
     [{ name: 'x', behavior: [] }, `Policy "x" is left out: behavior is [], where ${BEHAVIORS} is needed.`],
-    [{ name: 'x', behavior: { debouce: 60000 } }, 'Policy "x" is left out: behavior has "debouce" (did you mean "debounce"?), which the gate doesn\'t read; behavior holds none of "debounce", "rate_limit" and "passive_sample".'],
+    [{ name: 'x', behavior: { debouce: 60000 } }, 'Policy "x" is left out: behavior has "debouce" (did you mean "debounce"?), which the gate doesn\'t read; behavior holds none of "debounce", "rate_limit", "passive_sample" and "judge".'],
     [{ name: 'x', behavior: { debounce: '60000' } }, 'Policy "x" is left out: behavior.debounce is "60000", where a number of milliseconds is needed, such as 60000.'],
     [{ name: 'x', behavior: { rate_limit: { tokens: 3 } } }, 'Policy "x" is left out: behavior.rate_limit.refillIntervalMs is missing, where a positive number of milliseconds is needed.'],
     [{ name: 'x', behavior: { rate_limit: { tokens: 0, refillIntervalMs: 1000 } } }, 'Policy "x" is left out: behavior.rate_limit.tokens is 0, where a positive number is needed.'],
@@ -1799,7 +1799,9 @@ test('a reconcile whose write leaves gate.json unable to load runs what it read 
   // The disk fills partway through the reconcile's write.
   const gate = failingStart(dir, 'write', 'ENOSPC: no space left on device, write', { default: 'skip', policies: [userInput, tickets] } as GateConfig);
 
-  assert.deepEqual(names(gate), ['user-input', 'mine', 'tickets'], 'what it read, and what it was adding');
+  // The recipe's rule "tickets" takes its recipe place, after "user-input" and ahead of gate.json's own "mine" (the
+  // start's merge against the recipe last applied), where an append put it last.
+  assert.deepEqual(names(gate), ['user-input', 'tickets', 'mine'], 'what it read, and what it was adding');
   assert.equal(gate.getStatus().configSource, 'file');
   const [fileError, unsaved, ...rest] = gate.getStatus().errors;
   // gate.json's entry says what's in force, as the start's entry beside it does.
@@ -1845,14 +1847,14 @@ test('a reconcile whose write leaves gate.json unable to load runs what it read 
   });
   assert.throws(() => gate.removePolicy('mine'), { message: /^gate\.json isn't JSON the gate can read \(/ });
   assert.deepEqual(readFileSync(configPath), left);
-  assert.deepEqual(names(gate), ['user-input', 'mine', 'tickets']);
+  assert.deepEqual(names(gate), ['user-input', 'tickets', 'mine']);
   // Once gate.json is gone, a change edits the text that write was writing, so gate.json's own fields and the rule the
   // gate leaves out are written back as written; and once it's written, nothing the start ran is unsaved.
   rmSync(configPath);
   gate.addPolicy({ name: 'later', behavior: 'defer' });
   const rewritten = onDisk(configPath);
   assert.equal(rewritten.comment, 'ops');
-  assert.deepEqual(rewritten.policies.map((rule) => rule.name), ['user-input', 'mine', 'held', 'tickets', 'later']);
+  assert.deepEqual(rewritten.policies.map((rule) => rule.name), ['user-input', 'tickets', 'mine', 'held', 'later']);
   assert.ok(!gate.getStatus().errors.some((said) => said.startsWith('At start, adding')), gate.getStatus().errors.join(' | '));
 
   // A write that fails at its close, after it wrote, may have left gate.json part-written too.
@@ -1966,7 +1968,7 @@ test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its
     return round![0]!;
   };
 
-  const timing = 'so nothing was saved. For a debounce, a rate limit or sampling, give debounceMs, rateLimit or passiveSample instead of behavior.';
+  const timing = 'so nothing was saved. For a debounce, a rate limit, sampling or the reply judge, give debounceMs, rateLimit, passiveSample or judge instead of behavior.';
   // XML tool mode parses `behavior` by its declared type, a string, so the
   // object form arrives as text.
   for (const [behavior, shown] of [['{"debounce": 60000}', '"{\\"debounce\\": 60000}"'], ['deffer', '"deffer"'], [5, '5'], [['always'], '["always"]']] as const) {
@@ -1988,7 +1990,7 @@ test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its
   assert.match(absent.content, /addPolicy: no policy named "nope" to anchor on — have: \[mentions\]/);
   // Its own parameters are checked as a rule's fields are: a slip is refused.
   const before = readFileSync(configPath, 'utf-8');
-  const parameters = '"name", "match", "behavior", "debounceMs", "rateLimit", "passiveSample", "position", "insertBefore", '
+  const parameters = '"name", "match", "behavior", "debounceMs", "rateLimit", "passiveSample", "judge", "position", "insertBefore", '
     + '"insertAfter", "passthrough" and "resets"';
   const slip = await call({ name: 'watch', passiveSample: { every: 10 }, pasthrough: true });
   assert.equal(slip.isError, true);
@@ -2141,15 +2143,26 @@ test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its
   // Each of the description's examples, made as the call it shows, is saved as it reads.
   const examples = [...description.matchAll(/`(\{ name: "[^`]+\})`/g)]
     .map((m) => new Function(`return (${m[1]});`)() as Record<string, unknown>);
-  assert.deepEqual(examples.map((e) => e.name), ['watch-notes', 'watch-cairn']);
+  assert.deepEqual(examples.map((e) => e.name), ['watch-notes', 'watch-cairn', 'ambient-judged']);
   for (const example of examples) {
     const result = await call(example);
     assert.equal(result.isError, false, result.content);
     assert.equal(JSON.parse(result.content).ignoredFields, undefined, 'every field it gives is read');
   }
-  assert.deepEqual(onDisk(configPath).policies.slice(-2), [
+  assert.deepEqual(onDisk(configPath).policies.slice(-3), [
     { name: 'watch-notes', match: { scope: ['workspace:modified'], mount: 'project', pathGlob: 'notes/*.md' }, behavior: 'always' },
     { name: 'watch-cairn', match: { source: 'discord', channel: 'discord:*:12345', tagsAny: ['chat:ambient'] }, behavior: { debounce: 60000 } },
+    {
+      name: 'ambient-judged',
+      match: { tagsAny: ['chat:ambient'] },
+      behavior: {
+        judge: {
+          debounceMs: 20000,
+          maxWaitMs: 120000,
+          instructions: 'Wake me when someone asks me something or the talk turns to the garden; let banter between others go by.',
+        },
+      },
+    },
   ]);
 
   // A change over a gate.json with problems keeps them as written.

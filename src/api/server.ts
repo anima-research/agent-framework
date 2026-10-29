@@ -489,9 +489,13 @@ export class ApiServer {
     if (!params.participant || !params.content) {
       throw new Error('participant and content are required');
     }
-    // ApiModule stores the message as one text block, which context-manager
-    // refuses unless its text is a string, so content that isn't text is
-    // refused here, where the caller hears it, rather than at dispatch.
+    // ApiModule stores the participant as a name, and the message as one text
+    // block, which context-manager refuses unless its text is a string. So a
+    // participant or content that isn't text is refused here, where the
+    // caller hears it, rather than at dispatch.
+    if (typeof params.participant !== 'string') {
+      throw new Error('participant must be text');
+    }
     if (typeof params.content !== 'string') {
       throw new Error('content must be text');
     }
@@ -518,8 +522,7 @@ export class ApiServer {
     const contextManager = agent.getContextManager();
     // A dry run: listed, never sent, so it persists no fold resolutions and
     // queues none of the compression its fold plan calls for (see
-    // Agent.compileWithInjections for what a dry run still leaves, and for
-    // context-manager#160's thinking binding).
+    // Agent.compileWithInjections for what a dry run still leaves).
     const { messages } = await contextManager.compile(undefined, undefined, { dryRun: true });
 
     const limit = params?.limit ?? 50;
@@ -650,7 +653,8 @@ export class ApiServer {
       throw new Error('agentName is required');
     }
 
-    const result = this.framework.undoLastTurn(params.agentName);
+    const { settled, ...result } = this.framework.undoLastTurn(params.agentName);
+    await settled;
 
     if (result.undone) {
       this.broadcast('branch:switched', {
@@ -668,7 +672,8 @@ export class ApiServer {
       throw new Error('agentName is required');
     }
 
-    const result = this.framework.redo(params.agentName);
+    const { settled, ...result } = this.framework.redo(params.agentName);
+    await settled;
 
     if (result.redone) {
       this.broadcast('branch:switched', {

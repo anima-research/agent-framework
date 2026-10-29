@@ -26,6 +26,7 @@
  * of bytes from another surface is the failure this exists to end.
  */
 
+import { NOTICE_TAG } from './notice-tags.js';
 import { createHash, randomBytes } from 'node:crypto';
 import { REFERENCE_STUB_MAX_CHARS, referenceTypeLabel } from './mcpl/references.js';
 import { safeSlice } from './safe-slice.js';
@@ -256,7 +257,7 @@ export type ParsedImagePlaceholder =
 const PLACEHOLDER_RE = /\[image: ([a-z0-9!#$&^_.+-]{1,127}\/[a-z0-9!#$&^_.+-]{1,127}), (~?[\d.]{1,16}(?:B|KB|MB))(?:, ref (img_[0-9a-z]{1,16}_\d{1,16}))?\]/g;
 /** `[ref_1_ab3d] cam.png — image/png, 1.2MB claimed — from tool result — …`
  *  (one line, at most REFERENCE_STUB_MAX_CHARS long: see parseImagePlaceholders). */
-const REFERENCE_STUB_RE = /^\[(ref_[0-9a-z]+_[0-9a-z]+)\] ([^\n]*)$/gm;
+const REFERENCE_STUB_RE = new RegExp(`^\\[(${NOTICE_TAG.referenceId}_[0-9a-z]+_[0-9a-z]+)\\] ([^\\n]*)$`, 'gm');
 const IMAGE_MIME_RE = /\bimage\/[a-z0-9!#$&^_.+-]+/i;
 
 /**
@@ -327,10 +328,10 @@ export interface StoredCut {
  * Where a tool result's text longer than `cap` is cut: by its stored copy
  * (cutStoredToolResult), by history's own truncation (truncateForHistory),
  * and by its live copy, for each text block beside an image
- * (tryNativeToolResultContent, framework.ts), so at one cap the stored copy
- * and the live copy cut alike. Under a readers' bound the stored copy's cut
- * can come earlier (cutStoredToolResultToFit). The text's length when it
- * isn't longer than `cap`.
+ * (toMembraneToolResult's nativeContent, framework.ts), so at one cap the
+ * stored copy and the live copy cut alike. Under a readers' bound the stored
+ * copy's cut can come earlier (cutStoredToolResultToFit). The text's length
+ * when it isn't longer than `cap`.
  *
  * The cut is made at the cap, or before it when the cap would split a
  * surrogate pair (safeSlice's rule), and that is where the moves back are
@@ -367,10 +368,11 @@ export function toolResultCutAt(text: string, cap: number): number {
  *
  * `shown` is what the live copy showed beside the stored text: null when the
  * live copy was the text itself, as for every result that carried no inline
- * image. Then what the cut keeps is exactly what the resident saw, and
- * nothing past it is kept (#403). A result that carried an inline image went
- * to the model as native blocks (tryNativeToolResultContent, framework.ts),
- * every image whatever the text's length, so its stored text is the only
+ * image, or whose links and markers came to more than the cap together, so
+ * goesNative said no.
+ * Then what the cut keeps is exactly what the resident saw, and nothing past
+ * it is kept (#403). A result whose live copy went to the model as native
+ * blocks (framework.ts) sent every image whatever the text's length, so its stored text is the only
  * place save_recent_image's inventory finds them, and a slot dropped by the
  * cut would be an image the resident saw that the index slides past (#104).
  * The image slots past the cut that lie wholly within what the live copy

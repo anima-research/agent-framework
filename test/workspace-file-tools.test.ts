@@ -35,6 +35,14 @@ function setup(t: TestContext, opts: { autoMaterialize?: boolean; maxFileSize?: 
   return { workspace, store, dir, call, disk, stored };
 }
 
+const MAY_WORK = "Calling again may work; if it fails the same way, whoever runs this host can find the whole error in this host's log.";
+// On Windows a store error's OS error is a Win32 code, which isn't read as an errno.
+const WIN32 = process.platform === 'win32';
+const NO_SPACE = WIN32 ? 'IO error: No space left on device (os error 28)' : 'no space left on the disk';
+const FULL_DISK = WIN32 ? `${NO_SPACE}. ${MAY_WORK}` : `${NO_SPACE}. Calling again won't change that; whoever runs this host can free space on its disk.`;
+const unstored = (tool: string, path: string, words: string): string =>
+  `The ${tool} of "${path}" stopped on an error the workspace didn't expect, before the ${tool === 'delete' ? 'deletion' : tool} was stored: ${words === 'no space' ? FULL_DISK : `${words}. ${MAY_WORK}`}`;
+
 const errorOf = (result: ToolResult): string => {
   assert.equal(result.success, false, 'the call was refused');
   assert.equal(result.isError, true);
@@ -78,7 +86,7 @@ test('a lone surrogate is refused in a write and in either of an edit\'s strings
     /^The write did nothing: "content" holds a lone UTF-16 surrogate/);
   assert.equal(disk('s.txt'), null);
   assert.match(errorOf(await call('write', { path: 'work/s\ud800.txt', content: 'x' })),
-    /^The path "work\/s\\ud800\.txt" holds a lone UTF-16 surrogate, which UTF-8 can't store, so no file on disk can have that name\. Nothing was done\.$/);
+    /^The write did nothing: "work\/s\\ud800\.txt" holds a lone UTF-16 surrogate, which UTF-8 can't store, so no file on disk can have that name\. Give the name without it\.$/);
 
   writeFileSync(join(dir, 'e.txt'), 'pair \ud83d\ude00 here\n');
   assert.match(errorOf(await call('edit', { path: 'work/e.txt', oldString: 'here', newString: 'x\udc00' })),
@@ -209,11 +217,11 @@ test("a deletion whose tombstone can't be written is refused and stores nothing,
   s.treeRemove = (...args) => {
     removals++;
     realRemove.apply(store, args as never);
-    throw new Error('No space left on device (os error 28)');
+    throw new Error('IO error: No space left on device (os error 28)');
   };
   intents.update = () => { throw new Error('injected intent exception'); };
   try {
-    assert.equal(errorOf(await call('delete', { path: 'work/d.txt' })), 'injected intent exception');
+    assert.equal(errorOf(await call('delete', { path: 'work/d.txt' })), unstored('delete', 'work/d.txt', 'injected intent exception'));
   } finally {
     delete s.treeRemove;
     intents.update = update;
@@ -223,10 +231,10 @@ test("a deletion whose tombstone can't be written is refused and stores nothing,
   // deletion stops there too, and the tombstone is put back.
   intents.update = (...args: unknown[]) => {
     update.apply(intents, args);
-    throw new Error('No space left on device (os error 28)');
+    throw new Error('IO error: No space left on device (os error 28)');
   };
   try {
-    assert.equal(errorOf(await call('delete', { path: 'work/d.txt' })), 'No space left on device (os error 28)');
+    assert.equal(errorOf(await call('delete', { path: 'work/d.txt' })), unstored('delete', 'work/d.txt', 'no space'));
   } finally {
     intents.update = update;
   }
@@ -273,8 +281,8 @@ test("a deletion that lands gives up its path's store origin, and one whose remo
   const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
   s.treeRemove = () => { throw new Error('injected store failure'); };
   try {
-    assert.equal(errorOf(await call('delete', { path: 'work/k.txt' })), 'injected store failure');
-    assert.equal(errorOf(await call('delete', { path: 'work/u.txt' })), 'injected store failure');
+    assert.equal(errorOf(await call('delete', { path: 'work/k.txt' })), unstored('delete', 'work/k.txt', 'injected store failure'));
+    assert.equal(errorOf(await call('delete', { path: 'work/u.txt' })), unstored('delete', 'work/u.txt', 'injected store failure'));
   } finally {
     delete s.treeRemove;
   }
@@ -299,7 +307,7 @@ test("a tombstone a put-back couldn't take back deletes nothing, is no deletion 
   const warnings: string[] = [];
   console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
   try {
-    assert.equal(errorOf(await call('delete', { path: 'work/k.txt' })), 'injected store failure');
+    assert.equal(errorOf(await call('delete', { path: 'work/k.txt' })), unstored('delete', 'work/k.txt', 'injected store failure'));
   } finally {
     delete s.treeRemove;
     console.warn = warn;
@@ -345,7 +353,7 @@ test("a deletion whose removal lands while reading the tree back fails keeps its
     const record = realRemove.apply(store, args as never);
     if (args[0] !== mountTree) return record;
     failRead = true;
-    throw new Error('No space left on device (os error 28)');
+    throw new Error('IO error: No space left on device (os error 28)');
   };
   s.treeGet = (...args) => {
     if (failRead && args[0] === mountTree) {
@@ -355,7 +363,10 @@ test("a deletion whose removal lands while reading the tree back fails keeps its
     return realGet.apply(store, args as never);
   };
   try {
-    assert.match(errorOf(await call('delete', { path: 'work/l.txt' })), /reading its entries back failed too \(injected read failure\), so whether the change is stored isn't known$/);
+    assert.equal(errorOf(await call('delete', { path: 'work/l.txt' })), 'The delete of "work/l.txt" stopped on an error the workspace didn\'t expect: '
+      + `the store failed as it set the change (${NO_SPACE}), and reading it back failed too (injected read failure). `
+      + 'Whether it changed anything isn\'t known: read "work/l.txt" to see what the workspace holds there now. '
+      + (WIN32 ? MAY_WORK : "Calling again won't change that; whoever runs this host can free space on its disk."));
   } finally {
     delete s.treeRemove;
     delete s.treeGet;
@@ -416,26 +427,26 @@ test('a write, edit or delete whose store throws after recording it says the cha
       const record = real.apply(store, args);
       if (!armed || args[0] !== mountTree) return record;
       armed = false;
-      throw new Error('No space left on device (os error 28)');
+      throw new Error('IO error: No space left on device (os error 28)');
     };
   }
   try {
     armed = true;
     assert.equal(errorOf(await call('write', { path: 'work/w.txt', content: 'new\n' })),
-      'The write of "work/w.txt" is stored in the workspace, so don\'t send it again. The store failed after recording it: No space left on device (os error 28).');
+      `The write of "work/w.txt" is stored in the workspace, so don't send it again. The store failed after recording it: IO error: No space left on device (os error 28).`);
     armed = true;
     assert.equal(errorOf(await call('edit', { path: 'work/e.txt', oldString: 'line', newString: 'line, edited' })),
       'The edit of "work/e.txt" is stored in the workspace, so don\'t send it again: a second edit can apply the change twice. '
-      + 'The store failed after recording it: No space left on device (os error 28).');
+      + 'The store failed after recording it: IO error: No space left on device (os error 28).');
     armed = true;
     assert.equal(errorOf(await call('delete', { path: 'work/d.txt' })),
-      'The deletion of "work/d.txt" is stored in the workspace, so don\'t send it again. The store failed after recording it: No space left on device (os error 28).');
+      'The deletion of "work/d.txt" is stored in the workspace, so don\'t send it again. The store failed after recording it: IO error: No space left on device (os error 28).');
     // writeBinary's peer callers read inChronicle as the file being there.
     armed = true;
     assert.deepEqual(await workspace.writeBinary('work/b.bin', Buffer.from([0, 1, 2]), 'application/octet-stream'), {
       success: false,
       isError: true,
-      error: 'Stored "work/b.bin" in Chronicle, but the store failed after recording it: No space left on device (os error 28).',
+      error: 'Stored "work/b.bin" in Chronicle, but the store failed after recording it: IO error: No space left on device (os error 28).',
       data: { inChronicle: true },
     });
     assert.equal(armed, false);
@@ -457,9 +468,9 @@ test('a write, edit or delete whose store throws after recording it says the cha
   assert.equal((await call('read', { path: 'work/k.txt' })).success, true);
   for (const name of ['treeSet', 'treeRemove']) s[name] = () => { throw new Error('injected store failure'); };
   try {
-    assert.equal(errorOf(await call('write', { path: 'work/k.txt', content: 'changed\n' })), 'injected store failure');
-    assert.equal(errorOf(await call('edit', { path: 'work/k.txt', oldString: 'kept', newString: 'changed' })), 'injected store failure');
-    assert.equal(errorOf(await call('delete', { path: 'work/k.txt' })), 'injected store failure');
+    assert.equal(errorOf(await call('write', { path: 'work/k.txt', content: 'changed\n' })), unstored('write', 'work/k.txt', 'injected store failure'));
+    assert.equal(errorOf(await call('edit', { path: 'work/k.txt', oldString: 'kept', newString: 'changed' })), unstored('edit', 'work/k.txt', 'injected store failure'));
+    assert.equal(errorOf(await call('delete', { path: 'work/k.txt' })), unstored('delete', 'work/k.txt', 'injected store failure'));
   } finally {
     delete s.treeSet;
     delete s.treeRemove;
@@ -487,7 +498,7 @@ test('a write, edit or delete whose store throws after recording it says the cha
       if (!once) return realSet.apply(store, args as never);
       once = false;
       if (records) realSet.apply(store, args as never);
-      throw new Error('No space left on device (os error 28)');
+      throw new Error('IO error: No space left on device (os error 28)');
     };
     try {
       await assert.rejects(asMode644(), (error: Error) => error.name === (records ? 'StoredThenFailed' : 'Error'));
@@ -519,10 +530,10 @@ test('on a mount that pushes, a write, edit or delete whose store throws after r
       const record = real.apply(store, args);
       if (!armed || args[0] !== mountTree) return record;
       armed = false;
-      throw new Error('No space left on device (os error 28)');
+      throw new Error('IO error: No space left on device (os error 28)');
     };
   }
-  const failed = 'The store failed after recording it: No space left on device (os error 28). ';
+  const failed = 'The store failed after recording it: IO error: No space left on device (os error 28). ';
   const writes = "Its push to disk didn't run, so disk lacks the change until a materialize of the path writes it.";
   try {
     armed = true;
@@ -539,7 +550,7 @@ test('on a mount that pushes, a write, edit or delete whose store throws after r
     assert.deepEqual(await workspace.writeBinary('work/b.bin', Buffer.from([0, 1, 2]), 'application/octet-stream'), {
       success: false,
       isError: true,
-      error: `Stored "work/b.bin" in Chronicle, but the store failed after recording it: No space left on device (os error 28). `
+      error: `Stored "work/b.bin" in Chronicle, but the store failed after recording it: IO error: No space left on device (os error 28). `
         + "Its push to disk didn't run, so disk lacks the change until a materialize of the path writes it.",
       data: { inChronicle: true },
     });
@@ -565,8 +576,8 @@ test('on a mount that pushes, a write, edit or delete whose store throws after r
   assert.equal(disk('d.txt'), null);
 
   // A write of the bytes its path holds already leaves nothing a read back
-  // could tell apart, so a set that throws is answered with the store's
-  // error, whether it recorded first or not.
+  // could tell apart, so a set that throws says the file already holds
+  // them, with the store's error, whether it recorded first or not.
   const treeStateId = (workspace as unknown as { mounts: Map<string, { treeStateId: string }> }).mounts.get('work')!.treeStateId;
   const realSet = store.treeSet;
   for (const records of [false, true]) {
@@ -574,10 +585,11 @@ test('on a mount that pushes, a write, edit or delete whose store throws after r
     s.treeSet = (...args) => {
       sets.push(args.slice(0, 2));
       if (records) realSet.apply(store, args as never);
-      throw new Error('No space left on device (os error 28)');
+      throw new Error('IO error: No space left on device (os error 28)');
     };
     try {
-      assert.equal(errorOf(await call('write', { path: 'work/e.txt', content: 'line, edited\n' })), 'No space left on device (os error 28)');
+      assert.equal(errorOf(await call('write', { path: 'work/e.txt', content: 'line, edited\n' })),
+        `The write of "work/e.txt" stopped on an error the workspace didn't expect: ${NO_SPACE}. "work/e.txt" already held what the call gave, so it holds that in the workspace either way.`);
     } finally {
       delete s.treeSet;
     }
@@ -898,7 +910,7 @@ test('a read of a file disk deleted since the workspace read it says so', async 
   assert.equal((await call('read', { path: 'work/g.txt' })).success, true);
   rmSync(join(dir, 'g.txt'));
   assert.equal(errorOf(await call('read', { path: 'work/g.txt' })),
-    "File not found: work/g.txt. Disk's copy was deleted since the workspace last agreed with it, and that was taken in first.");
+    `The read did nothing: there's no file at "work/g.txt" any more: disk's copy was deleted since the workspace last agreed with it, and the workspace took that in first. ls or glob lists the files that exist.`);
 });
 
 test('a read of a draft whose disk copy also changed shows the draft and names the conflict', async (t) => {
@@ -929,7 +941,7 @@ test("a read of a draft whose disk copy turned binary says a sync keeps disk's c
   // draft goes, and disk keeps its bytes.
   assert.equal((await call('sync', { path: 'work/m.txt' })).success, true);
   assert.equal(errorOf(await call('read', { path: 'work/m.txt' })),
-    'work/m.txt is on disk but not stored in the workspace (binary or over the size limit).');
+    `The read did nothing: "work/m.txt" is on disk, but the workspace doesn't store it: it's binary, or over this mount's size limit. read, edit and delete act only on the files it stores, so calling again won't change that.`);
   assert.deepEqual([...readFileSync(join(dir, 'm.txt'))], [0, 1, 2, 0, 255, 0]);
 });
 
@@ -961,7 +973,7 @@ test('a read of a draft whose disk copy was deleted says a sync takes the deleti
       + "Sync the path to take disk's deletion, which removes the workspace's copy, or materialize it with force to write the workspace's copy back to disk.");
   // A sync of the path takes the deletion: the draft goes.
   assert.equal((await call('sync', { path: 'work/d.txt' })).success, true);
-  assert.equal(errorOf(await call('read', { path: 'work/d.txt' })), 'File not found: work/d.txt');
+  assert.equal(errorOf(await call('read', { path: 'work/d.txt' })), `The read did nothing: there's no file at "work/d.txt". ls or glob lists the files that exist.`);
   // A forced materialize of the path writes the draft back.
   assert.equal((await call('materialize', { path: 'work/e.txt', force: true })).success, true);
   assert.equal(disk('e.txt')!.toString(), 'agent draft\n');
@@ -1013,7 +1025,7 @@ test("a read of a file disk made binary answers the disk-only text, not a deleti
   assert.equal((await call('read', { path: 'work/b.txt' })).success, true);
   writeFileSync(join(dir, 'b.txt'), Buffer.from([0, 1, 2, 0, 255, 0]));
   assert.equal(errorOf(await call('read', { path: 'work/b.txt' })),
-    'work/b.txt is on disk but not stored in the workspace (binary or over the size limit).');
+    `The read did nothing: "work/b.txt" is on disk, but the workspace doesn't store it: it's binary, or over this mount's size limit. read, edit and delete act only on the files it stores, so calling again won't change that.`);
 });
 
 test('readBinary serves a binary file the workspace holds as it holds it, though disk changed it', async (t) => {
@@ -1035,12 +1047,12 @@ test('readBinary serves a binary file the workspace holds as it holds it, though
 test("grep's refusal of an invalid pattern gives the parser's reason", async (t) => {
   const { dir, call } = setup(t);
   writeFileSync(join(dir, 'g.txt'), 'x\n');
-  assert.match(errorOf(await call('grep', { pattern: '(' })), /^The grep did nothing: Invalid regular expression: \/\(\/: Unterminated group\.$/);
+  assert.match(errorOf(await call('grep', { pattern: '(' })), /^The grep did nothing: "pattern" "\(" isn't a valid regular expression \(Unterminated group\)\. To match a character such as "\(", "\[" or "\*" as itself, put "\\" before it\.$/);
 });
 
 test('a refusal raised inside a tool reads without an "Error: " prefix', async (t) => {
   const { call } = setup(t);
-  assert.equal(errorOf(await call('read', { path: 'zzz/a.txt' })), 'Unknown mount: "zzz". Available: work');
+  assert.equal(errorOf(await call('read', { path: 'zzz/a.txt' })), `The read did nothing: "zzz/a.txt" starts with "zzz", which is no mount's name, and a path starts with its mount's name; the mounts are "work".`);
 });
 
 test("a push that disk's shape refuses names what's in the way and the way out", async (t) => {
@@ -1086,7 +1098,7 @@ test('an edit of a file disk deleted since the workspace read it says so', async
   assert.equal((await call('read', { path: 'work/g.txt' })).success, true);
   rmSync(join(dir, 'g.txt'));
   assert.equal(errorOf(await call('edit', { path: 'work/g.txt', oldString: 'here', newString: 'x' })),
-    "File not found: work/g.txt. Disk's copy was deleted since the workspace last agreed with it, and that was taken in first.");
+    `The edit did nothing: there's no file at "work/g.txt" any more: disk's copy was deleted since the workspace last agreed with it, and the workspace took that in first. ls or glob lists the files that exist.`);
   assert.equal(existsSync(join(dir, 'g.txt')), false, 'the edit put nothing back');
 });
 
@@ -1131,7 +1143,7 @@ test('a write, edit or delete that fails before its change is stored answers onl
     ];
     for (const [name, input] of calls) {
       const result = await call(name, input);
-      assert.equal(errorOf(result), 'injected before the entry', name);
+      assert.equal(errorOf(result), unstored(name, input.path as string, 'injected before the entry'), name);
     }
   } finally {
     ws.withMount = withMount;
@@ -1211,7 +1223,7 @@ test("an edit of a file disk made binary answers the disk-only text, not a delet
   assert.equal((await call('read', { path: 'work/b.txt' })).success, true);
   writeFileSync(join(dir, 'b.txt'), Buffer.from([0, 1, 2, 0, 255, 0]));
   assert.equal(errorOf(await call('edit', { path: 'work/b.txt', oldString: 'text', newString: 'x' })),
-    'work/b.txt is on disk but not stored in the workspace (binary or over the size limit).');
+    `The edit did nothing: "work/b.txt" is on disk, but the workspace doesn't store it: it's binary, or over this mount's size limit. read, edit and delete act only on the files it stores, so calling again won't change that.`);
   assert.deepEqual([...readFileSync(join(dir, 'b.txt'))], [0, 1, 2, 0, 255, 0], 'disk keeps its bytes');
 });
 
@@ -1240,13 +1252,13 @@ test('a deletion of such a draft whose store throws after recording it says it u
     const record = real.apply(store, args as never);
     if (!armed) return record;
     armed = false;
-    throw new Error('No space left on device (os error 28)');
+    throw new Error('IO error: No space left on device (os error 28)');
   };
   try {
     // The deletion gives up the workspace's side, so it owes disk no push:
     // the answer doesn't say one didn't run, and keeps its note.
     assert.equal(errorOf(await call('delete', { path: 'work/c.txt' })),
-      'The deletion of "work/c.txt" is stored in the workspace, so don\'t send it again. The store failed after recording it: No space left on device (os error 28). '
+      'The deletion of "work/c.txt" is stored in the workspace, so don\'t send it again. The store failed after recording it: IO error: No space left on device (os error 28). '
       + 'Nothing was unlinked: when last observed, disk held a file at work/c.txt that the workspace never took in (conflict: store-origin-collision), '
       + 'and a sync observes whatever disk holds there.');
     assert.equal(armed, false);
@@ -1268,11 +1280,12 @@ test("a forced deletion over a directory says no push unlinks one", async (t) =>
   assert.equal(statSync(join(dir, 'gone.txt')).isDirectory(), true, 'the directory stays');
 });
 
-test("a write over a FIFO is told to fix it and materialize again, with no force", { skip: process.platform === 'win32' ? 'no FIFOs' : false }, async (t) => {
+test("a write over a FIFO is told what's in the way and the ways past it, with no force", { skip: process.platform === 'win32' ? 'no FIFOs' : false }, async (t) => {
   const { dir, call } = setup(t, { autoMaterialize: true });
   assert.equal(spawnSync('mkfifo', [join(dir, 'p.txt')]).status, 0, 'mkfifo');
   assert.equal(errorOf(await call('write', { path: 'work/p.txt', content: 'x\n' })), 'The write of "work/p.txt" is stored in the workspace, so don\'t send it again. '
-    + "Its push to disk didn't complete: cannot verify disk copy (not a regular file) — fix it and materialize again.");
+    + "Its push to disk didn't complete: disk has a pipe, socket or device at this path, or a symlink to one, and no push writes a file over it, forced or not — "
+    + 'write the file under another path, or whoever runs this host can remove it, and materializing again then gets past it.');
   assert.equal(statSync(join(dir, 'p.txt')).isFIFO(), true, 'the FIFO stays');
 });
 
@@ -1280,12 +1293,13 @@ test("a write over a FIFO is told to fix it and materialize again, with no force
 // The fix round of the third review (af-ws-fix-r2)
 // ---------------------------------------------------------------------------
 
-test("a write over a symlink the mount doesn't follow is told to fix it, with no force", async (t) => {
+test("a write over a symlink the mount doesn't follow is told what's in the way and the ways past it, with no force", async (t) => {
   const { dir, call } = setup(t, { autoMaterialize: true });
   writeFileSync(join(dir, 'target.txt'), 'target\n');
   symlinkSync('target.txt', join(dir, 'l.txt'));
   assert.equal(errorOf(await call('write', { path: 'work/l.txt', content: 'x\n' })), 'The write of "work/l.txt" is stored in the workspace, so don\'t send it again. '
-    + "Its push to disk didn't complete: cannot verify disk copy (a symlink, which this mount does not follow) — fix it and materialize again.");
+    + "Its push to disk didn't complete: disk has a symlink at this path, which this mount does not follow, and no push writes through one, forced or not — "
+    + 'write the file under another path, or whoever runs this host can remove the link, and materializing again then gets past it.');
   assert.equal(lstatSync(join(dir, 'l.txt')).isSymbolicLink(), true, 'the link stays');
   assert.equal(readFileSync(join(dir, 'target.txt'), 'utf8'), 'target\n');
 });
@@ -1305,7 +1319,7 @@ test('a disk copy the workspace cannot read is offered force on the condition fo
   } catch { /* unreadable, as intended */ }
 
   const writeRefusal = (path: string): string => `The write of "work/${path}" is stored in the workspace, so don't send it again. `
-    + "Its push to disk didn't complete: cannot verify disk copy (cannot open (EACCES)) — fix it and materialize again, "
+    + "Its push to disk didn't complete: cannot verify disk copy (cannot open (permission denied)) — materializing again won't change that; whoever runs this host can change the permissions, and materializing again then gets past it, "
     + 'or, if disk lets the workspace write the file, materialize it with force to overwrite it.';
   assert.equal(errorOf(await call('write', { path: 'work/r.txt', content: 'v2\n' })), writeRefusal('r.txt'));
   assert.equal(errorOf(await call('write', { path: 'work/n.txt', content: 'v2\n' })), writeRefusal('n.txt'));
@@ -1313,7 +1327,7 @@ test('a disk copy the workspace cannot read is offered force on the condition fo
   // where it doesn't, which is why the offer carries its condition.
   const forced = await call('materialize', { force: true });
   assert.equal(forced.success, true, forced.error);
-  assert.match(JSON.stringify(forced.data), /n\.txt: not written: [^"]*EACCES/);
+  assert.match(JSON.stringify(forced.data), /n\.txt: not written: [^"]*permission denied/);
   chmodSync(join(dir, 'r.txt'), 0o600);
   chmodSync(join(dir, 'n.txt'), 0o600);
   assert.equal(readFileSync(join(dir, 'r.txt'), 'utf8'), 'v2\n');
@@ -1322,7 +1336,7 @@ test('a disk copy the workspace cannot read is offered force on the condition fo
   // A deletion's forced unlink needs its directory, not the file's own
   // permissions: this one unlinks it.
   assert.equal(errorOf(await call('delete', { path: 'work/s.txt' })), 'The deletion of "work/s.txt" is stored in the workspace, so don\'t send it again. '
-    + "Its push to disk didn't complete: cannot verify disk copy (cannot open (EACCES)) — fix it and materialize again with applyDeletions, "
+    + "Its push to disk didn't complete: cannot verify disk copy (cannot open (permission denied)) — materializing again with applyDeletions won't change that; whoever runs this host can change the permissions, and materializing again with applyDeletions then gets past it, "
     + 'or, if disk lets the workspace unlink the file, materialize it with force and applyDeletions to delete it.');
   const unlinked = await call('materialize', { path: 'work/s.txt', force: true, applyDeletions: true });
   assert.equal(unlinked.success, true, unlinked.error);
@@ -1358,7 +1372,7 @@ test("a path whose branch intent can't be read is told to sync the path, which r
   // A sync asks for an adoption, which gets past the intent's check and stops
   // at the symlink, before anything is adopted: its note is the symlink's,
   // where a pass that adopts nothing answers the intent's.
-  assert.match(JSON.stringify(blind.data), /"path":"w\.txt","reason":"disk could not be checked: a symlink, which this mount does not follow"/);
+  assert.match(JSON.stringify(blind.data), /"path":"w\.txt","reason":"disk could not be checked: a symlink, which this mount does not follow — syncing this path again won't change that; whoever runs this host can set followSymlinks: true on this mount if it leads inside the mount, mount what it leads to, or a directory that holds it, if it leads outside, or remove it if it leads nowhere"/);
   assert.match(JSON.stringify((await call('materialize', { path: 'work/w.txt' })).data), unseen, "a sync that can't see disk's copy leaves the intent");
   rmSync(join(dir, 'w.txt'));
   // Absent is a copy a sync sees, so the reason names the sync alone, and
@@ -1369,7 +1383,7 @@ test("a path whose branch intent can't be read is told to sync the path, which r
   assert.equal(seen.success, true, seen.error);
   const removed = await call('read', { path: 'work/w.txt' });
   assert.equal(removed.success, false, "the sync took disk's deletion");
-  assert.equal(removed.error, 'File not found: work/w.txt');
+  assert.equal(removed.error, `The read did nothing: there's no file at "work/w.txt". ls or glob lists the files that exist.`);
   assert.doesNotMatch(JSON.stringify((await call('materialize', { path: 'work/w.txt' })).data), /branch intent/, 'once it sees disk, the sync replaces it');
 });
 
@@ -1509,7 +1523,7 @@ for (const [kind, limit, copy] of [
     assert.equal((await call('sync', { path: 'work/b.txt' })).success, true);
     const after = await call('read', { path: 'work/b.txt' });
     assert.equal(after.success, false, "the sync gave up the workspace's copy");
-    assert.equal(after.error, 'work/b.txt is on disk but not stored in the workspace (binary or over the size limit).');
+    assert.equal(after.error, `The read did nothing: "work/b.txt" is on disk, but the workspace doesn't store it: it's binary, or over this mount's size limit. read, edit and delete act only on the files it stores, so calling again won't change that.`);
     const listed = (await call('ls', { path: 'work' })).data as { entries: Array<{ name: string; state: string }> };
     assert.equal(listed.entries.find((e) => e.name === 'b.txt')?.state, 'disk-only', 'the listing shows it disk-only');
     assert.deepEqual(disk('b.txt'), copy, 'disk keeps its copy');

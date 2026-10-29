@@ -26,6 +26,7 @@ import { AgentFramework } from '../src/index.js';
 import { resolveAutoContinue } from '../src/agent.js';
 import { autoContinueNotice } from '../src/auto-continue.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { bindAsConversationFork } from './helpers/dendrite.js';
 import type { ContentBlock, NormalizedResponse } from '@animalabs/membrane';
 
 class TriggerModule implements Module {
@@ -229,6 +230,27 @@ describe('autoContinue', () => {
       assert.equal(triggers.length, 2);
       assert.equal(triggers[1]!.reason, 'auto-continue');
       assert.equal(notices(framework).length, 1);
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it("a continuation's request ends on a changed context injection, stored after its [continue] row", async () => {
+    let gathered = 0;
+    (module as unknown as { gatherContext: () => Promise<unknown[]> }).gatherContext = async () =>
+      [{ namespace: 'lessons', position: 'afterUser', content: [text(`LESSON ${++gathered}`)] }];
+    const framework = await createFramework(true);
+    stubRegistry(framework);
+    script(framework, [empty(), skipReply()]);
+    try {
+      trigger(framework);
+      await within(framework.runUntilIdle(), 'the run to settle');
+      const textOf = (m: { content: unknown } | undefined) =>
+        ((m?.content ?? []) as Array<{ type: string; text?: string }>).filter((b) => b.type === 'text').map((b) => b.text ?? '').join('');
+      const continued = membrane.calls[1]!.messages;
+      assert.equal(textOf(continued.at(-1)), 'LESSON 2', 'it ends on the injection');
+      assert.ok(textOf(continued.at(-2)).startsWith('[continue] assistant'), 'right after the [continue] row');
+      assert.ok(continued.some((m) => textOf(m) === 'LESSON 1'), 'the first turn\'s copy stays where it was');
     } finally {
       await framework.stop();
     }
@@ -496,7 +518,6 @@ describe('autoContinue', () => {
       autoContinueAfterTurn(agent: unknown, routing: unknown, trigger: unknown, stopReason: string, opts?: unknown): void;
       pendingRequests: InferenceRequest[];
       ephemeralRuns: Map<string, unknown>;
-      conversationAgentHomes: Map<string, unknown>;
       providerAdmissionClosed: boolean;
       autoContinueStreaks: Map<string, number>;
     };
@@ -508,9 +529,9 @@ describe('autoContinue', () => {
       internals.ephemeralRuns.delete('assistant');
       assert.equal(queued().length, 0, 'an ephemeral run ends with its result');
 
-      internals.conversationAgentHomes.set('assistant', 'chan-alpha');
+      const unbind = bindAsConversationFork(framework, 'assistant', { serverId: 'stub', channelId: 'chan-alpha' });
       internals.autoContinueAfterTurn(agent, {}, undefined, 'end_turn');
-      internals.conversationAgentHomes.delete('assistant');
+      unbind();
       assert.equal(queued().length, 0, 'a conversation fork answers its home');
 
       internals.providerAdmissionClosed = true;
@@ -532,7 +553,7 @@ describe('autoContinue', () => {
     }
   });
 
-  it("the row says the last turn's closing words were held when it had already sent", async () => {
+  it("the row says the last turn's closing words were held when a send held them", async () => {
     const framework = await createFramework(true);
     stubRegistry(framework);
     const internals = framework as unknown as {
@@ -864,7 +885,7 @@ describe('autoContinueNotice', () => {
     );
     assert.equal(
       autoContinueNotice({ agentName: 'lena', stop: 'call skip_reply', last: false, heldAfterSend: true }),
-      '[continue] lena, another turn starts now. Your closing words last turn were held, not sent: that turn had already sent with a send tool. ' +
+      '[continue] lena, another turn starts now. Some or all of your closing words last turn were held, not sent: a send that turn may already have posted where they were going. ' +
         "If you're done, call skip_reply; anything you write without it is sent as usual.",
     );
   });

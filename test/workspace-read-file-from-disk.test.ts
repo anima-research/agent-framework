@@ -28,7 +28,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule, WorkspaceReadError } from '../src/modules/workspace/index.js';
-import { ROOT_REPLACED, ROOT_UNAVAILABLE } from '../src/modules/workspace/observe.js';
+import { ROOT_ON_ANOTHER_DEVICE, ROOT_REPLACED, ROOT_UNAVAILABLE } from '../src/modules/workspace/observe.js';
 import { changedAfterFstat, countingLoads, withFileHandle } from './helpers/file-handle.js';
 
 /** A valid 1x1 PNG, for read_image. */
@@ -126,7 +126,7 @@ test('nested paths read and reject lexical traversal / unknown mounts by code', 
   assert.equal((await workspace.readFileFromDisk('work/sub/deep.txt')).bytes.toString(), 'deep');
 
   const traversal = await expectRefusal(workspace.readFileFromDisk('work/../outside.txt'), 'traversal');
-  assert.match(traversal.message, /traversal/i);
+  assert.match(traversal.message, /^"work\/\.\.\/outside\.txt" climbs above the root of mount "work"/);
   await expectRefusal(workspace.readFileFromDisk('nope/file.txt'), 'unknown_mount');
 });
 
@@ -201,7 +201,7 @@ test('a FIFO is refused at once by each disk reader, without waiting for a write
     const err = await expectRefusal(within(workspace.readFileFromDisk('work/pipe'), 'readFileFromDisk'), 'not_found');
     assert.equal(err.message, 'Not a regular file: work/pipe');
     const image = await within(workspace.handleToolCall({ id: 'f', name: 'read_image', input: { path: 'work/pipe' } }), 'read_image');
-    assert.equal(image.error, 'Not a regular file: work/pipe');
+    assert.equal(image.error, `The read_image did nothing: "work/pipe" isn't a regular file (it's a pipe, a socket or a device), so the workspace doesn't read it. Calling again won't change that; whoever runs this host can put a regular file there.`);
     assert.deepEqual(await within(workspace.readBinaryFromDisk('work/pipe'), 'readBinaryFromDisk'), { error: 'Not a file: work/pipe' });
     assert.equal(opened, 0, 'no reader opened the FIFO');
   } finally {
@@ -283,7 +283,8 @@ test('an intermediate symlinked directory escaping the mount is rejected under n
   // which a mount that doesn't follow symlinks refuses as one, with the code
   // for where it leads.
   const err = await expectRefusal(workspace.readFileFromDisk('work/linkdir/secret.txt'), 'escape');
-  assert.equal(err.message, 'work/linkdir/secret.txt: "work/linkdir" is a symlink leading outside the mount, which this mount does not follow');
+  assert.equal(err.message, 'work/linkdir/secret.txt: "work/linkdir" is a symlink leading outside the mount, which this mount does not follow; '
+    + 'followed or not, nothing done through this mount reaches what it leads to, and whoever runs this host can mount it, or a directory that holds it');
   assert.ok(!err.message.includes(root));
 });
 
@@ -410,16 +411,16 @@ test('size is what the read found: a file that grows after the open, within maxB
   }
 });
 
-test('read_image keeps its historical error wording after sharing the containment core', async (t) => {
+test('read_image answers a directory and a missing file in the tools\' words after sharing the containment core', async (t) => {
   // The image reader was the original owner of this algorithm; its messages
   // are pinned by workspace-read-image.test.ts. Spot-check the two codes the
   // shared core maps most delicately (not_found variants and directory).
   const { mountDir, workspace } = setup(t);
   mkdirSync(join(mountDir, 'folder'));
   const dir = await workspace.handleToolCall({ id: 'c1', name: 'read_image', input: { path: 'work/folder' } });
-  assert.equal(dir.error, 'Path is a directory: work/folder');
+  assert.equal(dir.error, `The read_image did nothing: "work/folder" is a directory, not a file; ls "work/folder" lists what's in it.`);
   const missing = await workspace.handleToolCall({ id: 'c2', name: 'read_image', input: { path: 'work/nope.png' } });
-  assert.equal(missing.error, 'File not found: work/nope.png');
+  assert.equal(missing.error, `The read_image did nothing: there's no file at "work/nope.png". ls or glob lists the files that exist.`);
 });
 
 test('readBinaryFromDisk with maxBytes refuses a file that grows past it after the open, having loaded no more than maxBytes and one byte', async (t) => {
@@ -488,7 +489,7 @@ for (const replacement of ['link', 'directory'] as const) {
     assert.equal((await expectRefusal(workspace.readFileFromDisk('work/a.txt'), 'mount_unavailable')).message, replaced);
     assert.deepEqual(await workspace.readBinaryFromDisk('work/secret.txt'), { error: replaced });
     const image = await workspace.handleToolCall({ id: 'image', name: 'read_image', input: { path: 'work/pixel.png' } });
-    assert.equal(image.error, replaced);
+    assert.equal(image.error, `The read_image did nothing: "work/pixel.png" can't be read: ${ROOT_REPLACED}.`);
 
     // The remedy the refusal names: a sync with acceptRoot takes the root as it is now.
     const accepted = await workspace.handleToolCall({ id: 'accept', name: 'sync', input: { mount: 'work', acceptRoot: true } });
@@ -496,6 +497,22 @@ for (const replacement of ['link', 'directory'] as const) {
     assert.equal((await workspace.readFileFromDisk('work/secret.txt')).bytes.toString(), 'SECRET');
   });
 }
+
+test('a root with the recorded inode on another device, and no birth time recorded, is refused by a disk reader in those words, with no errno, until a sync accepts it', async (t) => {
+  const { mountDir, workspace } = await recorded(t);
+  const now = statSync(mountDir, { bigint: true });
+  const agreement = (workspace as unknown as { agreement: { write(entry: unknown, opts: object): void } }).agreement;
+  agreement.write({ t: 'root', mount: 'work', identity: { dev: String(now.dev + 1n), ino: String(now.ino) } }, {});
+
+  const err = await expectRefusal(workspace.readFileFromDisk('work/a.txt'), 'mount_unavailable');
+  assert.equal(err.message, `Mount unavailable: work: ${ROOT_ON_ANOTHER_DEVICE}`);
+  assert.equal(err.stage, 'root');
+  assert.equal(err.errno, undefined, 'no errno: a directory is there');
+
+  const accepted = await workspace.handleToolCall({ id: 'accept', name: 'sync', input: { mount: 'work', acceptRoot: true } });
+  assert.equal(accepted.success, true, accepted.error);
+  assert.equal((await workspace.readFileFromDisk('work/a.txt')).bytes.toString(), 'inside');
+});
 
 test('a root replaced by another directory between its check and the open is refused, not read', async (t) => {
   const { root, mountDir, workspace } = await recorded(t);
@@ -683,7 +700,7 @@ test('while the disk evidence awaits reopening, a read goes on, checked against 
     patched.appendJson = append;
   }
   const again = await workspace.handleToolCall({ id: 'again', name: 'sync', input: { mount: 'work' } });
-  assert.match(again.error ?? '', /until the store is reopened/, 'the evidence awaits reopening');
+  assert.match(again.error ?? '', /^The sync did nothing: the workspace can't check its files against disk until its store is reopened/, 'the evidence awaits reopening');
 
   assert.equal((await workspace.readFileFromDisk('work/a.txt')).bytes.toString(), 'inside', 'the mount\'s own file is read');
   renameSync(mountDir, join(root, 'mount-away'));
@@ -763,7 +780,7 @@ test("a workspace whose open couldn't read its disk evidence back refuses disk r
   });
   const err = await expectRefusal(workspace.readFileFromDisk('work/a.txt'), 'mount_unavailable');
   assert.equal(err.stage, 'root');
-  assert.match(err.message, /^Mount unavailable: work: Disk-agreement evidence is unavailable until the store is reopened/);
+  assert.match(err.message, /^Mount unavailable: work: the workspace can't check its files against disk until its store is reopened: reading back/);
   assert.equal(err.errno, undefined, 'a directory is there');
   rmSync(join(root, 'mount'), { recursive: true });
   writeFileSync(join(root, 'mount'), 'a file where the directory was');
@@ -789,7 +806,7 @@ test("a workspace whose open failed to record a changed mount refuses disk reads
   mkdirSync(join(root, 'other'));
   writeFileSync(join(root, 'other', 'a.txt'), 'the replacement');
   const other = await expectRefusal(workspace.readFileFromDisk('other/a.txt'), 'mount_unavailable');
-  assert.match(other.message, /^Mount unavailable: other: Disk-agreement evidence is unavailable until the store is reopened/);
+  assert.match(other.message, /^Mount unavailable: other: the workspace can't check its files against disk until its store is reopened/);
   const work = await expectRefusal(workspace.readFileFromDisk('work/a.txt'), 'mount_unavailable');
-  assert.match(work.message, /^Mount unavailable: work: Disk-agreement evidence is unavailable until the store is reopened/);
+  assert.match(work.message, /^Mount unavailable: work: the workspace can't check its files against disk until its store is reopened/);
 });

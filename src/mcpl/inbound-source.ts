@@ -22,6 +22,8 @@
  */
 
 import { createHash } from 'node:crypto';
+import { blockAsStored, MalformedContentError } from '@animalabs/context-manager';
+import { logDetail, logValue } from './log-value.js';
 
 /** The MCPL admission lane that accepted an item. Its contract decides what
  *  an `eventId` is worth: `push/event` deduplicates by eventId, and RFC-006
@@ -192,92 +194,65 @@ export function canonicalJson(value: unknown): string {
 }
 
 /**
- * A block as the store hands it back. Context-manager keeps inline media as
- * blobs (blob-manager.ts): an image whose source isn't a URL, and every
- * document, audio or video block, comes back as `{ type, source: { type:
- * 'base64', data, mediaType } }` and nothing else, its data re-encoded from
- * the decoded bytes, and an image's media type taken from its bytes'
- * signature where they have one. Any other block comes back as it was given,
- * except a store-internal `blob_ref` from an unresolved read, which resolves
- * to inline media by default. It is digested as given here, so an unresolved
- * read and its resolved form differ. Context-manager refuses caller-supplied
- * blob_ref writes; the MCPL lanes never store one.
+ * blockAsStored throws a `MalformedContentError` for a block the store
+ * refuses on write, a caller-supplied `blob_ref` among them. Such a block
+ * has no stored form, and whatever is thrown, it is digested as given.
  */
 function storedBlock(block: unknown): unknown {
-  const media = block as { type?: unknown; source?: { type?: unknown; data?: unknown; mediaType?: unknown } } | null;
-  const blob = media?.type === 'image'
-    ? media.source?.type !== 'url'
-    : media?.type === 'document' || media?.type === 'audio' || media?.type === 'video';
-  const source = media?.source;
-  if (!blob || typeof source?.data !== 'string') return block;
-  const data = canonicalBase64(source.data);
-  const mediaType = media!.type === 'image'
-    ? sniffRasterImageMediaType(Buffer.from(data.slice(0, 32), 'base64')) ?? source.mediaType
-    : source.mediaType;
-  return { type: media!.type, source: { type: 'base64', data, mediaType } };
-}
-
-/**
- * Base64 as the store writes it back from the decoded bytes: padded, with no
- * whitespace, the standard alphabet and zero unused bits. Data already in
- * that form, as every stored copy's is, is returned without decoding it all.
- */
-function canonicalBase64(data: string): string {
-  if (data.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(data)) {
-    const last = data.slice(-4);
-    if (Buffer.from(last, 'base64').toString('base64') === last) return data;
+  try {
+    return blockAsStored(block as Parameters<typeof blockAsStored>[0]);
+  } catch (err) {
+    if (!(err instanceof MalformedContentError)) {
+      const { name, message } = (err ?? {}) as { name?: unknown; message?: unknown };
+      console.error(
+        `[stored-digest-as-given] error=${logValue(typeof name === 'string' ? name : typeof err)}: ` +
+        logDetail(typeof message === 'string' ? message : ''),
+      );
+    }
+    return block;
   }
-  return Buffer.from(data, 'base64').toString('base64');
-}
-
-/**
- * The store's own test for raster image types with an unambiguous byte
- * signature, copied from context-manager's blob-manager.ts (it isn't
- * exported): the store relabels an image whose bytes match one of these.
- */
-function sniffRasterImageMediaType(bytes: Uint8Array): string | null {
-  if (bytes.length >= 8 &&
-      bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 &&
-      bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a) {
-    return 'image/png';
-  }
-  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
-    return 'image/jpeg';
-  }
-  if (bytes.length >= 6) {
-    const signature = Buffer.from(bytes.subarray(0, 6)).toString('ascii');
-    if (signature === 'GIF87a' || signature === 'GIF89a') return 'image/gif';
-  }
-  if (bytes.length >= 12 &&
-      Buffer.from(bytes.subarray(0, 4)).toString('ascii') === 'RIFF' &&
-      Buffer.from(bytes.subarray(8, 12)).toString('ascii') === 'WEBP') {
-    return 'image/webp';
-  }
-  return null;
 }
 
 /**
  * The version identity of a delivered body (agreed with the receipts lane,
  * room-220 #46752–#47210): SHA-256 hex of `canonicalJson([blocks])` over the
  * ContentBlock[] the framework stores for the body — after MCPL conversion,
- * before any host decoration is added and before storage shards it — with
- * each block as the store keeps it (storedBlock, canonicalJson). So a body
- * hashes alike as delivered, as handed to storage, and as read back from
- * the store. The one-element array keeps the framing an undecorated,
- * unsharded stored copy has always hashed to, so a stamped copy and an
- * older copy of the same body share a version.
+ * which marks the server's text at the framework's notice openings
+ * (supplied-text.ts), before any host decoration is added and before storage
+ * shards it — with
+ * each block as the store keeps it, which context-manager's `blockAsStored`
+ * gives. So a body hashes alike as delivered, as handed to storage, and as
+ * read back unsharded from the store with its blobs resolved, except one
+ * whose blocks the store changes together: when it mends a `tool_use` whose
+ * input isn't an object, it also releases a raw replay form (`rawXml`,
+ * `rawItem`) that the message's other blocks share, which no one block's
+ * stored form shows. A body an MCPL lane stamps is never one. A block the
+ * store refuses on write, a `blob_ref` among them, is digested as given. The
+ * one-element array keeps the framing an undecorated, unsharded stored copy
+ * has always hashed to, so a stamped copy and an older copy of the same body
+ * share a version where the store keeps the body as it did then.
+ *
+ * A digest is a digest under the context-manager release that computed it: a
+ * release that changes what the store keeps, such as its set of image
+ * signatures, changes the digest of a body it touches.
  *
  * Ingestion stamps it as `metadata.sourceBodyDigest`, and the same function
  * over exactly the blocks handed to storage (decorations included) as
  * `metadata.storedBodyDigest`, on both MCPL lanes. Both live outside the
  * frozen admission envelope: they describe the body actually delivered (a
  * materialization, a correction), not the admission. Neither proves later
- * presence or completeness; an unsharded stored copy that no longer hashes
+ * presence or completeness. An unsharded stored copy that no longer hashes
  * to its storedBodyDigest was changed after delivery (editMessage keeps
- * metadata). A body the store shards carries the whole body's two digests
- * on every shard, and no shard hashes to them. Check a copy read back with
- * its blobs resolved (getAllMessages, getMessage, or getMessageWindow
- * without `resolveBlobs: false`): a blob reference never matches.
+ * metadata), or holds blocks the store changes together, or its digest was
+ * taken under a release that kept some block of it differently: a
+ * context-manager release that changed a stored form, or an agent-framework
+ * release from 0.24.0 up to the one that brought in blockAsStored, which
+ * took stored forms from a copy of the store's transform. Digests already
+ * stamped are never recomputed. A body the store shards carries the whole
+ * body's two digests on every shard, and no shard hashes to them. Check a
+ * copy read back with its blobs resolved (getAllMessages, getMessage, or
+ * getMessageWindow without `resolveBlobs: false`): a blob reference never
+ * matches.
  *
  * Exported from the package root, so a consumer checks a copy against either
  * field with this same function rather than a copy of it.

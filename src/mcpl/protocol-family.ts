@@ -22,6 +22,7 @@
  * isn't `initialize`), the SDK's stdio probe launches the server twice, and a
  * server's era is a stable fact its configuration can state.
  */
+import { NOTICE_TAG } from '../notice-tags.js';
 import { DENY_BY_DEFAULT, capabilityPatternMatches } from './capability-grant.js';
 import { DEFAULT_EAGER_FETCH_MAX_BYTES, DEFAULT_MAX_TOTAL_BYTES } from './reference-fetcher.js';
 import { DEFAULT_MAX_INPUT_BYTES } from './tool-lifecycle.js';
@@ -198,11 +199,11 @@ export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token
 
 /** What a redaction gives in place of text when the configuration it
  *  redacts with can't be read ({@link redactServerText}). */
-export const WITHHELD_TEXT = "[withheld: the server's configuration couldn't be read to redact this]";
+export const WITHHELD_TEXT = `[${NOTICE_TAG.withheld}: the server's configuration couldn't be read to redact this]`;
 
 /** What {@link redactedData} gives in place of data nested deeper than it
  *  walks. */
-export const TOO_DEEP_TEXT = '[withheld: nested too deep to redact]';
+export const TOO_DEEP_TEXT = `[${NOTICE_TAG.withheld}: nested too deep to redact]`;
 
 /** How deep {@link redactedData} walks. A server's JSON can nest deeper than
  *  a recursive walk's stack holds (10,000 levels overflow it), and the walk
@@ -528,7 +529,7 @@ export function credentialRedactor(patterns: readonly CredentialPattern[]): Reda
 /** Any value as text: a value that can't be printed reads as a placeholder. */
 export function asText(text: unknown): string {
   if (typeof text === 'string') return text;
-  try { return String(text); } catch { return '[a value that cannot be printed]'; }
+  try { return String(text); } catch { return `[${NOTICE_TAG.unprintableValue}]`; }
 }
 
 /** A part of an environment variable's name that ends with a credential word, in the singular or plural, with any digits after it. */
@@ -641,6 +642,8 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 export function mcplPolicyGrants(config: McplServerConfig): string[] {
   const grants: string[] = [];
   if (isEffective(config.allowHostCommands)) grants.push('allowHostCommands');
+  // RFC-014 tool hints are an MCPL advertisement.
+  if (config.toolHints === true) grants.push('toolHints');
   // An allow-list, except that a pattern matching a path denied by default
   // grants it (computeGrant's explicitlyEnabled), named by the path.
   const enabled = config.enabledCapabilities as unknown;
@@ -692,7 +695,7 @@ export function serverConfigProblems(config: McplServerConfig): string[] {
   } catch (error) {
     return [(error as Error).message];
   }
-  const problems: string[] = [];
+  const problems: string[] = credentialRequiredProblems(config);
   if (binding.transport === 'http') {
     // fetch refuses a url with userinfo, and its error quotes the whole url,
     // password included, into the connect failure's log line, trace and
@@ -757,6 +760,38 @@ export function serverConfigProblems(config: McplServerConfig): string[] {
   return problems;
 }
 
+/** Strict-only admission, also applied to a captured policy at dial time.
+ * Nothing supplied in an invalid setting is quoted. Runtime providers are
+ * host-attached, so their presence is checked by the dial, not here. */
+function credentialRequiredProblems(config: McplServerConfig): string[] {
+  const flag: unknown = config.credentialRequired;
+  if (flag === undefined || flag === null || flag === false) return [];
+  const problem = (why: string) => [`MCP server "${config.id}": credentialRequired ${why}`];
+  if (flag !== true) return problem('must be a boolean');
+  let binding: ServerBinding;
+  try { binding = resolveServerBinding(config); }
+  catch { return problem('requires a valid WebSocket binding'); }
+  if (binding.transport !== 'websocket' || binding.family !== 'legacy') {
+    return problem('applies only to a legacy ws(s):// server, not HTTP, stdio or modern servers');
+  }
+  if (config.token !== undefined && config.token !== null) return problem('forbids a static token, including an empty token');
+  if (config.tokenTransport !== 'header') return problem("requires tokenTransport 'header'");
+  const url = new URL(config.url!);
+  if (url.hash) return problem('forbids a URL fragment');
+  if (url.protocol === 'ws:') {
+    if (!isLoopbackHost(url.hostname)) return problem('requires TLS outside loopback');
+    const name = url.hostname.toLowerCase();
+    const host = name.replace(/\.$/, '');
+    if (host.endsWith('.localhost') || name === 'localhost.') {
+      return problem('requires TLS for a localhost name other than localhost itself, which a resolver can send off this host; use localhost or a loopback address');
+    }
+    if (host === '0.0.0.0' || host === '[::]') {
+      return problem('requires TLS for the unspecified address, which is not a loopback address; use 127.0.0.1 or [::1]');
+    }
+  }
+  return [];
+}
+
 /**
  * What's wrong with a WebSocket server's `tokenTransport`, as a message, or
  * undefined: a value that is neither mode, or `'header'` with a url that
@@ -767,18 +802,19 @@ export function serverConfigProblems(config: McplServerConfig): string[] {
  * The refusal names the value's kind, never the value, which could be a
  * credential pasted into the wrong field, and quotes nothing of the url.
  */
-export function tokenTransportProblem(config: Pick<McplServerConfig, 'id' | 'tokenTransport'>, url: URL): string | undefined {
+export function tokenTransportProblem(config: Pick<McplServerConfig, 'id' | 'tokenTransport' | 'credentialRequired'>, url: URL): string | undefined {
   // A configuration read from JSON can hold anything here.
   const mode: unknown = config.tokenTransport;
   if (mode === undefined || mode === null || mode === 'query') return undefined;
   if (mode !== 'header') {
     return `MCP server "${config.id}": tokenTransport must be 'query' or 'header', not ${typeof mode === 'string' ? 'another string' : kindOf(mode)}`;
   }
+  const strict = config.credentialRequired === true;
   if (url.searchParams.has('token')) {
-    return `MCP server "${config.id}": with tokenTransport 'header' the url must not carry a "token" query parameter, which would still put a credential in it; give it as "token" or "accessProvider"`;
+    return `MCP server "${config.id}": with tokenTransport 'header' the url must not carry a "token" query parameter, which would still put a credential in it; give it as ${strict ? '"accessProvider"' : '"token" or "accessProvider"'}`;
   }
   if (url.username || url.password) {
-    return `MCP server "${config.id}": with tokenTransport 'header' the url must not carry userinfo (user:password@), since the Bearer header replaces the userinfo's Basic credential whenever it carries a credential; leave out "tokenTransport" to send the userinfo as before, or give the credential as "token" or "accessProvider"`;
+    return `MCP server "${config.id}": with tokenTransport 'header' the url must not carry userinfo (user:password@), since the Bearer header replaces the userinfo's Basic credential whenever it carries a credential; ${strict ? 'give the credential as "accessProvider"' : 'leave out "tokenTransport" to send the userinfo as before, or give the credential as "token" or "accessProvider"'}`;
   }
   return undefined;
 }
@@ -866,4 +902,24 @@ export function checkServerConfig(config: McplServerConfig): ServerBinding {
   if (problems.length > 0) throw new Error(problems.join('; '));
   for (const warning of serverConfigWarnings(config)) console.warn(`[mcp] ${warning}`);
   return resolveServerBinding(config);
+}
+
+const DROPPED_LINES_LOGGED = 3;
+const droppedLinesLogged = new WeakMap<object, number>();
+
+export function logDroppedLine(serverId: string, line: string, reason: 'unparsed' | 'not-object', connection: object): void {
+  if (/^[ \t]*$/.test(line)) return;
+  const logged = droppedLinesLogged.get(connection) ?? 0;
+  if (logged > DROPPED_LINES_LOGGED) return;
+  droppedLinesLogged.set(connection, logged + 1);
+  if (logged === DROPPED_LINES_LOGGED) {
+    console.error(`MCP server "${serverId}" sent another line that isn't a JSON object, so it was dropped; more such lines on this connection are dropped without a log line`);
+    return;
+  }
+  let length = 0;
+  for (const _ of line) length++;
+  const why = reason === 'not-object' ? 'is JSON but not an object'
+    : /^[ \t]*\{/.test(line) ? "starts like a JSON object but doesn't parse"
+    : "isn't JSON";
+  console.error(`MCP server "${serverId}" sent a line of length ${length} that ${why}, so it was dropped`);
 }

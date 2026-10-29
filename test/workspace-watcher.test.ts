@@ -5,7 +5,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { MountWatcher, type FsChange, type WatcherLifecycle } from '../src/modules/workspace/watcher.js';
+import { MountWatcher, identityOf, type FsChange, type WatcherLifecycle } from '../src/modules/workspace/watcher.js';
 import { changesFlow, isProbe } from './helpers/watcher-flow.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
 
@@ -241,6 +241,24 @@ function withOpenRefused<T>(path: string, fn: () => Promise<T>): Promise<T> {
     return openSync(file, ...rest);
   }, fn);
 }
+
+describe('MountWatcher root identity', () => {
+  it('keeps a root the same where its birth time follows its ctime, as where statx is unavailable, and tells a later-born one apart', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-watch-id-'));
+    try {
+      const s = statSync(dir);
+      const as = (fields: Partial<fs.Stats>) => Object.assign(Object.create(Object.getPrototypeOf(s)), s, fields) as fs.Stats;
+      const before = as({ ctimeMs: s.ctimeMs, birthtimeMs: s.ctimeMs });
+      const after = as({ ctimeMs: s.ctimeMs + 5, birthtimeMs: s.ctimeMs + 5 });
+      assert.deepStrictEqual(identityOf(after), identityOf(before), 'an entry made in the root moves both');
+      const born = as({ ctimeMs: s.ctimeMs + 5, birthtimeMs: s.ctimeMs - 1000 });
+      const reborn = as({ ctimeMs: s.ctimeMs + 9, birthtimeMs: s.ctimeMs + 1 });
+      assert.notDeepStrictEqual(identityOf(reborn), identityOf(born), 'a birth time apart from the ctime still tells');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('MountWatcher mergeOp', () => {
   // Each merge rule, from chokidar's events handed in within one debounce
@@ -1126,6 +1144,7 @@ describe('MountWatcher ignores what a walk passes over by design (connectome-hos
     mkdirSync(join(root, 'cache'), { recursive: true });
     mkdirSync(join(root, 'drafts~'), { recursive: true });
     for (const other of others) mkdirSync(join(root, other), { recursive: true });
+    for (const f of files) mkdirSync(join(root, dirname(f)), { recursive: true });
     let ready = false;
     const { watcher, batches } = collectOn({ onReady: () => { ready = true; } }, { ...makeConfig(), path: root, ignore }, others);
     try {
@@ -1157,6 +1176,35 @@ describe('MountWatcher ignores what a walk passes over by design (connectome-hos
     it(`passes over another mount's directory nested in this one, and reports what lies beside it (${backend})`, async () => {
       const files = ['inner/mount/x.txt', 'inner/kept.txt', 'kept.txt'];
       assert.deepEqual(await reported(collectOn, [], files, ['inner/kept.txt', 'kept.txt'], ['inner/mount']), ['inner/kept.txt', 'kept.txt']);
+    });
+
+    it(`passes over a directory a trailing "/" names, and reports a file of that name (${backend})`, async () => {
+      assert.deepEqual(await reported(collectOn, ['out/'], ['out/x.txt', 'deep/out/y.txt', 'sub/out', 'kept.txt'], ['sub/out', 'kept.txt']), ['kept.txt', 'sub/out']);
+    });
+
+    it(`reports nothing when a directory a trailing "/" names is removed, and reports a file of that name removed (${backend})`, async () => {
+      const root = join(tmp, 'work');
+      for (const f of ['out/x.txt', 'sub/out', 'kept.txt']) {
+        mkdirSync(join(root, dirname(f)), { recursive: true });
+        writeFileSync(join(root, f), 'x');
+      }
+      let ready = false;
+      const { watcher, batches } = collectOn({ onReady: () => { ready = true; } }, { ...makeConfig(), path: root, ignore: ['out/'] });
+      try {
+        await waitFor(() => ready, 'expected the watcher to be ready', 10_000);
+        await changesFlow(root, batches, ['', 'sub']);
+        rmSync(join(root, 'out'), { recursive: true });
+        unlinkSync(join(root, 'sub/out'));
+        writeFileSync(join(root, 'after.txt'), 'x');
+        const seen = (p: string) => batches.flat().some((c) => c.path === p);
+        await waitFor(() => seen('sub/out') && seen('after.txt'), 'expected sub/out and after.txt to be reported', 10_000);
+        await wait(SETTLE_MS);
+      } finally {
+        await watcher.stop();
+      }
+      const changes = batches.flat().filter((c) => !isProbe(c.path));
+      assert.deepEqual(changes.filter((c) => c.path === 'out' || c.path.startsWith('out/')), []);
+      assert.ok(changes.some((c) => c.path === 'sub/out' && c.op === 'deleted'), JSON.stringify(changes));
     });
   }
 

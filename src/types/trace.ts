@@ -115,6 +115,23 @@ export type TraceEvent =
       stack?: string;
     })
   | (TraceEventBase & {
+      /**
+       * A turn waiting out its error policy's delay before a retry says so:
+       * as the wait begins, with when it is due to end, and again every 60
+       * seconds while it lasts, while its agent is the one registered under
+       * its name, and never after the wait ends (its time coming, a stop, or
+       * an abort). The failure being retried is the `inference:failed` just
+       * before it. A host watching for agents gone quiet can tell a waiting
+       * one from a stuck one by it.
+       */
+      type: 'inference:waiting';
+      agentName: string;
+      /** When the wait is due to end (epoch ms): it counts down by its
+       *  timers, so a stalled event loop can end it later. Absent for a wait
+       *  too long for a date. */
+      until?: number;
+    })
+  | (TraceEventBase & {
       type: 'inference:exhausted';
       agentName: string;
       /** The failure's message, bounded as every trace event's `error` is (2,000 characters). */
@@ -471,6 +488,24 @@ export type TraceEvent =
       type: 'gate:debounce-delivered';
       policyName: string;
       eventCount: number;
+    })
+  | (TraceEventBase & {
+      /** The reply judge's verdict on a `judge` rule's batch. `verdict`:
+       *  `reply` or `wait` as the judge answered, `error` when it failed,
+       *  timed out or answered nothing usable; `woke` is whether the batch
+       *  then woke the agent (an error does by the host's onError).
+       *  The judge's reason is in the agent's gate_status, not here: it's
+       *  written from the agent's context. */
+      type: 'gate:judge-verdict';
+      policyName: string;
+      verdict: 'reply' | 'wait' | 'error';
+      woke: boolean;
+      eventCount: number;
+      durationMs: number;
+      model?: string;
+      inputTokens?: number;
+      cacheReadTokens?: number;
+      outputTokens?: number;
     })
   | (TraceEventBase & {
       /** A batched wake's turn started without its `[Gate: …]` line (the
@@ -836,7 +871,7 @@ export type TraceEvent =
       parkedAdmissions?: number;
       /** True when undrained turns were force-cancelled (abandon). */
       abandoned?: boolean;
-      /** Agents whose turn the abandon had not ended when its grace ran out: a token held with no stream and no check ahead (a puppet tool turn, a store surgery's reservation, a turn finishing its last delivery), or a turn that hadn't reached its next check, the tool-result guard's wait for its speech included. A turn whose stream the abandon cancelled while it was still streaming isn't listed, even one still running when the grace ran out. */
+      /** Agents whose turn the abandon had not ended when its grace ran out: a token held with no stream and no check ahead (a puppet tool turn, a store surgery's reservation, a turn finishing its last delivery), or a turn that hadn't reached its next check, the tool-result guard's wait for its speech included, or a turn whose stream's cancel threw with no check ahead, so that its stream goes on. A turn whose stream the abandon cancelled while it was still streaming isn't listed, even one still running when the grace ran out. */
       unabandonable?: string[];
     })
   | (TraceEventBase & {
@@ -852,6 +887,156 @@ export type TraceEvent =
       since?: number;
     })
 
+  /** A reader fork ended in prose without `deliver_summary`; its final prose was delivered as its report. */
+  | (TraceEventBase & {
+      type: 'tune-out:reader-prose-delivered';
+      agentName: string;
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      chars: number;
+    })
+
+  /** Bounded work the host's stop() cut off: left live for the next boot to end as `host-restart`. */
+  | (TraceEventBase & {
+      type: 'dendrite:agent-interrupted';
+      agentName: string;
+      kind: string;
+      incarnation: number;
+      reason: 'host-stop';
+    })
+
+  /** A tune-out reader fork was derived for one invocation (subconscious.reader: 'forks'). */
+  | (TraceEventBase & {
+      type: 'tune-out:reader-fork';
+      agentName: string;
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      trigger: 'cadence' | 'wake' | 'cancel';
+      /** Held messages the fork was handed, stored and queued. */
+      held: number;
+      /** Of those, the ones still queued behind the resident's turn. */
+      queued: number;
+    })
+
+  /**
+   * A tune-out reader fork threw: its framing, its derive or its run. One
+   * that failed before it reported gives its held messages back to the
+   * channel's backlog while the epoch still holds the channel (`returned`
+   * counts them), so the next reader for the channel is handed them.
+   */
+  | (TraceEventBase & {
+      type: 'tune-out:reader-fork-failed';
+      agentName: string;
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      trigger: 'cadence' | 'wake' | 'cancel';
+      error: string;
+      /** Whether the fork had reported through `deliver_summary` before it failed. */
+      reported: boolean;
+      returned: number;
+    })
+
+  // Dendrite: agent registry and lifecycle.
+  // `agent-created` is the consent event: it names the kind of agent, what
+  // ends it, and what happens to it when its spawner ends.
+  | (TraceEventBase & {
+      type: 'dendrite:agent-created';
+      agentName: string;
+      kind: string;
+      /** Whose weights; `inherit.from` is whose context. */
+      model?: string;
+      incarnation: number;
+      lifetime: import('../dendrite/types.js').AgentLifetime;
+      spawnedBy?: string;
+      onParentEnd?: import('../dendrite/types.js').ParentEndPolicy;
+      resultTo?: import('../dendrite/types.js').ResultRoute;
+      inherit?: import('../dendrite/types.js').ContextInheritance;
+    })
+  | (TraceEventBase & {
+      type: 'dendrite:agent-ended';
+      agentName: string;
+      kind: string;
+      incarnation: number;
+      reason: string;
+      by?: string;
+      /** The agent that spawned it, when its record names one. */
+      spawnedBy?: string;
+    })
+  | (TraceEventBase & {
+      /** The last event a replay of create()'s traces delivers when the
+       *  buffer kept only their first 1,000: how many came after. */
+      type: 'dendrite:early-traces-dropped';
+      dropped: number;
+    })
+  | (TraceEventBase & {
+      type: 'dendrite:agent-orphaned';
+      agentName: string;
+      formerParent: string;
+      reason: string;
+      /** Agents offered as a new parent, nearest first. */
+      candidates: string[];
+    })
+  | (TraceEventBase & {
+      type: 'dendrite:agent-reparented';
+      agentName: string;
+      parent: string;
+      by?: string;
+    })
+  | (TraceEventBase & {
+      type: 'dendrite:activation-cancelled';
+      agentName: string;
+      by?: string;
+      reason?: string;
+    })
+  /** The message entered the recipient's store (not merely queued for it). */
+  | (TraceEventBase & {
+      type: 'dendrite:mail-delivered';
+      mailId: string;
+      kind: string;
+      from: string;
+      to: string;
+    })
+  /** Queued for the recipient's next boundary; `mail-delivered` follows when it lands. */
+  | (TraceEventBase & {
+      type: 'dendrite:mail-deferred';
+      mailId: string;
+      kind: string;
+      from: string;
+      to: string;
+    })
+  | (TraceEventBase & {
+      type: 'dendrite:mail-held';
+      mailId: string;
+      kind: string;
+      from: string;
+      to: string;
+      reason: string;
+    })
+  /**
+   * The admission stage's decision for one inbound event (Dendrite §D):
+   * who may receive it, whether it is held (the epoch id) or delivered,
+   * whether it may wake them, and the gate's verdict.
+   */
+  | (TraceEventBase & {
+      type: 'admission:decided';
+      lane: 'channel' | 'push';
+      serverId: string;
+      channelId?: string;
+      messageId: string;
+      recipients: string[];
+      held: string | null;
+      wake: boolean;
+      gatePass: boolean;
+    })
+  /** Batched gate events dropped at delivery because their channel is held now. */
+  | (TraceEventBase & {
+      type: 'gate:held-dropped';
+      dropped: number;
+      channels: Array<string | undefined>;
+    })
   // Inbound acceptance observation (mcpl/inbound-source.ts): an installed
   // InboundAcceptanceObserver threw. Delivery is unaffected; the observer's
   // own coverage is interrupted for that acceptance.

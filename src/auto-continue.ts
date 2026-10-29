@@ -5,6 +5,8 @@
  * row the next turn reads.
  */
 
+import { NOTICE_TAG } from './notice-tags.js';
+
 /** The reason on a continuation's wake (InferenceRequest.reason). */
 export const AUTO_CONTINUE_REASON = 'auto-continue';
 
@@ -21,8 +23,9 @@ export const AUTO_CONTINUE_STOP_REASONS: ReadonlySet<string> = new Set(['end_tur
  * one shared message slot), says another turn starts, says how to stop
  * (`stop`, an imperative such as "call skip_reply") and that anything written
  * without it is sent as usual, and, on the last continuation of a run, that
- * the agent waits for the next event after it. When the last turn's closing
- * words were held because that turn had already sent, it says so. Short,
+ * the agent waits for the next event after it. When some or all of the last
+ * turn's closing words were held because a send that turn may already have
+ * posted where they were going, it says so. Short,
  * neutral and event-shaped on purpose: it rides as a system row in the
  * window, where instruction blocks about output have tripped classifiers,
  * and wording that reads as a lapse or a budget invites a published reply.
@@ -32,11 +35,15 @@ export function autoContinueNotice(opts: {
   stop: string;
   last: boolean;
   heldAfterSend?: boolean;
+  /** The run began with a heartbeat's turn, whose plain speech is held as drafts. */
+  heartbeat?: boolean;
 }): string {
-  return `[continue] ${opts.agentName}, another turn starts now.` +
+  return `[${NOTICE_TAG.continue}] ${opts.agentName}, another turn starts now.` +
     (opts.heldAfterSend
-      ? ' Your closing words last turn were held, not sent: that turn had already sent with a send tool.'
+      ? ' Some or all of your closing words last turn were held, not sent: a send that turn may already have posted where they were going.'
       : '') +
-    ` If you're done, ${opts.stop}; anything you write without it is sent as usual.` +
+    (opts.heartbeat
+      ? ` If you're done, ${opts.stop}; plain words you write without it and with no destination are held as drafts, as on the heartbeat's turn, and an explicit send reaches a channel.`
+      : ` If you're done, ${opts.stop}; anything you write without it is sent as usual.`) +
     (opts.last ? ' This is the last continuation in a row: after this turn you wait for the next event either way.' : '');
 }

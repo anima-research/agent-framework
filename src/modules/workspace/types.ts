@@ -58,7 +58,7 @@ export interface MountConfig {
    *   link is read and written where it leads now. Where that root now lies
    *   elsewhere than the last start placed it, each call nests in it, as a
    *   start would now, every mount
-   *   configured beneath its path, where that path leads beneath its root,
+   *   configured on or beneath its path, where that path leads beneath its root,
    *   and every other mount whose root, as that start placed it, lies
    *   beneath where its root lies now, or whose configured path lies
    *   beneath a directory that start found there. A mount configured
@@ -101,10 +101,32 @@ export interface MountConfig {
   /** Poll interval in ms for checking watched root identity changes (default: 2000) */
   watchRootPollMs?: number;
   /**
-   * Simple ignore patterns (NOT full gitignore syntax). Supported forms:
-   * - Exact name match: ".git", "node_modules"
-   * - Directory glob: "node_modules/**" (anything under node_modules)
-   * - Extension glob: "*.pyc" (any file ending in .pyc)
+   * Patterns in these of gitignore's forms, each covering the files
+   * gitignore's reading of it covers, with three differences: names compare
+   * exactly, as git's do with `core.ignorecase` off (its default folds case
+   * on macOS and Windows); "?" matches one character where git's matches
+   * one byte, so the two differ on names outside ASCII; and on a mount that
+   * follows links, a link to a directory counts as a directory, where git
+   * reads every link as a file:
+   * - A name, matched at any depth: ".git", "node_modules". Within a name,
+   *   "*" matches any run of characters and "?" any one: "*.pyc",
+   *   "npm-debug.log*".
+   * - A trailing "/" matches only a directory: "build/" covers every
+   *   directory named build, with what lies beneath it, and no file of that
+   *   name.
+   * - A leading or inner "/" makes a path from the mount's root: "/dist"
+   *   covers only the root's dist, and "a/b" only the root's a/b.
+   * - "**" as the first segment, before one name, matches that name at any
+   *   depth, as the name alone does; with a trailing "/**" as well, it reads
+   *   as the name with a trailing "/".
+   * - A trailing "/**" covers a directory from the root and what lies
+   *   beneath it: "node_modules/**" covers only the root's node_modules, and
+   *   no file of that name.
+   * The module refuses, when it's built, a pattern of any other form, such as
+   * a leading "!" or "#", a "[", a "\", a trailing space, "**" anywhere
+   * else, or an empty, "." or ".." segment, naming the pattern and why. A
+   * "?" can stand for a "[" or "\" in a name.
+   *
    * A sync without a path and the watcher pass over what the list covers,
    * and over entries with an editor's swap or backup file name whatever it
    * says, a directory with what lies beneath it: `.name.swp` and `.name.swx`
@@ -124,13 +146,17 @@ export interface MountConfig {
   ignore?: string[];
   /**
    * The files this mount holds, when it holds only some of what is under its
-   * path: the same pattern forms as `ignore`, read for files. A name or an
-   * extension glob covers a file by its own name, at any depth, and a directory
-   * glob (`dir/**`) covers what lies beneath that directory, and not a file
-   * named like it. Unlike `ignore`, a pattern that matches a directory's name
-   * covers nothing beneath it, since each file is covered by its own name:
-   * `["gate.json"]` holds every file named `gate.json`, and no other file
-   * beneath a directory of that name. A subtree is named with `dir/**`.
+   * path: patterns in `ignore`'s forms, read for files, and a `[` read as
+   * itself, so `[id].tsx` names that file. A pattern that matches
+   * only directories, with a trailing `/` or `/**`, covers what lies beneath a
+   * directory it matches: `fixtures/` every file beneath a directory named
+   * fixtures, at any depth, and `docs/**` or `/docs/` every file beneath the
+   * root's docs. Any other pattern covers a file by its own name, at any
+   * depth, or by its path from the root (`/gate.json`, `src/*.ts`). Unlike
+   * `ignore`, such a pattern covers nothing beneath a directory it matches,
+   * since each file is covered by its own name or path: `["gate.json"]` holds
+   * every file named `gate.json`, and no other file beneath a directory of
+   * that name.
    *
    * It's the mount's boundary for content: no workspace path reads, stores,
    * serves or writes back a file it doesn't cover, and no tool lists,
@@ -199,31 +225,62 @@ export interface MountConfig {
    * A path in a nested mount's directory is that mount's, whatever this
    * include covers: every tool gives the answer that names the mount holding
    * it and the path to use there. Through a link a mount follows, a place in
-   * that directory is named only where it's a directory, or a file that
-   * mount's own include covers with no file on its way, and is otherwise
-   * refused as leaving the mount. On a mount that doesn't follow links, a
-   * link on a path's way is refused, as on any such mount (followSymlinks).
-   * A nested mount's root is placed where disk has it at each start, and its
-   * directory is matched by spelling, so four cases fall outside this, as
-   * for any nested mount, and a fifth on a direct one: on a disk that folds
-   * names, a mount configured
-   * through a link that spells a directory otherwise than disk does isn't
-   * found nested, and this mount holds its files as its own; on such a disk,
-   * a path through a link that spells a nested mount's directory otherwise
-   * than that mount's configured path does, whether the link or the
-   * configured path is the one spelled otherwise than disk, isn't found to
-   * lead there, and this mount reads, lists, searches and writes there as
-   * its own, creating files too, though a walk from its root passes over the
-   * directory; on such a disk, a place in a nested mount's directory that a
-   * link does lead to is judged by that mount's include, and named, in the
-   * spelling the link's target gives, so a refusal can name a file disk
-   * spells outside that include, or leave a covered one unnamed; and a
-   * nested mount whose root moves while running, as `acceptRoot` takes,
-   * stays placed where it was until the next start; and where a direct
-   * mount's root is repointed between a read's parse and its open, a race
-   * left to whoever writes the disk, a mount nested in it by its
-   * directories alone, since its real root holds that root, can have the
-   * read serve a path in its directory.
+   * that directory is named only where it's a directory, or a file covered,
+   * with no file on its way, by that mount's own include and by the include
+   * of each other nested mount whose directory may hold it, from the
+   * innermost out to the first that surely holds it, and is otherwise
+   * refused as leaving the mount. A listing, or a pass, names a file there
+   * only where those includes cover it. On a mount that doesn't follow
+   * links, a link on a path's way is refused, as on any such mount
+   * (followSymlinks).
+   * Every check compares a path with a nested mount's directory level by
+   * level, as any disk may compare names: in either Unicode normalization
+   * form and in any case, as fully as a disk that folds names may compare
+   * them, at every level, whatever the disk does there, and reading nothing
+   * from the disk to do so. Start places each root the same way, so a mount
+   * configured through a link, or in a spelling, other than disk's is found
+   * nested. So a path, a walk or the workspace's history that names the
+   * directory in any spelling a disk may take for it reaches that mount,
+   * whether or not the directory is on disk yet, and so does a link whose
+   * target spells it otherwise. Where a link leads into the directory, the
+   * place beneath it is judged, and named, as disk spells it. A path that names the directory itself keeps what lies
+   * beneath as given, since that is the nested mount's to name. Where a disk
+   * keeps apart two names the comparison joins, it errs toward the nested
+   * mount, in where start places a mount as in every check: a name in
+   * another case, on a disk that tells case apart; a name in the other
+   * normalization form, on a disk that keeps the forms apart; and a name the
+   * comparison folds with it that a disk keeps apart, such as `ss` beside a
+   * nested `ß`, or one that differs from it only by a default-ignorable code
+   * point, such as a soft hyphen, on a disk that keeps those. Such a
+   * directory, or file, is no mount's, and every tool that names it is
+   * refused as a path that may lie in the nested mount, with the two
+   * spellings the workspace can't tell apart, and, for a link, where it
+   * leads, when that lies in this mount. The answer gives a step for each
+   * thing the caller may have meant: that mount's path to use; for a new
+   * file of this mount's, a path outside both spellings; and for one already
+   * there, whoever runs the workspace renaming one of the two spellings.
+   * Where start placed the nested mount only by a guess, comparing the real
+   * roots, as for two mounts' roots configured in spellings it can't tell
+   * apart, a path there is a guess too, however exactly it matches, and the
+   * answer names that directory as the path spells it, with the nested
+   * directory's spelling only in the step for a new file, names no host
+   * path, and asks for the configuration to be checked. Three cases fall
+   * outside this, as for any nested mount, and a fourth on a direct one: on a
+   * disk whose folding goes past the comparison's, which joins names that
+   * differ only by default-ignorable code points, in normalization form or in
+   * case, in full case folding, as Linux's casefold does, a name the
+   * comparison keeps apart can reach the directory; a second path to the
+   * directory that isn't a link, such as a bind mount, isn't found to lead
+   * there, though a walk passes over it, knowing each nested root by which
+   * directory it is; a nested mount whose root moves while running, as
+   * `acceptRoot` takes, stays placed where it was until the next start, but
+   * for the calls of a direct mount whose root has moved and on or beneath
+   * whose path it's configured, which place it where it lies; and where a
+   * direct mount's root is repointed between a read's parse and its open, or
+   * a write's parse and its staging, a race left to whoever writes the disk,
+   * a mount nested in it by its directories alone, since its real root holds
+   * that root, can have the read serve a path in its directory, or the write
+   * land there.
    *
    * Text the host registers for a path (`registerGeneratedTextFile`) is
    * served there whatever the include says, since it isn't one of the
@@ -237,12 +294,8 @@ export interface MountConfig {
    * include covers it.
    *
    * Left out, the mount holds everything under its path. Given, it's a list
-   * of at least one string, each a name, an `*.ext` glob or a `dir/**` glob,
-   * whose directory may be nested (`a/b/**`). The module refuses a pattern
-   * with a `/` that isn't such a glob, a `*` anywhere but a leading `*.` or
-   * that trailing `/**`, an empty, `.` or `..` segment, and, where `\` is the
-   * platform's separator, a `\`. Any other pattern is a file name, matched
-   * literally, so `[id].tsx` names the file of that name.
+   * of at least one pattern, and the module refuses one `ignore` would
+   * refuse but for a `[`.
    */
   include?: string[];
   /**
@@ -382,6 +435,11 @@ export interface MountState {
   initialSyncDone: boolean;
   /** Branch ID that was active when this mount last materialized */
   lastMaterializedBranchId: string | null;
+  /**
+   * What the mount's last pass found of its root, as of `at` (an ISO time):
+   * the words it listed for a root it couldn't use, or null where it used it.
+   */
+  lastPassRoot?: { at: string; listed: string | null };
   /**
    * The last on-agent-action scan, as of `at`: `complete` when it has
    * finished at all, `withinDeadline` when it finished before the deadline

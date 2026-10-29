@@ -11,9 +11,12 @@
  * inference tokens, not whether the agent should know about the event.
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { NOTICE_TAG } from '../notice-tags.js';
+import { cutToFit, suppliedValue } from '../supplied-text.js';
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
+import { canonical, duplicateName, lastRecipePath, noChanges, reconcileLine, reconcileWithRecipe, ruleName, type WrittenConfig } from './recipe-reconcile.js';
 import { closestNames, isNearMiss } from '../closest-names.js';
 import { MAX_TIMER_MS } from '../deadline-timer.js';
 import { safeSlice } from '../safe-slice.js';
@@ -32,10 +35,18 @@ import type {
   GateStatus,
   ShadowWarning,
   GateProbeRow,
+  JudgeConfig,
+  JudgeEventSummary,
+  JudgeFn,
+  JudgeVerdict,
+  UpcomingWake,
 } from './types.js';
 
 // Re-export types consumers need
-export type { GateConfig, GateOptions, GateDecision, GateEntryRef, GateEventInfo, WakeLine } from './types.js';
+export type {
+  GateConfig, GateOptions, GateDecision, GateEntryRef, GateEventInfo, WakeLine,
+  JudgeConfig, JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudgeOptions, UpcomingWake,
+} from './types.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -62,6 +73,15 @@ function parseGateJson(text: string): unknown {
 const MIN_DEBOUNCE_MS = 100;
 /** Maximum debounce value (ms). */
 const MAX_DEBOUNCE_MS = 300_000;
+/** Maximum `judge.maxWaitMs` (ms): an hour. */
+const MAX_JUDGE_WAIT_MS = 3_600_000;
+/** Longest `judge.instructions` (characters) a rule may hold: they go to the
+ *  judge with every batch, so they're kept short. */
+const MAX_JUDGE_INSTRUCTIONS = 4_000;
+/** How long a judge request may take by default (ms) before onError decides. */
+const DEFAULT_JUDGE_TIMEOUT_MS = 20_000;
+/** Judge failures in a row after which gate_status names the judge as failing. */
+const JUDGE_FAILING_STREAK = 3;
 
 /** Whether a check made at `last` is still fresh at `now`, less than the
  *  reload throttle ago. A clock stepped backwards since makes it stale, so
@@ -130,10 +150,11 @@ interface PendingEvent {
 
 /** Where the host put a message the gate wrote: the agent whose window it
  *  went to and, when it was held for that agent's live turn, the id it waits
- *  under in the host's queue. */
+ *  under in the host's queue, or else the id it was stored under. */
 export interface WritePlacement {
   agent?: string;
   deferredId?: string;
+  messageId?: string;
 }
 
 /**
@@ -181,6 +202,33 @@ export interface WakeProvenance {
 interface DebounceState {
   timer: ReturnType<typeof setTimeout>;
   events: PendingEvent[];
+  /** When the batch's first event arrived (ms), for a judge's maxWaitMs. */
+  firstAt: number;
+  /** When its timer fires (ms), as of its last re-arm (upcomingWakes). */
+  dueAt: number;
+  /** The judge the batch goes to when it fires, as its rule held it when the
+   *  batch began: a rule removed or changed meanwhile has its batch judged
+   *  as the rule it was asked. Absent for a debounce. */
+  judge?: JudgeConfig;
+}
+
+/** A batch the reply judge is deciding now. */
+interface JudgingState {
+  events: PendingEvent[];
+  judge: JudgeConfig;
+  started: number;
+  abort: AbortController;
+  /** The judge's time limit, cleared once it's decided or the gate disposed. */
+  timer?: ReturnType<typeof setTimeout>;
+  /** Batches of the same rule that fired meanwhile, judged once this one is
+   *  decided: delivered with it on reply, judged afresh on wait. */
+  queued: PendingEvent[];
+}
+
+/** A rule's verdict counts and newest verdict (gate_status judgeState). */
+interface JudgeRecord {
+  verdicts: { reply: number; wait: number; error: number };
+  last?: NonNullable<GatePolicyStats['judgeState']>['last'];
 }
 
 /** Token bucket for one (policy, key) pair under a rate_limit behavior. */
@@ -297,7 +345,7 @@ function referenceLine(count: number, channel: string, oldest: number, now: numb
 /** A handed batched-wake line's text (WakeLine), as it reads when written at
  *  `now`: the gate's words, its message's age counted to then. */
 export function wakeLineText(line: WakeLine, now: number): string {
-  return `[Gate: 1 event matched]\n\n${referenceLine(1, line.shown, line.at, now)}`;
+  return `[${NOTICE_TAG.gate}: 1 event matched]\n\n${referenceLine(1, line.shown, line.at, now)}`;
 }
 
 /** The event's own stored entry, as the framework is asked about it. */
@@ -332,7 +380,19 @@ function formatBehavior(b: import('./types.js').GateBehavior): string {
     const k = b.passive_sample.keyBy ? `,keyBy:${b.passive_sample.keyBy}` : '';
     return `passive_sample:${b.passive_sample.every}${k}`;
   }
+  if ('judge' in b) {
+    const w = b.judge.maxWaitMs !== undefined ? `,maxWait:${b.judge.maxWaitMs}` : '';
+    return `judge:${b.judge.debounceMs}${w}`;
+  }
   return 'unknown';
+}
+
+/** The quiet period (ms) of a batching behavior: a debounce's, or a judge's. */
+function batchQuietMs(b: GateBehavior): number | undefined {
+  if (typeof b !== 'object') return undefined;
+  if ('debounce' in b) return b.debounce;
+  if ('judge' in b) return b.judge.debounceMs;
+  return undefined;
 }
 
 /**
@@ -392,9 +452,10 @@ const MATCH_FIELDS = [
   'scope', 'source', 'channel', 'mount', 'pathGlob', 'tagsAny', 'tagsAll', 'tagsNone', 'metadataTrue', 'filter',
 ];
 const FILTER_FIELDS = ['type', 'pattern'];
-const BEHAVIOR_KINDS = ['debounce', 'rate_limit', 'passive_sample'] as const;
+const BEHAVIOR_KINDS = ['debounce', 'rate_limit', 'passive_sample', 'judge'] as const;
 const RATE_LIMIT_FIELDS = ['tokens', 'refillIntervalMs', 'keyBy'];
 const PASSIVE_SAMPLE_FIELDS = ['every', 'keyBy'];
+const JUDGE_FIELDS = ['debounceMs', 'maxWaitMs', 'instructions'];
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -599,6 +660,7 @@ function fieldLevels(file: string): ReadonlyArray<{ name: string; fields: readon
     { name: '"behavior"', fields: BEHAVIOR_KINDS },
     { name: '"behavior.rate_limit"', fields: RATE_LIMIT_FIELDS },
     { name: '"behavior.passive_sample"', fields: PASSIVE_SAMPLE_FIELDS },
+    { name: '"behavior.judge"', fields: JUDGE_FIELDS },
   ];
 }
 
@@ -839,7 +901,7 @@ function readRule(raw: unknown, unnamed: string, file = 'gate.json'): RuleReadin
   }, (m) => {
     const of = (fields: readonly string[]) => m.keys.some((key) => fields.includes(key));
     if (obj.match === undefined && (of(MATCH_FIELDS) || of(FILTER_FIELDS))) return 'so the rule matches every event';
-    if (obj.behavior === undefined && (of(BEHAVIOR_KINDS) || of(RATE_LIMIT_FIELDS) || of(PASSIVE_SAMPLE_FIELDS))) {
+    if (obj.behavior === undefined && (of(BEHAVIOR_KINDS) || of(RATE_LIMIT_FIELDS) || of(PASSIVE_SAMPLE_FIELDS) || of(JUDGE_FIELDS))) {
       return 'so the rule\'s behavior is "always"';
     }
     return undefined;
@@ -868,7 +930,7 @@ function readRule(raw: unknown, unnamed: string, file = 'gate.json'): RuleReadin
 
 type BehaviorKind = 'always' | 'defer' | 'skip' | (typeof BEHAVIOR_KINDS)[number];
 
-const BEHAVIORS_NEEDED = '"always", "defer" or "skip", or an object holding one of "debounce", "rate_limit" and "passive_sample"';
+const BEHAVIORS_NEEDED = '"always", "defer" or "skip", or an object holding one of "debounce", "rate_limit", "passive_sample" and "judge"';
 
 /**
  * A rule's behavior: "always" when left out; one of the three names; or an
@@ -877,7 +939,8 @@ const BEHAVIORS_NEEDED = '"always", "defer" or "skip", or an object holding one 
  * and is read so; a list, or an object holding none of the kinds, was
  * refused, and the rule is left out. Of
  * two kinds or more, "debounce", then "rate_limit", then "passive_sample" was
- * the one read, whatever their order, and is read so. Each other kind is read
+ * the one read, whatever their order, and is read so; "judge", newer than
+ * those, is read only where none of them is given. Each other kind is read
  * on its own as well, so that a refusal names its problems too, and a load
  * reads past them, since it isn't read either way. `kind` is the behavior's
  * kind even where it can't be read, for passthrough's check.
@@ -898,7 +961,7 @@ function readBehavior(r: Reader, value: unknown): { behavior?: GateBehavior | un
   const kinds = BEHAVIOR_KINDS.filter((k) => b[k] !== undefined);
   const kind = kinds[0];
   if (kind === undefined) {
-    r.problems.push({ text: 'behavior holds none of "debounce", "rate_limit" and "passive_sample"' });
+    r.problems.push({ text: 'behavior holds none of "debounce", "rate_limit", "passive_sample" and "judge"' });
     return {};
   }
   if (kinds.length > 1) {
@@ -1021,11 +1084,99 @@ function readPassiveSample(r: Reader, value: unknown): GateBehavior | undefined 
   return { passive_sample: out };
 }
 
+/**
+ * A judge: a debounce's quiet period, read as `debounce` is, with at its
+ * nearest bound one out of range; an optional longest wait, from that
+ * quiet period to an hour, likewise; and the agent's optional instructions to
+ * the judge, text of at most MAX_JUDGE_INSTRUCTIONS characters. Earlier
+ * releases knew no judge, so nothing deployed has one: a rule whose judge
+ * can't be read is left out, and its instructions, which go to a model with
+ * every batch, are never cut to fit.
+ */
+function readJudge(r: Reader, value: unknown): GateBehavior | undefined {
+  if (!isPlainObject(value)) {
+    r.problems.push({
+      text: `behavior.judge is ${shownValue(value)}, where an object is needed, such as {"debounceMs": 30000, "instructions": "..."}`,
+    });
+    return undefined;
+  }
+  const conf = withoutEmpty(`${r.where}: behavior.judge`, value, r.notes, {
+    maxWaitMs: 'a batch is judged only after its quiet period',
+    instructions: 'the judge decides without the agent\'s word',
+  });
+  readFieldNames(r, 'behavior.judge', conf, JUDGE_FIELDS);
+  let ok = true;
+  const ms = conf.debounceMs;
+  let debounceMs: number | undefined;
+  if (typeof ms !== 'number' || !Number.isFinite(ms)) {
+    r.problems.push({ text: `behavior.judge.debounceMs is ${shownValue(ms)}, where a number of milliseconds is needed, such as 30000` });
+    ok = false;
+  } else if (ms < MIN_DEBOUNCE_MS) {
+    r.problems.push({
+      text: `behavior.judge.debounceMs is ${ms} ms, under the ${MIN_DEBOUNCE_MS} ms minimum`, read: `so it's read as ${MIN_DEBOUNCE_MS} ms`,
+    });
+    debounceMs = MIN_DEBOUNCE_MS;
+  } else if (ms > MAX_DEBOUNCE_MS) {
+    r.problems.push({
+      text: `behavior.judge.debounceMs is ${ms} ms, over the ${MAX_DEBOUNCE_MS} ms maximum`, read: `so it's read as ${MAX_DEBOUNCE_MS} ms`,
+    });
+    debounceMs = MAX_DEBOUNCE_MS;
+  } else {
+    debounceMs = ms;
+  }
+  let maxWaitMs: number | undefined;
+  const wait = conf.maxWaitMs;
+  if (wait !== undefined) {
+    if (typeof wait !== 'number' || !Number.isFinite(wait)) {
+      r.problems.push({ text: `behavior.judge.maxWaitMs is ${shownValue(wait)}, where a number of milliseconds is needed, such as 120000` });
+      ok = false;
+    } else {
+      const floor = debounceMs ?? MIN_DEBOUNCE_MS;
+      if (wait < floor) {
+        r.problems.push({
+          text: `behavior.judge.maxWaitMs is ${wait} ms, under the rule's ${floor} ms quiet period`,
+          read: `so it's read as ${floor} ms`,
+        });
+        maxWaitMs = floor;
+      } else if (wait > MAX_JUDGE_WAIT_MS) {
+        r.problems.push({
+          text: `behavior.judge.maxWaitMs is ${wait} ms, over the ${MAX_JUDGE_WAIT_MS} ms maximum`,
+          read: `so it's read as ${MAX_JUDGE_WAIT_MS} ms`,
+        });
+        maxWaitMs = MAX_JUDGE_WAIT_MS;
+      } else {
+        maxWaitMs = wait;
+      }
+    }
+  }
+  const said = conf.instructions;
+  let instructions: string | undefined;
+  if (said !== undefined) {
+    if (typeof said !== 'string') {
+      r.problems.push({ text: `behavior.judge.instructions is ${shownValue(said)}, where text is needed` });
+      ok = false;
+    } else if (said.length > MAX_JUDGE_INSTRUCTIONS) {
+      r.problems.push({
+        text: `behavior.judge.instructions is ${said.length} characters long, over the ${MAX_JUDGE_INSTRUCTIONS}-character maximum`,
+      });
+      ok = false;
+    } else {
+      instructions = said;
+    }
+  }
+  if (!ok || debounceMs === undefined) return undefined;
+  const out: JudgeConfig = { debounceMs };
+  if (maxWaitMs !== undefined) out.maxWaitMs = maxWaitMs;
+  if (instructions !== undefined) out.instructions = instructions;
+  return { judge: out };
+}
+
 /** How each kind of behavior object is read. */
 const READ_KIND: Readonly<Record<(typeof BEHAVIOR_KINDS)[number], (r: Reader, value: unknown) => GateBehavior | undefined>> = {
   debounce: readDebounce,
   rate_limit: readRateLimit,
   passive_sample: readPassiveSample,
+  judge: readJudge,
 };
 
 /** A timing kind's keyBy: a field name. One of another type was read as none. */
@@ -1431,14 +1582,55 @@ function readStartingRules(raw: unknown): StartingRules {
   };
 }
 
+/**
+ * The recipe the gate last applied (lastRecipePath), as written, or null when
+ * it has none on record. It's read as the host's starting rules are, so a
+ * recipe recorded as given reads back as the start read it. A record that
+ * exists and isn't one the gate wrote (it can't be read, isn't JSON, is
+ * refused as the starting rules are, or names a rule twice) gives null with
+ * the reason, which quotes nothing from the file but a rule's name: a start
+ * then removes and redefines nothing, as the first does, and says why.
+ */
+function readLastRecipe(path: string): { recipe: WrittenConfig | null; problem?: string } {
+  if (!existsSync(path)) return { recipe: null };
+  let raw: unknown;
+  try {
+    raw = parseGateJson(readFileSync(path, 'utf-8'));
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return { recipe: null, problem: code ? `reading it failed with ${code}` : "it isn't JSON" };
+  }
+  const read = readStartingRules(raw);
+  if (read.refusedWhole !== undefined) return { recipe: null, problem: "it isn't read as the starting rules are" };
+  const rules = read.rules.map((rule) => rule.raw);
+  const twice = duplicateName(rules);
+  if (twice !== undefined) return { recipe: null, problem: `it names the rule "${twice}" twice` };
+  return { recipe: { rules, default: isPlainObject(raw) ? raw.default : undefined } };
+}
+
+/**
+ * A rule's meaning, for the start's merge: the rule as the gate reads it,
+ * where it reads, and as written where it doesn't. So a rule `wake_add_rule`
+ * wrote as read agrees with the same rule written more briefly.
+ */
+function ruleMeaning(rule: unknown): string {
+  const reading = readRule(rule, 'A policy');
+  return reading.policy ? `read ${canonical(reading.policy)}` : `written ${canonical(rule)}`;
+}
+
 /** What a start's write of the host's starting rules to gate.json did. */
 type StartWrite =
   | { kind: 'none' }
   /** A first start's write of the starting rules threw: at its open, or partway. */
   | { kind: 'seed-failed'; error: string; atOpen: boolean }
-  /** A later start's write of the rules it read plus the ones it was adding threw, or couldn't be made; `config` is what it was writing. */
+  /**
+   * A later start's write to gate.json threw, or couldn't be made; `config` is
+   * what it was writing: the rules it read plus the ones it was adding
+   * (`names`), with the merge's other changes (`changing`: the rules it was
+   * removing, redefining or moving, and "default").
+   */
   | {
-    kind: 'reconcile-failed'; names: string[]; error: string; atOpen: boolean; config: GateConfig;
+    kind: 'reconcile-failed'; names: string[]; changing?: string[]; error: string; atOpen: boolean; config: GateConfig;
     /** The text it was writing, whose reading is `config`, and what a load of it says, when the write itself failed. */
     text?: string;
     note?: string | null;
@@ -1490,6 +1682,18 @@ function describeStart(starting: StartingRules, write: StartWrite, held: Readonl
         + (write.text !== undefined
           ? 'Whoever runs this host can fix what kept them from being written.'
           : 'A start adds them once what kept them out is fixed.'),
+      );
+    }
+    // The merge's other changes: removals, redefinitions, moves and the default.
+    if (write.changing?.length) {
+      parts.push(
+        `At start, the recipe's changes to gate.json (${quotedList(write.changing)}) `
+        + (write.atOpen
+          ? `weren't saved (${write.error}), so the gate started with gate.json's rules as they were. `
+          : `may not all have been saved (${write.error}): the gate started with gate.json as the write left it. `)
+        + (write.text !== undefined
+          ? 'Whoever runs this host can fix what kept them from being written.'
+          : 'A start applies them once what kept them out is fixed.'),
       );
     }
   }
@@ -1583,15 +1787,23 @@ function describeUnsaved(starting: StartingRules, write: StartWrite, loaded: boo
         + 'from them too. Whoever runs this host can fix what kept it from being written, and gate.json.';
   }
   if (write.kind === 'reconcile-failed') {
-    const what = write.atOpen
-      ? `the host's starting rules ${quotedList(write.names)} couldn't be added to gate.json (${write.error}), and gate.json `
-        + "couldn't be loaded after that"
-      : `adding the host's starting rules ${quotedList(write.names)} to gate.json failed partway (${write.error}), so gate.json `
-        + 'may be left part-written';
+    // A write of the recipe's merge that did more than add rules, or one that only added them.
+    const merging = (write.changing?.length ?? 0) > 0;
+    const changes = quotedList([...write.names, ...(write.changing ?? [])]);
+    const what = merging
+      ? write.atOpen
+        ? `the recipe's changes to gate.json (${changes}) couldn't be written (${write.error}), and gate.json couldn't be loaded after that`
+        : `writing the recipe's changes to gate.json (${changes}) failed partway (${write.error}), so gate.json may be left part-written`
+      : write.atOpen
+        ? `the host's starting rules ${quotedList(write.names)} couldn't be added to gate.json (${write.error}), and gate.json `
+          + "couldn't be loaded after that"
+        : `adding the host's starting rules ${quotedList(write.names)} to gate.json failed partway (${write.error}), so gate.json `
+          + 'may be left part-written';
     // What those rules hold that the gate reads past or leaves out, since
     // gate.json's own entry is now its load error.
     const read = write.sentences?.length ? `, read as a load reads them: ${write.sentences.join(' ')}` : '.';
-    return `At start, ${what}. The gate runs the rules it read from gate.json and the ones it was adding, which aren't saved${read} `
+    const runs = merging ? 'the rules that write held' : "the rules it read from gate.json and the ones it was adding";
+    return `At start, ${what}. The gate runs ${runs}, which aren't saved${read} `
       + `A restart before gate.json is fixed starts from ${starting.config ? "the host's starting rules" : 'no rules'}. `
       + 'Whoever runs this host can fix what kept it from being written, and gate.json.';
   }
@@ -1615,30 +1827,72 @@ function globAtLeastAsBroad(earlier: string | undefined, later: string | undefin
   return earlier === later;
 }
 
+/** The event types the gate can see from an MCPL server: its pushes and its
+ *  channels' messages. */
+export const MCPL_GATE_EVENT_TYPES: readonly string[] = ['mcpl:push-event', 'mcpl:channel-incoming'];
+
+/** The event types a host knows a source sends (EventGate's
+ *  `eventTypesFrom`), or undefined when it could send any. */
+export type EventTypesFrom = (source: string) => readonly string[] | undefined;
+
+/** The event types `rule` can match: its scope's, narrowed to those its
+ *  source is known to send; 'all' when neither says. */
+function typesSeenBy(rule: GatePolicy, eventTypesFrom?: EventTypesFrom): { types: string[] | 'all'; known: boolean } {
+  const scope = rule.match.scope && rule.match.scope.length > 0 ? rule.match.scope : undefined;
+  const source = rule.match.source;
+  let sent: readonly string[] | undefined;
+  if (eventTypesFrom && source !== undefined && !source.includes('*')) {
+    try {
+      sent = eventTypesFrom(source);
+    } catch {
+      sent = undefined;
+    }
+  }
+  if (scope && sent) return { types: scope.filter((t) => sent!.includes(t)), known: true };
+  if (scope) return { types: scope, known: true };
+  if (sent) return { types: [...sent], known: true };
+  return { types: 'all', known: false };
+}
+
 /**
- * Event types for which `earlier` provably matches EVERY event that `later`
- * would match — i.e. the types for which `later` is unreachable when
- * `earlier` sits before it and consumes its matches. Returns null when
- * subsumption can't be proven (which is not proof of safety — the lint is
- * deliberately one-sided so every warning it emits is true).
+ * Whether `earlier` provably matches events `later` would match, so that
+ * `later` doesn't see them when `earlier` sits before it and consumes its
+ * matches: the event types concerned, whether that's every event `later`
+ * would match, and whether `later` is known to see those types. Returns null
+ * when it can't be proven (which is not proof of safety — the lint is
+ * deliberately one-sided so every note it emits is true).
  */
-function subsumedEventTypes(earlier: GatePolicy, later: GatePolicy): string[] | 'all' | null {
+function subsumedEventTypes(
+  earlier: GatePolicy,
+  later: GatePolicy,
+  eventTypesFrom?: EventTypesFrom,
+): Omit<ShadowWarning, 'earlier' | 'later'> | null {
   const e = earlier.match;
   const l = later.match;
 
-  // Scope: which of `later`'s event types does `earlier` cover?
-  let covered: string[] | 'all';
-  if (!e.scope || e.scope.length === 0) {
-    covered = l.scope && l.scope.length > 0 ? l.scope : 'all';
-  } else if (!l.scope || l.scope.length === 0) {
-    // `later` matches all types; `earlier` only consumes its own scope, so
-    // the shadow is partial — exactly those types.
-    covered = e.scope;
+  // Event types: which of those `later` can match does `earlier` cover?
+  const seen = typesSeenBy(later, eventTypesFrom);
+  const earlierTypes = e.scope && e.scope.length > 0 ? e.scope : 'all';
+  let eventTypes: string[] | 'all';
+  let whole: boolean;
+  let known = seen.known;
+  if (earlierTypes === 'all') {
+    eventTypes = seen.types;
+    whole = true;
+  } else if (seen.types === 'all') {
+    // `later` matches every type; `earlier` only consumes its own scope, so
+    // the overlap is partial — exactly those types, which may never reach
+    // `later`.
+    eventTypes = earlierTypes;
+    whole = false;
   } else {
-    const overlap = l.scope.filter((t) => e.scope!.includes(t));
+    const overlap = seen.types.filter((t) => earlierTypes.includes(t));
     if (overlap.length === 0) return null;
-    covered = overlap;
+    eventTypes = overlap;
+    whole = overlap.length === seen.types.length;
+    known = true;
   }
+  if (Array.isArray(eventTypes) && eventTypes.length === 0) return null;
 
   // Every remaining discriminator on `earlier` must be at least as broad as
   // `later`'s, otherwise some `later` events slip past `earlier`.
@@ -1666,38 +1920,55 @@ function subsumedEventTypes(earlier: GatePolicy, later: GatePolicy): string[] | 
   if (e.tagsAll && !subsetOf(e.tagsAll, l.tagsAll ?? [])) return null;
   if (e.tagsNone && !subsetOf(e.tagsNone, l.tagsNone ?? [])) return null;
 
-  return covered;
+  return { eventTypes, whole, known };
 }
 
 /**
- * Find rules made unreachable by earlier, broader rules (first match wins).
+ * Find rules an earlier, broader rule keeps from applying (first match wins),
+ * in whole or for some event types.
  * The 2026-08-08 Mythos incident is the canonical catch: a prepended
  * `{scope:[mcpl:channel-incoming]}` sampler silently made the
  * direct-address and mention rules dead for the whole incoming lane.
  * `passthrough` observers shadow nothing — non-firing matches fall through.
+ * `eventTypesFrom` leaves out types a rule's source is known never to send:
+ * a rule for an MCPL server's events isn't told about another rule that
+ * takes every `external-message`.
  */
-export function findShadowedPolicies(policies: GatePolicy[]): ShadowWarning[] {
+export function findShadowedPolicies(policies: GatePolicy[], eventTypesFrom?: EventTypesFrom): ShadowWarning[] {
   const out: ShadowWarning[] = [];
   for (let i = 0; i < policies.length; i++) {
     const earlier = policies[i];
     if (earlier.passthrough) continue;
     for (let j = i + 1; j < policies.length; j++) {
-      const covered = subsumedEventTypes(earlier, policies[j]);
-      if (covered) {
-        out.push({ earlier: earlier.name, later: policies[j].name, eventTypes: covered });
+      const found = subsumedEventTypes(earlier, policies[j], eventTypesFrom);
+      if (found) {
+        out.push({ earlier: earlier.name, later: policies[j].name, ...found });
       }
     }
   }
   return out;
 }
 
-/** Human-readable one-liner for a ShadowWarning, used in tool results,
- *  traces, and gate_status alike so the same hazard reads the same way
- *  everywhere. */
+/** A ShadowWarning in words, used in tool results, traces, and gate_status
+ *  alike so the same note reads the same way everywhere. It says which of
+ *  three it is (the rule never applies; it misses some of its events; it
+ *  may not be meant for those events at all) and what to do. */
 export function formatShadowWarning(w: ShadowWarning): string {
-  const types = w.eventTypes === 'all' ? 'ALL event types' : w.eventTypes.join(', ');
-  return `rule "${w.earlier}" makes "${w.later}" unreachable for ${types} `
-    + `(first match wins — every event "${w.later}" would match is consumed by "${w.earlier}" first)`;
+  const later = `"${w.later}"`;
+  const earlier = `"${w.earlier}"`;
+  const move = `move ${later} above ${earlier} (wake_add_rule with the whole rule and insertBefore: "${w.earlier}")`;
+  if (w.whole) {
+    return `${later} never applies: ${earlier} comes first and matches every event ${later} would. `
+      + `If ${later} should apply, ${move}, or narrow ${earlier}.`;
+  }
+  const types = w.eventTypes === 'all' ? 'all' : w.eventTypes.join(', ');
+  if (w.known) {
+    return `${earlier} comes first and takes ${later}'s ${types} events, so ${later} applies only to its others. `
+      + `If it should apply to those too, ${move}.`;
+  }
+  return `${earlier} comes first and takes every ${types} event, so ${later} sees none. `
+    + `Nothing to do unless ${later} is meant for ${types} events; then ${move}. `
+    + `A scope on ${later} naming the event types it's for clears this note.`;
 }
 
 /** The text of a thrown value, for a log line. It never throws itself, whatever was thrown. */
@@ -1776,9 +2047,35 @@ export class EventGate {
   /** The rules in force that the start couldn't save (describeUnsaved),
    *  until gate.json is written or a reload applies its text. */
   private startUnsaved: string | null = null;
+  /** What the start's merge of the recipe couldn't do (seedOrReconcile), said with startNotice until the next start. */
+  private startMergeNote: string | null = null;
+  /** Whether the start's unsaved rules (startUnsaved) are a merge's that did more than add rules. */
+  private startUnsavedMerged = false;
 
   // Debounce state
   private debounceTimers = new Map<string, DebounceState>();
+
+  // Reply judge state (`judge` rules). The judge itself, when the host wires
+  // one; without it a judge rule's batch is delivered as a debounce's.
+  private judgeFn: JudgeFn | undefined;
+  private judgeTimeoutMs: number;
+  private judgeOnError: 'wake' | 'skip';
+  /** Per rule, the batch the judge is deciding now. */
+  private judging = new Map<string, JudgingState>();
+  /** Per rule, a batch that fired while a turn changing the judged context ran or the host was
+   *  quiesced, held to be judged once both are clear: the judge reads the
+   *  context the turn leaves, which may already answer it. */
+  private judgeHeld = new Map<string, { events: PendingEvent[]; judge: JudgeConfig }>();
+  private judgeRecords = new Map<string, JudgeRecord>();
+  private changesJudgedContextFn: ((agentName: string) => boolean) | undefined;
+  /** Lifetime count of events dropped from batches waiting on the judge, at
+   *  the inference buffer's cap (MAX_INFERENCE_BUFFER per rule). */
+  private droppedJudgeEvents = 0;
+  /** Judge requests failed in a row, and the newest failure's reason: a host
+   *  whose provider can't serve the judge's model fails every time, which
+   *  gate_status says once it's a streak (judgeFailingNotice). */
+  private judgeFailStreak = 0;
+  private judgeLastFailure = '';
 
   // Rate-limit state — policy name → key → bucket.
   private rateLimitBuckets = new Map<string, Map<string, RateBucket>>();
@@ -1799,10 +2096,12 @@ export class EventGate {
   // Per-policy stats
   private stats = new Map<string, PolicyStats>();
 
-  // Shadow-lint cache (see refreshShadowWarnings) — recomputed on every
-  // config change, fingerprinted so an unchanged hazard set doesn't re-trace.
-  private shadowWarningsCache: ShadowWarning[] = [];
+  // The shadow lint's last findings (see refreshShadowWarnings), recomputed
+  // on every config change and fingerprinted so an unchanged set doesn't
+  // re-trace.
   private shadowWarningsFingerprint = '[]';
+  /** See the constructor's `eventTypesFrom`. */
+  private eventTypesFromFn: EventTypesFrom | undefined;
 
   // Observability counters for events that didn't match any policy
   private totalEvaluations = 0;
@@ -1820,8 +2119,8 @@ export class EventGate {
   private sleepSuppressed = 0;
   private sleepTimer: ReturnType<typeof setTimeout> | null = null;
   private sleepAgent: string | undefined;
-  // From dispose() to the next resumeSleep(): no sleep or self-wake timer is
-  // armed, though a turn a failed stop() left running can still ask for one.
+  // From dispose() on, no sleep or self-wake timer is armed, though a turn a
+  // failed stop() left running can still ask for one.
   private disposed = false;
 
   // Self-wake timers per agent (skip_reply's wake_in_seconds). Unlike sleep,
@@ -1830,6 +2129,10 @@ export class EventGate {
   // self-wake (an external wake supersedes it; the timer would otherwise
   // land as a redundant empty wake right after the turn).
   private selfWakeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** When each agent's pending self-wake fires, and what armed it
+   *  (upcomingWakes). Read only while its timer is in selfWakeTimers, so an
+   *  entry a fire or a cancel left behind says nothing. */
+  private selfWakeDue = new Map<string, { at: number; source: string }>();
 
   // Privileged users who may wake the agent through sleep. Hot-reloaded from
   // privilegedUsersPath on change.
@@ -1853,6 +2156,8 @@ export class EventGate {
   ) => unknown;
   private requestInferenceFn: (agentName: string, reason: string, source: string, provenance?: WakeProvenance, after?: WritePlacement) => void;
   private getAgentNamesFn: () => string[];
+  /** Delivery-time re-check: is this channel held from the recipients now? */
+  private isHeldFn: (serverId: string | undefined, channelId: string | undefined) => boolean;
   private resolveRouteChannelFn: (info: GateEventInfo) => string | undefined;
   private channelShownFn?: (channel: { serverId: string; channelId: string }) => string;
   private isNewestEntryFn?: (entry: GateEntryRef) => boolean;
@@ -1877,10 +2182,29 @@ export class EventGate {
      *  message is answered. */
     requestInference: (agentName: string, reason: string, source: string, provenance?: WakeProvenance, after?: WritePlacement) => void;
     getAgentNames: () => string[];
+    /**
+     * Whether a channel is held from the recipients (a tune-out epoch in
+     * force). A held event never enters a batch — admission runs before the
+     * gate — but a hold can begin after an event was batched; at delivery
+     * the batch is re-checked and held events are dropped (#232 H3).
+     */
+    isHeld?: (serverId: string | undefined, channelId: string | undefined) => boolean;
     /** Optional clock — defaults to Date.now. Tests inject for deterministic time. */
     now?: () => number;
     /** Per-event timeout (ms) for the optional gate.js script. Default 50. */
     scriptTimeoutMs?: number;
+    /** The reply judge `judge` rules ask (JudgeConfig). Absent: a judge
+     *  rule's batch is delivered as a debounce's, and gate_status says so. */
+    judge?: JudgeFn;
+    /** Whether a turn of this agent changes the context the judge reads. Such
+     *  turns, and only they, hold a judge rule's batch until they end, and one
+     *  that starts while the judge decides stops the judge, whose batch is
+     *  then judged after the turn. Absent: every agent's turns do. */
+    changesJudgedContext?: (agentName: string) => boolean;
+    /** How long a judge request may take (ms). Default 20,000. */
+    judgeTimeoutMs?: number;
+    /** What a judge failure does: wake (default) or skip. */
+    judgeOnError?: 'wake' | 'skip';
     /** Map an event to the registered channel it arrived on (the host knows
      *  how push-event origins compose into channel ids). The gate routes a
      *  batched wake by it, tests a policy's `match.channel` against it when
@@ -1901,6 +2225,11 @@ export class EventGate {
      *  (WakeProvenance.line), for a fresh start of the wake's turn to decide
      *  (WakeLine). Absent: every batched wake writes its line, as before. */
     isNewestEntry?: (entry: GateEntryRef) => boolean;
+    /** The event types the gate can see from a source, when the host knows
+     *  them (an MCPL server's id: MCPL_GATE_EVENT_TYPES), else undefined.
+     *  The rule-order notes (findShadowedPolicies) leave out types a rule's
+     *  source never sends. Absent: any source can send any type. */
+    eventTypesFrom?: EventTypesFrom;
   }) {
     this.configPath = opts.configPath;
     this.privilegedUsersPath = opts.privilegedUsersPath;
@@ -1908,10 +2237,18 @@ export class EventGate {
     this.addMessageFn = opts.addMessage;
     this.requestInferenceFn = opts.requestInference;
     this.getAgentNamesFn = opts.getAgentNames;
+    this.isHeldFn = opts.isHeld ?? (() => false);
     this.resolveRouteChannelFn = opts.resolveRouteChannel ?? defaultRouteChannel;
     this.channelShownFn = opts.channelShown;
     this.isNewestEntryFn = opts.isNewestEntry;
+    this.eventTypesFromFn = opts.eventTypesFrom;
     this.now = opts.now ?? (() => Date.now());
+    this.judgeFn = opts.judge;
+    this.changesJudgedContextFn = opts.changesJudgedContext;
+    this.judgeTimeoutMs = opts.judgeTimeoutMs !== undefined && Number.isFinite(opts.judgeTimeoutMs) && opts.judgeTimeoutMs > 0
+      ? Math.min(opts.judgeTimeoutMs, MAX_TIMER_MS)
+      : DEFAULT_JUDGE_TIMEOUT_MS;
+    this.judgeOnError = opts.judgeOnError === 'skip' ? 'skip' : 'wake';
     this.loadPrivileged();
 
     // Seed or reconcile the on-disk config from the host's starting rules
@@ -1919,14 +2256,13 @@ export class EventGate {
     // with a problem is read past it, or left out (readConfig).
     //
     // First start: write `initialConfig` as given, since gate.json is read the
-    // same way. Subsequent starts: if the recipe/config source declares
-    // policies whose names gate.json doesn't hold (e.g. the user edited the
-    // recipe between sessions), append them, as given, to its rule list.
-    // Existing policies are left alone, the ones the gate leaves out included,
-    // so user edits via `workspace--edit _config/gate.json` survive.
-    // The `default` field is not reconciled — it's an explicit operator
-    // choice and a recipe change shouldn't silently flip live wake
-    // behavior for a session that's already been running.
+    // same way, and record it as the recipe last applied, beside gate.json.
+    // Later starts: merge the recipe into gate.json against that record,
+    // three ways and as written (seedOrReconcile), so a rule the recipe
+    // dropped, renamed, moved or redefined follows it, while a rule edited at
+    // run time or by `workspace--edit _config/gate.json`, and one no recipe
+    // declared, stays. `default` follows the same rule: an unedited one takes
+    // the recipe's.
     const initial = opts.initialConfig;
     const starting = initial !== undefined ? readStartingRules(initial) : undefined;
     const write: StartWrite = starting ? this.seedOrReconcile(starting) : { kind: 'none' };
@@ -1934,8 +2270,8 @@ export class EventGate {
     // Load config: gate.json; without it, the starting rules as read, unless
     // none of them is used; and otherwise no rules, as a host without any has. When a
     // reconcile's own write left gate.json unable to load, the gate runs what
-    // that write held, the rules it read plus the ones it was adding, since a
-    // failed write of ours shouldn't take rules out of force. Over a gate.json
+    // that write held, the rules it read as the recipe's merge changed them,
+    // since a failed write of ours shouldn't take rules out of force. Over a gate.json
     // with no rule list to add them to, it runs gate.json's default with the
     // starting rules it lacks, as earlier releases did once they had written
     // them over it, where seedOrReconcile gives them (reconcile-unsaved). Where
@@ -1973,8 +2309,10 @@ export class EventGate {
     // What the start did is kept apart from gate.json's load error, so the
     // load above can't clear it when it succeeds.
     if (starting) {
-      this.startNotice = describeStart(starting, write, read.state === 'loaded' ? heldNames(read.listed) : null);
+      const described = describeStart(starting, write, read.state === 'loaded' ? heldNames(read.listed) : null);
+      this.startNotice = [described, this.startMergeNote].filter((part): part is string => part !== null).join(' ') || null;
       this.startUnsaved = describeUnsaved(starting, write, read.state === 'loaded');
+      this.startUnsavedMerged = write.kind === 'reconcile-failed' && (write.changing?.length ?? 0) > 0;
     }
     for (const said of [this.startNotice, this.startUnsaved]) {
       if (said) console.error(`[gate] ${said}`);
@@ -1996,10 +2334,17 @@ export class EventGate {
   // =========================================================================
 
   /**
-   * Write the starting rules to gate.json, as given, when it's absent, or add
-   * the ones it lacks by name, as given, to its own rule list when it loads.
-   * A rule gate.json holds holds its name, whether the gate reads it or leaves
-   * it out, so an operator's rule is never swapped for the host's. Where
+   * Write the starting rules to gate.json, as given, when it's absent, and
+   * record them as the recipe last applied (lastRecipePath); or, when it
+   * loads, merge them into its own rule list against that record, three ways
+   * and as written (reconcileWithRecipe), and record them. A rule as the last
+   * recipe left it follows the new one, a rule edited since keeps its edit, a
+   * rule no recipe declared stays, and `default` follows the same rule. A
+   * rule gate.json holds holds its name, whether the gate reads it or leaves
+   * it out. gate.json is written before the record, so a stop between the two
+   * leaves a state the next start reads rightly: the other order would make
+   * the old recipe's rules read as edits. Nothing is recorded where gate.json
+   * isn't written as the merge asks, or a name is given twice. Where
    * gate.json has no rules of its own and, under its default, one of them that
    * could wake the agent can't be put in force (left out, with no name, or kept
    * out by a rule of gate.json's of its name that the gate leaves out), or
@@ -2018,6 +2363,14 @@ export class EventGate {
         writeFileSync(this.configPath, JSON.stringify(starting.given, null, 2) + '\n');
       } catch (err) {
         return { kind: 'seed-failed', error: errorText(err), atOpen: beforeWriting(err) };
+      }
+      const twice = duplicateName(starting.rules.map((rule) => rule.raw));
+      if (twice !== undefined) {
+        this.startMergeNote = `At start, the recipe names the rule "${twice}" twice, so gate.json was seeded with it as given and it `
+          + "wasn't recorded as the recipe last applied: a later start merges the recipe by name, once gate.json and the recipe "
+          + 'name each rule once.';
+      } else {
+        this.recordRecipe(lastRecipePath(this.configPath), starting.given, 'gate.json was seeded with the recipe');
       }
       return { kind: 'none' };
     }
@@ -2054,10 +2407,10 @@ export class EventGate {
         };
       }
     }
-    const missing = starting.rules.filter((rule): rule is StartingRule & { name: string } => rule.name !== undefined && !held.has(rule.name));
-    if (missing.length === 0) return { kind: 'none' };
-    const names = missing.map((rule) => rule.name);
     if ('noList' in read.listed) {
+      const missing = starting.rules.filter((rule): rule is StartingRule & { name: string } => rule.name !== undefined && !held.has(rule.name));
+      if (missing.length === 0) return { kind: 'none' };
+      const names = missing.map((rule) => rule.name);
       // Adding them would write over what gate.json holds. Earlier releases
       // wrote them over it and ran them under its default, so the gate runs
       // them so, unsaved, beside it.
@@ -2067,41 +2420,122 @@ export class EventGate {
       if (running.length === 0) return { kind: 'reconcile-failed', names, atOpen: true, config: read.config, error };
       return { kind: 'reconcile-unsaved', names: running.map((policy) => policy.name), error, config: { policies: running, default: fileDefault } };
     }
-    const reconciled = { ...read.listed.top, policies: [...read.listed.rules, ...missing.map((rule) => rule.raw)] };
-    // What the write holds, as a load reads it, for a write that fails partway.
-    const holds = readConfig(reconciled, 'gate.json');
-    if ('refused' in holds) {
-      // A write of ours doesn't take gate.json's own rules out of force:
-      // nothing is written, so it loads as it did, without them. (With no
-      // rules of its own, gate.json isn't used at this start, above.)
-      return {
-        kind: 'reconcile-failed', names, atOpen: true, config: read.config,
-        error: 'with them, gate.json would leave out a rule that could wake the agent, and under its default, '
-          + `"${read.config.default ?? 'always'}", it wouldn't be used`,
-      };
-    }
-    const text = JSON.stringify(reconciled, null, 2) + '\n';
+    // Starting rules refused whole have nothing to merge or record.
+    if (starting.refusedWhole !== undefined) return { kind: 'none' };
+    // The merge, as written: gate.json's rule list and default against the
+    // recipe's, three ways, with the recipe last applied.
+    const recordPath = lastRecipePath(this.configPath);
+    const last = readLastRecipe(recordPath);
+    const given = isPlainObject(starting.given) ? starting.given : {};
+    let merged: ReturnType<typeof reconcileWithRecipe>;
+    let appended = false;
+    let appendedNote = '';
     try {
-      writeFileSync(this.configPath, text);
+      merged = reconcileWithRecipe(
+        { rules: read.listed.rules, default: read.listed.top.default },
+        { rules: starting.rules.map((rule) => rule.raw), default: given.default },
+        last.recipe,
+        ruleMeaning,
+      );
     } catch (err) {
-      return {
-        kind: 'reconcile-failed',
-        names,
-        error: errorText(err),
-        atOpen: beforeWriting(err),
-        config: holds.config,
-        text,
-        note: loadNote(holds.sentences),
-        sentences: holds.sentences,
+      // A name given twice: a merge by name can't say which rule was meant.
+      // So the start adds the rules gate.json lacks, after its own, as
+      // earlier releases did, and removes, redefines and records nothing.
+      const missing = starting.rules.filter((rule): rule is StartingRule & { name: string } => rule.name !== undefined && !held.has(rule.name));
+      const lacked = [...new Set(missing.map((rule) => rule.name))];
+      appended = true;
+      // What it did is said once its write is made (appendedNote), and a
+      // write that fails is said as any start's is.
+      const why = `At start, ${errorText(err)}, and the merge with the recipe needs one rule per name, so it didn't run`;
+      const remedy = 'Once gate.json and the recipe name each rule once, a start merges the recipe.';
+      this.startMergeNote = `${why}. ${remedy}`;
+      appendedNote = `${why}: `
+        + (lacked.length > 0
+          ? `the start added the rules gate.json lacked (${quotedList(lacked)}), after its own, and removed, redefined and recorded nothing. `
+          : 'gate.json is as it was, and nothing was recorded. ')
+        + remedy;
+      merged = {
+        rules: [...read.listed.rules, ...missing.map((rule) => rule.raw)],
+        default: read.listed.top.default,
+        defaultChanged: false,
+        changes: { ...noChanges(), added: missing.map((rule) => rule.name) },
       };
     }
-    this.emitTrace({
-      type: 'gate:config-reconciled',
-      configPath: this.configPath,
-      addedPolicies: names,
-      timestamp: Date.now(),
-    });
+    const { changes } = merged;
+    if (last.problem !== undefined) changes.recordUnreadable = last.problem;
+    const top = { ...read.listed.top };
+    if (merged.defaultChanged) {
+      if (merged.default === undefined) delete top.default;
+      else top.default = merged.default;
+    }
+    const reconciled = { ...top, policies: merged.rules };
+    const names = [...changes.added, ...changes.restored];
+    const changing = [...changes.removed, ...changes.updated, ...changes.moved, ...(changes.defaultChange ? ['default'] : [])];
+    const written = canonical(reconciled) !== canonical({ ...read.listed.top, policies: read.listed.rules });
+    if (written) {
+      // What the write holds, as a load reads it, for a write that fails partway.
+      const holds = readConfig(reconciled, 'gate.json');
+      if ('refused' in holds) {
+        // A write of ours doesn't take gate.json's own rules out of force:
+        // nothing is written or recorded, so it loads as it did. (With no
+        // rules of its own, gate.json isn't used at this start, above.)
+        const error = 'with them, gate.json would leave out a rule that could wake the agent, and under its default, '
+          + `"${changes.defaultChange?.to ?? read.config.default ?? 'always'}", it wouldn't be used`;
+        return { kind: 'reconcile-failed', names, changing, atOpen: true, config: read.config, error };
+      }
+      const text = JSON.stringify(reconciled, null, 2) + '\n';
+      try {
+        writeFileSync(this.configPath, text);
+      } catch (err) {
+        return {
+          kind: 'reconcile-failed',
+          names,
+          changing,
+          error: errorText(err),
+          atOpen: beforeWriting(err),
+          config: holds.config,
+          text,
+          note: loadNote(holds.sentences),
+          sentences: holds.sentences,
+        };
+      }
+    }
+    if (appended) this.startMergeNote = appendedNote;
+    // Said before the record is written, so a failed record write still
+    // leaves what the start did to gate.json named. A start that only added
+    // rules, since the merge couldn't run, is said in startNotice instead.
+    const line = appended ? null : reconcileLine(changes);
+    if (line) console.error(line);
+    if (line || names.length > 0) {
+      this.emitTrace({
+        type: 'gate:config-reconciled',
+        configPath: this.configPath,
+        ...changes,
+        // Every name the start added to gate.json, as an append's trace gave.
+        addedPolicies: names,
+        timestamp: Date.now(),
+      });
+    }
+    if (!appended && (!last.recipe || canonical({ rules: last.recipe.rules, default: last.recipe.default }) !== canonical({ rules: starting.rules.map((rule) => rule.raw), default: given.default }))) {
+      this.recordRecipe(recordPath, starting.given, written ? 'gate.json holds the recipe merged into it' : 'the merge left gate.json as it was');
+    }
     return { kind: 'none' };
+  }
+
+  /**
+   * Record the starting config, as given, as the recipe last applied, after
+   * gate.json holds what the start merged (`holds` says what that is). A
+   * write that fails is said with the start: the next start merges against
+   * the record as the write left it.
+   */
+  private recordRecipe(recordPath: string, given: unknown, holds: string): void {
+    try {
+      writeFileSync(recordPath, JSON.stringify(given, null, 2) + '\n');
+    } catch (err) {
+      this.startMergeNote = `At start, ${holds}, and the gate runs it, but recording the recipe in ${basename(recordPath)} failed `
+        + `(${errorText(err)}), so the next start merges against the record as this write left it. Whoever runs this host can `
+        + 'fix what kept it from being written.';
+    }
   }
 
   /**
@@ -2199,7 +2633,9 @@ export class EventGate {
     // holding the text in force, clears startUnsaved.
     return this.configSource === 'file'
       ? this.startUnsaved !== null
-        ? 'the rules it read from gate.json at start and the ones it was adding'
+        ? this.startUnsavedMerged
+          ? 'the rules its start was writing to gate.json'
+          : 'the rules it read from gate.json at start and the ones it was adding'
         : 'the rules of the last gate.json it used'
       : "the host's starting rules";
   }
@@ -2323,6 +2759,7 @@ export class EventGate {
     for (const name of removed) {
       this.clearPolicyState(name);
       this.stats.delete(name);
+      this.judgeRecords.delete(name);
     }
     const cleared = [...after.keys()].filter((name) => before.has(name) && before.get(name) !== after.get(name));
     for (const name of cleared) this.clearPolicyState(name);
@@ -2798,7 +3235,7 @@ export class EventGate {
     }
 
     if (typeof policy.behavior === 'object') {
-      if ('debounce' in policy.behavior) {
+      if ('debounce' in policy.behavior || 'judge' in policy.behavior) {
         this.handleDebounce(policy, info);
         return { trigger: false, policyName: policy.name, behavior: policy.behavior };
       }
@@ -2950,7 +3387,7 @@ export class EventGate {
     if (b === 'always') return true;
     if (b === 'defer' || b === 'skip') return false;
     if (typeof b === 'object') {
-      if ('debounce' in b) return false; // batches; never triggers inline
+      if ('debounce' in b || 'judge' in b) return false; // batches; never triggers inline
       if ('rate_limit' in b) {
         const cfg = b.rate_limit;
         const key = this.resolveKey(info, cfg.keyBy);
@@ -2995,16 +3432,8 @@ export class EventGate {
     return { trigger, policyName: null, behavior: this.config.default ?? 'always' };
   }
 
-  /**
-   * Probe a canonical set of synthetic chat/heartbeat events and report which
-   * rule wins each and whether it would wake. Backs the before/after table in
-   * the wake_add_rule result — the point where a rule change's real semantics
-   * must become legible (af#105; the Mythos stand-back-density incident would
-   * have been visible as `dm: discord-direct-address → stand-back-density`).
-   * Probes are representative shapes, not an exhaustive event space — rules
-   * keyed on specific channels/mounts may not match any probe.
-   */
-  probeTable(): GateProbeRow[] {
+  /** The canonical synthetic events the probe table runs: chat shapes as MCPL delivers them, and a heartbeat. */
+  private probeEvents(): Array<{ label: string; info: GateEventInfo }> {
     const chat = (
       label: string,
       eventType: string,
@@ -3050,8 +3479,34 @@ export class EventGate {
         } as GateEventInfo,
       },
     ];
+    return probes;
+  }
 
-    return probes.map(({ label, info }) => {
+  /**
+   * The rules no probe event matches, such as one scoped to an event type
+   * the probes don't model (`external-message`, how a module's messages are
+   * gated): the probe table can't show what they do, so a result that shows
+   * the table names them rather than let its rows read as their effect.
+   */
+  probeUnreached(): string[] {
+    const events = this.probeEvents().map(({ info }) => info);
+    return this.compiledPolicies
+      .filter((compiled) => !events.some((info) => this.compiledMatches(compiled, info)))
+      .map((compiled) => compiled.policy.name);
+  }
+
+  /**
+   * Probe a canonical set of synthetic chat/heartbeat events and report which
+   * rule wins each and whether it would wake. Backs the before/after table in
+   * the wake_add_rule result — the point where a rule change's real semantics
+   * must become legible (af#105; the Mythos stand-back-density incident would
+   * have been visible as `dm: discord-direct-address → stand-back-density`).
+   * Probes are representative shapes, not an exhaustive event space — rules
+   * keyed on specific channels/mounts, or on other event types, may not match
+   * any probe; `probeUnreached` names those.
+   */
+  probeTable(): GateProbeRow[] {
+    return this.probeEvents().map(({ label, info }) => {
       const d = this.probe(info);
       return {
         probe: label,
@@ -3072,22 +3527,32 @@ export class EventGate {
   /** Current shadow-lint findings for the live policy order. Fresh compute —
    *  cheap (policy lists are tens of entries at most). */
   lintShadows(): ShadowWarning[] {
-    return findShadowedPolicies(this.config.policies);
+    return findShadowedPolicies(this.config.policies, this.eventTypesFromFn);
   }
 
   /**
-   * Recompute shadow warnings and, when the set changed and is non-empty,
-   * emit a `gate:shadow-warnings` trace so the hazard lands in ops
-   * observability at the moment the order changed — not at the next missed
-   * DM. Called from writeConfig and reloadIfChanged.
+   * The sources the host knows changed (eventTypesFrom answers differently),
+   * as when an MCPL server connects or is removed: the rule-order notes are
+   * made again, and traced if they changed, as a change to the rules would.
+   */
+  sourcesChanged(): void {
+    this.refreshShadowWarnings('sources-changed');
+  }
+
+  /**
+   * Recompute shadow warnings and, when the set changed, emit a
+   * `gate:shadow-warnings` trace so the hazard lands in ops observability at
+   * the moment the order changed — not at the next missed DM — and, with an
+   * empty list, the moment the last of them went. Called from writeConfig,
+   * reloadIfChanged and sourcesChanged.
    */
   private refreshShadowWarnings(reason: string): void {
     const warnings = this.lintShadows();
     const fingerprint = JSON.stringify(warnings);
     if (fingerprint === this.shadowWarningsFingerprint) return;
+    const hadSome = this.shadowWarningsFingerprint !== '[]';
     this.shadowWarningsFingerprint = fingerprint;
-    this.shadowWarningsCache = warnings;
-    if (warnings.length > 0) {
+    if (warnings.length > 0 || hadSome) {
       this.emitTrace({
         type: 'gate:shadow-warnings',
         reason,
@@ -3133,7 +3598,8 @@ export class EventGate {
   }
 
   private handleDebounce(policy: GatePolicy, info: GateEventInfo): void {
-    const debounceMs = (policy.behavior as { debounce: number }).debounce;
+    const debounceMs = batchQuietMs(policy.behavior) ?? MIN_DEBOUNCE_MS;
+    const judge = typeof policy.behavior === 'object' && 'judge' in policy.behavior ? policy.behavior.judge : undefined;
 
     const event: PendingEvent = {
       policyName: policy.name,
@@ -3157,13 +3623,23 @@ export class EventGate {
     };
 
     const existing = this.debounceTimers.get(policy.name);
+    // A judge's maxWaitMs caps how far new events push the batch back: it's
+    // judged by then, from its first event, quiet or not.
+    const delay = (firstAt: number, batchJudge: JudgeConfig | undefined): number => {
+      const cap = batchJudge?.maxWaitMs;
+      return cap === undefined ? debounceMs : Math.max(0, Math.min(debounceMs, firstAt + cap - this.now()));
+    };
     if (existing) {
       clearTimeout(existing.timer);
       existing.events.push(event);
-      existing.timer = setTimeout(() => this.fireDebounce(policy.name), debounceMs);
+      const ms = delay(existing.firstAt, existing.judge);
+      existing.timer = setTimeout(() => this.fireDebounce(policy.name), ms);
+      existing.dueAt = this.now() + ms;
     } else {
-      const timer = setTimeout(() => this.fireDebounce(policy.name), debounceMs);
-      this.debounceTimers.set(policy.name, { timer, events: [event] });
+      const firstAt = this.now();
+      const ms = delay(firstAt, judge);
+      const timer = setTimeout(() => this.fireDebounce(policy.name), ms);
+      this.debounceTimers.set(policy.name, { timer, events: [event], firstAt, dueAt: firstAt + ms, ...(judge ? { judge } : {}) });
     }
   }
 
@@ -3176,6 +3652,14 @@ export class EventGate {
 
     const events = state.events;
     this.debounceTimers.delete(policyName);
+
+    // A judge rule's batch goes to the reply judge, which delivers it, or
+    // doesn't, once it has decided (judgeBatch). Without a judge wired it's
+    // delivered below, as a debounce's batch is.
+    if (state.judge && this.judgeFn) {
+      this.judgeBatch(policyName, events, state.judge);
+      return;
+    }
 
     // If any agent is currently inferring — or the host is quiesced — buffer
     // for later (with cap). While quiesced, delivering would write a
@@ -3213,7 +3697,23 @@ export class EventGate {
   // Event delivery
   // =========================================================================
 
-  private deliverEvents(events: PendingEvent[]): void {
+  private deliverEvents(batched: PendingEvent[]): void {
+    // Delivery-time re-check: a channel tuned out after its events were
+    // batched is held now, and "already shown above at arrival" would be
+    // untrue of them. They are dropped; the hold's own reader has them.
+    const heldAt = (e: PendingEvent): string | undefined => e.routeChannelId ?? e.channelId;
+    const events = batched.filter((e) => {
+      const channel = heldAt(e);
+      return !(channel && this.isHeldFn(e.serverId, channel));
+    });
+    if (events.length < batched.length) {
+      this.emitTrace({
+        type: 'gate:held-dropped',
+        dropped: batched.length - events.length,
+        channels: [...new Set(batched.filter((e) => !events.includes(e)).map(heldAt))],
+        timestamp: this.now(),
+      });
+    }
     if (events.length === 0) return;
 
     const policyNames = [...new Set(events.map(e => e.policyName))];
@@ -3226,7 +3726,7 @@ export class EventGate {
     const quoted = events.filter(e => !e.inContext);
     const referenced = events.filter(e => e.inContext);
 
-    const lines: string[] = quoted.map(e => `- [${e.policyName}] (${e.eventType}): ${e.content}`);
+    const lines: string[] = quoted.map(e => `- [${e.policyName}] (${e.eventType}): ${suppliedValue(e.content)}`);
     // How each referenced channel is named in the line, in order.
     const shown: string[] = [];
     if (referenced.length > 0) {
@@ -3245,7 +3745,7 @@ export class EventGate {
           ? '(unknown channel)'
           : e.routeChannelId !== undefined && e.serverId !== undefined && this.channelShownFn
             ? this.channelShownFn({ serverId: e.serverId, channelId: e.routeChannelId })
-            : id;
+            : suppliedValue(id);
         const key = JSON.stringify([e.serverId ?? null, id ?? null]);
         const entry = byChannel.get(key) ?? { name, count: 0, oldest: e.timestamp, label: e.channelLabel };
         entry.count += 1;
@@ -3258,7 +3758,7 @@ export class EventGate {
         // agent can still address tools that want the composite id. A name
         // may carry its own `#`, so one is added only where the name lacks
         // it, as at the other places that add a `#`.
-        const channel = label ? `${label.startsWith('#') ? label : `#${label}`} (${name})` : name;
+        const channel = label ? `${label.startsWith('#') ? '' : '#'}${suppliedValue(label)} (${name})` : name;
         shown.push(channel);
         lines.push(referenceLine(count, channel, oldest, Date.now()));
       }
@@ -3271,7 +3771,7 @@ export class EventGate {
     // gate hands the line to the wake (WakeProvenance.line) and a fresh start
     // of the wake's turn decides it (WakeLine). Several messages, one with
     // anything after it, or content the line quotes, keep the line now.
-    const text = `[Gate: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
+    const text = `[${NOTICE_TAG.gate}: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
     const only = events.length === 1 && events[0].inContext ? events[0] : undefined;
     let line: WakeLine | undefined;
     if (only && this.newestEntry(only)) {
@@ -3317,11 +3817,302 @@ export class EventGate {
   }
 
   // =========================================================================
+  // Reply judge (`judge` rules)
+  // =========================================================================
+
+  /**
+   * Send one of a judge rule's batches to the reply judge. While a resident's
+   * turn runs or the host is quiesced the batch is held instead, merged with
+   * any the rule already holds, and judged once both are clear
+   * (flushJudgeHeldIfClear): the judge then reads the context the turn left,
+   * which may already have answered it. While the judge decides one of the
+   * rule's batches, a later one waits for that verdict (finishJudging), so the
+   * judge never decides two of a rule's batches at once.
+   */
+  private judgeBatch(policyName: string, events: PendingEvent[], judge: JudgeConfig): void {
+    if (this.disposed) return;
+    const deciding = this.judging.get(policyName);
+    if (deciding) {
+      deciding.queued.push(...events);
+      this.capJudgeEvents(deciding.queued);
+      return;
+    }
+    if (this.judgedTurnRunning() || this.quiesced) {
+      this.holdForJudge(policyName, events, judge);
+      return;
+    }
+    const fn = this.judgeFn;
+    if (!fn) {
+      this.deliverOrBuffer(events);
+      return;
+    }
+    const abort = new AbortController();
+    const agentNames = this.getAgentNamesFn();
+    const state: JudgingState = { events, judge, started: Date.now(), abort, queued: [] };
+    this.judging.set(policyName, state);
+    const timedOut = new Promise<never>((_, reject) => {
+      state.timer = setTimeout(() => {
+        abort.abort();
+        reject(new Error(`the judge took more than ${this.judgeTimeoutMs} ms`));
+      }, this.judgeTimeoutMs);
+      // Never keep the process alive on the judge's account.
+      state.timer.unref?.();
+    });
+    let asked: Promise<JudgeVerdict>;
+    try {
+      asked = fn({
+        policyName,
+        ...(judge.instructions !== undefined ? { instructions: judge.instructions } : {}),
+        events: events.map((e) => this.judgeEventSummary(e)),
+        agentNames,
+        upcomingWakes: this.upcomingWakes(agentNames, policyName),
+        signal: abort.signal,
+      });
+    } catch (err) {
+      asked = Promise.reject(err);
+    }
+    Promise.race([asked, timedOut]).then(
+      (verdict) => this.finishJudging(policyName, state, verdict),
+      (err: unknown) => this.finishJudging(policyName, state, undefined, err),
+    ).finally(() => {
+      if (state.timer) clearTimeout(state.timer);
+    }).catch((err: unknown) => {
+      console.error(`[gate] Policy "${policyName}": the judge's verdict couldn't be applied (${errorText(err)})`);
+    });
+  }
+
+  /** Hold a batch for the judge until no turn changing the context it reads
+   *  runs and the host isn't quiesced, merged with what the rule already holds. */
+  private holdForJudge(policyName: string, events: PendingEvent[], judge: JudgeConfig): void {
+    const held = this.judgeHeld.get(policyName);
+    if (held) {
+      held.events.push(...events);
+      held.judge = judge;
+      this.capJudgeEvents(held.events);
+    } else {
+      const fresh = [...events];
+      this.capJudgeEvents(fresh);
+      this.judgeHeld.set(policyName, { events: fresh, judge });
+    }
+  }
+
+  /**
+   * Keep a rule's events waiting on the judge to the inference buffer's cap,
+   * dropping the oldest, counted and logged as bufferForInference counts its
+   * drops: a turn that never ends (the wake-wedge) or a long quiesce on a busy
+   * channel would otherwise grow them without bound. A queue beside a batch
+   * the judge is deciding is capped on its own, so its newest events are never
+   * the ones dropped for the batch ahead of it.
+   */
+  private capJudgeEvents(events: PendingEvent[]): void {
+    const drop = events.length - MAX_INFERENCE_BUFFER;
+    if (drop <= 0) return;
+    events.splice(0, drop);
+    const before = this.droppedJudgeEvents;
+    this.droppedJudgeEvents += drop;
+    if (Math.floor(before / 50) !== Math.floor(this.droppedJudgeEvents / 50) || before === 0) {
+      console.error(
+        `[gate] events waiting on the reply judge reached the cap (${MAX_INFERENCE_BUFFER} per rule): dropped `
+        + `${this.droppedJudgeEvents} oldest so far${this.quiesced ? ' during quiesce' : ''}`,
+      );
+    }
+  }
+
+  /** The rule's judge as it is now, when the rule is still a judge rule; else the one the batch was asked with. */
+  private currentJudge(policyName: string, asked: JudgeConfig): JudgeConfig {
+    const now = this.config.policies.find((p) => p.name === policyName)?.behavior;
+    return typeof now === 'object' && 'judge' in now ? now.judge : asked;
+  }
+
+  /**
+   * The gate's own timers that will wake `agentNames` with no new event, for
+   * the judge to weigh what waiting costs: each agent's pending self-wake
+   * (skip_reply's wake_in_seconds), the end of a sleep, and the pending
+   * batches of rules other than `exceptPolicy` (a debounce's wakes the agent
+   * when it fires; a judge rule's goes to the judge, so it only may).
+   */
+  upcomingWakes(agentNames: string[], exceptPolicy?: string): UpcomingWake[] {
+    const wakes: UpcomingWake[] = [];
+    const now = this.now();
+    for (const name of agentNames) {
+      const due = this.selfWakeDue.get(name);
+      if (due && this.selfWakeTimers.has(name)) {
+        wakes.push({ at: due.at, certain: true, what: `${agentNames.length > 1 ? `${name}'s` : 'its'} own ${due.source} timer` });
+      }
+    }
+    if (this.sleepUntil > now && (this.sleepAgent === undefined || agentNames.includes(this.sleepAgent))) {
+      wakes.push({ at: this.sleepUntil, certain: true, what: 'the end of its sleep' });
+    }
+    for (const [name, state] of this.debounceTimers) {
+      if (name === exceptPolicy || state.events.length === 0) continue;
+      const n = state.events.length;
+      const batch = `${n} ${n === 1 ? 'event' : 'events'}`;
+      wakes.push(state.judge
+        ? { at: state.dueAt, certain: false, what: `rule "${name}"'s batch of ${batch} goes to the judge` }
+        : { at: state.dueAt, certain: true, what: `rule "${name}"'s debounced batch of ${batch}` });
+    }
+    return wakes.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
+  }
+
+  /** A batch's event as the judge is shown it. */
+  private judgeEventSummary(e: PendingEvent): JudgeEventSummary {
+    const id = e.routeChannelId ?? e.channelId;
+    let channel: string | undefined;
+    if (id !== undefined) {
+      let name = id;
+      if (e.routeChannelId !== undefined && e.serverId !== undefined && this.channelShownFn) {
+        try {
+          name = this.channelShownFn({ serverId: e.serverId, channelId: e.routeChannelId });
+        } catch {
+          name = id;
+        }
+      }
+      channel = e.channelLabel ? `${e.channelLabel.startsWith('#') ? e.channelLabel : `#${e.channelLabel}`} (${name})` : name;
+    }
+    return {
+      eventType: e.eventType,
+      ...(channel !== undefined ? { channel } : {}),
+      ...(e.authorId !== undefined ? { authorId: e.authorId } : {}),
+      addressed: e.addressed,
+      content: e.content,
+      at: e.timestamp,
+    };
+  }
+
+  /**
+   * Apply the judge's verdict on a batch. Reply: the batch, with any of the
+   * rule's batches that fired meanwhile, is delivered as a debounce's is
+   * (held for a turn that started meanwhile, as fireDebounce holds one). Wait:
+   * nothing is delivered, and batches that fired meanwhile go to the judge
+   * afresh. A judge that failed, timed out or answered nothing usable decides
+   * by onError: "wake" delivers, "skip" doesn't. Each verdict is traced and
+   * counted for gate_status, and a failure is logged.
+   */
+  private finishJudging(policyName: string, state: JudgingState, verdict: JudgeVerdict | undefined, err?: unknown): void {
+    // A verdict for a batch the gate let go of (dispose() clears what the
+    // judge was deciding) applies to nothing, even after a start() since.
+    if (this.judging.get(policyName) !== state) return;
+    this.judging.delete(policyName);
+    if (state.timer) clearTimeout(state.timer);
+    const durationMs = Date.now() - state.started;
+    const failed = verdict == null || typeof verdict !== 'object' || typeof verdict.reply !== 'boolean';
+    if (failed && (err as { providerAdmission?: unknown } | undefined)?.providerAdmission === 'deferred') {
+      const wakes = this.judgeOnError === 'wake';
+      console.error(
+        `[gate] Policy "${policyName}": the reply judge made no call (${errorText(err)}), so its batch of ${state.events.length} `
+        + `${state.events.length === 1 ? 'event' : 'events'} ${wakes ? 'wakes the agent' : "doesn't wake the agent"} (judge onError "${this.judgeOnError}")`,
+      );
+      if (this.disposed) return;
+      if (wakes) this.deliverOrBuffer([...state.events, ...state.queued]);
+      else if (state.queued.length > 0) this.judgeBatch(policyName, state.queued, this.currentJudge(policyName, state.judge));
+      return;
+    }
+    const outcome: 'reply' | 'wait' | 'error' = failed ? 'error' : verdict.reply ? 'reply' : 'wait';
+    const reason = failed
+      ? (err !== undefined ? errorText(err) : 'the judge gave no verdict')
+      : typeof verdict.reason === 'string' ? verdict.reason : '';
+    const record = this.judgeRecords.get(policyName) ?? { verdicts: { reply: 0, wait: 0, error: 0 } };
+    record.verdicts[outcome]++;
+    record.last = {
+      at: Date.now(),
+      verdict: outcome,
+      reason: cutToFit(suppliedValue(reason), 300),
+      eventCount: state.events.length,
+      durationMs,
+      ...(!failed && typeof verdict.inputTokens === 'number' ? { inputTokens: verdict.inputTokens } : {}),
+    };
+    if (this.config.policies.some((p) => p.name === policyName)) this.judgeRecords.set(policyName, record);
+    if (failed) {
+      this.judgeFailStreak++;
+      this.judgeLastFailure = cutToFit(suppliedValue(reason), 200);
+    } else {
+      this.judgeFailStreak = 0;
+    }
+    const wake = outcome === 'reply' || (outcome === 'error' && this.judgeOnError === 'wake');
+    if (failed) {
+      console.error(
+        `[gate] Policy "${policyName}": the reply judge failed (${reason}), so its batch of ${state.events.length} `
+        + `${state.events.length === 1 ? 'event' : 'events'} ${wake ? 'wakes the agent' : "doesn't wake the agent"} (judge onError "${this.judgeOnError}")`,
+      );
+    }
+    this.emitTrace({
+      type: 'gate:judge-verdict',
+      policyName,
+      verdict: outcome,
+      woke: wake,
+      eventCount: state.events.length,
+      durationMs,
+      ...(!failed && verdict.model ? { model: verdict.model } : {}),
+      ...(!failed && typeof verdict.inputTokens === 'number' ? { inputTokens: verdict.inputTokens } : {}),
+      ...(!failed && typeof verdict.cacheReadTokens === 'number' ? { cacheReadTokens: verdict.cacheReadTokens } : {}),
+      ...(!failed && typeof verdict.outputTokens === 'number' ? { outputTokens: verdict.outputTokens } : {}),
+      timestamp: Date.now(),
+    });
+    if (this.disposed) return;
+    const judge = this.currentJudge(policyName, state.judge);
+    if (wake) {
+      this.deliverOrBuffer([...state.events, ...state.queued]);
+      return;
+    }
+    if (state.queued.length > 0) this.judgeBatch(policyName, state.queued, judge);
+  }
+
+  /** Deliver a batch now, or hold it for the agents' turns and the host's
+   *  quiesce to end, as fireDebounce does; a delivery that throws drops it,
+   *  named in the log. */
+  private deliverOrBuffer(events: PendingEvent[]): void {
+    if (events.length === 0) return;
+    if (this.inferring.size > 0 || this.quiesced) {
+      this.bufferForInference(events);
+      return;
+    }
+    try {
+      this.deliverEvents(events);
+    } catch (err) {
+      const one = events.length === 1;
+      console.error(
+        `[gate] a judged batch of ${events.length} ${one ? 'event' : 'events'} couldn't be delivered `
+        + `(${errorText(err)}), so the batch is dropped`,
+      );
+    }
+  }
+
+  private changesJudgedContext(agentName: string): boolean {
+    return this.changesJudgedContextFn?.(agentName) ?? true;
+  }
+
+  private judgedTurnRunning(): boolean {
+    return [...this.inferring].some((name) => this.changesJudgedContext(name));
+  }
+
+  private stopJudging(): void {
+    for (const [policyName, state] of [...this.judging]) {
+      this.judging.delete(policyName);
+      if (state.timer) clearTimeout(state.timer);
+      state.abort.abort();
+      this.holdForJudge(policyName, [...state.events, ...state.queued], state.judge);
+    }
+  }
+
+  /** Send the batches held for the judge once no turn changing the context it reads runs and the host isn't quiesced. */
+  private flushJudgeHeldIfClear(): void {
+    if (this.quiesced || this.judgedTurnRunning() || this.judgeHeld.size === 0) return;
+    const held = [...this.judgeHeld];
+    this.judgeHeld.clear();
+    // Deferred, as the inference buffer's flush is, to stay out of the
+    // turn-end callback that called this.
+    queueMicrotask(() => {
+      for (const [policyName, { events, judge }] of held) this.judgeBatch(policyName, events, this.currentJudge(policyName, judge));
+    });
+  }
+
+  // =========================================================================
   // Inference lifecycle
   // =========================================================================
 
   onInferenceStarted(agentName: string): void {
     this.inferring.add(agentName);
+    if (this.changesJudgedContext(agentName)) this.stopJudging();
     // A turn is starting — whatever caused it supersedes any pending
     // self-wake. (Arming happens MID-turn via skip_reply, i.e. after this
     // ran for the arming turn, so a fresh arm always survives its own turn.)
@@ -3334,18 +4125,19 @@ export class EventGate {
 
   /** A turn that continues another (a budget restart, a tool-result-guard
    *  retry) holds the entry its predecessor kept for it, and takes it again
-   *  where that entry ended in between: at a stop(), whose dispose() clears
-   *  every entry, or at a provider hold that kept the turn from starting,
-   *  whose end queues it again. Unlike onInferenceStarted it leaves a
-   *  pending self-wake alone: the logical turn that armed it is the one
-   *  still running. */
+   *  where that entry ended in between, as at a provider hold that kept the
+   *  turn from starting, whose end queues it again. Unlike
+   *  onInferenceStarted it leaves a pending self-wake alone: the logical
+   *  turn that armed it is the one still running. */
   onInferenceResumed(agentName: string): void {
     this.inferring.add(agentName);
+    if (this.changesJudgedContext(agentName)) this.stopJudging();
   }
 
   onInferenceEnded(agentName: string): void {
     this.inferring.delete(agentName);
     this.flushInferenceBufferIfClear();
+    this.flushJudgeHeldIfClear();
   }
 
   /**
@@ -3360,7 +4152,15 @@ export class EventGate {
   setQuiesced(quiesced: boolean): void {
     if (this.quiesced === quiesced) return;
     this.quiesced = quiesced;
-    if (!quiesced) this.flushInferenceBufferIfClear();
+    if (quiesced) {
+      // A judge reading the context now would read it mid-surgery, and call
+      // its provider while the host holds still: it's stopped, and its batch
+      // held to be judged at resume.
+      this.stopJudging();
+    } else {
+      this.flushInferenceBufferIfClear();
+      this.flushJudgeHeldIfClear();
+    }
   }
 
   private flushInferenceBufferIfClear(): void {
@@ -3393,12 +4193,19 @@ export class EventGate {
     bufferedEvents: number;
     droppedBufferedEvents: number;
     sleepUntil: number;
+    /** Events held for the reply judge until the turn or quiesce ends, and the judge's own drops at the cap. */
+    judgeHeldEvents: number;
+    droppedJudgeEvents: number;
   } {
+    let judgeHeldEvents = 0;
+    for (const held of this.judgeHeld.values()) judgeHeldEvents += held.events.length;
     return {
       inferring: [...this.inferring],
       bufferedEvents: this.inferenceBuffer.length,
       droppedBufferedEvents: this.droppedBufferedEvents,
       sleepUntil: this.sleepUntil,
+      judgeHeldEvents,
+      droppedJudgeEvents: this.droppedJudgeEvents,
     };
   }
 
@@ -3446,7 +4253,7 @@ export class EventGate {
     // Arm the self-wake: when the window elapses, clear sleep and request an
     // inference so the agent resumes on its own (not dependent on a heartbeat
     // tick or an incoming message). Cancelled by clearSleep()/`wake`, and by
-    // dispose(), after which start() arms it again (resumeSleep).
+    // dispose(), after which nothing arms it.
     this.armSleepWake();
     this.reloadPrivilegedIfChanged();
     this.emitTrace({
@@ -3461,23 +4268,10 @@ export class EventGate {
   }
 
   /**
-   * Arm timers again for a lifecycle that starts after a stop(), and the
-   * sleep's wake first: dispose() clears its timer and keeps the sleep. A
-   * sleep still ahead wakes the agent at its end; one that ended while
-   * stopped wakes it now, since that wake is what the agent asked for. With
-   * no sleep, wakeFromSleep does nothing.
-   */
-  resumeSleep(): void {
-    this.disposed = false;
-    if (this.sleepUntil > this.now()) this.armSleepWake();
-    else this.wakeFromSleep('sleep-expired');
-  }
-
-  /**
    * Arm the sleep's wake for its end by the gate's own clock. One timer holds
    * at most MAX_TIMER_MS, about 24.8 days, so a longer sleep waits in steps,
    * and wakeFromSleep reads the clock as each one fires. Nothing is armed
-   * while the gate is disposed: resumeSleep() arms it at the next start().
+   * once the gate is disposed.
    */
   private armSleepWake(): void {
     if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
@@ -3487,11 +4281,9 @@ export class EventGate {
   }
 
   /**
-   * `agentName` is gone, as a conversation fork's end or an ephemeral run's
-   * removes one: its pending self-wake is cancelled, and a sleep it set ends.
-   * The gate's sleep holds back every agent's wakes, so nobody is asleep once
-   * its agent is gone, and neither wake would reach a name that no longer
-   * exists. A sleep another agent set, or one set with no agent, stays.
+   * `agentName` is gone, as an agent's end removes one: its pending
+   * self-wake is cancelled, and a sleep it set ends, rather than go on
+   * quieting every agent and then wake a name that no longer exists.
    */
   agentGone(agentName: string): void {
     const selfWake = this.selfWakeTimers.get(agentName);
@@ -3499,7 +4291,7 @@ export class EventGate {
       clearTimeout(selfWake);
       this.selfWakeTimers.delete(agentName);
     }
-    if (this.sleepUntil !== 0 && this.sleepAgent === agentName) this.clearSleep();
+    if (this.sleepAgent === agentName) this.clearSleep();
   }
 
   // =========================================================================
@@ -3545,7 +4337,7 @@ export class EventGate {
       const placement: WritePlacement = {};
       this.addMessageFn('user', [{
         type: 'text',
-        text: `[self-wake] your ${source} timer (${Math.round(ms / 1000)}s) elapsed — now ${nowIso}`,
+        text: `[${NOTICE_TAG.selfWake}] your ${source} timer (${Math.round(ms / 1000)}s) elapsed — now ${nowIso}`,
       }], { source: 'gate:self-wake' }, agentName, placement);
       this.requestInferenceFn(
         agentName,
@@ -3556,6 +4348,7 @@ export class EventGate {
       );
     }, ms);
     this.selfWakeTimers.set(agentName, timer);
+    this.selfWakeDue.set(agentName, { at: this.now() + ms, source });
     this.emitTrace({
       type: 'gate:decision',
       eventType: 'selfwake:set',
@@ -3587,9 +4380,7 @@ export class EventGate {
    * fires early (Node's can, by a millisecond), or a clock set back.
    */
   private wakeFromSleep(reason: string): void {
-    // The timer that called it has fired; from resumeSleep(), for a sleep
-    // already over, one may still be armed, and it goes, so no stale step of
-    // it can fire later.
+    // The timer that called it has fired.
     if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
     if (this.sleepUntil === 0) return;
     if (this.sleepUntil > this.now()) {
@@ -3754,6 +4545,16 @@ export class EventGate {
           fireCount: this.passiveSampleFires.get(p.name) ?? 0,
         };
       }
+      if (typeof p.behavior === 'object' && 'judge' in p.behavior) {
+        const record = this.judgeRecords.get(p.name);
+        result.judgeState = {
+          pendingCount: debounce?.events.length ?? 0,
+          judging: this.judging.has(p.name),
+          heldCount: this.judgeHeld.get(p.name)?.events.length ?? 0,
+          verdicts: { ...(record?.verdicts ?? { reply: 0, wait: 0, error: 0 }) },
+          ...(record?.last ? { last: { ...record.last } } : {}),
+        };
+      }
       return result;
     });
 
@@ -3780,9 +4581,14 @@ export class EventGate {
       default: this.config.default ?? 'always',
       script: this.gateScript.status(),
       policies,
-      errors: [this.configErrorShown(), this.startNotice, this.startUnsaved, this.privilegedError]
+      errors: [
+        this.configErrorShown(), this.startNotice, this.startUnsaved, this.privilegedError,
+        this.judgeUnwiredNotice(), this.judgeFailingNotice(),
+      ]
         .filter((e): e is string => e !== null),
-      shadowWarnings: this.shadowWarningsCache.map(formatShadowWarning),
+      // Fresh, not the cache: the sources the host knows (eventTypesFrom)
+      // change as servers connect, with no change to the rules.
+      shadowWarnings: this.lintShadows().map(formatShadowWarning),
       totalEvaluations: this.totalEvaluations,
       defaultDecisions: {
         triggered: this.defaultTriggered,
@@ -3790,6 +4596,27 @@ export class EventGate {
         byEventType,
       },
     };
+  }
+
+  /** gate_status's word on judge rules in force with no judge wired. */
+  private judgeUnwiredNotice(): string | null {
+    if (this.judgeFn) return null;
+    const names = this.config.policies
+      .filter((p) => typeof p.behavior === 'object' && 'judge' in p.behavior)
+      .map((p) => p.name);
+    if (names.length === 0) return null;
+    return `${quotedList(names)} ${names.length === 1 ? 'is a judge rule' : 'are judge rules'}, and this host wires no reply `
+      + `judge, so ${names.length === 1 ? 'its batches wake' : 'their batches wake'} the agent as a debounce of the same quiet period would`;
+  }
+
+  /** gate_status's word on a judge that keeps failing (JUDGE_FAILING_STREAK in a row). */
+  private judgeFailingNotice(): string | null {
+    if (this.judgeFailStreak < JUDGE_FAILING_STREAK) return null;
+    return `the reply judge has failed its last ${this.judgeFailStreak} requests (the newest: ${this.judgeLastFailure}), `
+      + (this.judgeOnError === 'wake'
+        ? 'so judge rules wake the agent as debounces of the same quiet period would'
+        : "so judge rules' batches don't wake the agent")
+      + "; the host's judge model or provider may not serve it (GateOptions.judge)";
   }
 
   // =========================================================================
@@ -3802,15 +4629,24 @@ export class EventGate {
       clearTimeout(state.timer);
     }
     this.debounceTimers.clear();
+    // A judge deciding now is told to stop, and its verdict, when it comes,
+    // delivers nothing (finishJudging); held batches go with the buffer.
+    for (const state of this.judging.values()) {
+      if (state.timer) clearTimeout(state.timer);
+      state.abort.abort();
+    }
+    this.judging.clear();
+    this.judgeHeld.clear();
     for (const timer of this.selfWakeTimers.values()) {
       clearTimeout(timer);
     }
     this.selfWakeTimers.clear();
+    this.selfWakeDue.clear();
     // The sleep stays, with its note and agent, and its timer goes: fired
     // after a stop(), its wake reached a framework that had stopped, and the
-    // timer held the process until the sleep's end. The next start() arms it
-    // again (resumeSleep). Until then nothing arms one, nor a self-wake: a
-    // turn a failed stop() left running can still call sleep or skip_reply.
+    // timer held the process until the sleep's end. Nothing arms one after
+    // this, nor a self-wake: a turn a failed stop() left running can still
+    // call sleep or skip_reply.
     if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
     this.disposed = true;
     this.rateLimitBuckets.clear();
@@ -3820,13 +4656,9 @@ export class EventGate {
     this.inferenceBuffer = [];
     // stop() disposes the gate once its streams and event loop have ended (a
     // turn still compiling then is dropped at its next check, before it sends
-    // anything), and a start() goes on with this gate. An agent left here by
-    // a turn whose exit didn't end it (a retry stop() cancelled, a successor
-    // stop() refused) would make every debounced batch buffer until that
-    // agent's next turn ended. A turn that continues after the start() takes
-    // its entry again (onInferenceResumed). A start() made during the stop()
-    // is refused, so no turn of a new lifecycle can have begun before this
-    // runs.
+    // anything). An agent left here by a turn whose exit didn't end it (a
+    // retry stop() cancelled, a successor stop() refused) would make every
+    // debounced batch buffer until that agent's next turn ended.
     this.inferring.clear();
   }
 }

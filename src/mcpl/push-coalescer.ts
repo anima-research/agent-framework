@@ -439,14 +439,20 @@ export function validateCoalescedContent(
 /**
  * Whether the converter (`convertBlock` in convert-block.ts, which every lane
  * uses) shows a block as itself, its text or its image or
- * audio source, or as a reference stub, and not as a placeholder: an
+ * audio source (for MCP's embedded resource, its contents'), or as a
+ * reference stub, and not as a placeholder: an
  * unrecognized block, a no-data or no-media-type one, withheld inline data,
  * or a text block whose text isn't a string. This follows its branches in
  * their order.
  */
 function showsAsItself(b: Record<string, unknown>): boolean {
   if (b.type === 'text') return typeof b.text === 'string';
-  if (b.type === 'resource') return classifyBlock(b).kind === 'reference';
+  if (b.type === 'resource' || b.type === 'resource_link') {
+    const c = classifyBlock(b);
+    // MCP's embedded resource shows as the block its contents make.
+    if (c.kind === 'embedded') return c.contents.kind === 'block' && showsAsItself(c.contents.block);
+    return c.kind === 'reference';
+  }
   if (b.type !== 'image' && b.type !== 'audio') return false;
   if (isInlineContradiction(b)) return false;
   if (isFilledString(b.uri) && b.disposition !== undefined) return classifyBlock(b).kind === 'reference';
@@ -992,6 +998,25 @@ export class PushCoalescer<E = unknown> {
     await Promise.all(work);
     this.persist();
     return result;
+  }
+
+  /**
+   * Render and materialize one subject's pending batch for `agentName` now,
+   * outside a turn's assembly: a batch whose wake a hold keeps back, stored
+   * as it renders (held, as a plain push under the hold is), so whoever reads
+   * held traffic sees it and the turn after the hold doesn't take it again.
+   * A batch that opened while another render ran is rendered once that
+   * render settles. Resolves whether it materialized.
+   */
+  async materializeNow(agentName: string, subject: string): Promise<boolean> {
+    for (;;) {
+      if (this.suspended) return false;
+      const started = await this.locked(() => this.freeze(subject, agentName));
+      if (!started || started === 'declined') return false;
+      await started.done;
+      this.persist();
+      if (!started.joined) return started.rendering.materialized === true;
+    }
   }
 
   /**

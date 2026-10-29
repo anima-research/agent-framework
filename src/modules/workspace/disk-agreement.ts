@@ -10,14 +10,14 @@
  * intent — tombstones, store origin, conflicts — lives in BranchIntents and
  * rewinds with the tree.
  *
- * P is evidence about one directory, so each mount also records the identity
- * (device and inode) of the root that evidence was gathered under. A root
- * that isn't that directory any more (an unmounted drive whose mountpoint is
- * now empty, a replaced directory) is an unavailable mount, never a disk on
- * which every file was deleted; only an explicit acceptance takes it, and
- * that starts its evidence afresh. A place, where a walk stopped (`walks`),
- * binds no root: it only says where the next walk starts, in whatever
- * directory the root is by then.
+ * P is evidence about one directory, so each mount also records the identity of
+ * the root that evidence was gathered under (sameRootIdentity says when two
+ * name the same directory). A root that isn't that directory any more (an
+ * unmounted drive whose mountpoint is now empty, a replaced directory) is an
+ * unavailable mount, never a disk on which every file was deleted; only an
+ * explicit acceptance takes it, and that starts its evidence afresh. A place,
+ * where a walk stopped (`walks`), binds no root: it only says where the next
+ * walk starts, in whatever directory the root is by then.
  *
  * Every transition is write-ahead (see reconcile.ts): an `intent` entry
  * (`pending`, with the prior value and the expected one) is durable before the
@@ -33,9 +33,26 @@
  * succeed, since its completion releases a draft's protection.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { resolve } from 'node:path';
 import type { JsStore } from '@animalabs/chronicle';
 import { RecordJournal } from '../../record-journal.js';
+import { Refusal, onlyTheHost } from './answers.js';
+
+const UNTIL_REOPENED = "the workspace can't check its files against disk until its store is reopened";
+const REOPEN = onlyTheHost('reopen it with a restart');
+
+export class EvidenceUnavailable extends Refusal {
+  constructor(readonly why: string) {
+    super(`${UNTIL_REOPENED}: ${why}. ${REOPEN}`);
+  }
+}
+
+export function rootUnreadable(err: EvidenceUnavailable): string {
+  return `the root disk last agreed with can't be read until the store is reopened: ${err.why}. ${REOPEN}`;
+}
+
+export const callGate = new AsyncLocalStorage<{ passed: boolean }>();
 
 /** Everything `stat` says about a file that can vouch for unchanged bytes. */
 export interface Fingerprint {
@@ -94,10 +111,15 @@ export interface Interrupted {
 
 export type Physical = Agreed | Pending | Interrupted;
 
-/** Which directory a mount root is: its device and inode, as decimal strings. */
+/**
+ * Which directory a mount root is: its device and inode, and its birth time
+ * in nanoseconds as the runtime reports it, where that is above zero and isn't
+ * its ctime, as decimal strings.
+ */
 export interface RootIdentity {
   dev: string;
   ino: string;
+  born?: string;
 }
 
 /** Whether two configured roots name the same path, whatever their spelling
@@ -106,8 +128,33 @@ function sameRootPath(a: string, b: string): boolean {
   return resolve(a) === resolve(b);
 }
 
-export function sameRootIdentity(a: RootIdentity, b: RootIdentity): boolean {
-  return a.dev === b.dev && a.ino === b.ino;
+/**
+ * Whether the directory seen `now` is the one `recorded`: the same inode, and
+ * not born after the recorded one where `now`'s filesystem keeps a birth time
+ * fixed (`bornFixed`), since ext4 gives a directory made where one was removed
+ * its inode again, while overlayfs gives a directory copied up from a lower
+ * layer a later birth time under the same inode; and the same device, or the
+ * same birth time on another device, since macOS can give a volume another
+ * device number after a reboot. A birth time in whole seconds doesn't count
+ * across devices: filesystems made in the same second can give their roots
+ * one inode (2 on ext4) and one birth time.
+ */
+export function sameRootIdentity(recorded: RootIdentity, now: RootIdentity, bornFixed: boolean): boolean {
+  if (recorded.ino !== now.ino || (bornFixed && bornLater(recorded, now))) return false;
+  if (recorded.dev === now.dev) return true;
+  return fractional(recorded.born) && recorded.born === now.born;
+}
+
+export function onlyDeviceDiffers(recorded: RootIdentity, now: RootIdentity, bornFixed: boolean): boolean {
+  return !sameRootIdentity(recorded, now, bornFixed) && recorded.ino === now.ino && recorded.dev !== now.dev && !(bornFixed && bornLater(recorded, now));
+}
+
+function bornLater(recorded: RootIdentity, now: RootIdentity): boolean {
+  return recorded.born !== undefined && now.born !== undefined && BigInt(now.born) > BigInt(recorded.born);
+}
+
+function fractional(born: string | undefined): boolean {
+  return born !== undefined && !born.endsWith('000000000');
 }
 
 type JournalEntry =
@@ -219,18 +266,18 @@ export class DiskAgreement {
    */
   ensureReconciled(): void {
     if (this.journal.needsReopen) {
-      throw new Error(
-        'Disk-agreement evidence is unavailable until the store is reopened, as at the next start: ' +
-        'an append to its journal failed inside the store, and the evidence may lack what it recorded',
-      );
+      throw new EvidenceUnavailable('an append to its record of what disk last agreed with failed inside the store, so that record may lack what the append held');
     }
     if (!this.whole) {
-      throw new Error(
-        'Disk-agreement evidence is unavailable until the store is reopened, as at the next start: ' +
-        'reading it back from the store failed',
-      );
+      throw new EvidenceUnavailable('reading back its record of what disk last agreed with failed');
     }
     if (this.journal.needsReconcile) this.rebuild();
+    const gate = callGate.getStore();
+    if (gate) gate.passed = true;
+  }
+
+  get awaitsReopen(): boolean {
+    return this.journal.needsReopen || !this.whole;
   }
 
   /** Whether evidence recorded so far still awaits a barrier. */
@@ -314,11 +361,19 @@ export class DiskAgreement {
 
   /**
    * Record the root's identity just before the first evidence a mount gains:
-   * the caller saw it as the root while gathering that evidence. A no-op once
-   * one is recorded; changing it is acceptRoot's alone.
+   * the caller saw it as the root while gathering that evidence. Once one is
+   * recorded, the same directory seen on another device, or with a birth
+   * time the record lacks, replaces it and keeps the evidence; another
+   * directory is acceptRoot's alone.
    */
   recordRootIdentity(mount: string, identity: RootIdentity): void {
-    if (this.rootIdentity(mount) !== undefined) return;
+    const recorded = this.rootIdentity(mount);
+    if (recorded !== undefined) {
+      if (!sameRootIdentity(recorded, identity, false)) return;
+      const renumbered = recorded.dev !== identity.dev;
+      const bornLearned = recorded.born === undefined && identity.born !== undefined;
+      if (!renumbered && !bornLearned) return;
+    }
     this.write({ t: 'root', mount, identity }, {});
   }
 

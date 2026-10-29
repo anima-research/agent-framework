@@ -64,7 +64,7 @@ Chronicle's audit history.
   model: 'claude-opus-4-20250514',
   systemPrompt: '...',
   strategy: new AutobiographicalStrategy({ recentWindowTokens: 30000 }),
-  allowedTools: ['search--query', 'utils', 'files--archive'], // or 'all'
+  allowedTools: ['search--query', 'toolsets--open', 'toolsets--act', 'toolsets--look', 'toolsets--close', 'files--archive'], // or 'all'
   triggerSources: ['discord'],                   // or 'all'
   maxTokens: 8192,
   maxStreamTokens: 150_000,  // input token budget before stream restart
@@ -73,17 +73,13 @@ Chronicle's audit history.
 
 `allowedTools` is enforced at dispatch for registered agents. Omission or
 `'all'` permits all tools; an explicit list matches exact names, including
-`module--utility` names. Utilities aren't tools of their own: an agent's model
-and its scripts are offered them only through `utils`, whose `run` checks the
-utility's own name. An agent that should use a utility lists both `utils` and
-`module--utility`. The name alone passes the dispatch check for any call by
-that name, whether the host makes it with `executeToolCall` on the agent's
-behalf or the model or a script makes it without being offered it. The slot
-is hidden when the agent can use no registered utility. If utilities exist
-but none are permitted, `list` returns a failed `ToolResult` with the registered
-and permitted counts and migration advice, and a list containing `utils`
-logs one warning per Agent instance after registration.
-An empty registry still returns a successful empty list.
+`module--utility` names. A utility, like every tool of the host's built-in
+toolset (see "The host's own toolsets" below), is called through
+`toolsets--act`, and the dispatch check applies to the utility's own name: an
+agent that should use one lists `module--utility` and the `toolsets--` tools.
+An agent that can't use `toolsets--open` and `toolsets--act` gets no host
+toolsets: every tool it may call stays in its tool list, except module
+utilities, which are never in a tool list (it can still call one by name).
 
 Trusted module calls are exempt from agent allowlists. Genuinely unidentified
 public callers, including unknown legacy caller names, remain unrestricted.
@@ -118,7 +114,7 @@ interface Module {
 
   // Optional
   onAgentSpeech?(agentName: string, content: ContentBlock[], context: SpeechContext): Promise<void>;
-  gatherContext?(agentName: string): Promise<ContextInjection[]>;
+  gatherContext?(agentName: string): Promise<ModuleContextInjection[]>;
 }
 ```
 
@@ -137,6 +133,8 @@ return {
 - **ApiModule** - WebSocket API event processing
 - **WorkspaceModule** - Mountable filesystem abstraction with Chronicle tree state, filesystem watching, and materialization
 
+DiscordModule and ApiModule store a sender's name that comes from outside the framework in a form marked with its source: a Discord author's username as `<name> (Discord)`, and the name on every `api:message` event, from an ApiServer caller or a host's own, as `<name> (API)`. An `api:message` whose `participant` isn't text, which its type doesn't allow, isn't stored, and starts no turn. Such a name is stored on one line: each run of line breaks (U+2028 and U+2029 included) and other control characters becomes one space. Each of the framework's notice openings in it is marked with a backslash, as in the text a participant or a server supplies. The generic name `user`, in any capitalization, is stored as given. Unless a host gives one of its own agents the name `user`, in any capitalization, or a name ending in ` (Discord)` or ` (API)`, such a message never carries an agent's name, so the agent's request never takes it as the agent's own turn. Where an agent's request shows senders' names, the agent sees the marked form, and the unmarked one in rows stored by earlier versions. A host that pushes an `api:message` in an agent's name records a user turn, not that agent's, with the same exception, and the ApiServer's message list returns each message's participant as stored, so a caller sees its own messages under its name's stored form, `<name> (API)`. The ApiServer refuses a `participant` that isn't text, as it refuses content that isn't. The bot's own messages that a Discord history sync stores keep the name of the framework's first agent, as before. For a sender from outside, both modules also store the name as sent in `metadata.author` (with the author's Discord id), unless an `api:message` event's metadata already carries an `author` object, which is kept. History's author filter matches a row's `metadata.author` when it has one, and its participant otherwise. Code that tells senders apart should read a row's `metadata.author` (its `name`, and `id` for Discord) when it has one, and its participant otherwise, as the filter does: rows these modules stored in earlier versions have none, unless a host's `api:message` carried one.
+
 ### Event Processing
 
 The framework runs an event loop over a `ProcessQueue`. Each event is processed by all modules, which return `EventResponse` objects. If any response requests inference, the framework compiles context and starts a stream.
@@ -150,7 +148,9 @@ Each agent has a `ContextManager` (from `@connectome/context-manager`) that main
 - **PassthroughStrategy** - No compression, raw message replay up to budget
 - **AutobiographicalStrategy** - Chunks old messages and summarizes them into diary entries, preserving recent context uncompressed
 
-Before inference, modules and MCPL hooks can inject additional context via `gatherContext()`.
+A turn keeps the messages it opened with whole: at a start that opens a turn, the framework pins raw (`pinRange`, named `agent-framework:turn-inputs`) the rows the agent sees that were stored after both the newest of its own messages that it sees and its consumed watermark, starting at the first such row that holds more than tool results, and removes the pin when the turn ends. The pinned rows' tokens count against the budget. If a committing compile refuses as over budget with the pin held, the pin is removed and the compile runs once more, so the turn goes on as it would have without it. A silent heartbeat tick pins nothing, and neither does a strategy without pins.
+
+Before inference, modules and MCPL hooks can inject additional context via `gatherContext()`. An `afterUser` injection is stored in the agent's window, as the message `compile()` would have placed after the last user message, so it stays where the agent saw it: the replies after it keep their thinking, and the cache keeps the turns before it. A source's unchanged content isn't stored again while the copy the agent will read as current has it whole: the one its last request held, or a newer one a start stored whose compile then didn't record (it threw, or the start failed before it); once a fold has summarized it or the strategy's window has passed it, it's stored again, as one more row. Where a changed one lands right after the agent's own latest message, with no one else's message between, `[Continue]` still ends the request, after it. A stored row is history to the strategy, capped, sharded, budgeted and folded like any message. Its metadata carries `system: true`, `kind: 'context-injection'` and `contextInjection: { agent, namespace, contentHash, part, parts }`, which `storedInjectionMarkOf` reads, and every other agent's view leaves it out. A module's injection can set `placedEachCompile: true` to be placed by `compile()` at each start instead, near the end, at the cost of the thinking of every reply after its old place.
 
 ### Persistence
 
@@ -338,6 +338,37 @@ stdio server; `'header'` is refused with a url that carries a `token`
 parameter or userinfo of its own, since whenever the Bearer header carries a
 credential it replaces the userinfo's Basic one.
 
+Set `credentialRequired: true` for a fail-closed WebSocket dial. This requires
+`tokenTransport: 'header'` and a host-attached `accessProvider`, called on every
+dial including reconnects. A missing or throwing provider, or an empty or
+non-sendable result, stops the dial without connecting or falling back. Credentials
+must be printable ASCII with no space at either end; there is no minimum length.
+The server's authentication scheme decides which credentials it accepts.
+
+This mode forbids a static `token` (even empty), a URL `token` query parameter,
+userinfo and fragments. It supports only WebSocket servers, not HTTP, stdio or
+modern MCP. Cleartext `ws://` is allowed only to `localhost` or a literal loopback
+address, not to a `*.localhost` name, which a resolver can send off this host;
+use `wss://` for remote servers. These configuration mistakes are reported
+descriptively when the server is configured, and checked again before the
+provider runs at dial time.
+
+Strict dial errors have the fixed form `MCPL server "<id>": <code>`:
+
+| Code | Meaning |
+| --- | --- |
+| `provider-failed` | The provider is absent, throws, or returns an empty or non-sendable value. No connection is made. |
+| `credential-rejected` | The server answers the WebSocket upgrade with HTTP 401 or 403. |
+| `engine-unsupported` | A refused upgrade has no finite numeric status available from the client runtime. |
+| `connection-failed` | Any other upgrade status, socket/TLS error, open timeout, cancellation, or strict configuration refusal at dial time. |
+
+Redirects are not followed. Refused upgrades are classified only by the
+`unexpected-response` event's numeric `statusCode`, never by error text or response
+bodies; runtime support is determined by that capability, not a version list.
+Leaving `credentialRequired` out, or setting it to `false` or `null`, keeps optional
+credential behavior. Diagnostic filtering and credential retention are unchanged;
+this option controls dialing, not a guarantee that all diagnostics hide secrets.
+
 A modern server's tools get the same prefix, `enabledTools`/`disabledTools`,
 class overrides and dispatch as an MCPL server's, and `listMcplServers()`
 shows its `family`, `protocolVersion` and `transport`. Its config differs in
@@ -347,8 +378,10 @@ three ways:
   configuration error: `allowHostCommands: true`, an `enabledCapabilities`
   pattern that matches a capability denied by default, `channelSubscription:
   'auto'` or a non-empty list, a scope's non-empty `whitelist`, a
-  `toolLifecycle` `observe` or `inputs` block, and a
-  `toolLifecycle.maxInputBytes` or an `autofetch` bound above its default.
+  `toolLifecycle` `observe` or `inputs` block, a
+  `toolLifecycle.maxInputBytes` or an `autofetch` bound above its default,
+  and `toolHints: true` (an MCPL server takes hints when the setting is left
+  out; a modern server ignores the default).
   A setting
   that only takes something away, or repeats a default, is already
   satisfied, so it is accepted: `enabledFeatureSets` and the rest of
@@ -429,6 +462,158 @@ backlog is simply its unread backlog. Receipts and subject history are kept in
 the `mcpl/coalescing` state (retry window 1 h); audit lines are
 `mcpl:coalescing` trace events.
 
+#### Tool presence and toolsets (RFC-014)
+
+Every MCPL server is offered `experimental.mcpl.toolHints` unless its
+configuration sets `toolHints: false`, and its hints count only if it
+advertised `toolHints` too. A server that doesn't advertise them lists every
+tool as before. With `toolHints: false` on a server, the host advertises and
+reads nothing new for it. The `toolsets` module below is registered at
+creation in any case, since the host's own toolsets use it. A modern (MCP)
+server never has hints. Only a module given to `create()` can hold the name
+`toolsets`: MCPL servers that leave the setting out then have none, and a line
+says so. A server `toolPrefix` of `toolsets` is refused.
+
+With hints in effect, the server's static tools stay in the tool list as before, and its
+dynamic tools (those in a toolset, or hinted `mcpl/presence: "dynamic"`) never
+enter it, since every change to the list rebuilds the prompt cache. The
+framework registers a `toolsets` module with four constant tools at creation,
+for every agent (the host's own toolsets need them too, below), so the tool
+list doesn't change when a server starts to present:
+
+- `toolsets--open {server?, toolset?, instance?, options?, full?}` opens a
+  server's toolset (`server` and `toolset`), or a named instance of one, and
+  answers with what the server shows on opening and the tools usable now;
+  `server` alone opens the server's tab and `toolset: "settings"` alone the
+  host's built-in toolset (below);
+- `toolsets--act {server?, tool, instance?, args?}` calls a dynamic tool down
+  the same path as a direct call of it (the agent's `allowedTools`, the
+  server's tool policy, the state exchange, the reading of its result, RFC-007
+  observers and RFC-008 class rules, which see the server's tool and its class),
+  with only the instance added, in
+  `_meta["mcpl/instance"]`. It first checks `args` against the definition in
+  force for that instance; that check is bounded, and leaves `pattern` and
+  anything nested or branching too far to the server, which checks every
+  call itself;
+- `toolsets--look {server?, toolset?, instance?, tool?}` restates what is open
+  and what can be opened, or one tool's signature, description, class and
+  input schema. It
+  re-reads each server that presents toolsets first, and says so when it
+  couldn't; what that changed
+  is in the answer when look restates everything, and otherwise told as a
+  notice;
+- `toolsets--close {server?, toolset?, instance?, disconnect?}` closes it;
+  `server` alone moves the server to a tab or hides its open tab, and with
+  `disconnect: true` makes it a closed tab (below).
+
+### The host's own toolsets
+
+Beside the toolsets servers declare, the host presents some tools out of the
+tool list itself (RFC-014 §8.5 host-made toolsets, §8.1 surface presentation;
+`src/host-presentation.ts`). It's host presentation, not an MCPL wire change,
+and works for every server, with or without RFC-014. The `toolsets--` tools
+are registered for every agent, MCPL or none, unless a module holds the name.
+
+- **The built-in toolset, `settings`.** The host tools an agent reaches for
+  rarely: `agent_settings`, `wake_add_rule`, `wake_remove_rule`,
+  `gate_status`, `event_tags`, `set_tool_visibility`, `set_tool_description`,
+  `heartbeat--heartbeat_status`, `heartbeat--heartbeat_trigger`,
+  `workspace--status`, every module utility (`Module.getUtilities`), and a
+  module's tools it places there (`Module.toolPlacement` answering
+  `'builtin'`). None is in the tool list. `toolsets--open {toolset:"settings"}`
+  announces them, `toolsets--act {tool, args}` calls one while it's open, under
+  its own name and permissions, its `args` checked against the definition first, `toolsets--close {toolset:"settings"}` closes
+  it, and `toolsets--look {toolset:"settings"}` lists them either way. A
+  server's own toolset named `settings` is reached with its `server` named.
+- **Server tabs.** Each MCPL server is presented to each agent one of three
+  ways: `full` (its tools in the tool list, the default), a `tab` (connected,
+  its events still arriving, none of its tools in the tool list:
+  `toolsets--open {server}` announces them and lets `toolsets--act` call them,
+  named in full or bare with `server`; `toolsets--close {server}` hides them
+  again), or a `closed-tab` (disconnected until `toolsets--open {server}`
+  connects it again, with its configuration and credentials, an
+  `accessProvider` asked afresh). `toolsets--close {server}` moves a full
+  server to a tab, `toolsets--close {server, disconnect: true}` disconnects it,
+  and `toolsets--open {server, full: true}` puts it back in the tool list. A
+  server's configured `presentation` (`'full' | 'tab' | 'closed-tab'`) is where
+  each agent starts; what an agent chose is kept across restarts. A
+  connection is the host's, so a closed tab is disconnected for every agent of
+  the host, and `disconnect` is refused while another resident agent has the
+  server in its tool list or its tab open, or can't use the meta-tools (it
+  has every server in its list, and couldn't open a closed tab again). A
+  disconnect that fails changes nothing. An operator's own connect of a
+  closed tab ends it, and an operator's disconnect forgets the server's tab.
+- **Hidden tools.** A tool an agent hides with `set_tool_visibility` leaves its
+  tool list for the built-in toolset, or its server's tab, and comes back when
+  shown. The `toolsets--` tools can't be hidden.
+
+The tool list changes only when a server moves between full and a tab or a
+tool is hidden or shown, one prompt-cache write each; opening, acting in and
+closing a host toolset never change it. Which host toolsets an agent has open,
+and each server's presentation where the agent changed it, are kept in
+`<storePath>/config/toolsets.json`. An open host toolset whose announcement has
+left the context is reminded of, as a server's toolset is (§8.3). A call of a
+tool the agent may call by name still works by name; the tool list just
+doesn't carry it. `framework.presentedTools(agentName, tools, canUseMeta?)`
+applies this presentation to a tool list, so a host can tell a stream that
+isn't registered yet (a fork, before its run starts) what its first request
+will carry.
+
+`server` can be left out when only one server has the name. By our reading of
+the code, a server with no toolsets stops presenting them once its latest `tools/list` has no dynamic
+tool, so until the rebuild, act takes its last one only with `server` named.
+Hint changes apply
+as their message is read, in `rev` order, whatever becomes of the message (a
+refused push, a result that came after its timeout). A move between static and
+dynamic takes effect when the server's `tools/list` states it, and the tool
+list follows at its next rebuild that lists the server, whichever refresh
+brings it (a move is no reason to rebuild the tool list early). Until then the
+tool is called at either place, where the tool list shows it or where the
+server's latest list put it (RFC-014 §4.2 keeps it working where it is until
+the move applies), and
+once that rebuild has published the list, a notice says where it went. A list
+read while a rebuild is under way can undo a move that rebuild then publishes;
+neither is told, and the next rebuild puts the tool back.
+A skipped rev re-reads `tools/list` and then `toolsets/list`, which the host
+also reads after every (re)connect, adopting what the server kept open and
+never re-opening anything.
+What changed is told where it happened: after a call's own result, after the
+push that explains it, or as a notice (`kind: 'mcpl-toolsets'`, which wakes
+nothing) for a standalone `tools/hints`, a late result, an adoption, a
+recovery, or a call whose result may not reach the agent (a script's, a
+module's or a host's, or one the framework makes itself); an open, close or
+look made that way also shows its caller the change, unless the change has
+already gone as a notice (below). A dynamic tool's change also goes as a notice
+when it wouldn't fit whole within its result's inline cap, or when its call
+fails after the result was read. A call's change also goes as a notice, ahead of its
+result, when a later change goes to the agent before the call's caller has
+taken it, so changes are told in the order they were read (the agent's window
+can still show a call's result, a push's event, or a change its taker couldn't
+show after a change read later). The model's own call's change counts as told
+once its result is handed back: if the turn is stopped while the call is out
+(or, by our reading of the code, the agent is gone), the result is dropped and the change with it, and
+`toolsets--look` shows the state it left. Notices and reminders
+need the server's `pushEvents` grant, like any delivery; without it, a change
+that would go as a notice is dropped, and `toolsets--look` shows the state. A new tool's first sentence is told with its
+definition until text describing it has reached the model, except that, by our reading of the code, a puppet's
+open, close or look whose result the store refuses has already counted it. Suggestions are shown, never acted on. Each
+`ended` id is told once while the
+host runs (told ids are kept in memory), short of rare interleavings, such as a
+`toolsets--look` overlapping other reads of the same server, that can tell one
+twice. When an
+open toolset's announcements have left an agent's context (compressed or out
+of the window), the module's `gatherContext` restates what is open, as a
+stored `afterUser` injection (namespace `mcpl-toolsets`), at that agent's next
+start.
+
+A dynamic tool called by its prefixed name is refused, pointing at
+`toolsets--act`, unless the tool list or the server's latest list shows it as
+static (a move waiting for its rebuild). Calls to an undeclared toolset's
+tools are refused while the host has that group closed (RFC-014 §5.4), except
+by a tool's listed name until the rebuild that publishes its move into the
+group. Projection and surface mode are not implemented: a `surface` server's
+static tools are listed like any server's.
+
 #### Per-channel conversation routing (deprecated)
 
 > **Deprecated: `FrameworkConfig.conversations` (`ConversationRouter`).** Per-channel conversation routing sends each channel's traffic to its own fork agent, spawned from a template agent and closed after an idle TTL. It is being retired ([#235](https://github.com/anima-research/agent-framework/issues/235)). Its `'mention'` bind/trigger rule, the default for channels, reads `metadata.mentioned`, which discord-mcpl does not set, so on Discord channels an @-mention never binds a fork or triggers a bound one. Don't adopt it in new hosts. Existing configurations still route exactly as before, and the framework logs one `[deprecated]` line when it is created with `conversations` set. Removal is a follow-up.
@@ -439,8 +624,38 @@ the `mcpl/coalescing` state (retry window 1 h); audit lines are
 2. **Drive**: Framework iterates stream events (tokens, tool-calls, complete, error)
 3. **Tool yield**: Stream yields tool calls → framework dispatches concurrently → collects results
 4. **Resume**: All results in → stream resumes with tool results
-5. **Budget restart**: If input tokens exceed `maxStreamTokens`, the stream is cancelled, context is recompressed, and a fresh stream starts
+5. **Budget restart**: If input tokens exceed `maxStreamTokens`, the stream is cancelled, context is recompressed (the turn's opening messages kept whole, as Context Management says), and a fresh stream starts. An agent whose model binds its thinking (`thinkingBinding.binds`) with `physicalWindowTokens` set skips this, and the window projection restarts it instead before a request the window can't hold
 6. **Complete**: Final response saved to context, agent returns to idle
+
+### Inference bounds
+
+A model call that stops making progress is cut, so an agent isn't held by a provider that has gone quiet, or that keeps its connection open with keepalives (an Anthropic stream's pings, SSE comments) and never answers.
+
+- **A resident's streamed call**, and an MCPL server's streamed inference request, get membrane's progress bounds where the adapter's stream reports content (`AnthropicAdapter`, `BedrockAdapter`). Before content, a call ends 60 s after its send, or, once a thinking block has started, at the later of that and the block's allowance, its `max_tokens` at 87 tokens a second. Once content has begun, it ends after 150 s without a provider event, or after the block's allowance when the last event was a thinking block's start and the allowance is longer. Membrane's README gives the rules whole.
+- **Every streamed call the framework makes** also gets a flat bound from its last provider event: the larger of a setup term plus that allowance and 1,862 s (`FLAT_MINIMUM_MS`). The setup term is the larger of the before-content and between-events bounds, 150 s by default. So on an adapter with progress bounds the flat bound never runs out first. On one without, such as `OpenAICompatibleAdapter`, it's the only progress bound, and an SSE keepalive comment doesn't restart it, though a data frame that parses as an event does, a provider's own ping object included.
+- **A whole non-streamed call**, a compression's, the reply judge's, or an MCPL server's non-streamed inference request, ends the setup term plus its allowance after its send, or, when it names no `max_tokens`, at the larger of the setup term and the flat minimum, unless its caller passed a `progressTimeoutMs` of its own. Its caller gets the `timeout` error. The event gate's own 20 s judge timeout ends the reply judge's call first at the defaults. Context-manager takes a cut compression call as a transient failure: the lane pauses and tries again, so compression that never lands within its bound shows as a lane that keeps pausing, not as a failed turn, and is a reason to raise the bound. On an adapter whose `complete()` streams under the hood, such as membrane's OpenAI Responses adapter in subscription mode, membrane renews the bound at each parsed provider event, so there it runs from the last event, as a stream's flat bound does.
+- **A turn's call a bound cuts** fails as a `timeout`, and `DefaultErrorPolicy` gives it one fresh call, 1 s later, whatever other failures its turn had, except in a turn sent again after its retries ran out, before one of its rounds has run or had its tool calls cut off, whose failures get no retries. A fresh call that's cut too, with no other failure between, ends the turn, and its `[inference-failed]` note says the call timed out, that the call was made again and timed out again, and the reason. For a bound's cut the reason names the bound that ran out and the host's setting for it. A deadline expiry membrane throws (the Anthropic adapter's own watchdogs, the SDK's request timeout, a runtime's fetch timeout on a silent connection) counts the same toward the fresh call and the turn's end, and its reason is its own message, which names no setting. A bound's cut isn't `retryable`, so a host's own `errorPolicy` that retries only retryable errors gives it no fresh call; an expiry membrane throws stays `retryable`, as membrane made it.
+- **A stream that keeps sending content** isn't ended by any of these, since content is progress.
+
+These bounds don't replace the deadlines below them: a silent connection still meets the runtime's own fetch timeout (360 s on Bun 1.4.4) and, on `AnthropicAdapter`, the adapter's 600 s first-event and idle watchdogs, so on a silent connection a bound raised past those is met by them first.
+
+The phase bounds, and a reason that names the bound that ran out, need the `Membrane` a host passes in to come from membrane 0.8.0 or later. An older one ignores `progressBounds`, so only the flat bound acts, and a cut's reason names no bound.
+
+The flat and whole-call bounds read the request's `maxTokens`. A `max_tokens` set through `providerParams` or a hook isn't read, where membrane's own allowance reads what's sent, so a larger one set that way can let the flat bound run out before membrane's.
+
+Where the values come from: membrane's README gives its progress bounds' measurements, on a production router's streamed Anthropic calls to `claude-opus-5-5` and `claude-haiku-5-5`. The flat minimum is the longest silence between frames of any completed call in that router's OpenAI calls (the Responses API over a WebSocket), standing in for an OpenAI-compatible stream, which wasn't measured. The whole-call bound's setup term is five times the longest wait from the send to content or a thinking block's start in those calls (a wait that router cuts at 30 s and sends again, so a longer one is unseen), and its allowance is generation at 87 tokens a second, the 1st percentile of Opus's thinking speed over its thinking blocks of 30 seconds or more. No completed streamed call in that record ran past the whole-call bound. Bedrock, other models (`claude-opus-4-6` among them), OpenAI-compatible streams and calls that aren't streamed, compression's among them, weren't measured, so a host whose calls run slower raises the bounds with `inferenceBounds`. Membrane's README also reports the wait for content growing with the prompt, so a resident near a full context window is the likeliest to meet the before-content bound first.
+
+`inferenceBounds` sets them: `progressBounds` takes membrane's three values, from which the flat and whole-call bounds also derive, and `flatMinimumMs` the flat bound's least. `false` sets none. One setting covers every agent, so a host with one slower model or adapter raises them for all of its agents. A stream cut's reason is membrane's message, naming the bound that ran out, followed by the host setting for that bound, as in ``(the host's setting for this bound: `inferenceBounds.progressBounds.beforeContentMs`)``. A whole call's caller gets membrane's message alone. Each reason's opening and its setting:
+
+| The reason begins | The setting | Default |
+|---|---|---|
+| `No content within …s of the send` | `progressBounds.beforeContentMs` | 60,000 ms |
+| `No provider event within …s` | `progressBounds.betweenEventsMs` | 150,000 ms |
+| `No content within …s of a thinking block's start` (or `No provider event within …s of a thinking block's start`) | `progressBounds.thinkTokensPerSecond`: a lower rate allows a slower think | 87 |
+| `No provider progress within …ms`, on a stream | `flatMinimumMs`, or the setup term and allowance when they're larger | 1,862,000 ms |
+| `No provider progress within …ms`, on a call that isn't streamed | the setup term (`beforeContentMs`, `betweenEventsMs`) and the allowance (`thinkTokensPerSecond`, or the request's `maxTokens`); the larger of the setup term and `flatMinimumMs` when the request names no `maxTokens` | 150 s plus `maxTokens` at 87 a second; 1,862,000 ms with no `maxTokens` |
+
+Each cut of a turn's call is traced as `inference:failed`, with its reason as `error`, and logged with the turn's inference log as a failed call, whether or not its fresh call then answers, so a host can count cuts a resident never sees and raise a bound before turns start failing. An MCPL server's request that a bound cuts is traced as `mcpl:inference_fail` with the reason as `error`, and a compression or reply-judge call's cut reaches only its caller, as the `timeout` error.
 
 ### Abort / Cancellation
 
@@ -451,9 +666,11 @@ framework.abortInference('assistant', 'user requested stop');
 
 The non-streaming path uses `AbortSignal` forwarded to `membrane.stream()`, which returns an `AbortedResponse` with partial content. The streaming path cancels the `YieldingStream` directly.
 
-A turn whose stream is cancelled this way, or by `agent.cancelStream()`, ends as a stop, whether the stream reports the cancel as `aborted`, as an `error`, or by just closing: one `inference:aborted` carrying the caller's reason (`user` when none was given), a `[turn-interrupted]` note in the agent's context, and never `inference:exhausted`, which is for failed inferences. A stream that membrane aborts on its own, at a deadline or on an error (reason `timeout` or `error`), is a failed inference. `stop()` and an operator's quiesce abandon end a turn as a stop too, with their own reasons, `shutdown` and `quiesce_abandoned`, and write no note. A stopped stream still writes its inference-log row, with `success: false`.
+A turn whose stream is cancelled this way, or by `agent.cancelStream()`, ends as a stop, whether the stream reports the cancel as `aborted`, as an `error`, or by just closing: one `inference:aborted` carrying the caller's reason (`user` when none was given), a `[turn-interrupted]` note in the agent's context, and never `inference:exhausted`, which is for failed inferences. A stream that membrane aborts on its own, at a deadline or on an error (reason `timeout` or `error`), is a failed inference. `stop()` and an operator's quiesce abandon end a turn as a stop too, with their own reasons, `shutdown` and `quiesce_abandoned`, and write no note, except the `[speech-not-posted]` notice when the turn's rounds left speech unposted (XML tool mode, or a membrane without `roundContent`; see below). A stopped stream still writes its inference-log row, with `success: false`.
 
-A caller's stop and an operator's quiesce abandon also reach a turn that has no live stream: one running its modules' `gatherContext`, its MCPL hooks or its compile, one waiting to retry a failed inference or compile (`abortInference()` and an operator's abandon end the wait, and a stop through `Agent.cancelStream()` waits for it to run out), and one whose tool-result guard is waiting to retry after a refusal, which holds only the round's finished stream. The turn ends at its next check, before it sends anything more, as a stop on a live stream ends it, and a turn whose compile fails after the stop ends at the failure, before a provider hold, the error policy's retry or `inference:exhausted`. A caller's stop leaves the note saying the turn was stopped before it sent anything or before it finished, and an operator's abandon leaves none. `abortInference()` returns `true` for such a turn. In the guard's wait, `stop()` ends the turn as a stop with reason `shutdown`, and an operator's abandon ends it as the abandon, even when a caller's stop came first; with both, it ends as `stop()`'s. `stop()` drops a turn in its hooks, its compile or a wait to retry before it sends anything, as before, and drops one whose compile fails while it runs, once a caller's stop has reached it, rather than ending it as that stop. While the failure of a turn's stream is reported (`inference:failed`), the agent no longer holds that stream, so `abortInference()` from a listener reports `false`. A failure to build a turn's request is reported while the turn's check is still ahead, so there `abortInference()` reports `true`, and the turn ends at that check. A caller's stop made where no check of a turn is ahead stops nothing, and doesn't end the agent's next turn: while the agent is idle, while a turn finishes its last delivery, and while a non-streaming turn's tool results wait to start the turn's next call. A turn whose continuation (a budget restart's, or a tool-result guard's retry) waits to start, or whose failed call a provider-capacity hold or a provider's stated wait keeps for its retry, is ended by `abortInference()`, by an operator's quiesce abandon and by `stop()`: the continuation or retry is dropped, and the turn ends with the caller's reason, `quiesce_abandoned` or `shutdown`. After `abortInference()` or an abandon, wakes that arrived meanwhile still run (after the abandon, once the host resumes): those a hold keeps beside the retry, and those the scheduler merged into the retry's or the continuation's start before that start began, which the stop or the abandon puts back in the queue. A stop through `Agent.cancelStream()` stops nothing there.
+A caller's stop and an operator's quiesce abandon also reach a turn that has no live stream: one running its modules' `gatherContext`, its MCPL hooks or its compile, one waiting to retry a failed inference or compile (`abortInference()` and an operator's abandon end the wait, and a stop through `Agent.cancelStream()` waits for it to run out), and one whose tool-result guard is waiting to retry after a refusal, which holds only the round's finished stream. The turn ends at its next check, before it sends anything more, as a stop on a live stream ends it, and a turn whose compile fails after the stop ends at the failure, before a provider hold, the error policy's retry or `inference:exhausted`. A caller's stop leaves the note saying the turn was stopped before it sent anything or before it finished, and an operator's abandon leaves none, except the `[speech-not-posted]` notice when the turn's rounds left speech unposted. `abortInference()` returns `true` for such a turn. In the guard's wait, `stop()` ends the turn as a stop with reason `shutdown`, and an operator's abandon ends it as the abandon, even when a caller's stop came first; with both, it ends as `stop()`'s. `stop()` drops a turn in its hooks, its compile or a wait to retry before it sends anything, as before, and drops one whose compile fails while it runs, once a caller's stop has reached it, rather than ending it as that stop. While the failure of a turn's stream is reported (`inference:failed`), the agent no longer holds that stream, so `abortInference()` from a listener reports `false`. A failure to build a turn's request is reported while the turn's check is still ahead, so there `abortInference()` reports `true`, and the turn ends at that check. A caller's stop made where no check of a turn is ahead stops nothing, and doesn't end the agent's next turn: while the agent is idle, while a turn finishes its last delivery, and while a non-streaming turn's tool results wait to start the turn's next call. A turn whose continuation (a budget restart's, or a tool-result guard's retry) waits to start, or whose failed call a provider-capacity hold or a provider's stated wait keeps for its retry, is ended by `abortInference()`, by an operator's quiesce abandon and by `stop()`: the continuation or retry is dropped, and the turn ends with the caller's reason, `quiesce_abandoned` or `shutdown`. After `abortInference()` or an abandon, wakes that arrived meanwhile still run (after the abandon, once the host resumes): those a hold keeps beside the retry, and those the scheduler merged into the retry's or the continuation's start before that start began, which the stop or the abandon puts back in the queue. A stop through `Agent.cancelStream()` stops nothing there.
+
+In XML tool mode, or with a membrane that gives a tool round no `roundContent`, such a round's speech reaches a channel only when its stream completes. When the stream ends any other way (a failure, a stop, a tool that ends the turn, an error policy's retry, a context-budget or tool-result-guard restart, a quiesce abandon or `stop()`), the rounds' words are already in the agent's context, and a `[speech-not-posted]` notice tells the agent that nothing it wrote before its tool calls in those rounds was posted, so it can send what should go out again. It's written once for those rounds: where the turn ends, or before a retry's or a restart's request is sent. A turn its own `skip_reply` ends, a silent turn, a round still waiting on its tools when its stream ends (which never reaches the context) and the rounds of a stream that completes get none. In XML tool mode with thinking on, a round whose text was only thinking gets the notice too, since the framework has only the round's raw text there. A failed turn's `[inference-failed]` note says that its earlier rounds ran when any round reached the context with its results, and that a round's tool calls were started and may have taken effect when any of its streams ended before that round's results came back; a caller's stop says the latter in its `[turn-interrupted]` note too. A turn that fails, or that a caller stops, writes no `[delivered]` receipt, so when its rounds' plain speech was delivered live (native tool mode, in locus or hybrid routing), its `[inference-failed]` note, or the stop's `[turn-interrupted]` note, says that speech was handed on for delivery as written and that no `[delivered]` line was written for it. When some of its speech was still being routed as the turn ended, the note also says it may yet be posted and to check the channel before sending it again. A delivery that finished undelivered gets neither: a channel delivery's `[discord-send-failed]` note, or a refused `>>>` envelope's bounce, already says what happened. A quiesce abandon and `stop()` write neither note.
 
 ## API Server
 

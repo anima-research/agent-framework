@@ -26,6 +26,29 @@ export interface MessageQuery {
 }
 
 /**
+ * A context injection a module gathers (Module.gatherContext).
+ *
+ * An `afterUser` one is stored in the agent's window, as the message
+ * `compile()` would have placed after the last user message, where it then
+ * stays: so the replies after it keep their thinking, and the cache keeps the
+ * turns before it. The same source's unchanged content isn't stored again
+ * while the copy the agent will read as current has it whole: the one its
+ * last request held, or a newer one a start stored whose compile then
+ * didn't record. Once a fold has summarized it or a strategy's window has
+ * scrolled past it, it's stored again, as one more row. (See
+ * stored-injections.ts.)
+ *
+ * `placedEachCompile: true` opts out: `compile()` places the injection after
+ * the last user message at each start, near the end, as before it was
+ * stored. That's for context meant to stay near the end, such as
+ * instructions moved off `system`. Its cost: it moves, and on a model that
+ * binds a reply's thinking to everything before it, every reply after its old
+ * place loses its thinking. It has no effect on a `system` or `beforeUser`
+ * injection, which `compile()` always places.
+ */
+export type ModuleContextInjection = ContextInjection & { placedEachCompile?: true };
+
+/**
  * A message as a module context's reads answer it: a stored row, or a row
  * for a write the framework holds (`held`). Either is marked
  * `heldFromResidents` when a tune-out holds it from the residents.
@@ -49,10 +72,11 @@ export type ModuleMessage = StoredMessage & {
    * True on a message a tune-out holds from the residents: one that arrived
    * in a tuned-out channel, stamped `metadata.tuneOut` as it came in. The
    * store keeps it, but no resident is shown the row itself: no resident's
-   * compiled view includes it, during the tune-out or after it, and a tool
-   * boundary of a turn alive when it arrived stores it without injecting it
-   * into the live turn. The subconscious reads it. Its text can still reach
-   * a resident in rows of their own, which aren't marked, such as the
+   * compiled view includes it, during the tune-out or after it, and a
+   * resident's tool boundary of a turn alive when it arrived stores it
+   * without injecting it into the live turn. The subconscious reads it. Its
+   * text can still reach a resident in rows of their own, which aren't
+   * marked, such as the
    * cancel's `<tuned-out-backlog>` row, with the text of the tune-out's newest
    * messages, up to `backlogCap` of them and as many as fit in one of the
    * residents' messages, the stored ones first and then those still held;
@@ -119,15 +143,26 @@ export interface Module {
 
   /**
    * Utilities: agent-invocable operations that deliberately do NOT get a
-   * first-class tool slot. Every tool schema taxes every inference; a
-   * capability used twice a month shouldn't. Utilities are listed, described,
-   * and invoked through the framework's single `utils` tool instead — same
-   * ToolDefinition shape, same un-prefixed names, and dispatch arrives at the
-   * SAME handleToolCall as getTools() output, so a tool migrates between
-   * surfaces by moving its definition from one list to the other and nothing
-   * else. Optional; omitting it means the module contributes no utilities.
+   * slot in the tool list. Every tool schema taxes every inference; a
+   * capability used twice a month shouldn't. Utilities belong to the host's
+   * built-in toolset ("settings"): an agent sees them with
+   * `toolsets--look {toolset:"settings"}` and calls them with
+   * `toolsets--act` once it has opened it. Same ToolDefinition shape, same
+   * un-prefixed names, and dispatch arrives at the SAME handleToolCall as
+   * getTools() output. Optional; omitting it means the module contributes no
+   * utilities.
    */
   getUtilities?(): ToolDefinition[];
+
+  /**
+   * Where one of this module's tools (a getTools() name, unprefixed) is
+   * presented: in the agent's tool list (`'header'`, the default), or in the
+   * host's built-in toolset (`'builtin'`), out of the tool list, opened with
+   * `toolsets--open {toolset:"settings"}` and called with `toolsets--act`.
+   * For tools an agent uses rarely: settings, administration, status reads.
+   * Optional; omitting it keeps every tool in the tool list.
+   */
+  toolPlacement?(toolName: string): 'header' | 'builtin' | undefined;
 
   /**
    * Handle a tool call.
@@ -159,9 +194,16 @@ export interface Module {
    * Called before each inference to collect data (e.g., HUD overlays, game state)
    * that should be injected into the compiled context.
    * Complementary to MCPL push-based hooks — modules pull via gatherContext.
+   * An `afterUser` injection is appended to the agent's window, where it
+   * then stays, unless the copy the agent will read as current has the same
+   * content, every part of it (the one its last request held, or a newer
+   * one a start stored whose compile then didn't record), or it opts out
+   * (ModuleContextInjection.placedEachCompile). At a
+   * turn's start or a restart after tool results, that's where `compile()`
+   * would have placed it.
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
    */
-  gatherContext?(agentName: string): Promise<ContextInjection[]>;
+  gatherContext?(agentName: string): Promise<ModuleContextInjection[]>;
 
   /**
    * Called once an agent's tool batch has completed — when the round's last
@@ -202,18 +244,56 @@ export interface AgentSettingsExtension {
   properties: Record<string, unknown>;
   /** The setting keys this extension owns (must match `properties` keys). */
   keys: string[];
-  /** Current values for the extension's keys. */
+  /** Current values for the extension's keys. A refused agent_settings call
+   *  names what changed by comparing every field this returns, before the
+   *  call and at its refusal. */
   get(agentName: string): Record<string, unknown>;
   /** Apply a partial update (only this extension's keys present) and return
    *  the new values. Throw to surface a validation error to the agent. */
   update(agentName: string, patch: Record<string, unknown>): Record<string, unknown>;
   /** Restore the listed keys (or all when omitted) to defaults and return the
-   *  new values. Optional — extensions without reset semantics are skipped. */
+   *  new values. Optional: without it, a reset of every setting skips the
+   *  extension, and a reset that names one of its keys is refused. */
   reset?(agentName: string, keys?: string[]): Record<string, unknown>;
 }
 
 /**
  * Context provided to modules for interacting with the framework.
+ *
+ * Once the module's `stop()` has completed, through `removeModule()` or the
+ * framework's `stop()`, its context has no effect on the framework:
+ * - each push is dropped with a log line, as a push after the framework's
+ *   `stop()` is;
+ * - `setState`, `registerLogState`, `appendToLog`, `editLogItem`,
+ *   `editMessage`, `removeMessage`, `notifyOps`, `registerSpeechHandler` and
+ *   `unregisterSpeechHandler` do nothing; `addMessage` returns `''` and adds
+ *   nothing; `callTool` resolves with an error result and runs nothing;
+ *   `getModule` returns `null`; and `onTrace` subscribes nothing, while the
+ *   subscriptions made through the context end. None of these throws, and
+ *   the first such call of each method logs one line naming the module and
+ *   the method;
+ * - `findMessageByExternalId` answers without updating its mapping, and logs
+ *   nothing.
+ *
+ * Its reads (`getState`, `getLog`, `getLogLength`, `getMessage`,
+ * `queryMessages`, `getAgents`, `getActiveTools`, `findMessageByExternalId`)
+ * answer, and fail, as before; one that meets a held write may record that
+ * the write has landed, as any reader's does. The framework calls none of the
+ * module's `onProcess`, `onAgentSpeech` and `onToolBatchComplete` again; it
+ * drops whole a response of its that hadn't been applied by then, with a line
+ * naming what the response asked for if it asked for anything; and it leaves
+ * its `gatherContext` answer out of a turn whose answers it hadn't merged by
+ * then, with a line if it held injections. After `removeModule()`, the result
+ * its `handleToolCall` returns for a call it was running when its `stop()`
+ * completed is still delivered while the framework runs. The framework's
+ * `stop()` closes its event queue before it stops any module, so through the
+ * framework's `stop()` that result is dropped, with the line any tool result
+ * arriving after the framework's `stop()` gets. A result it pushes through
+ * its context after its `stop()` completes is dropped, as its other pushes
+ * are. A module whose `stop()` fails stays registered, and its context keeps
+ * working.
+ * References the module already holds, to other modules or to its own
+ * timers, stay as they are.
  */
 export interface ModuleContext {
   /**
@@ -304,11 +384,43 @@ export interface ModuleContext {
    * (ModuleMessage.held). The writes a process held, and keeps across a
    * restart, show to the next process's modules once create() has restored
    * them, which is after every module's start().
+   *
+   * With `opts.forAgent`, it's added to the named agent's window instead: a
+   * conversation fork's or a running sub-agent's own store, or, for an
+   * ordinary resident, the residents' shared slot. It's held while that
+   * agent's turn is alive, as a write for the primary is while the
+   * primary's is. A name that isn't a registered agent when the write is
+   * made, or the empty name, throws, naming the registered ones, so a write
+   * for a launcher that has gone is heard. For an ephemeral run (a
+   * sub-agent's run) or a conversation fork, whose window nothing reads
+   * after it's released, a write it never read goes to the primary at its
+   * release, as the write itself, through the primary's own delivery. It's
+   * read as the framework reads a notice: once it's below the target's
+   * consumed watermark, which a compile built to send moves when it
+   * commits (a row that compile's strategy left out counts as read too),
+   * and a tool round moves when it injects messages into a stream that
+   * declares it carries them. So one that waited for its target's end (a
+   * run's end, or a fork's last turn), one stored while it was idle and
+   * never sent, one stored at a tool round that ended the turn, and one
+   * injected into a stream that didn't declare it carries injections go to
+   * the primary. The framework's own
+   * writes for a run or a fork are unchanged: they stay in its store,
+   * unless they're notices the primary already takes in their place (a
+   * failed reply, or a channel notice its reader could act on). getMessage,
+   * editMessage and removeMessage read the delivery agent's window (the
+   * primary's, or the first agent's when none is primary): they don't take
+   * an id or handle for a row in a fork's or a sub-agent's window, and don't
+   * find it (read it with queryMessages and the same forAgent). The
+   * residents' shared slot is the primary's window too, for a primary
+   * that's an ordinary resident, so there they do.
+   * `metadata.external` with a target throws: its id map is read in the
+   * primary's window.
    */
   addMessage(
     participant: string,
     content: ContentBlock[],
-    metadata?: MessageMetadata & { external?: ExternalIdRef }
+    metadata?: MessageMetadata & { external?: ExternalIdRef },
+    opts?: { forAgent?: string },
   ): MessageId;
 
   /**
@@ -354,8 +466,17 @@ export interface ModuleContext {
    * restored them, after every module's start() (addMessage). A message a
    * tune-out holds from the residents is among the rows, marked
    * `heldFromResidents` (ModuleMessage).
+   *
+   * It reads the primary's window (the first registered agent's when none
+   * is primary), or with `opts.forAgent`, the named agent's: a conversation
+   * fork's or a running sub-agent's own store, or, for an ordinary resident,
+   * the residents' shared slot. For the subconscious, it's the
+   * subconscious's own store, not the residents' slot its compile merges
+   * in. A name that isn't a registered agent, or the empty name, throws,
+   * naming the registered ones, so a typo is heard rather than read as an
+   * empty window.
    */
-  queryMessages(filter: MessageQuery): MessageQueryResult;
+  queryMessages(filter: MessageQuery, opts?: { forAgent?: string }): MessageQueryResult;
 
   /**
    * Get info about all agents.

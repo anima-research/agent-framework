@@ -25,6 +25,10 @@ import type { PushEventParams, PushEventResult } from '../src/mcpl/types.js';
 import { MockMembrane, HeldStream, createMockResponse } from './helpers/mock-membrane.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/speech-route-mcpl-server.mjs');
+// These tests were written to the latest-inbound speech rule: a message
+// re-pins the turn, and the latest one is the default channel and the
+// fallback locus.
+const LEGACY = { locus: 'latest-inbound' } as const;
 
 async function waitFor(cond: () => boolean, what: string, timeoutMs = 15_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -33,6 +37,17 @@ async function waitFor(cond: () => boolean, what: string, timeoutMs = 15_000): P
     await new Promise((r) => setTimeout(r, 20));
   }
   throw new Error(`timed out waiting for: ${what}`);
+}
+
+async function postsSettled(framework: AgentFramework, agent: string): Promise<void> {
+  const posting = (framework as unknown as { proseSpeechChains: Map<string, Promise<void>> }).proseSpeechChains;
+  for (;;) {
+    await framework.runUntilIdle();
+    const chain = posting.get(agent);
+    await chain;
+    await framework.runUntilIdle();
+    if (posting.get(agent) === chain) return;
+  }
 }
 
 describe("a push naming another server's channel, through two real servers", () => {
@@ -56,6 +71,7 @@ describe("a push naming another server's channel, through two real servers", () 
     framework = await AgentFramework.create({
       storePath: join(dir, 'store'),
       membrane: membrane.asMembrane(),
+      speech: LEGACY,
       agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
       mcplServers: [
         { id: 'discord', command: process.execPath, args: [FIXTURE],
@@ -187,6 +203,7 @@ describe("a turn's replies go out through the server whose message triggered it"
     framework = await AgentFramework.create({
       storePath: join(dir, 'store'),
       membrane: membrane.asMembrane(),
+      speech: LEGACY,
       agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
       mcplServers: [
         { id: 'discord', command: process.execPath, args: [FIXTURE],
@@ -215,10 +232,7 @@ describe("a turn's replies go out through the server whose message triggered it"
   }
   async function settle(): Promise<void> {
     release();
-    for (let i = 0; i < 3; i++) {
-      await framework.runUntilIdle();
-      await new Promise((r) => setTimeout(r, 300));
-    }
+    await postsSettled(framework, 'scout');
   }
 
   // A script's call through the host's bridge, as the isolate hands it over:
@@ -326,7 +340,6 @@ describe("a turn's replies go out through the server whose message triggered it"
     assert.deepEqual(published('turn reply'), ['slack']);
     const shared = await background({ channelId: X, content: 'background note' });
     const named = await background({ channelId: X, serverId: 'discord', content: 'background note to discord' });
-    await new Promise((r) => setTimeout(r, 500));
     t.diagnostic(`shared: ${shared}`);
     t.diagnostic(`named: ${named}`);
     assert.deepEqual(published('background note'), ['discord'], 'only the call that names discord reached it');
@@ -356,7 +369,6 @@ describe("a turn's replies go out through the server whose message triggered it"
     }).scriptToolCall('scout', 'channel_publish', JSON.stringify({ channelId: X, content }), { watch: { turnId: second, endTurn: false }, startTurnId }));
     const fromFirst = await scriptCall(first, 'from the first turn\'s script');
     const fromSecond = await scriptCall(second, 'from the second turn\'s script');
-    await new Promise((r) => setTimeout(r, 500));
     t.diagnostic(`first turn's script: ${fromFirst}`);
     t.diagnostic(`second turn's script: ${fromSecond}`);
     assert.deepEqual(published("from the first turn's script"), [], "the second turn's channel isn't the first turn's script's");
@@ -376,7 +388,6 @@ describe("a turn's replies go out through the server whose message triggered it"
     await registry().handleChanged('slack', { removed: [X] });
     const gone = await background({ content: 'default after withdrawal' });
     const goneNamed = await background({ serverId: 'slack', content: 'default named slack after withdrawal' });
-    await new Promise((r) => setTimeout(r, 500));
     for (const [k, v] of Object.entries({ whileShared, namedDiscord, gone, goneNamed })) t.diagnostic(`${k}: ${v}`);
     assert.deepEqual(published('default while shared'), ['slack'], "the default's own server");
     assert.deepEqual(published('default named discord'), ['discord'], 'a serverId with no channelId names the default\'s id on that server');
@@ -389,8 +400,14 @@ describe("a turn's replies go out through the server whose message triggered it"
       'Server "slack" has no channel "discord:g1:room", the id of the channel this call would default to, so nothing was posted.');
   });
 
+  // Inside a turn, a publish naming no channel goes where the turn's plain
+  // speech would (publishInputWithTurnLocus): the turn's locus, here the
+  // lobby slack's addressed message woke it in, on slack, and not the
+  // default a later message set mid-turn.
+  const publishedTo = (text: string) => ['discord', 'slack'].flatMap((id) =>
+    lines(paths(id).status).filter((l) => l.event === 'publish' && String(l.text ?? '').includes(text)).map((l) => `${id} ${String(l.channelId)}`));
   for (const withdraws of [true, false]) {
-    it(`a channel_publish naming no channel, inside a turn, into a default another message set mid-turn goes through that message's server${withdraws ? ', and nowhere once it withdrew the channel' : ''}`, async () => {
+    it(`a channel_publish naming no channel, inside a turn, goes to the turn's locus through its server, not into a default another message set mid-turn${withdraws ? ', and nowhere once that server withdrew the locus' : ''}`, async () => {
       await registerX('slack', '#room (slack)');
       membrane.pushResponse(createMockResponse([
         { type: 'tool_use', id: 'pub-default', name: 'channel_publish', input: { content: 'in-turn default' } },
@@ -401,9 +418,9 @@ describe("a turn's replies go out through the server whose message triggered it"
       command('slack', { op: 'incoming', channelId: X, messageId: 'in-ambient', mode: 'ambient', text: 'in passing' });
       await waitFor(() => registry().getDefaultPublishChannel()?.channelId === X, 'the shared channel is the default');
       assert.deepEqual(registry().getDefaultPublishChannel(), { serverId: 'slack', channelId: X });
-      if (withdraws) await registry().handleChanged('slack', { removed: [X] });
+      if (withdraws) await registry().handleChanged('slack', { removed: ['slack:T1:C1'] });
       await settle();
-      assert.deepEqual(published('in-turn default'), withdraws ? [] : ['slack']);
+      assert.deepEqual(publishedTo('in-turn default'), withdraws ? [] : ['slack slack:T1:C1']);
     });
   }
 
@@ -528,6 +545,7 @@ describe('in explicit and hybrid mode, a reply goes out through no server but th
     framework = await AgentFramework.create({
       storePath: join(dir, 'store'),
       membrane: membrane.asMembrane(),
+      speech: LEGACY,
       agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', proseRouting }],
       mcplServers: [
         { id: 'discord', command: process.execPath, args: [FIXTURE],
@@ -670,10 +688,7 @@ describe('in explicit and hybrid mode, a reply goes out through no server but th
     await waitFor(() => started > 0, 'the turn started');
     release();
     await waitFor(() => !registry().listChannelsRaw().some((e) => e.serverId === 'slack' && e.descriptor.id === X), 'slack withdrew the channel');
-    for (let i = 0; i < 3; i++) {
-      await framework!.runUntilIdle();
-      await new Promise((r) => setTimeout(r, 300));
-    }
+    await postsSettled(framework!, 'scout');
     const failed = (traces as Array<{ type: string; serverId?: string; channelId?: string }>).filter((e) => e.type === 'mcpl:speech-route-failed');
     t.diagnostic(`failed ${JSON.stringify(failed)}; through ${JSON.stringify(published('written before the open'))}`);
     assert.deepEqual(published('written before the open'), []);
@@ -714,10 +729,7 @@ describe('in explicit and hybrid mode, a reply goes out through no server but th
     }, "slack's message on the shared channel arrived");
     await registry().handleChanged('slack', { removed: [X] });
     release();
-    for (let i = 0; i < 3; i++) {
-      await framework!.runUntilIdle();
-      await new Promise((r) => setTimeout(r, 300));
-    }
+    await postsSettled(framework!, 'scout');
     const locus = routing?.locus;
     t.diagnostic(`locus ${JSON.stringify(locus)}; wasIn ${JSON.stringify(routing?.wasIn)}; through ${JSON.stringify(published('re-pinned reply'))}`);
     assert.deepEqual(locus, { serverId: 'slack', channelId: X }, 'the locus moved to slack\'s channel');
@@ -751,6 +763,7 @@ describe("a script's call, through a real code_execution run", () => {
     framework = await AgentFramework.create({
       storePath: join(dir, 'store'),
       membrane: membrane.asMembrane(),
+      speech: LEGACY,
       agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
       mcplServers: [
         { id: 'discord', command: process.execPath, args: [FIXTURE],
@@ -782,8 +795,6 @@ describe("a script's call, through a real code_execution run", () => {
     const blocks = () => framework.getAgent('scout')!.getContextManager().getAllMessages().flatMap((m) => m.content);
     await waitFor(() => blocks().some((c) => c.type === 'tool_result' && (c as { toolName?: string }).toolName === 'code_execution'),
       'the script finished', 45_000);
-    await framework.runUntilIdle();
-    await new Promise((r) => setTimeout(r, 300));
     const result = blocks().find((c) => c.type === 'tool_result' && (c as { toolName?: string }).toolName === 'code_execution');
     t.diagnostic(JSON.stringify(result).slice(0, 600));
     assert.deepEqual(published('from the script'), ['slack']);
@@ -817,6 +828,7 @@ describe("with conversation routing, each server's channel is its own conversati
     framework = await AgentFramework.create({
       storePath: join(dir, 'store'),
       membrane: membrane.asMembrane(),
+      speech: LEGACY,
       agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
       mcplServers: [
         { id: 'discord', command: process.execPath, args: [FIXTURE],
@@ -859,6 +871,23 @@ describe("with conversation routing, each server's channel is its own conversati
     assert.equal(take(slackFork!, 'discord'), false, "slack's fork doesn't take discord's");
   });
 
+  it("a host's executeToolCall naming a fork, with no channel and outside the fork's turn, posts in the fork's home through its server, not into the default another server's message set", async () => {
+    await registerOpen();
+    command('discord', { op: 'incoming', channelId: X, messageId: 'd-1', mode: 'addressed', text: 'from discord' });
+    await waitFor(() => holders('from discord').length > 0, "discord's message reached a fork");
+    command('slack', { op: 'incoming', channelId: X, messageId: 's-1', mode: 'addressed', text: 'from slack' });
+    await waitFor(() => holders('from slack').length > 0, "slack's message reached a fork");
+    await framework!.runUntilIdle();
+    const [discordFork] = holders('from discord');
+    const via = (text: string) => ['discord', 'slack'].filter((id) => existsSync(paths(id).status) && readFileSync(paths(id).status, 'utf8')
+      .split('\n').filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>)
+      .some((l) => l.event === 'publish' && String(l.text ?? '').includes(text)));
+    const result = await framework!.executeToolCall({ id: 'h-1', name: 'channel_publish', input: { content: 'zz-home-post' }, callerAgentName: discordFork } as never);
+    assert.ok(result.success, result.error);
+    await waitFor(() => via('zz-home-post').length > 0, 'the post went out');
+    assert.deepEqual(via('zz-home-post'), ['discord']);
+  });
+
   it("each server's next message goes on to its own fork", async () => {
     await registerOpen();
     command('discord', { op: 'incoming', channelId: X, messageId: 'd-1', mode: 'addressed', text: 'discord first' });
@@ -876,9 +905,18 @@ describe("with conversation routing, each server's channel is its own conversati
 });
 
 describe("a gate wake's route, with two forks on one channel id", () => {
-  type Gate = { conversationRouter: ConversationRouter; conversationAgentHomes: Map<string, ChannelRef>; mayTakeGateRoute(a: string, r: ChannelRef): boolean };
+  type Gate = {
+    conversationRouter: ConversationRouter;
+    registry: { homeChannel(name: string): ChannelRef | undefined; list(): Array<{ name: string; homeChannel: ChannelRef }> };
+    mayTakeGateRoute(a: string, r: ChannelRef): boolean;
+  };
   const d = { serverId: 'discord', channelId: 'room' };
   const s = { serverId: 'slack', channelId: 'room' };
+  // The agent registry's records of the forks and their homes.
+  const homes = (forks: Array<[string, ChannelRef]>): Gate['registry'] => {
+    const byName = new Map(forks);
+    return { homeChannel: (name) => byName.get(name), list: () => forks.map(([name, homeChannel]) => ({ name, homeChannel })) };
+  };
 
   it("is taken only by the fork whose home is the route's server and channel", () => {
     const router = new ConversationRouter({ templateAgent: 'scout' });
@@ -886,7 +924,7 @@ describe("a gate wake's route, with two forks on one channel id", () => {
     router.bind(s, 'fork-s', 2);
     const framework = Object.create(AgentFramework.prototype) as Gate;
     framework.conversationRouter = router;
-    framework.conversationAgentHomes = new Map([['fork-d', d], ['fork-s', s]]);
+    framework.registry = homes([['fork-d', d], ['fork-s', s]]);
     assert.equal(framework.mayTakeGateRoute('fork-s', s), true);
     assert.equal(framework.mayTakeGateRoute('fork-d', s), false, "discord's fork doesn't take slack's route");
     assert.equal(framework.mayTakeGateRoute('fork-d', d), true);
@@ -899,7 +937,7 @@ describe("a gate wake's route, with two forks on one channel id", () => {
     router.bind(d, 'fork-d', 1);
     const framework = Object.create(AgentFramework.prototype) as Gate;
     framework.conversationRouter = router;
-    framework.conversationAgentHomes = new Map([['fork-d', d]]);
+    framework.registry = homes([['fork-d', d]]);
     assert.equal(framework.mayTakeGateRoute('fork-d', d), true);
     assert.equal(framework.mayTakeGateRoute('fork-d', s), false);
     t.diagnostic(`the trunk takes slack's route on that id: ${framework.mayTakeGateRoute('scout', s)}`);

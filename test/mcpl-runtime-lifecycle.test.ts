@@ -14,6 +14,7 @@ import { WebSocketServer } from 'ws';
 import type { AddressInfo } from 'node:net';
 
 import { AgentFramework } from '../src/index.js';
+import { referenceRegistry } from '../src/mcpl/references.js';
 import type { EventResponse, Module, ModuleContext, ToolDefinition, ToolResult } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
@@ -102,6 +103,9 @@ test('connectMcplServer lazily initializes MCPL on a zero-server framework and e
     assert.deepEqual(framework.listMcplServers(), [], 'no servers configured at start');
 
     await framework.connectMcplServer(serverConfig('dyn'));
+    // Its address is recorded where a reference's stub reads it: none, for a
+    // server the host spawns.
+    assert.equal(referenceRegistry.serverAddress('dyn'), 'no-address');
 
     const servers = framework.listMcplServers();
     assert.equal(servers.length, 1);
@@ -680,8 +684,9 @@ test('connectMcplServer hot-connects a network-only (WebSocket) MCPL server', as
       let msg: { id?: unknown; method?: string; params?: { arguments?: Record<string, unknown> } };
       try { msg = JSON.parse(String(data)); } catch { return; }
       const reply = (result: unknown) => ws.send(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }));
-      if (msg.method === 'initialize') reply({ protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.4', pushEvents: true } } } });
+      if (msg.method === 'initialize') reply({ protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.5', pushEvents: true } } } });
       else if (msg.method === 'tools/list') reply({ tools: [{ name: 'echo', description: 'e', inputSchema: { type: 'object' } }] });
+      else if (msg.method === 'featureSets/update') reply({ accepted: true });
     });
   });
   await new Promise<void>((resolve) => (wss.address() ? resolve() : wss.once('listening', () => resolve())));

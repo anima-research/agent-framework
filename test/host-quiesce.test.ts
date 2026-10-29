@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -24,6 +24,7 @@ import type { StreamEvent, YieldingStream, NormalizedRequest } from '@animalabs/
 import { JsStore } from '@animalabs/chronicle';
 
 import { AgentFramework, ResumeBlockedError } from '../src/index.js';
+import { setAbandonGraceForTests } from '../src/framework.js';
 import type { TraceEvent } from '../src/types/trace.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { schedulerPasses } from './helpers/scheduler-passes.js';
@@ -575,7 +576,7 @@ test('resume gates on a fresh feasibility verdict; force overrides', async () =>
   });
 });
 
-test('resume proceeds with a warn when the strategy cannot preview', async () => {
+test('resume proceeds when the strategy cannot preview', async () => {
   const membrane = new MockMembrane();
   await withFramework(membrane, async (framework) => {
     // Default PassthroughStrategy: no previewContext at all.
@@ -774,9 +775,10 @@ process.stdin.on('data', (c) => {
     if (!line.trim()) continue;
     let m; try { m = JSON.parse(line); } catch { continue; }
     const reply = (result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }) + '\\n');
-    if (m.method === 'initialize') reply({ protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.4', pushEvents: true } } } });
+    if (m.method === 'initialize') reply({ protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.5', pushEvents: true, featureSets: { chat: { description: 'chat', uses: ['pushEvents'] } } } } } });
     else if (m.method === 'tools/list') reply({ tools: [] });
-    else if (m.id === 900) log('push-response', { error: m.error ?? null });
+    else if (m.method === 'featureSets/update') reply({ accepted: true });
+    else if (m.id === 900) log('push-response', { result: m.result ?? null, error: m.error ?? null });
     else if (m.id === 901) log('resume-response', { result: m.result ?? null, error: m.error ?? null });
   }
 });
@@ -846,6 +848,9 @@ test('MCPL: pushes buffer while quiesced; host/command resume reopens and flushe
     assert.equal(framework.getHostModeStatus().quiesced, false);
     await waitFor('buffered push flushed after resume', () =>
       records().some((r) => r.event === 'push-response'));
+    const flushed = records().find((r) => r.event === 'push-response');
+    assert.equal(flushed?.error, null, 'the flushed push is answered, not refused with an error');
+    assert.equal((flushed?.result as { accepted?: unknown } | null)?.accepted, true, 'the flushed push is accepted');
   } finally {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
@@ -1005,6 +1010,7 @@ test('abandon reports turns it cannot cancel (token held, no stream)', async () 
     // A turn between dequeue and stream registration: token held, agent idle.
     const tokens = (framework as unknown as { activeTurnTokens: Map<string, object> }).activeTurnTokens;
     tokens.set('agent', {});
+    setAbandonGraceForTests(framework, 50);
     try {
       const status = await framework.quiesce({ timeoutMs: 1_000, abandon: true });
       assert.equal(status.drained, false);
@@ -1887,6 +1893,28 @@ test('a failed chronicle sync keeps flushed deferred writes in the durable queue
 
 const CRASH_CHILD = fileURLToPath(new URL('./helpers/quiesce-crash-child.js', import.meta.url));
 
+function runCrashChild(
+  storePath: string,
+  mode: string,
+  abort: AbortSignal,
+): Promise<{ status: number | null; signal: NodeJS.Signals | null; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [CRASH_CHILD, storePath, mode], { signal: abort, stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    let failure: Error | undefined;
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => { stderr += chunk; });
+    child.on('error', (error) => {
+      failure = error;
+      if (child.pid === undefined) reject(error);
+    });
+    child.on('close', (status, signal) => {
+      if (failure) reject(new Error(`${failure.message} (stderr: ${stderr.slice(-800)})`, { cause: failure }));
+      else resolve({ status, signal, stderr });
+    });
+  });
+}
+
 const CRASH_SCENARIOS = [
   { mode: 'after-ack', label: 'right after the first ack of the resume flush',
     expect: ['ACKED-BUT-NOT-SYNCED', 'STILL-PENDING'], bootQuiesced: true },
@@ -1901,7 +1929,7 @@ const CRASH_SCENARIOS = [
 ] as const;
 
 for (const scenario of CRASH_SCENARIOS) {
-  test(`a REAL process exit ${scenario.label} loses no deferred write and duplicates none`, async () => {
+  test(`a REAL process exit ${scenario.label} loses no deferred write and duplicates none`, async (context) => {
     const dir = mkdtempSync(join(tmpdir(), `host-quiesce-crash-${scenario.mode}-`));
     const storePath = join(dir, 'store');
     const config = () => ({
@@ -1912,11 +1940,8 @@ for (const scenario of CRASH_SCENARIOS) {
     });
     let framework: AgentFramework | null = null;
     try {
-      const child = spawnSync(process.execPath, [CRASH_CHILD, storePath, scenario.mode], {
-        encoding: 'utf8',
-        timeout: 60_000,
-      });
-      assert.equal(child.status, 0, `child staged the crash (stderr: ${child.stderr.slice(-800)})`);
+      const child = await runCrashChild(storePath, scenario.mode, context.signal);
+      assert.equal(child.status, 0, `child staged the crash (signal: ${child.signal}; stderr: ${child.stderr.slice(-800)})`);
 
       const wanted = new Set<string>(scenario.expect);
       const texts = () => framework!.getAgent('agent')!.getContextManager().getAllMessages()
@@ -1987,4 +2012,53 @@ test('nudge while quiesced says so', async () => {
     assert.equal(r.quiesced, true);
     assert.equal(framework.getHostModeStatus().gatedRequests, 1);
   });
+});
+
+test("an abandon whose cancel throws for one agent goes on to abandon the next agent's turn", async () => {
+  const membrane = new HangingMembrane();
+  const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: membrane.asMembrane(),
+    agents: [
+      { name: 'first', model: 'test-model', systemPrompt: 'test' },
+      { name: 'second', model: 'test-model', systemPrompt: 'test' },
+    ],
+    modules: [],
+  });
+  const errors = captureErrors();
+  const traces: TraceEvent[] = [];
+  framework.onTrace((event) => traces.push(event));
+  const abortedAs = (name: string) => traces
+    .filter((t) => t.type === 'inference:aborted' && (t as { agentName?: string }).agentName === name)
+    .map((t) => (t as { reason?: string }).reason);
+  let restore: (() => void) | undefined;
+  try {
+    framework.start();
+    // first takes its turn token before second, so the abandon reaches it first.
+    framework.nudgeAgent('first', 'operator');
+    await waitFor("first's turn to start", () => membrane.calls.length === 1);
+    framework.nudgeAgent('second', 'operator');
+    await waitFor("second's turn to start", () => membrane.calls.length === 2);
+    const stream = (framework.getAgent('first')!.state as { stream?: { cancel(): void } }).stream!;
+    const cancel = stream.cancel.bind(stream);
+    stream.cancel = () => { throw new Error('zz the stream refused its cancel'); };
+    restore = () => { stream.cancel = cancel; };
+    const quiescing = framework.quiesce({ timeoutMs: 50, abandon: true });
+    await waitFor("second's turn to end as abandoned", () => abortedAs('second').length > 0);
+    assert.deepEqual(abortedAs('second'), ['quiesce_abandoned']);
+    assert.ok(errors.lines.some((l) => l.startsWith("[host-mode] cannot abandon turn for first: its stream's cancel threw")),
+      errors.lines.join('\n'));
+    // first's stream goes on; a caller's stop ends it, and with it the abandon's grace.
+    restore();
+    assert.equal(framework.abortInference('first', 'user'), true);
+    const status = await quiescing;
+    assert.equal(status.quiesced, true);
+    assert.deepEqual(abortedAs('first'), ['user'], "first's turn ends as the caller's stop, not as abandoned");
+  } finally {
+    restore?.();
+    errors.restore();
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
