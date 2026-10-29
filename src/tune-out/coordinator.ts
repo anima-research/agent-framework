@@ -380,8 +380,9 @@ export class TuneOutCoordinator {
   /**
    * Cancels asked for while the framework keeps writes in memory
    * (writesHeld), by channel key, the all-except hold's under SCOPE_KEY:
-   * each runs as it was asked, with a note a later cancel gave it
-   * (deferCancel), once the writes are stored again (runDeferredCancels).
+   * each runs as it was asked, with its note, or a later cancel's when it
+   * had none (deferCancel), once the writes are stored again
+   * (runDeferredCancels).
    * In memory: a restart before then finds the tune-out still in force,
    * and an end time that passed cancels it at once (resumeActiveEpochs).
    */
