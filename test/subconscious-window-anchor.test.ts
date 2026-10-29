@@ -435,6 +435,49 @@ describe("the persistent subconscious's window start whose keeping failed, acros
   });
 });
 
+describe("the persistent subconscious's window start set while its window is the record", () => {
+  it('(n) is fixed at the next enter once a branch move recovers the window', { timeout: 120_000 }, async () => {
+    const h = await boot(place());
+    h.residentRow('PRE-1 before the tune-outs');
+    h.bump();
+    const t1 = h.internals.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5 }, 'agent-tool');
+    assert.ok(t1.ok);
+    h.residentRow('T1-HELD-1 chatter', { tuneOut: { epochId: t1.params.epochId } });
+    await h.framework.runUntilIdle();
+    assert.notEqual(h.windowStarts()?.[t1.params.epochId], undefined, "premise: T1's start is fixed and kept");
+
+    const strategy = h.subCm().getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
+    const initialize = strategy.initialize.bind(strategy);
+    let failNext = true;
+    strategy.initialize = async (...args: unknown[]) => {
+      if (failNext) { failNext = false; throw new Error('injected initialization failure'); }
+      return initialize(...args);
+    };
+    const branch = () => h.framework.getStore().currentBranch().name;
+    await h.framework.switchBranch(branch());
+    assert.ok(h.traces.some((e) => e.type === 'presentation:failed' && (e as { agentName?: string }).agentName === SUB),
+      "premise: the subconscious's window is the record after the move");
+    h.bump();
+    const t2 = h.internals.tuneOutCoordinator.enterAllExcept({ serverId: 'disc', channelId: 'disc:guild:quiet' }, { durationSeconds: 3600 }, 'agent-tool');
+    assert.ok(t2.ok, (t2 as { error?: string }).error);
+    await h.framework.switchBranch(branch());
+    await h.framework.runUntilIdle();
+    assert.equal(h.windowStarts()?.[t2.params.epochId], undefined, "premise: T2's start, set while the window was the record, isn't fixed at the recovering move");
+
+    assert.ok(h.internals.tuneOutCoordinator.cancel('disc', CHANNEL, 'agent-tool', 'test').ok);
+    await h.framework.runUntilIdle();
+    h.bump();
+    const t3 = h.internals.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5 }, 'agent-tool');
+    assert.ok(t3.ok, (t3 as { error?: string }).error);
+    await h.framework.runUntilIdle();
+    const cm = h.subCm();
+    const t2Start = t2.params.startedAtSequence;
+    const pastBefore = Math.max(0, ...cm.getPresentedMessages().filter((m) => m.sequence < t2Start).map((m) => cm.ordinalOf(m.id)! + 1));
+    assert.equal(h.windowStarts()?.[t2.params.epochId], pastBefore,
+      "the next enter fixes T2's start, just past the last row in the window stored before it");
+  });
+});
+
 describe('SubconsciousWindowAnchor', () => {
   /** A host over a window of `rows` (sequence and ordinal each), with the rows still owed. */
   function host(options: { presents?: boolean; rows?: Array<{ sequence: number; ordinal: number }>; owed?: number[]; length?: number }) {
