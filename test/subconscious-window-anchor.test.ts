@@ -319,6 +319,48 @@ describe("the persistent subconscious's window start when the oldest tune-out en
   });
 });
 
+describe("the persistent subconscious's window start of a tune-out entered while an older one holds it", () => {
+  it('(i) is fixed as soon as it can be, so a row presented again ahead of it later leaves its held rows in the window', { timeout: 120_000 }, async () => {
+    const h = await boot(place());
+    h.residentRow('PRE-1 before the tune-outs');
+    h.bump();
+    const t1 = h.internals.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5 }, 'agent-tool');
+    assert.ok(t1.ok);
+    h.residentRow('T1-HELD-1 chatter', { tuneOut: { epochId: t1.params.epochId } });
+    h.residentRow('BETWEEN-1 after T1');
+    h.bump();
+    const t2 = h.internals.tuneOutCoordinator.enterAllExcept({ serverId: 'disc', channelId: 'disc:guild:quiet' }, { durationSeconds: 3600 }, 'agent-tool');
+    assert.ok(t2.ok, (t2 as { error?: string }).error);
+    h.residentRow('T2-HELD-1 chatter', { tuneOut: { epochId: t2.params.epochId } });
+    await h.framework.runUntilIdle();
+    const cm = h.subCm();
+    const between = h.rowOf('BETWEEN-1 after T1').id;
+    const betweenAt = cm.ordinalOf(between)!;
+    const t2First = cm.ordinalOf(h.rowOf('T2-HELD-1 chatter').id)!;
+    assert.ok(betweenAt < t2First, 'premise: the row stored before T2 is ahead of its held row');
+
+    cm.retractRows([between]);
+    cm.presentRows([between]);
+    assert.ok(cm.ordinalOf(between)! > t2First, 'premise: it is in the window again, past the held row');
+
+    assert.ok(h.internals.tuneOutCoordinator.cancel('disc', CHANNEL, 'agent-tool', 'test').ok);
+    await h.framework.runUntilIdle();
+    const t3 = h.internals.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5 }, 'agent-tool');
+    assert.ok(t3.ok, (t3 as { error?: string }).error);
+    const start = h.strategy().getAnchorOrdinal()!;
+    assert.ok(start > betweenAt && start <= t2First, `T2's start, as it was before the row came back (${betweenAt} < ${start} <= ${t2First})`);
+    assert.equal(h.windowStarts()?.[t2.params.epochId], start, 'kept for T2');
+
+    h.membrane.script(SUB, final([signed('sig-i'), text('>>skip_reply nothing yet')]));
+    const calls = h.membrane.callsFor(SUB).length;
+    h.ask();
+    await waitFor('its next request', () => h.membrane.callsFor(SUB).length > calls);
+    await h.framework.runUntilIdle();
+    const body = JSON.stringify(h.membrane.callsFor(SUB).at(-1)!.messages);
+    assert.ok(body.includes('T2-HELD-1 chatter'), 'its request holds what T2 held');
+  });
+});
+
 describe('SubconsciousWindowAnchor', () => {
   /** A host over a window of `rows` (sequence and ordinal each), with the rows still owed. */
   function host(options: { presents?: boolean; rows?: Array<{ sequence: number; ordinal: number }>; owed?: number[]; length?: number }) {

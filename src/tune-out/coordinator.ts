@@ -279,9 +279,11 @@ export interface TuneOutFrameworkHooks {
    * tune-out's (never forward past active epochs): by its sequence while
    * the subconscious's window is the record, by its ordinal once that is
    * known, and else by an ordinal the framework fixes for it and reports
-   * (subconsciousWindowFixed).
+   * (subconsciousWindowFixed). `others` are the other active tune-outs'
+   * starts whose ordinal isn't kept yet, which the framework fixes and
+   * reports the same way without moving the window to them.
    */
-  setSubconsciousAnchor: (start: SubconsciousWindowStart) => void;
+  setSubconsciousAnchor: (start: SubconsciousWindowStart, others?: readonly SubconsciousWindowStart[]) => void;
   /**
    * Whether the subconscious's window keeps index ordinals (its context
    * manager presents rows, #291), so each tune-out's window start is kept as
@@ -521,7 +523,8 @@ export class TuneOutCoordinator {
    * that start is set again rather than the oldest active tune-out's, which
    * is later than it once the oldest was cancelled: so the window is the
    * same across a restart. An enter sets the oldest active tune-out's, as it
-   * always has.
+   * always has. The other active tune-outs whose start isn't kept yet go
+   * with it, for the framework to fix as soon as each can be.
    */
   private anchorSubconscious(occasion: 'enter' | 'resume' = 'enter'): void {
     const active = this.activeStarts();
@@ -543,7 +546,16 @@ export class TuneOutCoordinator {
       const { inForce: _was, ...rest } = state;
       this.writeWindowState(ordinal !== undefined ? { ...rest, inForce: ordinal } : rest);
     }
-    this.hooks.setSubconsciousAnchor({ sequence, ...(ordinal !== undefined ? { ordinal } : {}), epochIds });
+    const others: SubconsciousWindowStart[] = [];
+    if (kept) {
+      const bySequence = new Map<number, string[]>();
+      for (const e of active) {
+        if (e.sequence === sequence || state.starts[e.epochId] !== undefined) continue;
+        bySequence.set(e.sequence, [...(bySequence.get(e.sequence) ?? []), e.epochId]);
+      }
+      for (const [at, ids] of bySequence) others.push({ sequence: at, epochIds: ids });
+    }
+    this.hooks.setSubconsciousAnchor({ sequence, ...(ordinal !== undefined ? { ordinal } : {}), epochIds }, others);
   }
 
   // ==========================================================================
@@ -618,10 +630,12 @@ export class TuneOutCoordinator {
    * so a later anchor (another tune-out's enter, a restart) sets that
    * ordinal again rather than converting the tune-out's sequence anew, and
    * kept as the start in force while any tune-out is active, which a
-   * restart sets again (anchorSubconscious). Answers whether it is kept, so
-   * that the anchor tries again at its next presentation when it isn't.
+   * restart sets again (anchorSubconscious), when it is the start in force
+   * (`inForce`; another active tune-out's start fixed beside it isn't).
+   * Answers whether it is kept, so that the anchor tries again at its next
+   * presentation when it isn't.
    */
-  subconsciousWindowFixed(epochIds: readonly string[], ordinal: number): boolean {
+  subconsciousWindowFixed(epochIds: readonly string[], ordinal: number, inForce = true): boolean {
     if (!this.ordinalsKept()) return true;
     const active = new Set(this.activeStarts().map((e) => e.epochId));
     const state = this.readWindowState();
@@ -634,7 +648,7 @@ export class TuneOutCoordinator {
     // The window starts there now, whether or not the tune-outs it was fixed
     // for are active still (one cancelled before its start was fixed leaves
     // it in force, as any cancel does), while any tune-out is.
-    if (active.size > 0 && state.inForce !== ordinal) {
+    if (inForce && active.size > 0 && state.inForce !== ordinal) {
       state.inForce = ordinal;
       changed = true;
     }

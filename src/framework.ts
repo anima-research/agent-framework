@@ -5259,7 +5259,7 @@ export class AgentFramework {
           currentSequence: () => framework.store.currentSequence(),
           // By sequence while its window is the record; by a fixed ordinal
           // once the presentation index presents for it (window-anchor.ts).
-          setSubconsciousAnchor: (start) => framework.subconsciousAnchor?.set(start),
+          setSubconsciousAnchor: (start, others) => framework.subconsciousAnchor?.set(start, others),
           subconsciousWindowOrdinals: () => framework.presents(
             framework.subconsciousAgentName ? framework.agents.get(framework.subconsciousAgentName) : undefined),
           unseenBySubconscious: (keep) => framework.unseenBySubconscious(keep),
@@ -16740,7 +16740,7 @@ export class AgentFramework {
         const sub = this.agents.get(name);
         return sub && this.presentation ? this.presentation.owedOf(sub) : [];
       },
-      fixed: (epochIds, ordinal) => this.tuneOutCoordinator?.subconsciousWindowFixed(epochIds, ordinal) ?? true,
+      fixed: (epochIds, ordinal, inForce) => this.tuneOutCoordinator?.subconsciousWindowFixed(epochIds, ordinal, inForce) ?? true,
       emitTrace: (event) => this.emitTrace(event),
     });
     // With its window presented, a resident's rounds go out to it as a
