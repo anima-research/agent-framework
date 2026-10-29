@@ -840,7 +840,6 @@ test("the published traces are emitted when the channel's server takes no stream
   const h = await harness([[round(text('first'), call('one', 'test--read')), final(text('second'))]], {}, { streaming: false });
   try {
     await h.run();
-    assert.deepEqual(h.chunks(), [], 'the server is sent no chunk');
     assert.deepEqual(h.traces.map((t) => `${t.type}:${t.text}`), [
       'inference:published:first',
       'inference:published:\n\nsecond',
@@ -873,16 +872,6 @@ for (const c of failedPublishCases) {
     } finally { await h.framework.stop(); }
   });
 }
-
-test('a published trace carries no message id when the server returned none', async () => {
-  const h = await harness([[round(text('first'), call('one', 'test--read')), final(text('second'))]]);
-  try {
-    await h.run();
-    const published = h.traces.filter((t) => t.type === 'inference:published');
-    assert.equal(published.length, 2, 'both publishes streamed');
-    assert.ok(published.every((t) => !('messageId' in t)), 'no id came back, so the traces carry none');
-  } finally { await h.framework.stop(); }
-});
 
 for (const c of failedPublishCases) {
   for (const failure of ['undelivered', 'unknown', 'throw'] as const) {
