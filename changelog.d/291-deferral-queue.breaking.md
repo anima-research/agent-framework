@@ -7,7 +7,11 @@
   arrival order (if the agent ends first, those the primary takes in its place, a module's write for a run or a fork,
   a failed reply's notice or a channel notice it could act on, go on to it, and the rest are dropped, logged). A
   crash during the surgery, or before the recovery, loses such a write; earlier releases kept a quiesced host's queue
-  on disk. The `store-held-long` alert says so: a restart loses the writes the hold keeps in memory and those kept
+  on disk, and a surgery's deferred writes with it. A tune-out's cancel asked for meanwhile (its end time passing, a
+  wake past its budget, a tool's or a host's cancel) waits, the tune-out in force, until the writes are stored, then
+  runs, so its release is never kept in memory behind an end already on disk; `cancel()` and `cancelAllExcept()`
+  answer `{ ok: true, deferred: true }` then. A crash before that leaves the tune-out in force for the next boot,
+  which cancels one whose end time passed. The `store-held-long` alert says so: a restart loses the writes the hold keeps in memory and those kept
   for a manager refusing its work, where 0.28.0's said writes still queued at exit survive in a persisted deferral
   queue. `stop()` names what it leaves unstored: for each agent with writes still kept in memory, those kept while
   its manager refuses its work (lost) and those a surgery whose operation outlived `stop()`'s wait still holds, it

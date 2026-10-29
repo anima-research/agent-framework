@@ -241,6 +241,16 @@ export interface TuneOutFrameworkHooks {
    */
   commitDeliveries?: () => void;
   /**
+   * Whether a write the coordinator made now would be kept in memory rather
+   * than stored: a live surgery's hold, or a context manager of the primary
+   * or the subconscious refusing its work until a switch re-initializes it.
+   * A cancel then waits (deferCancel), the tune-out still in force, until
+   * the framework says the writes are stored again (runDeferredCancels), so
+   * the release is in the store before the epoch's end is recorded. Left
+   * out, never.
+   */
+  writesHeld?: () => boolean;
+  /**
    * The history-reading tool the resident actually has (e.g. a server's
    * `fetch_history`), or null. A truncation note names it only when it exists
    * (#232 gap 11).
@@ -356,6 +366,15 @@ export class TuneOutCoordinator {
   private scopeCache: AllExceptState | null | undefined;
   /** The epoch whose release this process delivered and whose hold is not yet recorded as cleared. */
   private scopeReleased: string | undefined;
+  /**
+   * Cancels asked for while the framework keeps writes in memory
+   * (writesHeld), by channel key, the all-except hold's under SCOPE_KEY:
+   * each runs, as it was asked, once the writes are stored again
+   * (runDeferredCancels). In memory: a restart before then finds the
+   * tune-out still in force, and an end time that passed cancels it at
+   * once (resumeActiveEpochs).
+   */
+  private readonly deferredCancels = new Map<string, () => void>();
   /** Timer key for the scope's cadence and expiry. */
   private static readonly SCOPE_KEY = '\0all-except';
 
@@ -803,6 +822,48 @@ export class TuneOutCoordinator {
     return { ok: true, params };
   }
 
+  /** Whether the framework keeps writes in memory now (writesHeld); a hook that throws counts as not. */
+  private writesHeldNow(): boolean {
+    try {
+      return this.hooks.writesHeld?.() === true;
+    } catch (err) {
+      console.error('[tune-out] could not ask whether writes are held in memory, so a cancel goes on:', err);
+      return false;
+    }
+  }
+
+  /**
+   * Keep a cancel asked for while writes are kept in memory, for
+   * runDeferredCancels. The first one asked for a hold stands; a later one
+   * for the same hold (an end time's retry, a wake past the budget) is
+   * dropped, and so, with a log line, is its reason.
+   */
+  private deferCancel(key: string, what: string, run: () => void): void {
+    if (this.deferredCancels.has(key)) return;
+    this.deferredCancels.set(key, run);
+    console.error(`[tune-out] the cancel of ${what} waits until the writes held in memory are stored, so that its release is stored before the tune-out's end is recorded`);
+  }
+
+  /**
+   * Run the cancels asked for while writes were kept in memory (deferCancel),
+   * in the order asked, now that the framework stores them again: it calls
+   * this once a surgery's hold has stored what it kept. One whose writes are
+   * still held waits on; one whose hold has ended meanwhile ends nothing.
+   * Never throws.
+   */
+  runDeferredCancels(): void {
+    if (this.deferredCancels.size === 0 || this.writesHeldNow()) return;
+    const runs = [...this.deferredCancels.values()];
+    this.deferredCancels.clear();
+    for (const run of runs) {
+      try {
+        run();
+      } catch (err) {
+        console.error('[tune-out] a cancel asked for while writes were held in memory failed when it ran:', err);
+      }
+    }
+  }
+
   /** Whether a reader (persistent subconscious or reader forks) attends holds. */
   hasReader(): boolean {
     return this.readerAvailable();
@@ -813,7 +874,11 @@ export class TuneOutCoordinator {
    * resident's window (capped), lifecycle notice, one wake for the
    * resident. `subconsciousNote` is the subconscious's own text (from its
    * cancel_tuneout call) — delivered verbatim under its name, never
-   * synthesized here.
+   * synthesized here. While the framework keeps writes in memory
+   * (writesHeld: a surgery's hold, a manager refusing its work), nothing
+   * ends yet: the cancel waits, the tune-out in force, and runs once the
+   * writes are stored (runDeferredCancels), so its release is stored
+   * before its end is recorded. It answers `deferred` then.
    */
   cancel(
     serverId: string,
@@ -825,7 +890,12 @@ export class TuneOutCoordinator {
     noteAuthor?: string,
     /** The lifecycle state the channel returns to (a tool close ends in 'closed'). */
     nextState: 'open' | 'closed' = 'open',
-  ): { ok: true } | { ok: false; error: string } {
+  ): { ok: true; deferred?: true } | { ok: false; error: string } {
+    if (this.channelRegistry.getTuneOutState(serverId, channelId) && this.writesHeldNow()) {
+      this.deferCancel(this.key(serverId, channelId), `${this.shown(serverId, channelId)} (${reason})`,
+        () => { this.cancel(serverId, channelId, source, reason, subconsciousNote, noteAuthor, nextState); });
+      return { ok: true, deferred: true };
+    }
     const ended = this.channelRegistry.cancelTuneOut(serverId, channelId, nextState, source);
     if (!ended) {
       // Its reader is the resident's tune_out: cancel_tuneout finds the channel first.
@@ -919,7 +989,9 @@ export class TuneOutCoordinator {
       [{ type: 'text', text: render(lines, truncated) }],
       { system: true, kind: 'tune-out-cancel', channelId, epochId },
     );
-    // The epoch is already ended durably; the release must be as durable.
+    // The epoch is already ended durably; the release must be as durable. It
+    // is stored, not kept in memory: a cancel made while the framework keeps
+    // writes in memory waits until it stores them again (deferCancel).
     this.hooks.commitDeliveries?.();
     // The subconscious's own words, under its own name, verbatim.
     const subName = this.hooks.subconsciousName();
@@ -1232,15 +1304,23 @@ export class TuneOutCoordinator {
    * End the all-except hold: durable flip, one release notice with a
    * per-channel backlog (each capped), the reader's note if any, one wake
    * for the resident, and the reader's own look at what it had not seen.
+   * While the framework keeps writes in memory it waits, as cancel does.
    */
   cancelAllExcept(
     source: string,
     reason: string,
     note?: string,
     noteAuthor?: string,
-  ): { ok: true } | { ok: false; error: string } {
+  ): { ok: true; deferred?: true } | { ok: false; error: string } {
     const scope = this.getAllExcept();
     if (!scope) return { ok: false, error: 'no all-except hold is active' };
+    // As a channel's cancel: while writes are kept in memory, the release
+    // would be, and writeScope(null) below is on disk at once.
+    if (this.writesHeldNow()) {
+      this.deferCancel(TuneOutCoordinator.SCOPE_KEY, `the all-except hold (${reason})`,
+        () => { this.cancelAllExcept(source, reason, note, noteAuthor); });
+      return { ok: true, deferred: true };
+    }
     const { epochId, except, backlogCap } = scope.params;
 
     const ofEpoch = (m: Pick<StoredMessage, 'metadata'>): boolean =>
@@ -2156,6 +2236,9 @@ export class TuneOutCoordinator {
 
   /** Stop all timers (framework shutdown). */
   stop(): void {
+    // A cancel still waiting for held writes ends nothing: the tune-out stays
+    // in force on disk, for the next boot.
+    this.deferredCancels.clear();
     for (const timer of this.cadenceTimers.values()) clearTimeout(timer);
     this.cadenceTimers.clear();
     for (const timer of this.expiryTimers.values()) clearTimeout(timer);

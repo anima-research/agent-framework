@@ -5202,6 +5202,14 @@ export class AgentFramework {
               .map((write) => ({ participant: write.participant, content: write.content, metadata: write.metadata }));
           },
           commitDeliveries: () => framework.commitDeliveries(),
+          // A release made while a surgery's hold keeps writes in memory, or
+          // while the primary's or the subconscious's manager refuses its
+          // work, would be kept there too, and lost to a crash before it is
+          // stored, while the epoch's end is on disk at once: the cancel
+          // waits (releaseSurgeryHeldWrites runs it).
+          writesHeld: () => framework.surgeryHold !== null
+            || [framework.primaryAgentName, framework.subconsciousAgentName]
+              .some((name) => name != null && framework.waitsForRecovery(name)),
           historyTool: () => framework.residentHistoryTool(),
           // Every reader of the shared slot compiles the dump with its own
           // strategy, so the dump fits the smallest of their bounds.
@@ -22146,6 +22154,14 @@ export class AgentFramework {
     }
     if (held.length > 0) {
       console.error(`[surgery] ${held.length} write(s) held while the store was held were replayed in arrival order`);
+    }
+    // A tune-out's cancel asked for while the writes were held waited for
+    // them (writesHeld): with them stored, its release is stored too, before
+    // the epoch's end is recorded.
+    try {
+      this.tuneOutCoordinator?.runDeferredCancels();
+    } catch (error) {
+      console.error('[surgery] the tune-out cancels asked for during the hold could not run at its release:', error);
     }
   }
 

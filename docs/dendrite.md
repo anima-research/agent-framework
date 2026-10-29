@@ -280,7 +280,7 @@ The tune-out coordinator exists whenever MCPL channels do. With a reader (the pe
 
 ### What a release is
 
-A release is a system-framed notice with the count, the channel and the epoch, then the held messages up to `backlogCap` as `author: text [image] …` lines in block order, then the reader's report under the reader's own name. Messages that arrived while a turn was alive are included: they are stored as they arrive. Above the cap the note names the history tool the resident actually has, or says the rest was not delivered. The release is made durable before the cancel returns.
+A release is a system-framed notice with the count, the channel and the epoch, then the held messages up to `backlogCap` as `author: text [image] …` lines in block order, then the reader's report under the reader's own name. Messages that arrived while a turn was alive are included: they are stored as they arrive. Above the cap the note names the history tool the resident actually has, or says the rest was not delivered. The release is stored and synced before the cancel returns. A cancel asked for while the framework keeps writes in memory (an operator surgery holds the store, or the primary's or the subconscious's context manager refuses its work until a switch re-initializes it) waits, the tune-out still in force, until those writes are stored, and then runs: its release is never kept in memory behind an end already on disk. A crash before then leaves the tune-out in force, and an end time that passed meanwhile cancels it at the next boot.
 
 ### The all-except scope
 

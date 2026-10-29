@@ -243,6 +243,65 @@ describe('admission: the hold is decided once, before any side effect', () => {
     } finally { await f.close(); }
   });
 
+  // AF-C-1: a tune-out's end recorded during a surgery's hold, its release
+  // kept in memory, would leave a crash before the release with neither the
+  // tune-out nor its backlog: the held messages filtered from the resident for
+  // good. So a cancel asked for while the hold keeps writes in memory waits,
+  // the tune-out in force, until the release stores them; then it runs. A
+  // crash during the hold leaves the tune-out in force, its stored messages
+  // held for the next boot's cancel.
+  it('gap 6 (surgery) — a cancel under a surgery hold waits for its release; a crash during the hold leaves the tune-out in force, and the next boot releases its backlog', async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    const crashed = mkdtempSync(join(tmpdir(), 'admission-reboot-'));
+    try {
+      await registerOpen(f, 'noisy');
+      enter(f, 'noisy', { backlogCap: 10 });
+      const coordinator = internals(f).tuneOutCoordinator!;
+      const registry = internals(f).channelRegistry;
+      const epochId = registry.getTuneOutState('editor', 'noisy')!.params.epochId;
+      const framework = f.framework as unknown as {
+        addMessage(p: string, c: unknown[], m: Record<string, unknown>): string;
+        reserveStoreForSurgery(verb: string, agentName: string): () => void;
+      };
+      // As admission stores a held message, for the primary.
+      const heldMessage = (t: string) => framework.addMessage('antra', [{ type: 'text', text: t }], {
+        tuneOut: { epochId }, channelId: 'noisy', serverId: 'editor', author: { id: 'U1', name: 'antra' },
+      });
+      heldMessage('stored before the hold');
+      const release = framework.reserveStoreForSurgery('roll back', 'agent');
+      try {
+        assert.equal(heldMessage('kept by the hold'), '', 'premise: the hold keeps it in memory');
+        // Its end time passes, as armExpiry's cancel, while the hold is up.
+        assert.deepEqual(coordinator.cancel('editor', 'noisy', 'duration', 'duration elapsed'), { ok: true, deferred: true });
+        assert.ok(registry.getTuneOutState('editor', 'noisy'), 'the tune-out stays in force while the hold keeps writes in memory');
+        assert.equal(has(f, '<tuned-out-backlog'), false, 'no release is stored yet');
+        assert.ok(!(internals(f) as unknown as { surgeryHeldWrites: Array<{ metadata?: { kind?: string } }> }).surgeryHeldWrites
+          .some((write) => write.metadata?.kind === 'tune-out-cancel'), 'nor kept in memory');
+        // The process ends here: the store as its last sync left it, what the hold kept gone with the process.
+        f.framework.getStore().sync();
+        cpSync(join(f.dir, 'store'), join(crashed, 'store'), { recursive: true });
+      } finally {
+        release();
+      }
+      // In this process, the cancel runs once the release has stored the hold's writes.
+      assert.equal(registry.getTuneOutState('editor', 'noisy'), null, 'ended at the release');
+      const dump = textOf(find(f, '<tuned-out-backlog'));
+      assert.match(dump, /messages=2/, 'the message the hold kept is counted');
+      assert.match(dump, /antra: stored before the hold\nantra: kept by the hold/, 'and listed, in arrival order');
+    } finally { await f.close(); }
+
+    const g = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig>, dir: crashed });
+    try {
+      assert.ok(internals(g).channelRegistry.getTuneOutState('editor', 'noisy'), 'the crash left the tune-out in force');
+      assert.equal(has(g, '<tuned-out-backlog'), false);
+      assert.ok(internals(g).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test').ok);
+      const dump = textOf(find(g, '<tuned-out-backlog'));
+      assert.match(dump, /messages=1/);
+      assert.match(dump, /antra: stored before the hold/, 'the backlog reaches the resident');
+      assert.equal(inWindow(g, '<tuned-out-backlog'), true, 'in its window');
+    } finally { await g.close(); }
+  });
+
   // A write for a primary whose context manager refuses its work after a
   // failed re-initialization waits in memory too, until the switch that
   // re-initializes it stores it (heldForRecovery): a tune-out reads those
