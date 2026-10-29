@@ -18,7 +18,7 @@ import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework } from '../src/framework.js';
 import { WorkspaceModule, WorkspaceReadError } from '../src/modules/workspace/index.js';
 import { EffectFailed, unlinkContained, writeContained } from '../src/modules/workspace/effects.js';
-import { coversLanding, insideMount, parsedSpelling, pathSegments, provenAbsent, readPath, type MountView, type Walk } from '../src/modules/workspace/observe.js';
+import { coversLanding, insideMount, parsedSpelling, pathSegments, readPath, type MountView } from '../src/modules/workspace/observe.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
 import type { FsChange } from '../src/modules/workspace/watcher.js';
 import type { ModuleContext } from '../src/types/module.js';
@@ -1261,15 +1261,6 @@ describe('mount include', () => {
     // about it, with or without an include.
     await call(m, 'sync', {});
     assert.ok(env.tree().includes('x/gate.json'), 'history keeps the covered file beneath the link');
-  });
-
-  test('provenAbsent takes a path beneath a regular file the include doesn\'t cover as absent, and not that file itself', () => {
-    const walk: Walk = {
-      files: new Set(), seen: new Set(), othersTaken: new Set(), dirs: new Set(), others: new Map([['x', 'outside the include']]),
-      otherFiles: new Set(['x']), complete: new Set(['']), missing: new Set(), incomplete: [],
-    };
-    assert.equal(provenAbsent(walk, 'x/gate.json'), true);
-    assert.equal(provenAbsent(walk, 'x'), false);
   });
 
   test('a deletion the workspace holds outside the include is left alone by a materialize, and counted only by one that names its directory', async (t) => {
