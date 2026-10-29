@@ -103,3 +103,36 @@ describe("a cancel that waits for the held writes says so to its caller", () => 
     } finally { release(); again(); await f.close(); }
   });
 });
+
+describe('a later cancel of a tune-out whose cancel already waits', () => {
+  it("gives the release its note when the waiting cancel has none, as an end time's cancel then the subconscious's", async () => {
+    const { f, registry, coordinator, release } = await heldDuringSurgery();
+    try {
+      assert.deepEqual(coordinator.cancel('editor', 'noisy', 'duration', 'duration elapsed'), { ok: true, deferred: true });
+      const answer = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', text: 'Someone asked for you.' });
+      assert.equal(answer.success, true, answer.error);
+      assert.equal(waiting(answer).waiting, true);
+      assert.doesNotMatch(waiting(answer).note ?? '', /note/, `nothing said of its note: ${waiting(answer).note}`);
+      release();
+      assert.equal(registry.getTuneOutState('editor', 'noisy'), null, 'ended at the release');
+      assert.ok(has(f, 'Someone asked for you.'), "the subconscious's note is delivered with the release");
+    } finally { release(); await f.close(); }
+  });
+
+  it("tells a later caller whose note won't go out with it, when the waiting cancel carries a note of its own", async () => {
+    const { f, registry, coordinator, release } = await heldDuringSurgery();
+    try {
+      const first = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', text: 'The first note.' });
+      assert.equal(first.success, true, first.error);
+      assert.doesNotMatch(waiting(first).note ?? '', /note/, 'the first caller is told nothing of a note');
+      const second = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', text: 'The second note.' });
+      assert.equal(second.success, true, second.error);
+      assert.equal(waiting(second).waiting, true);
+      assert.match(waiting(second).note ?? '', /Your note isn't delivered/, `the second caller is told: ${waiting(second).note}`);
+      release();
+      assert.equal(registry.getTuneOutState('editor', 'noisy'), null, 'ended at the release');
+      assert.ok(has(f, 'The first note.'), "the waiting cancel's note is delivered");
+      assert.ok(!has(f, 'The second note.'), 'and the second, as its caller was told, is not');
+    } finally { release(); await f.close(); }
+  });
+});

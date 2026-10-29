@@ -110,11 +110,12 @@ interface WindowStartsState {
   inForce?: number;
 }
 
-export function cancelWaitsNote(what: string): string {
+export function cancelWaitsNote(what: string, noteDropped = false): string {
   return 'Not cancelled yet: writes are being kept in memory (an operator\'s change to the store is in progress, or a '
     + 'context the cancel writes to waits to be re-initialized), so the cancel waits until they are stored. '
     + `${what} stays in force until then, and what it held is delivered when it ends. If the host stops before then, `
-    + 'the cancel is lost and it is still in force after the restart, unless its end time has passed by then.';
+    + 'the cancel is lost and it is still in force after the restart, unless its end time has passed by then.'
+    + (noteDropped ? ' Your note isn\'t delivered with it: the cancel already waiting carries a note of its own.' : '');
 }
 
 /**
@@ -376,12 +377,16 @@ export class TuneOutCoordinator {
   /**
    * Cancels asked for while the framework keeps writes in memory
    * (writesHeld), by channel key, the all-except hold's under SCOPE_KEY:
-   * each runs, as it was asked, once the writes are stored again
-   * (runDeferredCancels). In memory: a restart before then finds the
-   * tune-out still in force, and an end time that passed cancels it at
-   * once (resumeActiveEpochs).
+   * each runs as it was asked, with a note a later cancel gave it
+   * (deferCancel), once the writes are stored again (runDeferredCancels).
+   * In memory: a restart before then finds the tune-out still in force,
+   * and an end time that passed cancels it at once (resumeActiveEpochs).
    */
-  private readonly deferredCancels = new Map<string, () => void>();
+  private readonly deferredCancels = new Map<string, {
+    run: (note: string | undefined, noteAuthor: string | undefined) => void;
+    note?: string;
+    noteAuthor?: string;
+  }>();
   /** Timer key for the scope's cadence and expiry. */
   private static readonly SCOPE_KEY = '\0all-except';
 
@@ -841,14 +846,34 @@ export class TuneOutCoordinator {
 
   /**
    * Keep a cancel asked for while writes are kept in memory, for
-   * runDeferredCancels. The first one asked for a hold stands; a later one
-   * for the same hold (an end time's retry, a wake past the budget) is
-   * dropped, and so, with a log line, is its reason.
+   * runDeferredCancels, with its note. The first one asked for a hold
+   * stands, with its reason and source. A later one for the same hold (an
+   * end time's retry, a wake past the budget, an agent's cancel) adds
+   * nothing, except a note: the waiting cancel takes it, with its author,
+   * when it has none, and otherwise the later note is dropped, with a log
+   * line, and this answers 'note-dropped' so its caller can be told.
    */
-  private deferCancel(key: string, what: string, run: () => void): void {
-    if (this.deferredCancels.has(key)) return;
-    this.deferredCancels.set(key, run);
-    console.error(`[tune-out] the cancel of ${what} waits until the writes held in memory are stored, so that its release is stored before the tune-out's end is recorded`);
+  private deferCancel(
+    key: string,
+    what: string,
+    run: (note: string | undefined, noteAuthor: string | undefined) => void,
+    note: string | undefined,
+    noteAuthor: string | undefined,
+  ): 'waits' | 'note-dropped' {
+    const waiting = this.deferredCancels.get(key);
+    if (!waiting) {
+      this.deferredCancels.set(key, { run, ...(note !== undefined ? { note } : {}), ...(noteAuthor !== undefined ? { noteAuthor } : {}) });
+      console.error(`[tune-out] the cancel of ${what} waits until the writes held in memory are stored, so that its release is stored before the tune-out's end is recorded`);
+      return 'waits';
+    }
+    if (note === undefined) return 'waits';
+    if (waiting.note === undefined) {
+      waiting.note = note;
+      if (noteAuthor !== undefined) waiting.noteAuthor = noteAuthor;
+      return 'waits';
+    }
+    console.error(`[tune-out] a later cancel of ${what} is dropped with its note: the cancel already waiting carries a note of its own`);
+    return 'note-dropped';
   }
 
   /**
@@ -862,9 +887,9 @@ export class TuneOutCoordinator {
     if (this.deferredCancels.size === 0 || this.writesHeldNow()) return;
     const runs = [...this.deferredCancels.values()];
     this.deferredCancels.clear();
-    for (const run of runs) {
+    for (const { run, note, noteAuthor } of runs) {
       try {
-        run();
+        run(note, noteAuthor);
       } catch (err) {
         console.error('[tune-out] a cancel asked for while writes were held in memory failed when it ran:', err);
       }
@@ -897,11 +922,12 @@ export class TuneOutCoordinator {
     noteAuthor?: string,
     /** The lifecycle state the channel returns to (a tool close ends in 'closed'). */
     nextState: 'open' | 'closed' = 'open',
-  ): { ok: true; deferred?: true } | { ok: false; error: string } {
+  ): { ok: true; deferred?: true; noteDropped?: true } | { ok: false; error: string } {
     if (this.channelRegistry.getTuneOutState(serverId, channelId) && this.writesHeldNow()) {
-      this.deferCancel(this.key(serverId, channelId), `${this.shown(serverId, channelId)} (${reason})`,
-        () => { this.cancel(serverId, channelId, source, reason, subconsciousNote, noteAuthor, nextState); });
-      return { ok: true, deferred: true };
+      const kept = this.deferCancel(this.key(serverId, channelId), `${this.shown(serverId, channelId)} (${reason})`,
+        (note, author) => { this.cancel(serverId, channelId, source, reason, note, author, nextState); },
+        subconsciousNote, noteAuthor);
+      return { ok: true, deferred: true, ...(kept === 'note-dropped' ? { noteDropped: true as const } : {}) };
     }
     const ended = this.channelRegistry.cancelTuneOut(serverId, channelId, nextState, source);
     if (!ended) {
@@ -1318,15 +1344,16 @@ export class TuneOutCoordinator {
     reason: string,
     note?: string,
     noteAuthor?: string,
-  ): { ok: true; deferred?: true } | { ok: false; error: string } {
+  ): { ok: true; deferred?: true; noteDropped?: true } | { ok: false; error: string } {
     const scope = this.getAllExcept();
     if (!scope) return { ok: false, error: 'no all-except hold is active' };
     // As a channel's cancel: while writes are kept in memory, the release
     // would be, and writeScope(null) below is on disk at once.
     if (this.writesHeldNow()) {
-      this.deferCancel(TuneOutCoordinator.SCOPE_KEY, `the all-except hold (${reason})`,
-        () => { this.cancelAllExcept(source, reason, note, noteAuthor); });
-      return { ok: true, deferred: true };
+      const kept = this.deferCancel(TuneOutCoordinator.SCOPE_KEY, `the all-except hold (${reason})`,
+        (waitingNote, author) => { this.cancelAllExcept(source, reason, waitingNote, author); },
+        note, noteAuthor);
+      return { ok: true, deferred: true, ...(kept === 'note-dropped' ? { noteDropped: true as const } : {}) };
     }
     const { epochId, except, backlogCap } = scope.params;
 
@@ -2077,7 +2104,7 @@ export class TuneOutCoordinator {
           const result = this.cancelAllExcept('subconscious', 'subconscious judgment', note, caller);
           if (!result.ok) return { success: false, error: result.error, isError: true };
           return result.deferred
-            ? { success: true, data: { waiting: true, scope: 'all-except', note: cancelWaitsNote('The all-except hold') } }
+            ? { success: true, data: { waiting: true, scope: 'all-except', note: cancelWaitsNote('The all-except hold', result.noteDropped === true) } }
             : { success: true, data: { cancelled: true, scope: 'all-except' } };
         };
         // A call naming the all-except scope ends that hold outright, as the
@@ -2130,7 +2157,7 @@ export class TuneOutCoordinator {
         const result = this.cancel(channel.serverId, channel.channelId, 'subconscious', 'subconscious judgment', note, caller);
         if (!result.ok) return { success: false, error: result.error, isError: true };
         return result.deferred
-          ? { success: true, data: { waiting: true, note: cancelWaitsNote('The tune-out') } }
+          ? { success: true, data: { waiting: true, note: cancelWaitsNote('The tune-out', result.noteDropped === true) } }
           : { success: true, data: { cancelled: true } };
       }
       case 'note_disposition': {
