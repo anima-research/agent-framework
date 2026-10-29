@@ -2,9 +2,9 @@
  * The ranges agent-framework declares for its release set (#291).
  *
  * context-manager's range takes only a release with the window APIs the
- * presentation index calls. Main published context-manager 0.23.0 without
- * them, so the presentation release is 0.24.0, and a range that admitted
- * 0.23.0 would install a context-manager this framework fails to load on.
+ * presentation index calls. Main published context-manager 0.23.0, then 0.24.0
+ * (Dendrite's derive), without them, so the presentation release is 0.25.0, and
+ * a range that admitted 0.24.0 would install a context-manager this framework fails to load on.
  * Each @animalabs package context-manager depends on too is declared within
  * context-manager's own range, so an install takes one copy of each: two
  * membrane copies make the host's `Membrane` a type context-manager's
@@ -48,9 +48,9 @@ const within = (inner: string, outer: string): boolean => admits(outer, floorOf(
 
 describe("agent-framework's dependency ranges (#291's release set)", () => {
   it('the caret reading', () => {
-    assert.equal(admits('^0.24.0', '0.24.3'), true);
-    assert.equal(admits('^0.24.0', '0.23.0'), false);
-    assert.equal(admits('^0.24.0', '0.25.0'), false);
+    assert.equal(admits('^0.25.0', '0.25.3'), true);
+    assert.equal(admits('^0.25.0', '0.24.0'), false);
+    assert.equal(admits('^0.25.0', '0.26.0'), false);
     assert.equal(admits('^1.2.0', '1.9.0'), true);
     assert.equal(admits('^0.0.3', '0.0.4'), false);
     assert.equal(within('^0.8.2', '^0.8.0'), true);
@@ -58,11 +58,13 @@ describe("agent-framework's dependency ranges (#291's release set)", () => {
     assert.equal(within('^0.8.0', '^0.8.2'), false);
   });
 
-  it("takes context-manager only at a release with the window APIs: not main's 0.23.0, which has none", () => {
+  it("takes context-manager only at a release with the window APIs: not main's 0.23.0 or 0.24.0, which have none", () => {
     const range = ours.dependencies?.['@animalabs/context-manager'];
     assert.ok(range, 'agent-framework depends on context-manager');
-    assert.equal(admits(range, '0.23.0'), false,
-      `${range} admits context-manager 0.23.0, published without windowStatusOf, presentRows, retractRows or getPresentedMessages`);
+    for (const published of ['0.23.0', '0.24.0']) {
+      assert.equal(admits(range, published), false,
+        `${range} admits context-manager ${published}, published without windowStatusOf, presentRows, retractRows or getPresentedMessages`);
+    }
     const linked = installed('@animalabs/context-manager');
     assert.ok(admits(range, linked.version), `${range} admits the context-manager this suite runs on (${linked.version})`);
     const proto = ContextManager.prototype as unknown as Record<string, unknown>;
