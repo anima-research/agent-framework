@@ -316,7 +316,9 @@ export interface FrameworkConfig {
    * `complete()` streams under the hood, membrane renews it at each parsed
    * provider event. A call a bound cuts fails
    * with type `timeout`, and on an agent's turn DefaultErrorPolicy gives each
-   * such call one fresh call. One setting covers every agent. `false` sets
+   * such call one fresh call, except in a turn that re-arms an exhausted one,
+   * where `exhaustedTurnRearmMs` says what a cut does. One setting covers
+   * every agent. `false` sets
    * none of these bounds. Default: membrane's PROGRESS_BOUNDS and
    * FLAT_MINIMUM_MS.
    */
