@@ -13,7 +13,7 @@ import { join } from 'node:path';
 import type { ContentBlock, NormalizedMessage, ToolDefinition } from '@animalabs/membrane';
 
 import type { ContextManager, StoredMessage } from '@animalabs/context-manager';
-import { AgentFramework, isSystemChangeMessage, systemChangeMetadata, type Agent, type ToolCall } from '../src/index.js';
+import { AgentFramework, isSystemChangeMessage, systemChangeMetadata, taskForkSpec, type Agent, type AgentSpec, type ToolCall } from '../src/index.js';
 import { HistoryModule } from '../src/modules/history/index.js';
 import type { TraceEvent } from '../src/types/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
@@ -265,16 +265,21 @@ describe('toolDeclarations in the framework', () => {
     });
   });
 
-  describe("an ephemeral agent's headFrom", () => {
+  describe("an ephemeral agent that continues another's context", () => {
+    /** A spec saying the new agent continues `parent`'s context, copied by the host. */
+    const inheriting = (name: string, parent: string): Omit<AgentSpec, 'name'> => {
+      const { name: _name, ...spec } = taskForkSpec(name, { parent });
+      return spec;
+    };
     /** A resident with one declared change, and an ephemeral child seeded with its compiled rows, as a host's fork seeds one. */
-    async function forked(framework: AgentFramework, parentConfig: Record<string, unknown>, options: { headFrom?: string }, name: string) {
+    async function forked(framework: AgentFramework, parentConfig: Record<string, unknown>, spec: Omit<AgentSpec, 'name'> | undefined, name: string) {
       const alpha = framework.getAgent('alpha')!;
       say(alpha, 'user', 'hello');
       await alpha.buildActivationRequest([tool('a')]);
       await alpha.buildActivationRequest([tool('a'), tool('b')]);
       const { messages } = await alpha.getContextManager().compile(undefined, undefined, { dryRun: true });
       // A fork shares its parent's system prompt.
-      const { agent: child } = await framework.createEphemeralAgent({ ...resident(name), systemPrompt: 'You are alpha.', ...parentConfig } as never, undefined, options);
+      const { agent: child } = await framework.createEphemeralAgent({ ...resident(name), systemPrompt: 'You are alpha.', ...parentConfig } as never, spec);
       for (const m of messages) {
         if (isSystemChangeMessage(m)) child.getContextManager().addMessage(m.participant, m.content, systemChangeMetadata(name) as never);
         else child.getContextManager().addMessage(m.participant, m.content);
@@ -286,7 +291,7 @@ describe('toolDeclarations in the framework', () => {
       await withFramework([resident('alpha')], async (framework) => {
         const traces: TraceEvent[] = [];
         framework.onTrace((event) => { traces.push(event); });
-        const { child } = await forked(framework, {}, { headFrom: 'alpha' }, 'alpha-child');
+        const { child } = await forked(framework, {}, inheriting('alpha-child', 'alpha'), 'alpha-child');
         const request = await child.buildActivationRequest([tool('a'), tool('b')]);
         assert.deepEqual(request.tools, [tool('a')], "the parent's recorded head");
         assert.deepEqual(changesIn(request.messages), [[{ type: 'system_change', defineTools: [tool('b')] }]], "and the parent's change, once");
@@ -296,7 +301,7 @@ describe('toolDeclarations in the framework', () => {
 
     it("keeps the child's head its own: neither one's moves reach the other's record", async () => {
       await withFramework([resident('alpha')], async (framework) => {
-        const { alpha, child } = await forked(framework, {}, { headFrom: 'alpha' }, 'alpha-child');
+        const { alpha, child } = await forked(framework, {}, inheriting('alpha-child', 'alpha'), 'alpha-child');
         await child.buildActivationRequest([tool('a'), tool('b'), tool('c')]);
         const heads = framework as unknown as { headDeclarations: { read(name: string): { tools: { name: string }[] } | null } };
         assert.deepEqual(heads.headDeclarations.read('alpha')!.tools.map((t) => t.name), ['a'], "the child's change left the parent's record");
@@ -318,7 +323,7 @@ describe('toolDeclarations in the framework', () => {
         const heads = framework as unknown as { headDeclarations: { write(name: string, head: unknown): void } };
         heads.headDeclarations.write('alpha', { tools: [tool('old')], system: ['You are alpha.'] });
         // Both children share the parent's system prompt, as forks do.
-        const seeded = (await framework.createEphemeralAgent({ ...resident('seeded'), systemPrompt: 'You are alpha.' } as never, undefined, { headFrom: 'alpha' })).agent;
+        const seeded = (await framework.createEphemeralAgent({ ...resident('seeded'), systemPrompt: 'You are alpha.' } as never, inheriting('seeded', 'alpha'))).agent;
         const unseeded = (await framework.createEphemeralAgent({ ...resident('unseeded'), systemPrompt: 'You are alpha.' } as never)).agent;
         for (const child of [seeded, unseeded]) child.getContextManager().addMessage('user', [{ type: 'text', text: 'hello' } as ContentBlock]);
         const [a, b] = [await seeded.buildActivationRequest([tool('x')]), await unseeded.buildActivationRequest([tool('x')])];
@@ -328,7 +333,7 @@ describe('toolDeclarations in the framework', () => {
 
     it("keeps the child's head as recorded when what the parent's request carries is changed in place", async () => {
       await withFramework([resident('alpha')], async (framework) => {
-        const { alpha, child } = await forked(framework, {}, { headFrom: 'alpha' }, 'alpha-child');
+        const { alpha, child } = await forked(framework, {}, inheriting('alpha-child', 'alpha'), 'alpha-child');
         const parentRequest = await alpha.buildActivationRequest([tool('a'), tool('b')]);
         parentRequest.tools![0]!.description = 'changed in place, as a hook might';
         const request = await child.buildActivationRequest([tool('a'), tool('b')]);
@@ -341,7 +346,7 @@ describe('toolDeclarations in the framework', () => {
         const alpha = framework.getAgent('alpha')!;
         say(alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
-        const pending = framework.createEphemeralAgent({ ...resident('child'), systemPrompt: 'You are alpha.' } as never, undefined, { headFrom: 'alpha' });
+        const pending = framework.createEphemeralAgent({ ...resident('child'), systemPrompt: 'You are alpha.' } as never, inheriting('child', 'alpha'));
         // The parent's head moves while the child's context opens.
         const heads = framework as unknown as { headDeclarations: { write(name: string, head: unknown): void } };
         heads.headDeclarations.write('alpha', { tools: [tool('a'), tool('b')], system: ['You are alpha.'] });
@@ -353,11 +358,33 @@ describe('toolDeclarations in the framework', () => {
       });
     });
 
-    it('refuses a headFrom that names no running agent, naming it', async () => {
+    it("gives a child nothing from an inherit naming no running agent, so it starts as an unseeded child does", async () => {
       await withFramework([resident('alpha')], async (framework) => {
-        await assert.rejects(framework.createEphemeralAgent(resident('child') as never, undefined, { headFrom: 'nobody' }), /headFrom names no running agent: "nobody"/);
+        const seeded = (await framework.createEphemeralAgent({ ...resident('seeded'), systemPrompt: 'You are alpha.' } as never, inheriting('seeded', 'nobody'))).agent;
+        const unseeded = (await framework.createEphemeralAgent({ ...resident('unseeded'), systemPrompt: 'You are alpha.' } as never)).agent;
+        for (const child of [seeded, unseeded]) child.getContextManager().addMessage('user', [{ type: 'text', text: 'hello' } as ContentBlock]);
+        const [a, b] = [await seeded.buildActivationRequest([tool('x')]), await unseeded.buildActivationRequest([tool('x')])];
+        assert.deepEqual([a.tools, a.messages], [b.tools, b.messages]);
       });
     });
+
+    for (const mode of ['shared', 'copy'] as const) {
+      it(`starts a child deriveAgent makes (${mode}) on its parent's head, so its first request carries the parent's prefix and declares nothing`, async () => {
+        await withFramework([resident('alpha')], async (framework) => {
+          const traces: TraceEvent[] = [];
+          framework.onTrace((event) => { traces.push(event); });
+          const alpha = framework.getAgent('alpha')!;
+          say(alpha, 'user', 'hello');
+          await alpha.buildActivationRequest([tool('a')]);
+          await alpha.buildActivationRequest([tool('a'), tool('b')]);
+          const { agent: child } = await framework.deriveAgent({ name: 'alpha-child', from: 'alpha', mode });
+          const request = await child.buildActivationRequest([tool('a'), tool('b')]);
+          assert.deepEqual(request.tools, [tool('a')], "the parent's recorded head");
+          assert.deepEqual(changesIn(request.messages), [[{ type: 'system_change', defineTools: [tool('b')] }]], "and the parent's change, once");
+          assert.deepEqual(traces.filter((t) => (t as { agentName?: string }).agentName === 'alpha-child' && t.type.startsWith('head:')), [], 'no adoption, no declaration');
+        });
+      });
+    }
   });
 
   it("reports after host /undo the last conversational message the agent sees, not a change after it", async () => {

@@ -10730,20 +10730,21 @@ export class AgentFramework {
   /**
    * Create an ephemeral agent that is NOT registered in the main event loop.
    *
-   * `headFrom` names a running agent whose recorded head (toolDeclarations
-   * 'entries') the new agent starts with, as its own record: the same head
-   * object at first, since a record is never changed in place, and each of
-   * the new agent's moves records its own. That's for a host that seeds the
-   * agent with that agent's messages, its system changes stamped with
-   * `systemChangeMetadata(config.name)`, then sends the same prefix, so the
-   * new agent reads that agent's cache and declares only its own difference.
-   * A change copied unstamped is the host's own row to the new agent, which
-   * then declares that change again.
-   * That holds for a fork of the same self: system text that is the named
-   * agent's head's blocks, plus additions. A new agent with its own system
-   * prompt, or other system injections, meets a replacement at its first
-   * request and moves to its own head, as an agent without it would. A named
-   * agent on its head, or with nothing recorded, gives nothing: the new agent
+   * When `spec.inherit` names a running agent that declares its later tool
+   * and system changes as entries (toolDeclarations 'entries'), the new
+   * agent starts with that agent's recorded head, as its own record: the same
+   * head object at first, since a record is never changed in place, and each
+   * of the new agent's moves records its own. Its context then continues
+   * that agent's, shared, or copied by the host with that agent's system
+   * changes stamped with `systemChangeMetadata(config.name)`, and it sends the
+   * same prefix, so it reads that agent's cache and declares only its own
+   * difference. A change copied unstamped is the host's own row to the new
+   * agent, which then declares that change again.
+   * That holds for a fork of the same self: system text that is that agent's
+   * head's blocks, plus additions. A new agent with its own system prompt,
+   * or other system injections, meets a replacement at its first request and
+   * moves to its own head, as an agent without it would. An agent on its
+   * head, with nothing recorded, or not running gives nothing: the new agent
    * adopts at its first request, as without it.
    *
    * Used by SubagentModule (and similar) to prepare short-lived agents.
@@ -10774,7 +10775,6 @@ export class AgentFramework {
      * notice, reparenting, held results — apply to it.
      */
     spec?: Omit<AgentSpec, 'name'>,
-    options: { headFrom?: string } = {},
   ): Promise<{
     agent: Agent;
     contextManager: ContextManager;
@@ -10784,10 +10784,7 @@ export class AgentFramework {
     // after the name is reserved and ContextManager.open has registered the
     // agent's message and context states in the store.
     assertAgentSwitches(config);
-    const parent = options.headFrom === undefined ? undefined : this.agents.get(options.headFrom);
-    if (options.headFrom !== undefined && !parent) {
-      throw new Error(`createEphemeralAgent: headFrom names no running agent: "${options.headFrom}"`);
-    }
+    const parent = spec?.inherit ? this.agents.get(spec.inherit.from) : undefined;
     // Names are Chronicle namespaces and generation identities. Reserve before
     // opening the namespace so a second creation cannot append to an earlier
     // generation before runEphemeralToCompletion has a chance to reject it.
@@ -11005,13 +11002,14 @@ export class AgentFramework {
       if (!shared) {
         // The historical copy: the parent's compiled view, its turns renamed
         // so the child reads its inheritance as its own history.
-        const { messages } = await parent.getContextManager().compile();
-        for (const message of messages) {
-          created.contextManager.addMessage(
-            parent.isOwnParticipant(message.participant) ? options.name : message.participant,
-            message.content,
-          );
-        }
+        const compiled = await parent.getContextManager().compile();
+        const parentsOwnChanges = ownSystemChanges(compiled, parent.name);
+        compiled.messages.forEach((message, index) => {
+          const participant = parent.isOwnParticipant(message.participant) ? options.name : message.participant;
+          if (parentsOwnChanges.has(index)) {
+            created.contextManager.addMessage(participant, message.content, systemChangeMetadata(options.name) as never);
+          } else created.contextManager.addMessage(participant, message.content);
+        });
         created.agent.markContextConsumed();
       }
       await this.framePendingRound(parent, created.contextManager, options, shared);
@@ -15949,7 +15947,7 @@ export class AgentFramework {
     return true;
   }
 
-  /** Each agent's head store, for an ephemeral agent's `headFrom`. */
+  /** Each agent's head store, for an ephemeral agent that continues another's context (`spec.inherit`). */
   private readonly headStores = new WeakMap<Agent, HeadDeclarationStore>();
 
   /** Give an agent the recorded heads, and trace what moves its head. An
