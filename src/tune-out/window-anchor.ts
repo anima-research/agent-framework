@@ -56,6 +56,11 @@ export interface SubconsciousWindowAnchorHost {
    * `inForce`; false when it couldn't be kept.
    */
   fixed(epochIds: readonly string[], ordinal: number, inForce: boolean): boolean;
+  /**
+   * Keep `ordinal`, which the anchor was given and set, as the start in force
+   * (TuneOutCoordinator.subconsciousWindowInForce); false when it couldn't be kept.
+   */
+  inForce(ordinal: number): boolean;
   emitTrace(event: Omit<Extract<TraceEvent, { type: 'tune-out:subconscious-window' }>, 'timestamp' | 'traceId'>): void;
 }
 
@@ -68,8 +73,9 @@ export class SubconsciousWindowAnchor {
    * keeping the ordinal it was fixed at (`ordinal`) failed, which the next
    * presentation tries again. A start given its ordinal (`given`: kept, or
    * the one in force at a resume) while the window was the record waits to
-   * be set at it, as a set() while the window presents sets it, and nothing
-   * is kept for it.
+   * be set at it and kept as the start in force, as the coordinator keeps
+   * one when the window presents, with nothing fixed or kept for its
+   * tune-outs.
    */
   private pending: Array<{ start: SubconsciousWindowStart; ordinal?: number; given?: true; inForce: boolean }> = [];
 
@@ -156,6 +162,7 @@ export class SubconsciousWindowAnchor {
       const ordinal = entry.ordinal;
       if (entry.inForce) this.setInForce(strategy, ordinal, entry.start.epochIds);
       if (entry.given) {
+        if (entry.inForce && !this.host.inForce(ordinal)) continue;
         this.pending = this.pending.filter((p) => p !== entry);
         continue;
       }

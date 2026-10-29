@@ -16787,6 +16787,7 @@ export class AgentFramework {
         return sub && this.presentation ? this.presentation.owedOf(sub) : [];
       },
       fixed: (epochIds, ordinal, inForce) => this.tuneOutCoordinator?.subconsciousWindowFixed(epochIds, ordinal, inForce) ?? true,
+      inForce: (ordinal) => this.tuneOutCoordinator?.subconsciousWindowInForce(ordinal) ?? true,
       emitTrace: (event) => this.emitTrace(event),
     });
     // With its window presented, a resident's rounds go out to it as a

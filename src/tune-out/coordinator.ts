@@ -627,6 +627,18 @@ export class TuneOutCoordinator {
   }
 
   /**
+   * The framework set the subconscious's window start at `ordinal`, an
+   * ordinal it was given (a kept start's, or the start in force at a
+   * resume) and didn't fix: kept as the start in force while any tune-out
+   * is active, as the anchor's own write keeps it while the window presents
+   * (anchorSubconscious), and nothing kept for a tune-out. Answers whether
+   * it is kept, as subconsciousWindowFixed does.
+   */
+  subconsciousWindowInForce(ordinal: number): boolean {
+    return this.subconsciousWindowFixed([], ordinal, true);
+  }
+
+  /**
    * The framework fixed the subconscious's window start for `epochIds` at
    * `ordinal` (its index ordinal, #291): kept for each of them still active,
    * so a later anchor (another tune-out's enter, a restart) sets that
