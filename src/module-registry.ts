@@ -625,7 +625,8 @@ export class ModuleRegistry {
    * Tell modules an agent's tool batch completed (see
    * Module.onToolBatchComplete). Hooks run in parallel, each awaited up to
    * `timeoutMs`; a hook that throws or times out is logged and skipped, so a
-   * wedged module can't hold the round. Returns the modules that didn't
+   * wedged module can't hold the round. A module whose `stop()` completes
+   * before its hook is called isn't called. Returns the modules that didn't
    * finish, for the caller's trace.
    */
   async notifyToolBatchComplete(
@@ -643,10 +644,14 @@ export class ModuleRegistry {
         failures.push({ module: module.name, error: 'still running from an earlier batch' });
         continue;
       }
+      const registration = this.moduleContexts.get(module.name);
       // Called from a promise, so a hook that throws synchronously, before
       // returning its promise, is caught below like any other failure
       // instead of escaping the round (the result would never be provided).
-      const call = Promise.resolve().then(() => module.onToolBatchComplete!(agentName));
+      const call = Promise.resolve().then(() => {
+        if (this.moduleContexts.get(module.name) !== registration) return;
+        return module.onToolBatchComplete!(agentName);
+      });
       this.batchHooksRunning.set(module.name, call);
       const settled = (): void => {
         if (this.batchHooksRunning.get(module.name) === call) this.batchHooksRunning.delete(module.name);

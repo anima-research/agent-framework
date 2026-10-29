@@ -31,12 +31,12 @@
     logs one line naming the module and the method;
   - `findMessageByExternalId` answers without updating its mapping; reads
     answer, and fail, as before;
-  - its `onProcess` and `onAgentSpeech` aren't called again, and a response
-    of its that hadn't been applied is dropped whole, with a line naming
-    what it asked for if it asked for anything. A push it made while
-    registered still runs, since a push is its message to the others, made
-    while it was there, whereas applying a response would act on its behalf
-    after it's gone;
+  - its `onProcess`, `onAgentSpeech` and `onToolBatchComplete` aren't called
+    again, and a response of its that hadn't been applied is dropped whole,
+    with a line naming what it asked for if it asked for anything. A push it
+    made while registered still runs, since a push is its message to the
+    others, made while it was there, whereas applying a response would act on
+    its behalf after it's gone;
   - its `gatherContext` answer is left out of a turn whose answers the
     registry hadn't merged when its `stop()` completed, with a line if it
     held injections; a stop that completes after the merge leaves that

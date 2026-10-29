@@ -600,3 +600,29 @@ test("a module added under a stopped module's name has its onToolBatchComplete c
   assert.deepEqual(await registry.notifyToolBatchComplete('assistant', 20), []);
   assert.deepEqual(called, ['stopped', 'later']);
 });
+
+test("a module whose stop() completes after a tool batch's hooks have begun isn't called for that batch", async (t) => {
+  const { registry } = bareRegistry(t);
+  const called: string[] = [];
+  let stopCalled = false;
+  let release!: () => void;
+  const stopped = new Promise<void>((resolve) => { release = resolve; });
+  await registry.addModule({
+    name: 'gone',
+    async start() {},
+    stop() { stopCalled = true; return stopped; },
+    async onProcess() { return {}; },
+    getTools: () => [],
+    async handleToolCall() { return { success: true }; },
+    async onToolBatchComplete() { called.push('gone'); },
+  });
+  const removing = registry.removeModule('gone');
+  await waitFor('stop() to be called', () => stopCalled);
+  let notifying!: Promise<Array<{ module: string; error: string }>>;
+  void stopped.then(() => { notifying = registry.notifyToolBatchComplete('assistant', 20); });
+  release();
+  await removing;
+  assert.deepEqual(await notifying, []);
+  assert.equal(registry.getModule('gone'), null);
+  assert.deepEqual(called, []);
+});
