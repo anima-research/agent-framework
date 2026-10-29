@@ -12,6 +12,7 @@
  * - Expose synthesized tools: channel_list, channel_open, channel_close, channel_publish
  * - Build channel context for beforeInference params
  */
+import { attachAdmission, type AdmittedEnvelope, type RequiredIngress } from './inbound-admission.js';
 
 import { NOTICE_TAG } from '../notice-tags.js';
 import type { ContentBlock } from '@animalabs/membrane';
@@ -1852,6 +1853,7 @@ export class ChannelRegistry {
     serverId: string,
     params: ChannelsIncomingParams,
     responder?: Responder,
+    admission?: RequiredIngress,
   ): Promise<void> {
     const results: ChannelIncomingMessageResult[] = [];
     // Set when a coalesced message was admitted but its acknowledgement
@@ -1923,6 +1925,21 @@ export class ChannelRegistry {
           reason: `unknown channel "${message.channelId}" — register it first (§14.5)`,
         });
         continue;
+      }
+
+      let envelope: AdmittedEnvelope | undefined;
+      if (admission) {
+        const before = admission.check();
+        if (before) { results.push({ messageId: message.messageId, accepted: false, reason: before }); continue; }
+        const entry = this.channels.get(incomingKey)!;
+        const target = entry.descriptor;
+        const verdict = await admission.admit('channels/incoming', message);
+        const reason = admission.check() ?? (this.channels.get(incomingKey) !== entry || entry.descriptor !== target ? 'admission_stale' : undefined);
+        if (reason || !verdict.store) {
+          results.push({ messageId: message.messageId, accepted: false, reason: reason ?? (!verdict.store ? verdict.reason : 'admission_stale') });
+          continue;
+        }
+        envelope = Object.freeze({ connection: admission.key, mayWake: verdict.mayWake, ...(Object.hasOwn(verdict, 'replyIntent') ? { replyIntent: verdict.replyIntent } : {}) });
       }
 
       // ACCEPTED from here down: semantic processing only for admitted
@@ -2013,8 +2030,8 @@ export class ChannelRegistry {
       if (!coalesced) markAccepted();
 
       // The server-level veto only; the wake gate runs at admission.
-      let triggerInference = true;
-      if (this.shouldTriggerInference) {
+      let triggerInference = envelope?.mayWake !== false;
+      if (triggerInference && this.shouldTriggerInference) {
         // The text the agent's context gets, as the push lane's filter reads
         // it: the converted text blocks, a placeholder or reference stub
         // among them, NON_STRING_TEXT_PLACEHOLDER included.
@@ -2052,6 +2069,8 @@ export class ChannelRegistry {
         triggerInference,
         acceptedAt: Date.now(),
       };
+
+      if (envelope) attachAdmission(event, envelope);
 
       if (coalesced) {
         // RFC-006 §14.3: a coalesced message is admitted like any other and
