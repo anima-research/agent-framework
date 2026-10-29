@@ -4712,7 +4712,7 @@ export class AgentFramework {
       registry: framework.registry,
       turnAlive: (name) => {
         const agent = framework.agents.get(name);
-        return !!agent && (framework.hasTurn(name) || framework.turnAlive(agent));
+        return !!agent && framework.logicalTurnAlive(agent);
       },
       frozen: () => framework.quiesced || framework.surgeryHold !== null,
       emitTrace: (event) => framework.emitTrace(event),
@@ -14574,7 +14574,7 @@ export class AgentFramework {
     // A turn alive (its start, its stream, its tools, a continuation or a
     // provider hold's retry on its way) holds the window: its next rows
     // would land on what the undo took out.
-    if (this.hasTurn(agentName) || this.turnAlive(agent)) {
+    if (this.logicalTurnAlive(agent)) {
       throw new OperatorActionError('agent-busy', `Cannot undo: a turn of ${agentName}'s is alive`);
     }
     const checkpoints = this.getTurnCheckpoints(agentName);
@@ -14857,7 +14857,7 @@ export class AgentFramework {
     if (!this.presents(agent)) {
       throw new OperatorActionError('failed', `Cannot redo: ${agentName}'s undo was on its window, which isn't presented now`);
     }
-    if (this.hasTurn(agentName) || this.turnAlive(agent)) {
+    if (this.logicalTurnAlive(agent)) {
       throw new OperatorActionError('agent-busy', `Cannot redo: a turn of ${agentName}'s is alive`);
     }
     const result = this.redoOnWindow(agent, top, redoStack.slice(0, -1), requester);
@@ -17935,7 +17935,7 @@ export class AgentFramework {
         // A fork's channel messages are stored straight into its store; a
         // clock goes ahead of one only while the fork has no turn alive
         // (storeDueClock).
-        if (!this.turnAlive(target) && takesClockBefore('user', event.content, metadata, target.name)) {
+        if (!this.logicalTurnAlive(target) && takesClockBefore('user', event.content, metadata, target.name)) {
           this.storeDueClock(target, 'event');
         }
         // The stored copy carries the author as the fork reads them (presentAuthor), and its digest is of that copy.
@@ -18130,7 +18130,7 @@ export class AgentFramework {
     messageMetadata.triggered = trigger;
 
     // As for a correction above: a clock ahead only while no turn is alive.
-    if (!this.turnAlive(agent) && takesClockBefore('user', event.content, messageMetadata, agent.name)) {
+    if (!this.logicalTurnAlive(agent) && takesClockBefore('user', event.content, messageMetadata, agent.name)) {
       this.storeDueClock(agent, 'event');
     }
     const placement = this.writeToFork(agent, event.content, AgentFramework.withStoredDigest(messageMetadata, event.content));
@@ -18562,7 +18562,7 @@ export class AgentFramework {
       // of that turn's window (present false) and enters it at the turn's
       // end, before the closing turn starts. So it does while the host is
       // quiesced.
-      const present = !this.hasTurn(agent.name) && !this.turnAlive(agent) && !this.quiesced;
+      const present = !this.logicalTurnAlive(agent) && !this.quiesced;
       storeOwnRow(
         agent,
         'user',
@@ -21896,6 +21896,19 @@ export class AgentFramework {
     return routing.engaged.has(destinationKey(channel)) ? channel : undefined;
   }
 
+  /**
+   * Whether `agent`'s logical turn is alive: a turn token, or a continuation
+   * of its turn or a retry on its way (hasTurn: a budget restart's queued
+   * continuation, a provider hold's retry), or a live stream or a tool cycle
+   * pending (turnAlive). The one test the presentation index (its host's
+   * turnAlive) and the writes that weigh a turn share: a write stored then
+   * is marked not presented (addMessage) and takes no clock row ahead of it,
+   * and no undo or redo is made.
+   */
+  private logicalTurnAlive(agent: Agent): boolean {
+    return this.hasTurn(agent.name) || this.turnAlive(agent);
+  }
+
   /** Whether `agent` has a turn alive: starting, streaming or waiting on its tools. */
   private turnAlive(agent: Agent): boolean {
     return this.activeTurnTokens.has(agent.name)
@@ -22061,7 +22074,7 @@ export class AgentFramework {
         let id: MessageId;
         if (write.direct) {
           const target = this.agents.get(write.direct.agentName)!;
-          if (!this.turnAlive(target) && takesClockBefore(write.participant, write.content, write.metadata, target.name)) {
+          if (!this.logicalTurnAlive(target) && takesClockBefore(write.participant, write.content, write.metadata, target.name)) {
             this.storeDueClock(target, 'event');
           }
           id = this.storeInFork(target, write.content, write.metadata ?? {});
@@ -30363,24 +30376,26 @@ export class AgentFramework {
 
     // Where the write would once have waited for its agent's turn, and now
     // stays out of that agent's window until its next point: while the host
-    // is quiesced, a tool cycle of the agent's is mid-flight, or a turn of
-    // the agent's is alive at all (from dequeue through hooks and compile:
-    // the 2026-07-31 Mythos incident was a write landing inside that compile
-    // window), but for a fresh tool_result (a draining turn's continuation
-    // depends on it) and a write while the agent's start is assembling,
-    // which that start presents before its compile.
+    // is quiesced, or a logical turn of the agent's is alive at all
+    // (logicalTurnAlive: from dequeue through hooks and compile, the
+    // 2026-07-31 Mythos incident being a write landing inside that compile
+    // window; a tool cycle mid-flight; and a continuation or a held retry on
+    // its way, between a budget restart's release of its token and the next
+    // round), as the presentation index reads it, but for a fresh tool_result
+    // (a draining turn's continuation depends on it) and a write while the
+    // agent's start is assembling, which that start presents before its
+    // compile.
     const freshToolResult = content.some(b => b.type === 'tool_result');
-    const midTurn = !freshToolResult && !this.assembling.has(agent.name) &&
-      (this.quiesced || this.pendingAssistantBlocks.has(agent.name)
-        || this.activeTurnTokens.has(agent.name) || this.activeStreams.has(agent.name));
-    // A clock row due goes first (storeDueClock), when no turn of the agent's
-    // is alive or its turn is assembling before its compile: the clock is in
-    // whatever request comes next. A write stored while a turn of the agent's
-    // is alive takes none, as a fork's channel message doesn't: the clock
-    // would sit inside that turn. Its tool boundary or its next start takes
-    // the clock due.
+    const turnLive = this.logicalTurnAlive(agent);
+    const midTurn = !freshToolResult && !this.assembling.has(agent.name) && (this.quiesced || turnLive);
+    // A clock row due goes first (storeDueClock), when no logical turn of the
+    // agent's is alive or its turn is assembling before its compile: the
+    // clock is in whatever request comes next. A write stored while a turn of
+    // the agent's is alive, its continuation's gap included, takes none, as a
+    // fork's channel message doesn't: the clock would sit inside that turn.
+    // Its tool boundary or its next start takes the clock due.
     if (takesClockBefore(participant, content, metadata, agent.name)
-      && (!this.turnAlive(agent) || this.assembling.has(agent.name))) {
+      && (!turnLive || this.assembling.has(agent.name))) {
       this.storeDueClock(agent, 'event');
     }
     let stored: MessageId;

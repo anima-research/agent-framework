@@ -15,8 +15,8 @@
   written (a snapshot after the write failing) leaves the window presented rather than the agent in legacy mode.
   Two residents of one slot whose turns overlap each keep a window that is what their requests carried, so each
   request starts with the one before it and their rounds' signed thinking is sent again. A wake for a row stored where it would have been queued reads
-  that row (`WritePlacement.presented` false); a write stored during a turn takes no clock row, which the turn's
-  boundary or next start takes; each resident a batched wake is for writes its own line, at its own start; and
+  that row (`WritePlacement.presented` false); a write stored during a turn, the gap before a budget restart's
+  continuation or a held retry included, takes no clock row, which the turn's boundary or next start takes; each resident a batched wake is for writes its own line, at its own start; and
   another reader's live turn no longer holds back an agent's clock rows, `[continue]` rows or stored injections.
 - `undoLastTurn` and `redo` work on the agent's window (decision 4; the breaking entry says what that changes): the
   result's `window` field (`{ retracted, represented }`) says how many rows left or entered it, and a

@@ -134,6 +134,28 @@ describe('presentation points (#291)', () => {
     assert.deepEqual(h.traces.filter((e) => e.type === 'presentation:hand-off-mismatch'), [], 'the boundary handed its stream the rows its window took');
   });
 
+  // AF-A-3: between a budget restart's release of its turn token and the
+  // continuation's next round, the index counts the turn alive (hasTurn), and
+  // so does addMessage now: the write takes no clock and is placed as not
+  // presented, where it took a clock presented mid-turn ahead of a write that
+  // waited for the turn's end.
+  it("a write in a continuation's gap (a budget restart queued, no token held) is stored out of the window with no clock, placed as not presented", async () => {
+    const h = await boot({ clock: true });
+    // Not started, so the queue isn't drained: a budget restart's continuation, as driveStream queues it.
+    h.internals.pendingRequests.push({ agentName: 'mira', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now() });
+    assert.equal(h.internals.activeTurnTokens.has('mira'), false, 'setup: no token held');
+    const clocks = () => h.cm('mira').getAllMessages().filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'clock').length;
+    const clocksBefore = clocks();
+    const placement: Placement = {};
+    const id = h.internals.addMessage('alice', [text('a message during the restart')], undefined, { forAgent: 'mira', placement });
+    assert.equal(clocks(), clocksBefore, 'no clock row: it would sit inside the turn its continuation goes on with');
+    assert.equal(h.cm('mira').windowStatusOf(id), 'out', 'out of her window');
+    assert.deepEqual(placement, { agent: 'mira', messageId: id, presented: false });
+    h.internals.pendingRequests.length = 0;
+    h.internals.presentAtEndOf(h.agent('mira'));
+    assert.equal(h.inWindow('mira', 'a message during the restart'), true, "the turn's end presents it");
+  });
+
   // A boundary that threw into its handler left the stream unresumed, and
   // the turn hung: the timeout fails it fast.
   it("a tool boundary whose read of the record throws hears nothing, and the turn goes on to its answer; the row waits for the turn's end", { timeout: 60_000 }, async () => {
