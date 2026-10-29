@@ -7863,7 +7863,9 @@ export class AgentFramework {
    *  A uri the result calls expired is fetched in no mode: by its blocks, or
    *  by `claims` where given, those of everything a script's view of it
    *  shows (scriptViewClaims), nested fields included, as the module
-   *  route's demand fetch reads them (Ada-1017, room-203 #201013). */
+   *  route's demand fetch reads them (Ada-1017, room-203 #201013). Nor is a
+   *  reference a `never` marked (payloadNever), and a result whose blocks
+   *  can't be read for a nested `never` is fetched from in no mode at all. */
   private async autoFetchReferences(content: unknown, serverId: string, mode: 'register' | 'model' | 'script', claims?: ResultClaims): Promise<void> {
     if (!Array.isArray(content)) return;
     // Register every block first, then judge each uri once, by its latest

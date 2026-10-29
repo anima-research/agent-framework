@@ -963,16 +963,18 @@ export interface StubOptions {
  * testimonies read as one (UriClaims): the strictest claim wins, so a uri any
  * of them marks `disposition: never` is withheld, and one any of them gives
  * an expiry that counts is expired (claimedExpiry), whatever the order of the
- * blocks and whatever the registry evicted while it was read (Ada-1017's
- * call). A decision about a record reads its result's claims where the
- * result's references name its uri, a plain one included, and otherwise the
+ * blocks and whatever the registry evicted while it was read. A decision
+ * about a record reads its result's claims where the result's references
+ * name its uri, a plain one included, and otherwise the
  * record's own testimony, from an earlier result. A reference naming the uri
  * is that result's word on it, the latest, as the registry keeps it
  * (register() replaces a record's testimony with it until the record is
- * fetched), so an earlier result's `never` or expiry gives way to it
- * (Ada-1017's call). A link claims no disposition or expiry, so it adds
- * nothing here, and a result that names a uri only in links leaves its
- * record's testimony in force.
+ * fetched), so an earlier result's expiry gives way to it. A `never` doesn't:
+ * it marks the uri's record (payloadNever) for as long as the record lives,
+ * and the stub, the fetcher and a script's object read that mark first. A
+ * link claims no disposition or expiry, so it adds nothing here, and a
+ * result that names a uri only in links leaves its record's testimony in
+ * force.
  */
 export type ResultClaims = ReadonlyMap<string, UriClaims>;
 
@@ -1121,7 +1123,8 @@ export function claimedExpiry(record: ReferenceRecord, claims: ResultClaims | un
  * as userinfo. A `disposition: "never"` for the uri keeps it out whatever
  * the link says: any reference's in the same result (claims), for this uri
  * or one shown as the same text, or, where no reference in the result names
- * the uri, the record's.
+ * the uri, the record's; and a `never` that marked the record
+ * (payloadNever), whatever the result's references say.
  */
 export function shownLinkUri(t: ReferenceTestimony, record: ReferenceRecord, nowMs = Date.now(), claims?: ResultClaims): string | null {
   if (!t.fromLink || record.payloadNever || claimedNever(record, claims)) return null;
