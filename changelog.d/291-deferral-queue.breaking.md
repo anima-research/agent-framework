@@ -7,7 +7,11 @@
   arrival order (if the agent ends first, those the primary takes in its place, a module's write for a run or a fork,
   a failed reply's notice or a channel notice it could act on, go on to it, and the rest are dropped, logged). A
   crash during the surgery, or before the recovery, loses such a write; earlier releases kept a quiesced host's queue
-  on disk, and a surgery's deferred writes with it. A tune-out's cancel asked for meanwhile (its end time passing, a
+  on disk, and a surgery's deferred writes with it. So does a release whose store throws for one, its row not
+  landing: the writes after it go on, and the release logs the loss and raises an `ops:alert` of kind
+  `store-held-lost` for the agent, with the counts and kinds as at a stop, where earlier releases kept such a write
+  queued for the next drain. One whose row landed though its store threw counts as stored.
+  A tune-out's cancel asked for meanwhile (its end time passing, a
   wake past its budget, a tool's or a host's cancel) waits, the tune-out in force, until the writes are stored, then
   runs, so its release is never kept in memory behind an end already on disk; `cancel()` and `cancelAllExcept()`
   answer `{ ok: true, deferred: true }` then. A crash before that leaves the tune-out in force for the next boot,

@@ -1801,6 +1801,20 @@ interface TurnCheckpoint {
   windowBranch?: string;
 }
 
+/** What a report of writes kept in memory says of them: how many of each kind (`metadata.kind`, else `message`), how many are mail, and the sentences that say so. */
+function heldWritesTold(writes: readonly SurgeryHeldWrite[]): { kinds: Record<string, number>; mail: number; told: string } {
+  const kinds: Record<string, number> = {};
+  for (const write of writes) {
+    const kind = (write.metadata as { kind?: unknown } | undefined)?.kind;
+    const name = typeof kind === 'string' ? kind : 'message';
+    kinds[name] = (kinds[name] ?? 0) + 1;
+  }
+  const mail = writes.filter((write) => typeof (write.metadata as { dendrite?: { mailId?: unknown } } | undefined)?.dendrite?.mailId === 'string').length;
+  const told = 'Kinds: ' + Object.entries(kinds).map(([kind, count]) => `${count} ${kind}`).join(', ') + '.' +
+    (mail > 0 ? ` The mail among them (${mail}) stays held in the registry, and the next boot delivers it.` : '');
+  return { kinds, mail, told };
+}
+
 /** Whether two checkpoints are one turn's: a redo puts its undo's back only where an undo cut short didn't leave it in place. */
 function sameCheckpoint(a: TurnCheckpoint, b: TurnCheckpoint): boolean {
   return a.agentName === b.agentName && a.turnIndex === b.turnIndex && a.sequenceBefore === b.sequenceBefore
@@ -15228,13 +15242,7 @@ export class AgentFramework {
     for (const [agentName, { recovery, hold }] of kept) {
       const writes = [...recovery, ...hold];
       if (writes.length === 0) continue;
-      const kinds: Record<string, number> = {};
-      for (const write of writes) {
-        const kind = (write.metadata as { kind?: unknown } | undefined)?.kind;
-        const name = typeof kind === 'string' ? kind : 'message';
-        kinds[name] = (kinds[name] ?? 0) + 1;
-      }
-      const mail = writes.filter((write) => typeof (write.metadata as { dendrite?: { mailId?: unknown } } | undefined)?.dendrite?.mailId === 'string').length;
+      const { kinds, mail, told } = heldWritesTold(writes);
       const parts = [
         ...(recovery.length > 0
           ? [`${recovery.length} kept while its context manager refuses its work, which are lost: no switchBranch() re-initializes it after a stop`]
@@ -15244,14 +15252,32 @@ export class AgentFramework {
           : []),
       ];
       const message = `${writes.length === 1 ? '1 write' : `${writes.length} writes`} for ${agentName} kept in memory ` +
-        `${writes.length === 1 ? 'is' : 'are'} not stored by this stop (${parts.join('; ')}). Kinds: ` +
-        Object.entries(kinds).map(([kind, count]) => `${count} ${kind}`).join(', ') + '.' +
-        (mail > 0 ? ` The mail among them (${mail}) stays held in the registry, and the next boot delivers it.` : '');
+        `${writes.length === 1 ? 'is' : 'are'} not stored by this stop (${parts.join('; ')}). ${told}`;
       console.error(`[stop] agent=${agentName}: ${message}`);
       this.opsAlert('store-held-lost', agentName, message, {
         data: { count: writes.length, keptForRecovery: recovery.length, heldBySurgery: hold.length, kinds, mail },
       });
     }
+  }
+
+  /**
+   * The writes for `agentName` a surgery's release couldn't store (their
+   * store threw, and no row of theirs landed, or the store couldn't be read
+   * back to tell), told of once: a log line and an ops alert of kind
+   * `store-held-lost`. Each was accepted with no id, kept in memory until
+   * the release, and is lost; the writes after it went on.
+   */
+  private tellHeldWritesLost(agentName: string, writes: readonly SurgeryHeldWrite[], unknown: number, reason: string): void {
+    const { kinds, mail, told } = heldWritesTold(writes);
+    const one = writes.length === 1;
+    const message = `${one ? '1 write' : `${writes.length} writes`} for ${agentName}, accepted and kept in memory until a ` +
+      `surgery's release, ${one ? 'was' : 'were'} not stored: storing ${one ? 'it' : 'them'} there threw (${one ? '' : 'the first: '}${reason})` +
+      (unknown > 0 ? `, and the store couldn't be read back to tell whether ${unknown === writes.length ? (one ? 'it' : 'they') : `${unknown} of them`} landed` : '') +
+      `. ${one ? 'It is' : 'They are'} lost, and the writes after ${one ? 'it' : 'them'} went on. ${told}`;
+    console.error(`[surgery] agent=${agentName}: ${message}`);
+    this.opsAlert('store-held-lost', agentName, message, {
+      data: { count: writes.length, keptForRecovery: 0, heldBySurgery: writes.length, kinds, mail },
+    });
   }
 
   /** How many writes wait in memory for an agent's recovery (heldForRecovery), every agent's. */
@@ -22211,13 +22237,19 @@ export class AgentFramework {
    * and is traced when a later move stores it. A write for an agent gone
    * since goes on to the primary if it is one the primary takes in its
    * place, and is dropped otherwise (passHeldWritesOn), logged. A write that
-   * throws now is logged, and the rest go on.
+   * throws now is logged, and the rest go on: one whose row landed counts as
+   * stored, traced with the landed id; one whose row didn't, or whose store
+   * can't be read back to tell, is lost, and each agent's lost writes are
+   * told of once, by a log line and an ops alert of kind `store-held-lost`.
    */
   private releaseSurgeryHeldWrites(): void {
     // Read defensively: a framework built from its prototype, as some
     // suites build one, holds none.
     const held = this.surgeryHeldWrites?.splice(0) ?? [];
+    const lost = new Map<string, { writes: SurgeryHeldWrite[]; unknown: number; reason: string }>();
     for (const write of held) {
+      const target = write.direct ? this.agents.get(write.direct.agentName) : this.deliveryAgent(write.opts?.forAgent);
+      const before = target ? this.storedCountOf(target) : undefined;
       try {
         const named = write.direct?.agentName ?? write.opts?.forAgent;
         if (named !== undefined && !this.agents.has(named)) {
@@ -22237,11 +22269,25 @@ export class AgentFramework {
         if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'surgery-release' });
       } catch (error) {
         console.error(`[surgery] a write held while the store was held couldn't be stored at its release:`, error);
+        const landed = target && before !== undefined
+          ? this.storedSince(target, before, (m) => m.participant === nameAsStored(write.participant) && clockStampOf(m.metadata) === undefined,
+            'surgery', 'a held write')
+          : undefined;
+        if (landed && landed.length > 0) {
+          this.emitTrace({ type: 'message:added', messageId: landed[0]!.id, source: 'surgery-release' });
+          continue;
+        }
+        const agentName = target?.name ?? write.direct?.agentName ?? write.opts?.forAgent ?? 'the primary';
+        const entry = lost.get(agentName) ?? { writes: [], unknown: 0, reason: thrownText(error) };
+        entry.writes.push(write);
+        if (!landed) entry.unknown++;
+        lost.set(agentName, entry);
       }
     }
     if (held.length > 0) {
       console.error(`[surgery] ${held.length} write(s) held while the store was held were replayed in arrival order`);
     }
+    for (const [agentName, { writes, unknown, reason }] of lost) this.tellHeldWritesLost(agentName, writes, unknown, reason);
     // A tune-out's cancel asked for while the writes were held waited for
     // them (writesHeld): with them stored, its release is stored too, before
     // the epoch's end is recorded.

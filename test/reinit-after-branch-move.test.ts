@@ -162,8 +162,8 @@ describe('after a branch move, every agent on the store compiles without a resta
     await realTurn(framework, membrane, 'a', 'a turn to undo');
     assert.equal(framework.getUndoRedoState('a').undoDepth, 1, 'the turn recorded its checkpoint');
   };
-  const holdFor = (name: string, words: string): void => {
-    assert.equal(courier.addMessage('courier', text(words), undefined, { forAgent: name }), '', 'held by the hold, not stored');
+  const holdFor = (name: string, words: string, participant = 'courier'): void => {
+    assert.equal(courier.addMessage(participant, text(words), undefined, { forAgent: name }), '', 'held by the hold, not stored');
   };
   /** The managers whose strategy is set again from now on, by name. */
   const watchReinits = (): (() => string[]) => {
@@ -792,7 +792,7 @@ describe('after a branch move, every agent on the store compiles without a resta
     await works('b');
   });
 
-  it('a held write that throws at the release is logged, and the release still lets the store go', async () => {
+  it('a held write whose store throws at the release, its row not landing, is lost with one ops alert naming its agent and kind; the writes after it are stored, and the release still lets the store go', async () => {
     const logged: string[] = [];
     const quiet = console.error;
     console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
@@ -802,7 +802,11 @@ describe('after a branch move, every agent on the store compiles without a resta
       const pass = gatedSwitch('a');
       await pass.reached;
       holdFor('b', 'for b, during the hold');
-      cm.addMessage = () => { throw new Error('injected release write failure'); };
+      holdFor('b', 'for b, after it');
+      cm.addMessage = (...args: unknown[]) => {
+        if (JSON.stringify(args[1]).includes('during the hold')) throw new Error('injected release write failure');
+        return addMessage.apply(cm, args);
+      };
       pass.open();
       await pass.switched;
     } finally {
@@ -811,8 +815,44 @@ describe('after a branch move, every agent on the store compiles without a resta
     }
     assert.ok(logged.some((line) => line.includes("couldn't be stored at its release") && line.includes('injected release write failure')),
       logged.join('\n'));
+    assert.deepEqual(textsOfCm('b').filter((t) => t.startsWith('for b')), ['for b, after it'], 'the write after it is stored');
+    const lost = traces.filter((t): t is Extract<TraceEvent, { type: 'ops:alert' }> => t.type === 'ops:alert' && t.kind === 'store-held-lost');
+    assert.deepEqual(lost.map((alert) => [alert.agentName, alert.data]), [
+      ['b', { count: 1, keptForRecovery: 0, heldBySurgery: 1, kinds: { message: 1 }, mail: 0 }],
+    ]);
+    says(lost[0]!.message, '1 write for b, accepted and kept in memory', 'was not stored', 'injected release write failure',
+      'It is lost, and the writes after it went on.', 'Kinds: 1 message.');
     await framework.switchBranch(framework.getStore().currentBranch().name);
   });
+
+  for (const [whose, participant] of [['', 'courier'], [', from a writer whose name the store makes well formed,', 'courier\uD800']] as const) {
+  it(`a held write${whose} whose store throws at the release after its row landed counts as stored: traced once with its id, and no alert`, async () => {
+    const added = addedTraces();
+    const cm = cmOf('b') as unknown as { addMessage: (...args: unknown[]) => unknown };
+    const addMessage = cm.addMessage;
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      const pass = gatedSwitch('a');
+      await pass.reached;
+      holdFor('b', 'for b, during the hold', participant);
+      cm.addMessage = (...args: unknown[]) => {
+        const id = addMessage.apply(cm, args);
+        if (JSON.stringify(args[1]).includes('during the hold')) throw new Error('injected failure after the row landed');
+        return id;
+      };
+      pass.open();
+      await pass.switched;
+    } finally {
+      cm.addMessage = addMessage;
+      console.error = quiet;
+    }
+    const rows = cmOf('b').getAllMessages().filter((m) => JSON.stringify(m.content).includes('for b, during the hold'));
+    assert.equal(rows.length, 1, 'stored once');
+    assert.deepEqual(added.filter((a) => a.source === 'surgery-release'), [{ messageId: rows[0]!.id, source: 'surgery-release' }]);
+    assert.equal(traces.filter((t) => t.type === 'ops:alert' && t.kind === 'store-held-lost').length, 0, 'nothing is told as lost');
+  });
+  }
 
   it('a hold let go before its threshold says nothing after it', async () => {
     shortenHoldAlert(1_000);
