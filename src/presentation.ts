@@ -368,7 +368,8 @@ export interface PresentationHost {
   turnAlive(name: AgentName): boolean;
   /**
    * Whether others' rows are frozen out of every window: the host
-   * quiesced. Own rows still present. A surgery's hold isn't asked here: its
+   * quiesced, or booting until create()'s pass over the windows. Own rows
+   * still present. A surgery's hold isn't asked here: its
    * own refusals keep every point that reads this from being reached under
    * it (the framework's `frozen`, where the host is built).
    */

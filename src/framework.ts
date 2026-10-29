@@ -4853,7 +4853,8 @@ export class AgentFramework {
       // and presents each agent what it is owed (reserveStoreForSurgery).
       // At boot every window is frozen the same way (bootFreeze), until
       // create()'s pass over the windows: a module's write from its start()
-      // presents nothing before the boot reads which rows still owe a wake.
+      // presents no other agent's row before the boot reads which rows still
+      // owe a wake.
       frozen: () => framework.bootFreeze || framework.quiesced,
       emitTrace: (event) => framework.emitTrace(event),
     });
