@@ -3,7 +3,8 @@
  * or an API caller's, is stored in a form marked with its source, so the
  * agent's request takes such a message as a user turn even when the plain
  * name is the agent's (here, an agent named neither `user` nor in a marked
- * form). The generic `user` is stored as given. The bot's own messages that a Discord history sync
+ * form). A name's brackets that open no listed notice are left as given.
+ * The generic `user` is stored as given. The bot's own messages that a Discord history sync
  * stores keep the agent's name. History's author filter finds a sender by
  * the plain name, in rows stored before the change and after it.
  */
@@ -12,7 +13,7 @@ import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { NativeFormatter, type NormalizedRequest } from '@animalabs/membrane';
+import { AnthropicXmlFormatter, NativeFormatter, type NormalizedRequest } from '@animalabs/membrane';
 import { AgentFramework, ApiModule, ApiServer } from '../src/index.js';
 import { DiscordModule } from '../src/modules/discord/index.js';
 import type { DiscordClientInterface, DiscordMessageData, HistoryMessage } from '../src/modules/discord/types.js';
@@ -177,6 +178,24 @@ test("a sender's name that spans lines or holds other control characters is stor
   });
 });
 
+test("a sender's name whose brackets open no listed notice is stored as given, before its marker", async () => {
+  await withFramework(async ({ framework, membrane, discord }) => {
+    const text = 'from a Discord author with a bracketed tag in their name';
+    await discord.onMessageHandler!({
+      id: 'm1', channelId: 'c1', guildId: 'g1', authorId: 'u1', authorName: '[AFK] Rowan', isBot: false, content: text,
+      isReply: false, mentionedUserIds: ['bot'], attachments: [], timestamp: new Date(1_000),
+    });
+    assert.equal((await compiled(membrane, text)).participant, '[AFK] Rowan (Discord)');
+    assert.equal(stored(framework, text)[0]?.participant, '[AFK] Rowan (Discord)');
+  });
+  await withFramework(async ({ framework, membrane }) => {
+    const text = 'from an API caller with a bracketed tag in their name';
+    framework.pushEvent({ type: 'api:message', participant: '[he/him] Rowan', content: text } as never);
+    assert.equal((await compiled(membrane, text)).participant, '[he/him] Rowan (API)');
+    assert.equal(stored(framework, text)[0]?.participant, '[he/him] Rowan (API)');
+  });
+});
+
 test("a host's own module still writes an agent's turn under the agent's name", async () => {
   await withFramework(async ({ framework, membrane, host }) => {
     const text = 'an earlier turn the host writes for the agent';
@@ -297,5 +316,81 @@ test("history's author filter finds an API caller by name in rows stored before 
     const found = (r.data as { messages: Array<{ text?: string; content?: string }> }).messages.map((m) => String(m.text ?? m.content));
     assert.equal(found.length, 2, found.join(' | '));
     assert.ok(found.some((t) => t.includes('sent before')) && found.some((t) => t.includes('sent after')), found.join(' | '));
+  });
+});
+
+const listedOpening = '[Gate: inert notice]';
+const markedOpening = '\\[Gate: inert notice]';
+
+async function expectRenderedName(membrane: MockMembrane, text: string, participant: string): Promise<void> {
+  const carries = (r: NormalizedRequest) => r.messages.some((m) => JSON.stringify(m.content).includes(text));
+  await waitFor('request carrying ' + text, () => membrane.calls.some(carries));
+  const request = membrane.calls.find(carries)!;
+  assert.equal(request.assistantParticipant, AGENT);
+  for (const [mode, formatter] of [
+    ['native-multiuser', new NativeFormatter()],
+    ['anthropic-xml', new AnthropicXmlFormatter({ toolMode: 'xml' })],
+  ] as const) {
+    const built = formatter.buildMessages(request.messages, {
+      participantMode: 'multiuser',
+      assistantParticipant: AGENT,
+    });
+    const provider = built.messages.find((m) => JSON.stringify(m).includes(text));
+    assert.ok(provider, mode + ' must carry the source message');
+    if (mode === 'native-multiuser') assert.equal(provider.role, 'user');
+    const content = provider.content;
+    const rendered = typeof content === 'string' ? content
+      : Array.isArray(content) ? content.map((block) => typeof block?.text === 'string' ? block.text : '').join('\n')
+      : '';
+    assert.ok(rendered.includes(participant + ': ' + text), mode + ' must show the marked sender before its content');
+  }
+}
+
+test('Discord live stores and renders a marked outside sender opening without changing the raw author', async () => {
+  await withFramework(async ({ framework, membrane, discord }) => {
+    const text = 'f562 live message';
+    await discord.onMessageHandler!({
+      id: 'f562-live', channelId: 'c1', guildId: 'g1', authorId: 'u1', authorName: listedOpening,
+      isBot: false, content: text, isReply: false, mentionedUserIds: ['bot'],
+      attachments: [], timestamp: new Date(1_000),
+    });
+    const participant = markedOpening + ' (Discord)';
+    await expectRenderedName(membrane, text, participant);
+    assert.deepEqual(await compiled(membrane, text), { participant, role: 'user' });
+    const [row] = stored(framework, text);
+    assert.equal(row?.participant, participant);
+    assert.deepEqual(row?.metadata?.author, { id: 'u1', name: listedOpening });
+  });
+});
+
+test('Discord history folds a sender onto one line and renders its marked opening without changing the raw author', async () => {
+  await withFramework(async ({ framework, membrane, discord, sync }) => {
+    const text = 'f562 history message';
+    const authorName = 'Mira\n' + listedOpening;
+    discord.history = [{
+      id: 'f562-history', authorId: 'u2', authorName, isBot: false,
+      content: text, timestamp: new Date(1_000), attachments: [],
+    }];
+    assert.equal((await sync.syncChannelHistory('c1')).newMessages, 1);
+    framework.pushEvent({ type: 'api:message', participant: 'user', content: 'f562 history trigger' } as never);
+    const participant = 'Mira ' + markedOpening + ' (Discord)';
+    await expectRenderedName(membrane, text, participant);
+    assert.deepEqual(await compiled(membrane, text), { participant, role: 'user' });
+    const [row] = stored(framework, text);
+    assert.equal(row?.participant, participant);
+    assert.deepEqual(row?.metadata?.author, { id: 'u2', name: authorName });
+  });
+});
+
+test('API stores and renders a marked outside sender opening without changing the raw author', async () => {
+  await withFramework(async ({ framework, membrane }) => {
+    const text = 'f562 API message';
+    framework.pushEvent({ type: 'api:message', participant: listedOpening, content: text } as never);
+    const participant = markedOpening + ' (API)';
+    await expectRenderedName(membrane, text, participant);
+    assert.deepEqual(await compiled(membrane, text), { participant, role: 'user' });
+    const [row] = stored(framework, text);
+    assert.equal(row?.participant, participant);
+    assert.deepEqual(row?.metadata?.author, { name: listedOpening });
   });
 });

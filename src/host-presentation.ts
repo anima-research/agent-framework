@@ -29,7 +29,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { ToolDefinition } from './types/events.js';
-import { checkArgs, firstSentence, renderToolDefinition, signature } from './mcpl/tool-signature.js';
+import { checkArgs, renderToolDefinition, toolLine } from './mcpl/tool-signature.js';
 import { META_TOOL_NAMES } from './mcpl/toolset-host.js';
 
 /** The built-in toolset's name, as agents address it (`toolsets--open {toolset: "settings"}`). */
@@ -274,10 +274,7 @@ export class HostPresentation {
   private announce(label: string, tools: ToolDefinition[], closeHint: string): string {
     const lines = [`${label} open: call these with ${META_TOOL_NAMES.act} {tool, args}; they aren't in your tool list.`];
     if (!tools.length) lines.push('  (none right now)');
-    for (const t of tools) {
-      const sentence = firstSentence(t.description);
-      lines.push(`  ${signature(t)}${sentence ? ` — ${sentence}` : ''}`);
-    }
+    for (const t of tools) lines.push(toolLine(t));
     lines.push(`${closeHint} closes it.`);
     return lines.join('\n');
   }
@@ -318,7 +315,7 @@ export class HostPresentation {
       const open = this.isOpen(agentName, BUILTIN_TOOLSET);
       return [
         `${this.builtinLabel} ${open ? 'open' : 'closed'}${open ? '' : ` — ${META_TOOL_NAMES.open} {toolset:"${BUILTIN_TOOLSET}"} opens it`}`,
-        ...tools.map((t) => `  ${signature(t)}${firstSentence(t.description) ? ` — ${firstSentence(t.description)}` : ''}`),
+        ...tools.map((t) => toolLine(t)),
       ].join('\n');
     }
     const { serverId } = which;
@@ -329,7 +326,7 @@ export class HostPresentation {
     const head = mode === 'full'
       ? `${this.tabLabel(serverId)} in your tool list${tools.length ? `; its hidden tools (${open ? 'open' : 'closed'}):` : '.'}`
       : `${this.tabLabel(serverId)} a tab, connected, ${open ? 'open' : `hidden — ${META_TOOL_NAMES.open} {server:"${serverId}"} opens it`}:`;
-    return [head, ...tools.map((t) => `  ${signature(t)}${firstSentence(t.description) ? ` — ${firstSentence(t.description)}` : ''}`)].join('\n');
+    return [head, ...tools.map((t) => toolLine(t))].join('\n');
   }
 
   /** `toolsets--look {tool}` for a host toolset's tool, or null when no host toolset has it. */

@@ -21,21 +21,21 @@ concurrency:
 jobs:
   # Which macOS legs a run takes. macOS runners are what queue (the
   # organization gets few at once, shared by every repository), so a pull
-  # request takes the ones that test it: Build & Test's macOS leg at the
-  # engines floor only, and code_execution's Bun macOS legs only when it
-  # touches what they run: any source (the tests import the framework, not
-  # only code_execution), tsconfig.json, package.json, their own tests and
-  # helpers, or this workflow. ci-workflow-pins.test.ts checks every file
-  # those tests import falls inside the filter. The diff is base...head, as
-  # changelog.yml takes it, not the merge commit, which can carry main's
-  # newer commits. Pushes to main take every leg.
+  # request takes fewer: Install & start's macOS leg at the engines floor
+  # only, and code_execution's Bun macOS legs only when it touches what they
+  # run: any source (the tests import the framework, not only code_execution),
+  # tsconfig.json, package.json, their own tests and helpers, or this
+  # workflow. ci-workflow-pins.test.ts checks every file those tests import
+  # falls inside the filter. The diff is base...head, as changelog.yml takes
+  # it, not the merge commit, which can carry main's newer commits. Pushes to
+  # main take every leg.
   changes:
     name: What the change touches
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       bun-os: ${{ steps.decide.outputs.bun-os }}
-      build-exclude: ${{ steps.decide.outputs.build-exclude }}
+      start-exclude: ${{ steps.decide.outputs.start-exclude }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -52,10 +52,10 @@ jobs:
           both='["ubuntu-latest","macos-latest"]'
           if [ "$EVENT" != "pull_request" ]; then
             echo "bun-os=$both" >> "$GITHUB_OUTPUT"
-            echo 'build-exclude=[{"os":"macos-latest","node":24}]' >> "$GITHUB_OUTPUT"
+            echo 'start-exclude=[{"os":"ubuntu-latest","node":"22.12.0"}]' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo 'build-exclude=[{"os":"macos-latest","node":24},{"os":"macos-latest","node":"latest"}]' >> "$GITHUB_OUTPUT"
+          echo 'start-exclude=[{"os":"ubuntu-latest","node":"22.12.0"},{"os":"macos-latest","node":24},{"os":"macos-latest","node":"latest"}]' >> "$GITHUB_OUTPUT"
           changed=$(git diff --name-only "$BASE"..."$HEAD_SHA")
           echo "$changed"
           if echo "$changed" | grep -qE '^(src/|test/code-execution|test/helpers/|tsconfig\.json$|package\.json$|\.github/workflows/ci\.yml$)'; then
@@ -65,31 +65,13 @@ jobs:
           fi
 
   build-and-test:
-    name: Build & Test (${{ matrix.os }}, node ${{ matrix.node }})
-    needs: changes
-    runs-on: ${{ matrix.os }}
+    name: Build & Test (ubuntu-latest, node 22.12.0)
+    runs-on: ubuntu-latest
     # Without a limit, a step that hangs leaves the check pending until
     # GitHub's six-hour limit. Passing runs take under seven minutes. A
-    # test file stuck under Node 22.12, or a test stuck under Node 24, fails
-    # sooner and by name, through npm test's --test-timeout.
+    # test file stuck under Node 22.12 fails sooner and by name, through npm
+    # test's --test-timeout.
     timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      # Both platforms: a package-lock.json regenerated over an existing
-      # node_modules tree records only that machine's native binaries, so a
-      # lock made on macOS breaks Linux installs and vice versa. Each runner
-      # catches the lock the other's platform produced. Tests run on ubuntu.
-      # Node: the engines floor, pinned exactly; the newest Node the range
-      # admits; and, between them, every maintained major line (24), as
-      # membrane and context-manager test theirs. stdio flushing semantics
-      # around process exit differ between versions and platforms. macOS runs
-      # the two ends on a push to main, and the floor alone on a pull request
-      # (`changes`): its runners queue, and the ends rarely part on one
-      # platform without the other's ubuntu leg showing it.
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        node: ['22.12.0', 24, latest]
-        exclude: ${{ fromJSON(needs.changes.outputs.build-exclude) }}
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -99,7 +81,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          node-version: ${{ matrix.node }}
+          node-version: '22.12.0'
 
       # Root lockfiles are deliberately gitignored in this repo, so plain
       # npm install, as publish.yml's build-and-test job does. No lock to
@@ -113,16 +95,10 @@ jobs:
       - name: Build
         run: npm run build
 
-      # Tests run on both platforms: process/stdio behaviour differs (pipes
-      # are asynchronous on macOS), and ubuntu-only runs have missed that.
-      #
       # As many test files at once as the runner has cores, said here rather
-      # than left to Node's default of one fewer. macOS runners come with 3
-      # cores or 5, and on 3 the default ran two files at once: 582 s, where
-      # a 5-core runner took 290 s for the same tests. At the core count,
-      # those took 444 s and 236 s, and ubuntu's 4-core runs went from about
-      # 380 s to 300 s. Most files wait on timers and child processes, not
-      # the CPU.
+      # than left to Node's default of one fewer: ubuntu's 4-core runs went
+      # from about 380 s to 300 s. Most files wait on timers and child
+      # processes, not the CPU.
       - name: Test
         run: |
           AF_TEST_CONCURRENCY=$(node -p "require('node:os').cpus().length")
@@ -135,7 +111,7 @@ jobs:
       # closed"). These files run unforced so that class fails here, not in a
       # later PR's qualification. They get npm test's --test-timeout too:
       # under Node 22.12 it fails a file whose leftover work keeps it alive, by
-      # name, and under Node 24 the job's limit ends such a file.
+      # name.
       - name: Test unforced (work in flight at stop)
         run: node --test --test-timeout=600000 dist/test/stop-with-work-in-flight.test.js dist/test/stop-with-host-operations.test.js dist/test/conversation-routing.test.js
 
@@ -149,6 +125,37 @@ jobs:
         run: |
           found=$(find . -name 'report.*.json' -not -path './node_modules/*')
           if [ -n "$found" ]; then echo "Node diagnostic reports were written (they list the environment):"; echo "$found"; exit 1; fi
+
+  install-and-start:
+    name: Install & start (${{ matrix.os }}, node ${{ matrix.node }})
+    needs: changes
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: ['22.12.0', 24, latest]
+        exclude: ${{ fromJSON(needs.changes.outputs.start-exclude) }}
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build
+        run: npm run build
+
+      - name: Packed release installs on its own
+        run: node scripts/pack-installs-alone.mjs
 
   # The release as npm would pack it, installed on its own and loaded, as
   # the publish workflow checks before it publishes (see

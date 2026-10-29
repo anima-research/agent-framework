@@ -2298,7 +2298,7 @@ describe('queued context maintenance timer', () => {
       }
     });
 
-    it("a regular pass's tick held across a start(): no second pass starts beside it, and a later stop(t) waits for it again", { timeout: 20_000 }, async () => {
+    it("a regular pass's tick held past a stop(t)'s budget: a later stop(t) waits for it again", { timeout: 20_000 }, async () => {
       // start() runs the first pass at once; the interval never fires here.
       const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-pass-stop-budget-'));
       const strategy = new GatedTickStrategy();
@@ -2318,9 +2318,6 @@ describe('queued context maintenance timer', () => {
         await waitFor(() => strategy.ticks === 1);
         const outcome = await stopWithin(framework, 100);
         assert.ok(maintenancePending(outcome), String(outcome));
-        framework.start();
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        assert.equal(strategy.ticks, 1, 'no pass started beside the held one');
         const again = await stopWithin(framework, 100);
         assert.ok(maintenancePending(again), `a later stop() waits for the pass still held: ${String(again)}`);
         assert.equal(framework.getStore().isClosed(), false, 'the tick is still held');

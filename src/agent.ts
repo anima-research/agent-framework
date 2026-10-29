@@ -2,6 +2,7 @@ import { NOTICE_TAG } from './notice-tags.js';
 import { heartbeatToolAlias } from './heartbeat/heartbeat.js';
 import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, ThinkingBindingEntry, YieldingStream } from '@animalabs/membrane';
 import { isAbortedResponse } from '@animalabs/membrane';
+import { streamBounds, type InferenceBounds } from './inference-bounds.js';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
 import { storeOwnRow } from './dendrite/audience.js';
@@ -53,6 +54,9 @@ export interface ActivationRequestOptions {
    *  pass it (its errorPolicy is their retry layer); a direct caller of
    *  startStream keeps membrane's retries. */
   membraneRetries?: boolean;
+  /** The framework's inferenceBounds, resolved: the stream gets their phase
+   *  bounds and flat bound. None when left out. */
+  inferenceBounds?: InferenceBounds | null;
 }
 
 /** A compile's render stats, as context-manager's `getRenderStats()` types
@@ -166,6 +170,23 @@ const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
 const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
 
+export function assertThinkingBinding(setting: string, value: AgentConfig['thinkingBinding']): void {
+  if (holdsSettings(setting, value, '{ binds: true, dropBlock: true }')) {
+    assertBooleanSetting(
+      `${setting}.dropBlock`,
+      value.dropBlock,
+      'true asks the provider to drop a signed thinking block whose earlier conversation changed rather than refuse the request, ' +
+        'and false or leaving it out sends nothing, so the account\'s default applies',
+    );
+    assertBooleanSetting(
+      `${setting}.binds`,
+      value.binds,
+      'true says the model binds its signed thinking to the conversation before it, so each compile tells the context manager so, ' +
+        'and false or leaving it out compiles as before',
+    );
+  }
+}
+
 /**
  * Refuse an agent config whose `promptCaching`, `toolResultGuard`,
  * `toolWrapperProseGuard`, `thinking.enabled`, `thinkingBinding.dropBlock`,
@@ -193,20 +214,7 @@ export function assertAgentSwitches(config: AgentConfig): void {
       'true asks the provider for extended thinking, and false or leaving it out doesn\'t',
     );
   }
-  if (holdsSettings(`${agent} thinkingBinding`, config.thinkingBinding, '{ binds: true, dropBlock: true }')) {
-    assertBooleanSetting(
-      `${agent} thinkingBinding.dropBlock`,
-      config.thinkingBinding.dropBlock,
-      'true asks the provider to drop a signed thinking block whose earlier conversation changed rather than refuse the request, ' +
-        'and false or leaving it out sends nothing, so the account\'s default applies',
-    );
-    assertBooleanSetting(
-      `${agent} thinkingBinding.binds`,
-      config.thinkingBinding.binds,
-      'true says the model binds its signed thinking to the conversation before it, so each compile tells the context manager so, ' +
-        'and false or leaving it out compiles as before',
-    );
-  }
+  assertThinkingBinding(`${agent} thinkingBinding`, config.thinkingBinding);
   if (holdsSettings(`${agent} refusalHandling`, config.refusalHandling, '{ autoRewind: true }')) {
     assertBooleanSetting(
       `${agent} refusalHandling.autoRewind`,
@@ -2349,6 +2357,7 @@ export class Agent {
       // since membrane 0.7 its own schedules, ten minutes at a 529, would
       // otherwise run inside each of the caller's attempts, out of its sight.
       ...(options.membraneRetries === false ? { retry: false } : {}),
+      ...streamBounds(options.inferenceBounds ?? null, request.config.maxTokens),
       // Retry a content-policy refusal at the provider seam rather than at
       // the framework level: membrane replays the SAME request immediately
       // (cache-warm), where a framework-level requeue would recompile and

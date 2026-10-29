@@ -2456,7 +2456,7 @@ const SETTLED_AS_IT_LEFT = ['staged', 'linked', 'withheld', 'annotated', 'stub_u
 // gone with it. Pinned for a failure whose stream ends only after the run's
 // caller has deregistered the agent, in both shapes, and for a run the
 // completion watchdog ends while its stream says nothing.
-for (const how of ['an uncaused error', 'an abort whose reason is timeout', 'the completion watchdog'] as const) {
+for (const how of ['an uncaused error', 'an abort whose reason is error', 'the completion watchdog'] as const) {
   test(`an ephemeral run that ends by ${how} with its batch pending settles the batch as it leaves`, async () => {
     const h = await harness([[calls('one')]]);
     if (how !== 'the completion watchdog') waitAfterTerminal(h.membrane, () => h.framework.getAgent('ephemeral') === null);
@@ -2469,8 +2469,8 @@ for (const how of ['an uncaused error', 'an abort whose reason is timeout', 'the
       stream.processResponse = () => {};
       if (how === 'an uncaused error') {
         stream.events.push({ type: 'error', error: new MembraneError({ type: 'auth', retryable: false, message: 'key revoked', rawError: { status: 401 } }) });
-      } else if (how === 'an abort whose reason is timeout') {
-        stream.events.push({ type: 'aborted', reason: 'timeout' });
+      } else if (how === 'an abort whose reason is error') {
+        stream.events.push({ type: 'aborted', reason: 'error' });
       }
     };
     let outcome = 'pending';
@@ -2491,7 +2491,7 @@ for (const how of ['an uncaused error', 'an abort whose reason is timeout', 'the
       assert.equal(created.agent.toolResultGuard.hasPending, false, 'the run left no batch pending');
     } finally { await h.framework.stop(); }
     assert.match(outcome, how === 'the completion watchdog' ? /^rejected: Ephemeral agent "ephemeral" stalled/
-      : how === 'an uncaused error' ? /^rejected: key revoked/ : /^rejected: Stream aborted: timeout/, 'the run ends as expected');
+      : how === 'an uncaused error' ? /^rejected: key revoked/ : /^rejected: Stream aborted: error/, 'the run ends as expected');
     assert.equal(spills, 1, "the batch's original is offered to the host's spill once");
     const audit = await ephemeralBatchAudit(h.base);
     assert.deepEqual(audit.types, SETTLED_AS_IT_LEFT, 'the batch is settled once, and its stub says where its original is');
@@ -3871,12 +3871,16 @@ test('unguarded results are read after the direct compile', async () => {
   } finally { await h.framework.stop(); }
 });
 
-test('stop then start reopens withheld spills', async () => {
+test("a new framework on a stopped one's store spills withheld results: its spill gate is its own", async () => {
   const dir = mkdtempSync(join(tmpdir(), 'guard-restart-')); dirs.push(dir);
   const store = JsStore.openOrCreate({ path: join(dir, 'store') });
-  const framework = await AgentFramework.create({ store, membrane: new ScriptMembrane([]).asMembrane(),
+  const create = () => AgentFramework.create({ store, membrane: new ScriptMembrane([]).asMembrane(),
     agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system', toolResultGuard: true }],
     modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0 });
+  const first = await create();
+  first.start();
+  await first.stop();
+  const framework = await create();
   const f = framework as unknown as {
     toolResultFilePlace: () => unknown;
     writeToolResultFile: () => Promise<unknown>;
@@ -3885,8 +3889,6 @@ test('stop then start reopens withheld spills', async () => {
   let writes = 0;
   f.writeToolResultFile = async () => { writes++; return { path: 'work/original.txt' }; };
   try {
-    framework.start();
-    await framework.stop();
     framework.start();
     const guard = framework.getAgent('assistant')!.toolResultGuard;
     guard.storeResults([{ type: 'tool_result', toolUseId: 'one', content: 'original' }],
@@ -3898,11 +3900,61 @@ test('stop then start reopens withheld spills', async () => {
   } finally { await framework.stop(); store.close(); }
 });
 
-test('a framework compile from before stop cannot drive after restart', async () => {
+test('a stop() tried again lets withheld spills write until its own drain, as the first stop did until its own', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'guard-retried-stop-')); dirs.push(dir);
+  const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+  let entered!: () => void;
+  const inCall = new Promise<void>((resolve) => { entered = resolve; });
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => { release = resolve; });
+  const holder: Module = {
+    name: 'holder',
+    async start() {},
+    async stop() {},
+    async onProcess(event) { if (event.type === 'module-event') { entered(); await released; } return {}; },
+    getTools: () => [],
+    async handleToolCall(): Promise<never> { throw new Error('No tool calls expected'); },
+  };
+  const framework = await AgentFramework.create({ store, membrane: new ScriptMembrane([]).asMembrane(),
+    agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system', toolResultGuard: true }],
+    modules: [holder], syncIntervalMs: 0, maintenanceIntervalMs: 0 });
+  const f = framework as unknown as {
+    toolResultFilePlace: () => unknown;
+    writeToolResultFile: () => Promise<unknown>;
+  };
+  f.toolResultFilePlace = () => ({ path: 'work/original.txt', safeLabel: 'original' });
+  let writes = 0;
+  f.writeToolResultFile = async () => { writes++; return { path: 'work/original.txt' }; };
+  const guard = framework.getAgent('assistant')!.toolResultGuard;
+  const withhold = async (id: string) => {
+    guard.storeResults([{ type: 'tool_result', toolUseId: id, content: 'original' }],
+      [{ toolUseId: id, content: 'original' }], [], undefined, undefined);
+    guard.abandon('test');
+    await guard.whenAnnotated();
+  };
+  try {
+    framework.start();
+    framework.pushEvent({ type: 'module-event', source: 'holder', eventType: 'hold', payload: null } as ProcessEvent);
+    await inCall;
+    await assert.rejects(framework.stop(20), (error: unknown) => error instanceof Error && /pending: event loop/.test(error.message));
+    await withhold('after-first');
+    assert.equal(writes, 0, 'closed after the first stop drained');
+    const retry = framework.stop();
+    await withhold('during-retry');
+    assert.equal(writes, 1, 'open again while the retry waits');
+    assert.match(String(toolResults(framework).at(-1)!.content), /is in workspace file work\/original.txt/);
+    release();
+    await retry;
+    await withhold('after-retry');
+    assert.equal(writes, 1, 'closed again after the retry drained');
+  } finally { release(); await framework.stop().catch(() => {}); store.close(); }
+});
+
+test('a framework compile from before stop cannot drive once stop() has begun', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'guard-generation-')); dirs.push(dir);
   const store = JsStore.openOrCreate({ path: join(dir, 'store') });
-  // One scripted answer for the turn compiled before the stop, one for the turn begun after the restart.
-  const membrane = new ScriptMembrane([[answer()], [answer()]]);
+  // One scripted answer for the turn compiled before the stop.
+  const membrane = new ScriptMembrane([[answer()]]);
   const framework = await AgentFramework.create({ store, membrane: membrane.asMembrane(),
     agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system' }],
     modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0 });
@@ -3934,72 +3986,16 @@ test('a framework compile from before stop cannot drive after restart', async ()
       starting = (framework as unknown as { startAgentStream(a: typeof agent): Promise<void> }).startAgentStream(agent);
       await entered.opened;
       await framework.stop();
-      framework.start();
       compile.open();
       await starting;
     } finally { console.error = error; }
     assert.equal(driven, 0);
-    assert.ok(lines.some((line) => /stopped and started again/.test(line) && /dropped before it sends anything/.test(line)), lines.join('\n'));
+    assert.ok(lines.some((line) => /the framework was stopping/.test(line) && /dropped before it sends anything/.test(line)), lines.join('\n'));
     // The turn emitted inference:started before its compile, so it gets one
     // terminal event: a listener's bracket (a typing loop) closes.
     assert.deepEqual(turnEvents.map((event) => event.type), ['inference:started', 'inference:aborted']);
-    assert.match(turnEvents[1]?.reason ?? '', /stopped and started again.*dropped before it sends anything/);
+    assert.match(turnEvents[1]?.reason ?? '', /the framework was stopping.*dropped before it sends anything/);
     unsubscribe();
-    // A turn begun after the restart is admitted and drives its stream.
-    await (framework as unknown as { startAgentStream(a: typeof agent): Promise<void> }).startAgentStream(agent);
-    await until(() => driven === 1, 'the turn begun after the restart drives');
-  } finally { compile.open(); await starting; await framework.stop(); store.close(); }
-});
-
-test("a dropped turn leaves nothing the next turn's stream reads as a stop: its own error stays a failure", async () => {
-  // The dropped turn's stream is never iterated, so no driver collects
-  // anything it leaves. It lets go of the stream without a cancel record
-  // (agent.reset()); were one left, the next stream's genuine error would
-  // read it and end as a deliberate stop instead of a failure.
-  const dir = mkdtempSync(join(tmpdir(), 'guard-dropped-record-')); dirs.push(dir);
-  const store = JsStore.openOrCreate({ path: join(dir, 'store') });
-  // The dropped turn's answer, then the next turn's (made to error), then a retry's.
-  const membrane = new ScriptMembrane([[answer()], [answer()], [answer()]]);
-  const framework = await AgentFramework.create({ store, membrane: membrane.asMembrane(),
-    agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system' }],
-    modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0 });
-  const agent = framework.getAgent('assistant')!;
-  const compile = gate();
-  const entered = gate();
-  // The stream path compiles through the agent's own assembler
-  // (buildActivationRequest is only its wrapper for previews).
-  const hooked = agent as unknown as { assembleActivationRequest: (...args: unknown[]) => Promise<unknown> };
-  const assemble = hooked.assembleActivationRequest.bind(agent);
-  hooked.assembleActivationRequest = async (...args) => { entered.open(); await compile.opened; return assemble(...args); };
-  const stream = membrane.streamYielding.bind(membrane);
-  membrane.streamYielding = (...args) => {
-    const result = stream(...args);
-    // The first stream iterated is the next turn's: it fails on its own.
-    if (membrane.streams.length === 2) {
-      (result as unknown as { events: unknown[] }).events.unshift({ type: 'error', error: new Error('provider failed') });
-    }
-    return result;
-  };
-  let starting: Promise<void> | undefined;
-  try {
-    const error = console.error;
-    console.error = () => {};
-    try {
-      starting = (framework as unknown as { startAgentStream(a: typeof agent): Promise<void> }).startAgentStream(agent);
-      await entered.opened;
-      await framework.stop();
-      framework.start();
-      compile.open();
-      await starting;
-    } finally { console.error = error; }
-    const events: string[] = [];
-    framework.onTrace((event) => {
-      if (event.type.startsWith('inference:') && (event as { agentName?: string }).agentName === 'assistant') events.push(event.type);
-    });
-    await (framework as unknown as { startAgentStream(a: typeof agent): Promise<void> }).startAgentStream(agent);
-    await until(() => events.includes('inference:failed') || events.includes('inference:aborted'), "the next turn's stream ends");
-    assert.ok(events.includes('inference:failed'), `its error takes the failure path: ${JSON.stringify(events)}`);
-    assert.ok(!events.includes('inference:aborted'), `not a deliberate stop: ${JSON.stringify(events)}`);
   } finally { compile.open(); await starting; await framework.stop(); store.close(); }
 });
 

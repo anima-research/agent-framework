@@ -12,6 +12,7 @@ import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, DetailedUsage, ToolParameter, ToolResult as MembraneToolResult, ToolResultContentBlock, StreamEvent } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
 import { classifyFailure, retryDecision, MEMBRANE_RETRY_SETTINGS, type RetrySettings } from '@animalabs/membrane/retry';
+import { deadlineCut, isDeadlineExpiry, resolveInferenceBounds, wholeCallMs, type InferenceBounds } from './inference-bounds.js';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SILENT_HEARTBEAT_SEPARATOR, type RequestOnlyPrompt, type RequestOnlyStamps } from './silent-heartbeat.js';
@@ -91,9 +92,9 @@ import { deferredWritesRefusal, isToolBlockEntry, readPersistedDeferredWrites, t
 import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
-import { Agent, assertAgentSwitches, dryCompileStatsOf, type RenderStats } from './agent.js';
+import { Agent, assertAgentSwitches, assertThinkingBinding, dryCompileStatsOf, type RenderStats } from './agent.js';
 import { assertBooleanSetting, holdsSettings, kindOf } from './config-checks.js';
-import { ModuleRegistry, checkedToolResult, ensureStateRegistered, storableToolResult, thrownResult } from './module-registry.js';
+import { ModuleRegistry, checkedToolResult, droppedToolResultLine, ensureStateRegistered, retiredPushLine, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { prefixesMeet, prefixesMeetError } from './mcpl/prefix-rule.js';
 import { logDetail, logValue } from './mcpl/log-value.js';
@@ -886,7 +887,7 @@ import { HEARTBEAT_CHANGING_TOOLS, Heartbeat, isHeartbeatMcplServer, type Heartb
 import type { GateEntryRef, GateEventInfo, WakeLine } from './gate/types.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
-import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
+import { McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
 import { ToolsetHub, TOOLSETS_MODULE, META_TOOL_NAMES, type ToolsetController } from './mcpl/toolset-host.js';
 import { HostPresentation, BUILTIN_TOOLSET, type HostActTarget } from './host-presentation.js';
 import { isEmptyChange, type Presence } from './mcpl/tool-presence.js';
@@ -894,7 +895,7 @@ import { ToolsetsModule, resolveAct, withLookHint, type TakenChange } from './mc
 import { ModernMcpConnection } from './mcpl/modern-connection.js';
 import { MAX_TIMER_MS, WITHHELD_TEXT, asText, credentialRedactor, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverCredentialPatterns, serverTextRedactor, type CredentialPattern } from './mcpl/protocol-family.js';
 import { MALFORMED_CONTENT_NOTICE, normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
-import { boundedForLog, describeCause } from './mcpl/errors.js';
+import { boundedForLog, describeCause, hostStoppedWhileHandling } from './mcpl/errors.js';
 import { assertServerConfigBooleans, buildWebSocketUrl, isWebSocketTransport } from './mcpl/transport.js';
 import type {
   McplServerConfig,
@@ -1181,8 +1182,8 @@ function resumesLogicalTurn(reason: string | undefined): boolean {
  */
 const TURN_RETRY: unique symbol = Symbol('turn-retry');
 /**
- * The batch a start that carries a turn on (continuesTurn) was merged from,
- * when the scheduler merged wakes that aren't the turn's into it: every
+ * The batch a start was merged from, when the scheduler merged more than
+ * one request into it and any of them isn't the turn's: every
  * request it took in, as each was. Until the start takes its turn token it
  * stands for them all. A scheduler pass that takes it back puts the batch in
  * its place, each request with its own identity and flags; a quiesce at the
@@ -1213,14 +1214,9 @@ function waitAlertsOnItsOwn(wait: ProviderWait): boolean {
   return wait.until === null || wait.until - wait.setAt > PROVIDER_WAIT_ALERT_MS;
 }
 
-// membrane 0.8.0 marks a deadline it reports as run out with this registered
-// symbol (on a sent request, or the Anthropic SDK's timeout, which covers its
-// connect timeout too), and doesn't export its reader.
-const MEMBRANE_DEADLINE_EXPIRY: unique symbol = Symbol.for('membrane.deadlineExpiry');
-
 function isTransientFailure(error: Error): boolean {
   if (!isMembraneError(error) || error.retryable !== true) return false;
-  if ((error as { [MEMBRANE_DEADLINE_EXPIRY]?: unknown })[MEMBRANE_DEADLINE_EXPIRY] === true) return false;
+  if (isDeadlineExpiry(error)) return false;
   return error.type === 'server' || error.type === 'network' || error.type === 'timeout' || error.type === 'rate_limit';
 }
 
@@ -1708,11 +1704,6 @@ const LIVE_SPEECH_UNRECEIPTED = `Plain speech its rounds routed live was handed 
  *  and this says no retry follows it. */
 const RETRY_CANCELLED_BY_STOP = 'a retry waiting while the framework was stopping is dropped before it sends anything';
 
-/** The reason on the inference:aborted that ends a turn whose start waited to
- *  retry a failed compile across a stop() and a start(): the retry would
- *  revive the earlier lifecycle's turn in the next one. */
-const RETRY_ACROSS_RESTART = 'a retry waiting while the framework was stopped and started again is dropped before it sends anything';
-
 /** The reason on the inference:aborted that ends a turn whose continuation
  *  was dropped before it started, other than by an abandon or a stop. */
 const CONTINUATION_DROPPED = "a turn's continuation was dropped before it started";
@@ -1865,9 +1856,10 @@ function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
 /**
  * Refuse a config whose `subconscious`, `watchdog` or `processLogging` is
  * anything but an object, null or false (holdsSettings), or whose switch in
- * one holds anything but true or false (assertBooleanSetting). A subconscious
- * that isn't on has its `allowChannelSpeech` left unchecked, since nothing
- * reads it then.
+ * one holds anything but true or false (assertBooleanSetting), or whose
+ * subconscious's `thinkingBinding` assertThinkingBinding refuses, whichever
+ * its reader. A subconscious that isn't on has its `allowChannelSpeech` and
+ * `thinkingBinding` left unchecked, since nothing reads them then.
  */
 function assertFrameworkSwitches(config: FrameworkConfig): void {
   if (holdsSettings('subconscious', config.subconscious, '{ enabled: true }')) {
@@ -1883,6 +1875,7 @@ function assertFrameworkSwitches(config: FrameworkConfig): void {
         config.subconscious.allowChannelSpeech,
         'true lets the subconscious speak in channels with speak_in_channel, and false or leaving it out refuses it',
       );
+      assertThinkingBinding('subconscious.thinkingBinding', config.subconscious.thinkingBinding);
     }
   }
   if (holdsSettings('watchdog', config.watchdog, '{ enabled: true }')) {
@@ -2210,15 +2203,16 @@ export interface HostModeStatus {
   activeTurnAgents: string[];
   /** Wakes that own provider admission while waiting for an in-flight
    * auxiliary call — no turn token yet, but a turn is one settle away. The
-   * admission continuation rechecks quiesce and requeues them; `drained`
-   * is false until it has. A parked continuation of a turn is counted here
-   * and, as a turn alive, in `activeTurns` and `activeTurnAgents`. */
+   * admission continuation rechecks quiesce and provider holds, and requeues
+   * a wake either keeps from starting; `drained` is false until it has. A
+   * parked continuation of a turn is counted here and, as a turn alive, in
+   * `activeTurns` and `activeTurnAgents`. */
   parkedAdmissions: number;
   /** Inference requests waiting to start: queued (parked by the quiesce wake
    * gate while quiesced, or, while serving, until the scheduler's next pass
    * takes them), in a scheduler pass's hands, or held by a provider hold (an
    * acceleration or host hold, or a provider's stated wait). There, a start
-   * that carries a turn on counts as the wakes merged into it. A start parked
+   * merged from several requests counts as those it took in. A start parked
    * on provider admission behind an auxiliary call counts once in
    * `parkedAdmissions` instead, however many wakes are merged into it.
    * Continuations of a turn (budget restart, tool results) and a held turn's
@@ -2499,9 +2493,15 @@ function hostCommandRequester(serverId: string, params: HostCommandParams): Oper
  *   schedule, jittered, 10 s doubling to 5 min (by default 13 tries, where
  *   membrane's settings have 7: about 30 min).
  * - rate limited (429): the base schedule with at least 5 tries.
- * - any other retryable failure, a stream deadline on a sent request
- *   included (membrane leaves those to its caller): the base schedule (by
- *   default 3 tries, 1 s then 2 s).
+ * - a deadline expiry, which membrane leaves to its caller: a progress
+ *   bound's cut (FrameworkConfig.inferenceBounds), the adapter's own
+ *   watchdogs, the SDK's request timeout or a runtime's fetch timeout. The
+ *   deadline schedule: by default 2 tries, 1 s apart, so one fresh call. For
+ *   one, the framework's `attempt` counts that call's consecutive expiries,
+ *   not the turn's other failures, so each call a deadline cuts gets its
+ *   fresh call. Settings with no deadline schedule give it their base one.
+ * - any other retryable failure: the base schedule (by default 3 tries, 1 s
+ *   then 2 s).
  * A provider's stated wait (`retryAfterMs`) is waited when it is longer than
  * the backoff, up to the schedule's ceiling, which by default is at least the
  * framework's own cap (PROVIDER_ACCELERATION_MAX_COOLDOWN_MS, ten minutes);
@@ -2523,6 +2523,10 @@ export class DefaultErrorPolicy implements ErrorPolicy {
   }
 
   onInferenceError(error: Error, _agentName: string, attempt: number): ErrorAction {
+    if (isDeadlineExpiry(error)) {
+      const decision = retryDecision(this.settings.deadline ? 'deadline' : 'retryable', attempt + 1, undefined, this.settings);
+      return decision.retry ? { retry: true, delayMs: decision.delayMs } : { retry: false };
+    }
     if (!isMembraneError(error)) {
       // Not a provider failure membrane classified: retried as any other
       // retryable failure, on the base schedule.
@@ -2531,9 +2535,7 @@ export class DefaultErrorPolicy implements ErrorPolicy {
     }
     if (error.retryable === false) return { retry: false };
     // The facts membrane classifies by, read off the error itself (from either
-    // copy of membrane, as isMembraneError takes one). No `deadline` fact: a
-    // stream deadline is a retryable timeout here, as it was before membrane
-    // 0.7, where membrane itself gives it no retry.
+    // copy of membrane, as isMembraneError takes one).
     const facts = error as { retryable?: boolean; type?: string; httpStatus?: number; message?: string };
     // A failure that doesn't say is retried as an unknown one is; only false refuses (handled above).
     const cls = classifyFailure({ retryable: facts.retryable !== false, type: facts.type, httpStatus: facts.httpStatus, message: facts.message });
@@ -2563,6 +2565,19 @@ const MAINTENANCE_TICKS_PER_PASS = 8;
  *  together, and then on awareness drains still running, such as its
  *  startup's delivery. */
 const FAILED_CREATE_TEARDOWN_TIMEOUT_MS = 30_000;
+const ABANDON_GRACE_MS = 10_000;
+
+const testAbandonGraces = new WeakMap<AgentFramework, number>();
+
+/**
+ * For tests only: `framework`'s abandon takes `ms` as its grace in place of
+ * {@link ABANDON_GRACE_MS}. Set it only where the test holds every turn the
+ * abandon reaches past the grace, so no turn can end within it and a short
+ * grace only brings the abandon's report sooner.
+ */
+export function setAbandonGraceForTests(framework: AgentFramework, ms: number): void {
+  testAbandonGraces.set(framework, ms);
+}
 
 /** The version of @animalabs/chronicle this package loads, as its package.json says, or undefined where that can't be read. */
 function chronicleVersion(): string | undefined {
@@ -2613,9 +2628,10 @@ interface ProviderAccelerationCooldown {
   /** Armed by an auxiliary (compression) failure with no primary involved:
    *  release reopens auxiliary admission without synthesising an inference. */
   auxiliaryOrigin?: boolean;
-  /** Its held requests were taken out by dropContinuations: release reopens
-   *  admission without synthesising an inference in their place. */
-  emptiedByDrop?: boolean;
+  /** Its held requests were all taken out, by dropContinuations ('drop') or
+   *  by a withdrawal of their coalescing subject ('withdrawal'): release
+   *  reopens admission without synthesising an inference in their place. */
+  emptiedBy?: 'drop' | 'withdrawal';
   rearm?: { number: number; of: number };
   /** Set when this hold is a provider wait (a stated retry-after) for the
    *  agent's primary model: it holds primary turns only. Auxiliary calls are
@@ -2654,13 +2670,21 @@ const PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS = 65_000;
  *  longest stated wait an ephemeral run sleeps in its turn: a longer one ends
  *  the run instead (nonOwningProviderWait). */
 const PROVIDER_ACCELERATION_MAX_COOLDOWN_MS = 10 * 60_000;
+const FAILURE_ADVICE = 'If this recurs with the same cause, change approach rather than retrying identically ' +
+  '(e.g. drop an oversized attachment or an unsupported setting).';
+const TIMEOUT_ADVICE = 'If a reply is still owed from that turn, you can give it now.';
+const MADE_AGAIN = 'The call was made again, and it timed out again.';
 const OVERLOADED_TURN_TRIES = 13;
-const TURN_RETRY_SETTINGS: RetrySettings = Object.fromEntries(
-  Object.entries(MEMBRANE_RETRY_SETTINGS as RetrySettings).map(([cls, s]) => [cls, s && {
-    ...s,
-    ...(cls === 'overloaded' ? { maxAttempts: OVERLOADED_TURN_TRIES } : {}),
-    statedWaitCeilingMs: s.statedWaitCeilingMs === null ? null : Math.max(s.statedWaitCeilingMs, PROVIDER_ACCELERATION_MAX_COOLDOWN_MS),
-  }])) as RetrySettings;
+const DEADLINE_TURN_TRIES = 2;
+const TURN_RETRY_SETTINGS: RetrySettings = {
+  ...Object.fromEntries(
+    Object.entries(MEMBRANE_RETRY_SETTINGS as RetrySettings).map(([cls, s]) => [cls, s && {
+      ...s,
+      ...(cls === 'overloaded' ? { maxAttempts: OVERLOADED_TURN_TRIES } : {}),
+      statedWaitCeilingMs: s.statedWaitCeilingMs === null ? null : Math.max(s.statedWaitCeilingMs, PROVIDER_ACCELERATION_MAX_COOLDOWN_MS),
+    }])),
+  deadline: { maxAttempts: DEADLINE_TURN_TRIES, firstDelayMs: 1_000, multiplier: 1, maxDelayMs: 1_000, statedWaitCeilingMs: null },
+} as RetrySettings;
 const PROVIDER_ACCELERATION_JITTER_MS = 5_000;
 /** Longest delay one setTimeout can represent (2^31-1 ms, about 24.8 days);
  *  a longer timer fires almost at once, so longer waits re-arm in steps. */
@@ -2709,6 +2733,11 @@ async function* turnStreamEvents(stream: YieldingStream, agentName: string): Asy
       if (decidedBy !== undefined) {
         console.error(`[stream] ${agentName}: the stream sent an event (${event.type}) after its ${decidedBy} event, which decided its turn; it and the rest of the stream decide nothing`);
         return;
+      }
+      if (event.type === 'aborted' && event.reason === 'timeout') {
+        decidedBy = 'error';
+        yield { type: 'error', error: deadlineCut(event.message) } as StreamEvent;
+        continue;
       }
       if (event.type === 'complete' || event.type === 'error' || event.type === 'aborted') decidedBy = event.type;
       yield event;
@@ -2860,6 +2889,7 @@ interface EphemeralRun {
   endReason?: AgentEndReason;
   /** Who ended it, when it was stopped from outside. */
   endedBy?: string;
+  endedFromOutside?: true;
 }
 
 // heldFromResidents, the one predicate for "held from the resident", lives
@@ -3202,6 +3232,31 @@ const splitsPair = (text: string, index: number): boolean =>
   index > 0 && index < text.length && isHighSurrogate(text, index - 1) && isLowSurrogate(text, index);
 
 /**
+ * Whether an MCPL server's child ended the way a server ends when it's asked
+ * to: exit 0, death by a signal that asks a process to end (SIGTERM, SIGINT,
+ * SIGHUP), or a shell's report of such a death by its convention, 128 plus the
+ * signal's number (143, 130, 129). A service manager's stop signals the host
+ * and its children together, so a child can go before the host's stop()
+ * closes it: its loss is that stop, not a failure, and raises no mcpl-down.
+ * A child the stdio transport ended itself after a pipe error was ended by
+ * that failure, whatever its code or signal. A WebSocket's close codes are
+ * 1000 and up, so they never match.
+ */
+function endedAsAsked(ended: { code?: number | null; signal?: string | null; pipeFailed?: boolean }): boolean {
+  if (ended.pipeFailed) return false;
+  const { code, signal } = ended;
+  return code === 0 || code === 143 || code === 130 || code === 129 ||
+    signal === 'SIGTERM' || signal === 'SIGINT' || signal === 'SIGHUP';
+}
+
+/** A lost connection's words for an alert: the transport's reason, then its
+ *  exit or close code and signal, each when there is one. */
+function closeWords(reason: string | null | undefined, code: number | null | undefined, signal: string | null | undefined): string {
+  const how = [reason ?? null, code != null ? `code ${code}` : null, signal ? `signal ${signal}` : null].filter((part) => part !== null);
+  return how.length > 0 ? ` (${how.join(', ')})` : '';
+}
+
+/**
  * `text` when it fits within `max` characters; otherwise its head and tail
  * around a marker stating how many of how many characters were omitted, the
  * whole within `max`. A cut that would separate a surrogate pair moves toward
@@ -3437,6 +3492,17 @@ export function shedMayHelp(errorType: string | undefined, httpStatus: number | 
   return errorType === 'invalid_request' && (httpStatus === undefined || httpStatus === 400 || httpStatus === 422);
 }
 
+function responseParts(response: EventResponse | undefined): string {
+  return [
+    response?.addMessages?.length ? `${response.addMessages.length} message(s) to add` : '',
+    response?.editMessages?.length ? `${response.editMessages.length} edit(s)` : '',
+    response?.removeMessages?.length ? `${response.removeMessages.length} removal(s)` : '',
+    response?.stateUpdate !== undefined ? 'a state update' : '',
+    response?.requestInference ? 'an inference request' : '',
+    response?.toolsChanged ? 'a tools change' : '',
+  ].filter(Boolean).join(', ');
+}
+
 /**
  * What a thrown value says, safely and briefly, as boundedErrorMessage gives
  * it, with `recorded` applied before the cut, so no part of a credential
@@ -3608,6 +3674,13 @@ interface StreamRequestNotes {
 
 const SUBCONSCIOUS_MODEL_FIELDS = ['physicalWindowTokens', 'thinkingBinding'] as const satisfies ReadonlyArray<keyof AgentConfig>;
 
+function readerModelFields(cfg: SubconsciousConfig): Pick<AgentConfig, (typeof SUBCONSCIOUS_MODEL_FIELDS)[number]> {
+  return {
+    ...(cfg.physicalWindowTokens != null ? { physicalWindowTokens: cfg.physicalWindowTokens } : {}),
+    ...(holdsSettings('subconscious.thinkingBinding', cfg.thinkingBinding, '{ binds: true, dropBlock: true }') ? { thinkingBinding: cfg.thinkingBinding } : {}),
+  };
+}
+
 const JUDGE_PARAMETER: ToolParameter = {
   type: 'object',
   description:
@@ -3676,9 +3749,10 @@ export class AgentFramework {
   private store: JsStore;
   private ownsStore: boolean;
   private stopPromise: Promise<void> | null = null;
-  private stopCompleted = false;
+  // Nothing sets it back to 'none': a stop ends its instance (#315).
+  private stopState: 'none' | 'stopping' | 'completed' | 'failed' = 'none';
+  private closedStopFailure: { error: unknown } | undefined;
   private ownedStoreClosed = false;
-  private ownedStoreManagersClosed = false;
   /** Whether the latest stop() got through its teardown with nothing failed:
    * every step and every wait up to and including the one on awareness
    * drains, whatever failed after that, in the storage work that finishes
@@ -3694,8 +3768,8 @@ export class AgentFramework {
    * promise: a stream it cancelled or an event loop still in a call; and a
    * stream whose cancel threw, which stop() doesn't wait for. A later
    * stop() waits for each again, beside what it finds, whatever has happened
-   * since to the entry it was found under (a run's end removes its stream's,
-   * a start() replaces the loop), so neither a budget nor a cancel that
+   * since to the entry it was found under (a run's end removes its stream's),
+   * so neither a budget nor a cancel that
    * threw lets the store close under work still running. Each leaves once it
    * settles. */
   private readonly leftRunning = new Map<Promise<unknown>, { label: string; kind: 'stream' | 'loop' }>();
@@ -3757,6 +3831,9 @@ export class AgentFramework {
   private providerAccelerationLastRecovery: Map<string, ProviderAccelerationReceipt> = new Map();
   private providerAccelerationDefaultCooldownMs = PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS;
   private providerAccelerationJitterMs = PROVIDER_ACCELERATION_JITTER_MS;
+  private inferenceBounds: InferenceBounds | null = resolveInferenceBounds(undefined);
+  private readonly deadlineCuts = new Map<string, number>();
+  private readonly freshCallsCut = new Set<string>();
   private providerHoldHook: ProviderHoldHook | undefined;
   /** Provider waits (stated retry-after) per (agent, model), kept across restarts. */
   private providerWaits: ProviderWaits | undefined;
@@ -3764,8 +3841,6 @@ export class AgentFramework {
   private retryWaitWakers = new Set<() => void>();
   private waitingTraceEveryMs = WAITING_TRACE_EVERY_MS;
   private providerAdmissionClosed = false;
-  /** Invalidates framework turns still assembling when stop begins. */
-  private lifecycleGeneration = 0;
   /** Last time we reported stale (busy-requeued) inference requests, per agent. */
   private staleWarnAt = new Map<string, number>();
   /** Per-agent last inference activity (epoch ms), for /healthz + doctor tooling. */
@@ -3917,6 +3992,7 @@ export class AgentFramework {
   private turnRearmMs: readonly number[] = DEFAULT_TURN_REARM_MS;
   private turnRearms: Map<string, number> = new Map();
   private exhaustingRearms: Set<string> = new Set();
+  private rearmDeadlineCuts: Set<string> = new Set();
   private statedWaitRuns: Map<string, StatedWaitRun> = new Map();
   /** N consecutive failed inferences ⇒ the agent is treated as hard-down and
    *  escalated loudly to stderr. */
@@ -4506,6 +4582,7 @@ export class AgentFramework {
       getMessage: (id) => this.getMessage(id),
       queryMessages: (filter, opts) => this.queryMessages(filter, opts),
       pushEvent: (event, moduleName) => this.pushModuleEvent(event, moduleName, true),
+      dropRetiredPush: (event, moduleName) => this.dropRetiredModuleEvent(event, moduleName),
       onTrace: (listener) => this.onTrace(listener),
       // The ONLY entry that confers module origin — a private closure the
       // framework hands to its own module registry. The public
@@ -4533,6 +4610,7 @@ export class AgentFramework {
   static async create(config: FrameworkConfig): Promise<AgentFramework> {
     // Before anything opens or starts: a refused config must leave nothing behind.
     if (config.codeExecution != null) validateCodeExecutionConfig(config.codeExecution);
+    resolveInferenceBounds(config.inferenceBounds);
     assertFrameworkSwitches(config);
     for (const agentConfig of config.agents) assertAgentSwitches(agentConfig);
     assertAgentNamesUnique(config.agents);
@@ -4757,10 +4835,30 @@ export class AgentFramework {
         const agent = framework.agents.get(name);
         return !!agent && framework.logicalTurnAlive(agent);
       },
-      frozen: () => framework.bootFreeze || framework.quiesced || framework.surgeryHold !== null,
+      // Quiesced, every window is frozen but for each agent's own rows. A
+      // surgery's hold needs no term here (B5): its own refusals keep every
+      // point that reads this from being reached under it. Its reservation
+      // holds a turn token for every registered agent, so each is
+      // turn-alive, and a point at rest (a turn's end, a row stored for a
+      // reader at rest, the pass at rest) presents nothing to it: those
+      // return on turnAlive before they read this. No agent registers under
+      // it: a derived or ephemeral one is refused, a conversation fork's
+      // spawn waits it out (and the reservation refuses while one is being
+      // created), and the rest register in create(). No turn starts or
+      // streams under it: the scheduler requeues every wake while it holds,
+      // a parked admission finds the token and requeues, and the reservation
+      // refuses while any turn, continuation, retry or puppet call is alive,
+      // so no turn start and no tool boundary is reached. Its release clears
+      // the hold before it gives the tokens back, replays the writes it kept
+      // and presents each agent what it is owed (reserveStoreForSurgery).
+      // At boot every window is frozen the same way (bootFreeze), until
+      // create()'s pass over the windows: a module's write from its start()
+      // presents nothing before the boot reads which rows still owe a wake.
+      frozen: () => framework.bootFreeze || framework.quiesced,
       emitTrace: (event) => framework.emitTrace(event),
     });
     framework.turnRearmMs = turnRearmDelays(config.exhaustedTurnRearmMs);
+    framework.inferenceBounds = resolveInferenceBounds(config.inferenceBounds);
 
     // Before any delivery.
     await framework.reconcileDiscordAwarenessAtStartup();
@@ -5326,9 +5424,7 @@ export class AgentFramework {
    * maintenance, event loop and operator operations, so a dump shows what
    * those waits are on, and before its modules and MCPL servers stop, so a
    * stop() whose teardown hangs, fails or times out doesn't keep it listed.
-   * With none in the set, one line says no framework is running. A framework
-   * started again after a completed stop() doesn't rejoin; whether that
-   * lifecycle is supported is #315.
+   * With none in the set, one line says no framework is running.
    *
    * One listener serves the process, installed by the first create() to
    * reach the join and kept: once a process's last SIGUSR2 listener is
@@ -5372,36 +5468,39 @@ export class AgentFramework {
 
   /**
    * Start the event loop. A start() on a running framework does nothing.
-   * Refused, with an error, from a stop() call until that stop() settles,
-   * since that stop would wait on the lifecycle a start() begins, or tear it
-   * down under it. What a start() after a settled stop() should do is #315's
-   * question.
+   * A stop ends its instance (#315): once a stop() is admitted, start() and
+   * addModule() are refused with an error, for good. While that stop() runs,
+   * the error says the framework is stopping. Once it has settled, the error
+   * says what to do: create a new AgentFramework on the store, and after a
+   * failed stop(), call stop() again first, until one resolves. When a
+   * failed stop() left its owned store closed, so that it can't be tried
+   * again, the error carries that failure as its cause.
+   *
+   * A new instance on the store keeps what the store holds. With the
+   * heartbeat on and the same heartbeat state file (heartbeat.statePath, or
+   * its default), it keeps the heartbeat's schedule as it reads it from that
+   * file: a tick or a reminder that fell due meanwhile fires once, shortly
+   * after it starts. What an instance holds only in memory is lost with it,
+   * as on a process restart: an agent's sleep and its wake, a self-wake, the
+   * inference requests still queued (a budget restart, a heartbeat's wake, a
+   * nudge), a re-armed turn's wait and count, and the redo stack. #627 is
+   * about keeping a sleep and a self-wake across a restart. To pause and
+   * resume one framework in place, use quiesce() and resume().
    */
   start(): void {
     // Before the running check: stop() claims its attempt before it clears
     // running, so a start() made in its first steps, such as from a trace
     // listener, is refused too.
-    this.resetCompletedStop('start()');
+    this.refuseOnceStopped('start()');
     if (this.running) {
       return;
     }
 
     this.running = true;
-    this.providerAdmissionClosed = false;
     this.earlyTraces = null;
-    // A new lifecycle: a turn compiled before an earlier stop() never drives,
-    // and withheld spills, closed for the generation a stop ended, are open
-    // for this one.
-    this.lifecycleGeneration++;
-    // Its servers' addresses, which an earlier stop() took out of the
-    // reference registry, for its stubs.
     for (const config of this.mcplServerConfigs.values()) {
       referenceRegistry.setServerAddress(config.id, serverAddressOf(config), this);
     }
-    // A sleep kept through a stop() wakes this lifecycle at its end, or now
-    // if it ended while stopped. Before the loop's first pass, so that a wake
-    // owed now joins the requests already pending in one turn.
-    this.eventGate?.resumeSleep();
     this.heartbeat?.start();
     this.loopPromise = this.runLoop();
 
@@ -5428,11 +5527,14 @@ export class AgentFramework {
   }
 
   /**
-   * Stop the event loop. Until it settles, start() and addModule() are
-   * refused. Each step of the teardown runs whatever an earlier one did: one
-   * that throws, such as a host stream's cancel(), fails the stop() once the
-   * rest has run. When a step or a wait up to and including
-   * the wait on awareness drains fails or times out, storage stays open and
+   * Stop the event loop, and with it this framework, for good: once a stop()
+   * is admitted, start() and addModule() are refused, as start() says. A
+   * stop() whose budget is refused, which it rejects with a RangeError, is
+   * not admitted and changes nothing. Each step of the teardown runs
+   * whatever an earlier one did: one that throws, such as a host stream's
+   * cancel(), fails the stop() once the rest has run. When a step or a wait
+   * up to and including the wait on awareness drains fails or times out,
+   * storage stays open and
    * stop() can be called again; one that fails after it, in the storage work
    * that finishes the stop, fails the stop() without keeping storage open.
    * A timed-out wait lets teardown go on while what it waited for may still
@@ -5440,7 +5542,8 @@ export class AgentFramework {
    * @param teardownTimeoutMs Optional budget for each of stop()'s waits, in
    * turn: on the streams it cancels, on maintenance in flight (a pass or an
    * over-budget drain kick), on the event loop, on an operator's operations
-   * already running, on modules and MCPL together, then on Discord awareness
+   * already running, on modules and MCPL (its servers and the inference
+   * requests they made) together, then on Discord awareness
    * drains, which send nothing once stop() has begun, recording the call the
    * close ended. With a budget, a stop() can take up to six of them, besides
    * the withheld-spill deadline of a guard's write still under way. Omit to
@@ -5460,9 +5563,7 @@ export class AgentFramework {
    *   dropped, though a write the stream already had under way can still
    *   land in the run's namespace after them.
    * - an event loop still in a call, such as a module's onProcess, finishes
-   *   that call and the rest of its iteration, and then exits. A start()
-   *   made once that stop() has failed runs its own loop beside that last
-   *   iteration.
+   *   that call and the rest of its iteration, and then exits.
    * - a later stop() waits again, within its own budget, for any stream or
    *   loop this one left running, so the store never closes under it.
    *
@@ -5484,11 +5585,13 @@ export class AgentFramework {
     let settle!: { resolve: () => void; reject: (error: unknown) => void };
     const attempt = new Promise<void>((resolve, reject) => { settle = { resolve, reject }; });
     this.stopPromise = attempt;
-    void attempt.then(() => { this.stopCompleted = true; }, () => {});
-    // Failed cleanup can be retried while its original store is open. A
-    // terminal storage failure after successful close must remain a failure.
-    void attempt.catch(() => {
-      if (!this.ownedStoreClosed && this.stopPromise === attempt) this.stopPromise = null;
+    this.stopState = 'stopping';
+    void attempt.then(() => { this.stopState = 'completed'; }, (error: unknown) => {
+      this.stopState = 'failed';
+      // Failed cleanup can be retried while its original store is open. A
+      // terminal storage failure after successful close must remain a failure.
+      if (this.ownedStoreClosed) this.closedStopFailure = { error };
+      else if (this.stopPromise === attempt) this.stopPromise = null;
     });
     // The body still starts in this call, so its synchronous steps (closing
     // the queue among them) happen before stop() returns.
@@ -5496,22 +5599,29 @@ export class AgentFramework {
     return attempt;
   }
 
-  /** What start() and addModule() pass before either begins work of a
-   * lifecycle. A stop() still running refuses both, from the moment it
-   * claims its attempt until that attempt settles. A failed stop() has
-   * cleared its attempt, unless it closed an owned store, or the context
-   * managers it closes before that store, which are refused first. A
-   * completed stop() is cleared, and the call goes on as before;
-   * whether a lifecycle should begin after a stop() is #315's question. */
-  private resetCompletedStop(verb: 'start()' | 'addModule()'): void {
-    if (this.ownedStoreClosed) throw new Error('Cannot start a new lifecycle: owned store is closed');
-    if (this.ownedStoreManagersClosed) {
-      throw new Error('Cannot start a new lifecycle: stop() closed its context managers, and then failed to close its owned store');
-    }
-    if (this.stopPromise && !this.stopCompleted) throw new Error(`${verb} refused: the framework is stopping`);
-    if (this.stopCompleted) {
-      this.stopPromise = null;
-      this.stopCompleted = false;
+  private refuseOnceStopped(verb: 'start()' | 'addModule()'): void {
+    switch (this.stopState) {
+      case 'none':
+        return;
+      case 'stopping':
+        throw new Error(`${verb} refused: the framework is stopping`);
+      case 'completed':
+        throw new Error(`${verb} refused: this framework has stopped, and a stopped framework doesn't start again. ` +
+          'Create a new AgentFramework on its store to go on, with its storePath if it opened the store itself.');
+      case 'failed': {
+        const closed = this.closedStopFailure;
+        if (closed) {
+          throw new Error(`${verb} refused: this framework's stop() failed and its owned store is closed, so stop() can't be tried again: ` +
+            `it rejects with that same failure, this error's cause: ${shutdownErrorMessage(closed.error)}. ` +
+            "A stopped framework doesn't start again, and a new AgentFramework on its store doesn't finish what that stop() left unfinished.",
+          { cause: closed.error });
+        }
+        throw new Error(`${verb} refused: this framework's stop() failed, and a stopped framework doesn't start again. ` +
+          'A failed stop() may have left its cleanup or final persistence unfinished. ' +
+          "Call stop() again: once a stop() of this one resolves, they're done, and only then should a new " +
+          'AgentFramework use its store, with its storePath if this one opened the store itself, ' +
+          'or another instance use anything this one shares.');
+      }
     }
   }
 
@@ -5633,6 +5743,13 @@ export class AgentFramework {
     // holding the wait for operator operations below until its handshake's
     // deadline.
     step(() => this.endConnectsInFlight());
+    // Nor does a server lost before or during the stop launch or dial again
+    // on its own: a retry already scheduled starts nothing, and none is
+    // scheduled after.
+    step(() => {
+      for (const connection of this.mcplServerRegistry?.getAllServers() ?? []) connection.stopReconnecting();
+      for (const connection of this.modernServers().values()) connection.stopReconnecting();
+    });
     step(() => this.pushCoalescer?.suspend());
     step(() => this.flushCoalescingSnapshot());
     this.running = false;
@@ -5643,11 +5760,10 @@ export class AgentFramework {
     for (const run of this.ephemeralRuns.values()) run.endReason ??= 'host-stop';
     this.providerAdmissionClosed = true;
     for (const wake of [...this.retryWaitWakers]) step(wake);
-    this.lifecycleGeneration++;
-    // The generation this stop ends; withheld spills close for it alone, so a
-    // start() after this stop has settled reopens them for its own.
-    const stoppingGeneration = this.lifecycleGeneration;
+    this.guardSpillsClosed = false;
     step(() => this.queue.close());
+    let inferences: Array<{ label: string; promise: Promise<void> }> = [];
+    step(() => { inferences = this.inferenceRouter?.stopAll() ?? []; });
     step(() => this.tuneOutCoordinator?.stop());
 
     // Stop running code_execution scripts before cancelling streams: a
@@ -5662,9 +5778,8 @@ export class AgentFramework {
     this.toolImageLedgers.clear();
 
     // A turn whose continuation is still on its way ends with the stop, as
-    // a turn's start a stop reaches does: the continuation would start only
-    // after a start(), in a lifecycle where its logical turn is gone
-    // (openLogical, below). Before the holds and the parks go, so the
+    // a turn's start a stop reaches does: the continuation never starts.
+    // Before the holds and the parks go, so the
     // continuation leaves them with its turn. Each drop is a step of its
     // own, so one that throws leaves the next agent's turn to end all the
     // same, as stop()'s other loops do.
@@ -5675,11 +5790,7 @@ export class AgentFramework {
     });
     // A stopped host must never hang behind its own cooldown.
     step(() => this.cancelProviderAdmission());
-    // An open logical turn doesn't survive a stop: a start after a restart
-    // on this instance opens a new one rather than continuing the old turn's
-    // routing (openLogical). A resume still continues its turn, with its
-    // routing state (turnRouting), since it carries that turn's own request
-    // on: beginAgentTurn opens the turn again for it.
+    // An open logical turn doesn't survive a stop.
     this.openLogical.clear();
 
     // Cancel the stream of every agent whose state holds one: streaming,
@@ -5788,7 +5899,7 @@ export class AgentFramework {
     // its idle watchdog. What was written for it is stored already (#291);
     // that stream's late events are dropped once the run has left, and a later
     // stop() waits for the stream itself (leftRunning). (A start() is refused
-    // until this stop() settles, so no new lifecycle begins beside it.)
+    // once a stop() is admitted, so no new lifecycle begins beside it.)
     for (const [name, run] of this.ephemeralRuns) run.settle.reject(ephemeralRunStopped(name));
 
     // Admission closed when stop() began. What admitted operations start now,
@@ -5819,11 +5930,9 @@ export class AgentFramework {
     // generation and nothing reads the old fork's window again. So each live
     // fork ends here as a closing fork's end disposes it, and its release
     // passes on what it left unread, as any release does. Its channel unbinds
-    // first, as the idle sweep's does: a start() after this stop() would
-    // otherwise route a message for it to a name that's gone. A
-    // fork whose spawn is still waiting for its creation to return has no
-    // binding yet, and its spawn binds nothing once it has ended
-    // (spawnConversationAgent).
+    // first, as the idle sweep's does. A fork whose spawn is still waiting
+    // for its creation to return has no binding yet, and its spawn binds
+    // nothing once it has ended (spawnConversationAgent).
     // Each is a step of its own, and each fork ends whatever its stream or
     // turn is doing, as each run does above: its end settles a tool-result
     // batch its stream still held and removes the stream's entries
@@ -5880,17 +5989,17 @@ export class AgentFramework {
     // workspace: its stub names the audit record. A write that was past its
     // deadline isn't waited for here, but the workspace's own stop waits for
     // the mount turn it holds, bounded only by teardownTimeoutMs.
-    this.guardSpillsClosedFor = stoppingGeneration;
+    this.guardSpillsClosed = true;
 
     // Stop modules and both engines' MCP servers in parallel
-    const shutdownPromises: Promise<void>[] = [this.moduleRegistry.stopAll(teardownTimeoutMs)];
+    const shutdownPromises: Promise<void>[] = [this.moduleRegistry.stopAll(teardownTimeoutMs), waitFor(inferences)];
     if (this.mcplServerRegistry) {
       shutdownPromises.push(this.mcplServerRegistry.closeAll(teardownTimeoutMs));
     }
     shutdownPromises.push(this.closeModernMcpConnections(teardownTimeoutMs));
     // A stopped framework's servers' addresses leave the reference registry,
     // so no other framework's stub reads them and the registry doesn't keep
-    // this one reachable. start() records them again.
+    // this one reachable.
     step(() => { for (const id of this.mcplServerConfigs.keys()) referenceRegistry.forgetServerAddress(id, this); });
     // Timed-out or failed teardown retains its context and may still write.
     // Sync available state best-effort, but leave its store open for a retry.
@@ -5961,7 +6070,7 @@ export class AgentFramework {
     }
 
     if (this.ownsStore && teardownSucceeded) {
-      if (this.closeOpenManagers()) this.ownedStoreManagersClosed = true;
+      this.closeOpenManagers();
       try {
         this.store.close();
         this.ownedStoreClosed = true;
@@ -6396,10 +6505,9 @@ export class AgentFramework {
     }
     contextManager.close();
   }
-  private closeOpenManagers(): boolean {
+  private closeOpenManagers(): void {
     const alive = [...this.openManagers].flatMap((ref) => ref.deref() ?? []);
     for (const contextManager of alive) this.closeManager(contextManager);
-    return alive.length > 0;
   }
   /** The framework's membrane, with each complete() call passed through
    *  `admit` along with the model it names. */
@@ -6409,8 +6517,17 @@ export class AgentFramework {
       const value = Reflect.get(obj, prop, receiver);
       if (prop === 'complete' && typeof value === 'function') {
         return (...args: unknown[]) => {
-          const model = (args[0] as { config?: { model?: unknown } } | undefined)?.config?.model;
-          return admit(() => Reflect.apply(value, this.membrane, args) as Promise<unknown>,
+          const config = (args[0] as { config?: { model?: unknown; maxTokens?: unknown } } | undefined)?.config;
+          const model = config?.model;
+          const options = args[1] as { progressTimeoutMs?: unknown } | undefined;
+          const bounds = this.inferenceBounds;
+          const sent = bounds !== null && options?.progressTimeoutMs === undefined
+            ? [args[0], {
+              ...options,
+              progressTimeoutMs: wholeCallMs(bounds, typeof config?.maxTokens === 'number' ? config.maxTokens : undefined),
+            }, ...args.slice(2)]
+            : args;
+          return admit(() => Reflect.apply(value, this.membrane, sent) as Promise<unknown>,
             typeof model === 'string' ? model : undefined);
         };
       }
@@ -6535,7 +6652,7 @@ export class AgentFramework {
       // length: an operator release of it returns the hold to AF's own pacing.
       ...(pacing?.stated ? { statedWait: { model: agent.model, ownUntil: now + pacing.ownMs } } : {}),
       ...(auxiliary && (!existing || existing.auxiliaryOrigin) ? { auxiliaryOrigin: true } : {}),
-      ...(existing?.emptiedByDrop && held.length === 0 ? { emptiedByDrop: true } : {}) });
+      ...(existing?.emptiedBy && held.length === 0 ? { emptiedBy: existing.emptiedBy } : {}) });
     if (auxiliary && !existing) {
       console.error(`[provider-cooldown] agent=${agent.name} host hold (${hostHold!.reason}) from an auxiliary call — ` +
         `holding primary/auxiliary for ${delayMs}ms`);
@@ -6550,11 +6667,22 @@ export class AgentFramework {
     if (wait && trigger && (wait.until === null || wait.until > now)) this.noteStatedWaitRun(agent.name, wait, now);
     return true;
   }
-  private rearmExhaustedTurn(agent: Agent, error: Error, trigger: InferenceRequest | undefined, ownsProviderGate: boolean, routing: TurnRouting | undefined): void {
+  private takeAsTransient(agentName: string, error: Error, trigger: InferenceRequest | undefined): boolean {
+    if (isTransientFailure(error)) {
+      this.rearmDeadlineCuts.delete(agentName);
+      return true;
+    }
+    if (!isRearmed(trigger) || !isDeadlineExpiry(error)) return false;
+    const first = !this.rearmDeadlineCuts.has(agentName);
+    this.rearmDeadlineCuts.add(agentName);
+    return first;
+  }
+
+  private rearmExhaustedTurn(agent: Agent, error: Error, trigger: InferenceRequest | undefined, ownsProviderGate: boolean, routing: TurnRouting | undefined, asTransient: boolean): void {
     if (!ownsProviderGate || trigger === undefined || this.providerAdmissionClosed || this.turnRearmMs.length === 0) return;
     const done = this.turnRearms.get(agent.name) ?? 0;
     const notSent = (why: string) => console.error(`[inference-rearm] agent=${agent.name} turn not re-armed: ${why}`);
-    if (!isTransientFailure(error)) {
+    if (!asTransient) {
       if (done > 0) notSent(`its failure isn't transient (${isMembraneError(error) ? error.type : boundFailureText(error.message, FAILURE_SUMMARY_MAX_CHARS)})`);
       return;
     }
@@ -6694,12 +6822,15 @@ export class AgentFramework {
           ? `no longer holds primary turns: the primary model is now ${model} (the wait stays recorded)`
           : `primary hold ended after ${Date.now() - cooldown.startedAt}ms`));
     }
-    if ((cooldown.auxiliaryOrigin || cooldown.emptiedByDrop) && cooldown.heldRequests.length === 0) {
+    if ((cooldown.auxiliaryOrigin || cooldown.emptiedBy) && cooldown.heldRequests.length === 0) {
       // Nobody asked for an inference while parked, or what was held was a
-      // continuation since dropped with its turn: just reopen the gate. A
-      // primary the hold left pending won't run, so its recovery ends.
-      console.error(`[provider-cooldown] agent=${agentName} ${cooldown.auxiliaryOrigin ? 'auxiliary hold' : 'hold, its held continuation dropped,'} released after ${Date.now() - cooldown.startedAt}ms`);
-      if (cooldown.emptiedByDrop) this.endPendingPrimary(agentName);
+      // continuation since dropped with its turn, or wakes since withdrawn:
+      // just reopen the gate. A primary the hold left pending won't run, so
+      // its recovery ends.
+      const which = cooldown.emptiedBy === 'drop' ? 'hold, its held continuation dropped,'
+        : cooldown.emptiedBy === 'withdrawal' ? 'hold, its held wakes withdrawn,' : 'auxiliary hold';
+      console.error(`[provider-cooldown] agent=${agentName} ${which} released after ${Date.now() - cooldown.startedAt}ms`);
+      if (cooldown.emptiedBy) this.endPendingPrimary(agentName);
       this.flushAuxiliaryAdmission(agentName);
       return;
     }
@@ -7352,12 +7483,7 @@ export class AgentFramework {
    */
   pushEvent(event: ProcessEvent): void {
     if (event.type === 'tool-result' && this.queue?.isClosed) {
-      // What an operator reconciling a dropped result needs (the resident
-      // may run the tool again): which tool, and whether it succeeded.
-      const outcome = event.result.success && !event.result.isError
-        ? 'succeeded'
-        : `failed${event.result.error ? `: ${thrownText(event.result.error)}` : ''}`;
-      console.error(`[framework] ${event.agentName}: result of tool call ${event.callId} (${event.toolName ? `${event.toolName}, ` : ''}${event.moduleName}) arrived after stop — dropped; the tool ${outcome}`);
+      console.error(droppedToolResultLine(event, 'after stop'));
       return;
     }
     this.queue.push(event);
@@ -7385,6 +7511,14 @@ export class AgentFramework {
     }
     if (traced) this.pushEvent(event);
     else this.queue.push(event);
+  }
+
+  private dropRetiredModuleEvent(event: ProcessEvent, moduleName: string): void {
+    if (this.queue.isClosed) {
+      this.pushModuleEvent(event, moduleName, true);
+      return;
+    }
+    console.error(retiredPushLine(event, moduleName));
   }
 
   /**
@@ -7438,12 +7572,14 @@ export class AgentFramework {
   }
 
   /**
-   * Add a module at runtime. Refused, with a rejection, while a stop() is
-   * still running: a module added then would either be stopped by that stop
-   * or, once the stop has taken its list of modules to stop, stay started
-   * past it.
+   * Add a module at runtime. Refused, with a rejection, once a stop() has
+   * been admitted, before anything else is checked: while that stop() runs,
+   * a module added then would either be stopped by it or, once it has taken
+   * its list of modules to stop, stay started past it; once it has settled,
+   * the framework has stopped for good, as start() says.
    */
   async addModule(module: Module): Promise<void> {
+    this.refuseOnceStopped('addModule()');
     // A server's tool prefix and a module's name share one namespace, as
     // create() checks at startup: a module isn't added under a prefix a
     // server holds, or one a restart is moving its server to.
@@ -7461,7 +7597,6 @@ export class AgentFramework {
         throw new Error(`Module "${module.name}" collides with MCPL server "${id}"'s toolPrefix "${module.name}" (a closed tab)`);
       }
     }
-    this.resetCompletedStop('addModule()');
     await this.moduleRegistry.addModule(module);
     // The workspace asks whether an agent's history holds a message for its
     // head-move notice (noticeHeadMoves) and the writes it weighs against it.
@@ -8319,15 +8454,11 @@ export class AgentFramework {
   private stallSkips = 0;
   /** See WITHHELD_SPILL_DEADLINE_MS; an instance field so tests can shorten it. */
   private withheldSpillDeadlineMs = WITHHELD_SPILL_DEADLINE_MS;
-  /** The lifecycle generation whose stop() has let the running annotations
-   *  finish: a withheld original is then no longer written to a workspace
-   *  that is stopping, and its stub names the audit record. A start() after
-   *  that stop() has finished has a generation of its own, so the spill gate
-   *  is open again for an instance kept with a store it doesn't own and that
-   *  is still open (start() doesn't restore stopped modules or MCPL
-   *  connections, and refuses an owned store that stop() closed). A start()
-   *  made while a stop() is still running is refused. */
-  private guardSpillsClosedFor: number | null = null;
+  /** Set once a stop() has let the running annotations finish, and cleared
+   *  as each stop() begins: while set, a withheld original is no longer
+   *  written to a workspace that is stopping, and its stub names the audit
+   *  record. */
+  private guardSpillsClosed = false;
 
   /** A new agent's guard: its persisted setting, the tool-results spill its
    *  withheld originals are written to, and the set stop() waits on
@@ -9054,7 +9185,7 @@ export class AgentFramework {
     // Bounded grace for cancelled streams. Stop cancels streams too; a turn
     // with no stream settles on its own. Report the abandon that already ran,
     // even if stop cuts its grace short.
-    const grace = Date.now() + 10_000;
+    const grace = Date.now() + (testAbandonGraces.get(this) ?? ABANDON_GRACE_MS);
     while (this.quiesced && !this.queue?.isClosed && this.activeTurnTokens.size > 0 && Date.now() < grace) {
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
@@ -11440,6 +11571,7 @@ export class AgentFramework {
     if (run) {
       run.endReason ??= 'stopped';
       run.endedBy ??= options.by;
+      run.endedFromOutside = true;
       // The awaiting caller is told who stopped the job and why, whether or
       // not a stream was in flight: settled first, so the aborted stream's own
       // settle ('Stream cancelled') finds the run already settled. The caller's
@@ -11829,12 +11961,22 @@ export class AgentFramework {
     if (run) {
       run.endReason = reason;
       run.endedBy = record.ended?.by;
+      run.endedFromOutside = true;
       run.settle.reject(new AgentStoppedError(name, reason, record.ended?.by, detail));
       return;
     }
     const agent = this.agents.get(name);
     if (!agent) return;
     this.releaseAgentRuntime(agent, this.channelOfHome(record.homeChannel), undefined, record.lifetime.kind === 'persistent');
+  }
+
+  private forgetFailureAccounting(name: string): void {
+    this.consecutiveInferenceFailures.delete(name);
+    this.exhaustionRewinds.delete(name);
+    this.refusalStreak.delete(name);
+    this.refusalRewinds.delete(name);
+    this.rewindEpisode.delete(name);
+    if (this.forcedRewind.delete(name)) console.error(`[unstick] agent=${name} its /unstick session ended with its agent`);
   }
 
   /**
@@ -11881,6 +12023,9 @@ export class AgentFramework {
     this.agents.delete(name);
     this.forgetPresentation(agent);
     this.agentConfigs.delete(name);
+    this.deadlineCuts.delete(name);
+    this.freshCallsCut.delete(name);
+    this.forgetFailureAccounting(name);
     this.thinkingLossIncidents.forget(name);
     this.reasoningLoss.forget(name);
     // main's manager release: the context manager an ephemeral run or a fork
@@ -11922,6 +12067,7 @@ export class AgentFramework {
     // waits ends here as at a turn's end, alerted if it ran long
     // (endStatedWaitRun).
     this.turnRearms.delete(name);
+    this.rearmDeadlineCuts.delete(name);
     this.exhaustingRearms.delete(name);
     this.exhaustedTurns.delete(name);
     this.endStatedWaitRun(name);
@@ -12393,13 +12539,12 @@ export class AgentFramework {
 
   /**
    * A start dropped before its stream sends anything (its agent was replaced,
-   * or stop() closed admission or ended the lifecycle the start began in)
-   * ends the logical turn it was running. stop() ends every open turn
-   * (openLogical), but a fresh start that awaited its batches' assembly
-   * across a stop() reaches its routing after it and opens its turn. That
-   * turn would then stay open, and the agent's first start after a restart
-   * would continue the dropped turn's routing. The identity check leaves any
-   * other turn open.
+   * or stop() closed admission) ends the logical turn it was running. stop()
+   * ends every open turn (openLogical), but a fresh start that awaited its
+   * batches' assembly across a stop() reaches its routing after it and opens
+   * its turn. That turn would then stay open, and the next start of the
+   * agent's name would continue the dropped turn's routing. The identity
+   * check leaves any other turn open.
    */
   private endDroppedTurn(agentName: string, routing: TurnRouting): void {
     if (this.openLogical.get(agentName) === routing) this.openLogical.delete(agentName);
@@ -12716,6 +12861,9 @@ export class AgentFramework {
         this.eventGate?.onInferenceEnded(agent.name);
         this.agents.delete(agent.name);
         this.forgetPresentation(agent);
+        this.deadlineCuts.delete(agent.name);
+        this.freshCallsCut.delete(agent.name);
+        if (run.endedFromOutside) this.forgetFailureAccounting(agent.name);
         this.thinkingLossIncidents.forget(agent.name);
         this.reasoningLoss.forget(agent.name);
         // Its pending self-wake ends with it, as a fork's does.
@@ -16725,8 +16873,9 @@ export class AgentFramework {
     // idiom): reasoning effort (thinking), provider params, token ceilings,
     // caching, refusal handling, timezone — a same-model side-process must
     // not silently run under different inference conditions than the
-    // resident it serves. Only identity- and surface-defining fields are
-    // overridden below.
+    // resident it serves. Below, identity- and surface-defining fields are
+    // overridden, and the window and thinking binding where the
+    // subconscious's config sets its own.
     const model = cfg.model ?? primaryConfig.model;
     const inherited: AgentConfig = { ...primaryConfig };
     if (model !== primaryConfig.model) {
@@ -16734,6 +16883,7 @@ export class AgentFramework {
     }
     const agentConfig: AgentConfig = {
       ...inherited,
+      ...readerModelFields(cfg),
       name,
       // Its own voice is its name alone, and its turns go out under it: the
       // principal's other names (selfParticipants) and the name its turns go
@@ -16887,6 +17037,7 @@ export class AgentFramework {
           config: {
             model: cfg.model,
             proseRouting: 'disabled',
+            ...readerModelFields(cfg),
           },
           inheritRefusals: true,
           onParentEnd: 'end',
@@ -16999,13 +17150,7 @@ export class AgentFramework {
   }
 
   private async runLoop(): Promise<void> {
-    // A loop ends with its lifecycle. A stop() whose budget ran out while
-    // this loop was in a call (a module's onProcess) returns before the call
-    // does, and a start() after it begins a lifecycle with a loop of its own;
-    // this one finishes its iteration and exits, rather than running beside
-    // that loop for good.
-    const lifecycle = this.lifecycleGeneration;
-    while (this.running && this.lifecycleGeneration === lifecycle) {
+    while (this.running) {
       try {
         await this.processNextEvent();
       } catch (error) {
@@ -17720,14 +17865,22 @@ export class AgentFramework {
   private async dispatchProcessEventToModules(event: ProcessEvent, startTime = Date.now()): Promise<void> {
     // Dispatch to all modules, tracking responses with module names
     const responses: ModuleProcessResponse[] = [];
-    for (const module of this.moduleRegistry.getAllModules()) {
+    const registrations = new Map<ModuleProcessResponse, object | undefined>();
+    const stillRegistered = (entry: ModuleProcessResponse): boolean =>
+      this.moduleRegistry.registrationOf(entry.moduleName) === registrations.get(entry);
+    const dispatched = this.moduleRegistry.getAllModules()
+      .map((module) => ({ module, registration: this.moduleRegistry.registrationOf(module.name) }));
+    for (const { module, registration } of dispatched) {
       // The framework's own toolsets module answers no event; every agent has
       // it now, so it isn't listed beside the modules that do.
       if (module instanceof ToolsetsModule) continue;
+      if (this.moduleRegistry.registrationOf(module.name) !== registration) continue;
       try {
         const processState = this.moduleRegistry.createProcessState(module.name);
         const response = await module.onProcess(event, processState);
-        responses.push({ moduleName: module.name, response });
+        const entry = { moduleName: module.name, response };
+        responses.push(entry);
+        registrations.set(entry, registration);
       } catch (error) {
         console.error(`Module ${module.name} error handling process event:`, error);
       }
@@ -17752,7 +17905,17 @@ export class AgentFramework {
     // responses, a tool call's dispatch and the trace go on, since a module
     // can't catch a throw on this path, and one module's mustn't cost the
     // event.
-    const applying = responses.filter(({ moduleName, response }) => {
+    const dropUnregistered = (entry: ModuleProcessResponse): boolean => {
+      if (stillRegistered(entry)) return false;
+      const parts = responseParts(entry.response);
+      if (parts) {
+        console.error(
+          `[process] module ${entry.moduleName} stopped before its response to ${event.type} was applied, so none of it was: ${parts}`,
+        );
+      }
+      return true;
+    };
+    const applying = responses.filter((entry) => !dropUnregistered(entry)).filter(({ moduleName, response }) => {
       const refusal = malformedResponseContent(response);
       if (refusal === null) return true;
       const { where, places } = refusal;
@@ -17775,7 +17938,7 @@ export class AgentFramework {
       const { moduleName, response } = entry;
       const step = { at: 'its start' };
       try {
-        await this.applyProcessResponse(response, event, moduleName, surface, step);
+        this.applyProcessResponse(response, event, moduleName, surface, step);
       } catch (error) {
         entry.threw = { at: step.at, error: error instanceof Error ? error.message : String(error) };
         console.error(
@@ -17803,7 +17966,7 @@ export class AgentFramework {
     }
   }
 
-  private async applyProcessResponse(
+  private applyProcessResponse(
     response: EventResponse,
     event: ProcessEvent,
     moduleName: string,
@@ -17811,7 +17974,7 @@ export class AgentFramework {
     surface: InboundSource | undefined,
     /** Names the operation under way, for the line when one throws. */
     step: { at: string },
-  ): Promise<void> {
+  ): void {
     // Add messages. Only the framework writes the inbound envelope: one a
     // module's metadata carries (echoed from a server's event, say) is
     // dropped, and a surface event's messages carry the framework's own.
@@ -18667,6 +18830,9 @@ export class AgentFramework {
     } else {
       // Nothing live under the name: only what the process keeps by name.
       this.closingConversationAgents.delete(agentName);
+      this.deadlineCuts.delete(agentName);
+      this.freshCallsCut.delete(agentName);
+      this.forgetFailureAccounting(agentName);
       this.thinkingLossIncidents.forget(agentName);
       this.reasoningLoss.forget(agentName);
       // A continuation of its turn still on its way goes with it.
@@ -19737,25 +19903,45 @@ export class AgentFramework {
     }
   }
 
-  /** Withdraw unstarted wakes whose sole cause is this subject (§4.2). */
+  /** Withdraw unstarted wakes whose sole cause is this subject (§4.2), and
+   *  a merged start whose every request is withdrawn. */
   private cancelCoalescedWakes(subject: string): void {
-    this.pendingRequests = this.pendingRequests.filter((r) => r.coalescingSubject !== subject);
-    for (const cooldown of this.providerAccelerationCooldowns.values()) {
-      cooldown.heldRequests = cooldown.heldRequests.filter((r) => r.coalescingSubject !== subject);
-    }
-    // A wake of the subject's merged into a start that carries a turn on
+    // A wake of the subject's merged into a start
     // (MERGED_BATCH) is withdrawn from the start's batch, so no stop puts
     // it back and no pass unpacks it.
+    const emptied = new Set<InferenceRequest>();
     const unrecord = (r: InferenceRequest): void => {
       const batch = mergedBatch(r);
       if (batch?.some((w) => w.coalescingSubject === subject)) {
-        (r as MarkedRequest)[MERGED_BATCH] = batch.filter((w) => w.coalescingSubject !== subject);
+        const left = batch.filter((w) => w.coalescingSubject !== subject);
+        (r as MarkedRequest)[MERGED_BATCH] = left;
+        if (left.length === 0) emptied.add(r);
       }
     };
     for (const r of this.pendingRequests) unrecord(r);
     for (const cooldown of this.providerAccelerationCooldowns.values()) cooldown.heldRequests.forEach(unrecord);
     for (const r of this.parkedContinuations ?? []) unrecord(r);
     for (const pass of this.passRequests ?? []) for (const requests of pass.values()) requests.forEach(unrecord);
+    const withdrawn = (r: InferenceRequest): boolean => r.coalescingSubject === subject || emptied.has(r);
+    this.pendingRequests = this.pendingRequests.filter((r) => !withdrawn(r));
+    for (const cooldown of this.providerAccelerationCooldowns.values()) {
+      const held = cooldown.heldRequests.length;
+      cooldown.heldRequests = cooldown.heldRequests.filter((r) => !withdrawn(r));
+      if (held > 0 && cooldown.heldRequests.length === 0) cooldown.emptiedBy = 'withdrawal';
+    }
+    for (const pass of this.passRequests ?? []) {
+      for (const requests of pass.values()) {
+        if (!requests.some((r) => emptied.has(r))) continue;
+        const left = requests.filter((r) => !emptied.has(r));
+        requests.length = 0;
+        requests.push(...left);
+      }
+    }
+    for (const start of emptied) {
+      if (!start.coalescingBatch || start.coalescingSubject !== undefined) continue;
+      console.error(`[coalescing] ${start.agentName}: its deferred batches were withdrawn while its wake waited; turn not started (no wake cause left)`);
+      this.emitTrace({ type: 'mcpl:coalescing', kind: 'turn-withdrawn', agentName: start.agentName, subjects: start.coalescingBatchSubjects ?? [] });
+    }
   }
 
   /** Unread (the coalescer's isUnread) by the consumed watermark, or, by the
@@ -20313,7 +20499,7 @@ export class AgentFramework {
         if (recovery) recovery.releasedAt = now;
         requests = [...providerCooldown.heldRequests, ...requests];
       }
-      // A start that carries a turn on and came back before it took its
+      // A start that came back before it took its
       // token stands for the batch it was merged from (MERGED_BATCH),
       // including one a hold released just now. The batch takes its place,
       // each request as it was, judged one by one from here: a wait holds
@@ -20704,10 +20890,10 @@ export class AgentFramework {
       else delete start[TURN_CARRY];
       if (requests.every(isRearmed)) start[REARMED] = true;
       else delete start[REARMED];
-      // A start that carries a turn on and took in wakes that don't records
-      // the batch it was merged from (MERGED_BATCH): until it takes its
-      // token it stands for them all.
-      if (continuesTurn(start) && requests.some((r) => !continuesTurn(r))) start[MERGED_BATCH] = [...requests];
+      // A start merged from more than one request, any of them not the
+      // turn's, records the batch it was merged from (MERGED_BATCH): until
+      // it takes its token it stands for them all.
+      if (requests.length > 1 && requests.some((r) => !continuesTurn(r))) start[MERGED_BATCH] = [...requests];
       else delete start[MERGED_BATCH];
       await this.startAgentStream(agent, start);
     }
@@ -24240,6 +24426,7 @@ export class AgentFramework {
     attempt = 0,
     providerGateAlreadyHeld = false,
   ): Promise<void> {
+    if (attempt === 0) this.deadlineCuts.delete(agent.name);
     const ownsProviderGate = this.registry.ownsProviderScheduling(agent.name);
     // A stopping framework starts no turn, whoever owns provider admission
     // (conversation agents and ephemeral runs do not take the gate).
@@ -24304,6 +24491,15 @@ export class AgentFramework {
             this.releasePrimaryProviderGate(agent.name);
             this.pendingRequests.push(...batch);
             console.error(`[provider-admission] ${agent.name}: host quiesced while parked — the merged start goes back as its ${batch.length} requests`);
+            return;
+          }
+          if (this.providerAccelerationCooldowns.has(agent.name)) {
+            this.releasePrimaryProviderGate(agent.name);
+            this.eventGate?.onInferenceEnded(agent.name);
+            this.pendingRequests.push(trigger ?? {
+              agentName: agent.name, reason: 'provider-admission:requeue', source: 'scheduler', timestamp: Date.now(),
+            });
+            console.error(`[provider-admission] ${agent.name}: a provider hold stands — parked wake requeued for the scheduler, not started`);
             return;
           }
           await this.startAgentStream(agent, trigger, attempt, true);
@@ -24457,7 +24653,7 @@ export class AgentFramework {
     if (hold) {
       const held = hold.heldRequests.length;
       hold.heldRequests = take(hold.heldRequests);
-      if (held > 0 && hold.heldRequests.length === 0) hold.emptiedByDrop = true;
+      if (held > 0 && hold.heldRequests.length === 0) hold.emptiedBy = 'drop';
     }
     for (const parked of [...this.parkedContinuations]) {
       if (!isContinuation(parked)) continue;
@@ -24569,9 +24765,8 @@ export class AgentFramework {
    * gets inference:aborted with `reason`, and lastInference records its end
    * as driveStream's would, when the record is still this turn's. Nothing of
    * the kind when another turn of this agent's name holds the turn token (one
-   * begun after a stop and start, or by a replacement agent object): the
-   * event and the record carry only the name, so this frame's would end that
-   * newer turn instead.
+   * begun by a replacement agent object): the event and the record carry only
+   * the name, so this frame's would end that newer turn instead.
    */
   private abortDroppedTurn(agentName: string, turnToken: number, reason: string, startedAt: number): void {
     const owner = this.activeTurnTokens.get(agentName);
@@ -24760,7 +24955,6 @@ export class AgentFramework {
      *  operator's abandon. */
     checkWindow: CheckWindow,
   ): Promise<boolean> {
-    const lifecycle = this.lifecycleGeneration;
     const resumesTurn = resumesLogicalTurn(trigger?.reason);
     let carry = turnCarryOf(trigger);
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
@@ -24927,7 +25121,7 @@ export class AgentFramework {
     // everything the turn has decided about where its speech goes.
     //  - A resume (a budget restart, a tool-result-guard retry) carries its
     //    turn's request on and keeps the turn's object as it is, and the
-    //    turn stays, or after a stop() becomes again, the agent's open turn.
+    //    turn stays, or becomes again, the agent's open turn.
     //  - A silent start routes no prose. It gets an object of its own, with
     //    no locus, so it neither takes nor disturbs an open turn's. Its
     //    object is the agent's live routing while it runs, and the open
@@ -24952,8 +25146,6 @@ export class AgentFramework {
     let opensTurn = false;
     if (resumesTurn) {
       routing = this.routingOf(agent.name);
-      // The turn a resume continues is open, unless a stop() ended every
-      // open turn since: it opens again, so its later starts continue it.
       if (!trigger?.suppressProse && !this.openLogical.has(agent.name)) this.openLogical.set(agent.name, routing);
     } else if (trigger?.suppressProse) {
       const continued = continuesTurn(trigger) ? this.turnRouting.get(agent.name) : undefined;
@@ -25109,11 +25301,11 @@ export class AgentFramework {
     });
     // A budget restart continues the same logical inference window. The
     // predecessor keeps EventGate liveness until its successor terminates,
-    // and the successor takes it again if it ended in between: at a stop()
-    // (a restart left queued, which a start() then takes up), or at a
+    // and the successor takes it again if it ended in between: at a
     // provider hold that kept the successor from starting (a stated wait at
-    // its last admission check, or a cooldown after its own call failed),
-    // whose end queues it again.
+    // its last admission check, a hold standing when its park behind an
+    // auxiliary call ended, or a cooldown after its own call failed), whose
+    // end queues it again.
     if (!resumesTurn) {
       this.eventGate?.onInferenceStarted(agent.name);
     } else {
@@ -25201,13 +25393,11 @@ export class AgentFramework {
       // An ephemeral watchdog may dispose this Agent while hooks/compile await,
       // and stop() may close provider admission. Do not create a provider
       // stream after its generation lost ownership, or once admission closed,
-      // or once a stop() and a start() have begun another lifecycle, as after
-      // the compile: these come before a stop kept for the turn, which goes
-      // with it.
-      if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed || lifecycle !== this.lifecycleGeneration) {
+      // as after the compile: these come before a stop kept for the turn,
+      // which goes with it.
+      if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed) {
         const why = this.agents.get(agent.name) !== agent ? 'the agent was replaced or removed'
-          : this.providerAdmissionClosed ? 'the framework was stopping'
-            : 'the framework was stopped and started again';
+          : 'the framework was stopping';
         const reason = `a turn assembled while ${why} is dropped before it sends anything`;
         console.error(`[turn] ${agent.name}: ${reason}`);
         this.endDroppedTurn(agent.name, routing);
@@ -25266,23 +25456,22 @@ export class AgentFramework {
         // This turn's retries are the framework's (errorPolicy below), not
         // membrane's inside each attempt.
         membraneRetries: false,
+        inferenceBounds: this.inferenceBounds,
       });
       // Each later round this stream sends is noted as it goes (noteRoundSent).
       if (noteRequestSent) this.streamRequestNotes.set(stream, { note: noteRequestSent, rounds: [], stopped: false });
       if (carriedBodies) this.streamCarried.set(stream, new Set(carriedBodies));
       // The compile can wait for annotations (each batch has one spill
-      // deadline), so check ownership, admission, and the lifecycle again.
-      // A stop followed by start must not revive this earlier turn.
+      // deadline), so check ownership and admission again.
       // Membrane's yielding stream starts its request when it is first
       // iterated, so cancelling it here, before driveStream, sends nothing.
       // A turn that was mid-compile when stop() cancelled every stream would
       // otherwise register after that pass and outlive stop(). The caller's
       // finally releases the turn token.
       const stopping = this.providerAdmissionClosed;
-      if (this.agents.get(agent.name) !== agent || stopping || lifecycle !== this.lifecycleGeneration) {
+      if (this.agents.get(agent.name) !== agent || stopping) {
         const why = this.agents.get(agent.name) !== agent ? 'the agent was replaced or removed'
-          : stopping ? 'the framework was stopping'
-            : 'the framework was stopped and started again';
+          : 'the framework was stopping';
         const reason = `a turn compiled while ${why} is dropped before it sends anything`;
         console.error(`[turn] ${agent.name}: ${reason}`);
         this.cancelUnsentStream(agent, stream, `compiled while ${why}`);
@@ -25413,14 +25602,12 @@ export class AgentFramework {
       // catch never holds a compiled request.) As at the checks after the
       // hooks and after the compile, a replaced agent or a stopping framework
       // comes first: the turn is dropped as theirs, and the stop goes with
-      // it, and so does a framework stopped and started again, as after the
-      // compile. A failed start with no stop goes on below as before.
+      // it. A failed start with no stop goes on below as before.
       const stopAtFailure = this.takeStartStop(agent, checkWindow);
       if (stopAtFailure) {
-        if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed || lifecycle !== this.lifecycleGeneration) {
+        if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed) {
           const why = this.agents.get(agent.name) !== agent ? 'the agent was replaced or removed'
-            : this.providerAdmissionClosed ? 'the framework was stopping'
-              : 'the framework was stopped and started again';
+            : 'the framework was stopping';
           const reason = `a turn whose request couldn't be built while ${why} is dropped before it sends anything`;
           console.error(`[turn] ${agent.name}: ${reason}`);
           this.endDroppedTurn(agent.name, routing);
@@ -25433,6 +25620,7 @@ export class AgentFramework {
       }
 
       const retry = trigger && withTurnCarry(trigger, carry);
+      const asTransient = this.takeAsTransient(agent.name, err, trigger);
       if (ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
         // Capacity scheduling is not poisoned history. The cooldown timer owns
         // one later fresh compile; no immediate retry or exhaustion marker.
@@ -25449,24 +25637,25 @@ export class AgentFramework {
         return false;
       }
 
-      const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && !gotPartway(routing))
-        ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, attempt);
+      const cuts = isDeadlineExpiry(err) ? this.deadlineCuts.get(agent.name) ?? 0 : undefined;
+      const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && (!gotPartway(routing) || (isDeadlineExpiry(err) && !asTransient)))
+        ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, cuts ?? attempt);
+      if (action.retry && cuts !== undefined) this.deadlineCuts.set(agent.name, cuts + 1);
+      else this.deadlineCuts.delete(agent.name);
+      if (!action.retry && cuts !== undefined && cuts > 0) this.freshCallsCut.add(agent.name);
       if (action.retry) {
         // A policy's delay can be a provider's retry-after: wait all of it.
         await this.waitForRetry(action.delayMs, checkWindow, agent);
-        if (this.providerAdmissionClosed || lifecycle !== this.lifecycleGeneration) {
+        if (this.providerAdmissionClosed) {
           // stop() ended the wait: that cancels the retry, it does not hasten
-          // it. A stop() and a start() since this start began cancel it too,
-          // as after the compile: the retry would revive the earlier
-          // lifecycle's turn in the next one, and a stop kept for the turn
-          // goes with it. The turn ends as one dropped before it sends
-          // anything does: a terminal event saying why, after the
-          // inference:failed above, and its record's end. Nothing is written
+          // it, and a stop kept for the turn goes with it. The turn ends as
+          // one dropped before it sends anything does: a terminal event
+          // saying why, after the inference:failed above, and its record's
+          // end. Nothing is written
           // but the [speech-not-posted] notice; this frame still owns its
           // token, since no retry frame replaced it.
           this.nameUnpostedSpeech(agent, routing);
-          this.abortDroppedTurn(agent.name, turnToken,
-            this.providerAdmissionClosed ? RETRY_CANCELLED_BY_STOP : RETRY_ACROSS_RESTART, turnStartedAt);
+          this.abortDroppedTurn(agent.name, turnToken, RETRY_CANCELLED_BY_STOP, turnStartedAt);
           if (this.activeTurnTokens.get(agent.name) === turnToken) {
             this.activeTurnTokens.delete(agent.name);
             this.activeTurnTriggers.delete(agent.name);
@@ -25510,7 +25699,7 @@ export class AgentFramework {
           speech: '',
           ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
         }, routing);
-        if (isRearmed(trigger) && isTransientFailure(err)) this.exhaustingRearms.add(agent.name);
+        if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
         this.emitTrace({
           type: 'inference:exhausted',
           agentName: agent.name,
@@ -25530,7 +25719,7 @@ export class AgentFramework {
         if (action.emit) {
           this.pushEvent(action.emit);
         }
-        this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, routing);
+        this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, routing, asTransient);
       }
       // No handoff on either failure branch: the terminal branch deleted the
       // token above; the retry branch's recursive startAgentStream replaced
@@ -27347,6 +27536,7 @@ export class AgentFramework {
 
             this.abandonAgentScripts(agent.name, 'stream error', streamRouting);
             const retry = retryOf(trigger);
+            const asTransient = this.takeAsTransient(agent.name, err, trigger);
 
             // A hold takes the turn's retry, or, once stop() has closed
             // admission, the turn ends here (endFailureAtStop).
@@ -27362,8 +27552,12 @@ export class AgentFramework {
               break;
             }
 
-            const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && !gotPartway(streamRouting))
-              ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, attempt);
+            const cuts = isDeadlineExpiry(err) ? this.deadlineCuts.get(agent.name) ?? 0 : undefined;
+            const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && (!gotPartway(streamRouting) || (isDeadlineExpiry(err) && !asTransient)))
+              ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, cuts ?? attempt);
+            if (action.retry && cuts !== undefined) this.deadlineCuts.set(agent.name, cuts + 1);
+            else this.deadlineCuts.delete(agent.name);
+            if (!action.retry && cuts !== undefined && cuts > 0) this.freshCallsCut.add(agent.name);
             if (action.retry) {
               // A stop made during the wait reaches no stream: the check after
               // the wait ends the turn, as the guard's check after its wait
@@ -27420,7 +27614,7 @@ export class AgentFramework {
                 speech: '',
                 ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
               }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined, streamRouting);
-              if (isRearmed(trigger) && isTransientFailure(err)) this.exhaustingRearms.add(agent.name);
+              if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
               this.emitTrace({
                 type: 'inference:exhausted',
                 agentName: agent.name,
@@ -27438,7 +27632,7 @@ export class AgentFramework {
               if (action.emit) {
                 this.pushEvent(action.emit);
               }
-              this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting);
+              this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting, asTransient);
             }
             break;
           }
@@ -27513,7 +27707,7 @@ export class AgentFramework {
                   agentName: agent.name,
                   error: terminal,
                 });
-                this.rearmExhaustedTurn(agent, new Error(terminal), trigger, ownsProviderGate, streamRouting);
+                this.rearmExhaustedTurn(agent, new Error(terminal), trigger, ownsProviderGate, streamRouting, false);
                 // Postmortem 2026-05-28 P2 #7: persist the abort to the
                 // inference log so future investigations can attribute the
                 // terminal cause without relying on live in-memory reducer
@@ -27531,6 +27725,8 @@ export class AgentFramework {
           }
 
           case 'usage': {
+            this.rearmDeadlineCuts.delete(agent.name);
+            this.deadlineCuts.delete(agent.name);
             // Cumulative across the stream's rounds: replace, never sum.
             latestUsage = event.usage;
             // The stream's accumulated fresh input, which is what the
@@ -27773,6 +27969,7 @@ export class AgentFramework {
       agent.reset();
       this.emitTrace({ type: 'inference:failed', agentName: agent.name, error: err.message, stack: err.stack });
       const retry = retryOf(trigger);
+      const asTransient = this.takeAsTransient(agent.name, err, trigger);
       if (ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
         // Once stop() has closed admission, nothing is held, and the turn
         // ends here (endFailureAtStop).
@@ -27804,14 +28001,14 @@ export class AgentFramework {
         speech: '',
         ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
       }, streamRouting);
-      if (isRearmed(trigger) && isTransientFailure(err)) this.exhaustingRearms.add(agent.name);
+      if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
       this.emitTrace({
         type: 'inference:exhausted',
         agentName: agent.name,
         error: err.message,
         ...this.classifyInferenceError(err),
       });
-      this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting);
+      this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting, asTransient);
       // Postmortem 2026-05-28 P2 #7: catch-path failures (stream itself
       // threw) were previously only visible via in-memory trace listeners.
       // Persist to inference log for forensic attribution.
@@ -29069,7 +29266,7 @@ export class AgentFramework {
     // A batch with no finite deadline (a host whose deadline() threw) gets
     // this write's own, rather than a timer Node would cut to 1 ms.
     if (!Number.isFinite(deadline)) deadline = Date.now() + this.withheldSpillDeadlineMs;
-    if (this.guardSpillsClosedFor === this.lifecycleGeneration) return null;
+    if (this.guardSpillsClosed) return null;
     const place = this.toolResultFilePlace(label);
     if (!place) return null;
     if (this.stalledSpills.size > 0) {
@@ -30900,6 +31097,7 @@ export class AgentFramework {
   private noteSpokenTo(agentName: string, metadata: MessageMetadata | undefined): void {
     const agent = this.agents.get(agentName);
     if ((agent && !this.agentSees(agent, metadata)) || isOwnScheduleWrite(metadata) || !isConversationalInjection(metadata)) return;
+    this.rearmDeadlineCuts?.delete(agentName);
     if (this.turnRearms?.delete(agentName)) console.error(`[inference-rearm] agent=${agentName} re-send count started again: a message was said to it`);
   }
 
@@ -32228,6 +32426,7 @@ export class AgentFramework {
     const ended = this.exhaustedTurns?.get(agentName);
     this.exhaustedTurns?.delete(agentName);
     const rearmed = this.exhaustingRearms?.delete(agentName) === true;
+    const madeAgain = this.freshCallsCut?.delete(agentName) === true;
     // The reason is the failure's own message, and a provider can echo the
     // whole rejected request in it: one household's [inference-failed]
     // marker carried ~1.7 MB of its own request back into its context. Every
@@ -32284,9 +32483,10 @@ export class AgentFramework {
     // (2) Agent-facing chronicle marker (no inference triggered → no loop).
     const agent = this.agents.get(agentName);
     if (agent && !(rearmed && !ended) && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1') {
-      const cause = [errorType, httpStatus !== undefined ? `HTTP ${httpStatus}` : undefined]
-        .filter((part): part is string => part !== undefined)
-        .join(', ');
+      const timedOut = errorType === 'timeout';
+      const causeParts = [errorType, httpStatus !== undefined ? `HTTP ${httpStatus}` : undefined]
+        .filter((part): part is string => part !== undefined);
+      const cause = timedOut && causeParts.length === 1 ? '' : causeParts.join(', ');
       try {
         storeOwnRow(
           agent,
@@ -32295,17 +32495,17 @@ export class AgentFramework {
             type: 'text',
             text:
               (ended
-                ? `[${NOTICE_TAG.inferenceFailed}] Your previous turn did not complete: it ` +
-                  `failed${cause ? ` (${suppliedValue(cause)})` : ''}.` +
+                ? `[${NOTICE_TAG.inferenceFailed}] Your previous turn did not complete: ` +
+                  `${timedOut ? 'its last call timed out' : 'it failed'}${cause ? ` (${suppliedValue(cause)})` : ''}.` +
+                  `${madeAgain ? ` ${MADE_AGAIN}` : ''}` +
                   `${ended.roundsRan ? ' Its earlier rounds ran, and their tool calls ran as their results show.' : ''}` +
                   `${ended.callsCutOff ? ` ${CALLS_CUT_OFF}` : ''}` +
                   `${ended.liveSpeech ? ` ${LIVE_SPEECH_UNRECEIPTED}` : ''}` +
                   `${ended.speechRouting ? ` ${SPEECH_STILL_ROUTING}` : ''} Reason: `
-                : `[${NOTICE_TAG.inferenceFailed}] Your previous turn did not complete: the model ` +
-                  `call failed${cause ? ` (${suppliedValue(cause)})` : ''} and produced no response, so nothing was sent. Reason: `) +
-              `${failureShown(markerReason)}. If this recurs with the same cause, change approach ` +
-              `rather than retrying identically (e.g. drop an oversized attachment ` +
-              `or an unsupported setting).`,
+                : `[${NOTICE_TAG.inferenceFailed}] Your previous turn did not complete: ` +
+                  `the model call ${timedOut ? 'timed out' : 'failed'}${cause ? ` (${suppliedValue(cause)})` : ''} ` +
+                  `and produced no response, so nothing was sent.${madeAgain ? ` ${MADE_AGAIN}` : ''} Reason: `) +
+              `${failureShown(markerReason)}. ${timedOut ? TIMEOUT_ADVICE : FAILURE_ADVICE}`,
           }],
           { system: true, kind: 'inference-failed', reason: markerReason, consecutive: streak, ...classification, ...cutAt(markerReason) },
         );
@@ -32564,6 +32764,7 @@ export class AgentFramework {
       this.featureSetManager,
       inferenceRouting ?? null,
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      () => this.inferenceBounds,
     );
 
     // Checkpoint manager (Step 8), built and loaded at the top
@@ -32782,13 +32983,11 @@ export class AgentFramework {
           attempt: 0,
           willRetry: !!left?.willReconnect,
         });
-        // So the server doesn't vanish quietly: alert at once, since no
-        // attempt follows, for what needs the operator. That's a
-        // protocol-version verdict, as the reconnect path alerts for one, or
-        // a launch that couldn't be reaped, whose reap nothing retries on its
-        // own.
-        if (error instanceof McplProtocolVersionError || left?.holdsUnreapedChild) {
-          this.opsAlert('mcpl-down', config.id, `MCPL server unreachable at startup: ${message}`);
+        // So the server doesn't vanish quietly: nothing connects it again on
+        // its own, so alert at once. One that connected before its setup
+        // threw is still connected, and gets no alert.
+        if (!left?.willReconnect && !left?.isConnected) {
+          this.opsAlert('mcpl-down', config.id, `MCPL server not connected at startup, and this host won't retry it on its own: ${message}`);
         }
       }
     }
@@ -34738,9 +34937,10 @@ export class AgentFramework {
 
   /**
    * Restart an MCPL server at runtime: disconnect, then reconnect with the
-   * same (or an updated) config. This actually respawns a stdio child —
-   * unlike `reconnect: true`, which only retries after transport-level
-   * failures. Throws if the server has no stored config and none is given.
+   * same (or an updated) config. This respawns a stdio child at once,
+   * whatever its state; `reconnect: true` spawns a fresh child only after
+   * the connection fails or its child exits. Throws if the server has no
+   * stored config and none is given.
    * What its connect would refuse is refused before the running server is
    * torn down. Until the connect, a connect or a restart started meanwhile
    * is refused the id and the tool prefix the restart moves the server to,
@@ -35222,12 +35422,9 @@ export class AgentFramework {
           // request turned away at stop gets, so it can send it again to
           // the host's next run. Optional chaining: prototype-built
           // harnesses leave the queue unset.
-          const stopping = !!this.queue?.isClosed;
+          const answer = this.queue?.isClosed ? hostStoppedWhileHandling() : { code: -32603, message: 'Internal error' };
           try {
-            tracked.respondError?.(
-              stopping ? -32000 : -32603,
-              stopping ? 'the host stopped while handling this request' : 'Internal error',
-            );
+            tracked.respondError?.(answer.code, answer.message);
           } catch (sendError) {
             responseError = recorded(describeCause(sendError));
           }
@@ -35384,6 +35581,7 @@ export class AgentFramework {
         respond: (result: unknown) => void;
         respondError: (code: number, message: string) => void;
         sendChunk?: (chunk: InferenceChunkParams) => void;
+        signal?: AbortSignal;
       },
     ) => {
       // RFC-006 §5.3 / SPEC §10.7: no inference from inside a render.
@@ -35409,6 +35607,7 @@ export class AgentFramework {
           // Chunks go out on the transport the request came on, as its
           // answer does.
           ...(responder.sendChunk ? { sendChunk: responder.sendChunk } : {}),
+          ...(responder.signal ? { signal: responder.signal } : {}),
         });
       }
     });
@@ -35724,14 +35923,15 @@ export class AgentFramework {
       // that next one (see refreshMcplTools).
       this.noteMcplServerClosed(connection.id);
       this.dropMcplToolClasses(connection.id);
+      // The transport's own words only: a WebSocket server's close text
+      // stays off the trace.
+      const reason = info?.reason !== undefined && !info.reasonFromPeer ? boundFailureText(info.reason) : null;
       this.emitTrace({
         type: 'mcpl:server-closed',
         serverId: connection.id,
         code: code ?? null,
         signal: signal ?? null,
-        // The transport's own words only: a WebSocket server's close text
-        // stays off the trace.
-        reason: info?.reason !== undefined && !info.reasonFromPeer ? boundFailureText(info.reason) : null,
+        reason,
         willReconnect: connection.willReconnect,
       });
       this.emitTrace({ type: 'module:removed', moduleName: `mcpl:${connection.id}` });
@@ -35741,6 +35941,14 @@ export class AgentFramework {
         // RFC-014: its toolsets go with it; a next connection reads them again.
         this.toolsetHub?.get(connection.id)?.detach(connection);
         this.handleToolsListChanged(connection.id);
+        // Lost on its own with no reconnect coming: nothing in this host
+        // connects it again on its own. A close the host made itself (stop(),
+        // a disconnect, a restart) is byHost, a loss once stop() has begun is
+        // part of the close the host is making, and a child that ended as
+        // asked was stopped: none of them gets an alert.
+        if (!info?.byHost && !this.stopHasBegun() && !endedAsAsked({ code, signal, pipeFailed: info?.pipeFailed })) {
+          this.opsAlert('mcpl-down', connection.id, `MCPL server closed${closeWords(reason, code, signal)}, and this host won't reconnect it on its own`);
+        }
       }
     });
   }
@@ -35766,11 +35974,12 @@ export class AgentFramework {
       this.emitTrace({ type: 'module:added', moduleName: `mcpl:${connection.id}` });
       this.handleToolsListChanged(connection.id);
     });
-    const failed = (params: { error: string; attempt: number; permanent?: boolean }) => {
+    const failed = (params: { error: string; stderrTail?: string; attempt: number; permanent?: boolean }) => {
       this.emitTrace({
         type: 'mcpl:server-connect-failed',
         serverId: connection.id,
         error: recorded(params.error),
+        ...(params.stderrTail === undefined ? {} : { stderrTail: recorded(params.stderrTail) }),
         attempt: params.attempt,
         willRetry: connection.willReconnect,
       });
@@ -35788,7 +35997,7 @@ export class AgentFramework {
     connection.on('error', (err: Error) => {
       this.emitTrace({ type: 'mcpl:server-error', serverId: connection.id, error: recorded(err.message) });
     });
-    connection.on('close', () => {
+    connection.on('close', (info: { reason: string; code?: number | null; signal?: NodeJS.Signals | null; pipeFailed?: boolean }) => {
       // A closed provider's class hints are stale (RFC-008), as for MCPL,
       // and so is a listing already under way.
       this.noteMcplServerClosed(connection.id);
@@ -35796,8 +36005,9 @@ export class AgentFramework {
       this.emitTrace({
         type: 'mcpl:server-closed',
         serverId: connection.id,
-        code: null,
-        signal: null,
+        code: info.code ?? null,
+        signal: info.signal ?? null,
+        reason: info.reason,
         willReconnect: connection.willReconnect,
       });
       this.emitTrace({ type: 'module:removed', moduleName: `mcpl:${connection.id}` });
@@ -35817,6 +36027,13 @@ export class AgentFramework {
           // Gone for good: its tools leave the agents' list, as a
           // disconnect's do.
           this.handleToolsListChanged(connection.id);
+          // Lost on its own: nothing in this host connects it again on its
+          // own. A loss once stop() has begun is part of the close the host
+          // is making, and a child that ended as asked was stopped: neither
+          // gets an alert.
+          if (!this.stopHasBegun() && !endedAsAsked(info)) {
+            this.opsAlert('mcpl-down', connection.id, `MCP server closed${closeWords(info.reason, info.code, info.signal)}, and this host won't reconnect it on its own`);
+          }
         });
       }
     });

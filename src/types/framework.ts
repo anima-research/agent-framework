@@ -6,6 +6,7 @@ import type { ProcessEvent } from './events.js';
 import type { McplServerConfig, InferenceRoutingPolicy } from '../mcpl/types.js';
 import type { ConversationRouterConfig } from '../mcpl/conversation-router.js';
 import type { GateOptions } from '../gate/types.js';
+import type { InferenceBoundsOptions } from '../inference-bounds.js';
 
 // Re-export trace types
 export type { TraceEvent, TraceEventListener } from './trace.js';
@@ -318,6 +319,30 @@ export interface FrameworkConfig {
   errorPolicy?: ErrorPolicy;
 
   /**
+   * How long a model call may go without progress before it is cut. A
+   * resident's streamed call, and an MCPL server's, gets membrane's progress
+   * bounds where its adapter's stream reports content (Anthropic, Bedrock),
+   * and on every adapter a flat bound from its last provider event: the
+   * larger of a setup term (the larger of `beforeContentMs` and
+   * `betweenEventsMs`) plus the request's `maxTokens` at
+   * `thinkTokensPerSecond`, and `flatMinimumMs`. An auxiliary call
+   * (compression, the reply judge) and an MCPL server's non-streamed call get
+   * a bound on the whole call from its send, the setup term plus that
+   * allowance (the larger of the setup term and `flatMinimumMs` when it
+   * names no `maxTokens`), unless its
+   * caller passed a `progressTimeoutMs` of its own; where an adapter's
+   * `complete()` streams under the hood, membrane renews it at each parsed
+   * provider event. A call a bound cuts fails
+   * with type `timeout`, and on an agent's turn DefaultErrorPolicy gives each
+   * such call one fresh call, except in a turn that re-arms an exhausted one,
+   * where `exhaustedTurnRearmMs` says what a cut does. One setting covers
+   * every agent. `false` sets
+   * none of these bounds. Default: membrane's PROGRESS_BOUNDS and
+   * FLAT_MINIMUM_MS.
+   */
+  inferenceBounds?: false | InferenceBoundsOptions;
+
+  /**
    * Host verdict on a failed inference: "this cannot succeed until later".
    * Consulted before the error policy and before the built-in
    * organization-acceleration classification, for a persistent agent's
@@ -355,20 +380,32 @@ export interface FrameworkConfig {
    * channel isn't sent again: one whose turn was woken for a channel id that
    * names no one registered channel and never found one, and whose request
    * names none of its own. A failure that states a wait is held for that wait
-   * first, as any turn's is, and a deadline ends the turn as before, whether
-   * the host set it or membrane marks one as run out: the runtime's or
-   * undici's on a sent request, the Anthropic adapter's watchdogs, or the
-   * Anthropic SDK's timeout, which covers its connect timeout too. Until one
-   * of the re-armed turn's rounds has run or had its tool calls cut off, its
-   * failure gets no retries from the error policy: on another transient
-   * failure the next delay follows, until the list runs out, and a failure of
-   * any other kind ends the re-arming. A wake for the agent while it waits
-   * starts its turn at once, with the re-armed trigger merged in. That turn is
-   * the wake's: the error policy retries its failures. A completed turn starts
-   * the count again, and so does a message said to the agent: not a system
-   * message or notice; not an edit, reaction or deletion, unless an edit is
-   * the first version of a message the agent sees; not a message its own view
-   * leaves out, such as one a tune-out holds from it; and not the agent's own
+   * first, as any turn's is, and a turn that ends on a deadline, whether the
+   * host set it or membrane marks one as run out (the runtime's or undici's
+   * on a sent request, the Anthropic adapter's watchdogs, or the Anthropic
+   * SDK's timeout, which covers its connect timeout too), isn't re-armed,
+   * save the exception below. Until one of the re-armed turn's rounds has run
+   * or had its tool calls cut off, its failure gets no retries from the error
+   * policy: on another transient failure the next delay follows, until the
+   * list runs out, and a failure of any other kind ends the re-arming. The
+   * one exception is a re-armed turn's send that fails with a deadline marked
+   * as run out, membrane's or a bound the host sets on the call
+   * (`inferenceBounds`), as when a stream stalls. Such a cut counts as a
+   * transient failure, so a turn that ends on it is re-armed as for a
+   * transient failure, unless it follows another such cut with no transient
+   * failure, answered round or message said to the agent between them: two
+   * such cuts in a row end the re-arming, and the second gets no retry from
+   * the error policy, even in a re-armed turn that got partway. A transient
+   * failure or an answered round in any of the agent's turns clears an
+   * earlier cut, and so does a message said to the agent, or the agent's end.
+   * Every such cut counts, including one the error policy retries or a host's
+   * provider hold takes. A wake for the agent while it waits starts its turn
+   * at once, with the re-armed trigger merged in. That turn is the
+   * wake's: the error policy retries its failures. A completed turn starts the
+   * count again, and so does a message said to the agent: not a system message
+   * or notice; not an edit, reaction or deletion, unless an edit is the first
+   * version of a message the agent sees; not a message its own view leaves
+   * out, such as one a tune-out holds from it; and not the agent's own
    * schedule, the heartbeat's tick or reminder, a self-wake timer it set, or a
    * script's wake. A notice a module or an MCPL server stores as a message
    * counts. A message in the residents' shared slot counts for each resident
@@ -576,7 +613,10 @@ export interface InferencePolicy {
  */
 export interface ErrorPolicy {
   /**
-   * Handle an inference error.
+   * Handle an inference error. `attempt` is how many times the turn's
+   * request has failed before this one; for a deadline expiry (a progress
+   * bound's cut, or one membrane marks), how many times that call's request
+   * has expired in a row before this one.
    */
   onInferenceError(
     error: Error,

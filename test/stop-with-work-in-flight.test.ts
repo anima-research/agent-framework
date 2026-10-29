@@ -19,19 +19,16 @@
  *     is stopping, and its own text goes only to the host's log.
  * Any other event pushed to a stopped framework still throws to its caller.
  * A turn waiting to retry is work in flight too: stop() cancels the retry,
- * and leaves no agent inferring at the event gate, which a start() after the
- * stop goes on with (#334). The turn ends with inference:aborted, saying no
- * retry follows its inference:failed, whether its stream failed to start or
- * failed once started. A turn that continues after that start() is marked
- * inferring again.
+ * and leaves no agent inferring at the event gate (#334). The turn ends with
+ * inference:aborted, saying no retry follows its inference:failed, whether
+ * its stream failed to start or failed once started.
  * Work that outlasts stop()'s budget fails the stop, with teardown gone on
  * and the store left open (#373): a stream whose cancel can't reach it,
  * whose agent's window takes what was written meanwhile only at its own end
  * (#291), and an event loop in a
  * module's onProcess, which finishes that iteration once the call returns
- * and exits, rather than run beside the loop of a start() made meanwhile.
- * Two such waits fail it together, and a later stop() waits for what an
- * earlier one left running, a start() between them or not.
+ * and exits. Two such waits fail it together, and a later stop() waits for
+ * what an earlier one left running.
  * Each test waits on the event it needs (a log line, an answer), not on a
  * fixed delay, and then one more turn, so a late rejection would be seen.
  */
@@ -44,7 +41,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from '@babel/parser';
-import { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock } from '@animalabs/membrane';
 import type {
   ErrorAction,
@@ -471,54 +467,6 @@ describe('stop() with work still in flight', () => {
     assert.deepEqual(rejections, []);
   });
 
-  it('a budget restart taken up after a stop() and a start() marks its agent inferring again', { timeout: 60_000 }, async () => {
-    // A restart left queued when stop() ends the loop continues its turn once
-    // a start() on the same framework takes it up. stop() cleared the gate's
-    // entries, and a turn that continues another doesn't start a new one, so
-    // it has to take its agent's again: while no agent is inferring, the gate
-    // delivers debounced batches, and residents share one message slot.
-    const store = JsStore.openOrCreate({ path: join(tempDir, 'store') });
-    let release!: () => void;
-    const released = new Promise<void>((resolve) => { release = resolve; });
-    let streaming!: () => void;
-    const inStream = new Promise<void>((resolve) => { streaming = resolve; });
-    const membrane = new MockMembrane();
-    membrane.streamYielding = (request) => {
-      membrane.calls.push(request);
-      streaming();
-      return new HeldStream(released, [createMockResponse([{ type: 'text', text: 'continued' }] as ContentBlock[])]);
-    };
-    const framework = await AgentFramework.create({
-      store,
-      membrane: membrane.asMembrane(),
-      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'test' }],
-      modules: [new SlowModule()],
-      gate: { configPath: join(tempDir, 'gate.json'), config: { policies: [], default: 'always' } },
-    });
-    const internal = framework as unknown as {
-      eventGate: { inferenceDiagnostics(): { inferring: string[] } };
-      pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number }>;
-    };
-    try {
-      framework.start();
-      await framework.stop();
-      // Queued while the framework is stopped, as a restart that stop() left
-      // queued is: the next start()'s loop takes it up.
-      internal.pendingRequests.push({ agentName: 'assistant', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now() });
-      framework.start();
-      await inStream;
-      assert.deepEqual(internal.eventGate.inferenceDiagnostics().inferring, ['assistant'], 'the continuing turn holds its entry');
-      release();
-      await until(() => internal.eventGate.inferenceDiagnostics().inferring.length === 0, 'the turn to end');
-      assert.equal(membrane.calls.length, 1);
-      assert.deepEqual(rejections, []);
-    } finally {
-      release();
-      await framework.stop();
-      store.close();
-    }
-  });
-
   describe("stop()'s budget, with work that outlasts it", () => {
     /** What `promise` has come to after `ms`: its rejection, 'resolved', or
      *  'still pending', so a stop() that doesn't come back fails the test
@@ -686,10 +634,7 @@ describe('stop() with work still in flight', () => {
       }
     });
 
-    it("a stop() after a timed-out one and a start() waits for the old loop too, and keeps the store open until it has settled", { timeout: 30_000 }, async () => {
-      // The start() replaces the loop a stop() waits for. What the first
-      // stop()'s budget left running stays the framework's to wait for, so
-      // the second one doesn't close the store under the old loop's call.
+    it("a stop() after a timed-out one waits for the loop that one left running, and keeps the store open until it has settled", { timeout: 30_000 }, async () => {
       const { framework, entered, letGo, push } = await frameworkWithHeldWork();
       try {
         framework.start();
@@ -697,14 +642,13 @@ describe('stop() with work still in flight', () => {
         await until(() => entered.includes('hang'), 'the loop to enter the call');
         const first = await settledWithin(framework.stop(100), 5_000);
         assert.ok(first instanceof ShutdownTimeoutError && first.pending.includes('event loop'), String(first));
-        framework.start();
         const second = await settledWithin(framework.stop(100), 5_000);
         assert.ok(second instanceof ShutdownTimeoutError
           && second.message === 'Shutdown timed out after 100 ms; pending: event loop', String(second));
-        assert.equal(framework.getStore().isClosed(), false, "the old loop's call is still running");
+        assert.equal(framework.getStore().isClosed(), false, "the loop's call is still running");
         letGo('hang');
         await framework.stop();
-        assert.equal(framework.getStore().isClosed(), true, 'a stop() closes the store once the old loop has settled');
+        assert.equal(framework.getStore().isClosed(), true, 'a stop() closes the store once the loop has settled');
         assert.deepEqual(rejections, []);
       } finally {
         letGo('hang');
@@ -712,7 +656,7 @@ describe('stop() with work still in flight', () => {
       }
     });
 
-    it("a loop whose stop() came back while it was in a call exits once that call returns, though a start() was made meanwhile, and the new lifecycle's loop runs on", { timeout: 30_000 }, async () => {
+    it("a loop whose stop() came back while it was in a call exits once that call returns", { timeout: 30_000 }, async () => {
       const { framework, entered, letGo, push, internals } = await frameworkWithHeldWork();
       try {
         framework.start();
@@ -720,15 +664,11 @@ describe('stop() with work still in flight', () => {
         await until(() => entered.includes('hang'), 'the loop to enter the call');
         const outcome = await settledWithin(framework.stop(100), 5_000);
         assert.ok(outcome instanceof ShutdownTimeoutError && outcome.pending.includes('event loop'), String(outcome));
-        const oldLoop = internals.loopPromise!;
-        framework.start();
-        const newLoop = internals.loopPromise!;
-        assert.notEqual(newLoop, oldLoop, 'the start() runs a loop of its own');
+        const loop = internals.loopPromise!;
+        assert.equal(await settledWithin(loop, 100), 'still pending', 'the loop is still in its call');
         letGo('hang');
-        assert.equal(await settledWithin(oldLoop, 5_000), 'resolved', 'the old loop exits once its call returns');
-        assert.equal(await settledWithin(newLoop, 100), 'still pending', "the new lifecycle's loop runs on");
+        assert.equal(await settledWithin(loop, 5_000), 'resolved', 'the loop exits once its call returns');
         await framework.stop();
-        assert.equal(await settledWithin(newLoop, 5_000), 'resolved', 'and ends with its own stop()');
         assert.deepEqual(rejections, []);
       } finally {
         letGo('hang');
@@ -922,7 +862,7 @@ describe('stop() with work still in flight', () => {
       };
       fw.pushHandler = { handlePushEvent: handler };
       fw.channelRegistry = { handleIncoming: handler, handleRegister: handler, handleChanged: handler, stopAll: () => {} };
-      fw.inferenceRouter = { handleInferenceRequest: handler };
+      fw.inferenceRouter = { handleInferenceRequest: handler, stopAll: () => [] };
       fw.handleHostCommand = handler;
     }
 

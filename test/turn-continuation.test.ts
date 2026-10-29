@@ -18,6 +18,7 @@ import { join } from 'node:path';
 import type { NormalizedRequest, NormalizedResponse, YieldingStream } from '@animalabs/membrane';
 import type { EventResponse, InferenceRequest, Module, ProcessEvent, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { AgentFramework, OperatorActionError } from '../src/index.js';
+import { setAbandonGraceForTests } from '../src/framework.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
 import { forkAgentName } from '../src/mcpl/conversation-router.js';
 import type { StreamEvent } from '@animalabs/membrane';
@@ -39,7 +40,7 @@ async function waitFor(label: string, predicate: () => boolean, timeoutMs = 10_0
 
 interface Internals {
   providerWaits: { set(agent: string, model: string, ms: number, reason: string): unknown };
-  providerAccelerationCooldowns: Map<string, { heldRequests: InferenceRequest[]; emptiedByDrop?: boolean }>;
+  providerAccelerationCooldowns: Map<string, { heldRequests: InferenceRequest[]; emptiedBy?: 'drop' | 'withdrawal' }>;
   processInferenceRequests(): Promise<void>;
   activeTurnTokens: Map<string, number>;
   providerAccelerationRecoveries: Map<string, unknown>;
@@ -56,7 +57,6 @@ interface Internals {
   providerHoldHook: ((error: Error, agentName: string) => { holdMs: number; reason: string } | undefined) | undefined;
   holdProviderAcceleration(agent: unknown, error: Error, trigger?: InferenceRequest, auxiliary?: boolean): boolean;
   pushCoalescer: unknown;
-  lifecycleGeneration: number;
 }
 const internals = (framework: AgentFramework) => framework as unknown as Internals;
 
@@ -878,6 +878,38 @@ describe('a turn whose continuation is dropped ends there', () => {
     }
   });
 
+  it("a start parked behind an auxiliary call whose failure arms a host's hold is held with its turn alive and the gate's window closed, and runs once the hold releases, taking the window again", async () => {
+    let framework: AgentFramework | undefined;
+    let windowAtContinuation: boolean | undefined;
+    const h = await restartTurn({
+      wait: false, auxiliaryDuringRestart: true, gate: true,
+      onStreamMade: (index) => { if (index === 1 && framework) windowAtContinuation = gateInferring(framework); },
+    });
+    framework = h.framework;
+    const internal = internals(h.framework);
+    const gate = internal.providerGate('prime');
+    try {
+      await waitFor('the continuation to park, its frame gone', () => gate.idleWaiters.length > 0 && frameLetGo(h.framework));
+      let spent = true;
+      internal.providerHoldHook = () => (spent ? { holdMs: 1_000, reason: 'the host says wait' } : undefined);
+      internal.holdProviderAcceleration(h.framework.getAgent('prime'), new Error('compression failed'), undefined, true);
+      gate.auxiliaryInFlight = 0;
+      for (const resolve of gate.idleWaiters.splice(0)) resolve();
+      await waitFor('the hold to keep the continuation', () =>
+        internal.providerAccelerationCooldowns.get('prime')?.heldRequests.some((r) => r.reason === 'context_budget_restart') ?? false);
+      assert.equal(h.membrane.calls.length, 1, 'no call while the hold stands');
+      assert.deepEqual(h.framework.getHostModeStatus().activeTurnAgents, ['prime'], 'the held continuation keeps the turn alive');
+      assert.equal(gateInferring(h.framework), false, "the gate's window is closed while the hold keeps the turn from starting");
+      spent = false;
+      await waitFor('the continuation to run once the hold releases', () => h.membrane.calls.length === 2);
+      assert.equal(windowAtContinuation, true, "the continuation's start took the gate's window again");
+      await waitFor('the turn to end', () => h.framework.getHostModeStatus().drained);
+      assert.deepEqual(h.endLines(), [], 'nothing was dropped');
+    } finally {
+      await h.cleanup();
+    }
+  });
+
   it("abortInference() while a provider wait holds the continuation ends the turn: the continuation is dropped, with one inference:aborted carrying the stop's reason", async () => {
     const h = await restartTurn({ wait: true });
     try {
@@ -1244,6 +1276,7 @@ describe('a framework cancel that throws', () => {
     const h = await restartTurn({ wait: false, cancelThrows: true, gate: true, blockFirstTool: blocked, until: () => true });
     try {
       await waitFor('the tool to start', () => h.module.firstToolStarted);
+      setAbandonGraceForTests(h.framework, 50);
       const status = await h.framework.quiesce({ timeoutMs: 200, abandon: true });
       assert.deepEqual(status.unabandonable, ['prime']);
       assert.equal(status.drained, false);
@@ -1277,21 +1310,18 @@ describe('a framework cancel that throws', () => {
     }
   });
 
-  for (const how of ['stopping', 'replaced', 'restarted'] as const) {
-    const why = how === 'stopping' ? 'the framework was stopping'
-      : how === 'replaced' ? 'the agent was replaced or removed' : 'the framework was stopped and started again';
+  for (const how of ['stopping', 'replaced'] as const) {
+    const why = how === 'stopping' ? 'the framework was stopping' : 'the agent was replaced or removed';
     it(`a start compiled while ${why}, whose cancel throws, is dropped as one whose cancel worked`, async () => {
       let fw: AgentFramework | null = null;
       const h = await restartTurn({
         wait: false, cancelThrowsAt: 1, gate: true, until: () => true,
         // As the continuation's compile makes its stream: the framework
-        // starts stopping, the agent is replaced under its name, or a stop()
-        // and a start() advance the lifecycle, admission open again.
+        // starts stopping, or the agent is replaced under its name.
         onStreamMade: (index) => {
           if (index !== 1 || !fw) return;
           if (how === 'stopping') internals(fw).providerAdmissionClosed = true;
-          else if (how === 'replaced') internals(fw).agents.set('prime', Object.create(fw.getAgent('prime')!));
-          else internals(fw).lifecycleGeneration += 2;
+          else internals(fw).agents.set('prime', Object.create(fw.getAgent('prime')!));
         },
         beforeStart: (framework) => { fw = framework; },
       });

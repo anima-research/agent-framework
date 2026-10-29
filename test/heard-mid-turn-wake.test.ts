@@ -451,6 +451,7 @@ describe('a wake for a write heard mid-turn', () => {
         id: 'chat',
         sendToolsCall: async (...args: unknown[]) => { sent.push(args); return { content: [{ type: 'text', text: 'sent' }] }; },
       } : null,
+      getAllServers: () => [],
       closeAll: async () => {},
     };
     fw.mcplServerConfigs = new Map([['chat', { id: 'chat', toolPrefix: 'chat' }]]);
@@ -970,6 +971,7 @@ describe('a wake for a write heard mid-turn', () => {
     };
     fw.mcplServerRegistry = {
       getServer: (id: string) => id === 'chat' ? { id: 'chat', sendToolsCall: async () => ({ content: [{ type: 'text', text: 'sent' }] }) } : null,
+      getAllServers: () => [],
       closeAll: async () => {},
     };
     fw.mcplServerConfigs = new Map([['chat', { id: 'chat', toolPrefix: 'chat' }]]);
