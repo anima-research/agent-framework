@@ -19577,7 +19577,7 @@ export class AgentFramework {
     if (occ.event.lane === 'channel') {
       const event = { ...occ.event.event, coalescingSubject, ...narrowing, ...firstViewMark, ...(assemblingFor ? { assemblingFor } : {}) };
       const placement = await this.handleMcplChannelIncoming(event);
-      await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
+      await this.dispatchAfterDelivery(event as unknown as ProcessEvent);
       return placement;
     }
     if (occ.scope.kind === 'channel') {
@@ -19610,7 +19610,7 @@ export class AgentFramework {
         ...frozenSource(push.inboundSource),
       };
       const placement = await this.handleMcplChannelIncoming(event);
-      await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
+      await this.dispatchAfterDelivery(event as unknown as ProcessEvent);
       return placement;
     }
     const event: McplPushEvent = {
@@ -19627,8 +19627,16 @@ export class AgentFramework {
       ...frozenSource(occ.event.event.inboundSource),
     };
     const placement = this.handleMcplPushEvent(event);
-    await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
+    await this.dispatchAfterDelivery(event as unknown as ProcessEvent);
     return placement;
+  }
+
+  private async dispatchAfterDelivery(event: ProcessEvent): Promise<void> {
+    try {
+      await this.dispatchProcessEventToModules(event);
+    } catch (error) {
+      console.error("[coalescing] the modules' handling of a delivered occurrence threw; its message stays stored, and it isn't delivered again:", error);
+    }
   }
 
   private async wakeForCoalescedBatch(occ: CoalescedOccurrence<CoalescedDelivery>): Promise<void> {

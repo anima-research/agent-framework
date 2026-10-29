@@ -2695,6 +2695,38 @@ test("a render whose store write is refused leaves a batch opened while it rende
   assert(read(), "a turn of the agent's read the newer batch");
 });
 
+test("a render stored whose modules' handling then throws is stored once and not delivered again", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.alwaysRespond();
+  f.renderer(async () => ({ content: [{ type: 'text', text: 'stored_render' }] }));
+  const internals = f.framework as unknown as { dispatchProcessEventToModules(event: unknown): Promise<void> };
+  const dispatch = internals.dispatchProcessEventToModules.bind(f.framework);
+  let threw = 0;
+  internals.dispatchProcessEventToModules = async (event) => {
+    if (threw === 0 && JSON.stringify(event).includes('stored_render')) {
+      threw++;
+      throw new Error('zz-dispatch-failed');
+    }
+    return dispatch(event);
+  };
+  const kinds: string[] = [];
+  f.framework.onTrace((e) => { if (e.type === 'mcpl:coalescing') kinds.push((e as { kind: string }).kind); });
+  const error = console.error;
+  console.error = () => {};
+  try {
+    await f.send('push/event', f.params('1', 'stored_fallback', { deferred: true, initial: true }));
+    await settles(f.framework.runUntilIdle(), 'the drain');
+  } finally {
+    console.error = error;
+  }
+  assert.equal(threw, 1, "the modules' handling of the stored render threw");
+  assert.equal(f.context().split('stored_render').length - 1, 1, 'the render is stored once');
+  assert(!f.context().includes('stored_fallback'), 'its fallback is not stored');
+  assert(!kinds.includes('deliver-failed'), 'the delivery is not taken as failed');
+  const coalescer = (f.framework as unknown as { pushCoalescer: { pendingBatches(): number } }).pushCoalescer;
+  assert.equal(coalescer.pendingBatches(), 0, 'no batch is left for a recovery wake');
+});
+
 test('R16b: a producer retry re-wakes a batch left asleep by a failed freeze', async (t) => {
   const f = await fixture(); t.after(f.close);
   const coalescer = (f.framework as unknown as { pushCoalescer: { options: { recoveryBackoffMs?: number }; pendingBatches(): number } }).pushCoalescer;
