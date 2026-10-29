@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import { fixture, eventually } from './helpers/coalescing-fixture.js';
 import type { FrameworkConfig } from '../src/types/framework.js';
 import type { ContentBlock } from '@animalabs/membrane';
+import type { EventResponse, Module, ProcessEvent, ProcessState } from '../src/index.js';
 import { createMockResponse, HeldStream } from './helpers/mock-membrane.js';
 import {
   SUB, internals, textOf, stored, held, has, find, MENTION,
@@ -106,7 +107,7 @@ describe('tune-out, all-except scope', () => {
       await f.framework.runUntilIdle();
       await eventually(() => f.published.some((p) => JSON.stringify(p).includes('zz-still in work')), 'the speech went out');
       assert.equal(f.published.find((p) => JSON.stringify(p).includes('zz-still in work'))!.channelId, 'work');
-      const told = stored(f).some((m) => JSON.stringify(m.content).includes("This turn's plain speech still lands in work; from your next turn it lands in the excepted channel while this holds, except on a turn that has no channel, such as a heartbeat's."));
+      const told = stored(f).some((m) => JSON.stringify(m.content).includes("This turn's plain speech still lands in work; from your next turn it lands in the excepted channel while this holds, except on a turn that has no channel, such as a heartbeat's, or one that holds private input."));
       assert.ok(told, "the focus result says this turn's speech stays in work");
     } finally { await f.close(); }
   });
@@ -549,4 +550,92 @@ describe('tune-out, all-except scope', () => {
       assert.equal(quiet.published.length, 0, 'announce: false — nothing is posted');
     } finally { await quiet.close(); }
   });
+});
+
+class SurfaceModule implements Module {
+  readonly name = 'surface';
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools() { return []; }
+  async handleToolCall() { return { success: false, error: 'no tools' }; }
+  async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
+    if (event.type !== 'external-message') return {};
+    return { addMessages: [{ participant: 'user', content: [{ type: 'text', text: String(event.content) }] }], requestInference: true };
+  }
+}
+
+describe('a private turn and the focus', () => {
+  const tuiMessage = (content: string) =>
+    ({ type: 'external-message', source: 'tui', content, metadata: {}, triggerInference: true }) as never;
+  const say = (text: string) => createMockResponse([{ type: 'text', text }] as ContentBlock[]);
+  const focusCall = (input: Record<string, unknown>) =>
+    createMockResponse([{ type: 'tool_use', id: `fx-${input.mode ?? 'enter'}`, name: 'focus', input }] as ContentBlock[], 'tool_use');
+  const clear = (f: Awaited<ReturnType<typeof fixture>>) => {
+    f.membrane.responses.length = 0; // the fixture pre-scripts an `ok`
+    (f.membrane as unknown as { responseIndex: number }).responseIndex = 0;
+  };
+  const sent = (f: Awaited<ReturnType<typeof fixture>>, text: string) => f.published.filter((p) => JSON.stringify(p).includes(text));
+
+  it('a private turn that enters a focus keeps no channel, and is told its plain speech stays private', async () => {
+    const f = await fixture({ framework: { modules: [new SurfaceModule()], tuneOut: { enabled: true } } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      clear(f);
+      const registry = internals(f).channelRegistry as unknown as { startTyping: (channel: unknown, metadata?: unknown) => void };
+      const startTyping = registry.startTyping.bind(registry);
+      const typing: string[] = [];
+      registry.startTyping = (channel, metadata) => {
+        typing.push(typeof channel === 'string' ? channel : (channel as { channelId: string }).channelId);
+        startTyping(channel, metadata);
+      };
+      f.membrane.pushResponse(focusCall({ channelId: 'work', durationSeconds: 120 }));
+      f.membrane.pushResponse(say('zz-the code is 4417'));
+      f.framework.pushEvent(tuiMessage('for your eyes only: what is the door code?'));
+      await f.framework.runUntilIdle();
+      assert.equal(internals(f).tuneOutCoordinator!.getAllExcept()?.params.except.channelId, 'work', 'control: the focus holds');
+      assert.ok(stored(f).some((m) => JSON.stringify(m.content).includes('This turn holds private input, so its plain speech stays private;')),
+        "the focus result says this turn's speech stays private");
+      assert.deepEqual([...typing], [], 'the private turn shows typing in no channel');
+      f.membrane.pushResponse(say('zz-a room answer'));
+      await incoming(f, 'work', 'w1', 'agent, are you there?', MENTION);
+      await f.framework.runUntilIdle();
+      await eventually(() => sent(f, 'zz-a room answer').length > 0, "control: the room's turn speaks in work");
+      assert.ok(typing.includes('work'), `control: the room's turn shows typing in work: ${JSON.stringify(typing)}`);
+      assert.deepEqual(sent(f, 'zz-the code is 4417'), [], 'the private words reached no channel');
+    } finally { await f.close(); }
+  });
+
+  for (const fromPrivate of [true, false]) {
+    it(`under 'latest-inbound', the turn a focus cancel wakes speaks ${fromPrivate ? 'in no channel when a private turn cancelled' : 'in the latest inbound when a room turn cancelled'}`, async () => {
+      const f = await fixture({ framework: { modules: [new SurfaceModule()], tuneOut: { enabled: true }, speech: { locus: 'latest-inbound' } } as Partial<FrameworkConfig> });
+      try {
+        await registerOpen(f, 'work', 'noisy');
+        clear(f);
+        f.membrane.pushResponse(say('zz-first'));
+        await incoming(f, 'noisy', 'n1', 'agent, hello', MENTION);
+        await f.framework.runUntilIdle();
+        await eventually(() => sent(f, 'zz-first').length > 0, 'premise: a room turn spoke, so the latest inbound names a channel');
+        const r = internals(f).tuneOutCoordinator!.enterAllExcept({ serverId: 'editor', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool');
+        assert.ok(r.ok, 'premise: a focus on work');
+        // One stream per turn: the mock hands every queued response to the next stream.
+        const feed = [[focusCall({ mode: 'cancel' }), say('zz-cancelled')], [say('zz-after the release')]];
+        const streamYielding = f.membrane.streamYielding.bind(f.membrane);
+        f.membrane.streamYielding = (request, options) => {
+          const queue = f.membrane as unknown as { responses: unknown[]; responseIndex: number };
+          if (queue.responseIndex >= queue.responses.length) for (const response of feed.shift() ?? []) f.membrane.pushResponse(response);
+          return streamYielding(request, options);
+        };
+        if (fromPrivate) f.framework.pushEvent(tuiMessage('please end the focus'));
+        else await incoming(f, 'work', 'w1', 'agent, end the focus', MENTION);
+        await f.framework.runUntilIdle();
+        assert.equal(internals(f).tuneOutCoordinator!.getAllExcept(), null, 'control: the focus ended');
+        f.membrane.pushResponse(say('zz-sentinel'));
+        await incoming(f, 'noisy', 'n2', 'agent, one more', MENTION);
+        await f.framework.runUntilIdle();
+        await eventually(() => sent(f, 'zz-sentinel').length > 0, 'a later room turn spoke, after anything earlier was sent');
+        assert.ok(has(f, 'zz-after the release'), 'premise: the turn the release woke spoke');
+        assert.equal(sent(f, 'zz-after the release').length, fromPrivate ? 0 : 1, JSON.stringify(f.published));
+      } finally { await f.close(); }
+    });
+  }
 });

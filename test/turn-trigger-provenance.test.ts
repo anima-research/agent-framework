@@ -5,7 +5,7 @@
  * ONE request — so a host stamping gateway telemetry never reports one
  * person's channel with another person's id.
  */
-import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, destinationKey } from '../src/mcpl/channel-registry.js';
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
@@ -2079,6 +2079,34 @@ describe('private wins, one way', () => {
       const told = wired.filter((w) => w.includes('[routing]') && w.includes(ROOM));
       assert.equal(told.length, 1, `the room is named once, with the injections: ${JSON.stringify(wired)}`);
       assert.match(told[0]!, /addressed you from discord:g:room while you were busy\. Your plain speech stays in your archive \(no channel\)/);
+      assert.deepEqual(rig.routed, []);
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("under 'delivery', a private turn's boundary that injects an unaddressed follow-up where the turn sent names the room with the injections", async () => {
+    let framework: AgentFramework | undefined;
+    const tool = robot(() => {
+      (routingOf(framework!).engaged as Set<string>).add(destinationKey(ref(ROOM)));
+      (framework as unknown as { addMessage(participant: string, content: unknown, metadata: unknown): unknown }).addMessage(
+        'someone', [{ type: 'text', text: 'and another thing' }], { channelId: ROOM, serverId: 'discord', tags: [] });
+    });
+    const rig = await surfaceRig({ modules: [tool] });
+    framework = rig.framework;
+    try {
+      rig.membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'looking' },
+        { type: 'tool_use', id: 'm1', name: 'robot--move', input: {} },
+      ] as never, 'tool_use'));
+      rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }]));
+      rig.framework.pushEvent(tuiMessage());
+      await rig.until(() => rig.starts.length >= 1 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the turn');
+      const wired = rig.streams[0]!.receivedToolResultOptions
+        .flatMap((o) => o?.injectedMessages ?? []).map((m) => JSON.stringify(m.content));
+      assert.ok(wired.some((w) => w.includes('and another thing')), `control: the room's message was injected: ${JSON.stringify(wired)}`);
+      assert.deepEqual(named(rig), [[ROOM]], JSON.stringify(rig.texts()));
+      assert.ok(wired.some((w) => w.includes('This private turn also holds') && w.includes(ROOM)), `the notice rode the injections: ${JSON.stringify(wired)}`);
       assert.deepEqual(rig.routed, []);
     } finally {
       await rig.close();

@@ -12695,7 +12695,8 @@ export class AgentFramework {
       'nothing summarizes or wakes you; the backlog is delivered when you ' +
       'cancel. scope "all-except" holds EVERY channel (DMs and new channels ' +
       'included) except channelId, for durationSeconds (required); your plain ' +
-      'speech lands in that channel meanwhile; the reader pauses rather than ' +
+      'speech lands in that channel meanwhile, except in a turn that has taken ' +
+      'in private input; the reader pauses rather than ' +
       'cancels when its wake budget is spent. mode "check" reports what is ' +
       'held without releasing it (`peek` shows one channel\'s newest held lines).',
     inputSchema: {
@@ -12738,7 +12739,8 @@ export class AgentFramework {
     description:
       'Focus on one channel for a bounded time: every other channel — DMs ' +
       'and channels that appear later included — is held and stops waking ' +
-      'you; your plain speech lands in the focused channel. The same hold as ' +
+      'you; your plain speech lands in the focused channel, except in a turn ' +
+      'that has taken in private input. The same hold as ' +
       'tune_out with scope "all-except". mode "cancel" releases the held ' +
       'backlog per channel; mode "check" reports what is held.',
     inputSchema: {
@@ -36793,7 +36795,7 @@ export class AgentFramework {
       return { success: true, data: coordinator.check({ ...(peek ? { peek } : {}), ...(peekLimit !== undefined ? { peekLimit } : {}) }) };
     }
     if (input.mode === 'cancel' && (allExcept || (!input.channelId && coordinator.getAllExcept()))) {
-      const r = coordinator.cancelAllExcept('agent-tool', 'agent request');
+      const r = coordinator.cancelAllExcept('agent-tool', 'agent request', undefined, undefined, workTurn);
       return r.ok ? { success: true, data: { cancelled: 'all-except' } } : { success: false, error: r.error, isError: true };
     }
 
@@ -36822,19 +36824,22 @@ export class AgentFramework {
       const speaker = this.agents.get(agentName);
       const home = this.homeOf(agentName);
       const open = turn && this.openLogical.get(agentName) === turn ? turn : undefined;
-      if (open && open.locus == null && !open.noChannel && !open.heartbeat && !home
+      if (open && open.locus == null && !open.noChannel && !open.heartbeat && !open.nonChannelOrigin && !home
         && (speaker?.proseRouting === 'locus' || speaker?.proseRouting === 'hybrid')) {
         open.locus = resolved;
         noteTurnChannel(open, resolved);
         this.rememberAnnouncedLocus(agentName, resolved);
       }
+      const except = "except on a turn that has no channel, such as a heartbeat's, or one that holds private input";
       const speech = home
         ? `Your plain speech stays in ${this.channelShown(home)}, your conversation's channel.`
-        : open?.locus && !sameChannel(open.locus, resolved)
-          ? `This turn's plain speech still lands in ${this.channelShown(open.locus)}; from your next turn it lands in the excepted channel while this holds, except on a turn that has no channel, such as a heartbeat's.`
-          : open && (open.noChannel || open.heartbeat)
-            ? "This turn has no channel, so its plain speech goes to none; from your next turn it lands in the excepted channel while this holds, except on a turn that has no channel, such as a heartbeat's."
-            : "Your plain speech lands in the excepted channel while this holds, except on a turn that has no channel, such as a heartbeat's.";
+        : open?.nonChannelOrigin
+          ? `This turn holds private input, so its plain speech stays private; from your next turn it lands in the excepted channel while this holds, ${except}.`
+          : open?.locus && !sameChannel(open.locus, resolved)
+            ? `This turn's plain speech still lands in ${this.channelShown(open.locus)}; from your next turn it lands in the excepted channel while this holds, ${except}.`
+            : open && (open.noChannel || open.heartbeat)
+              ? `This turn has no channel, so its plain speech goes to none; from your next turn it lands in the excepted channel while this holds, ${except}.`
+              : `Your plain speech lands in the excepted channel while this holds, ${except}.`;
       return {
         success: true,
         data: {

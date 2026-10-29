@@ -1054,6 +1054,7 @@ export class TuneOutCoordinator {
     reason: string,
     note?: string,
     noteAuthor?: string,
+    callerTurnId?: number,
   ): { ok: true } | { ok: false; error: string } {
     const scope = this.getAllExcept();
     if (!scope) return { ok: false, error: 'no all-except hold is active' };
@@ -1118,7 +1119,7 @@ export class TuneOutCoordinator {
       this.hooks.deliverFromReader(noteAuthor, [{ type: 'text', text: note }], { kind: 'subconscious-note', epochId });
     }
     const primary = this.hooks.primaryName();
-    if (primary) this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out');
+    if (primary) this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out', callerTurnId);
     const notice = `[${NOTICE_TAG.tuneOutCancelled}: all channels except ${this.shown(except.serverId, except.channelId)} — ${reason}.]`;
     if (source !== 'subconscious' && subName) {
       this.hooks.addMessage('user', [{ type: 'text', text: notice }], { system: true, kind: 'tune-out-cancel-report', scope: 'all-except' }, subName);
