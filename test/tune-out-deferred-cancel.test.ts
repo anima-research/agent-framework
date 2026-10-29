@@ -149,8 +149,8 @@ describe('a later cancel of a tune-out whose cancel already waits', () => {
   });
 });
 
-describe("a cancel while the primary's context manager refuses its work", () => {
-  it('waits, the tune-out in force, though nothing is kept for its recovery yet, and runs once a switch re-initializes it', async () => {
+describe("a cancel while the primary's or the subconscious's context manager refuses its work", () => {
+  for (const whose of ['primary', 'subconscious'] as const) it(`waits while the ${whose}'s refuses, the tune-out in force, though nothing is kept for its recovery yet, and runs once a switch re-initializes it`, async () => {
     const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
     try {
       await registerOpen(f, 'work', 'noisy');
@@ -161,7 +161,10 @@ describe("a cancel while the primary's context manager refuses its work", () => 
       (f.framework as unknown as Framework).addMessage('antra', [{ type: 'text', text: 'held before the failure' }], {
         tuneOut: { epochId }, channelId: 'noisy', serverId: 'editor', author: { id: 'U1', name: 'antra' },
       });
-      const strategy = f.framework.getAgent('agent')!.getContextManager().getStrategy() as unknown as {
+      const names = f.framework as unknown as { primaryAgentName: string; subconsciousAgentName: string | null };
+      const refusing = whose === 'primary' ? names.primaryAgentName : names.subconsciousAgentName;
+      assert.ok(refusing, `premise: the fixture has a ${whose}`);
+      const strategy = f.framework.getAgent(refusing)!.getContextManager().getStrategy() as unknown as {
         initialize?: (...args: unknown[]) => Promise<void>;
       };
       const initialize = strategy.initialize?.bind(strategy);
@@ -172,13 +175,14 @@ describe("a cancel while the primary's context manager refuses its work", () => 
       };
       const branch = f.framework.getStore().currentBranch().name;
       await f.framework.switchBranch(branch);
+      assert.equal(failNext, false, `premise: the ${whose}'s re-initialization failed`);
       const kept = (f.framework as unknown as { heldForRecovery: Map<string, unknown[]> }).heldForRecovery;
-      assert.equal(kept.get('agent')?.length ?? 0, 0, 'premise: nothing is kept for its recovery yet');
+      assert.equal(kept.get(refusing)?.length ?? 0, 0, 'premise: nothing is kept for its recovery yet');
 
       assert.deepEqual(coordinator.cancel('editor', 'noisy', 'duration', 'duration elapsed'), { ok: true, deferred: true },
         'the cancel waits');
       assert.ok(registry.getTuneOutState('editor', 'noisy'), 'the tune-out stays in force');
-      assert.equal(kept.get('agent')?.length ?? 0, 0, 'and no release is kept in memory behind an end on disk');
+      assert.equal(kept.get(refusing)?.length ?? 0, 0, 'and no release is kept in memory behind an end on disk');
 
       await f.framework.switchBranch(branch);
       assert.equal(registry.getTuneOutState('editor', 'noisy'), null, 'it ends once a switch re-initializes the manager');
