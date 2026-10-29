@@ -6,11 +6,14 @@
   `event_tags`, `wake_add_rule`, `wake_remove_rule`, `sleep`, `wake`,
   `think`, `journal`, `skip_reply` or `prose_help` reached the module
   registry and failed with "Invalid tool name format", and the puppet stored
-  that failure in the agent's window as a call the agent had made. Now:
-  - a call of one of these tools with agent origin (the puppet's, and a
-    host's) runs the handler the agent's own call runs and gets its answer,
-    except `skip_reply`, which ends the turn it's called in, while an
-    awaited call isn't made in a turn: a host's call of it gets a refusal
+  that failure in the agent's window as a call the agent had made. Now,
+  for each of these tools the framework has (the gate tools only with an
+  event gate, and `think`, `journal` and `skip_reply` only with a channel
+  registry, which an MCPL server brings):
+  - a call of one with agent origin (the puppet's, and a host's) runs the
+    handler the agent's own call runs and gets its answer, except
+    `skip_reply`, which ends the turn it's called in, while an awaited
+    call isn't made in a turn: a host's call of it gets a refusal
     and does nothing, and the puppet refuses it, by name or through a
     `toolsets--act` that reaches it, before anything runs or is stored, as
     it refuses a tool that isn't on the agent's surface. A `sleep` made off
@@ -19,7 +22,7 @@
   - a module's call of the agent's own tools, `think`, `journal`,
     `skip_reply` and `drafts`, is refused with a reason that says so, and
     does nothing, and a module's call of the others runs for the agent its
-    `callerAgentName` names (`__ephemeral__` where it names none);
+    `callerAgentName` names;
   - where the dispatcher would answer one of these calls with a refusal
     (such as a conversation fork's `sleep`), the awaited call gets it
     without `refused`, which `ToolResult.refused` says a programmatic call
