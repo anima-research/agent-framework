@@ -465,7 +465,7 @@ describe('a stream counts its usage once, however it ends', () => {
 
   for (const [name, ending] of [
     ['a stream error', { type: 'error', error: new MembraneError({ type: 'auth', retryable: false, message: 'key revoked', rawError: { status: 401 } }) } as StreamEvent],
-    ['an abort', { type: 'aborted', reason: 'timeout' } as StreamEvent],
+    ['an abort', { type: 'aborted', reason: 'error' } as StreamEvent],
     ['a thrown stream', new Error('socket hang up')],
   ] as const) {
     it(`${name} after a finished round counts that round once and logs it with the failure`, async () => {
