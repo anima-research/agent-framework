@@ -1,3 +1,4 @@
+import { AdmissionConnectError, admittedEnvelope, attachAdmission, wakeForbidden, type RequiredIngress } from './mcpl/inbound-admission.js';
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { presentAuthor } from './author-presentation.js';
 import { constants as bufferConstants } from 'node:buffer';
@@ -17214,7 +17215,7 @@ export class AgentFramework {
     }
 
     // Queue inference requests
-    if (response.requestInference) {
+    if (response.requestInference && !wakeForbidden(event)) {
       step.at = 'its inference request';
       const source = 'source' in event ? (event as { source: string }).source : 'unknown';
 
@@ -18795,6 +18796,12 @@ export class AgentFramework {
   private coalescedAuthorized(occ: CoalescedOccurrence<CoalescedDelivery>): boolean {
     const server = this.mcplServerRegistry?.getServer(occ.serverId);
     if (!server?.isConnected || !server.policyEstablished) return false;
+    if (server.requiredAdmission) {
+      const envelope = (occ.event.event as unknown as { [admittedEnvelope]?: import('./mcpl/inbound-admission.js').AdmittedEnvelope })[admittedEnvelope];
+      // Neither persisted work without a live key nor a previous incarnation
+      // borrows the replacement transport's grant. This is not durable reauthorization.
+      if (!envelope || !server.requiredAdmission.isCurrent(envelope.connection)) return false;
+    }
     // §3.2: work admitted under another binding (the id since reassigned to a
     // different endpoint) never acquires the replacement peer's authority —
     // and its private notice data is never sent to that peer.
@@ -32290,6 +32297,9 @@ export class AgentFramework {
         // An accounting failure ends startup. create()'s release closes every
         // server connected so far, within its deadline.
         if (error instanceof DiscordAwarenessAccountingError) throw error;
+        // A required binder/attestation refusal is terminal; an ordinary
+        // transport outage retains the existing log-and-continue policy.
+        if (error instanceof AdmissionConnectError) throw error;
         // Fail-open: log and continue with remaining servers
         const err = error instanceof Error ? error : new Error(String(error));
         const message = redactServerText(err.message, config);
@@ -34851,6 +34861,11 @@ export class AgentFramework {
         this.refuseServerItem('push/event', connection.id, responder);
         return;
       }
+      // Required delivery stays closed until the push admission adapter is installed.
+      if (connection.requiredAdmission) {
+        responder?.respond({ accepted: false, reason: 'admission_unsupported' });
+        return;
+      }
       // RFC-014 §6.1 carrier 2: the tool change this push explains was
       // applied as it was read; it's told after the event's own content. A
       // push the host then refuses still tells its change, on its own.
@@ -34913,6 +34928,11 @@ export class AgentFramework {
         // push, before the router runs.
         if (this.queue?.isClosed) {
           this.refuseServerItem('inference/request', connection.id, responder);
+          return;
+        }
+        // Required delivery stays closed until the inference admission adapter is installed.
+        if (connection.requiredAdmission) {
+          responder.respondError(-32600, 'admission_unsupported');
           return;
         }
         await this.inferenceRouter.handleInferenceRequest(connection.id, params, {
@@ -35016,6 +35036,11 @@ export class AgentFramework {
     ) => {
       if (this.queue?.isClosed) {
         this.refuseServerItem('channels/incoming', connection.id, responder);
+        return;
+      }
+      // Required delivery stays closed until the channel admission adapter is installed.
+      if (connection.requiredAdmission) {
+        responder?.respond({ results: Array.isArray(params.messages) ? params.messages.map(message => ({ messageId: message.messageId, accepted: false, reason: 'admission_unsupported' })) : [] });
         return;
       }
       await this.channelRegistry?.handleIncoming(connection.id, params, responder as never);

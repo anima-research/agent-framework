@@ -1,3 +1,4 @@
+import { RequiredAdmission, AdmissionConnectError, type RequiredIngress, type RefusalCode } from './inbound-admission.js';
 /**
  * McplServerConnection — manages a single JSON-RPC 2.0 connection to an MCPL server.
  *
@@ -456,6 +457,33 @@ export class McplServerConnection extends EventEmitter {
   /** Increments at every transport boundary. RFC-007 terminals go only to
    *  the epoch their opening went to, never across a reconnect. */
   transportEpoch = 0;
+  readonly requiredAdmission?: RequiredAdmission;
+  private readonly admissionReceipts = new WeakMap<object, RequiredIngress>();
+
+  /** Only transport receipt creates an ingress key; never reconstruct one downstream. */
+  admissionFor(params: object): RequiredIngress {
+    return this.admissionReceipts.get(params) ?? this.requiredAdmission!.capture(() => 'admission_missing');
+  }
+
+  /** The same capability response and notification diagnostic on either profile. */
+  private refuseCapability(name: string, requiredCap: string, value: unknown): void {
+    const phase = this.policyEstablished ? 'not in the effective grant' : 'initial policy not yet established (§5.3)';
+    const responder = value as { respondError?: (code: number, message: string, data?: unknown) => void } | undefined;
+    if (responder?.respondError) {
+      responder.respondError(CAPABILITY_DISABLED, `${name} rejected: capability "${requiredCap}" ${phase}`, { capability: requiredCap });
+    } else {
+      console.error(`[mcpl] ${this.id}: discarded ${logValue(name)} — "${requiredCap}" ${phase}`);
+    }
+  }
+
+  private refuseAdmission(name: string, params: unknown, responder: any, reason: RefusalCode): void {
+    if (name === 'channels-incoming') {
+      const messages = (params as { messages?: any[] } | null)?.messages;
+      responder?.respond?.({ results: Array.isArray(messages) ? messages.map(m => ({ messageId: typeof m?.messageId === 'string' ? m.messageId : '', accepted: false, reason })) : [] });
+    } else if (name === 'push-event') responder?.respond?.({ accepted: false, reason });
+    else responder?.respondError?.(-32600, reason);
+  }
+
 
   private transportEnded = new AbortController();
 
@@ -533,6 +561,7 @@ export class McplServerConnection extends EventEmitter {
    * performs a fresh initialize handshake, so authority from the dead epoch
    * must be revoked before the replacement transport is exposed. */
   private resetPolicyForTransportBoundary(): void {
+    this.requiredAdmission?.invalidate();
     this.grant = CapabilityGrant.empty();
     this.policyEstablished = false;
     this.transportEpoch++;
@@ -768,9 +797,11 @@ export class McplServerConnection extends EventEmitter {
     id: string,
     capabilities: McplCapabilities | null,
     transport: McplTransport | null,
+    admission?: RequiredAdmission,
   ) {
     super();
     this.id = id;
+    this.requiredAdmission = admission;
     this.capabilities = capabilities;
     this.transport = transport;
 
@@ -999,6 +1030,21 @@ export class McplServerConnection extends EventEmitter {
    */
   override emit(event: string | symbol, ...args: unknown[]): boolean {
     const name = typeof event === 'string' ? event : '';
+    if (this.requiredAdmission && ['channels-incoming', 'push-event', 'inference-request'].includes(name)) {
+      const cap = McplServerConnection.EVENT_TO_REQUIRED_CAPABILITY[name]!;
+      if (!this.grant.has(cap)) {
+        this.refuseCapability(name, cap, args[1]);
+        return true;
+      }
+      if (!this.isConnected || !this.controlPlaneReady || !this.dataPlaneReady) {
+        this.refuseAdmission(name, args[0], args[1], 'admission_not_ready');
+        return true;
+      }
+      if (!args[0] || typeof args[0] !== 'object' || !this.admissionReceipts.has(args[0] as object)) {
+        this.refuseAdmission(name, args[0], args[1], 'admission_missing');
+        return true;
+      }
+    }
     if (this.planeReadyFor(name)) {
       // Positive-grant admission (§5.4/§14.1), at the single choke-point
       // every path shares: live routing AND buffer flushes re-enter here, so
@@ -1024,13 +1070,7 @@ export class McplServerConnection extends EventEmitter {
       }
       const requiredCap = McplServerConnection.EVENT_TO_REQUIRED_CAPABILITY[name];
       if (requiredCap && !this.grant.has(requiredCap)) {
-        const phase = this.policyEstablished ? 'not in the effective grant' : 'initial policy not yet established (§5.3)';
-        const responder = args[1] as { respondError?: (code: number, message: string, data?: unknown) => void } | undefined;
-        if (responder?.respondError) {
-          responder.respondError(CAPABILITY_DISABLED, `${name} rejected: capability "${requiredCap}" ${phase}`, { capability: requiredCap });
-        } else {
-          console.error(`[mcpl] ${this.id}: discarded ${logValue(name)} — "${requiredCap}" ${phase}`);
-        }
+        this.refuseCapability(name, requiredCap, args[1]);
         return true;
       }
       // §6.6: a request that will never be answered MUST get an error. A
@@ -1221,9 +1261,10 @@ export class McplServerConnection extends EventEmitter {
     hostCapabilities: McplHostCapabilities,
     signal?: AbortSignal,
   ): Promise<McplServerConnection> {
+    const admission = config.inboundAdmission === undefined ? undefined : new RequiredAdmission(config.inboundAdmission, config.id);
     let established: Awaited<ReturnType<typeof McplServerConnection.handshake>>;
     try {
-      established = await McplServerConnection.handshake(config, hostCapabilities, signal);
+      established = await McplServerConnection.handshake(config, hostCapabilities, signal, admission, 0);
     } catch (error) {
       if (!(error instanceof HandshakeCleanupError)) throw error;
       // The launch may still be running. A connection owns it, closed and
@@ -1234,7 +1275,7 @@ export class McplServerConnection extends EventEmitter {
     }
     const { transport, capabilities, droppedCapabilities, mcpToolsAdvertised, protocolVersion, toolsetDeclarations } = established;
 
-    const connection = new McplServerConnection(config.id, capabilities, transport);
+    const connection = new McplServerConnection(config.id, capabilities, transport, admission);
     connection.toolsetDeclarations = toolsetDeclarations;
     connection.droppedCapabilities = droppedCapabilities;
     connection.mcpToolsAdvertised = mcpToolsAdvertised;
@@ -1289,6 +1330,8 @@ export class McplServerConnection extends EventEmitter {
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
     signal?: AbortSignal,
+    admission?: RequiredAdmission,
+    epoch = 0,
   ): Promise<{ transport: McplTransport; capabilities: McplCapabilities | null; droppedCapabilities: ReadonlySet<string>; mcpToolsAdvertised: boolean; protocolVersion: string; toolsetDeclarations: Record<string, unknown> | null }> {
     const closedWhileConnecting = () => new Error(`MCPL server "${config.id}" was closed while connecting`);
     if (signal?.aborted) throw closedWhileConnecting();
@@ -1309,6 +1352,15 @@ export class McplServerConnection extends EventEmitter {
       console.error(`[mcpl] ${config.id}: transport error after the handshake settled: ${redactServerText(err.message, config)}`);
     };
 
+    const refuseEarly = (line: string) => {
+      if (!admission) return;
+      let request: any;
+      try { request = JSON.parse(line); } catch { return; }
+      if (['channels/incoming', 'push/event', 'inference/request'].includes(request.method) && request.id != null) {
+        transport.writeLine(JSON.stringify({ jsonrpc: '2.0', id: request.id, error: { code: CAPABILITY_DISABLED, message: 'capability_denied' } }));
+      }
+    };
+    if (admission) transport.on('line', refuseEarly);
     try {
       if (signal?.aborted) throw closedWhileConnecting();
       const initId = 0; // use id=0 for the handshake
@@ -1400,6 +1452,21 @@ export class McplServerConnection extends EventEmitter {
             ));
             return;
           }
+          if (admission) {
+            void admission.attest(result).then(() => {
+          const caps = result?.capabilities as Record<string, unknown> | undefined;
+          const experimental = caps?.experimental as Record<string, unknown> | undefined;
+          // §5.1: `tools` capability is the OUTER standard MCP member — the
+          // experimental manifest cannot mint it. Carried alongside so the
+          // grant can join it into §6.4 derivation.
+          resolve({
+            mcpl: (experimental?.mcpl as McplCapabilities) ?? null,
+            mcpToolsAdvertised: caps?.tools !== undefined,
+            protocolVersion: answered,
+          });
+            }, reject);
+            return;
+          }
           const caps = result?.capabilities as Record<string, unknown> | undefined;
           const experimental = caps?.experimental as Record<string, unknown> | undefined;
           // §5.1: `tools` capability is the OUTER standard MCP member — the
@@ -1454,6 +1521,8 @@ export class McplServerConnection extends EventEmitter {
       const stopCause = transport.stdioStopCause;
       if (stopCause) throw failed(`MCPL server "${config.id}": this host stopped using the server's stdio during the handshake (${stopCause.message})`);
 
+      if (admission) admission.bind(epoch);
+
       // Send `initialized` notification (no id)
       transport.writeLine(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }));
 
@@ -1474,11 +1543,13 @@ export class McplServerConnection extends EventEmitter {
       // listener of its own, in the continuation of this return, before any
       // I/O callback can emit.
       transport.off('error', logAfterSettled);
+      if (admission) transport.off('line', refuseEarly);
       return {
         transport, capabilities: scoped, droppedCapabilities: new Set(dropped), mcpToolsAdvertised, protocolVersion,
         toolsetDeclarations: toolsetDeclarationsOf(rawCapabilities),
       };
     } catch (err) {
+      if (admission) { admission.invalidate(); transport.off('line', refuseEarly); }
       // Never leak the child / socket if the handshake fails. A cleanup that
       // can't confirm the child exited is part of the failure, never
       // swallowed: the launch may still be running, so the caller keeps it.
@@ -1516,7 +1587,7 @@ export class McplServerConnection extends EventEmitter {
       // a retry stub would restart the server forever for nothing. A connect
       // its caller ended (stop(), or a disconnect of its id) isn't retried
       // either, nor is a launch that couldn't be reaped.
-      if (config.reconnect !== true || error instanceof McplProtocolVersionError || error instanceof McplUnreapedLaunchError || signal?.aborted) {
+      if (config.reconnect !== true || error instanceof McplProtocolVersionError || error instanceof AdmissionConnectError || error instanceof McplUnreapedLaunchError || signal?.aborted) {
         throw error;
       }
 
@@ -1544,7 +1615,7 @@ export class McplServerConnection extends EventEmitter {
     hostCapabilities: McplHostCapabilities,
   ): McplServerConnection {
     // Null transport — the stub is closed until its first background reconnect.
-    const stub = new McplServerConnection(config.id, null, null);
+    const stub = new McplServerConnection(config.id, null, null, config.inboundAdmission === undefined ? undefined : new RequiredAdmission(config.inboundAdmission, config.id));
     stub.closed = true;
     stub.requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     stub.config = config;
@@ -2070,7 +2141,8 @@ export class McplServerConnection extends EventEmitter {
 
     let established: Awaited<ReturnType<typeof McplServerConnection.handshake>>;
     try {
-      established = await McplServerConnection.handshake(config, hostCapabilities, signal);
+      if (this.requiredAdmission) this.resetPolicyForTransportBoundary();
+      established = await McplServerConnection.handshake(config, hostCapabilities, signal, this.requiredAdmission, this.transportEpoch);
     } catch (error) {
       const unreaped = error instanceof HandshakeCleanupError;
       if (unreaped) this.holdUnreaped(error.transport, error.cleanup);
@@ -2086,8 +2158,8 @@ export class McplServerConnection extends EventEmitter {
       // for good: close() can confirm its exit, but close() is terminal, so
       // nothing resumes this connection. Every other failure keeps the
       // backoff loop.
-      if (error instanceof McplProtocolVersionError) this.reconnectEnabled = false;
-      const permanent = unreaped || error instanceof McplProtocolVersionError;
+      if (error instanceof McplProtocolVersionError || error instanceof AdmissionConnectError) this.reconnectEnabled = false;
+      const permanent = unreaped || error instanceof McplProtocolVersionError || error instanceof AdmissionConnectError;
       const message = unreaped ? `${failure.message}; ${this.unreapedFailure()}` : failure.message;
       const stderrTail = stderrTailOf(failure);
       this.emit('reconnect-failed', { error: message, ...(stderrTail ? { stderrTail } : {}), attempt, ...(permanent ? { permanent: true } : {}) });
@@ -2119,7 +2191,7 @@ export class McplServerConnection extends EventEmitter {
     // policy responses are never buffered), and then opens the planes.
     this.controlPlaneReady = false;
     this.dataPlaneReady = false;
-    this.resetPolicyForTransportBoundary();
+    if (!this.requiredAdmission) this.resetPolicyForTransportBoundary();
     this.transport = transport;
     this.capabilities = capabilities;
     this.toolsetDeclarations = toolsetDeclarations;
@@ -2411,7 +2483,7 @@ export class McplServerConnection extends EventEmitter {
       // RFC-014: its hints apply as it's read, whether or not anyone still
       // waits for it. A dead transport's revs are its own, so a response
       // read after its boundary is never tapped.
-      if (!late) this.tapResponse(msg as JsonRpcResponse);
+      if (!late && !this.requiredAdmission) this.tapResponse(msg as JsonRpcResponse);
       this.handleResponse(msg as JsonRpcResponse, late);
       return;
     }
@@ -2436,11 +2508,19 @@ export class McplServerConnection extends EventEmitter {
       return;
     }
 
+    // Required admission does not support peer-initiated hints on either
+    // carrier. Refuse before the read tap can mutate state or schedule recovery.
+    if (this.requiredAdmission && request.method === 'tools/hints') {
+      if (request.id != null) this.sendErrorResponse(request.id, -32600, 'admission_unsupported');
+      else console.error(`[mcpl] ${this.id}: discarded tools/hints — admission_unsupported`);
+      return;
+    }
+
     // RFC-014 §6.1: a push's hints apply as it's read, before the plane gate
     // holds it or the grant refuses it. A standalone tools/hints is consumed
     // here when a tap listens (it needs no grant), and answered if it came as
     // a request; with no tap it stays a method this host doesn't handle.
-    if (request.method === 'push/event') this.tap({ kind: 'push', params: request.params });
+    if (request.method === 'push/event' && !this.requiredAdmission) this.tap({ kind: 'push', params: request.params });
     else if (request.method === 'tools/hints' && this.readTap) {
       this.tap({ kind: 'hints', params: request.params });
       if (request.id != null) this.sendResponse(request.id, {});
@@ -2491,6 +2571,15 @@ export class McplServerConnection extends EventEmitter {
       return;
     }
 
+    if (this.requiredAdmission && ['channels-incoming', 'push-event', 'inference-request'].includes(eventName) && request.params && typeof request.params === 'object') {
+      const cap = McplServerConnection.EVENT_TO_REQUIRED_CAPABILITY[eventName]!;
+      this.admissionReceipts.set(request.params, this.requiredAdmission.capture(() => {
+        if (this.transportEpoch !== epoch || !this.isConnected) return 'admission_stale';
+        if (!this.grant.has(cap)) return 'admission_stale';
+        if (!this.controlPlaneReady || !this.dataPlaneReady) return 'admission_not_ready';
+      }));
+    }
+
     // Emit the typed event with params and (for requests) a respond callback
     if (request.id != null) {
       // Server expects a response — provide a respond helper
@@ -2534,6 +2623,10 @@ export class McplServerConnection extends EventEmitter {
   private afterBoundary(request: JsonRpcRequest, epoch: number): void {
     const event = typeof request.method === 'string' && Object.hasOwn(McplServerConnection.METHOD_TO_EVENT, request.method)
       ? McplServerConnection.METHOD_TO_EVENT[request.method] : undefined;
+    if (this.requiredAdmission && event && ['channels-incoming', 'push-event', 'inference-request'].includes(event)) {
+      this.refuseAdmission(event, request.params, request.id != null ? this.responderFor(request.id, epoch) : undefined, 'admission_stale');
+      return;
+    }
     if (this.closedForGood || event === undefined || !McplServerConnection.WORLD_EVENTS.has(event)) {
       console.error(
         `[mcpl] ${this.id}: dropped a message read after its transport closed` +
