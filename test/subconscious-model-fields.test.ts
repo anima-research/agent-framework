@@ -159,7 +159,7 @@ describe('the subconscious and the resident\'s model fields', () => {
 });
 
 describe('a fork reader and the resident\'s model fields', () => {
-  const resident: Partial<AgentConfig> = { physicalWindowTokens: 1_000_000, thinkingBinding: { binds: true, dropBlock: true } };
+  const resident: Partial<AgentConfig> = { physicalWindowTokens: 1_000_000, thinkingBinding: { binds: true } };
 
   async function forkFields(subconscious: Record<string, unknown>) {
     const dir = mkdtempSync(join(tmpdir(), 'subconscious-model-fields-'));
@@ -174,8 +174,10 @@ describe('a fork reader and the resident\'s model fields', () => {
     });
     try {
       const derive = framework.deriveAgent.bind(framework);
+      let deriving = false;
       const derived = new Promise<Agent>((resolve, reject) => {
         framework.deriveAgent = async (options) => {
+          deriving = true;
           const fork = await derive(options).catch((error: unknown) => { reject(error); throw error; });
           resolve(fork.agent);
           return fork;
@@ -186,6 +188,7 @@ describe('a fork reader and the resident\'s model fields', () => {
         serverId: 'disc', channelId: 'disc:guild:noisy', epochId: 'epoch-0001', trigger: 'wake',
         notice: '[Tune-out wake]', backlog: [], queued: [], dispositions: null,
       });
+      assert.ok(deriving, 'the invocation derives its fork before it returns');
       const fork = await derived;
       return {
         fields: { model: fork.model, physicalWindowTokens: fork.physicalWindowTokens, binding: fork.thinkingBindingOption() ?? null },
@@ -194,9 +197,9 @@ describe('a fork reader and the resident\'s model fields', () => {
     } finally { await framework.stop(); }
   }
 
-  it('runs with the window and binding set for it, on another model or the resident\'s, and the resident keeps its own', async () => {
+  it('is derived with the window and binding set for it, on another model or the resident\'s, and the resident keeps its own', async () => {
     const cases: Array<[Record<string, unknown>, { model: string; physicalWindowTokens?: number; binding: { binds: true; dropBlock: boolean } | null }]> = [
-      [{ model: 'model-b', physicalWindowTokens: 200_000, thinkingBinding: { binds: true } }, { model: 'model-b', physicalWindowTokens: 200_000, binding: { binds: true, dropBlock: false } }],
+      [{ model: 'model-b', physicalWindowTokens: 200_000, thinkingBinding: { binds: true, dropBlock: true } }, { model: 'model-b', physicalWindowTokens: 200_000, binding: { binds: true, dropBlock: true } }],
       [{ model: 'model-a', physicalWindowTokens: 500_000, thinkingBinding: { binds: false } }, { model: 'model-a', physicalWindowTokens: 500_000, binding: null }],
     ];
     for (const [subconscious, expected] of cases) {
@@ -209,16 +212,16 @@ describe('a fork reader and the resident\'s model fields', () => {
       );
       for (const config of [kept.config, kept.given]) {
         assert.equal(config?.physicalWindowTokens, 1_000_000);
-        assert.deepEqual(config?.thinkingBinding, { binds: true, dropBlock: true });
+        assert.deepEqual(config?.thinkingBinding, { binds: true });
       }
     }
   });
 
-  it('on the resident\'s model with neither set, or set to null or false, it runs with the resident\'s', async () => {
+  it('on the resident\'s model with neither set, or set to null or false, it is derived with the resident\'s', async () => {
     for (const subconscious of [{ model: 'model-a' }, { model: 'model-a', physicalWindowTokens: null, thinkingBinding: null }, { model: 'model-a', thinkingBinding: false }]) {
       const { fields } = await forkFields(subconscious);
       assert.equal(fields.physicalWindowTokens, 1_000_000, JSON.stringify(subconscious));
-      assert.deepEqual(fields.binding && { binds: fields.binding.binds, dropBlock: fields.binding.dropBlock }, { binds: true, dropBlock: true }, JSON.stringify(subconscious));
+      assert.deepEqual(fields.binding && { binds: fields.binding.binds, dropBlock: fields.binding.dropBlock }, { binds: true, dropBlock: false }, JSON.stringify(subconscious));
     }
   });
 });
