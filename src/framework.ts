@@ -14575,6 +14575,12 @@ export class AgentFramework {
         const failed = failures.find((f) => f.agentName === agent.name);
         this.presentation?.rebase(agent, failed && 'error' in failed ? failed.error : undefined);
       }
+      // A start given while the subconscious's window was the record (an
+      // earlier move's re-initialization failed) waits for a presentation,
+      // and the rebase's write-down tells no listener: so it is set or fixed
+      // here, before a select converts its sequence (window-anchor.ts).
+      const subconscious = this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName) : undefined;
+      if (this.presents(subconscious)) this.subconsciousAnchor?.presented();
       return failures;
     } catch (error) {
       console.error('[operator] following a branch move failed; an agent whose context did not follow it stays as it was:', error);

@@ -74,8 +74,10 @@ export class SubconsciousWindowAnchor {
 
   /**
    * Set the window start (the coordinator's setSubconsciousAnchor). In
-   * legacy mode by its sequence, as before the index, and a start not kept
-   * yet waits to be fixed, as below, once the window presents. In presented mode by
+   * legacy mode by its sequence, as before the index, and every active start
+   * waits for the window's next presentation (presented): one kept before
+   * the window was the record is set and kept at its kept ordinal then, and
+   * one not kept yet is fixed then, as below. In presented mode by
    * its ordinal when one was fixed, clamped to the window's index length
    * and traced when past it; else by its sequence for now, converted as the
    * strategy converts one, and the ordinal is fixed (see the module doc) as
@@ -89,28 +91,21 @@ export class SubconsciousWindowAnchor {
     try {
       const strategy = this.host.strategy();
       if (!strategy) return;
+      // A start's kept ordinal, or the one an earlier set fixed it at and
+      // couldn't set or keep, which the next presentation tries again.
+      const was = this.pending;
+      const carried = (wanted: SubconsciousWindowStart, inForce: boolean) => {
+        const ordinal = wanted.ordinal ?? was.find((p) => sameStart(p.start, wanted))?.ordinal;
+        return { start: wanted, ...(ordinal !== undefined ? { ordinal } : {}), inForce };
+      };
       if (!this.host.presents()) {
-        this.pending = [...(start.ordinal === undefined ? [start] : []), ...others]
-          .map((wanted) => ({ start: wanted, inForce: wanted === start }));
+        this.pending = [carried(start, true), ...others.map((other) => carried(other, false))];
         strategy.setAnchor(start.sequence);
         return;
       }
-      const was = this.pending;
-      const carried = (wanted: SubconsciousWindowStart, inForce: boolean) => ({
-        ...(was.find((p) => sameStart(p.start, wanted)) ?? { start: wanted }),
-        inForce,
-      });
       this.pending = others.map((other) => carried(other, false));
       if (start.ordinal !== undefined) {
-        const length = this.host.cm()?.indexLength() ?? 0;
-        const ordinal = Math.min(start.ordinal, length);
-        strategy.setAnchorOrdinal(ordinal);
-        if (ordinal !== start.ordinal) {
-          this.host.emitTrace({
-            type: 'tune-out:subconscious-window', agentName: this.host.agentName,
-            epochIds: [...start.epochIds], how: 'clamped', ordinal, kept: start.ordinal,
-          });
-        }
+        this.setInForce(strategy, start.ordinal, start.epochIds);
       } else {
         this.pending.unshift(carried(start, true));
         strategy.setAnchor(start.sequence);
@@ -155,12 +150,28 @@ export class SubconsciousWindowAnchor {
         entry.ordinal = ordinal;
       }
       const ordinal = entry.ordinal;
-      if (entry.inForce) strategy.setAnchorOrdinal(ordinal);
+      if (entry.inForce) this.setInForce(strategy, ordinal, entry.start.epochIds);
       if (!this.host.fixed(entry.start.epochIds, ordinal, entry.inForce)) continue;
       this.pending = this.pending.filter((p) => p !== entry);
       this.host.emitTrace({
         type: 'tune-out:subconscious-window', agentName: this.host.agentName,
         epochIds: [...entry.start.epochIds], how: 'fixed', ordinal,
+      });
+    }
+  }
+
+  /**
+   * Start the window at `ordinal`, clamped to the window's index length on a
+   * branch whose window is shorter (a rollback), traced when it is.
+   */
+  private setInForce(strategy: AnchoredStrategy, ordinal: number, epochIds: readonly string[]): void {
+    const length = this.host.cm()?.indexLength() ?? 0;
+    const at = Math.min(ordinal, length);
+    strategy.setAnchorOrdinal(at);
+    if (at !== ordinal) {
+      this.host.emitTrace({
+        type: 'tune-out:subconscious-window', agentName: this.host.agentName,
+        epochIds: [...epochIds], how: 'clamped', ordinal: at, kept: ordinal,
       });
     }
   }

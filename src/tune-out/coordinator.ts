@@ -533,7 +533,9 @@ export class TuneOutCoordinator {
     const sequence = Math.min(...active.map((e) => e.sequence));
     const epochIds = active.filter((e) => e.sequence === sequence).map((e) => e.epochId);
     const kept = this.ordinalsKept();
-    const state: WindowStartsState = kept ? this.readWindowState() : { starts: {} };
+    // Read while the window is the record too, so a start kept before it was
+    // goes to the anchor at its ordinal, for the window's next presentation.
+    const state: WindowStartsState = this.hooks.subconsciousName() != null ? this.readWindowState() : { starts: {} };
     let ordinal = epochIds.map((id) => state.starts[id]).find((o) => o !== undefined);
     // At a resume, the start in force before the restart (a cancelled
     // tune-out's, say), and never past the oldest active one's own start
@@ -548,14 +550,12 @@ export class TuneOutCoordinator {
       this.writeWindowState(ordinal !== undefined ? { ...rest, inForce: ordinal } : rest);
     }
     const others: SubconsciousWindowStart[] = [];
-    if (kept) {
-      const bySequence = new Map<number, string[]>();
-      for (const e of active) {
-        if (e.sequence === sequence || state.starts[e.epochId] !== undefined) continue;
-        bySequence.set(e.sequence, [...(bySequence.get(e.sequence) ?? []), e.epochId]);
-      }
-      for (const [at, ids] of bySequence) others.push({ sequence: at, epochIds: ids });
+    const bySequence = new Map<number, string[]>();
+    for (const e of active) {
+      if (e.sequence === sequence || state.starts[e.epochId] !== undefined) continue;
+      bySequence.set(e.sequence, [...(bySequence.get(e.sequence) ?? []), e.epochId]);
     }
+    for (const [at, ids] of bySequence) others.push({ sequence: at, epochIds: ids });
     this.hooks.setSubconsciousAnchor({ sequence, ...(ordinal !== undefined ? { ordinal } : {}), epochIds }, others);
   }
 

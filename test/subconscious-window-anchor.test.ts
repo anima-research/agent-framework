@@ -361,6 +361,61 @@ describe("the persistent subconscious's window start of a tune-out entered while
   });
 });
 
+describe("the persistent subconscious's window start across a branch move its window couldn't follow", () => {
+  // A move whose re-initialization of the subconscious fails leaves its
+  // window the record until the next move recovers it. A tune-out entered
+  // meanwhile, and one whose start was kept before, are both set or fixed at
+  // the recovering move, the kept one at its kept ordinal.
+  it('(j) keeps a start kept before the window was the record, and fixes one entered while it was, at the move that recovers it', { timeout: 120_000 }, async () => {
+    const h = await boot(place());
+    h.residentRow('PRE-1 before the tune-outs');
+    h.bump();
+    const t1 = h.internals.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5 }, 'agent-tool');
+    assert.ok(t1.ok);
+    h.residentRow('T1-HELD-1 chatter', { tuneOut: { epochId: t1.params.epochId } });
+    await h.framework.runUntilIdle();
+    const cm = h.subCm();
+    const kept = h.windowStarts()?.[t1.params.epochId];
+    assert.equal(kept, cm.ordinalOf(h.rowOf('T1-HELD-1 chatter').id), "premise: T1's start is fixed and kept at its first held row");
+    // A row stored before T1 enters the window again past its held row (as
+    // an undo and its redo do): fixing T1's start again from the window would
+    // now give a later ordinal.
+    const pre1 = h.rowOf('PRE-1 before the tune-outs').id;
+    cm.retractRows([pre1]);
+    cm.presentRows([pre1]);
+    assert.ok(cm.ordinalOf(pre1)! > kept!, 'premise: it is in the window again, past the held row');
+
+    const strategy = cm.getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
+    const initialize = strategy.initialize.bind(strategy);
+    let failNext = true;
+    strategy.initialize = async (...args: unknown[]) => {
+      if (failNext) { failNext = false; throw new Error('injected initialization failure'); }
+      return initialize(...args);
+    };
+    const branch = () => h.framework.getStore().currentBranch().name;
+    await h.framework.switchBranch(branch());
+    assert.ok(h.traces.some((e) => e.type === 'presentation:failed' && (e as { agentName?: string }).agentName === SUB),
+      "premise: the subconscious's window is the record after the move");
+
+    // Nothing is stored for the subconscious meanwhile, so the recovering
+    // move's release presents it nothing: the move itself sets and fixes.
+    h.bump();
+    const t2 = h.internals.tuneOutCoordinator.enterAllExcept({ serverId: 'disc', channelId: 'disc:guild:quiet' }, { durationSeconds: 3600 }, 'agent-tool');
+    assert.ok(t2.ok, (t2 as { error?: string }).error);
+    assert.equal(h.windowStarts()?.[t2.params.epochId], undefined, 'premise: no start is fixed while the window is the record');
+
+    await h.framework.switchBranch(branch());
+    assert.equal(h.strategy().getAnchorOrdinal(), kept, "the window starts at T1's kept ordinal at the recovering move");
+    assert.equal(h.windowStarts()?.[t1.params.epochId], kept, "and T1's start is kept as it was");
+    assert.notEqual(h.windowStarts()?.[t2.params.epochId], undefined, "T2's start, entered while the window was the record, is fixed and kept at the move");
+    await h.framework.runUntilIdle();
+    h.residentRow('AFTER-1 the move');
+    await h.framework.runUntilIdle();
+    assert.equal(h.windowStarts()?.[t1.params.epochId], kept, "a row presented after the move doesn't fix T1's start again");
+    assert.equal(h.strategy().getAnchorOrdinal(), kept);
+  });
+});
+
 describe('SubconsciousWindowAnchor', () => {
   /** A host over a window of `rows` (sequence and ordinal each), with the rows still owed. */
   function host(options: { presents?: boolean; rows?: Array<{ sequence: number; ordinal: number }>; owed?: number[]; length?: number }) {
@@ -436,6 +491,36 @@ describe('SubconsciousWindowAnchor', () => {
     assert.deepEqual(h.fixed, [{ epochIds: ['t1'], ordinal: 1 }, { epochIds: ['t2'], ordinal: 2 }],
       'each fixed past the last row stored before its start, once the window presents');
     assert.deepEqual(h.calls, ['setAnchor(50)', 'setAnchorOrdinal(1)'], 'and only the start in force moves the window');
+  });
+
+  it('a start kept before the window was the record is set at its kept ordinal at the first presentation, clamped to the window, and not fixed again', () => {
+    const options = { presents: false };
+    const h = host(options);
+    h.anchor.set({ sequence: 50, ordinal: 9, epochIds: ['t1'] }, [{ sequence: 70, epochIds: ['t2'] }]);
+    assert.deepEqual(h.calls, ['setAnchor(50)'], 'by sequence while the window is the record');
+    options.presents = true;
+    h.state.rows.push({ sequence: 10, ordinal: 0 }, { sequence: 60, ordinal: 1 }, { sequence: 20, ordinal: 2 });
+    h.anchor.presented();
+    assert.deepEqual(h.calls, ['setAnchor(50)', 'setAnchorOrdinal(3)'], 'at its kept ordinal, clamped to the window');
+    assert.deepEqual(h.traces.filter((e) => (e as { how?: string }).how === 'clamped'),
+      [{ type: 'tune-out:subconscious-window', agentName: SUB, epochIds: ['t1'], how: 'clamped', ordinal: 3, kept: 9 }]);
+    assert.deepEqual(h.fixed, [{ epochIds: ['t1'], ordinal: 9 }, { epochIds: ['t2'], ordinal: 3 }],
+      'kept as it was, and the other start fixed past the last row stored before it');
+  });
+
+  it('a start fixed and not kept keeps that ordinal through a set while the window is the record', () => {
+    const options = { presents: true, rows: [{ sequence: 10, ordinal: 0 }] };
+    const h = host(options);
+    h.state.keepFails = 1;
+    h.anchor.set({ sequence: 50, epochIds: ['t1'] });
+    assert.deepEqual(h.fixed, [{ epochIds: ['t1'], ordinal: 1 }], 'premise: fixed at 1, and its keeping failed');
+    options.presents = false;
+    h.anchor.set({ sequence: 50, epochIds: ['t1'] });
+    options.presents = true;
+    h.state.rows.push({ sequence: 20, ordinal: 1 }, { sequence: 30, ordinal: 2 });
+    h.anchor.presented();
+    assert.deepEqual(h.fixed, [{ epochIds: ['t1'], ordinal: 1 }, { epochIds: ['t1'], ordinal: 1 }],
+      'kept at the ordinal it was fixed at, though rows stored before its start entered the window since');
   });
 
   it('a start whose setting or keeping fails is set and kept at the next presentation, at the ordinal it was fixed at', () => {
