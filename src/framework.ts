@@ -31100,13 +31100,15 @@ export class AgentFramework {
    * Its stream is over or cancelled, or, when stop() ends it, may still run
    * past its cancel, and then drops each event that comes after the agent
    * has left (driveStream); a turn of its still assembling or compiling, as
-   * when stop() ends it, drops before it sends anything. One path still
-   * stores after the release: a `complete` that arrived while the agent
+   * when stop() ends it, drops before it sends anything. One path can still
+   * store after the release: a `complete` that arrived while the agent
    * still waited for tools awaits the spill of its last tool results, and
-   * stores them once that resolves, even if a watchdog has ended the run
-   * meanwhile. A tool boundary stores nothing for a round whose turn was
-   * stopped while its results were prepared. The agent's store stays in
-   * Chronicle for investigation.
+   * stores them once that resolves unless the agent's state was replaced
+   * meanwhile, as a run's disposal by its watchdog or its caller replaces it,
+   * or stop() or a quiesce's abandon cancelled its stream
+   * (roundStoppedDuringBuild): then it stores nothing, as a tool boundary
+   * stores nothing for a round whose turn was stopped while its results were
+   * prepared. The agent's store stays in Chronicle for investigation.
    */
   private releaseWindow(agent: Agent): void {
     for (const { metadata, ...written } of this.releasedWindow(agent)?.unread ?? []) {
