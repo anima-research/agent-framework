@@ -18902,6 +18902,8 @@ export class AgentFramework {
         ...(assemblingFor ? { assemblingFor } : {}),
         ...frozenSource(push.inboundSource),
       };
+      const envelope = (push as unknown as { [admittedEnvelope]?: import('./mcpl/inbound-admission.js').AdmittedEnvelope })[admittedEnvelope];
+      if (envelope) attachAdmission(event, envelope);
       const placement = await this.handleMcplChannelIncoming(event);
       await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
       return placement;
@@ -19289,6 +19291,7 @@ export class AgentFramework {
         ...(event.tags ? { tags: event.tags } : {}),
       },
     });
+    if (admittedEnvelope in event && !decision.wake) event.triggerInference = false;
     metadata.triggered = decision.wake;
     if (decision.held && triggerChannel) {
       metadata.tuneOut = { epochId: decision.held.epochId };
@@ -34862,9 +34865,14 @@ export class AgentFramework {
         this.refuseServerItem('push/event', connection.id, responder);
         return;
       }
-      // Required delivery stays closed until the push admission adapter is installed.
       if (connection.requiredAdmission) {
-        responder?.respond({ accepted: false, reason: 'admission_unsupported' });
+        const original = connection.admissionFor(params);
+        const admission: RequiredIngress = {
+          ...original,
+          check: () => this.queue?.isClosed ? 'admission_not_ready' :
+            this.mcplServerRegistry?.getServer(connection.id) !== connection ? 'admission_stale' : original.check(),
+        };
+        await this.pushHandler?.handleRequiredPushEvent(connection.id, params, responder as never, admission);
         return;
       }
       // RFC-014 §6.1 carrier 2: the tool change this push explains was
