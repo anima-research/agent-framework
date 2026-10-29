@@ -7469,11 +7469,8 @@ export class AgentFramework {
     const workspace = this.getWorkspaceModule();
     if (workspace === module && typeof workspace.useHistory === 'function') {
       workspace.useHistory((agentName, messageId) => {
-        const agent = this.agents.get(agentName);
-        if (!agent) return false;
-        const cm = agent.getContextManager();
-        if (cm.getMessage(messageId as MessageId) == null) return false;
-        return !this.presents(agent) || cm.windowStatusOf(messageId as MessageId) !== 'undone';
+        const cm = this.agents.get(agentName)?.getContextManager();
+        return !!cm && cm.getMessage(messageId as MessageId) != null && !AgentFramework.undoneInWindow(cm, messageId as MessageId);
       });
     }
     // With the presentation index an undo moves no branch: the workspace asks
