@@ -65,7 +65,7 @@ function batchedWakeRig(speech?: { locus: 'delivery' | 'latest-inbound' }) {
           policies: [{
             name: 'batch',
             match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'] },
-            behavior: { debounce: 400 },
+            behavior: { debounce: 100 },
           }],
           default: 'skip',
         },
@@ -108,11 +108,11 @@ function batchedWakeRig(speech?: { locus: 'delivery' | 'latest-inbound' }) {
    * Holds the gate's batches: when a batch's timer fires with fewer than two
    * events in it, the batch stays pending, and the returned function counts
    * those held fires. A test that pairs two sends calls this, sends its first
-   * event, waits until that event's batch has been held past its 400 ms
+   * event, waits until that event's batch has been held past its 100 ms
    * window, and then sends the second, which joins the same batch. That batch
    * fires on the timer the second event starts, with both events in it,
    * however long the second took to arrive. Without the hold, whether the
-   * two share a batch depends on the second reaching the gate within 400 ms
+   * two share a batch depends on the second reaching the gate within 100 ms
    * of the first, which a loaded runner can miss.
    *
    * The hold lasts for the rest of the test, since each test builds its own
