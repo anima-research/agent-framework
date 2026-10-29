@@ -1503,6 +1503,54 @@ describe('present while acting', () => {
     });
   }
 
+  // The delivery rule's addressed-elsewhere notice skips a boundary that
+  // restarts past maxStreamTokens, the window projection forcing it as well
+  // or not, as the re-pin above does: the restart's start tells the agent
+  // instead, so it hears of the message once.
+  const addressedFrom = (framework: AgentFramework): string[] =>
+    framework.getAgent('assistant')!.getContextManager().getAllMessages()
+      .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'routing-notice')
+      .flatMap((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text))
+      .filter((text) => text.startsWith('[routing] Someone addressed you from '));
+
+  for (const [label, physicalWindowTokens] of [
+    ['gives no addressed-elsewhere notice at its boundary under the delivery rule', undefined],
+    ['the window projection forces as well gives no addressed-elsewhere notice at its boundary under the delivery rule', 50],
+  ] as const) {
+    it(`a budget restart ${label}`, async () => {
+      const overBudget = createMockResponse([
+        { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+      ] as ContentBlock[], 'tool_use');
+      overBudget.usage = { inputTokens: 100, outputTokens: 5 };
+      membrane.pushResponse(overBudget);
+
+      const framework = await createFramework({ maxStreamTokens: 20, ...(physicalWindowTokens !== undefined ? { physicalWindowTokens } : {}) });
+      stubChannelRegistry(framework);
+      module.toolDelayMs = 25;
+      module.interjection = 'quick question for you';
+      module.interjectionMetadata = addressed('discord:dm:antra');
+      feedStart(framework, 2, [{ type: 'text', text: 'After the restart.' }] as ContentBlock[]);
+      const reasons: string[] = [];
+      let atBoundary: string[] | undefined;
+      framework.onTrace((event) => {
+        if (event.type !== 'inference:stream_restarted') return;
+        reasons.push((event as { reason: string }).reason);
+        atBoundary = addressedFrom(framework);
+      });
+      trigger(framework);
+      await framework.runUntilIdle();
+
+      assert.equal(membrane.calls.length, 2, 'the turn restarted');
+      assert.deepEqual(reasons, [physicalWindowTokens !== undefined ? 'physical_window' : 'context_budget'], "the restart is the window projection's where it forces one");
+      assert.deepEqual(atBoundary, [], 'the restarting boundary stored no addressed-elsewhere notice');
+      const told = addressedFrom(framework);
+      assert.equal(told.length, 1, 'the agent is told once');
+      assert.ok(told[0]!.startsWith('[routing] Someone addressed you from discord:dm:antra at your budget restart.'), "by the restart's start");
+
+      await framework.stop();
+    });
+  }
+
   it("a budget restart that re-pins its turn stops the typing its earlier stream left in the old channel", async () => {
     // The over-budget stream hands the turn on at a tool boundary, before any
     // content of the next round, so it never shows the move itself: the
