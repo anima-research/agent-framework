@@ -18740,10 +18740,13 @@ export class AgentFramework {
       }
       // Written for the fork's closing turn, as a [continue] row is for a
       // continuation's: its own row. Expiry keys on the fork's last activity
-      // alone, so a turn of the fork's may be alive: the row then stays out
-      // of that turn's window (present false) and enters it at the turn's
-      // end, before the closing turn starts. So it does while the host is
-      // quiesced.
+      // alone, so a turn of the fork's may be alive: the row then isn't
+      // presented at its write (present false), and that turn's next point
+      // presents it, a tool boundary, where the live stream hears it, or else
+      // the turn's end, before the closing turn starts. Nor is it while the
+      // host is quiesced, when a boundary presents nothing past its round's
+      // rows: a live turn's end presents it then, or with no turn alive, the
+      // resume.
       const present = !this.logicalTurnAlive(agent) && !this.quiesced;
       storeOwnRow(
         agent,
