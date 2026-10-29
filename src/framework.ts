@@ -4147,6 +4147,7 @@ export class AgentFramework {
    * write is stored at once.
    */
   private presentation: AgentPresentation | null = null;
+  private bootFreeze = false;
   /** The arrival listener adoptPresentation installed for each agent, by its unsubscribe. */
   private readonly presentationListeners = new Map<Agent, () => void>();
   /**
@@ -4707,6 +4708,7 @@ export class AgentFramework {
     // handle from one) the first agent's write-down would throw.
     const unbatched = unbatchedStoreRefusal(store);
     if (unbatched !== undefined) throw new Error(unbatched);
+    framework.bootFreeze = true;
     framework.presentation = new AgentPresentation({
       liveAgents: () => framework.agents.values(),
       registry: framework.registry,
@@ -4714,7 +4716,7 @@ export class AgentFramework {
         const agent = framework.agents.get(name);
         return !!agent && framework.logicalTurnAlive(agent);
       },
-      frozen: () => framework.quiesced || framework.surgeryHold !== null,
+      frozen: () => framework.bootFreeze || framework.quiesced || framework.surgeryHold !== null,
       emitTrace: (event) => framework.emitTrace(event),
     });
     framework.turnRearmMs = turnRearmDelays(config.exhaustedTurnRearmMs);
@@ -5099,6 +5101,7 @@ export class AgentFramework {
     // suppressions, made with the host stopped through one agent's context.
     framework.wakeForUnpresentedTuneOutRows();
     framework.wakeForUnpresentedMail();
+    framework.bootFreeze = false;
     framework.presentation?.repairAndRest();
     framework.presentation?.retractAbsentRows();
     framework.reconcileAgentRegistry(interruptedAgents);

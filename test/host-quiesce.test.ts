@@ -1524,3 +1524,53 @@ test("an abandon whose cancel throws for one agent goes on to abandon the next a
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('a quiesced boot keeps its stored rows out of the windows when a module writes at its start, until resume', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'af-quiesce-start-write-'));
+  const text = (t: string) => ({ type: 'text', text: t }) as never;
+  const textOf = (row: { content: Array<{ type: string; text?: string }> }) =>
+    row.content.filter((b) => b.type === 'text').map((b) => b.text ?? '').join('');
+  class StartWriter {
+    readonly name = 'start-writer';
+    async start(ctx: { addMessage(participant: string, content: never[]): string }): Promise<void> {
+      ctx.addMessage('user', [text('MODULE-START-ROW')]);
+    }
+    async stop(): Promise<void> {}
+    getTools() { return []; }
+    async handleToolCall() { return { success: false, error: 'no tools' }; }
+    async onProcess() { return {}; }
+  }
+  const make = (modules: unknown[]) => AgentFramework.create({
+    storePath: join(dir, 'store.chronicle'),
+    membrane: new MockMembrane() as never,
+    agents: [{ name: 'mira', model: 'test-model', systemPrompt: 'You are mira.' }],
+    modules,
+    syncIntervalMs: 0,
+    maintenanceIntervalMs: 0,
+  } as never);
+  const inWindow = (framework: AgentFramework, t: string) => {
+    const cm = framework.getAgent('mira')!.getContextManager();
+    const row = cm.getAllMessages().find((m) => textOf(m as never) === t);
+    assert.ok(row, `a row "${t}" is stored`);
+    return cm.ordinalOf(row.id) !== undefined;
+  };
+  const first = await make([]);
+  let second: AgentFramework | undefined;
+  try {
+    await first.quiesce({ reason: 'maintenance' });
+    (first as unknown as { addMessage(p: string, c: never[]): string }).addMessage('user', [text('STORED-WHILE-QUIESCED')]);
+    assert.equal(inWindow(first, 'STORED-WHILE-QUIESCED'), false, 'the premise: out of the window while quiesced');
+    await first.stop();
+
+    second = await make([new StartWriter()]);
+    assert.equal(second.getHostModeStatus().quiesced, true, 'the host boots quiesced');
+    assert.equal(inWindow(second, 'STORED-WHILE-QUIESCED'), false, 'still out of the window after the boot');
+    assert.equal(inWindow(second, 'MODULE-START-ROW'), false, "and the module's row with it");
+    await second.resume();
+    assert.equal(inWindow(second, 'STORED-WHILE-QUIESCED'), true, 'resume presents it');
+    assert.equal(inWindow(second, 'MODULE-START-ROW'), true);
+  } finally {
+    await second?.stop().catch(() => {});
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

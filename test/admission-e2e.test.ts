@@ -21,6 +21,20 @@ import {
   type Stored, SUB, internals, textOf, stored, held, has, find, inWindow, AMBIENT, MENTION,
   incoming, dm, registerOpen, enter, settle, channellessTurnLocus, blockInTool,
 } from './helpers/admission.js';
+import type { ContentBlock } from '@animalabs/membrane';
+import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
+
+/** A module that stores a row for the primary from its start(), as a host's module may. */
+class StartWriter implements Module {
+  readonly name = 'start-writer';
+  async start(ctx: ModuleContext): Promise<void> {
+    ctx.addMessage('user', [{ type: 'text', text: 'written at the module\'s start' } as ContentBlock]);
+  }
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] { return []; }
+  async handleToolCall(_call: ToolCall): Promise<ToolResult> { return { success: false, error: 'no tools' }; }
+  async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> { return {}; }
+}
 
 describe('admission: the hold is decided once, before any side effect', () => {
   it('gap 1 — tuning out a DM holds the next DM (the push-event lane consults the hold)', async () => {
@@ -403,6 +417,34 @@ describe('admission: the hold is decided once, before any side effect', () => {
       assert.equal(inWindow(g, '<tuned-out-backlog'), true, 'the boot presents it at rest');
       await g.turn();
       assert.match(g.lastRequest(), /tuned-out-backlog[^]*antra: held before the crash/, "the wake's turn reads the release");
+    } finally { await g.close(); }
+  });
+
+  it('gap 6 — the next boot keeps the release\'s wake when a module writes at its start, before the boot reads what is owed', async () => {
+    const gate = new GateModule();
+    const f = await fixture({ framework: { subconscious: SUB, modules: [gate] } as Partial<FrameworkConfig> });
+    const crashed = mkdtempSync(join(tmpdir(), 'admission-reboot-'));
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enter(f, 'noisy', { backlogCap: 10 });
+      const { loop } = await blockInTool(f, gate);
+      await incoming(f, 'noisy', 'n1', 'held before the crash');
+      await eventually(() => has(f, 'held before the crash'), 'held message stored');
+      assert.ok(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test').ok);
+      assert.equal(inWindow(f, '<tuned-out-backlog'), false, "out of the live turn's window");
+      cpSync(join(f.dir, 'store'), join(crashed, 'store'), { recursive: true });
+      f.alwaysRespond();
+      gate.release('g1');
+      await loop;
+    } finally { await f.close(); }
+
+    const g = await fixture({ framework: { subconscious: SUB, modules: [new StartWriter()] } as Partial<FrameworkConfig>, dir: crashed });
+    try {
+      assert.ok(has(g, 'written at the module\'s start'), "the premise: the module's start wrote its row");
+      const pending = internals(g).pendingRequests;
+      assert.deepEqual(pending.filter((r) => r.agentName === 'agent' && /tune-out released/.test(r.reason)).length, 1,
+        'the release owes the resident its wake, once');
+      assert.equal(inWindow(g, '<tuned-out-backlog'), true, 'the boot presents it at rest');
     } finally { await g.close(); }
   });
 
