@@ -1271,6 +1271,13 @@ describe('present while acting', () => {
     ], 'the turn answered where it was');
     assert.deepEqual(movedTo(framework), [], 'the agent was told of no move');
 
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Answering it.' }] as ContentBlock[]));
+    trigger(framework);
+    await framework.runUntilIdle();
+    assert.equal(membrane.calls.length, 3, 'a next turn ran');
+    assert.ok(JSON.stringify(membrane.calls[2]!.messages).includes('a question for you'), "a later point presents the arrival: the next turn's request carries it");
+    assert.ok(cm.getPresentedMessages().some((m) => m.id === arrival.id), 'in the window');
+
     await framework.stop();
   });
 
