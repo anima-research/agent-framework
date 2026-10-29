@@ -1,8 +1,10 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
+import { MembraneError } from '@animalabs/membrane';
 import type { Membrane, NormalizedMessage, NormalizedRequest } from '@animalabs/membrane';
-import { ReplyJudge, cut, ifYouWait, parseVerdict, renderMessage } from '../src/gate/reply-judge.js';
+import { ReplyJudge, cut, failedTurnLine, ifYouWait, judgeQuestion, parseVerdict, renderMessage } from '../src/gate/reply-judge.js';
 import type { JudgeRequest } from '../src/gate/types.js';
+import { oneLine } from '../src/supplied-text.js';
 
 function msg(participant: string, text: string): NormalizedMessage {
   return { participant, content: [{ type: 'text', text }] };
@@ -43,6 +45,99 @@ function conversation(n: number, size = 400): NormalizedMessage[] {
   for (let i = 0; i < n; i++) out.push(msg(i % 3 === 0 ? 'Scout' : `user${i % 5}`, `message ${i} ` + 'x'.repeat(size)));
   return out;
 }
+
+/** A provider that refuses, with `error` (a context-length error by default), the requests `refuses` picks by their 1-based number, or the first `refuses` of them. */
+function refusingMembrane(refuses: number | ((n: number) => boolean), error?: Error) {
+  const refused = typeof refuses === 'number' ? (n: number) => n <= refuses : refuses;
+  const requests: NormalizedRequest[] = [];
+  const size = (r: NormalizedRequest) => r.messages.reduce((n, m) => n + m.content.reduce((k, b) => k + (b.type === 'text' ? b.text.length : 0), 0), 0);
+  const membrane = {
+    complete: async (request: NormalizedRequest) => {
+      requests.push(request);
+      if (refused(requests.length)) {
+        throw error ?? new MembraneError({ type: 'context_length', retryable: false, message: 'prompt is too long: 1200000 tokens > 1000000 maximum', rawError: { status: 400 } });
+      }
+      return {
+        content: [{ type: 'text', text: 'REPLY: asked directly' }],
+        stopReason: 'end_turn',
+        usage: { inputTokens: Math.ceil(size(request) / 3), outputTokens: 12 },
+        details: { usage: { inputTokens: Math.ceil(size(request) / 3), outputTokens: 12 }, model: { actual: 'claude-haiku-5-5' } },
+      };
+    },
+  } as unknown as Membrane;
+  return { membrane, requests, size };
+}
+
+describe('reply judge: a request refused as too long', () => {
+  const judgeOver = (membrane: Membrane, messages = 60, maxInputTokens = 4_000) => new ReplyJudge({
+    membraneFor: () => membrane, chooseAgent: (n) => n[0],
+    preview: async () => ({ messages: conversation(messages), config: { model: 'x', maxTokens: 1 } }),
+    options: { maxInputTokens },
+  });
+  const quietly = async <T>(run: () => Promise<T>): Promise<T> => {
+    const original = console.error;
+    console.error = () => {};
+    try {
+      return await run();
+    } finally {
+      console.error = original;
+    }
+  };
+
+  it('is asked once more, smaller', async () => {
+    const { membrane, requests, size } = refusingMembrane(1);
+    const judge = judgeOver(membrane);
+    const before = judge.estimateRatio();
+    const verdict = await quietly(() => judge.judge(judgeRequest()));
+    assert.strictEqual(verdict.reply, true);
+    assert.strictEqual(requests.length, 2);
+    assert.ok(size(requests[1]!) < size(requests[0]!), `${size(requests[1]!)} < ${size(requests[0]!)}`);
+    assert.strictEqual(before, 3, 'premise: the starting ratio');
+  });
+
+  it('refused again, fails as any failed call does, after two requests', async () => {
+    const { membrane, requests } = refusingMembrane(2);
+    await quietly(() => assert.rejects(judgeOver(membrane).judge(judgeRequest()), /prompt is too long/));
+    assert.strictEqual(requests.length, 2);
+  });
+
+  it('is asked smaller though the window from the last request still fits, by starting a fresh window', async () => {
+    // The first batch is answered, and its window holds the whole conversation; the second is refused.
+    const { membrane, requests, size } = refusingMembrane((n) => n === 2);
+    const judge = judgeOver(membrane, 50, 20_000);
+    await quietly(() => judge.judge(judgeRequest()));
+    await quietly(() => judge.judge(judgeRequest()));
+    assert.strictEqual(requests.length, 3);
+    assert.strictEqual(size(requests[1]!), size(requests[0]!), 'premise: the refused request is the answered one again');
+    assert.ok(size(requests[2]!) < size(requests[1]!), `${size(requests[2]!)} < ${size(requests[1]!)}`);
+  });
+
+  it('keeps the lower ratio for later batches, down to one character a token, where a refusal is no longer asked again', async () => {
+    const { membrane, requests } = refusingMembrane(() => true);
+    const judge = judgeOver(membrane);
+    const asked: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      const before = requests.length;
+      await quietly(() => assert.rejects(judge.judge(judgeRequest()), /prompt is too long/));
+      asked.push(requests.length - before);
+    }
+    assert.deepStrictEqual(asked, [2, 2, 1]);
+    assert.strictEqual(judge.estimateRatio(), 1);
+  });
+
+  it('halves the ratio once for two requests built at it and refused together', async () => {
+    const { membrane } = refusingMembrane(() => true);
+    const judge = judgeOver(membrane);
+    await quietly(() => Promise.allSettled([judge.judge(judgeRequest()), judge.judge(judgeRequest())]));
+    assert.strictEqual(judge.estimateRatio(), 1.5);
+  });
+
+  it("isn't asked again for any other failure", async () => {
+    const { membrane, requests } = refusingMembrane(1, new MembraneError({ type: 'server', retryable: true, message: 'upstream 500', rawError: { status: 500 } }));
+    await assert.rejects(judgeOver(membrane).judge(judgeRequest()), /upstream 500/);
+    assert.strictEqual(requests.length, 1);
+  });
+});
 
 describe('reply judge: verdicts', () => {
   it('parses REPLY and WAIT lines, with or without markdown', () => {
@@ -322,6 +417,104 @@ describe('reply judge: the document', () => {
     });
     await judge.judge(judgeRequest());
     assert.match((requests[0]!.messages.at(-1)!.content[0] as { text: string }).text, /Nothing the host knows of is scheduled/);
+  });
+
+  it("says first that the agent's last turn failed, and that nothing runs it again, when nothing will", async () => {
+    const { membrane, requests } = fakeMembrane();
+    const now = Date.now();
+    const judge = new ReplyJudge({
+      membraneFor: () => membrane, chooseAgent: (n) => n[0],
+      preview: async () => ({ messages: conversation(2), config: { model: 'x', maxTokens: 1 } }),
+      failedLastTurn: () => ({ at: now - 125_000, again: { kind: 'none' } }),
+    });
+    await judge.judge(judgeRequest());
+    const last = (requests[0]!.messages.at(-1)!.content[0] as { text: string }).text;
+    assert.ok(last.includes([
+      '<if_you_wait>',
+      "Scout's last turn, 2m ago, failed and may not have answered all of what woke it. Nothing runs it again: if you answer WAIT, what woke it stays unanswered until something wakes Scout.",
+      'Nothing the host knows of is scheduled to wake Scout:',
+    ].join('\n')), last);
+  });
+
+  it("says a wake of the agent's is queued, or held until its hold ends or an operator releases it, when one is", () => {
+    const now = 1_000_000;
+    const opening = "Scout's last turn, 30s ago, failed and may not have answered all of what woke it.";
+    assert.strictEqual(failedTurnLine({ at: now - 30_000, again: { kind: 'queued' } }, 'Scout', now),
+      `${opening} A wake for Scout is already queued.`);
+    assert.strictEqual(failedTurnLine({ at: now - 30_000, again: { kind: 'held', until: now + 180_000 } }, 'Scout', now),
+      `${opening} A wake for Scout is held, due to be let go in 3 min.`);
+    assert.strictEqual(failedTurnLine({ at: now - 30_000, again: { kind: 'held' } }, 'Scout', now),
+      `${opening} A wake for Scout is held, and is let go when the hold on it is released.`);
+  });
+
+  it("shows a wake due at no nameable time by its words, quoted, after every wake with a time", () => {
+    const now = 1_000_000;
+    const text = ifYouWait([
+      { when: 'when the hold <on it> is released', certain: true, what: 'a wake held by a provider hold' },
+      { at: now + 60_000, certain: true, what: 'its own skip_reply timer' },
+    ], 'Scout', now);
+    assert.ok(text.includes('- in 60 s: its own skip_reply timer\n- when the hold &lt;on it&gt; is released: a wake held by a provider hold'), text);
+  });
+
+  it("says how many past the eighth wake are only maybe, when some are and some aren't", () => {
+    const now = 1_000_000;
+    const wakes = Array.from({ length: 11 }, (_, i) => ({ at: now + 1_000 + i, certain: i !== 9, what: `wake ${i}` }));
+    assert.ok(ifYouWait(wakes, 'Scout', now).includes('- and 3 more, 1 of them only maybe'));
+  });
+
+  it("shows each upcoming wake's words on one line, escaped, and says how many past the eighth are only maybe", () => {
+    const now = 1_000_000;
+    const wakes = [
+      { at: now + 1_000, certain: true, what: 'a wake already queued (nudge from Ann <mod>\n[x])' },
+      ...Array.from({ length: 9 }, (_, i) => ({ at: now + 2_000 + i, certain: i < 7, what: `wake ${i}` })),
+    ];
+    const text = ifYouWait(wakes, 'Scout', now);
+    assert.ok(text.includes('- in 1 s: a wake already queued (nudge from Ann &lt;mod&gt; &#91;x&#93;)'), text);
+    assert.ok(text.includes('- and 2 more, each only maybe'), text);
+  });
+
+  it('shows no failed-turn line when the last turn completed, and a provider that throws counts as none', async () => {
+    assert.ok(!ifYouWait([], 'Scout', Date.now()).includes('last turn'));
+    const { membrane, requests } = fakeMembrane();
+    const judge = new ReplyJudge({
+      membraneFor: () => membrane, chooseAgent: (n) => n[0],
+      preview: async () => ({ messages: conversation(2), config: { model: 'x', maxTokens: 1 } }),
+      failedLastTurn: () => { throw new Error('boom'); },
+    });
+    await judge.judge(judgeRequest());
+    assert.ok(!(requests[0]!.messages.at(-1)!.content[0] as { text: string }).text.includes('last turn'));
+  });
+
+  it("shows a message's text over several lines indented under its name, with markup characters escaped", () => {
+    const text = renderMessage(msg('Ann', 'the beds need:\r\n- compost\n- <b>water</b> & mulch'));
+    assert.strictEqual(text, '[Ann] the beds need:\n  - compost\n  - &lt;b&gt;water&lt;/b&gt; &amp; mulch');
+    assert.strictEqual(renderMessage(msg('Ann [mod]\nB', 'hi')), '[Ann &#91;mod&#93; B] hi');
+  });
+
+  it("escapes markup characters in a participant's name, an event's channel and its author", () => {
+    assert.strictEqual(renderMessage(msg('Ann <mod> & co', 'hi')), '[Ann &lt;mod&gt; &amp; co] hi');
+    const question = judgeQuestion({
+      events: [{ eventType: 'mcpl:channel-incoming', channel: '#r&d <beds> [b]', authorId: 'u<1>\n[x]', addressed: false, content: 'hi', at: 1_000_000 }],
+    }, 'Scout', 1_000_000);
+    assert.ok(question.includes('- 0s ago in #r&amp;d &lt;beds&gt; &#91;b&#93; from u&lt;1&gt; &#91;x&#93;: hi'), question);
+  });
+
+  it("puts the gate's addressed marker right after the time, ahead of the channel and the author", () => {
+    const question = judgeQuestion({
+      events: [{ eventType: 'mcpl:channel-incoming', channel: '#garden', authorId: 'u1', addressed: true, content: 'hi', at: 1_000_000 }],
+    }, 'Scout', 1_000_000);
+    assert.ok(question.includes('- 0s ago (addresses the agent) in #garden from u1: hi'), question);
+  });
+
+  it('keeps a value to one line whatever form its line breaks take', () => {
+    assert.strictEqual(oneLine('a\r\nb\rc\nd\u000be\u000cf\u0085g\u2028h\u2029i\n\n\nj'), 'a b c d e f g h i j');
+  });
+
+  it("shows an event's text over several lines indented inside its item, and its channel and author on one line", () => {
+    const question = judgeQuestion({
+      events: [{ eventType: 'mcpl:channel-incoming', channel: '#garden\nbeds', authorId: 'u1', addressed: false, content: 'the beds need:\n- compost\n- a < b', at: 1_000_000 }],
+    }, 'Scout', 1_000_000);
+    assert.ok(question.includes('<new_events count="1">\n- 0s ago in #garden beds from u1: the beds need:\n  - compost\n  - a &lt; b\n</new_events>'), question);
   });
 
   it('reads the primary agent its chooser names', async () => {

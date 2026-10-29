@@ -4752,6 +4752,7 @@ export class AgentFramework {
         // timers: a wake already queued for it, and a turn a provider cooldown
         // holds until it ends.
         upcomingWakes: (agentName) => framework.upcomingWakesFor(agentName),
+        failedLastTurn: (agentName) => framework.failedLastTurnFor(agentName),
       });
       framework.judgeWired = judge !== undefined;
       const configuredServerIds = new Set((config.mcplServers ?? []).map((server) => server.id));
@@ -6049,28 +6050,61 @@ export class AgentFramework {
   }
   /**
    * Wakes the framework holds for `agentName` that need no new event: a
-   * request already queued for it (it runs as soon as the agent is free) and
-   * turns a provider cooldown holds until its end. The reply judge is told of
-   * them beside the gate's own timers, so it can weigh what waiting costs.
+   * request already queued for it, and one a provider hold keeps until it
+   * ends. The reply judge is told of them beside the gate's own timers, so it
+   * can weigh what waiting costs.
    */
   private upcomingWakesFor(agentName: string): import('./gate/types.js').UpcomingWake[] {
     const wakes: import('./gate/types.js').UpcomingWake[] = [];
-    const queued = this.pendingRequests.filter((r) => r.agentName === agentName);
+    const { queued, held } = this.wakesOnTheirWay(agentName);
     if (queued.length > 0) {
-      const reason = queued[0]!.reason;
       wakes.push({
         certain: true,
-        what: `${queued.length === 1 ? 'a wake' : `${queued.length} wakes`} already queued (${safeSlice(String(reason), 0, 80)})`,
+        what: `${queued.length === 1 ? 'a wake' : `${queued.length} wakes`} already queued (${safeSlice(String(queued[0]), 0, 80)})`,
       });
     }
-    const cooldown = this.providerAccelerationCooldowns.get(agentName);
-    if (cooldown && cooldown.heldRequests.length > 0 && Number.isFinite(cooldown.until)) {
-      wakes.push({ at: cooldown.until, certain: true, what: cooldown.rearm
-        ? `a turn whose retries ran out, sent again (${cooldown.rearm.number} of ${cooldown.rearm.of})`
-        : 'a turn held by a provider cooldown, when it ends' });
+    if (held) {
+      wakes.push(held.until === undefined
+        ? { when: 'when the hold on it is released', certain: true, what: 'a wake held by a provider hold' }
+        : { at: held.until, certain: true, what: held.rearm
+          ? `a turn whose retries ran out, sent again (${held.rearm.number} of ${held.rearm.of})`
+          : 'a wake held by a provider hold, when it ends' });
     }
     wakes.push(...this.heartbeatWakesFor(agentName));
     return wakes;
+  }
+
+  private wakesOnTheirWay(agentName: string): { queued: string[]; held?: { until?: number; rearm?: { number: number; of: number } } } {
+    const mine = (r: InferenceRequest): boolean => r.agentName === agentName;
+    const requests = [...this.pendingRequests.filter(mine), ...[...this.parkedContinuations].filter(mine)];
+    for (const pass of this.passRequests) for (const taken of pass.values()) requests.push(...taken.filter(mine));
+    const queued = requests.map((r) => String(r.reason));
+    const gate = this.providerGates.get(agentName);
+    if (gate && gate.primaryDepth > 0 && !this.activeTurnTokens.has(agentName) && queued.length === 0) {
+      queued.push('a start waiting for an auxiliary call to finish');
+    }
+    const ends = (until: number | null | undefined): { until?: number } =>
+      (typeof until === 'number' && Number.isFinite(until) ? { until } : {});
+    const model = this.agents.get(agentName)?.model;
+    const cooldown = this.providerAccelerationCooldowns.get(agentName);
+    if (cooldown && !(cooldown.rearm && queued.length > 0)) {
+      const releaseWakes = cooldown.heldRequests.length > 0 || !(cooldown.auxiliaryOrigin || cooldown.emptiedBy);
+      if (releaseWakes || queued.length > 0) {
+        return { queued: [], held: { ...ends(cooldown.until), ...(cooldown.rearm ? { rearm: cooldown.rearm } : {}) } };
+      }
+    }
+    const wait = queued.length > 0 && model !== undefined ? this.providerWaits?.active(agentName, model) : undefined;
+    if (wait) return { queued: [], held: ends(wait.until) };
+    return { queued };
+  }
+
+  private failedLastTurnFor(agentName: string): import('./gate/types.js').FailedLastTurn | undefined {
+    if (!(this.consecutiveInferenceFailures.get(agentName) ?? 0)) return undefined;
+    const at = this.lastInferenceAt.get(agentName)?.failedAt;
+    if (at === undefined) return undefined;
+    const { queued, held } = this.wakesOnTheirWay(agentName);
+    if (queued.length > 0) return { at, again: { kind: 'queued' } };
+    return { at, again: held ? { kind: 'held', ...(held.until !== undefined ? { until: held.until } : {}) } : { kind: 'none' } };
   }
 
   /**
@@ -6914,6 +6948,7 @@ export class AgentFramework {
     for (const { wait, release } of released) {
       console.error(`[provider-wait] agent=${agentName} model=${wait.model} released by ${by} (${release})`);
     }
+    this.eventGate?.providerCallsReleased();
     // The agent's context strategy may pace its own provider calls by the same
     // stated wait. From context-manager 0.17, its compression lane exposes
     // releaseCompressionPause. The release is the operator's word on that
@@ -12846,6 +12881,11 @@ export class AgentFramework {
     },
   ];
 
+  private static readonly WAKE_REMOVE_RULE_REST =
+    'Any pending debounce batch for that rule is still delivered, held while your turn runs, as ' +
+    'its timer would deliver it. Returns whether a rule was removed (false if no ' +
+    'rule had that name).';
+
   /** Synthesized wake-rule tools: add/remove a gate.json policy at runtime.
    *  Present when a gate is wired. They write validated policies into the
    *  hot-reloaded gate.json (same validation as load), so a rule takes effect
@@ -12973,10 +13013,7 @@ export class AgentFramework {
     {
       name: 'wake_remove_rule',
       description:
-        'Remove a wake rule (gate.json policy) by name at runtime. Any pending ' +
-        'debounce batch for that rule is still delivered, held while your turn runs, as ' +
-        'its timer would deliver it. Returns whether a rule was removed (false if no ' +
-        'rule had that name).',
+        'Remove a wake rule (gate.json policy) by name at runtime. ' + AgentFramework.WAKE_REMOVE_RULE_REST,
       inputSchema: {
         type: 'object',
         properties: {
@@ -12992,8 +13029,9 @@ export class AgentFramework {
       if (tool.name === 'wake_remove_rule') {
         return {
           ...tool,
-          description: tool.description + ' A judge rule\'s batch, whether waiting out its quiet period, ' +
-            'held or being judged, still goes to the judge, by the rule as it was.',
+          description: 'Remove a wake rule (gate.json policy) by name at runtime; a judge rule\'s pending ' +
+            'batches still go to the judge, by the rule as it was. ' + AgentFramework.WAKE_REMOVE_RULE_REST +
+            ' A judge rule\'s batch is pending while it waits out its quiet period, is held or is being judged.',
         };
       }
       if (tool.name !== 'wake_add_rule') return tool;
@@ -14724,6 +14762,7 @@ export class AgentFramework {
       settle();
       if (this.surgeryHold === hold) this.surgeryHold = null;
       resolveHold();
+      this.eventGate?.providerCallsReleased();
       for (const [name, token] of reserved) {
         if (this.activeTurnTokens.get(name) === token) this.activeTurnTokens.delete(name);
       }

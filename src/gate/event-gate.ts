@@ -82,6 +82,9 @@ const MAX_JUDGE_INSTRUCTIONS = 4_000;
 const DEFAULT_JUDGE_TIMEOUT_MS = 20_000;
 /** Judge failures in a row after which gate_status names the judge as failing. */
 const JUDGE_FAILING_STREAK = 3;
+/** The latest instant a Date can name (ms): a later stated end can't be shown. */
+const MAX_DATE_MS = 8.64e15;
+const JUDGE_REFUSAL_MIN_RETRY_MS = 1_000;
 
 /** Whether a check made at `last` is still fresh at `now`, less than the
  *  reload throttle ago. A clock stepped backwards since makes it stale, so
@@ -206,9 +209,10 @@ interface DebounceState {
   firstAt: number;
   /** When its timer fires (ms), as of its last re-arm (upcomingWakes). */
   dueAt: number;
-  /** The judge the batch goes to when it fires, as its rule held it when the
-   *  batch began: a rule removed or changed meanwhile has its batch judged
-   *  as the rule it was asked. Absent for a debounce. */
+  /** The judge rule the batch began under. When the judge is asked, the
+   *  rule as it is then decides it, while it's still a judge rule; a batch
+   *  whose rule was removed or is no longer a judge rule is judged by this
+   *  one. Absent for a debounce. */
   judge?: JudgeConfig;
 }
 
@@ -223,11 +227,12 @@ interface JudgingState {
   /** Batches of the same rule that fired meanwhile, judged once this one is
    *  decided: delivered with it on reply, judged afresh on wait. */
   queued: PendingEvent[];
+  ask: number;
 }
 
 /** A rule's verdict counts and newest verdict (gate_status judgeState). */
 interface JudgeRecord {
-  verdicts: { reply: number; wait: number; error: number };
+  verdicts: { reply: number; wait: number; error: number; refused: number };
   last?: NonNullable<GatePolicyStats['judgeState']>['last'];
 }
 
@@ -2076,6 +2081,10 @@ export class EventGate {
    *  gate_status says once it's a streak (judgeFailingNotice). */
   private judgeFailStreak = 0;
   private judgeLastFailure = '';
+  private judgeRefusal: { hold: string; until?: number } | null = null;
+  private judgeRefusalTimer: ReturnType<typeof setTimeout> | null = null;
+  private judgeAsks = 0;
+  private judgeNewestOutcome = 0;
 
   // Rate-limit state — policy name → key → bucket.
   private rateLimitBuckets = new Map<string, Map<string, RateBucket>>();
@@ -2203,7 +2212,8 @@ export class EventGate {
     changesJudgedContext?: (agentName: string) => boolean;
     /** How long a judge request may take (ms). Default 20,000. */
     judgeTimeoutMs?: number;
-    /** What a judge failure does: wake (default) or skip. */
+    /** What a judge failure, or a judge call the framework refuses without
+     *  making it, does: wake (default) or skip (ReplyJudgeOptions.onError). */
     judgeOnError?: 'wake' | 'skip';
     /** Map an event to the registered channel it arrived on (the host knows
      *  how push-event origins compose into channel ids). The gate routes a
@@ -2734,7 +2744,8 @@ export class EventGate {
   /**
    * Clear the state of each rule `was` held in force that `next` leaves out or
    * gives another behavior: a reload calls it before it puts `next` in force,
-   * a write after. Without this, a rule that came back, or whose tokens 100
+   * a write after, and each sends the pending batches (fireCleared) once
+   * `next` is in force. Without this, a rule that came back, or whose tokens 100
    * became 5 (or keyBy switched, or every 10 became 3), would run on the
    * buckets and counters of the rule it was. A rule left out loses its stats
    * (matchCount, lastMatchTimestamp) too; a rule kept keeps them, which are
@@ -2763,8 +2774,11 @@ export class EventGate {
     }
     const cleared = [...after.keys()].filter((name) => before.has(name) && before.get(name) !== after.get(name));
     for (const name of cleared) this.clearPolicyState(name);
-    for (const name of [...removed, ...cleared]) this.fireDebounce(name);
     return { removed, cleared };
+  }
+
+  private fireCleared(names: string[]): void {
+    for (const name of names) this.fireDebounce(name);
   }
 
   private reloadIfChanged(): void {
@@ -2782,9 +2796,9 @@ export class EventGate {
       const newConfig = read.config;
 
       const { removed: removedPolicies, cleared: stateClearedPolicies } = this.clearStateFor(this.config, newConfig);
-
       this.config = newConfig;
       this.compiledPolicies = this.compilePolicies(newConfig);
+      this.fireCleared([...removedPolicies, ...stateClearedPolicies]);
       // Recorded only now that its rules are in force, so a reload that
       // throws before here is tried again at the next check.
       this.configText = read.text;
@@ -3023,7 +3037,8 @@ export class EventGate {
     this.configUnused = false;
     this.startUnsaved = null;
     this.lastReloadTimestamp = Date.now();
-    this.clearStateFor(was, read.config);
+    const { removed, cleared } = this.clearStateFor(was, read.config);
+    this.fireCleared([...removed, ...cleared]);
   }
 
   // =========================================================================
@@ -3359,7 +3374,7 @@ export class EventGate {
   /**
    * Clear one policy's live state (rate-limit buckets, passive-sample
    * counters, denial / fire counters) and stop its debounce timer, leaving
-   * its pending batch for fireDebounce to send, as clearStateFor does once
+   * its pending batch for fireDebounce to send, as fireCleared does once
    * every policy's state is cleared. It leaves stats (matchCount,
    * lastMatchTimestamp), which are history; clearStateFor deletes a removed
    * policy's.
@@ -3697,15 +3712,17 @@ export class EventGate {
   // Event delivery
   // =========================================================================
 
+  private heldNow(e: PendingEvent): boolean {
+    const channel = e.routeChannelId ?? e.channelId;
+    return channel ? this.isHeldFn(e.serverId, channel) : false;
+  }
+
   private deliverEvents(batched: PendingEvent[]): void {
     // Delivery-time re-check: a channel tuned out after its events were
     // batched is held now, and "already shown above at arrival" would be
     // untrue of them. They are dropped; the hold's own reader has them.
     const heldAt = (e: PendingEvent): string | undefined => e.routeChannelId ?? e.channelId;
-    const events = batched.filter((e) => {
-      const channel = heldAt(e);
-      return !(channel && this.isHeldFn(e.serverId, channel));
-    });
+    const events = batched.filter((e) => !this.heldNow(e));
     if (events.length < batched.length) {
       this.emitTrace({
         type: 'gate:held-dropped',
@@ -3841,6 +3858,18 @@ export class EventGate {
       this.holdForJudge(policyName, events, judge);
       return;
     }
+    if (this.judgeRefusing()) {
+      if (this.judgeOnError === 'skip') this.holdForJudge(policyName, events, judge);
+      else this.deliverOrBuffer(events);
+      return;
+    }
+    const held = this.judgeHeld.get(policyName);
+    if (held) {
+      this.judgeHeld.delete(policyName);
+      events = [...held.events, ...events];
+      this.capJudgeEvents(events);
+    }
+    judge = this.currentJudge(policyName, judge);
     const fn = this.judgeFn;
     if (!fn) {
       this.deliverOrBuffer(events);
@@ -3848,7 +3877,7 @@ export class EventGate {
     }
     const abort = new AbortController();
     const agentNames = this.getAgentNamesFn();
-    const state: JudgingState = { events, judge, started: Date.now(), abort, queued: [] };
+    const state: JudgingState = { events, judge, started: Date.now(), abort, queued: [], ask: ++this.judgeAsks };
     this.judging.set(policyName, state);
     const timedOut = new Promise<never>((_, reject) => {
       state.timer = setTimeout(() => {
@@ -3865,7 +3894,7 @@ export class EventGate {
         ...(judge.instructions !== undefined ? { instructions: judge.instructions } : {}),
         events: events.map((e) => this.judgeEventSummary(e)),
         agentNames,
-        upcomingWakes: this.upcomingWakes(agentNames, policyName),
+        upcomingWakes: this.upcomingWakesBut(agentNames, { batch: state }),
         signal: abort.signal,
       });
     } catch (err) {
@@ -3928,10 +3957,20 @@ export class EventGate {
    * The gate's own timers that will wake `agentNames` with no new event, for
    * the judge to weigh what waiting costs: each agent's pending self-wake
    * (skip_reply's wake_in_seconds), the end of a sleep, and the pending
-   * batches of rules other than `exceptPolicy` (a debounce's wakes the agent
-   * when it fires; a judge rule's goes to the judge, so it only may).
+   * batches of rules other than `exceptPolicy`, with those rules' events
+   * buffered while a turn runs or the host is quiesced. A debounce's batch
+   * wakes the agent when it's delivered: when it fires, or, buffered, once no
+   * turn runs and the host isn't quiesced. A judge rule's batch goes to the
+   * judge, whether it's collecting, being decided (with what queued behind
+   * it) or held, so it only may.
    */
   upcomingWakes(agentNames: string[], exceptPolicy?: string): UpcomingWake[] {
+    return this.upcomingWakesBut(agentNames, { policy: exceptPolicy });
+  }
+
+  /** upcomingWakes without rule `policy`'s batches, or without `batch`, the
+   *  one the judge is being asked about, its rule's others still listed. */
+  private upcomingWakesBut(agentNames: string[], leftOut: { policy?: string; batch?: JudgingState }): UpcomingWake[] {
     const wakes: UpcomingWake[] = [];
     const now = this.now();
     for (const name of agentNames) {
@@ -3943,13 +3982,32 @@ export class EventGate {
     if (this.sleepUntil > now && (this.sleepAgent === undefined || agentNames.includes(this.sleepAgent))) {
       wakes.push({ at: this.sleepUntil, certain: true, what: 'the end of its sleep' });
     }
+    const count = (n: number): string => `${n} ${n === 1 ? 'event' : 'events'}`;
     for (const [name, state] of this.debounceTimers) {
-      if (name === exceptPolicy || state.events.length === 0) continue;
-      const n = state.events.length;
-      const batch = `${n} ${n === 1 ? 'event' : 'events'}`;
+      if (name === leftOut.policy || state.events.length === 0) continue;
+      const batch = count(state.events.length);
       wakes.push(state.judge
         ? { at: state.dueAt, certain: false, what: `rule "${name}"'s batch of ${batch} goes to the judge` }
         : { at: state.dueAt, certain: true, what: `rule "${name}"'s debounced batch of ${batch}` });
+    }
+    for (const [name, state] of this.judging) {
+      if (name === leftOut.policy || state === leftOut.batch) continue;
+      const queued = state.queued.length > 0 ? `, with ${count(state.queued.length)} queued behind it` : '';
+      wakes.push({ certain: false, what: `rule "${name}"'s batch of ${count(state.events.length)}${queued}, which the judge is deciding` });
+    }
+    const refusal = this.judgeHeldForRefusal() ? this.judgeRefusal : null;
+    for (const [name, held] of this.judgeHeld) {
+      if (name === leftOut.policy || held.events.length === 0) continue;
+      const batch = `rule "${name}"'s batch of ${count(held.events.length)}`;
+      wakes.push(refusal?.until !== undefined
+        ? { at: refusal.until, certain: false, what: `${batch}, held for the judge while its calls are refused` }
+        : refusal
+          ? { certain: false, when: 'once a later judge call gets a REPLY or WAIT, or the hold on its calls is released, and no turn or quiesce holds it', what: `${batch}, held for the judge` }
+          : { certain: false, when: 'once no turn or quiesce holds it', what: `${batch}, held for the judge` });
+    }
+    const buffered = this.inferenceBuffer.filter((e) => e.policyName !== leftOut.policy && !this.heldNow(e)).length;
+    if (buffered > 0) {
+      wakes.push({ certain: true, when: "once no turn runs and the host isn't quiesced", what: `${count(buffered)} buffered for delivery` });
     }
     return wakes.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
   }
@@ -3997,21 +4055,14 @@ export class EventGate {
     const durationMs = Date.now() - state.started;
     const failed = verdict == null || typeof verdict !== 'object' || typeof verdict.reply !== 'boolean';
     if (failed && (err as { providerAdmission?: unknown } | undefined)?.providerAdmission === 'deferred') {
-      const wakes = this.judgeOnError === 'wake';
-      console.error(
-        `[gate] Policy "${policyName}": the reply judge made no call (${errorText(err)}), so its batch of ${state.events.length} `
-        + `${state.events.length === 1 ? 'event' : 'events'} ${wakes ? 'wakes the agent' : "doesn't wake the agent"} (judge onError "${this.judgeOnError}")`,
-      );
-      if (this.disposed) return;
-      if (wakes) this.deliverOrBuffer([...state.events, ...state.queued]);
-      else if (state.queued.length > 0) this.judgeBatch(policyName, state.queued, this.currentJudge(policyName, state.judge));
+      this.refusedJudging(policyName, state, err, durationMs);
       return;
     }
     const outcome: 'reply' | 'wait' | 'error' = failed ? 'error' : verdict.reply ? 'reply' : 'wait';
     const reason = failed
       ? (err !== undefined ? errorText(err) : 'the judge gave no verdict')
       : typeof verdict.reason === 'string' ? verdict.reason : '';
-    const record = this.judgeRecords.get(policyName) ?? { verdicts: { reply: 0, wait: 0, error: 0 } };
+    const record = this.judgeRecords.get(policyName) ?? { verdicts: { reply: 0, wait: 0, error: 0, refused: 0 } };
     record.verdicts[outcome]++;
     record.last = {
       at: Date.now(),
@@ -4028,6 +4079,10 @@ export class EventGate {
     } else {
       this.judgeFailStreak = 0;
     }
+    const newest = !failed && state.ask > this.judgeNewestOutcome;
+    if (newest) this.judgeNewestOutcome = state.ask;
+    const wasRefused = newest && this.judgeRefusal !== null;
+    if (wasRefused) this.clearJudgeRefusal();
     const wake = outcome === 'reply' || (outcome === 'error' && this.judgeOnError === 'wake');
     if (failed) {
       console.error(
@@ -4049,12 +4104,104 @@ export class EventGate {
       timestamp: Date.now(),
     });
     if (this.disposed) return;
+    if (wasRefused) this.flushJudgeHeldIfClear();
     const judge = this.currentJudge(policyName, state.judge);
     if (wake) {
       this.deliverOrBuffer([...state.events, ...state.queued]);
       return;
     }
     if (state.queued.length > 0) this.judgeBatch(policyName, state.queued, judge);
+  }
+
+  private refusedJudging(policyName: string, state: JudgingState, err: unknown, durationMs: number): void {
+    const hold = safeSlice(errorText(err), 0, 300);
+    const stated = (err as { retryAfterMs?: unknown }).retryAfterMs;
+    // A wait that isn't a number of ms a Date can end at states no end (a
+    // hold until released): a timer given one would fire at once.
+    const now = Date.now();
+    const end = typeof stated === 'number' ? now + Math.max(0, stated) : undefined;
+    const until = end !== undefined && end <= MAX_DATE_MS ? end : undefined;
+    if (state.ask > this.judgeNewestOutcome) {
+      this.judgeNewestOutcome = state.ask;
+      this.judgeRefusal = { hold, ...(until !== undefined ? { until: Math.max(until, now + JUDGE_REFUSAL_MIN_RETRY_MS) } : {}) };
+    }
+    const wakes = this.judgeOnError === 'wake';
+    if (!this.disposed && !wakes) {
+      this.holdForJudge(policyName, [...state.events, ...state.queued], state.judge);
+      if (this.judgeRefusal) this.armJudgeRefusalTimer();
+      else this.flushJudgeHeldIfClear();
+    }
+    const n = state.events.length;
+    const went = wakes ? 'wakes the agent' : this.judgeHeldForRefusal() ? "is held while the judge's calls are refused" : 'goes back to the judge';
+    console.error(
+      `[gate] Policy "${policyName}": the reply judge's call was refused (${hold}), so its batch of ${n} `
+      + `${n === 1 ? 'event' : 'events'} ${went} (judge onError "${this.judgeOnError}")`,
+    );
+    const record = this.judgeRecords.get(policyName) ?? { verdicts: { reply: 0, wait: 0, error: 0, refused: 0 } };
+    record.verdicts.refused++;
+    record.last = { at: Date.now(), verdict: 'refused', reason: hold, eventCount: n, durationMs };
+    if (this.config.policies.some((p) => p.name === policyName)) this.judgeRecords.set(policyName, record);
+    this.emitTrace({
+      type: 'gate:judge-verdict',
+      policyName,
+      verdict: 'refused',
+      woke: wakes,
+      eventCount: n,
+      durationMs,
+      hold,
+      ...(until !== undefined ? { until } : {}),
+      timestamp: Date.now(),
+    });
+    if (this.disposed) return;
+    if (wakes) this.deliverOrBuffer([...state.events, ...state.queued]);
+  }
+
+  private armJudgeRefusalTimer(): void {
+    if (this.judgeRefusalTimer) clearTimeout(this.judgeRefusalTimer);
+    this.judgeRefusalTimer = null;
+    const until = this.judgeRefusal?.until;
+    if (until === undefined || this.disposed) return;
+    const delay = Math.max(0, until - Date.now());
+    this.judgeRefusalTimer = setTimeout(() => {
+      this.judgeRefusalTimer = null;
+      // A wait longer than one timer is waited out in steps.
+      if (this.judgeRefusing()) this.armJudgeRefusalTimer();
+      else this.flushJudgeHeldIfClear();
+    }, Math.min(delay, MAX_TIMER_MS));
+    this.judgeRefusalTimer.unref?.();
+  }
+
+  private clearJudgeRefusal(): void {
+    this.judgeRefusal = null;
+    if (this.judgeRefusalTimer) clearTimeout(this.judgeRefusalTimer);
+    this.judgeRefusalTimer = null;
+  }
+
+  private judgeRefusing(): boolean {
+    const until = this.judgeRefusal?.until;
+    return until !== undefined && until > Date.now();
+  }
+
+  private judgeHeldForRefusal(): boolean {
+    return this.judgeOnError === 'skip' && this.judgeRefusal !== null && (this.judgeRefusal.until === undefined || this.judgeRefusing());
+  }
+
+  /**
+   * The framework let the agent's provider calls go again before any end a
+   * refusal stated: an operator released a provider wait, or a surgery let go
+   * of the store. (Under "skip", a provider hold on the agent is asked about
+   * again at the end it stated, by the refusal's timer; one its host extended
+   * then refuses again with its new end. Under "wake" nothing is held for it.)
+   * Batches held for a refused judge call are judged now, unless a turn or the
+   * host's quiesce still holds them; one refused again is held again. A
+   * refusal of a call asked before this, reported after it, doesn't stand.
+   */
+  providerCallsReleased(): void {
+    if (this.disposed) return;
+    this.judgeNewestOutcome = this.judgeAsks;
+    if (this.judgeRefusal === null) return;
+    this.clearJudgeRefusal();
+    this.flushJudgeHeldIfClear();
   }
 
   /** Deliver a batch now, or hold it for the agents' turns and the host's
@@ -4097,12 +4244,16 @@ export class EventGate {
   /** Send the batches held for the judge once no turn changing the context it reads runs and the host isn't quiesced. */
   private flushJudgeHeldIfClear(): void {
     if (this.quiesced || this.judgedTurnRunning() || this.judgeHeld.size === 0) return;
-    const held = [...this.judgeHeld];
-    this.judgeHeld.clear();
     // Deferred, as the inference buffer's flush is, to stay out of the
     // turn-end callback that called this.
     queueMicrotask(() => {
-      for (const [policyName, { events, judge }] of held) this.judgeBatch(policyName, events, this.currentJudge(policyName, judge));
+      if (this.disposed || this.judgeHeldForRefusal()) return;
+      for (const policyName of [...this.judgeHeld.keys()]) {
+        const held = this.judgeHeld.get(policyName);
+        if (!held) continue;
+        this.judgeHeld.delete(policyName);
+        this.judgeBatch(policyName, held.events, held.judge);
+      }
     });
   }
 
@@ -4551,7 +4702,7 @@ export class EventGate {
           pendingCount: debounce?.events.length ?? 0,
           judging: this.judging.has(p.name),
           heldCount: this.judgeHeld.get(p.name)?.events.length ?? 0,
-          verdicts: { ...(record?.verdicts ?? { reply: 0, wait: 0, error: 0 }) },
+          verdicts: { ...(record?.verdicts ?? { reply: 0, wait: 0, error: 0, refused: 0 }) },
           ...(record?.last ? { last: { ...record.last } } : {}),
         };
       }
@@ -4583,7 +4734,7 @@ export class EventGate {
       policies,
       errors: [
         this.configErrorShown(), this.startNotice, this.startUnsaved, this.privilegedError,
-        this.judgeUnwiredNotice(), this.judgeFailingNotice(),
+        this.judgeUnwiredNotice(), this.judgeFailingNotice(), this.judgeRefusalNotice(),
       ]
         .filter((e): e is string => e !== null),
       // Fresh, not the cache: the sources the host knows (eventTypesFrom)
@@ -4619,6 +4770,25 @@ export class EventGate {
       + "; the host's judge model or provider may not serve it (GateOptions.judge)";
   }
 
+  private judgeRefusalNotice(): string | null {
+    const refusal = this.judgeRefusal;
+    if (refusal === null || (refusal.until !== undefined && refusal.until <= Date.now())) return null;
+    let held = 0;
+    for (const batch of this.judgeHeld.values()) held += batch.events.length;
+    const wakes = this.judgeOnError === 'wake';
+    const events = `${held} ${held === 1 ? 'event' : 'events'}`;
+    if (refusal.until !== undefined) {
+      return `The reply judge's calls are refused until ${new Date(refusal.until).toISOString()}: ${refusal.hold}. `
+        + (wakes
+          ? "Until then, each judge rule's batch wakes the agent without being judged."
+          : `Until then, judge rules' batches are held (${events} now), and they're judged after that, or sooner if the hold is released.`);
+    }
+    return `A reply judge call was refused, and the hold stated no end: ${refusal.hold}. `
+      + (wakes
+        ? "Each judge rule's batch is still asked about, and wakes the agent if the call is refused."
+        : `Nothing asks the judge again on its own: judge rules' held batches (${events} now) are judged once a new batch gets a verdict, or when the hold is released.`);
+  }
+
   // =========================================================================
   // Cleanup
   // =========================================================================
@@ -4637,6 +4807,7 @@ export class EventGate {
     }
     this.judging.clear();
     this.judgeHeld.clear();
+    this.clearJudgeRefusal();
     for (const timer of this.selfWakeTimers.values()) {
       clearTimeout(timer);
     }
