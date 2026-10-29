@@ -2131,14 +2131,20 @@ export class Agent {
    * `fits: false`. It throws what `previewContext` throws: an `UncoveredDropError` from its dry select's coverage
    * check, and from a hierarchical strategy built from another copy, whose select succeeded, that copy's refusal:
    * a `NoFoldPlanToPreviewError` from a 0.23.1 copy, or a plain Error from a 0.23.0 copy, such as a host's own.
+   * `excludePins` lists pin ids the preview reads as absent (context-manager's `excludePins`): it answers what the
+   * compile would do were they unpinned, and unpins nothing.
    * @internal For the framework's restart decision; not a host API.
    */
-  previewCompile(): ReturnType<ContextManager['previewContext']> {
+  previewCompile(excludePins?: readonly string[]): ReturnType<ContextManager['previewContext']> {
     const thinkingBinding = this.thinkingBindingOption();
+    const opts = {
+      ...(thinkingBinding ? { thinkingBinding } : {}),
+      ...(excludePins && excludePins.length > 0 ? { excludePins } : {}),
+    };
     return this.contextManager.previewContext(
       this.previewBudget(),
       undefined,
-      thinkingBinding ? { thinkingBinding } : undefined,
+      Object.keys(opts).length > 0 ? opts : undefined,
     );
   }
 

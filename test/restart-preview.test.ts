@@ -714,3 +714,69 @@ test('under kv-unified, with a module awaiting at each tool result, restarts who
     assert.ok(wholePagesIn(last, 40).includes(newest), `the last stream's request holds the turn's newest result, page ${newest}, whole`);
   });
 });
+
+// The pin a turn holds on its opening rows (the framework's turn-inputs pin) beside the restart's preview: the
+// preview asks whether the restart's compile would fit with that pin left out, and releases nothing. A declined
+// restart keeps the pin; a taken one's compile drops it only by refusing with it held.
+const TURN_INPUTS = 'agent-framework:turn-inputs';
+const turnPins = (framework: AgentFramework) =>
+  framework.getAgent('prime')!.getContextManager().listPins().filter((pin) => pin.name === TURN_INPUTS);
+const excludedBy = (preview: Preview) => (preview.args[2] as { excludePins?: readonly string[] } | undefined)?.excludePins;
+const UNPINNED_AND_COMPILED_AGAIN = "the compile refused with the turn's inputs pinned";
+
+test("under kv-unified, a restart whose compile fits only with the turn's opening rows unpinned is taken, and its compile drops the pin by refusing with it", async () => {
+  const module = new PagesModule();
+  const membrane = new LongTurnMembrane(longTurn(30), module, 36_000);
+  const agent = agentConfig({ maxStreamTokens: 8_000, contextBudgetTokens: 16_000, physicalWindowTokens: undefined, strategy: strategy('kv-unified', 2_000) });
+  const logged = await loggedDuring(() => withFramework(membrane, module, agent, async (framework) => {
+    const cm = framework.getAgent('prime')!.getContextManager();
+    for (let i = 1; i <= 12; i++) cm.addMessage('User', [{ type: 'text', text: `[in${i}] ${'brief text '.repeat(180)}` }]);
+    await drain(framework, 400);
+    const previews = recordPreviews(framework);
+    const record = cm.previewContext;
+    const heldAtPreview: string[][] = [];
+    cm.previewContext = (...args: Parameters<typeof record>) => {
+      heldAtPreview.push(turnPins(framework).map((pin) => pin.id));
+      return record(...args);
+    };
+    ask(framework);
+    await waitUntil('the turn to end', () => failureRows(framework).length > 0 || storedText(framework).includes(FINAL), 120_000);
+    assert.deepEqual(failureRows(framework), [], 'the turn ended without a failure row');
+    assert.ok(storedText(framework).includes(FINAL), 'the turn answered');
+    const pinned = previews.map((preview, i) => ({ preview, held: heldAtPreview[i] ?? [] })).filter(({ held }) => held.length > 0);
+    assert.ok(pinned.length > 0, 'previews were asked while the turn held its pin');
+    for (const { preview, held } of pinned) assert.deepEqual(excludedBy(preview), held, "each such preview left the turn's pin out");
+    const lastPinned = pinned[pinned.length - 1]!;
+    assert.equal(lastPinned.preview.fits, true, 'the last preview asked with the pin held fit without it');
+    assert.ok(previews.length > pinned.length, 'and its restart was taken, after which no pin was held');
+    assert.deepEqual(turnPins(framework), [], 'no pin is left once the turn has ended');
+    assert.ok(!requestText(membrane.streams[membrane.streams.length - 1]).includes('[in1] brief'), "the restarts' compiles folded the opening rows once the pin was gone");
+  }));
+  assert.equal(logged.filter((line) => line.includes(UNPINNED_AND_COMPILED_AGAIN)).length, 1, "one compile refused with the turn's pin held, and dropped it");
+});
+
+test("under kv-unified, a restart declined while the turn holds its pin leaves the pin in place, at each boundary that declines it, to the turn's end", async () => {
+  const module = new PagesModule();
+  const membrane = new LongTurnMembrane(longTurn(30), module, 40_000);
+  const agent = agentConfig({ maxStreamTokens: 8_000, contextBudgetTokens: 20_000, physicalWindowTokens: undefined, strategy: strategy('kv-unified', 6_000) });
+  const logged = await loggedDuring(() => withFramework(membrane, module, agent, async (framework, traces) => {
+    const previews = recordPreviews(framework);
+    const heldAtDecline: string[][] = [];
+    framework.onTrace((event) => {
+      if (event.type === 'inference:restart_declined') heldAtDecline.push(turnPins(framework).map((pin) => pin.id));
+    });
+    let held: string[] = [];
+    module.onCall = (call) => { if (call === 1) held = turnPins(framework).map((pin) => pin.id); };
+    ask(framework);
+    await waitUntil('the turn to end', () => failureRows(framework).length > 0 || storedText(framework).includes(FINAL), 120_000);
+    assert.ok(storedText(framework).includes(FINAL), 'the turn answered');
+    assert.equal(held.length, 1, 'the turn held one pin on its opening rows');
+    assert.ok(previews.length > 0 && previews.every((preview) => JSON.stringify(excludedBy(preview)) === JSON.stringify(held)),
+      "each preview left the turn's pin out");
+    assert.ok(declined(traces).length > 1, `the restart was declined at more than one boundary (${declined(traces).length})`);
+    assert.deepEqual(heldAtDecline, declined(traces).map(() => held), 'each decline left the pin in place');
+    assert.ok(requestText(membrane.streams[membrane.streams.length - 1]).includes('Read the pages, please.'), "the last stream's request holds the opening request");
+    assert.deepEqual(turnPins(framework), [], "the turn's end removed the pin");
+  }));
+  assert.equal(logged.filter((line) => line.includes(UNPINNED_AND_COMPILED_AGAIN)).length, 0, 'no compile refused with the pin held');
+});

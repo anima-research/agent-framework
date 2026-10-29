@@ -12410,7 +12410,9 @@ export class AgentFramework {
    * (`clearedBy` without `'newer-message'`) is remembered for its stream with what its preview rested on, and its
    * preview isn't asked again while that holds (`Agent.restartPreviewKey`): the rows a stream adds can't make that
    * compile fit, so a full dry select at every later boundary would answer the same. `previewed` is false for such
-   * a remembered answer.
+   * a remembered answer. The preview leaves out the pin the turn holds on its opening rows (`pinTurnInputs`): it
+   * answers whether the restart's compile would fit were they unpinned, and releases nothing. A declined restart
+   * keeps the pin; a taken one's compile drops it only where it refuses with the pin held (the compile's fallback).
    */
   private declineBudgetRestart(agent: Agent): { decline: RestartDecline; previewed: boolean } | undefined {
     let decline: RestartDecline | undefined;
@@ -12418,7 +12420,8 @@ export class AgentFramework {
       const key = agent.restartPreviewKey();
       const remembered = this.restartDeclines.get(agent);
       if (remembered?.streamId === agent.streamId && remembered.key === key) return { decline: remembered, previewed: false };
-      const preview = agent.previewCompile();
+      const pin = this.turnRouting.get(agent.name)?.inputsPin;
+      const preview = agent.previewCompile(pin?.agent === agent ? [pin.id] : undefined);
       if (preview !== null && !preview.fits) {
         decline = {
           reason: 'wont_fit', finalTokens: preview.finalTokens, budgetTokens: preview.budgetTokens,
