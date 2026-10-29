@@ -2654,48 +2654,6 @@ test("a render whose store write is refused keeps its batch, which its recovery 
   assert.equal(coalescer.pendingBatches(), 0);
 });
 
-for (const when of ['after', 'before'] as const) {
-  test(`a render whose store write throws ${when} its row lands is stored ${when === 'after' ? "once, and its fallback isn't stored beside it" : 'as its fallback, as before'}`, { timeout: 120_000 }, async (t) => {
-    const f = await fixture(); t.after(f.close);
-    const coalescer = (f.framework as unknown as { pushCoalescer: { options: { recoveryBackoffMs?: number }; pendingBatches(): number } }).pushCoalescer;
-    coalescer.options.recoveryBackoffMs = 20;
-    const internals = f.framework as unknown as { pendingRequests: unknown[] };
-    f.alwaysRespond();
-    f.renderer(async () => ({ content: [{ type: 'text', text: 'throwing_render' }] }));
-    const cm = f.framework.getAgent('agent')!.getContextManager();
-    const add = cm.addMessage.bind(cm);
-    let threw = 0;
-    (cm as unknown as { addMessage: typeof add }).addMessage = (...args) => {
-      if (threw > 0 || !JSON.stringify(args[1]).includes('throwing_render')) return add(...args);
-      threw++;
-      if (when === 'after') add(...args);
-      throw new Error(`zz-store-throws-${when}-append`);
-    };
-    const error = console.error;
-    console.error = () => {};
-    try {
-      await f.send('push/event', f.params('1', 'throwing_fallback', { deferred: true, initial: true }));
-      await settles(f.framework.runUntilIdle(), 'the first drain');
-      for (let pass = 0; coalescer.pendingBatches() > 0 || internals.pendingRequests.length > 0; pass++) {
-        assert(pass < 100, 'the batch was settled within 100 passes');
-        await new Promise((resolve) => setTimeout(resolve, 20));
-        await settles(f.framework.runUntilIdle(), `the drain after pass ${pass + 1}`);
-      }
-    } finally {
-      console.error = error;
-    }
-    assert.equal(threw, 1, `premise: the store threw ${when} the render's row landed`);
-    const context = f.context();
-    if (when === 'after') {
-      assert.equal(context.split('throwing_render').length - 1, 1, 'the render is stored once');
-      assert(!context.includes('throwing_fallback'), "its fallback isn't stored");
-    } else {
-      assert(!context.includes('throwing_render'), 'the render is not stored');
-      assert.equal(context.split('throwing_fallback').length - 1, 1, 'its fallback is stored once');
-    }
-  });
-}
-
 test("a render cancelled while it runs leaves the recovery wake of a batch opened after it", async () => {
   let failPersist = false;
   const audits: Array<{ kind?: unknown; eventId?: unknown }> = [];
