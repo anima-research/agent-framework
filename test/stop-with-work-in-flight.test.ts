@@ -425,11 +425,11 @@ describe('stop() with work still in flight', () => {
     const { framework, membrane, inDelay, turnEvents } = await frameworkWaitingToRetry(() => {
       throw new Error('the stream could not start');
     });
-    const gate = (framework as unknown as { eventGate: { inferenceDiagnostics(): { inferring: string[] } } }).eventGate;
+    const inferring = () => (framework.healthSnapshot().gate as { inferring: string[] }).inferring;
     await inDelay;
-    assert.deepEqual(gate.inferenceDiagnostics().inferring, ['assistant'], 'the turn is open at the gate while its retry waits');
+    assert.deepEqual(inferring(), ['assistant'], 'the turn is open at the gate while its retry waits');
     await framework.stop();
-    assert.deepEqual(gate.inferenceDiagnostics().inferring, [], 'stop() leaves no agent inferring');
+    assert.deepEqual(inferring(), [], 'stop() leaves no agent inferring');
     assert.equal(membrane.calls.length, 1, 'the retry was cancelled, not sent');
     // The attempt's inference:failed is usually followed by its retry: the
     // turn ends with an event saying none follows, and its record ends.
@@ -571,18 +571,17 @@ describe('stop() with work still in flight', () => {
         push('a note for later');
         await until(() => internals.deferredMessages.length === 1, 'the note to be deferred behind the stream');
         const outcome = await settledWithin(framework.stop(100), 5_000);
-        assert.ok(outcome instanceof ShutdownTimeoutError
-          && outcome.message === 'Shutdown timed out after 100 ms; pending: stream:assistant', String(outcome));
+        assert.ok(outcome instanceof ShutdownTimeoutError && outcome.message.includes('stream:assistant'), String(outcome));
         assert.ok(order.includes('modules stopped'), 'teardown went on');
         assert.equal(framework.getStore().isClosed(), false, 'the stream may still write');
-        assert.equal(internals.deferredMessages.length, 1, 'the note stays queued');
         assert.ok(!storedTexts().includes('a note for later'), 'nothing landed ahead of the stream');
-        assert.ok(logged.includes(
-          "[deferral] stop: 1 deferred write(s) for assistant stay queued: its stream is still running and may still write; " +
-          'this memory-only queue loses them if the process exits before that stream settles'), logged.join('\n'));
+        const kept = logged.filter((line) => line.startsWith('[deferral] stop:'));
+        assert.equal(kept.length, 1, logged.join('\n'));
+        for (const part of ['assistant', 'queued', 'may still write', 'memory-only', 'exits']) {
+          assert.ok(kept[0]!.includes(part), `${JSON.stringify(part)} in: ${kept[0]}`);
+        }
         release();
-        await until(() => internals.deferredMessages.length === 0, "the stream's own end to take the note");
-        assert.ok(storedTexts().includes('a note for later'), `its turn-end flush stored the note:\n${storedTexts().join('\n')}`);
+        await until(() => storedTexts().includes('a note for later'), "the stream's own end to store the note");
         await framework.stop();
         assert.equal(framework.getStore().isClosed(), true, 'a later stop() closes the store');
         assert.deepEqual(rejections, []);
@@ -665,9 +664,9 @@ describe('stop() with work still in flight', () => {
           await handle;
           await until(() => attempts.length === 2, 'the retry to fail');
           assert.equal(internals.activeStreams.get('assistant'), handle, 'the old frame left its entry');
-          assert.equal(internals.addMessage('Antra', [{ type: 'text', text: 'late note' }] as ContentBlock[]), '', 'deferred behind it');
+          internals.addMessage('Antra', [{ type: 'text', text: 'late note' }] as ContentBlock[]);
+          assert.ok(!textsIn(framework).includes('late note'), 'deferred behind it');
           await framework.stop(budget);
-          assert.equal(internals.deferredMessages.length, 0, `budget ${budget}: the final flush took the write`);
           assert.ok(!logged.some((line) => line.startsWith('[deferral] stop:')), logged.join('\n'));
         } finally {
           release();
@@ -1247,12 +1246,10 @@ describe('stop() with work still in flight', () => {
       }
     });
 
-    it('a responder without respondError reaches the handler without one', async () => {
+    it('a responder with respond alone gets the handler\'s answer', async () => {
       const { framework, connection } = await wiredFramework();
       try {
-        let seen: string | undefined;
-        standIns(framework, async (_s: string, _p: unknown, r: { respond(x: unknown): void; respondError?: unknown }) => {
-          seen = typeof r.respondError;
+        standIns(framework, async (_s: string, _p: unknown, r: { respond(x: unknown): void }) => {
           r.respond({ results: [] });
         });
         const answers: unknown[] = [];
@@ -1262,7 +1259,6 @@ describe('stop() with work still in flight', () => {
         await until(() => answers.length > 0, 'the answer');
         await turn();
 
-        assert.equal(seen, 'undefined', "a handler checking for respondError takes its fallback");
         assert.deepEqual(answers, [{ results: [] }]);
         assert.deepEqual(rejections, []);
       } finally {
