@@ -2121,8 +2121,8 @@ export class EventGate {
   private sleepSuppressed = 0;
   private sleepTimer: ReturnType<typeof setTimeout> | null = null;
   private sleepAgent: string | undefined;
-  // From dispose() to the next resumeSleep(): no sleep or self-wake timer is
-  // armed, though a turn a failed stop() left running can still ask for one.
+  // From dispose() on, no sleep or self-wake timer is armed, though a turn a
+  // failed stop() left running can still ask for one.
   private disposed = false;
 
   // Self-wake timers per agent (skip_reply's wake_in_seconds). Unlike sleep,
@@ -4127,11 +4127,10 @@ export class EventGate {
 
   /** A turn that continues another (a budget restart, a tool-result-guard
    *  retry) holds the entry its predecessor kept for it, and takes it again
-   *  where that entry ended in between: at a stop(), whose dispose() clears
-   *  every entry, or at a provider hold that kept the turn from starting,
-   *  whose end queues it again. Unlike onInferenceStarted it leaves a
-   *  pending self-wake alone: the logical turn that armed it is the one
-   *  still running. */
+   *  where that entry ended in between, as at a provider hold that kept the
+   *  turn from starting, whose end queues it again. Unlike
+   *  onInferenceStarted it leaves a pending self-wake alone: the logical
+   *  turn that armed it is the one still running. */
   onInferenceResumed(agentName: string): void {
     this.inferring.add(agentName);
     if (this.changesJudgedContext(agentName)) this.stopJudging();
@@ -4256,7 +4255,7 @@ export class EventGate {
     // Arm the self-wake: when the window elapses, clear sleep and request an
     // inference so the agent resumes on its own (not dependent on a heartbeat
     // tick or an incoming message). Cancelled by clearSleep()/`wake`, and by
-    // dispose(), after which start() arms it again (resumeSleep).
+    // dispose(), after which nothing arms it.
     this.armSleepWake();
     this.reloadPrivilegedIfChanged();
     this.emitTrace({
@@ -4271,23 +4270,10 @@ export class EventGate {
   }
 
   /**
-   * Arm timers again for a lifecycle that starts after a stop(), and the
-   * sleep's wake first: dispose() clears its timer and keeps the sleep. A
-   * sleep still ahead wakes the agent at its end; one that ended while
-   * stopped wakes it now, since that wake is what the agent asked for. With
-   * no sleep, wakeFromSleep does nothing.
-   */
-  resumeSleep(): void {
-    this.disposed = false;
-    if (this.sleepUntil > this.now()) this.armSleepWake();
-    else this.wakeFromSleep('sleep-expired');
-  }
-
-  /**
    * Arm the sleep's wake for its end by the gate's own clock. One timer holds
    * at most MAX_TIMER_MS, about 24.8 days, so a longer sleep waits in steps,
    * and wakeFromSleep reads the clock as each one fires. Nothing is armed
-   * while the gate is disposed: resumeSleep() arms it at the next start().
+   * once the gate is disposed.
    */
   private armSleepWake(): void {
     if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
@@ -4396,9 +4382,7 @@ export class EventGate {
    * fires early (Node's can, by a millisecond), or a clock set back.
    */
   private wakeFromSleep(reason: string): void {
-    // The timer that called it has fired; from resumeSleep(), for a sleep
-    // already over, one may still be armed, and it goes, so no stale step of
-    // it can fire later.
+    // The timer that called it has fired.
     if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
     if (this.sleepUntil === 0) return;
     if (this.sleepUntil > this.now()) {
@@ -4662,9 +4646,9 @@ export class EventGate {
     this.selfWakeDue.clear();
     // The sleep stays, with its note and agent, and its timer goes: fired
     // after a stop(), its wake reached a framework that had stopped, and the
-    // timer held the process until the sleep's end. The next start() arms it
-    // again (resumeSleep). Until then nothing arms one, nor a self-wake: a
-    // turn a failed stop() left running can still call sleep or skip_reply.
+    // timer held the process until the sleep's end. Nothing arms one after
+    // this, nor a self-wake: a turn a failed stop() left running can still
+    // call sleep or skip_reply.
     if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
     this.disposed = true;
     this.rateLimitBuckets.clear();
@@ -4674,13 +4658,9 @@ export class EventGate {
     this.inferenceBuffer = [];
     // stop() disposes the gate once its streams and event loop have ended (a
     // turn still compiling then is dropped at its next check, before it sends
-    // anything), and a start() goes on with this gate. An agent left here by
-    // a turn whose exit didn't end it (a retry stop() cancelled, a successor
-    // stop() refused) would make every debounced batch buffer until that
-    // agent's next turn ended. A turn that continues after the start() takes
-    // its entry again (onInferenceResumed). A start() made during the stop()
-    // is refused, so no turn of a new lifecycle can have begun before this
-    // runs.
+    // anything). An agent left here by a turn whose exit didn't end it (a
+    // retry stop() cancelled, a successor stop() refused) would make every
+    // debounced batch buffer until that agent's next turn ended.
     this.inferring.clear();
   }
 }

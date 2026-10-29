@@ -1140,6 +1140,7 @@ async function frameworkWith(
   const servers = new Map(order.map((id) => [id, {
     id,
     isConnected: true,
+    stopReconnecting() {},
     policyEstablished: true,
     grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
     sendChannelsPublish: async (p: { channelId: string; content: Array<{ text: string }> }) => {

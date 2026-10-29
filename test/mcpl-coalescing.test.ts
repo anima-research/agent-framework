@@ -3965,3 +3965,139 @@ test('an admission whose receipt is never written is observed once, after its ef
   assert.deepEqual(observed, ['p1'], 'observed once, though no write landed');
   assert.deepEqual(deliveredWhenObserved, [1], 'after its delivery');
 });
+
+// ---------------------------------------------------------------------------
+// A wake the scheduler merged, taken back before its turn starts, is merged
+// again from the wakes it took in
+// ---------------------------------------------------------------------------
+
+type MergedWakeInternals = {
+  withAuxiliaryAdmission<T>(agentName: string, run: () => Promise<T>, model?: string): Promise<T>;
+  providerGate(agent: string): { idleWaiters: Array<() => void> };
+  providerAccelerationCooldowns: Map<string, { heldRequests: Wake[] }>;
+  pendingRequests: Wake[];
+};
+
+const statedWait = (retryAfterMs: number) => new MembraneError({
+  type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs,
+  message: 'rate limit reached', rawError: { status: 429 },
+} as ConstructorParameters<typeof MembraneError>[0]);
+
+function auxiliaryCall(f: Fixture) {
+  let settle!: (error?: Error) => void;
+  const done = (f.framework as unknown as MergedWakeInternals).withAuxiliaryAdmission('agent', () => new Promise<void>((resolve, reject) => {
+    settle = (error) => (error ? reject(error) : resolve());
+  }), 'test').catch(() => {});
+  return { end: (error?: Error): Promise<void> => { settle(error); return done; } };
+}
+
+const heldWakes = (f: Fixture): Wake[] => (f.framework as unknown as MergedWakeInternals).providerAccelerationCooldowns.get('agent')?.heldRequests ?? [];
+
+async function mergedWakeParked(f: Fixture) {
+  const auxiliary = auxiliaryCall(f);
+  await f.send('push/event', f.params('a1', 'batch_a', { deferred: true, initial: true, key: 'docA' }));
+  await f.send('push/event', f.params('b1', 'batch_b', { deferred: true, initial: true, key: 'docB' }));
+  await settles(f.framework.runUntilIdle(), 'the merged wake parking');
+  assert.equal((f.framework as unknown as MergedWakeInternals).providerGate('agent').idleWaiters.length, 1, 'one wake parked behind the auxiliary call');
+  return auxiliary;
+}
+
+async function mergedWakeHeld(f: Fixture) {
+  await (await mergedWakeParked(f)).end(statedWait(60_000));
+  await eventually(() => heldWakes(f).length === 1, 'the merged wake held at its last admission boundary');
+  assert.equal(heldWakes(f)[0]!.coalescingBatchSubjects?.length, 2, 'the held wake stands for both batches');
+}
+
+const retract = async (f: Fixture, key: string) =>
+  assert.equal((await f.send('push/event', f.params(`${key}-gone`, 'gone', { retract: true, key }))).result.coalesce.outcome, 'retracted');
+
+function withdrawnTurns(f: Fixture) {
+  const traced: Array<{ agentName?: string; subjects?: string[] }> = [];
+  f.framework.onTrace((e) => {
+    if (e.type === 'mcpl:coalescing' && (e as { kind?: string }).kind === 'turn-withdrawn') traced.push(e as { agentName?: string; subjects?: string[] });
+  });
+  return traced;
+}
+
+function stderrLines(t: TestContext) {
+  const lines: string[] = [];
+  const write = console.error;
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); write(...args); };
+  t.after(() => { console.error = write; });
+  return lines;
+}
+
+const holdReleased = (f: Fixture) =>
+  assert.ok(!(f.framework as unknown as MergedWakeInternals).providerAccelerationCooldowns.has('agent'), 'the hold released');
+
+test('a wake merged from two deferred batches and held by a stated wait is withdrawn with them, traced turn-withdrawn, and its hold releases with no turn', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const withdrawn = withdrawnTurns(f);
+  const stderr = stderrLines(t);
+  await mergedWakeHeld(f);
+  assert.equal(f.framework.getHostModeStatus().gatedRequests, 2, 'the held wake counts as the two wakes it took in');
+  const subjects = heldWakes(f)[0]!.coalescingBatchSubjects!;
+  await retract(f, 'docA');
+  await retract(f, 'docB');
+  assert.equal(withdrawn.length, 1, 'traced as a withdrawn turn when the last batch goes');
+  assert.equal(withdrawn[0]!.agentName, 'agent');
+  assert.deepEqual([...withdrawn[0]!.subjects!].sort(), [...subjects].sort(), 'naming both batches');
+  f.framework.releaseProviderWait('agent');
+  await settles(f.framework.runUntilIdle(), 'the pass after the release');
+  holdReleased(f);
+  assert.equal(f.membrane.calls.length, 0, 'no model call: the wake has nothing left to read');
+  assert.ok(stderr.some((line) => line.includes('agent=agent hold, its held wakes withdrawn, released')), 'the release says its wakes were withdrawn');
+});
+
+test('a wake merged from two deferred batches and sent back by a quiesce while it waited for an auxiliary call starts no turn once both batches are withdrawn', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const auxiliary = await mergedWakeParked(f);
+  const quiescing = f.framework.quiesce({ reason: 'test' });
+  await auxiliary.end();
+  await quiescing;
+  assert.equal(f.framework.getHostModeStatus().parkedAdmissions, 0, 'the wake left its park');
+  await f.framework.resume();
+  assert.equal((f.framework as unknown as MergedWakeInternals).pendingRequests.length, 1, 'the wake waits whole in the queue: no pass has taken it since the resume');
+  await retract(f, 'docA');
+  await retract(f, 'docB');
+  await settles(f.framework.runUntilIdle(), 'the pass after the resume');
+  assert.equal(f.membrane.calls.length, 0, 'no model call: the wake has nothing left to read');
+});
+
+test('a wake merged from two deferred batches and held by a stated wait is withdrawn at its turn\'s start when neither batch renders anything', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const withdrawn = withdrawnTurns(f);
+  f.renderer(async () => ({ content: [] }));
+  await mergedWakeHeld(f);
+  const subjects = heldWakes(f)[0]!.coalescingBatchSubjects!;
+  f.framework.releaseProviderWait('agent');
+  await settles(f.framework.runUntilIdle(), 'the pass after the release');
+  assert.equal(f.membrane.calls.length, 0, 'no model call: neither batch gave the turn anything to read');
+  assert.equal(withdrawn.length, 1, 'traced as a withdrawn turn');
+  assert.deepEqual([...withdrawn[0]!.subjects!].sort(), [...subjects].sort(), 'naming both batches');
+});
+
+test('a wake merged from two deferred batches and held by a stated wait renders both at its turn once the wait is released', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.renderer(async (params) => ({ content: [{ type: 'text', text: `rendered_${String(params.key)}` }] }));
+  await mergedWakeHeld(f);
+  f.framework.releaseProviderWait('agent');
+  await settles(f.framework.runUntilIdle(), 'the turn after the release');
+  assert.equal(f.membrane.calls.length, 1);
+  assert(f.lastRequest().includes('rendered_docA') && f.lastRequest().includes('rendered_docB'), 'both batches rendered into the turn');
+});
+
+test('a deferred batch\'s wake held by a stated wait starts no turn once its batch is withdrawn', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await auxiliaryCall(f).end(statedWait(60_000));
+  await f.send('push/event', f.params('a1', 'batch_a', { deferred: true, initial: true, key: 'docA' }));
+  await settles(f.framework.runUntilIdle(), 'the wake held');
+  assert.equal(heldWakes(f).length, 1, 'the wake is held by the wait');
+  const stderr = stderrLines(t);
+  await retract(f, 'docA');
+  f.framework.releaseProviderWait('agent');
+  await settles(f.framework.runUntilIdle(), 'the pass after the release');
+  holdReleased(f);
+  assert.equal(f.membrane.calls.length, 0, 'no model call: nothing is left for a turn to read');
+  assert.ok(stderr.some((line) => line.includes('agent=agent hold, its held wakes withdrawn, released')), 'the release says its wakes were withdrawn');
+});

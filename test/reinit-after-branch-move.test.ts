@@ -1926,7 +1926,7 @@ describe('conversation forks and a branch move', () => {
     });
   });
 
-  it("a spawn after a failed stop() is refused, and so is one after a completed stop() and an addModule(): neither begins a lifecycle", { timeout: 30_000 }, async () => {
+  it("a spawn after a failed stop() is refused, and so is one after a completed stop(), where addModule() and start() are refused too", { timeout: 30_000 }, async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'reinit-fork-stopped-'));
     const store = JsStore.openOrCreate({ path: join(tempDir, 'store') });
     let failStop = true;
@@ -1953,11 +1953,9 @@ describe('conversation forks and a branch move', () => {
       await assert.rejects(spawn('a-failed-g1'), /conversation agent "a-failed-g1" not created: the framework is stopping/);
       failStop = false;
       await framework.stop();
-      await framework.addModule(stopper('added'));
-      await assert.rejects(spawn('a-added-g1'), /conversation agent "a-added-g1" not created: the framework is stopping/);
-      framework.start();
-      await spawn('a-started-g1');
-      assert.ok(framework.getAgent('a-started-g1'), 'a start() begins a lifecycle that spawns');
+      await assert.rejects(spawn('a-stopped-g1'), /conversation agent "a-stopped-g1" not created: the framework is stopping/);
+      await assert.rejects(framework.addModule(stopper('added')), /addModule\(\) refused: this framework has stopped/);
+      assert.throws(() => framework.start(), /start\(\) refused: this framework has stopped/);
     } finally {
       failStop = false;
       await framework.stop().catch(() => {});
@@ -2000,29 +1998,34 @@ describe('conversation forks and a branch move', () => {
     }
   });
 
-  it('a spawn after a stop() and a start() is made: the check is for a stop() of this lifecycle', { timeout: 30_000 }, async () => {
+  it("a spawn on a new framework on a stopped one's store is made, seeded from the template", { timeout: 30_000 }, async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'reinit-fork-restart-'));
     const store = JsStore.openOrCreate({ path: join(tempDir, 'store') });
-    const framework = await AgentFramework.create({
+    const create = () => AgentFramework.create({
       store,
       membrane: new MockMembrane().asMembrane(),
       agents: [{ name: 'a', model: 'test-model', systemPrompt: 'You are a.', strategy: autobiographical() }],
       modules: [],
       conversations: { templateAgent: 'a', bind: { channel: 'mention' }, strategyFactory: () => autobiographical() },
     });
+    const first = await create();
+    let next: AgentFramework | undefined;
     try {
-      framework.getAgent('a')!.getContextManager().addMessage('user', [{ type: 'text', text: 'hello a' }]);
+      first.getAgent('a')!.getContextManager().addMessage('user', [{ type: 'text', text: 'hello a' }]);
       // Written past the framework, the row enters a's window at a's next
-      // point (#291); the seed below reads the template's window.
-      (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent('a'));
-      framework.start();
-      await framework.stop();
-      framework.start();
-      await (framework as unknown as ForkInternals).createConversationAgent('a-after-g1', { serverId: 'world', channelId: 'world:after' });
-      assert.ok(framework.getAgent('a-after-g1'), 'registered');
-      assert.deepEqual(await textsOf(framework, 'a-after-g1'), ['hello a'], 'seeded from the template');
+      // point (#291); the seed below reads the template's window, as the
+      // next framework reopens it from the store.
+      (first as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(first.getAgent('a'));
+      first.start();
+      await first.stop();
+      next = await create();
+      next.start();
+      await (next as unknown as ForkInternals).createConversationAgent('a-after-g1', { serverId: 'world', channelId: 'world:after' });
+      assert.ok(next.getAgent('a-after-g1'), 'registered');
+      assert.deepEqual(await textsOf(next, 'a-after-g1'), ['hello a'], 'seeded from the template');
     } finally {
-      await framework.stop().catch(() => {});
+      await next?.stop().catch(() => {});
+      await first.stop().catch(() => {});
       if (!store.isClosed()) store.close();
       rmSync(tempDir, { recursive: true, force: true });
     }
