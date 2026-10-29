@@ -428,6 +428,8 @@ async function harness(opts: {
   modules?: Module[];
   /** FrameworkConfig.heartbeat: the framework's own heartbeat. */
   heartbeat?: boolean | Record<string, unknown>;
+  /** FrameworkConfig.speech: where a turn's plain speech lands when nothing names a destination. */
+  speech?: { locus: 'delivery' | 'latest-inbound' };
 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'prose-drafts-e2e-'));
   const commandPath = join(dir, 'commands.jsonl');
@@ -470,6 +472,7 @@ async function harness(opts: {
       }],
       modules: opts.modules ?? [],
       ...(opts.heartbeat !== undefined ? { heartbeat: opts.heartbeat as never } : {}),
+      ...(opts.speech ? { speech: opts.speech } : {}),
       ...(opts.codeExecution ? { codeExecution: { enabled: true } } : {}),
       ...(opts.retries !== undefined ? {
         errorPolicy: {
@@ -3807,7 +3810,14 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
       it(`a conversation agent's stated provider wait, reported as ${how === 'error' ? 'an error' : 'a throw'}, after stop() has closed admission names the speech`, async () => {
         const h = await harness({ xml: true, roundPreamble: true, retries: 1 });
         try {
-          (h.framework as unknown as { conversationAgentHomes: Map<string, unknown> }).conversationAgentHomes.set('scout', { serverId: 'discord', channelId: ROOM });
+          // main's test makes scout a conversation agent through conversationAgentHomes; on this
+          // branch that is the registry's record: a home channel, and a role that doesn't own
+          // provider scheduling (as conversationForkSpec gives a fork).
+          const scout = (h.framework as unknown as {
+            registry: { live: Map<string, { homeChannel?: { serverId: string; channelId: string }; roles: { ownsProviderScheduling: boolean } }> };
+          }).registry.live.get('scout')!;
+          scout.homeChannel = { serverId: 'discord', channelId: ROOM };
+          scout.roles.ownsProviderScheduling = false;
           breakAfterToolRound(h.membrane, how, {
             failure: () => new MembraneError({ type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 30_000, message: 'rate limited', rawError: { status: 429 } }),
             beforeFailure: () => { (h.framework as unknown as { providerAdmissionClosed: boolean }).providerAdmissionClosed = true; },
@@ -4389,7 +4399,8 @@ describe('a heartbeat turn holds its plain speech as drafts', () => {
   });
 
   it('a channel-less wake that is not the heartbeat still takes the latest inbound channel, as before', async () => {
-    const h = await harness();
+    // The latest inbound channel is a fallback only under 'latest-inbound'.
+    const h = await harness({ speech: { locus: 'latest-inbound' } });
     try {
       await h.turn([createMockResponse([text('a reply in the room')])]);
       await h.turn([createMockResponse([text('words from a timer')])], 'scout', 'request');

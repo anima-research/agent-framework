@@ -1948,7 +1948,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     // A logical turn still open between its streams, engaged with chan-beta:
     // no turn is alive, so no tool boundary weighs what is stored now, and
     // it's noted as one of the turn's arrivals.
-    const open = { engaged: new Set([destinationKey(srv('chan-beta'))]), wasIn: [] as ChannelRef[], arrivals: [] as Array<{ messageId: string; channel: ChannelRef }> };
+    const open = { engaged: new Set([destinationKey(srv('chan-beta'))]), wasIn: [] as ChannelRef[], arrivals: [] as Array<{ messageId: string; channel: ChannelRef; addressed: boolean }> };
     internals.openLogical.set('assistant', open);
     const errors: string[] = [];
     const error = console.error;
@@ -1967,7 +1967,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     const copies = framework.getAgent('assistant')!.getContextManager().getAllMessages()
       .filter((m) => (m.metadata as { deferredWriteId?: string } | undefined)?.deferredWriteId === 'w1');
     assert.equal(copies.length, 1, 'stored once');
-    assert.deepEqual(open.arrivals, [{ messageId: copies[0]!.id, channel: srv('chan-beta') }], 'and noted as one of the open turn\'s arrivals');
+    assert.deepEqual(open.arrivals, [{ messageId: copies[0]!.id, channel: srv('chan-beta'), addressed: false }], 'and noted as one of the open turn\'s arrivals');
     await framework.stop();
   });
 
@@ -1982,7 +1982,7 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     };
     // An open turn engaged with both channels, between its streams: the
     // earlier write throws after it's stored, and the later one lands.
-    const open = { engaged: new Set([destinationKey(srv('chan-alpha')), destinationKey(srv('chan-beta'))]), wasIn: [] as ChannelRef[], arrivals: [] as Array<{ messageId: string; channel: ChannelRef }> };
+    const open = { engaged: new Set([destinationKey(srv('chan-alpha')), destinationKey(srv('chan-beta'))]), wasIn: [] as ChannelRef[], arrivals: [] as Array<{ messageId: string; channel: ChannelRef; addressed: boolean }> };
     internals.openLogical.set('assistant', open);
     const errors: string[] = [];
     const error = console.error;
@@ -1997,8 +1997,8 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     const idOf = (writeId: string) => agent.getContextManager().getAllMessages()
       .find((m) => (m.metadata as { deferredWriteId?: string } | undefined)?.deferredWriteId === writeId)!.id;
     assert.deepEqual(open.arrivals, [
-      { messageId: idOf('w1'), channel: srv('chan-alpha') },
-      { messageId: idOf('w2'), channel: srv('chan-beta') },
+      { messageId: idOf('w1'), channel: srv('chan-alpha'), addressed: false },
+      { messageId: idOf('w2'), channel: srv('chan-beta'), addressed: false },
     ]);
     assert.deepEqual(internals.remainingArrival(agent, open), srv('chan-beta'), "the turn's newest arrival is the later write's");
     await framework.stop();

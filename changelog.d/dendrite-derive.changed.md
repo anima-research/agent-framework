@@ -1,0 +1,2 @@
+- `createEphemeralAgent(config, spec)` with `spec.inherit.mode: 'shared'` opens the agent's context by derivation from the named agent instead of a fresh isolated namespace.
+- A mid-turn injected message whose participant is one of the receiving agent's `selfParticipants` is no longer injected into the live stream (it would render as an assistant turn); it stays window-only, as a message under the agent's own name already did.
