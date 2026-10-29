@@ -14566,6 +14566,7 @@ export class AgentFramework {
   private async followBranchMove(except?: string): Promise<ManagerReinitFailure[]> {
     let failures: ManagerReinitFailure[] = [];
     try {
+      this.subconsciousAnchor?.branchMoved();
       this.redoStacks.clear();
       failures = await this.reinitializeManagers(except);
       // A manager that refused its work, and doesn't now, has the writes
@@ -14575,7 +14576,6 @@ export class AgentFramework {
         const failed = failures.find((f) => f.agentName === agent.name);
         this.presentation?.rebase(agent, failed && 'error' in failed ? failed.error : undefined);
       }
-      this.subconsciousAnchor?.branchMoved();
       return failures;
     } catch (error) {
       console.error('[operator] following a branch move failed; an agent whose context did not follow it stays as it was:', error);

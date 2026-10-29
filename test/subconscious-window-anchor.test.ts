@@ -393,6 +393,46 @@ describe("the persistent subconscious's window start whose keeping failed, acros
     assert.equal(state?.starts?.[t1.params.epochId], undefined, "T1's start isn't kept on the branch moved to at the ordinal fixed before the move");
     assert.equal(state?.inForce, undefined, 'nor its ordinal kept as the start in force');
   });
+
+  it("(m) isn't kept at that ordinal by the move's own presentation of the subconscious's rows", { timeout: 120_000 }, async () => {
+    const h = await boot(place());
+    h.residentRow('PRE-1 before the tune-out');
+    await h.framework.runUntilIdle();
+    h.bump();
+    const write = h.internals.channelRegistry.writeCoordinatorState.bind(h.internals.channelRegistry);
+    let refusing = true;
+    let refused = 0;
+    h.internals.channelRegistry.writeCoordinatorState = (id: string, value: unknown) => {
+      if (id === STARTS && refusing) { refused++; throw new Error('injected write failure'); }
+      write(id, value);
+    };
+    const errors = console.error;
+    console.error = () => {};
+    let t1: ReturnType<Internals['tuneOutCoordinator']['enter']>;
+    try {
+      t1 = h.internals.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5 }, 'agent-tool');
+      h.membrane.script(SUB, final([signed('sig-m'), text('>>skip_reply nothing yet')]));
+      h.ask();
+      await waitFor('its request', () => h.membrane.callsFor(SUB).length >= 1);
+      await h.framework.runUntilIdle();
+    } finally { console.error = errors; }
+    assert.ok(t1.ok);
+    assert.ok(refused >= 1, "premise: keeping T1's start was refused");
+    const own = h.subCm().getAllMessages().find((m) => m.content.some((b) => b.type === 'thinking' && (b as { signature?: string }).signature === 'sig-m'));
+    assert.ok(own, "premise: the subconscious's own reply is stored");
+
+    const store = h.framework.getStore() as unknown as { currentBranch(): { name: string }; createBranchAt(name: string, from: string, at: number): unknown };
+    store.createBranchAt('side', store.currentBranch().name, own!.sequence);
+    const presentation = (h.framework as unknown as { presentation: { onPresented(agent: string, l: (e: { occasion: string }) => void): () => void } }).presentation;
+    let atRebase = 0;
+    presentation.onPresented(SUB, (e) => { if (e.occasion === 'rebase') atRebase++; });
+    refusing = false;
+    await h.framework.switchBranch('side');
+    assert.ok(atRebase > 0, "premise: the move's rebase presented the subconscious's own rows");
+    const state = h.internals.channelRegistry.readCoordinatorState(STARTS) as { starts: Record<string, number>; inForce?: number } | null;
+    assert.equal(state?.starts?.[t1.params.epochId], undefined, "T1's start isn't kept on the branch moved to at the ordinal fixed before the move");
+    assert.equal(state?.inForce, undefined, 'nor its ordinal kept as the start in force');
+  });
 });
 
 describe('SubconsciousWindowAnchor', () => {
