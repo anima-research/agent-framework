@@ -14,10 +14,12 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { ContextManager, MessageId, MessageMetadata, StoredMessage } from '@animalabs/context-manager';
+import { JsStore } from '@animalabs/chronicle';
+import { ContextManager as StoreWindow, PassthroughStrategy, type ContextManager, type MessageId, type MessageMetadata, type StoredMessage } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import { AgentFramework, OperatorActionError, audienceOf } from '../src/index.js';
 import type { Agent, EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
+import { residentContextOptions } from '../src/context-options.js';
 import { GateModule, until } from './helpers/dendrite.js';
 import { WireMembrane, final, round } from './helpers/wire-membrane.js';
 
@@ -420,6 +422,55 @@ describe('presentation points (#291)', () => {
     h.internals.saveTurnCheckpoints('mira', checkpoints);
     assert.deepEqual(h.framework.undoLastTurn('mira').window, { retracted: 1, represented: 0 });
     assert.deepEqual(h.windowTexts('mira'), ['first', 'one', 'second'], 'from the first row in the window stored after its sequence');
+  });
+
+  // AF-A-2: a turn an earlier release recorded carries no audience stamp, and
+  // the index reads an unstamped row as an arrival, so an undo that took the
+  // turn's rows out as arrived saw them back at the agent's next point. Its
+  // own rows (its voice's, and the results of its own calls) leave as undone.
+  it("an undo of a turn recorded before the audience stamp takes its own rows out as undone, and no later point brings them back", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-presentation-points-'));
+    dirs.push(dir);
+    const storePath = join(dir, 'store.chronicle');
+    let before: number;
+    {
+      // An earlier release's store: two turns of mira's, the second with a tool round, nothing stamped.
+      const store = JsStore.openOrCreate({ path: storePath });
+      const cm = await StoreWindow.open({ store, ...residentContextOptions('mira'), strategy: new PassthroughStrategy() });
+      cm.addMessage('user', [text('first')]);
+      cm.addMessage('mira', [text('one')]);
+      cm.addMessage('user', [text('second')]);
+      before = store.currentSequence();
+      cm.addMessage('mira', [text('looking'), { type: 'tool_use', id: 'old-1', name: 'test--echo', input: {} } as ContentBlock]);
+      cm.addMessage('user', [{ type: 'tool_result', toolUseId: 'old-1', content: 'ok' } as ContentBlock]);
+      cm.addMessage('mira', [text('two')]);
+      cm.close();
+      store.close();
+    }
+    const framework = await AgentFramework.create({
+      storePath, membrane: new WireMembrane().asMembrane(),
+      agents: [{ name: 'mira', model: 'test-model', systemPrompt: 'You are mira.', allowedTools: 'all', proseRouting: 'disabled' }],
+      modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+    });
+    frameworks.push(framework);
+    const internals = framework as unknown as Internals;
+    const cm = framework.getAgent('mira')!.getContextManager();
+    const windowTexts = () => cm.getPresentedMessages().map((m) => textOf(m) || m.content.map((b) => b.type).join('+'));
+    assert.deepEqual(windowTexts(), ['first', 'one', 'second', 'looking', 'tool_result', 'two'], 'setup: written down at boot');
+    // The earlier release's checkpoint for the second turn: no window length.
+    internals.saveTurnCheckpoints('mira', [{ agentName: 'mira', turnIndex: 1, sequenceBefore: before, branchName: framework.getStore().currentBranch().name, timestamp: Date.now() }]);
+    assert.deepEqual(framework.undoLastTurn('mira').window, { retracted: 3, represented: 0 });
+    assert.deepEqual(windowTexts(), ['first', 'one', 'second']);
+    const statusOf = (t: string) => cm.windowStatusOf(cm.getAllMessages().find((m) => (textOf(m) || m.content[0]!.type) === t)!.id);
+    assert.deepEqual(['looking', 'tool_result', 'two'].map(statusOf), ['undone', 'undone', 'undone'], 'its own rows, the tool result among them');
+    // A write for mira while she is idle presents her at rest.
+    internals.addMessage('alice', [text('hello again')], undefined, { forAgent: 'mira' });
+    assert.deepEqual(windowTexts(), ['first', 'one', 'second', 'hello again'], 'the undone turn stays out');
+    internals.presentAtEndOf(framework.getAgent('mira')!);
+    assert.deepEqual(windowTexts(), ['first', 'one', 'second', 'hello again']);
+    const redone = framework.redo('mira');
+    assert.deepEqual(redone.window, { retracted: 1, represented: 3 }, 'a redo puts the turn back');
+    assert.deepEqual(windowTexts(), ['first', 'one', 'second', 'looking', 'tool_result', 'two']);
   });
 
   it("a co-resident's live turn no longer holds an agent's own rows back", async () => {

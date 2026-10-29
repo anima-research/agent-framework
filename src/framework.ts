@@ -2322,8 +2322,27 @@ interface WindowBody {
   /** The ordinal it holds in the window. */
   ordinal: number;
   sequence: number;
-  /** Whether it is the agent's own row (isOwnRowOf). */
+  /** Whether it is the agent's own row (ownWindowRow): its stamp's, or for a
+   *  row stored before the stamp, its voice's or its own calls' results. */
   own: boolean;
+}
+
+/**
+ * Whether a row of `agent`'s window is its own (AgentFramework.windowBodiesFrom):
+ * a stamped row by its stamp; an unstamped one, which an earlier release
+ * stored, when it is stored under the agent's voice, or holds tool results
+ * and every one answers a call in `ownCalls`. The tool calls of each own row
+ * are added to `ownCalls`, so pass the window's rows in order.
+ */
+function ownWindowRow(row: StoredMessage, agent: Pick<Agent, 'name' | 'isOwnParticipant'>, ownCalls: Set<string>): boolean {
+  const stamp = audienceOf(row.metadata);
+  const results = row.content.filter((b) => b.type === 'tool_result');
+  const own = stamp
+    ? stamp.ownRowOf === agent.name
+    : agent.isOwnParticipant(nameAsStored(row.participant))
+      || (results.length > 0 && results.every((b) => ownCalls.has((b as { toolUseId?: string }).toolUseId ?? '')));
+  if (own) for (const b of row.content) if (b.type === 'tool_use') ownCalls.add((b as { id: string }).id);
+  return own;
 }
 
 /** What an undo on the window (#291, decision 4) keeps for its redo. */
@@ -14562,7 +14581,7 @@ export class AgentFramework {
     if (checkpoints.length === 0) return { undone: false };
     const checkpoint = checkpoints.pop()!;
     const cm = agent.getContextManager();
-    const tail = this.windowBodiesFrom(cm, this.checkpointLength(cm, checkpoint), agentName);
+    const tail = this.windowBodiesFrom(cm, this.checkpointLength(cm, checkpoint), agent);
     const own = tail.filter((row) => row.own).map((row) => row.id);
     const others = tail.filter((row) => !row.own).map((row) => row.id);
     const branch = this.store.currentBranch().name;
@@ -14643,18 +14662,28 @@ export class AgentFramework {
   /**
    * The bodies of `cm`'s window at ordinal `from` and after, in window
    * order: each by the shard that names it, with its ordinal and sequence,
-   * and whether it is `agentName`'s own row.
+   * and whether it is `agent`'s own row. A stamped row is the agent's own
+   * when its stamp says so (isOwnRowOf). A row stored before the audience
+   * stamp (every turn an earlier release recorded, whose checkpoints an
+   * undo still takes) carries none, and the presentation index reads it as
+   * an arrival, so an undo that took it out as arrived would see it come
+   * back at the agent's next point: it is the agent's own when it is stored
+   * under the agent's voice (isOwnParticipant), or holds only results of
+   * calls an own row of the window made, which such a release stored under
+   * `user`.
    */
-  private windowBodiesFrom(cm: ContextManager, from: number, agentName: string): WindowBody[] {
+  private windowBodiesFrom(cm: ContextManager, from: number, agent: Agent): WindowBody[] {
     const bodies: WindowBody[] = [];
+    const ownCalls = new Set<string>();
     let previous: StoredMessage | undefined;
     for (const row of cm.getPresentedMessages()) {
       const head = !previous || !continuesBody(previous, row);
       previous = row;
       if (!head) continue;
+      const own = ownWindowRow(row, agent, ownCalls);
       const ordinal = cm.ordinalOf(row.id) ?? -1;
       if (ordinal < from) continue;
-      bodies.push({ id: row.id, ordinal, sequence: row.sequence, own: isOwnRowOf(row.metadata, agentName) });
+      bodies.push({ id: row.id, ordinal, sequence: row.sequence, own });
     }
     return bodies;
   }
@@ -14711,7 +14740,7 @@ export class AgentFramework {
     const cm = agent.getContextManager();
     const { tail, lengthAfterUndo, kept } = entry.window;
     const undoneIds = new Set(tail.map((row) => row.id));
-    const since = this.windowBodiesFrom(cm, 0, agentName)
+    const since = this.windowBodiesFrom(cm, 0, agent)
       .filter((row) => undoneIds.has(row.id) || (row.ordinal >= lengthAfterUndo && !kept.has(row.id)))
       .map((row) => row.id);
     if (since.length > 0) cm.retractRows(since);

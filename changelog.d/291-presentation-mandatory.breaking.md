@@ -7,7 +7,9 @@
   can't be written down at its registration (another version's index format, a failed write) stays in legacy mode,
   its window the whole record, as before, until a branch move writes its window down on the new branch.
   - **Undo and redo are on the agent's window** (decision 4): `undoLastTurn` takes the turn's rows out of the
-    agent's window, its own as undone and others' back to arrived, and `redo` puts them back. Neither writes the
+    agent's window, its own as undone and others' back to arrived, and `redo` puts them back. In a turn an earlier
+    release recorded, whose rows carry no audience stamp, a row stored under the agent's name, or one holding only
+    results of its own calls, is its own. Neither writes the
     record or moves a branch, so neither reverts the workspace or `_config` mounts, MCPL checkpoints or the
     inference log any more: `rollbackToMessage` is the record-level revert. The result's `fromBranch` and `toBranch`
     are both the store's branch and its `window` says how many rows left or entered; the `undo:completed` and
