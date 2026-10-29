@@ -1148,9 +1148,15 @@ export type TraceEvent =
       reason: PresentationRetractReason;
     })
   | (TraceEventBase & {
-      /** An undo on the presentation index: the undone turn's rows left the
-       *  agent's window (`retracted`), and a redo presented them again
-       *  (`represented`). No branch moved. */
+      /** An undo or a redo on the presentation index, counted in bodies.
+       *  An undo's `retracted` is the bodies from the turn's checkpoint on
+       *  that left the agent's window, the turn's own and what arrived
+       *  after it, and it carries no `represented`. A redo's
+       *  `retracted` is the rows that entered the window after the undo, and
+       *  any of the undo's own still in it after an undo cut short, which
+       *  left so the redone rows come back after their prefix; its
+       *  `represented` is the undone rows presented again. No branch
+       *  moved. */
       type: 'window:undone';
       agentName: string;
       retracted: number;
