@@ -453,8 +453,12 @@ test('a connected server whose child exits 1, or is killed by SIGKILL, is said t
 
 /** On SIGUSR1 the child closes its stdin, says so on stderr, and asks the host
  *  a ping, so the host's next write meets a closed pipe while the child still
- *  runs. A modern host drops the ping, so the test calls a tool instead. */
-const DEAF_ON_USR1 = 'import { closeSync } from "node:fs"; process.on("SIGUSR1", () => { closeSync(0); process.stderr.write("deaf\\n"); process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: "deaf", method: "ping" }) + "\\n"); });';
+ *  runs. A modern host drops the ping, so the test calls a tool instead.
+ *  /dev/null takes fd 0 at once, as libuv assumes fds 0 to 2 stay taken (see
+ *  deafen() in fixtures/modern-raw-server.mjs): on macOS, with fd 0 left free,
+ *  the child was aborted by libuv's assertion `fd > STDERR_FILENO` when its
+ *  first stderr write opened that pipe. */
+const DEAF_ON_USR1 = 'import { closeSync, openSync } from "node:fs"; process.on("SIGUSR1", () => { closeSync(0); openSync("/dev/null", "r"); process.stderr.write("deaf\\n"); process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: "deaf", method: "ping" }) + "\\n"); });';
 
 test('a connected server whose child the transport ends after a pipe failure is said to the operator once, though it dies by SIGTERM, in either engine', { timeout: 90_000 }, async (t) => {
   for (const engine of ['legacy', 'modern'] as const) {
