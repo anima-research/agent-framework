@@ -217,3 +217,5 @@ export {
   type SilentHeartbeatStamp,
   type SilentHeartbeatTick,
 } from './silent-heartbeat.js';
+
+export type { InboundAdmissionConfig, AdmissionInput, AdmissionVerdict, AdmitInbound, AdmissionLane, ConnectionKey, RefusalCode } from './mcpl/inbound-admission.js';
