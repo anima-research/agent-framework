@@ -1487,8 +1487,8 @@ export class DiscordModule implements Module {
     // framework takes out the body a shard belongs to. The message is the
     // live path's even when no row is found, so a running sync doesn't
     // store what its fetch may still hold, and that ends its entry, but for
-    // an answered create with no row, whose entry keeps the delete
-    // (LiveCreate.unapplied) for the release.
+    // an answered create with no row, whose entry keeps the delete its
+    // handler recorded (LiveCreate.unapplied) for the release.
     this.noteLive(del.discordMessageId);
     const rows = this.storedRows(del.discordMessageId);
     if (rows.length === 0 && this.creating.get(del.discordMessageId)?.phase === 'writing') return {};
