@@ -1,9 +1,11 @@
 - **Turns opened from a private surface** (WebUI, TUI, CLI, headless, or an
   `api:message`: any `external-message` or `api:message` whose
   `metadata.channelId` names no channel, other than the framework's own
-  MCPL tool-list notice) freeze no inferred channel locus, so
-  their plain speech stays on that surface unless the agent uses an explicit
-  send. Before, such a turn's speech went to the most recent inbound channel.
+  MCPL tool-list notice) take no fallback channel, so their plain speech
+  stays on that surface unless the agent uses an explicit send. Before, such
+  a turn took 0.30.0's fallback: the excepted channel while an all-except
+  tune-out is open, and under `speech.locus: 'latest-inbound'` the most
+  recent inbound channel.
 
   Private wins, one way. A start whose batch holds a private surface's wake is
   private, whatever else the batch holds: directly, through one gate debounce
@@ -28,8 +30,9 @@
   auto-continuation (`autoContinue`), a bounce's wake, a rewind's retry, its
   re-send after its retries ran out (`exhaustedTurnRearmMs`), a self-wake it
   arms with `skip_reply`'s `wake_in_seconds`, a `sleep`'s wake, the resident's
-  turn after a tune-out cancel it asked for, and the wakes of a script it
-  started (`wake_agent()`, and a script left running reporting its end). Each
+  turn after a tune-out cancel it asked for, an all-except hold's included,
+  and the wakes of a script it started (`wake_agent()`, and a script left
+  running reporting its end). Each
   goes by the turn that caused it as that turn stands when its start reads it,
   so a turn that took in private input after causing it counts, even after the
   wake was queued. An operator's `nudge` or `unstick`, or an
@@ -46,15 +49,33 @@
   says how to publish with a send. A script's wake message is private input,
   as a private surface's message is, when the script's start turn is private
   as the message is stored or injected: a turn that reads it is private, and a
-  tool boundary that injects it makes its turn private from there.
+  tool boundary that injects it makes its turn private from there. An agent
+  derived from, or spawned by, an agent whose turn is open and private
+  (`deriveAgent`, or `createEphemeralAgent` with `inherit` or `spawnedBy`, a
+  tune-out reader fork included) is that turn's work, and so is an
+  ephemeral run handed mail from such work: what it sends is private input
+  too, its result, its messages and the notice that a restart interrupted
+  it, and its record says so (`AgentRecord.privateTurn`). So is mail an
+  agent sends while its own turn is open and private (`sendAgentMessage`).
+  A resident whose subagent was started, or handed its words, during a
+  private turn gets a private turn when the subagent's outcome lands, a
+  channel turn that takes it in at a boundary included, and names a
+  channel to post there. A host that derives or spawns an agent for its
+  own reason while a private turn is open gets a result its agent answers
+  privately. A tune-out release that a crash left deferred,
+  restored at the next boot, opens its turn as before: that turn reads the
+  channel messages the hold kept, not an operator's words.
 
   In locus and hybrid mode, a private turn that holds a channel's message
   tells its resident which channels' messages it holds and that its plain
   speech reaches none of them, in a `[routing]` notice before it replies,
   naming each channel once in the turn. That covers a channel wake its start
   takes in, a gate debounce window's channel messages, and a message one of
-  its tool boundaries takes in that would have moved a channel turn's locus,
-  whether the boundary injects it or leaves it to the turn's next start. In
+  its tool boundaries takes in that addressed the agent or follows up where
+  the turn sent, whether the boundary injects it or leaves it to the turn's
+  next start. Under `'delivery'`, 0.30.0's own notice that someone addressed
+  the agent from another channel may name a channel first, and the turn
+  names it once either way. In
   explicit and disabled mode no channel's message moves where plain speech
   goes, in any turn, so no channel is named.
 
@@ -88,7 +109,11 @@
   before it opens, as the dispatcher's other refusals are, so its result
   carries `refused` (`ToolResult.refused`); a script's reaches the script as
   an Error. A private turn's `channel_open` doesn't move the locus, and says
-  so. Its `sleep` announcement isn't posted. When the model refuses (a refusal
+  so, and neither does its entering an all-except hold (`focus`, or
+  `tune_out` with `scope: 'all-except'`), whose answer says the turn's plain
+  speech stays private. The `focus` and `tune_out` descriptions name that
+  exception, so every resident's tool list changes once more. Its `sleep`
+  announcement isn't posted. When the model refuses (a refusal
   stop), a private turn's refusal reacts on no message, and its failure record
   names no channel.
 
@@ -100,8 +125,9 @@
   (`kind: 'surface'`). Before, it got no source stamp.
 
 - **Servers and modules writing message metadata:** a `callerTurnId` key in a
-  message a server or module stores is now dropped, since only the framework
-  writes that key. The first drop from each server is logged.
+  message a server or module stores, or a `dendrite.privateTurn` mark in one a
+  module stores, is now dropped, since only the framework writes them. The
+  first drop from each server is logged.
 
 - **A report from a script a turn started, deferred across a restart,** such
   as an update's, counts as private input in the next run, whichever turn it

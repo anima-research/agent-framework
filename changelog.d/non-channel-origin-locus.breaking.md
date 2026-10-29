@@ -18,11 +18,14 @@
   `inference.request`, is private too while the agent's stored history
   holds a private surface's message, even right after a channel turn: an
   `unstick` asked in a room posts its outcome notice there, and the answer
-  reaches no channel.
+  reaches no channel. So does the answer to what a subagent or fork started,
+  or handed an operator's words, during a private turn sends back, a channel
+  turn that takes it in included.
   - **Who needs to act:** a host that counts on every addressed channel
-    message getting a reply of its own, or on an `unstick` or `nudge`
-    answering in its channel, when its operators talk to the same agent
-    through a private surface.
+    message getting a reply of its own, on an `unstick` or `nudge`
+    answering in its channel, or on a subagent's outcome being answered in a
+    channel, when its operators talk to the same agent through a private
+    surface.
   - **Migration:** nothing to change in code. The resident answers such a
     message with an explicit send, as the notice says.
   - **Unchanged:** other than a retake, a start that holds no private input
