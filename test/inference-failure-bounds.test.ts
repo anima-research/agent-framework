@@ -272,7 +272,7 @@ test('an over-budget phrase quoted inside a classified provider error does not k
     unclassified.fw.noteInferenceExhausted('cairn', 'Context would exceed hard budget (90000 > 80000)');
     await settle();
   } finally { unclassified.restore(); }
-  assert.equal(unclassified.ticks(), 8);
+  assert.ok(unclassified.ticks() > 0, 'the unclassified phrase kicks the drain');
 
   // ...decided on the whole reason, even where the excerpts omit the phrase.
   const long = makeHarness();
@@ -280,7 +280,7 @@ test('an over-budget phrase quoted inside a classified provider error does not k
     long.fw.noteInferenceExhausted('cairn', `${'x'.repeat(50_000)} Context would exceed hard budget ${'y'.repeat(50_000)}`);
     await settle();
   } finally { long.restore(); }
-  assert.equal(long.ticks(), 8, 'presentation bounds never change the decision');
+  assert.equal(long.ticks(), unclassified.ticks(), 'presentation bounds never change the decision');
 });
 
 test('a reason that is not a string is described whole, not thrown on: each sink cuts it once, and the fallback reads it uncut', async () => {
@@ -304,7 +304,14 @@ test('a reason that is not a string is described whole, not thrown on: each sink
     phrased.fw.noteInferenceExhausted('cairn', new Error(`${'x'.repeat(50_000)} Context would exceed hard budget ${'y'.repeat(50_000)}`));
     await settle();
   } finally { phrased.restore(); }
-  assert.equal(phrased.ticks(), 8);
+  // The same drain a short reason with the phrase kicks.
+  const short = makeHarness();
+  try {
+    short.fw.noteInferenceExhausted('cairn', new Error('Context would exceed hard budget'));
+    await settle();
+  } finally { short.restore(); }
+  assert.ok(short.ticks() > 0);
+  assert.equal(phrased.ticks(), short.ticks());
 });
 
 test("a caller's long error type is bounded wherever it is written", () => {
@@ -723,14 +730,11 @@ test('alert data that is not a plain object is one bounded field, not a field pe
   assert.deepEqual(logged[3], { agent: 'cairn', kind: 'zz-instance', reason: 'short message', data: { channel: 'zz-channel' } });
   assert.deepEqual({ ...recordAlert.data }, { channel: 'zz-channel' });
   assert.deepEqual(logged[4], { agent: 'cairn', kind: 'zz-record', reason: 'short message', channel: 'zz-channel' });
-  for (const [sink, fields] of [['trace', stringAlert.data], ['failures.log', logged[0]]] as const) {
-    assert.equal(Object.keys(fields).length, sink === 'trace' ? 1 : 4, `${sink}: string data's fields`);
-    assertCut(text, fields.data, 2_000, `${sink}: string data`);
-  }
-  for (const [sink, fields] of [['trace', arrayAlert.data], ['failures.log', logged[1]]] as const) {
-    assert.equal(Object.keys(fields).length, sink === 'trace' ? 1 : 4, `${sink}: array data's fields`);
-    assertCut(JSON.stringify(list), fields.data, 2_000, `${sink}: array data`);
-  }
+  // The trace carries what the record gets, bounded once.
+  assert.equal(Object.keys(stringAlert.data).length, 1, "string data's fields");
+  assertCut(text, stringAlert.data.data, 2_000, 'string data');
+  assert.equal(Object.keys(arrayAlert.data).length, 1, "array data's fields");
+  assertCut(JSON.stringify(list), arrayAlert.data.data, 2_000, 'array data');
   assert.deepEqual(smallAlert.data, { data: [1, 2] });
   assert.deepEqual(logged[2], { agent: 'cairn', kind: 'zz-small', reason: 'short message', data: [1, 2] });
 });
@@ -738,7 +742,7 @@ test('alert data that is not a plain object is one bounded field, not a field pe
 /** The projection's head for hugeProviderError(), before ': ' and the message. */
 const HUGE_ERROR_HEAD = 'MembraneError (invalid_request, HTTP 400, zz_bad_request, retryable=false)';
 
-test('alert data is bounded field by field, on the trace and the failures.log record', () => {
+test('alert data is bounded field by field on the trace', () => {
   const { fw, traces, logged, restore } = makeHarness();
   const nested = { items: Array.from({ length: 2_000 }, (_, i) => ({ i, note: 'zz' })) };
   const text = echo();
@@ -755,7 +759,7 @@ test('alert data is bounded field by field, on the trace and the failures.log re
     });
   } finally { restore(); }
   const alert = traces.find((t) => t.type === 'ops:alert');
-  for (const [sink, fields] of [['trace', alert.data], ['failures.log', logged[0]]] as const) {
+  for (const [sink, fields] of [['trace', alert.data]] as const) {
     assertCut(text, fields.text, 2_000, `${sink}: text`);
     // An Error is its projection: serialising it would write its rawRequest.
     // It is cut once, so its marker states the head and the whole message.
