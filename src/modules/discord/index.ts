@@ -1508,13 +1508,24 @@ export class DiscordModule implements Module {
       const unapplied = live.unapplied;
       if (unapplied === undefined || !this.storedRow(discordMessageId)) continue;
       live.unapplied = undefined;
+      const apply = (what: string, step: () => void) => {
+        try {
+          step();
+        } catch (error) {
+          console.error(`Discord: ${what} of message ${discordMessageId}, made while its create was kept in memory, wasn't applied when the release stored it:`, error);
+        }
+      };
       if (unapplied === 'delete') {
-        for (const id of this.answerDelete({ type: 'discord:delete', discordMessageId }).removeMessages ?? []) ctx.removeMessage(id);
+        apply('the delete', () => {
+          for (const id of this.answerDelete({ type: 'discord:delete', discordMessageId }).removeMessages ?? []) ctx.removeMessage(id);
+        });
         continue;
       }
       for (const { text, attachments } of unapplied) {
-        const answer = this.answerEdit({ type: 'discord:edit', discordMessageId, newContent: text, ...(attachments ? { attachments } : {}) });
-        for (const { messageId, content } of answer.editMessages ?? []) ctx.editMessage(messageId, content);
+        apply('an edit', () => {
+          const answer = this.answerEdit({ type: 'discord:edit', discordMessageId, newContent: text, ...(attachments ? { attachments } : {}) });
+          for (const { messageId, content } of answer.editMessages ?? []) ctx.editMessage(messageId, content);
+        });
       }
     }
   }
