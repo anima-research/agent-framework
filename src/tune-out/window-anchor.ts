@@ -63,9 +63,10 @@ export interface SubconsciousWindowAnchorHost {
 export class SubconsciousWindowAnchor {
   /**
    * The starts whose ordinal isn't set and kept yet, the one in force
-   * (`inForce`) first if it is among them: some row older than a start is
-   * still out of the window, or setting or keeping the ordinal it was fixed
-   * at (`ordinal`) failed, which the next presentation tries again.
+   * (`inForce`) first if it is among them: the window doesn't present yet,
+   * some row older than a start is still out of the window, or setting or
+   * keeping the ordinal it was fixed at (`ordinal`) failed, which the next
+   * presentation tries again.
    */
   private pending: Array<{ start: SubconsciousWindowStart; ordinal?: number; inForce: boolean }> = [];
 
@@ -73,7 +74,8 @@ export class SubconsciousWindowAnchor {
 
   /**
    * Set the window start (the coordinator's setSubconsciousAnchor). In
-   * legacy mode by its sequence, as before the index. In presented mode by
+   * legacy mode by its sequence, as before the index, and a start not kept
+   * yet waits to be fixed, as below, once the window presents. In presented mode by
    * its ordinal when one was fixed, clamped to the window's index length
    * and traced when past it; else by its sequence for now, converted as the
    * strategy converts one, and the ordinal is fixed (see the module doc) as
@@ -88,7 +90,8 @@ export class SubconsciousWindowAnchor {
       const strategy = this.host.strategy();
       if (!strategy) return;
       if (!this.host.presents()) {
-        this.pending = [];
+        this.pending = [...(start.ordinal === undefined ? [start] : []), ...others]
+          .map((wanted) => ({ start: wanted, inForce: wanted === start }));
         strategy.setAnchor(start.sequence);
         return;
       }

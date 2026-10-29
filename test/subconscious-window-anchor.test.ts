@@ -424,6 +424,20 @@ describe('SubconsciousWindowAnchor', () => {
     assert.equal(h.fixed.length, 1, 'once');
   });
 
+  it('a start set while the window is the record, and the other active ones, are fixed at its first presentation', () => {
+    const options = { presents: false };
+    const h = host(options);
+    h.anchor.set({ sequence: 50, epochIds: ['t1'] }, [{ sequence: 70, epochIds: ['t2'] }]);
+    assert.deepEqual(h.calls, ['setAnchor(50)'], 'by sequence while the window is the record');
+    assert.deepEqual(h.fixed, [], 'and nothing fixed then');
+    options.presents = true;
+    h.state.rows.push({ sequence: 10, ordinal: 0 }, { sequence: 60, ordinal: 1 });
+    h.anchor.presented();
+    assert.deepEqual(h.fixed, [{ epochIds: ['t1'], ordinal: 1 }, { epochIds: ['t2'], ordinal: 2 }],
+      'each fixed past the last row stored before its start, once the window presents');
+    assert.deepEqual(h.calls, ['setAnchor(50)', 'setAnchorOrdinal(1)'], 'and only the start in force moves the window');
+  });
+
   it('a start whose setting or keeping fails is set and kept at the next presentation, at the ordinal it was fixed at', () => {
     const failedSet = host({ rows: [{ sequence: 10, ordinal: 0 }] });
     failedSet.state.setFails = 1;
