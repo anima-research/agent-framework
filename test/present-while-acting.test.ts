@@ -8,10 +8,10 @@
  * routes only trailing prose.
  * Previously all segments were batched to the end of the turn.
  *
- * HEAR-while-acting — messages arriving mid-turn (deferred by addMessage
- * while tool_use blocks are pending) are flushed to the context window at
- * the tool-result boundary AND injected into the live stream via
- * provideToolResults(results, { injectedMessages }) (membrane ≥0.5.72), so
+ * HEAR-while-acting — messages arriving mid-turn are stored at once and
+ * stay out of the window while tool_use blocks are pending; the tool-result
+ * boundary presents them to the window AND injects them into the live stream
+ * via provideToolResults(results, { injectedMessages }) (membrane ≥0.5.72), so
  * the next round of the SAME turn sees them instead of the agent staying
  * deaf until the turn ends. (A message a tune-out holds from the residents
  * is stored there but not injected: module-rows-held-from-residents.) That
@@ -124,9 +124,8 @@ class RobotModule implements Module {
             : {}),
       } as unknown as ProcessEvent);
       // The run loop takes this message while the tool round is still
-      // pending (pendingAssistantBlocks non-empty), so it lands among the
-      // deferred messages: it's queued here, before this call returns, and
-      // the round's result is queued only after the call returns.
+      // pending (pendingAssistantBlocks non-empty), so it is stored out of
+      // the window until the round's boundary presents it.
     }
     return { success: true, data: { ok: true, tool: call.name } };
   }
@@ -1375,7 +1374,7 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
-  it('a message deferred in a start that fails before its stream lands then, so a newer one during the hold wins', async () => {
+  it('a message stored in a start that fails before its stream is the older arrival, so a newer one during the hold wins', async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
     ] as ContentBlock[], 'tool_use'));
@@ -1425,8 +1424,8 @@ describe('present while acting', () => {
       addMessage(participant: string, content: ContentBlock[], metadata: Record<string, unknown>): string;
     };
     let storedInStart = '';
-    // Another agent's tool cycle is pending when the start fails: the flush
-    // at its end waits only on this agent's own cycle.
+    // Another agent's tool cycle is pending when the start fails: what the
+    // start stored waits only on this agent's own cycle.
     const cycles = (framework as unknown as { pendingAssistantBlocks: Map<string, ContentBlock[]> }).pendingAssistantBlocks;
     module.startHook = async () => {
       storedInStart = store.addMessage('Antra', [{ type: 'text', text: 'quick question for you' }] as ContentBlock[], addressed('discord:dm:antra'));
