@@ -4,7 +4,7 @@ import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { AgentFramework } from '../src/index.js';
-import type { AgentConfig } from '../src/index.js';
+import type { Agent, AgentConfig } from '../src/index.js';
 import type { SubconsciousConfig } from '../src/tune-out/tools.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
@@ -94,21 +94,24 @@ describe('the subconscious and the resident\'s model fields', () => {
     }
   });
 
-  it('an enabled subconscious\'s thinkingBinding that isn\'t an object or holds a switch that isn\'t true or false is refused before anything opens, and a disabled one\'s is left unchecked', async () => {
-    for (const thinkingBinding of ['yes', { binds: 'true' }, { binds: true, dropBlock: 'true' }]) {
-      const dir = mkdtempSync(join(tmpdir(), 'subconscious-model-fields-'));
-      dirs.push(dir);
-      await assert.rejects(
-        AgentFramework.create({
-          storePath: join(dir, 'store'),
-          membrane: new MockMembrane().asMembrane(),
-          agents: [{ name: 'assistant', model: 'model-a', systemPrompt: 'test', maxTokens: 4_000 }],
-          modules: [],
-          subconscious: { enabled: true, systemPrompt: 'notice', thinkingBinding } as unknown as SubconsciousConfig,
-        }),
-        /subconscious\.thinkingBinding/,
-      );
-      assert.deepEqual(readdirSync(dir), [], JSON.stringify(thinkingBinding));
+  it('an enabled subconscious\'s thinkingBinding that isn\'t an object or holds a switch that isn\'t true or false is refused before anything opens, whichever its reader, and a disabled one\'s is left unchecked', async () => {
+    const readers = [{ systemPrompt: 'notice' }, { reader: 'forks', model: 'model-a', voice: 'v' }];
+    for (const reader of readers) {
+      for (const thinkingBinding of ['yes', { binds: 'true' }, { binds: true, dropBlock: 'true' }]) {
+        const dir = mkdtempSync(join(tmpdir(), 'subconscious-model-fields-'));
+        dirs.push(dir);
+        await assert.rejects(
+          AgentFramework.create({
+            storePath: join(dir, 'store'),
+            membrane: new MockMembrane().asMembrane(),
+            agents: [{ name: 'assistant', model: 'model-a', systemPrompt: 'test', maxTokens: 4_000 }],
+            modules: [],
+            subconscious: { enabled: true, ...reader, thinkingBinding } as unknown as SubconsciousConfig,
+          }),
+          /subconscious\.thinkingBinding/,
+        );
+        assert.deepEqual(readdirSync(dir), [], JSON.stringify({ ...reader, thinkingBinding }));
+      }
     }
     const { framework } = await withSubconscious({}, { enabled: false, thinkingBinding: 'yes' } as unknown as Partial<SubconsciousConfig>);
     await framework.stop();
@@ -152,5 +155,70 @@ describe('the subconscious and the resident\'s model fields', () => {
       assert.deepEqual(inherited, rest(storedConfig(framework, 'assistant')));
       for (const key of Object.keys(settings)) assert.ok(key in inherited, key);
     } finally { await framework.stop(); }
+  });
+});
+
+describe('a fork reader and the resident\'s model fields', () => {
+  const resident: Partial<AgentConfig> = { physicalWindowTokens: 1_000_000, thinkingBinding: { binds: true, dropBlock: true } };
+
+  async function forkFields(subconscious: Record<string, unknown>) {
+    const dir = mkdtempSync(join(tmpdir(), 'subconscious-model-fields-'));
+    dirs.push(dir);
+    const residentConfig: AgentConfig = { name: 'assistant', model: 'model-a', systemPrompt: 'test', maxTokens: 4_000, ...resident };
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [residentConfig],
+      modules: [],
+      subconscious: { enabled: true, reader: 'forks', voice: 'v', ...subconscious } as SubconsciousConfig,
+    });
+    try {
+      const derive = framework.deriveAgent.bind(framework);
+      const derived = new Promise<Agent>((resolve, reject) => {
+        framework.deriveAgent = async (options) => {
+          const fork = await derive(options).catch((error: unknown) => { reject(error); throw error; });
+          resolve(fork.agent);
+          return fork;
+        };
+      });
+      framework.runEphemeralToCompletion = async () => ({ speech: '', toolCallsCount: 0 });
+      (framework as unknown as { invokeReaderFork(invocation: unknown): void }).invokeReaderFork({
+        serverId: 'disc', channelId: 'disc:guild:noisy', epochId: 'epoch-0001', trigger: 'wake',
+        notice: '[Tune-out wake]', backlog: [], queued: [], dispositions: null,
+      });
+      const fork = await derived;
+      return {
+        fields: { model: fork.model, physicalWindowTokens: fork.physicalWindowTokens, binding: fork.thinkingBindingOption() ?? null },
+        resident: { config: storedConfig(framework, 'assistant'), given: residentConfig },
+      };
+    } finally { await framework.stop(); }
+  }
+
+  it('runs with the window and binding set for it, on another model or the resident\'s, and the resident keeps its own', async () => {
+    const cases: Array<[Record<string, unknown>, { model: string; physicalWindowTokens?: number; binding: { binds: true; dropBlock: boolean } | null }]> = [
+      [{ model: 'model-b', physicalWindowTokens: 200_000, thinkingBinding: { binds: true } }, { model: 'model-b', physicalWindowTokens: 200_000, binding: { binds: true, dropBlock: false } }],
+      [{ model: 'model-a', physicalWindowTokens: 500_000, thinkingBinding: { binds: false } }, { model: 'model-a', physicalWindowTokens: 500_000, binding: null }],
+    ];
+    for (const [subconscious, expected] of cases) {
+      const { fields, resident: kept } = await forkFields(subconscious);
+      const { model, physicalWindowTokens, binding } = fields;
+      assert.deepEqual(
+        { model, physicalWindowTokens, binding: binding && { binds: binding.binds, dropBlock: binding.dropBlock } },
+        expected,
+        JSON.stringify(subconscious),
+      );
+      for (const config of [kept.config, kept.given]) {
+        assert.equal(config?.physicalWindowTokens, 1_000_000);
+        assert.deepEqual(config?.thinkingBinding, { binds: true, dropBlock: true });
+      }
+    }
+  });
+
+  it('on the resident\'s model with neither set, or set to null or false, it runs with the resident\'s', async () => {
+    for (const subconscious of [{ model: 'model-a' }, { model: 'model-a', physicalWindowTokens: null, thinkingBinding: null }, { model: 'model-a', thinkingBinding: false }]) {
+      const { fields } = await forkFields(subconscious);
+      assert.equal(fields.physicalWindowTokens, 1_000_000, JSON.stringify(subconscious));
+      assert.deepEqual(fields.binding && { binds: fields.binding.binds, dropBlock: fields.binding.dropBlock }, { binds: true, dropBlock: true }, JSON.stringify(subconscious));
+    }
   });
 });

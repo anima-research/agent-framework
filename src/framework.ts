@@ -1836,8 +1836,8 @@ function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
  * Refuse a config whose `subconscious`, `watchdog` or `processLogging` is
  * anything but an object, null or false (holdsSettings), or whose switch in
  * one holds anything but true or false (assertBooleanSetting), or whose
- * persistent subconscious's `thinkingBinding` assertThinkingBinding refuses. A
- * subconscious that isn't on has its `allowChannelSpeech` and
+ * subconscious's `thinkingBinding` assertThinkingBinding refuses, whichever
+ * its reader. A subconscious that isn't on has its `allowChannelSpeech` and
  * `thinkingBinding` left unchecked, since nothing reads them then.
  */
 function assertFrameworkSwitches(config: FrameworkConfig): void {
@@ -1854,9 +1854,7 @@ function assertFrameworkSwitches(config: FrameworkConfig): void {
         config.subconscious.allowChannelSpeech,
         'true lets the subconscious speak in channels with speak_in_channel, and false or leaving it out refuses it',
       );
-      if (config.subconscious.reader !== 'forks') {
-        assertThinkingBinding('subconscious.thinkingBinding', config.subconscious.thinkingBinding);
-      }
+      assertThinkingBinding('subconscious.thinkingBinding', config.subconscious.thinkingBinding);
     }
   }
   if (holdsSettings('watchdog', config.watchdog, '{ enabled: true }')) {
@@ -3426,6 +3424,13 @@ interface StreamRequestNotes {
 }
 
 const SUBCONSCIOUS_MODEL_FIELDS = ['physicalWindowTokens', 'thinkingBinding'] as const satisfies ReadonlyArray<keyof AgentConfig>;
+
+function readerModelFields(cfg: SubconsciousConfig): Pick<AgentConfig, (typeof SUBCONSCIOUS_MODEL_FIELDS)[number]> {
+  return {
+    ...(cfg.physicalWindowTokens != null ? { physicalWindowTokens: cfg.physicalWindowTokens } : {}),
+    ...(holdsSettings('subconscious.thinkingBinding', cfg.thinkingBinding, '{ binds: true, dropBlock: true }') ? { thinkingBinding: cfg.thinkingBinding } : {}),
+  };
+}
 
 const JUDGE_PARAMETER: ToolParameter = {
   type: 'object',
@@ -15822,8 +15827,7 @@ export class AgentFramework {
     }
     const agentConfig: AgentConfig = {
       ...inherited,
-      ...(cfg.physicalWindowTokens != null ? { physicalWindowTokens: cfg.physicalWindowTokens } : {}),
-      ...(holdsSettings('subconscious.thinkingBinding', cfg.thinkingBinding, '{ binds: true, dropBlock: true }') ? { thinkingBinding: cfg.thinkingBinding } : {}),
+      ...readerModelFields(cfg),
       name,
       model,
       systemPrompt: cfg.systemPrompt,
@@ -15931,6 +15935,7 @@ export class AgentFramework {
           config: {
             model: cfg.model,
             proseRouting: 'disabled',
+            ...readerModelFields(cfg),
           },
           inheritRefusals: true,
           onParentEnd: 'end',
