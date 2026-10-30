@@ -438,6 +438,9 @@ export class Agent {
   /** Told when that changes (the framework records it beside the persisted budget). */
   private compiledBudgetListener?: (budget: number, fit: boolean) => boolean;
   private contextManager: ContextManager;
+  /** How many edits and removals of stored rows its context manager has reported (onMessage): part of the restart
+   *  preview's key (restartPreviewKey), so a decline remembered before a row was edited or removed is asked again. */
+  private storedRowChanges = 0;
   private membrane: Membrane;
 
   constructor(
@@ -480,6 +483,9 @@ export class Agent {
     this.contextBudgetTokens = config.contextBudgetTokens;
     this.configuredContextBudgetTokens = config.contextBudgetTokens;
     this.contextManager = contextManager;
+    if (typeof contextManager.onMessage === 'function') {
+      contextManager.onMessage((event) => { if (event.type !== 'add') this.storedRowChanges++; });
+    }
     this.membrane = membrane;
     const hot = this.getHotContextSettings();
     this.configuredTailTokens = hot?.tailTokens;
@@ -2151,10 +2157,10 @@ export class Agent {
   /**
    * What a preview's answer rests on besides the rows a stream adds, as one string: the budget it's given, the
    * compression holds, the live settings that change the select (`tailTokens`, `transitionPaceTokens`,
-   * `preparedWindowTokens`), and the strategy's compression state: its counts of compressed chunks and summaries
-   * where it reports any of them (`getStats`), and otherwise its pending work, whose text a landing can leave reading
-   * the same. A restart declined for a reason a newer message can't clear is previewed again only once this has
-   * changed.
+   * `preparedWindowTokens`), the strategy's compression state (its counts of compressed chunks and summaries where it
+   * reports any of them, `getStats`, and otherwise its pending work, whose text a landing can leave reading the same),
+   * and how many times a stored row has been edited or removed. A restart declined for a reason a newer message can't
+   * clear is previewed again only once this has changed.
    * @internal For the framework's restart decision; not a host API.
    */
   restartPreviewKey(): string {
@@ -2167,6 +2173,7 @@ export class Agent {
       [...cm.getCompressionHolds()].sort(),
       hot && [hot.tailTokens, hot.transitionPaceTokens ?? null, hot.preparedWindowTokens ?? null],
       counts?.some((count) => typeof count === 'number') ? counts : cm.getPendingWork()?.description ?? null,
+      this.storedRowChanges,
     ]);
   }
 

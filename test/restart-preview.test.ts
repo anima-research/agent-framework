@@ -439,6 +439,8 @@ for (const { what, clearedBy } of [
   { what: "the pending compression work of a strategy whose stats hold none of the counts changes", clearedBy: ['compression'] },
   { what: 'a compression lands', clearedBy: ['compression'] },
   { what: "a compression lands, after a decline that named no way to make room while compression work was pending (an empty clearedBy isn't final)", clearedBy: [] },
+  { what: 'a stored row is edited', clearedBy: ['compression'] },
+  { what: 'a stored row is removed', clearedBy: ['compression'] },
 ] as const) {
   test(`a restart declined for a reason a newer message can't clear is previewed again once ${what}, and taken once it fits`, async () => {
     const membrane = new TurnMembrane([[...toolRounds(6, 4_000), answer('Done on the first stream.')], [answer(FINAL)]]);
@@ -453,6 +455,7 @@ for (const { what, clearedBy } of [
       Object.defineProperty(prime.toolResultGuard, 'pendingWireReserveTokens', { get: () => reserve });
       const [held] = compressHistory(framework, 1);
       cm.holdCompression([held]);
+      const stored = what.startsWith('a stored row') ? cm.addMessage('User', [{ type: 'text', text: `[x] ${PAGE}` }]) : undefined;
       strategy.readiness = { ready: false, description: 'Compressing chunk 0' };
       strategy.reportsStats = what === "the pending compression work of a strategy that reports no counts changes" ? false
         : what === "the pending compression work of a strategy whose stats hold none of the counts changes" ? 'none of the counts' : true;
@@ -463,6 +466,8 @@ for (const { what, clearedBy } of [
         else if (what === 'a compression hold is released') cm.releaseCompression([held]);
         else if (what === 'a live context setting changes') cm.updateHotContextSettings({ tailTokens: 1_000 });
         else if (what.startsWith('the pending compression work')) strategy.readiness = { ready: false, description: 'Compressing chunk 1' };
+        else if (what === 'a stored row is edited') cm.editMessage(stored!, [{ type: 'text', text: '[x] a line' }]);
+        else if (what === 'a stored row is removed') cm.removeMessage(stored!);
         else strategy.compressionCount++;
       };
       ask(framework);
