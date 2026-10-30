@@ -699,6 +699,24 @@ describe('Dendrite lifecycle', () => {
     resumed.cleanup();
   });
 
+  it("a resumed job reports its head as any agent does", async () => {
+    const framework = await boot();
+    const traces: TraceEvent[] = [];
+    framework.onTrace((event) => traces.push(event));
+    framework.start();
+    membrane.script('job-h', say('job-h done'));
+    const config = { model: 'test-model', systemPrompt: 'Do the task.', toolDeclarations: 'entries' as const };
+    const made = await framework.createEphemeralAgent({ name: 'job-h', ...config }, workerSpec('job-h', { spawnedBy: 'mira' }));
+    made.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+    await framework.runEphemeralToCompletion(made.agent, made.contextManager);
+    const resumed = await framework.resumeAgent('job-h', config);
+    const before = traces.length;
+    await resumed.agent.buildActivationRequest([{ name: 'look', description: 'look', inputSchema: { type: 'object', properties: {} } }]);
+    assert.ok(traces.slice(before).some((t) => t.type.startsWith('head:') && (t as { agentName?: string }).agentName === 'job-h'),
+      'its first request on the resumed context reports its head');
+    resumed.cleanup();
+  });
+
   it("an earlier resume's cleanup, called again, leaves a later resume's hold on the name", async () => {
     const framework = await boot();
     framework.start();

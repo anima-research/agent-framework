@@ -1521,12 +1521,25 @@ test("a push's Discord channel, composed from its origin, is registered for the 
 test("a message moves the turn's locus to its own server's channel, by the server its metadata carries", async (t) => {
   const f = await frameworkWith(t, ['a', 'b']);
   const repin = (m: Record<string, unknown>, routing: { engaged: Set<string> }) =>
-    (f.framework as unknown as { repinChannel(m: unknown, r: unknown): ChannelRef | undefined }).repinChannel(m, routing);
+    (f.framework as unknown as { repinChannel(row: unknown, r: unknown): ChannelRef | undefined }).repinChannel({ content: [], metadata: m }, routing);
   const routing = { engaged: new Set([destinationKey(b)]), wasIn: [] as ChannelRef[] };
   assert.deepEqual(repin({ channelId: 'general', serverId: 'a', tags: ['chat:addressed'] }, routing), a, 'an addressed message');
   assert.deepEqual(repin({ channelId: 'general', serverId: 'b' }, routing), b, 'a follow-up where the turn sent');
   assert.equal(repin({ channelId: 'general', serverId: 'a' }, routing), undefined, "a's channel wasn't sent into, though it shares b's id");
   assert.equal(repin({ channelId: 'general', tags: ['chat:addressed'] }, routing), undefined, 'no server, and two channels with that id');
+});
+
+test("a system change moves no turn's locus, whatever channel its metadata names", async (t) => {
+  const f = await frameworkWith(t, ['a', 'b']);
+  const change = [{ type: 'system_change', defineTools: [{ name: 'zz_tool', description: 'ZZCHANGE', inputSchema: { type: 'object', properties: {} } }] }];
+  const repin = (m: Record<string, unknown>, routing: { engaged: Set<string> }) =>
+    (f.framework as unknown as { repinChannel(row: unknown, r: unknown): ChannelRef | undefined }).repinChannel({ content: change, metadata: m }, routing);
+  const routing = { engaged: new Set([destinationKey(b)]), wasIn: [] as ChannelRef[] };
+  const said = (m: Record<string, unknown>) =>
+    (f.framework as unknown as { repinChannel(row: unknown, r: unknown): ChannelRef | undefined }).repinChannel({ content: [{ type: 'text', text: 'hi' }], metadata: m }, routing);
+  assert.deepEqual(said({ channelId: 'general', serverId: 'a', tags: ['chat:addressed'] }), a, 'the premise: a message said with the same metadata moves it');
+  assert.equal(repin({ channelId: 'general', serverId: 'a', tags: ['chat:addressed'] }, routing), undefined, 'one addressed to a channel');
+  assert.equal(repin({ channelId: 'general', serverId: 'b' }, routing), undefined, 'one in the channel the turn sent in');
 });
 
 test("a gate wake's route goes to a fork only where it's the fork's own home, on its server", async (t) => {

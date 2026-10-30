@@ -214,6 +214,78 @@ describe('a message injected at a tool boundary', () => {
     assert.notEqual(next('HEARD'), '');
   });
 
+  for (const toolDeclarations of ['entries', 'head'] as const) {
+    it(`a host's system change stored at a resident's tool boundary without metadata goes in exactly where its next request sends it (toolDeclarations '${toolDeclarations}')`, async () => {
+      framework = await AgentFramework.create({
+        storePath: join(tempDir, 'test.chronicle'),
+        membrane: membrane.asMembrane(),
+        agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.', strategy: new WindowedPassthroughStrategy({}) as never, toolDeclarations }],
+        modules: [module],
+      });
+      module.framework = framework;
+      const change: ContentBlock = { type: 'system_change', defineTools: [{ name: 'zz_tool', description: 'ZZCHANGE', inputSchema: { type: 'object', properties: {} } }] } as unknown as ContentBlock;
+      const injected = await turnWith([[change], [text('HEARD')]]);
+      assert.notEqual(holding(injected, 'HEARD'), '', 'the message beside it goes in');
+      const next = await nextRequest();
+      assert.notEqual(next('HEARD'), '', 'the premise: the next request is the resident\'s');
+      const sent = next('ZZCHANGE') !== '';
+      assert.equal(sent, toolDeclarations === 'entries', "under 'entries' a host's change row goes out as stored; on the head every change row stays out");
+      assert.equal(holding(injected, 'ZZCHANGE') !== '', sent, 'and the live turn heard it exactly when the next request sends it');
+    });
+  }
+
+  for (const toolDeclarations of ['entries', 'head'] as const) {
+    it(`at the subconscious's boundary, a host's system change written for it without metadata is stored but not injected, since its view leaves out every change not its own, as its next request does (its principal's toolDeclarations '${toolDeclarations}')`, async () => {
+      let ctx: ModuleContext | null = null;
+      const writer: Module = {
+        name: 'writer',
+        async start(c: ModuleContext) { ctx = c; },
+        async stop() {},
+        getTools: () => [],
+        async handleToolCall() { return { success: false, isError: true, error: 'no tools' }; },
+        async onProcess() { return {}; },
+      };
+      framework = await AgentFramework.create({
+        storePath: join(tempDir, 'test.chronicle'),
+        membrane: membrane.asMembrane(),
+        agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.', toolDeclarations }],
+        modules: [writer],
+        subconscious: { enabled: true, systemPrompt: 'notice' },
+      });
+      framework.start();
+      const streams: Array<{ receivedToolResultOptions: Array<{ injectedMessages?: Array<{ content: unknown[] }> } | undefined> }> = [];
+      const open = membrane.streamYielding.bind(membrane);
+      let wrote = false;
+      membrane.streamYielding = ((request: never, options: never) => {
+        const stream = open(request, options);
+        streams.push(stream as never);
+        if (!wrote) {
+          wrote = true;
+          ctx!.addMessage('Antra', [{ type: 'system_change', defineTools: [{ name: 'zz_tool', description: 'ZZCHANGE', inputSchema: { type: 'object', properties: {} } }] } as unknown as ContentBlock],
+            undefined as never, { forAgent: 'Subconscious' });
+          ctx!.addMessage('Antra', [text('HEARD')], undefined as never, { forAgent: 'Subconscious' });
+        }
+        return stream;
+      }) as never;
+      membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 't1', name: 'think', input: { content: 'hm' } }] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([text('Noted.')]));
+      assert.equal(framework.nudgeAgent('Subconscious').ok, true);
+      await framework.runUntilIdle();
+      const injected = streams.flatMap((s) => s.receivedToolResultOptions).flatMap((o) => o?.injectedMessages ?? []);
+      assert.ok(wrote, 'the premise: the writes were made while its turn ran');
+      const stored = framework.getAgent('Subconscious')!.getContextManager().getAllMessages();
+      assert.ok(stored.some((m) => JSON.stringify(m.content).includes('ZZCHANGE')), 'the change is stored, not dropped');
+      assert.notEqual(holding(injected, 'HEARD'), '', 'the message beside it goes in');
+      assert.equal(holding(injected, 'ZZCHANGE'), '', 'the change stays out of the live turn');
+      membrane.pushResponse(createMockResponse([text('Again.')]));
+      assert.equal(framework.nudgeAgent('Subconscious').ok, true);
+      await framework.runUntilIdle();
+      const sent = membrane.calls[membrane.calls.length - 1]!.messages.map((m) => JSON.stringify(m.content));
+      assert.ok(sent.some((x) => x.includes('HEARD')), "the premise: the next request is the subconscious's");
+      assert.ok(!sent.some((x) => x.includes('ZZCHANGE')), "and it leaves the change out, as the live turn did");
+    });
+  }
+
   it("at the subconscious's boundary, its own view decides: a row written for it with a tune-out's stamp goes in, and another agent's stored context injection stays out, as its next request has them", async () => {
     let ctx: ModuleContext | null = null;
     const writer: Module = {

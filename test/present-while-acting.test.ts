@@ -555,6 +555,43 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
+  it('under the default locus rule a system change stored mid-turn with an addressed message\'s metadata is no one speaking, so nothing is announced', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Station four, proceeding.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Still speaking into the scene.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework({ toolDeclarations: 'entries' } as never);
+    stubChannelRegistry(framework);
+    const handle = module.handleToolCall.bind(module);
+    module.handleToolCall = async (call) => {
+      (framework as unknown as { addMessage(participant: string, content: unknown[], metadata: unknown): unknown }).addMessage('system',
+        [{ type: 'system_change', defineTools: [{ name: 'zz-tool', description: 'zz', inputSchema: { type: 'object', properties: {} } }] }],
+        { channelId: 'discord:dm:antra', tags: ['chat:addressed'] });
+      return handle(call);
+    };
+
+    const notices: string[] = [];
+    framework.onTrace((event) => {
+      const e = event as { type: string; source?: string };
+      if (e.type === 'message:added' && e.source === 'routing-notice') notices.push(e.source!);
+    });
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    const stored = framework.getAgent('assistant')!.getContextManager().getAllMessages()
+      .filter((m) => (m.content as Array<{ type: string }>).some((b) => b.type === 'system_change'));
+    assert.equal(stored.length, 1, 'the premise: the tool stored the change mid-turn');
+    const handed = membrane.lastStream!.receivedToolResultOptions.flatMap((options) => options?.injectedMessages ?? []);
+    assert.ok(handed.some((m) => (m.content as Array<{ type: string }>).some((b) => b.type === 'system_change')), 'and the tool boundary handed it to the live stream');
+    assert.equal(notices.length, 1, 'the boot-baseline announcement alone');
+    await framework.stop();
+  });
+
   it('under the default locus rule an addressed mid-turn injection is announced — who, from where — but does not move the pin', async () => {
     // `speech.locus: 'delivery'` (architecture channel §3 carve-out,
     // 2026-10-06): incoming traffic never moves the locus, mid-turn

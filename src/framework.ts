@@ -40,6 +40,7 @@ import {
   locateMessageIndices,
   removeStoredMessage,
   removeStoredMessages,
+  scanFromTail,
 } from './stored-removal.js';
 import type {
   FrameworkConfig,
@@ -87,6 +88,19 @@ import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 import { Agent, assertAgentSwitches, assertThinkingBinding, dryCompileStatsOf, type RenderStats } from './agent.js';
+import {
+  isHeadDeclaration,
+  isOthersSystemChange,
+  isSystemChangeMessage,
+  isSystemChangeNotOwn,
+  lastConversational,
+  memoryHeadDeclarations,
+  ownSystemChanges,
+  systemChangeMetadata,
+  type HeadDeclaration,
+  type HeadDeclarationStore,
+  type HeadEvent,
+} from './system-changes.js';
 import { assertBooleanSetting, holdsSettings, kindOf } from './config-checks.js';
 import { ModuleRegistry, checkedToolResult, droppedToolResultLine, ensureStateRegistered, retiredPushLine, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
@@ -453,6 +467,11 @@ const isConversationalInjection = (metadata?: MessageMetadata): boolean => {
   if (isMarkerTagged(m.tags, m.firstView === true)) return false;
   return true;
 };
+
+type ViewedRow = { content: readonly ContentBlock[]; metadata?: unknown };
+
+const isConversationalRow = (row: ViewedRow): boolean =>
+  !isSystemChangeMessage(row) && isConversationalInjection(row.metadata as MessageMetadata | undefined);
 
 /**
  * The first message a module's process response adds, or edit it makes,
@@ -964,6 +983,7 @@ import {
 } from './operator-log.js';
 
 const FRAMEWORK_STATE_ID = 'framework/state';
+const headDeclarationId = (agentName: string) => `framework/head-declarations/${agentName}`;
 /** Dendrite agent registry: live records, incarnation counters, held mail. */
 const AGENT_REGISTRY_STATE_ID = 'framework/dendrite';
 /** Dendrite agent registry: append-only history of ended agent records. */
@@ -1149,6 +1169,21 @@ function describeDeferredWrite(msg: { id: string; participant: string; content: 
     return typeof type === 'string' ? type : 'untyped';
   };
   return `${msg.id} (${msg.participant}: ${[...new Set(msg.content.map(kind))].join('+') || 'empty'})`;
+}
+
+function indexBeforeLastMessages(cm: Pick<ContextManager, 'getMessageCount' | 'getMessageWindow'>, n: number): number {
+  let counted = 0;
+  let before: number | undefined;
+  scanFromTail(cm, (row, index) => {
+    if (isSystemChangeMessage(row)) return false;
+    if (counted === n) {
+      before = index;
+      return true;
+    }
+    counted++;
+    return false;
+  });
+  return before ?? -counted - 1;
 }
 
 /** Whether a deferred message can join a live stream at a tool boundary:
@@ -1562,7 +1597,7 @@ function turnInputs(
     for (let i = messages.length - 1; i >= 0; i--) {
       const message = messages[i];
       if (message.sequence <= floor) break scan;
-      if (!sees(message.metadata)) continue;
+      if (!sees(message.metadata) || isSystemChangeMessage(message)) continue;
       if (message.participant === agentName) break scan;
       last ??= message.id;
       const answers = Array.isArray(message.content) && message.content.length > 0
@@ -2808,6 +2843,42 @@ export const heldFromResidents = (metadata: Record<string, unknown> | undefined)
 const RESIDENT_VIEW_FILTER = (message: StoredMessage): boolean =>
   !heldFromResidents(message.metadata as Record<string, unknown> | undefined);
 
+type StoreView = { sees: (metadata: unknown) => boolean; keeps: (row: ViewedRow) => boolean };
+
+const ownParticipantsOf = (name: string, selfParticipants?: readonly string[]): ((agentName: string) => boolean) => {
+  const own = new Set([name, ...(selfParticipants ?? [])]);
+  return (agentName) => own.has(agentName);
+};
+
+const residentView = (name: string, isOwn: (agentName: string) => boolean): StoreView => {
+  const sees = (metadata: unknown): boolean =>
+    RESIDENT_VIEW_FILTER({ metadata } as StoredMessage) && !isAnotherAgentsInjection(metadata, name);
+  return { sees, keeps: (row) => sees(row.metadata) && !isOthersSystemChange(row, isOwn) };
+};
+
+const observerView = (name: string, includeHeld: boolean, isOwn: (agentName: string) => boolean): StoreView => {
+  const sees = (metadata: unknown): boolean =>
+    (includeHeld || RESIDENT_VIEW_FILTER({ metadata } as StoredMessage)) && !isAnotherAgentsInjection(metadata, name);
+  return { sees, keeps: (row) => sees(row.metadata) && !isSystemChangeNotOwn(row, isOwn) };
+};
+
+const derivedView = (source: StoreView, name: string, isOwn: (agentName: string) => boolean): StoreView => ({
+  sees: (metadata) => source.sees(metadata) || isOwnInjection(metadata, name),
+  keeps: (row) => source.keeps(row) || isOwnInjection(row.metadata, name) || (isSystemChangeMessage(row) && !isSystemChangeNotOwn(row, isOwn)),
+});
+
+const KEEP_EVERY = (): boolean => true;
+
+// context-manager keeps one filtered listing per listing and predicate, taking
+// the predicate as a pure function of the message (filterMessageStoreView).
+const compiledView = (
+  keeps: ((row: ViewedRow) => boolean) | undefined,
+  toolDeclarations: AgentConfig['toolDeclarations'],
+): ((message: StoredMessage) => boolean) => {
+  if (toolDeclarations === 'entries') return keeps ?? KEEP_EVERY;
+  return keeps ? (row) => keeps(row) && !isSystemChangeMessage(row) : (row) => !isSystemChangeMessage(row);
+};
+
 /** The context-manager surface shared inheritance needs; absent on versions without derivation. */
 interface DerivingContextManager {
   derive(options: {
@@ -3562,7 +3633,7 @@ interface StreamRequestNotes {
   stopped: boolean;
 }
 
-const SUBCONSCIOUS_MODEL_FIELDS = ['physicalWindowTokens', 'thinkingBinding'] as const satisfies ReadonlyArray<keyof AgentConfig>;
+const SUBCONSCIOUS_MODEL_FIELDS = ['physicalWindowTokens', 'thinkingBinding', 'toolDeclarations'] as const satisfies ReadonlyArray<keyof AgentConfig>;
 
 function readerModelFields(cfg: SubconsciousConfig): Pick<AgentConfig, (typeof SUBCONSCIOUS_MODEL_FIELDS)[number]> {
   return {
@@ -4216,7 +4287,7 @@ export class AgentFramework {
   // closes, before an owned store, each one alive.
   private readonly openManagers = new Set<WeakRef<ContextManager>>();
   private readonly openManagerRefs = new WeakMap<ContextManager, WeakRef<ContextManager>>();
-  private readonly storeSees = new WeakMap<ContextManager, (metadata: unknown) => boolean>();
+  private readonly storeViews = new WeakMap<ContextManager, StoreView>();
   private readonly collectedManagers = new FinalizationRegistry<WeakRef<ContextManager>>((ref) => this.openManagers.delete(ref));
   /** The coalescing commit in flight, if any (see commitCoalescingDurable). */
   private coalescingCommit: Promise<void> | null = null;
@@ -4267,6 +4338,7 @@ export class AgentFramework {
   /** Per live stream that can be noted, its rows so far after the compiled messages (noteRoundSent). */
   private readonly streamRequestNotes = new WeakMap<YieldingStream, StreamRequestNotes>();
   private readonly streamCarried = new WeakMap<YieldingStream, Set<MessageId>>();
+  private readonly streamsHandedChange = new WeakSet<YieldingStream>();
   /** Per pending round's blocks (pendingAssistantBlocks' value), what membrane held as that round's reply
    *  (`roundContent`, its results left out); null where the round has no `roundContent` (XML or fallback). Keyed by
    *  the blocks themselves, so it goes wherever they go. */
@@ -10807,6 +10879,25 @@ export class AgentFramework {
   /**
    * Create an ephemeral agent that is NOT registered in the main event loop.
    *
+   * When `spec.inherit` names a running agent that declares its later tool
+   * and system changes as entries (toolDeclarations 'entries'), the new
+   * agent starts with that agent's recorded head, as its own record: the same
+   * head object at first, since a record is never changed in place, and each
+   * of the new agent's moves records its own. Its context then continues
+   * that agent's, shared, or copied by the host once this returns, and it
+   * sends the same prefix, so it reads that agent's cache and declares only
+   * its own difference: a change its request already carries, whoever's row
+   * holds it, isn't declared again. A host that copies stamps that agent's
+   * system changes with `systemChangeMetadata(config.name)`, so they are the
+   * new agent's own, which a move of its head takes out of its context.
+   * That holds for a fork of the same self: system text that is that agent's
+   * head's blocks, plus additions. A new agent with its own system prompt,
+   * or other system injections, meets a replacement at its first request and
+   * moves to its own head, as an agent without it would. An agent on its
+   * head, with nothing recorded, or not running gives nothing, and so does an
+   * inherit at a checkpoint the caller names (`atSequence`), whose head isn't
+   * recorded: the new agent adopts at its first request, as without it.
+   *
    * Used by SubagentModule (and similar) to prepare short-lived agents.
    * Call runEphemeralToCompletion(agent, contextManager) to register and run
    * the returned agent. Framework-created identities have tool authority only
@@ -10844,6 +10935,8 @@ export class AgentFramework {
     // after the name is reserved and ContextManager.open has registered the
     // agent's message and context states in the store.
     assertAgentSwitches(config);
+    const parent = spec?.inherit && spec.inherit.atSequence === undefined ? this.agents.get(spec.inherit.from) : undefined;
+    const seedHead = parent?.declaresEntries() ? (this.headStores.get(parent)?.read(parent.name) ?? null) : null;
     // Names are Chronicle namespaces and generation identities. Reserve before
     // opening the namespace so a second creation cannot append to an earlier
     // generation before runEphemeralToCompletion has a chance to reject it.
@@ -10898,6 +10991,7 @@ export class AgentFramework {
           store: this.store,
           namespace,
           isolate: true,
+          viewFilter: compiledView(undefined, config.toolDeclarations),
           strategy: config.strategy ?? new PassthroughStrategy(),
           membrane: this.ephemeralAuxiliaryMembraneFor(config.name, release),
           debugLogContext: !!process.env.DEBUG_CONTEXT,
@@ -10908,6 +11002,9 @@ export class AgentFramework {
       release.manager = contextManager;
 
       const agent = new Agent(config, contextManager, this.membrane);
+      const heads = memoryHeadDeclarations();
+      if (seedHead) heads.write(config.name, seedHead);
+      this.attachHeads(agent, heads);
       this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
       this.ephemeralCandidates.set(agent, {
@@ -11055,13 +11152,14 @@ export class AgentFramework {
       if (!shared) {
         // The historical copy: the parent's compiled view, its turns renamed
         // so the child reads its inheritance as its own history.
-        const { messages } = await parent.getContextManager().compile();
-        for (const message of messages) {
-          created.contextManager.addMessage(
-            parent.isOwnParticipant(message.participant) ? options.name : message.participant,
-            message.content,
-          );
-        }
+        const compiled = await parent.getContextManager().compile();
+        const parentsOwnChanges = ownSystemChanges(compiled, (name) => parent.isOwnParticipant(name));
+        compiled.messages.forEach((message, index) => {
+          const participant = parent.isOwnParticipant(message.participant) ? options.name : message.participant;
+          if (parentsOwnChanges.has(index)) {
+            created.contextManager.addMessage(participant, message.content, systemChangeMetadata(options.name) as never);
+          } else created.contextManager.addMessage(participant, message.content);
+        });
         created.agent.markContextConsumed();
       }
       await this.framePendingRound(parent, created.contextManager, options, shared);
@@ -11233,7 +11331,12 @@ export class AgentFramework {
     const release: ManagerRelease = { released: false, calls: new Set() };
     let contextManager: ContextManager;
     try {
-      contextManager = await this.reopenAgentContext(record, config.strategy, this.ephemeralAuxiliaryMembraneFor(name, release));
+      contextManager = await this.reopenAgentContext(
+        { ...record, ...(fullConfig.selfParticipants !== undefined ? { selfParticipants: fullConfig.selfParticipants } : {}) },
+        config.strategy,
+        this.ephemeralAuxiliaryMembraneFor(name, release),
+        { toolDeclarations: fullConfig.toolDeclarations },
+      );
     } catch (error) {
       this.resumesPending.delete(name);
       throw error;
@@ -11246,6 +11349,7 @@ export class AgentFramework {
         throw new Error(`resumeAgent: "${name}" was registered while it was being resumed`);
       }
       agent = new Agent(fullConfig, contextManager, this.membrane);
+      this.attachHeads(agent, memoryHeadDeclarations());
       this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     } catch (error) {
@@ -11297,6 +11401,7 @@ export class AgentFramework {
         strategy: new PassthroughStrategy(),
         membrane: this.membrane,
         solve: 'fresh',
+        viewFilter: this.storeViews.get(source)?.keeps ?? KEEP_EVERY,
         ...(options.atSequence !== undefined ? { atSequence: options.atSequence } : {}),
       });
     }
@@ -11308,33 +11413,31 @@ export class AgentFramework {
     return this.reopenAgentContext(record, new PassthroughStrategy());
   }
 
-  /** Open the context an ended agent left, wherever it lives. */
-  private async reopenAgentContext(record: AgentRecord, strategy?: ContextStrategy, membrane: Membrane = this.membrane): Promise<ContextManager> {
-    // The residents' view as createAgent gives it: held rows out, and another
-    // agent's stored context injections out, since those are that agent's
-    // context, not conversation (Weft's ninth-round probe: an ended reader
-    // reopened for inspection showed a co-resident's injection it never saw live).
-    const residentSees = (name: string) => (metadata: unknown): boolean =>
-      RESIDENT_VIEW_FILTER({ metadata } as StoredMessage) && !isAnotherAgentsInjection(metadata, name);
-    // A context derived from a reader of the shared slot sees, as it did live
-    // (deriveSharedContext, #291), what its source saw and its own stored
-    // injections; its source's view is composed the same way, up the shared
-    // sources the registry names, to the reader the first was derived from.
-    const derivedSees = (from: AgentRecord, walked = new Set<string>()): ((metadata: unknown) => boolean) => {
+  /** Open the context an ended agent left, wherever it lives: as it's stored, or with `compiling`, as that agent compiles it. */
+  private async reopenAgentContext(
+    record: AgentRecord,
+    strategy?: ContextStrategy,
+    membrane: Membrane = this.membrane,
+    compiling?: { toolDeclarations: AgentConfig['toolDeclarations'] },
+  ): Promise<ContextManager> {
+    const viewOf = (from: AgentRecord, walked = new Set<string>()): StoreView | undefined => {
       const source = from.inherit?.mode === 'shared' ? from.inherit.from : undefined;
-      if (source === undefined || walked.has(from.name)) return residentSees(from.name);
-      walked.add(from.name);
-      const sourceRecord = this.registry.inspect(source);
-      const sourceSees = sourceRecord ? derivedSees(sourceRecord, walked) : residentSees(source);
-      return (metadata) => sourceSees(metadata) || isOwnInjection(metadata, from.name);
+      if (source !== undefined && !walked.has(from.name)) {
+        walked.add(from.name);
+        const sourceRecord = this.registry.inspect(source);
+        const sourceView = sourceRecord ? viewOf(sourceRecord, walked) : residentView(source, ownParticipantsOf(source));
+        return sourceView && derivedView(sourceView, from.name, ownParticipantsOf(from.name, from.selfParticipants));
+      }
+      const observed = from.relationships.observes.find((edge) => edge.agent === undefined && edge.slot === undefined);
+      const isOwn = ownParticipantsOf(from.name, from.selfParticipants);
+      if (observed) return observerView(from.name, observed.includeHeld === true, isOwn);
+      return from.readsSharedSlot === true ? residentView(from.name, isOwn) : undefined;
     };
-    // The predicate is the manager's view filter, and is recorded beside it,
-    // so main's checks of whether an agent sees a row (agentSees) ask what its
-    // view holds when the reopened context is live.
-    const seen = (contextManager: ContextManager, sees: (metadata: unknown) => boolean): ContextManager => {
-      this.storeSees.set(contextManager, sees);
+    const seen = (contextManager: ContextManager, view: StoreView): ContextManager => {
+      this.storeViews.set(contextManager, view);
       return contextManager;
     };
+    const filterOf = (view: StoreView | undefined) => compiling ? compiledView(view?.keeps, compiling.toolDeclarations) : view?.keeps;
     if (record.inherit?.mode === 'shared') {
       const derivation = record.inherit.derivation as ContextDerivationRecord | undefined;
       const reopen = (ContextManager as unknown as { reopenDerived?: ReopenDerived }).reopenDerived;
@@ -11344,17 +11447,17 @@ export class AgentFramework {
             '@animalabs/context-manager cannot reopen (ContextManager.reopenDerived)',
         );
       }
-      // A context derived from a reader of the shared slot keeps the view it had.
-      const sees = derivation.slots?.messageNamespace === null ? derivedSees(record) : undefined;
+      const view = viewOf(record);
+      const viewFilter = filterOf(view);
       const reopened = await reopen.call(ContextManager, {
         store: this.store,
         derivation,
         strategy: strategy ?? new PassthroughStrategy(),
         membrane,
-        ...(sees ? { viewFilter: (message: StoredMessage) => sees(message.metadata) } : {}),
+        ...(viewFilter ? { viewFilter } : {}),
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
-      return sees ? seen(reopened, sees) : reopened;
+      return view ? seen(reopened, view) : reopened;
     }
     if (!record.namespace) {
       throw new Error(`Agent "${record.name}": its record names no context to reopen`);
@@ -11363,16 +11466,18 @@ export class AgentFramework {
     // configuration, say) is reopened as createAgent opened it: on the
     // shared slot, through the residents' view. Isolated, its namespace
     // holds none of what it read (nissa's #546 review, round 2).
-    const sees = record.readsSharedSlot === true ? residentSees(record.name) : undefined;
+    const view = record.readsSharedSlot === true ? viewOf(record) : undefined;
+    const viewFilter = filterOf(view);
     const opened = await ContextManager.open({
       store: this.store,
       namespace: record.namespace,
-      ...(sees ? { viewFilter: (message: StoredMessage) => sees(message.metadata) } : { isolate: true }),
+      ...(view ? {} : { isolate: true }),
+      ...(viewFilter ? { viewFilter } : {}),
       strategy: strategy ?? new PassthroughStrategy(),
       membrane,
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
-    return sees ? seen(opened, sees) : opened;
+    return view ? seen(opened, view) : opened;
   }
 
   /** Open a derived agent's context on a branch of its own (see deriveAgent). */
@@ -11410,16 +11515,14 @@ export class AgentFramework {
     // the fork's own injections were hidden from its compile while its
     // parent's showed (#291; Weft's eleventh note, on the real compile path).
     // The composed predicate goes to derive, so the first compile already
-    // reads through it, and is recorded beside the manager (storeSees), so
+    // reads through it, and is recorded beside the manager (storeViews), so
     // main's checks of whether an agent sees a row (agentSees: a tool
     // boundary's injection, an arrival, a reader of an unread message) ask
     // what its compile shows. A source with no view recorded has no filter
     // (an isolated run's): it sees every row, so its fork keeps none, and
     // sees its own.
-    const sourceSees = this.storeSees.get(source);
-    const sees = sourceSees
-      ? (metadata: unknown): boolean => sourceSees(metadata) || isOwnInjection(metadata, config.name)
-      : undefined;
+    const sourceView = this.storeViews.get(source);
+    const view = sourceView && derivedView(sourceView, config.name, ownParticipantsOf(config.name, config.selfParticipants));
     const contextManager = await source.derive({
       branch: ownBranch,
       strategy: config.strategy ?? new PassthroughStrategy(),
@@ -11429,10 +11532,10 @@ export class AgentFramework {
       solve: inherit.solve ?? 'reuse',
       inherit: { refusals: inherit.refusals === true },
       ...(inherit.atSequence !== undefined ? { atSequence: inherit.atSequence } : {}),
-      ...(sees ? { viewFilter: (message: StoredMessage) => sees(message.metadata) } : {}),
+      viewFilter: compiledView(view?.keeps, config.toolDeclarations),
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
-    if (sees) this.storeSees.set(contextManager, sees);
+    if (view) this.storeViews.set(contextManager, view);
     const derivation = (contextManager as ContextManager & Partial<DerivingContextManager>).getDerivation?.();
     return {
       contextManager,
@@ -11994,6 +12097,7 @@ export class AgentFramework {
     this.releaseManager(agent);
     this.toolImageLedgers.delete(name);
     this.evictTurnCheckpoints(name);
+    this.headDeclarationCache?.heads.delete(name);
     this.activeTurnTokens.delete(name);
     this.activeTurnTriggers.delete(name);
     this.logicalTurnToolCalls.delete(agent);
@@ -13447,7 +13551,7 @@ export class AgentFramework {
     let idx = -1;
     for (let i = all.length - 1; i >= 0; i--) {
       const meta = (all[i].metadata ?? {}) as { system?: unknown };
-      if (meta.system) continue;
+      if (meta.system || isSystemChangeMessage(all[i] as { content: readonly ContentBlock[] })) continue;
       const { from: start } = bodyRangeIn(all, i);
       const body = all.slice(start, i + 1);
       if (!body.every((m) => !Array.isArray(m.content) || asNextRequestCarries(m.content) === null)
@@ -14099,14 +14203,16 @@ export class AgentFramework {
       }
       const n = Math.max(1, Math.min(50, Math.floor(params.messages)));
       const cm = agent.getContextManager();
-      const total = cm.getMessageCount();
-      if (n >= total) {
+      const targetIndex = indexBeforeLastMessages(cm, n);
+      if (targetIndex < 0) {
         return {
           ok: false,
-          error: `Cannot remove ${n} message(s) — history has ${total}; at least one must remain.`,
+          error: `Cannot remove ${n} message(s) — history has ${-targetIndex - 1}; at least one must remain.`,
         };
       }
-      const target = cm.getMessageWindow(total - 1 - n, 1, { resolveBlobs: false }).messages[0];
+      const target = cm.getMessageWindow(targetIndex, 1, { resolveBlobs: false }).messages[0];
+      const after = cm.getMessageCount() - targetIndex - 1;
+      const changesAmong = cm.getMessageWindow(targetIndex + 1, after, { resolveBlobs: false }).messages.filter(isSystemChangeMessage).length;
       try {
         const r = await this.rollbackToMessage(agentName, {
           messageId: String(target.id),
@@ -14120,7 +14226,7 @@ export class AgentFramework {
         });
         return {
           ok: true,
-          messagesRemoved: r.messagesRemoved,
+          messagesRemoved: r.messagesRemoved - changesAmong,
           removedRefs: r.removedRefs,
           markers: r.markers,
           lastVisible: r.lastVisible,
@@ -14176,8 +14282,8 @@ export class AgentFramework {
   ): Promise<{ participant?: string; role?: string; preview?: string } | null> {
     try {
       const preview = await this.previewActivation(agentName);
-      const messages = (preview as { messages?: unknown[] }).messages ?? [];
-      const last = messages[messages.length - 1] as
+      const messages = ((preview as { messages?: unknown[] }).messages ?? []) as { content: ContentBlock[] }[];
+      const last = lastConversational(messages) as
         | { role?: string; participant?: string; content?: unknown }
         | undefined;
       if (!last) return null;
@@ -15942,15 +16048,111 @@ export class AgentFramework {
     }
   }
 
+  // chronicle's state is the branch's: after a switch (undo, redo, a rollback,
+  // a fork) a read gives the other branch's.
+  private headDeclarationCache: { branch: string; heads: Map<string, HeadDeclaration | null> } | null = null;
+  // chronicle: a branch made from another carries only registered states, and
+  // each registration costs a lookup at every branch made.
+  private readonly registeredHeadStates = new Set<string>();
+  private readonly headDeclarationsUnreadable = new Map<string, string>();
+
+  private readonly headDeclarations: HeadDeclarationStore = {
+    read: (agentName) => this.readHeadDeclaration(agentName) ?? null,
+    write: (agentName, head) => this.storeHeadDeclaration(agentName, head),
+    delete: (agentName) => this.readHeadDeclaration(agentName) === null || this.storeHeadDeclaration(agentName, null),
+  };
+
+  private headStateId(agentName: string): string {
+    const id = headDeclarationId(agentName);
+    if (!this.registeredHeadStates.has(id)) {
+      ensureStateRegistered(this.store, { id, strategy: 'snapshot' });
+      this.registeredHeadStates.add(id);
+    }
+    return id;
+  }
+
+  private headsOnBranch(): Map<string, HeadDeclaration | null> {
+    const branch = this.store.currentBranch().id;
+    if (this.headDeclarationCache?.branch !== branch) this.headDeclarationCache = { branch, heads: new Map() };
+    return this.headDeclarationCache.heads;
+  }
+
+  private readHeadDeclaration(agentName: string): HeadDeclaration | null | undefined {
+    const heads = this.headsOnBranch();
+    if (heads.has(agentName)) return heads.get(agentName);
+    const branch = this.headDeclarationCache!.branch;
+    try {
+      const stored = this.store.getStateJson(headDeclarationId(agentName));
+      const head = isHeadDeclaration(stored) ? stored : null;
+      if (stored != null && head === null) console.error(`[head-declarations] ${agentName}: the recorded head isn't one, so it was set aside`);
+      heads.set(agentName, head);
+      this.headDeclarationsUnreadable.delete(agentName);
+      return head;
+    } catch (error) {
+      if (this.headDeclarationsUnreadable.get(agentName) !== branch) console.error(`[head-declarations] ${agentName}: the recorded head could not be read:`, error);
+      this.headDeclarationsUnreadable.set(agentName, branch);
+      return undefined;
+    }
+  }
+
+  private storeHeadDeclaration(agentName: string, head: HeadDeclaration | null): boolean {
+    const recorded = this.readHeadDeclaration(agentName);
+    if (recorded !== undefined && JSON.stringify(recorded) === JSON.stringify(head)) return true;
+    try {
+      this.store.setStateJson(this.headStateId(agentName), head);
+    } catch (error) {
+      console.error(`[head-declarations] ${agentName}: the recorded head could not be stored:`, error);
+      return false;
+    }
+    this.headsOnBranch().set(agentName, head);
+    return true;
+  }
+
+  private thinkingSetAside(agent: Agent, said: string): string {
+    if (!agent.mayBindThinking) return '';
+    return agent.thinkingBindingOption() ? `, ${said}` : `, ${said} if its model binds it`;
+  }
+
+  private keepToHeadAfterRefusal(agent: Agent, error: Error, carriedChange: boolean): boolean {
+    if (!agent.declaresEntries() || !carriedChange) return false;
+    const recognised = isMembraneError(error) && error.systemChangeRefused === true;
+    const refused = isMembraneError(error) && error.httpStatus === 400 && error.type !== 'context_length' && error.type !== 'auth';
+    if (!recognised && !refused) return false;
+    agent.keepToHeadUntilBuiltAgain();
+    console.error(`[head-declarations] ${agent.name}: a request carrying a system change was refused, so it declares on its head until it's built again: ${error.message}`);
+    if (!recognised) {
+      this.opsAlert('head-resend', agent.name,
+        `a 400 membrane doesn't recognise as a refused system change ended a request that carried one, so it goes again on the agent's head${this.thinkingSetAside(agent, 'which sets aside the thinking the request held')}. The 400 may not be about the change. The agent keeps to its head until it's built again, so until then each change to its tools or system text rewrites its cache: ${error.message}`,
+        { data: { httpStatus: 400 } });
+    }
+    this.emitTrace({ type: 'head:resend', agentName: agent.name, error: error.message });
+    return true;
+  }
+
+  private readonly headStores = new WeakMap<Agent, HeadDeclarationStore>();
+
+  private attachHeads(agent: Agent, store: HeadDeclarationStore = this.headDeclarations): void {
+    this.headStores.set(agent, store);
+    agent.attachHeadDeclarations(store, (event: HeadEvent) => {
+      this.emitTrace({ ...event, agentName: agent.name });
+      if (event.type === 'head:moved' && event.forced) {
+        const why = event.forced === 'budget'
+          ? `a compile was refused over budget with ${event.changesRemoved} system changes kept, so the head took them and the compile ran again`
+          : `the system changes reached ${event.changeTokens} tokens, a fifth of the last response's ${event.inputTokens}, and no compile had taken them into the head at no further cost, so the head took them`;
+        this.opsAlert('head-consolidated', agent.name,
+          `${why}: one whole write${this.thinkingSetAside(agent, 'and the thinking the request held set aside')}`,
+          { data: { forced: event.forced, changesRemoved: event.changesRemoved, ...(event.forced === 'share' ? { changeTokens: event.changeTokens, inputTokens: event.inputTokens } : {}) } });
+      }
+    });
+  }
+
   private async createAgent(config: AgentConfig): Promise<Agent> {
     // The residents' view (RESIDENT_VIEW_FILTER: held rows out, read by
     // heldFromResidents) composed with this agent's own: another agent's
     // stored context injections out. Main's boundary and arrival checks read
-    // the same predicate (storeSees, agentSees), so they and the compiled
+    // the same predicate (storeViews, agentSees), so they and the compiled
     // view agree.
-    const sees = (metadata: unknown): boolean =>
-      !heldFromResidents(metadata as Record<string, unknown> | undefined)
-      && !isAnotherAgentsInjection(metadata, config.name);
+    const view = residentView(config.name, ownParticipantsOf(config.name, config.selfParticipants));
     // Create context manager for this agent
     const contextManager = await ContextManager.open({
       store: this.store,
@@ -15972,18 +16174,24 @@ export class AgentFramework {
       // that agent's context, not conversation: they stay out of this view,
       // and so out of its folds, as the residents share this slot. The
       // resident filter keeps held (tuned-out) rows out as before (`sees`).
-      viewFilter: (message) => sees(message.metadata),
+      viewFilter: compiledView(view.keeps, config.toolDeclarations),
     });
     this.trackManager(contextManager);
-    this.storeSees.set(contextManager, sees);
+    this.storeViews.set(contextManager, view);
 
     const agent = new Agent(config, contextManager, this.membrane);
+    this.attachHeads(agent);
     this.adoptToolResultGuard(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     this.sharedSlotAgents.add(agent);
     // The first resident declared owns default delivery.
     this.announceAgentCreated(
-      this.registry.register({ ...residentSpec(config.name, { primary: !this.primaryAgentName }), model: config.model }),
+      this.registry.register({
+        ...residentSpec(config.name, { primary: !this.primaryAgentName }),
+        model: config.model,
+        ...(config.selfParticipants?.length ? { selfParticipants: config.selfParticipants } : {}),
+        ...(config.presentAs && config.presentAs !== config.name ? { presentAs: config.presentAs } : {}),
+      }),
     );
     let restoredSettings: AgentRuntimeSettingsOverrides | null;
     try {
@@ -16047,24 +16255,26 @@ export class AgentFramework {
       // oversized tool results / attachments under the same policy.
       maxMessageTokens: primaryConfig.strategy?.maxMessageTokens,
     });
-    const sees = (metadata: unknown): boolean => !isAnotherAgentsInjection(metadata, name);
+    const view = observerView(name, true, ownParticipantsOf(name));
     const contextManager = await ContextManager.open({
       store: this.store,
       namespace: `subconscious/${primaryName}`,
       isolate: true,
       // The residents' shared un-namespaced slot, merged read-only, with the
       // tune-out's stamped messages included. The filter, which context-
-      // manager applies to the merged view too, leaves out only the
-      // residents' stored context injections (stored-injections.ts): their
-      // context, which this agent never saw while they were placed unstored.
+      // manager applies to the merged view too, leaves out every system change
+      // not its own, a host's included, since those in the residents' slot
+      // declare the residents' tools, not its own; and the residents' stored
+      // context injections (stored-injections.ts), their context, which this
+      // agent never saw while they were placed unstored.
       auxiliaryMessageViews: [{}],
-      viewFilter: (message) => sees(message.metadata),
+      viewFilter: view.keeps,
       strategy,
       membrane: this.membrane,
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
     this.trackManager(contextManager);
-    this.storeSees.set(contextManager, sees);
+    this.storeViews.set(contextManager, view);
 
     // Inherit the principal's inference settings wholesale (fork-template
     // idiom): reasoning effort (thinking), provider params, token ceilings,
@@ -16075,6 +16285,8 @@ export class AgentFramework {
     // subconscious's config sets its own.
     const model = cfg.model ?? primaryConfig.model;
     const inherited: AgentConfig = { ...primaryConfig };
+    delete inherited.selfParticipants;
+    delete inherited.presentAs;
     if (model !== primaryConfig.model) {
       for (const field of SUBCONSCIOUS_MODEL_FIELDS) delete inherited[field];
     }
@@ -16096,6 +16308,7 @@ export class AgentFramework {
       clock: undefined,
     };
     const agent = new Agent(agentConfig, contextManager, this.membrane);
+    this.attachHeads(agent);
     this.adoptToolResultGuard(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     this.sharedSlotAgents.add(agent); // reads the shared slot through its merged view
@@ -16189,6 +16402,7 @@ export class AgentFramework {
             model: cfg.model,
             proseRouting: 'disabled',
             ...readerModelFields(cfg),
+            ...(cfg.model != null && cfg.model !== this.agents.get(primary)!.model ? { toolDeclarations: 'head' as const } : {}),
           },
           inheritRefusals: true,
           onParentEnd: 'end',
@@ -16588,7 +16802,8 @@ export class AgentFramework {
           // context injection, is drained and stored like any other, but not
           // injected: the next compile leaves it out as well, so the window's
           // compiled prefix and the live request still match without it
-          // (#232 gap 5).
+          // (#232 gap 5). So is a system change for an agent on its head,
+          // whose requests leave every change out.
           //
           // A stream that declares it can't carry injected messages
           // (supportsInjectedMessages false: membrane's XML prefill path,
@@ -16622,17 +16837,17 @@ export class AgentFramework {
               agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
             for (const [msg, { id, content }] of stored) {
               this.releaseLandedMail(msg.metadata, agent.name);
-              this.noteSpokenTo(agent.name, msg.metadata);
+              this.noteSpokenTo(agent.name, msg);
               // Every other resident reads what this boundary stores; for its
               // own agent, the boundary weighs what it injects below.
-              this.noteForOtherResidents(agent, msg.metadata, id);
+              this.noteForOtherResidents(agent, msg, id);
               // A message the agent's own view leaves out is stored and not
               // injected: a held message (the reader has it; admission's
               // predicate, heldFromResidents, is in every resident's view
               // filter) or another agent's stored context injection. Injecting
               // it here would put in the live turn what the next compile
               // hides (#232 gap 5; main's #853 reads the view itself).
-              if (!this.agentSees(agent, msg.metadata)) continue;
+              if (!this.agentKeeps(agent, msg) || (isSystemChangeMessage(msg) && !agent.declaresEntries())) continue;
               heard.push({ msg, id, content });
             }
             // Rendered in one call: a render prepares as a compile does, so
@@ -16696,21 +16911,21 @@ export class AgentFramework {
           // clear the send suppression: nothing new was said to the agent.
           // An edit the coalescer marks as the agent's first view is the
           // message it replaced, so it does (isConversationalInjection).
-          if (midTurnInjections.some((inj) => isConversationalInjection(inj.metadata))) {
+          if (midTurnInjections.some((inj) => isConversationalRow(inj))) {
             this.midTurnInputSignals.add(agent.name);
           }
 
-          // A live stream handed these messages after the results follows
-          // them in its next round, not the tool loop of a reply to
-          // [Continue]: that round's rows carry no prompt. One that doesn't
-          // say whether it carries them (membrane 0.5.x, whose native path
-          // carries them and whose XML path drops them) counts as carrying
-          // them here, as at the drain above. A boundary that ends the turn,
-          // restarts the stream or falls back to a new start below hands
-          // them to no live stream, and a new start reads its own prompt from
-          // what it sends. (The routing notice below rides only an injection
-          // already here.)
-          if (midTurnInjections.length > 0) {
+          // A live stream handed these messages, system changes aside, after
+          // the results follows them in its next round, not the tool loop of
+          // a reply to [Continue]: that round's rows carry no prompt. One
+          // that doesn't say whether it carries them (membrane 0.5.x, whose
+          // native path carries them and whose XML path drops them) counts as
+          // carrying them here, as at the drain above. A boundary that ends
+          // the turn, restarts the stream or falls back to a new start below
+          // hands them to no live stream, and a new start reads its own prompt
+          // from what it sends. (The routing notice below rides only an
+          // injection already here.)
+          if (midTurnInjections.some((inj) => !isSystemChangeMessage(inj))) {
             const turnTrigger = this.activeTurnTriggers.get(agent.name);
             if (turnTrigger) this.turnPrompts.delete(turnTrigger);
           }
@@ -16773,7 +16988,7 @@ export class AgentFramework {
             const routing = this.routingOf(agent.name);
             for (const inj of [...midTurnInjections]) {
               const m = inj.metadata as Record<string, unknown> | undefined;
-              if (!isConversationalInjection(inj.metadata)) continue;
+              if (!isConversationalRow(inj)) continue;
               if (typeof m?.channelId !== 'string') continue;
               if (!isAddressedMessage(m.tags as string[] | undefined)) continue;
               // Its channel as a re-pin reads it (repinChannel): on the
@@ -16837,7 +17052,7 @@ export class AgentFramework {
             // The last injection that qualifies wins (repinChannel).
             const routing = this.routingOf(agent.name);
             let newLocus: ChannelRef | undefined;
-            for (const inj of midTurnInjections) newLocus = this.repinChannel(inj.metadata, routing) ?? newLocus;
+            for (const inj of midTurnInjections) newLocus = this.repinChannel(inj, routing) ?? newLocus;
             if (newLocus) {
               // What this boundary just stored is newer than any arrival the
               // turn holds, so the arrivals can't move the locus back.
@@ -16850,7 +17065,7 @@ export class AgentFramework {
             // stream to tell) leaves what it stored for the agent to the
             // turn's next start, as arrivals: a budget restart, or a
             // re-inference on these tool results.
-            for (const { msg, id } of heard) this.noteArrival(agent.name, msg.metadata, id);
+            for (const { msg, id } of heard) this.noteArrival(agent.name, msg, id);
           }
 
           // A boundary that ends the stream (a result that ends the turn, a restart, a stopping framework) has
@@ -16967,6 +17182,7 @@ export class AgentFramework {
               const injected = currentState.supportsInjectedMessages === true ? midTurnInjections.map((injection) => injection.id) : [];
               for (const id of [replyId, resultsId, ...injected]) if (id !== undefined) carried.add(id);
             }
+            if (midTurnInjections.some(isSystemChangeMessage)) this.streamsHandedChange.add(currentState.stream);
             currentState.stream.provideToolResults(
               submitted,
               midTurnInjections.length > 0 ? { injectedMessages } : undefined,
@@ -17701,6 +17917,7 @@ export class AgentFramework {
     if (this.usedEphemeralAgentNames.has(name) || this.agents.has(name)) {
       throw new Error(`Conversation agent name "${name}" is already registered or reserved`);
     }
+    const templateHead = this.headDeclarations.read(template.name);
     this.usedEphemeralAgentNames.set(name, 'conversation');
     this.conversationSpawnsInFlight.add(name);
     const release: ManagerRelease = { released: false, calls: new Set() };
@@ -17710,6 +17927,7 @@ export class AgentFramework {
         store: this.store,
         namespace: `conversations/${name}`,
         isolate: true,
+        viewFilter: compiledView(undefined, templateConfig.toolDeclarations),
         // Strategy instances are stateful — never share the template's.
         strategy: router.strategyFactory?.() ?? new PassthroughStrategy(),
         // Provider cooldown ownership belongs to the persistent resident only;
@@ -17778,8 +17996,10 @@ export class AgentFramework {
         // The copy is the fork's own, and the template's annotation edits only
         // the template's message: seed only once each of the template's
         // annotations has finished.
-        const { messages: compiledWhole, provenance } = await template.toolResultGuard.afterAnnotations(
+        const templateCompile = await template.toolResultGuard.afterAnnotations(
           () => template.getContextManager().compile(undefined, undefined, { dryRun: true }));
+        const { messages: compiledWhole, provenance } = templateCompile;
+        const templatesOwnChanges = new Set([...ownSystemChanges(templateCompile, (name) => template.isOwnParticipant(name))].flatMap((i) => compiledWhole[i]!.content));
         const templateRows = template.getContextManager().getAllMessages();
         // The template's stored context injections (stored-injections.ts) are
         // its context, not the conversation, so the seed leaves them out, as
@@ -17798,12 +18018,16 @@ export class AgentFramework {
         logSeedOmissions(name, template.name, compiledWhole.length - compiled.length, compiled, withoutReasoning, withoutNotices, seed);
         for (const msg of seed) {
           const participant = msg.participant === template.name ? name : msg.participant;
-          contextManager.addMessage(participant, msg.content);
+          if (isSystemChangeMessage(msg) && msg.content.every((block) => templatesOwnChanges.has(block))) {
+            contextManager.addMessage(participant, msg.content, systemChangeMetadata(name) as never);
+          } else contextManager.addMessage(participant, msg.content);
         }
+        if (templateHead) this.headDeclarations.write(name, templateHead);
       }
 
       const config: AgentConfig = { ...templateConfig, name, strategy: undefined };
       const agent = new Agent(config, contextManager, this.membrane);
+      this.attachHeads(agent);
       this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
       this.announceAgentCreated(this.registry.register({
@@ -21321,7 +21545,7 @@ export class AgentFramework {
   /**
    * The channel a message moves its turn's locus to, by the addressed
    * re-pin rule (2026-07-31, n=6 and n=7): a conversational message (by
-   * isConversationalInjection: not a system marker, nor a reaction, reaction
+   * isConversationalRow: not a system change or a system marker, nor a reaction, reaction
    * removal, edit or deletion marker, apart from an edit the coalescer marks
    * as the agent's first view) that addressed the agent, or that follows up
    * in a channel the turn sent into (TurnRouting.engaged). Undefined for any
@@ -21332,9 +21556,9 @@ export class AgentFramework {
    * agent is told it was addressed from elsewhere and the locus stays
    * (addressedElsewhereNotice).
    */
-  private repinChannel(metadata: MessageMetadata | undefined, routing: TurnRouting): ChannelRef | undefined {
-    if (!isConversationalInjection(metadata)) return undefined;
-    const m = metadata as Record<string, unknown> | undefined;
+  private repinChannel(row: ViewedRow, routing: TurnRouting): ChannelRef | undefined {
+    if (!isConversationalRow(row)) return undefined;
+    const m = row.metadata as Record<string, unknown> | undefined;
     if (typeof m?.channelId !== 'string') return undefined;
     // The message's own server, which every channel message's metadata
     // carries; one without it names its channel only if no other server
@@ -21551,9 +21775,6 @@ export class AgentFramework {
     return this.quiesced || this.sharedSlotBusy(agent);
   }
 
-  /** Rows isNewestIn reads back past clock rows and stored injections. */
-  private static readonly NEWEST_SCAN_ROWS = 32;
-
   /** Rows a window's last-clock scan reads at a time. */
   private static readonly CLOCK_SCAN_ROWS = 256;
 
@@ -21581,8 +21802,13 @@ export class AgentFramework {
   }
 
   private agentSees(agent: Agent, metadata: unknown): boolean {
-    const sees = this.storeSees.get(agent.getContextManager());
-    return !sees || sees(metadata);
+    const view = this.storeViews.get(agent.getContextManager());
+    return !view || view.sees(metadata);
+  }
+
+  private agentKeeps(agent: Agent, row: ViewedRow): boolean {
+    const view = this.storeViews.get(agent.getContextManager());
+    return !view || view.keeps(row);
   }
 
   /**
@@ -21594,15 +21820,15 @@ export class AgentFramework {
    * reads) or another agent's stored context injection, never enters its
    * compiled view, so the agent won't see it, and it moves nothing.
    */
-  private noteArrival(agentName: string, metadata: MessageMetadata | undefined, messageId: MessageId): void {
+  private noteArrival(agentName: string, row: ViewedRow, messageId: MessageId): void {
     const open = this.openLogical.get(agentName);
     if (!open) return;
     const agent = this.agents.get(agentName);
-    if (agent && !this.agentSees(agent, metadata)) return;
-    if (isConversationalInjection(metadata)) (open.heard ??= new Map()).set(messageId, ++lastHeardAt);
-    const channel = this.repinChannel(metadata, open);
+    if (agent && !this.agentSees(agent, row.metadata)) return;
+    if (isConversationalRow(row)) (open.heard ??= new Map()).set(messageId, ++lastHeardAt);
+    const channel = this.repinChannel(row, open);
     if (!channel) return;
-    const tags = (metadata as Record<string, unknown> | undefined)?.tags as string[] | undefined;
+    const tags = (row.metadata as Record<string, unknown> | undefined)?.tags as string[] | undefined;
     open.arrivals.push({ messageId, channel, addressed: isAddressedMessage(tags) });
   }
 
@@ -21622,13 +21848,13 @@ export class AgentFramework {
    * message slot, and a tool boundary weighs only the messages drained for
    * its own agent, so no boundary of another resident's turn weighs it.
    */
-  private noteForOtherResidents(agent: Agent, metadata: MessageMetadata | undefined, messageId: MessageId): void {
+  private noteForOtherResidents(agent: Agent, row: ViewedRow, messageId: MessageId): void {
     if (!this.isOrdinaryResident(agent)) return;
     for (const name of this.registry.sharedSlotReaders()) {
       const reader = this.agents.get(name);
       if (reader && reader !== agent && this.isOrdinaryResident(reader)) {
-        this.noteSpokenTo(reader.name, metadata);
-        this.noteArrival(reader.name, metadata, messageId);
+        this.noteSpokenTo(reader.name, row);
+        this.noteArrival(reader.name, row, messageId);
       }
     }
   }
@@ -26294,14 +26520,16 @@ export class AgentFramework {
             const retry = retryOf(trigger);
             const asTransient = this.takeAsTransient(agent.name, err, trigger);
 
+            const onHead = this.keepToHeadAfterRefusal(agent, err,
+              compiledRequest?.messages.some(isSystemChangeMessage) === true || this.streamsHandedChange.has(stream));
             // A hold takes the turn's retry, or, once stop() has closed
             // admission, the turn ends here (endFailureAtStop).
-            if (ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
+            if (!onHead && ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
               this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting);
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               break;
             }
-            const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, retry);
+            const statedWait = onHead || ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, retry);
             if (statedWait === 'held') {
               this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting);
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
@@ -26309,8 +26537,9 @@ export class AgentFramework {
             }
 
             const cuts = isDeadlineExpiry(err) ? this.deadlineCuts.get(agent.name) ?? 0 : undefined;
-            const action: ErrorAction = statedWait === 'fail' || (isRearmed(trigger) && (!gotPartway(streamRouting) || (isDeadlineExpiry(err) && !asTransient)))
-              ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, cuts ?? attempt);
+            const action: ErrorAction = onHead ? { retry: true, delayMs: 0 }
+              : statedWait === 'fail' || (isRearmed(trigger) && (!gotPartway(streamRouting) || (isDeadlineExpiry(err) && !asTransient)))
+                ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, cuts ?? attempt);
             if (action.retry && cuts !== undefined) this.deadlineCuts.set(agent.name, cuts + 1);
             else this.deadlineCuts.delete(agent.name);
             if (!action.retry && cuts !== undefined && cuts > 0) this.freshCallsCut.add(agent.name);
@@ -26541,6 +26770,7 @@ export class AgentFramework {
               : agent.maxTokens;
             if (realTotal > 0) {
               agent.lastStreamRealInputTokens = realTotal;
+              agent.noteResponseInput(realTotal);
               agent.lastStreamOutputTokens = callOutputTokens;
               agent.lastStreamUnreportedTokens = 0;
             } else {
@@ -29752,7 +29982,7 @@ export class AgentFramework {
     );
     if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.messageId = stored; }
     this.releaseLandedMail(metadata, agent.name);
-    this.noteStored(agent, metadata, stored, opts?.bypassDeferralFor);
+    this.noteStored(agent, { content, metadata }, stored, opts?.bypassDeferralFor);
     return stored;
   }
 
@@ -29859,18 +30089,23 @@ export class AgentFramework {
   }
 
   /** Whether `entry`'s own stored entry is the newest in `agent`'s window,
-   *  clock rows, stored context injections and rows the agent's own view
-   *  leaves out after it aside: a channel message by its server, channel and
-   *  message id, a push event by its server and event id, and never one the
-   *  agent's view leaves out, such as one a tune-out holds. Past
-   *  NEWEST_SCAN_ROWS such rows, it answers no. */
+   *  clock rows, stored context injections, system changes and rows the
+   *  agent's own view leaves out after it aside: a channel message by its
+   *  server, channel and message id, a push event by its server and event id,
+   *  and never one the agent's view leaves out, such as one a tune-out holds. */
   private isNewestIn(agent: Agent, entry: GateEntryRef): boolean {
-    // A clock row the framework wrote after it (a turn start's, an event's),
-    // or a stored context injection (any agent's, a start's), isn't a
-    // message a reply could be meant for, so it doesn't count.
-    const newest = agent.getContextManager().queryMessages({ limit: AgentFramework.NEWEST_SCAN_ROWS, reverse: true }).messages
-      .find((m) => (m.metadata as { kind?: unknown } | undefined)?.kind !== CLOCK_ROW_KIND && !storedInjectionMarkOf(m.metadata)
-        && this.agentSees(agent, m.metadata));
+    // A clock row the framework wrote after it (a turn start's, an event's), a
+    // stored context injection (any agent's, a start's), a system change (any
+    // agent's, or a host's) or a row the agent's own view leaves out isn't a
+    // message a reply could be meant for, so it doesn't count, however many
+    // follow it.
+    let newest: { metadata?: unknown } | undefined;
+    scanFromTail(agent.getContextManager(), (row) => {
+      if ((row.metadata as { kind?: unknown } | undefined)?.kind === CLOCK_ROW_KIND || storedInjectionMarkOf(row.metadata)
+        || isSystemChangeMessage(row) || !this.agentSees(agent, row.metadata)) return false;
+      newest = row;
+      return true;
+    });
     const md = newest?.metadata as Record<string, unknown> | undefined;
     if (!md || entry.serverId === undefined || md.serverId !== entry.serverId) return false;
     if (entry.eventType === 'mcpl:channel-incoming') {
@@ -29892,9 +30127,9 @@ export class AgentFramework {
         : this.agents.values().next().value;
   }
 
-  private noteSpokenTo(agentName: string, metadata: MessageMetadata | undefined): void {
+  private noteSpokenTo(agentName: string, row: ViewedRow): void {
     const agent = this.agents.get(agentName);
-    if ((agent && !this.agentSees(agent, metadata)) || isOwnScheduleWrite(metadata) || !isConversationalInjection(metadata)) return;
+    if ((agent && !this.agentSees(agent, row.metadata)) || isOwnScheduleWrite(row.metadata as MessageMetadata | undefined) || !isConversationalRow(row)) return;
     this.rearmDeadlineCuts?.delete(agentName);
     if (this.turnRearms?.delete(agentName)) console.error(`[inference-rearm] agent=${agentName} re-send count started again: a message was said to it`);
   }
@@ -29903,12 +30138,12 @@ export class AgentFramework {
    *  agent when none of its turns is alive or the message was assembled for
    *  the start now beginning (no tool boundary will weigh it), and one for
    *  every other resident's open turn. */
-  private noteStored(agent: Agent, metadata: MessageMetadata | undefined, stored: MessageId, bypassDeferralFor?: string): void {
-    this.noteSpokenTo(agent.name, metadata);
+  private noteStored(agent: Agent, row: ViewedRow, stored: MessageId, bypassDeferralFor?: string): void {
+    this.noteSpokenTo(agent.name, row);
     if (!this.activeTurnTokens.has(agent.name) || bypassDeferralFor === agent.name) {
-      this.noteArrival(agent.name, metadata, stored);
+      this.noteArrival(agent.name, row, stored);
     }
-    this.noteForOtherResidents(agent, metadata, stored);
+    this.noteForOtherResidents(agent, row, stored);
   }
 
   /**
@@ -30394,9 +30629,9 @@ export class AgentFramework {
       // Held mail whose message just landed is released (Dendrite).
       this.releaseLandedMail(msg.metadata, agent.name);
       this.emitTrace({ type: 'message:added', messageId: id, source: `deferred-flush:${occasion}` });
-      this.noteSpokenTo(agent.name, msg.metadata);
-      this.noteArrival(agent.name, msg.metadata, id);
-      this.noteForOtherResidents(agent, msg.metadata, id);
+      this.noteSpokenTo(agent.name, msg);
+      this.noteArrival(agent.name, msg, id);
+      this.noteForOtherResidents(agent, msg, id);
     }
     this.ackDeferredWrites();
     return this.queuedFor(agent.name);
@@ -30452,7 +30687,7 @@ export class AgentFramework {
         ...(bypassFor(msg) ? { bypassDeferralFor: bypassFor(msg) } : {}),
       }), (msg, id) => {
       const agent = this.deliveryAgent(msg.forAgent);
-      if (agent) this.noteStored(agent, msg.metadata, id, bypassFor(msg));
+      if (agent) this.noteStored(agent, msg, id, bypassFor(msg));
     });
     if (opts?.traceAs) {
       for (const { id } of written.values()) if (id) this.emitTrace({ type: 'message:added', messageId: id, source: opts.traceAs });
@@ -31102,7 +31337,7 @@ export class AgentFramework {
   private settleFound(msg: DeferredWrite, agent: Agent, stored: MessageId, landed: { count?: number; sharded: boolean; named?: true }): void {
     this.deferredMessages = this.deferredMessages.filter((m) => m !== msg);
     this.unackedDeferredWrites.push(msg);
-    this.noteStored(agent, msg.metadata, stored);
+    this.noteStored(agent, msg, stored);
     this.logDeferredWriteError(msg, `held writes for ${agent.name}`, undefined, { ...landed, foundLater: true });
   }
 

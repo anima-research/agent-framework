@@ -270,6 +270,24 @@ test("a turn's pin covers what arrived since the agent's last turn, an aside sto
   });
 });
 
+test("a turn's pin starts at its first input past a change row a host stored before it, since a change row isn't a message said to the agent", async () => {
+  const module = new PagesModule();
+  const membrane = new TurnMembrane([[answer('First answered.')], [...toolRounds(1), answer(FINAL)]]);
+  await withFramework(membrane, module, agentConfig(), async (framework) => {
+    ask(framework, 'First, say hello.');
+    await waitUntil('the first turn to end', () => storedText(framework).includes('First answered.') && idle(framework));
+    cmOf(framework).addMessage('system', [{ type: 'system_change', defineTools: [{ name: 'zz-pin-tool', description: 'zz', inputSchema: { type: 'object', properties: {} } }] }] as unknown as ContentBlock[]);
+    let pins: ProtectedRange[] | undefined;
+    module.onCall = (call) => { if (call === 1) pins = inputPins(framework); };
+    ask(framework);
+    await waitUntil('the second turn to end', () => storedText(framework).includes(FINAL));
+    assert.equal(pins?.length, 1, 'one pin while the turn runs');
+    const [from, to] = span(framework, pins![0]);
+    assert.ok(from > rowWith(framework, 'zz-pin-tool'), "the pin starts past the host's change row");
+    assert.ok(from <= rowWith(framework, OPENING) && to >= rowWith(framework, OPENING), 'and covers the request');
+  });
+});
+
 class RefusingFirstMembrane extends TurnMembrane {
   override streamYielding(request: NormalizedRequest): YieldingStream {
     if (this.streams.length > 0) return super.streamYielding(request);

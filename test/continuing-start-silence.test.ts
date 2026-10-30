@@ -15,6 +15,7 @@ const PROMISE = 'stays held until a new message reaches you or this turn ends';
 const NEW_MESSAGE = 'thanks, is it the final version?';
 const CHATTER = 'someone else talking in the room';
 const FINAL = 'Done — I sent it to the room.';
+const CHANGE = 'ZZCHANGE: a tool a host added';
 const REPLY = "Yes, it's the final version.";
 const text = (t: string) => ({ type: 'text', text: t }) as ContentBlock;
 const call = (id: string, name: string, input: Record<string, unknown> = {}) => ({ type: 'tool_use', id, name, input }) as ContentBlock;
@@ -139,6 +140,7 @@ interface Harness {
   wake(request: Omit<InferenceRequest, 'agentName'>): void;
   endTurn(): Promise<void>;
   storeFor(agentName: string, body: string): ReturnType<ModuleContext['addMessage']>;
+  storeChange(): void;
   remove(id: ReturnType<ModuleContext['addMessage']>): void;
 }
 
@@ -160,6 +162,7 @@ async function turn(options: {
   residents?: boolean;
   gather?: (h: Harness, agentName: string, n: number) => void;
   beforeEnd?: (h: Harness) => Promise<void>;
+  toolDeclarations?: 'entries';
 }): Promise<Turn> {
   const dir = mkdtempSync(join(tmpdir(), 'af-continuing-start-'));
   const commandPath = join(dir, 'commands.jsonl');
@@ -185,6 +188,7 @@ async function turn(options: {
     agents: [{
       name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', proseRouting: options.proseRouting,
       ...(options.maxStreamTokens !== undefined ? { maxStreamTokens: options.maxStreamTokens } : {}),
+      ...(options.toolDeclarations ? { toolDeclarations: options.toolDeclarations } : {}),
     }, ...(options.residents ? [{ name: 'other', model: 'test-model', systemPrompt: 'You are other.' }] : [])],
     mcplServers: [{
       id: 'discord', command: process.execPath, args: [join(import.meta.dirname, 'fixtures/speech-route-mcpl-server.mjs')],
@@ -230,6 +234,9 @@ async function turn(options: {
       return gate.ctx!.addMessage('user', [text(body)], undefined, { forAgent: agentName });
     },
     remove: (id) => gate.ctx!.removeMessage(id),
+    storeChange: () => {
+      gate.ctx!.addMessage('Host', [{ type: 'system_change', defineTools: [{ name: 'zz_tool', description: CHANGE, inputSchema: { type: 'object', properties: {} } }] } as unknown as ContentBlock]);
+    },
   };
   if (options.gather) gate.onGather = (agentName, n) => options.gather!(h, agentName, n);
   try {
@@ -416,6 +423,33 @@ describe('a start that continues the turn keeps a hold an explicit send set, unt
     });
     assert.ok(read(run.requests[1], CHATTER), 'the retry read the chatter');
     answered(run);
+  });
+
+  it('a system change a host stores during the hold leaves the line held, since nothing was said to the agent', async () => {
+    const run = await turn({
+      proseRouting: 'locus', hold: { error: 'provider unavailable', during: async (h) => {
+        h.storeChange();
+        await h.until(() => h.stored(CHANGE), 'the change');
+      } },
+      stream: (n) => (n === 1 ? new ErrorsAfter([SEND, HELD], 2) : final()),
+    });
+    assert.equal(run.requests.length, 2, 'the change started no turn of its own');
+    assert.deepEqual(run.publishes, []);
+    assert.ok(heldAsSend(run, FINAL), JSON.stringify(run.drafts));
+  });
+
+  it("under 'entries', a system change handed to the round after a send leaves the retry's line held, since nothing was said to the agent", async () => {
+    const run = await turn({
+      proseRouting: 'locus', toolDeclarations: 'entries',
+      whileGated: async (h) => {
+        h.storeChange();
+        await h.until(() => h.queued(CHANGE), 'the change to wait for the boundary');
+      },
+      stream: (n) => (n === 1 ? new ErrorsAfter([SEND, HELD], 2) : final()),
+    });
+    assert.ok(read(run.requests[1], CHANGE), 'the retry carried the change');
+    assert.deepEqual(run.publishes, []);
+    assert.ok(heldAsSend(run, FINAL), JSON.stringify(run.drafts));
   });
 
   it("chatter queued while the failed stream's last request ran clears the hold for the held retry that reads it", async () => {

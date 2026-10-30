@@ -229,8 +229,8 @@ export interface AgentSpec {
   inherit?: ContextInheritance;
   /**
    * Stored participants that render as this agent's own (assistant) turns
-   * at request assembly. Stored authorship is never rewritten; this is a
-   * model-facing role assignment only.
+   * at request assembly, and whose system changes are its own (see
+   * `AgentConfig.selfParticipants`). Stored authorship is never rewritten.
    */
   selfParticipants?: string[];
   /** The participant name its turns are presented under, when not its own name. */

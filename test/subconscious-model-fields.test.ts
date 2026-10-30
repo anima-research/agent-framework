@@ -29,8 +29,8 @@ async function withSubconscious(resident: Partial<AgentConfig>, subconscious: Pa
 }
 
 function fieldsOf(framework: AgentFramework, name: string) {
-  const agent = framework.getAgent(name)! as unknown as { physicalWindowTokens?: number; thinkingBinds: boolean; thinkingDropBlock: boolean; model: string };
-  return { model: agent.model, physicalWindowTokens: agent.physicalWindowTokens, thinkingBinds: agent.thinkingBinds, thinkingDropBlock: agent.thinkingDropBlock };
+  const agent = framework.getAgent(name)! as unknown as { physicalWindowTokens?: number; declaresBinding: boolean; thinkingDropBlock: boolean; model: string };
+  return { model: agent.model, physicalWindowTokens: agent.physicalWindowTokens, declaresBinding: agent.declaresBinding, thinkingDropBlock: agent.thinkingDropBlock };
 }
 
 function storedConfig(framework: AgentFramework, name: string): AgentConfig | undefined {
@@ -43,8 +43,8 @@ describe('the subconscious and the resident\'s model fields', () => {
   it('on another model, it carries neither the resident\'s window nor its binding, and the resident\'s config keeps both', async () => {
     const { framework, residentConfig } = await withSubconscious(resident, { model: 'model-b' });
     try {
-      assert.deepEqual(fieldsOf(framework, 'assistant'), { model: 'model-a', physicalWindowTokens: 1_000_000, thinkingBinds: true, thinkingDropBlock: true });
-      assert.deepEqual(fieldsOf(framework, 'Subconscious'), { model: 'model-b', physicalWindowTokens: undefined, thinkingBinds: false, thinkingDropBlock: false });
+      assert.deepEqual(fieldsOf(framework, 'assistant'), { model: 'model-a', physicalWindowTokens: 1_000_000, declaresBinding: true, thinkingDropBlock: true });
+      assert.deepEqual(fieldsOf(framework, 'Subconscious'), { model: 'model-b', physicalWindowTokens: undefined, declaresBinding: false, thinkingDropBlock: false });
       for (const config of [storedConfig(framework, 'assistant'), residentConfig]) {
         assert.equal(config?.physicalWindowTokens, 1_000_000);
         assert.deepEqual(config?.thinkingBinding, { binds: true, dropBlock: true });
@@ -56,7 +56,7 @@ describe('the subconscious and the resident\'s model fields', () => {
     for (const subconscious of [{}, { model: 'model-a' }]) {
       const { framework } = await withSubconscious(resident, subconscious);
       try {
-        assert.deepEqual(fieldsOf(framework, 'Subconscious'), { model: 'model-a', physicalWindowTokens: 1_000_000, thinkingBinds: true, thinkingDropBlock: true });
+        assert.deepEqual(fieldsOf(framework, 'Subconscious'), { model: 'model-a', physicalWindowTokens: 1_000_000, declaresBinding: true, thinkingDropBlock: true });
       } finally { await framework.stop(); }
     }
   });
@@ -66,8 +66,8 @@ describe('the subconscious and the resident\'s model fields', () => {
       model: 'model-b', physicalWindowTokens: 200_000, thinkingBinding: { binds: true, dropBlock: true },
     });
     try {
-      assert.deepEqual(fieldsOf(framework, 'Subconscious'), { model: 'model-b', physicalWindowTokens: 200_000, thinkingBinds: true, thinkingDropBlock: true });
-      assert.deepEqual(fieldsOf(framework, 'assistant'), { model: 'model-a', physicalWindowTokens: 1_000_000, thinkingBinds: true, thinkingDropBlock: true });
+      assert.deepEqual(fieldsOf(framework, 'Subconscious'), { model: 'model-b', physicalWindowTokens: 200_000, declaresBinding: true, thinkingDropBlock: true });
+      assert.deepEqual(fieldsOf(framework, 'assistant'), { model: 'model-a', physicalWindowTokens: 1_000_000, declaresBinding: true, thinkingDropBlock: true });
       for (const config of [storedConfig(framework, 'assistant'), residentConfig]) {
         assert.equal(config?.physicalWindowTokens, 1_000_000);
         assert.deepEqual(config?.thinkingBinding, { binds: true, dropBlock: true });
@@ -77,10 +77,10 @@ describe('the subconscious and the resident\'s model fields', () => {
 
   it('on the resident\'s model, each of the two set for it takes the place of the resident\'s, and null or false leaves it out', async () => {
     const cases: Array<[Record<string, unknown>, ReturnType<typeof fieldsOf>]> = [
-      [{ physicalWindowTokens: 500_000 }, { model: 'model-a', physicalWindowTokens: 500_000, thinkingBinds: true, thinkingDropBlock: true }],
-      [{ thinkingBinding: { binds: false } }, { model: 'model-a', physicalWindowTokens: 1_000_000, thinkingBinds: false, thinkingDropBlock: false }],
-      [{ physicalWindowTokens: null, thinkingBinding: null }, { model: 'model-a', physicalWindowTokens: 1_000_000, thinkingBinds: true, thinkingDropBlock: true }],
-      [{ thinkingBinding: false }, { model: 'model-a', physicalWindowTokens: 1_000_000, thinkingBinds: true, thinkingDropBlock: true }],
+      [{ physicalWindowTokens: 500_000 }, { model: 'model-a', physicalWindowTokens: 500_000, declaresBinding: true, thinkingDropBlock: true }],
+      [{ thinkingBinding: { binds: false } }, { model: 'model-a', physicalWindowTokens: 1_000_000, declaresBinding: false, thinkingDropBlock: false }],
+      [{ physicalWindowTokens: null, thinkingBinding: null }, { model: 'model-a', physicalWindowTokens: 1_000_000, declaresBinding: true, thinkingDropBlock: true }],
+      [{ thinkingBinding: false }, { model: 'model-a', physicalWindowTokens: 1_000_000, declaresBinding: true, thinkingDropBlock: true }],
     ];
     for (const [subconscious, expected] of cases) {
       const { framework, residentConfig } = await withSubconscious(resident, subconscious as Partial<SubconsciousConfig>);
@@ -148,7 +148,7 @@ describe('the subconscious and the resident\'s model fields', () => {
           promptCaching: settings.promptCaching,
         },
       );
-      const own = ['physicalWindowTokens', 'thinkingBinding', 'name', 'model', 'systemPrompt', 'strategy', 'proseRouting', 'allowedTools', 'clock'];
+      const own = ['physicalWindowTokens', 'thinkingBinding', 'toolDeclarations', 'name', 'model', 'systemPrompt', 'strategy', 'proseRouting', 'allowedTools', 'clock'];
       const rest = (config: AgentConfig | undefined) =>
         Object.fromEntries(Object.entries(config ?? {}).filter(([key]) => !own.includes(key)));
       const inherited = rest(storedConfig(framework, 'Subconscious'));

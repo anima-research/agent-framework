@@ -5,7 +5,7 @@
  * fork its source's view filter, which leaves out every stored injection but
  * the source's own, so the framework replaces it (deriveSharedContext) and
  * records the same predicate for main's checks of whether an agent sees a row
- * (storeSees, agentSees). Reopened after it ends, a fork's context keeps the
+ * (storeViews, agentSees). Reopened after it ends, a fork's context keeps the
  * view it had live, a fork of a fork's included (reopenAgentContext).
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
@@ -16,7 +16,7 @@ import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, type ContextInjection } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
-import { AgentFramework, type Agent } from '../src/index.js';
+import { AgentFramework, systemChangeMetadata, taskForkSpec, type Agent } from '../src/index.js';
 import { GateModule, RoutedMembrane, say, until, waitCall } from './helpers/dendrite.js';
 
 const supported =
@@ -64,8 +64,8 @@ describe("a shared fork's view", () => {
       storePath: join(tempDir, 'store.chronicle'),
       membrane: membrane.asMembrane(),
       agents: [
-        { name: 'mira', model: 'test-model', systemPrompt: 'You are mira.' },
-        { name: 'oren', model: 'test-model', systemPrompt: 'You are oren.' },
+        { name: 'mira', model: 'test-model', systemPrompt: 'You are mira.', toolDeclarations: 'entries' },
+        { name: 'oren', model: 'test-model', systemPrompt: 'You are oren.', toolDeclarations: 'entries' },
       ],
       modules: [gates],
       syncIntervalMs: 0,
@@ -146,4 +146,228 @@ describe("a shared fork's view", () => {
     assert.deepEqual(await shown(leftBelow), ['MIRA-OWN', 'FORK-OWN', 'FORK2-OWN'], "the reopened fork of a fork, as live: its source's source's view too");
     assert.deepEqual(seenBy(readerOf(leftBelow), leftBelow), ['MIRA-OWN', 'FORK-OWN', 'FORK2-OWN']);
   });
+
+  it("keeps its source's system changes and its own and leaves out another resident's, and reopened after it ends still leaves out another resident's", { skip }, async () => {
+    const change = (name: string) => [{ type: 'system_change', defineTools: [{ name, description: name, inputSchema: { type: 'object', properties: {} } }] }] as never;
+    const changeTools = async (cm: ContextManager): Promise<string[]> =>
+      (await cm.compile(undefined, undefined, { dryRun: true })).messages.flatMap((m) =>
+        (m.content as Array<{ type: string; defineTools?: Array<{ name: string }> }>)
+          .filter((b) => b.type === 'system_change').flatMap((b) => (b.defineTools ?? []).map((t) => t.name)));
+    const mira = framework.getAgent('mira')!;
+    mira.getContextManager().addMessage('user', [text('Please look into the open issues.')]);
+    mira.getContextManager().addMessage('system', change('mira-tool'), systemChangeMetadata('mira') as never);
+    framework.getAgent('oren')!.getContextManager().addMessage('system', change('oren-tool'), systemChangeMetadata('oren') as never);
+    assert.deepEqual(await changeTools(mira.getContextManager()), ['mira-tool'], "the premise: the source's view keeps its own change and leaves out another resident's");
+    const fork = await framework.deriveAgent({
+      name: 'fork-1',
+      from: 'mira',
+      framing: [{ participant: 'user', content: [text(FRAMING)] }],
+    });
+    fork.contextManager.addMessage('system', change('fork-tool'), systemChangeMetadata('fork-1') as never);
+    assert.deepEqual(await changeTools(fork.contextManager), ['mira-tool', 'fork-tool'], "the fork's compile: its source's change and its own, not another resident's");
+    framework.start();
+    membrane.script('fork-1', say('fork-1 done'));
+    assert.equal((await framework.runEphemeralToCompletion(fork.agent, fork.contextManager)).speech, 'fork-1 done');
+    assert.deepEqual(await changeTools(await framework.inspectAgentContext('fork-1')), [],
+      "the reopened fork: another resident's change out of its view, and its source's and its own gone from its branch at its first request, where it adopts its head and takes its own");
+  });
+});
+
+describe("a shared fork of an isolated-slot reader's view", () => {
+  let tempDir: string;
+  let membrane: RoutedMembrane;
+  let framework: AgentFramework;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'dendrite-fork-view-isolated-'));
+    membrane = new RoutedMembrane();
+    membrane.identify = (request) =>
+      JSON.stringify(request.messages).includes('[FORK-FRAMING]') ? 'fork-1' : request.assistantParticipant ?? '';
+    framework = await AgentFramework.create({
+      storePath: join(tempDir, 'store.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'mira', model: 'test-model', systemPrompt: 'You are mira.' }],
+      subconscious: { enabled: true, systemPrompt: 'notice' },
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    });
+  });
+
+  afterEach(async () => {
+    try { await framework.stop(); } catch { /* already stopped */ }
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  const compiled = async (cm: ContextManager): Promise<string[]> =>
+    (await cm.compile(undefined, undefined, { dryRun: true })).messages.map(textOf);
+
+  it("a fork of the subconscious, reopened after it ends, shows what its live compile showed", { skip }, async () => {
+    const mira = framework.getAgent('mira')!;
+    const sub = framework.getAgent('Subconscious')!;
+    mira.getContextManager().addMessage('user', [text('MIRA-SAID')]);
+    mira.getContextManager().addMessage('Antra', [text('HELD-ROW')], { tuneOut: { epochId: 'e1' } } as never);
+    internals(framework).storeInjections(mira, [injection('MIRA-OWN')]);
+    const fork = await framework.deriveAgent({
+      name: 'fork-1',
+      from: sub.name,
+      framing: [{ participant: 'user', content: [text(FRAMING)] }],
+    });
+    internals(framework).storeInjections(fork.agent, [injection('FORK-OWN')]);
+    const live = await compiled(fork.contextManager);
+    assert.ok(live.includes('FORK-OWN'), "the premise: the fork's compile shows its own injection");
+    assert.ok(live.includes('MIRA-SAID'), "the premise: like its source's, the fork's compile reads the residents' slot");
+    assert.ok(!live.includes('MIRA-OWN'), "like its source's, the fork's compile leaves out a resident's stored injection");
+    assert.ok(live.includes('HELD-ROW'), "and, like its source's, shows a row a tune-out holds from the residents");
+    membrane.script('fork-1', say('fork-1 done'));
+    framework.start();
+    assert.equal((await framework.runEphemeralToCompletion(fork.agent, fork.contextManager)).speech, 'fork-1 done');
+    const left = await framework.inspectAgentContext('fork-1');
+    const reopened = await compiled(left);
+    assert.ok(!reopened.includes('MIRA-OWN'), "the reopened fork, as live, leaves out the resident's stored injection");
+    assert.ok(reopened.includes('HELD-ROW'), 'and shows the held row');
+    assert.ok(reopened.includes('FORK-OWN') && reopened.includes('MIRA-SAID'), "and its own injection and the residents' row");
+  });
+});
+
+describe("a shared child of a resident with former names", () => {
+  let tempDir: string;
+  let membrane: RoutedMembrane;
+  let framework: AgentFramework;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'dendrite-fork-view-former-'));
+    membrane = new RoutedMembrane();
+    framework = await AgentFramework.create({
+      storePath: join(tempDir, 'store.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [
+        { name: 'mira', model: 'test-model', systemPrompt: 'You are mira.', selfParticipants: ['mira-old'], presentAs: 'mira-shown' },
+        { name: 'oren', model: 'test-model', systemPrompt: 'You are oren.' },
+      ],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    });
+  });
+
+  afterEach(async () => {
+    await framework.stop();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("keeps, reopened after it ends, a change its source counts as its own under a former name, as it did live", { skip }, async () => {
+    const changeTools = async (cm: ContextManager): Promise<string[]> =>
+      (await cm.compile(undefined, undefined, { dryRun: true })).messages.flatMap((m) =>
+        (m.content as Array<{ type: string; defineTools?: Array<{ name: string }> }>)
+          .filter((b) => b.type === 'system_change').flatMap((b) => (b.defineTools ?? []).map((t) => t.name)));
+    const mira = framework.getAgent('mira')!;
+    mira.getContextManager().addMessage('user', [text('Please look into the open issues.')]);
+    mira.getContextManager().addMessage('system',
+      [{ type: 'system_change', defineTools: [{ name: 'old-tool', description: 'old', inputSchema: { type: 'object', properties: {} } }] }] as never,
+      systemChangeMetadata('mira-old') as never);
+    const { name: _name, ...spec } = taskForkSpec('job-1', { parent: 'mira', inherit: { mode: 'shared' } });
+    const job = await framework.createEphemeralAgent({ name: 'job-1', model: 'test-model', systemPrompt: 'Do the task.', toolDeclarations: 'entries' }, spec);
+    job.contextManager.addMessage('user', [text('Run once.')]);
+    assert.deepEqual(await changeTools(job.contextManager), ['old-tool'], "live, the child keeps the change its source keeps");
+    framework.start();
+    membrane.script('job-1', say('job-1 done'));
+    assert.equal((await framework.runEphemeralToCompletion(job.agent, job.contextManager)).speech, 'job-1 done');
+    assert.deepEqual(await changeTools(job.contextManager), ['old-tool'], 'and still at its end');
+    assert.deepEqual(await changeTools(await framework.inspectAgentContext('job-1')), ['old-tool'], 'reopened, as at its end');
+    const record = framework.getAgentRecord('mira')!;
+    assert.deepEqual([record.selfParticipants, record.presentAs], [['mira-old'], 'mira-shown'], "the resident's record states its mapping");
+  });
+
+  it("gives a resumed child the view of the mapping it resumes with", { skip }, async () => {
+    const changeTools = async (cm: ContextManager): Promise<string[]> =>
+      (await cm.compile(undefined, undefined, { dryRun: true })).messages.flatMap((m) =>
+        (m.content as Array<{ type: string; defineTools?: Array<{ name: string }> }>)
+          .filter((b) => b.type === 'system_change').flatMap((b) => (b.defineTools ?? []).map((t) => t.name)));
+    const mira = framework.getAgent('mira')!;
+    mira.getContextManager().addMessage('user', [text('Please look into the open issues.')]);
+    mira.getContextManager().addMessage('system',
+      [{ type: 'system_change', defineTools: [{ name: 'zed-tool', description: 'zed', inputSchema: { type: 'object', properties: {} } }] }] as never,
+      systemChangeMetadata('zed') as never);
+    const { name: _name, ...spec } = taskForkSpec('job-2', { parent: 'mira', inherit: { mode: 'shared' } });
+    const job = await framework.createEphemeralAgent({ name: 'job-2', model: 'test-model', systemPrompt: 'Do the task.', toolDeclarations: 'entries' }, spec);
+    job.contextManager.addMessage('user', [text('Run once.')]);
+    assert.deepEqual(await changeTools(job.contextManager), [], "the premise: live, a change stamped by another is out of its view");
+    framework.start();
+    membrane.script('job-2', say('job-2 done'));
+    await framework.runEphemeralToCompletion(job.agent, job.contextManager);
+    const resumed = await framework.resumeAgent('job-2', { model: 'test-model', systemPrompt: 'Do the task.', selfParticipants: ['zed'], toolDeclarations: 'entries' } as never);
+    assert.deepEqual(await changeTools(resumed.contextManager), ['zed-tool'], 'resumed as zed too, its view keeps the change it now counts as its own');
+    resumed.cleanup();
+  });
+
+  it("gives a child resumed with no mapping of its own the view of its record's", { skip }, async () => {
+    const changeTools = async (cm: ContextManager): Promise<string[]> =>
+      (await cm.compile(undefined, undefined, { dryRun: true })).messages.flatMap((m) =>
+        (m.content as Array<{ type: string; defineTools?: Array<{ name: string }> }>)
+          .filter((b) => b.type === 'system_change').flatMap((b) => (b.defineTools ?? []).map((t) => t.name)));
+    const mira = framework.getAgent('mira')!;
+    mira.getContextManager().addMessage('user', [text('Please look into the open issues.')]);
+    mira.getContextManager().addMessage('system',
+      [{ type: 'system_change', defineTools: [{ name: 'zed-tool', description: 'zed', inputSchema: { type: 'object', properties: {} } }] }] as never,
+      systemChangeMetadata('zed') as never);
+    const { name: _name, ...spec } = taskForkSpec('job-3', { parent: 'mira', inherit: { mode: 'shared' } });
+    const job = await framework.createEphemeralAgent({ name: 'job-3', model: 'test-model', systemPrompt: 'Do the task.', toolDeclarations: 'entries' }, { ...spec, selfParticipants: ['zed'] });
+    job.contextManager.addMessage('user', [text('Run once.')]);
+    framework.start();
+    membrane.script('job-3', say('job-3 done'));
+    await framework.runEphemeralToCompletion(job.agent, job.contextManager);
+    assert.deepEqual(framework.getAgentRecord('job-3')!.selfParticipants, ['zed'], 'the premise: its record states zed as its own');
+    const resumed = await framework.resumeAgent('job-3', { model: 'test-model', systemPrompt: 'Do the task.', toolDeclarations: 'entries' } as never);
+    assert.deepEqual(await changeTools(resumed.contextManager), ['zed-tool'], "resumed with no mapping of its own, its view counts its record's");
+    resumed.cleanup();
+  });
+});
+
+describe("a resumed 'head' job", () => {
+  let tempDir: string;
+  let membrane: RoutedMembrane;
+  let framework: AgentFramework;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'dendrite-fork-view-resumed-'));
+    membrane = new RoutedMembrane();
+    framework = await AgentFramework.create({
+      storePath: join(tempDir, 'store.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'mira', model: 'test-model', systemPrompt: 'You are mira.' }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    });
+  });
+
+  afterEach(async () => {
+    await framework.stop();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  const bulky = (name: string) =>
+    [{ type: 'system_change', defineTools: [{ name, description: `${name} `.repeat(20000), inputSchema: { type: 'object', properties: {} } }] }] as never;
+  const job = { model: 'test-model', systemPrompt: 'Do the task.', contextBudgetTokens: 20000 };
+
+  for (const [how, shared] of [['in a namespace of its own', false], ["continuing a resident's context", true]] as const) {
+    it(`sends its request beside a host's change rows that alone exceed its budget, ${how}`, { skip }, async () => {
+      framework.getAgent('mira')!.getContextManager().addMessage('user', [text('Please look into the open issues.')]);
+      const { name: _name, ...spec } = taskForkSpec('job', { parent: 'mira', inherit: { mode: 'shared' } });
+      const first = await framework.createEphemeralAgent({ name: 'job', ...job } as never, shared ? spec : undefined);
+      first.contextManager.addMessage('user', [text('Run once.')]);
+      framework.start();
+      membrane.script('job', say('job done'));
+      await framework.runEphemeralToCompletion(first.agent, first.contextManager);
+      const resumed = await framework.resumeAgent('job', job as never);
+      resumed.contextManager.addMessage('system', bulky('h1'));
+      resumed.contextManager.addMessage('system', bulky('h2'));
+      resumed.contextManager.addMessage('user', [text('Once more.')]);
+      const request = await resumed.agent.buildActivationRequest([]);
+      assert.equal(textOf(request.messages.at(-1)!), 'Once more.');
+      assert.ok(!request.messages.some((m) => (m.content as Array<{ type: string }>).some((b) => b.type === 'system_change')), 'and no change row');
+      resumed.cleanup();
+    });
+  }
 });
