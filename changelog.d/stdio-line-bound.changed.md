@@ -21,5 +21,7 @@
   host had stopped using the server's stdio (write EPIPE)`, and so do the
   `mcpl:server-closed` trace's `reason` and the `mcpl-down` alert that quotes
   it. For a line past the bound, X is "the server wrote a line on stdout
-  longer than 104,857,600 UTF-16 code units". A host that matches the old
-  words needs the new ones.
+  longer than 104,857,600 UTF-16 code units". A loss whose child outlived
+  SIGKILL ended "and its child outlived SIGKILL", and now ends "and the
+  server's process outlived SIGKILL". A host that matches the old words
+  needs the new ones.
