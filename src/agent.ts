@@ -2682,9 +2682,10 @@ export class Agent {
    * the agent's metadata is neither folded onto the head nor consolidated,
    * and what any other row the request carries already says is left out of
    * the change. On the head,
-   * what's current goes out, and changes left from an earlier 'entries'
-   * period go, and so does its record where the store can read it (one it
-   * can't read stays until a read succeeds).
+   * what's current goes out, and while a record left from an earlier
+   * 'entries' period is there, or the compile holds changes of the agent's
+   * own, the record goes and then those changes; a record the store can't
+   * clear stays, with them, until it can.
    * Under 'entries': with no record, the current head is adopted; a
    * replacement of system text moves the head to what's current; a
    * difference a change can say is declared at the end, unless the agent's
@@ -2706,23 +2707,19 @@ export class Agent {
     const current = this.currentHead(availableTools, compiled.systemInjections);
     const own = ownSystemChanges(compiled, (name) => this.ownParticipants.has(name));
     if (!entries) {
-      // A record left from an earlier 'entries' period goes, on whichever
-      // branch is current: a switch can bring one back. The store deletes
-      // only a record it holds, so this costs a lookup otherwise.
-      if (!dryRun) this.headDeclarations.delete(this.name);
-      // The agent's own change rows go too. The request leaves every change
-      // row out, but this compile held the agent's, and what it committed
+      // A compile that held the agent's own rows (as one through a manager
+      // that keeps change rows does, an 'entries' agent's kept to its head)
+      // runs again without them: what it committed
       // (context-manager's comparison baseline, and with `binds: true` its
-      // thinking-binding record) would hold rows no later compile has, so
-      // the next would differ from it there and leave out the thinking minted
-      // since. So once they're removed, the compile runs again without them.
-      // That compile leaves out the thinking after where they stood, which
-      // was minted with them in the prefix: the cost of leaving them, which
-      // the request does either way.
-      if (!dryRun && own.size > 0) {
+      // thinking-binding record) would hold rows no later compile has, so the
+      // next would differ from it there and leave out the thinking minted
+      // since.
+      if (!dryRun && (own.size > 0 || this.headDeclarations.read(this.name)) && this.headDeclarations.delete(this.name)) {
         const changesRemoved = this.removeOwnChanges();
-        this.onHeadEvent?.({ type: 'head:moved', why: 'on-head', changesRemoved });
-        if (changesRemoved > 0) return { compiled: await compile(current), head: current };
+        if (changesRemoved > 0) {
+          this.onHeadEvent?.({ type: 'head:moved', why: 'on-head', changesRemoved });
+          if (own.size > 0) return { compiled: await compile(current), head: current };
+        }
       }
       return { compiled, head: current };
     }

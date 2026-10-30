@@ -2871,6 +2871,19 @@ const derivedView = (source: StoreView, name: string, isOwn: (agentName: string)
   keeps: (row) => source.keeps(row) || isOwnInjection(row.metadata, name) || (isSystemChangeMessage(row) && !isSystemChangeNotOwn(row, isOwn)),
 });
 
+const KEEP_EVERY = (): boolean => true;
+
+// By configuration, once a manager opens: context-manager keeps one filtered
+// listing per listing and predicate, taking the predicate as a pure function
+// of the message (filterMessageStoreView), so it can't follow the fail-safe.
+const compiledView = (
+  keeps: ((row: ViewedRow) => boolean) | undefined,
+  toolDeclarations: AgentConfig['toolDeclarations'],
+): ((message: StoredMessage) => boolean) => {
+  if (toolDeclarations === 'entries') return keeps ?? KEEP_EVERY;
+  return keeps ? (row) => keeps(row) && !isSystemChangeMessage(row) : (row) => !isSystemChangeMessage(row);
+};
+
 /** The context-manager surface shared inheritance needs; absent on versions without derivation. */
 interface DerivingContextManager {
   derive(options: {
@@ -10983,6 +10996,7 @@ export class AgentFramework {
           store: this.store,
           namespace,
           isolate: true,
+          viewFilter: compiledView(undefined, config.toolDeclarations),
           strategy: config.strategy ?? new PassthroughStrategy(),
           membrane: this.ephemeralAuxiliaryMembraneFor(config.name, release),
           debugLogContext: !!process.env.DEBUG_CONTEXT,
@@ -11326,6 +11340,7 @@ export class AgentFramework {
         { ...record, ...(fullConfig.selfParticipants !== undefined ? { selfParticipants: fullConfig.selfParticipants } : {}) },
         config.strategy,
         this.ephemeralAuxiliaryMembraneFor(name, release),
+        { toolDeclarations: fullConfig.toolDeclarations },
       );
     } catch (error) {
       this.resumesPending.delete(name);
@@ -11391,6 +11406,7 @@ export class AgentFramework {
         strategy: new PassthroughStrategy(),
         membrane: this.membrane,
         solve: 'fresh',
+        viewFilter: this.storeViews.get(source)?.keeps ?? KEEP_EVERY,
         ...(options.atSequence !== undefined ? { atSequence: options.atSequence } : {}),
       });
     }
@@ -11402,8 +11418,13 @@ export class AgentFramework {
     return this.reopenAgentContext(record, new PassthroughStrategy());
   }
 
-  /** Open the context an ended agent left, wherever it lives. */
-  private async reopenAgentContext(record: AgentRecord, strategy?: ContextStrategy, membrane: Membrane = this.membrane): Promise<ContextManager> {
+  /** Open the context an ended agent left, wherever it lives: as it's stored, or with `compiling`, as that agent compiles it. */
+  private async reopenAgentContext(
+    record: AgentRecord,
+    strategy?: ContextStrategy,
+    membrane: Membrane = this.membrane,
+    compiling?: { toolDeclarations: AgentConfig['toolDeclarations'] },
+  ): Promise<ContextManager> {
     const viewOf = (from: AgentRecord, walked = new Set<string>()): StoreView | undefined => {
       const source = from.inherit?.mode === 'shared' ? from.inherit.from : undefined;
       if (source !== undefined && !walked.has(from.name)) {
@@ -11421,6 +11442,7 @@ export class AgentFramework {
       this.storeViews.set(contextManager, view);
       return contextManager;
     };
+    const filterOf = (view: StoreView | undefined) => compiling ? compiledView(view?.keeps, compiling.toolDeclarations) : view?.keeps;
     if (record.inherit?.mode === 'shared') {
       const derivation = record.inherit.derivation as ContextDerivationRecord | undefined;
       const reopen = (ContextManager as unknown as { reopenDerived?: ReopenDerived }).reopenDerived;
@@ -11431,12 +11453,13 @@ export class AgentFramework {
         );
       }
       const view = viewOf(record);
+      const viewFilter = filterOf(view);
       const reopened = await reopen.call(ContextManager, {
         store: this.store,
         derivation,
         strategy: strategy ?? new PassthroughStrategy(),
         membrane,
-        ...(view ? { viewFilter: view.keeps } : {}),
+        ...(viewFilter ? { viewFilter } : {}),
         debugLogContext: !!process.env.DEBUG_CONTEXT,
       });
       return view ? seen(reopened, view) : reopened;
@@ -11449,10 +11472,12 @@ export class AgentFramework {
     // shared slot, through the residents' view. Isolated, its namespace
     // holds none of what it read (nissa's #546 review, round 2).
     const view = record.readsSharedSlot === true ? viewOf(record) : undefined;
+    const viewFilter = filterOf(view);
     const opened = await ContextManager.open({
       store: this.store,
       namespace: record.namespace,
-      ...(view ? { viewFilter: view.keeps } : { isolate: true }),
+      ...(view ? {} : { isolate: true }),
+      ...(viewFilter ? { viewFilter } : {}),
       strategy: strategy ?? new PassthroughStrategy(),
       membrane,
       debugLogContext: !!process.env.DEBUG_CONTEXT,
@@ -11512,7 +11537,7 @@ export class AgentFramework {
       solve: inherit.solve ?? 'reuse',
       inherit: { refusals: inherit.refusals === true },
       ...(inherit.atSequence !== undefined ? { atSequence: inherit.atSequence } : {}),
-      ...(view ? { viewFilter: view.keeps } : {}),
+      viewFilter: compiledView(view?.keeps, config.toolDeclarations),
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
     if (view) this.storeViews.set(contextManager, view);
@@ -16188,7 +16213,7 @@ export class AgentFramework {
       // that agent's context, not conversation: they stay out of this view,
       // and so out of its folds, as the residents share this slot. The
       // resident filter keeps held (tuned-out) rows out as before (`sees`).
-      viewFilter: view.keeps,
+      viewFilter: compiledView(view.keeps, config.toolDeclarations),
     });
     this.trackManager(contextManager);
     this.storeViews.set(contextManager, view);
@@ -17941,6 +17966,7 @@ export class AgentFramework {
         store: this.store,
         namespace: `conversations/${name}`,
         isolate: true,
+        viewFilter: compiledView(undefined, templateConfig.toolDeclarations),
         // Strategy instances are stateful — never share the template's.
         strategy: router.strategyFactory?.() ?? new PassthroughStrategy(),
         // Provider cooldown ownership belongs to the persistent resident only;

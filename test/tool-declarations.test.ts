@@ -544,6 +544,23 @@ describe('toolDeclarations', () => {
     assert.deepEqual(events, []);
   });
 
+  it("keeps its own change rows on the head while its record can't be cleared, and takes both out once it can", async () => {
+    const context = fakeContext([said('user', 'hello'), changeRow([tool('b')])]);
+    const real = memoryHeadDeclarations();
+    real.write('agent', { tools: [tool('a')], system: ['You are an agent.'] });
+    let clears = false;
+    const heads: HeadDeclarationStore = { read: (name) => real.read(name), write: (name, head) => real.write(name, head), delete: (name) => clears && real.delete(name) };
+    const agent = agentOn(context, {}, heads);
+    const held = await agent.buildActivationRequest([tool('a'), tool('b')]);
+    assert.deepEqual(changesIn(held.messages), [], 'its request carries no change row');
+    assert.equal(changeRows(context.rows).length, 1, 'its row stays with the record');
+    assert.ok(real.read('agent'), 'and the record stays');
+    clears = true;
+    await agent.buildActivationRequest([tool('a'), tool('b')]);
+    assert.deepEqual(changeRows(context.rows), [], 'once the record clears, its row goes');
+    assert.equal(real.read('agent'), null);
+  });
+
   it('changes nothing in a dry run: at adoption, at a replacement, or on the head with rows left', async () => {
     const dry = { dryRun: true };
     {

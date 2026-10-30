@@ -64,8 +64,8 @@ describe("a shared fork's view", () => {
       storePath: join(tempDir, 'store.chronicle'),
       membrane: membrane.asMembrane(),
       agents: [
-        { name: 'mira', model: 'test-model', systemPrompt: 'You are mira.' },
-        { name: 'oren', model: 'test-model', systemPrompt: 'You are oren.' },
+        { name: 'mira', model: 'test-model', systemPrompt: 'You are mira.', toolDeclarations: 'entries' },
+        { name: 'oren', model: 'test-model', systemPrompt: 'You are oren.', toolDeclarations: 'entries' },
       ],
       modules: [gates],
       syncIntervalMs: 0,
@@ -169,7 +169,7 @@ describe("a shared fork's view", () => {
     membrane.script('fork-1', say('fork-1 done'));
     assert.equal((await framework.runEphemeralToCompletion(fork.agent, fork.contextManager)).speech, 'fork-1 done');
     assert.deepEqual(await changeTools(await framework.inspectAgentContext('fork-1')), [],
-      "the reopened fork: another resident's change out of its view, and its source's and its own gone from its branch at its first request, as an agent on its head removes its own");
+      "the reopened fork: another resident's change out of its view, and its source's and its own gone from its branch at its first request, where it adopts its head and takes its own");
   });
 });
 
@@ -267,7 +267,7 @@ describe("a shared child of a resident with former names", () => {
       [{ type: 'system_change', defineTools: [{ name: 'old-tool', description: 'old', inputSchema: { type: 'object', properties: {} } }] }] as never,
       systemChangeMetadata('mira-old') as never);
     const { name: _name, ...spec } = taskForkSpec('job-1', { parent: 'mira', inherit: { mode: 'shared' } });
-    const job = await framework.createEphemeralAgent({ name: 'job-1', model: 'test-model', systemPrompt: 'Do the task.' }, spec);
+    const job = await framework.createEphemeralAgent({ name: 'job-1', model: 'test-model', systemPrompt: 'Do the task.', toolDeclarations: 'entries' }, spec);
     job.contextManager.addMessage('user', [text('Run once.')]);
     assert.deepEqual(await changeTools(job.contextManager), ['old-tool'], "live, the child keeps the change its source keeps");
     framework.start();
@@ -290,13 +290,13 @@ describe("a shared child of a resident with former names", () => {
       [{ type: 'system_change', defineTools: [{ name: 'zed-tool', description: 'zed', inputSchema: { type: 'object', properties: {} } }] }] as never,
       systemChangeMetadata('zed') as never);
     const { name: _name, ...spec } = taskForkSpec('job-2', { parent: 'mira', inherit: { mode: 'shared' } });
-    const job = await framework.createEphemeralAgent({ name: 'job-2', model: 'test-model', systemPrompt: 'Do the task.' }, spec);
+    const job = await framework.createEphemeralAgent({ name: 'job-2', model: 'test-model', systemPrompt: 'Do the task.', toolDeclarations: 'entries' }, spec);
     job.contextManager.addMessage('user', [text('Run once.')]);
     assert.deepEqual(await changeTools(job.contextManager), [], "the premise: live, a change stamped by another is out of its view");
     framework.start();
     membrane.script('job-2', say('job-2 done'));
     await framework.runEphemeralToCompletion(job.agent, job.contextManager);
-    const resumed = await framework.resumeAgent('job-2', { model: 'test-model', systemPrompt: 'Do the task.', selfParticipants: ['zed'] } as never);
+    const resumed = await framework.resumeAgent('job-2', { model: 'test-model', systemPrompt: 'Do the task.', selfParticipants: ['zed'], toolDeclarations: 'entries' } as never);
     assert.deepEqual(await changeTools(resumed.contextManager), ['zed-tool'], 'resumed as zed too, its view keeps the change it now counts as its own');
     resumed.cleanup();
   });
@@ -312,14 +312,62 @@ describe("a shared child of a resident with former names", () => {
       [{ type: 'system_change', defineTools: [{ name: 'zed-tool', description: 'zed', inputSchema: { type: 'object', properties: {} } }] }] as never,
       systemChangeMetadata('zed') as never);
     const { name: _name, ...spec } = taskForkSpec('job-3', { parent: 'mira', inherit: { mode: 'shared' } });
-    const job = await framework.createEphemeralAgent({ name: 'job-3', model: 'test-model', systemPrompt: 'Do the task.' }, { ...spec, selfParticipants: ['zed'] });
+    const job = await framework.createEphemeralAgent({ name: 'job-3', model: 'test-model', systemPrompt: 'Do the task.', toolDeclarations: 'entries' }, { ...spec, selfParticipants: ['zed'] });
     job.contextManager.addMessage('user', [text('Run once.')]);
     framework.start();
     membrane.script('job-3', say('job-3 done'));
     await framework.runEphemeralToCompletion(job.agent, job.contextManager);
     assert.deepEqual(framework.getAgentRecord('job-3')!.selfParticipants, ['zed'], 'the premise: its record states zed as its own');
-    const resumed = await framework.resumeAgent('job-3', { model: 'test-model', systemPrompt: 'Do the task.' } as never);
+    const resumed = await framework.resumeAgent('job-3', { model: 'test-model', systemPrompt: 'Do the task.', toolDeclarations: 'entries' } as never);
     assert.deepEqual(await changeTools(resumed.contextManager), ['zed-tool'], "resumed with no mapping of its own, its view counts its record's");
     resumed.cleanup();
   });
+});
+
+describe("a resumed 'head' job", () => {
+  let tempDir: string;
+  let membrane: RoutedMembrane;
+  let framework: AgentFramework;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'dendrite-fork-view-resumed-'));
+    membrane = new RoutedMembrane();
+    framework = await AgentFramework.create({
+      storePath: join(tempDir, 'store.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'mira', model: 'test-model', systemPrompt: 'You are mira.' }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    });
+  });
+
+  afterEach(async () => {
+    await framework.stop();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  const bulky = (name: string) =>
+    [{ type: 'system_change', defineTools: [{ name, description: `${name} `.repeat(20000), inputSchema: { type: 'object', properties: {} } }] }] as never;
+  const job = { model: 'test-model', systemPrompt: 'Do the task.', contextBudgetTokens: 20000 };
+
+  for (const [how, shared] of [['in a namespace of its own', false], ["continuing a resident's context", true]] as const) {
+    it(`sends its request beside a host's change rows that alone exceed its budget, ${how}`, { skip }, async () => {
+      framework.getAgent('mira')!.getContextManager().addMessage('user', [text('Please look into the open issues.')]);
+      const { name: _name, ...spec } = taskForkSpec('job', { parent: 'mira', inherit: { mode: 'shared' } });
+      const first = await framework.createEphemeralAgent({ name: 'job', ...job } as never, shared ? spec : undefined);
+      first.contextManager.addMessage('user', [text('Run once.')]);
+      framework.start();
+      membrane.script('job', say('job done'));
+      await framework.runEphemeralToCompletion(first.agent, first.contextManager);
+      const resumed = await framework.resumeAgent('job', job as never);
+      resumed.contextManager.addMessage('system', bulky('h1'));
+      resumed.contextManager.addMessage('system', bulky('h2'));
+      resumed.contextManager.addMessage('user', [text('Once more.')]);
+      const request = await resumed.agent.buildActivationRequest([]);
+      assert.equal(textOf(request.messages.at(-1)!), 'Once more.');
+      assert.ok(!request.messages.some((m) => (m.content as Array<{ type: string }>).some((b) => b.type === 'system_change')), 'and no change row');
+      resumed.cleanup();
+    });
+  }
 });

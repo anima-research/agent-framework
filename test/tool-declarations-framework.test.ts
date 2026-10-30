@@ -219,7 +219,7 @@ describe('toolDeclarations in the framework', () => {
     });
   });
 
-  it("compiles again on the head once it takes the agent's own change rows out, so a reply after keeps its thinking, with `binds: true`", async () => {
+  it("takes the agent's record and its own change rows out once it's built again on the head, and a reply after keeps its thinking, with `binds: true`", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'tool-declarations-onhead-'));
     const storePath = join(tempDir, 'store.chronicle');
     const binding = { binds: true, dropBlock: true };
@@ -233,10 +233,13 @@ describe('toolDeclarations in the framework', () => {
       // The same agent built on its head: its change row from the 'entries' period goes.
       await withFramework([{ ...resident('alpha'), toolDeclarations: 'head', thinkingBinding: binding }], async (framework) => {
         const alpha = framework.getAgent('alpha')!;
+        const heads = framework as unknown as { headDeclarations: { read(name: string): unknown } };
+        assert.ok(heads.headDeclarations.read('alpha'), "the premise: its record from the 'entries' period");
         const assembled = await (alpha as unknown as Assembling).assembleActivationRequest([tool('a'), tool('b')]);
         assert.deepEqual(changesIn(assembled.request.messages), []);
         const cm = alpha.getContextManager();
         assert.equal(cm.getAllMessages().filter(isChange).length, 0, 'the change row went');
+        assert.equal(heads.headDeclarations.read('alpha'), null, 'and its record');
         // The reply, as its stream stores it and notes it.
         const reply = cm.addMessage('alpha', [{ type: 'thinking', thinking: 'why', signature: 's' } as ContentBlock, { type: 'text', text: 'so' } as ContentBlock]);
         assert.equal(cm.noteRequestSent([reply], assembled.binding.identity as never, assembled.compiled.provenance!.compileId!), true);
@@ -246,6 +249,24 @@ describe('toolDeclarations in the framework', () => {
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }
+  });
+
+  it("compiles again on the head once it takes its own change rows out, kept to its head after a refusal, so a reply after keeps its thinking, with `binds: true`", async () => {
+    await withFramework([{ ...resident('alpha'), thinkingBinding: { binds: true, dropBlock: true } }], async (framework) => {
+      const alpha = framework.getAgent('alpha')!;
+      say(alpha, 'user', 'hello');
+      await alpha.buildActivationRequest([tool('a')]);
+      await alpha.buildActivationRequest([tool('a'), tool('b')]);
+      alpha.keepToHeadUntilBuiltAgain();
+      const assembled = await (alpha as unknown as Assembling).assembleActivationRequest([tool('a'), tool('b')]);
+      assert.deepEqual(changesIn(assembled.request.messages), []);
+      const cm = alpha.getContextManager();
+      assert.equal(cm.getAllMessages().filter(isChange).length, 0, 'its change row went');
+      const reply = cm.addMessage('alpha', [{ type: 'thinking', thinking: 'why', signature: 's' } as ContentBlock, { type: 'text', text: 'so' } as ContentBlock]);
+      assert.equal(cm.noteRequestSent([reply], assembled.binding.identity as never, assembled.compiled.provenance!.compileId!), true);
+      const next = await alpha.buildActivationRequest([tool('a'), tool('b')]);
+      assert.ok(next.messages.some((m) => m.content.some((b) => (b as { type?: string }).type === 'thinking')), 'the reply keeps its thinking at the next compile');
+    });
   });
 
   it('leaves out the thinking a replacement of the head sets aside, with `binds: true`, and keeps it past a declared change', async () => {
@@ -1056,6 +1077,118 @@ describe('toolDeclarations in the framework', () => {
       const request = await alpha.buildActivationRequest([tool('a')]);
       const shown = request.messages.map((m) => (isChange(m) ? 'change' : m.content.map((b) => (b as { text?: string }).text ?? '').join('')));
       assert.deepEqual(shown.slice(shown.indexOf('my reply')), ['my reply', '[Continue]']);
+    });
+  });
+
+  describe("a 'head' agent's compile, which leaves every change row out, as its request does", () => {
+    const bulky = (name: string) => [{ type: 'system_change', defineTools: [{ ...tool(name), description: `${name} `.repeat(20000) }] }] as unknown as ContentBlock[];
+    const tight = { contextBudgetTokens: 20000 };
+    const lastText = (messages: readonly NormalizedMessage[]) => (messages.at(-1)!.content[0] as { text?: string }).text;
+    const internals = (framework: AgentFramework) => framework as unknown as { createConversationAgent(name: string, channelId: string): Promise<Agent> };
+
+    it("sends a resident's request beside a host's change rows that alone exceed its budget", async () => {
+      await withFramework([{ ...resident('alpha'), toolDeclarations: 'head', ...tight }], async (framework) => {
+        const alpha = framework.getAgent('alpha')!;
+        alpha.getContextManager().addMessage('system', bulky('h1'));
+        alpha.getContextManager().addMessage('system', bulky('h2'));
+        say(alpha, 'user', 'hello');
+        const request = await alpha.buildActivationRequest([tool('a')]);
+        assert.deepEqual(changesIn(request.messages), []);
+        assert.equal(lastText(request.messages), 'hello');
+      });
+    });
+
+    it("sends an isolated ephemeral agent's request beside a host's change rows that alone exceed its budget", async () => {
+      await withFramework([resident('alpha')], async (framework) => {
+        const { agent } = await framework.createEphemeralAgent({ name: 'solo', model: 'test-model', systemPrompt: 'You work alone.', ...tight } as never);
+        agent.getContextManager().addMessage('system', bulky('h1'));
+        agent.getContextManager().addMessage('system', bulky('h2'));
+        say(agent, 'user', 'hello');
+        const request = await agent.buildActivationRequest([tool('a')]);
+        assert.deepEqual(changesIn(request.messages), []);
+        assert.equal(lastText(request.messages), 'hello');
+      });
+    });
+
+    it("sends a host's shared child's request beside a host's change rows in its parent's context that alone exceed its budget", async () => {
+      await withFramework([{ ...resident('alpha'), toolDeclarations: 'head' }], async (framework) => {
+        const alpha = framework.getAgent('alpha')!;
+        alpha.getContextManager().addMessage('system', bulky('h1'));
+        alpha.getContextManager().addMessage('system', bulky('h2'));
+        say(alpha, 'user', 'hello');
+        const { name: _name, ...spec } = taskForkSpec('host-child', { parent: 'alpha', inherit: { mode: 'shared' } });
+        const { agent: child } = await framework.createEphemeralAgent({ name: 'host-child', model: 'test-model', systemPrompt: 'You are alpha.', ...tight } as never, spec);
+        const request = await child.buildActivationRequest([tool('a')]);
+        assert.deepEqual(changesIn(request.messages), []);
+        assert.equal(lastText(request.messages), 'hello');
+      });
+    });
+
+    it("sends a conversation fork's request beside a host's change rows that alone exceed its budget", async () => {
+      await withFramework([{ ...resident('alpha'), toolDeclarations: 'head', ...tight }], async (framework) => {
+        say(framework.getAgent('alpha')!, 'user', 'hello');
+        const fork = await internals(framework).createConversationAgent('alpha-fork', 'chanA');
+        fork.getContextManager().addMessage('system', bulky('h1'));
+        fork.getContextManager().addMessage('system', bulky('h2'));
+        say(fork, 'user', 'and you');
+        const request = await fork.buildActivationRequest([tool('a')]);
+        assert.deepEqual(changesIn(request.messages), []);
+        assert.equal(lastText(request.messages), 'and you');
+      }, undefined, { conversations: { templateAgent: 'alpha' } });
+    });
+
+    it("leaves an 'entries' child of a 'head' conversation fork, which has no view, its own change, declared once", async () => {
+      await withFramework([{ ...resident('alpha'), toolDeclarations: 'head' }], async (framework) => {
+        say(framework.getAgent('alpha')!, 'user', 'hello');
+        await internals(framework).createConversationAgent('alpha-fork', 'chanA');
+        const { name: _name, ...spec } = taskForkSpec('fork-child', { parent: 'alpha-fork', inherit: { mode: 'shared' } });
+        const { agent: child } = await framework.createEphemeralAgent({ ...resident('fork-child'), systemPrompt: 'You are alpha.' } as never, spec);
+        await child.buildActivationRequest([tool('a')]);
+        await child.buildActivationRequest([tool('a'), tool('b')]);
+        const request = await child.buildActivationRequest([tool('a'), tool('b')]);
+        assert.deepEqual(changesIn(request.messages), [[{ type: 'system_change', defineTools: [tool('b')] }]], 'its own change, once');
+        const own = child.getContextManager().getAllMessages().filter(isChange).filter((m) => (m.metadata as { agent?: string } | undefined)?.agent === 'fork-child');
+        assert.equal(own.length, 1, 'and stored once');
+      }, undefined, { conversations: { templateAgent: 'alpha' } });
+    });
+
+    it("keeps its own change rows on the head while its record can't be cleared, and takes both out once it can", async () => {
+      await withFramework([resident('alpha')], async (framework) => {
+        const internals = framework as unknown as { store: { setStateJson(id: string, value: unknown): unknown }; headDeclarations: { read(name: string): unknown } };
+        const alpha = framework.getAgent('alpha')!;
+        say(alpha, 'user', 'hello');
+        await alpha.buildActivationRequest([tool('a')]);
+        await alpha.buildActivationRequest([tool('a'), tool('b')]);
+        alpha.keepToHeadUntilBuiltAgain();
+        const rows = () => alpha.getContextManager().getAllMessages().filter(isChange).length;
+        const set = internals.store.setStateJson.bind(internals.store);
+        internals.store.setStateJson = (id, value) => {
+          if (id === 'framework/head-declarations/alpha') throw new Error('no space left on device');
+          return set(id, value);
+        };
+        try {
+          await alpha.buildActivationRequest([tool('a'), tool('b')]);
+          assert.equal(rows(), 1, 'its row stays with the record');
+          assert.ok(internals.headDeclarations.read('alpha'), 'and the record stays');
+        } finally {
+          internals.store.setStateJson = set;
+        }
+        await alpha.buildActivationRequest([tool('a'), tool('b')]);
+        assert.equal(rows(), 0, 'once the record clears, its row goes');
+        assert.equal(internals.headDeclarations.read('alpha'), null);
+      });
+    });
+
+    it("shows a host's change row in an inspection of a live 'head' resident, whose compile leaves it out", async () => {
+      await withFramework([{ ...resident('alpha'), toolDeclarations: 'head' }], async (framework) => {
+        const alpha = framework.getAgent('alpha')!;
+        say(alpha, 'user', 'hello');
+        const hostChange = [{ type: 'system_change', defineTools: [tool('h')] }] as unknown as ContentBlock[];
+        alpha.getContextManager().addMessage('system', hostChange);
+        const compiledChanges = async (cm: ContextManager) => changesIn((await cm.compile(undefined, undefined, { dryRun: true })).messages);
+        assert.deepEqual(await compiledChanges(alpha.getContextManager()), [], "the premise: alpha's compile leaves it out");
+        assert.deepEqual(await compiledChanges(await framework.inspectAgentContext('alpha')), [hostChange], 'inspected, it shows as stored');
+      });
     });
   });
 
