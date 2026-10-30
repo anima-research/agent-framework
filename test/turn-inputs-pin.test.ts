@@ -818,3 +818,30 @@ test("a shared fork's opening and its end leave its parent's turn-inputs pin in 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// The audit of #291's mind-neutrality, D4: the turn-opening pin had no off
+// switch. `turnInputsPin: false` places none, and a pin of the name left
+// from before goes at the next start, as a silent start's does.
+test('with turnInputsPin false, a turn places no pin, listPins is empty while it runs, and a pin of the name left from before is gone once it starts', async () => {
+  const module = new PagesModule();
+  const membrane = new TurnMembrane([[...toolRounds(2), answer(FINAL)]]);
+  await withFramework(membrane, module, agentConfig({ turnInputsPin: false }), async (framework) => {
+    const old = cmOf(framework).addMessage('Dana', text('An old message.'));
+    cmOf(framework).pinRange(old, old, { name: PIN });
+    assert.equal(inputPins(framework).length, 1, "premise: a pin of the turn's name from before");
+    const during: Array<readonly ProtectedRange[]> = [];
+    module.onCall = () => { during.push(cmOf(framework).listPins()); };
+    ask(framework);
+    await waitUntil('the turn to end', () => storedText(framework).includes(FINAL));
+    assert.equal(during.length, 2, "premise: the pins were read during the turn's two rounds");
+    assert.deepEqual(during, [[], []], 'no pin of any name while the turn runs');
+    assert.deepEqual(cmOf(framework).listPins(), [], 'and none after it');
+  });
+});
+
+test('turnInputsPin takes true or false and nothing else', async () => {
+  await assert.rejects(
+    AgentFramework.create({ agents: [agentConfig({ turnInputsPin: 'false' as never })], membrane: new MockMembrane().asMembrane(), modules: [] }),
+    /Agent "prime" turnInputsPin must be true or false, unquoted, not a string/,
+  );
+});

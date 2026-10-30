@@ -25595,7 +25595,10 @@ export class AgentFramework {
     if (opensTurn) {
       const head = agent.branchHead();
       if (head) routing.start = head;
-      if (!routing.silent) this.pinTurnInputs(agent, routing);
+      // A silent start, and an agent whose configuration turns the pin off
+      // (turnInputsPin: false), pin nothing, and a pin of the name left from
+      // before goes.
+      if (!routing.silent && agent.pinsTurnInputs) this.pinTurnInputs(agent, routing);
       else agent.unpinTurnInputs();
     }
     this.turnRouting.set(agent.name, routing);

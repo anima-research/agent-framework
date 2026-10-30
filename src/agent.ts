@@ -190,7 +190,7 @@ export function assertThinkingBinding(setting: string, value: AgentConfig['think
 
 /**
  * Refuse an agent config whose `promptCaching`, `toolResultGuard`,
- * `toolWrapperProseGuard`, `thinking.enabled`, `thinkingBinding.dropBlock`,
+ * `toolWrapperProseGuard`, `turnInputsPin`, `thinking.enabled`, `thinkingBinding.dropBlock`,
  * `thinkingBinding.binds` or `refusalHandling.autoRewind` holds anything but true or false
  * (assertBooleanSetting, where null counts as left out), or whose `thinking`, `thinkingBinding` or
  * `refusalHandling` is anything but an object, null or false (holdsSettings),
@@ -237,6 +237,11 @@ export function assertAgentSwitches(config: AgentConfig): void {
     config.toolWrapperProseGuard,
     'true keeps a response whose whole prose is a tool-call-shaped wrapper from running or entering the agent\'s history, ' +
       'and false or leaving it out doesn\'t',
+  );
+  assertBooleanSetting(
+    `${agent} turnInputsPin`,
+    config.turnInputsPin,
+    'true or leaving it out pins the rows that open a turn raw until it ends, and false places no pin',
   );
   const observes: unknown = config.observes;
   if (observes !== undefined && observes !== null
@@ -493,6 +498,7 @@ export class Agent {
     this.clock = resolveClockConfig(config.name, config.clock);
     this.cacheTtl = config.cacheTtl ?? '1h';
     this.promptCaching = config.promptCaching !== false;
+    this.pinsTurnInputs = config.turnInputsPin !== false;
     this.prefillUserMessage = config.prefillUserMessage;
     this.providerParams = config.providerParams;
     this.sameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
@@ -1276,6 +1282,9 @@ export class Agent {
   markAnswered(watermark: ReadMark | null): void {
     if (watermark) this.answeredWatermark = watermark;
   }
+
+  /** Whether a turn this agent opens pins its inputs (AgentConfig.turnInputsPin, on by default). */
+  readonly pinsTurnInputs: boolean;
 
   /**
    * Keep the rows of the agent's window from `first` through `last` raw for

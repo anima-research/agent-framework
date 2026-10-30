@@ -433,6 +433,19 @@ export interface AgentConfig {
   clock?: import('../clock-rows.js').ClockConfig;
 
   /**
+   * Keep the rows that open a turn raw for the whole turn (on when left out):
+   * at a start that opens a turn, the framework pins raw the rows of the
+   * agent's window after its newest own message and its consumed mark
+   * (`pinRange`, named `agent-framework:turn-inputs`; the README says
+   * which rows exactly), and removes the pin when the turn ends, so the
+   * strategy doesn't compress the rows the turn opened with while it runs. `false` places no pin:
+   * the turn's opening rows are compressed as any others, and a pin of the
+   * name left from before (a crash's) is removed at the next start that opens
+   * a turn, as a silent start removes one.
+   */
+  turnInputsPin?: boolean;
+
+  /**
    * The other configured agents whose own rows this agent's window takes
    * (none when left out). Residents share one slot, and each is shown only
    * its own rows and the rows meant for it: another resident's rounds,
