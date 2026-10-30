@@ -89,19 +89,6 @@ test('bare parent stop waits for a nested child shutdown beyond five seconds', a
   }
 });
 
-test('borrowed-store lifecycle changes invalidate a successful stop memo', async t => {
-  const { store, config } = await fixture(t);
-  const framework = await AgentFramework.create({ ...config, store });
-  await framework.stop();
-  let calls = 0;
-  await framework.addModule(module('later', async () => { calls++; }));
-  await framework.stop();
-  assert.equal(calls, 1);
-  framework.start();
-  await framework.stop();
-  assert.equal((framework as any).running, false);
-});
-
 test('real Chronicle consumed close failure remains terminal with its original error', async t => {
   const { framework, store, config } = await fixture(t);
   const close = store.close.bind(store);
@@ -117,8 +104,13 @@ test('real Chronicle consumed close failure remains terminal with its original e
   assert.equal(store.isClosed(), true, 'Chronicle consumes its native handle before sync');
   await assert.rejects(framework.stop(), error => error === closeFailure);
   assert.equal(closeCalls, 1);
-  assert.throws(() => framework.start(), /owned store is closed/);
-  await assert.rejects(framework.addModule(module('later', async () => {})), /owned store is closed/);
+  for (const refusal of [
+    (() => { try { framework.start(); } catch (error) { return error; } return undefined; })(),
+    await framework.addModule(module('later', async () => {})).then(() => undefined, (error: unknown) => error),
+  ]) {
+    assert.ok(refusal instanceof Error && /refused: this framework's stop\(\) failed and its owned store is closed, so stop\(\) can't be tried again/.test(refusal.message), String(refusal));
+    assert.equal(refusal.cause, closeFailure, "the refusal carries the close's failure");
+  }
 });
 
 test('final sync failure rejects stop and still closes an owned store', async t => {
@@ -218,8 +210,8 @@ for (const synchronous of [false, true]) {
     const order: string[] = [];
     const registry = new McplServerRegistry();
     const servers = (registry as unknown as { servers: Map<string, McplServerConnection> }).servers;
-    servers.set('failing', { close: () => synchronous ? (() => { throw failure; })() : Promise.reject(failure) } as unknown as McplServerConnection);
-    servers.set('delayed', { close: async () => { await waiting; order.push('connection-closed'); } } as unknown as McplServerConnection);
+    servers.set('failing', { stopReconnecting() {}, close: () => synchronous ? (() => { throw failure; })() : Promise.reject(failure) } as unknown as McplServerConnection);
+    servers.set('delayed', { stopReconnecting() {}, close: async () => { await waiting; order.push('connection-closed'); } } as unknown as McplServerConnection);
     const { framework, store } = await fixture(t);
     (framework as unknown as { mcplServerRegistry: McplServerRegistry }).mcplServerRegistry = registry;
     const sync = store.sync.bind(store), close = store.close.bind(store);

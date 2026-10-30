@@ -26,6 +26,7 @@ import { AgentFramework } from '../src/index.js';
 import { resolveAutoContinue } from '../src/agent.js';
 import { autoContinueNotice } from '../src/auto-continue.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { bindAsConversationFork } from './helpers/dendrite.js';
 import type { ContentBlock, NormalizedResponse } from '@animalabs/membrane';
 
 class TriggerModule implements Module {
@@ -517,7 +518,6 @@ describe('autoContinue', () => {
       autoContinueAfterTurn(agent: unknown, routing: unknown, trigger: unknown, stopReason: string, opts?: unknown): void;
       pendingRequests: InferenceRequest[];
       ephemeralRuns: Map<string, unknown>;
-      conversationAgentHomes: Map<string, unknown>;
       providerAdmissionClosed: boolean;
       autoContinueStreaks: Map<string, number>;
     };
@@ -529,9 +529,9 @@ describe('autoContinue', () => {
       internals.ephemeralRuns.delete('assistant');
       assert.equal(queued().length, 0, 'an ephemeral run ends with its result');
 
-      internals.conversationAgentHomes.set('assistant', 'chan-alpha');
+      const unbind = bindAsConversationFork(framework, 'assistant', { serverId: 'stub', channelId: 'chan-alpha' });
       internals.autoContinueAfterTurn(agent, {}, undefined, 'end_turn');
-      internals.conversationAgentHomes.delete('assistant');
+      unbind();
       assert.equal(queued().length, 0, 'a conversation fork answers its home');
 
       internals.providerAdmissionClosed = true;

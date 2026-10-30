@@ -1311,7 +1311,10 @@ describe('conversation forks and an undo', () => {
     router.bind({ serverId: 'world', channelId: 'world:late' }, 'a-late-g1', 1);
     framework.getAgent('a-late-g1')!.getContextManager().addMessage('user', [{ type: 'text', text: 'late own' }]);
   };
-  const count = (texts: string[], text: string) => texts.filter((t) => t === text).length;
+  // On this branch a fork's stored copy of a channel message carries its author
+  // (`alice: …`, presentAuthor), so a text is found as written or so prefixed.
+  const matches = (t: string, text: string) => t === text || t.endsWith(': ' + text);
+  const count = (texts: string[], text: string) => texts.filter((t) => matches(t, text)).length;
   type Alert = { kind: string; agentName: string; message: string };
   const reinitAlertsOf = (framework: AgentFramework): Alert[] => {
     const alerts: Alert[] = [];
@@ -1406,6 +1409,7 @@ describe('conversation forks and an undo', () => {
         assert.deepEqual(alerts.map((alert) => alert.agentName), [emptied], JSON.stringify(alerts));
         says(alerts[0]!.message, 'it was disposed and its channel unbound');
         assert.ok(!framework.getAgent(emptied), 'disposed');
+        assert.equal(framework.getAgentRecord(emptied)?.ended?.reason, 'context-emptied');
         assert.equal(framework.getConversationRouter()!.getBinding({ serverId: 'world', channelId }), undefined, 'its channel is unbound');
         assert.ok(framework.getAgent('a-early-g1'), 'the fork with history stays');
       });
@@ -1686,15 +1690,15 @@ describe('conversation forks and an undo', () => {
       pass.open();
       await undo.settled;
       const texts = await textsOf(framework, 'a-early-g1');
-      const own = texts.indexOf('early own');
-      const message = texts.indexOf('MESSAGE DURING THE UNDO');
-      const correction = texts.indexOf('CORRECTION DURING THE UNDO');
+      const own = texts.findIndex((t) => matches(t, 'early own'));
+      const message = texts.findIndex((t) => matches(t, 'MESSAGE DURING THE UNDO'));
+      const correction = texts.findIndex((t) => matches(t, 'CORRECTION DURING THE UNDO'));
       assert.ok(own >= 0 && message > own && correction > message, `its own history, then the two writes: ${JSON.stringify(texts)}`);
       assert.equal(count(texts, 'MESSAGE DURING THE UNDO') + count(texts, 'CORRECTION DURING THE UNDO'), 2, JSON.stringify(texts));
       assert.deepEqual(added.filter((t) => t.source === 'mcpl:channel-incoming').map((t) => t.messageId), ['', ''],
         `traced at the deferral, with no id yet: ${JSON.stringify(added)}`);
       const storedId = (words: string) => early.getAllMessages()
-        .find((m) => m.content.some((b) => (b as { text?: string }).text === words))?.id;
+        .find((m) => m.content.some((b) => typeof (b as { text?: string }).text === 'string' && matches((b as { text: string }).text, words)))?.id;
       assert.deepEqual(added.filter((t) => t.source === 'deferred-flush:surgery-release').map((t) => t.messageId),
         [storedId('MESSAGE DURING THE UNDO'), storedId('CORRECTION DURING THE UNDO')], `traced as each lands, with its stored id: ${JSON.stringify(added)}`);
     });
@@ -1750,7 +1754,7 @@ describe('conversation forks and an undo', () => {
     });
   });
 
-  it("a spawn after a failed stop() is refused, and so is one after a completed stop() and an addModule(): neither begins a lifecycle", { timeout: 30_000 }, async () => {
+  it("a spawn after a failed stop() is refused, and so is one after a completed stop(), where addModule() and start() are refused too", { timeout: 30_000 }, async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'reinit-fork-stopped-'));
     const store = JsStore.openOrCreate({ path: join(tempDir, 'store') });
     let failStop = true;
@@ -1777,11 +1781,9 @@ describe('conversation forks and an undo', () => {
       await assert.rejects(spawn('a-failed-g1'), /conversation agent "a-failed-g1" not created: the framework is stopping/);
       failStop = false;
       await framework.stop();
-      await framework.addModule(stopper('added'));
-      await assert.rejects(spawn('a-added-g1'), /conversation agent "a-added-g1" not created: the framework is stopping/);
-      framework.start();
-      await spawn('a-started-g1');
-      assert.ok(framework.getAgent('a-started-g1'), 'a start() begins a lifecycle that spawns');
+      await assert.rejects(spawn('a-stopped-g1'), /conversation agent "a-stopped-g1" not created: the framework is stopping/);
+      await assert.rejects(framework.addModule(stopper('added')), /addModule\(\) refused: this framework has stopped/);
+      assert.throws(() => framework.start(), /start\(\) refused: this framework has stopped/);
     } finally {
       failStop = false;
       await framework.stop().catch(() => {});
@@ -1824,26 +1826,30 @@ describe('conversation forks and an undo', () => {
     }
   });
 
-  it('a spawn after a stop() and a start() is made: the check is for a stop() of this lifecycle', { timeout: 30_000 }, async () => {
+  it("a spawn on a new framework on a stopped one's store is made, seeded from the template", { timeout: 30_000 }, async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'reinit-fork-restart-'));
     const store = JsStore.openOrCreate({ path: join(tempDir, 'store') });
-    const framework = await AgentFramework.create({
+    const create = () => AgentFramework.create({
       store,
       membrane: new MockMembrane().asMembrane(),
       agents: [{ name: 'a', model: 'test-model', systemPrompt: 'You are a.', strategy: autobiographical() }],
       modules: [],
       conversations: { templateAgent: 'a', bind: { channel: 'mention' }, strategyFactory: () => autobiographical() },
     });
+    const first = await create();
+    let next: AgentFramework | undefined;
     try {
-      framework.getAgent('a')!.getContextManager().addMessage('user', [{ type: 'text', text: 'hello a' }]);
-      framework.start();
-      await framework.stop();
-      framework.start();
-      await (framework as unknown as ForkInternals).createConversationAgent('a-after-g1', { serverId: 'world', channelId: 'world:after' });
-      assert.ok(framework.getAgent('a-after-g1'), 'registered');
-      assert.deepEqual(await textsOf(framework, 'a-after-g1'), ['hello a'], 'seeded from the template');
+      first.getAgent('a')!.getContextManager().addMessage('user', [{ type: 'text', text: 'hello a' }]);
+      first.start();
+      await first.stop();
+      next = await create();
+      next.start();
+      await (next as unknown as ForkInternals).createConversationAgent('a-after-g1', { serverId: 'world', channelId: 'world:after' });
+      assert.ok(next.getAgent('a-after-g1'), 'registered');
+      assert.deepEqual(await textsOf(next, 'a-after-g1'), ['hello a'], 'seeded from the template');
     } finally {
-      await framework.stop().catch(() => {});
+      await next?.stop().catch(() => {});
+      await first.stop().catch(() => {});
       if (!store.isClosed()) store.close();
       rmSync(tempDir, { recursive: true, force: true });
     }
@@ -1899,7 +1905,11 @@ describe('conversation forks and an undo', () => {
         (e: unknown) => e instanceof OperatorActionError && e.code === 'agent-busy' && /is being created/.test(e.message));
       const placement = await arriving;
       assert.ok(placement?.agent && framework.getAgent(placement.agent), `the spawn made its fork: ${JSON.stringify(placement)}`);
-      assert.equal(cmA.getAllMessages().length, 2, 'the rollback changed nothing');
+      // On this branch the spawn also tells its source (Dendrite's derivation
+      // notice), so the two rows stand first and the only row after them is that notice.
+      const texts = storedTexts(cmA);
+      assert.deepEqual(texts.slice(0, 2), ['hello a', 'again'], 'the rollback changed nothing');
+      assert.ok(texts.length <= 3, `only the derivation notice may follow: ${JSON.stringify(texts)}`);
     });
   });
 

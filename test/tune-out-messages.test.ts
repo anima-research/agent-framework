@@ -18,6 +18,7 @@ const SETTINGS = { epochId: 'e1', cadenceSeconds: 300, backlogCap: 50, maxWakes:
 function hooks(opts: { subconscious?: boolean; forkBound?: boolean }) {
   return {
     subconsciousName: () => (opts.subconscious === false ? undefined : 'Subconscious'),
+    primaryName: () => 'scout',
     isForkBound: () => opts.forkBound ?? false,
     allowChannelSpeech: () => false,
   };
@@ -40,6 +41,7 @@ function coordinator(opts: { tunedOut?: Array<{ channelId: string; expiresAtMs?:
       const found = tunedOut.find((t) => t.channelId === channelId);
       return found ? { params: { ...SETTINGS, expiresAtMs: found.expiresAtMs } } : null;
     },
+    readCoordinatorState: () => null,
     cancelTuneOut: () => null,
   };
   return new TuneOutCoordinator(registry as never, {} as never, hooks(opts) as never);

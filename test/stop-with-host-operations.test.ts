@@ -242,6 +242,7 @@ describe('stop() with an operator operation in flight', () => {
       id: 'srv',
       isConnected: true,
       readied: 0,
+      stopReconnecting(): void {},
       pauseDataPlane(): void {},
       readyControlPlane(): void {},
       ready(): void { this.readied++; },

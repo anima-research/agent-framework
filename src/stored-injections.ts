@@ -84,6 +84,13 @@ export function isAnotherAgentsInjection(metadata: unknown, agentName: string): 
   return mark !== undefined && mark.agent !== agentName;
 }
 
+/** Whether a row is `agentName`'s own stored injection: its context, which
+ *  its view keeps however the rest is read, as a shared fork's does, whose
+ *  view is otherwise its source's (AgentFramework's deriveSharedContext). */
+export function isOwnInjection(metadata: unknown, agentName: string): boolean {
+  return storedInjectionMarkOf(metadata)?.agent === agentName;
+}
+
 /**
  * Whether an injection is stored, rather than placed by `compile()` each
  * time: an `afterUser` one, unless it opts out

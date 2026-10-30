@@ -306,8 +306,8 @@ for (const mode of ['native', 'xml'] as const) {
       );
 
       assert.strictEqual(answer.result, undefined);
-      assert.deepStrictEqual(answer.error, { code: -32603, message: 'The inference stopped before it finished (timeout)' });
-      assert.deepStrictEqual(answer.sent, ['chunk:A summ', 'error:The inference stopped before it finished (timeout)']);
+      assert.deepStrictEqual(answer.error, { code: -32603, message: 'The inference stopped before it finished (timeout: no event for 120000ms)' });
+      assert.deepStrictEqual(answer.sent, ['chunk:A summ', 'error:The inference stopped before it finished (timeout: no event for 120000ms)']);
     });
 
     it('answers a refusal with the error, not end_turn', async () => {

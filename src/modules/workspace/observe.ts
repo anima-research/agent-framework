@@ -46,7 +46,7 @@ import type { BigIntStats } from 'node:fs';
 import { lstat, mkdir, open, readdir, readlink, realpath, stat, statfs } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
-import { sameRootIdentity, type Fingerprint, type RootIdentity } from './disk-agreement.js';
+import { onlyDeviceDiffers, sameRootIdentity, type Fingerprint, type RootIdentity } from './disk-agreement.js';
 import { OUTSIDE_STEP, UNFOLLOWED_STEP, errnoClause, errnoCode, systemWords } from './answers.js';
 
 export interface MountView {
@@ -164,8 +164,14 @@ export const LEAVES_MOUNT = 'a symlink that leaves the mount';
 export const NOT_A_DIRECTORY = 'a parent path is not a directory';
 export const ROOT_UNAVAILABLE = 'the mount root is unavailable';
 export const ROOT_REPLACED =
-  'the mount root is not the directory disk last agreed with (an unmounted drive, or a replaced directory): ' +
-  'reconnect it; if it was replaced on purpose, sync the mount with acceptRoot to take it as it is now';
+  'the mount root is not the directory disk last agreed with (an unmounted drive, a directory moved aside, or a replaced one); ' +
+  'whoever runs this host can say which: a drive they can reconnect, a directory moved aside they can put back, ' +
+  'and a replaced directory a sync of the mount with acceptRoot takes as it is now';
+export const ROOT_ON_ANOTHER_DEVICE =
+  'the mount root has the inode disk last agreed with, but another device number: a reboot can renumber a volume, ' +
+  'and another volume mounted at the same place can have a root with the same inode; whoever runs this host can ' +
+  'say which, and if it is the same directory, a sync of the mount with acceptRoot takes it as it is now; if not, ' +
+  'they can mount the right volume';
 export const CHANGED = 'it changed while it was observed';
 export const CHANGED_WALK = 'the directory changed while the walk ran';
 export const FILE_CHANGED = 'the file changed while it was read';
@@ -1026,6 +1032,8 @@ export class CheckedDir {
     private readonly dev: bigint,
     private readonly ino: bigint,
     private readonly born: bigint,
+    /** For the root: whether its filesystem keeps a birth time fixed (filesystemKeepsBirthTime). */
+    readonly bornFixed = false,
   ) {}
 
   /** Which directory it is. */
@@ -1094,7 +1102,12 @@ export async function rootAbsence(root: string): Promise<string | undefined> {
 async function checkedAt(view: MountView, rel: string, real: string): Promise<CheckedDir | null> {
   const info = await lstat(real, { bigint: true }).catch(() => null);
   if (!info?.isDirectory()) return null;
-  return new CheckedDir(rel, real, lexicalOf(view, rel), info.dev, info.ino, info.birthtimeNs);
+  return new CheckedDir(rel, real, lexicalOf(view, rel), info.dev, info.ino, bornOf(info), rel === '' && await filesystemKeepsBirthTime(real));
+}
+
+function bornOf(info: BigIntStats): bigint {
+  // Where statx is unavailable, libuv gives the ctime as the birth time (uv__to_stat).
+  return info.birthtimeNs === info.ctimeNs ? 0n : info.birthtimeNs;
 }
 
 /**
@@ -1141,8 +1154,8 @@ async function locateDir(view: MountView, rootReal: string, rel: string): Promis
     // A root that isn't the directory disk last agreed under proves nothing
     // about the files that agreed: an empty mountpoint where a drive was
     // would otherwise read as every file deleted.
-    if (rel === '' && view.rootIdentity && !sameRootIdentity(checked.identity(), view.rootIdentity)) {
-      return { kind: 'unobserved', reason: ROOT_REPLACED };
+    if (rel === '' && view.rootIdentity && !sameRootIdentity(view.rootIdentity, checked.identity(), checked.bornFixed)) {
+      return { kind: 'unobserved', reason: onlyDeviceDiffers(view.rootIdentity, checked.identity(), checked.bornFixed) ? ROOT_ON_ANOTHER_DEVICE : ROOT_REPLACED };
     }
     return { kind: 'checked', dir: checked };
   }
@@ -1153,9 +1166,9 @@ async function locateDir(view: MountView, rootReal: string, rel: string): Promis
  * The mount root as it is now: its identity if it is available (a directory,
  * the one the pass was given, and the one disk last agreed under), else why not.
  */
-export async function locateRoot(view: MountView, rootReal: string): Promise<{ identity: RootIdentity } | { reason: string; errno?: string }> {
+export async function locateRoot(view: MountView, rootReal: string): Promise<{ identity: RootIdentity; bornFixed: boolean } | { reason: string; errno?: string }> {
   const found = await checkRoot(view, rootReal);
-  return 'dir' in found ? { identity: found.dir.identity() } : found;
+  return 'dir' in found ? { identity: found.dir.identity(), bornFixed: found.dir.bornFixed } : found;
 }
 
 /** The mount root as locateRoot finds it, checked, so a caller can ask later whether it's still there. */
@@ -1265,7 +1278,7 @@ export async function confirmAbsent(view: MountView, rootReal: string, rel: stri
     }
     if (info.isDirectory()) {
       if (last) return { reason: CHANGED }; // present after all
-      cur = new CheckedDir(childRel, cur.at(name), lexicalOf(view, childRel), info.dev, info.ino, info.birthtimeNs);
+      cur = new CheckedDir(childRel, cur.at(name), lexicalOf(view, childRel), info.dev, info.ino, bornOf(info));
       walked.push(cur);
       continue;
     }
@@ -1355,6 +1368,34 @@ export async function filesystemTrustsCtime(root: string): Promise<boolean> {
   if (process.platform !== 'linux') return false;
   try {
     return fsTypeTrustsCtime((await statfs(root)).type);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Linux filesystems that give a directory its birth time when it is made and
+ * have no call that changes it (statfs f_type). Overlayfs isn't one: copying a
+ * directory up from a lower layer gives it the copy's birth time under the
+ * same device and inode.
+ */
+const BIRTH_FIXED_FS_TYPES = new Set<number>([
+  0xef53, // ext2/ext3/ext4
+  0x58465342, // xfs
+  0x9123683e, // btrfs
+  0x01021994, // tmpfs
+  0xf2f52010, // f2fs
+  0x2fc12fc1, // zfs
+]);
+
+export function fsTypeKeepsBirthTime(type: number | bigint): boolean {
+  return BIRTH_FIXED_FS_TYPES.has(Number(type) >>> 0);
+}
+
+export async function filesystemKeepsBirthTime(dir: string): Promise<boolean> {
+  if (process.platform !== 'linux') return false;
+  try {
+    return fsTypeKeepsBirthTime((await statfs(dir)).type);
   } catch {
     return false;
   }
@@ -2106,7 +2147,7 @@ async function checkChild(view: MountView, rootReal: string, parent: CheckedDir,
     return 'reason' in proof ? { kind: 'unobserved', ...proof } : { kind: 'absent', by: proof.by };
   }
   if (!info.isDirectory()) return { kind: 'unobserved', reason: CHANGED_WALK };
-  return { kind: 'checked', dir: new CheckedDir(rel, real, lexicalOf(view, rel), info.dev, info.ino, info.birthtimeNs) };
+  return { kind: 'checked', dir: new CheckedDir(rel, real, lexicalOf(view, rel), info.dev, info.ino, bornOf(info)) };
 }
 
 /**

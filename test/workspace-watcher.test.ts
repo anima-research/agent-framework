@@ -5,7 +5,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { MountWatcher, type FsChange, type WatcherLifecycle } from '../src/modules/workspace/watcher.js';
+import { MountWatcher, identityOf, type FsChange, type WatcherLifecycle } from '../src/modules/workspace/watcher.js';
 import { changesFlow, isProbe } from './helpers/watcher-flow.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
 
@@ -241,6 +241,24 @@ function withOpenRefused<T>(path: string, fn: () => Promise<T>): Promise<T> {
     return openSync(file, ...rest);
   }, fn);
 }
+
+describe('MountWatcher root identity', () => {
+  it('keeps a root the same where its birth time follows its ctime, as where statx is unavailable, and tells a later-born one apart', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-watch-id-'));
+    try {
+      const s = statSync(dir);
+      const as = (fields: Partial<fs.Stats>) => Object.assign(Object.create(Object.getPrototypeOf(s)), s, fields) as fs.Stats;
+      const before = as({ ctimeMs: s.ctimeMs, birthtimeMs: s.ctimeMs });
+      const after = as({ ctimeMs: s.ctimeMs + 5, birthtimeMs: s.ctimeMs + 5 });
+      assert.deepStrictEqual(identityOf(after), identityOf(before), 'an entry made in the root moves both');
+      const born = as({ ctimeMs: s.ctimeMs + 5, birthtimeMs: s.ctimeMs - 1000 });
+      const reborn = as({ ctimeMs: s.ctimeMs + 9, birthtimeMs: s.ctimeMs + 1 });
+      assert.notDeepStrictEqual(identityOf(reborn), identityOf(born), 'a birth time apart from the ctime still tells');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('MountWatcher mergeOp', () => {
   // Each merge rule, from chokidar's events handed in within one debounce

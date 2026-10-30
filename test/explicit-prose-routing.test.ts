@@ -23,6 +23,7 @@ import type {
   ToolCall,
   ToolResult,
   InferenceRequest,
+  ErrorPolicy,
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 import { destinationKey, type ChannelRef } from '../src/mcpl/channel-registry.js';
@@ -155,10 +156,16 @@ describe('explicit prose routing', () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  async function createFramework(mode: 'explicit' | 'hybrid' | 'disabled' = 'explicit', settings: Record<string, unknown> = {}): Promise<AgentFramework> {
+  const retryAtOnce: ErrorPolicy = {
+    maxRetries: 1,
+    onInferenceError: (_error, _agentName, attempt) => (attempt < 1 ? { retry: true, delayMs: 0 } : { retry: false }),
+  };
+
+  async function createFramework(mode: 'explicit' | 'hybrid' | 'disabled' = 'explicit', settings: Record<string, unknown> = {}, errorPolicy?: ErrorPolicy): Promise<AgentFramework> {
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
+      ...(errorPolicy ? { errorPolicy } : {}),
       agents: [{
         name: 'assistant',
         model: 'test-model',
@@ -1265,7 +1272,7 @@ describe('explicit prose routing', () => {
       { type: 'tool_use', id: 'retry-held', name: 'robot--move', input: { dir: 'north' } },
     ] as ContentBlock[], 'tool_use'));
     membrane.pushResponse(createMockResponse([] as ContentBlock[]));
-    const framework = await createFramework(mode);
+    const framework = await createFramework(mode, {}, retryAtOnce);
     const routed = stubRegistry(framework);
     const internals = framework as unknown as {
       proseSpeechChains: Map<string, Promise<void>>;
@@ -3034,7 +3041,7 @@ describe('explicit prose routing', () => {
       { type: 'tool_use', id: 'continued-tool', name: 'robot--move', input: { dir: 'north' } },
     ] as ContentBlock[], 'tool_use'));
     membrane.pushResponse(createMockResponse([] as ContentBlock[]));
-    const framework = await createFramework(mode);
+    const framework = await createFramework(mode, {}, how === 'retry' ? retryAtOnce : undefined);
     const routed = stubRegistry(framework);
     const { chunks } = captureStream(framework);
     const internals = framework as unknown as {
@@ -3209,7 +3216,7 @@ describe('explicit prose routing', () => {
         { type: 'tool_use', id: 'late-two', name: 'robot--move', input: { dir: 'south' } },
       ] as ContentBlock[], 'tool_use'));
       membrane.pushResponse(createMockResponse([] as ContentBlock[]));
-      const framework = await createFramework(mode);
+      const framework = await createFramework(mode, {}, retryAtOnce);
       const routed = stubRegistry(framework);
       const { chunks } = captureStream(framework);
       const internals = framework as unknown as { turnRouting: Map<string, RoutingState> };

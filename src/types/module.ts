@@ -120,7 +120,10 @@ export interface Module {
 
   /**
    * Start the module.
-   * Called when the framework starts or when the module is added.
+   * Called when the module is added: create() adds the modules it is given,
+   * so for those it runs before create() returns. Its own removal and the
+   * framework's stop() wait for it to settle before the module's stop()
+   * runs, so it mustn't await either.
    */
   start(ctx: ModuleContext): Promise<void>;
 
@@ -132,6 +135,8 @@ export interface Module {
    * a host wires up after create() returns, such as a WorkspaceModule's
    * initStore(). A stop() that saves state can therefore run before that
    * wiring, and shouldn't then save over state it was handed and hasn't used.
+   * It isn't called before the module's start() has settled, so it can end
+   * what start() set up.
    */
   stop(): Promise<void>;
 
@@ -259,6 +264,41 @@ export interface AgentSettingsExtension {
 
 /**
  * Context provided to modules for interacting with the framework.
+ *
+ * Once the module's `stop()` has completed, through `removeModule()` or the
+ * framework's `stop()`, its context has no effect on the framework:
+ * - each push is dropped with a log line, as a push after the framework's
+ *   `stop()` is;
+ * - `setState`, `registerLogState`, `appendToLog`, `editLogItem`,
+ *   `editMessage`, `removeMessage`, `notifyOps`, `registerSpeechHandler` and
+ *   `unregisterSpeechHandler` do nothing; `addMessage` returns `''` and adds
+ *   nothing; `callTool` resolves with an error result and runs nothing;
+ *   `getModule` returns `null`; and `onTrace` subscribes nothing, while the
+ *   subscriptions made through the context end. None of these throws, and
+ *   the first such call of each method logs one line naming the module and
+ *   the method;
+ * - `findMessageByExternalId` answers without updating its mapping, and logs
+ *   nothing.
+ *
+ * Its reads (`getState`, `getLog`, `getLogLength`, `getMessage`,
+ * `queryMessages`, `getAgents`, `getActiveTools`, `findMessageByExternalId`)
+ * answer, and fail, as before; one that meets a held write may record that
+ * the write has landed, as any reader's does. The framework calls none of the
+ * module's `onProcess`, `onAgentSpeech` and `onToolBatchComplete` again; it
+ * drops whole a response of its that hadn't been applied by then, with a line
+ * naming what the response asked for if it asked for anything; and it leaves
+ * its `gatherContext` answer out of a turn whose answers it hadn't merged by
+ * then, with a line if it held injections. After `removeModule()`, the result
+ * its `handleToolCall` returns for a call it was running when its `stop()`
+ * completed is still delivered while the framework runs. The framework's
+ * `stop()` closes its event queue before it stops any module, so through the
+ * framework's `stop()` that result is dropped, with the line any tool result
+ * arriving after the framework's `stop()` gets. A result it pushes through
+ * its context after its `stop()` completes is dropped, as its other pushes
+ * are. A module whose `stop()` fails stays registered, and its context keeps
+ * working.
+ * References the module already holds, to other modules or to its own
+ * timers, stay as they are.
  */
 export interface ModuleContext {
   /**

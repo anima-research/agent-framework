@@ -68,6 +68,10 @@ export function boundedForLog(text: string, max = 200): string {
   return points.length > max ? `${points.slice(0, max).join('')}…` : points.join('');
 }
 
+export function hostStoppedWhileHandling(): JsonRpcError {
+  return { code: -32000, message: 'the host stopped while handling this request' };
+}
+
 /**
  * Create a "feature set not enabled" error.
  * Returned when a server sends a message tagged with a feature set

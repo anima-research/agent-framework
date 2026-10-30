@@ -7,7 +7,7 @@
 import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
 import type { ProcessEvent, ConversationRouterConfig, TraceEvent, Module, ModuleContext, ToolCall, ToolResult } from '../src/index.js';
@@ -222,9 +222,9 @@ describe('Conversation routing', () => {
     assert.ok(!messages.some((m) => JSON.stringify(m.content).includes('from srv')), "and not srv's");
     // Each spawned fork's home keeps its server, which its channel tools and
     // speech go to (shared-channel-id's fork tests, over recording servers).
-    const homes = (framework as unknown as { conversationAgentHomes: Map<string, unknown> }).conversationAgentHomes;
-    assert.deepEqual(homes.get(forkName('slack:D1', 1)), { serverId: 'srv', channelId: 'slack:D1' });
-    assert.deepEqual(homes.get(otherFork.name), { serverId: 'other', channelId: 'slack:D1' });
+    const homes = (framework as unknown as { registry: { homeChannel(name: string): unknown } }).registry;
+    assert.deepEqual(homes.homeChannel(forkName('slack:D1', 1)), { serverId: 'srv', channelId: 'slack:D1' });
+    assert.deepEqual(homes.homeChannel(otherFork.name), { serverId: 'other', channelId: 'slack:D1' });
     assert.deepEqual(spawned, [{ serverId: 'srv', channelId: 'slack:D1' }, { serverId: 'other', channelId: 'slack:D1' }],
       'each spawn is traced with its server');
     await framework.stop();
@@ -422,8 +422,9 @@ describe('Conversation routing', () => {
     const { seeded, lines } = await seedOf(framework);
     const types = seeded.flatMap((m) => m.content.map((b) => b.type));
     assert.ok(!types.includes('tool_use') && !types.includes('thinking'), `no unanswered call or thinking in the seed: ${types}`);
-    // The seed is everything before the fork's own first message ('hi').
-    const firstOwn = seeded.findIndex((m) => JSON.stringify(m.content).includes('"hi"'));
+    // The seed is everything before the fork's own first message ('hi',
+    // stored as the model reads it: under its author's name).
+    const firstOwn = seeded.findIndex((m) => JSON.stringify(m.content).includes('"alice: hi"'));
     assert.ok(firstOwn > 1, 'the incoming message follows the seed');
     // The thinking goes first, so the round's row holds only its unanswered
     // call, which the pairing pass replaces with its placeholder.
@@ -837,14 +838,14 @@ describe('Conversation routing', () => {
   // The gate's sleep quiets the whole agent, every conversation of it, so a
   // fork's sleep and wake are refused (#646), and a fork's end tells the gate,
   // which cancels the fork's pending self-wake.
-  async function makeGatedFramework(conversations: Partial<ConversationRouterConfig> = {}) {
+  async function makeGatedFramework(conversations: Partial<ConversationRouterConfig> = {}, gate: { privilegedUsersPath?: string } = {}) {
     return AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
       agents: [{ name: 'trunk', model: 'test-model', systemPrompt: 'You are the trunk.' }],
       modules: [],
       conversations: { templateAgent: 'trunk', ...conversations },
-      gate: { config: { policies: [], default: 'always' }, configPath: join(tempDir, 'gate.json') },
+      gate: { config: { policies: [], default: 'always' }, configPath: join(tempDir, 'gate.json'), ...gate },
     });
   }
   const gateOf = (framework: AgentFramework) => (framework as unknown as { eventGate: EventGate }).eventGate;
@@ -873,7 +874,12 @@ describe('Conversation routing', () => {
   it("a fork's wake is refused, so the primary's sleep stays", async () => {
     membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'w1', name: 'wake', input: {} }], 'tool_use'));
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
-    const framework = await makeGatedFramework();
+    // The message that wakes the fork is a privileged user's: admission gates a
+    // fork's channel message as it gates every inbound (Dendrite §D), and a
+    // sleeping agent is roused by its heartbeat or a privileged user alone.
+    const privilegedUsersPath = join(tempDir, 'privileged.json');
+    writeFileSync(privilegedUsersPath, JSON.stringify(['U1']));
+    const framework = await makeGatedFramework({}, { privilegedUsersPath });
     const gate = gateOf(framework);
     const calls = gateToolCalls(framework);
     try {

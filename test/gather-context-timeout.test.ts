@@ -16,6 +16,7 @@ import type { Module } from '../src/types/index.js';
 function makeRegistry(modules: Module[]): ModuleRegistry {
   const registry = Object.create(ModuleRegistry.prototype) as ModuleRegistry;
   (registry as any).modules = new Map(modules.map((m) => [m.name, m]));
+  (registry as any).moduleContexts = new Map(modules.map((m) => [m.name, {}]));
   return registry;
 }
 

@@ -79,6 +79,8 @@ export interface McplConnectionCloseInfo {
   /** True when `reason` is the peer's own text, a WebSocket server's close
    *  reason, rather than the transport's or the host's words. */
   reasonFromPeer?: boolean;
+  /** True when the stdio transport ended the child after a pipe error. */
+  pipeFailed?: boolean;
   /** True when the host closed the link (`close()` / `reconnectAfterFailure()`),
    *  false when the transport dropped unexpectedly. */
   byHost: boolean;
@@ -454,6 +456,8 @@ export class McplServerConnection extends EventEmitter {
    *  the epoch their opening went to, never across a reconnect. */
   transportEpoch = 0;
 
+  private transportEnded = new AbortController();
+
   /**
    * RFC-014: the server's `toolHints`, `toolsets` and `surface` members as it
    * advertised them at the last handshake (toolsetDeclarationsOf), or null.
@@ -531,6 +535,8 @@ export class McplServerConnection extends EventEmitter {
     this.grant = CapabilityGrant.empty();
     this.policyEstablished = false;
     this.transportEpoch++;
+    this.transportEnded.abort();
+    this.transportEnded = new AbortController();
     // What the server sent that is still held came on the transport that is
     // now gone. What it said about its own process is dropped: its requests
     // wait on answers that can no longer reach whoever asked (an inference
@@ -724,6 +730,20 @@ export class McplServerConnection extends EventEmitter {
    *  after a protocol-version verdict, and while a launch is unreaped. */
   get willReconnect(): boolean {
     return this.reconnectEnabled;
+  }
+
+  /**
+   * Stop reconnecting, closing nothing: a retry already scheduled starts
+   * nothing when its timer fires, none is scheduled after, and an attempt
+   * under way is aborted, as close() aborts it, so one still waiting on its
+   * access provider never dials and a child it spawned is reaped. The host's
+   * stop() does this first, so nothing is launched or dialed while it shuts
+   * down; close() clears the timer.
+   * @internal For the framework's stop(); not a host API.
+   */
+  stopReconnecting(): void {
+    this.reconnectEnabled = false;
+    this.reconnecting?.abort.abort();
   }
 
   /** Whether a child this connection launched couldn't be confirmed exited.
@@ -2492,6 +2512,7 @@ export class McplServerConnection extends EventEmitter {
   private responderFor(id: string | number, epoch: number) {
     return {
       id,
+      signal: epoch === this.transportEpoch ? this.transportEnded.signal : AbortSignal.abort(),
       respond: (result: unknown) => this.sendResponse(id, result, epoch),
       respondError: (code: number, message: string, data?: unknown) =>
         this.sendErrorResponse(id, code, message, data, epoch),
@@ -2787,6 +2808,7 @@ export class McplServerConnection extends EventEmitter {
           signal: info.signal ?? null,
           reason: info.reason ?? (byHost ? 'closed by host' : undefined),
           ...(info.reasonFromPeer ? { reasonFromPeer: true } : {}),
+          ...(info.pipeFailed ? { pipeFailed: true } : {}),
           byHost,
         };
         this.emit('close', closeInfo.code, closeInfo.signal, closeInfo);

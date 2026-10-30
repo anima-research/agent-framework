@@ -1201,8 +1201,7 @@ describe('dataIsContent travels with the result', () => {
   });
 });
 
-test("a framework's stop takes its servers' addresses out of the registry, and its start records them again", async () => {
-  // On a store of its own, so it can start again after it stops.
+test("a framework's stop takes its servers' addresses out of the registry", async () => {
   const dir = mkdtempSync(join(tmpdir(), 'tool-result-blocks-lifecycle-'));
   const store = JsStore.openOrCreate({ path: join(dir, 'store') });
   const framework = await AgentFramework.create({
@@ -1220,11 +1219,42 @@ test("a framework's stop takes its servers' addresses out of the registry, and i
     assert.deepEqual(referenceRegistry.serverAddress('zz-lifecycle'), { url: 'wss://zz-lifecycle.example' });
     await framework.stop();
     assert.equal(referenceRegistry.serverAddress('zz-lifecycle'), undefined);
-    framework.start();
-    assert.deepEqual(referenceRegistry.serverAddress('zz-lifecycle'), { url: 'wss://zz-lifecycle.example' });
   } finally {
     await framework.stop();
     store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a framework's start() puts its servers' addresses in force over another framework's for the same id", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tool-result-blocks-precedence-'));
+  const stores: JsStore[] = [];
+  const frameworks: AgentFramework[] = [];
+  const create = async (name: string, url: string) => {
+    const store = JsStore.openOrCreate({ path: join(dir, name) });
+    stores.push(store);
+    const framework = await AgentFramework.create({
+      store,
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', allowedTools: 'all' }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    });
+    frameworks.push(framework);
+    (framework as unknown as { setMcplServerConfig(config: unknown): void })
+      .setMcplServerConfig({ id: 'zz-precedence', url });
+    return framework;
+  };
+  try {
+    const first = await create('first', 'wss://zz-first.example');
+    await create('second', 'wss://zz-second.example');
+    assert.deepEqual(referenceRegistry.serverAddress('zz-precedence'), { url: 'wss://zz-second.example' }, 'the one configured last is in force');
+    first.start();
+    assert.deepEqual(referenceRegistry.serverAddress('zz-precedence'), { url: 'wss://zz-first.example' }, "the first's start puts its own in force");
+  } finally {
+    for (const framework of frameworks) await framework.stop();
+    for (const store of stores) store.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });

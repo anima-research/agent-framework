@@ -75,6 +75,7 @@ describe('duration expiry', () => {
         params: { ...PARAMS, expiresAtMs: Date.now() - 5_000 },
         wakeCount: 0,
       }),
+      readCoordinatorState: () => null,
       cancelTuneOut: (_s: string, c: string) => {
         cancels.push(c);
         return { params: PARAMS, wakeCount: 0 };
@@ -106,7 +107,7 @@ describe('duration expiry', () => {
       nameShown: (channel: { channelId: string }) => channel.channelId,
       quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
       listChannelsRaw: () => [],
-      getTuneOutState: () => null,
+      getTuneOutState: (_s: string, c: string) => (c === '#a' && !cancels.includes(c) ? { params: PARAMS, wakeCount: 0 } : null),
       enterTuneOut: () => {},
       cancelTuneOut: (_s: string, c: string) => {
         cancels.push(c);
@@ -145,6 +146,7 @@ describe('duration expiry', () => {
       quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
       listChannelsRaw: () => [],
       getTuneOutState: () => null,
+      readCoordinatorState: () => null,
       enterTuneOut: (_s: string, _c: string, p: TuneOutParams) => { entered.push(p); },
     } as unknown as ChannelRegistry;
     const hooks = {
