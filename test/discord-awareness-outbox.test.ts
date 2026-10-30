@@ -1630,6 +1630,7 @@ function hostCommandFramework(outbox: DiscordAwarenessOutbox | null, messages: A
   // A surgery waits for maintenance work that is running: here, none.
   framework.maintenancePass = null;
   framework.overBudgetDrains = new Set();
+  framework.maintenanceApart = new Map();
   // Its hold wakes maintenance calls parked at the provider gates: here, none.
   framework.providerGates = new Map();
   framework.conversationSpawnsInFlight = new Set();
