@@ -44,7 +44,16 @@ Required traffic is authorized before admission. Data received after initialize
 is held during startup staging, policy exchange and quiesce just like unconfigured
 traffic. At flush it is authorized against the current grant and admitted under
 the current key. Superseded-epoch items are refused as `admission_stale`, never
-rebound. A pause during a running preflight still refuses that item.
+rebound. Required backlogs drain one complete data handler at a time in arrival
+order, including every item of a channel batch. A flush waits for any pre-pause
+callbacks still occupying all admission slots instead of refusing held work as
+overload. New data arriving during the drain joins the same bounded hold buffer;
+control traffic and RPC responses remain live. A slow handler delays later held
+data, and time waiting in the hold buffer is outside the admission timeout.
+
+Without a backlog, independently sent live items still run admission concurrently:
+callback latency can reorder them. Items within a channel batch remain sequential.
+A pause during a running preflight still refuses that item.
 Required connections never advertise `toolHints`, even if `toolHints: true` is
 configured. Under RFC-014 §6.3 the peer must not send hints and should tailor
 its inventory to a hint-less host. No RFC-014 controller is installed by the

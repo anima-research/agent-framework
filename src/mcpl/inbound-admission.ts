@@ -93,6 +93,7 @@ export class RequiredAdmission {
   private key?: ConnectionKey;
   private binding?: ReturnType<InboundAdmissionConfig['bind']>;
   private readonly pending = new Set<AbortController>();
+  private readonly capacityWaiters = new Set<() => void>();
   private readonly config: InboundAdmissionConfig;
   constructor(config: InboundAdmissionConfig, readonly connectionId: string) {
     this.config = Object.freeze({ ...config, ...(config.initializeAttestation ? { initializeAttestation: Object.freeze({ ...config.initializeAttestation }) } : {}) });
@@ -153,6 +154,12 @@ export class RequiredAdmission {
     });
     if (!verdict.store) throw new AdmissionConnectError('initialize_attestation_refused');
   }
+  /** Only a held-data drainer waits. Live ingress still refuses overload
+   * immediately, and a queued item owns no slot or timeout until dispatched. */
+  waitForCapacity(): Promise<void> | undefined {
+    if (this.pending.size < MAX_PENDING_ADMISSIONS) return;
+    return new Promise(resolve => { this.capacityWaiters.add(resolve); });
+  }
   private async run(work: (signal: AbortSignal) => Promise<AdmissionVerdict>, signal?: AbortSignal): Promise<AdmissionVerdict> {
     if (signal?.aborted) return refusal('admission_stale');
     if (this.pending.size >= MAX_PENDING_ADMISSIONS) return refusal('admission_denied');
@@ -175,7 +182,11 @@ export class RequiredAdmission {
       if (!result.store && result.reason === 'admission_timeout') controller.abort();
       return result;
     }
-    finally { clearTimeout(timer); signal?.removeEventListener('abort', abort); this.pending.delete(controller); }
+    finally {
+      clearTimeout(timer); signal?.removeEventListener('abort', abort); this.pending.delete(controller);
+      for (const resolve of this.capacityWaiters) resolve();
+      this.capacityWaiters.clear();
+    }
   }
 }
 
