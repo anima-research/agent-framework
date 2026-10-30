@@ -19,19 +19,21 @@
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import type { ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { Client, SdkError, SdkErrorCode, SdkHttpError, UnsupportedProtocolVersionError } from '@modelcontextprotocol/client';
 import { ModernMcpConnection } from '../src/mcpl/modern-connection.js';
-import { StdioTransport } from '../src/mcpl/transport.js';
+import { StdioTransport, setStdioExitGraceForTests } from '../src/mcpl/transport.js';
 import { McplProtocolVersionError, McplRequestError } from '../src/mcpl/server-connection.js';
 import { MAX_TIMER_MS } from '../src/mcpl/protocol-family.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SERVER = join(here, 'fixtures', 'modern-raw-server.mjs');
+const SHORT_GRACE_MS = 50;
 
 interface LogEntry { event: string; method?: string; id?: unknown; tool?: string; pid?: number; launch: number }
 
@@ -406,9 +408,10 @@ function firstLaunch(stuck: boolean): { readonly pid: number; pipeFailed: () => 
     first = transport;
     transport.once('unreaped', () => markUnreaped());
     if (stuck) {
-      const child = (transport as unknown as { child: { pid: number; kill: (signal?: string) => boolean } }).child;
+      const child = (transport as unknown as { child: ChildProcess & { pid: number } }).child;
       const realKill = child.kill.bind(child);
       child.kill = () => true; // signals never arrive: the child outlives both bounds
+      setStdioExitGraceForTests(child, SHORT_GRACE_MS);
       cleanups.push(async () => {
         realKill('SIGKILL');
         await until(() => !alive(child.pid), 'the stuck child killed');
@@ -462,7 +465,7 @@ test("a connect whose stdio pipe failed, and whose child was found unreaped befo
   // The hold is reported once, by the connect's own cleanup.
   const held = errors.filter((m) => /Not starting another launch while it may still be running/.test(m));
   assert.equal(held.length, 1, errors.join('\n'));
-  assert.match(held[0]!, /^MCP server "raw": stdio child \d+ of MCP server "raw" did not exit within 2000ms of SIGKILL; it could not be reaped\. /);
+  assert.match(held[0]!, new RegExp(`^MCP server "raw": stdio child \\d+ of MCP server "raw" did not exit within ${SHORT_GRACE_MS}ms of SIGKILL; it could not be reaped\\. `));
   assert.deepEqual(closes, [], 'it never connected, so nothing closed');
   assert.equal(wire(log).filter((e) => e.event === 'start').length, 1, 'one launch');
   // close() retries the reap: refused while the child runs, then done.
@@ -503,7 +506,7 @@ test("a connect whose stdio pipe failed reads that way when the failure has alre
  * stand for a loss read from a failed pipe while the child still runs: the
  * transport closes before the child has exited (R1-1).
  */
-function liveLine(connection: ModernMcpConnection): { markClosed: (info: { reason: string }) => void; child: { pid: number; kill: (signal?: string) => boolean } } {
+function liveLine(connection: ModernMcpConnection): { markClosed: (info: { reason: string }) => void; child: ChildProcess & { pid: number } } {
   const session = (connection as unknown as { session: { wire: { inner: { line: unknown } } } | null }).session;
   assert.ok(session, 'a live session');
   return session.wire.inner.line as never;
@@ -540,6 +543,7 @@ test('a lost transport whose child can\'t be reaped halts reconnecting (R1-1)', 
   const line = liveLine(connection);
   const realKill = line.child.kill.bind(line.child);
   line.child.kill = () => true; // signals never arrive: the child outlives both bounds
+  setStdioExitGraceForTests(line.child, SHORT_GRACE_MS);
   // Before the connection's close(), which then reaps an exited child.
   cleanups.push(async () => {
     realKill('SIGKILL');
@@ -566,6 +570,7 @@ test("without reconnect, a lost transport whose child can't be reaped is a perma
   const line = liveLine(connection);
   const realKill = line.child.kill.bind(line.child);
   line.child.kill = () => true; // signals never arrive: the child outlives both bounds
+  setStdioExitGraceForTests(line.child, SHORT_GRACE_MS);
   cleanups.push(async () => {
     realKill('SIGKILL');
     await until(() => !alive(line.child.pid), 'the held child killed');
@@ -586,6 +591,7 @@ test("a close() during a lost transport's failing reap reports the failure itsel
   const line = liveLine(connection);
   const realKill = line.child.kill.bind(line.child);
   line.child.kill = () => true; // signals never arrive: the child outlives both bounds
+  setStdioExitGraceForTests(line.child, SHORT_GRACE_MS);
   cleanups.push(async () => {
     realKill('SIGKILL');
     await until(() => !alive(line.child.pid), 'the held child killed');
@@ -934,11 +940,12 @@ test('close() reaps: a child that ignores SIGTERM is killed before close resolve
 
 test('a child that cannot be reaped fails close() explicitly, never a claimed exit', async () => {
   const transport = await StdioTransport.spawn({ id: 'stuck', command: process.execPath, args: ['-e', 'setInterval(() => {}, 1 << 30)'] });
-  const child = (transport as unknown as { child: { pid: number; kill: (signal?: string) => boolean } }).child;
+  const child = (transport as unknown as { child: ChildProcess & { pid: number } }).child;
   const realKill = child.kill.bind(child);
   child.kill = () => true; // signals never arrive: the child outlives both bounds
+  setStdioExitGraceForTests(child, SHORT_GRACE_MS);
   cleanups.push(() => { realKill('SIGKILL'); });
-  await assert.rejects(transport.close(), /^Error: stdio child \d+ of MCP server "stuck" did not exit within 2000ms of SIGKILL; it could not be reaped$/);
+  await assert.rejects(transport.close(), new RegExp(`^Error: stdio child \\d+ of MCP server "stuck" did not exit within ${SHORT_GRACE_MS}ms of SIGKILL; it could not be reaped$`));
   // Calls share the one attempt and its verdict.
   await assert.rejects(transport.close(), /could not be reaped/);
 });
@@ -946,15 +953,16 @@ test('a child that cannot be reaped fails close() explicitly, never a claimed ex
 test('a failed launch that cannot be reaped halts reconnecting; close() settles it', async () => {
   const log = scratchLog();
   const realSpawn = StdioTransport.spawn;
-  const stuck: Array<{ pid: number; kill: (signal?: string) => boolean }> = [];
+  const stuck: Array<{ pid: number; kill: ChildProcess['kill'] }> = [];
   let launches = 0;
   (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = async (config) => {
     const transport = await realSpawn.call(StdioTransport, config);
     if (++launches > 1) {
       // From the second launch on, signals never arrive.
-      const child = (transport as unknown as { child: { pid: number; kill: (signal?: string) => boolean } }).child;
+      const child = (transport as unknown as { child: ChildProcess & { pid: number } }).child;
       const realKill = child.kill.bind(child);
       child.kill = () => true;
+      setStdioExitGraceForTests(child, SHORT_GRACE_MS);
       stuck.push({ pid: child.pid, kill: realKill });
     }
     return transport;
@@ -1342,6 +1350,7 @@ test("a server that closes its stdin and outlives SIGKILL too is held as a launc
   const line = liveLine(connection);
   const realKill = line.child.kill.bind(line.child);
   line.child.kill = () => true; // signals never arrive: the child outlives both bounds
+  setStdioExitGraceForTests(line.child, SHORT_GRACE_MS);
   // Before the connection's close(), which then reaps an exited child.
   cleanups.push(async () => {
     realKill('SIGKILL');
@@ -1357,7 +1366,7 @@ test("a server that closes its stdin and outlives SIGKILL too is held as a launc
   await until(() => failures.length > 0, 'the permanent failure');
   assert.equal(failures.length, 1);
   assert.equal(failures[0]!.permanent, true);
-  assert.match(failures[0]!.error, /^its stdio pipe failed with write EPIPE; the previous launch could not be reaped \(stdio child \d+ of MCP server "raw" did not exit within 2000ms of SIGKILL; it could not be reaped\); reconnecting is halted$/);
+  assert.match(failures[0]!.error, new RegExp(`^its stdio pipe failed with write EPIPE; the previous launch could not be reaped \\(stdio child \\d+ of MCP server "raw" did not exit within ${SHORT_GRACE_MS}ms of SIGKILL; it could not be reaped\\); reconnecting is halted$`));
   assert.equal(connection.isConnected, false);
   assert.equal(connection.willReconnect, false);
   assert.equal(connection.holdsUnreapedChild, true);
@@ -1438,6 +1447,7 @@ test("a host that closes the connection as an unreaped launch's loss closes it g
   const line = liveLine(connection);
   const realKill = line.child.kill.bind(line.child);
   line.child.kill = () => true; // signals never arrive: the child outlives both bounds
+  setStdioExitGraceForTests(line.child, SHORT_GRACE_MS);
   // Before the connection's close(), which then reaps an exited child.
   cleanups.push(async () => {
     realKill('SIGKILL');

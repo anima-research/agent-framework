@@ -1589,15 +1589,15 @@ describe('a compile refused for budget holds its turn (#304)', () => {
       const t = await residentTurn({ maintenanceIntervalMs: 50 });
       const fw = t.framework as unknown as {
         conversationRouter: unknown;
-        createConversationAgent: (name: string, channelId: string) => Promise<unknown>;
+        createConversationAgent: (name: string, home: { serverId: string; channelId: string }) => Promise<unknown>;
       };
       const fork = 'prime--chanA';
       try {
         fw.conversationRouter = {
-          templateAgent: 'prime', expired: () => [], channelForAgent: () => 'chanA', touch: () => {},
+          templateAgent: 'prime', idleTtlMs: 60_000, expired: () => [], channelForAgent: () => 'chanA', touch: () => {},
           getBinding: () => undefined, closurePrompt: () => undefined,
         };
-        await fw.createConversationAgent(fork, 'chanA');
+        await fw.createConversationAgent(fork, { serverId: 'stub', channelId: 'chanA' });
         backlog.fit = false;
         backlog.fitAt = backlog.ticks + 12;
         t.internal.pendingRequests.push({ agentName: fork, reason: 'external-message', source: 'test', timestamp: Date.now() } as never);

@@ -38,13 +38,13 @@ export interface WatcherLifecycle {
   onReattach?: () => void;
 }
 
-interface RootIdentity {
+export interface RootIdentity {
   dev: number;
   ino: number;
   birthtimeMs: number;
 }
 
-const identityOf = (stat: Stats): RootIdentity => ({ dev: stat.dev, ino: stat.ino, birthtimeMs: stat.birthtimeMs });
+export const identityOf = (stat: Stats): RootIdentity => ({ dev: stat.dev, ino: stat.ino, birthtimeMs: stat.birthtimeMs === stat.ctimeMs ? 0 : stat.birthtimeMs });
 
 /**
  * Manages filesystem watching for a single mount.
@@ -481,10 +481,12 @@ export class MountWatcher {
   private sameIdentity(a: RootIdentity, b: RootIdentity): boolean {
     // birthtimeMs tells a root made again from a removed one whose inode
     // number it took, unless both were made within one tick of the clock or
-    // the file system keeps no birth time. A held root's removal shows in its
-    // link count instead, and where the root isn't held the rename's force
-    // covers those.
-    return a.dev === b.dev && a.ino === b.ino && a.birthtimeMs === b.birthtimeMs;
+    // either side's birth time can't be read (0: none kept, or one equal to
+    // the ctime, as where statx is unavailable or nothing has changed in the
+    // root since it was made). A held root's removal shows in its link count
+    // instead, and where the root isn't held the rename's force covers those.
+    return a.dev === b.dev && a.ino === b.ino
+      && (a.birthtimeMs === 0 || b.birthtimeMs === 0 || a.birthtimeMs === b.birthtimeMs);
   }
 
   private isErrno(err: unknown, code: string): boolean {

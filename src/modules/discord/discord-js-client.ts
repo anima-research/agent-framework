@@ -2,24 +2,18 @@
  * Discord.js client adapter implementing DiscordClientInterface
  */
 
-import {
-  ChannelType,
+import { createRequire } from 'node:module';
+import type {
   Client,
   DiscordAPIError,
-  DiscordjsError,
-  DiscordjsErrorCodes,
-  DiscordjsTypeError,
-  GatewayIntentBits,
-  Partials,
-  RESTJSONErrorCodes,
   TextChannel,
   DMChannel,
-  type Channel,
-  type Message,
-  type Attachment,
-  type User,
-  type Guild,
-  type GuildBasedChannel,
+  Channel,
+  Message,
+  Attachment,
+  User,
+  Guild,
+  GuildBasedChannel,
 } from 'discord.js';
 import type {
   DiscordClientInterface,
@@ -30,6 +24,12 @@ import type {
   HistoryMessage,
 } from './types.js';
 import { DiscordRefusal } from './refusal.js';
+
+const requireHere = createRequire(import.meta.url);
+
+function discordJs(): typeof import('discord.js') {
+  return requireHere('discord.js') as typeof import('discord.js');
+}
 
 /** The ids a tool's call named, for the words of Discord's refusal. */
 interface Named {
@@ -55,6 +55,7 @@ function target(named: Named): string {
  * `overrides` words a code as one tool means it.
  */
 function refusalReason(error: DiscordAPIError, named: Named, overrides: Partial<Record<number, string>> = {}): string {
+  const { RESTJSONErrorCodes } = discordJs();
   const override = typeof error.code === 'number' ? overrides[error.code] : undefined;
   if (override !== undefined) return override;
   switch (error.code) {
@@ -103,6 +104,7 @@ function unknownEmoji(named: Named): string {
  * emoji it can't read. Any other error has no words here.
  */
 function localRefusalReason(error: unknown, named: Named): string | undefined {
+  const { DiscordjsError, DiscordjsTypeError, DiscordjsErrorCodes } = discordJs();
   if (!(error instanceof DiscordjsError) && !(error instanceof DiscordjsTypeError)) return undefined;
   switch ((error as { code?: unknown }).code) {
     case DiscordjsErrorCodes.MessageThreadParent:
@@ -149,15 +151,16 @@ export class DiscordJsClient implements DiscordClientInterface {
     this.guildIds = config.guildIds;
     this.channelIds = config.channelIds;
 
-    this.client = new Client({
+    const djs = discordJs();
+    this.client = new djs.Client({
       intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-        GatewayIntentBits.DirectMessages,
-        GatewayIntentBits.GuildMessageReactions,
+        djs.GatewayIntentBits.Guilds,
+        djs.GatewayIntentBits.GuildMessages,
+        djs.GatewayIntentBits.MessageContent,
+        djs.GatewayIntentBits.DirectMessages,
+        djs.GatewayIntentBits.GuildMessageReactions,
       ],
-      partials: [Partials.Channel, Partials.Message],
+      partials: [djs.Partials.Channel, djs.Partials.Message],
     });
 
     this.setupEventHandlers();
@@ -301,17 +304,18 @@ export class DiscordJsClient implements DiscordClientInterface {
       await message.startThread({ name });
       return undefined;
     } catch (error) {
-      if (error instanceof DiscordAPIError) {
+      const djs = discordJs();
+      if (error instanceof djs.DiscordAPIError) {
         // Discord answers a retried start that it had already carried out as
         // a thread that exists: say it's there.
-        if (error.code === RESTJSONErrorCodes.ThreadAlreadyCreatedForMessage) return `${sent}, and its thread exists already, with the message's own id, ${message.id}.`;
+        if (error.code === djs.RESTJSONErrorCodes.ThreadAlreadyCreatedForMessage) return `${sent}, and its thread exists already, with the message's own id, ${message.id}.`;
         // The message is out, and `named` holds it, so no sentence points
         // elsewhere, where posting it again would post it twice.
         // The bot has just posted in the channel, so Missing Access is about
         // its threads, not about seeing it.
         const permission = `this bot isn't allowed to start threads in channel ${channelId} (Discord answered "Missing Permissions"), and calling again won't change that. Ask whoever runs this host to grant the permission.`;
         const access = `this bot can't start threads in channel ${channelId} (Discord answered "Missing Access"), and calling again won't change that. Ask whoever runs this host to give it access.`;
-        return `${sent}, but no thread was started: ${refusalReason(error, named, { [RESTJSONErrorCodes.MissingPermissions]: permission, [RESTJSONErrorCodes.MissingAccess]: access })} Once that's settled, ${startOne} starts one.`;
+        return `${sent}, but no thread was started: ${refusalReason(error, named, { [djs.RESTJSONErrorCodes.MissingPermissions]: permission, [djs.RESTJSONErrorCodes.MissingAccess]: access })} Once that's settled, ${startOne} starts one.`;
       }
       // The thread refusals localRefusalReason words, a message outside a
       // text or announcement channel and one that has a thread, can't come
@@ -359,7 +363,7 @@ export class DiscordJsClient implements DiscordClientInterface {
     } catch (error) {
       // A message that isn't there may be one an earlier call deleted, or a
       // retried request of this one, so its sentence has no lead.
-      if (error instanceof DiscordRefusal && error.cause instanceof DiscordAPIError && error.cause.code === RESTJSONErrorCodes.UnknownMessage) {
+      if (error instanceof DiscordRefusal && error.cause instanceof discordJs().DiscordAPIError && error.cause.code === discordJs().RESTJSONErrorCodes.UnknownMessage) {
         throw new DiscordRefusal(`Channel ${channelId} has no message ${messageId} now: it's deleted, or the id is wrong. discord--fetch_history with that channelId shows its recent messages and their ids.`, { cause: error.cause });
       }
       throw error;
@@ -393,7 +397,7 @@ export class DiscordJsClient implements DiscordClientInterface {
     } catch (error) {
       // Discord's answer for a message that has a thread, whether an earlier
       // call started it or a retried request of this one did.
-      if (error instanceof DiscordRefusal && error.cause instanceof DiscordAPIError && error.cause.code === RESTJSONErrorCodes.ThreadAlreadyCreatedForMessage) {
+      if (error instanceof DiscordRefusal && error.cause instanceof discordJs().DiscordAPIError && error.cause.code === discordJs().RESTJSONErrorCodes.ThreadAlreadyCreatedForMessage) {
         throw new DiscordRefusal(`Message ${messageId} has a thread already, whose id is the message's own: discord--send with channelId ${messageId} posts in it.`, { cause: error.cause });
       }
       throw error;
@@ -427,7 +431,7 @@ export class DiscordJsClient implements DiscordClientInterface {
     try {
       return await run();
     } catch (error) {
-      if (error instanceof DiscordAPIError || error instanceof DiscordRefusal) throw error;
+      if (error instanceof discordJs().DiscordAPIError || error instanceof DiscordRefusal) throw error;
       throw new DiscordRefusal(`${lead}: looking up ${what} stopped on an unexpected error: ${error instanceof Error ? error.message : String(error)}. Calling it again is safe.`, { cause: error });
     }
   }
@@ -443,7 +447,7 @@ export class DiscordJsClient implements DiscordClientInterface {
     try {
       return await run();
     } catch (error) {
-      if (error instanceof DiscordAPIError) throw new DiscordRefusal(`${lead}: ${refusalReason(error, named)}`, { cause: error });
+      if (error instanceof discordJs().DiscordAPIError) throw new DiscordRefusal(`${lead}: ${refusalReason(error, named)}`, { cause: error });
       const local = localRefusalReason(error, named);
       if (local !== undefined) throw new DiscordRefusal(`${lead}: ${local}`, { cause: error });
       throw error;
@@ -471,7 +475,7 @@ export class DiscordJsClient implements DiscordClientInterface {
     const inPosts = (kind: string) => `${kind}, whose messages are in its posts, each a thread with its own id, which this module has no tool to list`;
     const is = type === 'category' ? 'a category, which holds channels, not messages'
       : type === 'forum' ? inPosts('a forum')
-      : channel.type === ChannelType.GuildMedia ? inPosts('a media channel')
+      : channel.type === discordJs().ChannelType.GuildMedia ? inPosts('a media channel')
       : type === 'unknown' ? 'a kind of channel that holds no messages'
       : `a ${type} channel, which holds no messages`;
     return `channel ${channelId} is ${is}. discord--list_channels with a guildId shows the server's channels and their ids.`;

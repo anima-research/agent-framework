@@ -2,6 +2,7 @@ import { NOTICE_TAG } from './notice-tags.js';
 import { heartbeatToolAlias } from './heartbeat/heartbeat.js';
 import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, ThinkingBindingEntry, YieldingStream } from '@animalabs/membrane';
 import { isAbortedResponse } from '@animalabs/membrane';
+import { streamBounds, type InferenceBounds } from './inference-bounds.js';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
@@ -53,6 +54,9 @@ export interface ActivationRequestOptions {
    *  pass it (its errorPolicy is their retry layer); a direct caller of
    *  startStream keeps membrane's retries. */
   membraneRetries?: boolean;
+  /** The framework's inferenceBounds, resolved: the stream gets their phase
+   *  bounds and flat bound. None when left out. */
+  inferenceBounds?: InferenceBounds | null;
 }
 
 /** A compile's render stats, as context-manager's `getRenderStats()` types
@@ -165,6 +169,24 @@ function wireDigest(value: unknown): string {
 const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
 const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
+const TURN_INPUTS_PIN = 'agent-framework:turn-inputs';
+
+export function assertThinkingBinding(setting: string, value: AgentConfig['thinkingBinding']): void {
+  if (holdsSettings(setting, value, '{ binds: true, dropBlock: true }')) {
+    assertBooleanSetting(
+      `${setting}.dropBlock`,
+      value.dropBlock,
+      'true asks the provider to drop a signed thinking block whose earlier conversation changed rather than refuse the request, ' +
+        'and false or leaving it out sends nothing, so the account\'s default applies',
+    );
+    assertBooleanSetting(
+      `${setting}.binds`,
+      value.binds,
+      'true says the model binds its signed thinking to the conversation before it, so each compile tells the context manager so, ' +
+        'and false or leaving it out compiles as before',
+    );
+  }
+}
 
 /**
  * Refuse an agent config whose `promptCaching`, `toolResultGuard`,
@@ -193,20 +215,7 @@ export function assertAgentSwitches(config: AgentConfig): void {
       'true asks the provider for extended thinking, and false or leaving it out doesn\'t',
     );
   }
-  if (holdsSettings(`${agent} thinkingBinding`, config.thinkingBinding, '{ binds: true, dropBlock: true }')) {
-    assertBooleanSetting(
-      `${agent} thinkingBinding.dropBlock`,
-      config.thinkingBinding.dropBlock,
-      'true asks the provider to drop a signed thinking block whose earlier conversation changed rather than refuse the request, ' +
-        'and false or leaving it out sends nothing, so the account\'s default applies',
-    );
-    assertBooleanSetting(
-      `${agent} thinkingBinding.binds`,
-      config.thinkingBinding.binds,
-      'true says the model binds its signed thinking to the conversation before it, so each compile tells the context manager so, ' +
-        'and false or leaving it out compiles as before',
-    );
-  }
+  assertThinkingBinding(`${agent} thinkingBinding`, config.thinkingBinding);
   if (holdsSettings(`${agent} refusalHandling`, config.refusalHandling, '{ autoRewind: true }')) {
     assertBooleanSetting(
       `${agent} refusalHandling.autoRewind`,
@@ -324,6 +333,11 @@ export class Agent {
   /** Provider-specific request parameters forwarded unchanged by Membrane. */
   readonly providerParams?: Record<string, unknown>;
   readonly sameRoundThinkTextPolicy: AgentConfig['sameRoundThinkTextPolicy'];
+  /** The participant name this agent's turns are presented under (see AgentConfig.presentAs). */
+  readonly presentAs: string;
+  /** Stored participants presented as this agent's own turns: its name plus AgentConfig.selfParticipants. */
+  private readonly ownParticipants: ReadonlySet<string>;
+  private readonly deniedAtDispatch: ReadonlySet<string>;
 
   private _state: AgentState = { status: 'idle' };
   private _inferenceStartedAt = 0;
@@ -453,6 +467,9 @@ export class Agent {
     this.prefillUserMessage = config.prefillUserMessage;
     this.providerParams = config.providerParams;
     this.sameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
+    this.presentAs = config.presentAs ?? config.name;
+    this.ownParticipants = new Set([config.name, ...(config.selfParticipants ?? [])]);
+    this.deniedAtDispatch = new Set(config.denyToolsAtDispatch ?? []);
     this.maxStreamTokens = config.maxStreamTokens ?? 150_000;
     // The window size converted as the projection's comparison (`projected > window`) converts it, so a string such
     // as "200000" from a JSON or YAML config is its number, for every rule that reads it. A value whose number isn't
@@ -510,6 +527,36 @@ export class Agent {
     // offered, since the framework refuses the server beside its heartbeat.
     const alias = heartbeatToolAlias(toolName);
     return alias !== undefined && this.allowedTools.includes(alias);
+  }
+
+  /**
+   * Whether a call to an advertised tool is refused at dispatch
+   * (see AgentConfig.denyToolsAtDispatch).
+   */
+  deniesAtDispatch(toolName: string): boolean {
+    return this.deniedAtDispatch.has(toolName);
+  }
+
+  /** Whether a stored participant is this agent's own voice. */
+  isOwnParticipant(participant: string): boolean {
+    return this.ownParticipants.has(participant);
+  }
+
+  /**
+   * Role assignment for a request: every participant that is this agent's
+   * own voice — its name, and for a derived agent the agent it inherited
+   * from — is presented under one name, which the formatter maps to the
+   * assistant role. Stored authorship is untouched; this shapes the request
+   * only. For a plain agent (no selfParticipants, presentAs = name) the
+   * input is returned as is.
+   */
+  private presentOwnTurns(messages: NormalizedMessage[]): NormalizedMessage[] {
+    if (this.ownParticipants.size === 1 && this.presentAs === this.name) return messages;
+    return messages.map((m) =>
+      this.ownParticipants.has(m.participant) && m.participant !== this.presentAs
+        ? { ...m, participant: this.presentAs }
+        : m,
+    );
   }
 
   /**
@@ -1162,6 +1209,63 @@ export class Agent {
   }
 
   /**
+   * Keep the stored rows from `first` through `last` raw for the turn now
+   * opening, with a raw pin under one name per agent. Any pin of that name
+   * already held is removed first, one a crash left included. Under a
+   * strategy without pins nothing is pinned. A committing compile that
+   * refuses as over budget while a pin of that name is held removes it and
+   * compiles once more, and `unpinTurnInputs` removes it. Returns the pin's
+   * id, or undefined when nothing was pinned.
+   *
+   * @internal For the framework's turn starts; not a host API.
+   */
+  pinTurnInputs(first: MessageId, last: MessageId): string | undefined {
+    if (!this.unpinTurnInputs()) return undefined;
+    const cm = this.contextManager;
+    if (typeof (cm.getStrategy() as { pinRange?: unknown }).pinRange !== 'function') return undefined;
+    try {
+      return cm.pinRange(first, last, { name: TURN_INPUTS_PIN });
+    } catch (error) {
+      console.error(`[turn-inputs] ${this.name}: could not pin the turn's inputs (${first}..${last}), so they may be compressed:`, error);
+      return undefined;
+    }
+  }
+
+  /** Remove the turn's input pin `pinId`, or without one every pin of its
+   *  name. False when a removal threw.
+   *  @internal For the framework's turn starts and ends; not a host API. */
+  unpinTurnInputs(pinId?: string): boolean {
+    try {
+      for (const pin of this.contextManager.listPins()) {
+        if (pin.name === TURN_INPUTS_PIN && (pinId === undefined || pin.id === pinId)) this.contextManager.unpin(pin.id);
+      }
+      return true;
+    } catch (error) {
+      console.error(`[turn-inputs] ${this.name}: could not remove the turn's input pin:`, error);
+      return false;
+    }
+  }
+
+  private async compileUnpinningOnRefusal(compile: () => Promise<CompileResult>): Promise<CompileResult> {
+    const pinned = this.holdsTurnInputsPin();
+    try {
+      return await compile();
+    } catch (error) {
+      if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError' || !pinned || !this.unpinTurnInputs()) throw error;
+      console.error(`[turn-inputs] ${this.name}: the compile refused with the turn's inputs pinned, so they are unpinned and it compiles again`);
+      return compile();
+    }
+  }
+
+  private holdsTurnInputsPin(): boolean {
+    try {
+      return this.contextManager.listPins().some((pin) => pin.name === TURN_INPUTS_PIN);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Per destination (a server's channel, by its key), the newest consumed
    * watermark the agent had read when it published there by a route the
    * framework sees (its prose, a sleep's announcement, a channel_publish, a
@@ -1290,7 +1394,9 @@ export class Agent {
    * run. It isn't told the agent's thinking binding (`thinkingBinding.binds`),
    * so a context manager that keeps a thinking-binding record neither reads
    * nor writes the record here, and what it returns keeps thinking whose
-   * earlier conversation changed. */
+   * earlier conversation changed. Called while a turn's input pin is held
+   * (pinTurnInputs), a refusal as over budget removes the pin and compiles
+   * once more, as the turn's own compiles do. */
   async compileContext(budget?: TokenBudget): Promise<CompileResult> {
     // RFC-006 §3.3: consumption is determined at assembly — a compile that
     // fails assembled nothing, so the watermark moves only on success.
@@ -1298,7 +1404,7 @@ export class Agent {
     const marksBefore = this.watermarkMarks;
     const shownBefore = this.shownWatermark;
     if (watermark) this.shownWatermark = watermark;
-    const compile = () => this.contextManager.compile(this.compileBudget(budget));
+    const compile = () => this.compileUnpinningOnRefusal(() => this.contextManager.compile(this.compileBudget(budget)));
     let result: CompileResult;
     try {
       result = budget ? await compile() : await this.compileAtLiveBudget(compile);
@@ -1554,7 +1660,8 @@ export class Agent {
     // agent before the consumed watermark moves, once it returns.
     const shownBefore = this.shownWatermark;
     if (watermark) this.shownWatermark = watermark;
-    const compile = () => this.contextManager.compile(this.compileBudget(budget), injections, opts as never);
+    const select = () => this.contextManager.compile(this.compileBudget(budget), injections, opts as never);
+    const compile = opts?.dryRun ? select : () => this.compileUnpinningOnRefusal(select);
     let result: CompileResult;
     try {
       result = budget || opts?.dryRun ? await compile() : await this.compileAtLiveBudget(compile);
@@ -1652,8 +1759,9 @@ export class Agent {
       // What it holds of the stored injections is what the agent last saw.
       this.noteRenderedInjections(compiled);
       const { systemInjections } = compiled;
-      // The framework's own pricing stamp never goes out (thinking-token-stamp.ts).
-      const messages = withoutTokenEstimates(compiled.messages);
+      // The framework's own pricing stamp never goes out (thinking-token-stamp.ts);
+      // the agent's own turns are then presented under its name (presentOwnTurns).
+      const messages = this.presentOwnTurns(withoutTokenEstimates(compiled.messages));
       // Read once, after the first compile, since results may have become
       // ready while it ran; the refusal retry, assembled while the agent is
       // inferring, sends the same ones.
@@ -1665,6 +1773,7 @@ export class Agent {
         system: this.buildSystemPrompt(systemInjections),
         tools: tools.length > 0 ? tools : undefined,
         ...this.requestSettings(),
+        assistantParticipant: this.presentAs,
       };
     };
     const request = await assemble();
@@ -1900,6 +2009,8 @@ export class Agent {
     // The framework's own pricing stamp never goes out (thinking-token-stamp.ts).
     messages = withoutTokenEstimates(messages);
 
+    messages = this.presentOwnTurns(messages);
+
     // Silent heartbeat ticks and replies to a [Continue] turn store no
     // prompt row. Render each request-only turn before its response's first
     // surviving row, so the wire formatter cannot merge the response into the
@@ -1910,7 +2021,7 @@ export class Agent {
     // renders. "First" is per agent: a broadcast tick shares its eventId with
     // every resident.
     const index = this.indexRequestOnlyRows();
-    const rendered = renderRequestOnlyRows(messages, index, this.name);
+    const rendered = renderRequestOnlyRows(messages, index, this.presentAs);
     messages = rendered.messages;
     // A tick opens wherever its separator isn't already rendered: on its first
     // request, and on a restart whose compile left none of the tick's rows,
@@ -1929,7 +2040,7 @@ export class Agent {
     let continuePrompt: RequestOnlyPrompt | undefined;
     if (openingTick) {
       messages = [...messages, silentHeartbeatSeparatorTurn()];
-    } else if (endsOnOwnMessage(messages, this.name, injectionTail)) {
+    } else if (endsOnOwnMessage(messages, this.presentAs, injectionTail)) {
       // Safety: ensure messages don't end with an assistant message.
       // Some models reject trailing assistant messages ("prefill not supported"),
       // and after context compression a stale assistant turn can end up last.
@@ -1979,7 +2090,7 @@ export class Agent {
       cacheTtl: this.cacheTtl,
       ...(this.prefillUserMessage && { prefillUserMessage: this.prefillUserMessage }),
       ...(this.providerParams && { providerParams: this.providerParams }),
-      assistantParticipant: this.name,
+      assistantParticipant: this.presentAs,
     };
   }
 
@@ -2072,7 +2183,7 @@ export class Agent {
     try {
       const stored = cm.getAllMessages() as unknown as readonly StoredRowLike[];
       if (this.requestOnlyIndex?.source === stored) return this.requestOnlyIndex.index;
-      const index = indexRequestOnlyRows(stored, this.name);
+      const index = indexRequestOnlyRows(stored, this.ownParticipants);
       this.requestOnlyIndex = { source: stored, index };
       return index;
     } catch (error) {
@@ -2178,6 +2289,7 @@ export class Agent {
       // since membrane 0.7 its own schedules, ten minutes at a 529, would
       // otherwise run inside each of the caller's attempts, out of its sight.
       ...(options.membraneRetries === false ? { retry: false } : {}),
+      ...streamBounds(options.inferenceBounds ?? null, request.config.maxTokens),
       // Retry a content-policy refusal at the provider seam rather than at
       // the framework level: membrane replays the SAME request immediately
       // (cache-warm), where a framework-level requeue would recompile and

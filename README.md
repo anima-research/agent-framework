@@ -133,7 +133,7 @@ return {
 - **ApiModule** - WebSocket API event processing
 - **WorkspaceModule** - Mountable filesystem abstraction with Chronicle tree state, filesystem watching, and materialization
 
-DiscordModule and ApiModule store a sender's name that comes from outside the framework in a form marked with its source: a Discord author's username as `<name> (Discord)`, and the name on every `api:message` event, from an ApiServer caller or a host's own, as `<name> (API)`. An `api:message` whose `participant` isn't text, which its type doesn't allow, isn't stored, and starts no turn. Such a name is stored on one line: each run of line breaks (U+2028 and U+2029 included) and other control characters becomes one space. The generic name `user`, in any capitalization, is stored as given. Unless a host gives one of its own agents the name `user`, in any capitalization, or a name ending in ` (Discord)` or ` (API)`, such a message never carries an agent's name, so the agent's request never takes it as the agent's own turn. Where an agent's request shows senders' names, the agent sees the marked form, and the unmarked one in rows stored by earlier versions. A host that pushes an `api:message` in an agent's name records a user turn, not that agent's, with the same exception, and the ApiServer's message list returns each message's participant as stored, so a caller sees its own messages under `<name> (API)`. The ApiServer refuses a `participant` that isn't text, as it refuses content that isn't. The bot's own messages that a Discord history sync stores keep the name of the framework's first agent, as before. For a sender from outside, both modules also store the name as sent in `metadata.author` (with the author's Discord id), unless an `api:message` event's metadata already carries an `author` object, which is kept. History's author filter matches a row's `metadata.author` when it has one, and its participant otherwise. Code that tells senders apart should read a row's `metadata.author` (its `name`, and `id` for Discord) when it has one, and its participant otherwise, as the filter does: rows these modules stored in earlier versions have none, unless a host's `api:message` carried one.
+DiscordModule and ApiModule store a sender's name that comes from outside the framework in a form marked with its source: a Discord author's username as `<name> (Discord)`, and the name on every `api:message` event, from an ApiServer caller or a host's own, as `<name> (API)`. An `api:message` whose `participant` isn't text, which its type doesn't allow, isn't stored, and starts no turn. Such a name is stored on one line: each run of line breaks (U+2028 and U+2029 included) and other control characters becomes one space. Each of the framework's notice openings in it is marked with a backslash, as in the text a participant or a server supplies. The generic name `user`, in any capitalization, is stored as given. Unless a host gives one of its own agents the name `user`, in any capitalization, or a name ending in ` (Discord)` or ` (API)`, such a message never carries an agent's name, so the agent's request never takes it as the agent's own turn. Where an agent's request shows senders' names, the agent sees the marked form, and the unmarked one in rows stored by earlier versions. A host that pushes an `api:message` in an agent's name records a user turn, not that agent's, with the same exception, and the ApiServer's message list returns each message's participant as stored, so a caller sees its own messages under its name's stored form, `<name> (API)`. The ApiServer refuses a `participant` that isn't text, as it refuses content that isn't. The bot's own messages that a Discord history sync stores keep the name of the framework's first agent, as before. For a sender from outside, both modules also store the name as sent in `metadata.author` (with the author's Discord id), unless an `api:message` event's metadata already carries an `author` object, which is kept. History's author filter matches a row's `metadata.author` when it has one, and its participant otherwise. Code that tells senders apart should read a row's `metadata.author` (its `name`, and `id` for Discord) when it has one, and its participant otherwise, as the filter does: rows these modules stored in earlier versions have none, unless a host's `api:message` carried one.
 
 ### Event Processing
 
@@ -147,6 +147,8 @@ Each agent has a `ContextManager` (from `@connectome/context-manager`) that main
 
 - **PassthroughStrategy** - No compression, raw message replay up to budget
 - **AutobiographicalStrategy** - Chunks old messages and summarizes them into diary entries, preserving recent context uncompressed
+
+A turn keeps the messages it opened with whole: at a start that opens a turn, the framework pins raw (`pinRange`, named `agent-framework:turn-inputs`) the rows the agent sees that were stored after both the newest of its own messages that it sees and its consumed watermark, starting at the first such row that holds more than tool results, and removes the pin when the turn ends. The pinned rows' tokens count against the budget. If a committing compile refuses as over budget with the pin held, the pin is removed and the compile runs once more, so the turn goes on as it would have without it. A silent heartbeat tick pins nothing, and neither does a strategy without pins.
 
 Before inference, modules and MCPL hooks can inject additional context via `gatherContext()`. An `afterUser` injection is stored in the agent's window, as the message `compile()` would have placed after the last user message, so it stays where the agent saw it: the replies after it keep their thinking, and the cache keeps the turns before it. A source's unchanged content isn't stored again while the copy the agent will read as current has it whole: the one its last request held, or a newer one a start stored whose compile then didn't record (it threw, or the start failed before it); once a fold has summarized it or the strategy's window has passed it, it's stored again, as one more row. Where a changed one lands right after the agent's own latest message, with no one else's message between, `[Continue]` still ends the request, after it. A stored row is history to the strategy, capped, sharded, budgeted and folded like any message. Its metadata carries `system: true`, `kind: 'context-injection'` and `contextInjection: { agent, namespace, contentHash, part, parts }`, which `storedInjectionMarkOf` reads, and every other agent's view leaves it out. A module's injection can set `placedEachCompile: true` to be placed by `compile()` at each start instead, near the end, at the cost of the thinking of every reply after its old place.
 
@@ -335,6 +337,37 @@ refused on an http(s):// server, which always sends the header, and on a
 stdio server; `'header'` is refused with a url that carries a `token`
 parameter or userinfo of its own, since whenever the Bearer header carries a
 credential it replaces the userinfo's Basic one.
+
+Set `credentialRequired: true` for a fail-closed WebSocket dial. This requires
+`tokenTransport: 'header'` and a host-attached `accessProvider`, called on every
+dial including reconnects. A missing or throwing provider, or an empty or
+non-sendable result, stops the dial without connecting or falling back. Credentials
+must be printable ASCII with no space at either end; there is no minimum length.
+The server's authentication scheme decides which credentials it accepts.
+
+This mode forbids a static `token` (even empty), a URL `token` query parameter,
+userinfo and fragments. It supports only WebSocket servers, not HTTP, stdio or
+modern MCP. Cleartext `ws://` is allowed only to `localhost` or a literal loopback
+address, not to a `*.localhost` name, which a resolver can send off this host;
+use `wss://` for remote servers. These configuration mistakes are reported
+descriptively when the server is configured, and checked again before the
+provider runs at dial time.
+
+Strict dial errors have the fixed form `MCPL server "<id>": <code>`:
+
+| Code | Meaning |
+| --- | --- |
+| `provider-failed` | The provider is absent, throws, or returns an empty or non-sendable value. No connection is made. |
+| `credential-rejected` | The server answers the WebSocket upgrade with HTTP 401 or 403. |
+| `engine-unsupported` | A refused upgrade has no finite numeric status available from the client runtime. |
+| `connection-failed` | Any other upgrade status, socket/TLS error, open timeout, cancellation, or strict configuration refusal at dial time. |
+
+Redirects are not followed. Refused upgrades are classified only by the
+`unexpected-response` event's numeric `statusCode`, never by error text or response
+bodies; runtime support is determined by that capability, not a version list.
+Leaving `credentialRequired` out, or setting it to `false` or `null`, keeps optional
+credential behavior. Diagnostic filtering and credential retention are unchanged;
+this option controls dialing, not a guarantee that all diagnostics hide secrets.
 
 A modern server's tools get the same prefix, `enabledTools`/`disabledTools`,
 class overrides and dispatch as an MCPL server's, and `listMcplServers()`
@@ -591,8 +624,38 @@ static tools are listed like any server's.
 2. **Drive**: Framework iterates stream events (tokens, tool-calls, complete, error)
 3. **Tool yield**: Stream yields tool calls → framework dispatches concurrently → collects results
 4. **Resume**: All results in → stream resumes with tool results
-5. **Budget restart**: If input tokens exceed `maxStreamTokens`, the stream is cancelled, context is recompressed, and a fresh stream starts. An agent whose model binds its thinking (`thinkingBinding.binds`) with `physicalWindowTokens` set skips this, and the window projection restarts it instead before a request the window can't hold
+5. **Budget restart**: If input tokens exceed `maxStreamTokens`, the stream is cancelled, context is recompressed (the turn's opening messages kept whole, as Context Management says), and a fresh stream starts. An agent whose model binds its thinking (`thinkingBinding.binds`) with `physicalWindowTokens` set skips this, and the window projection restarts it instead before a request the window can't hold
 6. **Complete**: Final response saved to context, agent returns to idle
+
+### Inference bounds
+
+A model call that stops making progress is cut, so an agent isn't held by a provider that has gone quiet, or that keeps its connection open with keepalives (an Anthropic stream's pings, SSE comments) and never answers.
+
+- **A resident's streamed call**, and an MCPL server's streamed inference request, get membrane's progress bounds where the adapter's stream reports content (`AnthropicAdapter`, `BedrockAdapter`). Before content, a call ends 60 s after its send, or, once a thinking block has started, at the later of that and the block's allowance, its `max_tokens` at 87 tokens a second. Once content has begun, it ends after 150 s without a provider event, or after the block's allowance when the last event was a thinking block's start and the allowance is longer. Membrane's README gives the rules whole.
+- **Every streamed call the framework makes** also gets a flat bound from its last provider event: the larger of a setup term plus that allowance and 1,862 s (`FLAT_MINIMUM_MS`). The setup term is the larger of the before-content and between-events bounds, 150 s by default. So on an adapter with progress bounds the flat bound never runs out first. On one without, such as `OpenAICompatibleAdapter`, it's the only progress bound, and an SSE keepalive comment doesn't restart it, though a data frame that parses as an event does, a provider's own ping object included.
+- **A whole non-streamed call**, a compression's, the reply judge's, or an MCPL server's non-streamed inference request, ends the setup term plus its allowance after its send, or, when it names no `max_tokens`, at the larger of the setup term and the flat minimum, unless its caller passed a `progressTimeoutMs` of its own. Its caller gets the `timeout` error. The event gate's own 20 s judge timeout ends the reply judge's call first at the defaults. Context-manager takes a cut compression call as a transient failure: the lane pauses and tries again, so compression that never lands within its bound shows as a lane that keeps pausing, not as a failed turn, and is a reason to raise the bound. On an adapter whose `complete()` streams under the hood, such as membrane's OpenAI Responses adapter in subscription mode, membrane renews the bound at each parsed provider event, so there it runs from the last event, as a stream's flat bound does.
+- **A turn's call a bound cuts** fails as a `timeout`, and `DefaultErrorPolicy` gives it one fresh call, 1 s later, whatever other failures its turn had, except in a turn sent again after its retries ran out, before one of its rounds has run or had its tool calls cut off, whose failures get no retries. A fresh call that's cut too, with no other failure between, ends the turn, and its `[inference-failed]` note says the call timed out, that the call was made again and timed out again, and the reason. For a bound's cut the reason names the bound that ran out and the host's setting for it. A deadline expiry membrane throws (the Anthropic adapter's own watchdogs, the SDK's request timeout, a runtime's fetch timeout on a silent connection) counts the same toward the fresh call and the turn's end, and its reason is its own message, which names no setting. A bound's cut isn't `retryable`, so a host's own `errorPolicy` that retries only retryable errors gives it no fresh call; an expiry membrane throws stays `retryable`, as membrane made it.
+- **A stream that keeps sending content** isn't ended by any of these, since content is progress.
+
+These bounds don't replace the deadlines below them: a silent connection still meets the runtime's own fetch timeout (360 s on Bun 1.4.4) and, on `AnthropicAdapter`, the adapter's 600 s first-event and idle watchdogs, so on a silent connection a bound raised past those is met by them first.
+
+The phase bounds, and a reason that names the bound that ran out, need the `Membrane` a host passes in to come from membrane 0.8.0 or later. An older one ignores `progressBounds`, so only the flat bound acts, and a cut's reason names no bound.
+
+The flat and whole-call bounds read the request's `maxTokens`. A `max_tokens` set through `providerParams` or a hook isn't read, where membrane's own allowance reads what's sent, so a larger one set that way can let the flat bound run out before membrane's.
+
+Where the values come from: membrane's README gives its progress bounds' measurements, on a production router's streamed Anthropic calls to `claude-opus-5-5` and `claude-haiku-5-5`. The flat minimum is the longest silence between frames of any completed call in that router's OpenAI calls (the Responses API over a WebSocket), standing in for an OpenAI-compatible stream, which wasn't measured. The whole-call bound's setup term is five times the longest wait from the send to content or a thinking block's start in those calls (a wait that router cuts at 30 s and sends again, so a longer one is unseen), and its allowance is generation at 87 tokens a second, the 1st percentile of Opus's thinking speed over its thinking blocks of 30 seconds or more. No completed streamed call in that record ran past the whole-call bound. Bedrock, other models (`claude-opus-4-6` among them), OpenAI-compatible streams and calls that aren't streamed, compression's among them, weren't measured, so a host whose calls run slower raises the bounds with `inferenceBounds`. Membrane's README also reports the wait for content growing with the prompt, so a resident near a full context window is the likeliest to meet the before-content bound first.
+
+`inferenceBounds` sets them: `progressBounds` takes membrane's three values, from which the flat and whole-call bounds also derive, and `flatMinimumMs` the flat bound's least. `false` sets none. One setting covers every agent, so a host with one slower model or adapter raises them for all of its agents. A stream cut's reason is membrane's message, naming the bound that ran out, followed by the host setting for that bound, as in ``(the host's setting for this bound: `inferenceBounds.progressBounds.beforeContentMs`)``. A whole call's caller gets membrane's message alone. Each reason's opening and its setting:
+
+| The reason begins | The setting | Default |
+|---|---|---|
+| `No content within …s of the send` | `progressBounds.beforeContentMs` | 60,000 ms |
+| `No provider event within …s` | `progressBounds.betweenEventsMs` | 150,000 ms |
+| `No content within …s of a thinking block's start` (or `No provider event within …s of a thinking block's start`) | `progressBounds.thinkTokensPerSecond`: a lower rate allows a slower think | 87 |
+| `No provider progress within …ms`, on a stream | `flatMinimumMs`, or the setup term and allowance when they're larger | 1,862,000 ms |
+| `No provider progress within …ms`, on a call that isn't streamed | the setup term (`beforeContentMs`, `betweenEventsMs`) and the allowance (`thinkTokensPerSecond`, or the request's `maxTokens`); the larger of the setup term and `flatMinimumMs` when the request names no `maxTokens` | 150 s plus `maxTokens` at 87 a second; 1,862,000 ms with no `maxTokens` |
+
+Each cut of a turn's call is traced as `inference:failed`, with its reason as `error`, and logged with the turn's inference log as a failed call, whether or not its fresh call then answers, so a host can count cuts a resident never sees and raise a bound before turns start failing. An MCPL server's request that a bound cuts is traced as `mcpl:inference_fail` with the reason as `error`, and a compression or reply-judge call's cut reaches only its caller, as the `timeout` error.
 
 ### Abort / Cancellation
 

@@ -40,6 +40,8 @@
  * rule with no name is never merged: the merge keys rules by name.
  */
 
+import { quotedValue } from '../supplied-text.js';
+
 /** What a start changed, by rule name, for its trace and its log line. */
 export interface RecipeChanges {
   added: string[];
@@ -173,11 +175,11 @@ export function reconcileWithRecipe(
   const agree = (a: unknown, b: unknown): boolean => meaningOf(a) === meaningOf(b);
   const liveDuplicate = duplicateName(live.rules);
   if (liveDuplicate !== undefined) {
-    throw new Error(`gate.json names the rule "${liveDuplicate}" twice`);
+    throw new Error(`gate.json names the rule ${quotedValue(liveDuplicate)} twice`);
   }
   const recipeDuplicate = duplicateName(recipe.rules);
   if (recipeDuplicate !== undefined) {
-    throw new Error(`the recipe names the rule "${recipeDuplicate}" twice`);
+    throw new Error(`the recipe names the rule ${quotedValue(recipeDuplicate)} twice`);
   }
 
   const changes = noChanges();
@@ -322,7 +324,7 @@ export function reconcileLine(changes: RecipeChanges): string | null {
     parts.push(`the recorded recipe couldn't be read (${changes.recordUnreadable}), so this start removed and redefined nothing`);
   }
   const list = (label: string, names: string[]) => {
-    if (names.length > 0) parts.push(`${label} ${names.join(', ')}`);
+    if (names.length > 0) parts.push(`${label} ${names.map((name) => quotedValue(name)).join(', ')}`);
   };
   list('added', changes.added);
   list('removed', changes.removed);
@@ -332,13 +334,13 @@ export function reconcileLine(changes: RecipeChanges): string | null {
   list('kept as edited, though the recipe changed or dropped it:', changes.keptEdited);
   if (changes.differsFromRecipe.length > 0) {
     parts.push(
-      `kept, though the recipe defines it otherwise: ${changes.differsFromRecipe.join(', ')} `
+      `kept, though the recipe defines it otherwise: ${changes.differsFromRecipe.map((name) => quotedValue(name)).join(', ')} `
         + '(remove such a rule, and the next start restores it from the recipe)',
     );
   }
   if (changes.outsideRecipe.length > 0) {
     parts.push(
-      `kept, not in the recipe: ${changes.outsideRecipe.join(', ')} `
+      `kept, not in the recipe: ${changes.outsideRecipe.map((name) => quotedValue(name)).join(', ')} `
         + "(a stale one can be removed, and no start brings it back)",
     );
   }
