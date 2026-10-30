@@ -164,6 +164,27 @@ describe('debounced writes already read and answered', () => {
     } finally { off(); await f.close(); }
   });
 
+  it('two unsatisfied residents share one remainder line in their real message slot', async () => {
+    const { f, module, start } = await setup(60_000, false, undefined,
+      ['agent', 'other', 'third'].map((name) => ({ name, model: 'test', systemPrompt: 'test' })));
+    try {
+      const { loop } = await start();
+      await send(f, 'module');
+      await eventually(() => deferred(f, 'new event'), 'event deferred');
+      module.release('first');
+      await loop;
+      fire(f);
+      const linesFor = (name: string) => f.framework.getAgent(name)!.getContextManager()
+        .getAllMessages().filter((row) => row.metadata?.source === 'gate:debounce');
+      const other = linesFor('other');
+      const third = linesFor('third');
+      assert.equal(other.length, 1);
+      assert.deepEqual(third, other, 'one stored line is visible to both residents; two writes would duplicate it');
+      await f.framework.runUntilIdle();
+      assert.equal(f.membrane.calls.length, 3, 'both unsatisfied recipients wake');
+    } finally { await f.close(); }
+  });
+
   for (const ambient of [false, true]) {
     it(`a channel event read without replying there ${ambient ? 'drops its ambient wake' : 'keeps its addressed wake'}`, async () => {
       const { f, module, start } = await setup(60_000);

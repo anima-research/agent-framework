@@ -58,6 +58,11 @@ const MAX_CONTENT_SNIPPET = 200;
 const MAX_TRACE_SNIPPET = 80;
 /** Max events buffered during inference before oldest are dropped. */
 const MAX_INFERENCE_BUFFER = 100;
+/** One 60s MCPL publish timeout plus 5s for teardown. A longer publication
+ *  chain must prefer an extra wake to indefinitely withholding unseen input. */
+const PUBLICATION_FENCE_TIMEOUT_MS = 65_000;
+/** Match the scheduler's once-per-minute fault/stale warning cadence. */
+const WRITE_CHECK_WARN_INTERVAL_MS = 60_000;
 /** Minimum interval between filesystem checks for config changes (ms). */
 const RELOAD_THROTTLE_MS = 1000;
 
@@ -110,6 +115,13 @@ const DEFAULT_CONFIG: GateConfig = {
 // ---------------------------------------------------------------------------
 // Internal types
 // ---------------------------------------------------------------------------
+
+interface PublicationFence {
+  events: PendingEvent[];
+  timer?: ReturnType<typeof setTimeout>;
+  ready: boolean;
+  timedOut: boolean;
+}
 
 interface PendingEvent {
   /** Placement of the event's write, not a second record of what was read.
@@ -2123,7 +2135,7 @@ export class EventGate {
   private inferenceBuffer: PendingEvent[] = [];
   /** Completed requests whose final channel publication is still settling.
    *  Only placement-backed channel wakes wait for these receipts. */
-  private settlingReplies = 0;
+  private publicationFences = new Map<string, Set<PublicationFence>>();
   /** Host quiesce suppression — see setQuiesced. */
   private quiesced = false;
   /** Lifetime count of buffer-cap evictions (see bufferForInference). */
@@ -2198,7 +2210,7 @@ export class EventGate {
   private channelShownFn?: (channel: { serverId: string; channelId: string }) => string;
   private isNewestEntryFn?: (entry: GateEntryRef) => boolean;
   private isWriteDoneFn?: (agentName: string, after: WritePlacement, replyTo?: { serverId: string; channelId: string }) => boolean;
-  private writeCheckErrorLogged = false;
+  private writeCheckWarnAt = -Infinity;
   /** Clock injection — keeps the new rate_limit / passive_sample paths
    *  testable without monkey-patching Date.now globally. */
   private now: () => number;
@@ -3782,7 +3794,7 @@ export class EventGate {
     // write or reload that sends it (clearStateFor), it would report a change
     // that was made as failed.
     try {
-      this.deliverEvents(events);
+      this.deliverEvents(events, true);
     } catch (err) {
       const one = events.length === 1;
       console.error(
@@ -3791,29 +3803,17 @@ export class EventGate {
       );
       return;
     }
-
-    this.emitTrace({
-      type: 'gate:debounce-delivered',
-      policyName,
-      eventCount: events.length,
-      timestamp: Date.now(),
-    });
   }
 
   // =========================================================================
   // Event delivery
   // =========================================================================
 
-  private deliverEvents(batched: PendingEvent[]): void {
-    // onInferenceEnded also releases the judge and diagnostics. Keep that
-    // timing, but don't test a channel write before the completing request's
-    // publication can have recorded publishedAfterReading. Other batches
-    // (including judge verdicts) keep their existing delivery timing.
-    if (this.settlingReplies > 0 && this.isWriteDoneFn) {
-      const waits = (e: PendingEvent) => e.after !== undefined && e.replyTo !== undefined;
-      this.bufferForInference(batched.filter(waits));
-      batched = batched.filter((e) => !waits(e));
-    }
+  private deliverEvents(
+    batched: PendingEvent[],
+    traceDelivery = false,
+    released?: { agentName: string; timedOut: boolean },
+  ): void {
     // Delivery-time re-check: a channel tuned out after its events were
     // batched is held now, and "already shown above at arrival" would be
     // untrue of them. They are dropped; the hold's own reader has them.
@@ -3832,27 +3832,53 @@ export class EventGate {
     }
     if (events.length === 0) return;
 
-    if (!this.isWriteDoneFn || !events.some((event) => event.after !== undefined)) {
+    const delivered = new Set<PendingEvent>();
+    if (!released && (!this.isWriteDoneFn || !events.some((event) => event.after !== undefined))) {
       this.deliverBatch(events);
-      return;
+      for (const event of events) delivered.add(event);
+    } else {
+      const recipients = released ? [released.agentName] : this.getAgentNamesFn();
+      // Keep one shared line per distinct remainder: ordinary residents read
+      // the same message slot. Writing it once per recipient would duplicate
+      // the line in that shared context. As before, separate resident/fork
+      // views are not solved here (recipient selection is a separate concern).
+      const groups: Array<{ events: PendingEvent[]; agents: string[] }> = [];
+      for (const agentName of recipients) {
+        const fences = this.publicationFences.get(agentName);
+        // Each event belongs to one fence, with that fence's own deadline.
+        // A later turn cannot extend the wait for events already held here.
+        const fence = !released && fences && [...fences].find((f) => !f.ready);
+        const unread = events.filter((event) => {
+          if (fence && this.isWriteDoneFn && event.after !== undefined && event.replyTo !== undefined) {
+            // Publication holds have no inference-buffer cap: input which
+            // would otherwise be delivered must never be evicted here.
+            fence.events.push(event);
+            return false;
+          }
+          return released?.timedOut || !this.writeDone(agentName, event);
+        });
+        if (unread.length === 0) continue;
+        const group = groups.find((g) => g.events.length === unread.length && g.events.every((e, i) => e === unread[i]));
+        if (group) group.agents.push(agentName);
+        else groups.push({ events: unread, agents: [agentName] });
+      }
+      // Historically even a host with no recipients writes the batch's line.
+      if (recipients.length === 0) {
+        this.deliverBatch(events, recipients);
+        for (const event of events) delivered.add(event);
+      }
+      for (const group of groups) {
+        this.deliverBatch(group.events, group.agents,
+          released?.agentName ?? (group.agents.length === recipients.length ? undefined : group.agents[0]));
+        for (const event of group.events) delivered.add(event);
+      }
     }
-    const recipients = this.getAgentNamesFn();
-    // Keep the old single shared line when every recipient has the same
-    // remainder (including hosts without the optional read test). Otherwise
-    // derive each wake's line and provenance only from its own remainder.
-    const groups: Array<{ events: PendingEvent[]; agents: string[] }> = [];
-    for (const agentName of recipients) {
-      const unread = events.filter((event) => !this.writeDone(agentName, event));
-      if (unread.length === 0) continue;
-      const group = groups.find((g) => g.events.length === unread.length && g.events.every((e, i) => e === unread[i]));
-      if (group) group.agents.push(agentName);
-      else groups.push({ events: unread, agents: [agentName] });
-    }
-    // Historically even a host with no recipients writes the batch's line.
-    if (recipients.length === 0) this.deliverBatch(events, recipients);
-    for (const group of groups) {
-      this.deliverBatch(group.events, group.agents,
-        group.agents.length === recipients.length ? undefined : group.agents[0]);
+    if (traceDelivery) {
+      const counts = new Map<string, number>();
+      for (const event of delivered) counts.set(event.policyName, (counts.get(event.policyName) ?? 0) + 1);
+      for (const [policyName, eventCount] of counts) {
+        this.emitTrace({ type: 'gate:debounce-delivered', policyName, eventCount, timestamp: Date.now() });
+      }
     }
   }
 
@@ -3861,9 +3887,10 @@ export class EventGate {
     try {
       return this.isWriteDoneFn(agentName, event.after, event.replyTo) === true;
     } catch (err) {
-      if (!this.writeCheckErrorLogged) {
-        this.writeCheckErrorLogged = true;
-        console.error(`[gate] Could not check whether a batched write was answered; keeping its wake (further check errors are not logged): ${errorText(err)}`);
+      const now = this.now();
+      if (now - this.writeCheckWarnAt >= WRITE_CHECK_WARN_INTERVAL_MS) {
+        this.writeCheckWarnAt = now;
+        console.error(`[gate] Could not check whether a batched write was answered; keeping its wake (check errors throttled to once per minute): ${errorText(err)}`);
       }
       return false;
     }
@@ -4288,18 +4315,29 @@ export class EventGate {
     if (this.changesJudgedContext(agentName)) this.stopJudging();
   }
 
-  /** `repliesSettled` is an internal host fence for final publication. It
-   *  delays only placement-backed channel debounce checks, not the judge,
-   *  self-wakes, sleep, or the inference-status snapshot. */
+  /** `repliesSettled` is an internal, per-agent fence for final publication.
+   *  It delays only that recipient's placement-backed channel debounce checks,
+   *  for at most PUBLICATION_FENCE_TIMEOUT_MS. The judge, self-wakes, sleep,
+   *  and inference-status snapshot keep their original timing. */
   onInferenceEnded(agentName: string, repliesSettled?: Promise<void>): void {
     if (repliesSettled && !this.disposed) {
-      this.settlingReplies++;
-      const release = () => {
-        if (this.disposed) return;
-        this.settlingReplies--;
-        this.flushInferenceBufferIfClear();
+      const fence: PublicationFence = { events: [], ready: false, timedOut: false };
+      const fences = this.publicationFences.get(agentName) ?? new Set<PublicationFence>();
+      fences.add(fence);
+      this.publicationFences.set(agentName, fences);
+      const release = (timedOut = false) => {
+        if (this.disposed || fence.ready) return;
+        fence.ready = true;
+        fence.timedOut = timedOut;
+        clearTimeout(fence.timer);
+        if (timedOut) {
+          console.error(`[gate] Final-publication fence for ${quotedValue(agentName)} exceeded ${PUBLICATION_FENCE_TIMEOUT_MS} ms; releasing its held events as wakeable`);
+        }
+        this.flushPublicationFencesIfClear();
       };
-      void repliesSettled.then(release, release);
+      fence.timer = setTimeout(() => release(true), PUBLICATION_FENCE_TIMEOUT_MS);
+      fence.timer.unref?.();
+      void repliesSettled.then(() => release(), () => release());
     }
     this.inferring.delete(agentName);
     this.flushInferenceBufferIfClear();
@@ -4331,6 +4369,7 @@ export class EventGate {
 
   private flushInferenceBufferIfClear(): void {
     if (this.quiesced) return;
+    this.flushPublicationFencesIfClear();
     if (this.inferring.size === 0 && this.inferenceBuffer.length > 0) {
       const events = this.inferenceBuffer.splice(0);
       // Defer to avoid re-entrancy inside trace callbacks. A delivery that
@@ -4338,7 +4377,7 @@ export class EventGate {
       // batch: thrown in the microtask, it would be uncaught.
       queueMicrotask(() => {
         try {
-          this.deliverEvents(events);
+          this.deliverEvents(events, true);
         } catch (err) {
           const one = events.length === 1;
           console.error(
@@ -4347,6 +4386,29 @@ export class EventGate {
           );
         }
       });
+    }
+  }
+
+  private flushPublicationFencesIfClear(): void {
+    if (this.disposed || this.quiesced || this.inferring.size > 0) return;
+    for (const [agentName, fences] of this.publicationFences) {
+      for (const fence of fences) {
+        if (!fence.ready) continue;
+        fences.delete(fence);
+        const events = fence.events.splice(0);
+        if (events.length === 0) continue;
+        // Keep released events outside the capped inference buffer too. If a
+        // turn or surgery is active at release, the ready fence waits here.
+        queueMicrotask(() => {
+          if (this.disposed) return;
+          try {
+            this.deliverEvents(events, true, { agentName, timedOut: fence.timedOut });
+          } catch (err) {
+            console.error(`[gate] ${events.length} events held for final publication couldn't be delivered (${errorText(err)}), so the batch is dropped`);
+          }
+        });
+      }
+      if (fences.size === 0) this.publicationFences.delete(agentName);
     }
   }
 
@@ -4365,9 +4427,13 @@ export class EventGate {
   } {
     let judgeHeldEvents = 0;
     for (const held of this.judgeHeld.values()) judgeHeldEvents += held.events.length;
+    const buffered = new Set(this.inferenceBuffer);
+    for (const fences of this.publicationFences.values()) {
+      for (const fence of fences) for (const event of fence.events) buffered.add(event);
+    }
     return {
       inferring: [...this.inferring],
-      bufferedEvents: this.inferenceBuffer.length,
+      bufferedEvents: buffered.size,
       droppedBufferedEvents: this.droppedBufferedEvents,
       sleepUntil: this.sleepUntil,
       judgeHeldEvents,
@@ -4830,7 +4896,10 @@ export class EventGate {
     this.rateLimitDenied.clear();
     this.passiveSampleFires.clear();
     this.inferenceBuffer = [];
-    this.settlingReplies = 0;
+    for (const fences of this.publicationFences.values()) {
+      for (const fence of fences) clearTimeout(fence.timer);
+    }
+    this.publicationFences.clear();
     // stop() disposes the gate once its streams and event loop have ended (a
     // turn still compiling then is dropped at its next check, before it sends
     // anything). An agent left here by a turn whose exit didn't end it (a
