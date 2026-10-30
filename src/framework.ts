@@ -2065,6 +2065,93 @@ function assertAgentNamesUnique(agents: readonly AgentConfig[]): void {
 }
 
 /**
+ * Who reads a tuned-out channel's traffic, as the text a resident reads
+ * says it: the persistent subconscious by the name it runs under, reader
+ * forks, or no reader (a silent hold, where `tuneOut.enabled` offers
+ * tune_out without one). A persistent reader's name is a value the host
+ * supplied, marked as such (suppliedValue).
+ */
+export type TuneOutReader =
+  | { readonly kind: 'persistent'; readonly name: string }
+  | { readonly kind: 'forks' }
+  | { readonly kind: 'none' };
+
+/**
+ * The `tune_out` tool for a host with `reader`. The text says what happens
+ * to the channel's traffic and what the reader there can do, by the name
+ * the host gave it, and where there is none, that the traffic is held for
+ * the resident until it cancels or the duration runs out. It says nothing
+ * of what a reader decides or why: the voice doctrine's standard
+ * (coordinator.ts), which puts no words in a model's mouth, holds for what
+ * the resident is told about its reader too.
+ */
+export function tuneOutTool(reader: TuneOutReader): import('./types/index.js').ToolDefinition {
+  const has = reader.kind !== 'none';
+  const who = reader.kind === 'persistent' ? reader.name : 'the reader';
+  const reads = reader.kind === 'persistent'
+    ? `${reader.name}, the reader configured here, reads it instead. It runs on a cadence and when a message there ` +
+      'mentions you, and can report to you in its own words and cancel the tune-out. '
+    : reader.kind === 'forks'
+      ? 'A reader reads it instead: a fork of your context, run on a cadence and when a message there mentions you, ' +
+        'which can report to you in its own words and cancel the tune-out. '
+      : 'No reader is configured here, so none reads it meanwhile: it is held for you, and delivered when you cancel ' +
+        'the tune-out or durationSeconds runs out. ';
+  return {
+    name: 'tune_out',
+    description:
+      'Hold a channel for a while: its traffic stops entering your context and stops waking you. ' +
+      reads +
+      'People who mention you get an automatic reaction so they know you saw nothing. ' +
+      'Cancelling (mode "cancel") delivers the held backlog. ' +
+      (has ? 'The tune-out auto-cancels after maxWakes mention-bursts. ' : '') +
+      `A tuned-out channel is kept open, so its traffic ${has ? `reaches ${who}` : 'is still received and held'}: ` +
+      'where this host opens and closes the server\'s channels, this opens a channel you closed, and answers once ' +
+      'that open is done. Where the channel isn\'t open then, the answer\'s openError says why, and when its ' +
+      `messages will ${has ? `reach ${who}` : 'be received'} where that's known. ` +
+      'Calling tune_out again for a channel already tuned out keeps its settings, and, where this host can open the ' +
+      'channel, tries the open again if it isn\'t open. ' +
+      'scope "all-except" holds EVERY channel (DMs and new channels included) except channelId, for ' +
+      'durationSeconds (required); your plain speech lands in that channel meanwhile' +
+      (has ? `; ${who} pauses rather than cancels when its wake budget is spent` : '') + '. ' +
+      'mode "check" reports what is held without releasing it (`peek` shows one channel\'s newest held lines).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channelId: { type: 'string', description: 'The channel to tune out — or, with scope "all-except", the one channel to keep.' },
+        serverId: { type: 'string', description: 'The channel\'s server, where the channel id exists on several servers; channelId also takes its server-qualified id ("serverId:channelId").' },
+        mode: { type: 'string', enum: ['enter', 'cancel', 'check'], description: 'Default: enter.' },
+        scope: { type: 'string', enum: ['channel', 'all-except'], description: 'Default: channel.' },
+        peek: { type: 'string', description: 'mode "check": a held channel whose newest held lines to show (nothing is released).' },
+        peekLimit: { type: 'number', description: 'mode "check": how many lines to peek (default 5, max 50).' },
+        cadenceSeconds: {
+          type: 'number',
+          description: `Summary cadence in seconds (default ${TUNE_OUT_DEFAULTS.cadenceSeconds}; floors at 30).`,
+        },
+        backlogCap: {
+          type: 'number',
+          description:
+            `Max raw messages delivered at cancel (default ${TUNE_OUT_DEFAULTS.backlogCap}). ` +
+            (has
+              ? `0 = deliver no raw backlog at all: ${reader.kind === 'persistent' ? `${reader.name}'s` : 'the reader\'s'} report is the whole delivery.`
+              : '0 = deliver no raw backlog at all: the cancel counts what was held and shows none of it.'),
+        },
+        maxWakes: {
+          type: 'number',
+          description: `Wake budget before auto-cancel (default ${TUNE_OUT_DEFAULTS.maxWakes}; floors at 1).`,
+        },
+        durationSeconds: {
+          type: 'number',
+          description:
+            'Optional bounded duration: the tune-out auto-cancels (backlog ' +
+            'delivered) after this many seconds; floors at 60. Unset = until cancelled.',
+        },
+      },
+      required: [],
+    },
+  };
+}
+
+/**
  * Refuse a config where an agent's `observes` names itself or no configured
  * agent: the edge would read nothing, and the window it was meant to widen
  * would stay as it is without a word. Names compare exactly, as agents' do.
@@ -8171,7 +8258,7 @@ export class AgentFramework {
       channelTools.push(AgentFramework.DRAFTS_TOOL);
     }
     if (this.tuneOutCoordinator && this.tuneOutOffered) {
-      channelTools.push(AgentFramework.TUNE_OUT_TOOL, AgentFramework.FOCUS_TOOL);
+      channelTools.push(this.tuneOutToolDefinition(), AgentFramework.FOCUS_TOOL);
     }
     const gateTools = this.eventGate
       ? [
@@ -8557,7 +8644,9 @@ export class AgentFramework {
   /** What an agent is told when a send tool's words go to a channel it tuned
    *  out, or undefined where nothing needs saying. A send keeps the tune-out
    *  (ChannelRegistry.openChannelNow), so the agent that sent there expecting
-   *  answers learns they still go to its subconscious. A send tool's answer
+   *  answers learns they are still held from it, and who reads them
+   *  meanwhile: the reader by the name it runs under, forks of its context,
+   *  or none (tuneOutReader). A send tool's answer
    *  carries this, send_dm's included, or for a code_execution script's send
    *  a notice in the agent's window: a tune-out diverts a DM too. The same setting
    *  turns it off, a conversation agent gets none, and a failure while
@@ -8573,8 +8662,14 @@ export class AgentFramework {
       // channel so tune_out picks it alone (ChannelRegistry.tuneOutEnd), for
       // a reader that may call tune_out.
       const end = this.canAgentUseTool(agentName, 'tune_out') ? registry.tuneOutEnd(channel) : undefined;
+      const reader = this.tuneOutReader();
+      const held = reader.kind === 'persistent'
+        ? `is still held from you, and read by ${reader.name}, until the tune-out ends.`
+        : reader.kind === 'forks'
+          ? 'is still held from you, and read by forks of your context, until the tune-out ends.'
+          : 'is still held until the tune-out ends, and delivered to you then; no reader is configured here to read it meanwhile.';
       return `${this.channelShown(channel)} stays tuned out: your words there don't end the tune-out, so its ` +
-        `traffic still goes to your subconscious until the tune-out ends.${end ? ` ${end}` : ''}`;
+        `traffic ${held}${end ? ` ${end}` : ''}`;
     } catch (err) {
       console.error(`[closed-channel-note] for ${agentName} failed: ${err instanceof Error ? err.message : String(err)}`);
       return undefined;
@@ -13174,65 +13269,24 @@ export class AgentFramework {
    * Query inference logs.
    * Returns entries with summary info (doesn't resolve blobs).
    */
-  /** Tune-out (issue #77): divert a channel to your subconscious. Present
-   *  only when the subconscious resident is configured. */
-  private static readonly TUNE_OUT_TOOL: import('./types/index.js').ToolDefinition = {
-    name: 'tune_out',
-    description:
-      'Divert a channel to your subconscious for a while: its traffic stops ' +
-      'entering your context and stops waking you. Your subconscious watches ' +
-      'it instead — summarizing on a cadence in its own voice, judging ' +
-      'whether mentions merit interrupting, and able to cancel. People who ' +
-      'mention you get an automatic reaction so they know you saw nothing. ' +
-      'Cancelling (mode "cancel") delivers the diverted backlog. The ' +
-      'tune-out auto-cancels after maxWakes mention-bursts. A tuned-out ' +
-      'channel is kept open, so its traffic reaches your subconscious: where ' +
-      'this host opens and closes the server\'s channels, this opens a ' +
-      'channel you closed, and answers once that open is done. Where the ' +
-      'channel isn\'t open then, the answer\'s openError says why, and when ' +
-      'its messages will reach your subconscious where that\'s known. ' +
-      'Calling tune_out again for a channel already tuned out keeps its ' +
-      'settings, and, where this host can open the channel, tries the open ' +
-      'again if it isn\'t open. Without a subconscious it is a silent hold: ' +
-      'nothing summarizes or wakes you; the backlog is delivered when you ' +
-      'cancel. scope "all-except" holds EVERY channel (DMs and new channels ' +
-      'included) except channelId, for durationSeconds (required); your plain ' +
-      'speech lands in that channel meanwhile; the reader pauses rather than ' +
-      'cancels when its wake budget is spent. mode "check" reports what is ' +
-      'held without releasing it (`peek` shows one channel\'s newest held lines).',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        channelId: { type: 'string', description: 'The channel to tune out — or, with scope "all-except", the one channel to keep.' },
-        serverId: { type: 'string', description: 'The channel\'s server, where the channel id exists on several servers; channelId also takes its server-qualified id ("serverId:channelId").' },
-        mode: { type: 'string', enum: ['enter', 'cancel', 'check'], description: 'Default: enter.' },
-        scope: { type: 'string', enum: ['channel', 'all-except'], description: 'Default: channel.' },
-        peek: { type: 'string', description: 'mode "check": a held channel whose newest held lines to show (nothing is released).' },
-        peekLimit: { type: 'number', description: 'mode "check": how many lines to peek (default 5, max 50).' },
-        cadenceSeconds: {
-          type: 'number',
-          description: `Summary cadence in seconds (default ${TUNE_OUT_DEFAULTS.cadenceSeconds}; floors at 30).`,
-        },
-        backlogCap: {
-          type: 'number',
-          description:
-            `Max raw messages delivered at cancel (default ${TUNE_OUT_DEFAULTS.backlogCap}). ` +
-            '0 = deliver no raw backlog at all: your subconscious\'s report is the whole delivery.',
-        },
-        maxWakes: {
-          type: 'number',
-          description: `Wake budget before auto-cancel (default ${TUNE_OUT_DEFAULTS.maxWakes}; floors at 1).`,
-        },
-        durationSeconds: {
-          type: 'number',
-          description:
-            'Optional bounded duration: the tune-out auto-cancels (backlog ' +
-            'delivered) after this many seconds; floors at 60. Unset = until cancelled.',
-        },
-      },
-      required: [],
-    },
-  };
+  /** Tune-out (issue #77): hold a channel. Offered when a reader is
+   *  configured or `tuneOut.enabled` is set (tuneOutOffered), its text
+   *  naming the reader there is, or saying there is none (tuneOutTool). */
+  private tuneOutToolDefinition(): import('./types/index.js').ToolDefinition {
+    return tuneOutTool(this.tuneOutReader());
+  }
+
+  /**
+   * The reader of a tuned-out channel's traffic, as the text a resident
+   * reads describes it (tuneOutTool, tunedOutSendNote): the persistent
+   * subconscious by the name it runs under, which the host gives it, reader
+   * forks as forks of the resident's context, or none.
+   */
+  private tuneOutReader(): TuneOutReader {
+    if (this.subconsciousAgentName) return { kind: 'persistent', name: suppliedValue(this.subconsciousAgentName) };
+    if (this.readerForks) return { kind: 'forks' };
+    return { kind: 'none' };
+  }
 
   /** `focus`: the resident-facing alias for `tune_out` with scope "all-except" (#232 decision 2). */
   private static readonly FOCUS_TOOL: import('./types/index.js').ToolDefinition = {
