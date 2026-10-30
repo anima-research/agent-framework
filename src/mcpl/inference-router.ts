@@ -7,7 +7,7 @@
  *
  * Spec reference: Section 11 (Server-Initiated Inference).
  */
-import type { RequiredIngress } from './inbound-admission.js';
+import { AdmissionRefusals, type RefusalCode, type RequiredIngress } from './inbound-admission.js';
 
 import type {
   Membrane,
@@ -185,6 +185,7 @@ export class InferenceRouter {
   private hookOrchestrator: HookOrchestrator;
   private featureSetManager: FeatureSetManager;
   private routingPolicy: InferenceRoutingPolicy | null;
+  private readonly admissionRefusals = new AdmissionRefusals();
   private emitTraceFn: (event: { type: string; [key: string]: unknown }) => void;
   /** The refusals for want of a model that have been logged: one line per
    *  server with no policy, and per server and feature set with one, so a
@@ -272,11 +273,18 @@ export class InferenceRouter {
     }
 
     if (admission) {
+      const report = (reason: RefusalCode) => this.admissionRefusals.report(this.emitTraceFn, serverId, 'inference/request', reason, params);
+      const refuse = (reason: RefusalCode) => { report(reason); responder.respondError(-32600, reason); };
       // Admission is part of the request's lifetime, not work before the
       // router starts tracking it. Stop answers while the transport is live;
       // transport loss answers nothing. Both release a noncooperative hook's
       // slot without waiting for its deadline or for connection teardown.
       const signal = responder.signal ? AbortSignal.any([stopped, responder.signal]) : stopped;
+      const cancelled = () => {
+        if (!signal.aborted) return false;
+        if (!stopped.aborted) report('admission_stale');
+        return true;
+      };
       const answerStop = () => {
         if (responder.signal?.aborted) return;
         const answer = hostStoppedWhileHandling();
@@ -286,18 +294,18 @@ export class InferenceRouter {
       stopped.addEventListener('abort', answerStop, { once: true });
       try {
         if (stopped.aborted) { answerStop(); return; }
-        if (signal.aborted) return;
+        if (cancelled()) return;
         const before = admission.check();
-        if (signal.aborted) return;
-        if (before) { responder.respondError(-32600, before); return; }
+        if (cancelled()) return;
+        if (before) { refuse(before); return; }
         const verdict = await admission.admit('inference/request', params, signal);
-        if (signal.aborted) return;
+        if (cancelled()) return;
         let reason = admission.check();
         try { this.featureSetManager.validateInbound(serverId, params.featureSet); } catch { reason ??= 'admission_stale'; }
         if (this.hookOrchestrator.isInHook) reason ??= 'admission_not_ready';
-        if (signal.aborted) return;
+        if (cancelled()) return;
         if (reason || !verdict.store || !verdict.mayWake) {
-          responder.respondError(-32600, reason ?? (!verdict.store ? verdict.reason : 'admission_denied'));
+          refuse(reason ?? (!verdict.store ? verdict.reason : 'admission_denied'));
           return;
         }
       } finally {

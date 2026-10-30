@@ -469,11 +469,9 @@ test('required held notification from a superseded epoch is refused, never rebou
   const epoch = connection.transportEpoch;
   f.disconnect();
   await eventually(() => connection.transportEpoch > epoch && connection.isConnected && connection.controlPlaneReady);
-  let reason: string | undefined;
-  const refuse = connection.refuseAdmission.bind(connection);
-  connection.refuseAdmission = (...args: any[]) => { reason = args[3]; return refuse(...args); };
+  const traces: any[] = []; f.framework.onTrace(event => traces.push(event));
   await f.framework.resume();
-  assert.equal(reason, 'admission_stale'); assert.equal(calls, 0);
+  assert(traces.some(e => e.type === 'mcpl:push-event-rejected' && e.reason === 'admission_stale')); assert.equal(calls, 0);
   await f.framework.runUntilIdle(); assert(!f.context().includes('old_epoch'));
 });
 

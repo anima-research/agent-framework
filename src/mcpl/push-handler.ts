@@ -1,4 +1,4 @@
-import { attachAdmission, type AdmittedEnvelope, type RequiredIngress } from './inbound-admission.js';
+import { AdmissionRefusals, attachAdmission, type AdmittedEnvelope, type RequiredIngress } from './inbound-admission.js';
 /**
  * PushHandler — handles push/event messages from MCPL servers.
  *
@@ -147,6 +147,8 @@ export class PushHandler {
    * 6. Emit trace
    * 7. Respond with accepted + inferenceId
    */
+  private readonly admissionRefusals = new AdmissionRefusals();
+
   /** Required-only preflight: the framework calls this before toolset notices. */
   async handleRequiredPushEvent(serverId: string, params: PushEventParams, responder: Responder | undefined, admission: RequiredIngress): Promise<void> {
     try {
@@ -156,19 +158,23 @@ export class PushHandler {
       else responder?.respond({ accepted: false, reason: 'Feature set validation failed' });
       return;
     }
+    const refuse = (reason: import('./inbound-admission.js').RefusalCode) => {
+      this.admissionRefusals.report(this.emitTraceFn, serverId, 'push/event', reason, params);
+      responder?.respond({ accepted: false, reason });
+    };
     // Acceptance would promise durable work across reconnect/recovery, but
     // this profile has no durable re-admission yet. Refuse before accepting.
     if (params.coalesce !== undefined) {
-      responder?.respond({ accepted: false, reason: 'admission_unsupported' });
+      refuse('admission_unsupported');
       return;
     }
     const before = admission.check();
-    if (before) { responder?.respond({ accepted: false, reason: before }); return; }
+    if (before) { refuse(before); return; }
     const verdict = await admission.admit('push/event', params);
     let reason = admission.check();
     try { this.featureSetManager.validateInbound(serverId, params.featureSet); } catch { reason ??= 'admission_stale'; }
     if (reason || !verdict.store) {
-      responder?.respond({ accepted: false, reason: reason ?? (!verdict.store ? verdict.reason : 'admission_stale') });
+      refuse(reason ?? (!verdict.store ? verdict.reason : 'admission_stale'));
       return;
     }
     const envelope = Object.freeze({ connection: admission.key, mayWake: verdict.mayWake, ...(Object.hasOwn(verdict, 'replyIntent') ? { replyIntent: verdict.replyIntent } : {}) });

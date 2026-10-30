@@ -12,7 +12,7 @@
  * - Expose synthesized tools: channel_list, channel_open, channel_close, channel_publish
  * - Build channel context for beforeInference params
  */
-import { attachAdmission, type AdmittedEnvelope, type RequiredIngress } from './inbound-admission.js';
+import { AdmissionRefusals, attachAdmission, type AdmittedEnvelope, type RequiredIngress } from './inbound-admission.js';
 
 import { NOTICE_TAG } from '../notice-tags.js';
 import type { ContentBlock } from '@animalabs/membrane';
@@ -1219,6 +1219,7 @@ export class ChannelRegistry {
 
   /** Holds back repeats of the line for a message refused because its
    *  channel isn't registered (RefusalLines). */
+  private readonly admissionRefusals = new AdmissionRefusals();
   private unknownChannelLines = new RefusalLines();
 
   /**
@@ -1929,18 +1930,22 @@ export class ChannelRegistry {
 
       let envelope: AdmittedEnvelope | undefined;
       if (admission) {
+        const refuse = (reason: import('./inbound-admission.js').RefusalCode) => {
+          this.admissionRefusals.report(this.emitTraceFn, serverId, 'channels/incoming', reason, message);
+          results.push({ messageId: message.messageId, accepted: false, reason });
+        };
         if (message.coalesce !== undefined) {
-          results.push({ messageId: message.messageId, accepted: false, reason: 'admission_unsupported' });
+          refuse('admission_unsupported');
           continue;
         }
         const before = admission.check();
-        if (before) { results.push({ messageId: message.messageId, accepted: false, reason: before }); continue; }
+        if (before) { refuse(before); continue; }
         const entry = this.channels.get(incomingKey)!;
         const target = entry.descriptor;
         const verdict = await admission.admit('channels/incoming', message);
         const reason = admission.check() ?? (this.channels.get(incomingKey) !== entry || entry.descriptor !== target ? 'admission_stale' : undefined);
         if (reason || !verdict.store) {
-          results.push({ messageId: message.messageId, accepted: false, reason: reason ?? (!verdict.store ? verdict.reason : 'admission_stale') });
+          refuse(reason ?? (!verdict.store ? verdict.reason : 'admission_stale'));
           continue;
         }
         envelope = Object.freeze({ connection: admission.key, mayWake: verdict.mayWake, ...(Object.hasOwn(verdict, 'replyIntent') ? { replyIntent: verdict.replyIntent } : {}) });

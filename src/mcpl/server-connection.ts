@@ -1,4 +1,4 @@
-import { RequiredAdmission, AdmissionConnectError, type RequiredIngress, type RefusalCode } from './inbound-admission.js';
+import { AdmissionRefusals, RequiredAdmission, AdmissionConnectError, type RequiredIngress, type RefusalCode } from './inbound-admission.js';
 /**
  * McplServerConnection — manages a single JSON-RPC 2.0 connection to an MCPL server.
  *
@@ -458,6 +458,7 @@ export class McplServerConnection extends EventEmitter {
    *  the epoch their opening went to, never across a reconnect. */
   transportEpoch = 0;
   readonly requiredAdmission?: RequiredAdmission;
+  private readonly admissionRefusals = new AdmissionRefusals();
   private readonly admissionEpochs = new WeakMap<object, number>();
   private readonly admissionReceipts = new WeakMap<object, RequiredIngress>();
 
@@ -478,11 +479,17 @@ export class McplServerConnection extends EventEmitter {
   }
 
   private refuseAdmission(name: string, params: unknown, responder: any, reason: RefusalCode): void {
+    const report = (item: unknown) => this.admissionRefusals.report(trace => super.emit('admission-rejected', trace), this.id,
+      name === 'channels-incoming' ? 'channels/incoming' : name === 'push-event' ? 'push/event' : 'inference/request', reason, item);
     if (name === 'channels-incoming') {
       const messages = (params as { messages?: any[] } | null)?.messages;
+      if (Array.isArray(messages) && messages.length) messages.forEach(report); else report(params);
       responder?.respond?.({ results: Array.isArray(messages) ? messages.map(m => ({ messageId: typeof m?.messageId === 'string' ? m.messageId : '', accepted: false, reason })) : [] });
-    } else if (name === 'push-event') responder?.respond?.({ accepted: false, reason });
-    else responder?.respondError?.(-32600, reason);
+    } else {
+      report(params);
+      if (name === 'push-event') responder?.respond?.({ accepted: false, reason });
+      else responder?.respondError?.(-32600, reason);
+    }
   }
 
 

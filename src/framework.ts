@@ -33432,6 +33432,7 @@ export class AgentFramework {
         this.mcplHostCapabilitiesFor(config, hints),
         abort.signal,
         (registering) => {
+          if (registering.requiredAdmission) registering.on('admission-rejected', trace => this.emitTrace(trace));
           registeredEpoch = registering.transportEpoch;
           this.mcplPolicyExchanges.set(registering, registeredEpoch);
           // RFC-014 §6.1: hints apply as the connection reads them, from its
