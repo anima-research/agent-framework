@@ -35,8 +35,11 @@ cancellation, avoid framework mutation/reentrancy and protect their own external
 effects. JavaScript timers cannot preempt a synchronous infinite loop or undo an
 external write.
 
-Required traffic is authorized before admission. Before readiness it is refused,
-not held; old-epoch traffic is never replayed. Required connections do not apply peer hints on pushes or standalone
+Required traffic is authorized before admission. Data received after initialize
+is held during startup staging, policy exchange and quiesce just like unconfigured
+traffic. At flush it is authorized against the current grant and admitted under
+the current key. Superseded-epoch items are refused as `admission_stale`, never
+rebound. A pause during a running preflight still refuses that item. Required connections do not apply peer hints on pushes or standalone
 `tools/hints`, or result-borne `mcpl/hints`. Result-borne hints are ignored
 without losing the result.
 Hinted pushes are unsupported and never reach the early tap. Standalone peer `tools/hints` is also refused before
@@ -47,7 +50,7 @@ inventory still supplies tool presence and `mcpl/rev` because the application
 asked for it, with no admission hook. A revision gap may trigger application-to-peer
 `tools/list` / `toolsets/list` recovery. This is catalogue bookkeeping and list
 recovery, not a wake, content delivery or stored data.
-Peers must send after readiness or explicitly retry refused work. A verdict is
+Peers need no retry for host-internal staging or quiesce. A verdict is
 not a delivery receipt: existing content checks and downstream failures still
 apply; already admitted siblings are not rolled back.
 

@@ -81,16 +81,26 @@ test('hook input is detached raw data and frozen; optional intent validator is i
 });
 
 for (const lane of ['channels/incoming', 'push/event', 'inference/request'] as const) {
-  test(`required pre-ready ${lane} is refused, not held`, async t => {
+  test(`required quiesced ${lane} is held and admitted on resume`, async t => {
     let calls = 0;
-    const f = await fixture({ server: { inboundAdmission: config(() => { calls++; return allow; }) } }); t.after(f.close); await f.register();
+    const f = await fixture({ featureSets: { doc: { description: 'doc', uses: ['pushEvents', 'inferenceRequest'] } }, server: { inboundAdmission: config(() => { calls++; return lane === 'inference/request' ? deny : allow; }) } });
+    t.after(f.close); await f.register();
     const connection = (f.framework as any).mcplServerRegistry.getServer('editor');
-    connection.pauseDataPlane();
-    const before = connection.bufferedEvents.length;
-    const params = lane === 'channels/incoming' ? { messages: [channel()] } : lane === 'push/event' ? f.params('p', 'body') : { featureSet: 'doc', messages: [] };
-    const r = await f.send(lane, params);
-    assert.equal(lane === 'channels/incoming' ? r.result.results[0].reason : lane === 'push/event' ? r.result.reason : r.error.message, 'admission_not_ready');
-    assert.equal(connection.bufferedEvents.length, before); assert.equal(calls, 0);
+    await f.framework.quiesce({ reason: 'test' });
+    const params = lane === 'channels/incoming' ? { messages: [channel()] } : lane === 'push/event' ? { ...f.params('p', 'held_body'), coalesce: undefined } : { featureSet: 'doc', messages: [] };
+    let answered = false;
+    const pending = f.send(lane, params).then(r => { answered = true; return r; });
+    await eventually(() => connection.bufferedEvents.length > 0);
+    assert.equal(calls, 0); assert.equal(answered, false);
+    await f.framework.resume();
+    const r = await pending;
+    assert.equal(calls, 1);
+    if (lane === 'inference/request') assert.equal(r.error.message, 'admission_denied');
+    else {
+      assert.equal(lane === 'channels/incoming' ? r.result.results[0].accepted : r.result.accepted, true);
+      await f.framework.runUntilIdle();
+      assert(f.context().includes(lane === 'channels/incoming' ? 'sensitive_body' : 'held_body'));
+    }
   });
 }
 
@@ -443,4 +453,42 @@ test('required handshake drops null, refuses all data lanes, and buffers a same-
   }
   assert.deepEqual(answers.find((r: any) => r.id === 'same-chunk')?.result, {});
   assert.equal(hooks, 0);
+});
+
+
+test('required startup-staged push waits for ready and a current grant before admission', async t => {
+  let calls = 0;
+  const connection = await McplServerConnection.connect({ id: 'endpoint-a', command: process.execPath, args: [peer], inboundAdmission: config(() => { calls++; return allow; }) }, { version: '0.5' });
+  t.after(() => connection.close());
+  connection.on('push-event', async (params, responder) => {
+    const verdict = await connection.admissionFor(params).admit('push/event', params);
+    responder.respond({ accepted: verdict.store });
+  });
+  const pending = connection.sendToolsCall('send', { method: 'push/event', params: { featureSet: 'feed', eventId: 'staged', payload: { content: [{ type: 'text', text: 'startup' }] } } });
+  await eventually(() => (connection as any).bufferedEvents.length > 0);
+  assert.equal(calls, 0);
+  connection.establishGrant(new CapabilityGrant(new Set(['pushEvents']), []));
+  connection.ready();
+  assert.equal((await pending as any).result.accepted, true);
+  assert.equal(calls, 1);
+});
+
+test('required held notification from a superseded epoch is refused, never rebound at flush', async t => {
+  let calls = 0;
+  const f = await fixture({ server: { inboundAdmission: config(() => { calls++; return allow; }), reconnect: true, reconnectIntervalMs: 10, reconnectMaxIntervalMs: 20 } }); t.after(f.close);
+  const connection = (f.framework as any).mcplServerRegistry.getServer('editor');
+  await f.framework.quiesce({ reason: 'test' });
+  // Read through the real transport, but as a notification so a dead responder
+  // is not needed to observe the stale flush.
+  f.notify('push/event', { ...f.params('old', 'old_epoch'), coalesce: undefined });
+  await eventually(() => connection.bufferedEvents.length > 0);
+  const epoch = connection.transportEpoch;
+  f.disconnect();
+  await eventually(() => connection.transportEpoch > epoch && connection.isConnected && connection.controlPlaneReady);
+  let reason: string | undefined;
+  const refuse = connection.refuseAdmission.bind(connection);
+  connection.refuseAdmission = (...args: any[]) => { reason = args[3]; return refuse(...args); };
+  await f.framework.resume();
+  assert.equal(reason, 'admission_stale'); assert.equal(calls, 0);
+  await f.framework.runUntilIdle(); assert(!f.context().includes('old_epoch'));
 });

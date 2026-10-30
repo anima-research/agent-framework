@@ -97,6 +97,7 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
   return {
     get framework() { return framework; }, membrane, renders, hostCaps, published, create, send, dir,
     port: (wss.address() as AddressInfo).port,
+    notify: (method: string, params: unknown) => socket.send(JSON.stringify({ jsonrpc: '2.0', method, params })),
     disconnect: () => socket.terminate(),
     online: (value: boolean) => { online = value; },
     register: (id = 'chat') => send('channels/register', { channels: [{ id, type: 'discord', label: id, metadata: { channelType: 'guild_text' } }] }),
