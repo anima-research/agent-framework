@@ -2333,16 +2333,25 @@ export class ChannelRegistry {
    * on a live channel, where main's would set nothing.
    */
   noteDelivered(channel: ChannelRef, messageId: string, threadId?: string, tags?: unknown, firstView = false): void {
+    this.recordDelivered(channel, messageId, threadId, tags, firstView);
+  }
+
+  /**
+   * noteDelivered, returning whether it set the anchor.
+   * @internal For the framework's parked-anchor commits; not a host API.
+   */
+  recordDelivered(channel: ChannelRef, messageId: string, threadId?: string, tags?: unknown, firstView = false): boolean {
     // A marker is ABOUT a message, not one the agent replies to: it leaves
     // the anchor where it was (#157), and so does a chat:system notice (a
     // join, the weather), which is about the place (isMarkerTagged). An edit
     // the coalescer delivered as the agent's first view of its message counts
     // as that message.
-    if (isMarkerTagged(tags, firstView)) return;
-    if (!this.entryAt(channel)) return;
+    if (isMarkerTagged(tags, firstView)) return false;
+    if (!this.entryAt(channel)) return false;
     this.defaultPublishChannel = { serverId: channel.serverId, channelId: channel.channelId };
     this.defaultPublishMessageId = messageId;
     this.defaultPublishThreadId = threadId;
+    return true;
   }
 
   /**
@@ -2510,10 +2519,9 @@ export class ChannelRegistry {
    * marker, apart from an edit the coalescer delivers on acceptance as the
    * agent's first view. Left process-global: per-channel inbound tracking
    * (the right messageId for a fork's own channel) is a separate concern from
-   * the outbound routing fix. An ephemeral run has none (takesGlobalFallback),
-   * so a subagent's refusal marks no one else's channel. Nor has a turn that
-   * deliberately has no channel (activeChannelResolver's null): woken for a
-   * channel id two servers register, it isn't replying to the latest inbound
+   * the outbound routing fix. An ephemeral run has none (takesGlobalFallback).
+   * Nor has a turn that deliberately has no channel (activeChannelResolver's
+   * null): woken for a channel id two servers register, it isn't replying to the latest inbound
    * message, which may be anywhere. A fork's turn always has a channel, its
    * home, so it's taken to be replying to the latest inbound message as every
    * fork's turn is, in explicit mode as in locus mode, where its locus is
@@ -2620,7 +2628,7 @@ export class ChannelRegistry {
     // server's channel with its id isn't taken for it. Its message and
     // thread go, as on main, so no message on a server that's gone is given
     // as the one an agent replies to (incomingFor), to that server added
-    // back or to a refusal's reaction.
+    // back.
     if (this.defaultPublishChannel?.serverId === serverId) {
       this.defaultPublishMessageId = null;
       this.defaultPublishThreadId = undefined;

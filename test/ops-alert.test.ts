@@ -18,6 +18,7 @@ function makeHarness() {
   fw.consecutiveInferenceFailures = new Map<string, number>();
   fw.inferenceFailureEscalationThreshold = 3;
   fw.exhaustionRewinds = new Map<string, number>();
+  fw.turnRouting = new Map();
   fw.lastInferenceAt = new Map<string, object>();
   fw.pendingRequests = [];
   fw.activeStreams = new Map();   // healthSnapshot reads its keys

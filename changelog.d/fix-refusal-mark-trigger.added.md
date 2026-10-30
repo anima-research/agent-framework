@@ -1,0 +1,1 @@
+- `InferenceRequest.answersMessageId`: the platform id of the one message a wake is for, in its `channelId`, as `getPendingRequests()` shows it. The framework sets it on its wakes for a single message and carries it onto a rewind's retry, and a refusal of the turn the wake opens is marked on that message, on a Discord channel.

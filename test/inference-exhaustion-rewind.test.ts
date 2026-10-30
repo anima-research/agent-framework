@@ -55,6 +55,7 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   const fw = Object.create(AgentFramework.prototype) as any;
   fw.consecutiveInferenceFailures = new Map();
   fw.exhaustionRewinds = new Map();
+  fw.turnRouting = new Map();
   fw.rewindEpisode = new Map();
   fw.lastInferenceAt = new Map(); // upstream last-inference tracking; noteInferenceExhausted writes it
   fw.pendingRequests = [];
