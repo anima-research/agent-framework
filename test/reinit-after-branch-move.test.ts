@@ -1758,6 +1758,80 @@ describe('conversation forks and a branch move', () => {
     });
   });
 
+  // #844's design question 8: a write a surgery's hold keeps for an agent
+  // that ends before the release is passed on as the agent ends, not at the
+  // release, and the ones dropped are told of by an alert, not only logged.
+  it("writes a surgery's hold keeps for a fork that ends during it go on as it ends: the module's write to the primary, stored at the release, and the channel message dropped, with an alert", { timeout: 30_000 }, async () => {
+    await withForks('reinit-fork-end-held-', async (framework, forkInternals, logged) => {
+      await forksAroundACheckpoint(framework, forkInternals);
+      type Kept = { direct?: { agentName: string }; opts?: { forAgent?: string } };
+      const internals = forkInternals as unknown as HoldInternals & {
+        reserveStoreForSurgery(verb: string, agentName: string): () => void;
+        surgeryHeldWrites: Kept[];
+      };
+      const lost: Alert[] = [];
+      framework.onTrace((event) => {
+        if (event.type === 'ops:alert' && event.kind === 'store-held-lost') lost.push(event as unknown as Alert);
+      });
+      const keptFor = (name: string) => internals.surgeryHeldWrites.filter((write) => (write.direct?.agentName ?? write.opts?.forAgent) === name).length;
+      const release = internals.reserveStoreForSurgery('roll back', 'a');
+      try {
+        holdFor(framework, 'a-early-g1', 'A MODULE WRITE DURING THE HOLD');
+        const placement = await internals.handleMcplChannelIncoming(channelMessage('world:early', 'A MESSAGE DURING THE HOLD'));
+        assert.ok(placement?.agent === 'a-early-g1' && !placement.messageId, `held by the hold, not stored: ${JSON.stringify(placement)}`);
+        assert.equal(keptFor('a-early-g1'), 2, 'premise: the hold keeps both for the fork');
+        framework.stopAgent('a-early-g1');
+        assert.ok(!framework.getAgent('a-early-g1'), 'ended');
+        assert.equal(keptFor('a-early-g1'), 0, 'its end took them out of the hold, so the release never meets them');
+        assert.deepEqual(lost.map((alert) => alert.agentName), ['a-early-g1'], `the dropped write is told of by an alert as the fork ends: ${JSON.stringify(lost)}`);
+        assert.match(lost[0]!.message, /^1 write kept in memory for a-early-g1, which has ended, was never stored and is dropped/);
+        assert.match(lost[0]!.message, /\(1 went\)/, 'and says the module write went on');
+        // No new agent of the name could be given these writes, whatever the
+        // end did: a framework-made name is one generation's, so a run can't
+        // take it again, and while the hold is up no run registers at all (a
+        // conversation fork's spawn waits for the release, and a shared
+        // derivation is refused).
+        await assert.rejects(framework.createEphemeralAgent({ name: 'a-early-g1', model: 'test-model', systemPrompt: 'again' }),
+          /already registered or has been used/);
+        const run = await framework.createEphemeralAgent({ name: 'a-run-during-the-hold', model: 'test-model', systemPrompt: 'a run' });
+        try {
+          await assert.rejects(framework.runEphemeralToCompletion(run.agent, run.contextManager), /refused: the store is under live roll back/);
+        } finally { run.cleanup(); }
+      } finally {
+        release();
+      }
+      const texts = storedTexts(framework.getAgent('a')!.getContextManager());
+      assert.equal(count(texts, 'A MODULE WRITE DURING THE HOLD'), 1, `the primary has the module's write once, stored at the release: ${JSON.stringify(texts)}`);
+      assert.equal(count(texts, 'A MESSAGE DURING THE HOLD'), 0, 'not the channel message');
+      assert.equal(lost.length, 1, 'the release tells of nothing more');
+      assert.ok(!logged.some((line) => line.includes('is not a registered agent')), `nothing replayed for the ended fork: ${logged.join('\n')}`);
+    });
+  });
+
+  it("a write the hold kept for one agent isn't given at the release to another registered under its name since", { timeout: 30_000 }, async () => {
+    await withForks('reinit-fork-held-other-incarnation-', async (framework, forkInternals) => {
+      await forksAroundACheckpoint(framework, forkInternals);
+      const internals = forkInternals as unknown as { agents: Map<string, unknown>; reserveStoreForSurgery(verb: string, agentName: string): () => void };
+      const release = internals.reserveStoreForSurgery('roll back', 'a');
+      const late = internals.agents.get('a-late-g1');
+      const other = framework.getAgent('a-early-g1')!;
+      try {
+        holdFor(framework, 'a-late-g1', 'KEPT FOR THE FIRST A-LATE');
+        // No registration is admitted during a hold (the test above), and an
+        // agent that ends takes its kept writes with it, so this is set by
+        // hand: another agent under the name, the first never having ended
+        // through the framework.
+        internals.agents.set('a-late-g1', other);
+      } finally {
+        release();
+        internals.agents.set('a-late-g1', late);
+      }
+      assert.equal(count(storedTexts(other.getContextManager()), 'KEPT FOR THE FIRST A-LATE'), 0, 'the other agent under the name is not given it');
+      assert.equal(count(storedTexts(framework.getAgent('a')!.getContextManager()), 'KEPT FOR THE FIRST A-LATE'), 1,
+        "it goes on to the primary, as a module's write for an agent that ended does");
+    });
+  });
+
   it("a fork whose disposal fails partway is reported with the failure, and the pass goes on to dispose the next emptied fork", { timeout: 30_000 }, async () => {
     await withForks('reinit-fork-disposefail-', async (framework, internals) => {
       await forksAroundACheckpoint(framework, internals);

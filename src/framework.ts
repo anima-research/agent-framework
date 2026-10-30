@@ -1866,6 +1866,10 @@ interface SurgeryHeldWrite {
   metadata?: MessageMetadata;
   opts?: FrameworkWriteOptions;
   direct?: { agentName: string };
+  /** The agent the write was kept for, as registered then: the incarnation
+   *  its name meant. Another agent registered under that name since isn't
+   *  the write's (heldWriteTargetGone). */
+  heldFor?: Agent;
   heldAt: number;
 }
 
@@ -15427,7 +15431,7 @@ export class AgentFramework {
     for (const [agentName, writes] of [...kept]) {
       if (failures.some((failure) => failure.agentName === agentName)) continue;
       kept.delete(agentName);
-      if (!this.agents.has(agentName)) {
+      if (writes.some((write) => this.heldWriteTargetGone(write, agentName) !== undefined)) {
         this.passHeldWritesOn(agentName, writes);
         continue;
       }
@@ -15561,24 +15565,81 @@ export class AgentFramework {
    * reader could act on, or a module's write for a run or a fork, which goes
    * as the write itself), goes on to the primary by name
    * (passNoticeToPrimary), in arrival order, where a hold keeps it until its
-   * release, as any write. The rest are dropped, which is logged. Never
+   * release, as any write. The rest are dropped, which is logged and, unless
+   * the caller's own alert counts them (`counted`: a move's disposal of the
+   * fork), told of by an ops alert of kind `store-held-lost`: unlike a
+   * released window's unread rows, they never reach the record. Never
    * throws.
    */
-  private passHeldWritesOn(agentName: string, writes: readonly SurgeryHeldWrite[]): { passed: number; dropped: number } {
+  private passHeldWritesOn(agentName: string, writes: readonly SurgeryHeldWrite[], opts?: { counted?: boolean }): { passed: number; dropped: number } {
     let passed = 0;
+    const lost: SurgeryHeldWrite[] = [];
     for (const write of writes) {
-      if (!passesToPrimary(write.metadata)) continue;
-      if (this.passNoticeToPrimary(agentName, write.metadata, { participant: write.participant, content: write.content })) passed++;
+      if (passesToPrimary(write.metadata)
+        && this.passNoticeToPrimary(agentName, write.metadata, { participant: write.participant, content: write.content })) {
+        passed++;
+      } else {
+        lost.push(write);
+      }
     }
-    const dropped = writes.length - passed;
+    const dropped = lost.length;
     if (dropped > 0) {
-      console.error(
-        `[surgery] ${dropped} write(s) kept in memory for ${agentName}, which has ended, ${dropped === 1 ? 'is' : 'are'} ` +
+      const line = `${dropped} write(s) kept in memory for ${agentName}, which has ended, ${dropped === 1 ? 'is' : 'are'} ` +
         "dropped, as no agent reads them now: only a notice its reader could act on, or a module's write, goes to " +
-        'the primary in its place',
-      );
+        'the primary in its place';
+      console.error(`[surgery] ${line}`);
+      if (!opts?.counted) {
+        try {
+          const { kinds, mail } = heldWritesTold(lost);
+          const message = `${dropped === 1 ? '1 write' : `${dropped} writes`} kept in memory for ${agentName}, which has ` +
+            `ended, ${dropped === 1 ? 'was' : 'were'} never stored and ${dropped === 1 ? 'is' : 'are'} dropped: no agent ` +
+            `reads ${dropped === 1 ? 'it' : 'them'} now, and only a notice its reader could act on, or a module's write, ` +
+            `goes to the primary in its place${passed > 0 ? ` (${passed} went)` : ''}. Kinds: ` +
+            Object.entries(kinds).map(([kind, count]) => `${count} ${kind}`).join(', ') + '.';
+          this.opsAlert('store-held-lost', agentName, message, { data: { count: dropped, passedOn: passed, kinds, mail, agentEnded: true } });
+        } catch (error) {
+          console.error(`[surgery] the alert for the writes dropped for ${agentName} failed:`, error);
+        }
+      }
     }
     return { passed, dropped };
+  }
+
+  /**
+   * The name a kept write names whose agent has ended, else undefined: no
+   * agent is registered under it, or another incarnation is, not the one
+   * the write was kept for (SurgeryHeldWrite.heldFor). A write that names no
+   * agent is the delivery agent's at its release, whichever that is then.
+   * `named` is the name the write was kept under, where a caller keys it.
+   */
+  private heldWriteTargetGone(write: SurgeryHeldWrite, named = write.direct?.agentName ?? write.opts?.forAgent): string | undefined {
+    if (named === undefined) return undefined;
+    const now = this.agents.get(named);
+    return !now || (write.heldFor !== undefined && write.heldFor !== now) ? named : undefined;
+  }
+
+  /**
+   * Take out of memory the writes kept for `agent`, which is ending: those
+   * kept while its context manager refused its work (heldForRecovery), then
+   * those a surgery's hold keeps that name it, in arrival order, so that
+   * neither a later move nor the hold's release meets them. Writes that
+   * name no agent stay: they are the delivery agent's at the release.
+   */
+  private takeHeldWritesFor(agent: Agent): SurgeryHeldWrite[] {
+    // Read defensively, as releaseSurgeryHeldWrites is.
+    const taken = [...(this.heldForRecovery?.get(agent.name) ?? [])];
+    this.heldForRecovery?.delete(agent.name);
+    const holding = this.surgeryHeldWrites ?? [];
+    for (let i = 0; i < holding.length;) {
+      const write = holding[i]!;
+      if ((write.direct?.agentName ?? write.opts?.forAgent) === agent.name && (write.heldFor === undefined || write.heldFor === agent)) {
+        holding.splice(i, 1);
+        taken.push(write);
+      } else {
+        i++;
+      }
+    }
+    return taken;
   }
 
   private reportLongHold(hold: { verb: string; agentName: string; since: number; reinitializing?: string }): void {
@@ -15612,24 +15673,12 @@ export class AgentFramework {
     for (const { agentName, home } of forks) {
       const agent = this.agents.get(agentName);
       if (!agent || agent.getContextManager().getMessageCount() > 0) continue;
-      // The writes kept in memory for it leave with it: those kept while its
-      // manager refused its work (heldForRecovery), then those the move's
-      // hold keeps for it, taken out before it is disposed so that neither
-      // its end nor the release meets them. The ones the primary takes in
-      // its place go on to it, held by the hold until its release as any
-      // write; the rest are dropped (passHeldWritesOn).
-      const held = [...(this.heldForRecovery?.get(agentName) ?? [])];
-      this.heldForRecovery?.delete(agentName);
-      const holding = this.surgeryHeldWrites ?? [];
-      for (let i = 0; i < holding.length;) {
-        const write = holding[i]!;
-        if ((write.direct?.agentName ?? write.opts?.forAgent ?? this.primaryAgentName) === agentName) {
-          holding.splice(i, 1);
-          held.push(write);
-        } else {
-          i++;
-        }
-      }
+      // The writes kept in memory for it leave with it (takeHeldWritesFor),
+      // taken out before it is disposed so that neither its end nor the
+      // release meets them. The ones the primary takes in its place go on to
+      // it, held by the hold until its release as any write; the rest are
+      // dropped (passHeldWritesOn), counted by the disposal's alert.
+      const held = this.takeHeldWritesFor(agent);
       let cleanupFailed: string | undefined;
       try {
         if (home && this.conversationRouter && this.conversationRouter.getBinding(home)?.agentName === agentName) {
@@ -15639,7 +15688,7 @@ export class AgentFramework {
       } catch (error) {
         cleanupFailed = failureDescription(error);
       }
-      const { passed } = this.passHeldWritesOn(agentName, held);
+      const { passed } = this.passHeldWritesOn(agentName, held, { counted: true });
       const failed = failures.find((f) => f.agentName === agentName && 'error' in f);
       disposals.push({ agentName, disposed: {
         heldWrites: held.length,
@@ -22534,7 +22583,7 @@ export class AgentFramework {
    */
   private storeInFork(target: Agent, content: ContentBlock[], metadata: MessageMetadata): MessageId {
     const presents = this.presents(target);
-    const kept = (): SurgeryHeldWrite => ({ participant: 'user', content, metadata, direct: { agentName: target.name }, heldAt: Date.now() });
+    const kept = (): SurgeryHeldWrite => ({ participant: 'user', content, metadata, direct: { agentName: target.name }, heldFor: target, heldAt: Date.now() });
     if (this.surgeryHold) {
       this.surgeryHeldWrites.push(kept());
       return '' as MessageId;
@@ -22574,9 +22623,13 @@ export class AgentFramework {
    * or give such a module a callback the release calls in its place. A
    * write for an agent whose context manager refuses its
    * work is kept in memory for it again (heldForRecovery), never dropped,
-   * and is traced when a later move stores it. A write for an agent gone
-   * since goes on to the primary if it is one the primary takes in its
-   * place, and is dropped otherwise (passHeldWritesOn), logged. A write that
+   * and is traced when a later move stores it. An agent that ends during
+   * the hold takes its writes out of it as it ends, and passes them on
+   * (releaseWindowNowOrAfterResume). One the release still meets for an
+   * agent gone, or for a name another agent is registered under since
+   * (heldWriteTargetGone), goes on to the primary if it is one the primary
+   * takes in its place, and is dropped otherwise (passHeldWritesOn), told of
+   * by an ops alert. A write that
    * throws now is logged, and the rest go on: one whose row landed counts as
    * stored, traced with the landed id; one whose row didn't is lost, and one
    * whose store can't be read back to tell may be. Each agent's are told of
@@ -22591,9 +22644,9 @@ export class AgentFramework {
       const target = write.direct ? this.agents.get(write.direct.agentName) : this.deliveryAgent(write.opts?.forAgent);
       const before = target ? this.storedCountOf(target) : undefined;
       try {
-        const named = write.direct?.agentName ?? write.opts?.forAgent;
-        if (named !== undefined && !this.agents.has(named)) {
-          this.passHeldWritesOn(named, [write]);
+        const gone = this.heldWriteTargetGone(write);
+        if (gone !== undefined) {
+          this.passHeldWritesOn(gone, [write]);
           continue;
         }
         let id: MessageId;
@@ -30909,6 +30962,7 @@ export class AgentFramework {
         participant, content,
         ...(given !== undefined ? { metadata: given } : {}),
         ...(opts ? { opts: rest } : {}),
+        heldFor: agent,
         heldAt: Date.now(),
       };
     };
@@ -31565,20 +31619,19 @@ export class AgentFramework {
    * write addressed to it meanwhile is treated as for any agent no longer
    * registered (dropped, or passed to the primary if it's a failed reply, a
    * channel notice its reader could act on, or a module's write for a run or
-   * a fork: passesToPrimary). The writes kept in memory for it while its
-   * context manager refused its work, which no window holds, are judged so
-   * at once.
+   * a fork: passesToPrimary). The writes kept in memory for it, while its
+   * context manager refused its work or by a surgery's hold still up, which
+   * no window holds, are judged so at once.
    */
   private releaseWindowNowOrAfterResume(agent: Agent): void {
-    // The writes kept in memory for it while its context manager refused its
-    // work (heldForRecovery) were never stored, so no window holds them: the
-    // ones the primary takes in its place go on to it now, as its window's
-    // unread notices do, and the rest are dropped (passHeldWritesOn).
-    const kept = this.heldForRecovery?.get(agent.name);
-    if (kept) {
-      this.heldForRecovery.delete(agent.name);
-      this.passHeldWritesOn(agent.name, kept);
-    }
+    // The writes kept in memory for it (takeHeldWritesFor) were never
+    // stored, so no window holds them: the ones the primary takes in its
+    // place go on to it now, as its window's unread notices do, held by a
+    // hold still up until its release as any write; the rest are dropped,
+    // told of by an ops alert (passHeldWritesOn). The release never meets
+    // them, nor an agent registered under the name later.
+    const kept = this.takeHeldWritesFor(agent);
+    if (kept.length > 0) this.passHeldWritesOn(agent.name, kept);
     this.releasedReaders.set(agent, recordedReaderFacts(this.registry, agent.name));
     if (this.quiesced) this.releasesAfterResume.set(agent.name, agent);
     else this.releaseWindow(agent);

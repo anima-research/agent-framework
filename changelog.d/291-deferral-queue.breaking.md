@@ -4,8 +4,12 @@
   with the id `''`: a live operator surgery (a rollback, a suppression, a branch switch), whose release stores it in
   arrival order, and an agent's context manager that refuses its work after a failed re-initialization, which keeps
   each write for the agent until a `switchBranch()` re-initializes it and that switch's release stores them in
-  arrival order (if the agent ends first, those the primary takes in its place, a module's write for a run or a fork,
-  a failed reply's notice or a channel notice it could act on, go on to it, and the rest are dropped, logged). A
+  arrival order. An agent that ends while either keeps writes for it takes them out as it ends, not at the release:
+  those the primary takes in its place, a module's write for a run or a fork, a failed reply's notice or a channel
+  notice it could act on, go on to it (held by a hold still up until its release, as any write), and the rest are
+  dropped, logged, with an `ops:alert` of kind `store-held-lost` for the agent (`data`: `count`, `passedOn`, `kinds`,
+  `mail`, `agentEnded: true`); a release that still meets a write for an agent gone, or for a name another agent is
+  registered under since, does the same, so a new agent of that name never gets an ended one's writes. A
   crash during the surgery, or before the recovery, loses such a write; earlier releases kept a quiesced host's queue
   on disk, and a surgery's deferred writes with it. So does a release whose store throws for one, its row not
   landing: the writes after it go on, and the release logs the loss and raises an `ops:alert` of kind
