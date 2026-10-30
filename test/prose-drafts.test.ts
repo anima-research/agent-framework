@@ -2167,7 +2167,7 @@ describe('a draft whose notice an undo takes out of the window', () => {
     }
   });
 
-  it('is not named again when a notice the undo gives back to the window still names it', async () => {
+  it("is named again at the next start when the undo took its mid-turn notice out with the turn's rows, the notice being the agent's own row", async () => {
     const h = await harness();
     try {
       await h.turn([createMockResponse([text('hello')])]);
@@ -2176,11 +2176,19 @@ describe('a draft whose notice an undo takes out of the window', () => {
         createMockResponse([]),
       ]);
       const [draft] = h.drafts();
+      const cm = h.framework.getAgent('scout')!.getContextManager();
+      const midTurn = h.messages().find((m) => (m.metadata as { kind?: string; draftIds?: string[] } | undefined)?.kind === 'prose-drafts'
+        && (m.metadata as { draftIds?: string[] }).draftIds?.includes(draft!.id));
+      assert.ok(midTurn, 'premise: the mid-turn notice names the draft');
+      assert.equal((midTurn!.metadata as { ownRowOf?: string }).ownRowOf, 'scout', "it is the agent's own row");
+      assert.equal(cm.windowStatusOf(midTurn!.id), 'in', 'premise: its window holds it before the undo');
       await undo(h);
       assert.ok(!windowNames(h, draft!.id), 'the undo took its notices out of the window');
       await h.turn([createMockResponse([])]);
-      assert.ok(windowNames(h, draft!.id), "the mid-turn notice is back in the window");
-      assert.deepEqual(catchUpsNaming(h, draft!.id), [], 'no catch-up names it');
+      assert.equal(cm.windowStatusOf(midTurn!.id), 'undone', "the mid-turn notice stays out, as the turn's other rows do");
+      assert.equal(catchUpsNaming(h, draft!.id).length, 1, 'the next start names the draft');
+      await h.turn([createMockResponse([])]);
+      assert.equal(catchUpsNaming(h, draft!.id).length, 1, 'a later start does not name it again');
     } finally {
       await h.close();
     }

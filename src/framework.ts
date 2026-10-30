@@ -21268,8 +21268,11 @@ export class AgentFramework {
    * turn whose round it came from (opts.routing). `notice: 'now'` also
    * queues a private notice naming them, which
    * the resident hears at its next tool boundary — only when the live stream
-   * presents mid-turn injections. Otherwise the turn-end receipt names them
-   * (or, after a crash, the next turn's catch-up). Drafts the journal cannot
+   * presents mid-turn injections. The notice is the agent's own row, about
+   * its own speech (#291), so an undo of the turn takes it out of the window
+   * with the turn's other rows, as it takes the receipt, and the next start
+   * names the draft again (noticeUnnoticedDrafts). Otherwise the turn-end
+   * receipt names them (or, after a crash, the next turn's catch-up). Drafts the journal cannot
    * hold are reported in the receipt: their words remain in history only.
    */
   private holdProseDrafts(
@@ -21309,13 +21312,20 @@ export class AgentFramework {
       textLen: held.reduce((n, d) => n + d.text.length, 0),
     });
     if (opts.notice === 'now') {
-      const target = this.noticeTargetFor(agent.name, 'held-draft');
+      const target = this.noticeTargetFor(agent.name, 'held-draft') ? this.agents.get(agent.name) : undefined;
       try {
-        if (target) this.addMessage(
+        // Written while its turn is alive, it waits out of the window
+        // (present false) for the turn's next point, as the write for the
+        // agent it replaces did: the tool boundary whose stream hears it, or
+        // the turn's end. With no turn alive it is presented now, as any own
+        // row written at rest.
+        if (target) storeOwnRow(
+          target,
           'user',
           [{ type: 'text', text: this.draftsHeldNotice(agent.name, held, reason, opts.because, opts.target, this.ownChannels(opts.routing)) }],
           { system: true, kind: 'prose-drafts', draftOwner: agent.name, draftIds: held.map((d) => d.id) } as MessageMetadata,
-          target,
+          undefined,
+          !this.logicalTurnAlive(target),
         );
       } catch (err) {
         console.error('[drafts] held-draft notice failed:', err);
