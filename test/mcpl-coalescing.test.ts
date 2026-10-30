@@ -2788,6 +2788,67 @@ test("a render whose store write is refused leaves a batch opened while it rende
   assert.equal(renders, 1, 'the server was asked to render the first batch only');
 });
 
+test("a render whose store write is refused while a newer batch is open saves that batch's fallback mark at once, so a restart before the assembly's other renders settle delivers it as its fallback", async () => {
+  // The host writes each save as it is asked for, so `saved` is what a
+  // restart finds.
+  let saved: CoalescingSnapshot | undefined;
+  const latch = () => { let open!: () => void; const opened = new Promise<void>((resolve) => { open = resolve; }); return { open, opened }; };
+  const documentStarted = latch(), documentGo = latch(), outlineGo = latch();
+  const kinds: string[] = [];
+  const rendered: string[] = [];
+  const delivered: string[] = [];
+  let refuse = true;
+  const words = (blocks: readonly unknown[]): string => blocks.map((b) => (b as { text?: string }).text ?? '').join('');
+  const host: CoalescerHost<null> = {
+    isUnread: () => true, isUnshown: () => true, remove: () => true,
+    deliver: async (occ, content) => {
+      if (refuse && occ.eventId === 'n1') throw new Error('zz-store-refused');
+      delivered.push(`${occ.eventId}: ${words(content ?? occ.content)}`);
+      return { agent: 'agent', messageId: `row-${occ.eventId}` };
+    },
+    wakeForBatch: async () => {}, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
+    audience: async () => ['agent'],
+    render: async (occ) => {
+      rendered.push(occ.eventId);
+      if (occ.eventId === 'n1') { documentStarted.open(); await documentGo.opened; }
+      if (occ.eventId === 'o1') await outlineGo.opened;
+      return { content: [{ type: 'text', text: `render_${occ.eventId}` }] };
+    },
+    audit: (record) => { kinds.push(String(record.kind)); },
+    save: (snapshot) => { saved = structuredClone(snapshot()); },
+  };
+  const occurrence = (key: string, eventId: string, initial = false): CoalescedOccurrence<null> => ({
+    serverId: 'editor', binding: 'binding', scope: { kind: 'featureSet', id: 'doc' }, key, eventId, timestamp: TS,
+    retract: false, deferred: true, initial, content: [{ type: 'text', text: `fallback_${eventId}` }], event: null,
+  });
+  const coalescer = new PushCoalescer<null>(host, { recoveryBackoffMs: 60_000 });
+  await coalescer.accept(occurrence('document', 'n1', true));
+  await coalescer.accept(occurrence('outline', 'o1', true));
+  // One assembly renders both subjects; the outline's render outlasts the document's.
+  let assembled = false;
+  const assembling = coalescer.assemble('agent').then(() => { assembled = true; });
+  await documentStarted.opened;
+  await coalescer.accept(occurrence('document', 'n2'));
+  documentGo.open();
+  for (let i = 0; !kinds.includes('deliver-failed'); i++) {
+    assert(i < 1000, "the document's render was delivered");
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.ok(!assembled, "premise: the outline's render is still out, so the assembly hasn't settled");
+  // The process stops here.
+  const onDisk = structuredClone(saved!);
+  outlineGo.open();
+  await assembling;
+  refuse = false;
+  rendered.length = 0;
+  delivered.length = 0;
+  const restored = new PushCoalescer<null>(host, { recoveryBackoffMs: 60_000 });
+  restored.restore(onDisk);
+  await restored.assemble('agent');
+  assert.ok(!rendered.includes('n2'), `the server isn't asked to render the newer batch on top of the render the agent never got: ${rendered.join(', ')}`);
+  assert.ok(delivered.includes('n2: fallback_n2'), `it is delivered as its fallback: ${delivered.join(' | ')}`);
+});
+
 test("a render stored whose modules' handling then throws is stored once and not delivered again", async (t) => {
   const f = await fixture(); t.after(f.close);
   f.alwaysRespond();

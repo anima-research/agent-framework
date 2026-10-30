@@ -1183,6 +1183,11 @@ export class PushCoalescer<E = unknown> {
             batch.noRender = true;
             state.batch = batch;
           }
+          // Saved now, not only once the assembly's other renders settle: a
+          // newer batch's last snapshot, its acceptance's, has it rendering
+          // as usual, and a restart before the next save would render it on
+          // top of the render the agent never got.
+          this.persist();
           this.scheduleRecovery(subject, state);
           return;
         }
