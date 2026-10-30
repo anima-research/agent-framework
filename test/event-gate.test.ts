@@ -875,6 +875,68 @@ describe('inference buffering', () => {
 
     assert.strictEqual(messages.length, 1);
   });
+
+  for (const interruption of ['turn', 'quiesce', 'dispose'] as const) {
+    it(`a ${interruption} between a turn's end and the delivery of what was held for it ${interruption === 'dispose' ? 'delivers nothing' : 'holds it until that ends'}`, async (t) => {
+      t.mock.timers.enable({ apis: ['setTimeout'] });
+      const path = writeConfig(`held-${interruption}.json`, {
+        policies: [{ name: 'chat', match: {}, behavior: { debounce: 100 } }],
+        default: 'skip',
+      });
+      const { gate, messages, inferenceRequests } = makeGate(path);
+      gate.onInferenceStarted('agent');
+      gate.evaluate(event({ content: 'unseen' }));
+      t.mock.timers.tick(250);
+      assert.strictEqual(gate.inferenceDiagnostics().bufferedEvents, 1, 'premise: held for the turn');
+
+      gate.onInferenceEnded('agent');
+      if (interruption === 'turn') gate.onInferenceStarted('agent');
+      else if (interruption === 'quiesce') gate.setQuiesced(true);
+      else gate.dispose();
+      await new Promise((r) => setImmediate(r));
+      assert.strictEqual(messages.length, 0);
+      assert.strictEqual(inferenceRequests.length, 0);
+      if (interruption === 'dispose') return;
+      assert.strictEqual(gate.inferenceDiagnostics().bufferedEvents, 1, 'held again');
+
+      if (interruption === 'turn') gate.onInferenceEnded('agent');
+      else gate.setQuiesced(false);
+      await new Promise((r) => setImmediate(r));
+      assert.strictEqual(messages.length, 1);
+      assert.strictEqual(inferenceRequests.length, 1);
+    });
+  }
+
+  it("what was held for two turns that ended before it went out stays in arrival order, under the backlog's cap, and goes out once", async (t) => {
+    t.mock.method(console, 'error', () => {});
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const path = writeConfig('held-two-turns.json', {
+      policies: [{ name: 'chat', match: {}, behavior: { debounce: 100 } }],
+      default: 'skip',
+    });
+    const { gate, messages, inferenceRequests } = makeGate(path);
+    const quoted = (i: number) => event({ eventType: 'clock:reminder', content: `m${i}` });
+    gate.onInferenceStarted('agent');
+    for (let i = 0; i < 100; i++) gate.evaluate(quoted(i));
+    t.mock.timers.tick(250);
+    gate.onInferenceEnded('agent');
+    gate.onInferenceStarted('agent');
+    gate.evaluate(quoted(100));
+    t.mock.timers.tick(250);
+    gate.onInferenceEnded('agent');
+    gate.onInferenceStarted('agent');
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(messages.length, 0);
+    assert.strictEqual(gate.inferenceDiagnostics().bufferedEvents, 100);
+    assert.strictEqual(gate.inferenceDiagnostics().droppedBufferedEvents, 1);
+
+    gate.onInferenceEnded('agent');
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(messages.length, 1);
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.deepStrictEqual([...JSON.stringify(messages[0]!.content).matchAll(/\(clock:reminder\): (m\d+)/g)].map((m) => m[1]),
+      Array.from({ length: 100 }, (_, i) => `m${i + 1}`));
+  });
 });
 
 // ---------------------------------------------------------------------------
