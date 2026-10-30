@@ -1,3 +1,4 @@
+import { withReplyConsumer, type PostAdmissionConsumer } from './reply-admission.js';
 import { AdmissionRefusals, RequiredAdmission, AdmissionConnectError, type RequiredIngress, type RefusalCode } from './inbound-admission.js';
 /**
  * McplServerConnection — manages a single JSON-RPC 2.0 connection to an MCPL server.
@@ -483,6 +484,8 @@ export class McplServerConnection extends EventEmitter {
   }
 
   private readonly admissionEpochs = new WeakMap<object, number>();
+  /** Installed by the framework before the ready planes open. */
+  postAdmissionConsumer?: PostAdmissionConsumer;
   private readonly admissionReceipts = new WeakMap<object, RequiredIngress>();
 
   /** Only transport receipt creates an ingress key; never reconstruct one downstream. */
@@ -1161,10 +1164,12 @@ export class McplServerConnection extends EventEmitter {
         }
         // Held data enters admission only at flush, under the current key.
         // The receipt epoch still prevents old transport work acquiring it.
-        this.admissionReceipts.set(params as object, this.requiredAdmission.capture(() => {
+        const admission = this.requiredAdmission.capture(() => {
           if (this.transportEpoch !== epoch || !this.isConnected || !this.grant.has(requiredCap!)) return 'admission_stale';
           if (!this.controlPlaneReady || !this.dataPlaneReady) return 'admission_not_ready';
-        }));
+        });
+        this.admissionReceipts.set(params as object, this.postAdmissionConsumer && name !== 'inference-request'
+          ? withReplyConsumer(admission, this.postAdmissionConsumer, this.transportEnded.signal) : admission);
       }
       // §6.6: a request that will never be answered MUST get an error. A
       // request whose event nothing on this host listens for would never be.

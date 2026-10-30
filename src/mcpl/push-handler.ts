@@ -1,3 +1,4 @@
+import { admissionRoutingFields } from './reply-admission.js';
 import { AdmissionRefusals, attachAdmission, type AdmittedEnvelope, type RequiredIngress } from './inbound-admission.js';
 /**
  * PushHandler — handles push/event messages from MCPL servers.
@@ -177,7 +178,7 @@ export class PushHandler {
       refuse(reason ?? (!verdict.store ? verdict.reason : 'admission_stale'));
       return;
     }
-    const envelope = Object.freeze({ connection: admission.key, mayWake: verdict.mayWake, ...(Object.hasOwn(verdict, 'replyIntent') ? { replyIntent: verdict.replyIntent } : {}) });
+    const envelope = Object.freeze({ connection: admission.key, mayWake: verdict.mayWake, ...admissionRoutingFields(verdict), ...(Object.hasOwn(verdict, 'replyIntent') ? { replyIntent: verdict.replyIntent } : {}) });
     // No await between the final check and the admitted continuation's first effect.
     return this.handlePushEvent(serverId, params, responder, envelope);
   }

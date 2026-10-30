@@ -1,3 +1,4 @@
+import { admissionRoutingFields } from './reply-admission.js';
 /**
  * ChannelRegistry — manages MCPL channel lifecycle, incoming messages, and
  * synthesized channel tools.
@@ -1948,7 +1949,7 @@ export class ChannelRegistry {
           refuse(reason ?? (!verdict.store ? verdict.reason : 'admission_stale'));
           continue;
         }
-        envelope = Object.freeze({ connection: admission.key, mayWake: verdict.mayWake, ...(Object.hasOwn(verdict, 'replyIntent') ? { replyIntent: verdict.replyIntent } : {}) });
+        envelope = Object.freeze({ connection: admission.key, mayWake: verdict.mayWake, ...admissionRoutingFields(verdict), ...(Object.hasOwn(verdict, 'replyIntent') ? { replyIntent: verdict.replyIntent } : {}) });
       }
 
       // ACCEPTED from here down: semantic processing only for admitted
