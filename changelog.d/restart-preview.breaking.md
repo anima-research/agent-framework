@@ -3,9 +3,20 @@
   context-manager's preview of its compile says it won't fit, or the
   preview fails: the stream goes on, each boundary that declines it emits
   an `inference:restart_declined` trace, and the next tool boundary over
-  the budget considers the restart again. On 0.30.0 the restart was taken
-  whatever its compile would do, and a compile that couldn't fit refused,
-  so the turn ended with an `over_budget` failure row.
+  the budget considers the restart again. On 0.30.0 a restart whose
+  compile the preview now says won't fit was taken too, and its compile
+  refused, ending the turn with an `over_budget` failure row, unless
+  something it rested on changed after the cancel, such as a compression
+  the stream had kept waiting landing before the compile.
+  - **A decline that only compression would clear isn't cleared by a
+    compression whose model call hasn't started.** The declined stream
+    keeps the agent's provider gate, and that call waits behind it until
+    the stream ends. A stored row edited or removed, a changed budget, or
+    a compression that lands with no call or from a call already under way
+    can still clear it. Where a restart would have let the waiting
+    compression land and the turn answer, as with a module that awaits at
+    each tool result, the turn now goes on, and with `physicalWindowTokens`
+    unset it can end with a `context_length` failure row.
   - **Migration:** with `physicalWindowTokens` unset, nothing else bounds a
     stream whose restart is declined: it can go on until the provider
     refuses a request at its own window, and the turn then ends with a

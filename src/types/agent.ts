@@ -98,10 +98,15 @@ export interface AgentConfig {
    *  with an `UncoveredDropError` is also logged. The stream goes on, and
    *  the next tool boundary over this budget considers the restart again.
    *  It previews anew only once what the last preview rested on has
-   *  changed (the budget, the compression holds, the live context settings
-   *  or the strategy's compression state), unless that preview said a newer
-   *  message could make room, failed, or met a drop no summary covers: each
-   *  of those every boundary previews. With
+   *  changed (the budget, the compression holds, the live context settings,
+   *  the strategy's compression state, or a stored row edited or removed),
+   *  unless that preview said a newer message could make room, failed, or
+   *  met a drop no summary covers: each of those every boundary previews. A
+   *  decline whose preview names only compression as what would make room
+   *  isn't cleared by a compression whose model call hasn't started: the
+   *  stream keeps the agent's provider gate, and that call waits behind it
+   *  until the stream ends. A summary adopted with no call, or a call
+   *  already under way, can still land. With
    *  `physicalWindowTokens` unset, nothing else then bounds the stream: it
    *  can go on until the provider refuses a request at its own window, and
    *  the turn then ends with its `context_length` failure row, which raises
