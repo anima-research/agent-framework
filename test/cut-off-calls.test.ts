@@ -149,9 +149,9 @@ async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<s
   console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
   try {
     framework.start();
-    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: { channelId: 'world:commons' } } as unknown as ProcessEvent);
     await framework.runUntilIdle();
-    framework.pushEvent({ type: 'external-message', source: 'test', content: 'And next?', metadata: {} } as unknown as ProcessEvent);
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'And next?', metadata: { channelId: 'world:commons' } } as unknown as ProcessEvent);
     await framework.runUntilIdle();
     const cm = framework.getAgent('resident')!.getContextManager() as unknown as { getAllMessages(): Run['rows'] };
     return {

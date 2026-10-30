@@ -179,12 +179,12 @@ describe('explicit prose routing', () => {
     return framework;
   }
 
-  function trigger(framework: AgentFramework): void {
+  function trigger(framework: AgentFramework, privateSurface = false): void {
     framework.pushEvent({
       type: 'external-message',
       source: 'test',
       content: 'go',
-      metadata: {},
+      metadata: privateSurface ? {} : { channelId: 'world:commons' },
     } as unknown as ProcessEvent);
   }
 
@@ -787,15 +787,14 @@ describe('explicit prose routing', () => {
     await framework.stop();
   });
 
-
   type RoutingState = {
-    pin?: ChannelRef; hybridHold?: 'private' | 'failed';
-    continuation: boolean; deliveries: ChannelRef[]; suppressed: number; drafts: Array<{ id: string; text: string }>; keptPrivate: number;
+    pin?: ChannelRef; nonChannelOrigin?: boolean; hybridHold?: 'private' | 'failed';
+    continuation: boolean; deliveries: ChannelRef[]; suppressed: number; drafts: Array<{ id: string; text: string }>; keptPrivate: number; privateSuppressed: number;
     triggerChannel?: ChannelRef; locus?: ChannelRef; engaged: Set<string>; wasIn: ChannelRef[]; arrivals: Array<{ messageId: string; channel: ChannelRef }>;
   };
   /** A turn's routing state, as the framework makes a fresh one. */
   const routingState = (fields: Partial<RoutingState> = {}): RoutingState => ({
-    continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0,
+    continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, privateSuppressed: 0,
     engaged: new Set(), wasIn: [], arrivals: [], ...fields,
   });
 
@@ -945,7 +944,6 @@ describe('explicit prose routing', () => {
       try { await drain(); } finally { await framework.stop(); }
     }
   }
-
 
   async function withHeldHybridCallback(
     lateText: string | null,
@@ -1539,7 +1537,9 @@ describe('explicit prose routing', () => {
       // continuation 2.)
       membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>>skip_reply' }] as ContentBlock[]));
       feedTurn(framework, 2, [{ type: 'text', text: '>>>skip_reply' }] as ContentBlock[]);
-      trigger(framework);
+      framework.pushEvent({
+        type: 'external-message', source: 'test', content: 'go', metadata: { channelId: 'chan-alpha' },
+      } as unknown as ProcessEvent);
       await framework.runUntilIdle();
       for (const end = Date.now() + 5000; turns < 3 && Date.now() < end;) {
         await new Promise<void>((resolve) => setTimeout(resolve, 5));
@@ -1689,12 +1689,12 @@ describe('explicit prose routing', () => {
       const receipts = context(framework).texts.filter((text) => text.startsWith('[delivered]'));
       assert.equal(receipts.length, 2, 'each supplied turn gets its own receipt');
       const delivered = receipts.find((text) => text.includes('chan-alpha'));
-      const held = receipts.find((text) => text.includes('held as draft'));
+      const suppressed = receipts.find((text) => text.includes('kept private'));
       assert.ok(delivered, "the earlier turn's delivery is acknowledged");
-      assert.doesNotMatch(delivered, /held as draft/, "the earlier receipt excludes the newer turn's held draft");
-      assert.ok(held, "the newer turn's held draft is acknowledged");
-      assert.match(held, /1 plain-speech segment\(s\) held as draft/);
-      assert.doesNotMatch(held, /chan-alpha/, "the newer receipt excludes the earlier delivery");
+      assert.doesNotMatch(delivered, /kept private/, "the earlier receipt excludes the newer private retention");
+      assert.ok(suppressed, "the newer turn's private retention is acknowledged");
+      assert.match(suppressed, /1 plain-speech segment.*kept private/);
+      assert.doesNotMatch(suppressed, /chan-alpha/, "the newer receipt excludes the earlier delivery");
     });
   });
 
@@ -2279,7 +2279,7 @@ describe('explicit prose routing', () => {
     });
     const help = decoded.join(' ').replace(/\s+/g, ' ');
     for (const clause of [
-      'A destination applies to the rest of that turn, until another is named.',
+      'A destination applies to the rest of that turn, until another is named',
       'A name that matches no channel, or several, bounces and leaves it as it was.',
       'A channel its server declared inbound-only is refused, and clears it.',
       'Where two servers register one channel id, the server goes first: >>server:service:guild:id … (a bounce lists each such name).',
@@ -2287,6 +2287,8 @@ describe('explicit prose routing', () => {
     ]) {
       assert.ok(help.includes(clause), `the help says: ${clause}`);
     }
+    assert.match(help, /private turn[^.]*only its own body/);
+    assert.match(help, /private turn[^.]*kept private[^.]*no draft/);
     assert.deepEqual(routed, [{ text: 'got it', locus: 'chan-alpha' }]);
 
     await framework.stop();
@@ -2542,7 +2544,6 @@ describe('explicit prose routing', () => {
 
     await framework.stop();
   });
-
 
   it('hybrid preserves authored >>> envelope, publishes only body cross-surface, and records canonical receipt', async () => {
     const authored = '>>>#cafe\nA message meant for the café.';
@@ -2825,13 +2826,196 @@ describe('explicit prose routing', () => {
     });
   }
 
-  it('hybrid leaves unprefixed prose on the frozen locus', async () => {
+  it('a deliberate envelope is delivered alike in a private turn and a channel one; only hybrid\'s unprefixed prose differs', async () => {
+    const cases: Array<{ mode: 'explicit' | 'hybrid'; text: string; channel: unknown[]; private: unknown[] }> = [
+      { mode: 'explicit', text: '>>#cafe A message meant for the café.',
+        channel: [{ text: 'A message meant for the café.', locus: 'discord:g:cafe' }],
+        private: [{ text: 'A message meant for the café.', locus: 'discord:g:cafe' }] },
+      { mode: 'hybrid', text: '>>>#cafe\nA message meant for the café.',
+        channel: [{ text: 'A message meant for the café.', locus: 'discord:g:cafe' }],
+        private: [{ text: 'A message meant for the café.', locus: 'discord:g:cafe' }] },
+      { mode: 'hybrid', text: 'Ordinary field speech.',
+        channel: [{ text: 'Ordinary field speech.', locus: 'world:commons' }],
+        private: [] },
+    ];
+    let n = 0;
+    for (const c of cases) {
+      for (const kind of ['private', 'channel'] as const) {
+        const local = new MockMembrane();
+        local.pushResponse(createMockResponse([{ type: 'text', text: c.text }] as ContentBlock[]));
+        const framework = await AgentFramework.create({
+          storePath: join(tempDir, `kinds-${++n}.chronicle`), membrane: local.asMembrane(),
+          agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'You are a test agent.', proseRouting: c.mode }],
+          modules: [new ToolboxModule()],
+        });
+        const routed = stubRegistry(framework);
+        framework.pushEvent({
+          type: 'external-message', source: 'test', content: 'go',
+          metadata: kind === 'channel' ? { channelId: 'world:commons' } : {},
+        } as unknown as ProcessEvent);
+        await framework.runUntilIdle();
+        assert.deepEqual(routed, c[kind], `${c.mode}, ${kind} turn: ${JSON.stringify(c.text)}`);
+        await framework.stop();
+      }
+    }
+  });
+
+  for (const bouncingPrivate of [true, false]) {
+    it(`a late bounce from a ${bouncingPrivate ? 'private turn, landing while a channel turn is live, wakes a turn whose plain words stay private, even where a fallback exists (a focus hold or \'latest-inbound\')' : 'channel turn, landing while a private turn is live, wakes a turn that speaks as on main'}`, async () => {
+      await withHeldHybridCallback('>>>#nowhere Where does this go?', async ({ framework, routed, earlier, next, pending, release }) => {
+        const internalsOf = framework as unknown as { notePrivateTurn(turnId: number): void };
+        const base = Date.now() * 1000 + 1_000_000_000;
+        const [bouncing, live] = [earlier, next] as Array<RoutingState & { turnId?: number }>;
+        bouncing.turnId = base + 1;
+        live.turnId = base + 2;
+        const privateOne = bouncingPrivate ? bouncing : live;
+        privateOne.nonChannelOrigin = true;
+        internalsOf.notePrivateTurn(privateOne.turnId!);
+        membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Ordinary words.' }] as ContentBlock[]));
+        release();
+        await within(pending, 'the late envelope');
+        await framework.runUntilIdle();
+        const stored = JSON.stringify(framework.getAgent('assistant')!.getContextManager().getAllMessages());
+        assert.ok(stored.includes('Ordinary words.'), 'control: the bounce woke its follow-up');
+        assert.deepEqual(routed.filter((r) => r.text === 'Ordinary words.').map((r) => r.locus), bouncingPrivate ? [] : ['world:commons']);
+      });
+    });
+  }
+
+  it("a private turn's bounce wakes a turn whose plain words stay private, even where a fallback exists (a focus hold or 'latest-inbound')", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>#nowhere Where does this go?' }] as ContentBlock[]));
+    const framework = await createFramework('explicit');
+    stubRegistry(framework);
+    let turns = 0;
+    framework.onTrace((e) => { if ((e as { type: string }).type === 'inference:started') turns++; });
+    feedTurn(framework, 2, [{ type: 'text', text: 'Ordinary words.' }] as ContentBlock[]);
+    trigger(framework, true);
+    await framework.runUntilIdle();
+    assert.equal(turns, 2, 'control: the bounce woke a turn');
+    const drafts = (framework as unknown as { proseDrafts: { open(a: string): Array<{ text: string }> } }).proseDrafts.open('assistant');
+    assert.ok(!drafts.some((d) => d.text === 'Ordinary words.'), `nothing holds them to resend to a channel: ${JSON.stringify(drafts)}`);
+    assert.ok(context(framework).texts.some((t) => t.includes('was kept private')), 'the resident is told they were kept private');
+    await framework.stop();
+  });
+
+  for (const [mode, label, text, plan] of [
+    ['hybrid', 'names no destination', '>>>\nThe plan is X.', []],
+    ['hybrid', 'names a channel that does not resolve', '>>>#missing The plan is X.', []],
+    ['explicit', 'names a channel that does not resolve', '>>#missing The plan is X.', []],
+    ['hybrid', 'names a channel whose delivery fails', '>>>#alpha The plan is X.', ['false']],
+    ['explicit', 'names a channel whose delivery fails', '>>#alpha The plan is X.', ['false']],
+  ] as const) {
+    it(`a private ${mode} turn's envelope that ${label} keeps its words private, with no draft, even where a fallback exists (a focus hold or 'latest-inbound')`, async () => {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text }] as ContentBlock[]));
+      const framework = await createFramework(mode);
+      const routed = stubRegistry(framework, [...plan]);
+      feedTurn(framework, 2, [{ type: 'text', text: 'Ordinary words.' }] as ContentBlock[]);
+      trigger(framework, true);
+      await framework.runUntilIdle();
+      assert.deepEqual(routed.map((r) => r.text), plan.length ? ['The plan is X.'] : [], 'control: only a resolved envelope is attempted');
+      const drafts = (framework as unknown as { proseDrafts: { open(a: string): Array<{ text: string }> } }).proseDrafts.open('assistant');
+      assert.deepEqual(drafts.map((d) => d.text), [], 'nothing holds the words to resend');
+      const notice = context(framework).texts.find((t) => t.startsWith('[prose-routing]') && t.includes('was not delivered'));
+      assert.ok(notice?.includes('It was kept private') && !notice.includes('{{unsent}}'), `the resident is told the words were kept private: ${notice}`);
+      await framework.stop();
+    });
+  }
+
+  for (const [mode, prefix, privateText] of [
+    ['hybrid', '>>>', '>>>#missing Second words.'],
+    ['explicit', '>>', 'Second words.'],
+  ] as const) {
+    it(`a private ${mode} turn's kept-private notice says which earlier draft {{unsent}} still names`, async () => {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: `${prefix}#missing First words.` }] as ContentBlock[]));
+      const framework = await createFramework(mode);
+      const routed = stubRegistry(framework);
+      feedTurn(framework, 2, [{ type: 'text', text: `${prefix}skip_reply` }] as ContentBlock[]);
+      feedTurn(framework, 3, [{ type: 'text', text: privateText }] as ContentBlock[]);
+      feedTurn(framework, 4, [{ type: 'text', text: `${prefix}skip_reply` }] as ContentBlock[]);
+      trigger(framework);
+      await framework.runUntilIdle();
+      const drafts = (framework as unknown as { proseDrafts: { open(a: string): Array<{ id: string; text: string }> } }).proseDrafts.open('assistant');
+      assert.deepEqual(drafts.map((d) => d.text), ['First words.'], 'control: the channel turn\'s bounce is held as a draft');
+      trigger(framework, true);
+      await framework.runUntilIdle();
+      assert.deepEqual(routed, []);
+      const notice = context(framework).texts.find((t) => t.startsWith('[prose-routing]') && t.includes('kept private'));
+      assert.ok(notice?.includes(`{{unsent}} still names draft ${drafts[0]!.id}, not these words.`), `the resident is told what {{unsent}} takes: ${notice}`);
+      await framework.stop();
+    });
+  }
+
+  for (const [mode, prefix, outcome] of [['hybrid', '>>>', 'false'], ['hybrid', '>>>', 'throw'], ['explicit', '>>', 'false']] as const) {
+    it(`a private ${mode} turn's resend that adds its own words to {{unsent}} holds no new draft when its delivery ${outcome === 'throw' ? 'throws' : 'fails'}`, async () => {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: `${prefix}#missing First words.` }] as ContentBlock[]));
+      const framework = await createFramework(mode);
+      const routed = stubRegistry(framework, [outcome]);
+      feedTurn(framework, 2, [{ type: 'text', text: `${prefix}skip_reply` }] as ContentBlock[]);
+      feedTurn(framework, 3, [{ type: 'text', text: `${prefix}#alpha Private note. {{unsent}}` }] as ContentBlock[]);
+      feedTurn(framework, 4, [{ type: 'text', text: `${prefix}skip_reply` }] as ContentBlock[]);
+      trigger(framework);
+      await framework.runUntilIdle();
+      trigger(framework, true);
+      await framework.runUntilIdle();
+      assert.deepEqual(routed.map((r) => r.text), ['Private note. First words.'], 'control: the resend was attempted');
+      const drafts = (framework as unknown as { proseDrafts: { open(a: string): Array<{ text: string }> } }).proseDrafts.open('assistant');
+      assert.deepEqual(drafts.map((d) => d.text), ['First words.'], "nothing holds the private turn's words to resend");
+      const notice = context(framework).texts.find((t) => t.startsWith('[prose-routing]') && t.includes('chan-alpha'));
+      assert.ok(notice?.includes(outcome === 'throw' ? "It isn't held as a draft" : 'It was kept private'), `the resident is told: ${notice}`);
+      await framework.stop();
+    });
+  }
+
+  for (const [mode, prefix] of [['hybrid', '>>>'], ['explicit', '>>']] as const) {
+    it(`a private ${mode} turn's bare {{unsent}} resend whose delivery fails keeps the draft it sent, and offers it again`, async () => {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: `${prefix}#missing First words.` }] as ContentBlock[]));
+      const framework = await createFramework(mode);
+      const routed = stubRegistry(framework, ['false']);
+      feedTurn(framework, 2, [{ type: 'text', text: `${prefix}skip_reply` }] as ContentBlock[]);
+      feedTurn(framework, 3, [{ type: 'text', text: `${prefix}#alpha {{unsent}}` }] as ContentBlock[]);
+      feedTurn(framework, 4, [{ type: 'text', text: `${prefix}skip_reply` }] as ContentBlock[]);
+      trigger(framework);
+      await framework.runUntilIdle();
+      trigger(framework, true);
+      await framework.runUntilIdle();
+      assert.deepEqual(routed.map((r) => r.text), ['First words.'], 'control: the resend was attempted');
+      const drafts = (framework as unknown as { proseDrafts: { open(a: string): Array<{ id: string; text: string }> } }).proseDrafts.open('assistant');
+      assert.deepEqual(drafts.map((d) => d.text), ['First words.'], 'the draft it sent stays held');
+      const notice = context(framework).texts.find((t) => t.startsWith('[prose-routing]') && t.includes('chan-alpha'));
+      assert.ok(notice?.includes(`It is held as draft ${drafts[0]!.id}`), `the resident is offered it again: ${notice}`);
+      await framework.stop();
+    });
+
+    it(`a private ${mode} turn's round that calls the drafts tool holds none of its plain words as a draft`, async () => {
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: `${prefix}#missing First words.` },
+        { type: 'tool_use', id: 'd1', name: 'drafts', input: { action: 'list' } },
+        { type: 'text', text: 'Private narration.' },
+        { type: 'tool_use', id: 'd2', name: 'drafts', input: { action: 'list' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: `${prefix}skip_reply` }] as ContentBlock[]));
+      const framework = await createFramework(mode);
+      const routed = stubRegistry(framework);
+      feedTurn(framework, 2, [{ type: 'text', text: `${prefix}skip_reply` }] as ContentBlock[]);
+      trigger(framework, true);
+      await framework.runUntilIdle();
+      assert.ok(context(framework).texts.some((t) => t.startsWith('[prose-routing]') && t.includes('#missing')), 'control: the envelope before it bounced');
+      assert.deepEqual(routed, []);
+      const drafts = (framework as unknown as { proseDrafts: { open(a: string): Array<{ text: string }> } }).proseDrafts.open('assistant');
+      assert.deepEqual(drafts.map((d) => d.text), [], 'nothing holds the words to resend');
+      await framework.stop();
+    });
+  }
+
+  it("hybrid keeps a private turn's unprefixed prose on its surface", async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Ordinary field speech.' }] as ContentBlock[]));
     const framework = await createFramework('hybrid');
     const routed = stubRegistry(framework);
-    trigger(framework);
+    trigger(framework, true);
     await framework.runUntilIdle();
-    assert.deepEqual(routed, [{ text: 'Ordinary field speech.', locus: 'world:commons' }]);
+    assert.deepEqual(routed, [], 'channel-less hybrid prose cannot use an inferred locus');
+    const receipts = context(framework).texts.filter((text) => text.startsWith('[delivered]'));
+    assert.ok(receipts.some((text) => text.includes('kept private')));
     await framework.stop();
   });
 
@@ -2849,7 +3033,6 @@ describe('explicit prose routing', () => {
     assert.ok(texts.some(t => t.includes('[prose-routing]') && t.includes('not delivered') && t.includes('>>>#<channel> {{unsent}}')));
     await framework.stop();
   });
-
 
   it('hybrid keeps an explicit target sticky across tool-round segments in the same turn', async () => {
     membrane.pushResponse(createMockResponse([
@@ -2870,7 +3053,6 @@ describe('explicit prose routing', () => {
     await framework.stop();
   });
 
-
   it('hybrid target-only envelope establishes the sticky destination for the next tool-round segment', async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: '>>>#cafe' },
@@ -2884,7 +3066,6 @@ describe('explicit prose routing', () => {
     assert.deepEqual(routed, [{ text: 'body follows', locus: 'discord:g:cafe' }]);
     await framework.stop();
   });
-
 
   it('hybrid >>>skip_reply clears a sticky target until a fresh valid envelope', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>>#cafe first' }, { type: 'tool_use', id: 'sk1', name: 'robot--move', input: { dir: 'north' } }] as ContentBlock[], 'tool_use'));
@@ -2929,7 +3110,6 @@ describe('explicit prose routing', () => {
     });
   }
 
-
   it('hybrid same-round successful say tool outranks a contradictory prose envelope', async () => {
     const authored = '>>>#cafe wrong-locus duplicate';
     membrane.pushResponse(createMockResponse([
@@ -2957,7 +3137,6 @@ describe('explicit prose routing', () => {
     ]);
     await framework.stop();
   });
-
 
   it('disabled mode suppresses text-only prose without a bounce, primer, or channel delivery', async () => {
     const authored = 'Internal continuity summary that must never publish.';

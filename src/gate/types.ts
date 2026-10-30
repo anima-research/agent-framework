@@ -397,6 +397,9 @@ export interface GateEventInfo {
   serverId: string;
   channelId: string;
   metadata?: Record<string, unknown>;
+  /** A private surface's message: the window it joins wakes a private turn
+   *  (wakeProvenance). */
+  nonChannelOrigin?: boolean;
   /** Workspace mount name (for workspace:* events). */
   mount?: string;
   /** Mount-prefixed paths touched (for workspace:* events). */

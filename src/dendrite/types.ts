@@ -251,6 +251,14 @@ export interface AgentSpec {
   namespace?: string;
   /** Free-form metadata surfaced in discovery. */
   metadata?: Record<string, unknown>;
+  /**
+   * Set by the framework at creation, and kept by a resumed record: the
+   * agent is a private turn's work. It was derived from, or spawned by, an agent whose turn was open
+   * and private (an operator's private input in it), or, as an ephemeral
+   * run, it was handed mail from such work. What it sends, and the notice
+   * that a restart interrupted it, make the turn that reads them private.
+   */
+  privateTurn?: true;
 }
 
 /** Why an agent identity ended. */
@@ -318,6 +326,8 @@ export interface AgentRecord {
   readsSharedSlot: boolean;
   namespace?: string;
   metadata?: Record<string, unknown>;
+  /** The spec's `privateTurn`, and set when an ephemeral run is handed mail from a private turn's work. */
+  privateTurn?: true;
   createdAt: number;
   /** Set when the identity has ended. Ended records stay inspectable. */
   ended?: { at: number; reason: AgentEndReason; by?: string };
@@ -352,6 +362,12 @@ export interface HeldMail {
   createdAt: number;
   /** Why it is still held. */
   heldBecause?: 'recipient-gone' | 'undelivered';
+  /**
+   * Set when it was sent from a private turn's work: by an agent whose turn
+   * was open and private, or by one that is such work (`AgentRecord.privateTurn`).
+   * The recipient's turn that reads it is private.
+   */
+  privateTurn?: true;
 }
 
 /**
