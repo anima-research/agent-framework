@@ -790,12 +790,12 @@ describe('explicit prose routing', () => {
 
   type RoutingState = {
     pin?: ChannelRef; hybridHold?: 'private' | 'failed';
-    continuation: boolean; deliveries: ChannelRef[]; suppressed: number; drafts: Array<{ id: string; text: string }>; keptPrivate: number;
+    continuation: boolean; deliveries: ChannelRef[]; suppressed: number; drafts: Array<{ id: string; text: string }>; keptPrivate: Partial<Record<string, number>>;
     triggerChannel?: ChannelRef; locus?: ChannelRef; engaged: Set<string>; wasIn: ChannelRef[]; arrivals: Array<{ messageId: string; channel: ChannelRef }>;
   };
   /** A turn's routing state, as the framework makes a fresh one. */
   const routingState = (fields: Partial<RoutingState> = {}): RoutingState => ({
-    continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0,
+    continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: {},
     engaged: new Set(), wasIn: [], arrivals: [], ...fields,
   });
 
@@ -1726,7 +1726,7 @@ describe('explicit prose routing', () => {
     const routed = stubRegistry(framework);
     const internals = framework as unknown as {
       deliverProse(agent: unknown, text: string, round?: { draftsRound?: boolean }): Promise<void>;
-      turnRouting: Map<string, { continuation: boolean; keptPrivate: number }>;
+      turnRouting: Map<string, { continuation: boolean; keptPrivate: Partial<Record<string, number>> }>;
       proseDrafts: ProseDraftStore;
     };
     const agent = framework.getAgent('assistant')!;
@@ -2060,7 +2060,7 @@ describe('explicit prose routing', () => {
       await gateway.deliverHybridProse(agent, 'still private', stub('chan-locus'), true, { routing, notice: 'later' });
       assert.deepEqual(routed, [], 'nothing is sent');
       assert.equal(routing.hybridHold, 'private');
-      assert.equal(routing.keptPrivate, 1, 'the unprefixed envelope after it is counted as kept private');
+      assert.deepEqual(routing.keptPrivate, { '>>>skip_reply': 1 }, 'the unprefixed envelope after it is counted as kept private, by >>>skip_reply');
       assert.deepEqual(routing.drafts, [], 'and is never drafted');
       assert.deepEqual(draftsOf(framework).open('assistant'), [], 'the journal holds nothing either');
     } finally {
@@ -3288,7 +3288,7 @@ describe('explicit prose routing', () => {
           const receipt = context(framework).texts.filter((t) => t.startsWith('[delivered]'));
           assert.equal(receipt.length, 1, `one receipt for the logical turn: ${receipt.join(' | ')}`);
           assert.match(receipt[0]!, /discord:g:cafe/, "it reports the replaced stream's late post");
-          assert.match(receipt[0]!, /1 plain-speech segment\(s\) kept private/, "and the retry's segment the hold kept private");
+          assert.match(receipt[0]!, /1 plain-speech segment\(s\) kept private \(>>>skip_reply\)/, "and the retry's segment the hold kept private, named by its cause");
         }
         assert.equal(context(framework).bounces, 0, 'nothing bounced');
       } finally {

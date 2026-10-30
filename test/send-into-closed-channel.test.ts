@@ -32,7 +32,7 @@ const origin = { kind: 'agent' as const, agentName: 'sol' };
 const ref = (id: string, serverId = 'discord') => ({ serverId, channelId: id });
 /** A turn's routing as its `[delivered]` receipt reads it: plain speech
  *  delivered to these channels on discord, and nothing else. */
-const receiptRouting = (...ids: string[]) => ({ deliveries: ids.map((id) => ref(id)), suppressed: 0, drafts: [], keptPrivate: 0 });
+const receiptRouting = (...ids: string[]) => ({ deliveries: ids.map((id) => ref(id)), suppressed: 0, drafts: [], keptPrivate: {} });
 /** The agent the harness's framework knows, with what a send's dispatch reads of it. */
 const agentStub = (more: Record<string, unknown> = {}) => ({
   canUseTool: () => true,
