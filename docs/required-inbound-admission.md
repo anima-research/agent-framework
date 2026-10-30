@@ -21,12 +21,15 @@ closed `RefusalCode` union. Unknown members, accessors and inconsistent branches
 are refused; neither metadata nor tags supply host authority. Optional intent
 must pass the host validator. It remains private and non-authorizing: no reply
 resolution, publication or persistence is added. Host modules can read the
-envelope on admitted events; private means host-only, not hidden from host code.
+`AdmittedEnvelope` via the exported read-only `admissionOf(event)` accessor
+(`undefined` for unconfigured events); private means host-only, not hidden from host code.
 
 Stamp support arrives with context-only delivery. This profile rejects a `stamp`
 member; it reserves no metadata keys and changes no storage schema.
 
-Initial bounds, open to maintainer review: `MAX_ADMISSION_TIMEOUT_MS = 60000`
+The package also exports `AdmissionConnectError` for direct setup failures
+(wrapped cleanup failures retain it in `cause`) and these initial bounds, open to
+maintainer review: `MAX_ADMISSION_TIMEOUT_MS = 60000`
 and `MAX_PENDING_ADMISSIONS = 64`. Timeout must be an integer in 1..60000;
 invalid configuration cannot start the connection. Each connection has its own
 budget (including attestation/validation); overload returns `admission_denied`
