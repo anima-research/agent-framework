@@ -17,6 +17,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { errorFromProviderStatus } from '@animalabs/membrane';
+import type { NormalizedRequest } from '@animalabs/membrane';
 import { AgentFramework, shedMayHelp } from '../src/framework.js';
 import { createMockResponse } from './helpers/mock-membrane.js';
 
@@ -371,15 +372,25 @@ test('a probe answered after the agent moved on sets its answer aside: nothing i
   for (const [what, move] of moves) {
     const h = makeHarness();
     let answer!: () => void;
+    let probes = 0;
     h.fw.auxiliaryMembraneFor = () => ({
-      complete: () => new Promise((resolve) => { answer = () => resolve(createMockResponse([{ type: 'text', text: 'ok' }])); }),
+      complete: () => {
+        probes++;
+        return new Promise((resolve) => { answer = () => resolve(createMockResponse([{ type: 'text', text: 'ok' }])); });
+      },
     });
+    let setAside = false;
     try {
       for (let i = 0; i < 3; i++) h.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
       await settle();
       move(h);
       answer();
       await settle();
+      setAside = h.errs.some((e) => e.includes("its probe's answer is set aside"));
+      if (what !== 'nothing (the control)') {
+        h.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+        await settle();
+      }
     } finally { h.restore(); }
     if (what === 'nothing (the control)') {
       assert.deepEqual([...h.removed].sort(), ['a1', 'r1'], 'the control sheds');
@@ -387,27 +398,33 @@ test('a probe answered after the agent moved on sets its answer aside: nothing i
     }
     assert.deepEqual(h.removed, [], `${what}: nothing is shed`);
     assert.equal(h.fw.pendingRequests.length, 0, `${what}: no retry is queued`);
-    assert.ok(h.errs.some((e) => e.includes("its probe's answer is set aside")), `${what}: it says the answer was set aside`);
+    assert.ok(setAside, `${what}: it says the answer was set aside`);
+    assert.equal(probes, what === 'the framework stopping' ? 1 : 2,
+      `${what}: the next failure ${what === 'the framework stopping' ? 'sends no probe, once stopping' : 'sends a probe of its own'}`);
   }
 });
 
-test('a failure with no request on the wire sends no probe and sheds nothing', async () => {
-  const h = makeHarness();
-  h.fw.failedRequests = { get: () => undefined, delete: () => true };
-  let probes = 0;
-  h.fw.auxiliaryMembraneFor = () => ({ complete: async () => { probes++; return createMockResponse([{ type: 'text', text: 'ok' }]); } });
-  try {
-    for (let i = 0; i < 3; i++) h.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
-    await settle();
-  } finally { h.restore(); }
-  assert.equal(probes, 0);
-  assert.deepEqual(h.removed, []);
-  assert.ok(h.errs.some((e) => e.includes('sheds nothing: no request reached the breaker')));
+test('a failure with no request on the wire sends no probe and sheds nothing, in a run whose history a probe already implicated too', async () => {
+  for (const implicated of [false, true]) {
+    const h = makeHarness();
+    h.fw.failedRequests = { get: () => undefined, delete: () => true };
+    if (implicated) h.fw.exhaustionRewinds.set('cairn', 1);
+    let probes = 0;
+    h.fw.auxiliaryMembraneFor = () => ({ complete: async () => { probes++; return createMockResponse([{ type: 'text', text: 'ok' }]); } });
+    try {
+      for (let i = 0; i < 3; i++) h.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+      await settle();
+    } finally { h.restore(); }
+    assert.equal(probes, 0, `implicated ${implicated}: no probe`);
+    assert.deepEqual(h.removed, [], `implicated ${implicated}: nothing shed`);
+    assert.ok(h.errs.some((e) => e.includes('sheds nothing: no request reached the breaker')), `implicated ${implicated}: it says why`);
+  }
 });
 
-test('a trip once stop() has begun, or after the agent was let go, sends no probe', async () => {
-  for (const what of ['stopping', 'let go']) {
+test('a trip once stop() has begun, or after the agent was let go, sends no probe and sheds nothing, in a run whose history a probe already implicated too', async () => {
+  for (const [what, implicated] of [['stopping', false], ['let go', false], ['stopping', true], ['let go', true]] as const) {
     const h = makeHarness();
+    if (implicated) h.fw.exhaustionRewinds.set('cairn', 1);
     let probes = 0;
     h.fw.auxiliaryMembraneFor = () => ({ complete: async () => { probes++; return createMockResponse([{ type: 'text', text: 'ok' }]); } });
     h.fw.onTrace((e: any) => {
@@ -419,9 +436,60 @@ test('a trip once stop() has begun, or after the agent was let go, sends no prob
       for (let i = 0; i < 3; i++) h.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
       await settle();
     } finally { h.restore(); }
-    assert.equal(probes, 0, `${what}: no probe`);
-    assert.deepEqual(h.removed, [], `${what}: nothing shed`);
+    assert.equal(probes, 0, `${what}, implicated ${implicated}: no probe`);
+    assert.deepEqual(h.removed, [], `${what}, implicated ${implicated}: nothing shed`);
+    assert.equal(h.fw.pendingRequests.length, 0, `${what}, implicated ${implicated}: no retry queued`);
   }
+});
+
+test("the probe carries every field of the failed request but its messages and its wire-receipt hook, and asks as the request's newest participant other than the agent", async () => {
+  const full = {
+    onCacheWireReceipt: () => {},
+    shedOversizeImages: true,
+    messages: [
+      { participant: 'nissa', content: [{ type: 'text', text: 'zz-first' }] },
+      { participant: 'sam', content: [{ type: 'text', text: 'zz-second' }] },
+      { participant: 'cairn', content: [{ type: 'text', text: 'zz-own' }] },
+    ],
+    system: 'zz-system',
+    config: { model: 'zz-model', maxTokens: 100, temperature: 0.5 },
+    tools: [{ name: 'zz_tool', description: 'zz', inputSchema: { type: 'object', properties: {} } }] as NonNullable<NormalizedRequest['tools']>,
+    toolMode: 'native',
+    stopSequences: ['zz-stop'],
+    maxParticipantsForStop: 3,
+    promptCaching: true,
+    cacheMarkers: 'cm-owned',
+    cacheTtl: '5m',
+    floatingCacheMarker: true,
+    contextPrefix: 'zz-prefix',
+    prefillUserMessage: 'zz-prefill',
+    assistantParticipant: 'cairn',
+    streaming: true,
+    providerParams: { zz: 1 },
+  } satisfies Required<NormalizedRequest>;
+  const presentedAsUser: NormalizedRequest = {
+    messages: [{ participant: 'User', content: [{ type: 'text', text: 'zz-own' }] }],
+    config: { model: 'zz-model', maxTokens: 100 },
+    assistantParticipant: 'User',
+  };
+  const probes: NormalizedRequest[] = [];
+  for (const request of [full, presentedAsUser]) {
+    const h = makeHarness();
+    h.fw.failedRequests = { get: () => request, delete: () => true };
+    h.fw.auxiliaryMembraneFor = () => ({
+      complete: async (probe: NormalizedRequest) => { probes.push(probe); return createMockResponse([{ type: 'text', text: 'ok' }]); },
+    });
+    try {
+      for (let i = 0; i < 3; i++) h.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+      await settle();
+    } finally { h.restore(); }
+  }
+  const { messages: _messages, onCacheWireReceipt: _hook, ...kept } = full;
+  const { messages: asked, ...carried } = probes[0]!;
+  assert.deepEqual(carried, kept, 'every other field, as the failed request had it');
+  assert.equal(asked.length, 1);
+  assert.equal(asked[0]!.participant, 'sam', "as the failed request's newest participant other than the agent");
+  assert.notEqual(probes[1]!.messages[0]!.participant, 'User', "an agent presented as 'User' isn't asked as itself");
 });
 
 test('shedMayHelp: an invalid_request at 400, 413 or 422 or with no status, or a context_length at 413, and nothing else', () => {

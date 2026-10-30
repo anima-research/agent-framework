@@ -3413,8 +3413,11 @@ const PROBE_FIELDS = {
 } as const satisfies Record<keyof NormalizedRequest, 'kept' | 'left out' | 'replaced'>;
 
 function withoutHistory(request: NormalizedRequest): NormalizedRequest {
+  let asking: string | undefined;
+  for (const message of request.messages) if (message.participant !== request.assistantParticipant) asking = message.participant;
+  asking ??= request.assistantParticipant === 'User' ? 'Human' : 'User';
   const probe: Record<string, unknown> = {
-    messages: [{ participant: 'User', content: [{ type: 'text', text: 'Reply with one word.' }] }],
+    messages: [{ participant: asking, content: [{ type: 'text', text: 'Reply with one word.' }] }],
   };
   for (const [field, use] of Object.entries(PROBE_FIELDS)) {
     const value = request[field as keyof NormalizedRequest];
@@ -5366,12 +5369,12 @@ export class AgentFramework {
    * A timed-out wait lets teardown go on while what it waited for may still
    * act on what is being torn down.
    * @param teardownTimeoutMs Optional budget for each of stop()'s waits, in
-   * turn: on the streams it cancels, on maintenance in flight (a pass or an
-   * over-budget drain kick), on the event loop, on an operator's operations
-   * already running, on modules and MCPL (its servers and the inference
-   * requests they made) together, where a module whose start() is still
-   * running counts until that start() has settled and its stop() returned,
-   * then on Discord awareness
+   * turn: on the streams it cancels, on maintenance in flight (a pass, an
+   * over-budget drain kick or a poison-history breaker's probe), on the
+   * event loop, on an operator's operations already running, on modules
+   * and MCPL (its servers and the inference requests they made) together,
+   * where a module whose start() is still running counts until that
+   * start() has settled and its stop() returned, then on Discord awareness
    * drains, which send nothing once stop() has begun, recording the call the
    * close ended. With a budget, a stop() can take up to six of them, besides
    * the withheld-spill deadline of a guard's write still under way. Omit to
@@ -5726,8 +5729,10 @@ export class AgentFramework {
     // before the store closes. Its bookkeeping outlives a timeout, since no
     // pass starts while one runs and a drain leaves its set only as it
     // settles, so it needs no leftRunning entry.
-    await waitFor(this.maintenanceRunning() ? [{ label: 'maintenance', promise: this.settleMaintenancePass() }] : []);
-    await waitFor([...this.breakerProbes].map((probe) => ({ label: 'poison-history probe', promise: probe.settled })));
+    await waitFor([
+      ...(this.maintenanceRunning() ? [{ label: 'maintenance', promise: this.settleMaintenancePass() }] : []),
+      ...[...this.breakerProbes].map((probe) => ({ label: 'poison-history probe', promise: probe.settled })),
+    ]);
 
     await waitFor(withLeftovers('loop', this.loopPromise ? [{ label: 'event loop', promise: this.loopPromise }] : []), 'loop');
 
@@ -32024,8 +32029,10 @@ export class AgentFramework {
       // stamp a rewind marker saying the API kept refusing them.
       // `retryable` is kept only for the trace.
       void retryable;
-      if (agent && shedMayHelp(errorType, httpStatus)) {
-        if ((this.exhaustionRewinds.get(agent.name) ?? 0) > 0) this.quarantinePoisonedHistory(agent, wholeReason);
+      if (agent && shedMayHelp(errorType, httpStatus) && !this.providerAdmissionClosed && this.agents.get(agent.name) === agent) {
+        if (!failedRequest) {
+          console.error(`[inference-rewind] agent=${agent.name} sheds nothing: no request reached the breaker to send without its history.`);
+        } else if ((this.exhaustionRewinds.get(agent.name) ?? 0) > 0) this.quarantinePoisonedHistory(agent, wholeReason);
         else this.probeBeforeShed(agent, failedRequest, wholeReason, { errorType, httpStatus });
       }
     }
@@ -32033,16 +32040,11 @@ export class AgentFramework {
 
   private probeBeforeShed(
     agent: Agent,
-    request: NormalizedRequest | undefined,
+    request: NormalizedRequest,
     wholeReason: string,
     failure: { errorType?: string; httpStatus?: number },
   ): void {
     const name = agent.name;
-    if (!request) {
-      console.error(`[inference-rewind] agent=${name} sheds nothing: no request reached the breaker to send without its history.`);
-      return;
-    }
-    if (this.providerAdmissionClosed || this.agents.get(name) !== agent) return;
     let historyMoved = false;
     const detach = agent.getContextManager().onMessage(() => { historyMoved = true; });
     const sent = {
@@ -32063,8 +32065,8 @@ export class AgentFramework {
         || (turn !== undefined && turn !== sent.turn)
         || this.store.currentBranch().name !== sent.branch
         || historyMoved) {
-        console.error(`[inference-rewind] agent=${name}: its probe's answer is set aside, since the agent moved on while it ` +
-          'was out; the next failure decides.');
+        console.error(`[inference-rewind] agent=${name}: its probe's answer is set aside, since the agent, its history or the ` +
+          'framework changed while it was out; the next failure decides.');
         return;
       }
       if (probeFailure === null) {
