@@ -544,7 +544,17 @@ export class TuneOutCoordinator {
     });
   }
 
+  /** Every tune-out on record, its channel registered now or not: a channel
+   *  its server registers only after the start, or whose server was removed,
+   *  still holds what its tune-out diverted, and the tune-out's end time
+   *  still releases it, which a cancel does without the channel. */
   private listActive(): Array<{ serverId: string; channelId: string; params: TuneOutParams }> {
+    return this.channelRegistry.tuneOutsOnRecord().map(({ serverId, channelId, params }) => ({ serverId, channelId, params }));
+  }
+
+  /** The tune-outs of the channels registered now, which an agent can name
+   *  (channelsNamed). */
+  private listConnected(): Array<{ serverId: string; channelId: string; params: TuneOutParams }> {
     const active: Array<{ serverId: string; channelId: string; params: TuneOutParams }> = [];
     for (const entry of this.channelRegistry.listChannelsRaw()) {
       const state = this.channelRegistry.getTuneOutState(entry.serverId, entry.descriptor.id);
@@ -1245,7 +1255,7 @@ export class TuneOutCoordinator {
     const countOf = (epochId: string) => [...stored, ...deferred].filter(
       (m) => (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId,
     ).length;
-    const channels = this.listActive().map(({ serverId, channelId, params }) => ({
+    const channels = this.listConnected().map(({ serverId, channelId, params }) => ({
       serverId, channelId, epochId: params.epochId, held: countOf(params.epochId),
       ...(params.expiresAtMs !== undefined ? { expiresAtMs: params.expiresAtMs } : {}),
     }));
@@ -2098,13 +2108,13 @@ export class TuneOutCoordinator {
    * how a tune-out ends without one. `backlogTo`
    * names the resident as the message's reader knows it: "you" to the
    * resident, "the resident" to the subconscious. It speaks of connected
-   * channels because listActive reads the registered ones: removing a server
-   * drops its channels and keeps their tune-outs, so a tune-out there is in
-   * neither this list nor the name's lookup (channelsNamed, which reads the
-   * registered channels too), and the text claims nothing about it.
+   * channels because listConnected reads the registered ones: removing a
+   * server drops its channels and keeps their tune-outs, so a tune-out there
+   * is in neither this list nor the name's lookup (channelsNamed, which reads
+   * the registered channels too), and the text claims nothing about it.
    */
   private notTunedOut(quoted: string, backlogTo: 'you' | 'the resident'): string {
-    const active = this.listActive().map((e) => this.quotedShown(e.serverId, e.channelId));
+    const active = this.listConnected().map((e) => this.quotedShown(e.serverId, e.channelId));
     const opening = active.length === 0
       ? 'no connected channel is tuned out now.'
       : `no connected channel ${quoted} is tuned out. Connected channels tuned out now: `
