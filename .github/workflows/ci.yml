@@ -93,11 +93,7 @@ jobs:
         run: npm run build
 
       - name: Test
-        run: |
-          AF_TEST_CONCURRENCY=$(node -p "2 * require('node:os').cpus().length")
-          echo "cores: $(node -p "require('node:os').cpus().length") (Node's availableParallelism: $(node -p "require('node:os').availableParallelism()")); test files at once: $AF_TEST_CONCURRENCY"
-          export AF_TEST_CONCURRENCY
-          npm test
+        run: node scripts/test-as-ci.mjs
 
       # npm test runs with --test-force-exit, which hides async work a test
       # leaves running, such as a late arrival after stop() ("Queue is

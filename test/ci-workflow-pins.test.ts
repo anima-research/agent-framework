@@ -2,12 +2,11 @@
  * Two things ci.yml decides from what a test can read:
  *
  * - How many test files run at once. ci.yml's Build & Test and publish.yml's
- *   Test step export AF_TEST_CONCURRENCY (twice the runner's core count),
- *   computed the same way in both, and npm test passes it on as
- *   --test-concurrency only when it is set. If either side is renamed or
- *   dropped, the suite goes back to Node's default of one file fewer than the
- *   cores, and if the two workflows differ, a release's gate runs the suite in
- *   a way no pull request's run checked. Nothing else fails: these tests do.
+ *   Test step run the suite through scripts/test-as-ci.mjs, which sets
+ *   AF_TEST_CONCURRENCY, and npm test passes it on as --test-concurrency only
+ *   when it is set. A step that ran npm test itself would set its width
+ *   somewhere else or not at all, and nothing else would fail: these tests do.
+ *   The script exits as npm test does, so a failing suite fails the step.
  * - When a pull request runs code_execution's Bun legs on macOS. The
  *   `changes` job runs them when the diff matches a filter. Every file those
  *   tests import or load by path, directly or through others, must match it,
@@ -15,15 +14,19 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
-import { dirname, join, normalize } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { delimiter, dirname, join, normalize } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const ROOT = new URL('../../', import.meta.url);
 const read = (path: string) => readFileSync(new URL(path, ROOT), 'utf8');
 const exists = (path: string) => existsSync(new URL(path, ROOT));
 
-/** A line that runs npm test, however it's spelled: `npm test`, `npm run test`, `npm t`, with arguments or not. */
-const NPM_TEST_LINE = /^\s*(?:run: )?npm (?:run )?(?:test|t)\b(?!:)/m;
+/** A line that runs npm test, however it's spelled: `npm test`, `npm run test`, `npm t`, after `env` or variable
+ *  assignments or not, with arguments or not. */
+const NPM_TEST_LINE = /^\s*(?:run: )?(?:env\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*npm (?:run )?(?:test|t)\b(?!:)/m;
 
 /** The steps of a workflow file that run `npm test`, each as its text from its `- name:` line to the next step's. */
 function npmTestSteps(workflow: string): string[] {
@@ -40,24 +43,47 @@ test("npm test passes AF_TEST_CONCURRENCY as --test-concurrency, only when it's 
 });
 
 for (const workflow of ['.github/workflows/ci.yml', '.github/workflows/publish.yml']) {
-  test(`${workflow}: every step that runs npm test exports AF_TEST_CONCURRENCY first`, () => {
-    const steps = npmTestSteps(read(workflow));
-    assert.ok(steps.length >= 1, `${workflow} has a step that runs npm test`);
-    for (const step of steps) {
-      const exported = step.indexOf('export AF_TEST_CONCURRENCY');
-      assert.ok(exported >= 0, `a step exports AF_TEST_CONCURRENCY:\n${step}`);
-      assert.ok(exported < step.search(NPM_TEST_LINE), `it exports it before npm test:\n${step}`);
-    }
+  test(`${workflow} runs the suite through scripts/test-as-ci.mjs, and no step runs npm test itself`, () => {
+    const text = read(workflow);
+    assert.match(text, /^\s*run: node scripts\/test-as-ci\.mjs\s*$/m);
+    assert.deepEqual(npmTestSteps(text), [], `${workflow} has no step that runs npm test`);
   });
 }
 
-test("ci.yml and publish.yml compute AF_TEST_CONCURRENCY the same way", () => {
-  const computed = (workflow: string) => {
-    const lines = npmTestSteps(read(workflow)).flatMap((step) => step.match(/^\s*(?:export\s+)?AF_TEST_CONCURRENCY=.*$/gm) ?? []);
-    assert.equal(lines.length, 1, `${workflow}'s npm test step sets AF_TEST_CONCURRENCY once`);
-    return lines[0]!.trim();
-  };
-  assert.equal(computed('.github/workflows/publish.yml'), computed('.github/workflows/ci.yml'));
+function testAsCi(then: string, callerWidth?: string) {
+  const dir = mkdtempSync(join(tmpdir(), 'test-as-ci-'));
+  try {
+    const seen = join(dir, 'seen');
+    writeFileSync(join(dir, 'npm'), `#!/bin/sh\nprintf '%s|%s' "$*" "$AF_TEST_CONCURRENCY" > "$TEST_AS_CI_SEEN"\n${then}\n`);
+    chmodSync(join(dir, 'npm'), 0o755);
+    const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${dir}${delimiter}${process.env.PATH ?? ''}`, TEST_AS_CI_SEEN: seen };
+    if (callerWidth === undefined) delete env.AF_TEST_CONCURRENCY;
+    else env.AF_TEST_CONCURRENCY = callerWidth;
+    const run = spawnSync(process.execPath, [fileURLToPath(new URL('scripts/test-as-ci.mjs', ROOT))], { cwd: dir, env, encoding: 'utf8' });
+    const [args, width] = existsSync(seen) ? readFileSync(seen, 'utf8').split('|') : [];
+    return { status: run.status, signal: run.signal, stdout: run.stdout, args, width };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('scripts/test-as-ci.mjs runs npm test at the width it reports, whatever the caller set', () => {
+  for (const callerWidth of [undefined, '1']) {
+    const run = testAsCi('exit 0', callerWidth);
+    assert.equal(run.status, 0, `exits 0 when npm test does (caller's width ${callerWidth})`);
+    assert.equal(run.args, 'test');
+    const reported = /test files at once: (\d+)$/m.exec(run.stdout)?.[1];
+    assert.ok(reported && Number(reported) > 0, `reports a width: ${run.stdout}`);
+    assert.equal(run.width, reported, 'npm test gets the width the script reports');
+    if (callerWidth !== undefined) assert.notEqual(run.width, callerWidth, "npm test doesn't get the caller's width");
+  }
+});
+
+test('scripts/test-as-ci.mjs fails when npm test fails', () => {
+  assert.equal(testAsCi('exit 3').status, 3, 'exits with npm test\'s status');
+  const killed = testAsCi('kill -KILL $$');
+  assert.equal(killed.args, 'test', `npm test ran before its signal: ${JSON.stringify(killed)}`);
+  assert.equal(killed.signal, 'SIGKILL', `ends by the signal that killed npm: ${JSON.stringify(killed)}`);
 });
 
 /** The ERE the `changes` job matches the pull request's changed paths against for Bun's macOS legs. */
