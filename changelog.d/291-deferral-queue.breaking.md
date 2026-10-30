@@ -86,4 +86,6 @@
   know whether a quiesce held anything finds nothing held by it: a write made during a quiesce is stored at once
   (unless one of the two holds above keeps it), an agent's own rows enter its window as they are written, and the
   rest enter the window of each agent with no turn alive at resume, and a draining turn's agent's at that turn's
-  next presentation point.
+  next presentation point. Such a write is as durable as any other: the store's periodic sync keeps running while
+  the host is quiesced, so it reaches disk at the next sync, as it would with the host running, where earlier releases
+  kept it in the queue the quiesce wrote.
