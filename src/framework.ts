@@ -1601,7 +1601,7 @@ function turnInputs(
     for (let i = messages.length - 1; i >= 0; i--) {
       const message = messages[i];
       if (message.sequence <= floor) break scan;
-      if (!sees(message.metadata)) continue;
+      if (!sees(message.metadata) || isSystemChangeMessage(message)) continue;
       if (message.participant === agentName) break scan;
       last ??= message.id;
       const answers = Array.isArray(message.content) && message.content.length > 0
