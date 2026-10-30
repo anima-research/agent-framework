@@ -5,29 +5,37 @@
   compression had made the context fit, nothing ran it again, so the agent
   stayed silent until its next wake. Now a resident's or a conversation
   agent's turn is held while its context manager has compression pending, and
-  later wakes join it. The hold leaves the provider gate open, so compression
-  keeps running. An ephemeral run, a turn in a framework that `start()` hasn't
-  started (only `runUntilIdle()` runs its turns, so nothing would run a
-  released one), and a refusal with nothing pending fail as before. What a
-  held turn changes for hosts is under Changed.
+  later wakes join it. The hold leaves the provider gate open and drives
+  compression itself: from its start it ticks the agent's context manager
+  while each tick starts a compression call, so it doesn't wait for a
+  maintenance pass, and it drives it again after each pass (with the
+  maintenance timer off, every 5 seconds). A tick that starts no call, as
+  while compression is paused after a failure, ends that drive. An ephemeral
+  run, a turn in a framework that `start()` hasn't started (only
+  `runUntilIdle()` runs its turns, so nothing would run a released one), and a
+  refusal with nothing pending fail as before. What a held turn changes for
+  hosts is under Changed.
   - **When it runs:** as one fresh compile, once context-manager's preview of
     that compile, at its budget and with its thinking binding, says it fits. A
     dry compile can't say so, since it can resolve a plan the turn's compile
     refuses. A refusal the preview rethrows, such as a context refusal, counts
     as a refusal. A strategy with no preview gets the dry compile. The
     hierarchical strategy's preview reports a context that doesn't fit, and
-    for one that does, the dry compile decides. The hold looks after every
-    maintenance pass and every drain kick it starts, so a maintenance pass
-    that never ends, or with the maintenance timer off a drain whose tick
-    never ends, keeps the turn held until an abandoning quiesce or a stop
-    ends it. It takes a fresh verdict only once something that could make the
-    context fit has changed: compression's progress or whether it still has
-    compression pending, a message added, edited or removed (other than the
-    arrival of a stored context injection, the hold's own note among them, or
-    of a clock row), the agent's runtime settings, or the budget its next
-    compile plans at. A turn released and refused again is held again, as of
-    the refusal that first held it, and isn't released again until one of
-    those changes.
+    for one that does, the dry compile decides. The hold looks after each tick
+    it drives that starts a compression call, so a call that makes the context
+    fit releases the turn at once, and looks again when each drive ends and
+    after each maintenance pass. With the maintenance timer on, nothing drives
+    compression again until a pass ends, so a pass that never ends keeps the
+    turn held, once the hold's own drive has ended, until an abandoning
+    quiesce or a stop ends it; with the timer off, so does a tick of the
+    hold's own that never ends. It takes a fresh verdict only once something
+    that could make the context fit has changed: compression's progress or
+    whether it still has compression pending, a message added, edited or
+    removed (other than the arrival of a stored context injection, the hold's
+    own note among them, or of a clock row), the agent's runtime settings, or
+    the budget its next compile plans at. A turn released and refused again is
+    held again, as of the refusal that first held it, and isn't released again
+    until one of those changes.
   - **When it ends without a fit:** once compression has nothing pending and
     the context still doesn't fit. The turn then compiles once more: it runs
     if that compile fits, and otherwise its refusal takes the error policy's

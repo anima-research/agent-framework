@@ -2521,6 +2521,9 @@ interface LocalProviderGate {
   primaryDepth: number;
   primaryPending: boolean;
   auxiliaryInFlight: number;
+  /** Auxiliary calls admitted so far: a budget hold reads whether a tick it
+   *  drove started compression work (kickOverBudgetDrain). */
+  auxiliaryStarted: number;
   auxiliaryWaiters: Array<() => void>;
   idleWaiters: Array<() => void>;
   deferredAuxiliary: number;
@@ -2615,7 +2618,6 @@ interface BudgetHold {
   checkpoint: RecordedTurnCheckpoint | undefined;
   checkQueued?: boolean;
   drainKicked?: boolean;
-  alertedLong?: boolean;
 }
 /** Longest delay one setTimeout can represent (2^31-1 ms, about 24.8 days);
  *  a longer timer fires almost at once, so longer waits re-arm in steps. */
@@ -2632,7 +2634,6 @@ const WAITING_TRACE_EVERY_MS = 60_000;
  *  waits in a row hold one turn longer than this (noteStatedWaitRun,
  *  endStatedWaitRun). */
 const PROVIDER_WAIT_ALERT_MS = 60 * 60_000;
-const BUDGET_HOLD_ALERT_MS = PROVIDER_WAIT_ALERT_MS;
 /**
  * A MembraneError, from this framework's copy of membrane or from another: the
  * host supplies the Membrane instance (config.membrane), so with two copies
@@ -6047,7 +6048,7 @@ export class AgentFramework {
   private providerGate(agentName: string): LocalProviderGate {
     let gate = this.providerGates.get(agentName);
     if (!gate) {
-      gate = { primaryDepth: 0, primaryPending: false, auxiliaryInFlight: 0,
+      gate = { primaryDepth: 0, primaryPending: false, auxiliaryInFlight: 0, auxiliaryStarted: 0,
         auxiliaryWaiters: [], idleWaiters: [], deferredAuxiliary: 0 };
       this.providerGates.set(agentName, gate);
     }
@@ -6117,6 +6118,7 @@ export class AgentFramework {
     // A wait recorded while this call was parked binds it too.
     this.refuseHeldProviderModel(agentName, model);
     gate.auxiliaryInFlight++;
+    gate.auxiliaryStarted++;
     try { return await run(); }
     catch (error) {
       // Compression can be the first call to find a spent quota (idle agent,
@@ -6786,7 +6788,7 @@ export class AgentFramework {
       heldRequests: hold.heldRequests.length,
     });
     if (this.budgetHolds.get(agent.name) !== hold || hold.state !== 'holding') return true;
-    if (!existing) this.alertBudgetHold(agent, hold, 'Held');
+    if (!existing) this.logBudgetHold(agent, hold);
     else {
       console.error(`[budget-hold] agent=${agent.name} released turn refused again (${errorType}): ${hold.reason} \u2014 ` +
         `held again, as of its first hold ${describeWait(now - hold.startedAt)} ago`);
@@ -6804,26 +6806,28 @@ export class AgentFramework {
     }
   }
 
+  /** After a maintenance pass: each hold looks, and one still holding drives
+   *  compression again from where the pass left it. */
   private checkBudgetHolds(): void {
     if (!this.budgetHolds?.size) return;
-    for (const name of [...this.budgetHolds.keys()]) void this.checkBudgetHold(name);
+    for (const name of [...this.budgetHolds.keys()]) {
+      void this.checkBudgetHold(name).then(() => {
+        const agent = this.agents.get(name);
+        if (agent) this.compressForBudgetHold(agent);
+      });
+    }
   }
 
-  private alertBudgetHold(agent: Agent, hold: BudgetHold, held: string): void {
+  /** A hold's start is logged, and raises no alert: its turn goes on. A
+   *  compression call that fails while it holds is reported as maintenance
+   *  reports one (reportMaintenanceFailure). */
+  private logBudgetHold(agent: Agent, hold: BudgetHold): void {
     const readiness = this.contextReadiness(agent.getContextManager());
     const compression = 'pending' in readiness && readiness.pending
       ? ` Compression: ${boundFailureText(readiness.pending, FAILURE_SUMMARY_MAX_CHARS)}`
       : '';
-    const says = `compile refused (${hold.errorType}): ${hold.reason} \u2014 ${held}: ` +
-      `this turn runs once a check finds its context fits its budget.${compression}`;
-    console.error(`[budget-hold] agent=${agent.name} ${says}`);
-    this.opsAlert('context-refusal', agent.name, says, { skipLog: true });
-  }
-
-  private alertLongBudgetHold(agent: Agent, hold: BudgetHold): void {
-    if (hold.alertedLong || Date.now() - hold.startedAt < BUDGET_HOLD_ALERT_MS) return;
-    hold.alertedLong = true;
-    this.alertBudgetHold(agent, hold, `Still held after ${describeWait(Date.now() - hold.startedAt)}`);
+    console.error(`[budget-hold] agent=${agent.name} compile refused (${hold.errorType}): ${hold.reason} \u2014 Held: ` +
+      `this turn runs once a check finds its context fits its budget.${compression}`);
   }
 
   private async checkBudgetHold(agentName: string): Promise<void> {
@@ -6832,10 +6836,7 @@ export class AgentFramework {
     if (hold?.state !== 'holding' || !agent) return;
     const pending = this.compressionPending(agent);
     const signature = this.budgetHoldSignature(agent, pending);
-    if (signature !== undefined && signature === hold.lookedAt) {
-      this.alertLongBudgetHold(agent, hold);
-      return;
-    }
+    if (signature !== undefined && signature === hold.lookedAt) return;
     let verdict = this.budgetHoldPreview(agent);
     if (verdict === undefined) {
       if (hold.checking) return;
@@ -6847,14 +6848,10 @@ export class AgentFramework {
       }
       if (this.budgetHolds.get(agentName) !== hold || hold.state !== 'holding') return;
       if (this.agents.get(agentName) !== agent) return;
-      if (verdict === 'refused' && this.budgetHoldSignature(agent) !== signature) {
-        this.alertLongBudgetHold(agent, hold);
-        return;
-      }
+      if (verdict === 'refused' && this.budgetHoldSignature(agent) !== signature) return;
     }
     if (verdict === 'refused' && pending) {
       hold.lookedAt = signature;
-      this.alertLongBudgetHold(agent, hold);
     } else if (verdict === 'refused') {
       this.releaseBudgetHold(agentName, 'nothing_pending');
     } else {
@@ -7056,16 +7053,38 @@ export class AgentFramework {
     const label = by === 'hold' ? 'budget hold' : 'OverBudget breaker';
     const drain = Promise.resolve().then(async () => {
       let ticks = 0;
+      let record: ContextMaintenanceAgentRun | undefined;
       try {
         const cm = agent.getContextManager();
-        while (ticks < 8 && !this.providerAdmissionClosed && !this.surgeryHold && this.agents.get(agentName) === agent) {
+        if (by === 'hold') {
+          const readiness = this.contextReadiness(cm);
+          const progress = this.contextProgress(cm);
+          record = {
+            agentName, startedAt: Date.now(), ticks: 0, readyBefore: false,
+            ...('pending' in readiness && readiness.pending ? { pendingBefore: readiness.pending } : {}),
+            ...(progress ? { progressBefore: progress } : {}),
+          };
+        }
+        // The breaker's kick takes eight ticks. A hold drives compression
+        // while it moves: it ticks on while each tick starts a compression
+        // call, and looks after each, so a tick that makes the context fit
+        // releases the turn at once. A tick that starts none, as while the
+        // lane is paused or a maintenance pass's call is in flight, ends it,
+        // and the hold drives it again after the next pass.
+        while ((by === 'hold' || ticks < 8) && !this.providerAdmissionClosed && !this.surgeryHold && this.agents.get(agentName) === agent) {
+          const started = by === 'hold' ? this.providerGates.get(agentName)?.auxiliaryStarted : undefined;
           await cm.tick();
           ticks++;
+          if (by === 'breaker') continue;
+          if (this.providerGates.get(agentName)?.auxiliaryStarted === started) break;
+          await this.checkBudgetHold(agentName);
+          if (this.budgetHolds.get(agentName)?.state !== 'holding') break;
         }
-        const stopped = ticks >= 8 ? ''
+        const stopped = by === 'breaker' && ticks >= 8 ? ''
           : this.agents.get(agentName) !== agent ? ', stopped as the agent was disposed'
           : this.providerAdmissionClosed ? ', stopped as the framework stops'
-          : ', stopped while a surgery holds the store';
+          : this.surgeryHold ? ', stopped while a surgery holds the store'
+          : '';
         if (!quiet || stopped) console.error(`${tag} drain kicked for ${agentName} (${label}, ${ticks} ticks${stopped})`);
       } catch (err) {
         if (err instanceof MaintenanceWithdrawnError) {
@@ -7074,6 +7093,11 @@ export class AgentFramework {
           console.error(`${tag} drain kicked for ${agentName} (${label}, ${ticks} ticks, stopped: ${this.syncMoveReinit.after === 'undo' ? 'an undo' : 'a redo'} moved the store under the tick: ${err.message})`);
         } else {
           console.error(`${tag} drain kick failed for ${agentName} after ${ticks} ticks: ${describeFailureWithFrames(err)}`);
+          if (record) {
+            record.ticks = ticks;
+            record.finishedAt = Date.now();
+            this.reportMaintenanceFailure(agentName, record, err instanceof Error ? String(err.message) : failureDescription(err));
+          }
         }
       } finally {
         this.overBudgetDrainInFlight.delete(agentName);
@@ -8016,12 +8040,13 @@ export class AgentFramework {
    * host-quiesce.test.ts), so the two cannot drift: settle the turn, ONE
    * inference:aborted carrying the caller's reason, the neutral
    * [turn-interrupted] marker, an attributable inference-log terminal, gate
-   * release. Deliberately none of the failure accounting: inference:failed /
-   * inference:exhausted feed the consecutive-failure streak, hard-down ops
-   * alerts, the poison-history breaker and the "[inference-failed]" marker —
-   * all of which told a resident, in the user's voice, that its turn failed
-   * and advised remediation for a failure that never happened — and
-   * errorPolicy would relaunch the very inference someone just stopped.
+   * release. Deliberately none of the failure accounting: inference:exhausted
+   * feeds the consecutive-failure streak, hard-down ops alerts, the
+   * poison-history breaker and the "[inference-failed]" marker (an attempt's
+   * inference:failed feeds none of them) — all of which told a resident, in
+   * the user's voice, that its turn failed and advised remediation for a
+   * failure that never happened — and errorPolicy would relaunch the very
+   * inference someone just stopped.
    *
    * Only called while `agent` still owns stream `myStreamId`.
    */
