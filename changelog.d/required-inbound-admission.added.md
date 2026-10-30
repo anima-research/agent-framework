@@ -8,8 +8,9 @@
   Independently sent live items without a backlog may still finish in callback
   latency order. Superseded-epoch items are refused. During initialize, data requests
   receive the existing capability error (-32002). Required connections do not
-  advertise `toolHints`, and refuse coalescing with `admission_unsupported` until
-  durable re-admission is supported; solicited result taps remain intact.
+  advertise `toolHints` or carry RFC-014 toolset presence; an explicit
+  `toolHints: true` override logs once at connect. They refuse coalescing with `admission_unsupported` until
+  durable re-admission is supported; generic result taps remain intact.
   `mayWake: false` caps downstream wakes, including module requests;
   `mayWake: true` does not override gate declines or prevent a module-driven wake.
   Admission refusals are traced with fixed codes and rate-limited diagnostics.
