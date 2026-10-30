@@ -39,17 +39,12 @@ Required traffic is authorized before admission. Data received after initialize
 is held during startup staging, policy exchange and quiesce just like unconfigured
 traffic. At flush it is authorized against the current grant and admitted under
 the current key. Superseded-epoch items are refused as `admission_stale`, never
-rebound. A pause during a running preflight still refuses that item. Required connections do not apply peer hints on pushes or standalone
-`tools/hints`, or result-borne `mcpl/hints`. Result-borne hints are ignored
-without losing the result.
-Hinted pushes are unsupported and never reach the early tap. Standalone peer `tools/hints` is also refused before
-the tap with `admission_unsupported` (JSON-RPC -32600 for requests); notifications
-are discarded without changing toolset state or scheduling recovery. These restrictions apply only to this explicit profile.
-The application's own solicited `tools/list` result is different: its completed
-inventory still supplies tool presence and `mcpl/rev` because the application
-asked for it, with no admission hook. A revision gap may trigger application-to-peer
-`tools/list` / `toolsets/list` recovery. This is catalogue bookkeeping and list
-recovery, not a wake, content delivery or stored data.
+rebound. A pause during a running preflight still refuses that item.
+Required connections never advertise `toolHints`, even if `toolHints: true` is
+configured. Under RFC-014 §6.3 the peer must not send hints and should tailor
+its inventory to a hint-less host. No RFC-014 controller is installed by the
+framework for these connections. Transport read taps and solicited `tools/*` /
+`toolsets/*` result bookkeeping are not suppressed by admission.
 Peers need no retry for host-internal staging or quiesce. A verdict is
 not a delivery receipt: existing content checks and downstream failures still
 apply; already admitted siblings are not rolled back.
@@ -58,9 +53,7 @@ The channel adapter checks actual registration before preflight and rechecks the
 entry, connection, epoch, readiness and grant afterward. No effect runs on a
 refusal. `mayWake: false` skips wake policy and caps downstream wake requests;
 it is **not** context-only delivery and does not suppress existing open/locus
-maintenance. Push feature authorization precedes even the unsupported-hints refusal; the early
-tap remains suppressed for every required push. Hint-free pushes run preflight
-after feature authorization, before deduplication,
+maintenance. Pushes run preflight after feature authorization, before deduplication,
 notices, coalescing or queueing. Inference requests run admission after feature and loop checks, before model
 resolution; false `mayWake` is `admission_denied` and sends no chunks.
 Pending inference admission belongs to the request lifetime: stop cancels it and

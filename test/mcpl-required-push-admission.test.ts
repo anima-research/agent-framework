@@ -28,22 +28,8 @@ for (const coalesced of [false, true]) for (const [name, verdict, reason] of cas
   });
 }
 
-test('required push with hints is unsupported and never invokes admission or the early tap', async t => {
-  let calls = 0; let taps = 0;
-  const f = await fixture({ server: { inboundAdmission: { timeoutMs: 50, bind: (connection: unknown) => ({ connection, admit: () => { calls++; return { store: true, mayWake: true }; } }), isReplyIntent: () => true } } }); t.after(f.close);
-  const connection = (f.framework as any).mcplServerRegistry.getServer('editor');
-  connection.setReadTap(() => { taps++; });
-  const response = await f.send('push/event', { ...f.params('hint', 'no'), hints: [] });
-  assert.deepEqual(response.result, { accepted: false, reason: 'admission_unsupported' });
-  assert.equal(calls, 0); assert.equal(taps, 0);
-});
-
-for (const featureSet of ['doc', 'unknown']) test(`required hinted push: feature authorization precedes unsupported hints (${featureSet})`, async t => {
-  let calls = 0; let taps = 0;
-  const f = await fixture({ server: { inboundAdmission: { timeoutMs: 5000, bind: (connection: unknown) => ({ connection, admit: () => { calls++; return { store: true, mayWake: true }; } }), isReplyIntent: () => true } } }); t.after(f.close);
-  (f.framework as any).mcplServerRegistry.getServer('editor').setReadTap(() => { taps++; });
-  const response = await f.send('push/event', { ...f.params('hints', 'never'), featureSet, hints: [] });
-  if (featureSet === 'unknown') assert.equal(response.error?.code, -32003);
-  else assert.deepEqual(response.result, { accepted: false, reason: 'admission_unsupported' });
-  assert.equal(calls, 0); assert.equal(taps, 0);
+for (const toolHints of [undefined, true, false]) test(`required connection does not offer hints even with toolHints=${toolHints}`, async t => {
+  const f = await fixture({ server: { toolHints, inboundAdmission: { timeoutMs: 5000, bind: (connection: unknown) => ({ connection, admit: () => ({ store: true, mayWake: false }) }), isReplyIntent: () => true } } }); t.after(f.close);
+  assert.notEqual(f.hostCaps[0]!.toolHints, true);
+  assert.equal((f.framework as any).mcplServerRegistry.getServer('editor').readTap, null);
 });
