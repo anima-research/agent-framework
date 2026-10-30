@@ -16752,18 +16752,16 @@ export class AgentFramework {
             this.midTurnInputSignals.add(agent.name);
           }
 
-          // A live stream handed these messages after the results follows
-          // them in its next round, not the tool loop of a reply to
-          // [Continue]: that round's rows carry no prompt. System changes
-          // aside: they aren't a turn, so a round handed only changes
-          // follows the prompt, as the assembly reads it. One that doesn't
-          // say whether it carries them (membrane 0.5.x, whose native path
-          // carries them and whose XML path drops them) counts as carrying
-          // them here, as at the drain above. A boundary that ends the turn,
-          // restarts the stream or falls back to a new start below hands
-          // them to no live stream, and a new start reads its own prompt from
-          // what it sends. (The routing notice below rides only an injection
-          // already here.)
+          // A live stream handed these messages, system changes aside, after
+          // the results follows them in its next round, not the tool loop of
+          // a reply to [Continue]: that round's rows carry no prompt. One
+          // that doesn't say whether it carries them (membrane 0.5.x, whose
+          // native path carries them and whose XML path drops them) counts as
+          // carrying them here, as at the drain above. A boundary that ends
+          // the turn, restarts the stream or falls back to a new start below
+          // hands them to no live stream, and a new start reads its own prompt
+          // from what it sends. (The routing notice below rides only an
+          // injection already here.)
           if (midTurnInjections.some((inj) => !isSystemChangeMessage(inj))) {
             const turnTrigger = this.activeTurnTriggers.get(agent.name);
             if (turnTrigger) this.turnPrompts.delete(turnTrigger);

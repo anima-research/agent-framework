@@ -540,16 +540,21 @@ for (const failsAt of ['setup', 'event'] as const) {
     const stalled = await stalledByMembrane(t);
     const membrane = new ScriptedMembrane((n) => (n <= 3 ? serverError : () => stalled), failsAt);
     const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100, 100, 100] });
+    let tried = false;
     let stored = false;
     r.fw.onTrace((e) => {
-      if ((e as { type: string }).type !== 'inference:exhausted' || stored || r.count('inference:exhausted') < 2) return;
-      stored = true;
+      if ((e as { type: string }).type !== 'inference:exhausted' || tried || r.count('inference:exhausted') < 2) return;
+      tried = true;
       (r.fw as unknown as { addMessage(role: string, content: unknown[], metadata: unknown): unknown })
         .addMessage('user', [{ type: 'system_change', defineTools: [{ name: 'zz_tool', description: 'a tool', inputSchema: { type: 'object', properties: {} } }] }], undefined);
+      stored = true;
     });
     r.say('zz-question');
     await waitFor(() => r.count('inference:exhausted') === 3, 'the next re-armed send to end exhausted, cut');
-    assert.ok(stored, "the change was stored while the first cut's exhaustion was reported");
+    assert.ok(stored, "the change was written while the first cut's exhaustion was reported");
+    assert.ok(r.fw.getAgent('resident')!.getContextManager().getAllMessages()
+      .some((m) => (m.content as Array<{ type: string; defineTools?: Array<{ name: string }> }>).some((b) => b.type === 'system_change' && b.defineTools?.[0]?.name === 'zz_tool')),
+    "and the resident's context holds it");
     assert.equal(r.admission().providerAdmission.heldRequests, 0, 'the change cleared no cut, so this cut is the chain\'s second and ends it');
   });
 }

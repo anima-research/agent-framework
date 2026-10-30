@@ -242,7 +242,7 @@ describe("a shared child of a resident with former names", () => {
       storePath: join(tempDir, 'store.chronicle'),
       membrane: membrane.asMembrane(),
       agents: [
-        { name: 'mira', model: 'test-model', systemPrompt: 'You are mira.', selfParticipants: ['mira-old'] },
+        { name: 'mira', model: 'test-model', systemPrompt: 'You are mira.', selfParticipants: ['mira-old'], presentAs: 'mira-shown' },
         { name: 'oren', model: 'test-model', systemPrompt: 'You are oren.' },
       ],
       modules: [],
@@ -276,7 +276,7 @@ describe("a shared child of a resident with former names", () => {
     assert.deepEqual(await changeTools(job.contextManager), ['old-tool'], 'and still at its end');
     assert.deepEqual(await changeTools(await framework.inspectAgentContext('job-1')), ['old-tool'], 'reopened, as at its end');
     const record = framework.getAgentRecord('mira')!;
-    assert.deepEqual([record.selfParticipants, record.presentAs], [['mira-old'], undefined], "the resident's record states its mapping");
+    assert.deepEqual([record.selfParticipants, record.presentAs], [['mira-old'], 'mira-shown'], "the resident's record states its mapping");
   });
 
   it("gives a resumed child the view of the mapping it resumes with", { skip }, async () => {
@@ -298,6 +298,28 @@ describe("a shared child of a resident with former names", () => {
     await framework.runEphemeralToCompletion(job.agent, job.contextManager);
     const resumed = await framework.resumeAgent('job-2', { model: 'test-model', systemPrompt: 'Do the task.', selfParticipants: ['zed'] } as never);
     assert.deepEqual(await changeTools(resumed.contextManager), ['zed-tool'], 'resumed as zed too, its view keeps the change it now counts as its own');
+    resumed.cleanup();
+  });
+
+  it("gives a child resumed with no mapping of its own the view of its record's", { skip }, async () => {
+    const changeTools = async (cm: ContextManager): Promise<string[]> =>
+      (await cm.compile(undefined, undefined, { dryRun: true })).messages.flatMap((m) =>
+        (m.content as Array<{ type: string; defineTools?: Array<{ name: string }> }>)
+          .filter((b) => b.type === 'system_change').flatMap((b) => (b.defineTools ?? []).map((t) => t.name)));
+    const mira = framework.getAgent('mira')!;
+    mira.getContextManager().addMessage('user', [text('Please look into the open issues.')]);
+    mira.getContextManager().addMessage('system',
+      [{ type: 'system_change', defineTools: [{ name: 'zed-tool', description: 'zed', inputSchema: { type: 'object', properties: {} } }] }] as never,
+      systemChangeMetadata('zed') as never);
+    const { name: _name, ...spec } = taskForkSpec('job-3', { parent: 'mira', inherit: { mode: 'shared' } });
+    const job = await framework.createEphemeralAgent({ name: 'job-3', model: 'test-model', systemPrompt: 'Do the task.' }, { ...spec, selfParticipants: ['zed'] });
+    job.contextManager.addMessage('user', [text('Run once.')]);
+    framework.start();
+    membrane.script('job-3', say('job-3 done'));
+    await framework.runEphemeralToCompletion(job.agent, job.contextManager);
+    assert.deepEqual(framework.getAgentRecord('job-3')!.selfParticipants, ['zed'], 'the premise: its record states zed as its own');
+    const resumed = await framework.resumeAgent('job-3', { model: 'test-model', systemPrompt: 'Do the task.' } as never);
+    assert.deepEqual(await changeTools(resumed.contextManager), ['zed-tool'], "resumed with no mapping of its own, its view counts its record's");
     resumed.cleanup();
   });
 });

@@ -141,11 +141,13 @@ export interface AgentConfig {
    *   move the head to what's current, with one write. Only for models that
    *   take mid-conversation system messages on the native formatter: the
    *   host's model records say which. Membrane refuses a system change any
-   *   other way. The agent counts only the change rows it stored itself, with
-   *   `systemChangeMetadata(name)`: a change row a host writes without that
-   *   goes out as written, and the agent neither counts it in what it
-   *   declares nor consolidates it. On the head, every change row is left
-   *   out of the request.
+   *   other way. The agent's own change rows are those stored with its
+   *   `systemChangeMetadata(name)`, or with one of its `selfParticipants`'
+   *   (see `selfParticipants`). A change row a host writes without such
+   *   metadata goes out as written, and the agent neither folds it onto its
+   *   head nor consolidates it, but declares nothing such a row already
+   *   carries.
+   *   On the head, every change row is left out of the request.
    *
    * What the framework adds: it keeps each agent's recorded head in its
    * store, so a restart keeps the head; and when a request carrying a change

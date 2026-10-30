@@ -482,6 +482,28 @@ describe('toolDeclarations', () => {
     assert.deepEqual(changeRows(context.rows).map((r) => r.metadata), [undefined]);
   });
 
+  it("doesn't declare again a removal a host's row already carries", async () => {
+    const host: Row = { id: 'host', participant: 'system', content: [{ type: 'system_change', removeTools: ['b'] } as never] };
+    const context = fakeContext([said('user', 'hello'), host]);
+    const heads = memoryHeadDeclarations();
+    heads.write('agent', { tools: [tool('a'), tool('b')], system: ['You are an agent.'] });
+    const request = await agentOn(context, { toolDeclarations: 'entries' }, heads).buildActivationRequest([tool('a')]);
+    assert.deepEqual(changesIn(request.messages), [host.content]);
+    assert.deepEqual(changeRows(context.rows).map((r) => r.id), ['host']);
+  });
+
+  it("doesn't declare again system text a host's row already adds, and declares each further copy the agent holds", async () => {
+    for (const [copies, declared] of [[1, []], [2, ['joined']]] as const) {
+      const host: Row = { id: 'host', participant: 'system', content: [{ type: 'system_change', addSystem: ['joined'] } as never] };
+      const context = fakeContext([said('user', 'hello'), host]);
+      const heads = memoryHeadDeclarations();
+      heads.write('agent', { tools: [tool('a')], system: ['You are an agent.'] });
+      const request = await agentOn(context, { toolDeclarations: 'entries' }, heads)
+        .buildActivationRequest([tool('a')], Array.from({ length: copies }, () => systemInjection('joined')));
+      assert.deepEqual(changesIn(request.messages), [host.content, ...(declared.length > 0 ? [[{ type: 'system_change', addSystem: [...declared] }]] : [])], `${copies} held`);
+    }
+  });
+
   it("traces nothing on the head for a change row a host stored without the agent's metadata, and leaves it out of the request", async () => {
     const host: Row = { id: 'host', participant: 'system', content: [{ type: 'system_change', defineTools: [tool('x')] } as never] };
     const context = fakeContext([said('user', 'hello'), host]);

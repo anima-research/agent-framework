@@ -2616,9 +2616,11 @@ export class Agent {
 
   /**
    * The head this request declares, and the change it adds, after the
-   * committing compile (system-changes.ts). It reads only the agent's own
-   * change rows (ownSystemChanges): one a host stored without the agent's
-   * metadata is neither folded onto the head nor consolidated. On the head,
+   * committing compile (system-changes.ts). It folds and consolidates only
+   * the agent's own change rows (ownSystemChanges): one a host stored without
+   * the agent's metadata is neither folded onto the head nor consolidated,
+   * and what any other row the request carries already says is left out of
+   * the change. On the head,
    * what's current goes out, and changes left from an earlier 'entries'
    * period go, and so does its record where the store can read it (one it
    * can't read stays until a read succeeds).

@@ -586,6 +586,8 @@ describe('present while acting', () => {
     const stored = framework.getAgent('assistant')!.getContextManager().getAllMessages()
       .filter((m) => (m.content as Array<{ type: string }>).some((b) => b.type === 'system_change'));
     assert.equal(stored.length, 1, 'the premise: the tool stored the change mid-turn');
+    const handed = membrane.lastStream!.receivedToolResultOptions.flatMap((options) => options?.injectedMessages ?? []);
+    assert.ok(handed.some((m) => (m.content as Array<{ type: string }>).some((b) => b.type === 'system_change')), 'and the tool boundary handed it to the live stream');
     assert.equal(notices.length, 1, 'the boot-baseline announcement alone');
     await framework.stop();
   });
