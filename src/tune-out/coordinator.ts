@@ -252,7 +252,7 @@ export interface TuneOutFrameworkHooks {
   /**
    * Whether a write the coordinator made now would be kept in memory rather
    * than stored: a live surgery's hold, or a context manager of the primary
-   * or the subconscious refusing its work until a switch re-initializes it.
+   * or the subconscious refusing its work until a branch move re-initializes it.
    * A cancel then waits (deferCancel), the tune-out still in force, until
    * the framework says the writes are stored again, or told of where storing
    * one fails (runDeferredCancels), so the release is in the store before

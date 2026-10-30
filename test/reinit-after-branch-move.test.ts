@@ -42,7 +42,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 //   in memory by the hold (a module's addMessage answers '', a fork's channel
 //   message is placed for the fork with no id) and stored at the release. A
 //   write for an agent whose manager then refuses its work waits in memory
-//   too, as does every write for it until a switch re-initializes it, which
+//   too, as does every write for it until a branch move re-initializes it, which
 //   stores them (main kept them in its queue); an agent that ends first passes
 //   on the ones the primary takes in its place.
 // - stop() has no queued write to name, persisted or not.
@@ -2578,7 +2578,7 @@ describe("a re-initialization alert's opening", () => {
   it('is in what the ops webhook keeps of the message, in every shape the builders make', () => {
     const branch = (kind: string) => `${kind}/a/${'9'.repeat(200)}`;
     // #291: no queue keeps a write. A refusing manager's writes wait in
-    // memory until a switch re-initializes it and stores them, and a hold
+    // memory until a branch move re-initializes it and stores them, and a hold
     // keeps its writes in memory until its release.
     const remedy = 're-initializes it and stores the writes kept in memory for it meanwhile; a restart loses them.';
     for (const [queued, says] of [[0, '0 writes'], [1, '1 write'], [2, '2 writes']] as const) {

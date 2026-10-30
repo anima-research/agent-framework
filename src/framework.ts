@@ -1856,7 +1856,7 @@ function sameCheckpoint(a: TurnCheckpoint, b: TurnCheckpoint): boolean {
 /**
  * A write a surgery's hold kept out of every store
  * (AgentFramework.surgeryHeldWrites), or one kept for an agent whose context
- * manager refuses its work until a switch re-initializes it
+ * manager refuses its work until a branch move re-initializes it
  * (AgentFramework.heldForRecovery): what addMessage was given, or, for a
  * write straight into a fork's store (`direct`), the fork's name and the row.
  */
@@ -3083,7 +3083,7 @@ export type ReinitMove = (typeof REINIT_MOVES)[number];
 
 // #291: no queue keeps a write for a manager that refuses its work. Each
 // write for its agent waits in memory instead (heldForRecovery), its writer
-// answered as a held write's is, until a switch re-initializes the manager
+// answered as a held write's is, until a branch move re-initializes the manager
 // and its release stores them in arrival order; a restart loses them, and an
 // agent that ends first passes on the ones the primary takes in its place.
 const RECOVERY = 're-initializes it and stores the writes kept in memory for it meanwhile; a restart loses them.';
