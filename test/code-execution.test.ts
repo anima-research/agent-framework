@@ -2485,7 +2485,7 @@ describe('a round whose run or wait call watches a script that can change its ro
       assert.ok(lines.some((line) => line.includes('assistant: round [code_execution] -> 1 prose segment(s) withheld: its turn no longer waits on it')),
         "the script's call found the round undecidable and withheld it");
       assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:') || e.startsWith('chunk:')), [], 'and published nothing');
-      assert.equal(routing.suppressed, suppressedBefore + 1, "and the turn's receipt counts the withheld segment as suppressed");
+      assert.equal(routing.suppressed, suppressedBefore, "and nothing is counted for the turn's receipt");
       assert.deepStrictEqual(routing.drafts, [], 'and holds none of it as a draft, since the script might have kept it private');
     } finally {
       console.error = error;
