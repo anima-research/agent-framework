@@ -1,10 +1,11 @@
 - **A line longer than 104,857,600 UTF-16 code units (100 Mi) on a stdio
-  MCPL server's stdout now ends that server's connection.** This host takes
-  no more lines from stdout from the read that takes the line past the bound,
-  writes nothing more to the child, and ends it at once with SIGTERM, then
-  SIGKILL if it outlives that. Requests in flight fail with the disconnect
-  when the child exits, unless their own deadline comes first, and a request
-  made after the line and before the exit is refused as not sent.
+  MCPL server's stdout now ends that server's connection.** This host
+  refuses the line as soon as a read takes it past the bound, takes no line
+  from stdout after it, writes nothing more to the child, and ends it at
+  once with SIGTERM, then SIGKILL if it outlives that. Requests in flight
+  fail with the disconnect when the child exits, unless their own deadline
+  comes first, and a request made after the line and before the exit is
+  refused as not sent.
   The close's `pipeFailed` is `true`, so a server that doesn't reconnect
   raises `mcpl-down`, as after a pipe failure. Each UTF-16 code unit is at
   least one byte of UTF-8, so such a line is also longer than 100 MiB, the
