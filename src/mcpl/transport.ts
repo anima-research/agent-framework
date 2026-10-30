@@ -371,6 +371,7 @@ export class StdioTransport extends McplTransport {
     this.child.stderr?.on('end', () => {
       received(decoder.end());
       if (carry.length > 0) this.pushStderr(carry);
+      carry = '';
       this.stderrDone = true;
     });
     // A stream destroyed by an error closes without ending: nothing more comes.

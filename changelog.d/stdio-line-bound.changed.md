@@ -19,7 +19,12 @@
   many went, `[N earlier stderr lines were dropped: unread stderr is held to
   104,857,600 UTF-16 code units, each line counted as its length plus 16]`.
   That replaces the modern engine's hold of the newest 200 lines, which
-  dropped older ones with no notice.
+  dropped older ones with no notice. Two holds are as before: the legacy
+  connection's own queue, which while its control plane is closed (until
+  it first opens, and from each reconnect until it reopens) holds up to
+  1,000 events that need no answer, stderr lines among them;
+  and the transport's stdout lines, held with no count bound whenever no
+  `'line'` listener is attached.
 - **The bound counts characters, not memory.** An unfinished line that
   arrives in very small reads takes more memory than its characters until
   its line end: up to about 32 bytes a character at one character a read.
