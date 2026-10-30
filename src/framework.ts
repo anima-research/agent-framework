@@ -6786,7 +6786,7 @@ export class AgentFramework {
       heldRequests: hold.heldRequests.length,
     });
     if (this.budgetHolds.get(agent.name) !== hold || hold.state !== 'holding') return true;
-    this.alertBudgetHold(agent, hold, 'Held');
+    if (!existing) this.alertBudgetHold(agent, hold, 'Held');
     const kick = setTimeout(() => this.compressForBudgetHold(agent), 0);
     kick.unref?.();
     return true;
@@ -6816,17 +6816,22 @@ export class AgentFramework {
     this.opsAlert('context-refusal', agent.name, says, { skipLog: true });
   }
 
+  private alertLongBudgetHold(agent: Agent, hold: BudgetHold): void {
+    if (hold.alertedLong || Date.now() - hold.startedAt < BUDGET_HOLD_ALERT_MS) return;
+    hold.alertedLong = true;
+    this.alertBudgetHold(agent, hold, `Still held after ${describeWait(Date.now() - hold.startedAt)}`);
+  }
+
   private async checkBudgetHold(agentName: string): Promise<void> {
     const hold = this.budgetHolds?.get(agentName);
     const agent = this.agents.get(agentName);
     if (hold?.state !== 'holding' || !agent) return;
-    if (!hold.alertedLong && Date.now() - hold.startedAt >= BUDGET_HOLD_ALERT_MS) {
-      hold.alertedLong = true;
-      this.alertBudgetHold(agent, hold, `Still held after ${describeWait(Date.now() - hold.startedAt)}`);
-    }
     const pending = this.compressionPending(agent);
     const signature = this.budgetHoldSignature(agent, pending);
-    if (signature !== undefined && signature === hold.lookedAt) return;
+    if (signature !== undefined && signature === hold.lookedAt) {
+      this.alertLongBudgetHold(agent, hold);
+      return;
+    }
     let verdict = this.budgetHoldPreview(agent);
     if (verdict === undefined) {
       if (hold.checking) return;
@@ -6838,10 +6843,14 @@ export class AgentFramework {
       }
       if (this.budgetHolds.get(agentName) !== hold || hold.state !== 'holding') return;
       if (this.agents.get(agentName) !== agent) return;
-      if (verdict === 'refused' && this.budgetHoldSignature(agent) !== signature) return;
+      if (verdict === 'refused' && this.budgetHoldSignature(agent) !== signature) {
+        this.alertLongBudgetHold(agent, hold);
+        return;
+      }
     }
     if (verdict === 'refused' && pending) {
       hold.lookedAt = signature;
+      this.alertLongBudgetHold(agent, hold);
     } else if (verdict === 'refused') {
       this.releaseBudgetHold(agentName, 'nothing_pending');
     } else {

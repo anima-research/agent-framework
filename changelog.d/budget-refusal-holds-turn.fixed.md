@@ -18,7 +18,8 @@
     hierarchical strategy's preview reports a context that doesn't fit, and
     for one that does, the dry compile decides. The hold looks after every
     maintenance pass and every drain kick it starts, so a maintenance pass
-    that never ends keeps the turn held until an abandoning quiesce or a stop
+    that never ends, or with the maintenance timer off a drain whose tick
+    never ends, keeps the turn held until an abandoning quiesce or a stop
     ends it. It takes a fresh verdict only once something that could make the
     context fit has changed: compression's progress or whether it still has
     compression pending, a message added, edited or removed (other than the

@@ -649,12 +649,13 @@ describe('a compile refused for budget holds its turn (#304)', () => {
           backlog.refuseCompiles = 1;
           await until(() => t.of('inference:held').length === 2, 'the released turn, refused again with compression still pending, to be held again');
           assert.deepEqual(t.of('inference:exhausted'), [], 'three hours on, a refusal after a release holds the turn again rather than failing it');
+          assert.equal(alerts().length, 2, 'the turn held again raises no alert of its own');
           backlog.alwaysPending = false;
           await until(() => t.membrane.calls.length === 1, 'the turn to run once a check finds it fits');
           assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit', 'fit']);
           assert.match(JSON.stringify(t.membrane.calls[0]), /so this turn waited 1[89]\d min for compression to make room/);
           await until(() => t.of('inference:completed').length === 1, 'the turn to complete');
-          assert.equal(alerts().filter((m) => m.includes('Still held after')).length, 1, 'one alert past the hour for the whole hold');
+          assert.equal(alerts().length, 2);
         } finally {
           let closed = false;
           void t.close().finally(() => { closed = true; });
@@ -666,29 +667,33 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     }
   });
 
-  it('alerts once for a hold that ends before an hour', async (tc) => {
+  it('raises no alert past the hour from the check that releases the turn, nor after the hold has ended', async (tc) => {
     tc.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.now() });
     const settle = async () => { for (let i = 0; i < 8; i++) await new Promise<void>((resolve) => setImmediate(resolve)); };
     const step = async (ms: number) => { tc.mock.timers.tick(ms); await settle(); };
-    const until = async (done: () => boolean, what: string) => {
-      for (let stepped = 0; !done(); stepped += 1_000) {
-        if (stepped >= 5 * 60_000) assert.fail(`${what} didn't happen within 5 min of the mocked clock`);
-        await step(1_000);
+    const until = async (done: () => boolean, what: string, stepMs = 1_000, boundMs = 5 * 60_000) => {
+      for (let stepped = 0; !done(); stepped += stepMs) {
+        if (stepped >= boundMs) assert.fail(`${what} didn't happen within ${boundMs / 60_000} min of the mocked clock`);
+        await step(stepMs);
       }
     };
     try {
       await withBacklog({ alwaysPending: true, stalled: true }, async (backlog) => {
-        const t = await residentTurn({ maintenanceIntervalMs: 60_000 });
+        const t = await residentTurn({ maintenanceIntervalMs: 2 * 60 * 60_000 });
+        const alerts = () => t.of('ops:alert').filter((e) => e.kind === 'context-refusal').length;
         try {
           t.send('Are you there?');
           await until(() => t.of('inference:held').length === 1, 'the hold');
-          for (let minute = 0; minute < 50; minute++) await step(60_000);
+          for (let minute = 0; minute < 61; minute++) await step(60_000);
+          assert.equal(holdOf(t)?.state, 'holding', 'held past the hour, with no check since its start');
+          assert.equal(alerts(), 1);
           backlog.alwaysPending = false;
           backlog.stalled = false;
           backlog.fit = true;
-          await until(() => t.of('inference:completed').length === 1, 'the turn to run and complete');
+          await until(() => t.of('inference:completed').length === 1, 'the next pass to release the turn, and the turn to complete', 60_000, 70 * 60_000);
+          assert.ok(Number(t.of('inference:hold_ended')[0]!.waitedMs) >= 60 * 60_000, 'the check that released it came past the hour');
           for (let minute = 0; minute < 40; minute++) await step(60_000);
-          assert.equal(t.of('ops:alert').filter((e) => e.kind === 'context-refusal').length, 1, 'only the alert at its start');
+          assert.equal(alerts(), 1, 'only the alert at its start');
         } finally {
           let closed = false;
           void t.close().finally(() => { closed = true; });
@@ -1721,6 +1726,16 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.deepEqual(t.of('inference:hold_ended').filter((e) => e.agentName === fork).map((e) => e.outcome), ['stopped']);
         assert.equal(t.internal.budgetHolds.has(fork), false, 'no hold is left under its name');
         assert.deepEqual(t.internal.pendingRequests.filter((r) => r.agentName === fork), [], 'and nothing of its waits to run');
+
+        const second = 'prime--chanB';
+        backlog.fit = true;
+        await fw.createConversationAgent(second, { serverId: 'stub', channelId: 'chanB' });
+        (t.internal.budgetHolds as unknown as Map<string, unknown>).set(second, {
+          state: 'released', startedAt: Date.now(), heldRequests: [], errorType: 'over_budget', reason: 'zz',
+          budget: undefined, actual: undefined, checking: false, checkpoint: undefined,
+        });
+        t.framework.stopAgent(second);
+        assert.equal(t.internal.budgetHolds.has(second), false, 'a record its turn hasn\'t settled yet goes with the agent too');
       } finally {
         fw.conversationRouter = undefined;
         await t.close();
