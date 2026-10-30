@@ -321,9 +321,6 @@ class SpawnerStdioTransport implements Transport {
   constructor(
     private readonly config: McplServerConfig,
     private readonly onStderr: (line: string) => void,
-    /** The child's pipe failed and it outlived SIGKILL too, so the line
-     *  stays open, owning it (the line's 'unreaped'): `reason` names the
-     *  pipe's error, and `failure` is the reap's. */
     private readonly onUnreaped: (reason: string, failure: Error) => void,
   ) {
     this.recorded = serverTextRedactor(config);
@@ -364,13 +361,11 @@ class SpawnerStdioTransport implements Transport {
       this.closeInfo = info;
       this.onclose?.();
     });
-    line.on('unreaped', (failure: Error) => this.onUnreaped(`its stdio pipe failed with ${line.pipeFailure?.message ?? 'an error'}`, failure));
+    line.on('unreaped', (failure: Error) => this.onUnreaped(`this host stopped using its stdio (${line.stdioStopCause?.message ?? 'an error'})`, failure));
   }
 
-  /** The first error on the child's stdin or stdout, once there is one: the
-   *  line is ending the child then, and writes nothing more to it. */
-  get pipeFailure(): Error | undefined {
-    return this.line?.pipeFailure;
+  get stdioStopCause(): Error | undefined {
+    return this.line?.stdioStopCause;
   }
 
   /** The last of the child's stderr, redacted, once the stream has ended or
@@ -385,10 +380,8 @@ class SpawnerStdioTransport implements Transport {
 
   async send(message: JSONRPCMessage): Promise<void> {
     if (!this.line || this.line.closed) throw new NotWrittenError(`MCP server "${this.config.id}" stdio transport is closed`);
-    // Once the child's stdin or stdout has failed, the line is ending it and
-    // writes nothing more to it, so a message is refused here as not sent.
-    const failed = this.pipeFailure;
-    if (failed) throw new NotWrittenError(`MCP server "${this.config.id}" stdio pipe failed with ${failed.message}`, true);
+    const stopped = this.stdioStopCause;
+    if (stopped) throw new NotWrittenError(`MCP server "${this.config.id}": this host stopped using its stdio (${stopped.message})`, true);
     this.line.writeLine(JSON.stringify(message));
   }
 
@@ -682,11 +675,6 @@ export class ModernMcpConnection extends EventEmitter {
       ? new SpawnerStdioTransport(
         this.config,
         (line) => { if (this.isCurrent(generation)) this.deliverStderr(line); },
-        // A child whose pipe failed and that outlived SIGKILL: a loss whose
-        // launch is already known unreaped, so it's held as the loss is
-        // handled (handleLost). During a connect there is no session to lose
-        // yet: a connect whose pipe has failed fails, whether or not the SDK
-        // resolves it (establish), and its cleanup holds the launch.
         (reason, failure) => { if (this.isCurrent(generation)) this.handleLost(generation, reason, failure); },
       )
       : null;
@@ -764,21 +752,21 @@ export class ModernMcpConnection extends EventEmitter {
       return;
     }
     // The transport closed while the client connected, such as a child that
-    // exited at the connect-time list-change subscribe, or the child's stdio
-    // pipe failed, such as that subscribe's write meeting EPIPE: the SDK
-    // reports the subscribe's failure only as an error, and resolves the
-    // connect anyway (R1-2). Adopted, the session would read as connected
-    // with nothing it can write to behind it, and from a child that outlived
-    // SIGKILL, whose 'unreaped' came while there was no session to lose, no
-    // later close would come to reconnect it. So the connect failed: its
-    // close reaps the child, and a child it can't reap is held. A failed
-    // pipe is named whether or not the child has exited by now.
-    const pipe = session.stdio?.pipeFailure;
-    if (session.lost || pipe) {
+    // exited at the connect-time list-change subscribe, or this host stopped
+    // using the child's stdio, such as after that subscribe's write met
+    // EPIPE: the SDK reports the subscribe's failure only as an error, and
+    // resolves the connect anyway (R1-2). Adopted, the session would read as
+    // connected with nothing it can write to behind it, and from a child that
+    // outlived SIGKILL, whose 'unreaped' came while there was no session to
+    // lose, no later close would come to reconnect it. So the connect failed:
+    // its close reaps the child, and a child it can't reap is held. The
+    // stop's cause is named whether or not the child has exited by now.
+    const stopped = session.stdio?.stdioStopCause;
+    if (session.lost || stopped) {
       const failure = await ModernMcpConnection.closeSession(session);
       if (failure) this.holdUnreaped(session, failure);
-      throw await ModernMcpConnection.withStderrTail(session, new Error(pipe
-        ? `MCP server "${this.id}" stdio pipe failed with ${pipe.message} while connecting`
+      throw await ModernMcpConnection.withStderrTail(session, new Error(stopped
+        ? `MCP server "${this.id}": this host stopped using its stdio while connecting (${stopped.message})`
         : `MCP server "${this.id}" closed its connection while connecting`));
     }
     this.session = session;
@@ -882,9 +870,7 @@ export class ModernMcpConnection extends EventEmitter {
     }
   }
 
-  /** The transport went away (child exit, or a closed HTTP client).
-   *  `unreaped`: the child's pipe failed and it outlived SIGKILL, so its
-   *  launch is already known unreaped. */
+  /** The transport went away (child exit, or a closed HTTP client). */
   private handleLost(generation: number, reason: string, unreaped?: Error, ended?: TransportCloseInfo): void {
     const session = this.session;
     if (session?.generation !== generation) return;

@@ -86,9 +86,17 @@ export class McpServer {
     // Connect to WebSocket API
     await this.connectWs();
 
-    readLines(process.stdin, (line) => this.handleInput(line), () => {
-      this.close();
-      process.exit(0);
+    readLines(process.stdin, {
+      line: (line) => this.handleInput(line),
+      end: () => {
+        this.close();
+        process.exit(0);
+      },
+      tooLong: (maxChars) => {
+        console.error(`MCP server stopped: a line on stdin was longer than ${maxChars.toLocaleString('en-US')} UTF-16 code units`);
+        this.close();
+        process.exit(1);
+      },
     });
 
     // Handle SIGINT gracefully

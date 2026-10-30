@@ -209,7 +209,7 @@ test("a handshake answered after its stdio pipe failed fails, holding a child th
   process.kill(stuck[0]!.pid, 'SIGUSR2');
   const error = await connecting;
   assert.ok(error instanceof McplUnreapedLaunchError, String(error));
-  assert.match(error.message, /^MCPL server "legacy" stdio pipe failed with write EPIPE during the handshake; its cleanup also failed: stdio child \d+ of MCP server "legacy" did not exit within \d+ms of SIGKILL; it could not be reaped$/);
+  assert.match(error.message, /^MCPL server "legacy": this host stopped using its stdio during the handshake \(write EPIPE\); its cleanup also failed: stdio child \d+ of MCP server "legacy" did not exit within \d+ms of SIGKILL; it could not be reaped$/);
   const owner = error.connection;
   assert.equal(owner.isConnected, false);
   assert.equal(owner.willReconnect, false);
@@ -232,7 +232,7 @@ test('a handshake fails when its answer is read in the same callback as a ping w
   const error = await connecting;
   assert.deepEqual(launch.sameCallback, [false, true], 'the ping and the answer were read in one callback');
   assert.ok(error instanceof Error && !(error instanceof McplUnreapedLaunchError), String(error));
-  assert.match(String(error), /^Error: MCPL server "legacy" stdio pipe failed with write EPIPE during the handshake$/);
+  assert.match(String(error), /^Error: MCPL server "legacy": this host stopped using its stdio during the handshake \(write EPIPE\)$/);
   assert.match(stderrTailOf(error) ?? '', /deaf-ping: stdin closed/, "the server's stderr goes with it, as with the handshake's other failures");
   assert.equal(alive(pid!), false, "gone once the connect failed: the handshake's cleanup reaped it");
 });
@@ -464,7 +464,7 @@ test("a write to a stdio child that has just exited is never thrown, and isn't r
   const closed: Array<{ reason?: string }> = [];
   transport.on('close', (info: { reason?: string }) => closed.push(info));
   child.emit('exit', 0, null);
-  assert.match(closed[0]?.reason ?? '', /its pipe failed with write EPIPE/);
+  assert.match(closed[0]?.reason ?? '', /this host had stopped using its stdio \(write EPIPE\)/);
 });
 
 test('close() during a WebSocket reconnect dial returns promptly, ending the dial', async () => {

@@ -3107,9 +3107,9 @@ const splitsPair = (text: string, index: number): boolean =>
  * signal's number (143, 130, 129). A service manager's stop signals the host
  * and its children together, so a child can go before the host's stop()
  * closes it: its loss is that stop, not a failure, and raises no mcpl-down.
- * A child the stdio transport ended itself after a pipe error was ended by
- * that failure, whatever its code or signal. A WebSocket's close codes are
- * 1000 and up, so they never match.
+ * A child the stdio transport ended itself, after a pipe error or a line on
+ * its stdout longer than the bound, was ended by that, whatever its code or
+ * signal. A WebSocket's close codes are 1000 and up, so they never match.
  */
 function endedAsAsked(ended: { code?: number | null; signal?: string | null; pipeFailed?: boolean }): boolean {
   if (ended.pipeFailed) return false;

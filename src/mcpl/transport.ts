@@ -40,8 +40,9 @@ export interface TransportCloseInfo {
    *  reason, rather than the transport's words. */
   reasonFromPeer?: boolean;
   /** True when a stdio transport ended its child itself, after an error on
-   *  the child's stdin or stdout: the exit's signal or code is then this
-   *  transport's doing, not a stop asked of the server. */
+   *  the child's stdin or stdout or a line on its stdout longer than the
+   *  bound: the exit's signal or code is then this transport's doing, not a
+   *  stop asked of the server. */
   pipeFailed?: boolean;
 }
 
@@ -53,9 +54,9 @@ export interface TransportCloseInfo {
  *  - `'stderr'` `(line: string)`            diagnostic line (stdio child stderr; never WS)
  *  - `'error'`  `(err: Error)`              transport-level error
  *  - `'close'`  `(info: TransportCloseInfo)` transport closed (once)
- *  - `'unreaped'` `(failure: Error)`        a stdio child whose pipe failed
- *    outlived SIGKILL too: the transport stays open, owning the child, and
- *    close() retries the reap (never WS)
+ *  - `'unreaped'` `(failure: Error)`        a stdio child this transport was
+ *    ending outlived SIGKILL too: the transport stays open, owning the
+ *    child, and close() retries the reap (never WS)
  *
  * Inbound `'line'`/`'stderr'` events are buffered until the first matching
  * listener attaches (and re-buffered whenever there are none), so no message is
@@ -116,14 +117,7 @@ export abstract class McplTransport extends EventEmitter {
     return '';
   }
 
-  /**
-   * The error a stdio child's stdin or stdout failed with, once one has. The
-   * transport is ending the child then, and stays open until it exits, but
-   * writes nothing more to it: writeLine drops each line, and both engines
-   * refuse a request as not sent. Undefined while writes go out, and always
-   * for a transport that has no pipes.
-   */
-  get pipeFailure(): Error | undefined {
+  get stdioStopCause(): Error | undefined {
     return undefined;
   }
 
@@ -281,11 +275,8 @@ export const STDERR_END_WAIT_MS = 1_000;
 
 export class StdioTransport extends McplTransport {
   readonly kind = 'stdio' as const;
-  /** The first error on the child's stdin or stdout, named in the close reason. */
-  private pipeError: Error | undefined;
-  /** Set when this transport ended the child after a pipe error, rather
-   *  than the child exiting on its own first. */
-  private endedForPipe = false;
+  private stopCause: Error | undefined;
+  private endedChild = false;
   /** The stream's last STDERR_WINDOW_CHARS, raw. */
   private stderrWindow = '';
   /** True once the child's stderr has ended or closed. */
@@ -310,8 +301,8 @@ export class StdioTransport extends McplTransport {
     return (cut ? '…' : '') + kept;
   }
 
-  override get pipeFailure(): Error | undefined {
-    return this.pipeError;
+  override get stdioStopCause(): Error | undefined {
+    return this.stopCause;
   }
 
   override stderrEnded(ms: number): Promise<void> {
@@ -344,7 +335,10 @@ export class StdioTransport extends McplTransport {
   ) {
     super(serverId);
 
-    this.stopLines = readLines(stdout, (line) => this.pushLine(line));
+    this.stopLines = readLines(stdout, {
+      line: (line) => this.pushLine(line),
+      tooLong: (maxChars) => this.stopStdio(new Error(`a line on stdout longer than ${maxChars.toLocaleString('en-US')} UTF-16 code units`), false),
+    }, testLineBound);
 
     // Stitch stderr chunks into whole lines (a chunk can split a line, and a
     // character's bytes), and keep the stream's last characters for
@@ -371,7 +365,7 @@ export class StdioTransport extends McplTransport {
     this.child.on('error', (err) => this.reportError(err));
     // The child's stdin and stdout carry the protocol, so after an error on
     // either, a write's EPIPE or a read error, this transport can't reach the
-    // child even if it's still running. Nothing more is written (pipeFailure),
+    // child even if it's still running. Nothing more is written (stdioStopCause),
     // and the handler first gives the child its exit grace to exit on its
     // own: a child already dead when the write failed, as one a stop's signal
     // reached first, exits within it, and its close carries its own code and
@@ -389,19 +383,8 @@ export class StdioTransport extends McplTransport {
     // Bun a child that closes its stdin isn't reported either: Bun emits no
     // 'error' for the writes to it (checked on 1.3.10, 1.4.3 and 1.4.4's
     // canary), so request timeouts are its only bound too.
-    const endOnPipeError = (err: Error) => {
-      if (this.pipeError) return;
-      this.pipeError = err;
-      void this.exitWithin(this.exitGrace()).then((gone) => {
-        if (gone || this.terminating) return;
-        this.endedForPipe = true;
-        return this.terminate();
-      }).catch((failure: unknown) => {
-        if (!this.closed) this.emit('unreaped', failure instanceof Error ? failure : new Error(String(failure)));
-      });
-    };
-    this.child.stdin?.on('error', endOnPipeError);
-    this.child.stdout?.on('error', endOnPipeError);
+    this.child.stdin?.on('error', (err) => this.stopStdio(err, true));
+    this.child.stdout?.on('error', (err) => this.stopStdio(err, true));
     // stderr carries diagnostics only: a read error on it is reported, to the
     // listeners or else in the log, and never thrown. It ends nothing once
     // the connection is wired; during a handshake the listener is the
@@ -410,9 +393,22 @@ export class StdioTransport extends McplTransport {
     this.child.on('exit', (code, signal) => this.markClosed({
       code,
       signal,
-      reason: this.pipeError ? `child process exited, and its pipe failed with ${this.pipeError.message}` : 'child process exited',
-      ...(this.endedForPipe ? { pipeFailed: true } : {}),
+      reason: this.stopCause ? `child process exited, and this host had stopped using its stdio (${this.stopCause.message})` : 'child process exited',
+      ...(this.endedChild ? { pipeFailed: true } : {}),
     }));
+  }
+
+  private stopStdio(cause: Error, exitGraceFirst: boolean): void {
+    if (this.stopCause) return;
+    this.stopCause = cause;
+    const exitedFirst = exitGraceFirst ? this.exitWithin(this.exitGrace()) : Promise.resolve(this.exited());
+    void exitedFirst.then((gone) => {
+      if (gone || this.terminating) return;
+      this.endedChild = true;
+      return this.terminate();
+    }).catch((failure: unknown) => {
+      if (!this.closed) this.emit('unreaped', failure instanceof Error ? failure : new Error(String(failure)));
+    });
   }
 
   /**
@@ -471,9 +467,7 @@ export class StdioTransport extends McplTransport {
   }
 
   writeLine(json: string): void {
-    // Nothing more goes to a child whose stdin or stdout has failed: this
-    // transport is ending it.
-    if (this.pipeError) return;
+    if (this.stopCause) return;
     // stdin may be gone if the child died between the closed-check and here.
     this.child.stdin?.write(escapeLineSeparators(json) + '\n');
   }
@@ -582,6 +576,13 @@ const testExitGraces = new WeakMap<ChildProcess, number>();
  */
 export function setStdioExitGraceForTests(child: ChildProcess, ms: number): void {
   testExitGraces.set(child, ms);
+}
+
+let testLineBound: number | undefined;
+
+/** @internal */
+export function setStdioLineBoundForTests(maxChars: number | undefined): void {
+  testLineBound = maxChars;
 }
 
 // ---------------------------------------------------------------------------

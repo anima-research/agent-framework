@@ -3,13 +3,15 @@ import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
 import { readLines } from '../src/line-reader.js';
 
+const noLineTooLong = () => assert.fail('no line here is past the bound');
+
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
 async function linesOf(chunks: Array<string | Buffer>): Promise<{ lines: string[]; linesAtEnd: number | undefined }> {
   const input = new PassThrough();
   const lines: string[] = [];
   let linesAtEnd: number | undefined;
-  const done = new Promise<void>((resolve) => readLines(input, (line) => lines.push(line), () => { linesAtEnd = lines.length; resolve(); }));
+  const done = new Promise<void>((resolve) => readLines(input, { line: (line) => lines.push(line), end: () => { linesAtEnd = lines.length; resolve(); }, tooLong: noLineTooLong }));
   for (const chunk of chunks) {
     input.write(chunk);
     await tick();
@@ -35,7 +37,7 @@ test('a CRLF split across two reads is one line end', async () => {
 test('a CR and its LF more than 100 ms apart are still one line end', async () => {
   const input = new PassThrough();
   const lines: string[] = [];
-  readLines(input, (line) => lines.push(line));
+  readLines(input, { line: (line) => lines.push(line), tooLong: noLineTooLong });
   input.write('a\r');
   await new Promise((resolve) => setTimeout(resolve, 150));
   input.end('\nb\n');
@@ -46,7 +48,7 @@ test('a CR and its LF more than 100 ms apart are still one line end', async () =
 test('a bare CR at the end of a read ends its line at once, and the next read starts the next', async () => {
   const input = new PassThrough();
   const lines: string[] = [];
-  readLines(input, (line) => lines.push(line));
+  readLines(input, { line: (line) => lines.push(line), tooLong: noLineTooLong });
   input.write('a\r');
   await tick();
   assert.deepEqual(lines, ['a']);
@@ -77,7 +79,7 @@ test('an empty stream gives no line, then the end', async () => {
 test('after stop, no further line arrives', async () => {
   const input = new PassThrough();
   const lines: string[] = [];
-  const stop = readLines(input, (line) => lines.push(line));
+  const stop = readLines(input, { line: (line) => lines.push(line), tooLong: noLineTooLong });
   input.write('a\n');
   await tick();
   stop();
@@ -91,12 +93,71 @@ test('a stop from inside a line handler delivers none of the lines left in that 
   const input = new PassThrough();
   const lines: string[] = [];
   let ended = false;
-  const stop: () => void = readLines(input, (line) => {
-    lines.push(line);
-    if (line === 'a') stop();
-  }, () => { ended = true; });
+  const stop: () => void = readLines(input, {
+    line: (line) => {
+      lines.push(line);
+      if (line === 'a') stop();
+    },
+    end: () => { ended = true; },
+    tooLong: noLineTooLong,
+  });
   input.end('a\nb\nlast');
   await tick();
   await tick();
   assert.deepEqual({ lines, ended }, { lines: ['a'], ended: false });
+});
+
+function boundedReader(maxChars?: number) {
+  const input = new PassThrough();
+  const lines: string[] = [];
+  const tooLong: number[] = [];
+  let ended = false;
+  readLines(input, { line: (line) => lines.push(line), end: () => { ended = true; }, tooLong: (bound) => tooLong.push(bound) }, maxChars);
+  const seen = () => ({ lines, tooLong, ended });
+  const write = async (chunk: string | Buffer) => { input.write(chunk); await tick(); };
+  const end = async () => { input.end(); await tick(); await tick(); };
+  return { write, end, seen };
+}
+
+test('a line as long as the bound arrives whole, its line end not counted', async () => {
+  const reader = boundedReader(4);
+  await reader.write('abcd\nwxyz\r\nmnop\r');
+  await reader.end();
+  assert.deepEqual(reader.seen(), { lines: ['abcd', 'wxyz', 'mnop'], tooLong: [], ended: true });
+});
+
+test('a line one past the bound is refused once: none of it arrives, nor any later line, nor the end', async () => {
+  const reader = boundedReader(4);
+  await reader.write('ab\nabcde\nok\n');
+  await reader.end();
+  assert.deepEqual(reader.seen(), { lines: ['ab'], tooLong: [4], ended: false });
+});
+
+test('a line is refused as soon as a read takes it past the bound, before any line end arrives', async () => {
+  const reader = boundedReader(4);
+  await reader.write('abc');
+  assert.deepEqual(reader.seen(), { lines: [], tooLong: [], ended: false });
+  await reader.write('de');
+  assert.deepEqual(reader.seen(), { lines: [], tooLong: [4], ended: false });
+  await reader.write('\nok\n');
+  assert.deepEqual(reader.seen(), { lines: [], tooLong: [4], ended: false });
+});
+
+test('the bound counts a line across reads, and a line that reaches it across reads arrives whole', async () => {
+  const fits = boundedReader(4);
+  for (const chunk of ['a', 'bc', 'd', '\n']) await fits.write(chunk);
+  await fits.end();
+  assert.deepEqual(fits.seen(), { lines: ['abcd'], tooLong: [], ended: true });
+
+  const over = boundedReader(4);
+  for (const chunk of ['a', 'bc', 'd', 'e']) await over.write(chunk);
+  assert.deepEqual(over.seen(), { lines: [], tooLong: [4], ended: false });
+});
+
+test("a last line with no line end that the stream's end takes past the bound is refused, and the end isn't reported", async () => {
+  const reader = boundedReader(4);
+  await reader.write(Buffer.concat([Buffer.from('abcd'), Buffer.from('é', 'utf8').subarray(0, 1)]));
+  assert.deepEqual(reader.seen(), { lines: [], tooLong: [], ended: false });
+  await reader.end();
+  assert.deepEqual(reader.seen(), { lines: [], tooLong: [4], ended: false });
 });
