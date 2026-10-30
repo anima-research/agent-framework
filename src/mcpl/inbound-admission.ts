@@ -1,4 +1,6 @@
 /** Host-owned, opt-in admission. No wire metadata can create this authority. */
+import { RefusalLines } from './refusal-lines.js';
+import { logValue } from './log-value.js';
 import type { ChannelIncomingMessage, PushEventParams, McplInferenceRequestParams } from './types.js';
 
 export const MAX_ADMISSION_TIMEOUT_MS = 60_000;
@@ -174,5 +176,22 @@ export class RequiredAdmission {
       return result;
     }
     finally { clearTimeout(timer); signal?.removeEventListener('abort', abort); this.pending.delete(controller); }
+  }
+}
+
+/** Fixed refusal codes only: never log payload, callback errors or private intent.
+ * Every refusal is traced; repeated lines are bounded per server/lane/code. */
+export class AdmissionRefusals {
+  private readonly lines = new RefusalLines();
+  report(emitTrace: (event: { type: string; [key: string]: unknown }) => void,
+    serverId: string, lane: AdmissionLane, reason: RefusalCode, item: unknown): void {
+    const p = item !== null && typeof item === 'object' ? item as Record<string, unknown> : {};
+    const id = (key: string): string => typeof p[key] === 'string' ? p[key] as string : '';
+    const name = lane === 'channels/incoming' ? 'channel-incoming' : lane === 'push/event' ? 'push-event' : 'inference-request';
+    const held = this.lines.admit(serverId, `${lane}:${reason}`);
+    if (held !== null) console.error(`[${name}-rejected] server=${logValue(serverId)} reason=${reason}${held ? ` (${held} more since the last line)` : ''}`);
+    if (lane === 'channels/incoming') emitTrace({ type: 'mcpl:channel-incoming-rejected', serverId, channelId: id('channelId'), messageId: id('messageId'), reason });
+    else if (lane === 'push/event') emitTrace({ type: 'mcpl:push-event-rejected', serverId, eventId: id('eventId'), featureSet: id('featureSet'), reason });
+    else emitTrace({ type: 'mcpl:inference_fail', serverId, model: null, error: reason, streamed: p.stream === true });
   }
 }

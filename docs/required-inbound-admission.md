@@ -81,7 +81,12 @@ for ordinary dispatch, including a ping in the same read chunk.
 
 Admission refusals after the handshake are itemwise channel results, push `{ accepted: false, reason }`
 results, or inference JSON-RPC errors with code -32600 and the fixed reason.
-Notifications have no wire receipt; no application status is sent for a refusal.
+Every admission refusal, including notifications, emits the lane's existing
+rejection trace (`mcpl:channel-incoming-rejected`, `mcpl:push-event-rejected`, or
+`mcpl:inference_fail`) with the fixed refusal code. A diagnostic line is limited
+to once per minute per server/lane/code, with suppressed counts on the next line.
+Neither payload nor callback exception text is logged. Notifications have no wire
+receipt; no application status is sent for a refusal.
 
 Optional `initializeAttestation: { read, matches }` checks detached initialize
 result data, after protocol agreement but before initialized/capability use.
