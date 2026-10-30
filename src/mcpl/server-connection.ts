@@ -458,6 +458,7 @@ export class McplServerConnection extends EventEmitter {
    *  the epoch their opening went to, never across a reconnect. */
   transportEpoch = 0;
   readonly requiredAdmission?: RequiredAdmission;
+  private readonly admissionEpochs = new WeakMap<object, number>();
   private readonly admissionReceipts = new WeakMap<object, RequiredIngress>();
 
   /** Only transport receipt creates an ingress key; never reconstruct one downstream. */
@@ -1030,21 +1031,6 @@ export class McplServerConnection extends EventEmitter {
    */
   override emit(event: string | symbol, ...args: unknown[]): boolean {
     const name = typeof event === 'string' ? event : '';
-    if (this.requiredAdmission && ['channels-incoming', 'push-event', 'inference-request'].includes(name)) {
-      const cap = McplServerConnection.EVENT_TO_REQUIRED_CAPABILITY[name]!;
-      if (!this.grant.has(cap)) {
-        this.refuseCapability(name, cap, args[1]);
-        return true;
-      }
-      if (!this.isConnected || !this.controlPlaneReady || !this.dataPlaneReady) {
-        this.refuseAdmission(name, args[0], args[1], 'admission_not_ready');
-        return true;
-      }
-      if (!args[0] || typeof args[0] !== 'object' || !this.admissionReceipts.has(args[0] as object)) {
-        this.refuseAdmission(name, args[0], args[1], 'admission_missing');
-        return true;
-      }
-    }
     if (this.planeReadyFor(name)) {
       // Positive-grant admission (§5.4/§14.1), at the single choke-point
       // every path shares: live routing AND buffer flushes re-enter here, so
@@ -1072,6 +1058,24 @@ export class McplServerConnection extends EventEmitter {
       if (requiredCap && !this.grant.has(requiredCap)) {
         this.refuseCapability(name, requiredCap, args[1]);
         return true;
+      }
+      if (this.requiredAdmission && ['channels-incoming', 'push-event', 'inference-request'].includes(name)) {
+        const params = args[0];
+        const epoch = params && typeof params === 'object' ? this.admissionEpochs.get(params) : undefined;
+        if (epoch === undefined) {
+          this.refuseAdmission(name, params, args[1], 'admission_missing');
+          return true;
+        }
+        if (epoch !== this.transportEpoch || !this.isConnected) {
+          this.refuseAdmission(name, params, args[1], 'admission_stale');
+          return true;
+        }
+        // Held data enters admission only at flush, under the current key.
+        // The receipt epoch still prevents old transport work acquiring it.
+        this.admissionReceipts.set(params as object, this.requiredAdmission.capture(() => {
+          if (this.transportEpoch !== epoch || !this.isConnected || !this.grant.has(requiredCap!)) return 'admission_stale';
+          if (!this.controlPlaneReady || !this.dataPlaneReady) return 'admission_not_ready';
+        }));
       }
       // §6.6: a request that will never be answered MUST get an error. A
       // request whose event nothing on this host listens for would never be.
@@ -2564,12 +2568,7 @@ export class McplServerConnection extends EventEmitter {
     }
 
     if (this.requiredAdmission && ['channels-incoming', 'push-event', 'inference-request'].includes(eventName) && request.params && typeof request.params === 'object') {
-      const cap = McplServerConnection.EVENT_TO_REQUIRED_CAPABILITY[eventName]!;
-      this.admissionReceipts.set(request.params, this.requiredAdmission.capture(() => {
-        if (this.transportEpoch !== epoch || !this.isConnected) return 'admission_stale';
-        if (!this.grant.has(cap)) return 'admission_stale';
-        if (!this.controlPlaneReady || !this.dataPlaneReady) return 'admission_not_ready';
-      }));
+      this.admissionEpochs.set(request.params, epoch);
     }
 
     // Emit the typed event with params and (for requests) a respond callback
