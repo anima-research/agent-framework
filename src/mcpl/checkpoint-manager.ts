@@ -17,6 +17,7 @@ import { ensureStateRegistered } from '../module-registry.js';
 import { boundedErrorMessage as thrownText } from '../error-message.js';
 
 import type { StateCheckpoint, JsonPatchOperation } from './types.js';
+import type { TraceEventInput } from '../types/trace.js';
 
 // ============================================================================
 // Constants
@@ -198,12 +199,12 @@ export function applyJsonPatch(doc: unknown, ops: JsonPatchOperation[]): unknown
 
 export class CheckpointManager {
   private store: JsStore;
-  private emitTraceFn: (event: { type: string; [key: string]: unknown }) => void;
+  private emitTraceFn: (event: TraceEventInput) => void;
   private trees = new Map<string, FeatureSetState>();
 
   constructor(
     store: JsStore,
-    emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
+    emitTraceFn: (event: TraceEventInput) => void,
   ) {
     this.store = store;
     this.emitTraceFn = emitTraceFn;

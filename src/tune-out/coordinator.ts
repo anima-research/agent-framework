@@ -25,6 +25,7 @@ import type { ChannelRef, ChannelRegistry, TuneOutParams } from '../mcpl/channel
 import type { McplServerRegistry } from '../mcpl/server-registry.js';
 import { CapabilityGrant } from '../mcpl/capability-grant.js';
 import { armAfter, armAt } from '../deadline-timer.js';
+import type { TraceEventInput } from '../types/trace.js';
 
 /** The options a tune-out call can give. */
 type TuneOutOption = 'durationSeconds' | 'cadenceSeconds' | 'backlogCap' | 'maxWakes';
@@ -258,7 +259,7 @@ export interface TuneOutFrameworkHooks {
    * discover it). Absent when `tuneOut.announce` is off.
    */
   announce?: (serverId: string, channelId: string, text: string) => Promise<{ success: boolean; error?: string }>;
-  emitTrace: (event: { type: string; [key: string]: unknown }) => void;
+  emitTrace: (event: TraceEventInput) => void;
 }
 
 export class TuneOutCoordinator {

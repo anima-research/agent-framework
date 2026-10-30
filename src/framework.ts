@@ -49,6 +49,7 @@ import type {
   ErrorAction,
   FrameworkState,
   TraceEvent,
+  TraceEventInput,
   TraceEventListener,
   InferenceLogEntry,
   InferenceLogQuery,
@@ -4815,7 +4816,7 @@ export class AgentFramework {
         } : {}),
         ...(judge && judgeOptions?.timeoutMs !== undefined ? { judgeTimeoutMs: judgeOptions.timeoutMs } : {}),
         ...(judge && judgeOptions?.onError !== undefined ? { judgeOnError: judgeOptions.onError } : {}),
-        emitTrace: (e) => framework.emitTrace(e as { type: TraceEvent['type']; [key: string]: unknown }),
+        emitTrace: (e) => framework.emitTrace(e),
         addMessage: (p, c, m, forAgent, placement) => framework.addMessage(p, c, m as MessageMetadata,
           forAgent || placement ? { ...(forAgent ? { forAgent } : {}), ...(placement ? { placement } : {}) } : undefined),
         requestInference: (agentName, reason, source, provenance, after) => {
@@ -5156,7 +5157,7 @@ export class AgentFramework {
                 },
               }
             : {}),
-          emitTrace: (e) => framework.emitTrace(e as never),
+          emitTrace: (e) => framework.emitTrace(e),
         },
       );
       framework.tuneOutCoordinator.resumeActiveEpochs();
@@ -6241,11 +6242,7 @@ export class AgentFramework {
     }
     this.emitTrace({ type: 'tool:started', module: 'heartbeat', tool: call.name, callId: call.id, input: call.input });
     const result = this.runHeartbeatTool(call);
-    this.emitTrace({
-      type: result.isError ? 'tool:failed' : 'tool:completed',
-      module: 'heartbeat', tool: call.name, callId: call.id, durationMs: 0,
-      ...(result.isError ? { error: result.error } : {}),
-    });
+    this.traceToolOutcome('heartbeat', call.name, call.id, result, 0);
     this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'heartbeat', result });
   }
 
@@ -31204,7 +31201,7 @@ export class AgentFramework {
     };
   }
 
-  private emitTrace(event: { type: TraceEvent['type']; [key: string]: unknown }): void {
+  private emitTrace(event: TraceEventInput): void {
     // Centralized inference-health observability. Every terminal failure path
     // funnels through an `inference:exhausted` trace and every successful model
     // response through `inference:completed`, so intercepting here is the one
@@ -31950,12 +31947,12 @@ export class AgentFramework {
     const coalescing = this.restorePushCoalescer();
     const checkpoints = new CheckpointManager(
       this.store,
-      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      (event) => this.emitTrace(event),
     );
     for (const config of serverConfigs) checkpoints.loadHostStates(config.id);
     this.mcplServerRegistry = new McplServerRegistry();
     this.featureSetManager = new FeatureSetManager(
-      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      (event) => this.emitTrace(event),
     );
     this.hookOrchestrator = new HookOrchestrator(this.mcplServerRegistry, this.featureSetManager);
     this.toolLifecycleEmitter = new ToolLifecycleEmitter({
@@ -31982,7 +31979,7 @@ export class AgentFramework {
     this.pushHandler = new PushHandler(
       this.featureSetManager,
       (event) => this.pushEvent(event as unknown as ProcessEvent),
-      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      (event) => this.emitTrace(event),
       triggerFilter,
       (serverId, params, event) => this.handleCoalescedPush(serverId, params, event),
       // An ordinary push: freeze its envelope and observe the acceptance at
@@ -32000,7 +31997,7 @@ export class AgentFramework {
       this.hookOrchestrator,
       this.featureSetManager,
       inferenceRouting ?? null,
-      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      (event) => this.emitTrace(event),
       () => this.inferenceBounds,
     );
 
@@ -32012,7 +32009,7 @@ export class AgentFramework {
       this.mcplServerRegistry,
       this.featureSetManager,
       (event) => this.pushEvent(event),
-      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      (event) => this.emitTrace(event),
       {
         store: this.store,
         handleCoalescedIncoming: (serverId, message, event) =>
@@ -35262,14 +35259,11 @@ export class AgentFramework {
     });
   }
 
-  /** An MCP tool call's trace: a result the server marked an error (or one
-   *  the reading takes as one, such as malformed content) is tool:failed, as
-   *  on the other tool paths; anything else is tool:completed. */
-  private traceMcpToolOutcome(serverId: string, tool: string, callId: string, result: ToolResult, durationMs: number): void {
+  private traceToolOutcome(module: string, tool: string, callId: string, result: ToolResult, durationMs: number): void {
     if (result.isError) {
-      this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool, callId, durationMs, error: result.error ?? 'tool returned an error' });
+      this.emitTrace({ type: 'tool:failed', module, tool, callId, durationMs, error: result.error ?? 'tool returned an error' });
     } else {
-      this.emitTrace({ type: 'tool:completed', module: `mcpl:${serverId}`, tool, callId, durationMs });
+      this.emitTrace({ type: 'tool:completed', module, tool, callId, durationMs });
     }
   }
 
@@ -35830,7 +35824,7 @@ export class AgentFramework {
       modern.callTool(toolName, args)
         .then((result) => reading(result, false))
         .then((result) => {
-          this.traceMcpToolOutcome(serverId, toolName, call.id, result, Date.now() - startTime);
+          this.traceToolOutcome(`mcpl:${serverId}`, toolName, call.id, result, Date.now() - startTime);
           this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: `mcpl:${serverId}`, result });
         })
         .catch(failDispatch);
@@ -35939,7 +35933,7 @@ export class AgentFramework {
       .then(({ result, toolResult: answer }) => {
         let toolResult = answer;
         const durationMs = Date.now() - startTime;
-        this.traceMcpToolOutcome(serverId, toolName, call.id, toolResult, durationMs);
+        this.traceToolOutcome(`mcpl:${serverId}`, toolName, call.id, toolResult, durationMs);
 
         // Record checkpoint from stateful tool response (Step 8).
         // Explicit response attribution is authoritative. Otherwise use the
@@ -36326,11 +36320,7 @@ export class AgentFramework {
         const destination = published.outcome?.status === 'delivered' ? published.outcome.destination : undefined;
         if (publisher && destination) publisher.notePublished(destinationKey(destination), readThrough);
         const durationMs = Date.now() - startTime;
-        this.emitTrace({
-          type: result.isError ? 'tool:failed' : 'tool:completed',
-          module: 'channels', tool: call.name, callId: call.id, durationMs,
-          ...(result.isError ? { error: result.error } : {}),
-        });
+        this.traceToolOutcome('channels', call.name, call.id, result, durationMs);
         // A successful channel_open plants the agent's feet in the opened
         // channel. The agent's own deliberate open is the strongest "my next
         // words go here" signal in the system — stronger than any injection —
@@ -36431,11 +36421,7 @@ export class AgentFramework {
       // Where notes follow an error that doesn't end in a stop, it gets one, so each reads as a sentence of its own.
       const said = given.error && !/[.!?]$/.test(given.error) ? `${given.error}.` : given.error;
       const result = given.isError && ignored.length > 0 ? { ...given, error: [said, ...ignored].join(' ') } : given;
-      this.emitTrace({
-        type: result.isError ? 'tool:failed' : 'tool:completed',
-        module: 'gate', tool: call.name, callId: call.id, durationMs: 0,
-        ...(result.isError ? { error: result.error } : {}),
-      });
+      this.traceToolOutcome('gate', call.name, call.id, result, 0);
       this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'gate', result });
     };
 
@@ -37099,12 +37085,7 @@ export class AgentFramework {
           : { success: false, isError: true,
               error: `fetch_reference couldn't fetch "${refId}": ${outcome.error}. ${outcome.remedy}` };
       }
-      this.emitTrace({
-        type: result.isError ? 'tool:failed' : 'tool:completed',
-        module: 'workspace', tool: call.name, callId: call.id,
-        durationMs: Date.now() - startTime,
-        ...(result.isError ? { error: result.error } : {}),
-      });
+      this.traceToolOutcome('workspace', call.name, call.id, result, Date.now() - startTime);
       this.pushEvent({
         type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'workspace',
         result: { ...result, isError: result.isError ?? false },
@@ -37115,14 +37096,7 @@ export class AgentFramework {
   private dispatchReadImageToolCall(agentName: string, call: ToolCall): void {
     this.emitTrace({ type: 'tool:started', module: 'workspace', tool: call.name, callId: call.id, input: call.input });
     const finish = (result: ToolResult): void => {
-      this.emitTrace({
-        type: result.isError ? 'tool:failed' : 'tool:completed',
-        module: 'workspace',
-        tool: call.name,
-        callId: call.id,
-        durationMs: 0,
-        ...(result.isError ? { error: result.error } : {}),
-      });
+      this.traceToolOutcome('workspace', call.name, call.id, result, 0);
       this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'workspace', result });
     };
     void (async (): Promise<void> => {
@@ -37260,14 +37234,7 @@ export class AgentFramework {
   private dispatchSaveImageToolCall(agentName: string, call: ToolCall): void {
     this.emitTrace({ type: 'tool:started', module: 'workspace', tool: call.name, callId: call.id, input: call.input });
     const finish = (result: ToolResult): void => {
-      this.emitTrace({
-        type: result.isError ? 'tool:failed' : 'tool:completed',
-        module: 'workspace',
-        tool: call.name,
-        callId: call.id,
-        durationMs: 0,
-        ...(result.isError ? { error: result.error } : {}),
-      });
+      this.traceToolOutcome('workspace', call.name, call.id, result, 0);
       this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'workspace', result });
     };
     type Candidate =
@@ -37893,14 +37860,7 @@ export class AgentFramework {
         isError: true,
       };
     }
-    this.emitTrace({
-      type: result.isError ? 'tool:failed' : 'tool:completed',
-      module: 'agent',
-      tool: call.name,
-      callId: call.id,
-      durationMs: 0,
-      ...(result.isError ? { error: result.error } : {}),
-    });
+    this.traceToolOutcome('agent', call.name, call.id, result, 0);
     this.pushEvent({
       type: 'tool-result',
       callId: call.id,

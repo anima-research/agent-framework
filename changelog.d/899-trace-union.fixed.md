@@ -1,0 +1,1 @@
+- A `tool:failed` trace now always carries `error` text, as its type says. Where a failed tool's result held none, for the `heartbeat`, `channels`, `gate`, `workspace` and `agent` modules' tools, `error` was `undefined`. It's now `tool returned an error`, as an MCPL tool's already was (#899).
