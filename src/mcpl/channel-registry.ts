@@ -1941,6 +1941,10 @@ export class ChannelRegistry {
 
       let envelope: AdmittedEnvelope | undefined;
       if (admission) {
+        if (message.coalesce !== undefined) {
+          results.push({ messageId: message.messageId, accepted: false, reason: 'admission_unsupported' });
+          continue;
+        }
         const before = admission.check();
         if (before) { results.push({ messageId: message.messageId, accepted: false, reason: before }); continue; }
         const entry = this.channels.get(incomingKey)!;

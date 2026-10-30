@@ -39,8 +39,8 @@ for (const coalesced of [false, true]) for (const [name, verdict, reason] of cas
     const before = f.context();
     const message = { ...f.channel('e1', 'never_store_this', { initial: true }, 'room/one', 'm1'), ...(!coalesced ? { coalesce: undefined } : {}) };
     const response = await f.send('channels/incoming', { messages: [message] });
-    assert.deepEqual(response.result, { results: [{ messageId: 'm1', accepted: false, reason }] });
-    assert.equal(calls, 1); assert.equal(validators, 0);
+    assert.deepEqual(response.result, { results: [{ messageId: 'm1', accepted: false, reason: coalesced ? 'admission_unsupported' : reason }] });
+    assert.equal(calls, coalesced ? 0 : 1); assert.equal(validators, 0);
     assert.equal(gates, 0);
     await f.framework.runUntilIdle();
     assert.equal(f.context(), before);

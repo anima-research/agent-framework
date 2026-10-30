@@ -226,16 +226,24 @@ for (const next of ['fresh', 'missing', 'attestation'] as const) test(`real reco
   }
 });
 
-test('required coalesced work cannot inherit a replacement epoch or a removed binding', async t => {
-  const f = await fixture({ server: { inboundAdmission: config(() => allow) } }); t.after(f.close);
-  const inner = f.framework as any; const connection = inner.mcplServerRegistry.getServer('editor');
-  let occurrence: any;
-  const accept = inner.pushCoalescer.accept.bind(inner.pushCoalescer);
-  inner.pushCoalescer.accept = (value: any) => { occurrence = value; return accept(value); };
-  await f.send('push/event', f.params('one', 'pending', { deferred: true }));
-  assert(occurrence); assert.equal(inner.coalescedAuthorized(occurrence), true);
-  connection.requiredAdmission.invalidate();
-  assert.equal(inner.coalescedAuthorized(occurrence), false, 'removed admission binding cannot authorize a later coalesced effect');
+for (const required of [true, false]) for (const lane of ['channels/incoming', 'push/event'] as const) test(`reconnect with pending ${lane} batch: required=${required} never promises unsupported durability`, async t => {
+  let calls = 0;
+  const f = await fixture({ server: { ...(required ? { inboundAdmission: config(() => { calls++; return allow; }) } : {}), reconnect: true, reconnectIntervalMs: 10, reconnectMaxIntervalMs: 20 } }); t.after(f.close); await f.register();
+  f.alwaysRespond();
+  const connection = (f.framework as any).mcplServerRegistry.getServer('editor');
+  const item = lane === 'push/event' ? f.params('pending', 'pending_body', { deferred: true }) : f.channel('pending', 'pending_body');
+  const response = await f.send(lane, lane === 'push/event' ? item : { messages: [item] });
+  const result = lane === 'push/event' ? response.result : response.result.results[0];
+  assert.equal(result.accepted, !required);
+  if (required) assert.equal(result.reason, 'admission_unsupported');
+  assert.equal(calls, 0);
+  const epoch = connection.transportEpoch;
+  f.disconnect();
+  await eventually(() => connection.transportEpoch > epoch && connection.isConnected && connection.dataPlaneReady);
+  await f.register();
+  await f.framework.runUntilIdle();
+  assert.equal(f.context().includes(lane === 'push/event' ? 'document_diff' : 'pending_body'), !required);
+  if (required) assert.equal(f.renders.length, 0);
 });
 
 test('real stdio notification awaiting admission cannot cross a replacement connection with the same id', async t => {
