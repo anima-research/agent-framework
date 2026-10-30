@@ -2883,6 +2883,104 @@ for (const atRecovery of ['readable', 'unreadable'] as const) {
   });
 }
 
+// The recovery's read-back looks for the occurrence it delivers by its
+// subject and its event (storedOccurrenceRows): an earlier event of the
+// subject, stored, is another occurrence, not a row of this one. Event 1's
+// render is stored; event 2's render's append throws before its row lands,
+// and the read of the store's length that would tell throws once, so
+// context-manager can't tell (WriteOutcomeUnknownError) though nothing of it
+// landed. Its recovery, the store readable, finds no row of event 2, and
+// stores its fallback once. Taking event 1's rows for it would store event 2
+// as nothing.
+test("a render whose store can't tell whether its row landed, where none did, has its fallback stored once at its recovery: an earlier event of its subject, stored, isn't taken for it", { timeout: 120_000 }, async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const coalescer = (f.framework as unknown as {
+    pushCoalescer: { options: { recoveryBackoffMs?: number }; pendingBatches(): number; host: { deliver: (...args: unknown[]) => Promise<unknown> } };
+  }).pushCoalescer;
+  coalescer.options.recoveryBackoffMs = 20;
+  const internals = f.framework as unknown as { pendingRequests: unknown[] };
+  f.alwaysRespond();
+  f.renderer(async (params) => ({ content: [{ type: 'text', text: `subject_render_${String(params.eventId)}` }] }));
+  const settle = async (what: string) => {
+    await settles(f.framework.runUntilIdle(), what);
+    for (let pass = 0; coalescer.pendingBatches() > 0 || internals.pendingRequests.length > 0; pass++) {
+      assert(pass < 100, `${what}: the batch was settled within 100 passes`);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await settles(f.framework.runUntilIdle(), `${what}, the drain after pass ${pass + 1}`);
+    }
+  };
+  const cm = f.framework.getAgent('agent')!.getContextManager();
+  const rowsWith = (text: string) => cm.getAllMessages().filter((m) => JSON.stringify(m.content).includes(text));
+  await f.send('push/event', f.params('1', 'subject_fallback_1', { deferred: true, initial: true }));
+  await settle('event 1');
+  const [first] = rowsWith('subject_render_1');
+  assert.ok(first && rowsWith('subject_render_1').length === 1, 'premise: event 1 is stored, as its render');
+  const subject = (first.metadata as { coalescingSubject?: unknown }).coalescingSubject;
+  assert.equal(typeof subject, 'string', 'premise: its row carries its subject');
+
+  // Event 2's render's append throws before its row lands, and the read of
+  // the store's length that would tell whether it landed throws once.
+  const store = (cm as unknown as { messageStore: { append: (...args: unknown[]) => unknown; length: () => number } }).messageStore;
+  const append = store.append;
+  const length = store.length;
+  let appendThrew = 0;
+  let lengthThrew = 0;
+  let lengthUnreadable = false;
+  store.append = (...args: unknown[]) => {
+    if (appendThrew === 0 && JSON.stringify(args[1]).includes('subject_render_2')) {
+      appendThrew++;
+      lengthUnreadable = true;
+      throw new Error('zz-append-threw-before-landing');
+    }
+    return append.apply(store, args);
+  };
+  store.length = () => {
+    if (lengthUnreadable) {
+      lengthUnreadable = false;
+      lengthThrew++;
+      throw new Error('zz-length-unreadable');
+    }
+    return length.apply(store);
+  };
+  const deliver = coalescer.host.deliver;
+  const recoveries: unknown[] = [];
+  coalescer.host.deliver = (...args: unknown[]) => {
+    if ((args[3] as { mayBeStored?: true } | undefined)?.mayBeStored) recoveries.push(args[3]);
+    return deliver(...args);
+  };
+  const audits: Array<{ kind: string; eventId?: unknown; mayBeStored?: unknown }> = [];
+  f.framework.onTrace((e) => { if (e.type === 'mcpl:coalescing') audits.push(e as unknown as { kind: string; eventId?: unknown; mayBeStored?: unknown }); });
+  const logged: string[] = [];
+  const error = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args.map((a) => (a instanceof Error ? a.message : String(a))).join(' ')); };
+  try {
+    await f.send('push/event', f.params('2', 'subject_fallback_2', { deferred: true }));
+    await settle('event 2');
+  } finally {
+    console.error = error;
+    store.append = append;
+    store.length = length;
+  }
+  assert.deepEqual([appendThrew, lengthThrew], [1, 1], "premise: event 2's append threw before its row landed, and the read that would tell threw");
+  assert.ok(logged.some((l) => l.includes("context-manager can't tell what of it landed") && l.includes('a row it has no id for')),
+    `the store's throw is logged as one context-manager can't tell of:\n${logged.join('\n')}`);
+  assert.deepEqual(audits.filter((a) => a.kind === 'deliver-failed').map((a) => [a.eventId, a.mayBeStored]), [['2', true]],
+    'event 2 is taken as one that may have been stored');
+  assert.equal(recoveries.length, 1, 'its recovery delivers it saying it may be stored');
+  assert.equal(rowsWith('subject_render_2').length, 0, 'premise: its render never landed');
+  const fallback = rowsWith('subject_fallback_2');
+  assert.equal(fallback.length, 1, `its fallback is stored once: event 1's row isn't taken for it\n${f.context()}`);
+  assert.deepEqual(
+    [(fallback[0]!.metadata as { coalescingSubject?: unknown }).coalescingSubject, (fallback[0]!.metadata as { eventId?: unknown }).eventId],
+    [subject, '2'], "as event 2 of event 1's subject",
+  );
+  assert.equal(rowsWith('subject_render_1').length, 1, 'event 1 stays stored once');
+  assert.equal(cm.windowStatusOf(fallback[0]!.id), 'in', 'the fallback is presented');
+  assert.ok(f.lastRequest().includes('subject_fallback_2'), 'and a request reads it');
+  assert.ok(!logged.some((l) => l.includes('may see the occurrence twice')), logged.join('\n'));
+  assert.equal(coalescer.pendingBatches(), 0);
+});
+
 // The coalescer's side of a delivery whose throw leaves the host unable to
 // tell whether it stored the occurrence (mayHaveStored): it stores nothing
 // then, and its recovery delivers that event saying it may be stored, so the
