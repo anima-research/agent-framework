@@ -62,7 +62,11 @@
     `ReaderInvocation.backlog` (and `ReaderFramingContext.backlog`) holds every message, as stored rows.
     `ReaderFramingContext.queuedCount` is deprecated and never set. A cancel's notice to the subconscious no longer
     carries held messages as `tune-out-cancel-held` rows after it: its view holds them stored. The trace
-    `tune-out:reader-fork` loses `queued`.
+    `tune-out:reader-fork` loses `queued`. With no queue, a cancel's release fails to be made durable only where
+    the store's sync fails (`commitDeliveries` answers false), so no queue over its cap keeps a tune-out in force
+    (the tune-out-cancel-order entry); a dump's record of what it covered (`released`) names a held message by its
+    id, and one an earlier release queued, which the boot's import stores, by its queued write's id, as that
+    release's records name it.
   - **Hosts:** `WritePlacement.deferredId` and `CoalescingPlacement.deferredId` are removed (a placement names its
     stored `messageId`, or only its agent while the write is kept in memory). `HostModeStatus.deferredWrites` is
     deprecated, and counts the writes kept in memory, a live surgery's and those waiting for an agent's recovery (0

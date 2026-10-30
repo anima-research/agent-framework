@@ -170,7 +170,7 @@ describe('passthrough observer rules', () => {
       });
       const errors = gate.getStatus().errors;
       assert.ok(
-        errors.some((e) => /passthrough is only valid/.test(e)),
+        errors.some((e) => /passthrough is true, and only a behavior\.rate_limit or behavior\.passive_sample rule/.test(e)),
         `expected passthrough validation error for ${JSON.stringify(behavior)}, got: ${JSON.stringify(errors)}`,
       );
     }
@@ -449,7 +449,7 @@ describe('anchored positions', () => {
     const { gate } = makeGate({ policies: [AMBIENT], default: 'skip' });
     assert.throws(
       () => gate.addPolicy(SAMPLER, { position: { before: 'no-such-rule' } }),
-      /no policy named "no-such-rule".*discord-ambient/s,
+      /position\.before is "no-such-rule", and no rule has that name\. The other rules are "discord-ambient"\./,
     );
   });
 

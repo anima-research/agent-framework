@@ -98,7 +98,7 @@ describe('validation: new behaviors', () => {
     const errors = gate.getStatus().errors;
     assert.deepStrictEqual(gate.getStatus().policies, []);
     assert.ok(
-      errors.some(e => /Policy "p" is left out: behavior\.rate_limit\.tokens is 0, where a positive number is needed\./.test(e)),
+      errors.some(e => /Rule "p" is left out: behavior\.rate_limit\.tokens is 0, where a positive number is needed\./.test(e)),
       `expected validation error, got: ${JSON.stringify(errors)}`,
     );
   });
@@ -121,7 +121,7 @@ describe('validation: new behaviors', () => {
       assert.deepStrictEqual(h.gate.getStatus().policies[0]!.behavior, { rate_limit: { tokens, refillIntervalMs } });
       assert.ok(
         h.gate.getStatus().errors.some(e => e.includes(
-          `Policy "p": behavior.rate_limit.refillIntervalMs is ${refillIntervalMs}, where a positive number of milliseconds is needed, ${read}`,
+          `Rule "p": behavior.rate_limit.refillIntervalMs is ${refillIntervalMs}, where a positive number of milliseconds is needed, ${read}`,
         )),
         JSON.stringify(h.gate.getStatus().errors),
       );
