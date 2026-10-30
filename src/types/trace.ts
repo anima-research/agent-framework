@@ -1,7 +1,7 @@
 import type { ThinkingBindingEntry } from '@animalabs/membrane';
 import type { ProcessEvent } from './events.js';
 import type { ModuleProcessResponse } from './framework.js';
-import type { SessionUsage } from '../usage/types.js';
+import type { UsageUpdatedEvent } from '../usage/types.js';
 import type { DraftReason } from '../prose-drafts.js';
 import type { RecipeChanges } from '../gate/recipe-reconcile.js';
 import type { DesiredChannelState } from '../mcpl/channel-registry.js';
@@ -528,8 +528,7 @@ export type TraceEvent =
       channelId?: string;
       messageId?: string;
     })
-  /** RFC-006 coalescing decision record (received / displaced / removed /
-   *  rendered / revoked / render-cancelled / late-render / render-failed).
+  /** RFC-006 coalescing decision record, by `kind`.
    *  A late-render whose push/render had already timed out, its fallback
    *  materialized, is recorded by the connection's wiring rather than the
    *  coalescer: it names `serverId`, `featureSet`, `key` and, for a
@@ -620,8 +619,9 @@ export type TraceEvent =
       matchedPolicy: string | null;
       trigger: boolean;
       behavior: string;
+      observed?: string[];
     })
-  | (TraceEventBase & RecipeChanges & {
+  | (TraceEventBase & Fields<RecipeChanges> & {
       type: 'gate:config-reconciled';
       configPath: string;
       addedPolicies: string[];
@@ -644,12 +644,7 @@ export type TraceEvent =
     })
 
   // Usage lifecycle
-  | (TraceEventBase & {
-      type: 'usage:updated';
-      totals: SessionUsage;
-      agentName: string;
-      inferenceCount: number;
-    })
+  | (TraceEventBase & Fields<UsageUpdatedEvent>)
 
   // Undo/redo lifecycle
   | (TraceEventBase & {
@@ -1289,6 +1284,8 @@ export type TraceEventListener = (event: TraceEvent) => void;
  * union's members without that field.
  */
 export type TraceEventInput = WithoutTimestamp<TraceEvent>;
+
+type Fields<Shape> = { [Key in keyof Shape]: Shape[Key] };
 
 type WithoutTimestamp<Event> = Event extends unknown
   ? { [Key in keyof Event as Key extends 'timestamp' ? never : Key]: Event[Key] }

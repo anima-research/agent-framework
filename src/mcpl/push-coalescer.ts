@@ -293,17 +293,19 @@ export interface CoalescingReceiptRecord {
   batch: { latest: CoalescedOccurrence<unknown>; notices: DeferredNotice[]; dropped: number } | null;
 }
 
-/** An RFC-006 audit record, as the coalescer hands it to its host. */
 export type CoalescingAudit = { subject: string; eventId: string } & (
   | { kind: 'received'; retract: boolean; deferred: boolean }
-  | { kind: 'removed' | 'remove-failed' | 'revoked' }
+  | { kind: 'removed' }
+  | { kind: 'remove-failed' }
+  | { kind: 'revoked' }
   | { kind: 'displaced'; batch?: true }
   | { kind: 'render-cancelled'; reason?: 'suspend' }
   | { kind: 'recovery-wake'; attempt: number; delayMs: number }
   | { kind: 'rendered'; source: 'render' | 'fallback'; empty: boolean }
   | { kind: 'render-failed'; serverId: string; field?: string; error: string }
   | { kind: 'late-render'; discarded: true }
-  | { kind: 'persist-failed' | 'accepted-observer-failed'; error: string }
+  | { kind: 'persist-failed'; error: string }
+  | { kind: 'accepted-observer-failed'; error: string }
 );
 
 export interface CoalescerHost<E> {

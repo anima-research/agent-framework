@@ -4,6 +4,6 @@
   - from MCPL pushes, inference and state: `mcpl:push_event`, `mcpl:inference_start`, `mcpl:inference_complete`, `mcpl:inference_fail`, `mcpl:state_registered`, `mcpl:checkpoint_recorded` and `mcpl:state_rollback`;
   - from tune-out: `tune-out:entered`, `tune-out:cancelled`, `tune-out:announced`, `tune-out:announce-failed`, `tune-out:ack-failed`, `tune-out:timer-failed` and `tune-out:wake-budget-paused`.
 
-  Every raise is now checked against the union by the compiler, its name and its fields, so a table keyed on `TraceEvent['type']` can name every trace a host receives.
+  The compiler now checks every raise's name against the union, and each field the raise writes out against its member, so a table keyed on `TraceEvent['type']` can name every trace a host receives.
 - `TraceEventInput`, exported: a trace as raised, before its `timestamp` is stamped.
-- Fields that were raised but not declared: `gate:config-reloaded`'s `removedPolicies` and `stateClearedPolicies`, and `tool:failed`'s optional `durationMs`.
+- Fields that were raised but not declared: `gate:config-reloaded`'s `removedPolicies` and `stateClearedPolicies`, `gate:decision`'s `observed`, and `tool:failed`'s optional `durationMs`.
