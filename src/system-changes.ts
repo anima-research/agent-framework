@@ -30,16 +30,18 @@ export interface HeadDeclaration {
  *  most one write, since every request compares before it goes. */
 export interface HeadDeclarationStore {
   read(agentName: string): HeadDeclaration | null;
-  write(agentName: string, head: HeadDeclaration): void;
-  delete(agentName: string): void;
+  /** Whether the head is now stored. */
+  write(agentName: string, head: HeadDeclaration): boolean;
+  /** Whether no record is left: false for one it couldn't clear. */
+  delete(agentName: string): boolean;
 }
 
 export function memoryHeadDeclarations(): HeadDeclarationStore {
   const heads = new Map<string, HeadDeclaration>();
   return {
     read: (agentName) => heads.get(agentName) ?? null,
-    write: (agentName, head) => { heads.set(agentName, head); },
-    delete: (agentName) => { heads.delete(agentName); },
+    write: (agentName, head) => { heads.set(agentName, head); return true; },
+    delete: (agentName) => { heads.delete(agentName); return true; },
   };
 }
 

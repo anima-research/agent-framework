@@ -686,6 +686,33 @@ describe('toolDeclarations in the framework', () => {
       });
     });
 
+    it("moves nothing while its head can't be stored, and keeps its change with the recorded head", async () => {
+      await withFramework([resident('alpha')], async (framework) => {
+        const internals = framework as unknown as Internals;
+        const alpha = framework.getAgent('alpha')!;
+        say(alpha, 'user', 'hello');
+        await alpha.buildActivationRequest([tool('a')], system('v1'));
+        await alpha.buildActivationRequest([tool('a'), tool('b')], system('v1'));
+        const set = internals.store.setStateJson.bind(internals.store);
+        internals.store.setStateJson = (id, value) => {
+          if (id === 'framework/head-declarations/alpha') throw new Error('no space left on device');
+          return set(id, value);
+        };
+        try {
+          for (const n of [1, 2]) {
+            const held = await alpha.buildActivationRequest([tool('a'), tool('b')], system('v2'));
+            assert.deepEqual(held.tools, [tool('a')], `request ${n}: the recorded head goes out`);
+            assert.deepEqual(changesIn(held.messages), [[{ type: 'system_change', defineTools: [tool('b')] }]], `request ${n}: with its change`);
+          }
+        } finally {
+          internals.store.setStateJson = set;
+        }
+        const next = await alpha.buildActivationRequest([tool('a'), tool('b')], system('v2'));
+        assert.deepEqual(next.tools, [tool('a'), tool('b')], 'once it stores, the replacement moves the head');
+        assert.deepEqual(changesIn(next.messages), [], 'and takes the change it now holds');
+      });
+    });
+
     it("registers an agent's state at its first write, and none for an agent on its head", async () => {
       const registered: string[] = [];
       await withFramework([resident('alpha'), { ...resident('beta'), toolDeclarations: 'head' }], async (framework) => {

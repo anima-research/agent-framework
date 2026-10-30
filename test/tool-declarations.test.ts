@@ -417,27 +417,57 @@ describe('toolDeclarations', () => {
     assert.deepEqual(continuePrompt, prompt, 'and the reply still continues the loop the results answer');
   });
 
-  it('moves the head, after a record write that failed, without the old changes beside a head that holds them', async () => {
-    // The changes go before the record: a stop between them leaves the old head and no rows.
+  it("moves nothing while its head isn't stored, and keeps its changes with the recorded head", async () => {
     const context = fakeContext([said('user', 'hello')]);
     const real = memoryHeadDeclarations();
     let failWrites = false;
     const heads: HeadDeclarationStore = {
       read: (name) => real.read(name),
-      write: (name, head) => { if (failWrites) throw new Error('the store refused the write'); real.write(name, head); },
+      write: (name, head) => !failWrites && real.write(name, head),
       delete: (name) => real.delete(name),
     };
     const agent = agentOn(context, { toolDeclarations: 'entries' }, heads);
     await agent.buildActivationRequest([tool('a')], [systemInjection('v1')]);
     await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('v1')]);
     failWrites = true;
-    await assert.rejects(agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('v2')]), /refused the write/);
-    assert.deepEqual(changeRows(context.rows), [], 'the change went before the record');
+    const held = await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('v2')]);
+    assert.deepEqual(held.tools, [tool('a')], 'the recorded head goes out');
+    assert.deepEqual(changesIn(held.messages), [[{ type: 'system_change', defineTools: [tool('b')] }]], 'with its change');
+    assert.deepEqual(real.read('agent'), { tools: [tool('a')], system: ['You are an agent.', 'v1'] }, 'the record is as it was');
     failWrites = false;
-    const next = await agentOn(context, { toolDeclarations: 'entries' }, heads).buildActivationRequest([tool('a'), tool('b')], [systemInjection('v2')]);
-    assert.deepEqual(next.tools, [tool('a'), tool('b')], 'the replacement moves the head');
-    assert.deepEqual(changeRows(context.rows), [], 'with no old change left beside it');
+    const next = await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('v2')]);
+    assert.deepEqual(next.tools, [tool('a'), tool('b')], 'once it stores, the replacement moves the head');
+    assert.deepEqual(changeRows(context.rows), [], 'and takes the change it now holds');
     assert.deepEqual(real.read('agent'), { tools: [tool('a'), tool('b')], system: ['You are an agent.', 'v2'] });
+  });
+
+  it("sends what's current and keeps its own change rows while it can't store a head with none recorded", async () => {
+    const context = fakeContext([said('user', 'hello'), changeRow([tool('b')])]);
+    const real = memoryHeadDeclarations();
+    const heads: HeadDeclarationStore = { read: (name) => real.read(name), write: () => false, delete: (name) => real.delete(name) };
+    const agent = agentOn(context, { toolDeclarations: 'entries' }, heads);
+    const request = await agent.buildActivationRequest([tool('a'), tool('b')]);
+    assert.deepEqual(request.tools, [tool('a'), tool('b')], 'what it advertises now goes out');
+    assert.equal(changeRows(context.rows).length, 1, 'and its change row stays');
+  });
+
+  it("lets a refusal over budget go on, keeping its own change rows, on the head while its record can't be cleared", async () => {
+    const context = fakeContext([said('user', 'hello'), changeRow([tool('b')])], { overBudget: (r) => r.some((row) => row.participant === 'system') });
+    const real = memoryHeadDeclarations();
+    real.write('agent', { tools: [tool('a')], system: ['You are an agent.'] });
+    const heads: HeadDeclarationStore = { read: (name) => real.read(name), write: (name, head) => real.write(name, head), delete: () => false };
+    const agent = agentOn(context, {}, heads);
+    await assert.rejects(agent.buildActivationRequest([tool('a')]), { name: 'OverBudgetError' });
+    assert.equal(changeRows(context.rows).length, 1, 'its row stays with the record');
+  });
+
+  it("lets a refusal over budget go on as it was on the head, its record kept, with no change row of its own to take", async () => {
+    const context = fakeContext([said('user', 'hello')], { overBudget: () => true });
+    const heads = memoryHeadDeclarations();
+    heads.write('agent', { tools: [tool('a')], system: ['You are an agent.'] });
+    const agent = agentOn(context, {}, heads);
+    await assert.rejects(agent.buildActivationRequest([tool('a')]), { name: 'OverBudgetError' });
+    assert.ok(heads.read('agent'), 'its record stays');
   });
 
   it("removes an earlier period's change rows on the head with nothing tracing it", async () => {
@@ -721,6 +751,25 @@ describe('toolDeclarations', () => {
       assert.equal(context.compiles.length - compiles, 2, 'the refused compile, and one more');
       assert.deepEqual(heads.read('agent')!.tools, [tool('a'), tool('b')]);
       assert.deepEqual(events.at(-1), { type: 'head:moved', why: 'consolidated', changesRemoved: 1, forced: 'budget' });
+    });
+
+    it("keeps its changes, and the refusal goes on, when a compile is refused over budget while its head can't be stored", async () => {
+      const rows = [said('user', 'hello')];
+      let refuse = false;
+      const context = fakeContext(rows, { overBudget: (r) => refuse && r.some((row) => row.participant === 'system') });
+      const real = memoryHeadDeclarations();
+      const heads: HeadDeclarationStore = {
+        read: (name) => real.read(name),
+        write: (name, head) => !refuse && real.write(name, head),
+        delete: (name) => real.delete(name),
+      };
+      const agent = agentOn(context, { toolDeclarations: 'entries' }, heads);
+      await agent.buildActivationRequest([tool('a')]);
+      await agent.buildActivationRequest([tool('a'), tool('b')]);
+      refuse = true;
+      await assert.rejects(agent.buildActivationRequest([tool('a'), tool('b')]), { name: 'OverBudgetError' });
+      assert.equal(changeRows(rows).length, 1, 'its change stays');
+      assert.deepEqual(real.read('agent')!.tools, [tool('a')], 'with the recorded head');
     });
 
     it("takes its own change rows out of a compile refused over budget with no head recorded, or on the head, and compiles once more", async () => {

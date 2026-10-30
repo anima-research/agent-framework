@@ -16055,9 +16055,7 @@ export class AgentFramework {
   private readonly headDeclarations: HeadDeclarationStore = {
     read: (agentName) => this.readHeadDeclaration(agentName) ?? null,
     write: (agentName, head) => this.storeHeadDeclaration(agentName, head),
-    delete: (agentName) => {
-      if (this.readHeadDeclaration(agentName)) this.storeHeadDeclaration(agentName, null);
-    },
+    delete: (agentName) => this.readHeadDeclaration(agentName) === null || this.storeHeadDeclaration(agentName, null),
   };
 
   private headStateId(agentName: string): string {
@@ -16100,22 +16098,21 @@ export class AgentFramework {
     }
   }
 
-  /** Record an agent's head, or with null, record none. A write that would
-   *  change nothing isn't made. One that can't be stored is logged, not
-   *  thrown: the request in hand is right either way. Memory keeps the head
-   *  that request went with, so the process stays consistent, and a later
-   *  write of that same head is skipped as changing nothing: the store keeps
-   *  the old one until a write of another head lands, or a restart or a
-   *  branch switch reads the store again and declares the difference once. */
-  private storeHeadDeclaration(agentName: string, head: HeadDeclaration | null): void {
+  /** Record an agent's head, or with null, record none, and say whether it's
+   *  stored. A write that would change nothing isn't made. One that can't be
+   *  stored is logged, not thrown, and memory keeps what it held, so the next
+   *  read finds the record as it was and a later write tries again. */
+  private storeHeadDeclaration(agentName: string, head: HeadDeclaration | null): boolean {
     const recorded = this.readHeadDeclaration(agentName);
-    if (recorded !== undefined && JSON.stringify(recorded) === JSON.stringify(head)) return;
-    this.headsOnBranch().set(agentName, head);
+    if (recorded !== undefined && JSON.stringify(recorded) === JSON.stringify(head)) return true;
     try {
       this.store.setStateJson(this.headStateId(agentName), head);
     } catch (error) {
       console.error(`[head-declarations] ${agentName}: the recorded head could not be stored:`, error);
+      return false;
     }
+    this.headsOnBranch().set(agentName, head);
+    return true;
   }
 
   /** What an operator line says of the thinking a move of an agent's head

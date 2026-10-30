@@ -2726,14 +2726,14 @@ export class Agent {
       }
       return { compiled, head: current };
     }
-    if (!recorded) return this.moveHead(compiled, compiledWith, current, 'adopted', dryRun, compile);
+    if (!recorded) return this.moveHead(compiled, compiledWith, recorded, current, 'adopted', dryRun, compile);
     const blocks = compiled.messages.flatMap((message, index) => (own.has(index) ? message.content.filter(isSystemChangeContent) : []));
     const ownDeclaration = effectiveDeclaration(recorded, blocks);
     const sent = compiled.messages.flatMap((message) => message.content.filter(isSystemChangeContent));
     const difference = withoutCarried(declarationDifference(ownDeclaration, current), ownDeclaration, effectiveDeclaration(recorded, sent));
-    if (difference.kind === 'replace') return this.moveHead(compiled, compiledWith, current, 'replaced', dryRun, compile);
+    if (difference.kind === 'replace') return this.moveHead(compiled, compiledWith, recorded, current, 'replaced', dryRun, compile);
     const consolidation = this.consolidation(compiled, own, blocks);
-    if (consolidation) return this.moveHead(compiled, compiledWith, current, 'consolidated', dryRun, compile, consolidation);
+    if (consolidation) return this.moveHead(compiled, compiledWith, recorded, current, 'consolidated', dryRun, compile, consolidation);
     if (difference.kind === 'none' || endsOnUnansweredCalls(compiled.messages, this.name) || this.changeWouldSplitCall()) {
       return { compiled, head: recorded };
     }
@@ -2771,18 +2771,21 @@ export class Agent {
    * a record, a move forced by the budget; without one, settleHead's
    * adoption. If that compile is refused too, the error goes on and the move
    * stands: the rows are gone and the head is current, as after any move.
-   * Any other error, or a refusal with no change row of the agent's kept,
+   * Any other error, a refusal with no change row of the agent's kept, a
+   * head that isn't stored, or on the head a record that can't be cleared,
    * goes on as it was. Never for a dry run.
    */
   private takeChangesOverBudget(error: unknown, entries: boolean, recorded: HeadDeclaration | null, current: HeadDeclaration): HeadDeclaration {
     if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError') throw error;
-    const removed = this.removeOwnChanges();
-    if (removed === 0) throw error;
+    const rows = this.ownChangeRows();
     if (!entries) {
+      if (rows.length === 0 || !this.headDeclarations.delete(this.name)) throw error;
+      const removed = this.removeOwnChanges(rows);
       this.onHeadEvent?.({ type: 'head:moved', why: 'on-head', changesRemoved: removed });
       return current;
     }
-    this.headDeclarations.write(this.name, copyHead(current));
+    if (rows.length === 0 || !this.headDeclarations.write(this.name, copyHead(current))) throw error;
+    const removed = this.removeOwnChanges(rows);
     this.onHeadEvent?.(recorded
       ? { type: 'head:moved', why: 'consolidated', changesRemoved: removed, forced: 'budget' }
       : { type: 'head:moved', why: 'adopted', changesRemoved: removed });
@@ -2790,11 +2793,11 @@ export class Agent {
   }
 
   /**
-   * Move the head to what's current: remove the changes it now holds, then
-   * record a copy of it, in that order, so a stop between the two leaves the
-   * old head and no changes. The next assembly then declares the difference
-   * as one change, or moves the head again for a replacement; never the old
-   * changes beside a head that already holds them. The compile runs again
+   * Move the head to what's current: record a copy of it, then remove the
+   * changes it now holds, in that order. A record that isn't stored moves
+   * nothing: the request goes on the recorded head, or with none recorded on
+   * what's current, the rows stay, and a later assembly moves again. The
+   * compile runs again
    * when what it read changed, or when it was told something of its head
    * (`compiledWith`, null when it was told nothing) that differs for this
    * one: kv-unified's hash and the thinking binding's digests are both of
@@ -2807,6 +2810,7 @@ export class Agent {
   private async moveHead(
     compiled: CompileResult,
     compiledWith: HeadDeclaration | null,
+    recorded: HeadDeclaration | null,
     current: HeadDeclaration,
     why: 'adopted' | 'replaced' | 'consolidated',
     dryRun: boolean,
@@ -2821,8 +2825,8 @@ export class Agent {
       const provenance = shown.provenance && { ...shown.provenance, messages: shown.provenance.messages.filter(kept) };
       return { compiled: { ...shown, messages: shown.messages.filter(kept), ...(provenance ? { provenance } : {}) }, head: current };
     }
+    if (!this.headDeclarations.write(this.name, copyHead(current))) return { compiled, head: recorded ?? current };
     const removed = this.removeOwnChanges();
-    this.headDeclarations.write(this.name, copyHead(current));
     this.onHeadEvent?.({ type: 'head:moved', why, changesRemoved: removed, ...sizes });
     const again = removed > 0 || (compiledWith !== null && headHash(compiledWith) !== headHash(current));
     return { compiled: again ? await compile(current) : compiled, head: current };
@@ -2874,10 +2878,13 @@ export class Agent {
     return changeTokens * 5 >= inputTokens ? { changeTokens, inputTokens, forced: 'share' } : undefined;
   }
 
-  private removeOwnChanges(): number {
-    const rows = [...this.ownParticipants]
+  private ownChangeRows() {
+    return [...this.ownParticipants]
       .flatMap((agent) => this.contextManager.queryMessages({ metadata: { kind: 'system-change', agent } }).messages)
       .filter((row) => isSystemChangeMessage(row as { content: readonly ContentBlock[] }));
+  }
+
+  private removeOwnChanges(rows = this.ownChangeRows()): number {
     for (const row of rows) this.contextManager.removeMessage(row.id);
     return rows.length;
   }
