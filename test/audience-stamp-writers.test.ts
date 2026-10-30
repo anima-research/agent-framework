@@ -316,6 +316,10 @@ const OWN_ROW_WRITERS: Record<string, { count: number; when: 'turn' | 'end' | 'u
   'framework.ts AgentFramework.noteInferenceExhausted': { count: 1, when: 'end', what: "an exhausted turn's [inference-failed] marker" },
   'framework.ts AgentFramework.settleDeliberateCancel': { count: 1, when: 'held-back', what: "a stop's [turn-interrupted] marker, held back once the stream no longer owns the agent" },
   'framework.ts AgentFramework.sweepExpiredConversations': { count: 1, when: 'held-back', what: "a fork's closure prompt, held back while a turn of the fork's is alive" },
+  // #844's design question 1: a notice about the agent's own speech, so an
+  // undo takes it with the turn. Written mid-round, before the boundary
+  // whose stream hears it, so it is held back while the turn is alive.
+  'framework.ts AgentFramework.holdProseDrafts': { count: 1, when: 'held-back', what: "a mid-turn [drafts] notice, held back for the boundary that injects it" },
   'framework.ts AgentFramework.deriveAgent': { count: 2, when: 'unregistered', what: "a derived agent's inheritance and framing" },
   'framework.ts AgentFramework.framePendingRound': { count: 2, when: 'unregistered', what: "a derived agent's framing of its parent's pending round" },
   'framework.ts AgentFramework.createConversationAgent': { count: 1, when: 'unregistered', what: "a conversation fork's seed" },
