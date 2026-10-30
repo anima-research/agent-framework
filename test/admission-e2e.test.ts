@@ -216,13 +216,17 @@ describe('admission: the hold is decided once, before any side effect', () => {
     } finally { await f.close(); }
   });
 
-  // Review 2, J-AF29: a surgery's hold is the one place a write still waits
-  // in memory, until the hold's release stores it. A tune-out that ends
-  // during the hold (its expiry, say) reads those writes beside the record
-  // (getSurgeryHeldMessages), as it once read the deferral queue; before,
-  // its dump left the message out, and its release stored it under the ended
+  // Review 2, J-AF29: a surgery's hold keeps a write in memory until the
+  // hold's release stores it. A check during the hold reads those writes
+  // beside the record (getSurgeryHeldMessages), as it once read the
+  // deferral queue. A cancel asked for during the hold (its expiry, say)
+  // waits for the release (AF-C-1, below), which stores them before the
+  // cancel runs, so its dump lists them from the record. A dump is made
+  // during the hold only where the writesHeld hook throws and the cancel
+  // goes on, and then reads them beside the record too. Before, the dump
+  // left the message out, and the release stored it under the ended
   // tune-out's hold, so no resident was ever shown it.
-  it('gap 7 (surgery) — a held message a surgery keeps in memory is counted while held and is in a release made during the hold', async () => {
+  it('gap 7 (surgery) — a held message a surgery keeps in memory is counted while held and is in the release of a cancel asked for during the hold', async () => {
     const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
     try {
       await registerOpen(f, 'work', 'noisy');
@@ -245,7 +249,8 @@ describe('admission: the hold is decided once, before any side effect', () => {
         assert.equal(coordinator.check().channels.find((c) => c.channelId === 'noisy')?.held, 2, 'a check counts it while held');
         const peek = coordinator.check({ peek: { serverId: 'editor', channelId: 'noisy' } }).peek ?? [];
         assert.ok(peek.some((line) => line.includes('kept by the hold')), 'and peeks it');
-        // The tune-out ends while the hold is up.
+        // The tune-out's end time passes while the hold is up: its cancel
+        // waits for the release.
         assert.ok(coordinator.cancel('editor', 'noisy', 'duration', 'duration elapsed').ok);
       } finally {
         release();

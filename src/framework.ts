@@ -5400,11 +5400,14 @@ export class AgentFramework {
             return primary ? primary.getContextManager().getAllMessages() : [];
           },
           // What a surgery's hold keeps for the primary's store until its
-          // release, as addMessage was given it: a tune-out that ends during
-          // the hold lists its held messages among them (#232 gap 7). So do
-          // the writes kept for the primary while its context manager
-          // refuses its work (heldForRecovery), which came first. A write
-          // straight into a fork's store isn't the primary's. Read
+          // release, as addMessage was given it, after the writes kept for
+          // the primary while its context manager refuses its work
+          // (heldForRecovery), which came first: a check during the hold
+          // counts and peeks a tune-out's held messages among them
+          // (#232 gap 7). A cancel waits for the release (writesHeld, below),
+          // so a dump lists them only where asking that throws and the
+          // cancel goes on.
+          // A write straight into a fork's store isn't the primary's. Read
           // defensively, as releaseSurgeryHeldWrites is.
           getSurgeryHeldMessages: () => {
             const primary = framework.primaryAgentName;

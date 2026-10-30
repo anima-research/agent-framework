@@ -238,10 +238,11 @@ export interface TuneOutFrameworkHooks {
   /**
    * The writes for the primary's store that a live surgery's hold keeps in
    * memory, in arrival order: made while the operator's switch is awaited,
-   * and stored, in that order, only at its release. A tune-out that ends
-   * during the hold has its held messages among them, which its dump lists
-   * and a check counts as it does the stored ones (#232 gap 7). Left out,
-   * none are.
+   * and stored, in that order, only at its release. A check during the hold
+   * counts and peeks a tune-out's held messages among them as it does the
+   * stored ones (#232 gap 7). A cancel waits for the release (writesHeld),
+   * so a dump lists them only where writesHeld throws and the cancel goes
+   * on during the hold. Left out, none are.
    */
   getSurgeryHeldMessages?: () => Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'>>;
   /**
@@ -438,8 +439,9 @@ export class TuneOutCoordinator {
   /**
    * Every message of the primary's store, in arrival order: those stored,
    * then those a live surgery's hold keeps in memory until its release
-   * (getSurgeryHeldMessages). What a dump lists and a check counts, so a
-   * tune-out that ends during the hold still has what it held then. A
+   * (getSurgeryHeldMessages). What a check counts and peeks, and what a
+   * dump lists: a dump made during the hold, which a cancel makes only
+   * where writesHeld throws, still has what the tune-out held then. A
    * reader is handed stored rows only (getStoredMessages): those the hold
    * keeps have no id until stored, and the dump has them.
    */
@@ -960,9 +962,11 @@ export class TuneOutCoordinator {
     this.divertedSinceInvocation.delete(this.key(serverId, channelId));
 
     // Backlog: every message held under this epoch, in store order, which
-    // is arrival order: a held message is stored as it arrives (#291), but
-    // while a surgery holds the store, which keeps it in memory until its
-    // release, after every stored one (residentMessages).
+    // is arrival order: a held message is stored as it arrives (#291). A
+    // cancel waits while a surgery's hold keeps writes in memory
+    // (writesHeld), so they are stored by now; one that went on during the
+    // hold, writesHeld having thrown, lists those the hold keeps after every
+    // stored one (residentMessages).
     const epochId = ended.params.epochId;
     const ofEpoch = (m: Pick<StoredMessage, 'metadata'>): boolean =>
       (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId;
