@@ -361,7 +361,7 @@ class SpawnerStdioTransport implements Transport {
       this.closeInfo = info;
       this.onclose?.();
     });
-    line.on('unreaped', (failure: Error) => this.onUnreaped(`this host stopped using its stdio (${line.stdioStopCause?.message ?? 'an error'})`, failure));
+    line.on('unreaped', (failure: Error) => this.onUnreaped(`this host stopped using the server's stdio (${line.stdioStopCause?.message ?? 'an error'})`, failure));
   }
 
   get stdioStopCause(): Error | undefined {
@@ -381,7 +381,7 @@ class SpawnerStdioTransport implements Transport {
   async send(message: JSONRPCMessage): Promise<void> {
     if (!this.line || this.line.closed) throw new NotWrittenError(`MCP server "${this.config.id}" stdio transport is closed`);
     const stopped = this.stdioStopCause;
-    if (stopped) throw new NotWrittenError(`MCP server "${this.config.id}": this host stopped using its stdio (${stopped.message})`, true);
+    if (stopped) throw new NotWrittenError(`MCP server "${this.config.id}": this host stopped using the server's stdio (${stopped.message})`, true);
     this.line.writeLine(JSON.stringify(message));
   }
 
@@ -766,7 +766,7 @@ export class ModernMcpConnection extends EventEmitter {
       const failure = await ModernMcpConnection.closeSession(session);
       if (failure) this.holdUnreaped(session, failure);
       throw await ModernMcpConnection.withStderrTail(session, new Error(stopped
-        ? `MCP server "${this.id}": this host stopped using its stdio while connecting (${stopped.message})`
+        ? `MCP server "${this.id}": this host stopped using the server's stdio while connecting (${stopped.message})`
         : `MCP server "${this.id}" closed its connection while connecting`));
     }
     this.session = session;

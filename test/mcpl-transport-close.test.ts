@@ -268,7 +268,7 @@ test("a failed write to a child's stdin ends the child, and the transport's clos
   const info = await within(closed, null);
   assert.ok(info, 'the transport closed within 5 s');
   assert.equal(info.signal, 'SIGTERM', 'the transport ended the child');
-  assert.equal(info.reason, 'child process exited, and this host had stopped using its stdio (write EPIPE)');
+  assert.equal(info.reason, 'child process exited, and this host had stopped using the server\'s stdio (write EPIPE)');
   assert.deepEqual(errors, [], "the close is the report: no 'error' is emitted");
 });
 
@@ -282,7 +282,7 @@ test("a read error on a child's stdout ends the child the same way, and nothing 
   const info = await within(closed, null);
   assert.ok(info, 'the transport closed within 5 s');
   assert.equal(info.signal, 'SIGTERM');
-  assert.equal(info.reason, 'child process exited, and this host had stopped using its stdio (injected stdout read failure)');
+  assert.equal(info.reason, 'child process exited, and this host had stopped using the server\'s stdio (injected stdout read failure)');
 });
 
 test("a read error on a child's stderr reaches the transport's 'error' listener once, ends nothing, and with no listener isn't thrown", { timeout: 10_000 }, async (t) => {
@@ -330,8 +330,8 @@ test('a handshake whose child exits at once is refused by its close, never by a 
   for (let run = 0; run < 10; run++) {
     const refusal = await McplServerConnection.connect({ id: 'exits-at-once', command: 'false' }, { version: '0.5' })
       .then(() => 'connected', (error: Error) => error.message);
-    assert.match(refusal, /^MCPL server "exits-at-once" transport closed before handshake completed \(child process exited(, and this host had stopped using its stdio \(write EPIPE\))?\)$/);
-    if (refusal.includes('stopped using its stdio')) withPipeError++;
+    assert.match(refusal, /^MCPL server "exits-at-once" transport closed before handshake completed \(child process exited(, and this host had stopped using the server's stdio \(write EPIPE\))?\)$/);
+    if (refusal.includes('stopped using the server\'s stdio')) withPipeError++;
   }
   // Not asserted: whether a run raced is the platform's. Logged for the reader.
   console.log(`# ${withPipeError} of 10 refusals named a pipe error that raced the exit`);
@@ -387,7 +387,7 @@ test('a server that closes its stdin is ended: a request fails with the disconne
     await within(answer, 'still waiting after 15 s', 15_000),
     /^The connection to the "deaf-after-initialize" server closed before it answered, so whether the request took effect is unknown\. Check its effect before trying again; this host is reconnecting to it\.$/,
   );
-  assert.equal((await within(closed, null, 15_000))?.reason, 'child process exited, and this host had stopped using its stdio (write EPIPE)');
+  assert.equal((await within(closed, null, 15_000))?.reason, 'child process exited, and this host had stopped using the server\'s stdio (write EPIPE)');
   assert.equal(await within(reconnected.then(() => 'reconnected'), 'no reconnect within 15 s', 15_000), 'reconnected');
 });
 
@@ -404,14 +404,14 @@ test("the framework's mcpl:server-closed trace carries the transport's reason, a
   framework.wireMcplEvents(connection, { id: 'srv' });
   connection.emit('close', null, 'SIGTERM', {
     transport: 'stdio', code: null, signal: 'SIGTERM', byHost: false,
-    reason: 'child process exited, and this host had stopped using its stdio (write EPIPE)',
+    reason: 'child process exited, and this host had stopped using the server\'s stdio (write EPIPE)',
   });
   connection.emit('close', 4001, null, {
     transport: 'websocket', code: 4001, signal: null, byHost: false, reason: 'token expired', reasonFromPeer: true,
   });
   connection.emit('close', null, null);
   assert.deepEqual(closes.map(({ code, signal, reason }) => ({ code, signal, reason })), [
-    { code: null, signal: 'SIGTERM', reason: 'child process exited, and this host had stopped using its stdio (write EPIPE)' },
+    { code: null, signal: 'SIGTERM', reason: 'child process exited, and this host had stopped using the server\'s stdio (write EPIPE)' },
     { code: 4001, signal: null, reason: null },
     { code: null, signal: null, reason: null },
   ]);
@@ -562,7 +562,7 @@ test("a failed write to a child that ignores SIGTERM ends it with SIGKILL 2 s la
   const info = await within(closed, null, 8000);
   assert.ok(info, 'the transport closed within 8 s');
   assert.equal(info.signal, 'SIGKILL', 'SIGKILL ended the child');
-  assert.equal(info.reason, 'child process exited, and this host had stopped using its stdio (write EPIPE)');
+  assert.equal(info.reason, 'child process exited, and this host had stopped using the server\'s stdio (write EPIPE)');
   assert.equal(received(signals), 1, 'one SIGTERM, then SIGKILL');
   assert.equal(logged.filter((line) => line.includes('ignored SIGTERM for 2000ms')).length, 1, logged.join('\n'));
 });
@@ -637,7 +637,7 @@ test("a pipe failure whose child outlives SIGKILL too leaves the transport open 
   // rather than repeating its verdict.
   const closed = new Promise<TransportCloseInfo>((resolve) => { transport.once('close', resolve); });
   realKill('SIGKILL');
-  assert.equal((await within(closed, null))?.reason, 'child process exited, and this host had stopped using its stdio (write EPIPE)');
+  assert.equal((await within(closed, null))?.reason, 'child process exited, and this host had stopped using the server\'s stdio (write EPIPE)');
   await transport.close();
 });
 
@@ -745,17 +745,17 @@ test('a legacy request made after a stdin failure is refused as not sent, and th
     return true;
   });
   // The pipe's error is the operator's, in the log.
-  assert.ok(logged.some((line) => /^MCPL server "deaf-and-stubborn": \S+ not sent, since this host stopped using its stdio \(.*write EPIPE/.test(line)), logged.join('\n'));
+  assert.ok(logged.some((line) => /^MCPL server "deaf-and-stubborn": \S+ not sent, since this host stopped using the server's stdio \(.*write EPIPE/.test(line)), logged.join('\n'));
   const info = await within(closed, null, 10_000);
   assert.equal(info?.signal, 'SIGKILL', 'SIGKILL ended it');
-  assert.equal(info?.reason, 'child process exited, and this host had stopped using its stdio (write EPIPE)');
+  assert.equal(info?.reason, 'child process exited, and this host had stopped using the server\'s stdio (write EPIPE)');
   const outcome = await within(first, 'still waiting', 10_000);
   assert.ok(outcome instanceof McplRequestError, `the written request failed with the close: ${String(outcome)}`);
   assert.equal(outcome.outcome, 'no-response', 'it went out, so it may have run');
   assert.equal(outcome.message, 'The connection to the "deaf-and-stubborn" server closed before it answered, so whether the request ' +
     'took effect is unknown. Check its effect before trying again; this host is reconnecting to it.');
   // How it closed, and the request it left unanswered, are the operator's, in the log.
-  assert.ok(logged.some((line) => /^MCPL server "deaf-and-stubborn" disconnected \(.*signal=SIGKILL, reason=child process exited, and this host had stopped using its stdio \(write EPIPE\)\) with 1 request\(s\) unanswered: mcpl\/manifest/.test(line)), logged.join('\n'));
+  assert.ok(logged.some((line) => /^MCPL server "deaf-and-stubborn" disconnected \(.*signal=SIGKILL, reason=child process exited, and this host had stopped using the server's stdio \(write EPIPE\)\) with 1 request\(s\) unanswered: mcpl\/manifest/.test(line)), logged.join('\n'));
   assert.equal(await within(reconnected.then(() => 'reconnected'), 'no reconnect within 15 s', 15_000), 'reconnected');
 });
 
@@ -775,7 +775,7 @@ function longLineOnManifest(name: string, ignoreTerm: boolean): string {
   ].join('\n');
 }
 
-const LONG_LINE_REASON = 'child process exited, and this host had stopped using its stdio (a line on stdout longer than 65,536 UTF-16 code units)';
+const LONG_LINE_REASON = 'child process exited, and this host had stopped using the server\'s stdio (the server wrote a line on stdout longer than 65,536 UTF-16 code units)';
 
 test('a server that writes a line longer than the bound is ended at once, with no exit grace: a request in flight fails with the disconnect, the close names the line, and the connection reconnects', { timeout: 60_000 }, async (t) => {
   setStdioLineBoundForTests(65_536);
@@ -825,7 +825,7 @@ test('a request made after a line longer than the bound is refused as not sent, 
       'so nothing ran. This host is reconnecting to it; try again later.');
     return true;
   });
-  assert.ok(logged.some((line) => /^MCPL server "long-line-stubborn": \S+ not sent, since this host stopped using its stdio \(.*a line on stdout longer than 65,536 UTF-16 code units/.test(line)), logged.join('\n'));
+  assert.ok(logged.some((line) => /^MCPL server "long-line-stubborn": \S+ not sent, since this host stopped using the server's stdio \(.*the server wrote a line on stdout longer than 65,536 UTF-16 code units/.test(line)), logged.join('\n'));
   const info = await within(closed, null, 10_000);
   assert.deepEqual({ signal: info?.signal, reason: info?.reason }, { signal: 'SIGKILL', reason: LONG_LINE_REASON });
   const outcome = await within(first, 'still waiting', 10_000);
@@ -861,7 +861,7 @@ test("a legacy server whose stdin fails and whose child outlives SIGKILL is held
   void connection.sendManifestRequest(30_000).catch(() => {}); // its write meets EPIPE
   await within(new Promise<void>((resolve) => { connection.once('reconnect-failed', () => resolve()); }), null, 10_000);
   assert.deepEqual(order, [
-    'close: this host stopped using its stdio (write EPIPE), and its child outlived SIGKILL (holds its child: true)',
+    'close: this host stopped using the server\'s stdio (write EPIPE), and its child outlived SIGKILL (holds its child: true)',
     'reconnect-failed',
   ]);
   assert.equal(failures[0]!.permanent, true);

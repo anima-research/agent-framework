@@ -1452,7 +1452,7 @@ export class McplServerConnection extends EventEmitter {
       // is reported only once the caller has wired the transport, so it
       // reaches the connection as a loss, like any later one.
       const stopCause = transport.stdioStopCause;
-      if (stopCause) throw failed(`MCPL server "${config.id}": this host stopped using its stdio during the handshake (${stopCause.message})`);
+      if (stopCause) throw failed(`MCPL server "${config.id}": this host stopped using the server's stdio during the handshake (${stopCause.message})`);
 
       // Send `initialized` notification (no id)
       transport.writeLine(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }));
@@ -2194,7 +2194,7 @@ export class McplServerConnection extends EventEmitter {
               : "This host won't reconnect to it on its own. If you need it, ask whoever runs this host."),
           'not-sent',
         ),
-        `MCPL server "${this.id}": ${method} not sent, since this host stopped using its stdio (${logDetail(stopCause.message)})`,
+        `MCPL server "${this.id}": ${method} not sent, since this host stopped using the server's stdio (${logDetail(stopCause.message)})`,
       );
     }
 
@@ -2820,7 +2820,7 @@ export class McplServerConnection extends EventEmitter {
     transport.on('unreaped', (failure: Error) => {
       if (this.closed || this.transport !== transport) return;
       this.holdUnreaped(transport, failure);
-      lost({ reason: `this host stopped using its stdio (${transport.stdioStopCause?.message ?? 'an error'}), and its child outlived SIGKILL` });
+      lost({ reason: `this host stopped using the server's stdio (${transport.stdioStopCause?.message ?? 'an error'}), and its child outlived SIGKILL` });
       this.emit('reconnect-failed', { error: this.unreapedFailure(), attempt: Math.max(1, this.reconnectAttempts), permanent: true });
     });
   }

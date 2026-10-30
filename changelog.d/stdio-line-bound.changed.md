@@ -10,10 +10,12 @@
   client sets on the WebSocket path by default.
 - **The `agent-framework-mcp` command exits with code 1** when a line on its
   stdin is longer than the same bound, after one stderr line naming it.
-- **A stdio transport that stopped using its child's stdio now says so in
-  those words.** Where its messages said "its pipe failed with X" or "stdio
-  pipe failed with X", they now say "this host stopped using its stdio (X)".
-  A close's reason reads `child process exited, and this host had stopped
-  using its stdio (write EPIPE)`, and so do the `mcpl:server-closed` trace's
-  `reason` and the `mcpl-down` alert that quotes it. A host that matches the
-  old words needs the new ones.
+- **The words for a stdio server whose stdio this host stopped using have
+  changed.** Where this host's messages said "its pipe failed with X" or "stdio
+  pipe failed with X", they now say "this host stopped using the server's
+  stdio (X)". A close's reason reads `child process exited, and this host had
+  stopped using the server's stdio (write EPIPE)`, and so do the
+  `mcpl:server-closed` trace's `reason` and the `mcpl-down` alert that quotes
+  it. For a line past the bound, X is "the server wrote a line on stdout
+  longer than 104,857,600 UTF-16 code units". A host that matches the old
+  words needs the new ones.

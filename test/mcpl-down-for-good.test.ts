@@ -474,11 +474,11 @@ test('a connected server whose child the transport ends after a pipe failure is 
     await waitFor(`the loss: ${engine}`, () => traces.some((event) => event.type === 'mcpl:server-closed'));
     const closed = traces.find((event) => event.type === 'mcpl:server-closed');
     assert.equal(closed?.signal, 'SIGTERM', engine);
-    assert.match(String(closed?.reason), /^child process exited, and this host had stopped using its stdio \(/, engine);
+    assert.match(String(closed?.reason), /^child process exited, and this host had stopped using the server's stdio \(/, engine);
     await waitFor(`the alert: ${engine}`, () => downAlerts(traces).length > 0);
     const alerts = downAlerts(traces);
     assert.equal(alerts.length, 1, `${engine}: ${JSON.stringify(alerts)}`);
-    assert.match(String(alerts[0]!.message), /closed \(child process exited, and this host had stopped using its stdio \(.+\), signal SIGTERM\), and this host won't reconnect it on its own$/, engine);
+    assert.match(String(alerts[0]!.message), /closed \(child process exited, and this host had stopped using the server's stdio \(.+\), signal SIGTERM\), and this host won't reconnect it on its own$/, engine);
   }
 });
 
@@ -497,13 +497,13 @@ test('a connected server whose child the transport ends after a line on stdout l
     const closed = traces.find((event) => event.type === 'mcpl:server-closed');
     assert.deepEqual(
       { signal: closed?.signal, reason: closed?.reason },
-      { signal: 'SIGTERM', reason: 'child process exited, and this host had stopped using its stdio (a line on stdout longer than 65,536 UTF-16 code units)' },
+      { signal: 'SIGTERM', reason: 'child process exited, and this host had stopped using the server\'s stdio (the server wrote a line on stdout longer than 65,536 UTF-16 code units)' },
       engine,
     );
     await waitFor(`the alert: ${engine}`, () => downAlerts(traces).length > 0);
     const alerts = downAlerts(traces);
     assert.equal(alerts.length, 1, `${engine}: ${JSON.stringify(alerts)}`);
-    assert.equal(alerts[0]!.message, `${engine === 'legacy' ? 'MCPL' : 'MCP'} server closed (child process exited, and this host had stopped using its stdio (a line on stdout longer than 65,536 UTF-16 code units), signal SIGTERM), and this host won't reconnect it on its own`, engine);
+    assert.equal(alerts[0]!.message, `${engine === 'legacy' ? 'MCPL' : 'MCP'} server closed (child process exited, and this host had stopped using the server's stdio (the server wrote a line on stdout longer than 65,536 UTF-16 code units), signal SIGTERM), and this host won't reconnect it on its own`, engine);
   }
 });
 
@@ -574,7 +574,7 @@ test('a server whose child dies by SIGTERM after the host\'s write to it failed 
       await waitFor('its reap', () => !servers.has(id));
     }
     const closed = traces.find((event) => event.type === 'mcpl:server-closed');
-    seen.push({ engine, signal: closed?.signal, writeFailed: /this host had stopped using its stdio/.test(String(closed?.reason)), alerts: downAlerts(traces).length, posted: posted.length });
+    seen.push({ engine, signal: closed?.signal, writeFailed: /this host had stopped using the server's stdio/.test(String(closed?.reason)), alerts: downAlerts(traces).length, posted: posted.length });
   }
   assert.deepEqual(seen, [
     { engine: 'legacy', signal: 'SIGTERM', writeFailed: true, alerts: 0, posted: 0 },

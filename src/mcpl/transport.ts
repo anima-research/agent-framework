@@ -337,7 +337,7 @@ export class StdioTransport extends McplTransport {
 
     this.stopLines = readLines(stdout, {
       line: (line) => this.pushLine(line),
-      tooLong: (maxChars) => this.stopStdio(new Error(`a line on stdout longer than ${maxChars.toLocaleString('en-US')} UTF-16 code units`), false),
+      tooLong: (maxChars) => this.stopStdio(new Error(`the server wrote a line on stdout longer than ${maxChars.toLocaleString('en-US')} UTF-16 code units`), false),
     }, testLineBound);
 
     // Stitch stderr chunks into whole lines (a chunk can split a line, and a
@@ -393,7 +393,7 @@ export class StdioTransport extends McplTransport {
     this.child.on('exit', (code, signal) => this.markClosed({
       code,
       signal,
-      reason: this.stopCause ? `child process exited, and this host had stopped using its stdio (${this.stopCause.message})` : 'child process exited',
+      reason: this.stopCause ? `child process exited, and this host had stopped using the server's stdio (${this.stopCause.message})` : 'child process exited',
       ...(this.endedChild ? { pipeFailed: true } : {}),
     }));
   }
