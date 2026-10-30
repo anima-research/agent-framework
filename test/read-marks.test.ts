@@ -136,6 +136,35 @@ describe('read marks', () => {
     } finally { r.cleanup(); }
   });
 
+  // Where the cut at the head keeps the whole window, the mark's length is
+  // the index length (the ordinal the next row takes), not the window's row
+  // count: once a row before the head has left the window (an undo, a
+  // retraction), it leaves a hole at its ordinal, the rows after it keep
+  // theirs, and a count of the rows present falls below the last one's.
+  for (const how of ['retracted', 'undone'] as const) {
+    it(`a legacy mark read after the write-down still covers the window's last row once a row before its head is ${how}, as a presented mark taken then would`, async () => {
+      const r = await rig();
+      try {
+        const add = (t: string) => r.cm.addMessage('user', text(t));
+        const [a, b, c] = [add('a'), add('b'), add('c')];
+        const mark = readMarkOf(r.cm)!;
+        r.cm.presentRows([]);
+        r.cm.retractRows([a], how === 'undone' ? { undone: true } : undefined);
+        assert.equal(r.cm.windowStatusOf(a), how === 'undone' ? 'undone' : 'out', `premise: a is ${how}`);
+        assert.ok(r.cm.presentedLength() <= r.cm.ordinalOf(c)!, `premise: the window holds fewer rows than c's ordinal (${r.cm.presentedLength()} rows, c at ${r.cm.ordinalOf(c)})`);
+        assert.ok(r.cm.indexLength() > r.cm.ordinalOf(c)!, 'and the index length is past it');
+        const presentedNow = readMarkOf(r.cm)!;
+        const d = add('d, stored after the mark');
+        const reads = (m: ReadMark) => [a, b, c, d].map((id) => covers(m, r.cm, r.row(id)));
+        assert.deepEqual(reads(mark), ['not-covered', 'covered', 'covered', 'not-covered'], `${how} a is out; b and c, before the head, are covered; d, after it, isn't`);
+        assert.deepEqual(reads(mark), reads(presentedNow), 'as a mark taken in presented mode then reads');
+        r.cm.presentRows([d]);
+        assert.deepEqual(reads(mark), ['not-covered', 'covered', 'covered', 'not-covered'], 'd presented: still not covered');
+        assert.deepEqual(reads(mark), reads(presentedNow));
+      } finally { r.cleanup(); }
+    });
+  }
+
   it("a legacy mark's reading of a presented window reads where the window holds a row a few times per test, whatever the window's length", async () => {
     const r = await rig();
     try {
