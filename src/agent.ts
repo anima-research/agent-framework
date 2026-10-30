@@ -32,6 +32,7 @@ import {
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
 } from './tool-result-history.js';
+import { appendAll } from './append-all.js';
 
 export interface ActivationRequestOptions {
   /** The silent heartbeat tick this request answers, if any. */
@@ -721,7 +722,7 @@ export class Agent {
       return await this.compileAtLiveBudgetNoting(compile, started);
     } finally {
       this.compilesRunning.delete(started);
-      const earliest = Math.min(...this.compilesRunning);
+      const earliest = [...this.compilesRunning].reduce((min, start) => Math.min(min, start), Infinity);
       for (const [budget, start] of this.latestEndedStart) {
         if (start < earliest) this.latestEndedStart.delete(budget);
       }
@@ -1753,7 +1754,7 @@ export class Agent {
       // inferring, sends the same ones.
       unguardedResults ??= this._state.status === 'ready' && !guardedResults
         ? this.buildToolResultMessages(this._state.toolResults) : [];
-      messages.push(...unguardedResults);
+      appendAll(messages, unguardedResults);
       return {
         messages: this.toolResultGuard.prepareRequest(messages, true),
         system: this.buildSystemPrompt(systemInjections),

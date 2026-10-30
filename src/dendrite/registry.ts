@@ -20,6 +20,7 @@ import type {
   HeldMail,
   RegistrySnapshot,
 } from './types.js';
+import { appendAll } from '../append-all.js';
 
 /** Thrown for a spec the registry refuses to load. */
 export class AgentSpecError extends Error {
@@ -427,8 +428,9 @@ export class AgentRegistry {
       if (!this.live.has(child.name)) continue; // ended by an earlier cascade
       if (child.onParentEnd === 'end') {
         const inner = this.endRecursive(child, 'parent-ended', record.name);
-        cascaded.push(...inner.cascaded, inner.ended);
-        orphaned.push(...inner.orphaned);
+        appendAll(cascaded, inner.cascaded);
+        cascaded.push(inner.ended);
+        appendAll(orphaned, inner.orphaned);
       } else {
         const candidates = adopters.filter((candidate) => candidate !== child.name);
         child.orphaned = { since: this.now(), formerParent, reason, candidates };

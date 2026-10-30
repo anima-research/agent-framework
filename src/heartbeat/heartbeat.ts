@@ -603,7 +603,7 @@ export class Heartbeat {
     this.cancelReminders?.();
     this.cancelReminders = null;
     if (!this.started || this.state.reminders.length === 0) return;
-    const due = Math.min(...this.state.reminders.map(dueAt));
+    const due = this.state.reminders.reduce((min, rem) => Math.min(min, dueAt(rem)), Infinity);
     this.cancelReminders = callAt(Math.max(due, this.notBefore), this.now, () => {
       this.cancelReminders = null;
       this.fireDueReminders();
