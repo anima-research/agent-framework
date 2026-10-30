@@ -23,21 +23,23 @@
     was held, rather than as an exhaustion within seconds. Wakes that arrive
     while it waits join it: the held list has no bound, and how large a long
     wait makes it hasn't been measured. The refused attempt emits
-    `inference:failed`, the turn's next start emits `inference:started`
-    again, and new traces `inference:held` and `inference:hold_ended` come
-    between.
+    `inference:failed`, as an attempt a provider hold keeps does, and then the
+    new trace `inference:held`; `inference:hold_ended` follows when the hold
+    ends, and the turn's next start emits `inference:started` again.
     `healthSnapshot()` gives each agent's `budgetHold` (or null).
-  - The `context-refusal` ops alert goes out when the hold starts, unless an
-    `inference:held` listener has already ended it (a turn held again after a
-    release raises none, and logs a `[budget-hold]` line saying so), and once
-    more at the first check after the hold has
-    waited an hour that keeps it held, the hour after which stated provider
-    waits in a row alert too (its `ops:alert` trace each time,
-    its webhook post at most once per 15 minutes for an agent). Each says the
-    turn runs once a check finds its context fits its budget, followed by
-    context-manager's own description of its pending work as of then. A hold's
-    first drain kick logs as `[budget-hold]`, and a later one only when it
-    stops early or fails.
+  - A held turn raises no ops alert, since it goes on. Before, the refused
+    compile's exhaustion raised `context-refusal`; a hold that ends without a
+    fit and whose turn's compile is refused again still does. The hold's start
+    logs a `[budget-hold]` line, unless an `inference:held` listener has
+    already ended it, saying the turn runs once a check finds its context fits
+    its budget, followed by context-manager's own description of its pending
+    work, and a turn held again after a release logs a line saying so. A
+    compression call that fails in a tick the hold drives raises
+    `context-maintenance-failed` for the agent, as one in a maintenance pass
+    does, logged and alerted again only when its text changes or once the
+    alert's cooldown has passed. The hold's first drive of compression logs as
+    `[budget-hold]` with its tick count, and a later one only when it stops
+    early or fails.
 - **Agents:** the turn's next start once its hold ends, with a fit or without,
   stores a note in the agent's history saying why it waited, where the turn
   reads it, as an `afterUser` context injection is stored (while the window is
