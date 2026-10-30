@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MembraneError } from '@animalabs/membrane';
 import type { ContentBlock, NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
-import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
+import type { EventResponse, InferenceRequest, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { bindAsConversationFork } from './helpers/dendrite.js';
@@ -507,6 +507,49 @@ test('providerHold is consulted before the built-in acceleration classification'
     assert.equal(admission.cooldownReason, 'weekly quota spent');
     assert.equal(admission.hostHold, true);
   } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// About twice the most a spread can pass as call arguments on Node 24.22.1
+// (between 124,887 and 125,498 elements).
+const HELD_PAST_A_SPREAD = 250_000;
+
+test('a provider hold releases a held list longer than a spread can pass: the turn starts once and takes every held wake', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'af-provider-cooldown-'));
+  const membrane = new AccelerationThenSuccessMembrane();
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
+    agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system' }],
+    modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+  });
+  const internal = framework as unknown as {
+    providerAccelerationDefaultCooldownMs: number;
+    providerAccelerationJitterMs: number;
+    providerAccelerationCooldowns: Map<string, { heldRequests: InferenceRequest[] }>;
+  };
+  internal.providerAccelerationDefaultCooldownMs = 1_000;
+  internal.providerAccelerationJitterMs = 0;
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  try {
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'first', metadata: {} });
+    await framework.runUntilIdle();
+    const held = internal.providerAccelerationCooldowns.get('resident')?.heldRequests;
+    assert.ok(held && held.length === 1, 'premise: the hold holds the turn the provider refused');
+    const since = held[0]!.timestamp;
+    for (let i = 1; i <= HELD_PAST_A_SPREAD; i++) held.push({ agentName: 'resident', reason: 'external-message', source: 'test', timestamp: since + i });
+    held.at(-1)!.wakeLines = [{ entry: { eventType: 'external-message', messageId: 'newest' }, policyNames: ['test'], shown: '#held-newest', at: since }];
+    assert.equal(framework.getHostModeStatus().gatedRequests, HELD_PAST_A_SPREAD, 'premise: every held wake waits');
+
+    t.mock.timers.tick(1_000);
+    await waitFor(framework, () => membrane.calls.length >= 2, 'the turn the release starts');
+    await framework.runUntilIdle();
+    assert.equal(membrane.calls.length, 2, 'one turn takes every held wake');
+    assert.ok(JSON.stringify(membrane.calls[1]).includes('in #held-newest '), "the newest held wake's line reaches the turn");
+    assert.equal(framework.getHostModeStatus().gatedRequests, 0, 'no held wake is left waiting');
+  } finally {
+    t.mock.timers.reset();
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
   }
