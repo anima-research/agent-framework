@@ -23,16 +23,23 @@
     compression pending, a message added, edited or removed (other than the
     arrival of a stored context injection, the hold's own note among them,
     or of a clock row), the agent's runtime settings, or the budget its next
-    compile plans at. A turn released and refused again is held again with
-    its first deadline, and isn't released again until one of those
-    changes.
-  - **When it ends without a fit:** 30 minutes after the refusal that started
-    it, or at once when compression has nothing pending. The turn then runs
-    if its context fits by then, and otherwise its refusal takes the error
-    policy's path, as a refused compile did, its reason saying when it was
-    first held. The 30 minutes also bound a compression that is pending but
-    doesn't move. The hold lives in memory: a restart drops it, and the
-    agent's next wake compiles afresh.
+    compile plans at. A turn released and refused again is held again, as of
+    the refusal that first held it, and isn't released again until one of
+    those changes.
+  - **When it ends without a fit:** once compression has nothing pending and
+    the context still doesn't fit. The turn then compiles once more: it runs
+    if that compile fits, and otherwise its refusal takes the error policy's
+    path, as a refused compile did, its reason saying when it was first
+    held. The hold has no time limit, since the turn can't run before its
+    context fits. Compression can stay pending
+    without moving: with context-manager 0.24.1, when every compression call
+    fails, as in an outage of its model's provider or with bad credentials,
+    it tries again every 10 minutes and decides nothing, and after a stated
+    wait it can't hold as an instant it makes no call until a restart, a
+    change of model or a release. The turn stays held through that and runs
+    once compression lands and the context fits. `releaseProviderWait()`
+    offers its release to the compression lane too. The hold lives in
+    memory: a restart drops it, and the agent's next wake compiles afresh.
   - **Undo:** a hold adds no undo step. When the refused start recorded a
     checkpoint, as a turn's first start does, the start the hold releases
     moves it to after the messages that arrived while the turn waited, so
