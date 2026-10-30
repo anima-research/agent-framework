@@ -1477,6 +1477,7 @@ interface TurnRouting {
   lastEnvelopeBounced?: boolean;
   /** Successful plain-prose destinations in delivery order; deduped by the receipt. */
   deliveries: ChannelRef[];
+  /** Plain-prose segments the turn suppressed without drafts (proseRouting=disabled, or a round withheld before its scripts returned: ScriptRound.withhold), reported by its receipt. */
   suppressed: number;
   /**
    * Drafts held during the turn (src/prose-drafts.ts), which its receipt
@@ -1749,7 +1750,9 @@ interface ScriptRound {
    * newer round of the same agent name replaced it. Whether a script would
    * have silenced the round is unknown, and a skip_reply's silence would
    * keep its prose private, so it is neither sent nor held as a draft. A log
-   * line names it. The sends it has made still count
+   * line names it, and in locus and hybrid mode the turn's delivery receipt
+   * counts its segments as suppressed: a turn that a later stream continues
+   * writes its receipt after the withhold. The sends it has made still count
    * for the turn's later speech. A round whose routing no longer waits on a script,
    * one that waits only on its sends or whose scripts returned while its
    * turn waited, is routed instead, a send that hasn't answered counting as
@@ -20039,6 +20042,7 @@ export class AgentFramework {
     return stamps;
   }
 
+  /** Record plain-prose segments this turn suppressed without drafts (proseRouting=disabled, or a round withheld before its scripts returned). */
   private recordProseSuppression(routing: TurnRouting, count: number): void {
     if (count <= 0) return;
     routing.suppressed += count;
@@ -21100,7 +21104,9 @@ export class AgentFramework {
       notes.push(`${keptCount} plain-speech segment(s) kept private (${why})`);
     }
     if (suppressed > 0) {
-      notes.push(`${suppressed} plain-speech segment(s) kept in the transcript (proseRouting=disabled — post to a channel only with an explicit send tool)`);
+      notes.push(agent.proseRouting === 'disabled'
+        ? `${suppressed} plain-speech segment(s) kept in the transcript (proseRouting=disabled — post to a channel only with an explicit send tool)`
+        : `${suppressed} plain-speech segment(s) suppressed`);
     }
     const suppressedNote = notes.join(' · ');
     // Nothing is confirmed delivered, but an unconfirmed draft (or a dismissed
@@ -25423,6 +25429,7 @@ export class AgentFramework {
                   console.error(
                     `[routing] ${agent.name}: round [${roundToolNames.join(', ')}] -> ${roundSegments.length} prose segment(s) withheld: ${why}`,
                   );
+                  this.recordProseSuppression(streamRouting, roundSegments.length);
                 },
               };
               this.scriptRounds.set(agent.name, round);
