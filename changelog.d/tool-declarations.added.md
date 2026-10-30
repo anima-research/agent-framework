@@ -42,6 +42,10 @@
   the mapping that ran. The subconscious no longer copies its resident's
   `selfParticipants` and `presentAs`: its resident's former-name turns read
   as another's, as its current ones already did.
+- A subconscious on another model than its resident, as the persistent
+  reader or as a reader fork, declares its tools and system text on its
+  head, whatever the resident's `toolDeclarations`. A reader fork on the
+  resident's own model keeps the resident's setting.
 - kv-unified's immutable-prefix hash takes an agent's tools as the wire
   carries them, leaving out a field whose value is undefined, as membrane's
   request does, where it wrote such a field as null. A host whose tool
