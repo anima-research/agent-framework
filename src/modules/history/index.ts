@@ -51,6 +51,7 @@ import type { SearchWorkerMessage, SearchWorkerMatch } from './search-regex-work
 import type { ChannelRegistry } from '../../mcpl/channel-registry.js';
 import { EmbedServiceError, SemanticIndexClient, SemanticIndexer, messageIndexText, parseSummaryKey, summaryIndexText, type SearchResponse, type SemanticIndexConfig, type SyncReport, type PendingChanges, type SyncCursors } from './semantic.js';
 import { unknownToolMessage } from '../unknown-tool.js';
+import { speechOf } from '../../send-tools.js';
 import { safeSlice } from '../../safe-slice.js';
 
 // ============================================================================
@@ -695,7 +696,9 @@ export class HistoryModule implements Module {
         description:
           'Fetch raw, uncompressed messages for a time range and/or channel, paginated oldest-first. ' +
           'Use after `stats` to pull the actual content. format:"text" flattens each message to a short ' +
-          'readable string (tool_use/tool_result/thinking/images rendered as bracketed labels); ' +
+          'readable string (a call of a tool the framework names for sending, editing or saying a message, such as ' +
+          'send_message, as its name and its words when it carries words, such as "[telegram--send_message] …"; ' +
+          'other tool_use/tool_result/thinking/images as bracketed labels); ' +
           'format:"raw" returns the content blocks unmodified. ' +
           'Two extra modes: (1) aroundId — pass a message id (e.g. from `search`) to get the conversation ' +
           'around it: `before` messages before it, the message itself (anchor:true), and `after` messages ' +
@@ -2452,9 +2455,10 @@ function projectMessage(msg: StoredMessage, format: 'text' | 'raw'): Record<stri
 }
 
 /** Flatten a message's content blocks to one short, readable string. Text
- *  blocks verbatim; everything else (tool_use/tool_result/thinking/media) as
- *  a short bracketed label — this is for agent readability and search
- *  matching, not byte-faithful reconstruction. */
+ *  blocks verbatim; a speech tool's call (send-tools.ts) as its name and
+ *  words; everything else (tool_use/tool_result/thinking/media) as a short
+ *  bracketed label — this is for agent readability and search matching, not
+ *  byte-faithful reconstruction. */
 function flattenContent(content: ContentBlock[]): string {
   return content.map(blockLabel).join(' ').trim();
 }
@@ -2463,8 +2467,10 @@ function blockLabel(block: ContentBlock): string {
   switch (block.type) {
     case 'text':
       return block.text;
-    case 'tool_use':
-      return `[tool_use: ${block.name}]`;
+    case 'tool_use': {
+      const said = speechOf(block.name, block.input);
+      return said ? `[${block.name}] ${said.words}` : `[tool_use: ${block.name}]`;
+    }
     case 'tool_result':
       return block.toolName ? `[tool_result: ${block.toolName}]` : '[tool_result]';
     case 'thinking':
