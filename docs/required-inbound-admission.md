@@ -55,10 +55,12 @@ Without a backlog, independently sent live items still run admission concurrentl
 callback latency can reorder them. Items within a channel batch remain sequential.
 A pause during a running preflight still refuses that item.
 Required connections never advertise `toolHints`, even if `toolHints: true` is
-configured. Under RFC-014 §6.3 the peer must not send hints and should tailor
+configured. That explicit combination logs one diagnostic at connect (not on
+automatic transport retries); it is not a configuration error. Under RFC-014 §6.3 the peer must not send hints and should tailor
 its inventory to a hint-less host. No RFC-014 controller is installed by the
-framework for these connections. Transport read taps and solicited `tools/*` /
-`toolsets/*` result bookkeeping are not suppressed by admission.
+framework for these connections, so they carry no RFC-014 toolset presence. The
+generic transport result tap is preserved; the framework does not use it for
+`toolsets/*` state on required connections.
 Peers need no retry for host-internal staging or quiesce. A verdict is
 not a delivery receipt: existing content checks and downstream failures still
 apply; already admitted siblings are not rolled back.

@@ -33420,6 +33420,9 @@ export class AgentFramework {
     // and the read tap agree though the state hintsFor reads can change
     // across the awaits below.
     const hints = this.hintsFor(config);
+    if (config.inboundAdmission !== undefined && config.toolHints === true) {
+      console.error(`[mcpl] ${logValue(config.id)}: toolHints: true is disabled by inboundAdmission; connecting without hint support`);
+    }
     try {
       // RFC-014: a hinted server's meta-tools exist before it connects.
       if (hints) await this.ensureToolsetsModule();

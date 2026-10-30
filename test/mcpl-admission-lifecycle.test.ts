@@ -353,7 +353,7 @@ for (const required of [true, false]) test(`solicited results: required=${requir
   assert.equal(taps, 1);
 });
 
-test('required solicited lists retain their bookkeeping tap and adopt toolsets/list results', async t => {
+test('required generic result taps remain usable by an explicitly attached controller scaffold', async t => {
   const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
   await once(wss, 'listening');
   let rev = 0;
