@@ -459,6 +459,16 @@ export class McplServerConnection extends EventEmitter {
   transportEpoch = 0;
   readonly requiredAdmission?: RequiredAdmission;
   private readonly admissionRefusals = new AdmissionRefusals();
+  private requiredFlushActive = false;
+  private requiredFlushItem?: HeldItem;
+  private requiredFlushCompletion?: Promise<void>;
+
+  /** @internal The contained framework handler supplies completion for the
+   * currently flushed item, including notifications and whole channel batches. */
+  trackHeldHandler(params: unknown, completion: void | Promise<void>): void {
+    if (this.requiredFlushItem && this.requiredFlushItem.args[0] === params) this.requiredFlushCompletion = completion || undefined;
+  }
+
   private readonly admissionEpochs = new WeakMap<object, number>();
   private readonly admissionReceipts = new WeakMap<object, RequiredIngress>();
 
@@ -855,7 +865,7 @@ export class McplServerConnection extends EventEmitter {
     this.droppedKeptRequests = 0;
     if (pending.length > 200) {
       console.error(
-        `[mcpl] ${this.id}: flushing ${pending.length} buffered event(s) synchronously ` +
+        `[mcpl] ${this.id}: flushing ${pending.length} buffered event(s) ${this.requiredAdmission ? 'sequentially' : 'synchronously'} ` +
         `(long pause backlog${dropped > 0 ? `; ${dropped} dropped at cap` : ''})`,
       );
     }
@@ -881,6 +891,16 @@ export class McplServerConnection extends EventEmitter {
    * need no grant and go on.
    */
   private flushHeld(snapshot: HeldItem[]): void {
+    if (this.requiredAdmission) {
+      // Keep the backlog in the ordinary bounded hold buffer across awaits,
+      // so pause, repeated ready(), and transport boundaries retain ownership.
+      this.replaceHeld(McplServerConnection.admissionOrder([...snapshot, ...this.bufferedEvents]));
+      if (!this.requiredFlushActive) {
+        this.requiredFlushActive = true;
+        void this.flushRequiredHeld().catch(error => this.reportInboundFailure(error, {}));
+      }
+      return;
+    }
     const waits = (item: HeldItem) => item.kept === true && McplServerConnection.WORLD_EVENTS.has(item.event);
     let pending = snapshot;
     if (!this.isConnected && snapshot.some(waits)) {
@@ -901,6 +921,44 @@ export class McplServerConnection extends EventEmitter {
       else this.dispatchInboundEvent(event, ...args);
     }
   }
+
+  /** Required backlogs release one complete data handler at a time. Control
+   * traffic and RPC responses stay live; new data joins the bounded backlog. */
+  private async flushRequiredHeld(): Promise<void> {
+    try {
+      while (!this.closedForGood) {
+        const index = this.bufferedEvents.findIndex(item => this.planeReadyFor(item.event)
+          && !(item.kept && McplServerConnection.WORLD_EVENTS.has(item.event) && !this.isConnected));
+        if (index < 0) return;
+        const item = this.bufferedEvents[index]!;
+        if (McplServerConnection.REQUIRED_DATA_EVENTS.has(item.event)) {
+          // Pre-pause live callbacks may still own all slots. A flush waits
+          // rather than manufacturing an overload refusal from held work.
+          const capacity = this.requiredAdmission!.waitForCapacity();
+          if (capacity) { await capacity; continue; }
+        }
+        this.replaceHeld(this.bufferedEvents.filter((_, i) => i !== index));
+        const ended = this.transportEnded.signal;
+        this.requiredFlushItem = item;
+        this.requiredFlushCompletion = undefined;
+        try { this.dispatchInboundEvent(item.event, ...item.args); }
+        finally { this.requiredFlushItem = undefined; }
+        const completion = this.requiredFlushCompletion;
+        this.requiredFlushCompletion = undefined;
+        if (completion && !ended.aborted) {
+          let release!: () => void;
+          const boundary = new Promise<void>(resolve => { release = resolve; });
+          ended.addEventListener('abort', release, { once: true });
+          try { await Promise.race([completion, boundary]); }
+          finally { ended.removeEventListener('abort', release); }
+        }
+      }
+    } finally {
+      this.requiredFlushActive = false;
+    }
+  }
+
+  private static readonly REQUIRED_DATA_EVENTS = new Set(['channels-incoming', 'push-event', 'inference-request']);
 
   /** Whether the plane an event belongs to is open (lifecycle events always
    *  pass), as the admission gate (emit) decides it. */
@@ -1038,6 +1096,10 @@ export class McplServerConnection extends EventEmitter {
    */
   override emit(event: string | symbol, ...args: unknown[]): boolean {
     const name = typeof event === 'string' ? event : '';
+    if (this.requiredAdmission && this.requiredFlushActive && McplServerConnection.REQUIRED_DATA_EVENTS.has(name)
+      && !(this.requiredFlushItem?.event === name && this.requiredFlushItem.args[0] === args[0])) {
+      return this.hold(name, args);
+    }
     if (this.planeReadyFor(name)) {
       // Positive-grant admission (§5.4/§14.1), at the single choke-point
       // every path shares: live routing AND buffer flushes re-enter here, so

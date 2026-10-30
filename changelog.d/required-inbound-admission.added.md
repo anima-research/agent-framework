@@ -3,7 +3,10 @@
   requests are authorized before an asynchronous, fail-closed host callback.
   Unconfigured connections retain their existing behaviour without a preflight.
   Required traffic is held during startup staging and quiesce, then admitted at
-  flush; superseded-epoch items are refused. During initialize, data requests
+  flush sequentially, preserving held-data order without overflowing admission
+  slots. New data joins an active drain; controls and RPC responses stay live.
+  Independently sent live items without a backlog may still finish in callback
+  latency order. Superseded-epoch items are refused. During initialize, data requests
   receive the existing capability error (-32002). Required connections do not
   advertise `toolHints`, and refuse coalescing with `admission_unsupported` until
   durable re-admission is supported; solicited result taps remain intact.

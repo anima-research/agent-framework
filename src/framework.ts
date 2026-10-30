@@ -34664,6 +34664,7 @@ export class AgentFramework {
     event: string,
     handler: (params: T, responder?: InboundResponder) => void | Promise<void>,
     recorded: (text: unknown) => string = asText,
+    trackCompletion?: (params: T, completion: Promise<void>) => void,
   ): (params: T, responder?: InboundResponder) => void {
     return (params: T, responder?: InboundResponder) => {
       // Whether the handler wrote a reply. A reply counts once its write
@@ -34808,11 +34809,12 @@ export class AgentFramework {
           // and logs it on a line of its own, printed through log-value as
           // the report's line is. Nothing catches the backstop, so a failure
           // of its own log is swallowed.
-          void Promise.resolve(result).then(succeeded, failed).catch((reportFailure: unknown) => {
+          const completion = Promise.resolve(result).then(succeeded, failed).catch((reportFailure: unknown) => {
             try {
               console.error(`[mcpl] ${serverId} ${event}: the handler failure's report threw: ${logDetail(describeCause(reportFailure))}`);
             } catch { /* nothing is left to log it to */ }
           });
+          trackCompletion?.(params, completion);
         } else succeeded();
       } catch (error) {
         failed(error);
@@ -34836,7 +34838,10 @@ export class AgentFramework {
       event: string,
       handler: (params: T, responder?: Responder) => void | Promise<void>,
     ): void => {
-      connection.on(event, this.containedInboundHandler(connection.id, event, handler, recorded));
+      const trackCompletion = connection.requiredAdmission && ['push-event', 'channels-incoming', 'inference-request'].includes(event)
+        ? (params: T, completion: Promise<void>) => connection.trackHeldHandler(params, completion)
+        : undefined;
+      connection.on(event, this.containedInboundHandler(connection.id, event, handler, recorded, trackCompletion));
     };
 
     // Forward subprocess stderr lines as trace events so consumers (conhost,
