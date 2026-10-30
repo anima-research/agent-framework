@@ -1480,8 +1480,7 @@ export class Agent {
    * head a mark pendingWatermark takes keeps): a message stored on that
    * branch later has a larger sequence. Sequences are numbered per branch, so
    * one compares with another only on the same branch. A record sequence, not
-   * a place in the agent's window (#291): for the reasoning-loss notice,
-   * which tells this turn's stored replies from earlier ones.
+   * a place in the agent's window (#291).
    */
   branchHead(): { branch: string; sequence: number } | undefined {
     const sequence = storeHeadOf(this.contextManager);
@@ -1576,9 +1575,8 @@ export class Agent {
   /**
    * A host's hook, called with each committing compile's `thinkingStrip` (never a dry run's) and the key of the
    * branch it read (`branchKey`), as the compile returns, whether or not its request is then sent, since the
-   * context manager's binding record takes the strip either way. One that throws is logged. The framework sets it
-   * at the agent's first stream unless a host has set one, so a host's own observer stands in for the framework's,
-   * whose `[reasoning]` line for the agent then isn't told.
+   * context manager's binding record takes the strip either way. One that throws is logged. The framework sets none
+   * of its own, and tells the agent nothing of a strip.
    */
   onThinkingStrip?: (strip: ThinkingStrip, branch: string) => void;
 

@@ -216,7 +216,6 @@ import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type StreamThinkingDrops } from './thinking-drops.js';
 import { asNextRequestCarries, roundRows, type RoundRow, type SentRow } from './sent-rows.js';
-import { ReasoningLossTeller } from './reasoning-loss.js';
 import { AgentPresentation, asCompiled, bearingOf, heldFromResidents, isInjectableMidTurn, observesOwnRows, readerFacts, recordedReaderFacts, type PresentationOccasion, type ReaderFacts } from './presentation.js';
 import { coverTest, covers, readMarkThrough, type MarkedRow, type ReadMark } from './read-marks.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
@@ -4195,7 +4194,6 @@ export class AgentFramework {
    * next turn.
    */
   private turnRouting: Map<string, TurnRouting> = new Map();
-  private readonly reasoningLoss = new ReasoningLossTeller();
   /**
    * The latest link of each agent's chain of queued prose deliveries. Every
    * stream queues its own behind it, a fresh turn's included, so the agent's
@@ -12349,7 +12347,6 @@ export class AgentFramework {
     this.freshCallsCut.delete(name);
     this.forgetFailureAccounting(name);
     this.thinkingLossIncidents.forget(name);
-    this.reasoningLoss.forget(name);
     // main's manager release: the context manager an ephemeral run or a fork
     // opened is released with the agent (releaseManager).
     this.releaseManager(agent);
@@ -13214,7 +13211,6 @@ export class AgentFramework {
         this.freshCallsCut.delete(agent.name);
         if (run.endedFromOutside) this.forgetFailureAccounting(agent.name);
         this.thinkingLossIncidents.forget(agent.name);
-        this.reasoningLoss.forget(agent.name);
         // Its pending self-wake ends with it, as a fork's does.
         this.eventGate?.agentGone(agent.name);
         this.releaseWindowNowOrAfterResume(agent);
@@ -19240,7 +19236,6 @@ export class AgentFramework {
       this.freshCallsCut.delete(agentName);
       this.forgetFailureAccounting(agentName);
       this.thinkingLossIncidents.forget(agentName);
-      this.reasoningLoss.forget(agentName);
       // A continuation of its turn still on its way goes with it.
       this.dropContinuations(agentName, { kind: 'dropped', why: 'its agent was disposed' });
       this.turnRouting.delete(agentName);
@@ -23516,25 +23511,6 @@ export class AgentFramework {
     this.writeChannelNotices(this.channelOpenedNotices(agentName, serverId, channels, cause), `auto-open notice (${cause})`, 'recordChannelAutoOpenNotice');
   }
 
-  private tellReasoningLoss(agent: Agent, make: () => string | undefined): void {
-    if (this.agents.get(agent.name) !== agent) return;
-    let line: string | undefined;
-    try {
-      line = make();
-    } catch (err) {
-      console.error(`[reasoning] ${agent.name}: could not tell what reasoning was lost:`, err);
-      return;
-    }
-    if (!line) return;
-    try {
-      this.addMessage('user', [{ type: 'text', text: line }], { system: true, kind: 'reasoning-loss' } as MessageMetadata, { forAgent: agent.name });
-    } catch (err) {
-      console.error(`[reasoning] ${agent.name}: the line for lost reasoning could not be stored:`, err);
-      return;
-    }
-    console.error(`[reasoning] ${agent.name}: told of reasoning no longer in its context`);
-  }
-
   /**
    * Write a builder's channel notices in order, each on its own: one that
    * can't be written is logged, and the rest are still written. A reader's
@@ -25839,10 +25815,6 @@ export class AgentFramework {
         const hub = this.toolsetHub;
         const name = agent.name;
         agent.onCompiledToSend = (messages) => hub.observeCompile(name, messages);
-      }
-      if (!agent.onThinkingStrip) {
-        agent.onThinkingStrip = (strip, branch) => this.tellReasoningLoss(agent, () => this.reasoningLoss.forStrip(
-          agent.name, branch, strip, (this.activeTurnTokens.has(agent.name) && this.turnRouting.get(agent.name)) || {}, agent.getContextManager()));
       }
 
       // Module gatherContext (fail-open, per-module timeout — the module's
@@ -28314,10 +28286,6 @@ export class AgentFramework {
             const placedDrops = thinkingDrops && thinkingReport ? thinkingDrops.place(thinkingReport.dropped) : [];
             if (thinkingDrops?.recordedAfter !== undefined) {
               this.noteThinkingLoss(agent.name, placedDrops, thinkingDrops.recordedAfter);
-            }
-            if (thinkingDrops) {
-              this.tellReasoningLoss(agent, () => this.reasoningLoss.forDrops(agent.name, thinkingDrops.branch ?? '',
-                placedDrops, streamRouting, agent.getContextManager()));
             }
             try {
               if (!thinkingDroppedInStream) {
