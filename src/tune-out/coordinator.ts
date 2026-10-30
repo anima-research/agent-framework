@@ -379,8 +379,9 @@ export class TuneOutCoordinator {
   private lateForks = new WeakSet<object>();
   /** The all-except scope's durable record, cached (undefined = not read yet). */
   private scopeCache: AllExceptState | null | undefined;
-  /** Timer key for the scope's cadence and expiry. */
-  private static readonly SCOPE_KEY = '\0all-except';
+  /** Timer key for the scope's cadence and expiry; never a channel's key,
+   *  which starts with `[`. */
+  private static readonly SCOPE_KEY = 'all-except';
 
   constructor(
     private readonly channelRegistry: ChannelRegistry,
@@ -388,8 +389,15 @@ export class TuneOutCoordinator {
     private readonly hooks: TuneOutFrameworkHooks,
   ) {}
 
+  /** A channel's key in the coordinator's maps and its stored last looks.
+   *  The store refuses an object key holding a NUL, so no separator: the
+   *  pair as JSON, which no server or channel id can make ambiguous. */
   private key(serverId: string, channelId: string): string {
-    return `${serverId}\0${channelId}`;
+    return JSON.stringify([serverId, channelId]);
+  }
+
+  private channelOf(key: string): [string, string] {
+    return JSON.parse(key) as [string, string];
   }
 
   /** The readers' hand-off bookkeeping's key: one epoch's reading of one channel. */
@@ -501,7 +509,7 @@ export class TuneOutCoordinator {
       if (!held.has(key) && this.holdFor(meta.serverId ?? '', meta.channelId)?.epochId === epochId) held.add(key);
     }
     for (const key of held) {
-      const [serverId, channelId] = key.split('\0') as [string, string];
+      const [serverId, channelId] = this.channelOf(key);
       this.rebuildTally(serverId, channelId);
     }
     this.pruneLooks();
@@ -1088,7 +1096,7 @@ export class TuneOutCoordinator {
         // One look per held channel with new traffic since the last look.
         for (const [channelKey, diverted] of this.divertedSinceInvocation) {
           if (diverted <= 0) continue;
-          const [serverId, channelId] = channelKey.split('\0') as [string, string];
+          const [serverId, channelId] = this.channelOf(channelKey);
           if (this.channelRegistry.getTuneOutState(serverId, channelId)) continue; // a per-channel epoch's own cadence
           this.invokeSubconscious(serverId, channelId, 'cadence', diverted);
         }
@@ -1187,7 +1195,7 @@ export class TuneOutCoordinator {
     this.writeScope(null);
     this.clearScopeTimers();
     for (const [key, pending] of this.pendingWakes) {
-      const [serverId, channelId] = key.split('\0') as [string, string];
+      const [serverId, channelId] = this.channelOf(key);
       if (this.channelRegistry.getTuneOutState(serverId, channelId)) continue;
       clearTimeout(pending.timer);
       this.pendingWakes.delete(key);
@@ -1228,7 +1236,7 @@ export class TuneOutCoordinator {
       }
     }
     for (const key of this.divertedSinceInvocation.keys()) {
-      const [serverId, channelId] = key.split('\0') as [string, string];
+      const [serverId, channelId] = this.channelOf(key);
       if (!this.channelRegistry.getTuneOutState(serverId, channelId)) this.divertedSinceInvocation.delete(key);
     }
     this.dropHandOffs(epochId);
