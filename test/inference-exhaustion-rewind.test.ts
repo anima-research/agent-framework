@@ -421,8 +421,8 @@ test('a failure with no request on the wire sends no probe and sheds nothing, in
   }
 });
 
-test('a trip once stop() has begun, or after the agent was let go, sends no probe and sheds nothing, in a run whose history a probe already implicated too', async () => {
-  for (const [what, implicated] of [['stopping', false], ['let go', false], ['stopping', true], ['let go', true]] as const) {
+test('a trip once stop() has begun, or after the agent was let go or replaced, sends no probe and sheds nothing, in a run whose history a probe already implicated too', async () => {
+  for (const [what, implicated] of [['stopping', false], ['let go', false], ['replaced', false], ['stopping', true], ['let go', true], ['replaced', true]] as const) {
     const h = makeHarness();
     if (implicated) h.fw.exhaustionRewinds.set('cairn', 1);
     let probes = 0;
@@ -430,6 +430,7 @@ test('a trip once stop() has begun, or after the agent was let go, sends no prob
     h.fw.onTrace((e: any) => {
       if (e.type !== 'ops:alert' || e.kind !== 'hard-down') return;
       if (what === 'stopping') h.fw.providerAdmissionClosed = true;
+      else if (what === 'replaced') h.fw.agents.set('cairn', { ...h.fw.agents.get('cairn') });
       else h.fw.agents.delete('cairn');
     });
     try {

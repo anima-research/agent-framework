@@ -210,7 +210,7 @@ test('one message and then two wakes: the good history before the message stays 
 });
 
 test('a failure the breaker leaves alone sends no probe and sheds nothing', async (t) => {
-  const membrane = new StandIn(failsFromThird(() => walk4('unsupported')));
+  const membrane = new StandIn(failsFromThird(() => providerError('context_length', 400, 'zz prompt is too long')));
   const r = await resident(t, membrane);
   for (const [i, text] of ['zz-q3', 'zz-q4', 'zz-q5'].entries()) {
     r.say(text);
@@ -312,7 +312,9 @@ test('a message that arrives while the probe is out sets its answer aside: an an
   await r.until(() => membrane.probes.length === 1, 'the probe to go out');
   r.say('zz-q4');
   await r.until(() => r.history().includes('zz-q4'), 'q4 to be stored while the probe is out');
+  const seen = stderr.length;
   answer('answered');
+  await r.until(() => stderr.slice(seen).some((line) => line.includes("its probe's answer is set aside")), 'the answer to be set aside');
   await r.until(() => r.count('inference:completed') === 3, "q4's turn to be answered once the probe is back");
   await r.quiet(60_000);
   assert.deepEqual(r.history().filter((x) => !x.startsWith('zz-answer-')), ['zz-q1', 'zz-q2', 'zz-q3', 'zz-q4']);
@@ -332,7 +334,9 @@ test('a message stored while the probe is out, with no turn of its own, sets the
   await r.until(() => membrane.probes.length === 1, 'the probe to go out');
   r.say('zz-quiet-q4');
   await r.until(() => r.history().includes('zz-quiet-q4'), 'the quiet message to be stored while the probe is out');
+  const seen = stderr.length;
   answer('answered');
+  await r.until(() => stderr.slice(seen).some((line) => line.includes("its probe's answer is set aside")), 'the answer to be set aside');
   await r.quiet(60_000);
   assert.deepEqual(r.history(), ['zz-q1', 'zz-answer-1', 'zz-q2', 'zz-answer-2', 'zz-q3', 'zz-quiet-q4']);
   assert.equal(r.rewindMarkers(), 0);
@@ -353,7 +357,9 @@ test('an edit to the history while the probe is out sets the answer aside too', 
   const cm = r.fw.getAgent('resident')!.getContextManager();
   const q3 = cm.getAllMessages().find((m) => m.content.some((b) => (b as { text?: string }).text === 'zz-q3'))!;
   cm.editMessage(q3.id, [{ type: 'text', text: 'zz-q3-edited' }]);
+  const seen = stderr.length;
   answer('answered');
+  await r.until(() => stderr.slice(seen).some((line) => line.includes("its probe's answer is set aside")), 'the answer to be set aside');
   await r.quiet(60_000);
   assert.deepEqual(r.history(), ['zz-q1', 'zz-answer-1', 'zz-q2', 'zz-answer-2', 'zz-q3-edited']);
   assert.equal(r.rewindMarkers(), 0);

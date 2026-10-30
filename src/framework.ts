@@ -5369,14 +5369,15 @@ export class AgentFramework {
    * A timed-out wait lets teardown go on while what it waited for may still
    * act on what is being torn down.
    * @param teardownTimeoutMs Optional budget for each of stop()'s waits, in
-   * turn: on the streams it cancels, on maintenance in flight (a pass, an
-   * over-budget drain kick or a poison-history breaker's probe), on the
+   * turn: on the streams it cancels, on the code_execution scripts it
+   * stops, on maintenance in flight (a pass, an over-budget drain kick or a
+   * poison-history breaker's probe), on the
    * event loop, on an operator's operations already running, on modules
    * and MCPL (its servers and the inference requests they made) together,
    * where a module whose start() is still running counts until that
    * start() has settled and its stop() returned, then on Discord awareness
    * drains, which send nothing once stop() has begun, recording the call the
-   * close ended. With a budget, a stop() can take up to six of them, besides
+   * close ended. With a budget, a stop() can take up to seven of them, besides
    * the withheld-spill deadline of a guard's write still under way. Omit to
    * wait until each settles, as required by existing module/child contracts.
    * A wait whose budget runs out fails the stop() with a ShutdownTimeoutError
