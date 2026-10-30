@@ -6,8 +6,9 @@
  *
  * Now, at the hard-down threshold, when the failure suggests the provider
  * refused the request's content or size (shedMayHelp: an invalid_request at
- * HTTP 400, 413 or 422 or with no status, or a context_length at 413), the
- * breaker auto-quarantines: sheds the newest complete exchange (the same
+ * HTTP 400, 413 or 422 or with no status, or a context_length at 413), and
+ * the failed request sent without its history is answered, the breaker
+ * auto-quarantines: sheds the newest complete exchange (the same
  * shedNewestTurn primitive the refusal auto-rewind and /unstick use — never
  * orphaning a tool_use/thinking block), drops ONE consolidated marker, and
  * queues a retry — bounded by the refusalHandling.maxRewinds cap so it can
@@ -29,14 +30,16 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   ];
   const removed: string[] = [];
   const added: Array<{ content: any[]; meta: any }> = [];
+  const listeners = new Set<(event: unknown) => void>();
+  const heard = (event: unknown) => { for (const listener of listeners) listener(event); };
   const cm = {
     getAllMessages: () => messages,
-    getMessageCount: () => messages.length,
-    getMessageWindow: (offset: number, limit: number) => ({ messages: messages.slice(offset, offset + limit), startIndex: offset }),
+    onMessage: (listener: (event: unknown) => void) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
     removeMessage: (id: string) => {
       removed.push(id);
       const i = messages.findIndex((m) => m.id === id);
       if (i >= 0) messages.splice(i, 1);
+      heard({ type: 'remove', messageId: id });
     },
     // A range by its two ends, inclusive, as context-manager's removeMessages.
     removeMessages: (fromId: string, toId: string) => {
@@ -44,16 +47,19 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
       const to = messages.findIndex((m) => m.id === toId);
       if (from < 0 || to < from) throw new Error(`no range ${fromId}..${toId}`);
       for (const m of messages.splice(from, to - from + 1)) removed.push(m.id);
+      heard({ type: 'removeRange', fromId, toId });
     },
     addMessage: (_p: string, content: any[], meta: any) => {
       const id = `marker-${added.length}`;
       added.push({ content, meta });
       messages.push({ id, participant: 'user', content, metadata: meta });
+      heard({ type: 'add', message: messages.at(-1) });
       return id;
     },
     editMessage: (id: string, content: any[]) => {
       const m = messages.find((x) => x.id === id);
       if (m) m.content = content;
+      heard({ type: 'edit', messageId: id, newContent: content });
     },
   };
 
@@ -73,6 +79,7 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   const onTheWire = { messages: [], config: { model: 'zz-model', maxTokens: 100 } };
   fw.failedRequests = { get: () => onTheWire, delete: () => true };
   fw.activeTurnTokens = new Map();
+  fw.breakerProbes = new Set();
   fw.store = { currentBranch: () => ({ name: 'main' }) };
   fw.auxiliaryMembraneFor = () => ({ complete: async () => createMockResponse([{ type: 'text', text: 'ok' }]) });
 
@@ -81,7 +88,7 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   console.error = (...a: unknown[]) => { errs.push(a.join(' ')); };
   const restore = () => { console.error = orig; };
 
-  return { fw, messages, removed, added, errs, restore };
+  return { fw, cm, messages, removed, added, errs, restore };
 }
 
 const REASON = '400 invalid_request: tool_use ids must have a corresponding tool_result';
@@ -346,6 +353,74 @@ test("a membrane error's type and status reach the gate through the exhausted tr
       await settle();
     } finally { h.restore(); }
     assert.equal(h.removed.length > 0, sheds, `${name}: ${sheds ? 'sheds' : 'keeps the history'}`);
+  }
+});
+
+test('a probe answered after the agent moved on sets its answer aside: nothing is shed, and the next failure decides', async () => {
+  const moves: Array<[string, (h: ReturnType<typeof makeHarness>) => void]> = [
+    ['nothing (the control)', () => {}],
+    ['the agent replaced', (h) => { h.fw.agents.set('cairn', { ...h.fw.agents.get('cairn') }); }],
+    ['the framework stopping', (h) => { h.fw.providerAdmissionClosed = true; }],
+    ['a surgery holding the store', (h) => { h.fw.surgeryHold = { verb: 'undo', agentName: 'cairn' }; }],
+    ['another failure counted', (h) => { h.fw.consecutiveInferenceFailures.set('cairn', 4); }],
+    ['another turn holding the agent', (h) => { h.fw.activeTurnTokens.set('cairn', 42); }],
+    ['the branch moved', (h) => { h.fw.store = { currentBranch: () => ({ name: 'undo/cairn/1' }) }; }],
+    ['a row edited', (h) => { h.cm.editMessage('u1', [{ type: 'text', text: 'edited' }]); }],
+    ['an older row removed', (h) => { h.cm.removeMessage('u1'); h.removed.length = 0; }],
+  ];
+  for (const [what, move] of moves) {
+    const h = makeHarness();
+    let answer!: () => void;
+    h.fw.auxiliaryMembraneFor = () => ({
+      complete: () => new Promise((resolve) => { answer = () => resolve(createMockResponse([{ type: 'text', text: 'ok' }])); }),
+    });
+    try {
+      for (let i = 0; i < 3; i++) h.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+      await settle();
+      move(h);
+      answer();
+      await settle();
+    } finally { h.restore(); }
+    if (what === 'nothing (the control)') {
+      assert.deepEqual([...h.removed].sort(), ['a1', 'r1'], 'the control sheds');
+      continue;
+    }
+    assert.deepEqual(h.removed, [], `${what}: nothing is shed`);
+    assert.equal(h.fw.pendingRequests.length, 0, `${what}: no retry is queued`);
+    assert.ok(h.errs.some((e) => e.includes("its probe's answer is set aside")), `${what}: it says the answer was set aside`);
+  }
+});
+
+test('a failure with no request on the wire sends no probe and sheds nothing', async () => {
+  const h = makeHarness();
+  h.fw.failedRequests = { get: () => undefined, delete: () => true };
+  let probes = 0;
+  h.fw.auxiliaryMembraneFor = () => ({ complete: async () => { probes++; return createMockResponse([{ type: 'text', text: 'ok' }]); } });
+  try {
+    for (let i = 0; i < 3; i++) h.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    await settle();
+  } finally { h.restore(); }
+  assert.equal(probes, 0);
+  assert.deepEqual(h.removed, []);
+  assert.ok(h.errs.some((e) => e.includes('sheds nothing: no request reached the breaker')));
+});
+
+test('a trip once stop() has begun, or after the agent was let go, sends no probe', async () => {
+  for (const what of ['stopping', 'let go']) {
+    const h = makeHarness();
+    let probes = 0;
+    h.fw.auxiliaryMembraneFor = () => ({ complete: async () => { probes++; return createMockResponse([{ type: 'text', text: 'ok' }]); } });
+    h.fw.onTrace((e: any) => {
+      if (e.type !== 'ops:alert' || e.kind !== 'hard-down') return;
+      if (what === 'stopping') h.fw.providerAdmissionClosed = true;
+      else h.fw.agents.delete('cairn');
+    });
+    try {
+      for (let i = 0; i < 3; i++) h.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+      await settle();
+    } finally { h.restore(); }
+    assert.equal(probes, 0, `${what}: no probe`);
+    assert.deepEqual(h.removed, [], `${what}: nothing shed`);
   }
 });
 

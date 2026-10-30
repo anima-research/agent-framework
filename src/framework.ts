@@ -3704,6 +3704,7 @@ export class AgentFramework {
   private pendingRequests: InferenceRequest[] = [];
   private readonly exhaustedTurns = new Map<string, { roundsRan: boolean; callsCutOff: boolean; liveSpeech: boolean; speechRouting: boolean }>();
   private readonly failedRequests = new Map<string, NormalizedRequest>();
+  private readonly breakerProbes = new Set<{ abort: AbortController; settled: Promise<void> }>();
   private readonly roundTurns = new WeakMap<ContentBlock[], TurnRouting>();
   private running = false;
   private loopPromise: Promise<void> | null = null;
@@ -5594,6 +5595,7 @@ export class AgentFramework {
     step(() => this.ackDeferredWrites());
     this.providerAdmissionClosed = true;
     for (const wake of [...this.retryWaitWakers]) step(wake);
+    for (const probe of this.breakerProbes) step(() => probe.abort.abort());
     this.guardSpillsClosed = false;
     step(() => this.queue.close());
     let inferences: Array<{ label: string; promise: Promise<void> }> = [];
@@ -5725,6 +5727,7 @@ export class AgentFramework {
     // pass starts while one runs and a drain leaves its set only as it
     // settles, so it needs no leftRunning entry.
     await waitFor(this.maintenanceRunning() ? [{ label: 'maintenance', promise: this.settleMaintenancePass() }] : []);
+    await waitFor([...this.breakerProbes].map((probe) => ({ label: 'poison-history probe', promise: probe.settled })));
 
     await waitFor(withLeftovers('loop', this.loopPromise ? [{ label: 'event loop', promise: this.loopPromise }] : []), 'loop');
 
@@ -32039,18 +32042,16 @@ export class AgentFramework {
       console.error(`[inference-rewind] agent=${name} sheds nothing: no request reached the breaker to send without its history.`);
       return;
     }
-    const cm = agent.getContextManager();
-    const newest = (): string => {
-      const count = cm.getMessageCount();
-      return count === 0 ? '0' : `${count}:${String(cm.getMessageWindow(count - 1, 1, { resolveBlobs: false }).messages[0]?.id)}`;
-    };
+    if (this.providerAdmissionClosed || this.agents.get(name) !== agent) return;
+    let historyMoved = false;
+    const detach = agent.getContextManager().onMessage(() => { historyMoved = true; });
     const sent = {
       streak: this.consecutiveInferenceFailures.get(name),
-      history: newest(),
       turn: this.activeTurnTokens.get(name),
       branch: this.store.currentBranch().name,
     };
-    void this.auxiliaryMembraneFor(name).complete(withoutHistory(request), { retry: false }).then(
+    const abort = new AbortController();
+    const settled = this.auxiliaryMembraneFor(name).complete(withoutHistory(request), { retry: false, signal: abort.signal }).then(
       (response): Error | null => (isAbortedResponse(response)
         ? new Error(`the probe was aborted (${String((response as { reason?: unknown }).reason ?? 'no reason given')})`)
         : null),
@@ -32061,7 +32062,7 @@ export class AgentFramework {
         || this.consecutiveInferenceFailures.get(name) !== sent.streak
         || (turn !== undefined && turn !== sent.turn)
         || this.store.currentBranch().name !== sent.branch
-        || newest() !== sent.history) {
+        || historyMoved) {
         console.error(`[inference-rewind] agent=${name}: its probe's answer is set aside, since the agent moved on while it ` +
           'was out; the next failure decides.');
         return;
@@ -32070,17 +32071,23 @@ export class AgentFramework {
         this.quarantinePoisonedHistory(agent, wholeReason);
         return;
       }
-      const probe = this.classifyInferenceError(probeFailure);
-      const same = probe.errorType === failure.errorType && probe.httpStatus === failure.httpStatus;
+      const answered = this.classifyInferenceError(probeFailure);
+      const same = answered.errorType === failure.errorType && answered.httpStatus === failure.httpStatus;
+      const status = answered.httpStatus === undefined ? 'with no status' : `at HTTP ${answered.httpStatus}`;
       const answer = `The probe's answer: ${boundFailureText(probeFailure.message, FAILURE_SUMMARY_MAX_CHARS)}`;
       const message = same
-        ? `the request fails without its history too, so the history isn't the cause, and none of it was shed. ${answer}`
+        ? `the request fails without its history too, with the same ${String(answered.errorType)} ${status}, so none of the history was shed. ${answer}`
         : `a probe without its history couldn't tell whether the history is the cause, so none of it was shed. ${answer}`;
       console.error(`[inference-rewind] agent=${name} kept its history: ${message}`);
-      this.opsAlert('history-kept', name, message, { data: { probe: same ? 'fails-without-history' : 'could-not-tell', ...probe } });
+      this.opsAlert('history-kept', name, message, { data: { probe: same ? 'fails-without-history' : 'could-not-tell', ...answered } });
     }).catch((error: unknown) => {
       console.error(`[inference-rewind] agent=${name}: the breaker's probe failed: ${describeFailureWithFrames(error)}`);
+    }).finally(() => {
+      detach();
+      this.breakerProbes.delete(probe);
     });
+    const probe = { abort, settled };
+    this.breakerProbes.add(probe);
   }
 
   /**
