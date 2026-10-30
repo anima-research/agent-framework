@@ -232,6 +232,29 @@ describe('an ephemeral run takes no global fallback (#551)', () => {
     } finally { await f.close(); }
   });
 
+  it('a subagent whose inference is refused marks no one\'s message and logs no locus, though a resident\'s turn answered the latest inbound message', async (t) => {
+    const calls: Array<{ name?: unknown; arguments?: Record<string, unknown> }> = [];
+    const f = await fixture({ toolsCall: (params) => { calls.push(params as never); return { content: [] }; } });
+    try {
+      await busyFallback(f);
+      const fw = f.framework as unknown as {
+        logFailure(record: Record<string, unknown>): void;
+        reactToRefusal(name: string, category: string): Promise<void>;
+      };
+      const records: Array<Record<string, unknown>> = [];
+      t.mock.method(fw, 'logFailure', (record: Record<string, unknown>) => { if (record.kind === 'refusal') records.push(record); });
+
+      await runSubagent(f, 'sub-run-refused', 'locus', false, createMockResponse([], 'refusal')).catch(() => undefined);
+      assert.deepEqual(records.map((r) => [r.agent, r.locus]), [['sub-run-refused', null]], 'the subagent\'s refusal is logged, with no locus');
+
+      // A mark the subagent's refusal sent would reach the server before the resident's.
+      await fw.reactToRefusal('agent', 'other');
+      await eventually(() => calls.length >= 1, 'control: the resident\'s refusal is marked');
+      await f.framework.runUntilIdle();
+      assert.deepEqual(calls.map((c) => [c.name, c.arguments?.messageId]), [['add_reaction', 'b1']], 'only the resident\'s refusal is marked');
+    } finally { await f.close(); }
+  });
+
   it('after the run is released, its name still takes no fallback, and a dispatch with no locus stays quiet', async () => {
     const f = await fixture();
     const t = speechTraces(f);
