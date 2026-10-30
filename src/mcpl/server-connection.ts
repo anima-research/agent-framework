@@ -2479,7 +2479,7 @@ export class McplServerConnection extends EventEmitter {
       // RFC-014: its hints apply as it's read, whether or not anyone still
       // waits for it. A dead transport's revs are its own, so a response
       // read after its boundary is never tapped.
-      if (!late && !this.requiredAdmission) this.tapResponse(msg as JsonRpcResponse);
+      if (!late) this.tapResponse(msg as JsonRpcResponse);
       this.handleResponse(msg as JsonRpcResponse, late);
       return;
     }
@@ -2504,19 +2504,11 @@ export class McplServerConnection extends EventEmitter {
       return;
     }
 
-    // Required admission does not support peer-initiated hints on either
-    // carrier. Refuse before the read tap can mutate state or schedule recovery.
-    if (this.requiredAdmission && request.method === 'tools/hints') {
-      if (request.id != null) this.sendErrorResponse(request.id, -32600, 'admission_unsupported');
-      else console.error(`[mcpl] ${this.id}: discarded tools/hints — admission_unsupported`);
-      return;
-    }
-
     // RFC-014 §6.1: a push's hints apply as it's read, before the plane gate
     // holds it or the grant refuses it. A standalone tools/hints is consumed
     // here when a tap listens (it needs no grant), and answered if it came as
     // a request; with no tap it stays a method this host doesn't handle.
-    if (request.method === 'push/event' && !this.requiredAdmission) this.tap({ kind: 'push', params: request.params });
+    if (request.method === 'push/event') this.tap({ kind: 'push', params: request.params });
     else if (request.method === 'tools/hints' && this.readTap) {
       this.tap({ kind: 'hints', params: request.params });
       if (request.id != null) this.sendResponse(request.id, {});

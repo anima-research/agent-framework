@@ -156,12 +156,6 @@ export class PushHandler {
       else responder?.respond({ accepted: false, reason: 'Feature set validation failed' });
       return;
     }
-    // The read tap was suppressed at receipt. Feature authorization still
-    // precedes this unsupported-combination refusal; no hook can override it.
-    if (Object.hasOwn(params, 'hints')) {
-      responder?.respond({ accepted: false, reason: 'admission_unsupported' });
-      return;
-    }
     const before = admission.check();
     if (before) { responder?.respond({ accepted: false, reason: before }); return; }
     const verdict = await admission.admit('push/event', params);

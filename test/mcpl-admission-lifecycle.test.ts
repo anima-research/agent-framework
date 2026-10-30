@@ -287,30 +287,19 @@ test('framework startup does not degrade when a required binder is absent', asyn
   } finally { await framework?.stop(); rmSync(dir, { recursive: true, force: true }); }
 });
 
-for (const required of [true, false]) test(`standalone tools/hints: required=${required} preserves the opt-in boundary over WebSocket`, async t => {
-  let hooks = 0;
-  const f = await fixture({
-    mcpl: { toolHints: true, toolsets: { workspace: { title: 'Workspace', default: 'closed' } } },
-    server: required ? { inboundAdmission: config(() => { hooks++; return allow; }) } : {},
-  }); t.after(f.close);
+for (const required of [true, false]) test(`standalone tools/hints: required=${required} follows negotiated support`, async t => {
+  const f = await fixture({ mcpl: { toolHints: true, toolsets: { workspace: { title: 'Workspace', default: 'closed' } } }, server: required ? { inboundAdmission: config(() => allow) } : {} }); t.after(f.close);
   const inner = f.framework as any;
-  const connection = inner.mcplServerRegistry.getServer('editor');
   const controller = inner.toolsets().get('editor');
-  assert(controller?.presents, 'a declaring peer has active toolset state, not a no-op tap');
-  connection.establishGrant(CapabilityGrant.empty());
-  const before = controller.presence.rev;
-  const tap = connection.readTap; let taps = 0;
-  connection.setReadTap((...args: any[]) => { taps++; tap(...args); });
-  const response = await f.send('tools/hints', { rev: before + 7, tools: [] });
-  assert.equal(hooks, 0);
+  assert.equal(f.hostCaps[0]!.toolHints === true, !required);
+  const response = await f.send('tools/hints', { rev: 7, tools: [] });
   if (required) {
-    assert.deepEqual(response.error, { code: -32600, message: 'admission_unsupported' });
-    assert.equal(taps, 0); assert.equal(controller.presence.rev, before);
-    assert.equal(controller.recoveryTimer, null);
+    assert.equal(controller, undefined, 'no RFC-014 controller on a hint-less connection');
+    assert.equal(response.error.code, -32601);
   } else {
     assert.deepEqual(response.result, {});
-    assert.equal(taps, 1); assert.equal(controller.presence.rev, before + 7);
-    assert.notEqual(controller.recoveryTimer, null, 'legacy skipped-revision recovery is unchanged');
+    assert.equal(controller.presence.rev, 7);
+    assert.notEqual(controller.recoveryTimer, null);
   }
 });
 
@@ -344,38 +333,17 @@ test('required receipt-presence arm refuses an object before dispatch (labelled 
   assert.equal(routed, 0, 'admissionFor fallback must not mask the receipt-presence boundary');
 });
 
-for (const required of [true, false]) test(`result-borne hints: required=${required} preserves the opt-in boundary over WebSocket`, async t => {
-  let hooks = 0;
-  const result = { content: [{ type: 'text', text: 'tool result' }], _meta: { 'mcpl/hints': { rev: 7, tools: [] } } };
-  const f = await fixture({
-    mcpl: { toolHints: true, toolsets: { workspace: { title: 'Workspace', default: 'closed' } } },
-    toolsCall: () => result,
-    server: required ? { inboundAdmission: config(() => { hooks++; return allow; }) } : {},
-  }); t.after(f.close);
-  const inner = f.framework as any;
-  const connection = inner.mcplServerRegistry.getServer('editor');
-  const controller = inner.toolsets().get('editor');
-  assert(controller?.presents, 'the declaring peer has active toolset state');
-  connection.establishGrant(CapabilityGrant.empty());
-  const before = controller.presence.rev;
-  assert.equal(before, 0);
-  const tap = connection.readTap; let taps = 0;
-  connection.setReadTap((...args: any[]) => { taps++; tap(...args); });
-  // The host solicits the result, but that grants no authority to its hints.
-  const response = await connection.sendToolsCall('probe', {});
-  assert.deepEqual(response, result, 'suppressing hint effects does not lose the tool result');
-  assert.equal(hooks, 0);
-  if (required) {
-    assert.equal(taps, 0); assert.equal(controller.presence.rev, before);
-    assert.equal(controller.recoveryTimer, null);
-  } else {
-    assert(taps > 0); assert.equal(controller.presence.rev, 7);
-    assert.notEqual(controller.recoveryTimer, null, 'legacy skipped-revision recovery is unchanged');
-  }
+for (const required of [true, false]) test(`solicited results: required=${required} preserves result taps`, async t => {
+  const result = { content: [{ type: 'text', text: 'tool result' }] };
+  const f = await fixture({ toolsCall: () => result, server: required ? { inboundAdmission: config(() => allow) } : {} }); t.after(f.close);
+  const connection = (f.framework as any).mcplServerRegistry.getServer('editor');
+  let taps = 0;
+  connection.setReadTap(() => { taps++; });
+  assert.deepEqual(await connection.sendToolsCall('probe', {}), result);
+  assert.equal(taps, 1);
 });
 
-
-test('required solicited tools/list still supplies presence and revision over WebSocket', async t => {
+test('required solicited lists retain their bookkeeping tap and adopt toolsets/list results', async t => {
   const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
   await once(wss, 'listening');
   let rev = 0;
@@ -391,7 +359,7 @@ test('required solicited tools/list still supplies presence and revision over We
         toolHints: true, toolsets: { workspace: { title: 'Workspace', default: 'closed' } },
       } } },
     } : m.method === 'tools/list' ? { tools, _meta: { 'mcpl/rev': rev } }
-      : m.method === 'toolsets/list' ? { rev, open: [], tools: [] } : { accepted: true };
+      : m.method === 'toolsets/list' ? { rev, open: [{ toolset: 'workspace', title: 'Open workspace' }], tools } : { accepted: true };
     ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }));
   }));
   const dir = mkdtempSync(join(tmpdir(), 'required-tool-inventory-'));
@@ -411,8 +379,13 @@ test('required solicited tools/list still supplies presence and revision over We
   });
   const inner = framework as any;
   const connection = inner.mcplServerRegistry.getServer('endpoint');
-  const controller = inner.toolsets().get('endpoint');
-  assert(controller?.presents);
+  assert.equal(inner.toolsets().get('endpoint'), undefined);
+  // Explicit host-side controller scaffold: negotiation installs none, but
+  // required transport must not suppress solicited result bookkeeping.
+  const controller = inner.toolsets().controllerFor({ id: 'endpoint' });
+  controller.attach(connection);
+  await connection.sendToolsList();
+  assert(controller.presents);
   connection.establishGrant(CapabilityGrant.empty());
   assert.equal(controller.presence.rev, 0);
   const before = JSON.stringify(framework.getAgent('assistant')!.getContextManager().getAllMessages());
@@ -425,13 +398,14 @@ test('required solicited tools/list still supplies presence and revision over We
   rev = 7;
   requests.length = 0;
   assert.deepEqual((await connection.sendToolsList()).tools, tools);
-  assert.equal(taps, 1, 'completed-inventory tap remains, while tapResponse is suppressed');
+  assert(taps >= 1, 'completed-inventory and solicited-result taps remain');
   assert.deepEqual(controller.presence.tool('inventory_probe'), tools[0]);
   assert.equal(controller.presence.rev, 7);
   assert.notEqual(controller.recoveryTimer, null, 'a solicited revision gap can schedule list recovery');
   await eventually(() => requests.filter(method => method === 'tools/list').length >= 2 && requests.includes('toolsets/list'));
   await eventually(() => !controller.recovering && controller.recoveryTimer === null);
   assert(requests.every(method => method === 'tools/list' || method === 'toolsets/list'));
+  assert([...controller.presence.view().values()].some((v: any) => v.title === 'Open workspace'), 'toolsets/list adopted the peer’s open toolset');
   assert.equal(hooks, 0);
   assert.equal(queued.length, 0, 'catalogue recovery queues no content or wake');
   assert.equal(membrane.calls.length, 0);

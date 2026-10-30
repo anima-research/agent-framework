@@ -33009,7 +33009,7 @@ export class AgentFramework {
    * for the framework's life.
    */
   private hintsFor(config: McplServerConfig): boolean {
-    if (config.toolHints === false || !isLegacyFamily(config)) return false;
+    if (config.inboundAdmission !== undefined || config.toolHints === false || !isLegacyFamily(config)) return false;
     if (config.toolHints === true) return true;
     if (this.toolsetsNameHeldAtStart !== null) return false;
     if ((config.toolPrefix ?? `mcpl--${config.id}`) === TOOLSETS_MODULE) return false;
