@@ -49,6 +49,13 @@ Peers need no retry for host-internal staging or quiesce. A verdict is
 not a delivery receipt: existing content checks and downstream failures still
 apply; already admitted siblings are not rolled back.
 
+Required `channels/incoming` items and `push/event` requests carrying `coalesce`
+are refused with `admission_unsupported`, before the hook, dedup or acceptance.
+This profile does not promise durable coalesced acceptance until current-key
+re-admission of restored and prior-epoch batches exists. Unconfigured coalescing
+and its pending batches still survive reconnect/recovery unchanged. Drain pending
+coalesced work before enabling this profile on an existing configured binding.
+
 The channel adapter checks actual registration before preflight and rechecks the
 entry, connection, epoch, readiness and grant afterward. No effect runs on a
 refusal. `mayWake: false` skips wake policy and caps downstream wake requests;
