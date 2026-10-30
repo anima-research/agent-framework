@@ -2521,9 +2521,6 @@ interface LocalProviderGate {
   primaryDepth: number;
   primaryPending: boolean;
   auxiliaryInFlight: number;
-  /** Auxiliary calls admitted so far: a budget hold reads whether a tick it
-   *  drove started compression work (kickOverBudgetDrain). */
-  auxiliaryStarted: number;
   auxiliaryWaiters: Array<() => void>;
   idleWaiters: Array<() => void>;
   deferredAuxiliary: number;
@@ -2613,7 +2610,8 @@ interface BudgetHold {
   budget: number | undefined;
   actual: number | undefined;
   recheck?: ReturnType<typeof setInterval>;
-  checking: boolean;
+  checking: Promise<'fit' | 'refused' | 'check_failed'> | undefined;
+  managerCalls: number;
   lookedAt?: string;
   checkpoint: RecordedTurnCheckpoint | undefined;
   checkQueued?: boolean;
@@ -6048,7 +6046,7 @@ export class AgentFramework {
   private providerGate(agentName: string): LocalProviderGate {
     let gate = this.providerGates.get(agentName);
     if (!gate) {
-      gate = { primaryDepth: 0, primaryPending: false, auxiliaryInFlight: 0, auxiliaryStarted: 0,
+      gate = { primaryDepth: 0, primaryPending: false, auxiliaryInFlight: 0,
         auxiliaryWaiters: [], idleWaiters: [], deferredAuxiliary: 0 };
       this.providerGates.set(agentName, gate);
     }
@@ -6118,7 +6116,7 @@ export class AgentFramework {
     // A wait recorded while this call was parked binds it too.
     this.refuseHeldProviderModel(agentName, model);
     gate.auxiliaryInFlight++;
-    gate.auxiliaryStarted++;
+    this.noteManagerCall(agentName);
     try { return await run(); }
     catch (error) {
       // Compression can be the first call to find a spent quota (idle agent,
@@ -6344,6 +6342,10 @@ export class AgentFramework {
   private auxiliaryMembraneFor(agentName: string): Membrane {
     return this.membraneAdmitting((run, model) => this.withAuxiliaryAdmission(agentName, run, model));
   }
+  private noteManagerCall(agentName: string): void {
+    const hold = this.budgetHolds?.get(agentName);
+    if (hold) hold.managerCalls++;
+  }
   /**
    * The reply judge's calls. None waits: under the agent's holds a call is
    * refused without being made, and the agent's turn stops the judge. A call
@@ -6396,6 +6398,7 @@ export class AgentFramework {
       this.withdrawMaintenanceUnderSurgery();
       this.withdrawMaintenanceWhenStopping(agentName);
       this.refuseHeldProviderModel(agentName, model);
+      this.noteManagerCall(agentName);
       try { return await run(); }
       catch (error) {
         if (model !== undefined && error instanceof Error) this.recordProviderWait(agentName, model, error);
@@ -6762,7 +6765,7 @@ export class AgentFramework {
     const figures = error as Error & { budget?: unknown; actual?: unknown };
     const hold: BudgetHold = existing ?? {
       state: 'holding', startedAt: now, heldRequests: [],
-      errorType, reason: '', budget: undefined, actual: undefined, checking: false, checkpoint: undefined,
+      errorType, reason: '', budget: undefined, actual: undefined, checking: undefined, managerCalls: 0, checkpoint: undefined,
     };
     hold.state = 'holding';
     hold.checkpoint = checkpoint;
@@ -6806,8 +6809,6 @@ export class AgentFramework {
     }
   }
 
-  /** After a maintenance pass: each hold looks, and one still holding drives
-   *  compression again from where the pass left it. */
   private checkBudgetHolds(): void {
     if (!this.budgetHolds?.size) return;
     for (const name of [...this.budgetHolds.keys()]) {
@@ -6818,9 +6819,6 @@ export class AgentFramework {
     }
   }
 
-  /** A hold's start is logged, and raises no alert: its turn goes on. A
-   *  compression call that fails while it holds is reported as maintenance
-   *  reports one (reportMaintenanceFailure). */
   private logBudgetHold(agent: Agent, hold: BudgetHold): void {
     const readiness = this.contextReadiness(agent.getContextManager());
     const compression = 'pending' in readiness && readiness.pending
@@ -6840,11 +6838,12 @@ export class AgentFramework {
     let verdict = this.budgetHoldPreview(agent);
     if (verdict === undefined) {
       if (hold.checking) return;
-      hold.checking = true;
+      const check = this.budgetHoldDryRun(agent);
+      hold.checking = check;
       try {
-        verdict = await this.budgetHoldDryRun(agent);
+        verdict = await check;
       } finally {
-        hold.checking = false;
+        if (hold.checking === check) hold.checking = undefined;
       }
       if (this.budgetHolds.get(agentName) !== hold || hold.state !== 'holding') return;
       if (this.agents.get(agentName) !== agent) return;
@@ -6939,10 +6938,12 @@ export class AgentFramework {
     if (hold.checkQueued) return;
     const kicked = this.kickOverBudgetDrain(agent.name, agent, () => {
       hold.checkQueued = false;
-      void this.checkBudgetHold(agent.name);
+      void this.checkBudgetHold(agent.name).then(() => {
+        if (kicked === 'already draining') this.compressForBudgetHold(agent);
+      });
     }, 'hold', hold.drainKicked);
     if (kicked === 'kicking' || kicked === 'already draining') hold.checkQueued = true;
-    hold.drainKicked = true;
+    if (kicked === 'kicking') hold.drainKicked = true;
   }
 
   private releaseBudgetHold(agentName: string, outcome: Exclude<BudgetHoldOutcome, 'stopped'>): void {
@@ -7065,20 +7066,19 @@ export class AgentFramework {
             ...(progress ? { progressBefore: progress } : {}),
           };
         }
-        // The breaker's kick takes eight ticks. A hold drives compression
-        // while it moves: it ticks on while each tick starts a compression
-        // call, and looks after each, so a tick that makes the context fit
-        // releases the turn at once. A tick that starts none, as while the
-        // lane is paused or a maintenance pass's call is in flight, ends it,
-        // and the hold drives it again after the next pass.
-        while ((by === 'hold' || ticks < 8) && !this.providerAdmissionClosed && !this.surgeryHold && this.agents.get(agentName) === agent) {
-          const started = by === 'hold' ? this.providerGates.get(agentName)?.auxiliaryStarted : undefined;
+        const holding = () => this.budgetHolds.get(agentName)?.state === 'holding';
+        while ((by === 'hold' ? holding() : ticks < 8) && !this.providerAdmissionClosed && !this.surgeryHold && this.agents.get(agentName) === agent) {
+          const calls = by === 'hold' ? this.budgetHolds.get(agentName)?.managerCalls : undefined;
           await cm.tick();
           ticks++;
           if (by === 'breaker') continue;
-          if (this.providerGates.get(agentName)?.auxiliaryStarted === started) break;
+          if (this.budgetHolds.get(agentName)?.managerCalls === calls) break;
           await this.checkBudgetHold(agentName);
-          if (this.budgetHolds.get(agentName)?.state !== 'holding') break;
+          const looking = this.budgetHolds.get(agentName)?.checking;
+          if (looking) {
+            await looking;
+            await this.checkBudgetHold(agentName);
+          }
         }
         const stopped = by === 'breaker' && ticks >= 8 ? ''
           : this.agents.get(agentName) !== agent ? ', stopped as the agent was disposed'
@@ -7091,13 +7091,12 @@ export class AgentFramework {
           console.error(`${tag} drain kicked for ${agentName} (${label}, ${ticks} ticks, stopped: ${err.message})`);
         } else if (this.syncMoveReinit && err instanceof Error && refusedForMovedBranch(err.message)) {
           console.error(`${tag} drain kicked for ${agentName} (${label}, ${ticks} ticks, stopped: ${this.syncMoveReinit.after === 'undo' ? 'an undo' : 'a redo'} moved the store under the tick: ${err.message})`);
+        } else if (record) {
+          record.ticks = ticks;
+          record.finishedAt = Date.now();
+          this.reportMaintenanceFailure(agentName, record, err instanceof Error ? String(err.message) : failureDescription(err));
         } else {
           console.error(`${tag} drain kick failed for ${agentName} after ${ticks} ticks: ${describeFailureWithFrames(err)}`);
-          if (record) {
-            record.ticks = ticks;
-            record.finishedAt = Date.now();
-            this.reportMaintenanceFailure(agentName, record, err instanceof Error ? String(err.message) : failureDescription(err));
-          }
         }
       } finally {
         this.overBudgetDrainInFlight.delete(agentName);
@@ -8168,7 +8167,7 @@ export class AgentFramework {
    * attributable inference-log terminal, ONE inference:aborted
    * carrying the framework's reason, gate release. No [turn-interrupted]
    * marker, since nobody stopped the agent, and none of the failure
-   * accounting that inference:failed / inference:exhausted drive.
+   * accounting that inference:exhausted drives.
    *
    * The script abort, reset and settle happen only while `agent` still owns
    * stream `myStreamId`; the log line and the trace are written either way.
@@ -26708,7 +26707,7 @@ export class AgentFramework {
               // Same contract as the aborted branch, for every mark: no
               // errorPolicy retry (which would relaunch the inference the
               // framework cancelled), no inference:failed or
-              // inference:exhausted (which feed the failure streak /
+              // inference:exhausted (the last feeds the failure streak /
               // hard-down / poison-history accounting), and — a
               // framework-owned cancel — no [turn-interrupted] marker:
               // nobody stopped the agent. The loop's head has dropped every

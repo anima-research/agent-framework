@@ -34,12 +34,11 @@
     already ended it, saying the turn runs once a check finds its context fits
     its budget, followed by context-manager's own description of its pending
     work, and a turn held again after a release logs a line saying so. A
-    compression call that fails in a tick the hold drives raises
-    `context-maintenance-failed` for the agent, as one in a maintenance pass
-    does, logged and alerted again only when its text changes or once the
-    alert's cooldown has passed. The hold's first drive of compression logs as
-    `[budget-hold]` with its tick count, and a later one only when it stops
-    early or fails.
+    compression call that fails in a tick the hold drives is reported as one
+    that fails in a maintenance pass is, as `context-maintenance-failed` for
+    the agent, under maintenance's rule for repeats. The hold's first drive of
+    compression logs a `[budget-hold]` line with its tick count, and a later
+    one only when it stops early.
 - **Agents:** the turn's next start once its hold ends, with a fit or without,
   stores a note in the agent's history saying why it waited, where the turn
   reads it, as an `afterUser` context injection is stored (while the window is
