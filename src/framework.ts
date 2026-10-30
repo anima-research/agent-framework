@@ -4885,6 +4885,8 @@ export class AgentFramework {
           });
         },
         getAgentNames: () => framework.registry.gateRecipients(),
+        getSharedSlotReaders: () => framework.registry.sharedSlotReaders(),
+        isWriteDone: (agentName, after, replyTo) => framework.gateWriteDone(agentName, after, replyTo),
         isHeld: (serverId, channelId) =>
           !!(serverId && channelId && framework.tuneOutCoordinator?.holdFor(serverId, channelId)),
         // Push events reach the gate with the adapter's raw channel id; map
@@ -6235,7 +6237,7 @@ export class AgentFramework {
     const targets = this.heartbeatTargets();
     const silent = wake.kind === 'heartbeat' && wake.silent;
     // Without a gate, a push wakes the agent, and so does a tick.
-    const triggers = (): boolean => !this.eventGate || this.eventGate.evaluate(this.heartbeatGateEvent({ ...wake, silent })).trigger;
+    const triggers = (after?: import('./gate/event-gate.js').WritePlacement): boolean => !this.eventGate || this.eventGate.evaluate(this.heartbeatGateEvent({ ...wake, silent }), after).trigger;
     if (silent) {
       if (!triggers()) return;
       console.error(`[heartbeat] silent scheduled wake ${logValue(wake.eventId)}`);
@@ -6255,7 +6257,7 @@ export class AgentFramework {
     const id = this.addMessage('user', [{ type: 'text', text: wake.text }], metadata as MessageMetadata, { placement });
     this.emitTrace({ type: 'message:added', messageId: id, source: wake.kind === 'reminder' ? 'heartbeat:reminder' : 'heartbeat' });
     // The text is in context whatever the rules decide, as a push's is.
-    if (!triggers()) return;
+    if (!triggers(placement)) return;
     for (const agentName of targets) {
       this.pendingRequests.push({
         agentName, reason: wake.kind, source: 'heartbeat', timestamp: Date.now(),
@@ -17226,7 +17228,7 @@ export class AgentFramework {
           eventType: event.type,
           serverId: source,
           channelId: '',
-        });
+        }, added);
         if (!decision.trigger) return;
       }
 
@@ -17402,6 +17404,7 @@ export class AgentFramework {
     // whether this counts as the latest delivered inbound. Every path below
     // consumes `decision`; none re-asks the policy.
     const addressed = isAddressedMessage(event.tags);
+    const placement: CoalescingPlacement = { agent: '' };
     const decision = this.admitInbound({
       lane: 'channel',
       serverId: event.serverId,
@@ -17426,7 +17429,7 @@ export class AgentFramework {
         author: event.author,
         ...(event.tags ? { tags: event.tags } : {}),
       },
-    });
+    }, placement);
     metadata.triggered = decision.wake;
     if (decision.held) {
       // The admission record rides the message; the hold's own bookkeeping
@@ -17519,7 +17522,6 @@ export class AgentFramework {
     // record and never enters a resident's view; a delivered one is also
     // the latest delivered inbound (the channel context's `incoming`, and
     // the fallback locus under the legacy rule) — a held one never is.
-    const placement: CoalescingPlacement = { agent: '' };
     const id = this.addMessage('user', incomingContent, AgentFramework.withStoredDigest(metadata, incomingContent), { placement, bypassDeferralFor: event.assemblingFor });
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
     if (decision.locus) this.noteDeliveredOrPark(event);
@@ -18940,6 +18942,9 @@ export class AgentFramework {
     // A deferred batch is admitted when it asks for its wake: the hold and
     // the gate decide now; its materialized delivery at assembly is vetoed
     // (`triggerInference: false`) and so is not shown to the gate again.
+    // No debounce placement here, even for a deferred render's plain wake:
+    // its reply requirement is the whole batch's allAmbient, not the latest
+    // occurrence's tags. Keep that aggregate wake conservative (#814).
     const decision = this.admitInbound({
       lane: 'push',
       serverId: occ.serverId,
@@ -19260,6 +19265,7 @@ export class AgentFramework {
     // Admission (Dendrite §D): the same decision as the channel lane. A DM
     // arrives here, so this is where tuning out a DM takes effect (#232 gap
     // 1). An event with no channel provenance cannot be held.
+    const placement: CoalescingPlacement = { agent: '' };
     const decision = this.admitInbound({
       lane: 'push',
       serverId: event.serverId,
@@ -19282,7 +19288,7 @@ export class AgentFramework {
         eventType: 'mcpl:push-event',
         ...(event.tags ? { tags: event.tags } : {}),
       },
-    });
+    }, placement);
     metadata.triggered = decision.wake;
     if (decision.held && triggerChannel) {
       metadata.tuneOut = { epochId: decision.held.epochId };
@@ -19292,7 +19298,6 @@ export class AgentFramework {
       );
     }
 
-    const placement: CoalescingPlacement = { agent: '' };
     if (!silentHeartbeat) {
       const id = this.addMessage('user', content, AgentFramework.withStoredDigest(metadata, content), { placement, bypassDeferralFor: event.assemblingFor });
       this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
@@ -24708,6 +24713,7 @@ export class AgentFramework {
     const streamRouting = this.routingOf(agent.name);
     let hadToolCalls = false;
     let generationLost = false;
+    let finishGateReplies: (() => void) | undefined;
 
     // ---- Present-while-acting turn state ---------------------------------
     // Output locus for the WHOLE logical turn: frozen when the turn opened
@@ -25811,7 +25817,13 @@ export class AgentFramework {
             // field.
             delete streamRouting.unpostedSpeech;
             agent.reset();
-            if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
+            if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId && this.eventGate) {
+              // The judge/status window ends now, as before. A debounce's
+              // channel-write check waits for the final publication receipt;
+              // every exit, including a failed send or disposal, releases it.
+              const repliesSettled = new Promise<void>((resolve) => { finishGateReplies = resolve; });
+              this.eventGate.onInferenceEnded(agent.name, repliesSettled);
+            }
             this.settleAgent(agent.name, {
               stopReason: 'completed',
               speech: guardedWrapperTool || cutResults
@@ -26769,6 +26781,7 @@ export class AgentFramework {
       agent.reset();
       if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
     } finally {
+      finishGateReplies?.();
       // The accounting writes to the store, and a write that fails must not
       // skip the teardown after it.
       try {
@@ -31147,14 +31160,8 @@ export class AgentFramework {
     // Settled first, so a write that landed is judged by its stored row; one
     // still a doubt stays queued, which keeps the wake.
     this.settleUnknownLandings((m) => m.id === writeId);
-    if (this.deferredMessages.some((m) => m.id === writeId)) return false;
     try {
-      const cm = agent.getContextManager();
-      const row = this.landedRow(cm, writeId);
-      // No row yet for a write drained from the queue and still to be stored
-      // (un-acked); one stored and awaiting a sync is judged by its row.
-      if (!row) return !this.unackedDeferredWrites.some((m) => m.id === writeId);
-      return this.writeAnswered(agent, cm, row, to);
+      return this.writeDoneFromEvidence(agent, { readsDeferredWrite: writeId }, to);
     } catch (error) {
       console.error(`[wake] ${agent.name}: could not read whether deferred write ${writeId} was read, so its wake stays:`, error);
       return false;
@@ -31163,10 +31170,7 @@ export class AgentFramework {
 
   private storedMessageDone(agent: Agent, messageId: string, to: PublishDestination | undefined): boolean {
     try {
-      const cm = agent.getContextManager();
-      const row = cm.getMessage(messageId);
-      if (!row) return true;
-      return this.writeAnswered(agent, cm, row, to);
+      return this.writeDoneFromEvidence(agent, { readsStoredMessage: messageId }, to);
     } catch (error) {
       console.error(`[wake] ${agent.name}: could not read whether stored message ${messageId} was read, so its wake stays:`, error);
       return false;
@@ -31178,6 +31182,41 @@ export class AgentFramework {
     const branch = cm.currentBranch().name;
     if (!watermark || watermark.branch !== branch || row.sequence > watermark.sequence) return false;
     return to === undefined || agent.publishedAfterReading(destinationKey(to), branch, row.sequence);
+  }
+
+  /** Read-only counterpart of the scheduler's write checks for a debounce.
+   *  Keep the same placement-owner restriction: another resident's live
+   *  boundary can cover shared rows it never received (#819). Unknown
+   *  landings stay wakeable rather than being settled while filtering. */
+  private gateWriteDone(agentName: string, after: import('./gate/event-gate.js').WritePlacement, to?: PublishDestination): boolean {
+    const agent = this.agents.get(agentName);
+    if (!agent) return false;
+    return this.writeDoneFromEvidence(agent, this.readsWriteFor(after, agentName), to);
+  }
+
+  /** Pure evidence lookup shared by scheduler and debounce checks. Only the
+   *  scheduler wrapper settles unknown landings; each caller keeps its own
+   *  fault policy (including the gate's throttled warning). */
+  private writeDoneFromEvidence(
+    agent: Agent,
+    mark: Pick<InferenceRequest, 'readsDeferredWrite' | 'readsStoredMessage'>,
+    to: PublishDestination | undefined,
+  ): boolean {
+    if (mark.readsDeferredWrite !== undefined) {
+      const id = mark.readsDeferredWrite;
+      if (this.deferredMessages.some((m) => m.id === id)) return false;
+      const cm = agent.getContextManager();
+      const row = this.landedRow(cm, id);
+      // A drained, un-acked write without a stored row remains wakeable.
+      if (!row) return !this.unackedDeferredWrites.some((m) => m.id === id);
+      return this.writeAnswered(agent, cm, row, to);
+    }
+    if (mark.readsStoredMessage !== undefined) {
+      const cm = agent.getContextManager();
+      const row = cm.getMessage(mark.readsStoredMessage);
+      return !row || this.writeAnswered(agent, cm, row, to);
+    }
+    return false;
   }
 
   private readsWriteFor(placement: { agent?: string; deferredId?: string; messageId?: string } | undefined, agentName: string): Pick<InferenceRequest, 'readsDeferredWrite' | 'readsStoredMessage'> {
@@ -36998,7 +37037,7 @@ export class AgentFramework {
    * framework's policy inputs (recipients, the hold in force, the wake
    * gate), traced. Callers apply it; nothing downstream re-asks.
    */
-  private admitInbound(env: InboundEnvelope): AdmissionDecision {
+  private admitInbound(env: InboundEnvelope, after?: import('./gate/event-gate.js').WritePlacement): AdmissionDecision {
     const gateInfo = (e: InboundEnvelope) => ({
       content: e.gateContent,
       eventType: String(e.gateMetadata.eventType ?? 'unknown'),
@@ -37016,7 +37055,7 @@ export class AgentFramework {
       ...(this.eventGate
         ? {
             gate: {
-              evaluate: (e: InboundEnvelope) => this.eventGate!.evaluate(gateInfo(e)).trigger,
+              evaluate: (e: InboundEnvelope) => this.eventGate!.evaluate(gateInfo(e), after).trigger,
               // "Would the gate have woken them": a debounce policy says yes,
               // later — for the hold's reader that is a pass, not a mute.
               probe: (e: InboundEnvelope) => {

@@ -58,6 +58,11 @@ const MAX_CONTENT_SNIPPET = 200;
 const MAX_TRACE_SNIPPET = 80;
 /** Max events buffered during inference before oldest are dropped. */
 const MAX_INFERENCE_BUFFER = 100;
+/** One 60s MCPL publish timeout plus 5s for teardown. A longer publication
+ *  chain must prefer an extra wake to indefinitely withholding unseen input. */
+const PUBLICATION_FENCE_TIMEOUT_MS = 65_000;
+/** Match the scheduler's once-per-minute fault/stale warning cadence. */
+const WRITE_CHECK_WARN_INTERVAL_MS = 60_000;
 /** Minimum interval between filesystem checks for config changes (ms). */
 const RELOAD_THROTTLE_MS = 1000;
 
@@ -111,7 +116,23 @@ const DEFAULT_CONFIG: GateConfig = {
 // Internal types
 // ---------------------------------------------------------------------------
 
+interface PublicationFence {
+  events: PendingEvent[];
+  timer?: ReturnType<typeof setTimeout>;
+  ready: boolean;
+  timedOut: boolean;
+}
+
 interface PendingEvent {
+  /** Delivery telemetry, shared by immediate recipients and a later fence release. */
+  deliveryTraced?: boolean;
+  /** The shared summary was written or attached to a wake, not read evidence. */
+  sharedSummaryQueued?: boolean;
+  /** Placement of the event's write, not a second record of what was read.
+   *  Retained by reference: admission can precede the host's write. */
+  after?: WritePlacement;
+  /** As on a direct wake: non-ambient channel traffic needs a reply there. */
+  replyTo?: { serverId: string; channelId: string };
   policyName: string;
   content: string;
   eventType: string;
@@ -2116,6 +2137,9 @@ export class EventGate {
   // Inference buffering
   private inferring = new Set<string>();
   private inferenceBuffer: PendingEvent[] = [];
+  /** Completed requests whose final channel publication is still settling.
+   *  Only placement-backed channel wakes wait for these receipts. */
+  private publicationFences = new Map<string, Set<PublicationFence>>();
   /** Host quiesce suppression — see setQuiesced. */
   private quiesced = false;
   /** Lifetime count of buffer-cap evictions (see bufferForInference). */
@@ -2184,11 +2208,14 @@ export class EventGate {
   ) => unknown;
   private requestInferenceFn: (agentName: string, reason: string, source: string, provenance?: WakeProvenance, after?: WritePlacement) => void;
   private getAgentNamesFn: () => string[];
+  private getSharedSlotReadersFn?: () => string[];
   /** Delivery-time re-check: is this channel held from the recipients now? */
   private isHeldFn: (serverId: string | undefined, channelId: string | undefined) => boolean;
   private resolveRouteChannelFn: (info: GateEventInfo) => string | undefined;
   private channelShownFn?: (channel: { serverId: string; channelId: string }) => string;
   private isNewestEntryFn?: (entry: GateEntryRef) => boolean;
+  private isWriteDoneFn?: (agentName: string, after: WritePlacement, replyTo?: { serverId: string; channelId: string }) => boolean;
+  private writeCheckWarnAt = -Infinity;
   /** Clock injection — keeps the new rate_limit / passive_sample paths
    *  testable without monkey-patching Date.now globally. */
   private now: () => number;
@@ -2210,6 +2237,15 @@ export class EventGate {
      *  message is answered. */
     requestInference: (agentName: string, reason: string, source: string, provenance?: WakeProvenance, after?: WritePlacement) => void;
     getAgentNames: () => string[];
+    /** @internal Readers of the host's one shared message slot. Other gate
+     *  recipients have isolated windows. Absent: legacy batch-line placement.
+     *  Shared summaries omit events already answered by any reader; their
+     *  original stored content and each unread recipient's wake remain. */
+    getSharedSlotReaders?: () => string[];
+    /** @internal Host's existing answered-write test, checked at delivery for
+     *  each recipient. Must not mutate the write or its read state. Absent,
+     *  or throwing: the event stays wakeable. */
+    isWriteDone?: (agentName: string, after: WritePlacement, replyTo?: { serverId: string; channelId: string }) => boolean;
     /**
      * Whether a channel is held from the recipients (a tune-out epoch in
      * force). A held event never enters a batch — admission runs before the
@@ -2265,6 +2301,8 @@ export class EventGate {
     this.addMessageFn = opts.addMessage;
     this.requestInferenceFn = opts.requestInference;
     this.getAgentNamesFn = opts.getAgentNames;
+    this.getSharedSlotReadersFn = opts.getSharedSlotReaders;
+    this.isWriteDoneFn = opts.isWriteDone;
     this.isHeldFn = opts.isHeld ?? (() => false);
     this.resolveRouteChannelFn = opts.resolveRouteChannel ?? defaultRouteChannel;
     this.channelShownFn = opts.channelShown;
@@ -3197,7 +3235,9 @@ export class EventGate {
   // Evaluate — main entry point
   // =========================================================================
 
-  evaluate(info: GateEventInfo): GateDecision {
+  /** `after` is an internal host placement, never event-supplied metadata.
+   *  Without it, a batch keeps its historical wake behavior. */
+  evaluate(info: GateEventInfo, after?: WritePlacement): GateDecision {
     this.reloadIfChanged();
 
     // Sleep suppression: while asleep, drop EXTERNAL wakes. Two things still
@@ -3243,11 +3283,11 @@ export class EventGate {
     let decision: GateDecision | null = null;
     const observed: string[] = [];
     if (scripted != null) {
-      decision = this.computeDecision({ name: 'gate.js', match: {}, behavior: scripted }, info);
+      decision = this.computeDecision({ name: 'gate.js', match: {}, behavior: scripted }, info, after);
     } else {
       for (const compiled of this.compiledPolicies) {
         if (!this.compiledMatches(compiled, info)) continue;
-        const candidate = this.computeDecision(compiled.policy, info);
+        const candidate = this.computeDecision(compiled.policy, info, after);
         if (candidate.trigger || !compiled.policy.passthrough) {
           decision = candidate;
           break;
@@ -3258,7 +3298,7 @@ export class EventGate {
 
     this.totalEvaluations++;
     if (!decision) {
-      decision = this.computeDecision(null, info);
+      decision = this.computeDecision(null, info, after);
       const bucket = this.defaultByEventType.get(info.eventType)
         ?? { triggered: 0, skipped: 0 };
       if (decision.trigger) {
@@ -3287,7 +3327,7 @@ export class EventGate {
     return decision;
   }
 
-  private computeDecision(policy: GatePolicy | null, info: GateEventInfo): GateDecision {
+  private computeDecision(policy: GatePolicy | null, info: GateEventInfo, after?: WritePlacement): GateDecision {
     if (!policy) {
       const trigger = (this.config.default ?? 'always') === 'always';
       return { trigger, policyName: null, behavior: this.config.default ?? 'always' };
@@ -3321,7 +3361,7 @@ export class EventGate {
 
     if (typeof policy.behavior === 'object') {
       if ('debounce' in policy.behavior || 'judge' in policy.behavior) {
-        this.handleDebounce(policy, info);
+        this.handleDebounce(policy, info, after);
         return { trigger: false, policyName: policy.name, behavior: policy.behavior };
       }
       if ('rate_limit' in policy.behavior) {
@@ -3682,11 +3722,16 @@ export class EventGate {
     }
   }
 
-  private handleDebounce(policy: GatePolicy, info: GateEventInfo): void {
+  private handleDebounce(policy: GatePolicy, info: GateEventInfo, after?: WritePlacement): void {
     const debounceMs = batchQuietMs(policy.behavior) ?? MIN_DEBOUNCE_MS;
     const judge = typeof policy.behavior === 'object' && 'judge' in policy.behavior ? policy.behavior.judge : undefined;
 
+    const routeChannelId = this.routeChannelFor(info);
     const event: PendingEvent = {
+      // A reply judge decides its own batches; this test is for debounces.
+      ...(!judge && after ? { after } : {}),
+      ...(routeChannelId && info.serverId && !info.tags?.includes('chat:ambient') && !info.tags?.includes('chat:system')
+        ? { replyTo: { serverId: info.serverId, channelId: routeChannelId } } : {}),
       policyName: policy.name,
       content: info.content.length > MAX_CONTENT_SNIPPET
         ? safeSlice(info.content, 0, MAX_CONTENT_SNIPPET) + '...'
@@ -3702,7 +3747,7 @@ export class EventGate {
       authorId: this.extractAuthorId(info.metadata) ?? undefined,
       serverId: info.serverId || undefined,
       addressed: Array.isArray(info.tags) && info.tags.includes('chat:addressed'),
-      routeChannelId: this.routeChannelFor(info),
+      routeChannelId,
       ...(typeof info.metadata?.messageId === 'string' ? { messageId: info.metadata.messageId } : {}),
       ...(typeof info.metadata?.eventId === 'string' ? { eventId: info.metadata.eventId } : {}),
     };
@@ -3760,7 +3805,7 @@ export class EventGate {
     // write or reload that sends it (clearStateFor), it would report a change
     // that was made as failed.
     try {
-      this.deliverEvents(events);
+      this.deliverEvents(events, true);
     } catch (err) {
       const one = events.length === 1;
       console.error(
@@ -3769,20 +3814,17 @@ export class EventGate {
       );
       return;
     }
-
-    this.emitTrace({
-      type: 'gate:debounce-delivered',
-      policyName,
-      eventCount: events.length,
-      timestamp: Date.now(),
-    });
   }
 
   // =========================================================================
   // Event delivery
   // =========================================================================
 
-  private deliverEvents(batched: PendingEvent[]): void {
+  private deliverEvents(
+    batched: PendingEvent[],
+    traceDelivery = false,
+    released?: { agentName: string; timedOut: boolean },
+  ): void {
     // Delivery-time re-check: a channel tuned out after its events were
     // batched is held now, and "already shown above at arrival" would be
     // untrue of them. They are dropped; the hold's own reader has them.
@@ -3801,6 +3843,114 @@ export class EventGate {
     }
     if (events.length === 0) return;
 
+    const delivered = new Set<PendingEvent>();
+    if (!released && !this.getSharedSlotReadersFn && (!this.isWriteDoneFn || !events.some((event) => event.after !== undefined))) {
+      this.deliverBatch(events);
+      for (const event of events) delivered.add(event);
+    } else {
+      const liveRecipients = this.getAgentNamesFn();
+      const recipients = released ? liveRecipients.filter((name) => name === released.agentName) : liveRecipients;
+      if (released && recipients.length === 0) return;
+      const checks = new Map<string, Map<PendingEvent, boolean>>();
+      const done = (agentName: string, event: PendingEvent): boolean => {
+        let checked = checks.get(agentName);
+        if (!checked) { checked = new Map(); checks.set(agentName, checked); }
+        if (!checked.has(event)) checked.set(event, this.writeDone(agentName, event));
+        return checked.get(event)!;
+      };
+      const groups: Array<{ events: PendingEvent[]; agents: string[] }> = [];
+      for (const agentName of recipients) {
+        const fences = this.publicationFences.get(agentName);
+        // Each event belongs to one fence, with that fence's own deadline.
+        // A later turn cannot extend the wait for events already held here.
+        const fence = !released && fences && [...fences].find((f) => !f.ready);
+        const unread = events.filter((event) => {
+          if (fence && this.isWriteDoneFn && event.after?.agent === agentName && event.replyTo !== undefined) {
+            // Publication holds have no inference-buffer cap: input which
+            // would otherwise be delivered must never be evicted here.
+            fence.events.push(event);
+            return false;
+          }
+          return released?.timedOut || !done(agentName, event);
+        });
+        if (unread.length === 0) continue;
+        const group = groups.find((g) => g.events.length === unread.length && g.events.every((e, i) => e === unread[i]));
+        if (group) group.agents.push(agentName);
+        else groups.push({ events: unread, agents: [agentName] });
+      }
+      // Historically even a host with no recipients writes the batch's line.
+      if (recipients.length === 0) {
+        this.deliverBatch(events, recipients);
+        for (const event of events) delivered.add(event);
+      }
+      if (this.getSharedSlotReadersFn) {
+        const shared = this.getSharedSlotReadersFn();
+        const sharedRecipients = groups.flatMap((g) => g.agents).filter((name) => shared.includes(name));
+        // There is no per-reader line in a shared store. Summarize only the
+        // common unseen remainder, never the union of divergent remainders.
+        // Omitted placement-backed events already have their original stored
+        // content; every unread recipient still gets its own wake/provenance.
+        // A summary prepared for an immediate recipient also serves a later
+        // fence release into the same slot. This flag tracks line emission,
+        // not consumption. Timeout cannot establish a common remainder: keep
+        // its wake without guessing at a new shared summary.
+        const common = sharedRecipients.length === 0 ? [] : events.filter((event) =>
+          !event.sharedSummaryQueued && !released?.timedOut && shared.every((name) => !done(name, event)));
+        const line = common.length > 0 ? this.deliverBatchLine(common, sharedRecipients[0]) : undefined;
+        for (const event of common) event.sharedSummaryQueued = true;
+        for (const group of groups) {
+          const residents = group.agents.filter((name) => shared.includes(name));
+          this.wakeBatch(group.events, residents, line);
+          for (const name of group.agents.filter((name) => !shared.includes(name))) {
+            // A fork's content and line belong to its own store. The host's
+            // newest-entry test describes the shared slot, not this window.
+            const forkLine = this.deliverBatchLine(group.events, name, false);
+            this.wakeBatch(group.events, [name], forkLine);
+          }
+          for (const event of group.events) delivered.add(event);
+        }
+      } else {
+        // Optional shared-store integration absent: retain legacy line placement.
+        for (const group of groups) {
+          this.deliverBatch(group.events, group.agents,
+            released?.agentName ?? (group.agents.length === recipients.length ? undefined : group.agents[0]));
+          for (const event of group.events) delivered.add(event);
+        }
+      }
+    }
+    if (traceDelivery) {
+      const counts = new Map<string, number>();
+      for (const event of delivered) {
+        if (event.deliveryTraced) continue;
+        event.deliveryTraced = true;
+        counts.set(event.policyName, (counts.get(event.policyName) ?? 0) + 1);
+      }
+      for (const [policyName, eventCount] of counts) {
+        this.emitTrace({ type: 'gate:debounce-delivered', policyName, eventCount, timestamp: Date.now() });
+      }
+    }
+  }
+
+  private writeDone(agentName: string, event: PendingEvent): boolean {
+    if (!event.after || !this.isWriteDoneFn) return false;
+    try {
+      return this.isWriteDoneFn(agentName, event.after, event.replyTo) === true;
+    } catch (err) {
+      const now = this.now();
+      if (now - this.writeCheckWarnAt >= WRITE_CHECK_WARN_INTERVAL_MS) {
+        this.writeCheckWarnAt = now;
+        console.error(`[gate] Could not check whether a batched write was answered; keeping its wake (check errors throttled to once per minute): ${errorText(err)}`);
+      }
+      return false;
+    }
+  }
+
+  private deliverBatch(events: PendingEvent[], recipients?: string[], forAgent?: string): void {
+    const line = this.deliverBatchLine(events, forAgent);
+    this.wakeBatch(events, recipients ?? this.getAgentNamesFn(), line);
+  }
+
+  private deliverBatchLine(events: PendingEvent[], forAgent?: string, deferLine = true): WakeLine | undefined {
     const policyNames = [...new Set(events.map(e => e.policyName))];
 
     // Events whose content the framework already stored at arrival (MCPL
@@ -3859,7 +4009,7 @@ export class EventGate {
     const text = `[${NOTICE_TAG.gate}: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
     const only = events.length === 1 && events[0].inContext ? events[0] : undefined;
     let line: WakeLine | undefined;
-    if (only && this.newestEntry(only)) {
+    if (deferLine && only && this.newestEntry(only)) {
       const shownChannel = only.routeChannelId ?? only.channelId;
       line = {
         entry: entryRef(only),
@@ -3872,9 +4022,13 @@ export class EventGate {
       this.addMessageFn('user', [{ type: 'text', text }], {
         source: 'gate:debounce',
         policies: policyNames,
-      });
+      }, forAgent);
     }
 
+    return line;
+  }
+
+  private wakeBatch(events: PendingEvent[], recipients: string[], line?: WakeLine): void {
     // Provenance of the batched wake (who/where woke the agent): the newest
     // ADDRESSED event first, else the newest event naming a channel or an
     // author; channel + author + addressed from that ONE event. When that
@@ -3886,7 +4040,7 @@ export class EventGate {
     // shared by every agent the batch wakes, so it is written once.
     const chosen = wakeProvenance(events);
     const provenance = line ? { ...chosen, line } : chosen;
-    for (const agentName of this.getAgentNamesFn()) {
+    for (const agentName of recipients) {
       this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
     }
   }
@@ -4219,7 +4373,30 @@ export class EventGate {
     if (this.changesJudgedContext(agentName)) this.stopJudging();
   }
 
-  onInferenceEnded(agentName: string): void {
+  /** `repliesSettled` is an internal, per-agent fence for final publication.
+   *  It delays only that recipient's placement-backed channel debounce checks,
+   *  for at most PUBLICATION_FENCE_TIMEOUT_MS. The judge, self-wakes, sleep,
+   *  and inference-status snapshot keep their original timing. */
+  onInferenceEnded(agentName: string, repliesSettled?: Promise<void>): void {
+    if (repliesSettled && !this.disposed) {
+      const fence: PublicationFence = { events: [], ready: false, timedOut: false };
+      const fences = this.publicationFences.get(agentName) ?? new Set<PublicationFence>();
+      fences.add(fence);
+      this.publicationFences.set(agentName, fences);
+      const release = (timedOut = false) => {
+        if (this.disposed || fence.ready) return;
+        fence.ready = true;
+        fence.timedOut = timedOut;
+        clearTimeout(fence.timer);
+        if (timedOut) {
+          console.error(`[gate] Final-publication fence for ${quotedValue(agentName)} exceeded ${PUBLICATION_FENCE_TIMEOUT_MS} ms; releasing its held events as wakeable`);
+        }
+        this.flushPublicationFencesIfClear();
+      };
+      fence.timer = setTimeout(() => release(true), PUBLICATION_FENCE_TIMEOUT_MS);
+      fence.timer.unref?.();
+      void repliesSettled.then(() => release(), () => release());
+    }
     this.inferring.delete(agentName);
     this.flushInferenceBufferIfClear();
     this.flushJudgeHeldIfClear();
@@ -4250,14 +4427,22 @@ export class EventGate {
 
   private flushInferenceBufferIfClear(): void {
     if (this.quiesced) return;
+    this.flushPublicationFencesIfClear();
     if (this.inferring.size === 0 && this.inferenceBuffer.length > 0) {
       const events = this.inferenceBuffer.splice(0);
       // Defer to avoid re-entrancy inside trace callbacks. A delivery that
       // throws drops what was held, named in the log, as fireDebounce drops a
       // batch: thrown in the microtask, it would be uncaught.
       queueMicrotask(() => {
+        if (this.disposed) return;
+        if (this.quiesced || this.inferring.size > 0) {
+          const pending = events.concat(this.inferenceBuffer);
+          this.inferenceBuffer = [];
+          this.bufferForInference(pending);
+          return;
+        }
         try {
-          this.deliverEvents(events);
+          this.deliverEvents(events, true);
         } catch (err) {
           const one = events.length === 1;
           console.error(
@@ -4266,6 +4451,36 @@ export class EventGate {
           );
         }
       });
+    }
+  }
+
+  private flushPublicationFencesIfClear(): void {
+    if (this.disposed || this.quiesced || this.inferring.size > 0) return;
+    for (const [agentName, fences] of this.publicationFences) {
+      for (const fence of fences) {
+        if (!fence.ready) continue;
+        fences.delete(fence);
+        const events = fence.events.splice(0);
+        if (events.length === 0) continue;
+        // Keep released events outside the capped inference buffer too. If a
+        // turn or surgery is active at release, the ready fence waits here.
+        queueMicrotask(() => {
+          if (this.disposed) return;
+          if (this.quiesced || this.inferring.size > 0) {
+            fence.events = events.concat(fence.events);
+            const pending = this.publicationFences.get(agentName) ?? new Set<PublicationFence>();
+            pending.add(fence);
+            this.publicationFences.set(agentName, pending);
+            return;
+          }
+          try {
+            this.deliverEvents(events, true, { agentName, timedOut: fence.timedOut });
+          } catch (err) {
+            console.error(`[gate] ${events.length} events held for final publication couldn't be delivered (${errorText(err)}), so the batch is dropped`);
+          }
+        });
+      }
+      if (fences.size === 0) this.publicationFences.delete(agentName);
     }
   }
 
@@ -4284,9 +4499,13 @@ export class EventGate {
   } {
     let judgeHeldEvents = 0;
     for (const held of this.judgeHeld.values()) judgeHeldEvents += held.events.length;
+    const buffered = new Set(this.inferenceBuffer);
+    for (const fences of this.publicationFences.values()) {
+      for (const fence of fences) for (const event of fence.events) buffered.add(event);
+    }
     return {
       inferring: [...this.inferring],
-      bufferedEvents: this.inferenceBuffer.length,
+      bufferedEvents: buffered.size,
       droppedBufferedEvents: this.droppedBufferedEvents,
       sleepUntil: this.sleepUntil,
       judgeHeldEvents,
@@ -4749,6 +4968,10 @@ export class EventGate {
     this.rateLimitDenied.clear();
     this.passiveSampleFires.clear();
     this.inferenceBuffer = [];
+    for (const fences of this.publicationFences.values()) {
+      for (const fence of fences) clearTimeout(fence.timer);
+    }
+    this.publicationFences.clear();
     // stop() disposes the gate once its streams and event loop have ended (a
     // turn still compiling then is dropped at its next check, before it sends
     // anything). An agent left here by a turn whose exit didn't end it (a
