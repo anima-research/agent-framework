@@ -12,10 +12,13 @@
  * blocks are refused, or moved into the watcher's assistant turns, where
  * they read as calls the watcher made.
  *
- * So the watcher is sent them as a transcript, a line per block: a call as
- * the tool's name and its input in brief, a result as the tool's name and
- * its outcome in brief, and no thinking at all. Text, images and the rest go
- * as stored. The rule is one function of the stored row, applied the same
+ * So by default the watcher is sent them as a transcript, a line per block:
+ * a call as the tool's name and its input in brief, a result as the tool's
+ * name and its outcome in brief, and no thinking at all. Text, images and
+ * the rest go as stored. The signature forbids sending a thinking block as
+ * part of another prefix, not its text: leaving the text out is this
+ * transcript's choice. A host can have the rounds sent as stored instead
+ * (PersistentReaderConfig.foreignRounds `'raw'`, as 0.30.0 sent them). The rule is one function of the stored row, applied the same
  * way to a compile's messages and to a row a tool boundary injects, so what
  * the watcher's window holds and what its requests carried stay one thing.
  *

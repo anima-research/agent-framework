@@ -93,7 +93,7 @@ import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 import { Agent, assertAgentSwitches, assertThinkingBinding, dryCompileStatsOf, type RenderStats } from './agent.js';
-import { assertBooleanSetting, holdsSettings, kindOf } from './config-checks.js';
+import { assertBooleanSetting, assertOneOfSetting, holdsSettings, kindOf } from './config-checks.js';
 import { ModuleRegistry, checkedToolResult, droppedToolResultLine, ensureStateRegistered, retiredPushLine, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { prefixesMeet, prefixesMeetError } from './mcpl/prefix-rule.js';
@@ -1958,8 +1958,10 @@ function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
  * anything but an object, null or false (holdsSettings), or whose switch in
  * one holds anything but true or false (assertBooleanSetting), or whose
  * subconscious's `thinkingBinding` assertThinkingBinding refuses, whichever
- * its reader. A subconscious that isn't on has its `allowChannelSpeech` and
- * `thinkingBinding` left unchecked, since nothing reads them then.
+ * its reader, or whose persistent subconscious's `foreignRounds` is neither
+ * of its modes (assertOneOfSetting). A subconscious that isn't on has its
+ * `allowChannelSpeech`, `thinkingBinding` and `foreignRounds` left
+ * unchecked, since nothing reads them then.
  */
 function assertFrameworkSwitches(config: FrameworkConfig): void {
   if (holdsSettings('subconscious', config.subconscious, '{ enabled: true }')) {
@@ -1976,6 +1978,15 @@ function assertFrameworkSwitches(config: FrameworkConfig): void {
         'true lets the subconscious speak in channels with speak_in_channel, and false or leaving it out refuses it',
       );
       assertThinkingBinding('subconscious.thinkingBinding', config.subconscious.thinkingBinding);
+      if (config.subconscious.reader !== 'forks') {
+        assertOneOfSetting(
+          'subconscious.foreignRounds',
+          config.subconscious.foreignRounds,
+          ['transcript', 'raw'],
+          '\'transcript\' or leaving it out sends a resident\'s rounds to the subconscious as a line per call and result, ' +
+            'without their thinking, and \'raw\' sends them as stored',
+        );
+      }
     }
   }
   if (holdsSettings('watchdog', config.watchdog, '{ enabled: true }')) {
@@ -17237,10 +17248,11 @@ export class AgentFramework {
       fixed: (epochIds, ordinal, inForce) => this.tuneOutCoordinator?.subconsciousWindowFixed(epochIds, ordinal, inForce) ?? true,
       emitTrace: (event) => this.emitTrace(event),
     });
-    // With its window presented, a resident's rounds go out to it as a
-    // transcript, its own as stored (foreign-rounds.ts, #291 answer 13):
-    // the one change its requests take at the switch.
-    if (this.presents(agent)) agent.setForeignRounds('transcript');
+    // With its window presented, a resident's rounds go out to it as its
+    // configuration's foreignRounds says, a transcript by default, its own
+    // as stored (foreign-rounds.ts, #291 answer 13): the one change its
+    // requests take at the switch.
+    if (this.presents(agent)) agent.setForeignRounds(cfg.foreignRounds ?? 'transcript');
     this.subconsciousConfig = cfg;
     return agent;
   }

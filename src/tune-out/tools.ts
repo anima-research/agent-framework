@@ -178,6 +178,27 @@ export interface PersistentReaderConfig extends SubconsciousConfigBase {
   systemPrompt: string;
   /** WindowedPassthroughStrategy re-anchor fraction (default 0.5). */
   reAnchorFraction?: number;
+  /**
+   * How a resident's rounds go out in the subconscious's requests once its
+   * window follows the presentation index (#291, answer 13). Its own rounds go
+   * as stored either way.
+   *
+   * - `'transcript'` (the default): a line per tool call (the tool's name and
+   *   its input in brief) and per result (its outcome in brief), the text as
+   *   stored, and none of the resident's thinking (foreign-rounds.ts).
+   * - `'raw'`: as stored, as 0.30.0 sent them: the resident's thinking
+   *   blocks, its tool calls and their results, in the subconscious's
+   *   requests under the resident's name. A provider pairs tool blocks only
+   *   in the turns of the agent that made the call, so it may refuse them, or
+   *   the formatter may move them into the subconscious's own turns, where
+   *   they read as calls it made.
+   *
+   * A thinking block's signature binds the block to the prefix the resident
+   * was sent, so the block can't be sent as part of another agent's prefix;
+   * its text could be. Leaving the text out is the transcript's choice, not
+   * the provider's.
+   */
+  foreignRounds?: 'transcript' | 'raw';
 }
 
 export interface ForkReaderConfig extends SubconsciousConfigBase {

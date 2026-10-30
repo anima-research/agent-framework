@@ -558,10 +558,10 @@ export class Agent {
    * How another agent's rounds go out in this agent's requests (#291, answer
    * 13): `'raw'`, as stored, or `'transcript'` (foreign-rounds.ts), a line
    * per call and per result and no thinking, the same in every compile and
-   * in what a tool boundary injects. The framework sets `'transcript'` for an
-   * agent that watches another's slot once its window follows the
-   * presentation index (the persistent subconscious); every other agent
-   * reads no other agent's rounds.
+   * in what a tool boundary injects. The framework sets the persistent
+   * subconscious's once its window follows the presentation index, as its
+   * configuration's `foreignRounds` says (`'transcript'` by default); every
+   * other agent reads no other agent's rounds.
    */
   private foreignRounds: 'raw' | 'transcript' = 'raw';
 

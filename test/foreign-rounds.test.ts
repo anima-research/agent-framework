@@ -125,3 +125,76 @@ describe("the persistent subconscious's own voice", () => {
     }
   });
 });
+
+// The audit of #291's mind-neutrality, D1: the transcript was fixed for
+// every persistent subconscious. `subconscious.foreignRounds` makes it the
+// default of a setting, whose other mode sends the rounds as stored, as
+// 0.30.0 did.
+describe('subconscious.foreignRounds', () => {
+  async function subconsciousRequest(foreignRounds: unknown) {
+    const dir = mkdtempSync(join(tmpdir(), 'sub-foreign-rounds-'));
+    const membrane = new WireMembrane();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      subconscious: { enabled: true, reader: 'persistent', systemPrompt: 'Read for scout.', foreignRounds },
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    } as never);
+    try {
+      await framework.start();
+      const scout = framework.getAgent('scout')!;
+      const stored = [thinking('sig-scout'), text('Looking it up.'), call('c1', 'search', { q: 'build status' })];
+      storeOwnRow(scout, 'scout', stored);
+      storeOwnRow(scout, 'user', [{ ...result('c1', 'green'), toolName: 'search' } as ContentBlock]);
+      (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({ agentName: 'Subconscious', reason: 'test', source: 'test', timestamp: Date.now() });
+      await framework.runUntilIdle();
+      const request = membrane.calls.at(-1)!;
+      assert.equal(request.assistantParticipant, 'Subconscious', "premise: the subconscious's request");
+      return { messages: request.messages, stored };
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it("'raw' sends a resident's round and its result as stored, its signed thinking and its call included", { timeout: 120_000 }, async () => {
+    const { messages, stored } = await subconsciousRequest('raw');
+    const round = messages.find((m) => m.participant === 'scout');
+    assert.ok(round, `the round is in its request: ${JSON.stringify(messages)}`);
+    assert.deepEqual(round.content, stored, 'as stored: the thinking with its signature, the text, the call');
+    assert.ok(messages.some((m) => m.content.some((b) => b.type === 'tool_result' && (b as { toolUseId?: string }).toolUseId === 'c1')),
+      'and the result as a tool_result block');
+    assert.ok(!JSON.stringify(messages).includes('[search called:'), 'no transcript line');
+  });
+
+  it("'transcript', and leaving it out, send the round as lines without its thinking", { timeout: 120_000 }, async () => {
+    for (const mode of ['transcript', undefined]) {
+      const { messages } = await subconsciousRequest(mode);
+      const round = messages.find((m) => m.participant === 'scout');
+      assert.ok(round, `${String(mode)}: the round is in its request`);
+      assert.deepEqual(round.content, [text('Looking it up.'), text('[search called: {"q":"build status"}]')], String(mode));
+      assert.ok(!JSON.stringify(messages).includes('sig-scout'), `${String(mode)}: no thinking goes out`);
+    }
+  });
+
+  it('refuses any other value at create, naming the setting and not the value', async () => {
+    for (const value of ['Raw', 1]) {
+      await assert.rejects(
+        AgentFramework.create({
+          agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+          subconscious: { enabled: true, reader: 'persistent', systemPrompt: 'Read for scout.', foreignRounds: value },
+          membrane: new WireMembrane().asMembrane(),
+          modules: [],
+        } as never),
+        (error: Error) => {
+          assert.match(error.message, /^subconscious\.foreignRounds must be 'transcript' or 'raw', not (another string|a number): /);
+          assert.ok(!error.message.includes('Raw'), 'the value is not quoted');
+          return true;
+        },
+      );
+    }
+  });
+});

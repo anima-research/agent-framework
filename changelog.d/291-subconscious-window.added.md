@@ -19,7 +19,11 @@
   - A resident's rounds go out to it as a transcript: a line per tool call (the tool's name and its input in brief)
     and per result (the outcome in brief), and none of the resident's thinking, the same in its compiles and in
     what its tool boundary injects (`Agent.setForeignRounds`, `Agent.injectedAsSent`). Its own rounds go as
-    stored, and it keeps their signed thinking across a row heard from the residents' slot.
+    stored, and it keeps their signed thinking across a row heard from the residents' slot. That is the default of
+    a new setting, `subconscious.foreignRounds`: `'raw'` sends a resident's rounds as stored, its thinking and
+    tool blocks included, as 0.30.0 did, and any other value is refused at `create()`. A thinking block's
+    signature rules out sending the block as part of another agent's prefix, not its text; leaving the text out is
+    the transcript's choice.
   - A reader fork's framing hand-off presents the held rows it is handed into the fork's window when its run takes
     it on: the fork holds them while it lives (`presentedToAnyone`), so a coalescer doesn't withdraw a row a reader
     was handed, and its view keeps them out of its compile, where the framing shows them. A fork its run refuses
