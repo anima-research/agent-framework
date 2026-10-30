@@ -8,6 +8,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AgentFramework } from '../src/framework.js';
+import { StdioTransport } from '../src/mcpl/transport.js';
+import { admissionConnectErrorOf, AdmissionConnectError } from '../src/mcpl/inbound-admission.js';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
 import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
 import { RequiredAdmission, MAX_PENDING_ADMISSIONS, type InboundAdmissionConfig, type AdmissionVerdict } from '../src/mcpl/inbound-admission.js';
@@ -473,4 +475,42 @@ test('required held notification from a superseded epoch is refused, never rebou
   await f.framework.resume();
   assert.equal(reason, 'admission_stale'); assert.equal(calls, 0);
   await f.framework.runUntilIdle(); assert(!f.context().includes('old_epoch'));
+});
+
+
+for (const failure of ['binding', 'attestation'] as const) test(`required ${failure} failure stays fatal when handshake cleanup fails`, async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'admission-cleanup-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const spawn = StdioTransport.spawn;
+  let cleanups = 0;
+  t.mock.method(StdioTransport, 'spawn', async (...args: Parameters<typeof spawn>) => {
+    const transport = await spawn.apply(StdioTransport, args);
+    const close = transport.close.bind(transport);
+    t.after(close);
+    transport.close = async () => {
+      if (++cleanups === 1) throw Error('test cleanup failure');
+      await close();
+    };
+    return transport;
+  });
+  let framework: AgentFramework | undefined;
+  t.after(async () => { await framework?.stop(); });
+  await assert.rejects(async () => {
+    framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: new MockMembrane().asMembrane(), agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }], modules: [], mcplServers: [{
+      id: 'endpoint-a', command: process.execPath, args: [peer], inboundAdmission: {
+        ...config(() => allow),
+        ...(failure === 'binding' ? { bind: () => undefined } : { initializeAttestation: { read: () => undefined, matches: () => false } }),
+      },
+    }] });
+  }, error => {
+    assert(admissionConnectErrorOf(error) instanceof AdmissionConnectError);
+    assert.match((error as Error).message, /test cleanup failure/);
+    return true;
+  });
+  assert(cleanups >= 2, 'failed startup retried the launch cleanup');
+});
+
+test('fatal admission cause lookup terminates on cycles and ordinary cleanup failures', () => {
+  const error = new Error('ordinary'); error.cause = error;
+  assert.equal(admissionConnectErrorOf(error), undefined);
 });

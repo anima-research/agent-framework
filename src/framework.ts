@@ -1,4 +1,4 @@
-import { AdmissionConnectError, admittedEnvelope, attachAdmission, wakeForbidden, type RequiredIngress } from './mcpl/inbound-admission.js';
+import { admissionConnectErrorOf, admittedEnvelope, attachAdmission, wakeForbidden, type RequiredIngress } from './mcpl/inbound-admission.js';
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { presentAuthor } from './author-presentation.js';
 import { constants as bufferConstants } from 'node:buffer';
@@ -32303,7 +32303,7 @@ export class AgentFramework {
         if (error instanceof DiscordAwarenessAccountingError) throw error;
         // A required binder/attestation refusal is terminal; an ordinary
         // transport outage retains the existing log-and-continue policy.
-        if (error instanceof AdmissionConnectError) throw error;
+        if (admissionConnectErrorOf(error)) throw error;
         // Fail-open: log and continue with remaining servers
         const err = error instanceof Error ? error : new Error(String(error));
         const message = redactServerText(err.message, config);

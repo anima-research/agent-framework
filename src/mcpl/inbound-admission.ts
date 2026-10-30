@@ -30,6 +30,15 @@ export const refusal = (reason: RefusalCode): AdmissionVerdict & { store: false 
 export class AdmissionConnectError extends Error {
   constructor(code: 'initialize_attestation_refused' | 'admission_missing') { super(code); this.name = 'AdmissionConnectError'; }
 }
+/** Startup wrappers preserve causes even when cleaning up a failed launch fails. */
+export function admissionConnectErrorOf(error: unknown): AdmissionConnectError | undefined {
+  const seen = new Set<Error>();
+  while (error instanceof Error && !seen.has(error)) {
+    if (error instanceof AdmissionConnectError) return error;
+    seen.add(error);
+    error = error.cause;
+  }
+}
 export function admissionConfigProblem(value: InboundAdmissionConfig): string | undefined {
   if (!value || !Number.isInteger(value.timeoutMs) || value.timeoutMs < 1 || value.timeoutMs > MAX_ADMISSION_TIMEOUT_MS ||
       typeof value.bind !== 'function' || typeof value.isReplyIntent !== 'function' ||
