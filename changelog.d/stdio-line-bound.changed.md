@@ -13,13 +13,13 @@
 - **A stderr line longer than the same bound is dropped,** with one line in
   its place saying so, `[a stderr line longer than 104,857,600 UTF-16 code
   units was dropped]`, and the connection stays up. Stderr lines that arrive
-  before anything listens for them, on either engine, are held to the same
-  bound, each line counted as its length plus 16: past it the oldest whole
-  lines go, the newest is always kept, and the first line handed on says how
-  many went, `[N earlier stderr lines were dropped: unread stderr is held to
-  104,857,600 UTF-16 code units, each line counted as its length plus 16]`.
-  That replaces the modern engine's hold of the newest 200 lines, which
-  dropped older ones with no notice. Two holds are as before: the legacy
+  before anything listens for them, on either engine, are held to the newest
+  200 lines and to the same bound in total: past either, the oldest whole
+  lines go, and the first line handed on says how many went, `[N earlier
+  stderr lines were dropped: unread stderr is held to 200 lines and
+  104,857,600 UTF-16 code units]`. On the modern engine that replaces a hold
+  of the newest 200 lines with no bound on their length, which dropped older
+  ones with no notice. Two holds are as before: the legacy
   connection's own queue, which while its control plane is closed (until
   it first opens, and from each reconnect until it reopens) holds up to
   1,000 events that need no answer, stderr lines among them;

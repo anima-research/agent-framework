@@ -884,10 +884,10 @@ test('a stderr line whose line end comes in the read that takes it past the boun
   assert.deepEqual({ lines, closed: transport.closed }, { lines: [STDERR_DROPPED_NOTICE, 'last'], closed: false });
 });
 
-test('stderr that arrives before anything listens is held to the bound, each line counted as its length plus 16: the oldest whole lines go, with one notice saying how many, and the newest arrive in order', { timeout: 15_000 }, async (t) => {
+test('stderr that arrives before anything listens is held to its newest 200 lines: the oldest go, with one notice saying how many, and the newest arrive in order', { timeout: 15_000 }, async (t) => {
   setStdioLineBoundForTests(65_536);
   t.after(() => setStdioLineBoundForTests(undefined));
-  const script = "for (let i = 1; i <= 3000; i++) process.stderr.write(String(i).padStart(4, '0') + 'x'.repeat(96) + '\\n');";
+  const script = "for (let i = 1; i <= 3000; i++) process.stderr.write(String(i).padStart(4, '0') + '\\n');";
   const transport = await StdioTransport.spawn({ id: 'stderr-flood', command: process.execPath, args: ['-e', script] });
   t.after(() => transport.close());
   await transport.stderrEnded(5_000);
@@ -895,8 +895,22 @@ test('stderr that arrives before anything listens is held to the bound, each lin
   const lines: string[] = [];
   transport.on('stderr', (line: string) => { lines.push(line); });
   await new Promise<void>((resolve) => { setImmediate(resolve); });
-  const kept = Array.from({ length: 564 }, (_, k) => String(2437 + k).padStart(4, '0') + 'x'.repeat(96));
-  assert.deepEqual(lines, ['[2,436 earlier stderr lines were dropped: unread stderr is held to 65,536 UTF-16 code units, each line counted as its length plus 16]', ...kept]);
+  const kept = Array.from({ length: 200 }, (_, k) => String(2801 + k).padStart(4, '0'));
+  assert.deepEqual(lines, ['[2,800 earlier stderr lines were dropped: unread stderr is held to 200 lines and 65,536 UTF-16 code units]', ...kept]);
+});
+
+test('long stderr lines that arrive before anything listens are held to the bound in total: the oldest whole lines go, with one notice saying how many', { timeout: 15_000 }, async (t) => {
+  setStdioLineBoundForTests(65_536);
+  t.after(() => setStdioLineBoundForTests(undefined));
+  const script = "for (let i = 1; i <= 3; i++) process.stderr.write(String(i) + 'x'.repeat(29_999) + '\\n');";
+  const transport = await StdioTransport.spawn({ id: 'stderr-long-held', command: process.execPath, args: ['-e', script] });
+  t.after(() => transport.close());
+  await transport.stderrEnded(5_000);
+  assert.equal((transport as unknown as { stderrDone: boolean }).stderrDone, true, "the child's stderr ended before anything listened");
+  const lines: string[] = [];
+  transport.on('stderr', (line: string) => { lines.push(line); });
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.deepEqual(lines, ['[1 earlier stderr line was dropped: unread stderr is held to 200 lines and 65,536 UTF-16 code units]', '2' + 'x'.repeat(29_999), '3' + 'x'.repeat(29_999)]);
 });
 
 test("a legacy server whose stdin fails and whose child outlives SIGKILL is held as a launch it can't reap: a permanent failure, and close() retries", { timeout: 60_000 }, async (t) => {

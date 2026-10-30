@@ -595,47 +595,36 @@ export function setStdioExitGraceForTests(child: ChildProcess, ms: number): void
 
 let testLineBound: number | undefined;
 
-// V8 keeps up to about 45 bytes beside a held line's characters (its string's
-// header and its array slot), so a flood of short lines would take several
-// times the ceiling in memory. Charging each held line 16 code units more
-// keeps what unread stderr holds within about 3 bytes a counted code unit.
-const STDERR_LINE_CHARGE = 16;
+const MAX_HELD_STDERR_LINES = 200;
 
 export class HeldStderr {
   private lines: string[] = [];
-  private head = 0;
-  private counted = 0;
+  private chars = 0;
   private dropped = 0;
 
   get empty(): boolean {
-    return this.head === this.lines.length && this.dropped === 0;
+    return this.lines.length === 0 && this.dropped === 0;
   }
 
   hold(line: string): void {
     // V8 can make a line split from a longer string a slice that keeps the
     // whole string alive, so a held line is copied to own only its characters.
     this.lines.push(Buffer.from(line, 'utf16le').toString('utf16le'));
-    this.counted += line.length + STDERR_LINE_CHARGE;
+    this.chars += line.length;
     const ceiling = testLineBound ?? MAX_LINE_CHARS;
-    while (this.counted > ceiling && this.head < this.lines.length - 1) {
-      this.counted -= this.lines[this.head].length + STDERR_LINE_CHARGE;
-      this.lines[this.head++] = '';
+    while (this.lines.length > MAX_HELD_STDERR_LINES || this.chars > ceiling) {
+      this.chars -= this.lines.shift()!.length;
       this.dropped++;
-    }
-    if (this.head > 1024 && this.head * 2 > this.lines.length) {
-      this.lines = this.lines.slice(this.head);
-      this.head = 0;
     }
   }
 
   take(): string[] {
-    const held = this.lines.slice(this.head);
+    const held = this.lines;
     const taken = this.dropped > 0
-      ? [`[${this.dropped.toLocaleString('en-US')} earlier stderr line${this.dropped === 1 ? ' was' : 's were'} dropped: unread stderr is held to ${(testLineBound ?? MAX_LINE_CHARS).toLocaleString('en-US')} UTF-16 code units, each line counted as its length plus ${STDERR_LINE_CHARGE}]`, ...held]
+      ? [`[${this.dropped.toLocaleString('en-US')} earlier stderr line${this.dropped === 1 ? ' was' : 's were'} dropped: unread stderr is held to ${MAX_HELD_STDERR_LINES} lines and ${(testLineBound ?? MAX_LINE_CHARS).toLocaleString('en-US')} UTF-16 code units]`, ...held]
       : held;
     this.lines = [];
-    this.head = 0;
-    this.counted = 0;
+    this.chars = 0;
     this.dropped = 0;
     return taken;
   }

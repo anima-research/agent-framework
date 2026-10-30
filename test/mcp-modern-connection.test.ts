@@ -81,7 +81,7 @@ test('connects once over Connectome\'s spawner and speaks 2026-07-28', async () 
   await until(() => stderr.includes('shout: hello'), "the fixture's stderr line arrives");
 });
 
-test('stderr that arrives before the caller listens is held to the bound, each line counted as its length plus 16: the oldest whole lines go, with one notice saying how many, and the newest arrive in order', async (t) => {
+test('stderr that arrives before the caller listens is held to its newest 200 lines: the oldest go, with one notice saying how many, and the newest arrive in order', async (t) => {
   setStdioLineBoundForTests(65_536);
   t.after(() => setStdioLineBoundForTests(undefined));
   const connection = await connect(config(scratch(), { env: { FIXTURE_STDERR_FLOOD: '3000' } }));
@@ -90,8 +90,8 @@ test('stderr that arrives before the caller listens is held to the bound, each l
   const stderr: string[] = [];
   connection.on('stderr', ({ line }: { line: string }) => stderr.push(line));
   await new Promise<void>((resolve) => { setImmediate(resolve); });
-  const kept = Array.from({ length: 564 }, (_, k) => String(2437 + k).padStart(4, '0') + 'x'.repeat(96));
-  assert.deepEqual(stderr, ['[2,437 earlier stderr lines were dropped: unread stderr is held to 65,536 UTF-16 code units, each line counted as its length plus 16]', ...kept, 'flood done']);
+  const kept = Array.from({ length: 199 }, (_, k) => String(2802 + k).padStart(4, '0') + 'x'.repeat(96));
+  assert.deepEqual(stderr, ['[2,802 earlier stderr lines were dropped: unread stderr is held to 200 lines and 65,536 UTF-16 code units]', ...kept, 'flood done']);
 });
 
 test('the child gets the env allowlist plus declared env, as legacy children do', async () => {
