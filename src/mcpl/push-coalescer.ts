@@ -1176,6 +1176,17 @@ export class PushCoalescer<E = unknown> {
         try {
           placement = await this.deliver({ ...occurrence, timestamp, content, ...(firstView ? { firstView: true } : {}) }, content, assemblingFor);
         } catch (error) {
+          // A delivery that throws is taken as one that stored nothing, and
+          // its batch goes to its recovery as its fallback. The limit that
+          // leaves (71daeae6): a store that throws after the occurrence's
+          // row landed, context-manager's own listener failing after its
+          // append or a sharded append whose clean-up failed too, has the
+          // recovery store the fallback beside that row, and the agent sees
+          // the occurrence twice. It stays so until context-manager's error
+          // carries the ids it landed, which would let this take a landed
+          // write as stored. A duplicate the agent can see is kept over a
+          // loss it couldn't: taking every throw as stored would lose the
+          // batch where nothing landed.
           failed = true;
           this.host.audit({ kind: 'deliver-failed', subject, eventId: occurrence.eventId, error: String(error) });
           if (state.batch) state.batch.noRender = true;
