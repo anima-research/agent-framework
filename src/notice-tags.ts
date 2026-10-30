@@ -67,7 +67,7 @@ export const NOTICE_TAG = {
 } as const;
 
 /**
- * The bracket openings context-manager 0.23.0 and 0.23.1 write into an
+ * The bracket openings context-manager 0.23.0 to 0.24.2 write into an
  * agent's context outside a tool result or read back from it, marked as the
  * framework's own are. Check them against each context-manager release the
  * framework takes.
@@ -77,9 +77,9 @@ export const CONTEXT_MANAGER_TAGS = [
 ] as const;
 
 /**
- * The bracket openings membrane 0.8.0 writes into an agent's request outside
- * a tool result, marked as the framework's own are. Check them against each
- * membrane release the framework takes.
+ * The bracket openings membrane 0.8.0 and 0.9.0 write into an agent's request
+ * outside a tool result, marked as the framework's own are. Check them against
+ * each membrane release the framework takes.
  */
 export const MEMBRANE_TAGS = [
   'Audio', 'continuing', 'Document', 'duplicate tool_result for', 'Image', 'orphan tool_result for', 'Start', 'Tool Result', 'Video',
