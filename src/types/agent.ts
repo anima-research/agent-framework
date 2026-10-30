@@ -601,6 +601,12 @@ export interface InferenceRequest {
    *  published into that channel having read it, or once the message isn't
    *  on its store's current branch, the wake starts no turn. */
   readsStoredMessage?: string;
+  /** The platform id of the one message this wake is for, in its channel
+   *  (`channelId`). The framework sets it on its wakes for a single message
+   *  and carries it onto a rewind's retry. If the turn it opens is refused,
+   *  the refusal reaction goes on that message (on a Discord channel). Left
+   *  out for a wake that is for no single message, such as a batch. */
+  answersMessageId?: string;
   agentName: string;
   reason: string;
   source: string;

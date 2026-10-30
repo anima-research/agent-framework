@@ -214,7 +214,7 @@ describe('an ephemeral run takes no global fallback (#551)', () => {
     } finally { await f.close(); }
   });
 
-  it('a subagent\'s refusal is logged with no locus; a resident\'s with the latest inbound channel', async (t) => {
+  it('a subagent\'s refusal is logged with no locus; a resident\'s with the channel of the message its turn answered', async (t) => {
     const f = await fixture();
     try {
       await busyFallback(f);
