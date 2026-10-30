@@ -1,6 +1,7 @@
 /**
  * toolDeclarations' fail-safe: a request whose system change the
- * provider refused, or that a 400 ended while it carried one, goes again at
+ * provider refused, or that a 400 ended while it carried one (a 400 membrane
+ * files as context overflow or an account refusal aside), goes again at
  * once on the agent's head, which it keeps to until it's built again; a 400
  * membrane doesn't recognise raises an operator line too. The refusal never
  * reaches the error policy, and the resend continues the same turn.
@@ -90,6 +91,10 @@ const refusal = (recognised: boolean) => Object.assign(
 const refusedBeforeSending = () => Object.assign(
   new MembraneError({ type: 'invalid_request', retryable: false, message: 'this adapter sends no system changes', rawError: null }),
   { systemChangeRefused: true },
+);
+const filed400 = (type: 'context_length' | 'auth', message: string) => Object.assign(
+  new MembraneError({ type, retryable: false, message, rawError: { status: 400 } }),
+  { httpStatus: 400 },
 );
 /** A failure that isn't a 400. */
 const serverError = () => Object.assign(
@@ -241,6 +246,24 @@ describe("toolDeclarations' fail-safe", () => {
     assert.equal(after500.onHead, false);
     assert.deepEqual(after500.policyCalls, [0]);
   });
+
+  for (const [type, message] of [['context_length', 'prompt is too long: 210000 tokens > 200000 maximum'], ['auth', 'your credit balance is too low']] as const) {
+    it(`leaves a 400 membrane files as ${type} to the error policy, though the request carried a change, and stays on 'entries'`, async () => {
+      const run = await turns({ binds: false, refuse: (r) => (carriesChange(r) ? filed400(type, message) : undefined) });
+      assert.equal(run.calls.length, 2, 'no resend on the head');
+      assert.equal(resends(run.traces), 0);
+      assert.equal(run.onHead, false, "it still declares 'entries'");
+      assert.deepEqual(run.policyCalls, [0], 'the error policy had it');
+    });
+
+    it(`resends on the head a refusal membrane recognises, though it files it as ${type}`, async () => {
+      const run = await turns({ binds: false, refuse: (r) => (carriesChange(r) ? Object.assign(filed400(type, message), { systemChangeRefused: true }) : undefined) });
+      assert.equal(run.calls.length, 3, 'a resend on the head');
+      assert.equal(resends(run.traces), 1);
+      assert.equal(run.onHead, true, 'and it keeps to its head');
+      assert.deepEqual(run.policyCalls, [], 'the error policy never had it');
+    });
+  }
 
   it('leaves a refused request that carried no change to the error policy, whatever the refusal', async () => {
     const run = await turns({ binds: false, second: ['a'], refuse: () => refusal(true) });

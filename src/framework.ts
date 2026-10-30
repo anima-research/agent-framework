@@ -16130,7 +16130,7 @@ export class AgentFramework {
   private keepToHeadAfterRefusal(agent: Agent, error: Error, carriedChange: boolean): boolean {
     if (!agent.declaresEntries() || !carriedChange) return false;
     const recognised = isMembraneError(error) && error.systemChangeRefused === true;
-    const refused = isMembraneError(error) && error.httpStatus === 400;
+    const refused = isMembraneError(error) && error.httpStatus === 400 && error.type !== 'context_length' && error.type !== 'auth';
     if (!recognised && !refused) return false;
     agent.keepToHeadUntilBuiltAgain();
     console.error(`[head-declarations] ${agent.name}: a request carrying a system change was refused, so it declares on its head until it's built again: ${error.message}`);
