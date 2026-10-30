@@ -41,6 +41,7 @@ import type {
   JudgeVerdict,
   UpcomingWake,
 } from './types.js';
+import { appendAll } from '../append-all.js';
 
 // Re-export types consumers need
 export type {
@@ -1560,7 +1561,7 @@ function readConfig(
       };
     }
   }
-  for (const rule of rules) sentences.push(...readingSentences(rule.reading, rule.outcome));
+  for (const rule of rules) appendAll(sentences, readingSentences(rule.reading, rule.outcome));
   // A list with no rules, or none the gate reads, where no sentence above said it has none.
   if (notUsed !== undefined && !sentences.some((said) => said.includes(notUsed))) {
     sentences.push(`${File} has no rules${rules.length > 0 ? ' but ones the gate leaves out' : ''}, so ${notUsedWhy}.`);
@@ -3918,7 +3919,7 @@ export class EventGate {
     if (this.disposed) return;
     const deciding = this.judging.get(policyName);
     if (deciding) {
-      deciding.queued.push(...events);
+      appendAll(deciding.queued, events);
       this.capJudgeEvents(deciding.queued);
       return;
     }
@@ -3971,7 +3972,7 @@ export class EventGate {
   private holdForJudge(policyName: string, events: PendingEvent[], judge: JudgeConfig): void {
     const held = this.judgeHeld.get(policyName);
     if (held) {
-      held.events.push(...events);
+      appendAll(held.events, events);
       held.judge = judge;
       this.capJudgeEvents(held.events);
     } else {

@@ -886,14 +886,14 @@ export class SemanticIndexer {
       // The current branch may then have items this pass didn't send, and
       // old items a failed delete left are still to go.
       if (left || oldItemsOwed) report.more = true;
-      this.consecutiveFailures = 0; this.lastError = named(notStats?.message ?? null, ...phaseErrors); this.lastSyncAt = Date.now();
+      this.consecutiveFailures = 0; this.lastError = named([notStats?.message ?? null, ...phaseErrors]); this.lastSyncAt = Date.now();
       return report;
     } catch (e) {
       this.consecutiveFailures++;
       const delay = Math.min(15 * 60_000, 5_000 * 2 ** Math.min(8, this.consecutiveFailures - 1));
       this.backoffUntil = Date.now() + delay;
       const failure = e instanceof Error ? e.message : String(e);
-      this.lastError = named(failure, notStats?.message ?? null, ...phaseErrors);
+      this.lastError = named([failure, notStats?.message ?? null, ...phaseErrors]);
       this.warn(`sync failed (${this.consecutiveFailures}×, retry in ${Math.round(delay / 1000)}s): ${failure}`);
       report.more = true;
       return report;
@@ -902,6 +902,6 @@ export class SemanticIndexer {
 }
 
 /** Each failure a sync pass met, once, in the order given, for its lastError: null if none. */
-function named(...failures: (string | null)[]): string | null {
+function named(failures: (string | null)[]): string | null {
   return [...new Set(failures.filter((f): f is string => f !== null))].join('; ') || null;
 }

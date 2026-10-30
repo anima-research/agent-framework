@@ -2,6 +2,7 @@
 
 import { createOfflineRecoveryBranch } from './offline-branch.js';
 import type { DiscordAwarenessMarks } from './discord-awareness-outbox.js';
+import { appendAll } from '../append-all.js';
 
 interface CliOptions {
   storePath?: string;
@@ -70,7 +71,7 @@ function parseArgs(args: string[]): CliOptions {
       case '--messages': options.messages = Number(value()); break;
       case '--suppress':
       case '--suppress-message':
-        options.suppressMessageIds.push(...value().split(',').map((item) => item.trim()).filter(Boolean));
+        appendAll(options.suppressMessageIds, value().split(',').map((item) => item.trim()).filter(Boolean));
         break;
       case '--suppress-range': {
         const raw = value();

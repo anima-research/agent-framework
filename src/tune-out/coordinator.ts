@@ -1652,7 +1652,7 @@ export class TuneOutCoordinator {
     if (trigger === 'cadence' && backlog.length === 0 && queued.length === 0) return false;
     // The cursor only moves forward: a returned row handed again can be
     // behind it.
-    const cursor = Math.max(this.readerCursor.get(key) ?? -1, ...backlog.map((m) => m.sequence));
+    const cursor = backlog.reduce((max, m) => Math.max(max, m.sequence), this.readerCursor.get(key) ?? -1);
     if (backlog.length > 0) this.readerCursor.set(key, cursor);
     const handed = this.readerHandedWrites.get(key) ?? new Set<string>();
     for (const m of queued) handed.add(m.writeId);

@@ -202,6 +202,7 @@ import { asNextRequestCarries, roundRows, type RoundRow, type SentRow } from './
 import { ReasoningLossTeller } from './reasoning-loss.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
 import { STORED_INJECTION_KEY, STORED_INJECTION_KIND, asStoredRow, hasRenderedContent, isAnotherAgentsInjection, isOwnInjection, isStoredKind, storedInjectionMarkOf, unitHash, type StoredInjectionMark } from './stored-injections.js';
+import { appendAll } from './append-all.js';
 
 /** An MCPL tool call refused because its server isn't in the registry: one
  *  closed for good, one removed, or one whose connect failed without
@@ -2451,7 +2452,7 @@ export class DefaultErrorPolicy implements ErrorPolicy {
 
   constructor(settings: RetrySettings = TURN_RETRY_SETTINGS) {
     this.settings = settings;
-    this.maxRetries = Math.max(0, ...Object.values(settings).map((s) => (s?.maxAttempts ?? 1) - 1));
+    this.maxRetries = Object.values(settings).reduce((max, s) => Math.max(max, (s?.maxAttempts ?? 1) - 1), 0);
   }
 
   onInferenceError(error: Error, _agentName: string, attempt: number): ErrorAction {
@@ -5803,7 +5804,7 @@ export class AgentFramework {
             if (pass && passesToPrimary(msg.metadata)) pass.passOn(msg);
             else entries.push(msg);
           }
-          entries.push(...(pass ? pass.forPrimary : unacked));
+          appendAll(entries, pass ? pass.forPrimary : unacked);
         }
         this.readdDrained(entries, 'stop: postponed releases');
         this.ackDeferredWrites();
@@ -6147,7 +6148,7 @@ export class AgentFramework {
         ? `a turn whose retries ran out, sent again (${cooldown.rearm.number} of ${cooldown.rearm.of})`
         : 'a turn held by a provider cooldown, when it ends' });
     }
-    wakes.push(...this.heartbeatWakesFor(agentName));
+    appendAll(wakes, this.heartbeatWakesFor(agentName));
     return wakes;
   }
 
@@ -6754,7 +6755,7 @@ export class AgentFramework {
     if (recovery) { recovery.releasedAt = Date.now(); recovery.heldRequests = cooldown.heldRequests.length; }
     const requests = cooldown.heldRequests.length > 0 ? cooldown.heldRequests : [{ agentName,
       reason: 'provider-acceleration-retry', source: 'framework', timestamp: Date.now() } satisfies InferenceRequest];
-    this.pendingRequests.push(...requests);
+    appendAll(this.pendingRequests, requests);
     console.error(cooldown.rearm
       ? `[inference-rearm] agent=${agentName} turn queued again (${cooldown.rearm.number} of ${cooldown.rearm.of})`
       : `[provider-cooldown] agent=${agentName} released after ${Date.now() - cooldown.startedAt}ms — ` +
@@ -6907,7 +6908,7 @@ export class AgentFramework {
     // (releaseProviderWait) before anything was held: nothing binds now, so
     // the requests start, as the release of an installed hold starts them.
     if (report && !this.providerWaits?.active(agent.name, wait.model)) {
-      this.pendingRequests.push(...requests);
+      appendAll(this.pendingRequests, requests);
       return true;
     }
     const existing = this.providerAccelerationCooldowns.get(agent.name);
@@ -8472,7 +8473,7 @@ export class AgentFramework {
     const extKeys: string[] = [];
     for (const ext of extensions.values()) {
       Object.assign(extProperties, ext.properties);
-      extKeys.push(...ext.keys);
+      appendAll(extKeys, ext.keys);
     }
     const settingsProp = baseSchema.properties.settings as { items?: { enum?: string[] } };
     return {
@@ -9371,7 +9372,7 @@ export class AgentFramework {
       const prev = this.deferredScanFrom.get(target!);
       this.deferredScanFrom.set(target!, prev === undefined ? count : Math.min(prev, count));
     }
-    this.unackedDeferredWrites.push(...entries);
+    appendAll(this.unackedDeferredWrites, entries);
     this.persistDeferredWrites();
   }
 
@@ -9913,7 +9914,7 @@ export class AgentFramework {
         `(interrupted flush) — skipped, not replayed`,
       );
     }
-    this.deferredMessages.push(...restored);
+    appendAll(this.deferredMessages, restored);
     this.deferredWritesPersisted = true;
     // A tune-out release that was still deferred at the crash owes the
     // resident the wake its cancel requested (#232 gap 6).
@@ -13488,7 +13489,7 @@ export class AgentFramework {
         const turnMembers = all.slice(turn.from, turn.to + 1);
         if (turnMembers.some((m) => hasBlock(m, 'tool_use'))) {
           from = turn.from;
-          removedIds.push(...turnMembers.map((m) => m.id).reverse());
+          appendAll(removedIds, turnMembers.map((m) => m.id).reverse());
         }
       }
       const sz = toolBlocks.reduce(
@@ -19039,7 +19040,7 @@ export class AgentFramework {
         if (!requests.some((r) => emptied.has(r))) continue;
         const left = requests.filter((r) => !emptied.has(r));
         requests.length = 0;
-        requests.push(...left);
+        appendAll(requests, left);
       }
     }
     for (const start of emptied) {
@@ -19520,7 +19521,7 @@ export class AgentFramework {
       const agent = this.agents.get(agentName);
       if (!agent) {
         // Agent not found — request is orphaned. Emit warning and drop.
-        const oldest = Math.min(...requests.map(r => r.timestamp));
+        const oldest = requests.reduce((min, r) => Math.min(min, r.timestamp), Infinity);
         this.emitTrace({
           type: 'inference:request_dropped',
           agentName,
@@ -19648,13 +19649,13 @@ export class AgentFramework {
           if (lines) kept.wakeLines = lines;
           newestByKey.set(key, kept);
         }
-        this.pendingRequests.push(...newestByKey.values());
+        appendAll(this.pendingRequests, [...newestByKey.values()]);
         if (passThrough.length === 0) continue;
         // The continuation continues its held turn; its parked siblings must
         // NOT be consumed by that turn — they were re-parked above, so narrow
         // the batch to the continuation(s) alone before the trigger selection.
         requests.length = 0;
-        requests.push(...passThrough);
+        appendAll(requests, passThrough);
       }
 
       // A batch that carries a continuation which resumes its logical turn
@@ -19671,10 +19672,10 @@ export class AgentFramework {
       if (requests.some((r) => resumesLogicalTurn(r.reason))) {
         const siblings = requests.filter((r) => !isTurnContinuation(r.reason));
         if (siblings.length > 0) {
-          this.pendingRequests.push(...siblings);
+          appendAll(this.pendingRequests, siblings);
           const continuations = requests.filter((r) => isTurnContinuation(r.reason));
           requests.length = 0;
-          requests.push(...continuations);
+          appendAll(requests, continuations);
         }
       }
 
@@ -19697,7 +19698,7 @@ export class AgentFramework {
         // Re-queue requests, but warn if they've been pending too long.
         // Suppressed while quiesced: a drain-phase busy requeue is expected,
         // not a wedge tell.
-        const oldest = Math.min(...requests.map(r => r.timestamp));
+        const oldest = requests.reduce((min, r) => Math.min(min, r.timestamp), Infinity);
         if (
           !this.quiesced &&
           now - oldest > STALE_REQUEST_MS &&
@@ -19729,7 +19730,7 @@ export class AgentFramework {
             `${requests.length} request(s) waiting ${Math.round((now - oldest) / 1000)}s`,
           );
         }
-        this.pendingRequests.push(...requests);
+        appendAll(this.pendingRequests, requests);
         continue;
       }
 
@@ -19757,7 +19758,7 @@ export class AgentFramework {
       if (read.length > 0) {
         const left = requests.filter((r) => !read.includes(r));
         requests.length = 0;
-        requests.push(...left);
+        appendAll(requests, left);
         console.error(`[wake] ${agentName}: dropped ${read.length} wake(s) for writes an answered request carried, and that it spoke after in the wake's channel where it carries one not marked ambient, or that were removed` +
           (requests.length === 0 ? '; no turn starts' : ''));
         if (requests.length === 0) {
@@ -19805,7 +19806,7 @@ export class AgentFramework {
       // enter while another reader's turn is alive (as for a clock row): the
       // continuation waits until that turn has ended.
       if (continuationMark && this.sharedSlotBusy(agent)) {
-        this.pendingRequests.push(...requests);
+        appendAll(this.pendingRequests, requests);
         continue;
       }
 
@@ -20271,7 +20272,7 @@ export class AgentFramework {
       logical.draftFailures = { count: (logical.draftFailures?.count ?? 0) + notHeld.count, error: notHeld.error };
     }
     if (held.length === 0) return held;
-    logical.drafts.push(...held);
+    appendAll(logical.drafts, held);
     console.error(`[drafts] ${agent.name}: held ${held.length} segment(s) as ${held.map((d) => d.id).join(', ')} (${reason})`);
     this.emitTrace({
       type: 'prose:drafts-held',
@@ -23288,7 +23289,7 @@ export class AgentFramework {
           const batch = trigger && mergedBatch(trigger);
           if (this.quiesced && batch) {
             this.releasePrimaryProviderGate(agent.name);
-            this.pendingRequests.push(...batch);
+            appendAll(this.pendingRequests, batch);
             console.error(`[provider-admission] ${agent.name}: host quiesced while parked — the merged start goes back as its ${batch.length} requests`);
             return;
           }
@@ -23449,7 +23450,7 @@ export class AgentFramework {
         if (!isContinuation(r)) left.push(r);
         else {
           dropped = true;
-          if (putsBack) back.push(...mergedWakes(r));
+          if (putsBack) appendAll(back, mergedWakes(r));
         }
       }
       return left;
@@ -23466,16 +23467,16 @@ export class AgentFramework {
       this.parkedContinuations.delete(parked);
       this.releasePrimaryProviderGate(agentName);
       dropped = true;
-      if (putsBack) back.push(...mergedWakes(parked));
+      if (putsBack) appendAll(back, mergedWakes(parked));
     }
     for (const pass of this.passRequests) {
       const requests = pass.get(agentName);
       if (!requests) continue;
       const left = take(requests);
       requests.length = 0;
-      requests.push(...left);
+      appendAll(requests, left);
     }
-    this.pendingRequests.push(...back);
+    appendAll(this.pendingRequests, back);
     if (!dropped || !drop) return;
     // A primary a provider hold left pending for what it released won't run
     // now, when nothing else of the agent's waits (endPendingPrimary).
@@ -31541,7 +31542,7 @@ export class AgentFramework {
     const notes = this.streamRequestNotes.get(stream);
     if (!notes || notes.stopped) return;
     if (unvouched) { notes.stopped = true; return; }
-    notes.rounds.push(...rows);
+    appendAll(notes.rounds, rows);
     this.noteStreamRows(agent, notes);
   }
 
@@ -36739,7 +36740,7 @@ export class AgentFramework {
         .filter(([field]) => !(field.startsWith('behavior.') && typeof input.behavior === 'object')));
       const policy = this.eventGate!.addPolicy(rawPolicy, {
         ...(position ? { position } : {}),
-        onIgnoredFields: (notes) => { ignored.push(...notes); },
+        onIgnoredFields: (notes) => { appendAll(ignored, notes); },
         fieldNames,
       });
       const after = this.eventGate!.probeTable();
