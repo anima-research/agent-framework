@@ -32920,7 +32920,7 @@ export class AgentFramework {
           const ended = coordinator.cancelAllExcept('channel-close', 'the excepted channel was closed');
           return ended.ok && ended.deferred
             ? 'The focus on it ends once an operator\'s change to the store is over, or a context that refuses writes is re-initialized by the host, and what the other channels held is delivered then.'
-            : 'The focus on it ended all the same, and what the other channels held was delivered.';
+            : 'The focus on it ended, and what the other channels held was delivered.';
         },
         focusChannelResolver: () => this.tuneOutCoordinator?.focusChannel() ?? null,
         // Route a conversation fork's plain-text speech to its HOME channel, not

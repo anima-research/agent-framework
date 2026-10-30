@@ -23,7 +23,10 @@
   the cancel writes to refuses writes until the host re-initializes it; cancelling again doesn't end the wait
   sooner; the tune-out stays in force until then, and what it held is delivered when it ends; and a host that stops
   first loses the cancel, so the tune-out is still in force after the restart unless its end time has passed.
-  `cancel_tuneout`'s note says too when the caller's note isn't delivered (`noteDropped`). A crash before the cancel
+  `cancel_tuneout`'s note says too when the caller's note isn't delivered (`noteDropped`). A `channel_close` of the
+  channel an all-except hold excepts carries what became of the focus, whatever became of the close (`note` on a
+  success, where it said nothing, and after the error on a failure): that the focus ended, or that it ends once the
+  wait is over. A crash before the cancel
   runs leaves the tune-out in force for the next boot, which cancels one whose end time passed. The
   `store-held-long` alert says so: a restart loses the writes the hold keeps in memory and those kept
   for a manager refusing its work, where 0.28.0's said writes still queued at exit survive in a persisted deferral

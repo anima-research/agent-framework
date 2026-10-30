@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { fixture } from './helpers/coalescing-fixture.js';
+import { fixture, eventually } from './helpers/coalescing-fixture.js';
 import type { FrameworkConfig } from '../src/types/framework.js';
 import { SUB, internals, textOf, stored, has, find, registerOpen, enter } from './helpers/admission.js';
 
@@ -111,6 +111,33 @@ describe("a cancel that waits for the held writes says so to its caller", () => 
       assert.doesNotMatch(result.error ?? '', /ended all the same|was delivered/, result.error);
       assert.match(result.error ?? '', /The focus on it ends once an operator's change to the store is over, or a context that refuses writes is re-initialized by the host/, result.error);
       assert.doesNotMatch(result.error ?? '', /Nothing you can do/, result.error);
+      again();
+      assert.equal(coordinator.getAllExcept(), null, 'ended at the release');
+    } finally { release(); again(); await f.close(); }
+  });
+
+  for (const already of [false, true]) it(`a close of the excepted channel${already ? ', closed already,' : ''} during a surgery's hold is answered ${already ? 'already closed' : 'closed'} and told the focus ends once the hold is over`, async () => {
+    const { f, coordinator, release } = await heldDuringSurgery();
+    let again = (): void => {};
+    try {
+      release();
+      assert.ok(coordinator.cancel('editor', 'noisy', 'agent-tool', 'test').ok, 'premise: the channel tune-out ended');
+      const close = (id: string): Promise<Answer> =>
+        f.framework.executeToolCall({ id, name: 'channel_close', input: { channelId: 'work' }, callerAgentName: 'agent' } as never) as Promise<Answer>;
+      if (already) {
+        assert.ok((await close('c0')).success, 'premise: work closed before the hold');
+        await eventually(() => internals(f).channelRegistry.getDesiredState('editor', 'work') === 'closed', 'work closed');
+      }
+      assert.ok(coordinator.enterAllExcept({ serverId: 'editor', channelId: 'work' }, { durationSeconds: 120, backlogCap: 10 }, 'agent-tool').ok);
+      again = (f.framework as unknown as Framework).reserveStoreForSurgery('roll back', 'agent');
+      const result = await close('c1');
+      assert.equal(result.success, true, result.error);
+      const data = (result.data ?? {}) as { status?: string; note?: string };
+      assert.equal(data.status, already ? 'already closed' : 'closed');
+      assert.ok(coordinator.getAllExcept(), 'premise: the hold is still in force');
+      assert.match(data.note ?? '', /The focus on it ends once an operator's change to the store is over, or a context that refuses writes is re-initialized by the host/,
+        `the answer says the focus waits, not only that the channel is closed: ${JSON.stringify(data)}`);
+      assert.doesNotMatch(data.note ?? '', /ended|was delivered/, data.note);
       again();
       assert.equal(coordinator.getAllExcept(), null, 'ended at the release');
     } finally { release(); again(); await f.close(); }

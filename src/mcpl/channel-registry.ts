@@ -1011,8 +1011,9 @@ interface ChannelRegistryOptions {
    * this is ends through the cancel flow (release the backlog, record the
    * end) before the lifecycle state flips to closed. A
    * tuned-out channel's close is refused before this (its cancel ends it).
-   * Returns what it ended, in a sentence the close's answer adds when the
-   * close itself isn't recorded.
+   * Returns what it ended, or that the end waits, in a sentence the close's
+   * answer carries whatever became of the close: as `note` on a success,
+   * after the error on a failure.
    */
   onToolClose?: (serverId: string, channelId: string) => string | undefined;
   /**
@@ -5245,7 +5246,7 @@ export class ChannelRegistry {
       }
       return {
         success: true,
-        data: { channelId: input.channelId, serverId: entry.serverId, status: 'already closed' },
+        data: { channelId: input.channelId, serverId: entry.serverId, status: 'already closed', ...(ended ? { note: ended } : {}) },
       };
     }
 
@@ -5288,12 +5289,15 @@ export class ChannelRegistry {
     const ended = this.onToolClose?.(entry.serverId, input.channelId);
 
     // A decision the log refused changed nothing for the channel, and the
-    // answer says so, and what the hook ended all the same.
+    // answer says so, and what the hook ended all the same. Every answer
+    // carries the hook's sentence, a success's as `note`: whether the close
+    // went through says nothing of the focus, whose end may wait (an
+    // operator's change to the store in progress).
+    const withEnded = (text: string): string => (ended ? `${text} ${ended}` : text);
     try {
       this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
     } catch (err) {
-      const text = this.lifecycleFailureText('close', entry, unrecordedDecision(err));
-      return { success: false, error: ended ? `${text} ${ended}` : text, isError: true };
+      return { success: false, error: withEnded(this.lifecycleFailureText('close', entry, unrecordedDecision(err))), isError: true };
     }
     // This channel's typing, not every channel with its id (stopTyping's
     // fan-out of a bare name).
@@ -5302,7 +5306,7 @@ export class ChannelRegistry {
     // Refused now, the close stays recorded for the server's next
     // registration, and the text says so.
     if (!this.directsLifecycle(entry.serverId)) {
-      return { success: false, error: this.lifecycleFailureText('close', entry, this.lifecycleRefusal(entry.serverId)), isError: true };
+      return { success: false, error: withEnded(this.lifecycleFailureText('close', entry, this.lifecycleRefusal(entry.serverId))), isError: true };
     }
 
     try {
@@ -5311,10 +5315,10 @@ export class ChannelRegistry {
       if (applied.open || now !== 'closed') throw new ChannelLifecycleError(supersededClause('close', now), 'superseded');
       return {
         success: true,
-        data: { channelId: input.channelId, serverId: entry.serverId, status: 'closed' },
+        data: { channelId: input.channelId, serverId: entry.serverId, status: 'closed', ...(ended ? { note: ended } : {}) },
       };
     } catch (err) {
-      return { success: false, error: this.lifecycleFailureText('close', entry, err), isError: true };
+      return { success: false, error: withEnded(this.lifecycleFailureText('close', entry, err)), isError: true };
     }
   }
 
