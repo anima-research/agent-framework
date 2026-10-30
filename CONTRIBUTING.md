@@ -203,7 +203,8 @@ npx tsc --noEmit      # typecheck
 
 `npm test` runs the compiled output, so a stale `dist/` will happily test
 code you no longer have — always build before testing, and after switching
-branches. The `pretest` hook copies `test/fixtures/*.mjs` into `dist/`.
+branches. The `pretest` hook copies `test/fixtures/*.mjs` and code_execution's
+`quickjs.wasm` into `dist/`.
 
 `--test-timeout=600000` bounds each test file as a whole under Node
 22.12, as it did under Node 20, and each test under Node 24, at ten

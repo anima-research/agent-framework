@@ -394,7 +394,7 @@ test('a spinning child whose parent is killed stops, orphaned for real', async (
         out += chunk.toString();
         if (out.includes('\n')) resolve(Number(out.trim()));
       });
-      parent.on('exit', () => reject(new Error('the parent exited before it started its child')));
+      parent.on('exit', (code) => reject(new Error(`the parent exited (code ${code}) before its child's first output`)));
     });
     // Gone, or a zombie its new parent hasn't reaped yet, which ps marks Z on Linux and macOS alike.
     const alive = () => {
