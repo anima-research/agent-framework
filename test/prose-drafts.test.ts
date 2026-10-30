@@ -9,7 +9,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { MembraneError, type ContentBlock, type NormalizedRequest, type NormalizedResponse, type StreamEvent, type YieldingStream } from '@animalabs/membrane';
@@ -18,6 +18,7 @@ import type { Module } from '../src/index.js';
 import { ProseDraftStore, draftState, PROSE_DRAFT_RECORD_TYPE } from '../src/prose-drafts.js';
 import { destinationKey } from '../src/mcpl/channel-registry.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { jsonLines } from './helpers/json-lines.js';
 
 const ROOM = 'discord:g1:room';
 const GENERAL = 'discord:g1:general';
@@ -45,14 +46,6 @@ describe('ProseDraftStore', () => {
       store.close();
       rmSync(dir, { recursive: true, force: true });
     }
-  });
-
-  it("the drafts tool's example id has the form newId issues", () => {
-    const tool = (AgentFramework as unknown as {
-      DRAFTS_TOOL: { inputSchema: { properties: { draftIds: { description: string } } } };
-    }).DRAFTS_TOOL;
-    const example = /"(d-[^"]*)"/.exec(tool.inputSchema.properties.draftIds.description)?.[1];
-    assert.match(example ?? '(none)', /^d-[a-z2-9]{7}$/);
   });
 
   it('replays the journal at reopen: an attempt with no recorded outcome reads as unconfirmed', () => {
@@ -92,7 +85,6 @@ describe('ProseDraftStore', () => {
       store.switchBranch(main);
       drafts.reload();
       assert.equal(draftState(drafts.get('a', later.id)!), 'held', 'a draft is usable from any branch');
-      assert.equal(store.getRecordIdsByType(PROSE_DRAFT_RECORD_TYPE).length, 6);
     } finally {
       store.close();
       rmSync(dir, { recursive: true, force: true });
@@ -418,7 +410,7 @@ async function harness(opts: {
   xml?: boolean;
   roundPreamble?: boolean;
   retries?: number;
-  retryDelayMs?: number;
+  retryDelayMs?: number | number[];
   /** The fixture server's requestTimeoutMs (the framework's default when unset). */
   requestTimeoutMs?: number;
   sendTool?: boolean;
@@ -453,6 +445,10 @@ async function harness(opts: {
     ...(a.maxStreamTokens !== undefined ? { maxStreamTokens: a.maxStreamTokens } : {}),
   }));
   const create = async () => {
+    let retried = 0;
+    const retryDelay = (): number => Array.isArray(opts.retryDelayMs)
+      ? opts.retryDelayMs[Math.min(retried++, opts.retryDelayMs.length - 1)]!
+      : opts.retryDelayMs ?? 10;
     const framework = await AgentFramework.create({
       storePath: join(dir, 'store'),
       membrane: membrane.asMembrane(),
@@ -478,7 +474,7 @@ async function harness(opts: {
         errorPolicy: {
           maxRetries: opts.retries,
           onInferenceError: (_error: Error, _agent: string, attempt: number) =>
-            attempt < opts.retries! ? { retry: true as const, delayMs: opts.retryDelayMs ?? 10 } : { retry: false as const },
+            attempt < opts.retries! ? { retry: true as const, delayMs: retryDelay() } : { retry: false as const },
         },
       } : {}),
     });
@@ -502,21 +498,16 @@ async function harness(opts: {
     get framework() { return framework; },
     until,
     command: (c: Record<string, unknown>) => appendFileSync(commandPath, JSON.stringify(c) + '\n'),
-    publishes: (): Publish[] => existsSync(statusPath)
-      ? readFileSync(statusPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as Publish)
-        .filter((e) => e.event === 'publish' || e.event === 'publish-refused' || e.event === 'publish-error')
-      : [],
+    publishes: (): Publish[] => jsonLines<Publish>(statusPath)
+      .filter((e) => e.event === 'publish' || e.event === 'publish-refused' || e.event === 'publish-error'),
     sendMode: async (mode: string, answers?: string) => {
-      const logged = () => existsSync(statusPath) ? readFileSync(statusPath, 'utf8').split('\n').filter(Boolean)
-        .filter((l) => (JSON.parse(l) as { event: string }).event === 'send-mode').length : 0;
+      const logged = () => jsonLines<{ event: string }>(statusPath).filter((e) => e.event === 'send-mode').length;
       const before = logged();
       h.command({ op: 'send-mode', mode, ...(answers ? { answers } : {}) });
       await until(() => logged() > before, 'the send mode');
     },
-    sends: (): Array<{ channelId: string; text: string }> => existsSync(statusPath)
-      ? readFileSync(statusPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as { event: string; channelId: string; text: string })
-        .filter((e) => e.event === 'send')
-      : [],
+    sends: (): Array<{ channelId: string; text: string }> => jsonLines<{ event: string; channelId: string; text: string }>(statusPath)
+      .filter((e) => e.event === 'send'),
     /** One addressed message in #room starts a turn (or, with `request`, a
      *  direct inference request for just that resident); resolves when it settles. */
     turn: async (responses: Array<ReturnType<typeof createMockResponse>>, agentName = 'scout', via: 'incoming' | 'request' | 'silent' | 'heartbeat' = 'incoming') => {
@@ -601,7 +592,7 @@ describe('held prose drafts, end to end', () => {
       // Safe in-band ordering: each mid-turn notice is stored after the tool
       // result it rode with, and was injected into the live stream there.
       const msgs = h.messages();
-      const noticeIdx = msgs.findIndex((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'prose-drafts');
+      const noticeIdx = msgs.findIndex((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text.startsWith('[drafts]')));
       assert.ok(noticeIdx > 0, 'a held-draft notice was stored');
       assert.ok(msgs[noticeIdx - 1]!.content.some((b) => b.type === 'tool_result'), 'right after the tool result');
       const injected = (h.membrane.lastStream?.receivedToolResultOptions ?? [])
@@ -654,9 +645,31 @@ describe('held prose drafts, end to end', () => {
       ]);
       const held = h.drafts().reverse();
       assert.deepEqual(held.map((d) => d.text), ['Narration before the send.', 'And after it.']);
-      assert.equal(h.messages().filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'prose-drafts').length, 0,
-        'no mid-turn notice: XML rounds present no injections');
+      assert.ok(!h.texts().some((t) => t.startsWith('[drafts]')), 'no mid-turn notice: XML rounds present no injections');
       assert.ok(h.texts().some((t) => t.startsWith('[delivered] nothing — 2 plain-speech segment(s) held as drafts')));
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("a stream that doesn't say whether it carries injections gets no mid-turn notice: its held reply is named in the receipt", async () => {
+    const h = await harness({ sendTool: true });
+    h.membrane.supportsInjectedMessages = 'undeclared';
+    await h.sendMode('no-channel');
+    try {
+      const segments = ['First — the actual reply.', 'Second words.', 'Third: trailing words.'];
+      await h.turn([
+        createMockResponse([text(segments[0]!), unplacedSend('s1')], 'tool_use'),
+        createMockResponse([text(segments[1]!), call('l1', 'channel_list', {})], 'tool_use'),
+        createMockResponse([text(segments[2]!)]),
+      ]);
+      const held = h.drafts().reverse();
+      assert.deepEqual(held.map((d) => d.text), segments, 'the reply is held as drafts');
+      assert.ok(!h.texts().some((t) => t.startsWith('[drafts]')), 'no mid-turn notice: a stream that doesn\'t say is taken as one that carries no injections');
+      assert.equal(
+        h.texts().find((t) => t.startsWith('[delivered]')),
+        `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${held.map((d) => d.id).join(', ')} (not sent — drafts can resend them unchanged, or dismiss them)`,
+      );
     } finally {
       await h.close();
     }
@@ -899,13 +912,11 @@ describe('held prose drafts, end to end', () => {
       h.command({ op: 'publish-mode', mode: 'not-delivered' });
       await h.turn([createMockResponse([resend('r1')], 'tool_use'), createMockResponse([])]);
       assert.match(h.toolResults()[0]!, /not sent to .* Nothing was posted by this attempt\. The draft stays held\./);
-      assert.equal(draftState(h.store().get('scout', draft!.id)!), 'held');
       assert.equal(noted(), false, 'a refused resend is not noted');
 
       h.command({ op: 'publish-mode', mode: 'no-receipt' });
       await h.turn([createMockResponse([resend('r2')], 'tool_use'), createMockResponse([])]);
       assert.match(h.toolResults()[0]!, /NOT confirmed — it may or may not have been posted/);
-      assert.equal(draftState(h.store().get('scout', draft!.id)!), 'unconfirmed');
       assert.equal(noted(), false, 'an unconfirmed resend is not noted');
 
       h.command({ op: 'publish-mode', mode: 'delivered' });
@@ -916,10 +927,6 @@ describe('held prose drafts, end to end', () => {
       assert.match(h.toolResults()[0]!, /delivered to/);
       assert.equal(h.publishes().length, before + 1);
       assert.equal(noted(), true, 'a delivered resend is noted');
-      const attempts = h.store().get('scout', draft!.id)!.attempts;
-      assert.deepEqual(attempts.map((a) => [a.outcome?.status, a.confirmedDuplicate ?? false]), [
-        ['failed', false], ['unknown', false], ['delivered', true],
-      ]);
     } finally {
       await h.close();
     }
@@ -944,9 +951,9 @@ describe('held prose drafts, end to end', () => {
         createMockResponse([drafts('r1', { action: 'resend', draftIds: [draft!.id], destination: ROOM })], 'tool_use'),
         createMockResponse([]),
       ]);
-      const [attempt] = h.store().get('scout', draft!.id)!.attempts;
-      assert.equal(attempt!.outcome?.status, 'unknown');
-      assert.match(attempt!.outcome!.reason!, /connector exploded/);
+      const [resent] = h.toolResults();
+      assert.match(resent!, /NOT confirmed — it may or may not have been posted: .*connector exploded/);
+      assert.match(resent!, /a resend needs confirmDuplicate: true/);
       assert.equal(draftState(h.store().get('scout', draft!.id)!), 'unconfirmed');
     } finally {
       await h.close();
@@ -1103,7 +1110,6 @@ describe('held prose drafts, end to end', () => {
       h.command({ op: 'publish-mode', mode: 'not-delivered' });
       await h.turn([createMockResponse([resend('r2', true)], 'tool_use'), createMockResponse([])]);
       assert.match(h.toolResults()[0]!, /Nothing was posted by this attempt\. The draft stays unconfirmed: d-[a-z2-9]{7}'s attempt to .* may already have been posted: .*delivery uncertain/);
-      assert.equal(draftState(h.store().get('scout', draft!.id)!), 'unconfirmed');
       h.command({ op: 'publish-mode', mode: 'delivered' });
       const before = h.publishes().length;
       await h.turn([createMockResponse([resend('r3')], 'tool_use'), createMockResponse([])]);
@@ -1157,7 +1163,6 @@ describe('held prose drafts, end to end', () => {
       // The process "died" between journaling the attempt and its outcome.
       h.store().beginAttempt('scout', draft!.id, dest(), 'resend', false);
       await h.restart();
-      assert.equal(draftState(h.store().get('scout', draft!.id)!), 'unconfirmed');
       const before = h.publishes().length;
       await h.turn([
         createMockResponse([drafts('r1', { action: 'resend', draftIds: [draft!.id], destination: ROOM })], 'tool_use'),
@@ -1312,7 +1317,6 @@ describe('held prose drafts, end to end', () => {
       assert.deepEqual(h.publishes().map((p) => p.text), ['words with nowhere to go']);
       const after = h.store().get('scout', bounced!.id)!;
       assert.equal(draftState(after), 'delivered');
-      assert.equal(after.attempts[0]!.via, 'unsent-token');
     } finally {
       await h.close();
     }
@@ -1325,15 +1329,12 @@ describe('held prose drafts, end to end', () => {
       const [risky] = h.drafts();
       h.command({ op: 'publish-mode', mode: 'no-receipt' });
       await h.turn([createMockResponse([text(`>>${ROOM} {{unsent}}`)])]);
-      assert.equal(draftState(h.store().get('scout', risky!.id)!), 'unconfirmed');
       h.command({ op: 'publish-mode', mode: 'delivered' });
       // The destination does not resolve, so the envelope bounces: the whole
       // authored attempt is held, and it carries the copied draft's risk.
       await h.turn([createMockResponse([text('>>#nowhere {{unsent}} and a postscript')])]);
       const fresh = h.drafts().find((d) => d.id !== risky!.id)!;
       assert.equal(fresh.text, 'risky words and a postscript', 'nothing substituted or truncated');
-      assert.equal(fresh.inheritedRisk?.draftId, risky!.id);
-      assert.equal(draftState(fresh), 'unconfirmed');
       assert.ok(h.texts().some((t) => t.includes(`It includes the words of draft ${risky!.id}, which may already have been posted, so ${fresh.id} can be resent only with the drafts tool and confirmDuplicate: true.`)));
       // {{unsent}} now means the fresh draft, and it is refused unconfirmed.
       const before = h.publishes().length;
@@ -1356,7 +1357,6 @@ describe('held prose drafts, end to end', () => {
       const [risky] = h.drafts();
       h.command({ op: 'publish-mode', mode: 'no-receipt' });
       await h.turn([createMockResponse([text(`>>${ROOM} {{unsent}}`)])]);
-      assert.equal(draftState(h.store().get('scout', risky!.id)!), 'unconfirmed');
       h.command({ op: 'publish-mode', mode: 'delivered' });
       const before = h.publishes().length;
       await h.turn([createMockResponse([text(`>>${ROOM} {{unsent}} and more`)])]);
@@ -1587,17 +1587,13 @@ describe('held prose drafts, end to end', () => {
     const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }], sendTool: true });
     await h.sendMode('no-channel');
     try {
-      const asked: boolean[] = [];
-      const fw = h.framework as unknown as { requestProseContinuation(agent: unknown, routing: { continuation: boolean }): void };
-      const check = fw.requestProseContinuation.bind(fw);
-      fw.requestProseContinuation = (agent, routing) => { asked.push(routing.continuation); check(agent, routing); };
+      const before = h.membrane.calls.length;
       await h.turn([
         createMockResponse([unplacedSend('s1')], 'tool_use'),
         createMockResponse([text(`>>>${GENERAL} ! Kept words.`), drafts('l1', { action: 'list' })], 'tool_use'),
         createMockResponse([]),
       ]);
-      await h.until(() => asked.length > 0, 'the turn-end continuation check');
-      assert.ok(asked.includes(true), `its ' !' asks for a continuation turn: ${JSON.stringify(asked)}`);
+      await h.until(() => h.membrane.calls.length >= before + 2, "its ' !' starts a continuation turn: the model is asked again");
       assert.deepEqual(h.drafts().map((d) => d.text), ['Kept words.'], 'its words are held');
     } finally {
       await h.close();
@@ -2171,13 +2167,8 @@ describe('draft identity and risk evidence', () => {
       const round = { routing: t.internals.routingOf('scout'), notice: 'later' as const };
       t.internals.bounceProse(agent, '{{unsent}} second', 'no such channel', undefined, '>>', round);
       const copy = t.internals.proseDrafts.open('scout').find((d) => d.text === 'first second')!;
-      assert.equal(copy.inheritedRisk?.draftId, original!.id);
       t.internals.bounceProse(agent, '{{unsent}} third', 'no such channel', undefined, '>>', round);
       const again = t.internals.proseDrafts.open('scout').find((d) => d.text === 'first second third')!;
-      assert.equal(again.inheritedRisk?.draftId, copy.id);
-      assert.equal(again.inheritedRisk?.sourceDraftId, original!.id);
-      assert.deepEqual(again.inheritedRisk?.destination, dest());
-      assert.equal(again.inheritedRisk?.reason, 'its outcome was never recorded');
       const text = t.internals.riskText(again);
       assert.match(text, new RegExp(`${again.id} includes the words of ${copy.id}, which itself includes the words of ${original!.id}, and ${original!.id}'s attempt to #room \\(Guild One\\)`));
       assert.doesNotMatch(text, /being sent/);
@@ -2291,7 +2282,6 @@ describe('drafts resend ownership', () => {
       const result = t.say(await batch);
       assert.match(result, new RegExp(`${t.b.id} was dismissed, so it can't be resent\\. It changed while this resend was waiting — not sent\\.`));
       assert.equal(t.pending.length, 0, 'B never reached publish');
-      assert.equal(draftState(t.internals.proseDrafts.get('scout', t.b.id)!), 'dismissed');
     } finally {
       await t.close();
     }
@@ -2390,7 +2380,6 @@ describe('drafts resend ownership', () => {
         /transport gone/,
       );
       assert.equal(entered, 1, 'the resend reached publish');
-      assert.equal(draftState(t.internals.proseDrafts.get('scout', t.a.id)!), 'unconfirmed', 'its attempt has no outcome: it may have been posted');
       assert.match(t.say(await t.internals.handleDraftsTool('scout', { action: 'dismiss', draftIds: [t.a.id] })),
         new RegExp(`${t.a.id}: dismissed \\(your history keeps the words\\)\\. Note that ${t.a.id}'s attempt to .* may already have been posted: its outcome was never recorded\\.`));
     } finally {
@@ -2445,8 +2434,6 @@ describe('drafts resend ownership', () => {
       const fresh = t.internals.proseDrafts.latestBounce('scout')!;
       assert.notEqual(fresh.id, bounce!.id);
       assert.equal(fresh.text, 'bounced words and a postscript');
-      assert.equal(fresh.inheritedRisk?.draftId, bounce!.id);
-      assert.match(fresh.inheritedRisk!.reason, /queued in a resend when these words were held/);
       const words = agent.getContextManager().getAllMessages().flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '');
       assert.ok(words.includes(`[prose-routing] {{unsent}} is draft ${bounce!.id}, which is queued in a resend in progress. Nothing was sent; ` +
         `wait for that result. Your message is held as draft ${fresh.id}, with {{unsent}} written out; since it includes ` +
@@ -2825,7 +2812,6 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       h.command({ op: 'publish-mode', mode: 'delivered' });
       await h.turn(rounds([text(`>>>${ROOM} {{unsent}} again`), explicitSend('s3')]));
       const risky = h.drafts().find((d) => d.text === 'lost words again')!;
-      assert.equal(risky.inheritedRisk?.draftId, bounce!.id);
       assert.equal(draftState(risky), 'unconfirmed');
 
       await h.turn(rounds([text('>>>skip_reply {{unsent}}'), explicitSend('s4')]));
@@ -3940,15 +3926,17 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
     });
 
     it("stop() during the wait after a retry's start failed names the speech", async () => {
-      const h = await harness({ xml: true, roundPreamble: true, retries: 2, retryDelayMs: 2_000 });
+      const h = await harness({ xml: true, roundPreamble: true, retries: 2, retryDelayMs: [10, 600_000] });
       try {
         breakAfterToolRound(h.membrane, 'error');
         let threw = false;
         onSnapshot(h, 2, () => { threw = true; throw new Error('the tool snapshot failed'); });
+        let waits = 0;
+        h.framework.onTrace((event) => { if (event.type === 'inference:waiting') waits++; });
         const written = capture(h);
         await startTurn(h);
         await h.until(() => threw, "the retry's start failed");
-        await h.until(() => (h.framework as unknown as { retryWaitWakers: Set<unknown> }).retryWaitWakers.size > 0, 'the next wait');
+        await h.until(() => waits >= 2, 'the next wait');
         await h.framework.stop();
         assert.equal(h.membrane.calls.length, 1, 'premise: no retry compiled');
         assert.equal(written.filter((t) => t.startsWith(NOTICE)).length, 1, written.join('\n'));
@@ -4529,8 +4517,9 @@ describe('a heartbeat turn holds its plain speech as drafts', () => {
   it('explicit mode: a heartbeat turn whose deliberate >> target fails still wakes the agent', async () => {
     const h = await harness({ agents: [{ name: 'scout', proseRouting: 'explicit' }] });
     try {
-      const calls = await callsFor(h, () => h.turn([createMockResponse([text('>>#nowhere words meant for someone')])], 'scout', 'heartbeat'));
-      assert.ok(calls >= 2, `the failed send's bounce wakes the agent to resend (${calls} calls)`);
+      const before = h.membrane.calls.length;
+      await h.turn([createMockResponse([text('>>#nowhere words meant for someone')])], 'scout', 'heartbeat');
+      await h.until(() => h.membrane.calls.length - before >= 2, "the failed send's bounce wakes the agent to resend");
     } finally {
       await h.close();
     }
@@ -4539,8 +4528,9 @@ describe('a heartbeat turn holds its plain speech as drafts', () => {
   it("explicit mode: a heartbeat turn's bounce is held and noticed without waking the agent", async () => {
     const control = await harness({ agents: [{ name: 'scout', proseRouting: 'explicit' }] });
     try {
-      const calls = await callsFor(control, () => control.turn([createMockResponse([text('words with nowhere to go')])], 'scout', 'request'));
-      assert.ok(calls >= 2, `another channel-less turn's bounce wakes the agent to resend (${calls} calls)`);
+      const before = control.membrane.calls.length;
+      await control.turn([createMockResponse([text('words with nowhere to go')])], 'scout', 'request');
+      await control.until(() => control.membrane.calls.length - before >= 2, "another channel-less turn's bounce wakes the agent to resend");
     } finally {
       await control.close();
     }

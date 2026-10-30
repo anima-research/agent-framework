@@ -225,15 +225,15 @@ test('restartMcplServer of an id whose disconnect is in flight is refused before
 
 test("a disconnect removes its server's prefix claim, and leaves one another server holds", async () => {
   await withFramework(true, async (framework) => {
-    const internals = framework as unknown as { mcplPrefixMap: Map<string, string> };
-    assert.equal(internals.mcplPrefixMap.get('mcpl--first'), 'first');
+    await framework.connectMcplServer(serverConfig('second', { toolPrefix: 'held' }) as never);
     await framework.disconnectMcplServer('first');
-    assert.equal(internals.mcplPrefixMap.has('mcpl--first'), false, 'its own claim is released');
-    // As after a restart under a new id: `second` holds the prefix `first` had.
-    await framework.connectMcplServer(serverConfig('first') as never);
-    internals.mcplPrefixMap.set('mcpl--first', 'second');
-    await framework.disconnectMcplServer('first');
-    assert.equal(internals.mcplPrefixMap.get('mcpl--first'), 'second', "the other server's claim stands");
+    // Its own claim is released: another server may take the prefix.
+    await framework.connectMcplServer(serverConfig('third', { toolPrefix: 'mcpl--first' }) as never);
+    // The other server's claim stands.
+    await assert.rejects(
+      framework.connectMcplServer(serverConfig('fourth', { toolPrefix: 'held' }) as never),
+      /toolPrefix "held" collides with server "second"/,
+    );
   });
 });
 

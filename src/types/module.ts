@@ -406,8 +406,7 @@ export interface ModuleContext {
    * and a tool round moves when it injects messages into a stream that
    * declares it carries them. So one that waited for its target's end (a
    * run's end, or a fork's last turn), one stored while it was idle and
-   * never sent, one stored at a tool round that ended the turn, and one
-   * injected into a stream that didn't declare it carries injections go to
+   * never sent, and one stored at a tool round that ended the turn go to
    * the primary. The framework's own
    * writes for a run or a fork are unchanged: they stay in its store,
    * unless they're notices the primary already takes in their place (a

@@ -18,7 +18,7 @@ import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework } from '../src/framework.js';
 import { WorkspaceModule, WorkspaceReadError } from '../src/modules/workspace/index.js';
 import { EffectFailed, unlinkContained, writeContained } from '../src/modules/workspace/effects.js';
-import { coversLanding, insideMount, patternRefusal, parsedSpelling, pathSegments, provenAbsent, readPath, type MountView, type Walk } from '../src/modules/workspace/observe.js';
+import { coversLanding, insideMount, parsedSpelling, pathSegments, readPath, type MountView } from '../src/modules/workspace/observe.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
 import type { FsChange } from '../src/modules/workspace/watcher.js';
 import type { ModuleContext } from '../src/types/module.js';
@@ -1263,15 +1263,6 @@ describe('mount include', () => {
     assert.ok(env.tree().includes('x/gate.json'), 'history keeps the covered file beneath the link');
   });
 
-  test('provenAbsent takes a path beneath a regular file the include doesn\'t cover as absent, and not that file itself', () => {
-    const walk: Walk = {
-      files: new Set(), seen: new Set(), othersTaken: new Set(), dirs: new Set(), others: new Map([['x', 'outside the include']]),
-      otherFiles: new Set(['x']), complete: new Set(['']), missing: new Set(), incomplete: [],
-    };
-    assert.equal(provenAbsent(walk, 'x/gate.json'), true);
-    assert.equal(provenAbsent(walk, 'x'), false);
-  });
-
   test('a deletion the workspace holds outside the include is left alone by a materialize, and counted only by one that names its directory', async (t) => {
     const env = new Env(t);
     env.writeDisk('gate.json', '{}\n');
@@ -1646,8 +1637,10 @@ describe('mount include', () => {
   });
 
   test('a pattern holding "\\" is refused on every platform, where "/" is the separator too', () => {
-    for (const pattern of ['sub\\gate.json', 'a\\b', '*.j\\son', 'docs\\x/**']) assert.notEqual(patternRefusal(pattern, 'include'), undefined, pattern);
-    for (const pattern of ['gate.json', '*.json', 'docs/**']) assert.equal(patternRefusal(pattern, 'include'), undefined, pattern);
+    // Refused as the module is built, as include is checked.
+    const build = (pattern: string) => () => new WorkspaceModule({ mounts: [{ name: 'work', path: '/tmp/x', mode: 'read-write', include: [pattern] } as MountConfig] });
+    for (const pattern of ['sub\\gate.json', 'a\\b', '*.j\\son', 'docs\\x/**']) assert.throws(build(pattern), /isn't read/, pattern);
+    for (const pattern of ['gate.json', '*.json', 'docs/**']) assert.doesNotThrow(build(pattern), pattern);
   });
 
   test('include is checked when the module is built, and the refusal names the mount and what it refused', () => {

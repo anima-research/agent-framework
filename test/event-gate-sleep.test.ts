@@ -19,7 +19,6 @@ import { JsStore } from '@animalabs/chronicle';
 import { EventGate } from '../src/gate/event-gate.js';
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
-import { goneNames } from './helpers/gone-names.js';
 import { gateToolCalls } from './helpers/gate-tool-calls.js';
 import { forceExpiry } from './helpers/force-expiry.js';
 import type { ChannelRef } from '../src/mcpl/channel-registry.js';
@@ -203,7 +202,7 @@ describe("EventGate sleep: its wake, a stop and a fork's end", () => {
       modules: [],
     });
     const gate = (framework as unknown as { eventGate: EventGate }).eventGate;
-    const gone = goneNames(gate);
+    const selfWakes = (gate as unknown as { selfWakeTimers: Map<string, unknown> }).selfWakeTimers;
     const calls = gateToolCalls(framework);
     try {
       framework.start();
@@ -212,14 +211,21 @@ describe("EventGate sleep: its wake, a stop and a fork's end", () => {
       gate.setSleep(3600, 'resting', 'agent');
       const created = await framework.createEphemeralAgent({ name: 'worker', model: 'test-model', systemPrompt: 'Work.', allowedTools: 'all' });
       created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+      let armed: boolean | undefined;
+      framework.onTrace((event) => {
+        const traced = event as { type?: string; processEvent?: { type?: string; toolName?: string } };
+        if (armed === undefined && traced.type === 'process:received' && traced.processEvent?.type === 'tool-result'
+          && traced.processEvent.toolName === 'sleep') armed = gate.armSelfWake('worker', 60).armed;
+      });
       await framework.runEphemeralToCompletion(created.agent, created.contextManager);
+      assert.strictEqual(armed, true, 'the run left a self-wake pending');
       assert.deepStrictEqual(calls.refused, [
         'sleep: Nothing was set: a sleep quiets the whole agent, not one run.',
         "wake: Nothing was changed: a sleep is the agent's, so this run can't end one.",
       ]);
       assert.deepStrictEqual(calls.started, [], 'refused before the tools run');
       assert.strictEqual(gate.getSleepState()?.note, 'resting', "the primary's sleep stands, neither replaced nor ended");
-      assert.deepStrictEqual(gone, ['worker'], "the run's end told the gate, which cancels its self-wake");
+      assert.ok(!selfWakes.has('worker'), "the run's end cancelled the self-wake it left pending");
     } finally {
       // So that a run where the sleep takes doesn't hold the file's process
       // for its hour.

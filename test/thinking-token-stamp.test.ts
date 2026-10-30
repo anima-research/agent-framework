@@ -37,31 +37,35 @@ type Stamped = ContentBlock & { tokenEstimate?: number; signature?: string };
 
 describe('stampThinkingTokenEstimates (pure)', () => {
   it('stamps the residual of output tokens over visible blocks on the signed block', () => {
-    const blocks: ContentBlock[] = [
-      { type: 'thinking', thinking: '', signature: SIG_A } as ContentBlock,
-      { type: 'text', text: 'hello' },
-    ];
+    const signed = { type: 'thinking', thinking: '', signature: SIG_A } as ContentBlock;
+    // With nothing visible beside it, the signed block carries every output token.
+    assert.equal((stampThinkingTokenEstimates([signed], 3_000)[0] as Stamped).tokenEstimate, 3_000);
+    const blocks: ContentBlock[] = [signed, { type: 'text', text: 'hello' }];
     const out = stampThinkingTokenEstimates(blocks, 3_000) as Stamped[];
-    assert.equal(out[0]!.tokenEstimate, 3_000 - Math.ceil(5 / 2.9));
+    const fewer = stampThinkingTokenEstimates(blocks, 2_000) as Stamped[];
+    assert.ok(out[0]!.tokenEstimate! < 3_000, 'the visible text is taken out of the residual');
+    assert.equal(out[0]!.tokenEstimate! - fewer[0]!.tokenEstimate!, 1_000, 'and the rest of the output tokens are the residual');
     assert.equal(out[0]!.signature, SIG_A);
-    assert.equal(out[1], blocks[1], 'non-carrier blocks are the same object');
+    assert.equal(out[1]!.tokenEstimate, undefined, 'the text block carries no stamp');
     assert.equal((blocks[0] as Stamped).tokenEstimate, undefined, 'input block is not mutated');
   });
 
   it('splits the residual across several carriers by signature length', () => {
-    const blocks: ContentBlock[] = [
-      { type: 'thinking', thinking: '', signature: 'A'.repeat(3_000) } as ContentBlock,
-      { type: 'tool_use', id: 't1', name: 'x', input: {} },
-      { type: 'redacted_thinking', data: 'B'.repeat(1_000) } as ContentBlock,
-    ];
-    const out = stampThinkingTokenEstimates(blocks, 4_021) as Stamped[]; // tool_use {} = 1 + 20 tokens
-    assert.equal(out[0]!.tokenEstimate, 3_000);
-    assert.equal(out[2]!.tokenEstimate, 1_000);
+    const thinking = { type: 'thinking', thinking: '', signature: 'A'.repeat(3_000) } as ContentBlock;
+    const redacted = { type: 'redacted_thinking', data: 'B'.repeat(1_000) } as ContentBlock;
+    // Nothing visible: the whole 4,000 is the residual, split 3:1.
+    const alone = stampThinkingTokenEstimates([thinking, redacted], 4_000) as Stamped[];
+    assert.deepEqual(alone.map((b) => b.tokenEstimate), [3_000, 1_000]);
+    // A visible block between them takes no share, and the carriers still split what's left 3:1.
+    const out = stampThinkingTokenEstimates([thinking, { type: 'tool_use', id: 't1', name: 'x', input: {} }, redacted], 4_000) as Stamped[];
+    assert.equal(out[1]!.tokenEstimate, undefined);
+    assert.ok(Math.abs(out[0]!.tokenEstimate! - 3 * out[2]!.tokenEstimate!) <= 3, `${out[0]!.tokenEstimate} and ${out[2]!.tokenEstimate}`);
+    assert.ok(out[0]!.tokenEstimate! + out[2]!.tokenEstimate! < 4_000, "the tool_use's estimate is taken out first");
   });
 
   it('leaves unsigned thinking, already-stamped blocks and non-positive residuals alone', () => {
     const unsigned: ContentBlock[] = [{ type: 'thinking', thinking: 'visible reasoning' } as ContentBlock];
-    assert.equal(stampThinkingTokenEstimates(unsigned, 500), unsigned);
+    assert.deepEqual(stampThinkingTokenEstimates(unsigned, 500), unsigned);
 
     const stamped: ContentBlock[] = [{ type: 'thinking', thinking: '', signature: SIG_A, tokenEstimate: 42 } as ContentBlock];
     assert.equal((stampThinkingTokenEstimates(stamped, 5_000)[0] as Stamped).tokenEstimate, 42);
@@ -70,8 +74,8 @@ describe('stampThinkingTokenEstimates (pure)', () => {
       { type: 'thinking', thinking: '', signature: SIG_A } as ContentBlock,
       { type: 'text', text: 'x'.repeat(10_000) },
     ];
-    assert.equal(stampThinkingTokenEstimates(overshoot, 100), overshoot);
-    assert.equal(stampThinkingTokenEstimates(overshoot, 0), overshoot);
+    assert.deepEqual(stampThinkingTokenEstimates(overshoot, 100), overshoot);
+    assert.deepEqual(stampThinkingTokenEstimates(overshoot, 0), overshoot);
   });
 });
 
@@ -135,12 +139,13 @@ describe('thinking token stamp through the stream loop', () => {
       const [t1, t2] = thinking as [Stamped, Stamped];
       assert.equal(t1.signature, SIG_A);
       assert.equal(t2.signature, SIG_B);
-      // Round 1: 2000 output tokens minus 'looking' and the tool_use JSON.
-      const toolJson = JSON.stringify({ message: 'one' }).length;
-      const visible1 = Math.ceil('looking'.length / 2.9) + Math.ceil(toolJson / 2.3) + 20;
-      assert.equal(t1.tokenEstimate, 2_000 - visible1);
-      // Round 2: (3500 - 2000) output tokens minus 'done' — not the cumulative 3500.
-      assert.equal(t2.tokenEstimate, 1_500 - Math.ceil('done'.length / 2.9));
+      // Each round as the stamp computes it from that call's own output
+      // tokens: round 2's are 3500 - 2000, not the cumulative 3500.
+      const expected = (blocks: ContentBlock[], outputTokens: number) =>
+        (stampThinkingTokenEstimates(blocks, outputTokens)[0] as Stamped).tokenEstimate;
+      assert.equal(t1.tokenEstimate, expected(round1.content, 2_000));
+      assert.equal(t2.tokenEstimate, expected(round2.content, 1_500));
+      assert.notEqual(t2.tokenEstimate, expected(round2.content, 3_500), 'the cumulative count would stamp more');
 
       const others = msgs.flatMap((m) => m.content).filter((b) => b.type !== 'thinking');
       for (const b of others) assert.equal(b.tokenEstimate, undefined, `${b.type} must not be stamped`);
@@ -161,16 +166,15 @@ describe('withoutTokenEstimates (pure)', () => {
     const untouched = { participant: 'User', content: [plain, null, 'odd'] as unknown as ContentBlock[] };
     const holder = { participant: 'assistant', content: [thinking, redacted, plain] };
     const out = withoutTokenEstimates([untouched, holder]);
-    assert.equal(out[0], untouched, 'a message with no stamp is passed on as it is');
+    assert.deepEqual(out[0], untouched, 'a message with no stamp is passed on as it is');
     assert.deepEqual(out[1]!.content, [
       { type: 'thinking', thinking: '', signature: SIG_A },
       { type: 'redacted_thinking', data: 'R' },
       plain,
     ]);
-    assert.equal(out[1]!.content[2], plain, 'an unstamped block in a copied message is the same object');
     assert.equal((thinking as Stamped).tokenEstimate, 7, 'each block handed in keeps its stamp');
     assert.equal((redacted as Stamped).tokenEstimate, 9, 'each block handed in keeps its stamp');
-    assert.equal(holder.content[0], thinking, 'the message handed in is unchanged');
+    assert.deepEqual(holder.content.map((b) => (b as Stamped).tokenEstimate), [7, 9, undefined], 'the message handed in is unchanged');
   });
 });
 

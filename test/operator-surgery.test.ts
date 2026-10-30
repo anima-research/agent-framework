@@ -520,15 +520,26 @@ describe('live operator surgery', () => {
     assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
 
     // A body of more shards than the operator log keeps ids for: its entry
-    // keeps the first 50 and says the list is cut.
+    // lists at most 50 of the ids it removed and says the list is cut.
+    const listsAtMost50Of = (logged: unknown, removed: string[], what: string) => {
+      const ids = logged as string[];
+      assert.ok(ids.length > 0 && ids.length <= 50, `${what}: ${ids.length} ids logged of ${removed.length} removed`);
+      assert.equal(new Set(ids).size, ids.length, `${what}: no id logged twice`);
+      for (const id of ids) assert.ok(removed.includes(id), `${what}: ${id} is one it removed`);
+    };
     const huge = appendBody('d-huge', 'g-huge', Array.from({ length: 60 }, (_, i) => `h${i}`));
     const big = await hide('d-huge');
     assert.equal(big.ok, true, String(big.error));
     assert.equal(big.hidden, 1);
     const entry = readLog(framework.getOperatorLogPath()!).filter((e) => e.kind === 'hide').at(-1)!;
-    assert.deepEqual(entry.result?.removedIds, huge.slice(0, 50));
+    listsAtMost50Of(entry.result?.removedIds, huge, '60 removed');
     assert.equal(entry.result?.removedIdsTruncated, true);
     for (const id of huge) assert.equal(cm().getMessage(id as never), null);
+    const huger = appendBody('d-huger', 'g-huger', Array.from({ length: 4 * huge.length }, (_, i) => `x${i}`));
+    assert.equal((await hide('d-huger')).ok, true);
+    const hugerEntry = readLog(framework.getOperatorLogPath()!).filter((e) => e.kind === 'hide').at(-1)!;
+    listsAtMost50Of(hugerEntry.result?.removedIds, huger, '240 removed');
+    assert.equal(hugerEntry.result?.removedIdsTruncated, true);
 
     // The range form takes what was stored between its two messages, from the
     // earlier one's first copy through the later one's first, in either

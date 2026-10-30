@@ -75,6 +75,7 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
 }
 
 const REASON = '400 invalid_request: tool_use ids must have a corresponding tool_result';
+const isRewindMarker = (m: { content: any[] }) => /kept refusing the requests that carried them/.test(m.content[0]?.text ?? '');
 
 test('at the threshold, an invalid_request with no status (shedMayHelp) triggers an automatic rewind + retry', () => {
   const { fw, removed, added, errs, restore } = makeHarness();
@@ -91,16 +92,14 @@ test('at the threshold, an invalid_request with no status (shedMayHelp) triggers
 
   // One consolidated rewind marker, saying the API kept refusing the requests
   // that carried the shed turns, not that the conversation was at fault.
-  const marker = added.find((m) => m.meta.kind === 'refusal-rewind');
+  const marker = added.find(isRewindMarker);
   assert.ok(marker, 'rewind marker added');
-  assert.equal(marker!.meta.cause, 'inference-failure');
   assert.match(marker!.content[0].text, /set aside because the model API kept refusing the requests that carried them \(/);
   assert.match(marker!.content[0].text, /\), so that the conversation could go on\./);
   assert.doesNotMatch(marker!.content[0].text, /rejecting the conversation/);
 
   // A retry was queued so the rewound history is verified immediately.
   assert.equal(fw.pendingRequests.length, 1);
-  assert.equal(fw.pendingRequests[0].reason, 'inference-failure-rewind-retry');
 
   assert.ok(errs.some((e) => e.includes('[inference-rewind]') && e.includes('auto-quarantined')));
 });
@@ -117,7 +116,7 @@ test('at the threshold, a row that carries nothing is passed over, uncounted, an
   } finally { restore(); }
   assert.deepEqual(messages.filter((m) => !m.metadata?.system).map((m) => m.id), ['u0', 'a0', 'a1'],
     'the newest message is gone, and the empty row after it stays with what came before');
-  const marker = added.find((m) => m.meta.kind === 'refusal-rewind');
+  const marker = added.find(isRewindMarker);
   assert.match(marker!.content[0].text, /The 1 most recent turn\(s\) were set aside/);
 });
 
@@ -148,7 +147,7 @@ test('non-retryable but NON-poison failures (auth/context_length/abort) NEVER sh
     assert.equal(removed.length, 0, `${errorType}: history must not be shed`);
     assert.equal(fw.pendingRequests.length, 0, `${errorType}: no rewind-retry queued`);
     assert.equal(
-      added.filter((m) => m.meta.kind === 'refusal-rewind').length,
+      added.filter(isRewindMarker).length,
       0,
       `${errorType}: no false rejection marker`,
     );
@@ -174,21 +173,29 @@ test('the breaker is capped: repeated failures stop shedding at maxRewinds', () 
   assert.equal(removed.length, 2, `cap of 2 respected, shed: ${removed.join(', ')}`);
   assert.equal(fw.pendingRequests.length, 2, 'retries stop when the cap is hit');
   assert.ok(errs.some((e) => e.includes('rewind cap 2 reached')));
-  // History still has the untouched older messages — the breaker cannot eat it all.
-  assert.equal(fw.exhaustionRewinds.get('cairn'), 2);
 });
 
 test('a successful inference resets both the streak and the rewind budget', () => {
-  const { fw, removed, restore } = makeHarness();
+  const { fw, removed, restore } = makeHarness({
+    maxRewinds: 1,
+    messages: [
+      { id: 'u1', participant: 'human', content: [{ type: 'text', text: 'go' }], metadata: { messageId: '1' } },
+      { id: 'a1', participant: 'agent', content: [{ type: 'tool_use', name: 'shell', id: 't1' }] },
+      { id: 'r1', participant: 'user', content: [{ type: 'tool_result', toolUseId: 't1', content: 'X' }] },
+      { id: 'a2', participant: 'agent', content: [{ type: 'tool_use', name: 'shell', id: 't2' }] },
+      { id: 'r2', participant: 'user', content: [{ type: 'tool_result', toolUseId: 't2', content: 'Y' }] },
+    ],
+  });
   try {
-    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
-    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
-    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request'); // shed #1
-    assert.equal(removed.length, 2); // one complete tool exchange
+    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    assert.deepEqual([...removed].sort(), ['a2', 'r2']);
 
     fw.emitTrace({ type: 'inference:completed', agentName: 'cairn' });
-    assert.equal(fw.consecutiveInferenceFailures.get('cairn'), 0);
-    assert.equal(fw.exhaustionRewinds.get('cairn'), 0);
+    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    assert.equal(removed.length, 2, 'a fresh streak: two failures shed nothing');
+    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    assert.deepEqual([...removed].sort(), ['a1', 'a2', 'r1', 'r2'], 'a fresh budget: the third sheds again');
   } finally { restore(); }
 });
 
@@ -226,7 +233,7 @@ test('the breaker reads the status: a 404 invalid_request never sheds, a 400 doe
     }
   } finally { missingModel.restore(); }
   assert.deepEqual(missingModel.removed, [], 'past the threshold, and nothing was shed');
-  assert.ok(!missingModel.added.some((m) => m.meta.kind === 'refusal-rewind'));
+  assert.ok(!missingModel.added.some(isRewindMarker));
   assert.equal(missingModel.fw.pendingRequests.length, 0);
   assert.ok(missingModel.errs.some((e) => e.includes('[inference-hard-down]')), 'it is still reported hard-down');
   assert.ok(alerts.some((a) => a.kind === 'hard-down' && a.agentName === 'cairn'), 'and raises the hard-down ops alert');

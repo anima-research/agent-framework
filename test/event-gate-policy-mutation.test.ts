@@ -130,7 +130,8 @@ describe('EventGate.addPolicy / removePolicy (wake_add_rule / wake_remove_rule)'
 });
 
 describe('Item 5 gate mechanism: every-message-debounced on chat:ambient', () => {
-  it('debounces ambient messages in a channel and fires one batched wake after the window', async () => {
+  it('debounces ambient messages in a channel and fires one batched wake after the window', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const inferences: InferenceCall[] = [];
     const gate = makeGate({ policies: [], default: 'defer' }, (c) => inferences.push(c));
 
@@ -153,7 +154,7 @@ describe('Item 5 gate mechanism: every-message-debounced on chat:ambient', () =>
     assert.strictEqual(gate.evaluate(ev(['chat:mention'])).trigger, false);
 
     assert.strictEqual(inferences.length, 0, 'no wake yet — window still open');
-    await new Promise((r) => setTimeout(r, 200));
+    t.mock.timers.tick(200);
     assert.strictEqual(inferences.length, 1, 'exactly one batched wake after the window settles');
 
     // Status shows the debounce policy with its match count.

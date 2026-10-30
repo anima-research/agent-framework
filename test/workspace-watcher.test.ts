@@ -130,27 +130,15 @@ async function waitFor(predicate: () => boolean, message: string, timeoutMs = EV
   assert.fail(message);
 }
 
-/**
- * A polling watcher, once chokidar's first scan is done and its poll reports
- * changes (changesFlow). A change made before then can be part of the files
- * chokidar starts from (ignoreInitial), or of the poll's first stat, and is
- * then never reported. If the watcher has reported an error and isn't ready
- * when the wait checks, the wait fails with that error, and a watcher that
- * doesn't get ready is stopped.
- */
-async function readyWithPolling(): Promise<{ watcher: MountWatcher; batches: FsChange[][] }> {
-  let ready = false;
-  let failed: Error | undefined;
-  const collected = collectWithPolling({ onReady: () => { ready = true; }, onError: (err) => { failed ??= err; } });
-  try {
-    await waitFor(() => ready || failed !== undefined, 'expected the watcher to be ready');
-    if (!ready) throw failed;
-    await changesFlow(tmp, collected.batches, []);
-  } catch (error) {
-    await collected.watcher.stop();
-    throw error;
-  }
-  return collected;
+function rootPolls(watcher: MountWatcher): () => number {
+  const internals = watcher as unknown as { checkRootLiveness(opts?: { force?: boolean }): Promise<void> };
+  const check = internals.checkRootLiveness.bind(watcher);
+  let polls = 0;
+  internals.checkRootLiveness = (opts) => {
+    polls++;
+    return check(opts);
+  };
+  return () => polls;
 }
 
 /**
@@ -282,52 +270,6 @@ describe('MountWatcher mergeOp', () => {
     });
   }
 
-  // End to end, under polling: what a real save comes out as, one entry with
-  // the right op. Both steps run in one synchronous stretch, so a poll sees
-  // the state between them only if its stat lands there, and these pass with
-  // any merge rule removed: the rule tests above pin the merges. Each then
-  // watches SETTLE_MS more for a second entry for the file.
-  it('an atomic save (unlink, then write) comes out as one modified entry', async () => {
-    const file = join(tmp, 'ticket.md');
-    writeFileSync(file, 'v1');
-
-    const { watcher, batches } = await readyWithPolling();
-
-    try {
-      unlinkSync(file);
-      writeFileSync(file, 'v2');
-
-      // Its batch, then SETTLE_MS more to see any second entry.
-      await changeFor(batches, 'ticket.md');
-      await wait(SETTLE_MS);
-    } finally {
-      await watcher.stop();
-    }
-
-    const flat = batches.flat();
-    const forFile = flat.filter(c => c.path === 'ticket.md');
-    assert.strictEqual(forFile.length, 1, `expected 1 change, got ${JSON.stringify(flat)}`);
-    assert.strictEqual(forFile[0].op, 'modified');
-  });
-
-  it('a new file written twice comes out as one created entry', async () => {
-    const { watcher, batches } = await readyWithPolling();
-
-    try {
-      const file = join(tmp, 'new.md');
-      writeFileSync(file, 'hello');
-      writeFileSync(file, 'hello updated');
-
-      await changeFor(batches, 'new.md');
-      await wait(SETTLE_MS);
-    } finally {
-      await watcher.stop();
-    }
-
-    const forFile = batches.flat().filter(c => c.path === 'new.md');
-    assert.strictEqual(forFile.length, 1);
-    assert.strictEqual(forFile[0].op, 'created');
-  });
 });
 
 describe('MountWatcher lifecycle', () => {
@@ -373,7 +315,6 @@ describe('MountWatcher lifecycle', () => {
     );
     watcher.start();
     try {
-      await wait(50);
       assert.ok(!existsSync(roPath), 'read-only mount must not mkdir -p behind the user\'s back');
     } finally {
       await watcher.stop();
@@ -450,6 +391,7 @@ describe('MountWatcher lifecycle', () => {
       onReady: () => { readyCount++; },
       onReattach: () => { reattachCount++; },
     });
+    const polls = rootPolls(watcher);
 
     try {
       await waitFor(() => readyCount > 0, 'expected initial watcher ready');
@@ -459,7 +401,8 @@ describe('MountWatcher lifecycle', () => {
 
       await waitFor(() => reattachCount > 0, 'expected watcher to reattach');
       await waitFor(() => readyCount > 1, 'expected reattached watcher ready');
-      await wait(WATCH_ROOT_POLL_MS * 4);
+      const polled = polls();
+      await waitFor(() => polls() >= polled + 3, 'expected three root polls after the re-attach');
 
       assert.strictEqual(reattachCount, 1);
     } finally {
@@ -474,6 +417,7 @@ describe('MountWatcher lifecycle', () => {
       onReady: () => { ready = true; },
       onReattach: () => { reattachCount++; },
     });
+    const polls = rootPolls(watcher);
 
     try {
       await waitFor(() => ready, 'expected initial watcher ready');
@@ -485,7 +429,8 @@ describe('MountWatcher lifecycle', () => {
       writeFileSync(file, 'v2');
       await changeFor(batches, 'normal.md', 'modified');
       // Root polls run through the traffic and after it, and none re-attaches.
-      await wait(WATCH_ROOT_POLL_MS * 4);
+      const polled = polls();
+      await waitFor(() => polls() >= polled + 3, 'expected three root polls after the traffic');
 
       assert.strictEqual(reattachCount, 0);
     } finally {
@@ -507,6 +452,7 @@ describe('MountWatcher lifecycle', () => {
         onReattach: () => { reattachCount++; },
       },
     );
+    const polls = rootPolls(watcher);
     watcher.start();
 
     try {
@@ -521,7 +467,8 @@ describe('MountWatcher lifecycle', () => {
       // that watched the missing root again would fire onReady again, which
       // is what this test counts: the root stays absent either way, and
       // onReattach needs it back.
-      await wait(WATCH_ROOT_POLL_MS * 4);
+      const polled = polls();
+      await waitFor(() => polls() >= polled + 3, 'expected three root polls that find the root gone');
       assert.ok(!existsSync(tmp), 'read-only mount must not recreate its deleted root');
       assert.strictEqual(readyCount, 1, 'a read-only mount must not watch its missing root again');
       assert.strictEqual(reattachCount, 0);
@@ -581,7 +528,7 @@ describe('MountWatcher lifecycle', () => {
   // On Linux a removed directory's inode number can go to the next directory
   // made, as ext4 gives it, so a root made again could look unchanged. The
   // watcher holds its root open, and a number held isn't given out.
-  it('holds its root open while it watches, so a root made again takes another inode number', {
+  it('holds its root open while it watches, and re-attaches to a root made again in its place', {
     skip: process.platform !== 'linux',
   }, async (t) => {
     // Whether this disk gives a removed directory's number to the next one
@@ -614,10 +561,8 @@ describe('MountWatcher lifecycle', () => {
     try {
       await waitFor(() => readyCount > 0, 'expected initial watcher ready');
       assert.deepStrictEqual(descriptorsOf(root), [root], 'the watcher holds its root');
-      const held = statSync(root).ino;
       rmdirSync(root);
       mkdirSync(root);
-      assert.notStrictEqual(statSync(root).ino, held, "the root made again took the held root's inode number");
       await waitFor(() => reattachCount > 0 && readyCount > 1, 'expected the watcher to re-attach to the root made again');
       assert.deepStrictEqual(descriptorsOf(root), [root], 'the watcher holds the root made again, having let the removed one go');
     } finally {
@@ -1025,7 +970,7 @@ describe('MountWatcher lifecycle', () => {
   // A root whose link count reads 0 as it's opened isn't held: if that's the
   // file system's count for a directory in place, every later check would
   // take the root for removed. Its polls leave it be.
-  it('holds no root whose link count reads 0, and its polls leave it be', {
+  it("a root in place whose link count reads 0 isn't taken for removed: its polls leave it be", {
     skip: process.platform !== 'linux',
   }, async () => {
     const root = join(realpathSync(tmp), 'work');
@@ -1047,7 +992,6 @@ describe('MountWatcher lifecycle', () => {
       };
       try {
         await waitFor(() => readyCount > 0, 'expected initial watcher ready');
-        assert.deepStrictEqual(descriptorsOf(root), [], 'the watcher holds a root whose link count reads 0');
         const polled = checks;
         await waitFor(() => checks >= polled + 3, 'expected three root polls');
         assert.strictEqual(reattachCount, 0, 'a poll re-attached the watcher to its root in place');

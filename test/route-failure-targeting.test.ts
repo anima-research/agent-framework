@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { AgentFramework, ShutdownTimeoutError } from '../src/index.js';
 import { ContextManager, PassthroughStrategy } from '@animalabs/context-manager';
 import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
+import { TOOL_RESULT_GUARD_AUDIT_STATE } from '../src/tool-result-guard.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { ProcessEvent, Module, ModuleContext, ToolDefinition, ToolCall, ToolResult, EventResponse } from '../src/index.js';
 import type { ContentBlock, NormalizedResponse } from '@animalabs/membrane';
@@ -728,7 +729,7 @@ describe('notices about an agent\'s own action', () => {
 
       await restart();
 
-      assert.deepEqual(disposed, [first.name, second.name], 'stop() ends each fork as its end does');
+      assert.deepEqual([...disposed].sort(), [first.name, second.name].sort(), 'stop() ends each fork as its end does');
       assert.equal(stopped.getAgent(first.name), null, 'the fork is removed');
       assert.equal(stopped.getAgent(second.name), null);
       const told = await primaryNotices();
@@ -975,16 +976,16 @@ describe('notices about an agent\'s own action', () => {
         [{ id: 'held-call', name: 'held--tool', input: {}, result: { toolUseId: 'held-call', content: 'A held result.' } }] as never,
         undefined, undefined);
       assert.ok(guard.hasPending, 'its batch is pending');
-      const abandoned: string[] = [];
-      const abandon = guard.abandon.bind(guard);
-      guard.abandon = (reason: string) => { abandoned.push(reason); abandon(reason); };
       const state = internals(framework);
       state.pendingAssistantBlocks.set(fork.name, []);
 
       await restart();
 
-      assert.deepEqual(abandoned, ['aborted'], "the fork's end withheld its batch as aborted");
       assert.equal(guard.hasPending, false);
+      // Settled conservatively: the guard's audit record, for an operator,
+      // has the fork's batch withheld, not admitted.
+      const audit = framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<{ agentName?: string; type?: string; reason?: string }> | null;
+      assert.ok((audit ?? []).some((record) => record.agentName === fork.name && record.type === 'withheld' && record.reason === 'aborted'), JSON.stringify(audit));
       assert.equal(state.pendingAssistantBlocks.has(fork.name), false, "and took its open tool round's entry");
     });
 
@@ -1867,19 +1868,6 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(count(messages, 'A reply by worker'), 0, 'it read it, so no one else is told');
     });
 
-    it('passes on, by name, a notice injected into a stream that doesn\'t declare it carries injected messages', async () => {
-      // Such a stream may be one that drops them (membrane's XML path), so
-      // the run can't be counted as having read it.
-      await run([
-        [{ type: 'tool_use', id: 'p1', name: 'sender--post', input: {} }],
-        [{ type: 'text', text: '>>skip_reply done' }],
-      ]);
-
-      assert.ok(injected().some((c) => c.includes(SEND_FAILED)), 'the notice was offered to the run\'s live stream');
-      const { messages } = await runFramework.getAgent('primary')!.getContextManager().compile();
-      assert.equal(count(messages, 'A reply by worker'), 1);
-    });
-
     it('passes on, by name, a notice its boundary stored but never sent, when a tool ends the turn', async () => {
       runMembrane.supportsInjectedMessages = true;
       sender.endTurnOnPost = true;
@@ -2132,7 +2120,7 @@ describe('notices about an agent\'s own action', () => {
 
       await runFramework.resume();
 
-      assert.equal(internals(runFramework).quiesced, false, 'resumed');
+      assert.equal(runFramework.getHostModeStatus().quiesced, false, 'resumed');
       assert.ok(!previewed.includes('worker'), 'the ended run is not weighed');
     });
 

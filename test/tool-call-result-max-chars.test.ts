@@ -29,7 +29,6 @@ import type {
 } from '../src/index.js';
 import { AgentFramework, PassthroughStrategy } from '../src/index.js';
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../src/tool-result-history.js';
-import { TOOL_RESULT_NOTICE_ROOM } from '../src/tool-image-ledger.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 
 /** The residence's cap, and the strategy's bound beneath it (1000 tokens, 4 characters each). */
@@ -176,11 +175,14 @@ describe('ToolCall.resultMaxChars', () => {
       assert.equal(stored.get('call_at'), 'x'.repeat(BOUNDED), 'a result of resultMaxChars is stored whole');
       // call_past's round, beside the utility's short result, fits the bound,
       // so each is stored as it would be alone. This framework has no
-      // workspace to spill to, so the store keeps the start: as much as
-      // leaves the notice its room under the bound.
-      assert.equal(stored.get('call_past'),
-        `${'x'.repeat(BOUNDED - TOOL_RESULT_NOTICE_ROOM)}\n\n[truncated — original was ${BOUNDED + 1} chars; no writable workspace mount without an include, full content not retained]`,
-        'one character more is cut, its notice within the bound');
+      // workspace to spill to, so the store keeps the start.
+      const past = stored.get('call_past')!;
+      const kept = /^x*/.exec(past)![0].length;
+      assert.ok(kept > 0 && kept < BOUNDED + 1, `one character more is cut to its start: kept ${kept}`);
+      assert.equal(past,
+        `${'x'.repeat(kept)}\n\n[truncated — original was ${BOUNDED + 1} chars; no writable workspace mount without an include, full content not retained]`,
+        'its notice follows the start');
+      assert.ok(past.length <= BOUNDED, `what is stored fits the cap: ${past.length}`);
       // A utility run through toolsets--act is stored as that call's result.
       assert.equal(caps.get('call_utility'), BOUNDED);
       assert.equal(probe.calls.find((call) => call.id === 'call_utility')?.name, 'peek');

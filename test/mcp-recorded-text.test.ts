@@ -880,12 +880,25 @@ test("a redaction from a place in the text gives what lies from there on, a cred
 
 test("an error answer's data is redacted through and through: its keys, keeping every entry, its numbers, and plain objects, to a depth past which it's withheld", () => {
   const redact = serverTextRedactor(config);
-  assert.deepEqual(
-    redactedData({ [secret]: [secret, { deep: `at ${secret}` }], [config.token]: 'kept', count: 2, none: null }, redact),
-    { redacted: ['redacted', { deep: 'at redacted' }], 'redacted (2)': 'kept', count: 2, none: null },
-  );
+  // Keys that redact alike are numbered, each entry kept under a name of its
+  // own; the doc leaves the number's form to the code, so the names are
+  // checked for being distinct and free of credentials.
+  const besides = (data: unknown, ...names: string[]) =>
+    Object.entries(data as Record<string, unknown>).filter(([key]) => !names.includes(key));
+  const free = (key: string) => !key.includes(secret) && !key.includes(config.token);
+  const both = redactedData({ [secret]: [secret, { deep: `at ${secret}` }], [config.token]: 'kept', count: 2, none: null }, redact) as Record<string, unknown>;
+  assert.deepEqual([both.count, both.none], [2, null]);
+  const alike = besides(both, 'count', 'none');
+  assert.equal(alike.length, 2, `each redacted key keeps its entry: ${JSON.stringify(both)}`);
+  assert.ok(alike.every(([key]) => free(key)), JSON.stringify(both));
+  assert.deepEqual(alike.find(([, value]) => Array.isArray(value))?.[1], ['redacted', { deep: 'at redacted' }]);
+  assert.ok(alike.some(([, value]) => value === 'kept'), JSON.stringify(both));
   // A key of the server's own that reads `redacted` keeps its name.
-  assert.deepEqual(redactedData({ [secret]: 'diagnostic', redacted: false }, redact), { 'redacted (2)': 'diagnostic', redacted: false });
+  const own = redactedData({ [secret]: 'diagnostic', redacted: false }, redact) as Record<string, unknown>;
+  assert.equal(own.redacted, false);
+  const moved = besides(own, 'redacted');
+  assert.equal(moved.length, 1, JSON.stringify(own));
+  assert.ok(free(moved[0]![0]) && moved[0]![1] === 'diagnostic', JSON.stringify(own));
   // A number whose digits are a credential.
   assert.deepEqual(redactedData({ pin: 9876543210123, count: 2 }, serverTextRedactor({ url: 'https://h/mcp', token: '9876543210123' })), { pin: 'redacted', count: 2 });
   // An object with no prototype is walked; an instance of a class is not.

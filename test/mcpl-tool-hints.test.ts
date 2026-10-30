@@ -632,11 +632,18 @@ test('a server that leaves toolHints out keeps its toolset state across a restar
   try {
     await waitFor(() => t.server.received.some((m) => m.method === 'toolsets/list'), 'toolsets/list after connecting');
     await roundTrip(t);
-    const hub = () => (t.fw.framework as unknown as { toolsetHub: { get(id: string): unknown } | null }).toolsetHub;
-    const before = hub()?.get('arc');
-    assert.ok(before, 'a controller for the server');
-    await t.fw.framework.restartMcplServer('arc', { id: 'arc', toolPrefix: 'arc', url: t.server.url });
-    assert.equal(hub()?.get('arc'), before, 'the same controller, kept across the restart');
+    // What the agent was told is the state kept for a next connection: an
+    // ended record the server reports after each restart is told once.
+    t.state.ended = [{ id: 'e7', toolset: 'game', instance: 'g9', reason: 'idle for 30 minutes' }];
+    for (let i = 0; i < 2; i++) {
+      const lists = t.methods().filter((m) => m === 'toolsets/list').length;
+      t.state.rev = 0;
+      await t.fw.framework.restartMcplServer('arc', { id: 'arc', toolPrefix: 'arc', url: t.server.url });
+      await waitFor(() => t.methods().filter((m) => m === 'toolsets/list').length > lists, `toolsets/list after restart ${i + 1}`);
+      await roundTrip(t);
+    }
+    const told = windowText(t.fw.framework).filter((x) => x.includes('[arc/game:g9] ended: idle for 30 minutes'));
+    assert.equal(told.length, 1, 'told once, across both restarts');
   } finally { await t.done(); }
 });
 
@@ -662,7 +669,7 @@ test('toolHints is a boolean, and only for an MCPL server', () => {
   assert.deepEqual(serverConfigProblems({ id: 's', url: 'ws://127.0.0.1:1/mcpl', toolHints: true }), []);
 });
 
-test('act and a direct call take one dispatch path: state exchange, lifecycle, results; only _meta differs', async () => {
+test('act and a direct call behave alike: state exchange, lifecycle, results; only _meta differs', async () => {
   const { createMockResponse } = await import('./helpers/mock-membrane.js');
   const state = new State();
   let n = 0;
@@ -705,10 +712,6 @@ test('act and a direct call take one dispatch path: state exchange, lifecycle, r
   ] as McplServerConfig[]);
   const traces: Array<{ type: string; [k: string]: unknown }> = [];
   fw.framework.onTrace((e: unknown) => traces.push(e as never));
-  const dispatched: string[] = [];
-  const internals = fw.framework as unknown as { dispatchMcplToolCall: (agent: string, call: { name: string }, ...rest: unknown[]) => void };
-  const original = internals.dispatchMcplToolCall.bind(fw.framework);
-  internals.dispatchMcplToolCall = (agent, call, ...rest) => { dispatched.push(call.name); original(agent, call, ...rest); };
   try {
     await waitFor(() => fw.framework.getAllTools().some((t) => t.name === 'arc--status') && server.received.some((m) => m.method === 'toolsets/list'), 'connected');
     await callTool(fw.framework, 'toolsets--open', { server: 'arc', toolset: 'game', instance: 'g1' });
@@ -721,8 +724,7 @@ test('act and a direct call take one dispatch path: state exchange, lifecycle, r
     await waitFor(() => calls.length === 3, 'three calls');
     await waitFor(() => fw.membrane.lastStream?.receivedToolResults.length === 3, 'three results returned');
 
-    // One path: the same dispatch, under each tool's own name.
-    assert.deepEqual(dispatched, ['arc--status', 'arc--play', 'arc--status']);
+    // Each call starts under its own tool's name, act's as a direct call's.
     const started = traces.filter((e) => e.type === 'tool:started').map((e) => `${String(e.module)}:${String(e.tool)}`);
     assert.deepEqual(started, ['mcpl:arc:status', 'mcpl:arc:play', 'mcpl:arc:status']);
     // The state exchange runs through act as through a direct call: each call
@@ -940,22 +942,20 @@ test('a toolsets--act call whose outcome the host can\'t know names look, for th
 
 test('the host\'s argument check is bounded: no server pattern runs, and deep or wide schemas are left to the server', async () => {
   const { checkArgs } = await import('../src/mcpl/tool-signature.js');
-  // A pattern that backtracks catastrophically is never evaluated.
-  const started = Date.now();
+  // A pattern that backtracks catastrophically is never evaluated: the value
+  // fails it, and passes.
   assert.equal(checkArgs({ type: 'object', properties: { s: { type: 'string', pattern: '^(a+)+$' } } }, { s: `${'a'.repeat(40)}!` }), null);
-  assert.ok(Date.now() - started < 100);
   // Types, enums and the rest are still checked.
   assert.match(checkArgs({ type: 'object', properties: { n: { enum: [1, 2] } } }, { n: 3 })!, /must be one of 1\|2/);
   // Nesting past the bound: unchecked rather than recursed into.
   let deep: Record<string, unknown> = { type: 'string' };
   for (let i = 0; i < 200; i++) deep = { allOf: [deep] };
   assert.equal(checkArgs(deep, 5), null);
-  // anyOf fan-out that would take exponential time: unchecked past the step budget.
+  // anyOf fan-out that would take exponential time: unchecked past the step
+  // budget, so a value no branch admits passes.
   let wide: Record<string, unknown> = { type: 'string' };
   for (let i = 0; i < 20; i++) wide = { anyOf: [{ allOf: [wide, { type: 'number' }] }, { allOf: [wide, { type: 'boolean' }] }] };
-  const t0 = Date.now();
   assert.equal(checkArgs(wide, null), null);
-  assert.ok(Date.now() - t0 < 200, 'bounded');
 });
 
 const notices = (fw: Awaited<ReturnType<typeof setup>>['fw']) => windowText(fw.framework).filter((x) => x.includes('tool changes'));

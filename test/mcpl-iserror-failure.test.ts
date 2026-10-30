@@ -105,15 +105,16 @@ test('a server\'s error reaches an in-process caller as the failure the model\'s
 
 test('an in-process caller\'s success is still the server\'s own blocks, and the model\'s call still reads text as one string', { timeout: 20_000 }, async (t) => {
   const { f, ctx, viaModel } = await setup(t);
+  const succeeded = (r: ToolResult) => ({ ...fields(r), isError: r.isError === true });
   const blocks = (ANSWERS.ok as { content: unknown[] }).content;
-  assert.deepEqual(fields(await f.framework.executeToolCall(lookup('x-ok', 'ok'))), { success: true, data: blocks, error: undefined, isError: undefined });
-  assert.deepEqual(fields(await ctx().callTool(lookup('m-ok', 'ok'))), { success: true, data: blocks, error: undefined, isError: undefined });
+  assert.deepEqual(succeeded(await f.framework.executeToolCall(lookup('x-ok', 'ok'))), { success: true, data: blocks, error: undefined, isError: false });
+  assert.deepEqual(succeeded(await ctx().callTool(lookup('m-ok', 'ok'))), { success: true, data: blocks, error: undefined, isError: false });
   const withImage = (ANSWERS.okImage as { content: unknown[] }).content;
-  assert.deepEqual(fields(await f.framework.executeToolCall(lookup('x-okImage', 'okImage'))), { success: true, data: withImage, error: undefined, isError: undefined });
-  assert.deepEqual(fields(await viaModel('d-ok', 'mcpl--editor--lookup', { case: 'ok' })), { success: true, data: 'a\nb', error: undefined, isError: false });
-  assert.deepEqual(fields(await viaModel('d-okImage', 'mcpl--editor--lookup', { case: 'okImage' })), { success: true, data: withImage, error: undefined, isError: false });
-  assert.deepEqual(fields(await f.framework.executeToolCall(lookup('x-okEmpty', 'okEmpty'))), { success: true, data: [], error: undefined, isError: undefined });
-  assert.deepEqual(fields(await viaModel('d-okEmpty', 'mcpl--editor--lookup', { case: 'okEmpty' })), { success: true, data: undefined, error: undefined, isError: false });
+  assert.deepEqual(succeeded(await f.framework.executeToolCall(lookup('x-okImage', 'okImage'))), { success: true, data: withImage, error: undefined, isError: false });
+  assert.deepEqual(succeeded(await viaModel('d-ok', 'mcpl--editor--lookup', { case: 'ok' })), { success: true, data: 'a\nb', error: undefined, isError: false });
+  assert.deepEqual(succeeded(await viaModel('d-okImage', 'mcpl--editor--lookup', { case: 'okImage' })), { success: true, data: withImage, error: undefined, isError: false });
+  assert.deepEqual(succeeded(await f.framework.executeToolCall(lookup('x-okEmpty', 'okEmpty'))), { success: true, data: [], error: undefined, isError: false });
+  assert.deepEqual(succeeded(await viaModel('d-okEmpty', 'mcpl--editor--lookup', { case: 'okEmpty' })), { success: true, data: undefined, error: undefined, isError: false });
 });
 
 test('the admin puppet stores a server\'s error as an error result, and traces it as one', { timeout: 20_000 }, async (t) => {

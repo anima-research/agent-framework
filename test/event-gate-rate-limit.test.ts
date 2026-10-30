@@ -387,7 +387,8 @@ describe('passive_sample', () => {
       }],
       default: 'skip',
     });
-    // 3 messages in A → 3rd fires
+    // Two messages in A, then B's first: on one shared counter, B's would be
+    // the third and fire; on B's own, it doesn't.
     for (let i = 0; i < 2; i++) {
       assert.strictEqual(
         gate.evaluate(event({ channelId: 'A', metadata: { channelId: 'A' } })).trigger,
@@ -395,13 +396,14 @@ describe('passive_sample', () => {
       );
     }
     assert.strictEqual(
-      gate.evaluate(event({ channelId: 'A', metadata: { channelId: 'A' } })).trigger,
-      true,
-    );
-    // First message in B → must not fire (counter independent)
-    assert.strictEqual(
       gate.evaluate(event({ channelId: 'B', metadata: { channelId: 'B' } })).trigger,
       false,
+      'B counts on its own',
+    );
+    // A's third fires on A's counter.
+    assert.strictEqual(
+      gate.evaluate(event({ channelId: 'A', metadata: { channelId: 'A' } })).trigger,
+      true,
     );
   });
 
@@ -616,14 +618,15 @@ describe('hot reload — changed behavior clears stale state', () => {
       policies: [{
         name: 'rl',
         match: {},
-        behavior: { rate_limit: { tokens: 1, refillIntervalMs: 100_000, keyBy: 'channelId' } },
+        behavior: { rate_limit: { tokens: 1, refillIntervalMs: 100_000, keyBy: 'userId' } },
       }],
       default: 'skip',
     });
-    // Burn the only token under channel A
-    h.gate.evaluate(event({ metadata: { channelId: 'A', senderId: 'u' } }));
+    // Burn the only token under user K. (keyBy channelId would key by the
+    // channel the gate routes the event to, not the field's value.)
+    h.gate.evaluate(event({ metadata: { userId: 'K', senderId: 'x' } }));
     assert.strictEqual(
-      h.gate.evaluate(event({ metadata: { channelId: 'A', senderId: 'u' } })).trigger,
+      h.gate.evaluate(event({ metadata: { userId: 'K', senderId: 'x' } })).trigger,
       false,
     );
 
@@ -637,10 +640,11 @@ describe('hot reload — changed behavior clears stale state', () => {
       default: 'skip',
     });
 
-    // Sender u under the new scheme must get a fresh bucket — old
-    // channel-A bucket is gone, doesn't bleed into the new partition.
+    // Sender K under the new scheme must get a fresh bucket: the old
+    // user-K bucket, under the same key, is gone, and doesn't bleed into
+    // the new partition.
     assert.strictEqual(
-      h.gate.evaluate(event({ metadata: { channelId: 'A', senderId: 'u' } })).trigger,
+      h.gate.evaluate(event({ metadata: { userId: 'other', senderId: 'K' } })).trigger,
       true,
     );
   });
@@ -679,13 +683,13 @@ describe('hot reload — changed behavior clears stale state', () => {
       policies: [{
         name: 'ps',
         match: {},
-        behavior: { passive_sample: { every: 3, keyBy: 'channelId' } },
+        behavior: { passive_sample: { every: 3, keyBy: 'userId' } },
       }],
       default: 'skip',
     });
-    // Two messages in channel A — counter at 2.
+    // Two messages from user K — counter at 2.
     for (let i = 0; i < 2; i++) {
-      h.gate.evaluate(event({ metadata: { channelId: 'A' } }));
+      h.gate.evaluate(event({ metadata: { userId: 'K' } }));
     }
 
     await rewriteConfig(h, {
@@ -697,9 +701,10 @@ describe('hot reload — changed behavior clears stale state', () => {
       default: 'skip',
     });
 
-    // First post-reload event under sender X — fresh counter (1, not 3).
+    // First post-reload event under sender K, the old counter's key: a fresh
+    // counter (1, not 3), so it doesn't fire.
     assert.strictEqual(
-      h.gate.evaluate(event({ metadata: { senderId: 'X' } })).trigger,
+      h.gate.evaluate(event({ metadata: { senderId: 'K' } })).trigger,
       false,
     );
   });
@@ -751,7 +756,7 @@ describe('hot reload — changed behavior clears stale state', () => {
     const reload = h.traces.find(t => t.type === 'gate:config-reloaded');
     assert.ok(reload, 'should have emitted a reload trace');
     assert.deepStrictEqual(reload.stateClearedPolicies, ['a']);
-    assert.strictEqual(reload.removedPolicies, undefined);
+    assert.deepEqual((reload.removedPolicies as unknown[] | undefined) ?? [], [], 'no policy was removed');
   });
 
   it('trace event lists removed policies separately from state-cleared ones', async () => {

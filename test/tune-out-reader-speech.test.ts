@@ -6,10 +6,10 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { CHANNEL, rig, skip, publishCall, speakCall } from './helpers/reader-fork-rig.js';
+import { CHANNEL, rig, publishCall, speakCall } from './helpers/reader-fork-rig.js';
 import { createMockResponse } from './helpers/mock-membrane.js';
 
-describe('reader forks with channel speech on', { skip }, () => {
+describe('reader forks with channel speech on', () => {
   const r = rig('speech-on', true);
 
   it("speak_in_channel is the fork's and goes out through the resident's publish path; channel_publish is still refused", async () => {

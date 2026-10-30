@@ -219,7 +219,7 @@ async function harness(opts: { sharedIdFirst?: boolean } = {}) {
 }
 
 test("a send into a channel the agent closed says so, what still reaches the agent, and how to open it, until they turn the note off", async () => {
-  const { registry, framework, reply, state } = await harness();
+  const { registry, framework, reply } = await harness();
   assert.equal((await registry.handleChannelToolCall('channel_open', { channelId }, origin)).success, true);
   assert.equal((await registry.handleChannelToolCall('channel_close', { channelId }, origin)).success, true);
 
@@ -234,7 +234,6 @@ test("a send into a channel the agent closed says so, what still reaches the age
   const settings = framework.closedChannelNoteSettingsExtension();
   assert.deepEqual(settings.get('sol'), { closed_channel_note: true });
   assert.deepEqual(settings.update('sol', { closed_channel_note: false }), { closed_channel_note: false });
-  assert.deepEqual(state()?.closedChannelNotes, { sol: false });
   assert.ok(!(await reply()).data.includes('[closed channel]'), 'no note once turned off');
   assert.throws(() => settings.update('sol', { closed_channel_note: 'off' }), /closed_channel_note must be true or false, not "off"/);
 

@@ -428,18 +428,26 @@ describe("stop()'s waits on the tool-result guard's annotations", () => {
 
   it('one that a module starts and that rejects while stop() waits settles the wait before the final sync, and the store closes', async (t) => {
     let framework!: AgentFramework;
+    let calls!: string[];
     const built = await frameworkToStop(t, new MockMembrane(), () => {
       // Started as the module stops; its timer fires once stop() has reached
       // its second wait, which follows the modules' stop with no timer of its
       // own between.
-      annotate(framework, new Promise((_resolve, reject) => {
+      const late = new Promise<void>((_resolve, reject) => {
         setTimeout(() => reject(new Error('zz a late annotation failed')), 0);
-      }));
+      });
+      late.catch(() => { calls.push('annotation settled'); });
+      annotate(framework, late);
     });
     framework = built.framework;
-    const { calls } = built;
+    calls = built.calls;
+    // Each store sync from here on, in the same list.
+    const store = framework.getStore();
+    const sync = store.sync.bind(store);
+    store.sync = () => { calls.push('sync'); sync(); };
     await framework.stop();
-    assert.deepEqual(calls, ['start', 'stop']);
+    assert.deepEqual(calls.filter((call) => call !== 'sync'), ['start', 'stop', 'annotation settled']);
+    assert.ok(calls.lastIndexOf('sync') > calls.indexOf('annotation settled'), `the final sync after the annotation settled: ${JSON.stringify(calls)}`);
     assert.equal(internals(framework).ownedStoreClosed, true, 'the store closed');
   });
 });

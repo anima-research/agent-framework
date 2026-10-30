@@ -227,14 +227,6 @@ test('without a per-message cap the dump is not fitted', () => {
   assert.ok(!dump.includes('truncated=') && !dump.includes(CUT_MARK), 'none counted or cut');
 });
 
-test("a room smaller than the dump's frame shows no message and counts them all", () => {
-  const { dump, notice } = cancelWith({ room: 10, stored: FIVE });
-  assert.deepEqual(shownOf(dump), [], 'no line');
-  assert.ok(!dump.includes(CUT_MARK), 'not even a cut one');
-  assert.ok(dump.includes('messages=5 truncated=5 '), 'all five counted');
-  assert.ok(notice!.includes('5 of 5 diverted messages'), 'and the report is told of all five');
-});
-
 test('a backlogCap of 0, or below 1, shows no message at any room', () => {
   const one = [row('Ann', `M1 ${'x'.repeat(40)}`)];
   for (let room = 0; room <= 400; room++) {

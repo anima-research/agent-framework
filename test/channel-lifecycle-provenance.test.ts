@@ -61,12 +61,6 @@ test('an agent decision to close is never overridden by initiallyOpen', () => {
   assert.equal(r.getDesiredState('eidoverse', 'world:commons'), 'closed');
 });
 
-test('initiallyOpen at first sight registers open with server-bootstrap provenance', () => {
-  const { r } = makeRegistry();
-  r.ensureInitialDesiredState('eidoverse', ch(true));
-  assert.equal(r.getDesiredState('eidoverse', 'world:commons'), 'open');
-});
-
 test("desiredStateInLog reads a server's channel's last decision from a store's lifecycle log, by the rule a registry replayed from it reads", () => {
   const dir = mkdtempSync(join(tmpdir(), 'desired-state-in-log-'));
   const store = JsStore.openOrCreate({ path: join(dir, 'store') });

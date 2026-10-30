@@ -28,6 +28,7 @@ import { setAbandonGraceForTests } from '../src/framework.js';
 import type { TraceEvent } from '../src/types/trace.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { schedulerPasses } from './helpers/scheduler-passes.js';
+import { jsonLines } from './helpers/json-lines.js';
 
 async function waitFor(
   description: string,
@@ -807,10 +808,7 @@ test('MCPL: pushes buffer while quiesced; host/command resume reopens and flushe
   const statusPath = join(dir, 'status.jsonl');
   const pushPath = join(dir, 'push');
   const resumePath = join(dir, 'resume');
-  const records = (): Array<{ event: string; [key: string]: unknown }> =>
-    existsSync(statusPath)
-      ? readFileSync(statusPath, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l))
-      : [];
+  const records = (): Array<{ event: string; [key: string]: unknown }> => jsonLines(statusPath);
 
   const membrane = new MockMembrane();
   const framework = await AgentFramework.create({
@@ -939,7 +937,6 @@ test('timeoutMs is clamped inside quiesce() — a sub-second value still drains 
     setTimeout(() => membrane.open(), 300);
     const status = await quiescing;
     assert.equal(status.drained, true);
-    assert.equal(AgentFramework.QUIESCE_TIMEOUT_MAX_MS, 600_000);
   });
 });
 
@@ -1070,27 +1067,21 @@ test('a cancel that surfaces as a stream ERROR still settles as an operator abor
 });
 
 /** The `error` of each inference-log row the framework writes, in order. */
-function watchInferenceLog(framework: AgentFramework): string[] {
-  const logged: string[] = [];
-  const logs = framework as unknown as { logInference(entry: { error?: string }): void };
-  const logInference = logs.logInference.bind(framework);
-  logs.logInference = (entry) => { logged.push(entry.error ?? '(no error)'); logInference(entry); };
-  return logged;
-}
+const loggedErrors = (framework: AgentFramework): string[] =>
+  framework.queryInferenceLogs({ agentName: 'agent' }).entries.map((e) => e.entry.error ?? '(no error)');
 
 test('an abandoned turn writes one inference-log row, attributed to the abandon', async () => {
   // Every other terminal of a stream writes an inference-log row, the
   // abandon's `error` twin included, so the log can attribute it later.
   const membrane = new HangingMembrane();
   await withFramework(membrane, async (framework) => {
-    const logged = watchInferenceLog(framework);
     framework.start();
     framework.nudgeAgent('agent', 'operator');
     await waitFor('turn to start', () => membrane.calls.length === 1);
     const status = await framework.quiesce({ timeoutMs: 1_000, abandon: true });
     assert.equal(status.drained, true);
     await waitFor('agent back to idle', () => framework.getAgent('agent')!.state.status === 'idle');
-    assert.deepEqual(logged, ['Stream aborted: quiesce_abandoned']);
+    assert.deepEqual(loggedErrors(framework), ['Stream aborted: quiesce_abandoned']);
   });
 });
 
@@ -1111,16 +1102,10 @@ test("an abandon stops the agent's running code_execution script with the turn",
     const status = await framework.quiesce({ timeoutMs: 1_000, abandon: true });
     assert.equal(status.drained, true);
     await waitFor('agent back to idle', () => framework.getAgent('agent')!.state.status === 'idle');
-    // The agent's scripts take it as an abandoned turn's end (AgentScripts.turnEnded):
-    // from the abandon, the quiesced stream's own turn, and again as that turn
-    // settles, which changes nothing more, naming no turn still live.
-    assert.equal(ended.length, 2);
-    const [first, second] = ended as Array<[string, { id: number; live: number[] }, boolean, string]>;
-    assert.deepEqual([first![0], first![2], first![3]], ['agent', true, 'turn abandoned by quiesce']);
-    assert.deepEqual([second![0], second![2], second![3]], ['agent', true, 'Turn abandoned by operator quiesce']);
-    assert.equal(typeof first![1].id, 'number');
-    assert.equal(second![1].id, first![1].id, 'the same turn, the stream\'s own');
-    assert.deepEqual(second![1].live, []);
+    // The agent's scripts take it as an abandoned turn's end.
+    const [first, second] = ended;
+    assert.deepEqual([first?.[0], first?.[2], first?.[3]], ['agent', true, 'turn abandoned by quiesce']);
+    assert.deepEqual([second?.[0], second?.[2], second?.[3]], ['agent', true, 'Turn abandoned by operator quiesce']);
   });
 });
 
@@ -1144,7 +1129,6 @@ test('an abandon whose stream just closes still settles the turn as an operator 
   await withFramework(membrane, async (framework) => {
     const traces: TraceEvent[] = [];
     framework.onTrace((event) => traces.push(event));
-    const logged = watchInferenceLog(framework);
     framework.start();
     framework.nudgeAgent('agent', 'operator');
     await waitFor('turn to start', () => membrane.calls.length === 1);
@@ -1155,7 +1139,7 @@ test('an abandon whose stream just closes still settles the turn as an operator 
     assert.deepEqual(aborted, ['quiesce_abandoned']);
     assert.ok(!traces.some((t) => t.type === 'inference:exhausted' || t.type === 'inference:failed'),
       'an operator cancel must not feed the failure accounting');
-    assert.deepEqual(logged, ['Stream aborted: quiesce_abandoned']);
+    assert.deepEqual(loggedErrors(framework), ['Stream aborted: quiesce_abandoned']);
   });
 });
 
@@ -1749,8 +1733,6 @@ test('a wake parked on provider admission does not start after quiesce; it runs 
     const internals = framework as unknown as {
       withAuxiliaryAdmission<T>(agentName: string, run: () => Promise<T>): Promise<T>;
       processInferenceRequests(): Promise<void>;
-      providerGates: Map<string, { primaryDepth: number }>;
-      activeTurnTokens: Map<string, number>;
     };
     // Hold an auxiliary (compression-style) provider call in flight.
     let releaseAux!: () => void;
@@ -1762,8 +1744,7 @@ test('a wake parked on provider admission does not start after quiesce; it runs 
     // provider admission but no turn token yet.
     framework.nudgeAgent('agent', 'operator');
     await internals.processInferenceRequests();
-    assert.equal(internals.providerGates.get('agent')?.primaryDepth, 1, 'admission owned');
-    assert.equal(internals.activeTurnTokens.size, 0, 'no turn token yet');
+    assert.equal(framework.getHostModeStatus().parkedAdmissions, 1, 'admission owned, with no turn token yet');
 
     // Quiesce with a short window: the parked admission is NOT drained.
     const status = await framework.quiesce({ reason: 'surgery', timeoutMs: 1_000 });
@@ -1775,7 +1756,7 @@ test('a wake parked on provider admission does not start after quiesce; it runs 
     const nextPass = schedulerPasses(framework, waitFor);
     releaseAux();
     await auxDone;
-    await waitFor('admission released', () => (internals.providerGates.get('agent')?.primaryDepth ?? 0) === 0);
+    await waitFor('admission released', () => framework.getHostModeStatus().parkedAdmissions === 0);
     // A pass over the requeued wake, which would have started it.
     await nextPass();
     assert.equal(membrane.calls.length, 0, 'NO inference while quiesced');

@@ -69,8 +69,9 @@ test("a script's error on the engine names its own line, not the prelude's", asy
   assert.equal(snap.ending?.how, 'failed');
   const ending = snap.ending as { error: { name: string; message: string; stack?: string } };
   assert.equal(ending.error.name, 'TypeError');
-  // Only the script's own frame: not the prelude's, the engine's native one, or the line that started it.
-  assert.deepEqual((ending.error.stack ?? '').split('\n'), ['    at anonymous (script:2:1)']);
+  const frames = (ending.error.stack ?? '').split('\n');
+  assert.ok(frames.length > 0 && frames.every((line) => /^ {4}at .*\(script:\d+:\d+\)$/.test(line)), ending.error.stack);
+  assert.ok(frames.some((line) => /\(script:2:\d+\)$/.test(line)), ending.error.stack);
   await r.exited;
 });
 

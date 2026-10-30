@@ -3,16 +3,11 @@ import assert from 'node:assert/strict';
 import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { JsStore } from '@animalabs/chronicle';
-import { ContextManager } from '@animalabs/context-manager';
 import type { NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
 import { AgentFramework } from '../src/index.js';
 import type { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
 import { MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 
-const supported =
-  typeof (JsStore.prototype as unknown as { view?: unknown }).view === 'function' &&
-  typeof (ContextManager.prototype as unknown as { derive?: unknown }).derive === 'function';
 const CHANNEL = 'disc:guild:noisy';
 const FIXTURE = join(import.meta.dirname, 'fixtures/tune-out-mcpl-server.mjs');
 
@@ -60,9 +55,7 @@ const resultOf = (stream: MockYieldingStream, id: string) => {
   return result;
 };
 
-test('a real reader fork carries its epoch and leaves a later hold and channel untouched', {
-  skip: supported ? false : 'installed chronicle or context-manager lacks branch-bound reader derivation',
-}, async () => {
+test('a real reader fork carries its epoch and leaves a later hold and channel untouched', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'reader-epoch-shared-'));
   const commandPath = join(dir, 'commands.txt');
   const statusPath = join(dir, 'status.jsonl');

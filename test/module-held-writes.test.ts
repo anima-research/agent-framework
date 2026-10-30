@@ -16,10 +16,9 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
 import { JsStore } from '@animalabs/chronicle';
-import type { MessageQuery, StoredMessage } from '@animalabs/context-manager';
+import type { MessageQuery } from '@animalabs/context-manager';
 import type { AgentConfig, EventResponse, Module, ModuleContext, ModuleMessage, ToolDefinition, ToolResult } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
-import { matchesMessageQuery } from '../src/held-writes.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 class ProbeModule implements Module {
@@ -510,7 +509,7 @@ test('a query over stored and held rows reverses and cuts to its limit as the st
 });
 
 test("held rows match a filter as context-manager's own query matches stored rows", async () => {
-  await withProbe(async ({ framework }) => {
+  await withProbe(async ({ framework, ctx }) => {
     const cm = framework.getAgent('assistant')!.getContextManager();
     const rows: Array<[string, Record<string, unknown> | undefined]> = [
       ['alice', { external: { source: 'discord', id: 'm1' }, channelId: 'c1', nested: { a: { b: 1 } } }],
@@ -519,7 +518,6 @@ test("held rows match a filter as context-manager's own query matches stored row
       ['carol', { flag: null, zero: 0, external: 'not an object' }],
       ['dave', undefined],
     ];
-    for (const [participant, metadata] of rows) cm.addMessage(participant, text(participant), metadata as never);
     const filters: MessageQuery[] = [
       {},
       { source: 'discord' },
@@ -538,13 +536,16 @@ test("held rows match a filter as context-manager's own query matches stored row
       { metadata: { 'external.source': 'discord', channelId: 'c2' } },
       { metadata: { 'external.length': 12 } },
     ];
-    const stored: StoredMessage[] = cm.getAllMessages();
-    for (const filter of filters) {
-      assert.deepEqual(
-        stored.filter((m) => matchesMessageQuery(m, filter)).map((m) => m.id),
-        cm.queryMessages(filter).messages.map((m) => m.id),
-        JSON.stringify(filter),
-      );
-    }
+    // Held: the module's query matches the held rows.
+    await framework.quiesce({ reason: 'test' });
+    const handles = rows.map(([participant, metadata], i) => ctx.addMessage(participant, text(`row ${i}`), metadata as never));
+    assert.ok(handles.every((handle) => ctx.getMessage(handle)!.held === true), 'premise: every row is held');
+    const held = filters.map((filter) => ctx.queryMessages(filter as never).messages.map(textOf));
+    // Stored: the same rows, written once the host resumes, through context-manager's own query.
+    await framework.resume();
+    assert.equal(cm.getAllMessages().filter((m) => textOf(m).startsWith('row ')).length, rows.length, 'premise: every row is stored');
+    filters.forEach((filter, i) => {
+      assert.deepEqual(held[i], cm.queryMessages(filter).messages.map(textOf), JSON.stringify(filter));
+    });
   });
 });
