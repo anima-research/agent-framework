@@ -14,7 +14,8 @@
   an autobiographical strategy drops each summary that folded one of them, with every summary above it, and folds the
   rows it keeps again, as the strategy of the context the suppression was made through does. Before, a suppression
   was not retroactive over derived state, and a summary that had folded a suppressed row went on showing it; on a
-  window that is still the record it still isn't.
+  window that is still the record it still isn't. The agent isn't told that its summaries were dropped and folded
+  again, after a suppression, a hide or an undo alike: a current limit, which docs/dendrite.md names.
 - At start, each window lets go of the rows its record no longer holds that no live context heard removed, such as
   an offline recovery's suppressions, made through the one agent's context it opens with the host stopped
   (`presentation:retracted`, reason `boot`).
