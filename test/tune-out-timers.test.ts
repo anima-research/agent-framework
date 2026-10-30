@@ -76,6 +76,7 @@ function harness(
     nameShown: (channel: { channelId: string }) => channel.channelId,
     quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
     listChannelsRaw: () => (state ? [{ serverId: 'disc', descriptor: { id: '#a' } }] : []),
+    tuneOutsOnRecord: () => (state ? [{ serverId: 'disc', channelId: '#a', params: state.params, source: 'agent-tool' }] : []),
     readCoordinatorState: (id: string) => coordinatorState.get(id) ?? null,
     writeCoordinatorState: (id: string, value: unknown) => { if (value === null) coordinatorState.delete(id); else coordinatorState.set(id, value); },
     getTuneOutState: () => state,
