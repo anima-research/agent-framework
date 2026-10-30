@@ -342,14 +342,30 @@ export class StdioTransport extends McplTransport {
     }, lineBound);
 
     let carry = '';
+    let dropping = false;
+    const dropped = `[a stderr line longer than ${lineBound.toLocaleString('en-US')} UTF-16 code units was dropped]`;
     const decoder = new StringDecoder('utf8');
     const received = (text: string) => {
       const window = this.stderrWindow + text;
       this.stderrWindow = window.slice(-STDERR_WINDOW_CHARS);
-      const lines = (carry + text).split('\n');
+      let rest = text;
+      if (dropping) {
+        const end = rest.indexOf('\n');
+        if (end === -1) return;
+        dropping = false;
+        rest = rest.slice(end + 1);
+      }
+      const lines = (carry + rest).split('\n');
       carry = lines.pop() ?? '';
-      for (const l of lines) if (l.length > 0) this.pushStderr(l);
-      for (; carry.length > lineBound; carry = carry.slice(lineBound)) this.pushStderr(carry.slice(0, lineBound));
+      for (const l of lines) {
+        if (l.length > lineBound) this.pushStderr(dropped);
+        else if (l.length > 0) this.pushStderr(l);
+      }
+      if (carry.length > lineBound) {
+        carry = '';
+        dropping = true;
+        this.pushStderr(dropped);
+      }
     };
     this.child.stderr?.on('data', (chunk: Buffer) => received(decoder.write(chunk)));
     // A last line with no newline is complete once the stream ends.
