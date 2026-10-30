@@ -2613,6 +2613,9 @@ interface BudgetHold {
   checking: boolean;
   lookedAt?: string;
   checkpoint: RecordedTurnCheckpoint | undefined;
+  checkQueued?: boolean;
+  drainKicked?: boolean;
+  alertedLong?: boolean;
 }
 /** Longest delay one setTimeout can represent (2^31-1 ms, about 24.8 days);
  *  a longer timer fires almost at once, so longer waits re-arm in steps. */
@@ -2629,6 +2632,7 @@ const WAITING_TRACE_EVERY_MS = 60_000;
  *  waits in a row hold one turn longer than this (noteStatedWaitRun,
  *  endStatedWaitRun). */
 const PROVIDER_WAIT_ALERT_MS = 60 * 60_000;
+const BUDGET_HOLD_ALERT_MS = PROVIDER_WAIT_ALERT_MS;
 /**
  * A MembraneError, from this framework's copy of membrane or from another: the
  * host supplies the Membrane instance (config.membrane), so with two copies
@@ -6782,13 +6786,7 @@ export class AgentFramework {
       heldRequests: hold.heldRequests.length,
     });
     if (this.budgetHolds.get(agent.name) !== hold || hold.state !== 'holding') return true;
-    const readiness = this.contextReadiness(agent.getContextManager());
-    const compression = 'pending' in readiness && readiness.pending
-      ? ` Compression: ${boundFailureText(readiness.pending, FAILURE_SUMMARY_MAX_CHARS)}`
-      : '';
-    const held = "Held: this turn's context doesn't fit until pending compression lands; it runs once it fits." + compression;
-    console.error(`[budget-hold] agent=${agent.name} compile refused (${errorType}): ${hold.reason} \u2014 ${held}`);
-    this.opsAlert('context-refusal', agent.name, `compile refused (${errorType}): ${hold.reason} \u2014 ${held}`, { skipLog: true });
+    this.alertBudgetHold(agent, hold, 'Held');
     const kick = setTimeout(() => this.compressForBudgetHold(agent), 0);
     kick.unref?.();
     return true;
@@ -6807,10 +6805,25 @@ export class AgentFramework {
     for (const name of [...this.budgetHolds.keys()]) void this.checkBudgetHold(name);
   }
 
+  private alertBudgetHold(agent: Agent, hold: BudgetHold, held: string): void {
+    const readiness = this.contextReadiness(agent.getContextManager());
+    const compression = 'pending' in readiness && readiness.pending
+      ? ` Compression: ${boundFailureText(readiness.pending, FAILURE_SUMMARY_MAX_CHARS)}`
+      : '';
+    const says = `compile refused (${hold.errorType}): ${hold.reason} \u2014 ${held}: ` +
+      `this turn runs once a check finds its context fits its budget.${compression}`;
+    console.error(`[budget-hold] agent=${agent.name} ${says}`);
+    this.opsAlert('context-refusal', agent.name, says, { skipLog: true });
+  }
+
   private async checkBudgetHold(agentName: string): Promise<void> {
     const hold = this.budgetHolds?.get(agentName);
     const agent = this.agents.get(agentName);
     if (hold?.state !== 'holding' || !agent) return;
+    if (!hold.alertedLong && Date.now() - hold.startedAt >= BUDGET_HOLD_ALERT_MS) {
+      hold.alertedLong = true;
+      this.alertBudgetHold(agent, hold, `Still held after ${describeWait(Date.now() - hold.startedAt)}`);
+    }
     const pending = this.compressionPending(agent);
     const signature = this.budgetHoldSignature(agent, pending);
     if (signature !== undefined && signature === hold.lookedAt) return;
@@ -6907,12 +6920,19 @@ export class AgentFramework {
   }
 
   private compressForBudgetHold(agent: Agent): void {
-    if (this.budgetHolds?.get(agent.name)?.state !== 'holding' || this.agents.get(agent.name) !== agent) return;
+    const hold = this.budgetHolds?.get(agent.name);
+    if (hold?.state !== 'holding' || this.agents.get(agent.name) !== agent) return;
     if (this.providerGateBlocked(agent.name)) {
       void this.checkBudgetHold(agent.name);
       return;
     }
-    this.kickOverBudgetDrain(agent.name, agent, () => void this.checkBudgetHold(agent.name), 'hold');
+    if (hold.checkQueued) return;
+    const kicked = this.kickOverBudgetDrain(agent.name, agent, () => {
+      hold.checkQueued = false;
+      void this.checkBudgetHold(agent.name);
+    }, 'hold', hold.drainKicked);
+    if (kicked === 'kicking' || kicked === 'already draining') hold.checkQueued = true;
+    hold.drainKicked = true;
   }
 
   private releaseBudgetHold(agentName: string, outcome: Exclude<BudgetHoldOutcome, 'stopped'>): void {
@@ -7000,6 +7020,7 @@ export class AgentFramework {
     agent: Agent,
     after?: () => void,
     by: 'breaker' | 'hold' = 'breaker',
+    quiet = false,
   ): 'not kicked: the framework is stopping' | 'not kicked: a surgery holds the store' | 'already draining' | 'kicking' {
     // Like a maintenance pass: none starts once stop() has begun, it starts
     // no tick while a surgery holds the store or once its agent has been
@@ -7032,7 +7053,7 @@ export class AgentFramework {
           : this.agents.get(agentName) !== agent ? ', stopped as the agent was disposed'
           : this.providerAdmissionClosed ? ', stopped as the framework stops'
           : ', stopped while a surgery holds the store';
-        console.error(`${tag} drain kicked for ${agentName} (${label}, ${ticks} ticks${stopped})`);
+        if (!quiet || stopped) console.error(`${tag} drain kicked for ${agentName} (${label}, ${ticks} ticks${stopped})`);
       } catch (err) {
         if (err instanceof MaintenanceWithdrawnError) {
           console.error(`${tag} drain kicked for ${agentName} (${label}, ${ticks} ticks, stopped: ${err.message})`);
@@ -9244,10 +9265,11 @@ export class AgentFramework {
    * in-flight turns to settle (turn-alive is a turn token, which spans
    * dequeue → settled teardown, a continuation of the turn on its way to its
    * start, or the turn's retry, which a provider hold or a budget hold keeps
-   * or which waits to start: turnHolders). A budget hold keeps its turn
-   * until compression makes the context fit or has nothing left to do, with
-   * no time limit, so a quiesce made while one holds a turn drains only if
-   * the turn is released and finishes within the window; `abandon: true`
+   * or which waits to start: turnHolders). A budget hold keeps its turn,
+   * with no time limit, until a check finds the context fits or fails for
+   * another reason, or compression has nothing left to do, so a quiesce made
+   * while one holds a turn drains only if the turn ends within the window:
+   * released and finished, or ended by `abortInference()`. `abandon: true`
    * ends it. Idempotent, but for the queue's write, which
    * every call makes first: when the queue can't reach disk, because its
    * write fails or it's over the cap, the call rejects with a
