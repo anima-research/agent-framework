@@ -11,11 +11,21 @@
   landing: the writes after it go on, and the release logs the loss and raises an `ops:alert` of kind
   `store-held-lost` for the agent, with the counts and kinds as at a stop, where earlier releases kept such a write
   queued for the next drain. One whose row landed though its store threw counts as stored.
-  A tune-out's cancel asked for meanwhile (its end time passing, a
-  wake past its budget, a tool's or a host's cancel) waits, the tune-out in force, until the release has stored the writes,
-  or told of those it couldn't, then runs, so its release is never kept in memory behind an end already on disk; `cancel()` and `cancelAllExcept()`
-  answer `{ ok: true, deferred: true }` then. A crash before that leaves the tune-out in force for the next boot,
-  which cancels one whose end time passed. The `store-held-long` alert says so: a restart loses the writes the hold keeps in memory and those kept
+  A tune-out's cancel asked for meanwhile (its end time passing, a wake past its budget, a tool's or a host's
+  cancel), or while the primary's or the subconscious's context manager refuses its work before anything is kept for
+  it, waits, the tune-out in force, until the release has stored the writes, or told of those it couldn't, then runs,
+  so its release is never kept in memory behind an end already on disk; `cancel()` and `cancelAllExcept()` answer
+  `{ ok: true, deferred: true }` then. A later cancel while one waits adds its note to the waiting cancel when that
+  has none; otherwise its note is dropped, logged, and the answer adds `noteDropped: true`. The tools say so to the
+  agent, where they answered `cancelled`: the resident's `tune_out` cancel answers `waiting` (the channel's name, or
+  `'all-except'`) and the subconscious's `cancel_tuneout` `waiting: true` (with `scope: 'all-except'` for that
+  hold), each with a `note`: not cancelled yet, since an operator's change to the store is in progress or a context
+  the cancel writes to refuses writes until the host re-initializes it; cancelling again doesn't end the wait
+  sooner; the tune-out stays in force until then, and what it held is delivered when it ends; and a host that stops
+  first loses the cancel, so the tune-out is still in force after the restart unless its end time has passed.
+  `cancel_tuneout`'s note says too when the caller's note isn't delivered (`noteDropped`). A crash before the cancel
+  runs leaves the tune-out in force for the next boot, which cancels one whose end time passed. The
+  `store-held-long` alert says so: a restart loses the writes the hold keeps in memory and those kept
   for a manager refusing its work, where 0.28.0's said writes still queued at exit survive in a persisted deferral
   queue. `stop()` names what it leaves unstored: for each agent with writes still kept in memory, those kept while
   its manager refuses its work (lost) and those a surgery whose operation outlived `stop()`'s wait still holds, it
