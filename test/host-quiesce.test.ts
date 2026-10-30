@@ -8,7 +8,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type {
@@ -1281,6 +1281,48 @@ test('the boot import of an earlier release\'s queue drops a malformed write, na
   }
 });
 
+test("the boot import drops a write context-manager refuses as malformed, naming it, stores what follows it for its agent, and doesn't store it at a later boot", { timeout: 60_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-refused-'));
+  const storePath = join(dir, 'store');
+  const config = () => ({
+    storePath,
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+    modules: [],
+  });
+  let framework = await AgentFramework.create(config());
+  const lines: string[] = [];
+  const error = console.error;
+  try {
+    const before = framework.getAgent('agent')!.getContextManager().getAllMessages().length;
+    await framework.stop();
+    mkdirSync(join(storePath, 'recovery'), { recursive: true });
+    const file = join(storePath, 'recovery', 'deferred-writes.json');
+    writeFileSync(file, JSON.stringify({ version: 2, pending: [
+      { id: 'first', seq: 1, participant: 'user', content: [{ type: 'text', text: 'first' }] },
+      { id: 'number-text', seq: 2, participant: 'user', content: [{ type: 'text', text: 5 }] },
+      { id: 'second', seq: 3, participant: 'user', content: [{ type: 'text', text: 'second' }] },
+    ] }));
+    const texts = () => framework.getAgent('agent')!.getContextManager().getAllMessages().slice(before)
+      .map((m) => (m.content[0] as { text: unknown }).text);
+
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    framework = await AgentFramework.create(config());
+    console.error = error;
+    assert.ok(lines.some((line) => line.includes('was refused as malformed, and dropped: number-text') && line.includes('content[0]')), lines.join('\n'));
+    assert.deepEqual(texts(), ['first', 'second'], 'what follows it for its agent is stored at this boot');
+    assert.ok(!existsSync(file) || !readFileSync(file, 'utf8').includes('number-text'), 'and the record no longer holds it');
+    await framework.stop();
+
+    framework = await AgentFramework.create(config());
+    assert.deepEqual(texts(), ['first', 'second'], 'a later boot stores nothing more');
+  } finally {
+    console.error = error;
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a context write while quiesced survives a restart, and enters the window at resume', async () => {
   // Before #291 such a write waited in a deferred queue persisted beside the
   // store, which the restart restored.
@@ -1485,6 +1527,56 @@ test("an abandon whose cancel throws for one agent goes on to abandon the next a
     restore?.();
     errors.restore();
     await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a quiesced boot keeps its stored rows out of the windows when a module writes at its start, until resume', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'af-quiesce-start-write-'));
+  const text = (t: string) => ({ type: 'text', text: t }) as never;
+  const textOf = (row: { content: Array<{ type: string; text?: string }> }) =>
+    row.content.filter((b) => b.type === 'text').map((b) => b.text ?? '').join('');
+  class StartWriter {
+    readonly name = 'start-writer';
+    async start(ctx: { addMessage(participant: string, content: never[]): string }): Promise<void> {
+      ctx.addMessage('user', [text('MODULE-START-ROW')]);
+    }
+    async stop(): Promise<void> {}
+    getTools() { return []; }
+    async handleToolCall() { return { success: false, error: 'no tools' }; }
+    async onProcess() { return {}; }
+  }
+  const make = (modules: unknown[]) => AgentFramework.create({
+    storePath: join(dir, 'store.chronicle'),
+    membrane: new MockMembrane() as never,
+    agents: [{ name: 'mira', model: 'test-model', systemPrompt: 'You are mira.' }],
+    modules,
+    syncIntervalMs: 0,
+    maintenanceIntervalMs: 0,
+  } as never);
+  const inWindow = (framework: AgentFramework, t: string) => {
+    const cm = framework.getAgent('mira')!.getContextManager();
+    const row = cm.getAllMessages().find((m) => textOf(m as never) === t);
+    assert.ok(row, `a row "${t}" is stored`);
+    return cm.ordinalOf(row.id) !== undefined;
+  };
+  const first = await make([]);
+  let second: AgentFramework | undefined;
+  try {
+    await first.quiesce({ reason: 'maintenance' });
+    (first as unknown as { addMessage(p: string, c: never[]): string }).addMessage('user', [text('STORED-WHILE-QUIESCED')]);
+    assert.equal(inWindow(first, 'STORED-WHILE-QUIESCED'), false, 'the premise: out of the window while quiesced');
+    await first.stop();
+
+    second = await make([new StartWriter()]);
+    assert.equal(second.getHostModeStatus().quiesced, true, 'the host boots quiesced');
+    assert.equal(inWindow(second, 'STORED-WHILE-QUIESCED'), false, 'still out of the window after the boot');
+    assert.equal(inWindow(second, 'MODULE-START-ROW'), false, "and the module's row with it");
+    await second.resume();
+    assert.equal(inWindow(second, 'STORED-WHILE-QUIESCED'), true, 'resume presents it');
+    assert.equal(inWindow(second, 'MODULE-START-ROW'), true);
+  } finally {
+    await second?.stop().catch(() => {});
     rmSync(dir, { recursive: true, force: true });
   }
 });

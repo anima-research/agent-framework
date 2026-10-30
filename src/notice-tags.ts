@@ -6,8 +6,12 @@
  * wherever it would open with one of these (supplied-text.ts). A toolset's
  * `[server/toolset:instance]` label is built from its server's id and names
  * instead, and so is a line of another agent's round as an agent that watches
- * its slot is sent it (foreign-rounds.ts, #291), from the tool's name, with
- * the call's input and the result's outcome in it marked as supplied text.
+ * its slot is sent it (foreign-rounds.ts, #291): a bracket of the
+ * framework's around the tool's name, which the other agent supplied, and
+ * the call's input or the result's outcome. The line is marked as one text,
+ * so an opening of one of these tags is marked wherever it forms across it,
+ * the name included, while the framework's own words and placeholders in it
+ * stay unmarked.
  */
 export const NOTICE_TAG = {
   turnInterrupted: 'turn-interrupted',

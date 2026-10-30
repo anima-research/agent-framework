@@ -110,6 +110,15 @@ interface WindowStartsState {
   inForce?: number;
 }
 
+export function cancelWaitsNote(what: string, noteDropped = false): string {
+  return 'Not cancelled yet: an operator\'s change to the store is in progress, or a context the cancel writes to '
+    + 'refuses writes until the host re-initializes it, so the cancel waits until that is over. Cancelling again '
+    + 'doesn\'t end the wait sooner, and how long it lasts isn\'t known here. '
+    + `${what} stays in force until then, and what it held is delivered when it ends. If the host stops before then, `
+    + 'the cancel is lost and it is still in force after the restart, unless its end time has passed by then.'
+    + (noteDropped ? ' Your note isn\'t delivered with it: the cancel already waiting carries a note of its own.' : '');
+}
+
 /**
  * Whether a held message is one of this channel's: by its channel id, and by
  * its server where it records one, since two servers can register the same
@@ -245,9 +254,9 @@ export interface TuneOutFrameworkHooks {
    * than stored: a live surgery's hold, or a context manager of the primary
    * or the subconscious refusing its work until a switch re-initializes it.
    * A cancel then waits (deferCancel), the tune-out still in force, until
-   * the framework says the writes are stored again (runDeferredCancels), so
-   * the release is in the store before the epoch's end is recorded. Left
-   * out, never.
+   * the framework says the writes are stored again, or told of where storing
+   * one fails (runDeferredCancels), so the release is in the store before
+   * the epoch's end is recorded. Left out, never.
    */
   writesHeld?: () => boolean;
   /**
@@ -271,9 +280,11 @@ export interface TuneOutFrameworkHooks {
    * tune-out's (never forward past active epochs): by its sequence while
    * the subconscious's window is the record, by its ordinal once that is
    * known, and else by an ordinal the framework fixes for it and reports
-   * (subconsciousWindowFixed).
+   * (subconsciousWindowFixed). `others` are the other active tune-outs'
+   * starts whose ordinal isn't kept yet, which the framework fixes and
+   * reports the same way without moving the window to them.
    */
-  setSubconsciousAnchor: (start: SubconsciousWindowStart) => void;
+  setSubconsciousAnchor: (start: SubconsciousWindowStart, others?: readonly SubconsciousWindowStart[]) => void;
   /**
    * Whether the subconscious's window keeps index ordinals (its context
    * manager presents rows, #291), so each tune-out's window start is kept as
@@ -369,12 +380,17 @@ export class TuneOutCoordinator {
   /**
    * Cancels asked for while the framework keeps writes in memory
    * (writesHeld), by channel key, the all-except hold's under SCOPE_KEY:
-   * each runs, as it was asked, once the writes are stored again
-   * (runDeferredCancels). In memory: a restart before then finds the
-   * tune-out still in force, and an end time that passed cancels it at
-   * once (resumeActiveEpochs).
+   * each runs as it was asked, with its note, or a later cancel's when it
+   * had none (deferCancel), once the writes are stored again, or told of
+   * where storing one fails (runDeferredCancels).
+   * In memory: a restart before then finds the tune-out still in force,
+   * and an end time that passed cancels it at once (resumeActiveEpochs).
    */
-  private readonly deferredCancels = new Map<string, () => void>();
+  private readonly deferredCancels = new Map<string, {
+    run: (note: string | undefined, noteAuthor: string | undefined) => void;
+    note?: string;
+    noteAuthor?: string;
+  }>();
   /** Timer key for the scope's cadence and expiry. */
   private static readonly SCOPE_KEY = '\0all-except';
 
@@ -509,7 +525,9 @@ export class TuneOutCoordinator {
    * that start is set again rather than the oldest active tune-out's, which
    * is later than it once the oldest was cancelled: so the window is the
    * same across a restart. An enter sets the oldest active tune-out's, as it
-   * always has.
+   * always has. Where the window presents, the other active tune-outs whose
+   * start isn't kept yet go with it, for the framework to fix as soon as
+   * each can be.
    */
   private anchorSubconscious(occasion: 'enter' | 'resume' = 'enter'): void {
     const active = this.activeStarts();
@@ -531,7 +549,16 @@ export class TuneOutCoordinator {
       const { inForce: _was, ...rest } = state;
       this.writeWindowState(ordinal !== undefined ? { ...rest, inForce: ordinal } : rest);
     }
-    this.hooks.setSubconsciousAnchor({ sequence, ...(ordinal !== undefined ? { ordinal } : {}), epochIds });
+    const others: SubconsciousWindowStart[] = [];
+    if (kept) {
+      const bySequence = new Map<number, string[]>();
+      for (const e of active) {
+        if (e.sequence === sequence || state.starts[e.epochId] !== undefined) continue;
+        bySequence.set(e.sequence, [...(bySequence.get(e.sequence) ?? []), e.epochId]);
+      }
+      for (const [at, ids] of bySequence) others.push({ sequence: at, epochIds: ids });
+    }
+    this.hooks.setSubconsciousAnchor({ sequence, ...(ordinal !== undefined ? { ordinal } : {}), epochIds }, others);
   }
 
   // ==========================================================================
@@ -585,16 +612,18 @@ export class TuneOutCoordinator {
     return { starts, ...(isOrdinal(state.inForce) ? { inForce: state.inForce } : {}) };
   }
 
-  /** Keep `state`; a write that fails is logged, and the anchor the strategy holds stays as it is. */
-  private writeWindowState(state: WindowStartsState): void {
+  /** Keep `state`, answering whether it was written; a write that fails is logged, and the anchor the strategy holds stays as it is. */
+  private writeWindowState(state: WindowStartsState): boolean {
     try {
       this.channelRegistry.writeCoordinatorState(this.windowStartsStateId, {
         v: 1,
         starts: state.starts,
         ...(state.inForce !== undefined ? { inForce: state.inForce } : {}),
       });
+      return true;
     } catch (err) {
       console.error(`[tune-out] the subconscious's window starts (${this.windowStartsStateId}) couldn't be written, so a restart fixes them again:`, err);
+      return false;
     }
   }
 
@@ -604,10 +633,13 @@ export class TuneOutCoordinator {
    * so a later anchor (another tune-out's enter, a restart) sets that
    * ordinal again rather than converting the tune-out's sequence anew, and
    * kept as the start in force while any tune-out is active, which a
-   * restart sets again (anchorSubconscious).
+   * restart sets again (anchorSubconscious), when it is the start in force
+   * (`inForce`; another active tune-out's start fixed beside it isn't).
+   * Answers whether it is kept, so that the anchor tries again at its next
+   * presentation when it isn't.
    */
-  subconsciousWindowFixed(epochIds: readonly string[], ordinal: number): void {
-    if (!this.ordinalsKept()) return;
+  subconsciousWindowFixed(epochIds: readonly string[], ordinal: number, inForce = true): boolean {
+    if (!this.ordinalsKept()) return true;
     const active = new Set(this.activeStarts().map((e) => e.epochId));
     const state = this.readWindowState();
     let changed = false;
@@ -619,11 +651,11 @@ export class TuneOutCoordinator {
     // The window starts there now, whether or not the tune-outs it was fixed
     // for are active still (one cancelled before its start was fixed leaves
     // it in force, as any cancel does), while any tune-out is.
-    if (active.size > 0 && state.inForce !== ordinal) {
+    if (inForce && active.size > 0 && state.inForce !== ordinal) {
       state.inForce = ordinal;
       changed = true;
     }
-    if (changed) this.writeWindowState(state);
+    return changed ? this.writeWindowState(state) : true;
   }
 
   /**
@@ -834,20 +866,41 @@ export class TuneOutCoordinator {
 
   /**
    * Keep a cancel asked for while writes are kept in memory, for
-   * runDeferredCancels. The first one asked for a hold stands; a later one
-   * for the same hold (an end time's retry, a wake past the budget) is
-   * dropped, and so, with a log line, is its reason.
+   * runDeferredCancels, with its note. The first one asked for a hold
+   * stands, with its reason and source. A later one for the same hold (an
+   * end time's retry, a wake past the budget, an agent's cancel) adds
+   * nothing, except a note: the waiting cancel takes it, with its author,
+   * when it has none, and otherwise the later note is dropped, with a log
+   * line, and this answers 'note-dropped' so its caller can be told.
    */
-  private deferCancel(key: string, what: string, run: () => void): void {
-    if (this.deferredCancels.has(key)) return;
-    this.deferredCancels.set(key, run);
-    console.error(`[tune-out] the cancel of ${what} waits until the writes held in memory are stored, so that its release is stored before the tune-out's end is recorded`);
+  private deferCancel(
+    key: string,
+    what: string,
+    run: (note: string | undefined, noteAuthor: string | undefined) => void,
+    note: string | undefined,
+    noteAuthor: string | undefined,
+  ): 'waits' | 'note-dropped' {
+    const waiting = this.deferredCancels.get(key);
+    if (!waiting) {
+      this.deferredCancels.set(key, { run, ...(note !== undefined ? { note } : {}), ...(noteAuthor !== undefined ? { noteAuthor } : {}) });
+      console.error(`[tune-out] the cancel of ${what} waits until the store takes writes again (an operator's change to it is in progress, or a context it writes to refuses writes until it is re-initialized), so that its release is stored before the tune-out's end is recorded`);
+      return 'waits';
+    }
+    if (note === undefined) return 'waits';
+    if (waiting.note === undefined) {
+      waiting.note = note;
+      if (noteAuthor !== undefined) waiting.noteAuthor = noteAuthor;
+      return 'waits';
+    }
+    console.error(`[tune-out] a later cancel of ${what} is dropped with its note: the cancel already waiting carries a note of its own`);
+    return 'note-dropped';
   }
 
   /**
    * Run the cancels asked for while writes were kept in memory (deferCancel),
    * in the order asked, now that the framework stores them again: it calls
-   * this once a surgery's hold has stored what it kept. One whose writes are
+   * this once a surgery's release has stored what its hold kept, or told of
+   * what it couldn't store. One whose writes are
    * still held waits on; one whose hold has ended meanwhile ends nothing.
    * Never throws.
    */
@@ -855,9 +908,9 @@ export class TuneOutCoordinator {
     if (this.deferredCancels.size === 0 || this.writesHeldNow()) return;
     const runs = [...this.deferredCancels.values()];
     this.deferredCancels.clear();
-    for (const run of runs) {
+    for (const { run, note, noteAuthor } of runs) {
       try {
-        run();
+        run(note, noteAuthor);
       } catch (err) {
         console.error('[tune-out] a cancel asked for while writes were held in memory failed when it ran:', err);
       }
@@ -877,8 +930,9 @@ export class TuneOutCoordinator {
    * synthesized here. While the framework keeps writes in memory
    * (writesHeld: a surgery's hold, a manager refusing its work), nothing
    * ends yet: the cancel waits, the tune-out in force, and runs once the
-   * writes are stored (runDeferredCancels), so its release is stored
-   * before its end is recorded. It answers `deferred` then.
+   * writes are stored, or told of where storing one fails
+   * (runDeferredCancels), so its release is stored before its end is
+   * recorded. It answers `deferred` then.
    */
   cancel(
     serverId: string,
@@ -890,11 +944,12 @@ export class TuneOutCoordinator {
     noteAuthor?: string,
     /** The lifecycle state the channel returns to (a tool close ends in 'closed'). */
     nextState: 'open' | 'closed' = 'open',
-  ): { ok: true; deferred?: true } | { ok: false; error: string } {
+  ): { ok: true; deferred?: true; noteDropped?: true } | { ok: false; error: string } {
     if (this.channelRegistry.getTuneOutState(serverId, channelId) && this.writesHeldNow()) {
-      this.deferCancel(this.key(serverId, channelId), `${this.shown(serverId, channelId)} (${reason})`,
-        () => { this.cancel(serverId, channelId, source, reason, subconsciousNote, noteAuthor, nextState); });
-      return { ok: true, deferred: true };
+      const kept = this.deferCancel(this.key(serverId, channelId), `${this.shown(serverId, channelId)} (${reason})`,
+        (note, author) => { this.cancel(serverId, channelId, source, reason, note, author, nextState); },
+        subconsciousNote, noteAuthor);
+      return { ok: true, deferred: true, ...(kept === 'note-dropped' ? { noteDropped: true as const } : {}) };
     }
     const ended = this.channelRegistry.cancelTuneOut(serverId, channelId, nextState, source);
     if (!ended) {
@@ -1311,15 +1366,16 @@ export class TuneOutCoordinator {
     reason: string,
     note?: string,
     noteAuthor?: string,
-  ): { ok: true; deferred?: true } | { ok: false; error: string } {
+  ): { ok: true; deferred?: true; noteDropped?: true } | { ok: false; error: string } {
     const scope = this.getAllExcept();
     if (!scope) return { ok: false, error: 'no all-except hold is active' };
     // As a channel's cancel: while writes are kept in memory, the release
     // would be, and writeScope(null) below is on disk at once.
     if (this.writesHeldNow()) {
-      this.deferCancel(TuneOutCoordinator.SCOPE_KEY, `the all-except hold (${reason})`,
-        () => { this.cancelAllExcept(source, reason, note, noteAuthor); });
-      return { ok: true, deferred: true };
+      const kept = this.deferCancel(TuneOutCoordinator.SCOPE_KEY, `the all-except hold (${reason})`,
+        (waitingNote, author) => { this.cancelAllExcept(source, reason, waitingNote, author); },
+        note, noteAuthor);
+      return { ok: true, deferred: true, ...(kept === 'note-dropped' ? { noteDropped: true as const } : {}) };
     }
     const { epochId, except, backlogCap } = scope.params;
 
@@ -2068,9 +2124,10 @@ export class TuneOutCoordinator {
             : undefined;
           if (refused) return { success: false, error: refused, isError: true };
           const result = this.cancelAllExcept('subconscious', 'subconscious judgment', note, caller);
-          return result.ok
-            ? { success: true, data: { cancelled: true, scope: 'all-except' } }
-            : { success: false, error: result.error, isError: true };
+          if (!result.ok) return { success: false, error: result.error, isError: true };
+          return result.deferred
+            ? { success: true, data: { waiting: true, scope: 'all-except', note: cancelWaitsNote('The all-except hold', result.noteDropped === true) } }
+            : { success: true, data: { cancelled: true, scope: 'all-except' } };
         };
         // A call naming the all-except scope ends that hold outright, as the
         // tool describes it and as the resident's tune_out cancel does: the
@@ -2120,9 +2177,10 @@ export class TuneOutCoordinator {
           `the tune-out on ${this.quotedShown(channel.serverId, channel.channelId)} isn't the hold you were started to read`);
         if (refused) return { success: false, error: refused, isError: true };
         const result = this.cancel(channel.serverId, channel.channelId, 'subconscious', 'subconscious judgment', note, caller);
-        return result.ok
-          ? { success: true, data: { cancelled: true } }
-          : { success: false, error: result.error, isError: true };
+        if (!result.ok) return { success: false, error: result.error, isError: true };
+        return result.deferred
+          ? { success: true, data: { waiting: true, note: cancelWaitsNote('The tune-out', result.noteDropped === true) } }
+          : { success: true, data: { cancelled: true } };
       }
       case 'note_disposition': {
         const key = String(input.key ?? '').trim();

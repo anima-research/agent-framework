@@ -5216,9 +5216,10 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * How the module asks whether an agent's history holds a message, as the
-   * framework judges its own notices (`cm.getMessage(id) !== null`): handed
-   * over once, when the module is added. Without it, no notice is held.
+   * How the module asks whether an agent's history holds a message: its
+   * record holds it, and, on a window the framework presents, no undo has
+   * taken it out of the window. Handed over once, when the module is added.
+   * Without it, no notice is held.
    */
   useHistory(lookup: (agentName: string, messageId: string) => boolean): void {
     this.historyLookup = lookup;
@@ -6277,10 +6278,11 @@ export class WorkspaceModule implements Module {
     mount.lastMaterializedBranchId = null;
     mount.lastMaterializedSeq = 0;
 
-    // force: this path only runs after a deliberate undo/redo/branch switch
-    // on the framework's own _config mount — restoring disk to the branch
-    // state IS the operator intent, so the freshness guard yields. named:
-    // the whole tree is that deliberate scope, entries without evidence too.
+    // force: this path only runs after a deliberate branch switch, rollback
+    // or suppression on the framework's own _config mount — restoring disk
+    // to the branch state IS the operator intent, so the freshness guard
+    // yields. named: the whole tree is that deliberate scope, entries
+    // without evidence too.
     const pushed = await this.withMount(mount, () => {
       const branchId = store.currentBranch().id;
       return this.pushUnlocked(mount, store.treeList(mount.treeStateId).map((e) => e.path), { force: true, named: true, branchId });

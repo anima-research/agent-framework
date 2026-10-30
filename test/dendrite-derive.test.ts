@@ -41,6 +41,9 @@ const textOf = (m: { content: Array<{ type: string; text?: string }> }): string 
 const own = <M extends { metadata?: unknown }>(messages: M[]): M[] =>
   messages.filter((m) => (m.metadata as { kind?: string } | undefined)?.kind !== 'dendrite-pending-round');
 
+const parentRows = (cm: { getAllMessages(): Array<{ id: string; metadata?: unknown }> }): string[] =>
+  cm.getAllMessages().filter((m) => (m.metadata as { kind?: string } | undefined)?.kind !== 'agent-lifecycle').map((m) => m.id);
+
 const FRAMING = '[FORK-FRAMING] You are the fork. Task: count the open issues.';
 
 function folding(): ContextStrategy {
@@ -174,6 +177,7 @@ describe('Dendrite deriveAgent', () => {
     // derivation, stored at once and kept out of her live window, #291.)
     for (let i = 0; i < history.length; i++) assert.equal(forkMessages[i], before[i]);
     assert.deepEqual(parentCm.getPresentedMessages().map((m) => m.id), history);
+    assert.deepEqual(parentRows(parentCm), history, "nor the parent's store");
 
     // The registry records what was inherited and where the child's writes live.
     const record = framework.getAgentRecord('fork-1')!;
@@ -361,6 +365,7 @@ describe('Dendrite deriveAgent', () => {
     const firstTexts = own(first.contextManager.getAllMessages()).slice(history.length).map((m) => m.participant);
     assert.equal(firstTexts.includes('fork-2'), false, 'the grandchild\'s turns never reached its parent');
     assert.equal(framework.getAgent('mira')!.getContextManager().getPresentedMessages().length, history.length, "nor mira's window");
+    assert.deepEqual(parentRows(framework.getAgent('mira')!.getContextManager()), history, "nor mira's store");
   });
 
   it('returns its result to the parent as attributed mail', { skip }, async () => {
@@ -562,6 +567,7 @@ describe('Dendrite deriveAgent', () => {
     );
     // The parent was never touched by either incarnation.
     assert.equal(framework.getAgent('mira')!.getContextManager().getPresentedMessages().length, history.length);
+    assert.deepEqual(parentRows(framework.getAgent('mira')!.getContextManager()), history);
 
     await assert.rejects(
       framework.resumeAgent('nobody', { model: 'test-model', systemPrompt: 'x' }),
@@ -623,6 +629,7 @@ describe('Dendrite deriveAgent', () => {
     // A copy has new ids: it shares nothing with the parent's store.
     assert.equal(copied.some((m) => history.includes(m.id)), false);
     assert.equal(parentCm.getPresentedMessages().length, history.length);
+    assert.deepEqual(parentRows(parentCm), history);
     // Configuration is inherited in copy mode too.
     const request = membrane.callsFor('fork-copy')[0]!;
     assert.deepEqual(request.config.thinking, { enabled: true, budgetTokens: 1024 });

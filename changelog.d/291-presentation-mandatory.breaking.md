@@ -30,4 +30,3 @@
   **Migration:** drop `presentationIndex` from the configuration. A host that listened for `undo:completed`,
   `redo:completed`, or `branch:switched` with reason `undo`/`redo`, to refresh a view listens for `window:undone`.
   A host that relied on undo reverting a mount or the inference log uses `rollbackToMessage`.
-- A fork derived inside a tool call is handed the results already received — all of them while a tool boundary builds them for storing — with the note for the call that derived it and for any call still running, so it never meets a dangling `tool_use` (the 0.30.0 `pendingRound` entry, read onto the presentation index).

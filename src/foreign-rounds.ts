@@ -25,40 +25,65 @@
  */
 import type { ContentBlock, NormalizedMessage } from '@animalabs/membrane';
 import { NOTICE_TAG } from './notice-tags.js';
-import { cutToFit, markedText } from './supplied-text.js';
+import { cutToFit, markedTexts, oneLine } from './supplied-text.js';
 
 /** How long one transcript line's call or outcome runs before it is cut. */
 const BRIEF_CHARS = 160;
 
-/** `text` on one line, cut to BRIEF_CHARS with an ellipsis, at a whole
- *  character, never parting a mark from its bracket (cutToFit). */
-function brief(text: string): string {
-  const line = text.replace(/\s+/g, ' ').trim();
-  return line.length > BRIEF_CHARS ? `${cutToFit(line, BRIEF_CHARS - 1)}…` : line;
+/** A piece of a transcript line's call or outcome, and whether the other
+ *  agent supplied it (a call's input, a result's text) or the framework
+ *  wrote it (a placeholder naming a result block's kind). */
+interface Piece {
+  text: string;
+  supplied: boolean;
 }
 
-/** A tool result's content as text: its text, its other blocks named by
- *  kind. What a result holds is supplied text (#852): set inside the
- *  framework's bracket here, where a tool_result block's own content isn't,
- *  an opening of one of the framework's notices in it is marked
- *  (markedText). The kind placeholders are the framework's own. */
-function resultText(content: string | ContentBlock[]): string {
-  if (typeof content === 'string') return markedText(content);
-  return content
-    .map((b) => (b.type === 'text' ? markedText((b as { text: string }).text) : `[${b.type}]`))
-    .filter((part) => part.length > 0)
-    .join(' ');
+/** `text` on one line: each line break the framework counts as one
+ *  (oneLine), and each other run of whitespace, as one space. */
+function flat(text: string): string {
+  return oneLine(text).replace(/\s+/g, ' ').trim();
 }
 
-/** A call's input in brief: its JSON, or what the model sent when that
- *  wasn't an object, marked as a result's text is (resultText). */
-function callText(block: Extract<ContentBlock, { type: 'tool_use' }>): string {
-  if (block.unparseableInput !== undefined) return markedText(block.unparseableInput);
+/** A tool result's content as pieces: its text, and its other blocks named
+ *  by kind, in placeholders that are the framework's own. */
+function resultPieces(content: string | ContentBlock[]): Piece[] {
+  if (typeof content === 'string') return [{ text: content, supplied: true }];
+  return content.map((b) => (b.type === 'text'
+    ? { text: (b as { text: string }).text, supplied: true }
+    : { text: `[${b.type}]`, supplied: false }));
+}
+
+/** A call's input as a piece: its JSON, or what the model sent when that
+ *  wasn't an object. */
+function callPiece(block: Extract<ContentBlock, { type: 'tool_use' }>): Piece {
+  if (block.unparseableInput !== undefined) return { text: block.unparseableInput, supplied: true };
   try {
-    return markedText(JSON.stringify(block.input ?? {}) ?? '');
+    return { text: JSON.stringify(block.input ?? {}) ?? '', supplied: true };
   } catch {
-    return '';
+    return { text: '', supplied: true };
   }
+}
+
+/**
+ * A transcript line: the framework's bracket around the tool's name, which
+ * the other agent's call supplied, the framework's words for what happened
+ * (`words[0]` before a call or outcome, `words[1]` when there is none), and
+ * the call or outcome in brief. What the line holds is supplied text
+ * (#852): set inside the framework's bracket here, where a tool block's own
+ * content isn't, an opening of one of the framework's notices is marked
+ * wherever it forms, read across the whole line (markedTexts): inside a
+ * piece, across a result's blocks, or where the name meets the bracket or
+ * the framework's words. Those words and the placeholders aren't marked.
+ * Each piece goes on one line first (flat), and the call or outcome is cut
+ * to BRIEF_CHARS with an ellipsis, at a whole character, never parting a
+ * mark from its bracket (cutToFit).
+ */
+function transcriptLine(name: string, words: readonly [string, string], body: readonly Piece[]): string {
+  const pieces = body.map((p) => ({ ...p, text: flat(p.text) })).filter((p) => p.text.length > 0);
+  const word = pieces.length > 0 ? words[0] : words[1];
+  const marked = markedTexts(['[', oneLine(name), word, ...pieces.map((p) => p.text)], [true, true, false, ...pieces.map((p) => p.supplied)]);
+  const said = marked.slice(3).join(' ');
+  return `${marked.slice(0, 3).join('')}${said.length > BRIEF_CHARS ? `${cutToFit(said, BRIEF_CHARS - 1)}…` : said}]`;
 }
 
 /** Where a row with nothing left to send stands, so the transcript keeps a row for each stored one. */
@@ -87,7 +112,7 @@ export function foreignRowAsSent(
         break;
       case 'tool_use': {
         changed = true;
-        out.push({ type: 'text', text: `[${block.name} called: ${brief(callText(block))}]` });
+        out.push({ type: 'text', text: transcriptLine(block.name, [' called: ', ' called: '], [callPiece(block)]) });
         break;
       }
       case 'tool_result': {
@@ -97,8 +122,8 @@ export function foreignRowAsSent(
         }
         changed = true;
         const name = block.toolName ?? context.callNames?.get(block.toolUseId) ?? 'a tool';
-        const outcome = brief(resultText(block.content));
-        out.push({ type: 'text', text: `[${name} ${block.isError ? 'failed' : 'returned'}${outcome ? `: ${outcome}` : ''}]` });
+        const word = block.isError ? ' failed' : ' returned';
+        out.push({ type: 'text', text: transcriptLine(name, [`${word}: `, word], resultPieces(block.content)) });
         break;
       }
       case 'text': {

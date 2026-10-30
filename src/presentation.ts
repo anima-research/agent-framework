@@ -32,11 +32,13 @@
  *   next turn start (holdUntilStart), so the cut holds until it speaks.
  *
  * Arrivals are read from the index itself (getUnpresentedMessages filtered
- * by bearingOf), never from the store's head: a crashed turn's arrivals, a
- * derived agent's inheritance and rows imported at boot are arrivals by
- * construction. The one scalar kept is a memo of where a scan may start,
- * reset whenever the branch, the index length or the reader's facts moved
- * under it.
+ * by bearingOf), never from the store's head: a crashed turn's arrivals and
+ * rows imported at boot are arrivals by construction. A shared derivation's
+ * inheritance isn't an arrival: it reaches the child through the window it
+ * was derived with, and bearingOf reads an unstamped row at or before the
+ * derivation's checkpoint (derivedAt) as elsewhere. The one scalar kept is
+ * a memo of where a scan may start, reset whenever the branch, the index
+ * length or the reader's facts moved under it.
  *
  * The module presents only for an agent it has taken on (adopt) whose
  * manager is in presented mode: it never calls presentRows on a manager in
@@ -89,7 +91,7 @@ export function isInjectableMidTurn(msg: { participant: string; content: Content
  *  shards on ingest) joins a body's consecutive shards: their non-text
  *  blocks, then one text block of their joined text. The join is that
  *  strategy's `mergeAdjacentBodyGroupRaw`, which context-manager doesn't
- *  export, so the rule is copied here, and a test compares the two. */
+ *  export, so the rule is copied here. */
 export function asCompiled(landed: ReadonlyArray<{ content: ContentBlock[] }>): ContentBlock[] {
   if (landed.length === 1) return landed[0]!.content;
   const blocks = landed.flatMap((m) => m.content);
@@ -366,7 +368,8 @@ export interface PresentationHost {
   turnAlive(name: AgentName): boolean;
   /**
    * Whether others' rows are frozen out of every window: the host
-   * quiesced. Own rows still present. A surgery's hold isn't asked here: its
+   * quiesced, or booting until create()'s pass over the windows. Own rows
+   * still present. A surgery's hold isn't asked here: its
    * own refusals keep every point that reads this from being reached under
    * it (the framework's `frozen`, where the host is built).
    */
@@ -1270,6 +1273,7 @@ export class AgentPresentation {
   ): { entered: Set<MessageId>; error?: unknown } {
     if (ids.length === 0) return { entered: new Set() };
     const cm = agent.getContextManager();
+    const lengthBefore = cm.indexLength();
     let error: unknown;
     try {
       cm.presentRows(ids);
@@ -1278,7 +1282,7 @@ export class AgentPresentation {
     }
     const entered = new Set(ids.filter((id) => cm.ordinalOf(id) !== undefined));
     const memo = this.memos.get(cm);
-    if (memo) memo.length = cm.indexLength();
+    if (memo && memo.length === lengthBefore) memo.length = cm.indexLength();
     if (error !== undefined) this.failed(agent, occasion, error);
     if (entered.size > 0) {
       if (!quiet) {

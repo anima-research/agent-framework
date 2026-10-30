@@ -162,8 +162,8 @@ describe('after a branch move, every agent on the store compiles without a resta
     await realTurn(framework, membrane, 'a', 'a turn to undo');
     assert.equal(framework.getUndoRedoState('a').undoDepth, 1, 'the turn recorded its checkpoint');
   };
-  const holdFor = (name: string, words: string): void => {
-    assert.equal(courier.addMessage('courier', text(words), undefined, { forAgent: name }), '', 'held by the hold, not stored');
+  const holdFor = (name: string, words: string, participant = 'courier'): void => {
+    assert.equal(courier.addMessage(participant, text(words), undefined, { forAgent: name }), '', 'held by the hold, not stored');
   };
   /** The managers whose strategy is set again from now on, by name. */
   const watchReinits = (): (() => string[]) => {
@@ -321,29 +321,42 @@ describe('after a branch move, every agent on the store compiles without a resta
 
   it("the API server's undo and redo tell clients of the window's change (window:undone), and a client that reads an agent's context then gets it", async () => {
     await checkpointTurn();
-    const api = new ApiServer(framework) as unknown as {
-      cmdUndo(params: { agentName: string }): Promise<Record<string, unknown>>;
-      cmdRedo(params: { agentName: string }): Promise<Record<string, unknown>>;
+    const api = new ApiServer(framework, { port: 0, host: '127.0.0.1' }) as unknown as {
+      start(): Promise<void>;
+      stop(): Promise<void>;
+      cmdUndo(params: { agentName: string }): Promise<Record<string, unknown> & { window?: { retracted: number; represented?: number } }>;
+      cmdRedo(params: { agentName: string }): Promise<Record<string, unknown> & { window?: { retracted: number; represented: number } }>;
       cmdAgentContext(params: { agentName: string }): Promise<{ context: unknown[] }>;
       broadcast(event: string, data: unknown): void;
     };
-    // b's rows were written past the framework, so they enter its window at
-    // its next point (#291): present them, as a turn of b's would.
-    (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent('b'));
-    const reads: Array<Promise<{ context: unknown[] }>> = [];
-    api.broadcast = (event) => {
-      if (event !== 'window:undone') return;
-      reads.push(api.cmdAgentContext({ agentName: 'b' }));
-    };
-    const undone = await api.cmdUndo({ agentName: 'a' });
-    assert.equal(undone.undone, true);
-    assert.ok(!('settled' in undone), `the answer carries no promise: ${Object.keys(undone).join(', ')}`);
-    const redone = await api.cmdRedo({ agentName: 'a' });
-    assert.equal(redone.redone, true);
-    assert.ok(!('settled' in redone), `the answer carries no promise: ${Object.keys(redone).join(', ')}`);
-    assert.equal(reads.length, 2, 'one event for each change');
-    for (const read of await Promise.all(reads)) assert.ok(read.context.length > 0, "b's context compiled");
-    assert.deepEqual(reinitAlerts(), []);
+    await api.start();
+    try {
+      // b's rows were written past the framework, so they enter its window at
+      // its next point (#291): present them, as a turn of b's would.
+      (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent('b'));
+      const events: Array<Record<string, unknown>> = [];
+      const reads: Array<Promise<{ context: unknown[] }>> = [];
+      api.broadcast = (event, data) => {
+        if (event !== 'window:undone') return;
+        events.push(data as Record<string, unknown>);
+        reads.push(api.cmdAgentContext({ agentName: 'b' }));
+      };
+      const undone = await api.cmdUndo({ agentName: 'a' });
+      assert.equal(undone.undone, true);
+      assert.ok(!('settled' in undone), `the answer carries no promise: ${Object.keys(undone).join(', ')}`);
+      const redone = await api.cmdRedo({ agentName: 'a' });
+      assert.equal(redone.redone, true);
+      assert.ok(!('settled' in redone), `the answer carries no promise: ${Object.keys(redone).join(', ')}`);
+      assert.equal(events.length, 2, 'one event for each change');
+      const [ofUndo, ofRedo] = events;
+      assert.deepEqual([ofUndo!.agentName, ofUndo!.retracted, 'represented' in ofUndo!], ['a', undone.window!.retracted, false], 'the undo says what left');
+      assert.deepEqual([ofRedo!.agentName, ofRedo!.retracted, ofRedo!.represented], ['a', redone.window!.retracted, redone.window!.represented], 'the redo says what left and what came back');
+      assert.ok(undone.window!.retracted > 0 && redone.window!.represented > 0, 'the turn left and came back');
+      for (const read of await Promise.all(reads)) assert.ok(read.context.length > 0, "b's context compiled");
+      assert.deepEqual(reinitAlerts(), []);
+    } finally {
+      await api.stop();
+    }
   });
 
   it('a host/command turn undo answers with the preview, compiled once the managers are current', async () => {
@@ -790,7 +803,7 @@ describe('after a branch move, every agent on the store compiles without a resta
     await works('b');
   });
 
-  it('a held write that throws at the release is logged, and the release still lets the store go', async () => {
+  it('a held write whose store throws at the release, its row not landing, is lost with one ops alert naming its agent and kind; the writes after it are stored, and the release still lets the store go', async () => {
     const logged: string[] = [];
     const quiet = console.error;
     console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
@@ -800,7 +813,11 @@ describe('after a branch move, every agent on the store compiles without a resta
       const pass = gatedSwitch('a');
       await pass.reached;
       holdFor('b', 'for b, during the hold');
-      cm.addMessage = () => { throw new Error('injected release write failure'); };
+      holdFor('b', 'for b, after it');
+      cm.addMessage = (...args: unknown[]) => {
+        if (JSON.stringify(args[1]).includes('during the hold')) throw new Error('injected release write failure');
+        return addMessage.apply(cm, args);
+      };
       pass.open();
       await pass.switched;
     } finally {
@@ -809,8 +826,84 @@ describe('after a branch move, every agent on the store compiles without a resta
     }
     assert.ok(logged.some((line) => line.includes("couldn't be stored at its release") && line.includes('injected release write failure')),
       logged.join('\n'));
+    assert.deepEqual(textsOfCm('b').filter((t) => t.startsWith('for b')), ['for b, after it'], 'the write after it is stored');
+    const lost = traces.filter((t): t is Extract<TraceEvent, { type: 'ops:alert' }> => t.type === 'ops:alert' && t.kind === 'store-held-lost');
+    assert.deepEqual(lost.map((alert) => [alert.agentName, alert.data]), [
+      ['b', { count: 1, keptForRecovery: 0, heldBySurgery: 1, kinds: { message: 1 }, mail: 0 }],
+    ]);
+    says(lost[0]!.message, '1 write for b, accepted and kept in memory', 'was not stored', 'injected release write failure',
+      'It is lost, and the writes after it went on.', 'Kinds: 1 message.');
     await framework.switchBranch(framework.getStore().currentBranch().name);
   });
+
+  it("a held write whose store throws at the release, and whose store then can't be read back, is told of as possibly lost, not as unstored", async () => {
+    const quiet = console.error;
+    console.error = () => {};
+    const cm = cmOf('b') as unknown as { addMessage: (...args: unknown[]) => unknown; getMessageWindow: (...args: unknown[]) => unknown };
+    const { addMessage, getMessageWindow } = cm;
+    let unreadable = false;
+    try {
+      const pass = gatedSwitch('a');
+      await pass.reached;
+      holdFor('b', 'for b, during the hold');
+      cm.addMessage = (...args: unknown[]) => {
+        if (JSON.stringify(args[1]).includes('during the hold')) {
+          unreadable = true;
+          throw new Error('injected release write failure');
+        }
+        return addMessage.apply(cm, args);
+      };
+      cm.getMessageWindow = (...args: unknown[]) => {
+        if (unreadable) {
+          unreadable = false;
+          throw new Error('injected read-back failure');
+        }
+        return getMessageWindow.apply(cm, args);
+      };
+      pass.open();
+      await pass.switched;
+    } finally {
+      cm.addMessage = addMessage;
+      cm.getMessageWindow = getMessageWindow;
+      console.error = quiet;
+    }
+    const lost = traces.filter((t): t is Extract<TraceEvent, { type: 'ops:alert' }> => t.type === 'ops:alert' && t.kind === 'store-held-lost');
+    assert.equal(lost.length, 1, 'told of once');
+    says(lost[0]!.message, '1 write for b, accepted and kept in memory', 'injected release write failure',
+      "couldn't be read back to tell whether it landed", 'may be lost');
+    assert.ok(!lost[0]!.message.includes('not stored') && !lost[0]!.message.includes('It is lost'),
+      `it says no more than the read-back knows:\n${lost[0]!.message}`);
+    await framework.switchBranch(framework.getStore().currentBranch().name);
+  });
+
+  for (const [whose, participant] of [['', 'courier'], [', from a writer whose name the store makes well formed,', 'courier\uD800']] as const) {
+  it(`a held write${whose} whose store throws at the release after its row landed counts as stored: traced once with its id, and no alert`, async () => {
+    const added = addedTraces();
+    const cm = cmOf('b') as unknown as { addMessage: (...args: unknown[]) => unknown };
+    const addMessage = cm.addMessage;
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      const pass = gatedSwitch('a');
+      await pass.reached;
+      holdFor('b', 'for b, during the hold', participant);
+      cm.addMessage = (...args: unknown[]) => {
+        const id = addMessage.apply(cm, args);
+        if (JSON.stringify(args[1]).includes('during the hold')) throw new Error('injected failure after the row landed');
+        return id;
+      };
+      pass.open();
+      await pass.switched;
+    } finally {
+      cm.addMessage = addMessage;
+      console.error = quiet;
+    }
+    const rows = cmOf('b').getAllMessages().filter((m) => JSON.stringify(m.content).includes('for b, during the hold'));
+    assert.equal(rows.length, 1, 'stored once');
+    assert.deepEqual(added.filter((a) => a.source === 'surgery-release'), [{ messageId: rows[0]!.id, source: 'surgery-release' }]);
+    assert.equal(traces.filter((t) => t.type === 'ops:alert' && t.kind === 'store-held-lost').length, 0, 'nothing is told as lost');
+  });
+  }
 
   it('a hold let go before its threshold says nothing after it', async () => {
     shortenHoldAlert(1_000);

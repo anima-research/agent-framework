@@ -326,7 +326,7 @@ describe('stop() with an operator operation in flight', () => {
         fw.emitTrace({ type: 'mcpl:coalescing', phase: 'suspended' });
       },
     };
-    // A turn to undo, so an admitted undo would move the branch.
+    // A turn to undo, so an admitted undo would have one to take out.
     const record = (framework as unknown as { recordTurnCheckpoint(name: string): void }).recordTurnCheckpoint.bind(framework);
     record('agent');
     framework.getAgent('agent')!.getContextManager().addMessage('user', [{ type: 'text', text: 'a turn' }]);

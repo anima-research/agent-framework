@@ -136,6 +136,7 @@ interface Harness {
   until(cond: () => boolean, what: string): Promise<void>;
   queued(body: string): boolean;
   stored(body: string): boolean;
+  inWindow(body: string): boolean;
   wake(request: Omit<InferenceRequest, 'agentName'>): void;
   endTurn(): Promise<void>;
   storeFor(agentName: string, body: string): ReturnType<ModuleContext['addMessage']>;
@@ -161,6 +162,7 @@ async function turn(options: {
   residents?: boolean;
   gather?: (h: Harness, agentName: string, n: number) => void;
   beforeEnd?: (h: Harness) => Promise<void>;
+  afterEnd?: (h: Harness) => void;
 }): Promise<Turn> {
   const dir = mkdtempSync(join(tmpdir(), 'af-continuing-start-'));
   const commandPath = join(dir, 'commands.jsonl');
@@ -230,6 +232,10 @@ async function turn(options: {
       return cm.getAllMessages().some((m) => JSON.stringify(m.content).includes(body) && cm.windowStatusOf(m.id) !== 'in');
     },
     stored: (body) => JSON.stringify(framework.getAgent('scout')!.getContextManager().getAllMessages()).includes(body),
+    inWindow: (body) => {
+      const cm = framework.getAgent('scout')!.getContextManager();
+      return cm.getAllMessages().some((m) => JSON.stringify(m.content).includes(body) && cm.windowStatusOf(m.id) === 'in');
+    },
     wake: (request) => internals.pendingRequests.push({ agentName: 'scout', ...request } as InferenceRequest),
     endTurn: async () => { internals.openLogical.delete('scout'); },
     storeFor: (agentName, body) => {
@@ -266,6 +272,7 @@ async function turn(options: {
     await until(() => streams >= 2 && !internals.activeTurnTokens.has('scout') && internals.pendingRequests.length === 0
       && !internals.providerAccelerationCooldowns.has('scout'), 'the turn to end');
     await framework.runUntilIdle();
+    options.afterEnd?.(h);
     return {
       publishes: lines().filter((l) => l.event === 'publish').map((l) => [l.channelId, l.text]),
       drafts: internals.proseDrafts.open('scout').map((d) => [d.text, d.reason]),
@@ -478,6 +485,10 @@ describe('a start that continues the turn keeps a hold an explicit send set, unt
     const run = await turn({
       proseRouting: 'locus', residents: true, whileGated: async (h) => { h.storeFor('other', CHATTER); },
       stream: (n) => (n === 1 ? new ErrorsAfter([SEND, HELD], 2) : reply()),
+      afterEnd: (h) => {
+        assert.ok(h.stored(CHATTER), 'premise: the message is stored');
+        assert.ok(!h.inWindow(CHATTER), "and isn't in scout's window once the turn ends");
+      },
     });
     assert.ok(!read(run.requests[1], CHATTER), "the message is other's");
     assert.deepEqual(run.publishes, []);
@@ -497,6 +508,7 @@ describe('a start that continues the turn keeps a hold an explicit send set, unt
       proseRouting: 'locus', residents: true,
       gather: (h, agentName, n) => { if (agentName === 'scout' && n === 2) h.storeForResidents(CHATTER); },
       stream: (n) => (n === 1 ? new ErrorsAfter([SEND, HELD], 2) : reply()),
+      afterEnd: (h) => { assert.ok(h.inWindow(CHATTER), "it enters scout's window once the turn ends"); },
     });
     assert.ok(!read(run.requests[1], CHATTER), "the retry's compile doesn't carry it");
     assert.deepEqual(run.publishes, []);
@@ -527,7 +539,9 @@ describe('a start that continues the turn keeps a hold an explicit send set, unt
   it('a message removed unread before the held retry starts leaves the line held', async () => {
     const run = await turn({
       proseRouting: 'locus', residents: true, hold: { error: 'provider unavailable', during: async (h) => {
-        h.remove(h.storeFor('other', CHATTER));
+        const id = h.storeForResidents(CHATTER);
+        assert.ok(id, 'premise: stored for both residents');
+        h.remove(id);
       } },
       stream: (n) => (n === 1 ? new ErrorsAfter([SEND, HELD], 2) : final()),
     });

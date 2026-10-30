@@ -1096,7 +1096,7 @@ export class PushCoalescer<E = unknown> {
       this.scheduleRecovery(subject, state);
       return 'declined';
     }
-    this.clearRecovery(subject);
+    this.disarmRecovery(subject);
     if (this.suspended) { state.rendering = undefined; state.batch = batch; return undefined; }
     // Authority (grant, registration, binding) is re-checked immediately
     // before dispatch: a server id reassigned to another endpoint during the
@@ -1152,9 +1152,12 @@ export class PushCoalescer<E = unknown> {
     }
     // Settlement runs under the lock: between the RPC's return and the state
     // update no admission can withdraw or replace what is being published.
+    let failed = false;
+    let current = false;
     await this.locked(async () => {
       try {
         if (rendering.cancelled || state.rendering !== rendering || this.suspended) return;
+        current = true;
         // Rule 4: authority is re-checked at response.
         if (!this.host.authorized(occurrence)) { this.host.audit({ kind: 'revoked', subject, eventId: occurrence.eventId }); return; }
         const empty = isVisiblyEmptyContent(content);
@@ -1169,7 +1172,20 @@ export class PushCoalescer<E = unknown> {
         // a run's oldest render can be one.
         const run = state.occupant?.rendered ? state.occupant : undefined;
         const firstView = batch.firstView === true && state.history === 'none' && !state.occupant;
-        const placement = await this.deliver({ ...occurrence, timestamp, content, ...(firstView ? { firstView: true } : {}) }, content, assemblingFor);
+        let placement: CoalescingPlacement | undefined;
+        try {
+          placement = await this.deliver({ ...occurrence, timestamp, content, ...(firstView ? { firstView: true } : {}) }, content, assemblingFor);
+        } catch (error) {
+          failed = true;
+          this.host.audit({ kind: 'deliver-failed', subject, eventId: occurrence.eventId, error: String(error) });
+          if (state.batch) state.batch.noRender = true;
+          else {
+            batch.noRender = true;
+            state.batch = batch;
+          }
+          this.scheduleRecovery(subject, state);
+          return;
+        }
         if (placement?.presented === false) {
           // Stored and not presented to its agent: another agent's, whose
           // turn is alive, or the assembling agent's own after its assembly
@@ -1208,6 +1224,7 @@ export class PushCoalescer<E = unknown> {
         if (placement) state.audienceAgent = placement.agent;
       } finally {
         if (state.rendering === rendering) state.rendering = undefined;
+        if (current && !failed) this.clearRecovery(subject);
       }
     });
   }

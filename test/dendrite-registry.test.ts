@@ -585,4 +585,23 @@ describe('AgentRegistry slots: where own rows go, apart from what is observed (#
     assert.deepEqual(third.inspect('Subconscious')!.ownSlot, { namespace: 'subconscious/mira' });
     assert.deepEqual(third.inspect('oren')!.ownSlot, { namespace: null });
   });
+
+  it("fills the own slot of a record written before own slots that the host's ended log answers, past the history kept in memory", () => {
+    const { state, make } = persisted();
+    const first = make();
+    first.register(residentSpec('mira', { primary: true }));
+    first.register(residentSpec('oren', { primary: false }));
+    first.register(subconsciousSpec('Subconscious', 'mira'));
+    first.end('oren', 'stopped');
+    first.end('Subconscious', 'stopped');
+    const legacy = new Map(JSON.parse(JSON.stringify(state.ended)).map((record: AgentRecord) => {
+      delete record.ownSlot;
+      return [record.name, record] as const;
+    }));
+    const logged = new AgentRegistry({ findEnded: (name) => (legacy.has(name) ? JSON.parse(JSON.stringify(legacy.get(name))) : undefined) });
+    logged.restore(null, []);
+    assert.deepEqual(logged.inspect('oren')?.ownSlot, { namespace: null }, 'a resident: the slot it owned');
+    assert.deepEqual(logged.inspect('Subconscious')?.ownSlot, { namespace: 'subconscious/mira' }, 'the subconscious: isolated, as it was opened');
+    assert.deepEqual(logged.observedSlotOf({ agent: 'oren' }), { namespace: null }, "an edge on the ended resident reads the slot it owned");
+  });
 });

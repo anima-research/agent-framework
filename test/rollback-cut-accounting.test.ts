@@ -135,8 +135,8 @@ describe("a rollback's accounting at the cut (#291, AF-7)", () => {
     // still waits.
     h.internals.addMessage('someone', [{ type: 'text', text: 'later' } as ContentBlock], {});
     assert.deepEqual(h.windowTexts(), ['t', 'later']);
-    // Its next turn start presents r with the turn's inputs, in the order
-    // they were stored, and its request carries it.
+    // Its next turn start presents r after the turn's ask, and its request
+    // carries it.
     h.framework.start();
     const request = await h.turn('ask', 'answer');
     assert.deepEqual(h.windowTexts(), ['t', 'later', 'ask', 'r', 'answer']);

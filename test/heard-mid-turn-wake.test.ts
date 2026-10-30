@@ -28,7 +28,7 @@ import type {
   ToolDefinition,
   ToolResult,
 } from '../src/index.js';
-import { AgentFramework } from '../src/index.js';
+import { AgentFramework, workerSpec } from '../src/index.js';
 import type { GateConfig } from '../src/gate/types.js';
 import { destinationKey } from '../src/mcpl/channel-registry.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
@@ -51,6 +51,7 @@ type Internals = {
   dispatchChannelToolCall(agentName: string, call: ToolCall): void;
   reserveStoreForSurgery(verb: string, agentName: string): () => void;
   surgeryHeldWrites: unknown[];
+  registry: { register(spec: ReturnType<typeof workerSpec>): unknown };
   processNextEvent(): Promise<void>;
   routingOf(agentName: string): unknown;
 };
@@ -703,6 +704,10 @@ describe('a wake for a write heard mid-turn', () => {
     ["a background script's wake", (framework) => internals(framework).scriptWake(
       'assistant', 'script-1', '[background-script script-1] finished: 42', 'wake',
     ), 'finished: 42'],
+    ["another agent's mail", (framework) => {
+      internals(framework).registry.register(workerSpec('job'));
+      return framework.sendAgentMessage('job', 'assistant', [text('the job says hello')]);
+    }, 'the job says hello'],
   ];
   for (const [what, write] of unchanneled) {
     it(`${what}, heard at the boundary, starts no turn of its own`, async () => {

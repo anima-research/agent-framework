@@ -240,9 +240,21 @@ export interface FrameworkConfig {
    * Where a release before #291 kept its durable queue of deferred context
    * writes. Defaults to `<storePath>/recovery/deferred-writes.json`; without
    * either, the store's `framework/deferred-writes` slot. This release keeps
-   * no queue (a write is stored at once, and enters each agent's window at
-   * that agent's presentation points): create() reads the record once,
-   * stores each write it holds, and clears it.
+   * no durable queue: a write is stored when it is made, and enters each
+   * agent's window at that agent's presentation points. Two holds keep a
+   * write in memory instead, and a crash loses it: a live operator surgery
+   * (a rollback, a suppression, a branch switch), until its release stores
+   * it, and an agent's context manager refusing its work after a failed
+   * re-initialization, until a switchBranch() re-initializes it.
+   *
+   * create() reads the record once and stores its writes. A write for an
+   * agent no longer registered goes to the primary when it is a failed
+   * reply, a channel notice its reader could act on, or a module's write
+   * for a run or a fork, and is dropped otherwise, logged. It then rewrites
+   * the record with what it left for the next boot: a write it couldn't
+   * store, or couldn't tell had already landed, with that agent's later
+   * writes. When the store doesn't sync after the import, the record is left
+   * as it was.
    *
    * @deprecated Read once at boot by the deferred-write importer; removed in
    * the next release.

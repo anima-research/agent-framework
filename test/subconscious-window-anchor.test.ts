@@ -319,16 +319,189 @@ describe("the persistent subconscious's window start when the oldest tune-out en
   });
 });
 
+describe("the persistent subconscious's window start of a tune-out entered while an older one holds it", () => {
+  it('(i) is fixed as soon as it can be, so a row presented again ahead of it later leaves its held rows in the window', { timeout: 120_000 }, async () => {
+    const h = await boot(place());
+    h.residentRow('PRE-1 before the tune-outs');
+    h.bump();
+    const t1 = h.internals.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5 }, 'agent-tool');
+    assert.ok(t1.ok);
+    h.residentRow('T1-HELD-1 chatter', { tuneOut: { epochId: t1.params.epochId } });
+    h.residentRow('BETWEEN-1 after T1');
+    h.bump();
+    const t2 = h.internals.tuneOutCoordinator.enterAllExcept({ serverId: 'disc', channelId: 'disc:guild:quiet' }, { durationSeconds: 3600 }, 'agent-tool');
+    assert.ok(t2.ok, (t2 as { error?: string }).error);
+    h.residentRow('T2-HELD-1 chatter', { tuneOut: { epochId: t2.params.epochId } });
+    await h.framework.runUntilIdle();
+    const cm = h.subCm();
+    const between = h.rowOf('BETWEEN-1 after T1').id;
+    const betweenAt = cm.ordinalOf(between)!;
+    const t2First = cm.ordinalOf(h.rowOf('T2-HELD-1 chatter').id)!;
+    assert.ok(betweenAt < t2First, 'premise: the row stored before T2 is ahead of its held row');
+
+    cm.retractRows([between]);
+    cm.presentRows([between]);
+    assert.ok(cm.ordinalOf(between)! > t2First, 'premise: it is in the window again, past the held row');
+
+    assert.ok(h.internals.tuneOutCoordinator.cancel('disc', CHANNEL, 'agent-tool', 'test').ok);
+    await h.framework.runUntilIdle();
+    const t3 = h.internals.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5 }, 'agent-tool');
+    assert.ok(t3.ok, (t3 as { error?: string }).error);
+    const start = h.strategy().getAnchorOrdinal()!;
+    assert.ok(start > betweenAt && start <= t2First, `T2's start, as it was before the row came back (${betweenAt} < ${start} <= ${t2First})`);
+    assert.equal(h.windowStarts()?.[t2.params.epochId], start, 'kept for T2');
+
+    h.membrane.script(SUB, final([signed('sig-i'), text('>>skip_reply nothing yet')]));
+    const calls = h.membrane.callsFor(SUB).length;
+    h.ask();
+    await waitFor('its next request', () => h.membrane.callsFor(SUB).length > calls);
+    await h.framework.runUntilIdle();
+    const body = JSON.stringify(h.membrane.callsFor(SUB).at(-1)!.messages);
+    assert.ok(body.includes('T2-HELD-1 chatter'), 'its request holds what T2 held');
+  });
+});
+
+describe("the persistent subconscious's window start whose keeping failed, across a branch move", () => {
+  it("(l) isn't kept on the branch moved to at the ordinal it was fixed at on the branch left", { timeout: 120_000 }, async () => {
+    const h = await boot(place());
+    h.residentRow('PRE-1 before the tune-out');
+    await h.framework.runUntilIdle();
+    h.bump();
+    const write = h.internals.channelRegistry.writeCoordinatorState.bind(h.internals.channelRegistry);
+    let refused = 0;
+    h.internals.channelRegistry.writeCoordinatorState = (id: string, value: unknown) => {
+      if (id === STARTS && refused === 0) { refused++; throw new Error('injected write failure'); }
+      write(id, value);
+    };
+    const errors = console.error;
+    console.error = () => {};
+    let t1: ReturnType<Internals['tuneOutCoordinator']['enter']>;
+    try {
+      t1 = h.internals.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5 }, 'agent-tool');
+    } finally { console.error = errors; }
+    assert.ok(t1.ok);
+    assert.equal(refused, 1, "premise: T1's start was fixed at its enter, and keeping it failed");
+    assert.equal(h.windowStarts()?.[t1.params.epochId], undefined, 'premise: nothing kept for it');
+
+    const store = h.framework.getStore() as unknown as { currentBranch(): { name: string }; currentSequence(): number; createBranchAt(name: string, from: string, at: number): unknown };
+    store.createBranchAt('side', store.currentBranch().name, store.currentSequence());
+    await h.framework.switchBranch('side');
+    assert.equal(store.currentBranch().name, 'side', 'premise: the store moved');
+    h.residentRow('SIDE-1 after the move');
+    await h.framework.runUntilIdle();
+    const state = h.internals.channelRegistry.readCoordinatorState(STARTS) as { starts: Record<string, number>; inForce?: number } | null;
+    assert.equal(state?.starts?.[t1.params.epochId], undefined, "T1's start isn't kept on the branch moved to at the ordinal fixed before the move");
+    assert.equal(state?.inForce, undefined, 'nor its ordinal kept as the start in force');
+  });
+
+  it("(m) isn't kept at that ordinal by the move's own presentation of the subconscious's rows", { timeout: 120_000 }, async () => {
+    const h = await boot(place());
+    h.residentRow('PRE-1 before the tune-out');
+    await h.framework.runUntilIdle();
+    h.bump();
+    const write = h.internals.channelRegistry.writeCoordinatorState.bind(h.internals.channelRegistry);
+    let refusing = true;
+    let refused = 0;
+    h.internals.channelRegistry.writeCoordinatorState = (id: string, value: unknown) => {
+      if (id === STARTS && refusing) { refused++; throw new Error('injected write failure'); }
+      write(id, value);
+    };
+    const errors = console.error;
+    console.error = () => {};
+    let t1: ReturnType<Internals['tuneOutCoordinator']['enter']>;
+    try {
+      t1 = h.internals.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5 }, 'agent-tool');
+      h.membrane.script(SUB, final([signed('sig-m'), text('>>skip_reply nothing yet')]));
+      h.ask();
+      await waitFor('its request', () => h.membrane.callsFor(SUB).length >= 1);
+      await h.framework.runUntilIdle();
+    } finally { console.error = errors; }
+    assert.ok(t1.ok);
+    assert.ok(refused >= 1, "premise: keeping T1's start was refused");
+    const own = h.subCm().getAllMessages().find((m) => m.content.some((b) => b.type === 'thinking' && (b as { signature?: string }).signature === 'sig-m'));
+    assert.ok(own, "premise: the subconscious's own reply is stored");
+
+    const store = h.framework.getStore() as unknown as { currentBranch(): { name: string }; createBranchAt(name: string, from: string, at: number): unknown };
+    store.createBranchAt('side', store.currentBranch().name, own!.sequence);
+    const presentation = (h.framework as unknown as { presentation: { onPresented(agent: string, l: (e: { occasion: string }) => void): () => void } }).presentation;
+    let atRebase = 0;
+    presentation.onPresented(SUB, (e) => { if (e.occasion === 'rebase') atRebase++; });
+    refusing = false;
+    await h.framework.switchBranch('side');
+    assert.ok(atRebase > 0, "premise: the move's rebase presented the subconscious's own rows");
+    const state = h.internals.channelRegistry.readCoordinatorState(STARTS) as { starts: Record<string, number>; inForce?: number } | null;
+    assert.equal(state?.starts?.[t1.params.epochId], undefined, "T1's start isn't kept on the branch moved to at the ordinal fixed before the move");
+    assert.equal(state?.inForce, undefined, 'nor its ordinal kept as the start in force');
+  });
+});
+
+describe("the persistent subconscious's window start set while its window is the record", () => {
+  it('(n) is fixed at the next enter once a branch move recovers the window, a restart before it setting the start kept in force', { timeout: 120_000 }, async () => {
+    const dir = place();
+    const h = await boot(dir);
+    h.residentRow('PRE-1 before the tune-outs');
+    h.bump();
+    const t1 = h.internals.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5 }, 'agent-tool');
+    assert.ok(t1.ok);
+    h.residentRow('T1-HELD-1 chatter', { tuneOut: { epochId: t1.params.epochId } });
+    await h.framework.runUntilIdle();
+    const t1Start = h.windowStarts()?.[t1.params.epochId];
+    assert.notEqual(t1Start, undefined, "premise: T1's start is fixed and kept");
+
+    const strategy = h.subCm().getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
+    const initialize = strategy.initialize.bind(strategy);
+    let failNext = true;
+    strategy.initialize = async (...args: unknown[]) => {
+      if (failNext) { failNext = false; throw new Error('injected initialization failure'); }
+      return initialize(...args);
+    };
+    const branch = () => h.framework.getStore().currentBranch().name;
+    await h.framework.switchBranch(branch());
+    assert.ok(h.traces.some((e) => e.type === 'presentation:failed' && (e as { agentName?: string }).agentName === SUB),
+      "premise: the subconscious's window is the record after the move");
+    h.bump();
+    const t2 = h.internals.tuneOutCoordinator.enterAllExcept({ serverId: 'disc', channelId: 'disc:guild:quiet' }, { durationSeconds: 3600 }, 'agent-tool');
+    assert.ok(t2.ok, (t2 as { error?: string }).error);
+    await h.framework.switchBranch(branch());
+    await h.framework.runUntilIdle();
+    assert.equal(h.windowStarts()?.[t2.params.epochId], undefined, "premise: T2's start, set while the window was the record, isn't fixed at the recovering move");
+
+    assert.ok(h.internals.tuneOutCoordinator.cancel('disc', CHANNEL, 'agent-tool', 'test').ok);
+    await h.framework.runUntilIdle();
+    const kept = h.internals.channelRegistry.readCoordinatorState(STARTS) as { starts: Record<string, number>; inForce?: number };
+    assert.equal(kept.inForce, t1Start, "premise: T1's start is kept in force at its cancel, T2 still active");
+    await h.framework.stop();
+    frameworks.splice(frameworks.indexOf(h.framework), 1);
+
+    const after = await boot(dir);
+    await after.framework.runUntilIdle();
+    assert.equal(after.strategy().getAnchorOrdinal(), t1Start, 'a restart sets the start kept in force');
+    assert.equal(after.windowStarts()?.[t2.params.epochId], undefined, "and T2's start, the oldest active and not kept, waits");
+    after.bump();
+    const t3 = after.internals.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5 }, 'agent-tool');
+    assert.ok(t3.ok, (t3 as { error?: string }).error);
+    await after.framework.runUntilIdle();
+    const cm = after.subCm();
+    const t2Start = t2.params.startedAtSequence;
+    const pastBefore = Math.max(0, ...cm.getPresentedMessages().filter((m) => m.sequence < t2Start).map((m) => cm.ordinalOf(m.id)! + 1));
+    assert.equal(after.windowStarts()?.[t2.params.epochId], pastBefore,
+      "the next enter fixes T2's start, just past the last row in the window stored before it");
+  });
+});
+
 describe('SubconsciousWindowAnchor', () => {
   /** A host over a window of `rows` (sequence and ordinal each), with the rows still owed. */
   function host(options: { presents?: boolean; rows?: Array<{ sequence: number; ordinal: number }>; owed?: number[]; length?: number }) {
     const calls: string[] = [];
     const fixed: Array<{ epochIds: readonly string[]; ordinal: number }> = [];
     const traces: unknown[] = [];
-    const state = { owed: options.owed ?? [], rows: options.rows ?? [] };
+    const state = { owed: options.owed ?? [], rows: options.rows ?? [], setFails: 0, keepFails: 0 };
     const strategy: AnchoredStrategy = {
       setAnchor: (sequence) => { calls.push(`setAnchor(${sequence})`); },
-      setAnchorOrdinal: (ordinal) => { calls.push(`setAnchorOrdinal(${ordinal})`); },
+      setAnchorOrdinal: (ordinal) => {
+        calls.push(`setAnchorOrdinal(${ordinal})`);
+        if (state.setFails > 0) { state.setFails--; throw new Error('the slot refused it'); }
+      },
       getAnchorOrdinal: () => undefined,
     };
     const anchor = new SubconsciousWindowAnchor({
@@ -341,7 +514,11 @@ describe('SubconsciousWindowAnchor', () => {
       strategy: () => strategy,
       presents: () => options.presents ?? true,
       owed: () => state.owed.map((sequence) => ({ sequence })),
-      fixed: (epochIds, ordinal) => { fixed.push({ epochIds, ordinal }); },
+      fixed: (epochIds, ordinal) => {
+        fixed.push({ epochIds, ordinal });
+        if (state.keepFails > 0) { state.keepFails--; return false; }
+        return true;
+      },
       emitTrace: (event) => { traces.push(event); },
     });
     return { anchor, calls, fixed, traces, state };
@@ -373,5 +550,62 @@ describe('SubconsciousWindowAnchor', () => {
     assert.deepEqual(h.calls, ['setAnchor(50)', 'setAnchorOrdinal(4)']);
     h.anchor.presented();
     assert.equal(h.fixed.length, 1, 'once');
+  });
+
+  it('a start set while the window is the record waits for the next set, not for a presentation', () => {
+    const options = { presents: true, rows: [{ sequence: 10, ordinal: 0 }] };
+    const h = host(options);
+    h.state.owed = [20];
+    h.anchor.set({ sequence: 50, epochIds: ['t1'] }, [{ sequence: 70, epochIds: ['t2'] }]);
+    assert.deepEqual(h.fixed, [], 'premise: both wait for a row stored before them');
+    options.presents = false;
+    h.anchor.set({ sequence: 50, epochIds: ['t1'] }, [{ sequence: 70, epochIds: ['t2'] }]);
+    assert.deepEqual(h.calls, ['setAnchor(50)', 'setAnchor(50)'], 'by sequence while the window is the record, as before it');
+    options.presents = true;
+    h.state.owed = [];
+    h.state.rows.push({ sequence: 20, ordinal: 1 });
+    h.anchor.presented();
+    assert.deepEqual(h.fixed, [], 'nothing waits to be fixed after it');
+    assert.deepEqual(h.calls, ['setAnchor(50)', 'setAnchor(50)']);
+  });
+
+  it("a start whose keeping failed isn't kept at that ordinal after a branch move; one still waiting is fixed on the branch it presents on", () => {
+    const options = { rows: [{ sequence: 10, ordinal: 0 }] };
+    const h = host(options);
+    h.state.keepFails = 1;
+    h.state.owed = [60];
+    h.anchor.set({ sequence: 50, epochIds: ['t1'] }, [{ sequence: 70, epochIds: ['t2'] }]);
+    assert.deepEqual(h.fixed, [{ epochIds: ['t1'], ordinal: 1 }], "premise: t1 fixed at 1 and not kept; t2 waits for a row stored before it");
+    h.anchor.branchMoved();
+    h.state.owed = [];
+    h.state.rows.push({ sequence: 20, ordinal: 1 }, { sequence: 60, ordinal: 2 });
+    h.anchor.presented();
+    assert.deepEqual(h.fixed, [{ epochIds: ['t1'], ordinal: 1 }, { epochIds: ['t2'], ordinal: 3 }],
+      "t1 isn't kept at the ordinal fixed before the move, and t2 is fixed on the window it presents on");
+  });
+
+  it('a start whose setting or keeping fails is set and kept at the next presentation, at the ordinal it was fixed at', () => {
+    const failedSet = host({ rows: [{ sequence: 10, ordinal: 0 }] });
+    failedSet.state.setFails = 1;
+    const errors = console.error;
+    console.error = () => {};
+    try {
+      failedSet.anchor.set({ sequence: 50, epochIds: ['t1'] });
+    } finally { console.error = errors; }
+    assert.deepEqual(failedSet.fixed, [], 'premise: the set failed, so nothing is kept');
+    failedSet.state.rows.push({ sequence: 20, ordinal: 1 });
+    failedSet.anchor.presented();
+    assert.deepEqual(failedSet.calls, ['setAnchor(50)', 'setAnchorOrdinal(1)', 'setAnchorOrdinal(1)'], 'set again at the ordinal it was fixed at');
+    assert.deepEqual(failedSet.fixed, [{ epochIds: ['t1'], ordinal: 1 }], 'and kept');
+
+    const failedKeep = host({ rows: [{ sequence: 10, ordinal: 0 }] });
+    failedKeep.state.keepFails = 1;
+    failedKeep.anchor.set({ sequence: 50, epochIds: ['t1'] });
+    assert.deepEqual(failedKeep.fixed, [{ epochIds: ['t1'], ordinal: 1 }], 'premise: its keeping failed once');
+    failedKeep.state.rows.push({ sequence: 20, ordinal: 1 });
+    failedKeep.anchor.presented();
+    assert.deepEqual(failedKeep.fixed, [{ epochIds: ['t1'], ordinal: 1 }, { epochIds: ['t1'], ordinal: 1 }], 'kept at the next presentation, at the same ordinal');
+    failedKeep.anchor.presented();
+    assert.equal(failedKeep.fixed.length, 2, 'and then no more');
   });
 });

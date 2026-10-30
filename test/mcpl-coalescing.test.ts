@@ -513,9 +513,13 @@ test('#196 finding 5, on the window: undo of a turn keeps the coalesced input th
   await f.send('push/event', f.params('b', 'unread_before_undo', { key: 'b', initial: true }));
   await f.turn();
   assert(f.lastRequest().includes('unread_before_undo'));
+  const cm = f.framework.getAgent('agent')!.getContextManager();
+  const before = cm.getPresentedMessages().length;
   const undone = f.framework.undoLastTurn('agent');
+  assert.equal(undone.undone, true, 'the undo undid a turn');
+  assert.ok(cm.getPresentedMessages().length < before, "the undone turn's own rows left the window");
   assert.equal(undone.fromBranch, undone.toBranch, 'no branch moved');
-  const window = JSON.stringify(f.framework.getAgent('agent')!.getContextManager().getPresentedMessages());
+  const window = JSON.stringify(cm.getPresentedMessages());
   assert(window.includes('unread_before_undo'), "the input stays in the window the undone turn's start presented it to");
   const r = await f.send('push/event', f.params('c', 'after_undo', { key: 'b' }));
   assert.equal(r.result.coalesce.outcome, 'appended', 'the request that carried it read it');
@@ -1454,6 +1458,7 @@ test("a render stored for a live turn, out of its window, isn't read by the resi
     assert.equal(f.membrane.calls.length, 0, "'other' read nothing, so its turn started no inference");
     assert.deepEqual(withdrawn, ['other']);
     assert.deepEqual(internals.pendingRequests.map((r) => r.agentName), ['agent'], 'the primary is woken for the render');
+    assert(f.context().includes('document_diff'), 'the render is stored while the turn is alive');
     assert(!f.window().includes('document_diff'), "which its window doesn't hold yet");
   } finally {
     endStandInTurn(internals);
@@ -1533,15 +1538,15 @@ test("a render stored for a live turn, out of its window, wakes its agent though
   assert(f.lastRequest().includes('first_render'), "the primary's turn read the render");
 });
 
-test("a notice after a render landed unread in a live turn's deferred queue leaves it there, and the turn reads it before the newer render (#548)", async (t) => {
+test("a notice after a render stored unread for a live turn, out of its window, leaves it there, and the turn reads it before the newer render (#548)", async (t) => {
   const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
   f.alwaysRespond();
   let renders = 0;
   f.renderer(() => Promise.resolve({ content: [{ type: 'text', text: ++renders > 1 ? 'second_render' : 'first_render' }] }));
   await f.send('push/event', f.params('1', 'first_fallback', { deferred: true, initial: true }));
   const internals = f.framework as unknown as TurnInternals;
-  // The primary's turn is alive, so 'other''s assembly places the render in
-  // the primary's deferred queue, unread. A notice then arrives. The render
+  // The primary's turn is alive, so 'other''s assembly stores the render for
+  // the primary, out of its window, unread. A notice then arrives. The render
   // is a delta the next one builds on (RFC-006 §5.2), so it stays, and the
   // notice's batch follows the primary.
   internals.activeTurnTokens.set('agent', -1);
@@ -1559,7 +1564,7 @@ test("a notice after a render landed unread in a live turn's deferred queue leav
   assert(request.includes('first_render') && request.indexOf('first_render') < request.indexOf('second_render'), 'one call read the first render, then the second');
 });
 
-test("a render placed in a live turn's deferred queue takes a newer batch of its subject to its agent, so another agent's assembly leaves that batch and the render's wake alone", async (t) => {
+test("a render stored for a live turn, out of its window, takes a newer batch of its subject to its agent, so another agent's assembly leaves that batch and the render's wake alone", async (t) => {
   const f = await fixture({ agents: TWO_RESIDENTS }); t.after(f.close);
   f.alwaysRespond();
   const withdrawn = withdrawals(f);
@@ -1574,11 +1579,11 @@ test("a render placed in a live turn's deferred queue takes a newer batch of its
   });
   await f.send('push/event', f.params('1', 'first_fallback', { deferred: true, initial: true }));
   const internals = f.framework as unknown as TurnInternals;
-  // As above: the primary's turn is alive, 'other''s assembly renders the
-  // batch into the primary's queue, and a notice during the render opens a
-  // newer batch, which wakes both. Once the render lands, the newer batch
-  // follows the primary, whose queue holds the render it builds on (RFC-006
-  // §5.2), wakes included. In the next pass the primary is still busy, and
+  // As above: the primary's turn is alive, 'other''s assembly stores the
+  // render for the primary, out of its window, and a notice during the render
+  // opens a newer batch, which wakes both. Once the render lands, the newer
+  // batch follows the primary, whose store holds the render it builds on
+  // (RFC-006 §5.2), wakes included. In the next pass the primary is still busy, and
   // 'other' has no wake left for the batch: the batch waits, with its wake,
   // for the primary.
   internals.activeTurnTokens.set('agent', -1);
@@ -1655,7 +1660,10 @@ test("a render an assembly joins reaches the joining agent's request when it lan
     .getTurnCheckpoints('agent').find((c) => c.indexLengthBefore !== undefined && c.indexLengthBefore > (cm.ordinalOf(render.id) ?? Infinity));
   assert.ok(checkpoint, "the render entered the primary's window before a turn's checkpoint: that turn's input");
   // As the turn's input, undoing the turn keeps it.
-  f.framework.undoLastTurn('agent');
+  const before = cm.getPresentedMessages().length;
+  const undone = f.framework.undoLastTurn('agent');
+  assert.equal(undone.undone, true, 'the undo undid a turn');
+  assert.ok(cm.getPresentedMessages().length < before, "the undone turn's own rows left the window");
   assert(f.window().includes('first_render'), 'the undo of the turn that read it keeps it');
 });
 
@@ -2237,7 +2245,7 @@ test("a provider hold keeps a wake to read a render or a stored message, a batch
     'each is held: none stands for another, which a withdrawal or a read could take with it');
 });
 
-test("an assembly that throws closes the window in which its writes bypass the turn's deferral", async (t) => {
+test("an assembly that throws ends the span in which its agent's writes go to the turn it assembles", async (t) => {
   const f = await fixture(); t.after(f.close);
   f.alwaysRespond();
   await f.send('push/event', f.params('1', 'first_fallback', { deferred: true, initial: true }));
@@ -2318,17 +2326,44 @@ test("a write for an agent while its assembly awaits a render is stored at once,
   }
 });
 
-test("a render queued for one resident isn't another resident's to read once its flush has stored it", async (t) => {
+test("a render that lands while the host is quiesced, for the agent whose assembly awaits it, is read by a turn of the agent's once the host resumes", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.alwaysRespond();
+  let release!: (value: unknown) => void;
+  let began!: () => void;
+  const started = new Promise<void>((resolve) => { began = resolve; });
+  f.renderer(() => {
+    began();
+    return new Promise((resolve) => { release = resolve; });
+  });
+  const internals = f.framework as unknown as TurnInternals & { quiesced: boolean };
+  const carried = () => f.membrane.calls.some((call) => JSON.stringify(call).includes('rendered_in_quiesce'));
+  await f.send('push/event', f.params('1', 'first_fallback', { deferred: true, initial: true }));
+  await eventually(() => internals.pendingRequests.length > 0, 'the batch wake');
+  const turn = f.framework.runUntilIdle();
+  await settles(started, 'the render');
+  internals.quiesced = true;
+  try {
+    release({ content: [{ type: 'text', text: 'rendered_in_quiesce' }] });
+    await settles(turn, 'the pass while quiesced');
+    assert(!carried(), 'no request carried it while the host was quiesced');
+  } finally {
+    internals.quiesced = false;
+  }
+  await settles(f.framework.runUntilIdle(), 'the pass after the resume');
+  assert(carried(), "a turn of the agent's read the render once the host resumed");
+});
+
+test("a render stored for one resident while its turn is alive isn't another resident's to read, and its own turn reads it", async (t) => {
   const f = await fixture({ agents: [...TWO_RESIDENTS, { name: 'third', model: 'test', systemPrompt: 'test' }] }); t.after(f.close);
   f.alwaysRespond();
   const withdrawn = withdrawals(f);
   await f.send('push/event', f.params('1', 'queued_fallback', { deferred: true, initial: true }));
   const internals = f.framework as unknown as TurnInternals;
   // One pass takes all three wakes. The primary's turn is alive (a stand-in
-  // token), so its wake waits; 'other''s assembly renders the batch into the
-  // primary's queue, and the primary is woken for it. Before 'third''s turn
-  // starts, the primary's turn ends, and its flush stores the render, as a
-  // torn-down turn's does.
+  // token), so its wake waits; 'other''s assembly stores the render for the
+  // primary, out of its window, and the primary is woken for it. Before
+  // 'third''s turn starts, the primary's turn ends.
   const start = internals.startAgentStream.bind(internals);
   internals.startAgentStream = async (...a: unknown[]) => {
     if ((a[0] as { name: string }).name === 'third') {
@@ -2594,6 +2629,197 @@ test('R16: a batch whose render-start commit failed is re-woken once storage rec
   assert.equal(traced.find((e) => e.kind === 'rendered')?.source, 'fallback');
   assert.equal(f.renders.length, 0);
   assert.equal(coalescer.pendingBatches(), 0);
+});
+
+test("a render whose store write is refused keeps its batch, which its recovery wake delivers as the fallback, without asking the server again", { timeout: 120_000 }, async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const coalescer = (f.framework as unknown as { pushCoalescer: { options: { recoveryBackoffMs?: number }; pendingBatches(): number } }).pushCoalescer;
+  coalescer.options.recoveryBackoffMs = 50;
+  const internals = f.framework as unknown as { pendingRequests: unknown[] };
+  f.renderer(async () => ({ content: [{ type: 'text', text: 'refused_render' }] }));
+  const cm = f.framework.getAgent('agent')!.getContextManager();
+  const add = cm.addMessage.bind(cm);
+  let refused = 0;
+  (cm as unknown as { addMessage: typeof add }).addMessage = (...args) => {
+    if (refused === 0 && JSON.stringify(args[1]).includes('refused_render')) {
+      refused++;
+      throw new Error('zz-store-refused');
+    }
+    return add(...args);
+  };
+  const kinds: string[] = [];
+  f.framework.onTrace((e) => { if (e.type === 'mcpl:coalescing') kinds.push((e as { kind: string }).kind); });
+  f.alwaysRespond();
+  await f.send('push/event', f.params('1', 'refused_fallback', { deferred: true, initial: true }));
+  await settles(f.framework.runUntilIdle(), 'the first drain');
+  assert.equal(refused, 1, "the store refused the render's write");
+  for (let pass = 0; !f.membrane.calls.some((c) => JSON.stringify(c).includes('refused_fallback')); pass++) {
+    assert(pass < 5, 'the batch was delivered within five recovery wakes');
+    await eventually(() => internals.pendingRequests.length > 0, 'recovery wake');
+    await settles(f.framework.runUntilIdle(), `the drain after recovery wake ${pass + 1}`);
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert(kinds.indexOf('deliver-failed') !== -1 && kinds.indexOf('deliver-failed') < kinds.indexOf('recovery-wake'), 'the refusal is traced, then re-woken by the recovery timer, without unrelated traffic');
+  assert(f.context().includes('refused_fallback'), 'the fallback is stored');
+  assert.equal(f.renders.length, 1, 'the server was asked to render it once');
+  assert.equal(coalescer.pendingBatches(), 0);
+});
+
+test("a render cancelled while it runs leaves the recovery wake of a batch opened after it", async () => {
+  let failPersist = false;
+  const audits: Array<{ kind?: unknown; eventId?: unknown }> = [];
+  let releaseRender!: () => void;
+  const gate = new Promise<void>((resolve) => { releaseRender = resolve; });
+  let renderStarted!: () => void;
+  const started = new Promise<void>((resolve) => { renderStarted = resolve; });
+  const wakes: string[] = [];
+  const host: CoalescerHost<null> = {
+    isUnread: () => true, isUnshown: () => true, remove: () => true,
+    deliver: async (occ) => ({ agent: 'agent', messageId: `row-${occ.eventId}` }),
+    wakeForBatch: async (occ) => { wakes.push(occ.eventId); }, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
+    audience: async () => ['agent'],
+    render: async (occ) => {
+      if (occ.eventId === 'n1') { renderStarted(); await gate; }
+      return { content: [{ type: 'text', text: `diff_${occ.eventId}` }] };
+    },
+    audit: (record) => { audits.push(record); },
+    save: () => {},
+    saveNow: () => { if (failPersist) throw new Error('EIO simulated'); },
+  };
+  const coalescer = new PushCoalescer<null>(host, { recoveryBackoffMs: 200 });
+  const occurrence = (eventId: string, flags: Partial<CoalescedOccurrence<null>>): CoalescedOccurrence<null> => ({
+    serverId: 'editor', binding: 'binding', scope: { kind: 'featureSet', id: 'doc' }, key: 'document', eventId, timestamp: TS,
+    retract: false, deferred: false, initial: false, content: [{ type: 'text', text: eventId }], event: null, ...flags,
+  });
+  await coalescer.accept(occurrence('n1', { deferred: true, initial: true }));
+  const first = coalescer.assemble('agent');
+  await started;
+  await coalescer.accept(occurrence('p1', {}));
+  assert(audits.some((a) => a.kind === 'render-cancelled' && a.eventId === 'n1'), "premise: the plain occurrence cancelled n1's render");
+  await coalescer.accept(occurrence('n2', { deferred: true }));
+  failPersist = true;
+  await coalescer.assemble('agent');
+  failPersist = false;
+  assert(audits.some((a) => a.kind === 'persist-failed' && a.eventId === 'n2'), "premise: n2's render-start couldn't be made durable");
+  releaseRender();
+  await first;
+  const woken = wakes.length;
+  const deadline = performance.now() + 5_000;
+  while (!wakes.slice(woken).includes('n2')) {
+    assert(performance.now() < deadline, "n2's recovery wake came within 5 s");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+});
+
+test("a render whose store write keeps being refused waits longer before each recovery wake", { timeout: 120_000 }, async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const coalescer = (f.framework as unknown as { pushCoalescer: { options: { recoveryBackoffMs?: number } } }).pushCoalescer;
+  coalescer.options.recoveryBackoffMs = 20;
+  const internals = f.framework as unknown as { pendingRequests: unknown[] };
+  f.renderer(async () => ({ content: [{ type: 'text', text: 'backoff_render' }] }));
+  const cm = f.framework.getAgent('agent')!.getContextManager();
+  const add = cm.addMessage.bind(cm);
+  let refused = 0;
+  (cm as unknown as { addMessage: typeof add }).addMessage = (...args) => {
+    if (refused < 3 && JSON.stringify(args[1]).includes('backoff_')) {
+      refused++;
+      throw new Error('zz-store-refused');
+    }
+    return add(...args);
+  };
+  const wakes: Array<{ attempt: number; delayMs: number }> = [];
+  f.framework.onTrace((e) => {
+    if (e.type === 'mcpl:coalescing' && (e as { kind?: string }).kind === 'recovery-wake') wakes.push(e as unknown as { attempt: number; delayMs: number });
+  });
+  f.alwaysRespond();
+  await f.send('push/event', f.params('1', 'backoff_fallback', { deferred: true, initial: true }));
+  await settles(f.framework.runUntilIdle(), 'the first drain');
+  for (let pass = 0; !f.context().includes('backoff_fallback'); pass++) {
+    assert(pass < 10, 'the batch was stored within ten wakes');
+    await eventually(() => internals.pendingRequests.length > 0, 'a recovery wake');
+    await settles(f.framework.runUntilIdle(), `the drain after wake ${pass + 1}`);
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(refused, 3, 'the store refused three writes');
+  assert.deepEqual(wakes.map((w) => w.attempt), [1, 2, 3], 'each recovery wake counts the failures before it');
+  assert(wakes[1]!.delayMs > wakes[0]!.delayMs && wakes[2]!.delayMs > wakes[1]!.delayMs, 'and waits longer than the one before');
+});
+
+test("a render whose store write is refused leaves a batch opened while it rendered to be delivered as its fallback, not rendered on top of the render the agent never got", { timeout: 120_000 }, async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.alwaysRespond();
+  let release!: (value: unknown) => void;
+  let began!: () => void;
+  const started = new Promise<void>((resolve) => { began = resolve; });
+  let renders = 0;
+  f.renderer(() => {
+    if (++renders > 1) return Promise.resolve({ content: [{ type: 'text', text: 'second_render' }] });
+    began();
+    return new Promise((resolve) => { release = resolve; });
+  });
+  const internals = f.framework as unknown as { pendingRequests: unknown[] };
+  await f.send('push/event', f.params('1', 'first_fallback', { deferred: true, initial: true }));
+  await eventually(() => internals.pendingRequests.length > 0, 'the batch wake');
+  const turn = f.framework.runUntilIdle();
+  await settles(started, 'the first render');
+  await f.send('push/event', f.params('2', 'second_fallback', { deferred: true }));
+  const cm = f.framework.getAgent('agent')!.getContextManager();
+  const add = cm.addMessage.bind(cm);
+  let refused = 0;
+  (cm as unknown as { addMessage: typeof add }).addMessage = (...args) => {
+    if (JSON.stringify(args[1]).includes('first_render')) {
+      refused++;
+      throw new Error('zz-store-refused');
+    }
+    return add(...args);
+  };
+  release({ content: [{ type: 'text', text: 'first_render' }] });
+  await settles(turn, 'the first drain');
+  assert.equal(refused, 1, "the store refused the first render's write");
+  const read = () => f.membrane.calls.some((c) => /second_(render|fallback)/.test(JSON.stringify(c)));
+  for (let pass = 0; !read(); pass++) {
+    assert(pass < 5, 'the newer batch was delivered within five wakes');
+    await eventually(() => internals.pendingRequests.length > 0, 'a wake');
+    await settles(f.framework.runUntilIdle(), `the drain after wake ${pass + 1}`);
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert(read(), "a turn of the agent's read the newer batch");
+  assert(f.membrane.calls.some((c) => JSON.stringify(c).includes('second_fallback')), 'as its fallback');
+  assert.equal(renders, 1, 'the server was asked to render the first batch only');
+});
+
+test("a render stored whose modules' handling then throws is stored once and not delivered again", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.alwaysRespond();
+  f.renderer(async () => ({ content: [{ type: 'text', text: 'stored_render' }] }));
+  const internals = f.framework as unknown as { dispatchProcessEventToModules(event: unknown): Promise<void> };
+  const dispatch = internals.dispatchProcessEventToModules.bind(f.framework);
+  let threw = 0;
+  internals.dispatchProcessEventToModules = async (event) => {
+    if (threw === 0 && JSON.stringify(event).includes('stored_render')) {
+      threw++;
+      throw new Error('zz-dispatch-failed');
+    }
+    return dispatch(event);
+  };
+  const kinds: string[] = [];
+  f.framework.onTrace((e) => { if (e.type === 'mcpl:coalescing') kinds.push((e as { kind: string }).kind); });
+  const error = console.error;
+  const logged: string[] = [];
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+  try {
+    await f.send('push/event', f.params('1', 'stored_fallback', { deferred: true, initial: true }));
+    await settles(f.framework.runUntilIdle(), 'the drain');
+  } finally {
+    console.error = error;
+  }
+  assert.equal(threw, 1, "the modules' handling of the stored render threw");
+  assert.equal(f.context().split('stored_render').length - 1, 1, 'the render is stored once');
+  assert(!f.context().includes('stored_fallback'), 'its fallback is not stored');
+  assert(!kinds.includes('deliver-failed'), 'the delivery is not taken as failed');
+  const coalescer = (f.framework as unknown as { pushCoalescer: { pendingBatches(): number } }).pushCoalescer;
+  assert.equal(coalescer.pendingBatches(), 0, 'no batch is left for a recovery wake');
+  assert(logged.some((line) => /server=editor eventId=1: the modules' handling/.test(line)), `the failure's line names its server and event: ${logged.join(' | ')}`);
 });
 
 test('R16b: a producer retry re-wakes a batch left asleep by a failed freeze', async (t) => {
@@ -3136,11 +3362,12 @@ test("#157: an edit that addresses the agent, of a follow-up that arrived during
   assert.equal(channel, 'other');
 });
 
-test("#157: an edit of a follow-up that arrived during a turn and was flushed at the turn's end, before any compile showed it, is the agent's first view", async (t) => {
+test("#157: an edit of a follow-up that arrived during a turn and entered the window at the turn's end, before any compile showed it, is the agent's first view", async (t) => {
   // The question wakes the turn. The follow-up and its edit wake nothing, so
-  // no compile shows the follow-up after the flush.
+  // no compile shows the follow-up after the turn's end.
   const f = await fixture({ server: { shouldTriggerInference: (content: string) => !content.includes('follow_up') } }); t.after(f.close); await f.register();
   let streams = 0;
+  let duringTurn: { stored: boolean; inWindow: boolean } | undefined;
   (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
     f.membrane.calls.push(request as never);
     const stream = new MockYieldingStream([createMockResponse([{ type: 'text', text: 'answer' }] as ContentBlock[])]);
@@ -3149,10 +3376,10 @@ test("#157: an edit of a follow-up that arrived during a turn and was flushed at
     (stream as unknown as Record<symbol, unknown>)[Symbol.asyncIterator] = async function* () {
       for await (const event of { [Symbol.asyncIterator]: iterate }) {
         // The follow-up arrives after the turn's last round, so no tool
-        // boundary drains it: it waits for the turn-end flush.
+        // boundary hears it.
         if ((event as { type?: string }).type === 'complete') {
           await f.send('push/event', f.params('d1', 'follow_up_wiht_typo', { initial: true }));
-          assert(!storedWith(f, 'follow_up_wiht_typo'), 'the follow-up was deferred, not stored at once');
+          duringTurn = { stored: !!storedWith(f, 'follow_up_wiht_typo'), inWindow: f.window().includes('follow_up_wiht_typo') };
         }
         yield event;
       }
@@ -3162,7 +3389,8 @@ test("#157: an edit of a follow-up that arrived during a turn and was flushed at
   await f.send('channels/incoming', { messages: [f.channel('c1', 'question', { initial: true }, 'chat', 'm1')] });
   await f.framework.runUntilIdle();
   assert.equal(streams, 1, 'one turn ran');
-  assert(storedWith(f, 'follow_up_wiht_typo'), "the turn-end flush stored the follow-up");
+  assert.deepEqual(duringTurn, { stored: true, inWindow: false }, "the follow-up was stored at once, out of the live turn's window");
+  assert(f.window().includes('follow_up_wiht_typo'), "the turn's end put the follow-up in the window");
   assert(!f.membrane.calls.some((c) => JSON.stringify(c).includes('follow_up_wiht_typo')), 'no request held the follow-up');
   const edit = await f.send('push/event', { ...f.params('d2', 'follow_up_fixed'), tags: ['chat:edited'] });
   assert.equal(edit.result.coalesce.outcome, 'replaced');
@@ -3393,8 +3621,9 @@ function firstViewProbe(state: { shown: boolean; read: boolean; shownEvents?: Se
   };
 }
 
-/** n1's render lands in 'other''s deferred queue as a first view, after n2
- *  opened a batch of the same subject during that render. */
+/** n1's render is stored for 'other' and not presented to it (`presented:
+ *  false`) as a first view, after n2 opened a batch of the same subject
+ *  during that render. */
 async function firstViewQueuedWithBatchPending(p: ReturnType<typeof firstViewProbe>): Promise<void> {
   await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
   const first = p.coalescer.assemble('agent');
@@ -3469,8 +3698,8 @@ test('#157: a plain edit that takes the place of a pending first-view batch afte
   assert.deepEqual(p.delivered.at(-1), { eventId: 'e1' });
 });
 
-/** n1's render lands in 'other''s deferred queue as the agent's first view,
- *  and `shown` says whether the agent is then shown it. n2 opens a batch
+/** n1's render is stored for 'other' and not presented to it as the agent's
+ *  first view, and `shown` says whether the agent is then shown it. n2 opens a batch
  *  beside it, which follows the run's agent and is no first view, since the
  *  run holds it; that batch starts rendering for 'other'; n3 opens a new
  *  batch during that render. Returns the held assembly, wrapped, since an
@@ -3515,11 +3744,8 @@ for (const shown of [false, true]) test(`#157: beside a queued first-view render
   assert.deepEqual(p.delivered.at(-1), { eventId: 'e1', ...(shown ? {} : { firstView: true as const }) });
 });
 
-/** n1's render lands in 'other''s deferred queue as the agent's first view;
- *  `shown` says whether the agent is then shown it, and a retraction
- *  withdraws it. */
 /** A run of n1, the agent's first view, and n3's render, which joined it
- *  unmarked, both queued for 'other'. */
+ *  unmarked, both stored for 'other' and not presented to it. */
 async function firstViewRunOfTwo(p: ReturnType<typeof firstViewProbe>): Promise<void> {
   await firstViewQueuedWithBatchPending(p);
   await p.coalescer.accept(p.occurrence('n3', { deferred: true, tags: ['chat:edited'] }));
@@ -3558,6 +3784,9 @@ for (const [mix, seen] of Object.entries(runMixes)) for (const [ending, end] of 
   assert.deepEqual(p.delivered.at(-1), { eventId: next }, 'something of the run may have been shown');
 });
 
+/** n1's render is stored for 'other' and not presented to it as the agent's
+ *  first view; `shown` says whether the agent is then shown it, and a
+ *  retraction withdraws it. */
 async function firstViewRetracted(p: ReturnType<typeof firstViewProbe>, state: { shown: boolean }, shown: boolean) {
   await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
   await p.coalescer.assemble('agent');
@@ -3620,9 +3849,9 @@ test("#157: a snapshot keeps a subject's ended first view, so a restored coalesc
   assert.deepEqual(p.delivered.at(-1), { eventId: 'n2' });
 });
 
-/** n1's render lands in 'other''s deferred queue as the agent's first view;
- *  `shown` says whether the agent is then shown it, and a plain edit
- *  displaces it. */
+/** n1's render is stored for 'other' and not presented to it as the agent's
+ *  first view; `shown` says whether the agent is then shown it, and a plain
+ *  edit displaces it. */
 async function firstViewDisplacedByPlain(p: ReturnType<typeof firstViewProbe>, state: { shown: boolean }, shown: boolean) {
   await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
   await p.coalescer.assemble('agent');

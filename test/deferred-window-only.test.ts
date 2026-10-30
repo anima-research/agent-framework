@@ -354,9 +354,22 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       assert.notEqual(third, '', 'stored at once');
       assert.equal(own.presented, false, "the primary's own cycle is pending");
       assert.equal(statusOf(framework, third), 'out');
+      const ownTargeted: { presented?: false } = {};
+      const fourth = internals.addMessage('Antra', text('targeted in its own cycle'), undefined, { forAgent: 'assistant', placement: ownTargeted });
+      assert.equal(ownTargeted.presented, false, 'a write targeted at it waits for its own cycle too');
+      assert.equal(statusOf(framework, fourth), 'out');
+      internals.pendingAssistantBlocks.delete('assistant');
+      internals.activeTurnTokens.set('assistant', -1);
+      const turnBound: { presented?: false } = {};
+      const fifth = internals.addMessage('Antra', text('primary-bound in its own turn'), undefined, { placement: turnBound });
+      const turnTargeted: { presented?: false } = {};
+      const sixth = internals.addMessage('Antra', text('targeted in its own turn'), undefined, { forAgent: 'assistant', placement: turnTargeted });
+      assert.deepEqual([turnBound.presented, turnTargeted.presented], [false, false], "the primary's own turn is alive");
+      assert.deepEqual([statusOf(framework, fifth), statusOf(framework, sixth)], ['out', 'out']);
     } finally {
       internals.pendingAssistantBlocks.delete('builder');
       internals.pendingAssistantBlocks.delete('assistant');
+      internals.activeTurnTokens.delete('assistant');
     }
     await framework.stop();
   });

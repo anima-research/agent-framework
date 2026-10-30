@@ -11,8 +11,7 @@
   agent is registered, a store handle without `appendManyToStateJsonWithIdentity` and a context-manager without
   `ContextManager.presentRows`, each with an error that names the range this package declares. chronicle 0.6.0 and
   context-manager 0.25.0 carry 0.5.0's and 0.24.0's changes, so what 0.30.0's entry says of derived agents and
-  branch views holds under them too. Until chronicle 0.6.0 and context-manager 0.25.0 are published, an install of
-  this release doesn't resolve.
+  branch views holds under them too.
   **Who needs to act:** a host that depends on chronicle or context-manager itself, such as connectome-host, which
   takes the same ranges alongside this release so that npm installs one copy of each; and a host that opens its own
   `JsStore` and passes it as `FrameworkConfig.store`, whose handle must come from chronicle 0.6.0 or later.

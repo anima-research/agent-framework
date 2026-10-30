@@ -657,13 +657,6 @@ export class ApiServer {
 
     const { settled, ...result } = this.framework.undoLastTurn(params.agentName);
     await settled;
-
-    // An undo is on the agent's window (#291) and moves no branch, so it
-    // says so as a window event, not a branch switch.
-    if (result.undone && result.window) {
-      this.broadcast('window:undone', { agentName: params.agentName, ...result.window, reason: 'undo' });
-    }
-
     return result;
   }
 
@@ -674,11 +667,6 @@ export class ApiServer {
 
     const { settled, ...result } = this.framework.redo(params.agentName);
     await settled;
-
-    if (result.redone && result.window) {
-      this.broadcast('window:undone', { agentName: params.agentName, ...result.window, reason: 'redo' });
-    }
-
     return result;
   }
 

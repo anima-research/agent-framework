@@ -382,6 +382,7 @@ test("another reader of the shared slot's live turn doesn't hold an agent's inje
   const [row] = storedInjections(prime);
   assert.ok(row, 'one row');
   assert.notEqual(prime.getContextManager().ordinalOf(row.id), undefined, "in prime's window");
+  presentAll(x);
   assert.equal(x.framework.getAgent('helper')!.getContextManager().ordinalOf(row.id), undefined, "and never in the helper's");
 });
 

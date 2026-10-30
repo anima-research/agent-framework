@@ -26,4 +26,5 @@
   is left out. `stats` stays an aggregate over the record, as do `overview`'s counts. Without the lookup (a context
   of an earlier framework, or a host's own) every tool and every answer is as it was.
 - `PresentationRetractReason`, the reasons `presentation:retracted` gives: `hide`, `suppress`, `coalescer`, `module`,
-  `resume`, `rewind`, `shed` and `boot`.
+  `resume`, `rewind`, `shed`, `boot` and `elsewhere` (rows stamped for other agents, taken out of an agent's window
+  when it is taken on or rebased).

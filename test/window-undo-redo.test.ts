@@ -138,6 +138,26 @@ describe('undo and redo on the window (#291)', () => {
     assert.equal(h.internals.isUnreadStoredMessage(h.mira, h.rowWith('second').id), false, 'what the turns read reads as read again');
   });
 
+  it('after two undos redone in turn, an undo takes out the last turn alone, and its redo gives the window back', async () => {
+    const h = await boot();
+    await h.turn('first', 'one');
+    await h.turn('second', 'two');
+    const window = h.windowTexts();
+    h.framework.undoLastTurn('mira');
+    h.framework.undoLastTurn('mira');
+    h.framework.redo('mira');
+    h.framework.redo('mira');
+    assert.deepEqual(h.windowTexts(), window, 'the premise: both turns are back, at new ordinals');
+
+    assert.deepEqual(h.framework.undoLastTurn('mira').window, { retracted: 1, represented: 0 });
+    assert.deepEqual(h.windowTexts(), ['first', 'one', 'second'], 'the first turn, redone before it, stays');
+    assert.deepEqual(h.framework.undoLastTurn('mira').window, { retracted: 2, represented: 0 });
+    assert.deepEqual(h.windowTexts(), ['first']);
+    h.framework.redo('mira');
+    h.framework.redo('mira');
+    assert.deepEqual(h.windowTexts(), window, 'and redone again, the window as it was');
+  });
+
   it('a row presented between the undos leaves at the redo that reaches past it and comes back after the redone turns', async () => {
     const h = await boot();
     await h.turn('first', 'one');
