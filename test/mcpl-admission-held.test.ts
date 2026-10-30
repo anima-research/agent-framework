@@ -130,3 +130,91 @@ for (const boundary of ['pause', 'reconnect'] as const) test(`active held flush 
   }
   await f.framework.runUntilIdle(); assert(!f.context().includes('held_0'));
 });
+
+test('held inference releases the drain after dispatch, not after the slow provider answers', async t => {
+  const dispatched: string[] = [];
+  const f = await fixture({ featureSets: { doc: { description: 'doc', uses: ['pushEvents', 'inferenceRequest'] } }, server: { inboundAdmission: {
+    timeoutMs: 5000, bind: (connection: unknown) => ({ connection, admit: async (input: any) => {
+      await delay(5);
+      return { store: true, mayWake: input.lane === 'inference/request' };
+    } }), isReplyIntent: () => true,
+  } } });
+  const inner = f.framework as any; const connection = inner.mcplServerRegistry.getServer('editor');
+  let release!: () => void;
+  const provider = new Promise<void>(resolve => { release = resolve; });
+  const replies: Promise<any>[] = [];
+  t.after(async () => { release(); await Promise.allSettled(replies); await f.close(); });
+  await f.register();
+  inner.inferenceRouter.resolveModel = () => 'test';
+  const complete = f.membrane.complete.bind(f.membrane);
+  inner.inferenceRouter.membrane = { complete: async (request: any) => {
+    dispatched.push('inference'); await provider; return complete(request);
+  } };
+  const push = inner.queue.push.bind(inner.queue);
+  inner.queue.push = (event: any) => {
+    if (event.type === 'mcpl:push-event' || event.type === 'mcpl:channel-incoming') dispatched.push(String(event.eventId ?? event.messageId));
+    return push(event);
+  };
+  await f.framework.quiesce({ reason: 'test' });
+  const first = f.send('push/event', params('push/event', 0));
+  let answered = false;
+  const inference = f.send('inference/request', { featureSet: 'doc', messages: [{ role: 'user', content: 'slow' }] })
+    .then(reply => { answered = true; return reply; });
+  const channel = f.send('channels/incoming', params('channels/incoming', 1));
+  const last = f.send('push/event', params('push/event', 2));
+  replies.push(first, inference, channel, last);
+  await eventually(() => connection.bufferedEvents.length === 4);
+  await f.framework.resume();
+  const deadline = performance.now() + 5000;
+  while (dispatched.length < 4) {
+    assert(performance.now() < deadline, 'all held data must dispatch while inference is still pending');
+    await delay(10);
+  }
+  assert.deepEqual(dispatched, ['0', 'inference', '1', '2']);
+  assert.equal(answered, false); assert.equal(inner.inferenceRouter.running.size, 1);
+  assert.equal((await first).result.accepted, true);
+  assert.equal((await channel).result.results[0].accepted, true);
+  assert.equal((await last).result.accepted, true);
+  await f.framework.runUntilIdle();
+  const stored = f.context();
+  assert(stored.indexOf('held_0') >= 0);
+  assert(stored.indexOf('held_0') < stored.indexOf('held_1'));
+  assert(stored.indexOf('held_1') < stored.indexOf('held_2'));
+  release(); assert((await inference).result);
+});
+
+test('live data arriving during a drain is captured behind held data in the same serial backlog', async t => {
+  const releases: Array<() => void> = []; const calls: number[] = []; const queued: number[] = [];
+  let active = 0; let peak = 0;
+  const f = await fixture({ server: { inboundAdmission: {
+    timeoutMs: 5000, bind: (connection: unknown) => ({ connection, admit: async (input: any) => {
+      peak = Math.max(peak, ++active); calls.push(Number(input.item.eventId ?? input.item.messageId));
+      await new Promise<void>(resolve => releases.push(resolve)); active--; return allow;
+    } }), isReplyIntent: () => true,
+  } } }); t.after(f.close); await f.register();
+  const inner = f.framework as any; const connection = inner.mcplServerRegistry.getServer('editor');
+  const push = inner.queue.push.bind(inner.queue);
+  inner.queue.push = (event: any) => {
+    if (event.type === 'mcpl:push-event' || event.type === 'mcpl:channel-incoming') queued.push(Number(event.eventId ?? event.messageId));
+    return push(event);
+  };
+  await f.framework.quiesce({ reason: 'test' });
+  f.notify('push/event', params('push/event', 0)); f.notify('channels/incoming', params('channels/incoming', 1));
+  await eventually(() => connection.bufferedEvents.length === 2);
+  await f.framework.resume(); await eventually(() => calls.length === 1);
+  const replies: Promise<any>[] = [];
+  for (let i = 2; i < 22; i++) {
+    const lane = i % 2 ? 'channels/incoming' : 'push/event';
+    if (i % 4 < 2) f.notify(lane, params(lane, i));
+    else replies.push(f.send(lane, params(lane, i)));
+  }
+  await eventually(() => connection.bufferedEvents.length === 21);
+  assert.deepEqual(calls, [0]); assert.equal(connection.requiredAdmission.pending.size, 1);
+  for (let i = 0; i < 22; i++) {
+    await eventually(() => releases.length === i + 1);
+    assert.deepEqual(calls, Array.from({ length: i + 1 }, (_, n) => n));
+    releases[i]!();
+  }
+  await Promise.all(replies); await eventually(() => !connection.requiredFlushActive);
+  assert.equal(peak, 1); assert.deepEqual(queued, Array.from({ length: 22 }, (_, i) => i));
+});
