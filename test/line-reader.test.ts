@@ -126,6 +126,24 @@ test('a line as long as the bound arrives whole, its line end not counted', asyn
   assert.deepEqual(reader.seen(), { lines: ['abcd', 'wxyz', 'mnop'], tooLong: [], ended: true });
 });
 
+test('a last line as long as the bound, with no line end, arrives when the stream ends, before the end is reported', async () => {
+  const reader = boundedReader(4);
+  await reader.write('abcd');
+  await reader.end();
+  assert.deepEqual(reader.seen(), { lines: ['abcd'], tooLong: [], ended: true });
+});
+
+test('the bound counts UTF-16 code units: two characters outside the BMP fill a bound of four, and one more unit is refused', async () => {
+  const fits = boundedReader(4);
+  await fits.write('\u{1F600}\u{1F600}\n');
+  await fits.end();
+  assert.deepEqual(fits.seen(), { lines: ['\u{1F600}\u{1F600}'], tooLong: [], ended: true });
+
+  const over = boundedReader(4);
+  await over.write('\u{1F600}\u{1F600}a\n');
+  assert.deepEqual(over.seen(), { lines: [], tooLong: [4], ended: false });
+});
+
 test('a line one past the bound is refused once: none of it arrives, nor any later line, nor the end', async () => {
   const reader = boundedReader(4);
   await reader.write('ab\nabcde\nok\n');

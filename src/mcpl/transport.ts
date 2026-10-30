@@ -22,7 +22,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import type { Readable } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
-import { escapeLineSeparators, readLines } from '../line-reader.js';
+import { MAX_LINE_CHARS, escapeLineSeparators, readLines } from '../line-reader.js';
 import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
@@ -335,14 +335,12 @@ export class StdioTransport extends McplTransport {
   ) {
     super(serverId);
 
+    const lineBound = testLineBound ?? MAX_LINE_CHARS;
     this.stopLines = readLines(stdout, {
       line: (line) => this.pushLine(line),
       tooLong: (maxChars) => this.stopStdio(new Error(`the server wrote a line on stdout longer than ${maxChars.toLocaleString('en-US')} UTF-16 code units`), false),
-    }, testLineBound);
+    }, lineBound);
 
-    // Stitch stderr chunks into whole lines (a chunk can split a line, and a
-    // character's bytes), and keep the stream's last characters for
-    // stderrTail.
     let carry = '';
     const decoder = new StringDecoder('utf8');
     const received = (text: string) => {
@@ -351,6 +349,7 @@ export class StdioTransport extends McplTransport {
       const lines = (carry + text).split('\n');
       carry = lines.pop() ?? '';
       for (const l of lines) if (l.length > 0) this.pushStderr(l);
+      for (; carry.length > lineBound; carry = carry.slice(lineBound)) this.pushStderr(carry.slice(0, lineBound));
     };
     this.child.stderr?.on('data', (chunk: Buffer) => received(decoder.write(chunk)));
     // A last line with no newline is complete once the stream ends.

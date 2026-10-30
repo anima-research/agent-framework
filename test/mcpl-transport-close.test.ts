@@ -834,6 +834,21 @@ test('a request made after a line longer than the bound is refused as not sent, 
   assert.equal(await within(reconnected.then(() => 'reconnected'), 'no reconnect within 15 s', 15_000), 'reconnected');
 });
 
+test('a stderr line longer than the bound is handed on in pieces as long as the bound, and the transport stays open', { timeout: 15_000 }, async (t) => {
+  setStdioLineBoundForTests(65_536);
+  t.after(() => setStdioLineBoundForTests(undefined));
+  const transport = await StdioTransport.spawn({
+    id: 'long-stderr',
+    command: process.execPath,
+    args: ['-e', "process.stderr.write('x'.repeat(65_537)); setTimeout(() => process.stderr.write('\\nlast\\n'), 100); setInterval(() => {}, 1 << 30);"],
+  });
+  t.after(() => transport.close());
+  const lines: string[] = [];
+  const last = new Promise<void>((resolve) => transport.on('stderr', (line: string) => { lines.push(line); if (line === 'last') resolve(); }));
+  assert.equal(await within(last.then(() => 'last'), 'no last line within 5 s'), 'last');
+  assert.deepEqual({ lengths: lines.map((line) => line.length), closed: transport.closed }, { lengths: [65_536, 1, 4], closed: false });
+});
+
 test("a legacy server whose stdin fails and whose child outlives SIGKILL is held as a launch it can't reap: a permanent failure, and close() retries", { timeout: 60_000 }, async (t) => {
   const connection = await McplServerConnection.connectWithReconnect(
     { id: 'deaf-unreapable', command: process.execPath, args: ['-e', DEAF_AND_STUBBORN], reconnect: true, reconnectIntervalMs: 10, reconnectMaxIntervalMs: 10 },
@@ -861,7 +876,7 @@ test("a legacy server whose stdin fails and whose child outlives SIGKILL is held
   void connection.sendManifestRequest(30_000).catch(() => {}); // its write meets EPIPE
   await within(new Promise<void>((resolve) => { connection.once('reconnect-failed', () => resolve()); }), null, 10_000);
   assert.deepEqual(order, [
-    'close: this host stopped using the server\'s stdio (write EPIPE), and its child outlived SIGKILL (holds its child: true)',
+    'close: this host stopped using the server\'s stdio (write EPIPE), and the server\'s process outlived SIGKILL (holds its child: true)',
     'reconnect-failed',
   ]);
   assert.equal(failures[0]!.permanent, true);

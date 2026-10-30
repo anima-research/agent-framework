@@ -2820,7 +2820,7 @@ export class McplServerConnection extends EventEmitter {
     transport.on('unreaped', (failure: Error) => {
       if (this.closed || this.transport !== transport) return;
       this.holdUnreaped(transport, failure);
-      lost({ reason: `this host stopped using the server's stdio (${transport.stdioStopCause?.message ?? 'an error'}), and its child outlived SIGKILL` });
+      lost({ reason: `this host stopped using the server's stdio (${transport.stdioStopCause?.message ?? 'an error'}), and the server's process outlived SIGKILL` });
       this.emit('reconnect-failed', { error: this.unreapedFailure(), attempt: Math.max(1, this.reconnectAttempts), permanent: true });
     });
   }

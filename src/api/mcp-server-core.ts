@@ -93,9 +93,8 @@ export class McpServer {
         process.exit(0);
       },
       tooLong: (maxChars) => {
-        console.error(`MCP server stopped: a line on stdin was longer than ${maxChars.toLocaleString('en-US')} UTF-16 code units`);
         this.close();
-        process.exit(1);
+        process.stderr.write(`MCP server stopped: a line on stdin was longer than ${maxChars.toLocaleString('en-US')} UTF-16 code units\n`, () => process.exit(1));
       },
     });
 

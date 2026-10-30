@@ -4,7 +4,7 @@ import { StringDecoder } from 'node:string_decoder';
 const LF = 0x0a;
 const CR = 0x0d;
 
-const MAX_LINE_CHARS = 100 * 1024 * 1024;
+export const MAX_LINE_CHARS = 100 * 1024 * 1024;
 
 export interface LineHandlers {
   line: (line: string) => void;

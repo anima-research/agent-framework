@@ -113,18 +113,12 @@ interface WireRecord {
   continued: boolean;
 }
 
-/**
- * A send that Connectome's own transport refused before writing anything (its
- * stdio line is closed): nothing of that request reached the server. `pipe`:
- * the child's stdin or stdout had failed, so this host can no longer write to
- * that server at all.
- */
 class NotWrittenError extends Error {
-  readonly pipe: boolean;
-  constructor(message: string, pipe = false) {
+  readonly stdioStopped: boolean;
+  constructor(message: string, stdioStopped = false) {
     super(message);
     this.name = 'NotWrittenError';
-    this.pipe = pipe;
+    this.stdioStopped = stdioStopped;
   }
 }
 
@@ -1196,9 +1190,9 @@ export class ModernMcpConnection extends EventEmitter {
       : `${said}, so whether the request took effect is unknown. Check its effect before trying again.`;
     if (!record.handedOff) {
       log(`${what} not sent: ${logDetail(message)}`);
-      const pipe = error instanceof NotWrittenError && error.pipe;
+      const stdioStopped = error instanceof NotWrittenError && error.stdioStopped;
       return new McplRequestError(
-        pipe
+        stdioStopped
           ? `The request wasn't sent: this host can no longer write to ${server}, so nothing ran. ${this.retryText()}`
           // Before the wire, the cause can pass (the stdio line closing as
           // the connection is lost) or stay (a tool's outputSchema the SDK
