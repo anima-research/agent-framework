@@ -817,6 +817,37 @@ export const BUILTIN_TOOLSET_TOOLS: ReadonlySet<string> = new Set([
   'workspace--status',
 ]);
 
+type ToolRoute =
+  | { kind: 'presentation' }
+  | { kind: 'host-act'; host: HostActTarget }
+  | { kind: 'toolset-act' }
+  | { kind: 'mcpl'; serverId: string; prefix: string }
+  | { kind: 'channel' }
+  | { kind: 'agent-settings' }
+  | { kind: 'save-image' }
+  | { kind: 'read-image' }
+  | { kind: 'fetch-reference' }
+  | { kind: 'gate-status' }
+  | { kind: 'tune-out' }
+  | { kind: 'subconscious' }
+  | { kind: 'sleep' }
+  | { kind: 'heartbeat' }
+  | { kind: 'wake-rule' }
+  | { kind: 'event-tags' }
+  | { kind: 'agent-verb' }
+  | { kind: 'code-execution' }
+  | { kind: 'drafts' }
+  | { kind: 'prose-help' }
+  | { kind: 'module' };
+
+function agentsOwnVerbRefusal(toolName: string): ToolResult {
+  return {
+    success: false,
+    error: `${toolName} is the agent's own, which a module's call can't make for it, so nothing was done.`,
+    isError: true,
+  };
+}
+
 type SettingsReading = {
   core: Record<string, string>;
   exts: Map<AgentSettingsExtension, { touched: readonly string[]; fields: Record<string, string> }>;
@@ -9507,20 +9538,21 @@ export class AgentFramework {
    * itself before it changes the host's mode, and refuses instead, unless
    * the call has `abandon` (writeDeferredWritesForQuiesce).
    */
-  private persistDeferredWrites(): void {
+  private persistDeferredWrites(): boolean {
     let outcome: DeferredWritesOutcome;
     try {
       outcome = this.writeDeferredWrites(this.quiesced);
     } catch (err) {
       console.error('[host-mode] failed to persist deferred context writes:', err);
       this.deferredWritesFellBehind({ error: err });
-      return;
+      return false;
     }
     if (outcome === 'over-cap') {
       this.deferredWritesFellBehind('over-cap');
-    } else if (outcome !== 'nothing') {
-      this.deferredWritesCaughtUp();
+      return false;
     }
+    if (outcome !== 'nothing') this.deferredWritesCaughtUp();
+    return true;
   }
 
   /**
@@ -12917,6 +12949,15 @@ export class AgentFramework {
       inputSchema: { type: 'object' },
     },
   ];
+
+  private static readonly WAKE_ADD_RULE_FIELDS: Readonly<Record<string, string>> = {
+    'behavior.debounce': 'debounceMs',
+    'behavior.rate_limit': 'rateLimit',
+    'behavior.passive_sample': 'passiveSample',
+    'behavior.judge': 'judge',
+    'position.before': 'insertBefore',
+    'position.after': 'insertAfter',
+  };
 
   /** Synthesized wake-rule tools: add/remove a gate.json policy at runtime.
    *  Present when a gate is wired. They write validated policies into the
@@ -26923,7 +26964,11 @@ export class AgentFramework {
 
   /**
    * Execute a tool call and return the result.
-   * Routes to the appropriate handler (module registry or MCPL).
+   * Routes it where the agent's own call of the name goes: to the
+   * framework's own tools the agent has (agent_settings, the workspace and
+   * gate tools, think, journal, prose_help and the rest), the channel tools,
+   * MCPL or the module registry. skip_reply, which ends the turn it's called
+   * in, is refused, since this call isn't made in one.
    * Its one caller in the framework is the operator's puppet
    * (puppetToolCall), which puts the agent's inline cap on the call as
    * resultMaxChars; a host may call it as well.
@@ -26970,8 +27015,11 @@ export class AgentFramework {
    *   wire ordering. For its own duration the puppet HOLDS the turn-alive
    *   marker (wakes requeue, cross-turn writers defer), so a wake landing
    *   during the tool's execution cannot start a turn underneath the pair.
-   * - Refused for tools outside the agent's own surface (canUseTool): the
-   *   stored pair must be an act the agent could genuinely have taken.
+   * - Refused for tools outside the agent's own surface (the tools it may
+   *   call, availableToolsForPresentation), and for skip_reply, by name or
+   *   through a toolsets--act that reaches it, which ends the turn it's
+   *   called in: the stored pair must be an act the agent could genuinely
+   *   have taken.
    * - The call executes FOR REAL through the shared dispatch (MCPL,
    *   channel tools, utils, modules) with the agent's provenance — a
    *   puppeted walk_to actually moves the avatar.
@@ -27023,12 +27071,19 @@ export class AgentFramework {
           `injecting a turn under an active stream corrupts wire ordering)`,
       );
     }
-    const onSurface = this.getToolsForAgent(agentName)
-      .some((t) => t.name === toolName && agent.canUseTool(t.name));
+    const onSurface = this.availableToolsForPresentation(agentName).some((t) => t.name === toolName);
     if (!onSurface) {
       throw new Error(
         `puppet refused: tool ${toolName} is not on ${agentName}'s surface — ` +
         `the stored pair must be an act the agent could genuinely have taken`,
+      );
+    }
+    const route = this.toolRoute({ id: '', name: toolName, input }, agentName);
+    const acting = route.kind === 'host-act' && route.host.kind === 'call' ? route.host.name : toolName;
+    if (acting === 'skip_reply') {
+      throw new Error(
+        "puppet refused: skip_reply ends the turn it's called in, and a puppeted call isn't made in one, " +
+        'so nothing was run or stored',
       );
     }
 
@@ -27169,96 +27224,123 @@ export class AgentFramework {
       return { success: false, error: marked, isError: true };
     }
 
-    if (isPresentationTool(call.name)) return this.editToolPresentation(call.callerAgentName ?? '__ephemeral__', call);
-    // Client-side programmatic tool calling for callers that await a tool's
-    // result: the puppet and a host through executeToolCall, and a module
-    // through callTool. Keyed by callerAgentName, so each agent's scripts are
-    // its own.
-    if (call.name === CODE_EXECUTION_TOOL_NAME && this.codeExecution) {
-      return this.runCodeExecution(call.callerAgentName ?? '__ephemeral__', call);
-    }
+    const subject = origin.kind === 'agent' ? origin.agentName : call.callerAgentName ?? '__ephemeral__';
+    const route = this.toolRoute(call, call.callerAgentName);
+    switch (route.kind) {
+      case 'presentation':
+        return this.editToolPresentation(call.callerAgentName ?? '__ephemeral__', call);
 
-    // toolsets--act on a host toolset's tool (the built-in one, a server's
-    // tab) goes where a programmatic call of that tool goes, under its name.
-    if (call.name === META_TOOL_NAMES.act && call.callerAgentName !== undefined) {
-      const host = this.hostPresentation?.resolveAct(call.callerAgentName, call.input) ?? null;
-      if (host?.kind === 'refused') return failed({ success: false, error: host.error, isError: true });
-      if (host?.kind === 'call') return this.executeToolCallFrom({ ...call, name: host.name, input: host.args }, origin);
-    }
+      // toolsets--act on a host toolset's tool (the built-in one, a server's
+      // tab) goes where a programmatic call of that tool goes, under its name.
+      case 'host-act':
+        if (route.host.kind === 'refused') return failed({ success: false, error: route.host.error, isError: true });
+        return this.executeToolCallFrom({ ...call, name: route.host.name, input: route.host.args }, origin);
 
-    // RFC-014: toolsets--act, resolved to the dynamic tool it calls, goes
-    // where a programmatic call of that tool goes, with its instance.
-    if (call.name === META_TOOL_NAMES.act && this.toolsetHub && this.mcplServerRegistry) {
-      const target = this.resolveToolsetAct(call);
-      if (!target.ok) return failed({ success: false, error: target.error, isError: true }, this.everyServerRedactor()(target.error));
-      if (origin.kind === 'agent') {
-        const failure = this.agentToolPermissionFailure(origin.agentName, target.call, false);
-        if (failure) return failed(failure, this.everyServerRedactor()(failure.error ?? ''));
+      // RFC-014: toolsets--act, resolved to the dynamic tool it calls, goes
+      // where a programmatic call of that tool goes, with its instance.
+      case 'toolset-act': {
+        const target = this.resolveToolsetAct(call);
+        if (!target.ok) return failed({ success: false, error: target.error, isError: true }, this.everyServerRedactor()(target.error));
+        if (origin.kind === 'agent') {
+          const failure = this.agentToolPermissionFailure(origin.agentName, target.call, false);
+          if (failure) return failed(failure, this.everyServerRedactor()(failure.error ?? ''));
+        }
+        return this.executeMcplToolCall(target.call, target.serverId, target.prefix);
       }
-      return this.executeMcplToolCall(target.call, target.serverId, target.prefix);
-    }
 
-    // MCPL tools go where the model's own call of the name goes, by the same
-    // resolver and with the prefix it matched: to the server whose listing
-    // has the name, else the longest matching prefix.
-    if (this.mcplServerRegistry) {
-      const mcpl = this.resolveMcplTool(call.name);
-      if (mcpl) return this.executeMcplToolCall(call, mcpl[0], mcpl[1]);
-    }
+      case 'mcpl':
+        return this.executeMcplToolCall(call, route.serverId, route.prefix);
 
-    // Synthesized channel tools. This route was missing: when
-    // subscription-GC moved off the retired MCPL unsubscribe tool onto the
-    // generic channel_close (discord-mcpl b095a9f), module-originated
-    // closes started failing downstream as "Invalid tool name format" —
-    // the janitor had been silently broken since. `origin` is trusted
-    // dispatch context established at the call boundary above, not
-    // inferred from which method was used: only the ModuleRegistry closure
-    // carries module provenance (see handleToolClose). The agent-only
-    // synthesized verbs (think, skip_reply) are deliberately not routed
-    // here.
-    if (call.name.startsWith('channel_') && this.channelRegistry) {
-      const turn = call.name === 'channel_publish' && call.callerAgentName ? this.callingTurnOf(call.callerAgentName, call) : undefined;
-      const input = call.name === 'channel_publish' && call.callerAgentName
-        ? this.publishInputWithTurnLocus(call.input, call.callerAgentName, turn)
-        : call.input;
-      return this.channelRegistry.handleChannelToolCall(call.name, input, origin.kind === 'agent' && turn ? { ...origin, inTurn: true } : origin);
-    }
+      // Synthesized channel tools. This route was missing: when
+      // subscription-GC moved off the retired MCPL unsubscribe tool onto the
+      // generic channel_close (discord-mcpl b095a9f), module-originated
+      // closes started failing downstream as "Invalid tool name format" —
+      // the janitor had been silently broken since. `origin` is trusted
+      // dispatch context established at the call boundary above, not
+      // inferred from which method was used: only the ModuleRegistry closure
+      // carries module provenance (see handleToolClose).
+      case 'channel': {
+        const turn = call.name === 'channel_publish' && call.callerAgentName ? this.callingTurnOf(call.callerAgentName, call) : undefined;
+        const input = call.name === 'channel_publish' && call.callerAgentName
+          ? this.publishInputWithTurnLocus(call.input, call.callerAgentName, turn)
+          : call.input;
+        return this.channelRegistry!.handleChannelToolCall(call.name, input, origin.kind === 'agent' && turn ? { ...origin, inTurn: true } : origin);
+      }
 
-    // drafts: the calling resident's own held drafts. A puppeted call has
-    // agent origin and acts on that resident's drafts, as the model's own
-    // call does through dispatchToolCall, but it isn't made inside the
-    // resident's turn, so it takes none of the turn's channels, engages none,
-    // and isn't noted as the resident's speech (callingTurnOf). A module
-    // holds no drafts.
-    if (call.name === 'drafts' && this.channelRegistry && origin.kind === 'agent') {
-      return this.draftsToolResult(origin.agentName, call.input);
-    }
+      case 'agent-settings':
+        return this.awaitedToolAnswer((deliver) => this.dispatchAgentSettingsToolCall(subject, call, deliver));
+      case 'save-image':
+        return this.awaitedToolAnswer((deliver) => this.dispatchSaveImageToolCall(subject, call, deliver));
+      case 'read-image':
+        return this.awaitedToolAnswer((deliver) => this.dispatchReadImageToolCall(subject, call, deliver));
+      case 'fetch-reference':
+        return this.awaitedToolAnswer((deliver) => this.dispatchFetchReferenceToolCall(subject, call, deliver));
+      case 'gate-status':
+        return this.awaitedToolAnswer((deliver) => this.dispatchGateToolCall(subject, call, deliver));
 
-    // The heartbeat's tools, for callers that await a tool's result (an
-    // in-process call, a puppet, a module's callTool). A module is trusted;
-    // an agent is held to what dispatch holds it to.
-    if (this.heartbeat?.ownsTool(call.name)) {
-      const refusal = origin.kind === 'module' ? null : this.heartbeatRefusal(call.callerAgentName ?? '__ephemeral__', call);
-      return refusal ? { success: false, error: refusal, isError: true } : this.runHeartbeatTool(call);
+      // The tune-out tool, in process: the same body the dispatcher runs, its
+      // answer awaited here (it can wait for the tune-out's transport).
+      case 'tune-out': {
+        const agentName = call.callerAgentName ?? this.primaryAgentName ?? '__ephemeral__';
+        const input = (call.input ?? {}) as Record<string, unknown>;
+        // The calling turn's own channels, as the channel tools read them here (origin.own).
+        const own = origin.kind === 'agent' ? origin.own ?? [] : [];
+        const turn = this.callingTurnOf(agentName, call);
+        return call.name === 'focus' ? this.handleFocusTool(agentName, input, own, turn) : this.handleTuneOutTool(agentName, input, own, turn);
+      }
+      case 'subconscious': {
+        const routed = this.readerToolCall(subject, call);
+        return 'refused' in routed ? failed({ success: false, error: `${routed.refused}, so the call didn't run.`, isError: true }) : routed.result;
+      }
+      case 'sleep':
+        return this.awaitedToolAnswer((deliver) => this.dispatchSleepToolCall(subject, call, deliver));
+
+      // The heartbeat's tools, for callers that await a tool's result (an
+      // in-process call, a puppet, a module's callTool). A module is trusted;
+      // an agent is held to what dispatch holds it to.
+      case 'heartbeat': {
+        const refusal = origin.kind === 'module' ? null : this.heartbeatRefusal(call.callerAgentName ?? '__ephemeral__', call);
+        return refusal ? { success: false, error: refusal, isError: true } : this.runHeartbeatTool(call);
+      }
+      case 'wake-rule':
+        return this.awaitedToolAnswer((deliver) => this.dispatchWakeRuleToolCall(subject, call, deliver));
+      case 'event-tags':
+        return this.awaitedToolAnswer((deliver) => this.dispatchEventTagsToolCall(subject, call, deliver));
+      case 'agent-verb':
+        if (origin.kind === 'module') return failed(agentsOwnVerbRefusal(call.name));
+        if (call.name === 'skip_reply') {
+          return failed({
+            success: false,
+            error: "skip_reply ends the turn it's called in, and this call wasn't made in a turn, so nothing was done.",
+            isError: true,
+          });
+        }
+        return this.channelRegistry!.handleChannelToolCall(call.name, call.input, origin);
+
+      // Client-side programmatic tool calling for callers that await a tool's
+      // result: the puppet and a host through executeToolCall, and a module
+      // through callTool. Keyed by callerAgentName, so each agent's scripts are
+      // its own.
+      case 'code-execution':
+        return this.runCodeExecution(call.callerAgentName ?? '__ephemeral__', call);
+
+      // drafts: the calling resident's own held drafts. A puppeted call has
+      // agent origin and acts on that resident's drafts, as the model's own
+      // call does through dispatchToolCall, but it isn't made inside the
+      // resident's turn, so it takes none of the turn's channels, engages none,
+      // and isn't noted as the resident's speech (callingTurnOf). A module
+      // holds no drafts.
+      case 'drafts':
+        if (origin.kind === 'module') return failed(agentsOwnVerbRefusal(call.name));
+        return this.draftsToolResult(origin.agentName, call.input);
+      case 'prose-help':
+        return { success: true, data: PROSE_ROUTING_HELP };
+      case 'module':
+        // Module tools. The caller uses the result in process, so it gets the
+        // module's own result, as the module returned it, less a refusal it
+        // claims, which is the dispatcher's to say.
+        return this.moduleRegistry.handleToolCall(call);
     }
-    // Module tools. The caller uses the result in process, so it gets the
-    // module's own result, as the module returned it, less a refusal it
-    // claims, which is the dispatcher's to say.
-    // The tune-out tool, in process: the same body the dispatcher runs, its
-    // answer awaited here (it can wait for the tune-out's transport).
-    if ((call.name === 'tune_out' || call.name === 'focus') && this.tuneOutCoordinator) {
-      const agentName = call.callerAgentName ?? this.primaryAgentName ?? '__ephemeral__';
-      const input = (call.input ?? {}) as Record<string, unknown>;
-      // The calling turn's own channels, as the channel tools read them here (origin.own).
-      const own = origin.kind === 'agent' ? origin.own ?? [] : [];
-      const turn = this.callingTurnOf(agentName, call);
-      return call.name === 'focus' ? this.handleFocusTool(agentName, input, own, turn) : this.handleTuneOutTool(agentName, input, own, turn);
-    }
-    if ((SUBCONSCIOUS_TOOL_NAMES as readonly string[]).includes(call.name)) {
-      const routed = this.readerToolCall(origin.kind === 'agent' ? origin.agentName : call.callerAgentName ?? '__ephemeral__', call);
-      return 'refused' in routed ? failed({ success: false, error: `${routed.refused}, so the call didn't run.`, isError: true }) : routed.result;
-    }
-    return this.moduleRegistry.handleToolCall(call);
   }
 
   /**
@@ -29105,6 +29187,53 @@ export class AgentFramework {
     return { name: call.name, cause: permitted || refused ? silenceCauseOf([call]) : null, refused, permitted };
   }
 
+  private toolRoute(call: ToolCall, actor: string | undefined): ToolRoute {
+    const name = call.name;
+    if (isPresentationTool(name)) return { kind: 'presentation' };
+    if (name === META_TOOL_NAMES.act) {
+      const host = actor === undefined ? null : this.hostPresentation?.resolveAct(actor, call.input) ?? null;
+      if (host) return { kind: 'host-act', host };
+      if (this.toolsetHub && this.mcplServerRegistry) return { kind: 'toolset-act' };
+    }
+    const mcpl = this.mcplServerRegistry ? this.resolveMcplTool(name) : null;
+    if (mcpl) return { kind: 'mcpl', serverId: mcpl[0], prefix: mcpl[1] };
+    if (name.startsWith('channel_') && this.channelRegistry) return { kind: 'channel' };
+    if (name === 'agent_settings') return { kind: 'agent-settings' };
+    if (name === 'save_recent_image') return { kind: 'save-image' };
+    if (name === 'read_image') return { kind: 'read-image' };
+    if (name === 'fetch_reference') return { kind: 'fetch-reference' };
+    if (name === 'gate_status' && this.eventGate) return { kind: 'gate-status' };
+    if ((name === 'tune_out' || name === 'focus') && this.tuneOutCoordinator) return { kind: 'tune-out' };
+    if ((SUBCONSCIOUS_TOOL_NAMES as readonly string[]).includes(name)) return { kind: 'subconscious' };
+    if ((name === 'sleep' || name === 'wake') && this.eventGate) return { kind: 'sleep' };
+    if (this.heartbeat?.ownsTool(name)) return { kind: 'heartbeat' };
+    if ((name === 'wake_add_rule' || name === 'wake_remove_rule') && this.eventGate) return { kind: 'wake-rule' };
+    if (name === 'event_tags' && this.eventGate) return { kind: 'event-tags' };
+    if ((name === 'think' || name === 'journal' || name === 'skip_reply') && this.channelRegistry) return { kind: 'agent-verb' };
+    if (name === CODE_EXECUTION_TOOL_NAME && this.codeExecution) return { kind: 'code-execution' };
+    if (name === 'drafts' && this.channelRegistry) return { kind: 'drafts' };
+    if (name === PROSE_HELP_TOOL.name) return { kind: 'prose-help' };
+    return { kind: 'module' };
+  }
+
+  private pushToolResult(agentName: string, call: ToolCall, moduleName: string): (result: ToolResult) => void {
+    return (result) => this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName, result });
+  }
+
+  private awaitedToolAnswer(run: (deliver: (result: ToolResult) => void) => void): Promise<ToolResult> {
+    return new Promise((resolve) => {
+      try {
+        run((result) => {
+          const answer = { ...result };
+          delete answer.refused;
+          resolve(answer);
+        });
+      } catch (error) {
+        resolve({ success: false, error: thrownText(error), isError: true });
+      }
+    });
+  }
+
   /**
    * Dispatch a call the agent made. `turnId` is the turn it was made in
    * (TurnRouting.turnId), as its caller knows it: a model's call, the turn
@@ -29155,217 +29284,207 @@ export class AgentFramework {
     const enrichedCall: ToolCall = { ...call, callerAgentName: agentName };
     if (turnId !== undefined) enrichedCall.callerTurnId = turnId;
     else delete enrichedCall.callerTurnId;
-    if (isPresentationTool(call.name)) {
-      const result = this.editToolPresentation(agentName, enrichedCall);
-      this.pushEvent({type:'tool-result',callId:call.id,toolName:call.name,agentName,moduleName:'tool-presentation',result});
-      return;
-    }
-
-
-    // toolsets--act on a host toolset's tool (the built-in one, a server's
-    // tab): the call of that tool, under its own name, down the path a
-    // direct call of it takes, permissions included.
-    if (enrichedCall.name === META_TOOL_NAMES.act) {
-      const host = this.hostPresentation?.resolveAct(agentName, enrichedCall.input) ?? null;
-      if (host) {
-        this.dispatchHostAct(agentName, call, host, turnId);
+    const route = this.toolRoute(enrichedCall, agentName);
+    switch (route.kind) {
+      case 'presentation': {
+        const result = this.editToolPresentation(agentName, enrichedCall);
+        this.pushEvent({type:'tool-result',callId:call.id,toolName:call.name,agentName,moduleName:'tool-presentation',result});
         return;
       }
-    }
 
-    // RFC-014: toolsets--act calls a server's dynamic tool, down the same
-    // path as a direct call of it (dispatchToolsetAct).
-    if (enrichedCall.name === META_TOOL_NAMES.act && this.toolsetHub && this.mcplServerRegistry) {
-      const scriptWaiter = this.scriptToolWaiters.get(enrichedCall.id);
-      if (scriptWaiter) scriptWaiter.route.toServer = true;
-      this.dispatchToolsetAct(agentName, enrichedCall);
-      return;
-    }
+      // toolsets--act on a host toolset's tool (the built-in one, a server's
+      // tab): the call of that tool, under its own name, down the path a
+      // direct call of it takes, permissions included.
+      case 'host-act':
+        this.dispatchHostAct(agentName, call, route.host, turnId);
+        return;
 
-    // Route MCPL tool calls to the appropriate server via prefix map
-    const mcplMatch = this.resolveMcplTool(enrichedCall.name);
-    if (mcplMatch && this.mcplServerRegistry) {
-      // A script's call: its waiter keeps that it went to a server, for the
-      // script lane's exit (scriptToolWaiters).
-      const scriptWaiter = this.scriptToolWaiters.get(enrichedCall.id);
-      if (scriptWaiter) scriptWaiter.route.toServer = true;
-      this.dispatchMcplToolCall(agentName, enrichedCall, mcplMatch[0], mcplMatch[1]);
-      return;
-    }
-
-    // Route synthesized channel tools
-    if (enrichedCall.name.startsWith('channel_') && this.channelRegistry) {
-      this.dispatchChannelToolCall(agentName, enrichedCall);
-      return;
-    }
-
-    if (enrichedCall.name === 'agent_settings') {
-      this.dispatchAgentSettingsToolCall(agentName, enrichedCall);
-      return;
-    }
-
-    if (enrichedCall.name === 'save_recent_image') {
-      this.dispatchSaveImageToolCall(agentName, enrichedCall);
-      return;
-    }
-
-    if (enrichedCall.name === 'read_image') {
-      this.dispatchReadImageToolCall(agentName, enrichedCall);
-      return;
-    }
-
-    if (enrichedCall.name === 'fetch_reference') {
-      this.dispatchFetchReferenceToolCall(agentName, enrichedCall);
-      return;
-    }
-
-    // Route gate_status tool
-    if (enrichedCall.name === 'gate_status' && this.eventGate) {
-      this.dispatchGateToolCall(agentName, enrichedCall);
-      return;
-    }
-
-    // Route the tune-out tool (residents) and the subconscious's surface
-    if ((enrichedCall.name === 'tune_out' || enrichedCall.name === 'focus') && this.tuneOutCoordinator) {
-      this.dispatchTuneOutToolCall(agentName, enrichedCall);
-      return;
-    }
-    if ((SUBCONSCIOUS_TOOL_NAMES as readonly string[]).includes(enrichedCall.name)) {
-      const routed = this.readerToolCall(agentName, enrichedCall);
-      if ('refused' in routed) {
-        const error = routed.refused;
-        const result = this.refusedResult(agentName, call.id, error);
-        this.emitTrace({ type: 'tool:failed', module: 'tune-out', tool: call.name, callId: call.id, error });
-        this.pushEvent({
-          type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'tune-out', result,
-        });
+      // RFC-014: toolsets--act calls a server's dynamic tool, down the same
+      // path as a direct call of it (dispatchToolsetAct).
+      case 'toolset-act': {
+        const scriptWaiter = this.scriptToolWaiters.get(enrichedCall.id);
+        if (scriptWaiter) scriptWaiter.route.toServer = true;
+        this.dispatchToolsetAct(agentName, enrichedCall);
         return;
       }
-      void routed.result
-        .then((result) => {
-          // Through pushEvent, like every other tool's result, so one that
-          // arrives after stop() is dropped rather than rejected unhandled.
+
+      case 'mcpl': {
+        // A script's call: its waiter keeps that it went to a server, for the
+        // script lane's exit (scriptToolWaiters).
+        const scriptWaiter = this.scriptToolWaiters.get(enrichedCall.id);
+        if (scriptWaiter) scriptWaiter.route.toServer = true;
+        this.dispatchMcplToolCall(agentName, enrichedCall, route.serverId, route.prefix);
+        return;
+      }
+
+      case 'channel': {
+        this.dispatchChannelToolCall(agentName, enrichedCall);
+        return;
+      }
+
+      case 'agent-settings': {
+        this.dispatchAgentSettingsToolCall(agentName, enrichedCall);
+        return;
+      }
+
+      case 'save-image': {
+        this.dispatchSaveImageToolCall(agentName, enrichedCall);
+        return;
+      }
+
+      case 'read-image': {
+        this.dispatchReadImageToolCall(agentName, enrichedCall);
+        return;
+      }
+
+      case 'fetch-reference': {
+        this.dispatchFetchReferenceToolCall(agentName, enrichedCall);
+        return;
+      }
+
+      case 'gate-status': {
+        this.dispatchGateToolCall(agentName, enrichedCall);
+        return;
+      }
+
+      case 'tune-out': {
+        this.dispatchTuneOutToolCall(agentName, enrichedCall);
+        return;
+      }
+      case 'subconscious': {
+        const routed = this.readerToolCall(agentName, enrichedCall);
+        if ('refused' in routed) {
+          const error = routed.refused;
+          const result = this.refusedResult(agentName, call.id, error);
+          this.emitTrace({ type: 'tool:failed', module: 'tune-out', tool: call.name, callId: call.id, error });
           this.pushEvent({
-            type: 'tool-result',
-            callId: enrichedCall.id,
-            toolName: enrichedCall.name,
-            agentName,
-            moduleName: 'tune-out',
-            result,
+            type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'tune-out', result,
           });
-        });
-      return;
-    }
-
-    // Route sleep / wake tools
-    if ((enrichedCall.name === 'sleep' || enrichedCall.name === 'wake') && this.eventGate) {
-      this.dispatchSleepToolCall(agentName, enrichedCall);
-      return;
-    }
-
-    // Route the heartbeat's tools (heartbeat--…)
-    if (this.heartbeat?.ownsTool(enrichedCall.name)) {
-      this.dispatchHeartbeatToolCall(agentName, enrichedCall);
-      return;
-    }
-
-    // Route wake-rule tools (runtime gate.json policy add/remove)
-    if ((enrichedCall.name === 'wake_add_rule' || enrichedCall.name === 'wake_remove_rule') && this.eventGate) {
-      this.dispatchWakeRuleToolCall(agentName, enrichedCall);
-      return;
-    }
-
-    // Route event_tags (tag/ontology discovery)
-    if (enrichedCall.name === 'event_tags' && this.eventGate) {
-      this.dispatchEventTagsToolCall(agentName, enrichedCall);
-      return;
-    }
-
-    // Route synthesized 'think' (private reasoning), 'journal' (private
-    // long-form notes) and 'skip_reply' (deliberate stay-silent) tools — handled by the channel registry like the other
-    // synthesized channel tools, but they aren't `channel_`-prefixed so they
-    // need an explicit route here.
-    if ((enrichedCall.name === 'think' || enrichedCall.name === 'journal' || enrichedCall.name === 'skip_reply') && this.channelRegistry) {
-      // skip_reply(wake_in_seconds): arm a gate self-wake so "not replying
-      // NOW" can also mean "back in a moment" — ends the turn, then wakes
-      // the agent after N seconds unless something else wakes it first
-      // (any turn start cancels the pending self-wake). Armed here because
-      // the framework owns the EventGate; the registry only words the
-      // confirmation. A wake the host can't set is refused, so the model
-      // learns that its turn remains open and no wake was armed: any
-      // wake_in_seconds without a gate, and one that isn't a number of
-      // seconds with one.
-      if (enrichedCall.name === 'skip_reply') {
-        const error = this.skipReplyRefusal(enrichedCall);
-        if (error !== undefined) {
-          const wakeValue = (enrichedCall.input as { wake_in_seconds?: unknown } | null | undefined)?.wake_in_seconds;
-          console.error(`[self-wake] agent=${agentName} wake_in_seconds=${logValue(wakeValue)} skip_reply refused: ${logDetail(this.eventGate ? "wake_in_seconds isn't a number of seconds" : 'No EventGate configured (FrameworkConfig.gate is unset)')}`);
-          const result = this.refusedResult(agentName, enrichedCall.id, error);
-          this.emitTrace({ type: 'tool:failed', module: 'channels', tool: enrichedCall.name, callId: enrichedCall.id, error });
-          this.pushEvent({ type: 'tool-result', callId: enrichedCall.id, toolName: enrichedCall.name, agentName, moduleName: 'channels', result });
           return;
         }
-        const skipping = this.callingTurnOf(agentName, enrichedCall);
-        if (skipping) {
-          skipping.privateEnd = true;
-          delete skipping.unpostedSpeech;
-        }
-        const wake = readSkipReplyWake(enrichedCall.input);
-        if (wake.kind === 'wake' && this.eventGate) {
-          const armedAt = Date.now();
-          const { inMs, armed } = this.eventGate.armSelfWake(agentName, wake.seconds, 'skip_reply');
-          // The heartbeat's tick or reminder due before the timer: if it wakes
-          // the agent, its turn cancels the timer, so the confirmation names
-          // it and the time the self-wake would have left.
-          const earlierWake = armed ? this.heartbeatWakeBefore(agentName, armedAt + inMs) : undefined;
-          console.error(armed
-            ? `[self-wake] agent=${agentName} armed in ${Math.round(inMs / 1000)}s (skip_reply)`
-              + (earlierWake ? `; due sooner, in ~${earlierWake.inSeconds}s: ${logDetail(earlierWake.what)}` : '')
-            : `[self-wake] agent=${agentName} not armed: the framework has stopped (skip_reply)`);
-          this.dispatchChannelToolCall(agentName, enrichedCall, earlierWake);
-          return;
-        }
+        void routed.result
+          .then((result) => {
+            // Through pushEvent, like every other tool's result, so one that
+            // arrives after stop() is dropped rather than rejected unhandled.
+            this.pushEvent({
+              type: 'tool-result',
+              callId: enrichedCall.id,
+              toolName: enrichedCall.name,
+              agentName,
+              moduleName: 'tune-out',
+              result,
+            });
+          });
+        return;
       }
-      this.dispatchChannelToolCall(agentName, enrichedCall);
-      return;
-    }
 
-    // Client-side programmatic tool calling: run a script that calls the
-    // agent's other tools in-process (script-inner calls come back through
-    // this very dispatcher with waiter-tracked call IDs).
-    if (enrichedCall.name === CODE_EXECUTION_TOOL_NAME && this.codeExecution) {
-      this.dispatchCodeExecutionToolCall(agentName, enrichedCall);
-      return;
-    }
+      case 'sleep': {
+        this.dispatchSleepToolCall(agentName, enrichedCall);
+        return;
+      }
 
-    // drafts: the resident's own held drafts (list/read/resend/dismiss).
-    // Answered by the framework; resend publishes through the registry's
-    // publish executor, so the result arrives asynchronously.
-    if (enrichedCall.name === 'drafts' && this.channelRegistry) {
-      const startedAt = Date.now();
-      this.emitTrace({ type: 'tool:started', module: 'framework', tool: 'drafts', callId: enrichedCall.id, input: enrichedCall.input });
-      void this.draftsToolResult(agentName, enrichedCall.input, this.callingTurnOf(agentName, enrichedCall), enrichedCall.id)
-        .then((result) => {
-          this.emitTrace({ type: 'tool:completed', module: 'framework', tool: 'drafts', callId: enrichedCall.id, durationMs: Date.now() - startedAt });
-          this.pushEvent({ type: 'tool-result', callId: enrichedCall.id, toolName: enrichedCall.name, agentName, moduleName: 'framework', result });
+      case 'heartbeat': {
+        this.dispatchHeartbeatToolCall(agentName, enrichedCall);
+        return;
+      }
+
+      case 'wake-rule': {
+        this.dispatchWakeRuleToolCall(agentName, enrichedCall);
+        return;
+      }
+
+      case 'event-tags': {
+        this.dispatchEventTagsToolCall(agentName, enrichedCall);
+        return;
+      }
+
+      case 'agent-verb': {
+        // skip_reply(wake_in_seconds): arm a gate self-wake so "not replying
+        // NOW" can also mean "back in a moment" — ends the turn, then wakes
+        // the agent after N seconds unless something else wakes it first
+        // (any turn start cancels the pending self-wake). Armed here because
+        // the framework owns the EventGate; the registry only words the
+        // confirmation. A wake the host can't set is refused, so the model
+        // learns that its turn remains open and no wake was armed: any
+        // wake_in_seconds without a gate, and one that isn't a number of
+        // seconds with one.
+        if (enrichedCall.name === 'skip_reply') {
+          const error = this.skipReplyRefusal(enrichedCall);
+          if (error !== undefined) {
+            const wakeValue = (enrichedCall.input as { wake_in_seconds?: unknown } | null | undefined)?.wake_in_seconds;
+            console.error(`[self-wake] agent=${agentName} wake_in_seconds=${logValue(wakeValue)} skip_reply refused: ${logDetail(this.eventGate ? "wake_in_seconds isn't a number of seconds" : 'No EventGate configured (FrameworkConfig.gate is unset)')}`);
+            const result = this.refusedResult(agentName, enrichedCall.id, error);
+            this.emitTrace({ type: 'tool:failed', module: 'channels', tool: enrichedCall.name, callId: enrichedCall.id, error });
+            this.pushEvent({ type: 'tool-result', callId: enrichedCall.id, toolName: enrichedCall.name, agentName, moduleName: 'channels', result });
+            return;
+          }
+          const skipping = this.callingTurnOf(agentName, enrichedCall);
+          if (skipping) {
+            skipping.privateEnd = true;
+            delete skipping.unpostedSpeech;
+          }
+          const wake = readSkipReplyWake(enrichedCall.input);
+          if (wake.kind === 'wake' && this.eventGate) {
+            const armedAt = Date.now();
+            const { inMs, armed } = this.eventGate.armSelfWake(agentName, wake.seconds, 'skip_reply');
+            // The heartbeat's tick or reminder due before the timer: if it wakes
+            // the agent, its turn cancels the timer, so the confirmation names
+            // it and the time the self-wake would have left.
+            const earlierWake = armed ? this.heartbeatWakeBefore(agentName, armedAt + inMs) : undefined;
+            console.error(armed
+              ? `[self-wake] agent=${agentName} armed in ${Math.round(inMs / 1000)}s (skip_reply)`
+                + (earlierWake ? `; due sooner, in ~${earlierWake.inSeconds}s: ${logDetail(earlierWake.what)}` : '')
+              : `[self-wake] agent=${agentName} not armed: the framework has stopped (skip_reply)`);
+            this.dispatchChannelToolCall(agentName, enrichedCall, earlierWake);
+            return;
+          }
+        }
+        this.dispatchChannelToolCall(agentName, enrichedCall);
+        return;
+      }
+
+      // Client-side programmatic tool calling: run a script that calls the
+      // agent's other tools in-process (script-inner calls come back through
+      // this very dispatcher with waiter-tracked call IDs).
+      case 'code-execution': {
+        this.dispatchCodeExecutionToolCall(agentName, enrichedCall);
+        return;
+      }
+
+      // drafts: the resident's own held drafts (list/read/resend/dismiss).
+      // Answered by the framework; resend publishes through the registry's
+      // publish executor, so the result arrives asynchronously.
+      case 'drafts': {
+        const startedAt = Date.now();
+        this.emitTrace({ type: 'tool:started', module: 'framework', tool: 'drafts', callId: enrichedCall.id, input: enrichedCall.input });
+        void this.draftsToolResult(agentName, enrichedCall.input, this.callingTurnOf(agentName, enrichedCall), enrichedCall.id)
+          .then((result) => {
+            this.emitTrace({ type: 'tool:completed', module: 'framework', tool: 'drafts', callId: enrichedCall.id, durationMs: Date.now() - startedAt });
+            this.pushEvent({ type: 'tool-result', callId: enrichedCall.id, toolName: enrichedCall.name, agentName, moduleName: 'framework', result });
+          });
+        return;
+      }
+
+      // prose_help: on-demand routing reference for explicit-prose agents.
+      // Answered inline — the grammar is a tool RESULT (model-requested), never
+      // ambient context (see PROSE_ROUTING_HELP / teach-by-bounce).
+      case 'prose-help': {
+        this.emitTrace({ type: 'tool:completed', module: 'framework', tool: 'prose_help', callId: enrichedCall.id, durationMs: 0 });
+        this.pushEvent({
+          type: 'tool-result',
+          callId: enrichedCall.id,
+          toolName: enrichedCall.name,
+          agentName,
+          moduleName: 'framework',
+          result: { success: true, data: PROSE_ROUTING_HELP },
         });
-      return;
-    }
+        return;
+      }
 
-    // prose_help: on-demand routing reference for explicit-prose agents.
-    // Answered inline — the grammar is a tool RESULT (model-requested), never
-    // ambient context (see PROSE_ROUTING_HELP / teach-by-bounce).
-    if (enrichedCall.name === 'prose_help') {
-      this.emitTrace({ type: 'tool:completed', module: 'framework', tool: 'prose_help', callId: enrichedCall.id, durationMs: 0 });
-      this.pushEvent({
-        type: 'tool-result',
-        callId: enrichedCall.id,
-        toolName: enrichedCall.name,
-        agentName,
-        moduleName: 'framework',
-        result: { success: true, data: PROSE_ROUTING_HELP },
-      });
-      return;
+      case 'module':
+        break;
+      default:
+        route satisfies never;
     }
 
     const sepIndex = enrichedCall.name.indexOf('--');
@@ -32038,7 +32157,13 @@ export class AgentFramework {
           if (!coordinator) return undefined;
           const scope = coordinator.getAllExcept();
           if (!scope || scope.params.except.serverId !== serverId || scope.params.except.channelId !== channelId) return undefined;
-          coordinator.cancelAllExcept('channel-close', 'the excepted channel was closed');
+          let released: ReturnType<typeof coordinator.cancelAllExcept>;
+          try {
+            released = coordinator.cancelAllExcept('channel-close', 'the excepted channel was closed');
+          } catch (err) {
+            throw new Error(`The close wasn't recorded: ${err instanceof Error ? err.message : String(err)}`);
+          }
+          if (!released.ok) throw new Error(`The close wasn't recorded: ${released.error}`);
           return 'The focus on it ended all the same, and what the other channels held was delivered.';
         },
         focusChannelResolver: () => this.tuneOutCoordinator?.focusChannel() ?? null,
@@ -36411,7 +36536,7 @@ export class AgentFramework {
    * (same path as gate.json load), so an invalid rule is surfaced as a tool
    * error and nothing is written.
    */
-  private dispatchWakeRuleToolCall(agentName: string, call: ToolCall): void {
+  private dispatchWakeRuleToolCall(agentName: string, call: ToolCall, deliver = this.pushToolResult(agentName, call, 'gate')): void {
     this.emitTrace({ type: 'tool:started', module: 'gate', tool: call.name, callId: call.id, input: call.input });
     // What wake_add_rule's input held that does nothing, checkToolInput's notes and
     // then the gate's on a rule it saved: a refusal names it too, so the call that
@@ -36422,14 +36547,23 @@ export class AgentFramework {
       const said = given.error && !/[.!?]$/.test(given.error) ? `${given.error}.` : given.error;
       const result = given.isError && ignored.length > 0 ? { ...given, error: [said, ...ignored].join(' ') } : given;
       this.traceToolOutcome('gate', call.name, call.id, result, 0);
-      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'gate', result });
+      deliver(result);
     };
 
     try {
       if (call.name === 'wake_remove_rule') {
         const input = (call.input ?? {}) as { name?: unknown };
         if (typeof input.name !== 'string' || !input.name) {
-          finish({ success: false, error: 'wake_remove_rule: `name` (string) is required', isError: true });
+          const edit = this.eventGate!.ruleNamesForChange();
+          const names = 'names' in edit ? edit.names.map((name) => quotedValue(name)) : [];
+          finish({
+            success: false,
+            error: `wake_remove_rule: name is ${shownValue(input.name)}, where the name of a rule is needed, so nothing was removed. `
+              + ('refused' in edit
+                ? edit.refused
+                : (names.length > 0 ? `The rules a change edits are ${names.join(', ')}.` : 'There is no rule to remove.') + edit.note),
+            isError: true,
+          });
           return;
         }
         const removed = this.removeGatePolicy(input.name);
@@ -36466,9 +36600,8 @@ export class AgentFramework {
       if (behaviorSources.length === 0) {
         finish({
           success: false,
-          error: this.judgeWired
-            ? 'wake_add_rule: specify exactly one behavior — `behavior` ("always"/"defer"/"skip"), `debounceMs`, `rateLimit`, `passiveSample`, or `judge`.'
-            : 'wake_add_rule: specify exactly one behavior — `behavior` ("always"/"defer"/"skip"), `debounceMs`, `rateLimit`, or `passiveSample`.',
+          error: 'wake_add_rule got no behavior, so nothing was saved. Give one of behavior ("always", "defer" or "skip"), '
+            + (this.judgeWired ? 'debounceMs, rateLimit, passiveSample or judge.' : 'debounceMs, rateLimit or passiveSample.'),
           isError: true,
         });
         return;
@@ -36476,7 +36609,7 @@ export class AgentFramework {
       if (behaviorSources.length > 1) {
         finish({
           success: false,
-          error: `wake_add_rule: give only one behavior, got [${behaviorSources.join(', ')}].`,
+          error: `wake_add_rule got more than one behavior (${behaviorSources.join(', ')}), so nothing was saved. Give only one of them.`,
           isError: true,
         });
         return;
@@ -36519,7 +36652,7 @@ export class AgentFramework {
       if (placementSources.length > 1) {
         finish({
           success: false,
-          error: `wake_add_rule: give at most one placement, got [${placementSources.join(', ')}].`,
+          error: `wake_add_rule got more than one placement (${placementSources.join(', ')}), so nothing was saved. Give only one of them.`,
           isError: true,
         });
         return;
@@ -36539,10 +36672,18 @@ export class AgentFramework {
       for (const field of ['insertBefore', 'insertAfter'] as const) {
         const anchor = input[field];
         if (anchor !== undefined && (typeof anchor !== 'string' || anchor.length === 0)) {
+          const edit = this.eventGate!.ruleNamesForChange();
+          const names = 'names' in edit ? edit.names.filter((name) => name !== input.name).map((name) => quotedValue(name)) : [];
           finish({
             success: false,
-            error: `wake_add_rule: ${field} must be the name of a rule, and it's ${shownValue(anchor)}, so nothing `
-              + `was saved. The rules are: [${this.getGatePolicyNames().join(', ')}].`,
+            error: `wake_add_rule: ${field} must be the name of a rule, and it's ${shownValue(anchor)}, so nothing was saved. `
+              + ('refused' in edit
+                ? edit.refused
+                : (names.length > 0
+                  ? `The other rules a change edits are ${names.join(', ')}. Give ${field} one of them to place the rule beside it, or leave it out`
+                  : `There is no other rule to place it beside, so leave ${field} out`)
+                  + ' to add the rule at the end, or, where a rule already has its name, to replace that rule where it is.'
+                  + edit.note),
             isError: true,
           });
           return;
@@ -36572,9 +36713,12 @@ export class AgentFramework {
       const before = new Map(
         this.eventGate!.probeTable().map((r) => [r.probe, r]),
       );
-      const policy = this.addGatePolicy(rawPolicy, {
+      const fieldNames = Object.fromEntries(Object.entries(AgentFramework.WAKE_ADD_RULE_FIELDS)
+        .filter(([field]) => !(field.startsWith('behavior.') && typeof input.behavior === 'object')));
+      const policy = this.eventGate!.addPolicy(rawPolicy, {
         ...(position ? { position } : {}),
         onIgnoredFields: (notes) => { ignored.push(...notes); },
+        fieldNames,
       });
       const after = this.eventGate!.probeTable();
       const probes = after.map((r) => {
@@ -36887,21 +37031,19 @@ export class AgentFramework {
     return decision;
   }
 
-  /**
-   * Make delivered messages durable now, including those the delivery left
-   * in the deferred queue: a tune-out release flips durable epoch state
-   * first, so its dump must not be lost to a crash in between (#232 gap 6).
-   */
-  private commitDeliveries(): void {
+  private commitDeliveries(): boolean {
+    let durable = true;
     if (this.deferredMessages.length > 0) {
       this.deferredWritesPersisted = true;
-      this.persistDeferredWrites();
+      durable = this.persistDeferredWrites();
     }
     try {
       this.store.sync();
     } catch (err) {
       console.error('[tune-out] could not sync the store after a release:', err);
+      return false;
     }
+    return durable;
   }
 
   /** The history-reading tool the primary resident actually has, if any (#232 gap 11). */
@@ -36912,7 +37054,7 @@ export class AgentFramework {
     return names.find((n) => /(^|--)(fetch_history|channel_read|read_history|history)$/.test(n)) ?? null;
   }
 
-  private dispatchSleepToolCall(agentName: string, call: ToolCall): void {
+  private dispatchSleepToolCall(agentName: string, call: ToolCall, deliver = this.pushToolResult(agentName, call, 'gate')): void {
     // The gate's sleep quiets the whole agent, every conversation of it, so a
     // conversation fork or an ephemeral run neither sets one nor ends the
     // agent's own. Refused before the tool runs, as a fork's channel_open is.
@@ -36931,7 +37073,7 @@ export class AgentFramework {
         ? `Nothing was set: a sleep quiets the whole agent, not one ${one}.${comeBack}`
         : `Nothing was changed: a sleep is the agent's, so this ${one} can't end one.`;
       this.emitTrace({ type: 'tool:failed', module: 'gate', tool: call.name, callId: call.id, error: `${agentName}: ${error}` });
-      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'gate', result: this.refusedResult(agentName, call.id, error) });
+      deliver(this.refusedResult(agentName, call.id, error));
       return;
     }
     this.emitTrace({ type: 'tool:started', module: 'gate', tool: call.name, callId: call.id, input: call.input });
@@ -36940,7 +37082,7 @@ export class AgentFramework {
 
     const finish = (result: ToolResult) => {
       this.emitTrace({ type: 'tool:completed', module: 'gate', tool: call.name, callId: call.id, durationMs: 0 });
-      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'gate', result });
+      deliver(result);
     };
 
     if (call.name === 'wake') {
@@ -37060,44 +37202,45 @@ export class AgentFramework {
    */
   /** RFC-005 on-demand dereference: [ref id] → workspace file, via the
    *  origin-bound, ceiling-bounded, digest-verified host fetcher. */
-  private dispatchFetchReferenceToolCall(agentName: string, call: ToolCall): void {
+  private dispatchFetchReferenceToolCall(agentName: string, call: ToolCall, deliver = this.pushToolResult(agentName, call, 'workspace')): void {
     this.emitTrace({ type: 'tool:started', module: 'workspace', tool: call.name, callId: call.id, input: call.input });
     const startTime = Date.now();
     void (async () => {
-      const args = (call.input ?? {}) as Record<string, unknown>;
-      const refId = String(args.ref_id ?? '');
-      const record = referenceRegistry.get(refId);
       let result: { success: boolean; data?: string; error?: string; isError?: boolean };
-      if (!record) {
-        // Vector 20: a stale or unknown id is a defined miss, never a
-        // different record.
-        result = { success: false, isError: true,
-          error: `unknown reference: ${refId || '(missing ref_id)'} — it may have been evicted; ids are never reused` };
-      } else {
-        const maxBytes = typeof args.max_bytes === 'number'
-          ? Math.min(args.max_bytes, DEFAULT_FETCH_MAX_BYTES) : undefined;
-        const outcome = await this.getReferenceFetcher().fetch(record, { maxBytes });
-        result = outcome.ok
-          ? { success: true, data: JSON.stringify({ path: outcome.path, bytes: outcome.bytes,
-              mime_type: outcome.mimeType, digest_verified: outcome.digestVerified ?? 'no digest claimed' }) }
-          // The fetcher says what happened as a clause about the reference,
-          // and what calling again can do as a sentence of its own.
-          : { success: false, isError: true,
-              error: `fetch_reference couldn't fetch "${refId}": ${outcome.error}. ${outcome.remedy}` };
+      try {
+        const args = (call.input ?? {}) as Record<string, unknown>;
+        const refId = String(args.ref_id ?? '');
+        const record = referenceRegistry.get(refId);
+        if (!record) {
+          // Vector 20: a stale or unknown id is a defined miss, never a
+          // different record.
+          result = { success: false, isError: true,
+            error: `unknown reference: ${refId || '(missing ref_id)'} — it may have been evicted; ids are never reused` };
+        } else {
+          const maxBytes = typeof args.max_bytes === 'number'
+            ? Math.min(args.max_bytes, DEFAULT_FETCH_MAX_BYTES) : undefined;
+          const outcome = await this.getReferenceFetcher().fetch(record, { maxBytes });
+          result = outcome.ok
+            ? { success: true, data: JSON.stringify({ path: outcome.path, bytes: outcome.bytes,
+                mime_type: outcome.mimeType, digest_verified: outcome.digestVerified ?? 'no digest claimed' }) }
+            // The fetcher says what happened as a clause about the reference,
+            // and what calling again can do as a sentence of its own.
+            : { success: false, isError: true,
+                error: `fetch_reference couldn't fetch "${refId}": ${outcome.error}. ${outcome.remedy}` };
+        }
+      } catch (error) {
+        result = { success: false, isError: true, error: `fetch_reference couldn't answer: ${thrownText(error)}` };
       }
       this.traceToolOutcome('workspace', call.name, call.id, result, Date.now() - startTime);
-      this.pushEvent({
-        type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'workspace',
-        result: { ...result, isError: result.isError ?? false },
-      });
+      deliver({ ...result, isError: result.isError ?? false });
     })();
   }
 
-  private dispatchReadImageToolCall(agentName: string, call: ToolCall): void {
+  private dispatchReadImageToolCall(agentName: string, call: ToolCall, deliver = this.pushToolResult(agentName, call, 'workspace')): void {
     this.emitTrace({ type: 'tool:started', module: 'workspace', tool: call.name, callId: call.id, input: call.input });
     const finish = (result: ToolResult): void => {
       this.traceToolOutcome('workspace', call.name, call.id, result, 0);
-      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'workspace', result });
+      deliver(result);
     };
     void (async (): Promise<void> => {
       try {
@@ -37189,13 +37332,11 @@ export class AgentFramework {
    * every sibling in the round to settle; if one never does, fail closed
    * rather than trust an index the batch may still change. Sibling saves
    * produce no images and are not waited on (two saves in one batch would
-   * otherwise deadlock into a double timeout). A script's own calls
-   * (`pytc-…`) skip the barrier: the batch's pending siblings include the
-   * code_execution call running that script, so waiting on them would wait
-   * on itself.
+   * otherwise deadlock into a double timeout). Only the round's own calls
+   * wait: a call that isn't among its pending calls, a script's (`pytc-…`)
+   * or an awaited call's, counts the images the agent has now.
    */
   private async awaitSiblingToolCalls(agent: Agent, call: ToolCall): Promise<void> {
-    if (call.id.startsWith('pytc-')) return;
     const BARRIER_MS = 120_000;
     const POLL_MS = 20;
     const startedAt = Date.now();
@@ -37203,6 +37344,7 @@ export class AgentFramework {
       const state = agent.state;
       // Idle (puppet path) or the round was torn down: nothing to wait on.
       if (state.status !== 'waiting_for_tools') return;
+      if (!state.pending.has(call.id)) return;
       const open = [...state.pending.values()].filter((p) => p.id !== call.id && p.name !== 'save_recent_image');
       if (open.length === 0) return;
       if (Date.now() - startedAt > BARRIER_MS) {
@@ -37231,11 +37373,11 @@ export class AgentFramework {
    * nothing. It never slides to an older image — a filename must not
    * authenticate bytes from another surface.
    */
-  private dispatchSaveImageToolCall(agentName: string, call: ToolCall): void {
+  private dispatchSaveImageToolCall(agentName: string, call: ToolCall, deliver = this.pushToolResult(agentName, call, 'workspace')): void {
     this.emitTrace({ type: 'tool:started', module: 'workspace', tool: call.name, callId: call.id, input: call.input });
     const finish = (result: ToolResult): void => {
       this.traceToolOutcome('workspace', call.name, call.id, result, 0);
-      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'workspace', result });
+      deliver(result);
     };
     type Candidate =
       | { kind: 'attachment'; data: string | null; mediaType: string; messagesBack: number }
@@ -37680,7 +37822,7 @@ export class AgentFramework {
       : `Changed before the refusal: ${changed.join(', ')}; no other setting reads differently.`;
   }
 
-  private dispatchAgentSettingsToolCall(agentName: string, call: ToolCall): void {
+  private dispatchAgentSettingsToolCall(agentName: string, call: ToolCall, deliver = this.pushToolResult(agentName, call, 'agent')): void {
     this.emitTrace({
       type: 'tool:started',
       module: 'agent',
@@ -37861,14 +38003,7 @@ export class AgentFramework {
       };
     }
     this.traceToolOutcome('agent', call.name, call.id, result, 0);
-    this.pushEvent({
-      type: 'tool-result',
-      callId: call.id,
-      toolName: call.name,
-      agentName,
-      moduleName: 'agent',
-      result,
-    });
+    deliver(result);
   }
 
   /** Aggregate the event-tag vocabulary: reserved chat:* core + each connected
@@ -37893,7 +38028,7 @@ export class AgentFramework {
     };
   }
 
-  private dispatchEventTagsToolCall(agentName: string, call: ToolCall): void {
+  private dispatchEventTagsToolCall(agentName: string, call: ToolCall, deliver = this.pushToolResult(agentName, call, 'gate')): void {
     this.emitTrace({ type: 'tool:started', module: 'gate', tool: call.name, callId: call.id, input: call.input });
     let result: import('./types/events.js').ToolResult;
     try {
@@ -37905,10 +38040,10 @@ export class AgentFramework {
       this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
       result = { success: false, error: err.message, isError: true };
     }
-    this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'gate', result });
+    deliver(result);
   }
 
-  private dispatchGateToolCall(agentName: string, call: ToolCall): void {
+  private dispatchGateToolCall(agentName: string, call: ToolCall, deliver = this.pushToolResult(agentName, call, 'gate')): void {
     this.emitTrace({ type: 'tool:started', module: 'gate', tool: call.name, callId: call.id, input: call.input });
     const startTime = Date.now();
 
@@ -37916,27 +38051,13 @@ export class AgentFramework {
       .then((result) => {
         const durationMs = Date.now() - startTime;
         this.emitTrace({ type: 'tool:completed', module: 'gate', tool: call.name, callId: call.id, durationMs });
-        this.pushEvent({
-          type: 'tool-result',
-          callId: call.id,
-          toolName: call.name,
-          agentName,
-          moduleName: 'gate',
-          result,
-        });
+        deliver(result);
       })
       .catch((error) => {
         const err = error instanceof Error ? error : new Error(String(error));
         this.emitTrace({ type: 'tool:failed', module: 'gate', tool: call.name, callId: call.id, error: err.message });
         this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
-        this.pushEvent({
-          type: 'tool-result',
-          callId: call.id,
-          toolName: call.name,
-          agentName,
-          moduleName: 'gate',
-          result: { success: false, error: err.message, isError: true },
-        });
+        deliver({ success: false, error: err.message, isError: true });
       });
   }
 

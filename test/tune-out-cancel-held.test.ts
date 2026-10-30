@@ -33,17 +33,19 @@ const textOf = (content: ContentBlock[]): string =>
 function cancelWith(opts: { backlogCap: number; source: string; stored: Row[]; held: Row[]; note?: string }) {
   const added: Added[] = [];
   const inferences: string[] = [];
+  const tunedOut = {
+    params: { epochId: 'eA', cadenceSeconds: 300, backlogCap: opts.backlogCap, maxWakes: 3, startedAtSequence: 0 },
+    wakeCount: 0,
+  };
+  let ended = false;
   const registry = {
     // No other tune-out or all-except hold, and nothing else stored.
-    getTuneOutState: () => null,
+    getTuneOutState: (_serverId: string, channelId: string) => (!ended && channelId === 'disc:guild:a' ? tunedOut : null),
     readCoordinatorState: () => null,
     // Each channel's id is unique here, so it's shown by its id.
     nameShown: (channel: { channelId: string }) => channel.channelId,
     quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
-    cancelTuneOut: () => ({
-      params: { epochId: 'eA', cadenceSeconds: 300, backlogCap: opts.backlogCap, maxWakes: 3, startedAtSequence: 0 },
-      wakeCount: 0,
-    }),
+    cancelTuneOut: () => { ended = true; return tunedOut; },
   };
   const hooks = {
     addMessage: (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, forAgent?: string) => {

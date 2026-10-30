@@ -81,13 +81,15 @@ describe('a tune-out\'s dump of what it held', () => {
   it('shows each author on its line, and quotes what was said as it was stored, the host\'s own placeholder plain', () => {
     const added: Array<{ content: ContentBlock[]; metadata?: Record<string, unknown> }> = [];
     const row = (author: string, text: string) => ({ participant: 'user', content: [{ type: 'text', text } as ContentBlock], metadata: { author: { name: author }, tuneOut: { epochId: 'eA' } } });
+    const tunedOut = { params: { epochId: 'eA', cadenceSeconds: 300, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 }, wakeCount: 0 };
+    let ended = false;
     const coordinator = new TuneOutCoordinator({
       // No other tune-out or all-except hold, and nothing else stored.
-      getTuneOutState: () => null,
+      getTuneOutState: (_s: string, c: string) => (!ended && c === 'disc:guild:a' ? tunedOut : null),
       readCoordinatorState: () => null,
       nameShown: (channel: { channelId: string }) => channel.channelId,
       quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
-      cancelTuneOut: () => ({ params: { epochId: 'eA', cadenceSeconds: 300, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 }, wakeCount: 0 }),
+      cancelTuneOut: () => { ended = true; return tunedOut; },
     } as never, {} as never, {
       addMessage: (_participant: string, content: ContentBlock[], metadata?: Record<string, unknown>) => { added.push({ content, ...(metadata ? { metadata } : {}) }); },
       requestInference: () => {},
@@ -122,13 +124,15 @@ describe('a tune-out\'s dump of what it held', () => {
     let cuts = 0;
     for (const words of CUT_INTO) for (let room = 60; room <= 700; room++) {
       const added: Array<{ content: ContentBlock[]; metadata?: Record<string, unknown> }> = [];
+      const tunedOut = { params: { epochId: 'eA', cadenceSeconds: 300, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 }, wakeCount: 0 };
+      let ended = false;
       const coordinator = new TuneOutCoordinator({
         // No other tune-out or all-except hold, and nothing else stored.
-        getTuneOutState: () => null,
+        getTuneOutState: (_s: string, c: string) => (!ended && c === 'disc:guild:a' ? tunedOut : null),
         readCoordinatorState: () => null,
         nameShown: (channel: { channelId: string }) => channel.channelId,
         quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
-        cancelTuneOut: () => ({ params: { epochId: 'eA', cadenceSeconds: 300, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 }, wakeCount: 0 }),
+        cancelTuneOut: () => { ended = true; return tunedOut; },
       } as never, {} as never, {
         addMessage: (_participant: string, content: ContentBlock[], metadata?: Record<string, unknown>) => { added.push({ content, ...(metadata ? { metadata } : {}) }); },
         requestInference: () => {},
