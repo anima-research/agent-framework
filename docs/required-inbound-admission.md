@@ -33,7 +33,8 @@ maintainer review: `MAX_ADMISSION_TIMEOUT_MS = 60000`
 and `MAX_PENDING_ADMISSIONS = 64`. Timeout must be an integer in 1..60000;
 invalid configuration cannot start the connection. Each connection has its own
 budget (including attestation/validation); overload returns `admission_denied`
-without queueing. Channel-batch items run sequentially with independent deadlines.
+without queueing. Channel-batch items run sequentially with independent deadlines,
+so a whole batch can take roughly its item count times `timeoutMs`.
 Timeout aborts the signal and discards late results. Callbacks must cooperate with
 cancellation, avoid framework mutation/reentrancy and protect their own external
 effects. JavaScript timers cannot preempt a synchronous infinite loop or undo an
@@ -67,7 +68,7 @@ refusal. `mayWake: false` skips wake policy and caps downstream wake requests;
 but a module may request inference just as on an unconfigured connection. The cap
 is only `mayWake: false`. It is **not** context-only delivery and does not suppress existing open/locus
 maintenance. Pushes run preflight after feature authorization, before deduplication,
-notices, coalescing or queueing. Inference requests run admission after feature and loop checks, before model
+notices or queueing. Inference requests run admission after feature and loop checks, before model
 resolution; false `mayWake` is `admission_denied` and sends no chunks.
 Pending inference admission belongs to the request lifetime: stop cancels it and
 answers once with the existing stopped-request error while the transport is live.
@@ -83,8 +84,8 @@ Admission refusals after the handshake are itemwise channel results, push `{ acc
 results, or inference JSON-RPC errors with code -32600 and the fixed reason.
 Every admission refusal, including notifications, emits the lane's existing
 rejection trace (`mcpl:channel-incoming-rejected`, `mcpl:push-event-rejected`, or
-`mcpl:inference_fail`) with the fixed refusal code. A diagnostic line is limited
-to once per minute per server/lane/code, with suppressed counts on the next line.
+`mcpl:inference_fail`) with the fixed refusal code. Repeated diagnostic lines are rate-limited per server/lane/code at each refusal
+boundary, with suppressed counts on the next line.
 Neither payload nor callback exception text is logged. Notifications have no wire
 receipt; no application status is sent for a refusal.
 
