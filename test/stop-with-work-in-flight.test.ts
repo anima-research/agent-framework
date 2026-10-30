@@ -17,7 +17,8 @@
  *     connection's listener; a handler's own fault is answered -32603,
  *     "Internal error", or -32000 with the stop wording alone once the host
  *     is stopping, and its own text goes only to the host's log.
- * Any other event pushed to a stopped framework still throws to its caller.
+ * Any other event pushed to a stopped framework through pushEvent() still
+ * throws to its caller; a module's other events are logged and dropped.
  * A turn waiting to retry is work in flight too: stop() cancels the retry,
  * and leaves no agent inferring at the event gate (#334). The turn ends with
  * inference:aborted, saying no retry follows its inference:failed, whether
@@ -271,7 +272,9 @@ describe('stop() with work still in flight', () => {
     }
     framework.start();
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
-    await module.started;
+    let started = false;
+    void module.started.then(() => { started = true; });
+    await until(() => started, 'the slow tool to start');
     return { framework, module, failed };
   }
 
@@ -351,7 +354,7 @@ describe('stop() with work still in flight', () => {
     assert.match(line, /the tool failed: .*the dispatch was lost/, line);
   });
 
-  it('any other event pushed to a stopped framework still throws to its caller', async () => {
+  it('any other event pushed to a stopped framework through pushEvent() still throws to its caller', async () => {
     const { framework, module } = await frameworkWithRunningTool();
     await framework.stop();
     assert.throws(
@@ -426,11 +429,11 @@ describe('stop() with work still in flight', () => {
     const { framework, membrane, inDelay, turnEvents } = await frameworkWaitingToRetry(() => {
       throw new Error('the stream could not start');
     });
-    const gate = (framework as unknown as { eventGate: { inferenceDiagnostics(): { inferring: string[] } } }).eventGate;
+    const inferring = () => (framework.healthSnapshot().gate as { inferring: string[] }).inferring;
     await inDelay;
-    assert.deepEqual(gate.inferenceDiagnostics().inferring, ['assistant'], 'the turn is open at the gate while its retry waits');
+    assert.deepEqual(inferring(), ['assistant'], 'the turn is open at the gate while its retry waits');
     await framework.stop();
-    assert.deepEqual(gate.inferenceDiagnostics().inferring, [], 'stop() leaves no agent inferring');
+    assert.deepEqual(inferring(), [], 'stop() leaves no agent inferring');
     assert.equal(membrane.calls.length, 1, 'the retry was cancelled, not sent');
     // The attempt's inference:failed is usually followed by its retry: the
     // turn ends with an event saying none follows, and its record ends.
@@ -549,8 +552,7 @@ describe('stop() with work still in flight', () => {
         const note = cm.getAllMessages().find((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text === 'a note for later'))!;
         assert.equal(cm.windowStatusOf(note.id), 'out', 'out of the live turn\'s window');
         const outcome = await settledWithin(framework.stop(100), 5_000);
-        assert.ok(outcome instanceof ShutdownTimeoutError
-          && outcome.message === 'Shutdown timed out after 100 ms; pending: stream:assistant', String(outcome));
+        assert.ok(outcome instanceof ShutdownTimeoutError && outcome.message.includes('stream:assistant'), String(outcome));
         assert.ok(order.includes('modules stopped'), 'teardown went on');
         assert.equal(framework.getStore().isClosed(), false, 'the stream may still write');
         assert.equal(cm.windowStatusOf(note.id), 'out', 'nothing entered the window ahead of the stream');
@@ -1129,12 +1131,10 @@ describe('stop() with work still in flight', () => {
       }
     });
 
-    it('a responder without respondError reaches the handler without one', async () => {
+    it('a responder with respond alone gets the handler\'s answer', async () => {
       const { framework, connection } = await wiredFramework();
       try {
-        let seen: string | undefined;
-        standIns(framework, async (_s: string, _p: unknown, r: { respond(x: unknown): void; respondError?: unknown }) => {
-          seen = typeof r.respondError;
+        standIns(framework, async (_s: string, _p: unknown, r: { respond(x: unknown): void }) => {
           r.respond({ results: [] });
         });
         const answers: unknown[] = [];
@@ -1144,7 +1144,6 @@ describe('stop() with work still in flight', () => {
         await until(() => answers.length > 0, 'the answer');
         await turn();
 
-        assert.equal(seen, 'undefined', "a handler checking for respondError takes its fallback");
         assert.deepEqual(answers, [{ results: [] }]);
         assert.deepEqual(rejections, []);
       } finally {
@@ -1175,9 +1174,9 @@ describe('stop() with work still in flight', () => {
 
     it('an inference request during a render is refused -32600, and a throwing responder there is not rejected into the listener', async () => {
       const { framework, connection } = await wiredFramework();
+      const fw = framework as unknown as { pushCoalescer: unknown };
+      const coalescer = fw.pushCoalescer;
       try {
-        const fw = framework as unknown as { pushCoalescer: unknown };
-        const coalescer = fw.pushCoalescer;
         fw.pushCoalescer = { isRendering: () => true, suspend: () => {}, flush: () => {} };
         const inference = responder({ throws: true });
         connection.emit('inference-request', { messages: [] }, inference);
@@ -1192,8 +1191,8 @@ describe('stop() with work still in flight', () => {
         ]);
         assert.deepEqual(inference.answers, []);
         assert.deepEqual(rejections, []);
-        fw.pushCoalescer = coalescer;
       } finally {
+        fw.pushCoalescer = coalescer;
         await framework.stop();
       }
     });

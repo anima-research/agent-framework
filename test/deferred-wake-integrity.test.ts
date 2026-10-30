@@ -61,11 +61,14 @@ import type { ContentBlock, NormalizedRequest, NormalizedResponse } from '@anima
 class DmModule implements Module {
   readonly name = 'dm';
   framework: AgentFramework | null = null;
+  ctx: ModuleContext | null = null;
   /** Next `halt` call pushes this text as an external message (with
    *  requestInference) BEFORE returning its endTurn result. */
   interjection: string | null = null;
 
-  async start(_ctx: ModuleContext): Promise<void> {}
+  async start(ctx: ModuleContext): Promise<void> {
+    this.ctx = ctx;
+  }
   async stop(): Promise<void> {}
 
   getTools(): ToolDefinition[] {
@@ -83,16 +86,24 @@ class DmModule implements Module {
       if (this.interjection) {
         const text = this.interjection;
         this.interjection = null;
+        const processed = new Promise<void>((resolve) => {
+          const off = this.framework!.onTrace((t) => {
+            if (t.type === 'process:completed' && (t.processEvent as { content?: unknown }).content === text) {
+              off();
+              resolve();
+            }
+          });
+        });
         this.framework!.pushEvent({
           type: 'external-message',
           source: 'test',
           content: text,
           metadata: { channelId: 'dm-antra' },
         } as unknown as ProcessEvent);
-        // Let the run loop process the queued message while this tool round
-        // is still pending, so it is stored out of the window with its wake
-        // queued behind the busy agent.
-        await new Promise((r) => setTimeout(r, 30));
+        await Promise.race([
+          processed,
+          new Promise((_, reject) => setTimeout(() => reject(new Error('the run loop never processed the DM')), 10_000).unref()),
+        ]);
       }
       return { success: true, data: { halted: true }, endTurn: true };
     }
@@ -255,8 +266,8 @@ describe('deferred-message wake integrity', () => {
     fw.activeTurnTokens.set('assistant', 999999);
     assert.equal(fw.activeStreams.size, 0, 'precondition: no live stream');
 
-    const id = fw.addMessage('Antra', [{ type: 'text', text: 'arrives mid-compile' }]);
-    assert.notEqual(id, '', 'message was stored');
+    const id = module.ctx!.addMessage('Antra', [{ type: 'text', text: 'arrives mid-compile' }]);
+    assert.ok(framework.getAgent('assistant')!.getContextManager().getMessage(id), `the write is stored at once, under its row's id: ${id}`);
     assert.equal(inWindow(framework, 'arrives mid-compile'), false, 'and waits outside the window');
 
     fw.activeTurnTokens.delete('assistant');

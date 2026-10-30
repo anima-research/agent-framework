@@ -69,6 +69,16 @@ const watchedPromise = () => {
   });
   return { promise, settle, waited: () => waitedOn };
 };
+const watchRunningPass = (framework: AgentFramework): (() => boolean) => {
+  const pass = (framework as unknown as { maintenancePass: Promise<void> | null }).maintenancePass;
+  assert.ok(pass, 'a maintenance pass is running');
+  let waitedOn = false;
+  const then = pass.then.bind(pass) as (onFulfilled?: unknown, onRejected?: unknown) => Promise<unknown>;
+  Object.defineProperty(pass, 'then', {
+    value: (onFulfilled?: unknown, onRejected?: unknown) => { waitedOn = true; return then(onFulfilled, onRejected); },
+  });
+  return () => waitedOn;
+};
 const settled = () => new Promise<void>((resolve) => { setImmediate(resolve); });
 const captureWebhook = () => {
   const hook = process.env.CONNECTOME_OPS_WEBHOOK;
@@ -2160,12 +2170,13 @@ describe('conversation forks and a branch move', () => {
     framework.start();
     gated.armed = true;
     await until(() => gated.entered, "m's maintenance tick to start", 8_000);
+    const waitedOn = watchRunningPass(framework);
     let moved: Promise<unknown> | undefined;
     let done = false;
     try {
       moved = move();
       void moved.then(() => { done = true; }, () => { done = true; });
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await until(waitedOn, 'the move to wait on the running maintenance pass', 8_000);
       assert.equal(done, false, 'the move waits on the running maintenance tick');
       await during();
     } finally {
@@ -2523,8 +2534,9 @@ describe('a branch switch while a maintenance call waits at the provider gate', 
       });
       strategy.framework = framework;
       const alerts: string[] = [];
-      (framework as unknown as { opsAlert: (kind: string, agentName: string, message: string) => void }).opsAlert =
-        (kind, agentName, message) => alerts.push(`${kind}:${agentName}:${message}`);
+      framework.onTrace((event) => {
+        if (event.type === 'ops:alert') alerts.push(`${event.kind}:${event.agentName}:${event.message}`);
+      });
       const internals = framework as unknown as {
         providerGate(name: string): { primaryPending: boolean; auxiliaryWaiters: Array<() => void> };
         saveTurnCheckpoints(agentName: string, checkpoints: unknown[]): void;
@@ -2808,10 +2820,11 @@ describe('a move while a maintenance tick is already running', () => {
     await withRunningTick('reinit-tick-switch-', async (framework, gated) => {
       const store = framework.getStore();
       store.createBranchAt('side', store.currentBranch().name, store.currentSequence());
+      const waitedOn = watchRunningPass(framework);
       const switching = framework.switchBranch('side');
       let done = false;
       void switching.then(() => { done = true; }, () => { done = true; });
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await until(waitedOn, 'the switch to wait on the running maintenance pass', 8_000);
       assert.equal(store.currentBranch().name, 'main', 'the store has not moved while the tick runs');
       assert.equal(done, false);
       gated.release!();

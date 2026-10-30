@@ -539,7 +539,8 @@ export interface InferenceOptions {
  * `supportsInjectedMessages` is what the stream declared with the round's
  * tool calls (membrane's `ToolContext.supportsInjectedMessages`): whether it
  * can carry messages injected with that round's results. It's absent when
- * the stream doesn't say, as on membrane 0.5.87 and earlier.
+ * the stream doesn't say, which reads as a stream that can't, and when there
+ * is no stream, as for the direct API.
  */
 export type AgentState =
   | { status: 'idle' }

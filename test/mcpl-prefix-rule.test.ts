@@ -69,8 +69,7 @@ async function waitFor(cond: () => boolean, what: string, timeoutMs = 10_000): P
   }
 }
 
-/** The MCPL tools offered to the model, by name. */
-const offered = (fw: AgentFramework) => (fw as unknown as { mcplTools: Array<{ name: string }> }).mcplTools.map((t) => t.name).sort();
+const offered = (fw: AgentFramework) => fw.getAllTools().map((t) => t.name).filter((name) => name.endsWith('--echo') || name.endsWith('--ping')).sort();
 
 test('create() refuses two servers whose prefixes meet, naming both servers, both prefixes and the rule', async () => {
   const cases: Array<[ReturnType<typeof unrun>[], string[]]> = [
@@ -106,8 +105,7 @@ test('a runtime connect whose prefix meets a server\'s is refused before anythin
     await waitFor(() => offered(h.fw).length === 1, 'the listing');
     await assert.rejects(h.fw.connectMcplServer(unrun('nested', 'foo--bar')), /server "nested" toolPrefix "foo--bar" meets server "short"'s toolPrefix "foo"/);
     assert.deepEqual(h.fw.listMcplServers().map((s) => s.id), ['short'], 'nothing is registered under the refused id');
-    const internals = h.fw as unknown as { mcplServerConfigs: Map<string, unknown>; mcplPrefixMap: Map<string, string> };
-    assert.equal(internals.mcplServerConfigs.has('nested'), false, 'and no config is kept for it');
+    const internals = h.fw as unknown as { mcplPrefixMap: Map<string, string> };
     assert.equal(internals.mcplPrefixMap.has('foo--bar'), false, 'nor its prefix');
     assert.deepEqual(offered(h.fw), ['foo--echo']);
   } finally {
@@ -132,8 +130,8 @@ test('a runtime connect of an id already registered is refused before it writes 
   try {
     await waitFor(() => offered(h.fw).length === 1, 'the listing');
     await assert.rejects(h.fw.connectMcplServer(unrun('short', 'elsewhere')), /MCPL server "short" is already registered/);
-    const internals = h.fw as unknown as { mcplServerConfigs: Map<string, { toolPrefix?: string }>; mcplPrefixMap: Map<string, string> };
-    assert.equal(internals.mcplServerConfigs.get('short')?.toolPrefix, 'foo', "the live server's config is kept");
+    assert.equal(h.fw.listMcplServers().find((s) => s.id === 'short')?.toolPrefix, 'foo', "the live server's config is kept");
+    const internals = h.fw as unknown as { mcplPrefixMap: Map<string, string> };
     assert.deepEqual([...internals.mcplPrefixMap], [['foo', 'short']], 'and no prefix is claimed for the refused connect');
     assert.equal(h.fw.listMcplServers().find((s) => s.id === 'short')?.connected, true);
   } finally {
@@ -146,9 +144,8 @@ test('a restart into the id of another live server is refused before it disconne
   try {
     await waitFor(() => offered(h.fw).length === 2, 'the listings');
     await assert.rejects(h.fw.restartMcplServer('first', fixture('second', 'three')), /MCPL server "second" is already registered/);
-    const internals = h.fw as unknown as { mcplServerConfigs: Map<string, { toolPrefix?: string }> };
     assert.equal(h.fw.listMcplServers().find((s) => s.id === 'first')?.connected, true, 'the server the restart was for is still connected');
-    assert.equal(internals.mcplServerConfigs.get('second')?.toolPrefix, 'two', "and the other server's config is kept");
+    assert.equal(h.fw.listMcplServers().find((s) => s.id === 'second')?.toolPrefix, 'two', "and the other server's config is kept");
     assert.deepEqual(offered(h.fw), ['one--echo', 'two--echo']);
   } finally {
     await h.cleanup();
@@ -172,8 +169,8 @@ test("a connect under a new prefix drops the prefix its id's failed connect left
   // The failed startup connect leaves `flaky` configured under `p`.
   const h = await create([unrun('flaky', 'p')]);
   try {
+    await assert.rejects(h.fw.connectMcplServer(unrun('x', 'p-')), /server "x" toolPrefix "p-" meets server "flaky"'s toolPrefix "p"/);
     const internals = h.fw as unknown as { mcplPrefixMap: Map<string, string> };
-    assert.deepEqual([...internals.mcplPrefixMap], [['p', 'flaky']]);
     await h.fw.connectMcplServer(fixture('flaky', 'q'));
     await waitFor(() => offered(h.fw).length === 1, 'the listing');
     assert.deepEqual([...internals.mcplPrefixMap], [['q', 'flaky']], 'one entry for the id');
@@ -207,8 +204,6 @@ test("a disconnect of an id with no config leaves the prefix another server set 
   try {
     await waitFor(() => offered(h.fw).length === 1, 'the listing');
     await h.fw.disconnectMcplServer('ghost');
-    const internals = h.fw as unknown as { mcplPrefixMap: Map<string, string> };
-    assert.equal(internals.mcplPrefixMap.get('mcpl--ghost'), 'owner', "the owner's prefix is still claimed");
     await assert.rejects(h.fw.connectMcplServer(unrun('dash', 'mcpl--ghost-')), /server "dash" toolPrefix "mcpl--ghost-" meets server "owner"'s toolPrefix "mcpl--ghost"/);
     assert.deepEqual(offered(h.fw), ['mcpl--ghost--echo']);
   } finally {

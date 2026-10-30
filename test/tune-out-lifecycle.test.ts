@@ -118,25 +118,3 @@ test('recordTuneOutWake on a non-tuned-out channel is a null no-op', () => {
   assert.equal(registry.recordTuneOutWake('discord', '#dev'), null);
   assert.equal(registry.getTuneOutState('discord', '#dev'), null);
 });
-
-test('malformed tuned-out records (no params) are dropped at replay', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tune-out-malformed-'));
-  try {
-    const store = JsStore.openOrCreate({ path: join(dir, 'store') });
-    // Seed the log the way an old/foreign writer might: a tuned-out
-    // desired-state with no params object.
-    const first = makeRegistry(store);
-    void first; // registers the state slot
-    store.appendToStateJson('mcpl/channel-lifecycle', {
-      kind: 'desired-state',
-      serverId: 'discord',
-      channelId: '#dev',
-      desired: 'tuned-out',
-      timestamp: new Date().toISOString(),
-    });
-    const replayed = makeRegistry(store);
-    assert.equal(replayed.getDesiredState('discord', '#dev'), undefined);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});

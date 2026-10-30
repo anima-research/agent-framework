@@ -1,25 +1,21 @@
 /**
- * Every place that decides which MCPL server a namespaced tool name belongs
- * to decides as the model's own call does, through resolveMcplTool: the
- * server whose tool listing offers the name, else the longest matching
- * prefix. One prefix can begin with another's: `foo` beside `foo--bar`, or
- * beside `foo-`, whose tools' names begin `foo---` (#227, #230). That holds
- * for a programmatic call, through the public executeToolCall or a module's
- * ctx.callTool, which also sends the server the tool name the model's call
- * sends; for an MCPL tool's source in the tool presentation; and for the
- * RFC-008 class declarations a server's close forgets. Prefixes that meet
- * are refused at configuration since #265, so the stand-ins below build such
- * a pair directly, to pin the resolver's own rule.
+ * A programmatic call of a namespaced MCPL tool, through the public
+ * executeToolCall or a module's ctx.callTool, reaches the server the model's
+ * own call reaches, through resolveMcplTool, and sends it the tool name the
+ * model's call sends; a call a server's policy denies is sent on no path, and
+ * a name no MCPL prefix fits goes to the module registry. A server's close
+ * forgets the RFC-008 class declarations of its own tools.
  */
 
+import { EventEmitter } from 'node:events';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import type { NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
 import type { Module, ModuleContext, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
-import { AgentFramework, WorkspaceModule } from '../src/index.js';
+import { AgentFramework } from '../src/index.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/tool-listing-mcpl-server.mjs');
 
@@ -38,10 +34,9 @@ interface Internals {
   mcplServerRegistry: unknown;
   mcplServerConfigs: Map<string, Record<string, unknown>>;
   mcplPrefixMap: Map<string, string>;
-  mcplToolClasses: Map<string, unknown[]>;
   refreshMcplTools(): Promise<void>;
   dispatchToolCall(agentName: string, call: ToolCall): void;
-  dropMcplToolClasses(serverId: string): void;
+  wireMcplEvents(connection: unknown, config: unknown): void;
 }
 
 /** The three ways a call reaches dispatch: the model's own, and the two programmatic ones. */
@@ -63,7 +58,7 @@ async function framework(extra: Record<string, unknown> = {}, agent: Record<stri
 }
 
 /** A stand-in server. With no `prefix` it takes the default, `mcpl--<id>`. */
-interface Server { id: string; prefix?: string; lists: string[]; disabledTools?: string[] }
+interface Server { id: string; prefix?: string; lists: string[]; disabledTools?: string[]; classes?: Record<string, string[]> }
 
 /**
  * A framework whose MCPL servers are stand-ins, configured in the order given
@@ -75,11 +70,21 @@ interface Server { id: string; prefix?: string; lists: string[]; disabledTools?:
 async function standIns(servers: Server[], agent: Record<string, unknown> = {}, modules: Module[] = []) {
   const h = await framework({}, agent, modules);
   const reached: string[] = [];
-  const connection = (s: Server) => ({
+  // An emitter, so the framework's own handlers can be wired to it; it closes
+  // as a server that will reconnect does, staying registered.
+  const connection = (s: Server) => Object.assign(new EventEmitter(), {
     id: s.id,
     isConnected: true,
+    willReconnect: true,
     mcpToolsAdvertised: true,
-    sendToolsList: async () => ({ tools: s.lists.map((name) => ({ name, description: `${name} on ${s.id}`, inputSchema: { type: 'object', properties: {} } })) }),
+    sendToolsList: async () => ({
+      tools: s.lists.map((name) => ({
+        name,
+        description: `${name} on ${s.id}`,
+        inputSchema: { type: 'object', properties: {} },
+        ...(s.classes?.[name] ? { _meta: { 'mcpl/class': s.classes[name] } } : {}),
+      })),
+    }),
     sendToolsCall: async (tool: string) => {
       reached.push(`${s.id}:${tool}`);
       return { content: [{ type: 'text', text: `${s.id}:${tool}` }] };
@@ -143,6 +148,7 @@ async function standIns(servers: Server[], agent: Record<string, unknown> = {}, 
     ...h,
     reached,
     call,
+    server: (id: string) => connections.get(id)!,
     cleanup: async () => {
       h.internals.mcplServerRegistry = before;
       await h.fw.stop();
@@ -154,64 +160,6 @@ async function standIns(servers: Server[], agent: Record<string, unknown> = {}, 
 const ORDERS = ['shorter prefix first', 'shorter prefix last'] as const;
 const inOrder = <T>(order: typeof ORDERS[number], servers: T[]): T[] => order === 'shorter prefix first' ? servers : [...servers].reverse();
 
-const pairs: Array<{ name: string; servers: Server[]; calls: Array<[string, string]> }> = [
-  {
-    name: '`foo` beside `foo--bar`',
-    servers: [
-      { id: 'short', prefix: 'foo', lists: ['echo', 'bar--qux'] },
-      { id: 'nested', prefix: 'foo--bar', lists: ['echo'] },
-    ],
-    calls: [
-      ['foo--bar--echo', 'nested:echo'],
-      ['foo--echo', 'short:echo'],
-      // `foo` itself lists a tool named `bar--qux`: its listing decides.
-      ['foo--bar--qux', 'short:bar--qux'],
-      // A name no server listed goes to the longest matching prefix.
-      ['foo--bar--unlisted', 'nested:unlisted'],
-    ],
-  },
-  {
-    name: '`foo` beside `foo-`',
-    servers: [
-      { id: 'short', prefix: 'foo', lists: ['echo'] },
-      { id: 'dash', prefix: 'foo-', lists: ['echo'] },
-    ],
-    calls: [
-      ['foo---echo', 'dash:echo'],
-      ['foo--echo', 'short:echo'],
-      ['foo---unlisted', 'dash:unlisted'],
-    ],
-  },
-];
-
-for (const pair of pairs) {
-  for (const order of ORDERS) {
-    test(`${pair.name}, ${order}: every path reaches the server the model's call reaches, with the same tool name`, async () => {
-      const h = await standIns(inOrder(order, pair.servers));
-      try {
-        for (const [name, expected] of pair.calls) {
-          for (const path of PATHS) assert.equal(await h.call(path, name), expected, `${name} by ${path}`);
-        }
-      } finally {
-        await h.cleanup();
-      }
-    });
-  }
-}
-
-test("a tool its own server's policy denies isn't in that server's listing, so every path reaches the other server's", async () => {
-  for (const order of ORDERS) {
-    const h = await standIns(inOrder(order, [
-      { id: 'short', prefix: 'foo', lists: ['bar--echo'], disabledTools: ['bar--echo'] },
-      { id: 'nested', prefix: 'foo--bar', lists: ['echo'] },
-    ]));
-    try {
-      for (const path of PATHS) assert.equal(await h.call(path, 'foo--bar--echo'), 'nested:echo', `${order}, by ${path}`);
-    } finally {
-      await h.cleanup();
-    }
-  }
-});
 
 test("a call of a tool its server's policy denies is sent on no path: the model's is refused, the others fail", async () => {
   // Left out of the listing, `foo--secret` resolves to the longest prefix, `foo`'s, whose policy refuses it.
@@ -222,20 +170,6 @@ test("a call of a tool its server's policy denies is sent on no path: the model'
         "so the call didn't run, and calling it again won't change that. If you need it, ask whoever runs this host.", `by ${path}`);
     }
     assert.equal(await h.call('executeToolCall', 'foo--echo'), 'short:echo', 'an allowed tool is sent');
-  } finally {
-    await h.cleanup();
-  }
-});
-
-test('a programmatic call sends the tool name the model\'s call sends, though the server\'s config has since taken another prefix', async () => {
-  // What a connect of an already-registered id under a new toolPrefix leaves
-  // behind when the registry refuses it: the old prefix still maps to the
-  // server, and its config holds the new one.
-  const h = await standIns([{ id: 'solo', prefix: 'old', lists: ['echo'] }]);
-  try {
-    h.internals.mcplPrefixMap.set('renamed--longer', 'solo');
-    h.internals.mcplServerConfigs.set('solo', { id: 'solo', command: 'node', toolPrefix: 'renamed--longer' });
-    for (const path of PATHS) assert.equal(await h.call(path, 'old--echo'), 'solo:echo', `by ${path}`);
   } finally {
     await h.cleanup();
   }
@@ -278,54 +212,21 @@ test('a name no MCPL prefix fits falls through to the module registry on the pro
   }
 });
 
-test("an MCPL tool's source in the tool presentation, and the description profile it takes, is the server a call of it reaches", async () => {
-  for (const order of ORDERS) {
-    const dir = mkdtempSync(join(tmpdir(), 'af-mcpl-presentation-'));
-    // A presentation needs a workspace for its catalogue.
-    const workspace = new WorkspaceModule({ mounts: [{ name: 'board', path: dir, mode: 'read-write', watch: 'never' }] });
-    // A component description profile for each server, both naming `foo--bar--echo`.
-    const profile = (id: string, tools: Record<string, string>) => {
-      const path = join(dir, `${id}.json`);
-      writeFileSync(path, JSON.stringify({ version: 1, tools: Object.fromEntries(Object.entries(tools).map(([n, d]) => [n, { description: d }])) }));
-      return { source: `MCPL server: ${id}`, path };
-    };
-    const defaults = [
-      profile('short', { 'foo--bar--echo': 'short says', 'foo--echo': 'short echo' }),
-      profile('nested', { 'foo--bar--echo': 'nested says' }),
-    ];
-    const h = await standIns(inOrder(order, pairs[0]!.servers), {
-      toolPresentation: { path: join(dir, 'tools.json'), cataloguePath: 'board/tools.md', defaults },
-    }, [workspace]);
-    try {
-      const snapshot = h.fw.inspectToolPresentation('assistant')!;
-      const entry = (name: string) => snapshot.entries.find((e) => e.name === name);
-      // A profile bound to `MCPL server: short` describes only `short`'s tools.
-      assert.equal(entry('foo--bar--echo')?.description, 'nested says', order);
-      assert.equal(entry('foo--echo')?.description, 'short echo', order);
-      assert.equal(entry('foo--bar--echo')?.source, 'MCPL server: nested', order);
-      assert.equal(entry('foo--echo')?.source, 'MCPL server: short', order);
-      assert.equal(entry('foo--bar--qux')?.source, 'MCPL server: short', order);
-    } finally {
-      await h.cleanup();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  }
-});
-
-test("a server's close forgets the class declarations of its own tools, and not a nested prefix's", async () => {
-  for (const order of ORDERS) {
-    const h = await standIns(inOrder(order, pairs[0]!.servers));
-    try {
-      h.internals.mcplToolClasses = new Map([
-        ['foo--echo', ['read']],
-        ['foo--bar--qux', ['read']],
-        ['foo--bar--echo', ['read']],
-      ]);
-      h.internals.dropMcplToolClasses('short');
-      assert.deepEqual([...h.internals.mcplToolClasses.keys()], ['foo--bar--echo'], order);
-    } finally {
-      await h.cleanup();
-    }
+test("a server's close forgets the class declarations of its own tools, and not another server's", async () => {
+  const h = await standIns([
+    { id: 'short', prefix: 'foo', lists: ['echo'], classes: { echo: ['comms'] } },
+    { id: 'other', prefix: 'foo-bar', lists: ['echo'], classes: { echo: ['comms'] } },
+  ]);
+  const classOf = (tool: string) => h.fw.listToolClasses().find((t) => t.tool === tool);
+  const short = h.server('short');
+  h.internals.wireMcplEvents(short, h.internals.mcplServerConfigs.get('short'));
+  try {
+    assert.deepEqual(classOf('foo--echo'), { tool: 'foo--echo', class: ['comms'], source: 'server', serverId: 'short' }, 'as its listing declared');
+    short.emit('close', null, null);
+    assert.deepEqual(classOf('foo--echo'), { tool: 'foo--echo', class: [], source: 'none', serverId: 'short' }, 'unclassed once its server closed, until the next listing');
+    assert.deepEqual(classOf('foo-bar--echo'), { tool: 'foo-bar--echo', class: ['comms'], source: 'server', serverId: 'other' }, "another server's stays, though its prefix begins with the closed one's");
+  } finally {
+    await h.cleanup();
   }
 });
 

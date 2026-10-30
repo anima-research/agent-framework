@@ -104,8 +104,7 @@ test("a response whose edit throws stops there, as before: its later edits and r
   const window = x.window();
   assert.ok(window.includes('Antra: before') && window.includes('Antra: to remove'), `nothing after the throw applied:\n${window.join('\n')}`);
   assert.ok(x.errors.some((e) => e.startsWith("[process] refused's response to ping threw at the edit of no-such-message")), x.errors.join('\n'));
-  const registry = (x.framework as unknown as { moduleRegistry: { getModuleState(name: string): unknown } }).moduleRegistry;
-  assert.equal(registry.getModuleState('refused'), null, 'its state update was not applied');
+  assert.equal(refused.ctx.getState(), null, 'its state update was not applied');
 });
 
 test("a response whose removals are applied in order keeps those before a throw, and not those after it", async (t) => {
@@ -118,8 +117,7 @@ test("a response whose removals are applied in order keeps those before a throw,
   x.framework.pushEvent({ type: 'ping', source: 'test' } as unknown as ProcessEvent);
   await x.framework.runUntilIdle();
   assert.deepEqual(x.window().filter((line) => line === 'Antra: first' || line === 'Antra: last'), ['Antra: last']);
-  const registry = (x.framework as unknown as { moduleRegistry: { getModuleState(name: string): unknown } }).moduleRegistry;
-  assert.equal(registry.getModuleState('refused'), null);
+  assert.equal(refused.ctx.getState(), null);
 });
 
 test("a response that throws while adding a message stops there, and the other modules' responses still apply", async (t) => {
@@ -153,8 +151,7 @@ test("a response whose edits and removals all apply has its state update applied
   fine.onPing = { editMessages: [{ messageId: kept, content: text('after') }], removeMessages: [gone], stateUpdate: { seen: true } };
   x.framework.pushEvent({ type: 'ping', source: 'test' } as unknown as ProcessEvent);
   await x.framework.runUntilIdle();
-  const registry = (x.framework as unknown as { moduleRegistry: { getModuleState(name: string): unknown } }).moduleRegistry;
-  assert.equal((registry.getModuleState('fine') as { seen?: boolean } | null)?.seen, true);
+  assert.equal(fine.ctx.getState<{ seen?: boolean }>()?.seen, true);
 });
 
 test("a tool-call event whose module's response throws at an edit still dispatches the call", async (t) => {

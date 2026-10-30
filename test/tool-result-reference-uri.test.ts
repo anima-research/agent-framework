@@ -14,12 +14,12 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
+import { convertBlock } from '../src/mcpl/convert-block.js';
 import { answerText, scriptCall } from './helpers/script-call.js';
 import type { Module, ModuleContext, ToolCall, ToolResult, ToolDefinition } from '../src/types/index.js';
 import { nonErrorResultText, toolResultDataToHistoryString } from '../src/tool-result-history.js';
 import { parseImagePlaceholders } from '../src/tool-image-ledger.js';
 import { keptWhenWithheld } from '../src/tool-result-guard.js';
-import { classifyBlock } from '../src/mcpl/references.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 const SIGNATURE = 'zz-secret-signature';
@@ -104,7 +104,6 @@ describe('data the serializer doesn\'t read as content blocks', () => {
     const array = toolResultDataToHistoryString([{ type: 'text', text: 'zz-text' }, block]);
     assert.equal(array, toolResultDataToHistoryString([{ type: 'text', text: 'zz-text' }, { type: 'image', data: BASE64, mimeType: 'image/png' }]));
     assert.ok(!array.includes(SIGNATURE), array);
-    assert.deepEqual(classifyBlock(block), { kind: 'inline', contradiction: false });
     // A null or empty uri is none: inline data beside it isn't a claim.
     const nullUri = { type: 'audio', data: BASE64, mimeType: 'audio/wav', uri: null };
     assert.equal(toolResultDataToHistoryString({ clip: nullUri }), JSON.stringify({ clip: nullUri }));
@@ -187,8 +186,9 @@ describe('data the serializer doesn\'t read as content blocks', () => {
       numeric: '[Image not shown: it arrived with no usable data or link.]',
       both: '[Audio not shown: it arrived with no usable inline data.]',
     });
-    // A media block with neither reads as it does with fields that aren't strings.
-    assert.deepEqual(classifyBlock({ type: 'image' }), { kind: 'invalid', shown: '[Image not shown: it arrived with no usable data or link.]' });
+    // On the push lane, a media block with neither reads as it does with
+    // fields that aren't strings.
+    assert.deepEqual(convertBlock({ type: 'image' } as never, 'p', 's'), { type: 'text', text: '[Image not shown: it arrived with no usable data or link.]' });
   });
 
   it("leaves a nested reference's stub out of save_recent_image's inventory, as main left the reference", () => {

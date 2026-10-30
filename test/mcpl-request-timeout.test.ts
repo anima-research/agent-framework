@@ -243,10 +243,9 @@ test('a mandatory call deadline overrides requestTimeoutMs: 0 and surfaces its l
   const list = await connection.sendToolsList();
   assert.equal(list.tools[0]?.description, RELEASED, 'the stub wrote the late reply first');
 
-  assert.deepEqual(orphaned, [{
-    method: 'tools/call',
-    hadState: false,
-    hadCheckpoint: false,
-    id: 1,
-  }]);
+  assert.equal(orphaned.length, 1);
+  // The id is the connection's own numbering of the call.
+  const { id, ...payload } = orphaned[0] as { id?: unknown };
+  assert.equal(typeof id, 'number');
+  assert.deepEqual(payload, { method: 'tools/call', hadState: false, hadCheckpoint: false });
 });

@@ -7,32 +7,18 @@
  * paid for is reused. The rendering contract is checked on PROVIDER-
  * FORMATTED requests, up to the fork boundary: the end of the parent's last
  * request before the turn that caused the derivation.
- *
- * Shared inheritance needs branch-bound store handles (`JsStore.view`) and
- * `ContextManager.derive`. Where the installed packages lack them, those
- * tests are skipped by name with the reason; the copy-mode and refusal
- * tests always run.
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { JsStore } from '@animalabs/chronicle';
 import { NativeFormatter } from '@animalabs/membrane';
 import type { NormalizedRequest } from '@animalabs/membrane';
-import { ContextManager } from '@animalabs/context-manager';
 import { AgentFramework, AutobiographicalStrategy } from '../src/index.js';
 import type { ContextStrategy } from '../src/index.js';
 import { GateModule, RoutedMembrane, say, until, waitCall } from './helpers/dendrite.js';
 import { createMockResponse } from './helpers/mock-membrane.js';
-
-const supported =
-  typeof (JsStore.prototype as unknown as { view?: unknown }).view === 'function' &&
-  typeof (ContextManager.prototype as unknown as { derive?: unknown }).derive === 'function';
-const skip = supported
-  ? false
-  : 'installed @animalabs/chronicle / context-manager lack branch-bound handles or ContextManager.derive';
 
 const textOf = (m: { content: Array<{ type: string; text?: string }> }): string =>
   m.content.filter((b) => b.type === 'text').map((b) => b.text ?? '').join('\n');
@@ -151,7 +137,7 @@ describe('Dendrite deriveAgent', () => {
     return { ...fork, result };
   }
 
-  it('shared inheritance: the fork continues from the parent\'s context and the parent is untouched', { skip }, async () => {
+  it('shared inheritance: the fork continues from the parent\'s context and the parent is untouched', async () => {
     const { history } = await miraMidTurn();
     const parentCm = framework.getAgent('mira')!.getContextManager();
     const before = parentCm.getAllMessages();
@@ -208,7 +194,7 @@ describe('Dendrite deriveAgent', () => {
     assert.equal(framework.getStore().currentBranch().name, 'main');
   });
 
-  it('rendering contract: the fork\'s first request is the parent\'s request plus its framing, byte for byte', { skip }, async () => {
+  it('rendering contract: the fork\'s first request is the parent\'s request plus its framing, byte for byte', async () => {
     const { parentRequest } = await miraMidTurn();
     membrane.script('fork-1', say('done'));
     await runFork({
@@ -278,7 +264,7 @@ describe('Dendrite deriveAgent', () => {
     assert.ok(JSON.stringify(parent.messages).includes('[mock summary]'), 'the shared prefix includes folded memories');
   });
 
-  it('a fresh solve at another budget is a supported choice: it renders differently and says so', { skip }, async () => {
+  it('a fresh solve at another budget is a supported choice: it renders differently and says so', async () => {
     const { parentRequest } = await miraMidTurn();
     membrane.script('fork-1', say('done'));
     await runFork({
@@ -300,7 +286,7 @@ describe('Dendrite deriveAgent', () => {
     assert.ok(fork.includes('[FORK-FRAMING]'));
   });
 
-  it('inherits the parent\'s refusal ledger only when asked, and says so in the record', { skip }, async () => {
+  it('inherits the parent\'s refusal ledger only when asked, and says so in the record', async () => {
     await miraMidTurn();
     const ledger = 'agents/mira/autobio:compression-refusal-quarantine-events';
     framework.getStore().appendToStateJson(ledger, { kind: 'checkpoint', at: 1, note: 'mira declined this' });
@@ -331,7 +317,7 @@ describe('Dendrite deriveAgent', () => {
     assert.equal(framework.getStore().getStateLen(ledger), 1, 'mira\'s own ledger is untouched');
   });
 
-  it('a running fork can itself be derived from, and each sees only its own line', { skip }, async () => {
+  it('a running fork can itself be derived from, and each sees only its own line', async () => {
     const { history } = await miraMidTurn();
     membrane.script('fork-1', waitCall('g-fork'), say('fork-1 done'));
     const first = await framework.deriveAgent({
@@ -368,7 +354,7 @@ describe('Dendrite deriveAgent', () => {
     assert.deepEqual(parentRows(framework.getAgent('mira')!.getContextManager()), history, "nor mira's store");
   });
 
-  it('returns its result to the parent as attributed mail', { skip }, async () => {
+  it('returns its result to the parent as attributed mail', async () => {
     await miraMidTurn();
     membrane.script('fork-1', say('7 open issues'));
     const { result } = await runFork({
@@ -403,7 +389,7 @@ describe('Dendrite deriveAgent', () => {
     );
   });
 
-  it('a fork made from inside a tool call sees the call that made it', { skip }, async () => {
+  it('a fork made from inside a tool call sees the call that made it', async () => {
     await miraMidTurn(); // mira is blocked in test--wait, call id call-g-mira; that turn is not stored yet
     membrane.script('fork-1', say('seen'));
     const { result, contextManager } = await runFork({
@@ -515,7 +501,7 @@ describe('Dendrite deriveAgent', () => {
     await run;
   });
 
-  it('a stopped fork resumes on the context it left, as a new incarnation', { skip }, async () => {
+  it('a stopped fork resumes on the context it left, as a new incarnation', async () => {
     const { history } = await miraMidTurn();
     membrane.script('fork-1', waitCall('g-fork'), say('never said'));
     const first = await framework.deriveAgent({
@@ -575,7 +561,7 @@ describe('Dendrite deriveAgent', () => {
     );
   });
 
-  it('inspects an earlier state of a live agent, and an ended fork, without changing either', { skip }, async () => {
+  it('inspects an earlier state of a live agent, and an ended fork, without changing either', async () => {
     const { history } = await miraMidTurn();
     const parentCm = framework.getAgent('mira')!.getContextManager();
     const cut = parentCm.getMessage(history[9]!)!.sequence;

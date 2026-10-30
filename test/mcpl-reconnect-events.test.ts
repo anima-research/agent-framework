@@ -657,15 +657,20 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     assert.equal(channelOf(registry, '5'), undefined, 'and the removal took the channel at the end');
   });
 
-  it('leaves a removal named by an object out of the admission order, since its string form can throw, and orders the rest', () => {
-    // A JSON object whose toString isn't a function makes String() throw. The
-    // order leaves that entry out rather than throwing, so a flush still
-    // orders what it holds.
-    const connectionClass = McplServerConnection as unknown as { admissionOrder(pending: unknown[]): unknown[] };
-    const kept = { event: 'channels-incoming', args: [{ messages: [{ channelId: 'room' }] }], kept: true };
-    const removal = { event: 'channels-changed', args: [JSON.parse('{"removed":[{"toString":1}]}')] };
-    const registration = { event: 'channels-register', args: [{ channels: [{ id: 'room' }] }] };
-    assert.deepStrictEqual(connectionClass.admissionOrder([kept, removal, registration]), [removal, registration, kept]);
+  it('a removal named by an object, whose string form can throw, keeps a flush from neither ordering nor admitting what it holds', async () => {
+    // A JSON object whose toString isn't a function makes String() throw.
+    const { grant, admitted, rejected, register, serverSends, registry } = await keptIncomingSetup();
+    // The registry refuses such a removal by throwing; the framework contains
+    // what an inbound handler throws, and so does this listener.
+    connection!.removeAllListeners('channels-changed');
+    connection!.on('channels-changed', (params: unknown, responder: unknown) => {
+      registry.handleChanged('flaky', params as never, responder as never).catch(() => {});
+    });
+    serverSends({ id: 3, method: 'channels/changed', params: { removed: [{ toString: 1 }] } });
+    register(4);
+    await openBothPlanes(grant);
+    assert.deepStrictEqual(rejected(), [], 'the kept message is not refused as an unknown channel');
+    assert.deepStrictEqual(admitted.map((event) => event.messageId), ['kept-1'], 'the registration was moved ahead of it, and it is admitted');
   });
 
   it('moves a channels/changed that only adds channels ahead of a kept message, as a registration', async () => {
@@ -776,6 +781,18 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     return { serverSends, lateSends, logged, written, held };
   }
 
+  /** Opens both planes under a grant of `capabilities` and returns the
+   *  messageIds of the incoming messages the flush admits, in order. */
+  function admittedIds(c: McplServerConnection | null, capabilities = ['channels.incoming']): string[] {
+    const ids: string[] = [];
+    c!.on('channels-incoming', (params: unknown) => { ids.push((params as { messages: Array<{ messageId: string }> }).messages[0]!.messageId); });
+    c!.establishGrant(new CapabilityGrant(new Set(capabilities), []));
+    const consoleError = console.error;
+    console.error = () => {};
+    try { c!.ready(); } finally { console.error = consoleError; }
+    return ids;
+  }
+
   it('keeps the incoming messages a transport boundary keeps out of the next transport\'s budget: after 10,000 kept, its request is held', async () => {
     const { serverSends, written, held } = await heldAcrossBoundary('channels/incoming', incoming);
     assert.equal(held().length, 10_000, 'every incoming message is kept');
@@ -833,11 +850,12 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     } finally {
       console.error = consoleError;
     }
-    const held = (connection as unknown as { bufferedEvents: Array<{ args: Array<{ messages?: Array<{ messageId: string }> }> }> }).bufferedEvents;
-    assert.equal(held.length, 10_000);
-    assert.equal(held[0]!.args[0]!.messages![0]!.messageId, 'm100001', 'the earliest are kept');
-    assert.equal(held[9_999]!.args[0]!.messages![0]!.messageId, 'm110000');
     assert.equal(logged.filter((line) => line.includes('kept-request bound (10000) — dropped 10000 request(s) a closed transport left')).length, 2, logged.join('\n'));
+    // What was kept is what the next grant admits.
+    const admitted = admittedIds(connection);
+    assert.equal(admitted.length, 10_000);
+    assert.equal(admitted[0], 'm100001', 'the earliest are kept');
+    assert.equal(admitted[9_999], 'm110000');
   });
 
   it('counts the requests read from the closed transport toward the kept bound as it holds them', async () => {
@@ -856,7 +874,7 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
   });
 
   it("starts the next pause's counts afresh after a flush", async () => {
-    const { serverSends, held } = await heldAcrossBoundary('channels/incoming', incoming);
+    const { serverSends } = await heldAcrossBoundary('channels/incoming', incoming);
     const consoleError = console.error;
     console.error = () => {};
     try {
@@ -868,7 +886,9 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     } finally {
       console.error = consoleError;
     }
-    assert.equal(held().length, 1_000);
+    const admitted = admittedIds(connection);
+    assert.equal(admitted.length, 1_000);
+    assert.equal(admitted[0], 'm30002', 'the oldest went');
   });
 
   it('keeps notifications out of the kept bound where boundaries join', async () => {
@@ -894,9 +914,13 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     } finally {
       console.error = consoleError;
     }
-    const held = (connection as unknown as { bufferedEvents: Array<{ args: unknown[] }> }).bufferedEvents;
-    assert.equal(held.filter((item) => item.args[1] === undefined).length, 5, 'the five notifications stay');
-    assert.equal(held.length, 10_005);
+    const admitted: Array<{ responder: unknown }> = [];
+    connection.on('channels-incoming', (_params: unknown, responder: unknown) => { admitted.push({ responder }); });
+    connection.establishGrant(new CapabilityGrant(new Set(['channels.incoming']), []));
+    console.error = () => {};
+    try { connection.ready(); } finally { console.error = consoleError; }
+    assert.equal(admitted.filter((item) => item.responder === undefined).length, 5, 'the five notifications stay');
+    assert.equal(admitted.length, 10_005);
   });
 
   it('holds a notification read from the closed transport as kept, outside both request counts', async () => {
@@ -911,18 +935,20 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
   });
 
   it("a control-plane flush keeps what a boundary kept out of the next transport's budget", async () => {
-    const { serverSends, written, held } = await heldAcrossBoundary('channels/incoming', incoming);
+    const { serverSends, written } = await heldAcrossBoundary('channels/incoming', incoming);
     // A quiesce opens the control plane first; the kept messages are data.
     connection!.establishGrant(new CapabilityGrant(new Set(['channels.incoming']), []));
+    const delivered: unknown[] = [];
+    connection!.on('channels-incoming', (params: unknown) => { delivered.push(params); });
     connection!.readyControlPlane();
-    assert.equal(held().length, 10_000, 'held again');
+    assert.equal(delivered.length, 0, 'held again');
     serverSends({ id: 10_001, method: 'channels/incoming', params: incoming(10_001) });
     assert.deepStrictEqual(written, [], 'nothing refused');
-    assert.equal(held().length, 10_001);
+    assert.equal(admittedIds(connection).length, 10_001, 'all of it is admitted once the data plane opens');
   });
 
   it("holds the next transport's notifications beside 10,000 kept requests, dropping none", async () => {
-    const { serverSends, held } = await heldAcrossBoundary('channels/incoming', incoming);
+    const { serverSends } = await heldAcrossBoundary('channels/incoming', incoming);
     const logged: string[] = [];
     const consoleError = console.error;
     console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
@@ -931,20 +957,22 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     } finally {
       console.error = consoleError;
     }
-    assert.equal(held().length, 10_005);
     assert.equal(logged.some((line) => line.includes('buffered-event cap')), false, logged.join('\n'));
+    assert.equal(admittedIds(connection).length, 10_005, 'none dropped');
   });
 
   it('frees the budget of the requests a transport boundary drops: after 10,000 held inference requests, the next transport\'s request is held', async () => {
-    const { serverSends, logged, written, held } = await heldAcrossBoundary('inference/request', (id) => ({ n: id }));
+    const { serverSends, logged, written } = await heldAcrossBoundary('inference/request', (id) => ({ n: id }));
     assert.ok(
       logged.some((line) => line.includes('dropped 10000 held message(s) from a transport that closed: 10000 inference-request')),
       logged.join('\n'),
     );
-    assert.deepStrictEqual(held(), []);
     serverSends({ id: 10_001, method: 'channels/incoming', params: incoming(10_001) });
     assert.deepStrictEqual(written, [], 'nothing refused');
-    assert.deepStrictEqual(held(), ['channels-incoming']);
+    let requests = 0;
+    connection!.on('inference-request', () => { requests++; });
+    assert.deepStrictEqual(admittedIds(connection, ['channels.incoming', 'inferenceRequest']), ['m10001'], 'the next transport\'s message, held');
+    assert.equal(requests, 0, 'none of the dropped requests is admitted');
   });
 
   it('a transport boundary crossed during a flush holds the rest of the snapshot to the boundary rule', async () => {
@@ -961,6 +989,8 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     });
     connection.on('inference-request', () => { seen.push('inference'); });
     connection.on('push-event', () => { seen.push('push'); });
+    let reconnected = 0;
+    connection.on('reconnect', () => { reconnected++; });
     const serverSends = (message: Record<string, unknown>) =>
       (connection as unknown as { transport: { emit(event: string, line: string): void } }).transport
         .emit('line', JSON.stringify({ jsonrpc: '2.0', ...message }));
@@ -978,12 +1008,15 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
       console.error = consoleError;
     }
     assert.deepStrictEqual(seen, ['incoming'], 'nothing after the boundary reached a listener');
-    const held = (connection as unknown as { bufferedEvents: Array<{ event: string }> }).bufferedEvents.map((item) => item.event);
-    assert.deepStrictEqual(held, ['push-event'], 'the push is kept, the inference requests and the filter dropped');
     assert.ok(
       logged.some((line) => line.includes('dropped 3 held message(s) from a transport that closed: 2 inference-request, 1 tools-observe')),
       logged.join('\n'),
     );
+    // The next transport's grant admits what the boundary kept.
+    await waitFor(() => reconnected === 1, 5000, 'reconnect after the drop');
+    connection.establishGrant(new CapabilityGrant(new Set(['channels.incoming', 'inferenceRequest', 'pushEvents']), []));
+    connection.ready();
+    assert.deepStrictEqual(seen, ['incoming', 'push'], 'the push is kept, the inference requests and the filter dropped');
   });
 
   it("sends a streamed inference's chunks only on the transport its request came on", async () => {

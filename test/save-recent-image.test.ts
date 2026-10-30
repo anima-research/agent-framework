@@ -44,6 +44,7 @@ import {
 import type {
   EventResponse,
   Module,
+  ModuleContext,
   ProcessEvent,
   ToolDefinition,
   ToolResult,
@@ -138,11 +139,18 @@ class SnapModule implements Module {
   readonly name = 'world';
   /** The `quote` tool cites this ref — set by the test once it knows it. */
   quotedRef = 'img_zzzzzz_1';
-  /** Delay before `snap` resolves — proves the same-batch barrier waits. */
-  snapDelayMs = 0;
-  /** Called as `snap` starts, and awaited, before its delay. */
+  snapAfterCall: string | null = null;
+  /** Called as `snap` starts, and awaited, before it waits on snapAfterCall. */
   onSnap?: () => unknown;
-  async start(): Promise<void> {}
+  private readonly started = new Set<string>();
+  private readonly onStarted = new Set<() => void>();
+  async start(ctx: ModuleContext): Promise<void> {
+    ctx.onTrace((event) => {
+      if (event.type !== 'tool:started') return;
+      this.started.add(event.callId);
+      for (const check of [...this.onStarted]) check();
+    });
+  }
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] {
     const schema = { type: 'object', properties: {} } as const;
@@ -243,7 +251,15 @@ class SnapModule implements Module {
         };
       default:
         await this.onSnap?.();
-        if (this.snapDelayMs > 0) await new Promise((r) => setTimeout(r, this.snapDelayMs));
+        if (this.snapAfterCall !== null) {
+          const id = this.snapAfterCall;
+          await new Promise<void>((resolve, reject) => {
+            const bound = setTimeout(() => { this.onStarted.delete(check); reject(new Error(`the call ${id} never started`)); }, 10_000);
+            const check = () => { if (this.started.has(id)) { clearTimeout(bound); this.onStarted.delete(check); resolve(); } };
+            this.onStarted.add(check);
+            check();
+          });
+        }
         return { success: true, data: [{ type: 'text', text: 'watchtower, facing north' }, png] };
     }
   }
@@ -1732,7 +1748,7 @@ describe('save_recent_image provenance (issue #104)', () => {
     // scan time and the older GIF gets saved under the snapshot's name.
     const h = await startTurn({
       prefix: 'sri-same-batch-',
-      world: (world) => { world.snapDelayMs = 150; },
+      world: (world) => { world.snapAfterCall = 'call_save'; },
       responses: [
         [snapCall('call_snap'), saveCall('call_save', { path: 'files/batched.png', index: 0 })],
         done,
@@ -1762,7 +1778,7 @@ describe('save_recent_image provenance (issue #104)', () => {
     // at review time and never by a test.
     const h = await startTurn({
       prefix: 'sri-same-batch-rev-',
-      world: (world) => { world.snapDelayMs = 150; },
+      world: (world) => { world.snapAfterCall = 'call_save'; },
       responses: [
         [saveCall('call_save', { path: 'files/batched-rev.png', index: 0 }), snapCall('call_snap')],
         done,
@@ -2553,7 +2569,6 @@ describe('ToolImageLedger', () => {
       mimeType: `image/${'p'.repeat(240)}`,
       sizeBytes: Number.MAX_SAFE_INTEGER,
       rejectedFields: [],
-      truncatedFields: [],
       ...extra,
     });
     // The longest stub buildReferenceStub writes: every label at its bound,

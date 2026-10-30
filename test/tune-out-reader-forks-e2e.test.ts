@@ -23,20 +23,6 @@ import type { TraceEvent } from '../src/index.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import type { NormalizedResponse } from '@animalabs/membrane';
 import type { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
-import { JsStore } from '@animalabs/chronicle';
-import { ContextManager } from '@animalabs/context-manager';
-
-// Reader forks are derived agents: they need the branch-bound store handles
-// and ContextManager.derive the Dendrite branches of chronicle and
-// context-manager carry. Against registry builds that lack them the fork is
-// never derived, and the 20 s waits below would fail instead of skipping
-// (the guard dendrite-derive.test.ts has; Weft, 2026-10-17).
-const supported =
-  typeof (JsStore.prototype as unknown as { view?: unknown }).view === 'function' &&
-  typeof (ContextManager.prototype as unknown as { derive?: unknown }).derive === 'function';
-const skip = supported
-  ? false
-  : 'installed @animalabs/chronicle / context-manager lack branch-bound handles or ContextManager.derive';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/tune-out-mcpl-server.mjs');
 const CHANNEL = 'disc:guild:noisy';
@@ -99,7 +85,7 @@ const textOf = (m: Msg | { content: Array<{ type: string; text?: string }> }): s
 const stripCache = (value: unknown): string =>
   JSON.stringify(value, (key, inner) => (key === 'cacheBreakpoint' || key === 'cache_control' ? undefined : inner));
 
-describe('tune-out with reader forks', { skip }, () => {
+describe('tune-out with reader forks', () => {
   let tempDir: string;
   let membrane: RoutedMembrane;
   let framework: AgentFramework;

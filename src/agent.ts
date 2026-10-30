@@ -1206,11 +1206,7 @@ export class Agent {
    * A message above it may still be replaced or withdrawn in place by its
    * sender, though it may already have been in one of the agent's requests.
    * A live stream carries each round's own content and results, which it
-   * stores at its tool boundaries, into its next request. It can also carry
-   * the messages injected at a boundary whose stream didn't say whether it
-   * carries injections, as no membrane 0.5.x stream does: its native path
-   * carries them and its XML path drops them, and either way they stay
-   * above it.
+   * stores at its tool boundaries, into its next request.
    */
   private consumedWatermark: ReadMark | null = null;
   /** Counts marks (markContextConsumed's and applyCompileWatermark's), so a
@@ -1220,17 +1216,16 @@ export class Agent {
    * How far a compile or a tool boundary may have put the agent's context in
    * front of it, per branch. It moves where the consumed watermark does,
    * and sooner: when a committing compile takes its mark, before it awaits,
-   * and at every tool boundary that injects, whether or not the stream says
-   * it carries injected messages. A message above it may still have been
-   * shown, though: for one, a live stream carries each round's own content
-   * and results, stored at a boundary that injected nothing, into its next
-   * request. A compile that throws assembled nothing, and gives its move
-   * back where it can (unshowFailedCompile). A mark taken in legacy mode,
-   * read while the window is the record, counts a prefix of the record, so a
-   * message stored below it without having been shown counts as shown, which
-   * errs toward a marker; one taken in presented mode, and one taken in
-   * legacy mode read once the window is written down, cover the window as it
-   * stood.
+   * and at every tool boundary that injects into its stream. A message above
+   * it may still have been shown, though: for one, a live stream carries each
+   * round's own content and results, stored at a boundary that injected
+   * nothing, into its next request. A compile that throws assembled nothing,
+   * and gives its move back where it can (unshowFailedCompile). A mark taken
+   * in legacy mode, read while the window is the record, counts a prefix of
+   * the record, so a message stored below it without having been shown
+   * counts as shown, which errs toward a marker; one taken in presented
+   * mode, and one taken in legacy mode read once the window is written down,
+   * cover the window as it stood.
    */
   private shownWatermark: ReadMark | null = null;
 
@@ -1411,10 +1406,9 @@ export class Agent {
   }
 
   /** Mark everything in the agent's window (in legacy mode, everything
-   *  stored) as possibly shown (a tool boundary that injected messages,
-   *  whatever its stream says it carries). Without a watermark the coalescer
-   *  counts a message as shown, as it counts one read without a consumed
-   *  watermark. */
+   *  stored) as possibly shown (a tool boundary that injected messages into
+   *  its stream). Without a watermark the coalescer counts a message as
+   *  shown, as it counts one read without a consumed watermark. */
   markContextShown(): void {
     this.shownWatermark = this.pendingWatermark();
   }

@@ -93,5 +93,9 @@ test('the helper leaves a process that isn\'t a test file\'s as it was', (t) => 
 
 test('npm test loads the helper before --test --test-force-exit', () => {
   const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')) as { scripts: { test: string } };
-  assert.match(pkg.scripts.test, /^node --import \.\/dist\/test\/helpers\/force-exit-blocking-stdout\.js --test --test-force-exit /);
+  // The runner gets the helper preloaded, and the flags it's written for.
+  const args = pkg.scripts.test.split(/\s+/);
+  const loads = args.findIndex((arg, i) => arg === '--import' && args[i + 1] === './dist/test/helpers/force-exit-blocking-stdout.js');
+  const firstFile = args.findIndex((arg) => /\.test\.js$/.test(arg));
+  assert.ok(loads >= 0 && firstFile > loads + 1 && args.includes('--test') && args.includes('--test-force-exit'), pkg.scripts.test);
 });

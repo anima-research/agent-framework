@@ -11049,8 +11049,9 @@ export class AgentFramework {
    * **Inheritance.** `mode: 'shared'` (the default) gives the child the
    * parent's messages and fold state through shared storage: nothing is
    * copied, the child folds with the parent's memory tree, and neither can
-   * alter what the other reads. It needs branch-bound store handles and is
-   * refused, not silently downgraded, where they are missing. `mode: 'copy'`
+   * alter what the other reads. It needs a store that supports derivation
+   * (`ContextManager.supportsDerivation`), and is refused, not silently
+   * downgraded, without one. `mode: 'copy'`
    * is the historical mechanism — the parent's compiled context re-added as
    * the child's own messages — and works everywhere.
    *
@@ -17716,18 +17717,22 @@ export class AgentFramework {
           // same facts: a resident's hidesHeld, isAnotherAgentsInjection, an
           // observe edge's includeHeld), so injecting it can't put in the live
           // turn what the next compile hides. The mail a message carries was
-          // released when it was stored. A stream that declares it can't carry
-          // injected messages (supportsInjectedMessages false: membrane's XML
-          // prefill path, from membrane 0.6.0) hears nothing: what arrived
-          // waits for the turn's end. A quiesce freezes the boundary too: it
-          // presents nothing of others' until the quiesce lifts.
+          // released when it was stored. Only a stream that declares it
+          // carries injected messages (supportsInjectedMessages true:
+          // membrane's native path) hears what arrived. Membrane's XML prefill
+          // path declares false, and a stream that doesn't say is taken as one
+          // that doesn't, so neither hears anything: what arrived waits for
+          // the turn's end. A boundary with no stream, the direct API's,
+          // presents it: its re-inference compiles from the window. A quiesce
+          // freezes the boundary too: it presents nothing of others' until
+          // the quiesce lifts.
           const midTurnInjections: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata; id?: MessageId }> = [];
           // What this boundary presented for the agent to hear, in order. An
           // agent whose window isn't presented (a write-down of it failed)
           // hears nothing here: its window is the record.
           const heard: Array<{ id: MessageId; participant: string; content: ContentBlock[]; metadata?: MessageMetadata }> = [];
           const presentsWindow = this.presents(agent);
-          const injects = currentState.supportsInjectedMessages !== false;
+          const injects = currentState.supportsInjectedMessages === true || !currentState.stream;
           // A clock row due (storeDueClock) goes right after the round's
           // results, ahead of the arrivals presented below, and joins the stream
           // the same way. A boundary that passed during the round can't
@@ -17801,12 +17806,10 @@ export class AgentFramework {
 
           // A live stream handed these messages after the results follows
           // them in its next round, not the tool loop of a reply to
-          // [Continue]: that round's rows carry no prompt. One that doesn't
-          // say whether it carries them (membrane 0.5.x, whose native path
-          // carries them and whose XML path drops them) counts as carrying
-          // them here, as at the drain above. A boundary that ends the turn,
-          // restarts the stream or falls back to a new start below hands
-          // them to no live stream, and a new start reads its own prompt from
+          // [Continue]: that round's rows carry no prompt. A boundary that
+          // ends the turn, restarts the stream or falls back to a new start
+          // below hands them to no live stream, and a new start reads its own
+          // prompt from
           // what it sends. (The routing notice below rides only an injection
           // already here.)
           if (midTurnInjections.length > 0) {
@@ -18041,11 +18044,10 @@ export class AgentFramework {
             }
             // Streaming path: convert results and resume the stream.
             // Mid-turn messages collected above ride along as injected user
-            // messages. Membrane's native path (from 0.5.72) appends them
-            // after the tool_result envelope, so the next round of THIS turn
-            // hears them. Its XML prefill path drops them with a warning on
-            // 0.5.x, and from 0.6.0 declares it can't carry them, so none are
-            // collected for it. Each goes as its participant and content
+            // messages. Membrane's native path appends them after the
+            // tool_result envelope, so the next round of THIS turn hears
+            // them. Its XML prefill path declares it can't carry them, so
+            // none are collected for it. Each goes as its participant and content
             // alone: a stored row's metadata is the host's record, not input
             // for membrane. Each goes with its name and text as the store
             // keeps them, whether it's a heard message, rendered or not, or a
@@ -18085,15 +18087,11 @@ export class AgentFramework {
             // the watermark of the turn's compile and read as unread, so a
             // coalesced replacement could remove a message the agent heard
             // and answered (and that its later replies were minted after).
-            // Only a stream that declares it carries them is marked read
-            // (supportsInjectedMessages true: membrane's native path, from
-            // membrane 0.6.0). One that doesn't say may be membrane 0.5.87's
-            // XML path, which drops them with a warning, and a message marked
-            // read there could no longer be replaced though the agent never
-            // saw it. So without the declaration they stay unread, as before
-            // this mark.
-            // The shown mark moves at every boundary that injects, declared
-            // or not, since there a doubt counts as shown.
+            // Only a stream that declares it carries them gets them, and so
+            // is marked read (supportsInjectedMessages true: membrane's native
+            // path).
+            // The shown mark moves at every boundary that injects into its
+            // stream.
             // The mark is the store's head, a scalar, as a compile's is: it
             // also covers what was stored since the compile without being
             // carried, such as another slot's messages, and a write stored
@@ -18105,8 +18103,7 @@ export class AgentFramework {
             // replies after it go without their thinking, whatever the mark
             // says; deferring those writers is the fix.
             if (midTurnInjections.length > 0) {
-              // Possibly shown, whatever the stream declares: the first-view
-              // mark (CoalescerHost.isUnshown) counts a doubt as shown.
+              // Shown: the stream carries them (CoalescerHost.isUnshown).
               agent.markContextShown();
               if (currentState.supportsInjectedMessages === true) agent.markContextConsumed();
             }
@@ -26734,7 +26731,7 @@ export class AgentFramework {
                 (b) => b.type !== 'tool_result'
               );
             } else {
-              // Fallback (older membrane / XML tool mode): preamble + calls.
+              // XML tool mode: this round's text and its calls.
               // XML mode: persist the verbatim generation on each tool_use
               // (membrane#36 round-trip fidelity). context.rawText is the
               // parser's fullMatch — the exact <function_calls> block the
@@ -26746,15 +26743,12 @@ export class AgentFramework {
               const rawXml = rawText && /^<(antml:)?function_calls>/.test(rawText)
                 ? rawText
                 : undefined;
-              // Persist THIS round's text only. `roundPreamble` (membrane
-              // ≥0.5.79) is the per-round delta; the legacy `preamble` is
-              // CUMULATIVE in XML mode — persisting it per round stored each
-              // round's text N times and re-persisted injected
-              // <function_results> as the agent's own words (the Evander
-              // 2026-08-08 scaffold-leak pyramid: r1 ×3, r2 ×2).
-              const roundText =
-                (event.context as { roundPreamble?: string }).roundPreamble ??
-                event.context.preamble;
+              // Persist THIS round's text only: `roundPreamble` is the
+              // per-round delta. The `preamble` beside it is CUMULATIVE in XML
+              // mode: persisting it per round would store each round's text N
+              // times and re-persist injected <function_results> as the
+              // agent's own words.
+              const roundText = (event.context as { roundPreamble?: string }).roundPreamble;
               assistantBlocks = [];
               if (roundText) {
                 assistantBlocks.push({ type: 'text', text: roundText });
@@ -26779,9 +26773,7 @@ export class AgentFramework {
 
             // Whether this stream can carry messages injected with the round's
             // results: true on membrane's native path and false on its XML
-            // prefill path, from membrane 0.6.0, and absent on 0.5.x, which
-            // doesn't declare it. The tool boundary reads it from the agent's
-            // state.
+            // prefill path. The tool boundary reads it from the agent's state.
             agent.enterWaitingForTools(
               calls,
               stream,
@@ -26823,13 +26815,11 @@ export class AgentFramework {
             if (liveRound) liveProseRouting = true;
             // Whether this round's tool-result batch (and anything queued
             // with it) will be presented to the model before it speaks
-            // again: the producer says so when it can (membrane from 0.6.0).
-            // Otherwise, as on membrane 0.5.x, every round counts as
-            // presenting it. That holds for 0.5.x's native rounds, while its
-            // XML path drops what's injected, so a 'now' notice there reaches
+            // again: the stream declares it (true on membrane's native path).
+            // On the XML path, which declares false, a 'now' notice reaches
             // the agent at its next compile instead.
             const presentsInjections =
-              (event.context as { supportsInjectedMessages?: boolean }).supportsInjectedMessages ?? true;
+              (event.context as { supportsInjectedMessages?: boolean }).supportsInjectedMessages === true;
             // Queued under this turn's routing, whenever it posts, and
             // streamed by this stream once published.
             // This round's request was answered: what it carried is heard.
@@ -27676,14 +27666,14 @@ export class AgentFramework {
               // active (native roundContent), each mid-turn round's prose was
               // already delivered when that round yielded — only the TRAILING
               // prose (blocks after the last tool round) remains here. On the
-              // fallback path (XML tool mode / older membrane: no roundContent,
-              // so nothing was live-routed) the historical behavior applies:
+              // XML tool path (no roundContent, so nothing was live-routed)
+              // the historical behavior applies:
               // route the whole turn's parsed segments, once, now. The global
               // speech/thoughts split is left untouched (module/TUI rendering
               // unaffected) — this only governs what reaches the channel.
               //
               // Native round routing uses the live sticky flag, which a fresh
-              // injected message can reset. The legacy/fallback path has no
+              // injected message can reset. The XML tool path has no
               // reliable round boundaries, so retain its historical turn-wide
               // scan to avoid double-posting.
               const toolCalls = response.content
@@ -31896,10 +31886,8 @@ export class AgentFramework {
    * and at a tool boundary whose stream declares it carries the messages
    * injected there (markContextConsumed). So a notice such a stream carried
    * is under it. One a boundary presented without sending (a turn a tool
-   * ended, a budget restart) is above it, and so is one injected into a
-   * stream that doesn't declare it carries injections, which may have
-   * dropped it: counted as unread, it goes to the primary even if the agent
-   * heard it, rather than to no one where the stream dropped it. null when
+   * ended, a budget restart, the direct API's boundary, which has no stream)
+   * is above it until a compile sends it, and counts as unread. null when
    * the window can't be read, which is logged.
    */
   private releasedWindow(agent: Agent): ReleasedWindow | null {

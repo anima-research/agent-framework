@@ -5,9 +5,9 @@ import type { ConversationContext, DiscordClientInterface } from '../src/modules
 import type { ModuleContext, TraceEvent, TraceEventListener } from '../src/types/index.js';
 
 // Discord's typing indicator expires after about 10 s, so the module refreshes
-// it every 8 s (TYPING_REFRESH_MS) from a turn's inference:started until an
-// event that ends the turn.
-const REFRESH_MS = 8_000;
+// it within that, from a turn's inference:started until an event that ends
+// the turn.
+const INDICATOR_LIFE_MS = 10_000;
 const agentName = 'assistant';
 
 const turnEnds: TraceEvent[] = [
@@ -52,7 +52,6 @@ async function startModule(): Promise<{
   } as unknown as ModuleContext;
   const module = new DiscordModule(client, { token: 'test-token' });
   await module.start(ctx);
-  assert.ok(listener, 'autoTyping, on by default, subscribes to the trace stream');
   // Where the agent's reply goes, as an incoming Discord message would set it.
   (module as unknown as { replyContexts: Map<string, ConversationContext> }).replyContexts.set('default', {
     channelId: 'channel-1',
@@ -69,12 +68,13 @@ for (const end of turnEnds) {
       try {
         emit({ type: 'inference:started', agentName, timestamp: 0 });
         assert.equal(typings(), 1, 'typing shows as the turn starts');
-        mock.timers.tick(REFRESH_MS);
-        assert.equal(typings(), 2, 'and is refreshed while the turn runs');
+        mock.timers.tick(INDICATOR_LIFE_MS);
+        assert.ok(typings() >= 2, "and is refreshed within the indicator's life while the turn runs");
+        const shown = typings();
 
         emit(end);
-        mock.timers.tick(REFRESH_MS * 3);
-        assert.equal(typings(), 2, `no refresh after ${end.type}`);
+        mock.timers.tick(INDICATOR_LIFE_MS * 3);
+        assert.equal(typings(), shown, `no refresh after ${end.type}`);
       } finally {
         await module.stop();
       }

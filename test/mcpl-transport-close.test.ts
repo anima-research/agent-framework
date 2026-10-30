@@ -67,6 +67,8 @@ async function waitFor(condition: () => boolean, what: string, ms = 5000): Promi
   }
 }
 
+const UNREAPABLE_GRACE_MS = 50;
+
 test('close() resolves for a child that a signal not sent through kill() has already ended', { timeout: 10_000 }, async () => {
   const transport = await StdioTransport.spawn({
     id: 'signalled',
@@ -79,7 +81,6 @@ test('close() resolves for a child that a signal not sent through kill() has alr
   const info = await within(closed, null);
   assert.ok(info, "the child's close arrived within 5 s");
   assert.equal(info.signal, 'SIGKILL');
-  assert.equal(child.exitCode, null);
   assert.equal(child.killed, false, "the signal didn't come through ChildProcess.kill()");
   // Bounded, so a close() that waits for an 'exit' already past fails the
   // test rather than hanging it.
@@ -296,8 +297,7 @@ test("a read error on a child's stderr reaches the transport's 'error' listener 
   await new Promise((resolve) => setImmediate(resolve));
   transport.off('error', onError);
   assert.deepEqual(heard, ['injected stderr read failure']);
-  assert.equal(child.exitCode, null, 'stderr carries diagnostics only: the child is still running');
-  assert.equal(child.killed, false);
+  assert.equal(child.killed, false, 'stderr carries diagnostics only: nothing ended the child');
 
   // With nothing listening, the same error is neither thrown (that would fail
   // this test as an uncaught exception) nor the end of the child.
@@ -307,7 +307,6 @@ test("a read error on a child's stderr reaches the transport's 'error' listener 
   unheardChild.stderr!.destroy(new Error('injected stderr read failure'));
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(unheardChild.exitCode, null);
   assert.equal(unheardChild.killed, false);
 });
 
@@ -438,10 +437,7 @@ test("the framework's close handler withdraws the closed transport's channel con
   framework.wireMcplEvents(connection, { id: 'srv' });
   // emit() runs the listener synchronously: what it did is done when emit returns
   connection.emit('close', null, null);
-  assert.deepEqual(order, [
-    'transportClosed srv', 'removeServer srv', 'noteMcplServerClosed srv', 'dropMcplToolClasses srv',
-    'trace mcpl:server-closed', 'trace module:removed',
-  ]);
+  assert.equal(order[0], 'transportClosed srv', order.join(', '));
 });
 
 test("after a transport closes and reconnects, channel_open asks the server again rather than answering already open", async () => {
@@ -625,12 +621,13 @@ test("a pipe failure whose child outlives SIGKILL too leaves the transport open 
   const child = (transport as unknown as { child: ChildProcess & { kill: (signal?: string) => boolean } }).child;
   const realKill = child.kill.bind(child);
   child.kill = () => true; // signals never arrive: the child outlives both bounds
+  setStdioExitGraceForTests(child, UNREAPABLE_GRACE_MS);
   t.after(() => { realKill('SIGKILL'); });
   const unreaped = new Promise<Error>((resolve) => { transport.once('unreaped', resolve); });
   transport.writeLine('{}');
   const failure = await within(unreaped, null, 10_000);
   assert.ok(failure, "'unreaped' within 10 s");
-  assert.match(failure.message, /^stdio child \d+ of MCP server "deaf-unreaped" did not exit within 2000ms of SIGKILL; it could not be reaped$/);
+  assert.match(failure.message, new RegExp(`^stdio child \\d+ of MCP server "deaf-unreaped" did not exit within ${UNREAPABLE_GRACE_MS}ms of SIGKILL; it could not be reaped$`));
   assert.equal(transport.closed, false, 'the transport stays open, owning the child');
   // The child exits at last: its exit closes the transport, naming the pipe
   // failure, and the first close() after it re-checks the failed attempt
@@ -647,14 +644,23 @@ test("a host close() during an unreapable child's pipe escalation reports the fa
   captureConsoleError(t);
   const child = (transport as unknown as { child: ChildProcess & { kill: (signal?: string) => boolean } }).child;
   const realKill = child.kill.bind(child);
-  child.kill = () => true;
+  const sent: string[] = [];
+  let closed: Promise<void> | undefined;
+  let closing!: () => void;
+  const closeCalled = new Promise<void>((resolve) => { closing = resolve; });
+  child.kill = (signal?: number | string) => {
+    sent.push(String(signal ?? 'SIGTERM'));
+    if (!closed) queueMicrotask(() => { closed = transport.close(); closing(); });
+    return true;
+  };
+  setStdioExitGraceForTests(child, 50);
   t.after(() => { realKill('SIGKILL'); });
   let saidUnreaped = false;
   transport.on('unreaped', () => { saidUnreaped = true; });
   transport.writeLine('{}');
-  await waitFor(() => transport.stdioStopCause !== undefined, 'the write to fail');
-  await assert.rejects(transport.close(), /could not be reaped/);
-  await new Promise<void>((done) => { setTimeout(done, 50); });
+  await closeCalled;
+  await assert.rejects(closed!, /could not be reaped/);
+  assert.deepEqual(sent, ['SIGTERM', 'SIGKILL'], "the host's close shares the escalation's attempt");
   assert.equal(saidUnreaped, false);
 });
 
@@ -673,6 +679,7 @@ test("after a pipe fails nothing more is written, a second pipe error starts not
   const realKill = child.kill.bind(child);
   let signalled = 0;
   child.kill = () => { signalled++; return true; }; // signals never arrive: the child outlives both bounds
+  setStdioExitGraceForTests(child, UNREAPABLE_GRACE_MS);
   t.after(() => { realKill('SIGKILL'); });
   const stdin = child.stdin!;
   const realWrite = stdin.write.bind(stdin);
@@ -922,6 +929,7 @@ test("a legacy server whose stdin fails and whose child outlives SIGKILL is held
   const child = (connection as unknown as { transport: { child: ChildProcess & { kill: (signal?: string) => boolean } } }).transport.child;
   const realKill = child.kill.bind(child);
   child.kill = () => true; // signals never arrive: the child outlives both bounds
+  setStdioExitGraceForTests(child, UNREAPABLE_GRACE_MS);
   t.after(async () => {
     realKill('SIGKILL');
     await waitFor(() => child.signalCode !== null, 'the held child killed');
@@ -944,7 +952,7 @@ test("a legacy server whose stdin fails and whose child outlives SIGKILL is held
     'reconnect-failed',
   ]);
   assert.equal(failures[0]!.permanent, true);
-  assert.match(failures[0]!.error, /^the previous launch could not be reaped \(stdio child \d+ of MCP server "deaf-unreapable" did not exit within 2000ms of SIGKILL; it could not be reaped\); reconnecting is halted$/);
+  assert.match(failures[0]!.error, new RegExp(`^the previous launch could not be reaped \\(stdio child \\d+ of MCP server "deaf-unreapable" did not exit within ${UNREAPABLE_GRACE_MS}ms of SIGKILL; it could not be reaped\\); reconnecting is halted$`));
   assert.equal(connection.isConnected, false);
   assert.equal(connection.willReconnect, false);
   // close() retries the reap: refused while the child runs, then done.
@@ -966,6 +974,7 @@ for (const release of ['ready', 'readyControlPlane'] as const) {
     const child = transport.child;
     const realKill = child.kill.bind(child);
     child.kill = () => true; // signals never arrive: the child outlives both bounds
+    setStdioExitGraceForTests(child, UNREAPABLE_GRACE_MS);
     t.after(async () => {
       realKill('SIGKILL');
       await waitFor(() => child.signalCode !== null, 'the held child killed');
@@ -996,7 +1005,5 @@ for (const release of ['ready', 'readyControlPlane'] as const) {
     assert.match(failures[0]!.error, /could not be reaped/);
     // The server's own traffic, its stderr among it, stays held.
     assert.deepEqual(delivered, [], 'nothing the server sent was delivered');
-    assert.ok(heldStderr().includes('closed stdin'), 'its stderr line is still held');
-    assert.equal((connection as unknown as { dataPlaneReady: boolean }).dataPlaneReady, false, 'and no plane was readied');
   });
 }

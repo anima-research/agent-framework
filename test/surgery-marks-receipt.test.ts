@@ -28,12 +28,12 @@ import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework, DiscordAwarenessOutbox, OperatorActionError } from '../src/index.js';
 import type { OperatorLogEntry } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
+import { jsonLines } from './helpers/json-lines.js';
 
 const FIXTURE = fileURLToPath(new URL('./fixtures/surgery-marks-mcpl-server.mjs', import.meta.url));
 
 function jsonl<T = Record<string, unknown>>(path: string): T[] {
-  if (!existsSync(path)) return [];
-  return readFileSync(path, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as T);
+  return jsonLines<T>(path);
 }
 
 async function waitFor(description: string, predicate: () => boolean, timeoutMs = 5_000): Promise<void> {

@@ -17,7 +17,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -32,6 +32,7 @@ import type { ChannelDescriptor } from '../src/mcpl/types.js';
 import { TUNE_OUT_DEFAULTS } from '../src/tune-out/coordinator.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { answerText, scriptCall } from './helpers/script-call.js';
+import { jsonLines } from './helpers/json-lines.js';
 
 function descriptor(id: string): ChannelDescriptor {
   return { id, type: 'test', label: id, direction: 'bidirectional', address: { value: id } };
@@ -1151,9 +1152,7 @@ async function framework(t: { after(fn: () => Promise<void>): void }) {
     await new Promise((r) => setTimeout(r, 20));
   }
   let emitted = 0;
-  const events = () => existsSync(statusPath)
-    ? readFileSync(statusPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as { event: string })
-    : [];
+  const events = () => jsonLines<{ event: string }>(statusPath);
   return {
     i,
     membrane,

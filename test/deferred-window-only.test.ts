@@ -18,10 +18,9 @@
  * A message a stream declares it carried has been read: RFC-006's consumed
  * watermark covers it, so a coalesced replacement can no longer remove it.
  * Only a stream that declares it carries injected messages (membrane's native
- * path, from 0.6.0) is known to have carried them. One that declares it can't
- * (membrane's XML prefill path, from 0.6.0) gets none, and what arrived
- * waits for the turn's end. One that doesn't say (membrane 0.5.x) gets them,
- * and they stay unread, though its native path carries them.
+ * path) gets them. One that declares it can't (membrane's XML prefill path)
+ * gets none, and neither does one that doesn't say: what arrived waits for
+ * the turn's end.
  *
  * Before #291 these writes waited in a deferred queue and were stored at
  * the boundary that drained them; the queue's own mechanics (its drain, its
@@ -269,19 +268,17 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     await framework.stop();
   });
 
-  it('a stream that doesn\'t say whether it carries injections gets them, and they stay unread', async () => {
-    // membrane 0.5.87 doesn't declare it, on either path, and its XML path
-    // drops what's injected: marked read there, a message the agent never
-    // saw could no longer be replaced.
+  it('a stream that can\'t carry injections gets none: what arrived waits for the turn to end', async () => {
+    membrane.supportsInjectedMessages = false; // membrane's XML prefill path declares it, from 0.6.0
     const framework = await runTurn('move', [{ participant: 'Antra', content: text('look left') }]);
-    assert.deepEqual(injected(), ['Antra: look left']);
-    assert.deepEqual(windowOf(framework).slice(2), ['user: <tool_result>', 'Antra: look left', 'assistant: Done.']);
+    assert.equal(membrane.lastStream!.receivedToolResultOptions[0], undefined, 'nothing was injected');
+    assert.deepEqual(windowOf(framework).slice(2), ['user: <tool_result>', 'assistant: Done.', 'Antra: look left']);
     assert.equal(unread(framework, 'look left'), true);
     await framework.stop();
   });
 
-  it('a stream that can\'t carry injections gets none: what arrived waits for the turn to end', async () => {
-    membrane.supportsInjectedMessages = false; // membrane's XML prefill path declares it, from 0.6.0
+  it('a stream that doesn\'t say whether it carries injections is taken as one that can\'t: what arrived waits for the turn to end', async () => {
+    membrane.supportsInjectedMessages = 'undeclared';
     const framework = await runTurn('move', [{ participant: 'Antra', content: text('look left') }]);
     assert.equal(membrane.lastStream!.receivedToolResultOptions[0], undefined, 'nothing was injected');
     assert.deepEqual(windowOf(framework).slice(2), ['user: <tool_result>', 'assistant: Done.', 'Antra: look left']);
@@ -324,6 +321,39 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     }
     assert.equal(unread(framework, 'bypassed'), !carries, carries ? 'what the stream carried is read' : 'a boundary that injected nothing marks nothing read');
     await framework.stop();
+  });
+
+  it("a boundary with no stream, the direct API's, presents its results while the host is quiesced, and what arrived for the agent enters after them at resume", async () => {
+    let writer!: ModuleContext;
+    const response = createMockResponse([{ type: 'tool_use', id: 'direct-1', name: 'robot--halt', input: {} }] as ContentBlock[], 'tool_use');
+    (membrane as unknown as { stream: () => Promise<typeof response> }).stream = async () => response;
+    const framework = await createFramework({
+      modules: [module, {
+        name: 'writer', async start(ctx: ModuleContext) { writer = ctx; }, async stop() {}, getTools: () => [],
+        async handleToolCall() { return { success: true }; }, async onProcess() { return {}; },
+      } as Module],
+    });
+    try {
+      const agent = framework.getAgent('assistant')!;
+      agent.getContextManager().addMessage('user', text('take the direct path'));
+      await agent.runInference(framework.getAllTools());
+      assert.equal(agent.state.status, 'waiting_for_tools');
+      await framework.quiesce({ timeoutMs: 1_000 });
+      writer.addMessage('Antra', text('look left'));
+      assert.ok(recordOf(framework).includes('Antra: look left'), 'stored at once');
+      assert.ok(!windowOf(framework).includes('Antra: look left'), 'and out of the window while the host is quiesced');
+      await (framework as unknown as { handleProcessEvent(e: unknown): Promise<void> }).handleProcessEvent({
+        type: 'tool-result', source: 'robot', moduleName: 'robot', agentName: 'assistant', callId: 'direct-1',
+        result: { success: true, data: { halted: true }, endTurn: true },
+      });
+      assert.equal(windowOf(framework).at(-1), 'user: <tool_result>', "the boundary presented its results, and nothing of another's while quiesced");
+      await framework.resume();
+      assert.deepEqual(windowOf(framework).slice(-2), ['user: <tool_result>', 'Antra: look left'], 'presented at resume, after the results');
+      assert.equal(unread(framework, 'look left'), true, 'never carried to the model, so it stays unread');
+    } finally {
+      await framework.resume().catch(() => {});
+      await framework.stop();
+    }
   });
 
   it('a message that enters the window at a boundary that ends the turn was never carried, and stays unread', async () => {

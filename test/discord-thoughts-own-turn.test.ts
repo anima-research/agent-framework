@@ -216,13 +216,6 @@ test('an agent\'s later post in a turn takes the turn\'s thoughts', async () => 
   assert.deepEqual(s.edits, ['M2: ||why||\nsecond']);
 });
 
-test('the module keeps the latest posts of 1,024 agents', async () => {
-  const s = setup(10_000);
-  for (let i = 0; i < 1024; i++) await s.send(`agent-${i}`, i + 1, `post ${i}`);
-  await s.module.onAgentSpeech('agent-0', [], ends(1));
-  assert.deepEqual(s.edits, ['M1: ||why||\npost 0']);
-});
-
 test('the module keeps the latest posts of at most 1,024 agents, and the agent that posted longest ago goes first', async () => {
   const s = setup(10_000);
   for (let i = 0; i < 1024; i++) await s.send(`agent-${i}`, i + 1, `post ${i}`);

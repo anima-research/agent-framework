@@ -22,7 +22,6 @@ import type { TraceEvent } from '../src/index.js';
 import type { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
 import { GateModule } from './helpers/dendrite.js';
 import { WireMembrane, final } from './helpers/wire-membrane.js';
-import { supported } from './helpers/reader-fork-rig.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/tune-out-mcpl-server.mjs');
 const CHANNEL = 'disc:guild:noisy';
@@ -64,7 +63,7 @@ afterEach(async () => {
   while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
 });
 
-describe("a reader fork's framing is a presentation to the fork (#291, AF-5)", { skip: supported ? false : 'needs ContextManager.derive' }, () => {
+describe("a reader fork's framing is a presentation to the fork (#291, AF-5)", () => {
   it('presents the held rows it hands into the fork, which holds them while it runs, and keeps them out of its compile', { timeout: 120_000 }, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'reader-framing-presented-'));
     dirs.push(dir);

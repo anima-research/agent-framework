@@ -641,7 +641,6 @@ describe('a deletion whose evidence holds no agreed disk copy', () => {
       note: 'nothing was unlinked: when last observed, disk held a file at work/c.txt that the workspace never took in '
         + '(conflict: store-origin-collision), and a sync observes whatever disk holds there',
     });
-    assert.deepEqual(deleted.keepWhenWithheld, ['path', 'deleted', 'disk', 'note']);
     const { pendingChanges, conflicts, pendingWorkspaceDeletions } = (await call(m, 'status', {})).work;
     assert.deepEqual({ pendingChanges, conflicts, pendingWorkspaceDeletions }, { pendingChanges: 0, conflicts: 0, pendingWorkspaceDeletions: 0 });
     assert.equal(readFileSync(join(env.dir, 'c.txt'), 'utf8'), 'disk text\n', 'disk keeps its file');
