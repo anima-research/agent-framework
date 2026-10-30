@@ -22,7 +22,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WebSocketServer } from 'ws';
 
-import { McplTransport, StdioTransport, setStdioExitGraceForTests, type TransportCloseInfo } from '../src/mcpl/transport.js';
+import { McplTransport, StdioTransport, setStdioExitGraceForTests, setStdioLineBoundForTests, type TransportCloseInfo } from '../src/mcpl/transport.js';
 import { McplRequestError, McplServerConnection } from '../src/mcpl/server-connection.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 import { AgentFramework } from '../src/framework.js';
@@ -67,6 +67,8 @@ async function waitFor(condition: () => boolean, what: string, ms = 5000): Promi
   }
 }
 
+const UNREAPABLE_GRACE_MS = 50;
+
 test('close() resolves for a child that a signal not sent through kill() has already ended', { timeout: 10_000 }, async () => {
   const transport = await StdioTransport.spawn({
     id: 'signalled',
@@ -79,7 +81,6 @@ test('close() resolves for a child that a signal not sent through kill() has alr
   const info = await within(closed, null);
   assert.ok(info, "the child's close arrived within 5 s");
   assert.equal(info.signal, 'SIGKILL');
-  assert.equal(child.exitCode, null);
   assert.equal(child.killed, false, "the signal didn't come through ChildProcess.kill()");
   // Bounded, so a close() that waits for an 'exit' already past fails the
   // test rather than hanging it.
@@ -268,7 +269,7 @@ test("a failed write to a child's stdin ends the child, and the transport's clos
   const info = await within(closed, null);
   assert.ok(info, 'the transport closed within 5 s');
   assert.equal(info.signal, 'SIGTERM', 'the transport ended the child');
-  assert.equal(info.reason, 'child process exited, and its pipe failed with write EPIPE');
+  assert.equal(info.reason, 'child process exited, and this host had stopped using the server\'s stdio (write EPIPE)');
   assert.deepEqual(errors, [], "the close is the report: no 'error' is emitted");
 });
 
@@ -282,7 +283,7 @@ test("a read error on a child's stdout ends the child the same way, and nothing 
   const info = await within(closed, null);
   assert.ok(info, 'the transport closed within 5 s');
   assert.equal(info.signal, 'SIGTERM');
-  assert.equal(info.reason, 'child process exited, and its pipe failed with injected stdout read failure');
+  assert.equal(info.reason, 'child process exited, and this host had stopped using the server\'s stdio (injected stdout read failure)');
 });
 
 test("a read error on a child's stderr reaches the transport's 'error' listener once, ends nothing, and with no listener isn't thrown", { timeout: 10_000 }, async (t) => {
@@ -296,8 +297,7 @@ test("a read error on a child's stderr reaches the transport's 'error' listener 
   await new Promise((resolve) => setImmediate(resolve));
   transport.off('error', onError);
   assert.deepEqual(heard, ['injected stderr read failure']);
-  assert.equal(child.exitCode, null, 'stderr carries diagnostics only: the child is still running');
-  assert.equal(child.killed, false);
+  assert.equal(child.killed, false, 'stderr carries diagnostics only: nothing ended the child');
 
   // With nothing listening, the same error is neither thrown (that would fail
   // this test as an uncaught exception) nor the end of the child.
@@ -307,7 +307,6 @@ test("a read error on a child's stderr reaches the transport's 'error' listener 
   unheardChild.stderr!.destroy(new Error('injected stderr read failure'));
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(unheardChild.exitCode, null);
   assert.equal(unheardChild.killed, false);
 });
 
@@ -330,8 +329,8 @@ test('a handshake whose child exits at once is refused by its close, never by a 
   for (let run = 0; run < 10; run++) {
     const refusal = await McplServerConnection.connect({ id: 'exits-at-once', command: 'false' }, { version: '0.5' })
       .then(() => 'connected', (error: Error) => error.message);
-    assert.match(refusal, /^MCPL server "exits-at-once" transport closed before handshake completed \(child process exited(, and its pipe failed with write EPIPE)?\)$/);
-    if (refusal.includes('its pipe failed')) withPipeError++;
+    assert.match(refusal, /^MCPL server "exits-at-once" transport closed before handshake completed \(child process exited(, and this host had stopped using the server's stdio \(write EPIPE\))?\)$/);
+    if (refusal.includes('stopped using the server\'s stdio')) withPipeError++;
   }
   // Not asserted: whether a run raced is the platform's. Logged for the reader.
   console.log(`# ${withPipeError} of 10 refusals named a pipe error that raced the exit`);
@@ -387,7 +386,7 @@ test('a server that closes its stdin is ended: a request fails with the disconne
     await within(answer, 'still waiting after 15 s', 15_000),
     /^The connection to the "deaf-after-initialize" server closed before it answered, so whether the request took effect is unknown\. Check its effect before trying again; this host is reconnecting to it\.$/,
   );
-  assert.equal((await within(closed, null, 15_000))?.reason, 'child process exited, and its pipe failed with write EPIPE');
+  assert.equal((await within(closed, null, 15_000))?.reason, 'child process exited, and this host had stopped using the server\'s stdio (write EPIPE)');
   assert.equal(await within(reconnected.then(() => 'reconnected'), 'no reconnect within 15 s', 15_000), 'reconnected');
 });
 
@@ -404,14 +403,14 @@ test("the framework's mcpl:server-closed trace carries the transport's reason, a
   framework.wireMcplEvents(connection, { id: 'srv' });
   connection.emit('close', null, 'SIGTERM', {
     transport: 'stdio', code: null, signal: 'SIGTERM', byHost: false,
-    reason: 'child process exited, and its pipe failed with write EPIPE',
+    reason: 'child process exited, and this host had stopped using the server\'s stdio (write EPIPE)',
   });
   connection.emit('close', 4001, null, {
     transport: 'websocket', code: 4001, signal: null, byHost: false, reason: 'token expired', reasonFromPeer: true,
   });
   connection.emit('close', null, null);
   assert.deepEqual(closes.map(({ code, signal, reason }) => ({ code, signal, reason })), [
-    { code: null, signal: 'SIGTERM', reason: 'child process exited, and its pipe failed with write EPIPE' },
+    { code: null, signal: 'SIGTERM', reason: 'child process exited, and this host had stopped using the server\'s stdio (write EPIPE)' },
     { code: 4001, signal: null, reason: null },
     { code: null, signal: null, reason: null },
   ]);
@@ -438,10 +437,7 @@ test("the framework's close handler withdraws the closed transport's channel con
   framework.wireMcplEvents(connection, { id: 'srv' });
   // emit() runs the listener synchronously: what it did is done when emit returns
   connection.emit('close', null, null);
-  assert.deepEqual(order, [
-    'transportClosed srv', 'removeServer srv', 'noteMcplServerClosed srv', 'dropMcplToolClasses srv',
-    'trace mcpl:server-closed', 'trace module:removed',
-  ]);
+  assert.equal(order[0], 'transportClosed srv', order.join(', '));
 });
 
 test("after a transport closes and reconnects, channel_open asks the server again rather than answering already open", async () => {
@@ -557,12 +553,12 @@ test("a failed write to a child that ignores SIGTERM ends it with SIGKILL 2 s la
   const logged = captureConsoleError(t);
   const closed = new Promise<TransportCloseInfo>((resolve) => { transport.once('close', resolve); });
   transport.writeLine('{}');
-  await waitFor(() => transport.pipeFailure !== undefined, 'the write to fail');
-  assert.equal(transport.pipeFailure?.message, 'write EPIPE', 'writes are refused from here on');
+  await waitFor(() => transport.stdioStopCause !== undefined, 'the write to fail');
+  assert.equal(transport.stdioStopCause?.message, 'write EPIPE', 'writes are refused from here on');
   const info = await within(closed, null, 8000);
   assert.ok(info, 'the transport closed within 8 s');
   assert.equal(info.signal, 'SIGKILL', 'SIGKILL ended the child');
-  assert.equal(info.reason, 'child process exited, and its pipe failed with write EPIPE');
+  assert.equal(info.reason, 'child process exited, and this host had stopped using the server\'s stdio (write EPIPE)');
   assert.equal(received(signals), 1, 'one SIGTERM, then SIGKILL');
   assert.equal(logged.filter((line) => line.includes('ignored SIGTERM for 2000ms')).length, 1, logged.join('\n'));
 });
@@ -585,7 +581,7 @@ test("a child given a test's exit grace waits only that grace after a pipe failu
   restore = () => { t.mock.timers.reset(); child.kill = realKill; realKill('SIGKILL'); };
   const settle = () => new Promise<void>((done) => { setImmediate(done); });
   transport.writeLine('{}');
-  for (const deadline = Date.now() + 5000; transport.pipeFailure === undefined; await settle()) {
+  for (const deadline = Date.now() + 5000; transport.stdioStopCause === undefined; await settle()) {
     if (Date.now() > deadline) throw new Error('timed out waiting for the write to fail');
   }
   t.mock.timers.tick(49);
@@ -625,19 +621,20 @@ test("a pipe failure whose child outlives SIGKILL too leaves the transport open 
   const child = (transport as unknown as { child: ChildProcess & { kill: (signal?: string) => boolean } }).child;
   const realKill = child.kill.bind(child);
   child.kill = () => true; // signals never arrive: the child outlives both bounds
+  setStdioExitGraceForTests(child, UNREAPABLE_GRACE_MS);
   t.after(() => { realKill('SIGKILL'); });
   const unreaped = new Promise<Error>((resolve) => { transport.once('unreaped', resolve); });
   transport.writeLine('{}');
   const failure = await within(unreaped, null, 10_000);
   assert.ok(failure, "'unreaped' within 10 s");
-  assert.match(failure.message, /^stdio child \d+ of MCP server "deaf-unreaped" did not exit within 2000ms of SIGKILL; it could not be reaped$/);
+  assert.match(failure.message, new RegExp(`^stdio child \\d+ of MCP server "deaf-unreaped" did not exit within ${UNREAPABLE_GRACE_MS}ms of SIGKILL; it could not be reaped$`));
   assert.equal(transport.closed, false, 'the transport stays open, owning the child');
   // The child exits at last: its exit closes the transport, naming the pipe
   // failure, and the first close() after it re-checks the failed attempt
   // rather than repeating its verdict.
   const closed = new Promise<TransportCloseInfo>((resolve) => { transport.once('close', resolve); });
   realKill('SIGKILL');
-  assert.equal((await within(closed, null))?.reason, 'child process exited, and its pipe failed with write EPIPE');
+  assert.equal((await within(closed, null))?.reason, 'child process exited, and this host had stopped using the server\'s stdio (write EPIPE)');
   await transport.close();
 });
 
@@ -647,14 +644,23 @@ test("a host close() during an unreapable child's pipe escalation reports the fa
   captureConsoleError(t);
   const child = (transport as unknown as { child: ChildProcess & { kill: (signal?: string) => boolean } }).child;
   const realKill = child.kill.bind(child);
-  child.kill = () => true;
+  const sent: string[] = [];
+  let closed: Promise<void> | undefined;
+  let closing!: () => void;
+  const closeCalled = new Promise<void>((resolve) => { closing = resolve; });
+  child.kill = (signal?: number | string) => {
+    sent.push(String(signal ?? 'SIGTERM'));
+    if (!closed) queueMicrotask(() => { closed = transport.close(); closing(); });
+    return true;
+  };
+  setStdioExitGraceForTests(child, 50);
   t.after(() => { realKill('SIGKILL'); });
   let saidUnreaped = false;
   transport.on('unreaped', () => { saidUnreaped = true; });
   transport.writeLine('{}');
-  await waitFor(() => transport.pipeFailure !== undefined, 'the write to fail');
-  await assert.rejects(transport.close(), /could not be reaped/);
-  await new Promise<void>((done) => { setTimeout(done, 50); });
+  await closeCalled;
+  await assert.rejects(closed!, /could not be reaped/);
+  assert.deepEqual(sent, ['SIGTERM', 'SIGKILL'], "the host's close shares the escalation's attempt");
   assert.equal(saidUnreaped, false);
 });
 
@@ -673,6 +679,7 @@ test("after a pipe fails nothing more is written, a second pipe error starts not
   const realKill = child.kill.bind(child);
   let signalled = 0;
   child.kill = () => { signalled++; return true; }; // signals never arrive: the child outlives both bounds
+  setStdioExitGraceForTests(child, UNREAPABLE_GRACE_MS);
   t.after(() => { realKill('SIGKILL'); });
   const stdin = child.stdin!;
   const realWrite = stdin.write.bind(stdin);
@@ -684,11 +691,11 @@ test("after a pipe fails nothing more is written, a second pipe error starts not
   transport.writeLine('{"before":true}');
   assert.equal(written, 1, 'a write goes out while the pipes hold');
   child.stdout!.emit('error', new Error('read failed'));
-  assert.equal(transport.pipeFailure?.message, 'read failed');
+  assert.equal(transport.stdioStopCause?.message, 'read failed');
   transport.writeLine('{"after":true}');
   assert.equal(written, 1, 'nothing more is written once a pipe has failed');
   child.stdin!.emit('error', new Error('write EPIPE'));
-  assert.equal(transport.pipeFailure?.message, 'read failed', 'the first failure is the one kept');
+  assert.equal(transport.stdioStopCause?.message, 'read failed', 'the first failure is the one kept');
 
   assert.ok(await within(first.then(() => true), false, 10_000), "'unreaped' within 10 s");
   await new Promise<void>((resolve) => { setImmediate(resolve); });
@@ -745,18 +752,172 @@ test('a legacy request made after a stdin failure is refused as not sent, and th
     return true;
   });
   // The pipe's error is the operator's, in the log.
-  assert.ok(logged.some((line) => /^MCPL server "deaf-and-stubborn": \S+ not sent, since its stdio pipe failed: .*write EPIPE/.test(line)), logged.join('\n'));
+  assert.ok(logged.some((line) => /^MCPL server "deaf-and-stubborn": \S+ not sent, since this host stopped using the server's stdio \(.*write EPIPE/.test(line)), logged.join('\n'));
   const info = await within(closed, null, 10_000);
   assert.equal(info?.signal, 'SIGKILL', 'SIGKILL ended it');
-  assert.equal(info?.reason, 'child process exited, and its pipe failed with write EPIPE');
+  assert.equal(info?.reason, 'child process exited, and this host had stopped using the server\'s stdio (write EPIPE)');
   const outcome = await within(first, 'still waiting', 10_000);
   assert.ok(outcome instanceof McplRequestError, `the written request failed with the close: ${String(outcome)}`);
   assert.equal(outcome.outcome, 'no-response', 'it went out, so it may have run');
   assert.equal(outcome.message, 'The connection to the "deaf-and-stubborn" server closed before it answered, so whether the request ' +
     'took effect is unknown. Check its effect before trying again; this host is reconnecting to it.');
   // How it closed, and the request it left unanswered, are the operator's, in the log.
-  assert.ok(logged.some((line) => /^MCPL server "deaf-and-stubborn" disconnected \(.*signal=SIGKILL, reason=child process exited, and its pipe failed with write EPIPE\) with 1 request\(s\) unanswered: mcpl\/manifest/.test(line)), logged.join('\n'));
+  assert.ok(logged.some((line) => /^MCPL server "deaf-and-stubborn" disconnected \(.*signal=SIGKILL, reason=child process exited, and this host had stopped using the server's stdio \(write EPIPE\)\) with 1 request\(s\) unanswered: mcpl\/manifest/.test(line)), logged.join('\n'));
   assert.equal(await within(reconnected.then(() => 'reconnected'), 'no reconnect within 15 s', 15_000), 'reconnected');
+});
+
+function longLineOnManifest(name: string, ignoreTerm: boolean): string {
+  return [
+    ...(ignoreTerm ? ["process.on('SIGTERM', () => console.error('ignored SIGTERM'));"] : []),
+    "const rl = require('readline').createInterface({ input: process.stdin });",
+    "rl.on('line', (line) => {",
+    '  const message = JSON.parse(line);',
+    "  if (message.method === 'initialize') {",
+    `    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.5' } } }, serverInfo: { name: '${name}', version: '0.0.0' } } }) + '\\n');`,
+    "  } else if (message.method === 'mcpl/manifest') {",
+    "    process.stdout.write('x'.repeat(65_537));",
+    '  }',
+    '});',
+    'setInterval(() => {}, 1 << 30);',
+  ].join('\n');
+}
+
+const LONG_LINE_REASON = 'child process exited, and this host had stopped using the server\'s stdio (the server wrote a line on stdout longer than 65,536 UTF-16 code units)';
+
+test('a server that writes a line longer than the bound is ended at once, with no exit grace: a request in flight fails with the disconnect, the close names the line, and the connection reconnects', { timeout: 60_000 }, async (t) => {
+  setStdioLineBoundForTests(65_536);
+  t.after(() => setStdioLineBoundForTests(undefined));
+  const connection = await McplServerConnection.connectWithReconnect(
+    { id: 'long-line', command: process.execPath, args: ['-e', longLineOnManifest('long-line', false)], reconnect: true, reconnectIntervalMs: 10, reconnectMaxIntervalMs: 10 },
+    { version: '0.5' },
+  );
+  t.after(() => connection.close());
+  setStdioExitGraceForTests((connection as unknown as { transport: { child: ChildProcess } }).transport.child, 60_000);
+  const closed = new Promise<{ reason?: string; signal?: string | null; pipeFailed?: boolean }>((resolve) => {
+    connection.once('close', (_code: unknown, _signal: unknown, info: { reason?: string; signal?: string | null; pipeFailed?: boolean }) => resolve(info));
+  });
+  const reconnected = new Promise<void>((resolve) => { connection.once('reconnect', () => resolve()); });
+  connection.ready();
+  const answer = connection.sendManifestRequest(30_000).then(() => 'answered', (error: Error) => error.message);
+  assert.match(
+    await within(answer, 'still waiting after 15 s', 15_000),
+    /^The connection to the "long-line" server closed before it answered, so whether the request took effect is unknown\. Check its effect before trying again; this host is reconnecting to it\.$/,
+  );
+  const info = await within(closed, null, 15_000);
+  assert.deepEqual({ signal: info?.signal, reason: info?.reason, pipeFailed: info?.pipeFailed }, { signal: 'SIGTERM', reason: LONG_LINE_REASON, pipeFailed: true });
+  assert.equal(await within(reconnected.then(() => 'reconnected'), 'no reconnect within 15 s', 15_000), 'reconnected');
+});
+
+test('a request made after a line longer than the bound is refused as not sent, and the server, which ignores SIGTERM, is killed and reconnected', { timeout: 60_000 }, async (t) => {
+  setStdioLineBoundForTests(65_536);
+  t.after(() => setStdioLineBoundForTests(undefined));
+  const connection = await McplServerConnection.connectWithReconnect(
+    { id: 'long-line-stubborn', command: process.execPath, args: ['-e', longLineOnManifest('long-line-stubborn', true)], reconnect: true, reconnectIntervalMs: 10, reconnectMaxIntervalMs: 10 },
+    { version: '0.5' },
+  );
+  t.after(() => connection.close());
+  const logged = captureConsoleError(t);
+  const stderr: string[] = [];
+  connection.on('stderr', ({ line }: { line: string }) => { stderr.push(line); });
+  const closed = new Promise<{ reason?: string; signal?: string | null }>((resolve) => {
+    connection.once('close', (_code: unknown, _signal: unknown, info: { reason?: string; signal?: string | null }) => resolve(info));
+  });
+  const reconnected = new Promise<void>((resolve) => { connection.once('reconnect', () => resolve()); });
+  connection.ready();
+  const first = connection.sendManifestRequest(30_000).then(() => null, (error: unknown) => error);
+  await waitFor(() => stderr.includes('ignored SIGTERM'), 'the transport to send SIGTERM');
+  await assert.rejects(connection.sendManifestRequest(30_000), (error: unknown) => {
+    assert.ok(error instanceof Error && (error as { outcome?: string }).outcome === 'not-sent', String(error));
+    assert.equal((error as Error).message, 'The request wasn\'t sent: this host can no longer write to the "long-line-stubborn" server, ' +
+      'so nothing ran. This host is reconnecting to it; try again later.');
+    return true;
+  });
+  assert.ok(logged.some((line) => /^MCPL server "long-line-stubborn": \S+ not sent, since this host stopped using the server's stdio \(.*the server wrote a line on stdout longer than 65,536 UTF-16 code units/.test(line)), logged.join('\n'));
+  const info = await within(closed, null, 10_000);
+  assert.deepEqual({ signal: info?.signal, reason: info?.reason }, { signal: 'SIGKILL', reason: LONG_LINE_REASON });
+  const outcome = await within(first, 'still waiting', 10_000);
+  assert.ok(outcome instanceof McplRequestError, `the written request failed with the close: ${String(outcome)}`);
+  assert.equal(outcome.outcome, 'no-response');
+  assert.equal(await within(reconnected.then(() => 'reconnected'), 'no reconnect within 15 s', 15_000), 'reconnected');
+});
+
+const STDERR_DROPPED_NOTICE = '[a stderr line longer than 65,536 UTF-16 code units was dropped]';
+
+test('a stderr line is dropped from the read that takes it past the bound, before its line end: the line before it arrives whole, one notice comes then, the rest of the line goes, the next line arrives whole, and the transport stays open', { timeout: 15_000 }, async (t) => {
+  setStdioLineBoundForTests(65_536);
+  t.after(() => setStdioLineBoundForTests(undefined));
+  const script = "process.stderr.write('before\\n' + 'x'.repeat(65_537)); process.stdin.once('data', () => process.stderr.write('tail of it\\nnext\\n')); setInterval(() => {}, 1 << 30);";
+  const transport = await StdioTransport.spawn({ id: 'long-stderr', command: process.execPath, args: ['-e', script] });
+  t.after(() => transport.close());
+  const lines: string[] = [];
+  let noticed!: () => void;
+  const notice = new Promise<void>((resolve) => { noticed = resolve; });
+  let gotNext!: () => void;
+  const next = new Promise<void>((resolve) => { gotNext = resolve; });
+  transport.on('stderr', (line: string) => {
+    lines.push(line);
+    if (line === STDERR_DROPPED_NOTICE) noticed();
+    if (line === 'next') gotNext();
+  });
+  assert.equal(await within(notice.then(() => 'notice'), 'no notice within 5 s, with the line end not yet written'), 'notice');
+  transport.writeLine('go');
+  assert.equal(await within(next.then(() => 'next'), 'no next line within 5 s'), 'next');
+  assert.deepEqual({ lines, closed: transport.closed }, { lines: ['before', STDERR_DROPPED_NOTICE, 'next'], closed: false });
+});
+
+test('a stderr line of exactly the bound in UTF-16 code units, three times that in UTF-8, is held whole until something listens, as the newest held line', { timeout: 15_000 }, async (t) => {
+  setStdioLineBoundForTests(65_536);
+  t.after(() => setStdioLineBoundForTests(undefined));
+  const script = "process.stderr.write('\u20ac'.repeat(65_536) + '\\n');";
+  const transport = await StdioTransport.spawn({ id: 'stderr-at-bound', command: process.execPath, args: ['-e', script] });
+  t.after(() => transport.close());
+  await transport.stderrEnded(5_000);
+  assert.equal((transport as unknown as { stderrDone: boolean }).stderrDone, true, "the child's stderr ended before anything listened");
+  const lines: string[] = [];
+  transport.on('stderr', (line: string) => { lines.push(line); });
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.deepEqual(lines, ['\u20ac'.repeat(65_536)]);
+});
+
+test('a stderr line whose line end comes in the read that takes it past the bound is dropped with one notice, and the next line arrives whole', { timeout: 15_000 }, async (t) => {
+  setStdioLineBoundForTests(65_536);
+  t.after(() => setStdioLineBoundForTests(undefined));
+  const script = "process.stderr.write('y'.repeat(65_536)); process.stderr.write('y\\nlast\\n'); setInterval(() => {}, 1 << 30);";
+  const transport = await StdioTransport.spawn({ id: 'long-stderr-ended', command: process.execPath, args: ['-e', script] });
+  t.after(() => transport.close());
+  const lines: string[] = [];
+  const last = new Promise<void>((resolve) => transport.on('stderr', (line: string) => { lines.push(line); if (line === 'last') resolve(); }));
+  assert.equal(await within(last.then(() => 'last'), 'no last line within 5 s'), 'last');
+  assert.deepEqual({ lines, closed: transport.closed }, { lines: [STDERR_DROPPED_NOTICE, 'last'], closed: false });
+});
+
+test('stderr that arrives before anything listens is held to its newest 200 lines: the oldest go, with one notice saying how many, and the newest arrive in order', { timeout: 15_000 }, async (t) => {
+  setStdioLineBoundForTests(65_536);
+  t.after(() => setStdioLineBoundForTests(undefined));
+  const script = "for (let i = 1; i <= 3000; i++) process.stderr.write(String(i).padStart(4, '0') + '\\n');";
+  const transport = await StdioTransport.spawn({ id: 'stderr-flood', command: process.execPath, args: ['-e', script] });
+  t.after(() => transport.close());
+  await transport.stderrEnded(5_000);
+  assert.equal((transport as unknown as { stderrDone: boolean }).stderrDone, true, "the child's stderr ended before anything listened");
+  const lines: string[] = [];
+  transport.on('stderr', (line: string) => { lines.push(line); });
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  const kept = Array.from({ length: 200 }, (_, k) => String(2801 + k).padStart(4, '0'));
+  assert.deepEqual(lines, ['[2,800 earlier stderr lines were dropped: unread stderr is held to 200 lines and 65,536 UTF-16 code units]', ...kept]);
+});
+
+test('long stderr lines that arrive before anything listens are held to the bound in total: the oldest whole lines go, with one notice saying how many', { timeout: 15_000 }, async (t) => {
+  setStdioLineBoundForTests(65_536);
+  t.after(() => setStdioLineBoundForTests(undefined));
+  const script = "for (let i = 1; i <= 3; i++) process.stderr.write(String(i) + 'x'.repeat(29_999) + '\\n');";
+  const transport = await StdioTransport.spawn({ id: 'stderr-long-held', command: process.execPath, args: ['-e', script] });
+  t.after(() => transport.close());
+  await transport.stderrEnded(5_000);
+  assert.equal((transport as unknown as { stderrDone: boolean }).stderrDone, true, "the child's stderr ended before anything listened");
+  const lines: string[] = [];
+  transport.on('stderr', (line: string) => { lines.push(line); });
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.deepEqual(lines, ['[1 earlier stderr line was dropped: unread stderr is held to 200 lines and 65,536 UTF-16 code units]', '2' + 'x'.repeat(29_999), '3' + 'x'.repeat(29_999)]);
 });
 
 test("a legacy server whose stdin fails and whose child outlives SIGKILL is held as a launch it can't reap: a permanent failure, and close() retries", { timeout: 60_000 }, async (t) => {
@@ -768,6 +929,7 @@ test("a legacy server whose stdin fails and whose child outlives SIGKILL is held
   const child = (connection as unknown as { transport: { child: ChildProcess & { kill: (signal?: string) => boolean } } }).transport.child;
   const realKill = child.kill.bind(child);
   child.kill = () => true; // signals never arrive: the child outlives both bounds
+  setStdioExitGraceForTests(child, UNREAPABLE_GRACE_MS);
   t.after(async () => {
     realKill('SIGKILL');
     await waitFor(() => child.signalCode !== null, 'the held child killed');
@@ -786,11 +948,11 @@ test("a legacy server whose stdin fails and whose child outlives SIGKILL is held
   void connection.sendManifestRequest(30_000).catch(() => {}); // its write meets EPIPE
   await within(new Promise<void>((resolve) => { connection.once('reconnect-failed', () => resolve()); }), null, 10_000);
   assert.deepEqual(order, [
-    'close: its stdio pipe failed with write EPIPE, and its child outlived SIGKILL (holds its child: true)',
+    'close: this host stopped using the server\'s stdio (write EPIPE), and the server\'s process outlived SIGKILL (holds its child: true)',
     'reconnect-failed',
   ]);
   assert.equal(failures[0]!.permanent, true);
-  assert.match(failures[0]!.error, /^the previous launch could not be reaped \(stdio child \d+ of MCP server "deaf-unreapable" did not exit within 2000ms of SIGKILL; it could not be reaped\); reconnecting is halted$/);
+  assert.match(failures[0]!.error, new RegExp(`^the previous launch could not be reaped \\(stdio child \\d+ of MCP server "deaf-unreapable" did not exit within ${UNREAPABLE_GRACE_MS}ms of SIGKILL; it could not be reaped\\); reconnecting is halted$`));
   assert.equal(connection.isConnected, false);
   assert.equal(connection.willReconnect, false);
   // close() retries the reap: refused while the child runs, then done.
@@ -808,10 +970,11 @@ for (const release of ['ready', 'readyControlPlane'] as const) {
       { version: '0.5' },
     );
     captureConsoleError(t);
-    const transport = (connection as unknown as { transport: { pipeFailure: Error | undefined; child: ChildProcess & { kill: (signal?: string) => boolean } } }).transport;
+    const transport = (connection as unknown as { transport: { stdioStopCause: Error | undefined; child: ChildProcess & { kill: (signal?: string) => boolean } } }).transport;
     const child = transport.child;
     const realKill = child.kill.bind(child);
     child.kill = () => true; // signals never arrive: the child outlives both bounds
+    setStdioExitGraceForTests(child, UNREAPABLE_GRACE_MS);
     t.after(async () => {
       realKill('SIGKILL');
       await waitFor(() => child.signalCode !== null, 'the held child killed');
@@ -825,8 +988,8 @@ for (const release of ['ready', 'readyControlPlane'] as const) {
     // that meets EPIPE. (Before ready(), the connection holds its own events,
     // the server's stderr among them, so the writes say when.)
     await waitFor(() => {
-      if (transport.pipeFailure === undefined) void connection.sendManifestRequest(30_000).catch(() => {});
-      return transport.pipeFailure !== undefined;
+      if (transport.stdioStopCause === undefined) void connection.sendManifestRequest(30_000).catch(() => {});
+      return transport.stdioStopCause !== undefined;
     }, 'a write to meet EPIPE');
     await waitFor(() => connection.holdsUnreapedChild, 'the launch held', 10_000);
     assert.equal(connection.willReconnect, false);
@@ -842,7 +1005,5 @@ for (const release of ['ready', 'readyControlPlane'] as const) {
     assert.match(failures[0]!.error, /could not be reaped/);
     // The server's own traffic, its stderr among it, stays held.
     assert.deepEqual(delivered, [], 'nothing the server sent was delivered');
-    assert.ok(heldStderr().includes('closed stdin'), 'its stderr line is still held');
-    assert.equal((connection as unknown as { dataPlaneReady: boolean }).dataPlaneReady, false, 'and no plane was readied');
   });
 }

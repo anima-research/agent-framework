@@ -133,19 +133,18 @@ describe('HistoryModule semantic_search', () => {
 
   it('syncs messages and summaries incrementally with cursors, then searches with mapped filters', async () => {
     const mod = new HistoryModule({ semantic: { url: svc.url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0, syncBatch: 2 } });
-    mod.bind(stubCm(messages, summaries));
+    const minted = [...summaries];
+    mod.bind(stubCm(messages, minted));
     const r1 = await mod.syncSemanticIndex()!;
     assert.deepEqual({ pushed: r1.pushed, inserted: r1.inserted, more: r1.more }, { pushed: 4, inserted: 4, more: false });
     assert.deepEqual([...svc.items.keys()].sort(), ['msg:m1', 'msg:m2', 'msg:m4', `sum:s1@${T0 + 9000}`]);
     assert.equal(svc.items.get('msg:m1')!.cursor, T0 + 1000);
     assert.equal(svc.items.get(`sum:s1@${T0 + 9000}`)!.cursor, T0 + 9000);
     assert.equal(svc.items.get('msg:m1')!.channel, 'chan-A');
-    // Second pass: the overlap re-sends the recent messages, and the summary at
-    // the cursor's millisecond is sent again; the service reports them all unchanged.
-    const before = svc.upserts.length;
+    minted.push({ id: 's2', level: 1, content: 'A second summary of the evening', tokens: 10, startMs: T0, endMs: T0 + 5000, firstSequence: 1, lastSequence: 4, createdMs: T0 + 9000 });
     const r2 = await mod.syncSemanticIndex()!;
-    assert.deepEqual({ inserted: r2.inserted, unchanged: r2.unchanged }, { inserted: 0, unchanged: r2.pushed });
-    assert.ok(svc.upserts.slice(before).flat().some((i) => i.id === `sum:s1@${T0 + 9000}`), 'the summary was sent again');
+    assert.deepEqual({ inserted: r2.inserted, unchanged: r2.unchanged }, { inserted: 1, unchanged: r2.pushed - 1 });
+    assert.ok(svc.items.has(`sum:s2@${T0 + 9000}`), 'the summary minted in the cursor\'s millisecond is indexed');
 
     const res = await mod.handleToolCall({ id: 'c1', name: 'semantic_search', input: { query: 'fluid sim', from: '2026-09-22T00:00:00Z', kinds: 'messages', limit: 5 } });
     assert.equal(res.success, true, JSON.stringify(res));

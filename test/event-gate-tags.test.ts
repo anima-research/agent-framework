@@ -72,7 +72,7 @@ describe('EventGate tag matching', () => {
     const gate = makeGate({
       policies: [
         { name: 'addressed', match: { tagsAny: ['chat:addressed'] }, behavior: 'always' },
-        { name: 'ambient', match: { tagsAll: ['chat:ambient'] }, behavior: { debounce: 1000 } },
+        { name: 'ambient', match: { tagsAny: ['chat:mention'] }, behavior: { debounce: 1000 } },
       ],
       default: 'skip',
     });

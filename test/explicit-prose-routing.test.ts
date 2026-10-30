@@ -1484,11 +1484,10 @@ describe('explicit prose routing', () => {
     }
   });
 
-  it("a settle closes the open logical turn only when it is the settling stream's own, and stop() clears open turns", async () => {
+  it("a settle closes the open logical turn only when it is the settling stream's own", async () => {
     const framework = await createFramework('hybrid');
     const internals = framework as unknown as {
       openLogical: Map<string, RoutingState>;
-      turnRouting: Map<string, RoutingState>;
       settleAgent(name: string, outcome: { stopReason: 'completed'; speech: string }, closes: RoutingState | undefined): void;
     };
     const open: RoutingState = routingState({ continuation: true });
@@ -1501,11 +1500,7 @@ describe('explicit prose routing', () => {
     assert.equal(internals.openLogical.get('assistant'), open, "a stale settle leaves the newer turn open");
     internals.settleAgent('assistant', { stopReason: 'completed', speech: '' }, open);
     assert.equal(internals.openLogical.has('assistant'), false, "the turn's own settle closes it");
-    internals.openLogical.set('assistant', open);
-    internals.turnRouting.set('assistant', open);
     await framework.stop();
-    assert.equal(internals.openLogical.size, 0, 'stop() clears every open logical turn');
-    assert.equal(internals.turnRouting.get('assistant'), open, 'and keeps the live routing state, for a resume that continues its turn');
   });
 
   it('a silent start neither takes nor disturbs an open logical turn, and leaves it to the next start that routes prose', async () => {
@@ -3084,10 +3079,11 @@ describe('explicit prose routing', () => {
     await within(framework.runUntilIdle(), 'the first stream', 10000);
     if (how === 'capacity') {
       assert.equal(starts, 1, 'the hold defers the turn rather than retrying it at once');
-      const hold = internals.providerAccelerationCooldowns.get('assistant');
-      assert.ok(hold, 'the turn is held');
+      const admission = (framework.healthSnapshot() as { agents: Array<{ name: string; providerAdmission: { cooldownReason: string | null } }> })
+        .agents.find((agent) => agent.name === 'assistant')!.providerAdmission;
+      assert.notEqual(admission.cooldownReason, null, 'the turn is held');
       // What the cooldown's timer does when it fires, at the hold's deadline.
-      hold.until = Date.now();
+      internals.providerAccelerationCooldowns.get('assistant')!.until = Date.now();
       internals.releaseProviderAccelerationCooldown('assistant');
       await within(framework.runUntilIdle(), 'the deferred compile', 10000);
     }

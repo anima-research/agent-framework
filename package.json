@@ -1,6 +1,6 @@
 {
   "name": "@animalabs/agent-framework",
-  "version": "0.30.0",
+  "version": "0.31.0",
   "description": "Multi-agent framework with pluggable modules, persistent state, and concurrent tool execution",
   "repository": {
     "type": "git",
@@ -31,7 +31,7 @@
     "dev": "tsc --watch",
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit",
-    "pretest": "mkdir -p dist/test/fixtures && cp test/fixtures/*.mjs dist/test/fixtures/",
+    "pretest": "mkdir -p dist/test/fixtures && cp test/fixtures/*.mjs dist/test/fixtures/ && cp src/code-execution/quickjs.wasm dist/src/code-execution/",
     "test": "node --import ./dist/test/helpers/force-exit-blocking-stdout.js --test --test-force-exit ${AF_TEST_CONCURRENCY:+--test-concurrency=$AF_TEST_CONCURRENCY} --test-timeout=600000 dist/test/*.test.js",
     "preversion": "node scripts/release-bump.mjs && node scripts/release-holds.mjs",
     "version": "node scripts/release-changelog.mjs && git add CHANGELOG.md changelog.d",
@@ -48,7 +48,7 @@
   "author": "Anima Research",
   "license": "MIT",
   "dependencies": {
-    "@animalabs/chronicle": "^0.5.0",
+    "@animalabs/chronicle": "^0.5.1",
     "@animalabs/context-manager": "^0.24.0",
     "@animalabs/membrane": "^0.8.0",
     "@modelcontextprotocol/client": "^2.3.1",

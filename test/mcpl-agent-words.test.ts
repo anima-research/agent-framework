@@ -19,7 +19,6 @@ import {
   REFERENCE_LIMITS,
   REFERENCE_LINK_TOO_LONG_TEXT,
   REFERENCE_NO_LINK_TEXT,
-  classifyBlock,
   referenceStubOrNull,
 } from '../src/mcpl/references.js';
 import { convertBlock } from '../src/mcpl/convert-block.js';
@@ -66,11 +65,10 @@ test("a reference block that can't be read says which part is missing, and what 
   // tool-result lane gives every inline shape its marker: this audio shows as
   // a tool result's audio does, and its data stays out of history.
   const audio = { type: 'audio', data: 'aGVsbG8=', mimeType: 'audio/wav', uri: '' };
-  assert.deepEqual(classifyBlock(audio), { kind: 'inline', contradiction: false });
   const stored = toolResultDataToHistoryString([{ type: 'text', text: 't' }, audio]);
   assert.equal(stored, "t\n[Audio not shown: this host's tool results carry only text and images (audio/wav, 6B).]");
   // A link that isn't empty still withholds it.
-  assert.deepEqual(classifyBlock({ ...audio, uri: 'https://zz.example/a.wav' }), { kind: 'inline', contradiction: true });
+  assert.equal(toolResultDataToHistoryString([{ ...audio, uri: 'https://zz.example/a.wav' }]), INLINE_WITHHELD_TEXT);
 });
 
 // ---------------------------------------------------------------------------
@@ -208,7 +206,7 @@ test("a request refused as not sent is refused through its promise when the host
     readonly kind = 'stdio' as const;
     failed: Error | undefined;
     writeFails: Error | undefined;
-    override get pipeFailure(): Error | undefined { return this.failed; }
+    override get stdioStopCause(): Error | undefined { return this.failed; }
     writeLine(): void { if (this.writeFails) throw this.writeFails; }
     async close(): Promise<void> {}
   }

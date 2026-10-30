@@ -57,7 +57,8 @@ function start(file: string, args: string[], env: Record<string, string>, cwd?: 
   const exited = new Promise<{ code: number | null; stderr: string }>((resolve) => {
     child.on('close', (code) => resolve({ code, stderr }));
   });
-  return { endStdin: () => child.stdin.end(), kill: () => child.kill(), exited };
+  child.stdin.on('error', () => {});
+  return { endStdin: () => child.stdin.end(), writeStdin: (chunk: Buffer) => child.stdin.write(chunk), kill: () => child.kill(), exited };
 }
 
 function within<T>(promise: Promise<T>, what: string): Promise<T> {
@@ -189,6 +190,20 @@ test("the command's answers on stdout carry U+2028 and U+2029 escaped, and parse
     assert.equal(answer.error.message, 'Method not found: no\u2028such\u2029method');
   } finally {
     child.kill();
+    await api.close();
+  }
+});
+
+test('a line on stdin longer than 104,857,600 UTF-16 code units ends the server with code 1 and one stderr line naming the bound', async () => {
+  const api = await standInApi();
+  const run = start(process.execPath, [BIN], { AGENT_FRAMEWORK_WS_URL: api.url });
+  try {
+    await within(api.connected, 'the server connected to the stand-in API');
+    run.writeStdin(Buffer.alloc(104_857_601, 0x78));
+    const { code, stderr } = await within(run.exited, 'the server exited after the long line');
+    assert.deepEqual({ code, stderr }, { code: 1, stderr: 'MCP server stopped: a line on stdin was longer than 104,857,600 UTF-16 code units\n' });
+  } finally {
+    run.kill();
     await api.close();
   }
 });

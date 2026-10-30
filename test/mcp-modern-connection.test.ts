@@ -19,6 +19,7 @@ import { fileURLToPath } from 'node:url';
 
 import { ModernMcpConnection } from '../src/mcpl/modern-connection.js';
 import { McplRequestError } from '../src/mcpl/server-connection.js';
+import { setStdioLineBoundForTests } from '../src/mcpl/transport.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -78,6 +79,19 @@ test('connects once over Connectome\'s spawner and speaks 2026-07-28', async () 
   await until(() => stderr.some((l) => /^modern fixture \d+ up$/.test(l)), 'the fixture says it is up');
   await connection.callTool('shout', { text: 'hello' });
   await until(() => stderr.includes('shout: hello'), "the fixture's stderr line arrives");
+});
+
+test('stderr that arrives before the caller listens is held to its newest 200 lines: the oldest go, with one notice saying how many, and the newest arrive in order', async (t) => {
+  setStdioLineBoundForTests(65_536);
+  t.after(() => setStdioLineBoundForTests(undefined));
+  const connection = await connect(config(scratch(), { env: { FIXTURE_STDERR_FLOOD: '3000' } }));
+  const held = (connection as unknown as { heldStderr: { lines: string[] } }).heldStderr;
+  await until(() => held.lines.at(-1) === 'flood done', "the fixture's last stderr line is held");
+  const stderr: string[] = [];
+  connection.on('stderr', ({ line }: { line: string }) => stderr.push(line));
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  const kept = Array.from({ length: 199 }, (_, k) => String(2802 + k).padStart(4, '0') + 'x'.repeat(96));
+  assert.deepEqual(stderr, ['[2,802 earlier stderr lines were dropped: unread stderr is held to 200 lines and 65,536 UTF-16 code units]', ...kept, 'flood done']);
 });
 
 test('the child gets the env allowlist plus declared env, as legacy children do', async () => {

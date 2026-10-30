@@ -150,6 +150,14 @@ function types(traces: TraceEvent[], ...wanted: string[]): string[] {
   return traces.map((t) => String(t.type)).filter((t) => wanted.includes(t));
 }
 
+/**
+ * How long a stopped inference is watched for a relaunch. When the cancel
+ * fell through the failure pipeline, the default errorPolicy's retry
+ * relaunched it about 1.2 s after the stop. Nothing marks that no retry is
+ * coming, so this is a window placed against that delay, not a wait.
+ */
+const RELAUNCH_WINDOW_MS = 1500;
+
 describe('a cancel that the stream reports as `error` is still a deliberate stop', () => {
   it('abortInference(reason) → ONE inference:aborted with the reason; no inference:failed, no retry', async () => {
     const { framework, membrane, agent, traces, teardown } =
@@ -157,9 +165,7 @@ describe('a cancel that the stream reports as `error` is still a deliberate stop
     try {
       assert.equal(framework.abortInference('assistant', 'operator_reclaim'), true);
       await waitFor(() => traces.some((t) => t.type === 'inference:aborted'));
-      // Give the failure pipeline's retry every chance to show up (the
-      // observed relaunch landed ~1.2s after the stop).
-      await new Promise((r) => setTimeout(r, 1500));
+      await new Promise((r) => setTimeout(r, RELAUNCH_WINDOW_MS));
 
       const aborted = traces.filter((t) => t.type === 'inference:aborted') as Array<{ reason?: string }>;
       assert.deepEqual(aborted.map((t) => t.reason), ['operator_reclaim'],
@@ -188,7 +194,7 @@ describe('a cancel that the stream reports as `error` is still a deliberate stop
     try {
       agent.cancelStream();
       await waitFor(() => traces.some((t) => t.type === 'inference:aborted'));
-      await new Promise((r) => setTimeout(r, 1500));
+      await new Promise((r) => setTimeout(r, RELAUNCH_WINDOW_MS));
 
       const aborted = traces.filter((t) => t.type === 'inference:aborted') as Array<{ reason?: string }>;
       assert.deepEqual(aborted.map((t) => t.reason), ['user']);
@@ -499,15 +505,11 @@ async function toolTurn(tool: 'end' | 'fetch', reports: CancelReport) {
       windowOpenAfterFirstStream = gate.inferenceDiagnostics().inferring.includes('assistant');
     };
   }
-  // Each inference-log entry as the framework writes it: 'ok' for a
+  // The inference log as a caller reads it, oldest first: 'ok' for a
   // success, 'failed' for a failure.
-  const written: string[] = [];
-  const log = framework as unknown as { logInference: (entry: { success?: boolean }) => void };
-  const writeLog = log.logInference.bind(framework);
-  log.logInference = (entry) => {
-    written.push(entry.success === false ? 'failed' : 'ok');
-    writeLog(entry);
-  };
+  const logged = (): string[] => framework.queryInferenceLogs({ agentName: 'assistant' }).entries
+    .map((e) => (e.entry.success === false ? 'failed' : 'ok'))
+    .reverse();
   // What the framework says on the console, such as a throw it ends as a
   // cancel: recorded, and still printed, so a failing test shows it.
   // Restored at teardown.
@@ -545,7 +547,7 @@ async function toolTurn(tool: 'end' | 'fetch', reports: CancelReport) {
   const terminals = (): string[] => lifecycle.filter((phase) => phase !== 'started');
   return {
     framework, membrane, traces, teardown, terminals, errors,
-    logged: () => [...written],
+    logged,
     windowCloses: () => windowCloses,
     windowOpenAfterFirstStream: () => windowOpenAfterFirstStream,
   };

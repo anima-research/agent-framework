@@ -61,8 +61,8 @@ test('a text attachment whose fetch throws reads the same', async (t) => {
   const blocks = await convert(t, async () => { throw new TypeError('fetch failed'); });
   assert.deepEqual(blocks, [{ type: 'text', text: '' }, { type: 'text', text: "[Attachment: notes.txt couldn't be fetched, so its text isn't in your context. If you need it, ask the sender in the channel to paste it.]" }]);
   assert.equal(warn.mock.calls.length, 1);
-  assert.match(String(warn.mock.calls[0].arguments[0]), /^Discord: Attachment notes\.txt in message m1 wasn't fetched:$/);
-  assert.equal((warn.mock.calls[0].arguments[1] as Error).message, 'fetch failed');
+  const line = warn.mock.calls[0].arguments.join(' ');
+  for (const part of ['notes.txt', 'm1', 'fetch failed']) assert.ok(line.includes(part), `the line names ${part}: ${line}`);
 });
 
 test('a text attachment that is fetched is read whole', async (t) => {

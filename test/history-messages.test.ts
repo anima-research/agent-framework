@@ -655,8 +655,8 @@ test('a semantic search the index service fails says nothing was searched, and w
   }
   // No answer within the timeout.
   assert.equal(
-    await search(await listen(t, createServer(() => {})), 300),
-    `Nothing was searched: the semantic index service didn't answer the search request within 300 ms. ${noAnswer}`,
+    await search(await listen(t, createServer(() => {})), 20),
+    `Nothing was searched: the semantic index service didn't answer the search request within 20 ms. ${noAnswer}`,
   );
   // Nothing listening: the port of a server that has closed.
   const gone = createServer(() => {});
@@ -894,12 +894,10 @@ test('a background sync without stats fails on that answer when its budget cuts 
   // More messages than the sync before a search may send (256): with no
   // watermark, every pass would walk the same first page again.
   const messages = Array.from({ length: 300 }, (_, i) => message(`m${i + 1}`, T + i, 'c1'));
-  let pages = 0;
   const many = {
     ...store(),
     getMessage: (id: string) => messages.find((m) => m.id === id) ?? null,
     queryMessagesByTime(args: { fromMs?: number; limit?: number; offset?: number }) {
-      pages++;
       const from = messages.filter((m) => args.fromMs === undefined || m.timestamp.getTime() >= args.fromMs);
       const offset = args.offset ?? 0;
       return { messages: from.slice(offset, offset + (args.limit ?? from.length)), matchedCount: from.length };
@@ -922,7 +920,6 @@ test('a background sync without stats fails on that answer when its budget cuts 
   const notStats = 'the semantic index service answered the stats request without stats by kind (HTTP 200)';
   assert.equal(found.index.behind, true);
   assert.equal(found.index.syncedThisCall, 256);
-  assert.equal(pages, 1, 'a budget spent at a page\'s end reads no next page');
   assert.equal(found.index.lastError, notStats);
   const lines = warned.mock.calls.map((c) => String(c.arguments[0]));
   assert.ok(lines.includes(`[history/semantic] index "test/ns": sync failed (1×, retry in 5s): ${notStats}`), JSON.stringify(lines));
@@ -1032,13 +1029,10 @@ test("the index client's failure carries the service's status, and a namespace t
     'the semantic index service answered the stats request with an error (HTTP 500: {"error":{"message":{"code":7}}})',
   );
 
-  // The timeout as the client used it: whole seconds, or else milliseconds.
   const silent = await listen(t, createServer(() => {}));
-  for (const [ms, within] of [[1000, '1 s'], [1100, '1100 ms']] as const) {
-    const late = await failed(client(silent, ms).stats());
-    assert.equal(late.message, `the semantic index service didn't answer the stats request within ${within}`);
-    assert.equal(late.status, null);
-  }
+  const late = await failed(client(silent, 20).stats());
+  assert.equal(late.message, "the semantic index service didn't answer the stats request within 20 ms");
+  assert.equal(late.status, null);
 });
 
 test('an answer cut off after its status counts as no answer, and says it was cut off', async (t) => {

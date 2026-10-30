@@ -123,7 +123,6 @@ test('a frame pushed a byte at a time decodes, and the decoder keeps one buffer 
   for (let i = 0; i < frame.length - 1; i++) assert.deepEqual(decoder.push(frame.subarray(i, i + 1)), []);
   // Short of its last byte: the body is one buffer of the length its header named.
   assert.equal((internals.body as Buffer).length, frame.length - 4);
-  assert.equal('chunks' in internals, false);
   assert.deepEqual(decoder.push(frame.subarray(frame.length - 1)), [{ t: 'out', text: 'x'.repeat(5000) }]);
   assert.equal(internals.body, null);
   // Two frames and part of a third in one chunk.

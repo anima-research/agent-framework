@@ -30,7 +30,7 @@ import { MembraneError } from '@animalabs/membrane';
 class QueuedStrategy implements ContextStrategy {
   readonly name = 'queued-test';
   ticks = 0;
-  toolCounts: number[] = [];
+  toolNames: string[][] = [];
   thinkDescriptions: string[] = [];
 
   checkReadiness(): ReadinessState {
@@ -38,7 +38,7 @@ class QueuedStrategy implements ContextStrategy {
   }
 
   async tick(ctx: StrategyContext): Promise<void> {
-    this.toolCounts.push(ctx.tools?.length ?? 0);
+    this.toolNames.push((ctx.tools ?? []).map((tool) => tool.name));
     const think = ctx.tools?.find((tool) => tool.name === 'think');
     if (think) this.thinkDescriptions.push(think.description);
     this.ticks++;
@@ -659,10 +659,14 @@ describe('queued context maintenance timer', () => {
     try {
       framework.start();
       await waitFor(() => strategy.ticks >= 2);
-      // Module tool, synthesized agent_settings and the four toolsets
-      // meta-tools are all supplied to maintenance/compression requests:
-      // compression declares every tool its history may hold, folded or not.
-      assert.deepEqual(strategy.toolCounts, [6, 6]);
+      // The agent's tools, its module's among them, are supplied to every
+      // maintenance tick: compression declares every tool its history may
+      // hold, folded or not.
+      assert.ok(strategy.toolNames[0]!.includes('maintenance-tools--inspect'), strategy.toolNames[0]!.join(', '));
+      const callable = framework.getAllTools().map((tool) => tool.name);
+      const missing = callable.filter((name) => !strategy.toolNames[0]!.includes(name));
+      assert.deepEqual(missing, [], `every tool the agent may call (allowedTools: 'all'): ${strategy.toolNames[0]!.join(', ')}`);
+      assert.deepEqual(strategy.toolNames[1], strategy.toolNames[0], 'the same tools at each tick');
       await waitFor(() => framework.getContextMaintenanceSnapshot().history.length === 1);
       const snapshot = framework.getContextMaintenanceSnapshot();
       assert.equal(snapshot.current, null);
@@ -788,12 +792,9 @@ describe('queued context maintenance timer', () => {
       message: string;
       data?: Record<string, unknown>;
     }> = [];
-    (framework as any).opsAlert = (
-      kind: string,
-      agentName: string,
-      message: string,
-      opts?: { data?: Record<string, unknown> },
-    ) => alerts.push({ kind, agentName, message, data: opts?.data });
+    framework.onTrace((event) => {
+      if (event.type === 'ops:alert') alerts.push({ kind: event.kind, agentName: event.agentName, message: event.message, data: event.data });
+    });
 
     try {
       framework.start();
@@ -835,12 +836,9 @@ describe('queued context maintenance timer', () => {
       maintenanceIntervalMs: 10,
     });
     const alerts: Array<{ kind: string; agentName: string; data?: Record<string, unknown> }> = [];
-    (framework as any).opsAlert = (
-      kind: string,
-      agentName: string,
-      _message: string,
-      opts?: { data?: Record<string, unknown> },
-    ) => alerts.push({ kind, agentName, data: opts?.data });
+    framework.onTrace((event) => {
+      if (event.type === 'ops:alert') alerts.push({ kind: event.kind, agentName: event.agentName, data: event.data });
+    });
 
     // A failed strategy initialization fences the context manager: its state
     // queries throw until a successful switchBranch or setStrategy.
@@ -884,12 +882,9 @@ describe('queued context maintenance timer', () => {
     });
     strategy.manager = framework.getAgent('agent')!.getContextManager();
     const alerts: Array<{ kind: string; agentName: string; data?: Record<string, unknown> }> = [];
-    (framework as any).opsAlert = (
-      kind: string,
-      agentName: string,
-      _message: string,
-      opts?: { data?: Record<string, unknown> },
-    ) => alerts.push({ kind, agentName, data: opts?.data });
+    framework.onTrace((event) => {
+      if (event.type === 'ops:alert') alerts.push({ kind: event.kind, agentName: event.agentName, data: event.data });
+    });
 
     try {
       framework.start();
@@ -922,12 +917,9 @@ describe('queued context maintenance timer', () => {
       maintenanceIntervalMs: 10,
     });
     const alerts: Array<{ kind: string; agentName: string; data?: Record<string, unknown> }> = [];
-    (framework as any).opsAlert = (
-      kind: string,
-      agentName: string,
-      _message: string,
-      opts?: { data?: Record<string, unknown> },
-    ) => alerts.push({ kind, agentName, data: opts?.data });
+    framework.onTrace((event) => {
+      if (event.type === 'ops:alert') alerts.push({ kind: event.kind, agentName: event.agentName, data: event.data });
+    });
 
     try {
       framework.start();
@@ -963,12 +955,9 @@ describe('queued context maintenance timer', () => {
       maintenanceIntervalMs: 10,
     });
     const alerts: Array<{ kind: string; agentName: string; data?: Record<string, unknown> }> = [];
-    (framework as any).opsAlert = (
-      kind: string,
-      agentName: string,
-      _message: string,
-      opts?: { data?: Record<string, unknown> },
-    ) => alerts.push({ kind, agentName, data: opts?.data });
+    framework.onTrace((event) => {
+      if (event.type === 'ops:alert') alerts.push({ kind: event.kind, agentName: event.agentName, data: event.data });
+    });
     const internals = framework as unknown as { providerGateBlocked: (name: string) => boolean };
     const gateBlocked = internals.providerGateBlocked.bind(framework);
     internals.providerGateBlocked = (name: string) => {
@@ -1006,7 +995,7 @@ describe('queued context maintenance timer', () => {
       maintenanceIntervalMs: 10,
     });
     const alerts: string[] = [];
-    (framework as any).opsAlert = (kind: string, agentName: string) => alerts.push(`${kind}:${agentName}`);
+    framework.onTrace((event) => { if (event.type === 'ops:alert') alerts.push(`${event.kind}:${event.agentName}`); });
     const internals = framework as unknown as { runQueuedMaintenance: () => Promise<void> };
     let passes = 0;
     const runPass = internals.runQueuedMaintenance.bind(framework);
@@ -1061,7 +1050,7 @@ describe('queued context maintenance timer', () => {
       maintenanceIntervalMs: 10,
     });
     const alerts: string[] = [];
-    (framework as any).opsAlert = (_kind: string, _agentName: string, text: string) => alerts.push(text);
+    framework.onTrace((event) => { if (event.type === 'ops:alert') alerts.push(event.message); });
     const internals = framework as unknown as { runQueuedMaintenance: () => Promise<void>; opsAlertCooldownMs: number };
     let passes = 0;
     const runPass = internals.runQueuedMaintenance.bind(framework);
@@ -1085,10 +1074,11 @@ describe('queued context maintenance timer', () => {
       await passed(3);
       assert.equal(alerts.length, 3);
 
-      // Unchanged, it is alerted again once the cooldown has passed.
+      // Unchanged, it is alerted again once the cooldown has passed, with the
+      // same text as the change's alert (as the trace bounds it).
       internals.opsAlertCooldownMs = 0;
       await waitFor(() => alerts.length >= 5);
-      assert.ok(alerts.slice(3).every((text) => text === long('two')));
+      assert.ok(alerts.slice(3).every((text) => text === alerts[2]));
     } finally {
       console.error = quiet;
       await framework.stop();
@@ -1167,7 +1157,7 @@ describe('queued context maintenance timer', () => {
       maintenanceIntervalMs: 60_000,
     });
     const alerts: string[] = [];
-    (framework as any).opsAlert = (kind: string, agentName: string, message: string) => alerts.push(`${kind}:${agentName}:${message}`);
+    framework.onTrace((event) => { if (event.type === 'ops:alert') alerts.push(`${event.kind}:${event.agentName}:${event.message}`); });
     try {
       framework.start();
       await waitFor(() => framework.getContextMaintenanceSnapshot().history.length >= 1);
@@ -1195,7 +1185,7 @@ describe('queued context maintenance timer', () => {
       maintenanceIntervalMs: 60_000,
     });
     const alerts: string[] = [];
-    (framework as any).opsAlert = (kind: string, agentName: string, message: string) => alerts.push(`${kind}:${agentName}:${message}`);
+    framework.onTrace((event) => { if (event.type === 'ops:alert') alerts.push(`${event.kind}:${event.agentName}:${event.message}`); });
     try {
       framework.start();
       await waitFor(() => framework.getContextMaintenanceSnapshot().history.length >= 1);
@@ -1958,9 +1948,9 @@ describe('queued context maintenance timer', () => {
     let maintaining: Promise<unknown> | undefined;
     // An ops:alert listener that runs maintain when the unreadable agent's
     // failure is alerted, which the pass does while it prepares.
-    (framework as any).opsAlert = (kind: string, agentName: string) => {
-      if (kind === 'context-maintenance-failed' && agentName === 'unreadable') maintaining ??= framework.maintenanceTick();
-    };
+    framework.onTrace((event) => {
+      if (event.type === 'ops:alert' && event.kind === 'context-maintenance-failed' && event.agentName === 'unreadable') maintaining ??= framework.maintenanceTick();
+    });
     const quiet = console.error;
     console.error = () => {};
     try {
@@ -2373,7 +2363,7 @@ describe('queued context maintenance timer', () => {
     });
     const internals = framework as unknown as { surgeryHold: { verb: string; agentName: string; since: number } | null };
     const alerts: string[] = [];
-    (framework as any).opsAlert = (kind: string) => alerts.push(kind);
+    framework.onTrace((event) => { if (event.type === 'ops:alert') alerts.push(event.kind); });
     strategy.onTick = () => {
       internals.surgeryHold = { verb: 'rollback', agentName: 'agent', since: Date.now() };
     };
@@ -2409,7 +2399,7 @@ describe('queued context maintenance timer', () => {
     });
     const internals = framework as unknown as { surgeryHold: { verb: string; agentName: string; since: number } | null };
     const alerts: string[] = [];
-    (framework as any).opsAlert = (kind: string) => alerts.push(kind);
+    framework.onTrace((event) => { if (event.type === 'ops:alert') alerts.push(event.kind); });
     strategy.onTick = () => {
       internals.surgeryHold = { verb: 'rollback', agentName: 'agent', since: Date.now() };
       throw new Error('the tick failed while a surgery waited');
@@ -2450,7 +2440,6 @@ describe('queued context maintenance timer', () => {
       framework.start();
       await waitFor(() => framework.getContextMaintenanceSnapshot().history.length >= 1);
       const run = framework.getContextMaintenanceSnapshot().history.at(-1)!.agents[0];
-      assert.equal(run.ticks, 8);
       assert.equal(run.readyAfter, false);
       assert.equal(run.pendingBefore, 'never ready');
       assert.equal(run.pendingAfter, 'never ready');

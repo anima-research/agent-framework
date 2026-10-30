@@ -453,10 +453,10 @@ above the agent's consumed watermark (set when the agent is created, and
 advanced at every compile of a request it sends, which a preview isn't, and at
 a tool boundary that injects messages into a stream declaring it carries them,
 as membrane's native path does from 0.6.0), on the current branch, not a
-sharded message, and not folded into a summary by compression. A message
-injected at a tool boundary whose stream doesn't say whether it carries
-injections, as no membrane 0.5.x stream does, stays unread though the model
-may have seen it. On any doubt — restart, branch switch, eviction — the host
+sharded message, and not folded into a summary by compression. A stream that
+doesn't say whether it carries injections is taken as one that doesn't: at a
+tool boundary nothing is injected into it, and what's queued waits for the
+turn's end. On any doubt — restart, branch switch, eviction — the host
 appends, as it does today. There is no per-subject cap: a busy channel's unread
 backlog is simply its unread backlog. Receipts and subject history are kept in
 the `mcpl/coalescing` state (retry window 1 h); audit lines are
@@ -858,8 +858,8 @@ retract of a batch takes off the mark of its emoji from each of its messages,
 whichever batch placed it. 0.22.x reads only versions 1 and 2, and its start
 stops on a version 3 file: to go back to 0.22.x, move the file aside first,
 and 0.22.x then starts with no marks history. A version 1 ledger, which only
-an unreleased commit wrote, is refused until it is moved away, and its error
-says what that gives up.
+an unreleased commit wrote, is refused as any version but 2 and 3 is, until it
+is moved away.
 
 ## Observability
 

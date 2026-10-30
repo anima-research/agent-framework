@@ -36,10 +36,15 @@ const NEVER_FIRES_IN_A_TEST_MS = 2 * LONGER_THAN_ANY_START_MS;
 function setup(over: { host?: Partial<ScriptsHost>; config?: Partial<ScriptsConfig>; capacity?: number } = {}) {
   const wakes: [string, string][] = [];
   const gates = new Map<string, () => void>();
+  const contexts = new Map<string, ScriptCallContext | undefined>();
   const host: ScriptsHost = {
     tools: () => [{ name: 'echo', description: 'Echoes.' }, { name: 'slow', description: 'Answers when released.' }],
-    dispatch: async (_agent, name, args) => {
-      if (name === 'slow') await new Promise<void>((resolve) => gates.set(JSON.parse(args).key ?? 'slow', resolve));
+    dispatch: async (_agent, name, args, ctx) => {
+      if (name === 'slow') {
+        const key = JSON.parse(args).key ?? 'slow';
+        contexts.set(key, ctx);
+        await new Promise<void>((resolve) => gates.set(key, resolve));
+      }
       return result(`${name} ${args}`);
     },
     wake: async (agent, _scriptId, text) => {
@@ -76,7 +81,8 @@ function setup(over: { host?: Partial<ScriptsHost>; config?: Partial<ScriptsConf
     gates.get(key)!();
     gates.delete(key);
   };
-  return { scripts, wakes, release, called };
+  const watching = (key = 'slow') => contexts.get(key)?.watching?.();
+  return { scripts, wakes, release, called, watching };
 }
 
 test('a script that ends within its bound returns whole', async () => {
@@ -154,9 +160,7 @@ test('an agent at its most running scripts, or a host at its most children, is r
 test("another agent's script, or one that isn't there, is refused by name", async () => {
   const { scripts } = setup();
   const r = await scripts.run('alice', `return 1;`);
-  await assert.rejects(scripts.wait('bob', r.scriptId), (e: unknown) => e instanceof ScriptRefusal && /no script "s\d+-[0-9a-z]{4}"/.test(e.message));
-  // An id carries its host's tag, so one from before a restart names no script here.
-  assert.match(r.scriptId, /^s\d+-[0-9a-z]{4}$/);
+  await assert.rejects(scripts.wait('bob', r.scriptId), (e: unknown) => e instanceof ScriptRefusal && e.message.includes(`no script "${r.scriptId}"`));
   await assert.rejects(scripts.wait('alice', 's1'), /no script "s1": it isn't one of yours, it ran before this host restarted, or it ended and was dropped/);
 });
 
@@ -173,7 +177,7 @@ test("another host's id names no script here, as one from before a restart doesn
     mine = await here.scripts.run('alice', `return 1;`);
   }
   assert.notEqual(mine.scriptId, theirs.scriptId);
-  await assert.rejects(here.scripts.wait('alice', theirs.scriptId), (e: unknown) => e instanceof ScriptRefusal && /no script "s1-[0-9a-z]{4}"/.test(e.message));
+  await assert.rejects(here.scripts.wait('alice', theirs.scriptId), (e: unknown) => e instanceof ScriptRefusal && e.message.includes(`no script "${theirs.scriptId}"`));
 });
 
 test('wake_agent() wakes its agent with the payload, and past the cap it is refused', async () => {
@@ -268,7 +272,6 @@ test('an abandoned wait leaves its yielded script running, and a later failure s
   const first = await scripts.run('alice', `await tools.slow({}); throw new Error('later');`);
   assert.equal(first.running, true);
   const waiting = scripts.wait('alice', first.scriptId, LONGER_THAN_ANY_START_MS, { turnId: 1, endTurn: false });
-  await new Promise((r) => setTimeout(r, 50));
   scripts.turnEnded('alice', { id: 1, live: [] }, true);
   assert.equal(scripts.running('alice'), 1, 'still running');
   await release();
@@ -625,17 +628,6 @@ test("dispose ends a child that said how its script ended and stayed", async () 
   assert.equal(disposed, true);
 });
 
-test("stop watches its script with the caller's watch, so a call's turn-ending result reaches the stop's result", async () => {
-  const { scripts, called } = setup();
-  const r = await scripts.run('alice', `await tools.slow({});`, 0);
-  await called();
-  const internals = scripts as unknown as { scripts: Map<string, { watch: unknown }> };
-  const watch = { endTurn: false };
-  const stopping = scripts.stop('alice', r.scriptId, watch);
-  assert.equal(internals.scripts.get(r.scriptId)!.watch, watch);
-  await stopping;
-});
-
 test("a left script's failure wakes its agent with a glimpse of a long message, and no count a second cut would misstate", async () => {
   const { scripts, wakes, release } = setup();
   // It yields on the call first, so it's left running when it fails.
@@ -689,40 +681,39 @@ test("turns that overlap: a turn's end stops a non-primary agent's scripts whose
 });
 
 test("an abandoned turn stops a non-primary agent's script its calls watch that never returned, though the turn is live, and lets go of one that did", async () => {
-  const { scripts, release, called } = setup({ host: { outlivesTurn: () => false }, config: { maxRunning: 6 } });
-  const internals = scripts as unknown as { scripts: Map<string, { watch: unknown }> };
+  const { scripts, release, called, watching } = setup({ host: { outlivesTurn: () => false }, config: { maxRunning: 6 } });
   // Its run call is still waiting on it: the script hasn't returned.
   const pending = scripts.run('helper', `await tools.slow({ key: 'u' });`, LONGER_THAN_ANY_START_MS, { watch: { turnId: 5, endTurn: false } });
   // This one returned at once, and a wait of the same turn watches it now.
   const returned = await scripts.run('helper', `await tools.slow({ key: 'r' });`, 0, { watch: { turnId: 5, endTurn: false } });
   const waiting = scripts.wait('helper', returned.scriptId, LONGER_THAN_ANY_START_MS, { turnId: 5, endTurn: false });
   await called('u');
+  await called('r');
   // Turn 5's stream is abandoned and will run again: the turn stays live.
   scripts.turnEnded('helper', { id: 5, live: [5] }, true, 'stream error');
   assert.deepEqual((await pending).ending, { how: 'stopped', reason: 'limit', why: 'its turn ended before the script returned (stream error)' });
-  assert.equal(internals.scripts.get(returned.scriptId)!.watch, null, 'the returned one is let go');
+  assert.equal(watching('r'), undefined, 'the returned one is let go: its call sees no one watching');
   assert.equal(scripts.list('helper').find((x) => x.scriptId === returned.scriptId)!.running, true, 'and runs on while its turn is live');
   await release('r');
   await waiting;
 });
 
 test("every turn of a primary agent's abandoned at once: a watched script that never returned stops, and one that did is let go", async () => {
-  const { scripts, release } = setup({ config: { maxRunning: 6 } });
-  const internals = scripts as unknown as { scripts: Map<string, { watch: unknown }> };
+  const { scripts, release, called, watching } = setup({ config: { maxRunning: 6 } });
   const pending = scripts.run('alice', `await tools.slow({ key: 'u' });`, LONGER_THAN_ANY_START_MS, { watch: { turnId: 2, endTurn: false } });
   const returned = await scripts.run('alice', `await tools.slow({ key: 'r' });`, 0, { watch: { turnId: 3, endTurn: false } });
   const waiting = scripts.wait('alice', returned.scriptId, LONGER_THAN_ANY_START_MS, { turnId: 3, endTurn: false });
-  await new Promise((res) => setTimeout(res, 50));
+  await called('r');
   scripts.turnEnded('alice', 'every', true, 'turn abandoned by quiesce');
   assert.equal((await pending).ending?.how, 'stopped');
-  assert.equal(internals.scripts.get(returned.scriptId)!.watch, null);
+  assert.equal(watching('r'), undefined, 'the returned one is let go: its call sees no one watching');
   assert.equal(scripts.list('alice').find((x) => x.scriptId === returned.scriptId)!.running, true, "a primary agent's script outlives its turns");
   await release('r');
   await waiting;
 });
 
 test("an abandoned turn acts only on the scripts its own calls watch", async () => {
-  const { scripts, release } = setup({ config: { yieldMs: 0 } });
+  const { scripts, release, called, watching } = setup({ config: { yieldMs: 0 } });
   const watched = async (turnId: number) =>
     (await scripts.run('alice', `await tools.slow({ key: 'k${turnId}' });`, 0, { watch: { turnId, endTurn: false } })).scriptId;
   const byOpen = await watched(5);
@@ -730,11 +721,11 @@ test("an abandoned turn acts only on the scripts its own calls watch", async () 
   const running = (id: string) => scripts.list('alice').find((x) => x.scriptId === id)!.running;
   // The waits that watch them: each script's run returned once, so an abandoned watch is let go, not stopped.
   const waits = [scripts.wait('alice', byOpen, LONGER_THAN_ANY_START_MS, { turnId: 5, endTurn: false }), scripts.wait('alice', bySilent, LONGER_THAN_ANY_START_MS, { turnId: 7, endTurn: false })];
-  await new Promise((res) => setTimeout(res, 50));
+  await called('k5');
+  await called('k7');
   scripts.turnEnded('alice', { id: 7, live: [5] }, true);
-  const internals = scripts as unknown as { scripts: Map<string, { watch: { turnId?: number } | null }> };
-  assert.equal(internals.scripts.get(bySilent)!.watch, null, "turn 7's watch is let go");
-  assert.equal(internals.scripts.get(byOpen)!.watch?.turnId, 5, "turn 5's watch stands");
+  assert.equal(watching('k7'), undefined, "turn 7's watch is let go: its script's call sees no one watching");
+  assert.equal(watching('k5')?.turnId, 5, "turn 5's watch stands");
   assert.deepEqual([byOpen, bySilent].map(running), [true, true]);
   await release('k5');
   await release('k7');
@@ -747,7 +738,6 @@ test("a wait whose turn was abandoned takes the ending to no one, so the ending'
   const r = await scripts.run('alice', WAKE_THEN_SPIN, 0);
   for (const end = Date.now() + LONGER_THAN_ANY_START_MS; Date.now() < end && !held.state.entered;) await new Promise((res) => setTimeout(res, 10));
   const waiting = scripts.wait('alice', r.scriptId, LONGER_THAN_ANY_START_MS, { turnId: 1, endTurn: false });
-  await new Promise((res) => setTimeout(res, 50));
   // The wait's turn is abandoned: the script had returned once, so its watch is let go.
   scripts.turnEnded('alice', { id: 1, live: [] }, true);
   await (scripts as unknown as Internals).scripts.get(r.scriptId)!.run.stop('limit');

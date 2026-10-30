@@ -18,7 +18,7 @@
  */
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import type { ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -30,6 +30,7 @@ import { StdioTransport, setStdioExitGraceForTests } from '../src/mcpl/transport
 import { McplProtocolVersionError, McplRequestError } from '../src/mcpl/server-connection.js';
 import { MAX_TIMER_MS } from '../src/mcpl/protocol-family.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
+import { jsonLines } from './helpers/json-lines.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SERVER = join(here, 'fixtures', 'modern-raw-server.mjs');
@@ -66,8 +67,7 @@ function scratchLog(): string {
   return join(dir, 'wire.jsonl');
 }
 
-const wire = (log: string): LogEntry[] =>
-  existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as LogEntry) : [];
+const wire = (log: string): LogEntry[] => jsonLines<LogEntry>(log);
 const calls = (log: string, tool: string) => wire(log).filter((e) => e.method === 'tools/call' && e.tool === tool).length;
 
 /**
@@ -425,7 +425,7 @@ function firstLaunch(stuck: boolean): { readonly pid: number; pipeFailed: () => 
       assert.ok(first, 'a launch');
       return (first as unknown as { child: { pid: number } }).child.pid;
     },
-    pipeFailed: () => until(() => first?.pipeFailure !== undefined, "the launch's pipe to fail"),
+    pipeFailed: () => until(() => first?.stdioStopCause !== undefined, "the launch's pipe to fail"),
     unreaped,
   };
 }
@@ -459,7 +459,7 @@ test("a connect whose stdio pipe failed, and whose child was found unreaped befo
   connection.on('error', (error: Error) => errors.push(error.message));
   const closes: unknown[] = [];
   connection.on('close', (info: unknown) => closes.push(info));
-  await assert.rejects(connection.start(), /^Error: MCP server "raw" stdio pipe failed with write EPIPE while connecting$/);
+  await assert.rejects(connection.start(), /^Error: MCP server "raw": this host stopped using the server's stdio while connecting \(write EPIPE\)$/);
   assert.equal(connection.isConnected, false);
   assert.equal(connection.holdsUnreapedChild, true);
   // The hold is reported once, by the connect's own cleanup.
@@ -486,7 +486,7 @@ test("a connect whose stdio pipe failed fails even when it resolves while its ch
   const connection = ModernMcpConnection.create({ id: 'raw', command: process.execPath, args: [SERVER, 'deaf-at-discover,ignore-sigterm', log], protocol: 'modern' });
   cleanups.push(() => connection.close());
   connection.on('error', () => { /* the subscribe's failure, reported by the SDK */ });
-  await assert.rejects(connection.start(), /^Error: MCP server "raw" stdio pipe failed with write EPIPE while connecting$/);
+  await assert.rejects(connection.start(), /^Error: MCP server "raw": this host stopped using the server's stdio while connecting \(write EPIPE\)$/);
   assert.equal(runningAtEnd, true, 'the child was still running when the subscribe ended');
   assert.equal(connection.isConnected, false);
   assert.equal(connection.holdsUnreapedChild, false);
@@ -497,7 +497,7 @@ test("a connect whose stdio pipe failed reads that way when the failure has alre
   const log = scratchLog();
   // The subscribe meets EPIPE, the transport ends the child with SIGTERM,
   // and the close ends the subscribe.
-  await assert.rejects(connect('deaf-at-discover', log), /^Error: MCP server "raw" stdio pipe failed with write EPIPE while connecting$/);
+  await assert.rejects(connect('deaf-at-discover', log), /^Error: MCP server "raw": this host stopped using the server's stdio while connecting \(write EPIPE\)$/);
   assert.equal(wire(log).filter((e) => e.event === 'start').length, 1, 'one launch');
 });
 
@@ -654,7 +654,7 @@ test("a read error on a stdio child's stderr is reported through the transport's
   // the error instead of an 'error'.
   assert.doesNotThrow(() => child.stdout!.emit('error', new Error('stdout read failed')), 'stdout');
   const info = await closed;
-  assert.match(info.reason ?? '', /its pipe failed with stdout read failed/);
+  assert.match(info.reason ?? '', /this host had stopped using the server's stdio \(stdout read failed\)/);
   assert.deepEqual(errors, ['stderr read failed']);
 });
 
@@ -1332,7 +1332,7 @@ test('a server that closes its stdin and ignores SIGTERM is killed and reconnect
       'This host is reconnecting to it; try again later.');
     return true;
   });
-  loggedLine(logged, /^MCP server "raw" tools\/call plain not sent: ".*stdio pipe failed with write EPIPE"$/);
+  loggedLine(logged, /^MCP server "raw" tools\/call plain not sent: ".*: this host stopped using the server's stdio \(write EPIPE\)"$/);
   // SIGKILL ends the child, and the connection reconnects as after any loss.
   await until(() => wire(log).filter((e) => e.event === 'start').length === 2 && connection.isConnected, 'the next launch, connected');
   assert.equal(closes.length, 1, closes.join('; '));
@@ -1366,7 +1366,7 @@ test("a server that closes its stdin and outlives SIGKILL too is held as a launc
   await until(() => failures.length > 0, 'the permanent failure');
   assert.equal(failures.length, 1);
   assert.equal(failures[0]!.permanent, true);
-  assert.match(failures[0]!.error, new RegExp(`^its stdio pipe failed with write EPIPE; the previous launch could not be reaped \\(stdio child \\d+ of MCP server "raw" did not exit within ${SHORT_GRACE_MS}ms of SIGKILL; it could not be reaped\\); reconnecting is halted$`));
+  assert.match(failures[0]!.error, new RegExp(`^this host stopped using the server's stdio \\(write EPIPE\\); the previous launch could not be reaped \\(stdio child \\d+ of MCP server "raw" did not exit within ${SHORT_GRACE_MS}ms of SIGKILL; it could not be reaped\\); reconnecting is halted$`));
   assert.equal(connection.isConnected, false);
   assert.equal(connection.willReconnect, false);
   assert.equal(connection.holdsUnreapedChild, true);

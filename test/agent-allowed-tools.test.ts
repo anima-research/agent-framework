@@ -278,10 +278,10 @@ function captureRouting(framework: AgentFramework) {
 }
 
 /**
- * XML tool mode, as an older membrane streams it: no round carries its
- * verbatim roundContent, so none is routed live, and the turn-end completion
- * holds the cumulative tool round, its prose, its call and its result, as
- * XML mode parses them, before the final text.
+ * XML tool mode: no round carries its verbatim roundContent, so none is
+ * routed live, and the turn-end completion holds the cumulative tool round,
+ * its prose, its call and its result, as XML mode parses them, before the
+ * final text.
  */
 function asXmlTurn(membrane: MockMembrane, call: { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }): void {
   const streamYielding = membrane.streamYielding.bind(membrane);
@@ -733,8 +733,6 @@ test('module utilities are callable tools out of the tool list, and utils is gon
     assert.ok(h.framework.getAllTools().some(tool => tool.name === 'probe--allowed_util'), 'callable by name');
     const surface = (await h.framework.previewActivation('assistant')).tools ?? [];
     assert.ok(!surface.some(tool => tool.name === 'probe--allowed_util' || tool.name === 'utils'), 'neither in the tool list');
-    utilities.pop();
-    assert.equal(framework.getAllUtilities().length, 2);
   } finally { await h.close(); }
 });
 

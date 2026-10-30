@@ -730,9 +730,10 @@ export type TraceEvent =
       /** Signal that terminated the child, if any. */
       signal: string | null;
       /** Why the transport closed, in its own words, such as `child process
-       *  exited, and its pipe failed with write EPIPE` or `closed by host`;
-       *  null when it gave none, or when its reason is a WebSocket server's
-       *  own close text, which stays off the trace. */
+       *  exited, and this host had stopped using the server's stdio (write
+       *  EPIPE)` or `closed by host`; null when it gave none, or when its
+       *  reason is a WebSocket server's own close text, which stays off the
+       *  trace. */
       reason: string | null;
       /** True when a background reconnect loop will revive the connection. */
       willReconnect: boolean;

@@ -7,7 +7,7 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,6 +16,7 @@ import { AgentFramework, ShutdownTimeoutError } from '../src/index.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 import { DiscordAwarenessOutbox, defaultDiscordAwarenessOutboxPath } from '../src/recovery/discord-awareness-outbox.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
+import { jsonLines } from './helpers/json-lines.js';
 
 const FIXTURE = fileURLToPath(new URL('./fixtures/surgery-marks-mcpl-server.mjs', import.meta.url));
 
@@ -99,11 +100,8 @@ function recordLedgerWrites(t: import('node:test').TestContext): number[] {
 async function untilCalls(dir: string, id: string, count: number): Promise<string[]> {
   const path = join(dir, `calls-${id}.jsonl`);
   for (let waited = 0; waited < 10_000; waited += 10) {
-    if (existsSync(path)) {
-      const calls = readFileSync(path, 'utf8').split('\n').filter(Boolean)
-        .map((line) => String((JSON.parse(line) as { args: { messageId: string } }).args.messageId));
-      if (calls.length >= count) return calls;
-    }
+    const calls = jsonLines<{ args: { messageId: string } }>(path).map((call) => String(call.args.messageId));
+    if (calls.length >= count) return calls;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.fail(`${id} never had ${count} call(s)`);

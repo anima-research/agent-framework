@@ -28,7 +28,7 @@ class ToolThenErrorStream implements YieldingStream {
   private events: StreamEvent[] = [{
     type: 'tool-calls',
     calls: [{ id: 'toolu_retry', name: 'mcpl--heartbeat--heartbeat_status', input: {} }],
-    context: { rawText: '', preamble: '', depth: 0, previousResults: [], accumulated: '', roundContent: [{ type: 'tool_use', id: 'toolu_retry', name: 'mcpl--heartbeat--heartbeat_status', input: {} }] },
+    context: { rawText: '', preamble: '', depth: 0, previousResults: [], accumulated: '', roundContent: [{ type: 'tool_use', id: 'toolu_retry', name: 'mcpl--heartbeat--heartbeat_status', input: {} }], supportsInjectedMessages: true },
   } as StreamEvent];
   private wake: (() => void) | null = null; private done = false;
   get isWaitingForTools() { return !this.done; } get pendingToolCallIds() { return this.done ? [] : ['toolu_retry']; } get toolDepth() { return 0; }
@@ -199,7 +199,7 @@ class LateToolAfterIdleMembrane {
           membrane.markDriven();
           await membrane.released;
           membrane.markLateOut();
-          yield { type: 'tool-calls', calls: [{ id: 'late', name: 'mcpl--heartbeat--heartbeat_status', input: {} }], context: { rawText: '', preamble: '', depth: 0, previousResults: [], accumulated: '', roundContent: [{ type: 'tool_use', id: 'late', name: 'mcpl--heartbeat--heartbeat_status', input: {} }] } } as StreamEvent;
+          yield { type: 'tool-calls', calls: [{ id: 'late', name: 'mcpl--heartbeat--heartbeat_status', input: {} }], context: { rawText: '', preamble: '', depth: 0, previousResults: [], accumulated: '', roundContent: [{ type: 'tool_use', id: 'late', name: 'mcpl--heartbeat--heartbeat_status', input: {} }], supportsInjectedMessages: true } } as StreamEvent;
           yield { type: 'complete', response: createMockResponse([{ type: 'text', text: 'late' }]) } as StreamEvent;
         } finally {
           membrane.markLeft();
@@ -360,27 +360,8 @@ describe('tool wrapper prose guard integration', () => {
     const run = framework.runEphemeralToCompletion(created.agent, created.contextManager);
     framework.start();
     const result = await run;
-    const internals = framework as unknown as {
-      logicalTurnToolCalls: WeakMap<object, { turnToken: number; count: number }>;
-      recordLogicalTurnToolCalls(agent: object, turnToken: number, count: number): void;
-    };
-    assert.equal(internals.logicalTurnToolCalls.has(created.agent), false, 'normal ephemeral cleanup removes logical-turn state');
-    internals.recordLogicalTurnToolCalls(created.agent, 1, 1);
-    assert.equal(internals.logicalTurnToolCalls.has(created.agent), false, 'late stream events cannot recreate disposed ephemeral state');
     await framework.stop();
     assert.deepEqual(result, { speech: '', toolCallsCount: 0 });
-  });
-
-  it('cleans logical-turn state when an ephemeral startup watchdog fires', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'af-wrapper-guard-ephemeral-watchdog-')); dirs.push(dir);
-    const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: new MockMembrane().asMembrane(), agents: [], modules: [new HeartbeatModule()] });
-    const created = await framework.createEphemeralAgent({ name: 'ephemeral-wrapper-watchdog', model: 'test', systemPrompt: 'sys', allowedTools: 'all', toolWrapperProseGuard: true });
-    created.contextManager.addMessage('user', [{ type: 'text', text: 'check' }]);
-    const internals = framework as unknown as { logicalTurnToolCalls: WeakMap<object, { turnToken: number; count: number }> };
-    internals.logicalTurnToolCalls.set(created.agent, { turnToken: 1, count: 1 });
-    await assert.rejects(framework.runEphemeralToCompletion(created.agent, created.contextManager, { startupTimeoutMs: 20 }), /failed to start inference/);
-    assert.equal(internals.logicalTurnToolCalls.has(created.agent), false);
-    await framework.stop();
   });
 
   it('refuses an ephemeral name that collides with a registered resident', async () => {
@@ -459,22 +440,6 @@ describe('tool wrapper prose guard integration', () => {
     await framework.stop();
   });
 
-  it('conversation disposal reclaims logical-turn state', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'af-wrapper-guard-conversation-cleanup-')); dirs.push(dir);
-    const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: new MockMembrane().asMembrane(), agents: [], modules: [new HeartbeatModule()] });
-    const internals = framework as unknown as {
-      logicalTurnToolCalls: WeakMap<object, { turnToken: number; count: number }>;
-      disposeConversationAgent(agentName: string): void;
-      agents: Map<string, object>;
-    };
-    const fork = { name: 'fork', toolResultGuard: { hasPending: false } };
-    internals.agents.set('fork', fork);
-    internals.logicalTurnToolCalls.set(fork, { turnToken: 1, count: 1 });
-    internals.disposeConversationAgent('fork');
-    assert.equal(internals.logicalTurnToolCalls.has(fork), false);
-    await framework.stop();
-  });
-
   it('enabled contains wrapper before continuity and publication, with content-free system receipt', async () => {
     const { routed, outgoing, all, module } = await run(true);
     assert.deepEqual(routed, []);
@@ -515,10 +480,12 @@ describe('tool wrapper prose guard integration', () => {
       assert.deepEqual(await run, { speech: 'Ordinary ephemeral answer.', toolCallsCount: 0 });
       // The terminal frame's teardown stops typing and sends the complete.
       const until = Date.now() + 5000;
-      while (Date.now() < until && !(typing.includes('stop:(all)') && outgoing.some(([kind]) => kind === 'complete'))) {
+      // A stop with no channel covers the run's channel, so either form shows it.
+      const stopped = () => typing.includes('stop:(all)') || typing.includes('stop:world:test');
+      while (Date.now() < until && !(stopped() && outgoing.some(([kind]) => kind === 'complete'))) {
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
-      assert.ok(typing.includes('stop:(all)'), 'terminal physical frame stops typing after ephemeral caller disposal');
+      assert.ok(stopped(), `terminal physical frame stops typing for its channel after ephemeral caller disposal: ${typing.join(', ')}`);
       assert.ok(outgoing.some(([kind, text]) => kind === 'complete' && text === 'Ordinary ephemeral answer.'), 'terminal physical frame finalizes outgoing stream');
     } finally {
       await framework.stop();

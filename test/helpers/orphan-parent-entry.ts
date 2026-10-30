@@ -21,4 +21,9 @@ let told = false;
     }
   }
 });
+child.on('close', (code, signal) => {
+  if (told) return;
+  process.stderr.write(`the child exited before its first output: code ${code}, signal ${signal}\n`);
+  process.exit(1);
+});
 setInterval(() => {}, 60_000);

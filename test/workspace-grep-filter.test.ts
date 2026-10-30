@@ -82,6 +82,8 @@ async function refusal(m: WorkspaceModule, input: Record<string, unknown>): Prom
   return String(res.error);
 }
 
+const quoted = (text: string) => new Set([...text.matchAll(/"([^"]*)"/g)].map((match) => match[1]));
+
 for (const [kind, mount] of KINDS) {
   describe(`grep's glob filter, on ${kind}`, () => {
     test('a filter with no "/" picks files by name at any depth', async (t) => {
@@ -127,10 +129,9 @@ for (const [kind, mount] of KINDS) {
 
     test('a directory path and a filter with a "/" that can\'t overlap are refused, naming the filter that reaches beneath it', async (t) => {
       const { m } = await opened(t, mount);
-      assert.equal(
-        await refusal(m, { path: 'work/src/deep', glob: 'er/*.ts' }),
-        'The grep did nothing: its glob "er/*.ts" is matched against paths from the mount\'s root, so no file within "work/src/deep" matches it. To filter beneath it, write "work/src/deep/er/*.ts".',
-      );
+      const said = await refusal(m, { path: 'work/src/deep', glob: 'er/*.ts' });
+      assert.ok(said.includes("from the mount's root"), said);
+      assert.deepEqual(quoted(said), new Set(['er/*.ts', 'work/src/deep', 'work/src/deep/er/*.ts']), said);
       assert.deepEqual(await grepped(m, { path: 'work/src/deep', glob: 'work/src/deep/er/*.ts' }), ['work/src/deep/er/b.ts']);
     });
 
@@ -147,10 +148,9 @@ for (const [kind, mount] of KINDS) {
     test('a refusal names no filter for one with an empty, "." or ".." segment, which no prefix makes match', async (t) => {
       const { m } = await opened(t, mount);
       for (const glob of ['./er/*.ts', '../src/deep/er/*.ts', 'er//*.ts', 'er/..', 'er/']) {
-        assert.equal(
-          await refusal(m, { path: 'work/src/deep', glob }),
-          `The grep did nothing: its glob ${JSON.stringify(glob)} is matched against paths from the mount's root, so no file within "work/src/deep" matches it.`,
-        );
+        const said = await refusal(m, { path: 'work/src/deep', glob });
+        assert.ok(said.includes("from the mount's root"), said);
+        assert.deepEqual(quoted(said), new Set([glob, 'work/src/deep']), said);
       }
     });
 
@@ -159,22 +159,19 @@ for (const [kind, mount] of KINDS) {
       // As written, work/src lies apart from src's own path; read
       // mount-prefixed, its directory is src, which holds the path's.
       assert.deepEqual(await grepped(m, { path: 'work/src', glob: 'work/src/*.ts' }), ['work/src/main.ts']);
-      assert.equal(
-        await refusal(m, { path: 'work/src', glob: 'work/lib/*.ts' }),
-        'The grep did nothing: its glob "work/lib/*.ts" is read mount-prefixed, from the root of mount "work", so no file within "work/src" matches it. To filter beneath it, write "work/src/lib/*.ts".',
-      );
+      const said = await refusal(m, { path: 'work/src', glob: 'work/lib/*.ts' });
+      assert.ok(said.includes('mount-prefixed'), said);
+      assert.deepEqual(quoted(said), new Set(['work/lib/*.ts', 'work', 'work/src', 'work/src/lib/*.ts']), said);
     });
 
     test('glob refuses a path its mount-prefixed pattern can\'t overlap, as grep does', async (t) => {
       const { m } = await opened(t, mount);
-      assert.equal(
-        await globRefusal(m, { path: 'work/src', pattern: 'work/lib/*.ts' }),
-        'The glob did nothing: its pattern "work/lib/*.ts" is read mount-prefixed, from the root of mount "work", so no file within "work/src" matches it. To match beneath it, write "work/src/lib/*.ts".',
-      );
-      assert.equal(
-        await globRefusal(m, { path: 'work/src/main.ts', pattern: 'work/lib/*.ts' }),
-        'The glob did nothing: its pattern "work/lib/*.ts" is read mount-prefixed, from the root of mount "work", so "work/src/main.ts" doesn\'t match it.',
-      );
+      const said = await globRefusal(m, { path: 'work/src', pattern: 'work/lib/*.ts' });
+      assert.ok(said.includes('mount-prefixed'), said);
+      assert.deepEqual(quoted(said), new Set(['work/lib/*.ts', 'work', 'work/src', 'work/src/lib/*.ts']), said);
+      const ofFile = await globRefusal(m, { path: 'work/src/main.ts', pattern: 'work/lib/*.ts' });
+      assert.ok(ofFile.includes('mount-prefixed'), ofFile);
+      assert.deepEqual(quoted(ofFile), new Set(['work/lib/*.ts', 'work', 'work/src/main.ts']), ofFile);
       assert.deepEqual(await globbed(m, { path: 'work/src', pattern: 'work/src/*.ts' }), ['work/src/main.ts']);
       // A pattern as written is relative to the path, so it isn't refused:
       // main.ts names the file directly in the path, and lib/*.ts names
@@ -212,10 +209,9 @@ for (const [kind, mount] of KINDS) {
 
     test('a file path and a filter with a "/" that can\'t overlap are refused', async (t) => {
       const { m } = await opened(t, mount);
-      assert.equal(
-        await refusal(m, { path: 'work/src/main.ts', glob: 'lib/*.ts' }),
-        'The grep did nothing: its glob "lib/*.ts" is matched against paths from the mount\'s root, so "work/src/main.ts" doesn\'t match it.',
-      );
+      const said = await refusal(m, { path: 'work/src/main.ts', glob: 'lib/*.ts' });
+      assert.ok(said.includes("from the mount's root"), said);
+      assert.deepEqual(quoted(said), new Set(['lib/*.ts', 'work/src/main.ts']), said);
     });
   });
 }

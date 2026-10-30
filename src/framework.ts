@@ -199,7 +199,6 @@ import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type StreamThinkingDrops } from './thinking-drops.js';
 import { asNextRequestCarries, roundRows, type RoundRow, type SentRow } from './sent-rows.js';
-import { ReasoningLossTeller } from './reasoning-loss.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
 import { STORED_INJECTION_KEY, STORED_INJECTION_KIND, asStoredRow, hasRenderedContent, isAnotherAgentsInjection, isOwnInjection, isStoredKind, storedInjectionMarkOf, unitHash, type StoredInjectionMark } from './stored-injections.js';
 
@@ -3141,9 +3140,9 @@ const splitsPair = (text: string, index: number): boolean =>
  * signal's number (143, 130, 129). A service manager's stop signals the host
  * and its children together, so a child can go before the host's stop()
  * closes it: its loss is that stop, not a failure, and raises no mcpl-down.
- * A child the stdio transport ended itself after a pipe error was ended by
- * that failure, whatever its code or signal. A WebSocket's close codes are
- * 1000 and up, so they never match.
+ * A child the stdio transport ended itself, after a pipe error or a line on
+ * its stdout longer than the bound, was ended by that, whatever its code or
+ * signal. A WebSocket's close codes are 1000 and up, so they never match.
  */
 function endedAsAsked(ended: { code?: number | null; signal?: string | null; pipeFailed?: boolean }): boolean {
   if (ended.pipeFailed) return false;
@@ -3793,7 +3792,6 @@ export class AgentFramework {
    * next turn.
    */
   private turnRouting: Map<string, TurnRouting> = new Map();
-  private readonly reasoningLoss = new ReasoningLossTeller();
   /**
    * The latest link of each agent's chain of queued prose deliveries. Every
    * stream queues its own behind it, a fresh turn's included, so the agent's
@@ -9533,8 +9531,9 @@ export class AgentFramework {
    * memory-only: they land within the turn, at a tool boundary or at its
    * end, and a crash before then loses them. That window runs to the turn's
    * end for a message held there and what is queued behind it, and, on a
-   * stream that declares it can't carry injected messages (membrane's XML
-   * prefill path, from 0.6.0), for every message deferred during the turn.
+   * stream that doesn't declare it carries injected messages (membrane's XML
+   * prefill path declares it can't), for every message deferred during the
+   * turn.
    *
    * A write that fails, or a queue over the cap, which writes nothing,
    * leaves the record as it last held it, except that store only, a write
@@ -10957,8 +10956,9 @@ export class AgentFramework {
    * **Inheritance.** `mode: 'shared'` (the default) gives the child the
    * parent's messages and fold state through shared storage: nothing is
    * copied, the child folds with the parent's memory tree, and neither can
-   * alter what the other reads. It needs branch-bound store handles and is
-   * refused, not silently downgraded, where they are missing. `mode: 'copy'`
+   * alter what the other reads. It needs a store that supports derivation
+   * (`ContextManager.supportsDerivation`), and is refused, not silently
+   * downgraded, without one. `mode: 'copy'`
    * is the historical mechanism — the parent's compiled context re-added as
    * the child's own messages — and works everywhere.
    *
@@ -11991,7 +11991,6 @@ export class AgentFramework {
     this.freshCallsCut.delete(name);
     this.forgetFailureAccounting(name);
     this.thinkingLossIncidents.forget(name);
-    this.reasoningLoss.forget(name);
     // main's manager release: the context manager an ephemeral run or a fork
     // opened is released with the agent (releaseManager).
     this.releaseManager(agent);
@@ -12791,7 +12790,6 @@ export class AgentFramework {
         this.freshCallsCut.delete(agent.name);
         if (run.endedFromOutside) this.forgetFailureAccounting(agent.name);
         this.thinkingLossIncidents.forget(agent.name);
-        this.reasoningLoss.forget(agent.name);
         // Its pending self-wake ends with it, as a fork's does.
         this.eventGate?.agentGone(agent.name);
         this.releaseWindowNowOrAfterResume(agent);
@@ -16593,18 +16591,21 @@ export class AgentFramework {
           // compiled prefix and the live request still match without it
           // (#232 gap 5).
           //
-          // A stream that declares it can't carry injected messages
-          // (supportsInjectedMessages false: membrane's XML prefill path,
-          // from membrane 0.6.0) gets none, so nothing is drained here.
-          // Everything queued for the agent waits for the turn-end flush, as
-          // a held message does, rather than sitting in the window between
-          // rounds the stream never showed it.
+          // Only a stream that declares it carries injected messages
+          // (supportsInjectedMessages true: membrane's native path) gets
+          // them. Membrane's XML prefill path declares false, and a stream
+          // that doesn't say is taken as one that doesn't, so nothing is
+          // drained for either: everything queued for the agent waits for
+          // the turn-end flush, as a held message does, rather than sitting
+          // in the window between rounds the stream never showed it. A
+          // boundary with no stream, the direct API's, drains: its
+          // re-inference compiles from the store.
           const midTurnInjections: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata; id?: MessageId }> = [];
           // What this boundary stored for the agent to hear, in store order,
           // for a boundary that leaves it to the turn's next start as
           // arrivals: that start's compile sends it.
           const heard: Array<{ msg: DeferredWrite; id: MessageId; content: ContentBlock[] }> = [];
-          if (currentState.supportsInjectedMessages !== false) {
+          if (currentState.supportsInjectedMessages === true || !currentState.stream) {
             // A clock row due (storeDueClock) goes right after the round's
             // results, ahead of what is drained below, and joins the stream
             // the same way. A boundary that passed during the round can't
@@ -16705,12 +16706,10 @@ export class AgentFramework {
 
           // A live stream handed these messages after the results follows
           // them in its next round, not the tool loop of a reply to
-          // [Continue]: that round's rows carry no prompt. One that doesn't
-          // say whether it carries them (membrane 0.5.x, whose native path
-          // carries them and whose XML path drops them) counts as carrying
-          // them here, as at the drain above. A boundary that ends the turn,
-          // restarts the stream or falls back to a new start below hands
-          // them to no live stream, and a new start reads its own prompt from
+          // [Continue]: that round's rows carry no prompt. A boundary that
+          // ends the turn, restarts the stream or falls back to a new start
+          // below hands them to no live stream, and a new start reads its own
+          // prompt from
           // what it sends. (The routing notice below rides only an injection
           // already here.)
           if (midTurnInjections.length > 0) {
@@ -16945,11 +16944,10 @@ export class AgentFramework {
             }
             // Streaming path: convert results and resume the stream.
             // Mid-turn messages collected above ride along as injected user
-            // messages. Membrane's native path (from 0.5.72) appends them
-            // after the tool_result envelope, so the next round of THIS turn
-            // hears them. Its XML prefill path drops them with a warning on
-            // 0.5.x, and from 0.6.0 declares it can't carry them, so none are
-            // collected for it. Each goes as its participant and content
+            // messages. Membrane's native path appends them after the
+            // tool_result envelope, so the next round of THIS turn hears
+            // them. Its XML prefill path declares it can't carry them, so
+            // none are collected for it. Each goes as its participant and content
             // alone: a stored row's metadata is the host's record, not input
             // for membrane. Each goes with its name and text as the store
             // keeps them, whether it's a heard message, rendered or not, or a
@@ -16980,15 +16978,11 @@ export class AgentFramework {
             // the watermark of the turn's compile and read as unread, so a
             // coalesced replacement could remove a message the agent heard
             // and answered (and that its later replies were minted after).
-            // Only a stream that declares it carries them is marked read
-            // (supportsInjectedMessages true: membrane's native path, from
-            // membrane 0.6.0). One that doesn't say may be membrane 0.5.87's
-            // XML path, which drops them with a warning, and a message marked
-            // read there could no longer be replaced though the agent never
-            // saw it. So without the declaration they stay unread, as before
-            // this mark.
-            // The shown mark moves at every boundary that injects, declared
-            // or not, since there a doubt counts as shown.
+            // Only a stream that declares it carries them gets them, and so
+            // is marked read (supportsInjectedMessages true: membrane's native
+            // path).
+            // The shown mark moves at every boundary that injects into its
+            // stream.
             // The mark is the store's head, a scalar, as a compile's is: it
             // also covers what was stored since the compile without being
             // carried, such as another slot's messages, and a write that
@@ -17000,8 +16994,7 @@ export class AgentFramework {
             // replies after it go without their thinking, whatever the mark
             // says; deferring those writers is the fix.
             if (midTurnInjections.length > 0) {
-              // Possibly shown, whatever the stream declares: the first-view
-              // mark (CoalescerHost.isUnshown) counts a doubt as shown.
+              // Shown: the stream carries them (CoalescerHost.isUnshown).
               agent.markContextShown();
               if (currentState.supportsInjectedMessages === true) agent.markContextConsumed();
             }
@@ -17979,7 +17972,6 @@ export class AgentFramework {
       this.freshCallsCut.delete(agentName);
       this.forgetFailureAccounting(agentName);
       this.thinkingLossIncidents.forget(agentName);
-      this.reasoningLoss.forget(agentName);
       // A continuation of its turn still on its way goes with it.
       this.dropContinuations(agentName, { kind: 'dropped', why: 'its agent was disposed' });
       this.turnRouting.delete(agentName);
@@ -21831,25 +21823,6 @@ export class AgentFramework {
     this.writeChannelNotices(this.channelOpenedNotices(agentName, serverId, channels, cause), `auto-open notice (${cause})`, 'recordChannelAutoOpenNotice');
   }
 
-  private tellReasoningLoss(agent: Agent, make: () => string | undefined): void {
-    if (this.agents.get(agent.name) !== agent) return;
-    let line: string | undefined;
-    try {
-      line = make();
-    } catch (err) {
-      console.error(`[reasoning] ${agent.name}: could not tell what reasoning was lost:`, err);
-      return;
-    }
-    if (!line) return;
-    try {
-      this.addMessage('user', [{ type: 'text', text: line }], { system: true, kind: 'reasoning-loss' } as MessageMetadata, { forAgent: agent.name });
-    } catch (err) {
-      console.error(`[reasoning] ${agent.name}: the line for lost reasoning could not be stored:`, err);
-      return;
-    }
-    console.error(`[reasoning] ${agent.name}: told of reasoning no longer in its context`);
-  }
-
   /**
    * Write a builder's channel notices in order, each on its own: one that
    * can't be written is logged, and the rest are still written. A reader's
@@ -24189,10 +24162,6 @@ export class AgentFramework {
         const name = agent.name;
         agent.onCompiledToSend = (messages) => hub.observeCompile(name, messages);
       }
-      if (!agent.onThinkingStrip) {
-        agent.onThinkingStrip = (strip, branch) => this.tellReasoningLoss(agent, () => this.reasoningLoss.forStrip(
-          agent.name, branch, strip, (this.activeTurnTokens.has(agent.name) && this.turnRouting.get(agent.name)) || {}, agent.getContextManager()));
-      }
 
       // Module gatherContext (fail-open, per-module timeout — the module's
       // contextTimeoutMs, else the registry default). Injections are
@@ -25183,7 +25152,7 @@ export class AgentFramework {
                 (b) => b.type !== 'tool_result'
               );
             } else {
-              // Fallback (older membrane / XML tool mode): preamble + calls.
+              // XML tool mode: this round's text and its calls.
               // XML mode: persist the verbatim generation on each tool_use
               // (membrane#36 round-trip fidelity). context.rawText is the
               // parser's fullMatch — the exact <function_calls> block the
@@ -25195,15 +25164,12 @@ export class AgentFramework {
               const rawXml = rawText && /^<(antml:)?function_calls>/.test(rawText)
                 ? rawText
                 : undefined;
-              // Persist THIS round's text only. `roundPreamble` (membrane
-              // ≥0.5.79) is the per-round delta; the legacy `preamble` is
-              // CUMULATIVE in XML mode — persisting it per round stored each
-              // round's text N times and re-persisted injected
-              // <function_results> as the agent's own words (the Evander
-              // 2026-08-08 scaffold-leak pyramid: r1 ×3, r2 ×2).
-              const roundText =
-                (event.context as { roundPreamble?: string }).roundPreamble ??
-                event.context.preamble;
+              // Persist THIS round's text only: `roundPreamble` is the
+              // per-round delta. The `preamble` beside it is CUMULATIVE in XML
+              // mode: persisting it per round would store each round's text N
+              // times and re-persist injected <function_results> as the
+              // agent's own words.
+              const roundText = (event.context as { roundPreamble?: string }).roundPreamble;
               assistantBlocks = [];
               if (roundText) {
                 assistantBlocks.push({ type: 'text', text: roundText });
@@ -25228,9 +25194,7 @@ export class AgentFramework {
 
             // Whether this stream can carry messages injected with the round's
             // results: true on membrane's native path and false on its XML
-            // prefill path, from membrane 0.6.0, and absent on 0.5.x, which
-            // doesn't declare it. The tool boundary reads it from the agent's
-            // state.
+            // prefill path. The tool boundary reads it from the agent's state.
             agent.enterWaitingForTools(
               calls,
               stream,
@@ -25272,13 +25236,11 @@ export class AgentFramework {
             if (liveRound) liveProseRouting = true;
             // Whether this round's tool-result batch (and anything queued
             // with it) will be presented to the model before it speaks
-            // again: the producer says so when it can (membrane from 0.6.0).
-            // Otherwise, as on membrane 0.5.x, every round counts as
-            // presenting it. That holds for 0.5.x's native rounds, while its
-            // XML path drops what's injected, so a 'now' notice there reaches
+            // again: the stream declares it (true on membrane's native path).
+            // On the XML path, which declares false, a 'now' notice reaches
             // the agent at its next compile instead.
             const presentsInjections =
-              (event.context as { supportsInjectedMessages?: boolean }).supportsInjectedMessages ?? true;
+              (event.context as { supportsInjectedMessages?: boolean }).supportsInjectedMessages === true;
             // Queued under this turn's routing, whenever it posts, and
             // streamed by this stream once published.
             // This round's request was answered: what it carried is heard.
@@ -26055,14 +26017,14 @@ export class AgentFramework {
               // active (native roundContent), each mid-turn round's prose was
               // already delivered when that round yielded — only the TRAILING
               // prose (blocks after the last tool round) remains here. On the
-              // fallback path (XML tool mode / older membrane: no roundContent,
-              // so nothing was live-routed) the historical behavior applies:
+              // XML tool path (no roundContent, so nothing was live-routed)
+              // the historical behavior applies:
               // route the whole turn's parsed segments, once, now. The global
               // speech/thoughts split is left untouched (module/TUI rendering
               // unaffected) — this only governs what reaches the channel.
               //
               // Native round routing uses the live sticky flag, which a fresh
-              // injected message can reset. The legacy/fallback path has no
+              // injected message can reset. The XML tool path has no
               // reliable round boundaries, so retain its historical turn-wide
               // scan to avoid double-posting.
               const toolCalls = response.content
@@ -26595,10 +26557,6 @@ export class AgentFramework {
             const placedDrops = thinkingDrops && thinkingReport ? thinkingDrops.place(thinkingReport.dropped) : [];
             if (thinkingDrops?.recordedAfter !== undefined) {
               this.noteThinkingLoss(agent.name, placedDrops, thinkingDrops.recordedAfter);
-            }
-            if (thinkingDrops) {
-              this.tellReasoningLoss(agent, () => this.reasoningLoss.forDrops(agent.name, thinkingDrops.branch ?? '',
-                placedDrops, streamRouting, agent.getContextManager()));
             }
             try {
               if (!thinkingDroppedInStream) {
@@ -30633,11 +30591,9 @@ export class AgentFramework {
    * at a tool boundary whose stream declares it carries the messages
    * injected there (markContextConsumed). So a notice such a stream carried
    * is under it. One a boundary stored without sending (a turn a tool ended,
-   * a budget restart) is above it, and so is one injected into a stream that
-   * doesn't declare it carries injections, which may have dropped it:
-   * counted as unread, it goes to the primary even if the agent heard it,
-   * rather than to no one where the stream dropped it. null when the window
-   * can't be read, which is logged.
+   * a budget restart, the direct API's boundary, which has no stream) is
+   * above it until a compile sends it, and counts as unread. null when the
+   * window can't be read, which is logged.
    */
   private releasedWindow(agent: Agent, held: ReadonlySet<string>): ReleasedWindow | null {
     try {

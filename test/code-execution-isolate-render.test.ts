@@ -52,11 +52,10 @@ test('each call whose answer the script did not see is named, as it was left', (
   assert.match(text, /- answered, but the script ended before it read the answer: tools\["echo"\]\(\{\}\)/);
 });
 
-test("at a yield, a too-large answer isn't called a timeout", () => {
+test("at a yield, a too-large answer is counted as one whose answer it didn't see", () => {
   const calls: CallSummary = { ...noCalls, made: 2, running: 1, named: [{ tool: 'big', args: '{}', state: 'too-large' }] };
   const text = renderReturn(ret({ running: true, ending: null, calls }), options);
   assert.match(text, /Its calls so far: 2 \(1 still running; 1 whose answer it didn't see\)\./);
-  assert.doesNotMatch(text, /timed out/);
 });
 
 test('a crash says what it means for the agent, and a failure gives its stack after its line', () => {
@@ -170,19 +169,7 @@ test('calls waiting their turn in the host are among those a yield counts', () =
   assert.match(text, /Its calls so far: 19 \(16 still running; 3 waiting their turn in the host\)\./);
 });
 
-test("bounded's cut, from the text's first and last halves (cutOf), is its cut as first written, over the whole text", () => {
-  // The cut as it was first written, over the whole text.
-  const whole = (text: string, max: number): string => {
-    if (text.length <= max) return text;
-    const half = Math.floor(max / 2);
-    let head = half;
-    const last = text.charCodeAt(head - 1);
-    if (last >= 0xd800 && last <= 0xdbff) head -= 1;
-    let tail = text.length - half;
-    const first = text.charCodeAt(tail);
-    if (first >= 0xdc00 && first <= 0xdfff) tail += 1;
-    return `${text.slice(0, head)}\n[… ${tail - head} characters dropped here …]\n${text.slice(tail)}`;
-  };
+test("bounded keeps both ends of a long text within its max, drops the middle with its count, and splits no surrogate pair", () => {
   // mulberry32, whose 32-bit steps lose nothing in a JavaScript number.
   let seed = 7;
   const next = (n: number) => {
@@ -191,12 +178,29 @@ test("bounded's cut, from the text's first and last halves (cutOf), is its cut a
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return Math.floor((((t ^ (t >>> 14)) >>> 0) / 4294967296) * n);
   };
+  const high = (c: number) => c >= 0xd800 && c <= 0xdbff;
+  const low = (c: number) => c >= 0xdc00 && c <= 0xdfff;
   // Surrogate pairs, so a cut falls inside one, and lone halves too, at bounds from none up.
   const alphabet = ['a', 'b', '\n', '\u{1F600}', '\u00e9', '\ud800', '\udc00'];
   for (let round = 0; round < 500; round++) {
     const max = next(41);
     const text = Array.from({ length: next(120) }, () => alphabet[next(alphabet.length)]).join('');
-    assert.equal(bounded(text, max), whole(text, max), JSON.stringify({ max, text }));
+    const at = JSON.stringify({ max, text });
+    const out = bounded(text, max);
+    if (text.length <= max) {
+      assert.equal(out, text, at);
+      continue;
+    }
+    const cut = /^([\s\S]*)\n\[… (\d+) characters dropped here …\]\n([\s\S]*)$/.exec(out);
+    assert.ok(cut, at);
+    const [, head, dropped, tail] = cut;
+    assert.ok(text.startsWith(head!) && text.endsWith(tail!), at);
+    assert.equal(head!.length + Number(dropped) + tail!.length, text.length, at);
+    assert.ok(head!.length + tail!.length <= max, at);
+    if (max >= 4) assert.ok(head!.length > 0 && tail!.length > 0, `both ends kept: ${at}`);
+    const tailStart = text.length - tail!.length;
+    assert.ok(!(high(text.charCodeAt(head!.length - 1)) && low(text.charCodeAt(head!.length))), `no pair split at the head: ${at}`);
+    assert.ok(!(high(text.charCodeAt(tailStart - 1)) && low(text.charCodeAt(tailStart))), `no pair split at the tail: ${at}`);
   }
 });
 

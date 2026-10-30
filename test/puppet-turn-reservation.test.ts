@@ -16,13 +16,16 @@ import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 type Internals = {
   pendingRequests: InferenceRequest[];
   processInferenceRequests(): Promise<void>;
-  activeTurnTokens: Map<string, number>;
   executeToolCall: (call: Record<string, unknown>) => Promise<unknown>;
   withAuxiliaryAdmission<T>(name: string, run: () => Promise<T>): Promise<T>;
-  providerGates: Map<string, { primaryDepth: number; auxiliaryInFlight: number }>;
-  deferredMessages: unknown[];
 };
-const settle = () => new Promise((r) => setTimeout(r, 30));
+async function until(cond: () => boolean, what: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
 
 describe('puppetToolCall vs a concurrent wake (#145)', () => {
   let tempDir: string;
@@ -56,17 +59,17 @@ describe('puppetToolCall vs a concurrent wake (#145)', () => {
     try {
       const puppet = framework.puppetToolCall('scout', 'agent_settings', { action: 'get' });
       await new Promise((r) => setImmediate(r));
-      assert.equal(i.activeTurnTokens.has('scout'), true, 'reserved while the tool runs');
+      assert.ok(framework.getHostModeStatus().activeTurnAgents.includes('scout'), 'reserved while the tool runs');
 
       // the race: a wake arrives mid-execution and the scheduler runs
       i.pendingRequests.push({ agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'test', timestamp: Date.now() });
       await i.processInferenceRequests();
       assert.equal(membrane.calls.length, 0, 'no turn started under the puppet');
-      assert.equal(i.pendingRequests.length, 1, 'the wake is requeued, not dropped');
+      assert.equal(framework.getHostModeStatus().gatedRequests, 1, 'the wake is requeued, not dropped');
 
       release();
       await puppet;
-      assert.equal(i.activeTurnTokens.has('scout'), false, 'reservation released');
+      assert.ok(!framework.getHostModeStatus().activeTurnAgents.includes('scout'), 'reservation released');
 
       await i.processInferenceRequests();
       await framework.runUntilIdle();
@@ -81,6 +84,7 @@ describe('puppetToolCall vs a concurrent wake (#145)', () => {
       assert.ok(turnText > use + 1, 'the turn the wake started comes AFTER the pair, and saw it');
     } finally {
       console.log = quiet;
+      release();
       await framework.stop();
     }
   });
@@ -112,25 +116,21 @@ describe('puppetToolCall vs a concurrent wake (#145)', () => {
       // 1. a wake passes the busy test and parks on provider admission
       i.pendingRequests.push({ agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'test', timestamp: Date.now() });
       await i.processInferenceRequests();
-      await settle();
+      const status = () => framework.getHostModeStatus();
+      await until(() => status().parkedAdmissions === 1, 'the wake to park on provider admission');
       assert.equal(membrane.calls.length, 0, 'parked behind the auxiliary call');
-      assert.equal(i.providerGates.get('scout')?.primaryDepth, 1, 'admission held while parked');
-      assert.equal(i.activeTurnTokens.has('scout'), false, 'no token yet — the park is before the token');
+      assert.ok(!status().activeTurnAgents.includes('scout'), 'no token yet — the park is before the token');
 
       // 2. a puppet takes the agent while the turn is parked
       const puppet = framework.puppetToolCall('scout', 'agent_settings', { action: 'get' });
-      await settle();
-      assert.equal(i.activeTurnTokens.has('scout'), true, 'puppet holds the reservation');
-      const puppetToken = i.activeTurnTokens.get('scout');
+      await until(() => status().activeTurnAgents.includes('scout'), 'the puppet to hold the reservation');
 
       // 3. the auxiliary settles: the parked turn would now resume
       releaseAux();
       await auxiliary;
-      await settle();
+      await until(() => status().gatedRequests === 1, 'the parked wake to be requeued');
       assert.equal(membrane.calls.length, 0, 'no provider call starts during the puppeted tool');
-      assert.equal(i.activeTurnTokens.get('scout'), puppetToken, 'the reservation is not replaced');
-      assert.equal(i.pendingRequests.length, 1, 'the wake is requeued for the scheduler, not dropped');
-      assert.equal(i.providerGates.get('scout')?.primaryDepth, 0, 'admission given back');
+      assert.equal(status().parkedAdmissions, 0, 'admission given back');
 
       // 4. the tool returns: the pair is persisted before the promise resolves
       releaseTool();
@@ -138,8 +138,7 @@ describe('puppetToolCall vs a concurrent wake (#145)', () => {
       const stored = () => (framework.getAgent('scout')!.getContextManager().getAllMessages() as Array<{ content: Array<{ type: string }> }>)
         .map((m) => m.content[0]?.type);
       assert.deepEqual(stored().filter((t) => t === 'tool_use' || t === 'tool_result'), ['tool_use', 'tool_result'], 'pair persisted when puppetToolCall resolves');
-      assert.equal(i.deferredMessages.length, 0, 'nothing stranded in the deferred queue');
-      assert.equal(i.activeTurnTokens.has('scout'), false, 'reservation released');
+      assert.ok(!status().activeTurnAgents.includes('scout'), 'reservation released');
 
       // 5. the retained wake runs afterwards and sees the pair
       await i.processInferenceRequests();

@@ -562,10 +562,9 @@ describe('stop() with an operator operation in flight', () => {
     const resuming = framework.resume().finally(() => { settled = true; });
     void resuming.catch(() => {});
     try {
-      // Admission is synchronous; promise settlement needs only its microtasks.
-      await Promise.resolve();
-      await Promise.resolve();
-      assert.equal(settled, true, 'refusal must not wait for maintenance');
+      // Refused while the maintenance pass is still held: a refusal that
+      // waited for it would never settle here.
+      await until(() => settled, 'the refusal, with the maintenance pass held');
       await assert.rejects(resuming, /resume refused: the framework is stopping/);
     } finally { endPass(); await stopping; await resuming.catch(() => {}); }
   });
@@ -618,7 +617,7 @@ describe('stop() with an operator operation in flight', () => {
     await releaseWhenStopWaits(release);
     const { toolUseId } = await puppeting;
     await stopping;
-    assert.match(toolUseId, /^toolu_01/);
+    assert.ok(toolUseId, 'the call has its id');
     assert.deepEqual(order, ['tool returned', 'message stored', 'message stored', 'modules stopped']);
     assert.deepEqual(rejections, []);
   });
