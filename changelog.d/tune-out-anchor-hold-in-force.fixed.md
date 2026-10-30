@@ -1,0 +1,1 @@
+- **Hosts with a subconscious:** entering a channel's tune-out while an older all-except hold is in force no longer moves the subconscious's window anchor past the hold's start.
