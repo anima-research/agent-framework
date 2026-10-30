@@ -196,25 +196,17 @@ async function withBacklog<T>(backlog: Partial<Backlog>, run: (b: Backlog) => Pr
 }
 
 interface CompressionCalls {
-  /** Compression calls that landed: the context fits from `fitAt` of them, and compression has work until `workUntil`. */
   landed: number; fitAt: number; workUntil: number;
-  /** Ticks after the refusal, and the calls they started. */
   ticks: number; started: number;
   refused: boolean;
-  /** Once this many calls have started, a tick starts none, as in a paused lane. */
   pauseAfter: number;
-  /** The call with this number fails, and its tick rethrows the failure. */
-  failCall?: number;
-  /** A tick waits on this after its call is made, before the call lands. */
-  gate?: Promise<void>;
+  gate?: Promise<void>; gateCall?: number;
+  previewless: boolean; dryRunGate?: Promise<void>;
 }
 
-/** A manager whose every tick, while it has work, makes one compression call
- *  through the manager's own membrane, which the framework built to admit the
- *  agent's auxiliary calls, as a strategy's compression call goes. */
 async function withCompressionCalls<T>(state: Partial<CompressionCalls>, run: (c: CompressionCalls) => Promise<T>): Promise<T> {
   const c: CompressionCalls = {
-    landed: 0, fitAt: Infinity, workUntil: Infinity, ticks: 0, started: 0, refused: false, pauseAfter: Infinity, ...state,
+    landed: 0, fitAt: Infinity, workUntil: Infinity, ticks: 0, started: 0, refused: false, pauseAfter: Infinity, previewless: false, ...state,
   };
   const fitsNow = () => c.landed >= c.fitAt;
   const working = () => c.refused && c.landed < c.workUntil;
@@ -222,13 +214,15 @@ async function withCompressionCalls<T>(state: Partial<CompressionCalls>, run: (c
   const original = { compile: proto.compile, tick: proto.tick, isReady: proto.isReady, previewContext: proto.previewContext };
   const passthrough = PassthroughStrategy.prototype as unknown as { getProgressSnapshot?: () => unknown };
   proto.compile = async function (this: unknown, ...args: unknown[]) {
+    const dryRun = (args[2] as { dryRun?: boolean } | undefined)?.dryRun === true;
+    if (dryRun && c.dryRunGate) await c.dryRunGate;
     if (!fitsNow()) {
-      if ((args[2] as { dryRun?: boolean } | undefined)?.dryRun !== true) c.refused = true;
+      if (!dryRun) c.refused = true;
       throw overBudget();
     }
     return original.compile.apply(this, args);
   };
-  proto.previewContext = function () { return { fits: fitsNow() }; };
+  proto.previewContext = function () { return c.previewless ? null : { fits: fitsNow() }; };
   proto.isReady = function () { return !working(); };
   proto.tick = async function (this: { membrane: { complete(request: unknown): Promise<unknown> } }) {
     if (!c.refused) return;
@@ -236,8 +230,7 @@ async function withCompressionCalls<T>(state: Partial<CompressionCalls>, run: (c
     if (c.started >= c.pauseAfter || !working()) return;
     const call = ++c.started;
     await this.membrane.complete({ messages: [], config: { model: 'test-model', maxTokens: 100 } });
-    if (c.gate) await c.gate;
-    if (call === c.failCall) throw new Error('zz compression call failed');
+    if (c.gate && (c.gateCall === undefined || c.gateCall === call)) await c.gate;
     c.landed++;
   };
   passthrough.getProgressSnapshot = function () { return { chunksCompressed: c.landed }; };
@@ -380,6 +373,7 @@ interface Internal {
   pendingRequests: Array<{ agentName: string }>;
   providerGateBlocked: (agentName: string) => boolean;
   disposeConversationAgent: (agentName: string) => void;
+  overBudgetDrains: Set<Promise<void>>;
 }
 type HeldRequest = { agentName: string; reason: string; coalescingBatch?: boolean; coalescingBatchSubjects?: string[]; coalescingSubject?: string };
 const holdOf = (t: { internal: Internal }) =>
@@ -665,7 +659,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
-  it('holds a refused turn through a compression outage however long it lasts, raising no alert, and runs it once compression lands', async (tc) => {
+  it('holds a refused turn through a compression outage however long it lasts, with no alert of its own, and runs it once compression lands', async (tc) => {
     tc.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.now() });
     const settle = async () => { for (let i = 0; i < 8; i++) await new Promise<void>((resolve) => setImmediate(resolve)); };
     const step = async (ms: number) => { tc.mock.timers.tick(ms); await settle(); };
@@ -855,13 +849,97 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
+  it('drives a conversation agent\'s compression as it drives a resident\'s', async () => {
+    await withCompressionCalls({ fitAt: 0, workUntil: 20 }, async (c) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
+      const fw = t.framework as unknown as {
+        conversationRouter: unknown;
+        createConversationAgent: (name: string, home: { serverId: string; channelId: string }) => Promise<unknown>;
+      };
+      const fork = 'prime--chanA';
+      try {
+        fw.conversationRouter = {
+          templateAgent: 'prime', idleTtlMs: 60_000, expired: () => [], channelForAgent: () => 'chanA', touch: () => {},
+          getBinding: () => undefined, closurePrompt: () => undefined,
+        };
+        await fw.createConversationAgent(fork, { serverId: 'stub', channelId: 'chanA' });
+        c.fitAt = 12;
+        t.internal.pendingRequests.push({ agentName: fork, reason: 'external-message', source: 'test', timestamp: Date.now() } as never);
+        assert.ok(await pollUntil(() => t.of('inference:completed').some((e) => e.agentName === fork), 3_000),
+          'the fork\'s turn ran with no maintenance pass');
+        assert.equal(c.landed, 12);
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => [e.agentName, e.outcome]), [[fork, 'fit']]);
+      } finally {
+        fw.conversationRouter = undefined;
+        await t.close();
+      }
+    });
+  });
+
+  it('drives compression itself once a drain kick it joined at its start has ended', async () => {
+    await withCompressionCalls({ fitAt: 12, workUntil: 12 }, async (c) => {
+      await errorLines(async (lines) => {
+        const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
+        const fw = t.framework as unknown as {
+          maintenancePass: unknown;
+          kickOverBudgetDrain: (name: string, agent: unknown) => string;
+        };
+        let letGo = () => {};
+        try {
+          assert.ok(await pollUntil(() => fw.maintenancePass === null, 3_000), 'the start pass is done');
+          c.refused = true;
+          c.gate = new Promise<void>((resolve) => { letGo = resolve; });
+          assert.equal(fw.kickOverBudgetDrain('prime', t.framework.getAgent('prime')), 'kicking');
+          assert.ok(await pollUntil(() => c.started === 1, 3_000), 'the breaker\'s kick is in its first call');
+          t.send('Are you there?');
+          assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && (t.internal.budgetHolds.get('prime') as { checkQueued?: boolean } | undefined)?.checkQueued === true, 3_000),
+            'the hold joined the kick in flight');
+          letGo();
+          assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000),
+            'once the kick\'s eight ticks ended, the hold drove the rest with no maintenance pass');
+          assert.equal(c.landed, 12);
+          assert.ok(lines.includes('[budget-hold] drain kicked for prime (budget hold, 4 ticks)'), 'its own first drive logs as the hold\'s');
+        } finally {
+          letGo();
+          await t.close();
+        }
+      });
+    });
+  });
+
+  it('waits for a look already in flight before it ticks again', async () => {
+    await withCompressionCalls({ fitAt: 3, workUntil: 6, previewless: true, gateCall: 3 }, async (c) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
+      const fw = t.framework as unknown as { checkBudgetHold: (agentName: string) => Promise<void> };
+      let letGo = () => {};
+      let letLook = () => {};
+      try {
+        c.gate = new Promise<void>((resolve) => { letGo = resolve; });
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => c.started === 3, 3_000), 'the third call, which makes the context fit, is in flight');
+        c.dryRunGate = new Promise<void>((resolve) => { letLook = resolve; });
+        (holdOf(t) as unknown as { lookedAt?: string }).lookedAt = undefined;
+        void fw.checkBudgetHold('prime');
+        letGo();
+        await new Promise((r) => setTimeout(r, 100));
+        letLook();
+        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000));
+        assert.equal(c.landed, 3, 'no call after the one that made it fit');
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
+      } finally {
+        letGo();
+        letLook();
+        await t.close();
+      }
+    });
+  });
+
   it('stops driving compression at a tick that starts no call, such as a paused lane\'s, and drives it again after the next maintenance pass', async () => {
     await withCompressionCalls({ fitAt: 12, workUntil: 12, pauseAfter: 3 }, async (c) => {
       const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
       try {
         t.send('Are you there?');
-        assert.ok(await pollUntil(() => c.ticks >= 4, 3_000), 'the hold drove compression');
-        await new Promise((r) => setTimeout(r, 300));
+        assert.ok(await pollUntil(() => c.ticks >= 4 && t.internal.overBudgetDrains.size === 0, 3_000), 'the hold drove compression, and its drive ended');
         assert.equal(c.ticks, 4, 'three ticks that each started a call, then one that started none, and no tick after it');
         assert.equal(holdOf(t)?.state, 'holding');
         c.pauseAfter = Infinity;
@@ -877,17 +955,24 @@ describe('a compile refused for budget holds its turn (#304)', () => {
   });
 
   it('reports a compression call that fails in a tick it drives as a maintenance pass reports one, and holds on', async () => {
-    await withCompressionCalls({ fitAt: 12, workUntil: 12, failCall: 2 }, async (c) => {
+    await withCompressionCalls({ fitAt: 12, workUntil: 12 }, async (c) => {
       const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
       const failures = () => t.of('ops:alert').filter((e) => e.kind === 'context-maintenance-failed');
+      const complete = t.membrane.complete.bind(t.membrane);
+      let calls = 0;
+      t.membrane.complete = async (request: NormalizedRequest) => {
+        if (++calls === 2) throw new Error('zz compression call failed');
+        return complete(request);
+      };
       try {
         t.send('Are you there?');
         assert.ok(await pollUntil(() => failures().length === 1, 3_000), 'the failure reached the operator');
         assert.equal(failures()[0]!.agentName, 'prime');
         assert.match(String(failures()[0]!.message), /zz compression call failed/);
         assert.equal((failures()[0]!.data as { scope?: string }).scope, 'agent');
-        await new Promise((r) => setTimeout(r, 200));
+        assert.ok(await pollUntil(() => t.internal.overBudgetDrains.size === 0, 3_000));
         assert.equal(c.ticks, 2, 'the failing tick ended the drive');
+        assert.equal(c.landed, 1);
         assert.equal(failures().length, 1);
         assert.equal(holdOf(t)?.state, 'holding', 'the turn stays held');
       } finally {
@@ -919,7 +1004,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
           assert.ok(await pollUntil(() => c.started === 1, 5_000), 'the hold\'s first tick has made its call');
           t.framework.stopAgent(fork);
           letGo();
-          await new Promise((r) => setTimeout(r, 300));
+          assert.ok(await pollUntil(() => t.internal.overBudgetDrains.size === 0, 3_000), 'the drive ended');
           assert.equal(c.ticks, 1, 'no tick after the disposal');
           assert.ok(lines.includes(`[budget-hold] drain kicked for ${fork} (budget hold, 1 ticks, stopped as the agent was disposed)`),
             lines.filter((l) => l.includes('drain kicked')).join('\n'));
@@ -942,12 +1027,9 @@ describe('a compile refused for budget holds its turn (#304)', () => {
           c.gate = new Promise<void>((resolve) => { letGo = resolve; });
           t.send('Are you there?');
           assert.ok(await pollUntil(() => c.started === 1, 5_000), 'the hold\'s first tick has made its call');
-          // A surgery is refused while a turn is held, so none takes the store
-          // while the hold drives compression; the store is held here as a
-          // surgery holds it, to pin the drive's own guard.
           fw.surgeryHold = { verb: 'rollback', agentName: 'other', since: Date.now() };
           letGo();
-          await new Promise((r) => setTimeout(r, 300));
+          assert.ok(await pollUntil(() => t.internal.overBudgetDrains.size === 0, 3_000), 'the drive ended');
           assert.equal(c.ticks, 1, 'no tick while the store is held');
           assert.ok(lines.includes('[budget-hold] drain kicked for prime (budget hold, 1 ticks, stopped while a surgery holds the store)'),
             lines.filter((l) => l.includes('drain kicked')).join('\n'));
@@ -1060,26 +1142,21 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
-  it('stops the hold\'s drain kick once stop() begins, and starts no kick after it', async () => {
-    await withBacklog({}, async (backlog) => {
+  it('stops the hold\'s drive once stop() begins, and starts no drive after it', async () => {
+    await withCompressionCalls({}, async (c) => {
       await errorLines(async (lines) => {
         const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
         const fw = t.framework as unknown as {
-          maintenancePass: unknown;
           overBudgetDrainAfter: Map<string, unknown[]>;
           kickOverBudgetDrain: (name: string, agent: unknown, after?: () => void, by?: 'breaker' | 'hold') => string;
         };
-        const proto = ContextManager.prototype as unknown as Patchable;
         let letGo = () => {};
         let stopping: Promise<void> | undefined;
         try {
-          assert.ok(await pollUntil(() => fw.maintenancePass === null, 3_000), 'the start pass is done');
-          const gate = new Promise<void>((resolve) => { letGo = resolve; });
-          proto.tick = async function () { backlog.ticks++; await gate; };
-          const before = backlog.ticks;
+          c.gate = new Promise<void>((resolve) => { letGo = resolve; });
           t.send('Are you there?');
-          assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.ticks === before + 1, 5_000),
-            'the hold\'s kick is in its first tick');
+          assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && c.started === 1, 5_000),
+            'the hold\'s drive is in its first call');
           let stopped = false;
           stopping = t.close().then(() => { stopped = true; });
           await new Promise((r) => setTimeout(r, 200));
@@ -1090,7 +1167,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
           assert.equal(fw.overBudgetDrainAfter.get('prime')?.length ?? 0, waiting, 'and keeps no callback');
           letGo();
           await stopping;
-          assert.equal(backlog.ticks, before + 1, 'the kick ticked no more once stop() began');
+          assert.equal(c.ticks, 1, 'the drive ticked no more once stop() began, though its tick had made a call');
           const kicks = lines.filter((l) => l.includes('drain kicked for prime'));
           assert.deepEqual(kicks, ['[budget-hold] drain kicked for prime (budget hold, 1 ticks, stopped as the framework stops)']);
         } finally {
