@@ -172,8 +172,6 @@ export type TraceEvent =
       /** When the hold started (epoch ms): this refusal, or for a released
        *  turn refused again, the refusal that first held it. */
       since: number;
-      /** The hold's deadline (epoch ms), 30 minutes after `since`. */
-      until: number;
       /** Requests the hold has taken so far, the refused one included. */
       heldRequests: number;
     })
@@ -185,18 +183,19 @@ export type TraceEvent =
        * fits (a dry compile does, for a strategy with no preview), and the
        * held requests are queued for one fresh compile. 'check_failed': that
        * check failed for a reason other than the budget, and the requests are
-       * queued for the turn's own compile to meet it. 'deadline': the 30
-       * minutes passed. 'nothing_pending': compression has nothing pending
-       * and the context still doesn't fit. After those two the requests are
-       * queued too, for one fresh compile, and a refusal of it takes the error
-       * policy's path, as a refused compile did before the hold. 'stopped':
+       * queued for the turn's own compile to meet it. 'nothing_pending':
+       * compression has nothing pending and the context still doesn't fit;
+       * the requests are queued too, for one fresh compile, and a refusal of
+       * it takes the error policy's path, as a refused compile did before the
+       * hold. A hold has no time limit: while compression stays pending, it
+       * holds until one of these. 'stopped':
        * the turn ended while it was held (an abandon, a stop of the turn or of
        * the framework, or the agent's leaving), reported after its
        * `inference:aborted`, once the wakes that joined it are back in the
        * queue (after an abandon or a stop of the turn) or gone with it
        * (otherwise).
        */
-      outcome: 'fit' | 'check_failed' | 'deadline' | 'nothing_pending' | 'stopped';
+      outcome: 'fit' | 'check_failed' | 'nothing_pending' | 'stopped';
       /** Since the hold started (`inference:held`'s `since`). */
       waitedMs: number;
       heldRequests: number;

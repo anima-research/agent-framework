@@ -2596,26 +2596,22 @@ const TURN_RETRY_SETTINGS: RetrySettings = {
   deadline: { maxAttempts: DEADLINE_TURN_TRIES, firstDelayMs: 1_000, multiplier: 1, maxDelayMs: 1_000, statedWaitCeilingMs: null },
 } as RetrySettings;
 const PROVIDER_ACCELERATION_JITTER_MS = 5_000;
-const BUDGET_HOLD_MS = 30 * 60_000;
 const BUDGET_HOLD_NOTE_NAMESPACE = 'framework:budget-hold';
-type BudgetHoldOutcome = 'fit' | 'check_failed' | 'deadline' | 'nothing_pending' | 'stopped';
+type BudgetHoldOutcome = 'fit' | 'check_failed' | 'nothing_pending' | 'stopped';
 function describeWait(ms: number): string {
   return ms < 60_000 ? `${Math.max(1, Math.round(ms / 1000))} s` : `${Math.round(ms / 60_000)} min`;
 }
 interface BudgetHold {
   state: 'holding' | 'released' | 'spent';
   startedAt: number;
-  until: number;
   heldRequests: InferenceRequest[];
   errorType: 'over_budget' | 'context_refusal';
   reason: string;
   budget: number | undefined;
   actual: number | undefined;
-  timer?: ReturnType<typeof setTimeout>;
   recheck?: ReturnType<typeof setInterval>;
   checking: boolean;
   lookedAt?: string;
-  ended?: { outcome: 'deadline' | 'nothing_pending' };
   checkpoint: RecordedTurnCheckpoint | undefined;
 }
 /** Longest delay one setTimeout can represent (2^31-1 ms, about 24.8 days);
@@ -3751,7 +3747,6 @@ export class AgentFramework {
   private providerAccelerationRecoveries: Map<string, ProviderAccelerationRecovery> = new Map();
   private providerAccelerationLastRecovery: Map<string, ProviderAccelerationReceipt> = new Map();
   private budgetHolds: Map<string, BudgetHold> = new Map();
-  private budgetHoldMs = BUDGET_HOLD_MS;
   private overBudgetDrainAfter: Map<string, Array<() => void>> = new Map();
   private budgetHoldRecheckMs = DEFAULT_MAINTENANCE_INTERVAL_MS;
   private readonly storeChanges = new WeakMap<ContextManager, { count: number }>();
@@ -6760,7 +6755,7 @@ export class AgentFramework {
     const now = Date.now();
     const figures = error as Error & { budget?: unknown; actual?: unknown };
     const hold: BudgetHold = existing ?? {
-      state: 'holding', startedAt: now, until: now + this.budgetHoldMs, heldRequests: [],
+      state: 'holding', startedAt: now, heldRequests: [],
       errorType, reason: '', budget: undefined, actual: undefined, checking: false, checkpoint: undefined,
     };
     hold.state = 'holding';
@@ -6770,8 +6765,6 @@ export class AgentFramework {
     hold.reason = boundFailureText(String(error.message), FAILURE_SUMMARY_MAX_CHARS);
     hold.budget = typeof figures.budget === 'number' ? figures.budget : undefined;
     hold.actual = typeof figures.actual === 'number' ? figures.actual : undefined;
-    hold.timer = setTimeout(() => this.releaseBudgetHold(agent.name, 'deadline'), Math.min(Math.max(0, hold.until - now), MAX_TIMER_DELAY_MS));
-    hold.timer.unref?.();
     if (this.maintenanceIntervalMs <= 0) {
       hold.recheck = setInterval(() => this.compressForBudgetHold(agent), this.budgetHoldRecheckMs);
       hold.recheck.unref?.();
@@ -6786,20 +6779,16 @@ export class AgentFramework {
       ...(hold.budget !== undefined ? { budget: hold.budget } : {}),
       ...(hold.actual !== undefined ? { actual: hold.actual } : {}),
       since: hold.startedAt,
-      until: hold.until,
       heldRequests: hold.heldRequests.length,
     });
     if (this.budgetHolds.get(agent.name) !== hold || hold.state !== 'holding') return true;
-    const deadline = new Date(hold.until).toISOString();
-    console.error(`[budget-hold] agent=${agent.name} compile refused (${errorType}): ${hold.reason} \u2014 ` +
-      `turn held until ${deadline} while compression catches up`);
-    this.opsAlert(
-      'context-refusal',
-      agent.name,
-      `compile refused (${errorType}): ${hold.reason} \u2014 the turn is held until ${deadline} while compression ` +
-      'catches up, and runs once the context fits; if it never does, raise contextBudgetTokens or overBudgetGraceRatio.',
-      { skipLog: true },
-    );
+    const readiness = this.contextReadiness(agent.getContextManager());
+    const compression = 'pending' in readiness && readiness.pending
+      ? ` Compression: ${boundFailureText(readiness.pending, FAILURE_SUMMARY_MAX_CHARS)}`
+      : '';
+    const held = "Held: this turn's context doesn't fit until pending compression lands; it runs once it fits." + compression;
+    console.error(`[budget-hold] agent=${agent.name} compile refused (${errorType}): ${hold.reason} \u2014 ${held}`);
+    this.opsAlert('context-refusal', agent.name, `compile refused (${errorType}): ${hold.reason} \u2014 ${held}`, { skipLog: true });
     const kick = setTimeout(() => this.compressForBudgetHold(agent), 0);
     kick.unref?.();
     return true;
@@ -6929,15 +6918,10 @@ export class AgentFramework {
   private releaseBudgetHold(agentName: string, outcome: Exclude<BudgetHoldOutcome, 'stopped'>): void {
     const hold = this.budgetHolds?.get(agentName);
     if (hold?.state !== 'holding') return;
-    this.clearBudgetHoldTimers(hold);
+    this.clearBudgetHoldRecheck(hold);
     const waitedMs = Date.now() - hold.startedAt;
     const released = hold.heldRequests;
-    if (outcome === 'fit' || outcome === 'check_failed') {
-      hold.state = 'released';
-    } else {
-      hold.state = 'spent';
-      hold.ended = { outcome };
-    }
+    hold.state = outcome === 'nothing_pending' ? 'spent' : 'released';
     hold.heldRequests = [];
     this.pendingRequests.push(...released);
     console.error(`[budget-hold] agent=${agentName} hold ended (${outcome}) after ${waitedMs}ms; ` +
@@ -6968,7 +6952,7 @@ export class AgentFramework {
     if (!hold) return undefined;
     this.budgetHolds.delete(agentName);
     if (hold.state !== 'holding') return undefined;
-    this.clearBudgetHoldTimers(hold);
+    this.clearBudgetHoldRecheck(hold);
     const waitedMs = Date.now() - hold.startedAt;
     const requests = hold.heldRequests;
     return {
@@ -6992,10 +6976,8 @@ export class AgentFramework {
     if (this.budgetHolds?.get(agentName)?.state !== 'holding') this.budgetHolds?.delete(agentName);
   }
 
-  private clearBudgetHoldTimers(hold: BudgetHold): void {
-    clearTimeout(hold.timer);
+  private clearBudgetHoldRecheck(hold: BudgetHold): void {
     clearInterval(hold.recheck);
-    hold.timer = undefined;
     hold.recheck = undefined;
   }
 
@@ -7005,18 +6987,11 @@ export class AgentFramework {
     const hold = this.budgetHolds?.get(agentName);
     if (hold?.state === 'released') {
       const agent = this.agents.get(agentName);
-      const outcome = hold.until <= Date.now() ? 'deadline'
-        : agent && !this.compressionPending(agent) ? 'nothing_pending' : undefined;
-      if (outcome) {
-        hold.state = 'spent';
-        hold.ended = { outcome };
-      }
+      if (agent && !this.compressionPending(agent)) hold.state = 'spent';
     }
-    if (hold?.state !== 'spent' || !hold.ended) return error;
-    const why = hold.ended.outcome === 'deadline'
-      ? `the hold's ${describeWait(this.budgetHoldMs)} bound passed`
-      : 'compression had nothing left to do';
-    error.message = `${error.message} (the turn was first held ${describeWait(Date.now() - hold.startedAt)} ago; ${why} and it still didn't fit)`;
+    if (hold?.state !== 'spent') return error;
+    error.message = `${error.message} (the turn was first held ${describeWait(Date.now() - hold.startedAt)} ago; ` +
+      "compression had nothing left to do and it still didn't fit)";
     return error;
   }
 
@@ -9217,8 +9192,7 @@ export class AgentFramework {
       const budget = this.budgetHolds?.get(agentName);
       if (!budget?.heldRequests.some(isTurnRetry)) return undefined;
       return {
-        says: `a budget hold keeps its turn to start again once its context fits, or at ` +
-          `${new Date(budget.until).toISOString()} at the latest: ${budget.reason}`,
+        says: `a budget hold keeps its turn to start again once its context fits: ${budget.reason}`,
         statedWait: false,
       };
     }
@@ -9269,8 +9243,12 @@ export class AgentFramework {
    * suppress gate deliveries, pause all MCPL data planes, and wait for
    * in-flight turns to settle (turn-alive is a turn token, which spans
    * dequeue → settled teardown, a continuation of the turn on its way to its
-   * start, or the turn's retry, which a provider hold keeps or which waits
-   * to start: turnHolders). Idempotent, but for the queue's write, which
+   * start, or the turn's retry, which a provider hold or a budget hold keeps
+   * or which waits to start: turnHolders). A budget hold keeps its turn
+   * until compression makes the context fit or has nothing left to do, with
+   * no time limit, so a quiesce made while one holds a turn drains only if
+   * the turn is released and finishes within the window; `abandon: true`
+   * ends it. Idempotent, but for the queue's write, which
    * every call makes first: when the queue can't reach disk, because its
    * write fails or it's over the cap, the call rejects with a
    * QuiesceBlockedError and the host's mode as it was, unless it has
@@ -31933,7 +31911,6 @@ export class AgentFramework {
           const hold = this.budgetHolds?.get(name);
           return hold?.state !== 'holding' ? null : {
             since: hold.startedAt,
-            until: hold.until,
             heldRequests: hold.heldRequests.length,
             errorType: hold.errorType,
             ...(hold.budget !== undefined ? { budget: hold.budget } : {}),
