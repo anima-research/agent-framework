@@ -92,16 +92,22 @@ export interface AgentConfig {
    *  where a prompt is mostly cached, this setting doesn't bound the
    *  request's size: `physicalWindowTokens`, when set, does. The restart is
    *  declined when context-manager's preview of its compile says it won't
-   *  fit, or the preview fails (a strategy with no preview restarts as
-   *  before), and each boundary that declines it emits an
+   *  fit, or the preview fails (a strategy with no preview, or with no fold
+   *  plan to preview as on the hierarchical path, restarts as before), and
+   *  each boundary that declines it emits an
    *  `inference:restart_declined` trace; a preview that fails other than
    *  with an `UncoveredDropError` is also logged. The stream goes on, and
    *  the next tool boundary over this budget considers the restart again.
    *  It previews anew only once what the last preview rested on has
    *  changed (the budget, the compression holds, the live context settings,
-   *  the strategy's compression state, or a stored row edited or removed),
+   *  the strategy's compression state, the pins and document marks other than
+   *  the turn's own, or a stored row edited or removed),
    *  unless that preview said a newer message could make room, failed, or
-   *  met a drop no summary covers: each of those every boundary previews. A
+   *  met a drop no summary covers: each of those every boundary previews.
+   *  With `toolResultGuard` on, no remembered decline is taken: the guard
+   *  holds each round's stored results from compression and edits them as
+   *  it settles them, so what a preview rests on changes at every round,
+   *  and each boundary past this budget that would restart previews anew. A
    *  decline whose preview names only compression as what would make room
    *  isn't cleared by a compression whose model call hasn't started: the
    *  stream keeps the agent's provider gate, and that call waits behind it
@@ -356,7 +362,10 @@ export interface AgentConfig {
   /** Opt-in tool-output admission and one guarded retry after a provider
    * refusal. Agents can persistently override this via agent_settings
    * tool_result_guard. Full originals remain in Chronicle's audit history.
-   * Default false. Disabling does not restore previously withheld output. */
+   * Default false. Disabling does not restore previously withheld output.
+   * Past `maxStreamTokens`, an agent with it on takes no remembered
+   * decline: each boundary that would restart previews the compile anew
+   * (see `maxStreamTokens`). */
   toolResultGuard?: boolean;
 
   /**

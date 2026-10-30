@@ -1,7 +1,8 @@
 - **Hosts that rely on `maxStreamTokens`'s restart:** a turn can now go on
   past `maxStreamTokens` without restarting. The restart is declined when
   context-manager's preview of its compile says it won't fit, or the
-  preview fails: the stream goes on, each boundary that declines it emits
+  preview fails other than by having no fold plan to preview: the stream
+  goes on, each boundary that declines it emits
   an `inference:restart_declined` trace, and the next tool boundary over
   the budget considers the restart again. On 0.30.0 a restart whose
   compile the preview now says won't fit was taken too, and its compile
@@ -11,12 +12,20 @@
   - **A decline that only compression would clear isn't cleared by a
     compression whose model call hasn't started.** The declined stream
     keeps the agent's provider gate, and that call waits behind it until
-    the stream ends. A stored row edited or removed, a changed budget, or
-    a compression that lands with no call or from a call already under way
-    can still clear it. Where a restart would have let the waiting
-    compression land and the turn answer, as with a module that awaits at
-    each tool result, the turn now goes on, and with `physicalWindowTokens`
-    unset it can end with a `context_length` failure row.
+    the stream ends. Other changes can still clear it, such as a stored row
+    edited or removed, a pin or document mark removed, a compression hold
+    released, a live context setting changed (`tailTokens`,
+    `transitionPaceTokens`, `preparedWindowTokens`), a changed budget, or a
+    compression that lands with no call or from a call already under way.
+    Where a restart would have let the waiting compression land and the
+    turn answer, as with a module that awaits at each tool result, the turn
+    now goes on, and with `physicalWindowTokens` unset it can end with a
+    `context_length` failure row.
+  - **An agent with `toolResultGuard` on takes no remembered decline: each
+    boundary past `maxStreamTokens` that would restart previews the compile
+    anew.** The guard holds each round's stored results from compression and
+    edits them as it settles them, so what a preview rests on changes at
+    every round.
   - **Migration:** with `physicalWindowTokens` unset, nothing else bounds a
     stream whose restart is declined: it can go on until the provider
     refuses a request at its own window, and the turn then ends with a
@@ -53,6 +62,7 @@
     keeps them raw. A taken restart's compile drops it only where it
     refuses with the pin held, as that pin's entry says.
   - **Unchanged:** a restart whose preview fits, the `physicalWindowTokens`
-    restart, a strategy with no preview (such as `PassthroughStrategy`),
-    which restarts as before, and a boundary past `maxStreamTokens` while
+    restart, a strategy with no preview (such as `PassthroughStrategy`) or
+    with no fold plan to preview (the hierarchical path), which restarts as
+    before, and a boundary past `maxStreamTokens` while
     the framework stops, which ends the turn with its stream.

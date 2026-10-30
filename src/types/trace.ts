@@ -247,8 +247,8 @@ export type TraceEvent =
        * `UncoveredDropError` (`uncovered_drop`), or it failed otherwise (`preview_error`, also logged).
        * `previewed` is false where the boundary took an earlier boundary's `wont_fit` on the same stream, one a
        * newer message couldn't clear, with nothing it rested on changed since (the budget, the compression holds,
-       * the live context settings, the strategy's compression state), and ran no preview; its figures are that
-       * earlier preview's.
+       * the live context settings, the strategy's compression state, the pins and document marks other than the
+       * turn's own, or a stored row edited or removed), and ran no preview; its figures are that earlier preview's.
        */
       type: 'inference:restart_declined';
       agentName: string;
