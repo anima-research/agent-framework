@@ -81,9 +81,9 @@ test('scripts/test-as-ci.mjs runs npm test at the width it reports, whatever the
 
 test('scripts/test-as-ci.mjs fails when npm test fails', () => {
   assert.equal(testAsCi('exit 3').status, 3, 'exits with npm test\'s status');
-  const killed = testAsCi('kill -TERM $$');
+  const killed = testAsCi('kill -KILL $$');
   assert.equal(killed.args, 'test', `npm test ran before its signal: ${JSON.stringify(killed)}`);
-  assert.notEqual(killed.status, 0, `fails when npm test is killed by a signal: ${JSON.stringify(killed)}`);
+  assert.equal(killed.signal, 'SIGKILL', `ends by the signal that killed npm: ${JSON.stringify(killed)}`);
 });
 
 /** The ERE the `changes` job matches the pull request's changed paths against for Bun's macOS legs. */
