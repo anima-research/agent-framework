@@ -210,10 +210,14 @@ test('every cut of failure text keeps surrogate pairs whole and states the whole
         const where = (sink: string) => `${JSON.stringify(inserted)} at ${at}, ${sink}`;
         posted.length = 0;
 
-        // An invalid_request at the escalation threshold: the marker, the
-        // logs, the status, the hard-down alert and the rewind marker.
+        // An invalid_request at the escalation threshold, for a request on the
+        // wire, in a run of failures whose history a probe has already
+        // implicated: the marker, the logs, the status, the hard-down alert and
+        // the rewind marker.
         const exhausted = makeHarness();
         exhausted.fw.inferenceFailureEscalationThreshold = 1;
+        exhausted.fw.exhaustionRewinds.set('cairn', 1);
+        exhausted.fw.failedRequests = { get: () => ({ messages: [], config: { model: 'zz-model', maxTokens: 100 } }), delete: () => true };
         const rewound: string[] = [];
         exhausted.fw.shedNewestTurn = () => ({ descriptor: 'zz-turn' });
         exhausted.fw.updateRewindMarker = (_agent: unknown, category: string) => { rewound.push(category); return 1; };
