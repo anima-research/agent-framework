@@ -8,7 +8,7 @@ import type { ContextInjection } from '@animalabs/context-manager';
 import { MembraneError } from '@animalabs/membrane';
 import type { ContentBlock, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import type { AgentConfig, EventResponse, Module, ProcessEvent, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
-import { AgentFramework } from '../src/index.js';
+import { AgentFramework, workerSpec } from '../src/index.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
 
 const ROUNDS = 12;
@@ -173,14 +173,14 @@ async function waitUntil(label: string, condition: () => boolean, timeoutMs = 30
 async function withFramework(
   membrane: MockMembrane,
   module: PagesModule,
-  agent: AgentConfig,
+  agent: AgentConfig | AgentConfig[],
   run: (framework: AgentFramework, traces: TraceEvent[]) => Promise<void>,
 ): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'restart-preview-'));
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store'),
     membrane: membrane.asMembrane(),
-    agents: [agent],
+    agents: Array.isArray(agent) ? agent : [agent],
     modules: [module],
     syncIntervalMs: 0,
   });
@@ -441,6 +441,9 @@ for (const { what, clearedBy } of [
   { what: "a compression lands, after a decline that named no way to make room while compression work was pending (an empty clearedBy isn't final)", clearedBy: [] },
   { what: 'a stored row is edited', clearedBy: ['compression'] },
   { what: 'a stored row is removed', clearedBy: ['compression'] },
+  { what: 'stored rows are removed as a range', clearedBy: ['compression'] },
+  { what: 'another pin is removed', clearedBy: ['compression'] },
+  { what: 'a document mark is removed', clearedBy: ['compression'] },
 ] as const) {
   test(`a restart declined for a reason a newer message can't clear is previewed again once ${what}, and taken once it fits`, async () => {
     const membrane = new TurnMembrane([[...toolRounds(6, 4_000), answer('Done on the first stream.')], [answer(FINAL)]]);
@@ -455,7 +458,10 @@ for (const { what, clearedBy } of [
       Object.defineProperty(prime.toolResultGuard, 'pendingWireReserveTokens', { get: () => reserve });
       const [held] = compressHistory(framework, 1);
       cm.holdCompression([held]);
-      const stored = what.startsWith('a stored row') ? cm.addMessage('User', [{ type: 'text', text: `[x] ${PAGE}` }]) : undefined;
+      const rowsNeeded = what.startsWith('a stored row') ? 1 : what.includes('range') || what.includes('pin') || what.includes('mark') ? 2 : 0;
+      const rows = Array.from({ length: rowsNeeded }, (_, i) => cm.addMessage('User', [{ type: 'text', text: `[x${i}] ${PAGE}` }]));
+      const stored = rows[0];
+      const otherPin = what === 'another pin is removed' ? cm.pinRange(rows[0]!, rows[1]!) : what === 'a document mark is removed' ? cm.markDocument(rows[0]!) : undefined;
       strategy.readiness = { ready: false, description: 'Compressing chunk 0' };
       strategy.reportsStats = what === "the pending compression work of a strategy that reports no counts changes" ? false
         : what === "the pending compression work of a strategy whose stats hold none of the counts changes" ? 'none of the counts' : true;
@@ -468,6 +474,8 @@ for (const { what, clearedBy } of [
         else if (what.startsWith('the pending compression work')) strategy.readiness = { ready: false, description: 'Compressing chunk 1' };
         else if (what === 'a stored row is edited') cm.editMessage(stored!, [{ type: 'text', text: '[x] a line' }]);
         else if (what === 'a stored row is removed') cm.removeMessage(stored!);
+        else if (what === 'stored rows are removed as a range') cm.removeMessages(rows[0]!, rows[1]!);
+        else if (otherPin !== undefined) cm.unpin(otherPin);
         else strategy.compressionCount++;
       };
       ask(framework);
@@ -479,6 +487,147 @@ for (const { what, clearedBy } of [
     });
   });
 }
+
+test("a restart declined for a reason a newer message can't clear is previewed again once a stored row is removed through another resident's manager, and taken once it fits", async () => {
+  const membrane = new TurnMembrane([[...toolRounds(6, 4_000), answer('Done on the first stream.')], [answer(FINAL)]]);
+  let changed = false;
+  const strategy = new ScriptedPreviewStrategy(() => (changed ? { fits: true, clearedBy: [] } : { fits: false, clearedBy: ['compression'] }));
+  const agent = agentConfig({ maxStreamTokens: 10, contextBudgetTokens: 60_000, physicalWindowTokens: undefined, strategy });
+  const other: AgentConfig = { name: 'other', model: 'test-model', systemPrompt: 'You are other.', triggerSources: [] };
+  const module = new PagesModule();
+  await withFramework(membrane, module, [agent, other], async (framework, traces) => {
+    const stored = framework.getAgent('prime')!.getContextManager().addMessage('User', [{ type: 'text', text: `[x] ${PAGE}` }]);
+    strategy.readiness = { ready: false, description: 'Compressing chunk 0' };
+    module.onCall = (call) => {
+      if (call !== 6) return;
+      changed = true;
+      framework.getAgent('other')!.getContextManager().removeMessage(stored);
+    };
+    ask(framework);
+    await waitUntil('the turn to end', () => storedText(framework).includes(FINAL) || storedText(framework).includes('Done on the first stream.') || failureRows(framework).length > 0);
+    assert.deepEqual(declined(traces).map((decline) => decline.previewed), [true, false], 'the 4th boundary declined, the 5th took its answer');
+    assert.equal(strategy.previews, 2, "the 6th boundary, once the other resident's manager removed a row, asked again");
+    assert.equal(restarted(traces).length, 1, 'and restarted');
+    assert.ok(storedText(framework).includes(FINAL), 'the turn answered on the restarted stream');
+  });
+});
+
+test('a toolResultGuard agent takes no remembered decline: each boundary past maxStreamTokens that would restart previews again', async () => {
+  const membrane = new TurnMembrane([[...toolRounds(6, 4_000), answer('Done on the first stream.')], [answer(FINAL)]]);
+  const strategy = new ScriptedPreviewStrategy(() => ({ fits: false, clearedBy: ['compression'] }));
+  const agent = agentConfig({ maxStreamTokens: 10, contextBudgetTokens: 60_000, physicalWindowTokens: undefined, strategy, toolResultGuard: true });
+  await withFramework(membrane, new PagesModule(), agent, async (framework, traces) => {
+    strategy.readiness = { ready: false, description: 'Compressing chunk 0' };
+    ask(framework);
+    await waitUntil('the turn to end', () => storedText(framework).includes(FINAL) || storedText(framework).includes('Done on the first stream.') || failureRows(framework).length > 0);
+    assert.deepEqual(declined(traces).map((decline) => decline.previewed), [true, true, true], 'the 4th, 5th and 6th boundaries each declined on a preview of their own');
+    assert.equal(strategy.previews, 3, 'each asked the preview');
+    assert.equal(restarted(traces).length, 0, 'and none restarted');
+  });
+});
+
+test("an agent outside the shared slot counts its own manager's row edits: its remembered decline is previewed again once one of its rows is edited", async () => {
+  const membrane = new TurnMembrane([[...toolRounds(6, 4_000), answer('Done on the first stream.')], [answer(FINAL)]]);
+  let changed = false;
+  const strategy = new ScriptedPreviewStrategy(() => (changed ? { fits: true, clearedBy: [] } : { fits: false, clearedBy: ['compression'] }));
+  const module = new PagesModule();
+  await withFramework(membrane, module, agentConfig({ triggerSources: [] }), async (framework, traces) => {
+    const { agent, contextManager } = await framework.createEphemeralAgent(
+      agentConfig({ name: 'worker', maxStreamTokens: 10, contextBudgetTokens: 60_000, physicalWindowTokens: undefined, strategy }),
+    );
+    const stored = contextManager.addMessage('User', [{ type: 'text', text: `[x] ${PAGE}` }]);
+    contextManager.addMessage('User', [{ type: 'text', text: 'Read the pages, please.' }]);
+    strategy.readiness = { ready: false, description: 'Compressing chunk 0' };
+    module.onCall = (call) => {
+      if (call !== 6) return;
+      changed = true;
+      contextManager.editMessage(stored, [{ type: 'text', text: '[x] a line' }]);
+    };
+    const run = await framework.runEphemeralToCompletion(agent, contextManager);
+    assert.equal(run.speech.includes(FINAL), true, 'the run answered on the restarted stream');
+    assert.deepEqual(declined(traces).map((decline) => decline.previewed), [true, false], 'the 4th boundary declined, the 5th took its answer');
+    assert.equal(strategy.previews, 2, 'the 6th boundary, once its own row was edited, asked again');
+    assert.equal(restarted(traces).length, 1, 'and restarted');
+  });
+});
+
+async function resumedSharedSlotJob(framework: AgentFramework, strategy: AgentConfig['strategy']) {
+  const { name: _name, ...job } = agentConfig({ name: 'job', maxStreamTokens: 10, contextBudgetTokens: 60_000, physicalWindowTokens: undefined });
+  const first = await framework.createEphemeralAgent(
+    { ...job, name: 'job', strategy: new PassthroughStrategy() },
+    { ...workerSpec('job'), readsSharedSlot: true },
+  );
+  first.contextManager.addMessage('User', [{ type: 'text', text: 'Begin.' }]);
+  await framework.runEphemeralToCompletion(first.agent, first.contextManager);
+  return framework.resumeAgent('job', { ...job, strategy });
+}
+
+test("a resumed job that reads the shared slot reads the slot's count: its remembered decline is previewed again once a resident removes a row", async () => {
+  const membrane = new TurnMembrane([[answer('Begun.')], [...toolRounds(6, 4_000), answer('Done on the first stream.')], [answer(FINAL)]]);
+  let changed = false;
+  const strategy = new ScriptedPreviewStrategy(() => (changed ? { fits: true, clearedBy: [] } : { fits: false, clearedBy: ['compression'] }));
+  const module = new PagesModule();
+  await withFramework(membrane, module, agentConfig({ triggerSources: [] }), async (framework, traces) => {
+    const prime = framework.getAgent('prime')!.getContextManager();
+    const resumed = await resumedSharedSlotJob(framework, strategy);
+    const stored = prime.addMessage('User', [{ type: 'text', text: `[x] ${PAGE}` }]);
+    strategy.readiness = { ready: false, description: 'Compressing chunk 0' };
+    module.onCall = (call) => {
+      if (call !== 6) return;
+      changed = true;
+      prime.removeMessage(stored);
+    };
+    const run = await framework.runEphemeralToCompletion(resumed.agent, resumed.contextManager);
+    assert.ok(run.speech.includes(FINAL), `the resumed job answered on the restarted stream: ${run.speech}`);
+    assert.deepEqual(declined(traces).map((decline) => decline.previewed), [true, false], 'the 4th boundary declined, the 5th took its answer');
+    assert.equal(strategy.previews, 2, "the 6th boundary, once the resident's manager removed a row, asked again");
+    assert.equal(restarted(traces).length, 1, 'and restarted');
+  });
+});
+
+test("a resumed job that reads the shared slot feeds the slot's count: a resident's remembered decline is previewed again once the job's manager edits a row", async () => {
+  const membrane = new TurnMembrane([[answer('Begun.')], [...toolRounds(6, 4_000), answer('Done on the first stream.')], [answer(FINAL)]]);
+  let changed = false;
+  const strategy = new ScriptedPreviewStrategy(() => (changed ? { fits: true, clearedBy: [] } : { fits: false, clearedBy: ['compression'] }));
+  const module = new PagesModule();
+  const agent = agentConfig({ maxStreamTokens: 10, contextBudgetTokens: 60_000, physicalWindowTokens: undefined, strategy });
+  await withFramework(membrane, module, agent, async (framework, traces) => {
+    const resumed = await resumedSharedSlotJob(framework, new PassthroughStrategy());
+    const stored = framework.getAgent('prime')!.getContextManager().addMessage('User', [{ type: 'text', text: `[x] ${PAGE}` }]);
+    strategy.readiness = { ready: false, description: 'Compressing chunk 0' };
+    module.onCall = (call) => {
+      if (call !== 6) return;
+      changed = true;
+      resumed.contextManager.editMessage(stored, [{ type: 'text', text: '[x] a line' }]);
+    };
+    try {
+      ask(framework);
+      await waitUntil('the turn to end', () => storedText(framework).includes(FINAL) || storedText(framework).includes('Done on the first stream.') || failureRows(framework).length > 0);
+      assert.deepEqual(declined(traces).map((decline) => decline.previewed), [true, false], 'the 4th boundary declined, the 5th took its answer');
+      assert.equal(strategy.previews, 2, "the 6th boundary, once the job's manager edited a row, asked again");
+      assert.equal(restarted(traces).length, 1, 'and restarted');
+      assert.ok(storedText(framework).includes(FINAL), 'the turn answered on the restarted stream');
+    } finally {
+      resumed.cleanup();
+    }
+  });
+});
+
+test('a framework that stops during a tool call asks for no restart preview past maxStreamTokens', async () => {
+  const membrane = new TurnMembrane([[...toolRounds(6, 4_000), answer('Done on the first stream.')], [answer(FINAL)]]);
+  const strategy = new ScriptedPreviewStrategy(() => ({ fits: false, clearedBy: ['compression'] }));
+  const agent = agentConfig({ maxStreamTokens: 10, contextBudgetTokens: 60_000, physicalWindowTokens: undefined, strategy });
+  const module = new PagesModule();
+  await withFramework(membrane, module, agent, async (framework) => {
+    let stopping: Promise<void> | undefined;
+    module.onCall = (call) => { if (call === 4) stopping = framework.stop(); };
+    ask(framework);
+    await waitUntil('the stop to begin', () => stopping !== undefined);
+    await stopping;
+    assert.equal(module.calls, 4, 'the stop began in the 4th tool call, whose boundary is the first past the budget');
+    assert.equal(strategy.previews, 0, 'no preview was asked');
+  });
+});
 
 // On the hierarchical path, once the dry select has succeeded, this copy of context-manager answers null. A strategy
 // built from another copy throws that copy's refusal, which this copy's ContextManager doesn't turn into null: a
@@ -720,9 +869,6 @@ test('under kv-unified, with a module awaiting at each tool result, restarts who
   });
 });
 
-// The pin a turn holds on its opening rows (the framework's turn-inputs pin) beside the restart's preview: the
-// preview asks whether the restart's compile would fit with that pin left out, and releases nothing. A declined
-// restart keeps the pin; a taken one's compile drops it only by refusing with it held.
 const TURN_INPUTS = 'agent-framework:turn-inputs';
 const turnPins = (framework: AgentFramework) =>
   framework.getAgent('prime')!.getContextManager().listPins().filter((pin) => pin.name === TURN_INPUTS);
@@ -765,6 +911,8 @@ test("under kv-unified, a restart declined while the turn holds its pin leaves t
   const membrane = new LongTurnMembrane(longTurn(30), module, 40_000);
   const agent = agentConfig({ maxStreamTokens: 8_000, contextBudgetTokens: 20_000, physicalWindowTokens: undefined, strategy: strategy('kv-unified', 6_000) });
   const logged = await loggedDuring(() => withFramework(membrane, module, agent, async (framework, traces) => {
+    const cm = framework.getAgent('prime')!.getContextManager();
+    const note = cm.markDocument(cm.addMessage('User', [{ type: 'text', text: '[note] a short note to keep' }]));
     const previews = recordPreviews(framework);
     const heldAtDecline: string[][] = [];
     framework.onTrace((event) => {
@@ -777,7 +925,8 @@ test("under kv-unified, a restart declined while the turn holds its pin leaves t
     assert.ok(storedText(framework).includes(FINAL), 'the turn answered');
     assert.equal(held.length, 1, 'the turn held one pin on its opening rows');
     assert.ok(previews.length > 0 && previews.every((preview) => JSON.stringify(excludedBy(preview)) === JSON.stringify(held)),
-      "each preview left the turn's pin out");
+      "each preview left the turn's pin out, and only it: the document mark held beside it stayed in");
+    assert.ok(cm.listPins().some((pin) => pin.id === note), 'the document mark is still held');
     assert.ok(declined(traces).length > 1, `the restart was declined at more than one boundary (${declined(traces).length})`);
     assert.deepEqual(heldAtDecline, declined(traces).map(() => held), 'each decline left the pin in place');
     assert.ok(requestText(membrane.streams[membrane.streams.length - 1]).includes('Read the pages, please.'), "the last stream's request holds the opening request");

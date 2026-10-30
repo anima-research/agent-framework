@@ -4172,6 +4172,8 @@ export class AgentFramework {
   /** Per source agent, per kind: how many derivations, since when, and at which count the last note went. */
   private derivationTallies: Map<string, Map<string, { count: number; since: number }>> = new Map();
   private readonly sharedSlotAgents = new Set<Agent>();
+  private readonly sharedSlotManagers = new WeakSet<ContextManager>();
+  private sharedSlotRowChanges = 0;
   /** The batched-wake lines already written (placeWakeLines), so every agent a
    *  wake was for, and every later start of it, writes each at most once. */
   private readonly placedWakeLines = new WeakSet<WakeLine>();
@@ -11219,6 +11221,7 @@ export class AgentFramework {
         throw new Error(`resumeAgent: "${name}" was registered while it was being resumed`);
       }
       agent = new Agent(fullConfig, contextManager, this.membrane);
+      if (this.sharedSlotManagers.has(contextManager)) agent.readRowChangesFrom(() => this.sharedSlotRowChanges);
       this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     } catch (error) {
@@ -11345,6 +11348,7 @@ export class AgentFramework {
       membrane,
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
+    if (sees) this.feedSharedSlot(opened);
     return sees ? seen(opened, sees) : opened;
   }
 
@@ -12417,11 +12421,12 @@ export class AgentFramework {
   private declineBudgetRestart(agent: Agent): { decline: RestartDecline; previewed: boolean } | undefined {
     let decline: RestartDecline | undefined;
     try {
-      const key = agent.restartPreviewKey();
+      const pin = this.turnRouting.get(agent.name)?.inputsPin;
+      const excludePins = pin?.agent === agent ? [pin.id] : undefined;
+      const key = agent.restartPreviewKey(excludePins);
       const remembered = this.restartDeclines.get(agent);
       if (remembered?.streamId === agent.streamId && remembered.key === key) return { decline: remembered, previewed: false };
-      const pin = this.turnRouting.get(agent.name)?.inputsPin;
-      const preview = agent.previewCompile(pin?.agent === agent ? [pin.id] : undefined);
+      const preview = agent.previewCompile(excludePins);
       if (preview !== null && !preview.fits) {
         decline = {
           reason: 'wont_fit', finalTokens: preview.finalTokens, budgetTokens: preview.budgetTokens,
@@ -15934,6 +15939,19 @@ export class AgentFramework {
     }
   }
 
+  private feedSharedSlot(contextManager: ContextManager): void {
+    if (typeof contextManager.onMessage === 'function') {
+      contextManager.onMessage((event) => { if (event.type !== 'add') this.sharedSlotRowChanges++; });
+    }
+    this.sharedSlotManagers.add(contextManager);
+  }
+
+  private joinSharedSlot(agent: Agent, contextManager: ContextManager): void {
+    this.feedSharedSlot(contextManager);
+    agent.readRowChangesFrom(() => this.sharedSlotRowChanges);
+    this.sharedSlotAgents.add(agent);
+  }
+
   private async createAgent(config: AgentConfig): Promise<Agent> {
     // The residents' view (RESIDENT_VIEW_FILTER: held rows out, read by
     // heldFromResidents) composed with this agent's own: another agent's
@@ -15972,7 +15990,7 @@ export class AgentFramework {
     const agent = new Agent(config, contextManager, this.membrane);
     this.adoptToolResultGuard(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
-    this.sharedSlotAgents.add(agent);
+    this.joinSharedSlot(agent, contextManager);
     // The first resident declared owns default delivery.
     this.announceAgentCreated(
       this.registry.register({ ...residentSpec(config.name, { primary: !this.primaryAgentName }), model: config.model }),
@@ -16090,7 +16108,7 @@ export class AgentFramework {
     const agent = new Agent(agentConfig, contextManager, this.membrane);
     this.adoptToolResultGuard(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
-    this.sharedSlotAgents.add(agent); // reads the shared slot through its merged view
+    this.joinSharedSlot(agent, contextManager); // reads the shared slot through its merged view
     // An attention tenant of the resident it serves: reads the shared slot
     // through its merged view (held traffic included), never a broadcast
     // recipient, and outlives policy epochs.

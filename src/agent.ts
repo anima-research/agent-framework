@@ -438,9 +438,7 @@ export class Agent {
   /** Told when that changes (the framework records it beside the persisted budget). */
   private compiledBudgetListener?: (budget: number, fit: boolean) => boolean;
   private contextManager: ContextManager;
-  /** How many edits and removals of stored rows its context manager has reported (onMessage): part of the restart
-   *  preview's key (restartPreviewKey), so a decline remembered before a row was edited or removed is asked again. */
-  private storedRowChanges = 0;
+  private rowChanges: () => number;
   private membrane: Membrane;
 
   constructor(
@@ -483,9 +481,11 @@ export class Agent {
     this.contextBudgetTokens = config.contextBudgetTokens;
     this.configuredContextBudgetTokens = config.contextBudgetTokens;
     this.contextManager = contextManager;
+    let rowChanges = 0;
     if (typeof contextManager.onMessage === 'function') {
-      contextManager.onMessage((event) => { if (event.type !== 'add') this.storedRowChanges++; });
+      contextManager.onMessage((event) => { if (event.type !== 'add') rowChanges++; });
     }
+    this.rowChanges = () => rowChanges;
     this.membrane = membrane;
     const hot = this.getHotContextSettings();
     this.configuredTailTokens = hot?.tailTokens;
@@ -2154,26 +2154,35 @@ export class Agent {
     );
   }
 
+  /** @internal For the framework's shared slot; not a host API. */
+  readRowChangesFrom(read: () => number): void {
+    this.rowChanges = read;
+  }
+
   /**
    * What a preview's answer rests on besides the rows a stream adds, as one string: the budget it's given, the
    * compression holds, the live settings that change the select (`tailTokens`, `transitionPaceTokens`,
    * `preparedWindowTokens`), the strategy's compression state (its counts of compressed chunks and summaries where it
    * reports any of them, `getStats`, and otherwise its pending work, whose text a landing can leave reading the same),
-   * and how many times a stored row has been edited or removed. A restart declined for a reason a newer message can't
-   * clear is previewed again only once this has changed.
+   * the pins and document marks other than `excludePins` (the ones the preview reads as absent), and how many times a
+   * stored row has been edited or removed. A restart declined for a reason a newer message can't clear is previewed
+   * again only once this has changed.
    * @internal For the framework's restart decision; not a host API.
    */
-  restartPreviewKey(): string {
+  restartPreviewKey(excludePins?: readonly string[]): string {
     const cm = this.contextManager;
     const hot = this.getHotContextSettings();
     const stats = (cm.getStrategy() as { getStats?: () => Record<string, unknown> }).getStats?.();
     const counts = stats && [stats.chunksCompressed, stats.compressionCount, stats.l1, stats.l2, stats.l3];
+    const pins = cm.listPins().filter((pin) => !excludePins?.includes(pin.id))
+      .map((pin) => [pin.id, pin.firstMessageId, pin.lastMessageId]).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
     return JSON.stringify([
       this.previewBudget(),
       [...cm.getCompressionHolds()].sort(),
       hot && [hot.tailTokens, hot.transitionPaceTokens ?? null, hot.preparedWindowTokens ?? null],
       counts?.some((count) => typeof count === 'number') ? counts : cm.getPendingWork()?.description ?? null,
-      this.storedRowChanges,
+      pins,
+      this.rowChanges(),
     ]);
   }
 

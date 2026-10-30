@@ -1503,10 +1503,6 @@ describe('present while acting', () => {
     });
   }
 
-  // The delivery rule's addressed-elsewhere notice skips a boundary that
-  // restarts past maxStreamTokens, the window projection forcing it as well
-  // or not, as the re-pin above does: the restart's start tells the agent
-  // instead, so it hears of the message once.
   const addressedFrom = (framework: AgentFramework): string[] =>
     framework.getAgent('assistant')!.getContextManager().getAllMessages()
       .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'routing-notice')
@@ -1546,6 +1542,52 @@ describe('present while acting', () => {
       const told = addressedFrom(framework);
       assert.equal(told.length, 1, 'the agent is told once');
       assert.ok(told[0]!.startsWith('[routing] Someone addressed you from discord:dm:antra at your budget restart.'), "by the restart's start");
+
+      await framework.stop();
+    });
+  }
+
+  for (const [label, speech] of [
+    ['re-pins to an addressed message there under the latest-inbound rule', 'latest-inbound'],
+    ['tells the agent of an addressed message there under the delivery rule', 'delivery'],
+  ] as const) {
+    it(`a boundary that declines its budget restart goes on on its stream, and ${label}`, async () => {
+      const overBudget = createMockResponse([
+        { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+      ] as ContentBlock[], 'tool_use');
+      overBudget.usage = { inputTokens: 100, outputTokens: 5 };
+      membrane.pushResponse(overBudget);
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'On the same stream.' }] as ContentBlock[]));
+
+      const framework = await createFramework({ ...(speech === 'latest-inbound' ? LEGACY : {}), maxStreamTokens: 20 });
+      const routed = stubChannelRegistry(framework);
+      const cm = framework.getAgent('assistant')!.getContextManager();
+      cm.previewContext = (() => ({ fits: false, clearedBy: ['compression'], finalTokens: 9_000, budgetTokens: 8_000 })) as unknown as typeof cm.previewContext;
+      module.toolDelayMs = 25;
+      module.interjection = 'quick question for you';
+      module.interjectionMetadata = addressed('discord:dm:antra');
+      const declines: string[] = [];
+      framework.onTrace((event) => { if (event.type === 'inference:restart_declined') declines.push(event.type); });
+      trigger(framework);
+      await framework.runUntilIdle();
+
+      assert.equal(declines.length, 1, 'the boundary declined the restart');
+      assert.equal(membrane.calls.length, 1, 'the turn went on on its one stream');
+      const wired = membrane.lastStream!.receivedToolResultOptions
+        .flatMap((o) => o?.injectedMessages ?? [])
+        .flatMap((m) => (m.content as Array<{ text?: string }>).map((b) => b.text ?? ''))
+        .filter((t) => t.includes('[routing]'));
+      if (speech === 'latest-inbound') {
+        assert.deepEqual(routed, [{ text: 'On the same stream.', locus: 'discord:dm:antra' }], 'its prose after the boundary followed the addressed message');
+        assert.deepEqual(movedTo(framework), ['discord:dm:antra']);
+        assert.equal(wired.filter((t) => t.startsWith('[routing] The conversation moved to discord:dm:antra')).length, 1, `the stream it went on was told of the move: ${JSON.stringify(wired)}`);
+      } else {
+        assert.deepEqual(routed, [{ text: 'On the same stream.', locus: 'chan-live-1' }], 'the pin did not move');
+        const told = addressedFrom(framework);
+        assert.equal(told.length, 1, 'the boundary told the agent once');
+        assert.ok(told[0]!.startsWith('[routing] Someone addressed you from discord:dm:antra'), told[0]);
+        assert.equal(wired.filter((t) => t.startsWith('[routing] Someone addressed you from discord:dm:antra')).length, 1, `the stream it went on was told: ${JSON.stringify(wired)}`);
+      }
 
       await framework.stop();
     });
