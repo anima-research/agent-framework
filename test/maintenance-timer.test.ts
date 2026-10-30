@@ -24,7 +24,7 @@ import type {
 } from '../src/index.js';
 import { AgentFramework, ShutdownTimeoutError } from '../src/index.js';
 import { OperatorActionError } from '../src/operator-log.js';
-import type { NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
+import type { NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
 
 class QueuedStrategy implements ContextStrategy {
@@ -627,6 +627,192 @@ class CapturingMembrane {
 function firstPass(framework: AgentFramework) {
   const history = framework.getContextMaintenanceSnapshot().history;
   return history[history.length - 1]!;
+}
+
+class CallingStrategy implements ContextStrategy {
+  readonly name = 'calling-maintenance-test';
+  queued = false;
+  needs = 1;
+  ticks = 0;
+  active = 0;
+  maxActive = 0;
+  outcome?: string;
+  constructor(readonly agent: string, private readonly log: string[]) {}
+
+  checkReadiness(): ReadinessState {
+    return { ready: !this.queued || this.ticks >= this.needs, description: `${this.agent} queued` };
+  }
+
+  async tick(ctx: StrategyContext): Promise<void> {
+    if (!this.queued || this.ticks >= this.needs) return;
+    this.active++;
+    this.maxActive = Math.max(this.maxActive, this.active);
+    try {
+      await ctx.membrane?.complete({
+        model: 'test-model',
+        messages: [{ role: 'user', content: [{ type: 'text', text: `compress ${this.agent}` }] }],
+      } as unknown as NormalizedRequest);
+      this.ticks++;
+    } catch (error) {
+      this.outcome = (error as Error).name;
+      throw error;
+    } finally {
+      this.active--;
+      this.log.push(`${this.agent} tick settled`);
+    }
+  }
+
+  select(
+    _store: MessageStoreView,
+    _log: ContextLogView,
+    _budget: TokenBudget,
+  ): ContextEntry[] {
+    return [];
+  }
+}
+
+function plainResponse(): NormalizedResponse {
+  return {
+    content: [{ type: 'text', text: 'done' }],
+    stopReason: 'end_turn',
+    rawAssistantText: 'done',
+    toolCalls: [],
+    toolResults: [],
+    usage: { inputTokens: 1, outputTokens: 1 },
+    details: { raw: {}, stop: { reason: 'end_turn', wasTruncated: false }, model: { requested: 'test-model', actual: 'test-model', provider: 'mock' } },
+  } as unknown as NormalizedResponse;
+}
+
+class OpenStream implements YieldingStream {
+  isWaitingForTools = false;
+  pendingToolCallIds: string[] = [];
+  toolDepth = 0;
+  private release!: (event: StreamEvent) => void;
+  private readonly next = new Promise<StreamEvent>((resolve) => { this.release = resolve; });
+  provideToolResults(): void { throw new Error('not waiting'); }
+  cancel(): void { this.release({ type: 'aborted', reason: 'user' } as StreamEvent); }
+  finish(): void { this.release({ type: 'complete', response: plainResponse() } as StreamEvent); }
+  async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> { yield await this.next; }
+}
+
+class TurnMembrane {
+  calls: string[] = [];
+  streams: OpenStream[] = [];
+  readonly plans = new Map<string, Array<{ until?: Promise<void>; error?: Error }>>();
+
+  async complete(request: NormalizedRequest): Promise<NormalizedResponse> {
+    const agent = /compress (\w+)/.exec(JSON.stringify(request.messages))?.[1] ?? '?';
+    this.calls.push(agent);
+    const step = this.plans.get(agent)?.shift();
+    if (step?.until) await step.until;
+    if (step?.error) throw step.error;
+    return plainResponse();
+  }
+
+  streamYielding(_request: NormalizedRequest): YieldingStream {
+    const stream = new OpenStream();
+    this.streams.push(stream);
+    return stream;
+  }
+
+  asMembrane(): import('@animalabs/membrane').Membrane {
+    return this as unknown as import('@animalabs/membrane').Membrane;
+  }
+}
+
+function watchMaintenanceWaits(framework: AgentFramework): { begun: number; pending: number } {
+  const internals = framework as unknown as { settleMaintenancePass(): Promise<void> };
+  const settle = internals.settleMaintenancePass.bind(framework);
+  const waits = { begun: 0, pending: 0 };
+  internals.settleMaintenancePass = async () => {
+    waits.begun++;
+    waits.pending++;
+    try { await settle(); } finally { waits.pending--; }
+  };
+  return waits;
+}
+
+async function eventLoopTurns(count: number): Promise<void> {
+  for (let i = 0; i < count; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+function heldUntilReleased(): { until: Promise<void>; release: () => void } {
+  let release!: () => void;
+  const until = new Promise<void>((resolve) => { release = resolve; });
+  return { until, release };
+}
+
+async function parkedBehind(
+  by: 'turn' | 'cooldown',
+  second: { until?: Promise<void>; error?: Error } = {},
+  whileFirstInFlight?: (framework: AgentFramework) => Promise<void>,
+) {
+  const dir = mkdtempSync(join(tmpdir(), `af-maintenance-parked-${by}-`));
+  const log: string[] = [];
+  const turnMembrane = new TurnMembrane();
+  const a = new CallingStrategy('A', log);
+  const b = new CallingStrategy('B', log);
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: turnMembrane.asMembrane(),
+    agents: [
+      { name: 'A', model: 'test-model', systemPrompt: 'test', strategy: a },
+      { name: 'B', model: 'test-model', systemPrompt: 'test', strategy: b },
+    ],
+    modules: [],
+    syncIntervalMs: 0,
+    maintenanceIntervalMs: 10,
+  });
+  const internals = framework as unknown as {
+    startAgentStream(agent: unknown): Promise<void>;
+    providerGate(agentName: string): { deferredAuxiliary: number };
+    providerAccelerationCooldowns: Map<string, Record<string, unknown>>;
+    flushAuxiliaryAdmission(agentName: string): void;
+    surgeryHold: unknown;
+  };
+  const cm = framework.getAgent('A')!.getContextManager();
+  const firstMessage = String(cm.addMessage('user', [{ type: 'text', text: 'm1' }]));
+  cm.addMessage('user', [{ type: 'text', text: 'm2' }]);
+  const first = heldUntilReleased();
+  turnMembrane.plans.set('A', [{ until: first.until }, second]);
+  let cooldownTimer: ReturnType<typeof setTimeout> | undefined;
+  framework.start();
+  a.needs = 2;
+  a.queued = true;
+  await waitFor(() => turnMembrane.calls.includes('A'));
+  if (by === 'turn') {
+    await internals.startAgentStream(framework.getAgent('A')!);
+  } else {
+    const now = Date.now();
+    cooldownTimer = setTimeout(() => {}, 60_000);
+    internals.providerAccelerationCooldowns.set('A', { startedAt: now, until: now + 60_000, timer: cooldownTimer, heldRequests: [], reason: 'test hold', failures: 1 });
+  }
+  await whileFirstInFlight?.(framework);
+  first.release();
+  await waitFor(() => internals.providerGate('A').deferredAuxiliary === 1
+    && (by === 'cooldown' || turnMembrane.streams.length === 1));
+  const openGate = (): void => {
+    if (by === 'turn') {
+      turnMembrane.streams[0]!.finish();
+    } else {
+      clearTimeout(cooldownTimer);
+      internals.providerAccelerationCooldowns.delete('A');
+      internals.flushAuxiliaryAdmission('A');
+    }
+  };
+  let stopped = false;
+  const stop = async (): Promise<void> => {
+    stopped = true;
+    await framework.stop();
+  };
+  const cleanup = async (): Promise<void> => {
+    first.release();
+    clearTimeout(cooldownTimer);
+    for (const stream of turnMembrane.streams) stream.cancel();
+    if (!stopped) await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  };
+  return { framework, turnMembrane, a, b, log, internals, cm, firstMessage, openGate, stop, cleanup };
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
@@ -2446,6 +2632,186 @@ describe('queued context maintenance timer', () => {
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  for (const by of ['turn', 'cooldown'] as const) {
+    it(`an agent's maintenance call parked behind its own ${by === 'turn' ? 'turn' : 'provider cooldown'} holds no other agent's maintenance, and goes once the gate opens`, { timeout: 10_000 }, async () => {
+      const parked = await parkedBehind(by);
+      try {
+        assert.deepEqual(parked.turnMembrane.calls, ['A'], "A's second call is parked");
+        parked.b.queued = true;
+        await waitFor(() => parked.turnMembrane.calls.includes('B'), 2000);
+        assert.deepEqual(parked.turnMembrane.calls, ['A', 'B'], "B's call goes out while A's is still parked");
+        const recordOfA = () => parked.framework.getContextMaintenanceSnapshot().history
+          .flatMap((run) => run.agents).find((agent) => agent.agentName === 'A');
+        assert.ok(recordOfA(), 'the pass that ticked A has ended');
+        assert.equal(recordOfA()!.finishedAt, undefined, "A's work in that pass hasn't");
+        parked.openGate();
+        await waitFor(() => parked.a.ticks === 2);
+        assert.deepEqual(parked.turnMembrane.calls, ['A', 'B', 'A']);
+        await waitFor(() => recordOfA()?.readyAfter === true);
+        assert.notEqual(recordOfA()?.finishedAt, undefined, "A's work in that pass is finished once its tick has settled");
+        assert.equal(recordOfA()?.ticks, 2, "A's record counts the tick that finished after its pass");
+      } finally {
+        await parked.cleanup();
+      }
+    });
+  }
+
+  it('stop() withdraws the parked call of a tick that left its pass, and that is no failure', { timeout: 10_000 }, async () => {
+    const parked = await parkedBehind('turn');
+    const alerts: string[] = [];
+    (parked.framework as any).opsAlert = (kind: string, subject: string) => { alerts.push(`${kind}:${subject}`); };
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      await parked.stop();
+      assert.equal(parked.a.outcome, 'MaintenanceWithdrawnError');
+      assert.deepEqual(parked.turnMembrane.calls, ['A'], 'the withdrawn call sent nothing');
+      assert.deepEqual(alerts.filter((alert) => alert.startsWith('context-maintenance-failed')), []);
+    } finally {
+      console.error = quiet;
+      await parked.cleanup();
+    }
+  });
+
+  it('stop() waits for a tick that left its pass, its call now in flight', { timeout: 10_000 }, async () => {
+    const second = heldUntilReleased();
+    const parked = await parkedBehind('turn', { until: second.until });
+    const waits = watchMaintenanceWaits(parked.framework);
+    try {
+      parked.openGate();
+      await waitFor(() => parked.turnMembrane.calls.length === 2, 2000);
+      const stopping = parked.stop().then(() => { parked.log.push('stop resolved'); });
+      await waitFor(() => waits.begun === 1);
+      await eventLoopTurns(3);
+      assert.equal(waits.pending, 1, "stop()'s wait for maintenance is still waiting on the tick");
+      second.release();
+      await stopping;
+      assert.deepEqual(parked.log.slice(-2), ['A tick settled', 'stop resolved']);
+    } finally {
+      second.release();
+      await parked.cleanup();
+    }
+  });
+
+  it('a rollback and resume() each wait for a tick that left its pass when its call parked', { timeout: 10_000 }, async () => {
+    const second = heldUntilReleased();
+    const parked = await parkedBehind('turn', { until: second.until });
+    const waits = watchMaintenanceWaits(parked.framework);
+    try {
+      parked.openGate();
+      await waitFor(() => parked.turnMembrane.calls.length === 2, 2000);
+      await parked.framework.quiesce();
+      const resuming = parked.framework.resume();
+      void resuming.catch(() => {});
+      const moved = parked.framework.rollbackToMessage('A', { messageId: parked.firstMessage });
+      await waitFor(() => parked.internals.surgeryHold !== null && waits.begun === 2);
+      await eventLoopTurns(3);
+      assert.equal(waits.pending, 2, "resume()'s and the rollback's waits for maintenance are still waiting on the tick");
+      assert.equal(parked.cm.currentBranch().name, 'main', 'the rollback waits for the tick');
+      second.release();
+      await assert.rejects(
+        resuming,
+        (error: unknown) => error instanceof OperatorActionError && error.code === 'agent-busy'
+          && error.message.includes('a live roll back for A holds the store'),
+        'resume() waited for the tick, and found the rollback holding the store after it',
+      );
+      await moved;
+      assert.equal(parked.log.includes('A tick settled'), true);
+      assert.notEqual(parked.cm.currentBranch().name, 'main');
+    } finally {
+      second.release();
+      await parked.cleanup();
+    }
+  });
+
+  it('resume() begun while a tick is still in its pass waits for that tick once it has parked and left the pass', { timeout: 10_000 }, async () => {
+    let waits!: { begun: number; pending: number };
+    let resumed!: Promise<ReturnType<AgentFramework['getContextMaintenanceSnapshot']>>;
+    const parked = await parkedBehind('cooldown', {}, async (framework) => {
+      waits = watchMaintenanceWaits(framework);
+      await framework.quiesce();
+      resumed = framework.resume().then(() => framework.getContextMaintenanceSnapshot());
+      void resumed.catch(() => {});
+      await waitFor(() => waits.begun === 1);
+    });
+    try {
+      const recordOfA = (snapshot = parked.framework.getContextMaintenanceSnapshot()) => snapshot.history
+        .flatMap((run) => run.agents).find((agent) => agent.agentName === 'A');
+      await waitFor(() => recordOfA() !== undefined, 2000);
+      await eventLoopTurns(3);
+      assert.equal(recordOfA()!.finishedAt, undefined, "A's tick left its pass, its call parked");
+      assert.equal(waits.pending, 1, "resume()'s wait for maintenance, begun before the tick left, is still waiting on it");
+      parked.openGate();
+      const atResume = recordOfA(await resumed);
+      assert.equal(atResume?.readyAfter, true, "A's work in that pass was finished when resume() returned");
+      assert.equal(atResume?.ticks, 2);
+    } finally {
+      await parked.cleanup();
+    }
+  });
+
+  it('no later pass ticks an agent while its tick that left a pass goes on, and a later pass ticks it once that tick has settled', { timeout: 10_000 }, async () => {
+    const second = heldUntilReleased();
+    const parked = await parkedBehind('turn', { until: second.until });
+    try {
+      parked.a.needs = 3;
+      parked.openGate();
+      await waitFor(() => parked.turnMembrane.calls.length === 2, 2000);
+      parked.b.queued = true;
+      await waitFor(() => parked.turnMembrane.calls.includes('B'), 2000);
+      assert.deepEqual(parked.turnMembrane.calls, ['A', 'A', 'B'], 'the pass that ticked B ticked A no further');
+      assert.equal(parked.a.maxActive, 1);
+      second.release();
+      await waitFor(() => parked.a.ticks === 3, 2000);
+      assert.deepEqual(parked.turnMembrane.calls, ['A', 'A', 'B', 'A'], "a later pass takes A's third tick");
+      assert.equal(parked.a.maxActive, 1);
+    } finally {
+      second.release();
+      await parked.cleanup();
+    }
+  });
+
+  it("a tick that fails after leaving its pass records its error on that pass's run, and alerts", { timeout: 10_000 }, async () => {
+    const parked = await parkedBehind('turn', { error: new Error('compression failed') });
+    const alerts: string[] = [];
+    (parked.framework as any).opsAlert = (kind: string, subject: string, message: string) => { alerts.push(`${kind}:${subject}:${message}`); };
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      const run = parked.framework.getContextMaintenanceSnapshot().history.find((entry) => entry.agents.some((agent) => agent.agentName === 'A'));
+      assert.ok(run, "the pass that ticked A has ended, its call still parked");
+      parked.openGate();
+      await waitFor(() => parked.framework.getContextMaintenanceSnapshot().history
+        .some((entry) => entry.id === run.id && entry.agents.some((agent) => agent.agentName === 'A' && agent.error === 'compression failed')), 2000);
+      assert.deepEqual(alerts, ['context-maintenance-failed:A:compression failed']);
+    } finally {
+      console.error = quiet;
+      await parked.cleanup();
+    }
+  });
+
+  it("a tick that left its pass has its entry finished, and the throw logged, when alerting its failure throws", { timeout: 10_000 }, async () => {
+    const parked = await parkedBehind('turn', { error: new Error('compression failed') });
+    (parked.framework as any).opsAlert = () => { throw new Error('alert sink down'); };
+    const logged: string[] = [];
+    const quiet = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      const run = parked.framework.getContextMaintenanceSnapshot().history.find((entry) => entry.agents.some((agent) => agent.agentName === 'A'));
+      assert.ok(run, 'the pass that ticked A has ended');
+      const recordOfA = () => parked.framework.getContextMaintenanceSnapshot().history
+        .find((entry) => entry.id === run.id)?.agents.find((agent) => agent.agentName === 'A');
+      assert.equal(recordOfA()!.finishedAt, undefined, "A's tick left its pass, its call parked");
+      parked.openGate();
+      await waitFor(() => logged.some((line) => line.includes("reporting an agent's failure failed") && line.includes('alert sink down')), 2000);
+      assert.equal(recordOfA()?.error, 'compression failed');
+      assert.notEqual(recordOfA()?.finishedAt, undefined, "A's work in that pass is finished");
+    } finally {
+      console.error = quiet;
+      await parked.cleanup();
     }
   });
 });
