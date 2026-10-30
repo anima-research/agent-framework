@@ -68,6 +68,9 @@ export abstract class McplTransport extends EventEmitter {
   private _closed = false;
   private lineBuffer: string[] = [];
   private stderrBuffer: string[] = [];
+  private stderrHead = 0;
+  private stderrBuffered = 0;
+  private stderrDropped = 0;
 
   /** The server's id from its config, so a line the transport logs names it.
    *  The stdio and WebSocket transports always give it; a test's stand-in
@@ -80,9 +83,15 @@ export abstract class McplTransport extends EventEmitter {
         const pending = this.lineBuffer;
         this.lineBuffer = [];
         queueMicrotask(() => { for (const l of pending) this.emit('line', l); });
-      } else if (event === 'stderr' && this.stderrBuffer.length > 0) {
-        const pending = this.stderrBuffer;
+      } else if (event === 'stderr' && (this.stderrBuffer.length > this.stderrHead || this.stderrDropped > 0)) {
+        const held = this.stderrBuffer.slice(this.stderrHead);
+        const pending = this.stderrDropped > 0
+          ? [`[${this.stderrDropped} earlier stderr line${this.stderrDropped === 1 ? ' was' : 's were'} dropped, to hold at most ${(testLineBound ?? MAX_LINE_CHARS).toLocaleString('en-US')} UTF-16 code units of unread stderr]`, ...held]
+          : held;
         this.stderrBuffer = [];
+        this.stderrHead = 0;
+        this.stderrBuffered = 0;
+        this.stderrDropped = 0;
         queueMicrotask(() => { for (const l of pending) this.emit('stderr', l); });
       }
     });
@@ -138,8 +147,21 @@ export abstract class McplTransport extends EventEmitter {
 
   /** Deliver a diagnostic line, buffering it if nobody is listening yet. */
   protected pushStderr(line: string): void {
-    if (this.listenerCount('stderr') > 0) this.emit('stderr', line);
-    else this.stderrBuffer.push(line);
+    if (this.listenerCount('stderr') > 0) {
+      this.emit('stderr', line);
+      return;
+    }
+    this.stderrBuffer.push(line);
+    this.stderrBuffered += line.length;
+    const ceiling = testLineBound ?? MAX_LINE_CHARS;
+    while (this.stderrBuffered > ceiling) {
+      this.stderrBuffered -= this.stderrBuffer[this.stderrHead++].length;
+      this.stderrDropped++;
+    }
+    if (this.stderrHead > 1024 && this.stderrHead * 2 > this.stderrBuffer.length) {
+      this.stderrBuffer = this.stderrBuffer.slice(this.stderrHead);
+      this.stderrHead = 0;
+    }
   }
 
   /**
