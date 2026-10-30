@@ -16,6 +16,7 @@ function writeConfig(name: string, config: unknown): string {
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const LONGER_THAN_ANY_START_MS = 60_000;
 async function until(done: () => boolean, what: string, withinMs = 5_000): Promise<void> {
   const by = Date.now() + withinMs;
   while (!done()) {
@@ -237,7 +238,7 @@ describe('judge rules: verdicts', () => {
     console.error = () => {};
     try {
       gate.evaluate(chat('hello'));
-      await sleep(200);
+      await until(() => judge.requests[0]?.signal.aborted === true && wakes.length === 1, 'the judge to be timed out and the agent woken', LONGER_THAN_ANY_START_MS);
     } finally {
       console.error = original;
     }
@@ -830,6 +831,14 @@ describe('wake_add_rule with judge', () => {
     assert.match(toolNamed('wake_remove_rule').description, /A judge rule's batch.*still goes to the judge, by the rule as it was\./);
   });
 
+  it("refuses a judge out of range in the agent's own terms: judge, not gate.json's behavior.judge", async (t) => {
+    const { call } = await judgeFramework(t, {});
+    const early = await call({ name: 'quick', judge: { debounceMs: 50 } });
+    assert.strictEqual(early.isError, true);
+    assert.match(early.content, /^Rule "quick" wasn't saved: judge\.debounceMs is 50 ms, under the 100 ms minimum/);
+    assert.doesNotMatch(early.content, /behavior\.judge/);
+  });
+
   it('a host that sets no GateOptions.judge has the judge wired, its defaults in force', async (t) => {
     const { framework } = await judgeFramework(t);
     const wakeAddRule = framework.getAllTools().find((tool) => tool.name === 'wake_add_rule')!;
@@ -843,7 +852,7 @@ describe('wake_add_rule with judge', () => {
     const { framework, configPath, call, wakeAddRule, toolNamed } = await judgeFramework(t, { enabled: false });
     const given = await call({ name: 'ambient', match: { tagsAny: ['chat:ambient'] }, judge: { debounceMs: 20000 } });
     assert.strictEqual(given.isError, true);
-    assert.match(given.content, /specify exactly one behavior/);
+    assert.match(given.content, /got no behavior, so nothing was saved/);
     assert.doesNotMatch(given.content, /`judge`/);
     assert.match(given.content, /"judge"/, 'the refusal names the parameter it does not read');
     assert.strictEqual((JSON.parse(readFileSync(configPath, 'utf-8')) as GateConfig).policies.some((p) => p.name === 'ambient'), false);

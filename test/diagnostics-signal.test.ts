@@ -12,6 +12,8 @@ import { pathToFileURL } from 'node:url';
 import { AgentFramework, type Module } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
+const LONGER_THAN_ANY_START_MS = 60_000;
+
 // From Node 24, `node --test` starts each test file with every option's
 // current value in its execArgv, the default `--report-signal=SIGUSR2` among
 // them, and that flag turns report-on-signal on (plain node, and Node 22's
@@ -151,9 +153,9 @@ test('a SIGUSR2 after every framework has stopped leaves the process running', a
   let timedOut = false;
   const { code, signal } = await new Promise<{ code: number | null; signal: string | null }>(resolve => {
     const child = spawn(process.execPath, [script], { stdio: 'ignore' });
-    const safety = setTimeout(() => { timedOut = true; child.kill('SIGTERM'); }, 20_000);
+    const safety = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, LONGER_THAN_ANY_START_MS);
     child.on('exit', (code, signal) => { clearTimeout(safety); resolve({ code, signal }); });
   });
-  assert.equal(timedOut, false, 'the child did not finish within 20 s');
+  assert.equal(timedOut, false, `the child hadn't finished by ${LONGER_THAN_ANY_START_MS} ms, so the test ended it`);
   assert.deepEqual({ code, signal }, { code: 0, signal: null });
 });

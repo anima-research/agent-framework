@@ -171,6 +171,8 @@ Each agent has a `ContextManager` (from `@connectome/context-manager`) that main
 - **PassthroughStrategy** - No compression, raw message replay up to budget
 - **AutobiographicalStrategy** - Chunks old messages and summarizes them into diary entries, preserving recent context uncompressed
 
+A turn keeps the messages it opened with whole: at a start that opens a turn, the framework pins raw (`pinRange`, named `agent-framework:turn-inputs`) the rows the agent sees that were stored after both the newest of its own messages that it sees and its consumed watermark, starting at the first such row that holds more than tool results, and removes the pin when the turn ends. The pinned rows' tokens count against the budget. If a committing compile refuses as over budget with the pin held, the pin is removed and the compile runs once more, so the turn goes on as it would have without it. A silent heartbeat tick pins nothing, and neither does a strategy without pins.
+
 Before inference, modules and MCPL hooks can inject additional context via `gatherContext()`. An `afterUser` injection is stored in the agent's window, as the message `compile()` would have placed after the last user message, so it stays where the agent saw it: the replies after it keep their thinking, and the cache keeps the turns before it. A source's unchanged content isn't stored again while the copy the agent will read as current has it whole: the one its last request held, or a newer one a start stored whose compile then didn't record (it threw, or the start failed before it); once a fold has summarized it or the strategy's window has passed it, it's stored again, as one more row. Where a changed one lands right after the agent's own latest message, with no one else's message between, `[Continue]` still ends the request, after it. A stored row is history to the strategy, capped, sharded, budgeted and folded like any message. Its metadata carries `system: true`, `kind: 'context-injection'` and `contextInjection: { agent, namespace, contentHash, part, parts }`, which `storedInjectionMarkOf` reads, and every other agent's view leaves it out. A module's injection can set `placedEachCompile: true` to be placed by `compile()` at each start instead, near the end, at the cost of the thinking of every reply after its old place.
 
 ### Persistence
@@ -358,6 +360,37 @@ refused on an http(s):// server, which always sends the header, and on a
 stdio server; `'header'` is refused with a url that carries a `token`
 parameter or userinfo of its own, since whenever the Bearer header carries a
 credential it replaces the userinfo's Basic one.
+
+Set `credentialRequired: true` for a fail-closed WebSocket dial. This requires
+`tokenTransport: 'header'` and a host-attached `accessProvider`, called on every
+dial including reconnects. A missing or throwing provider, or an empty or
+non-sendable result, stops the dial without connecting or falling back. Credentials
+must be printable ASCII with no space at either end; there is no minimum length.
+The server's authentication scheme decides which credentials it accepts.
+
+This mode forbids a static `token` (even empty), a URL `token` query parameter,
+userinfo and fragments. It supports only WebSocket servers, not HTTP, stdio or
+modern MCP. Cleartext `ws://` is allowed only to `localhost` or a literal loopback
+address, not to a `*.localhost` name, which a resolver can send off this host;
+use `wss://` for remote servers. These configuration mistakes are reported
+descriptively when the server is configured, and checked again before the
+provider runs at dial time.
+
+Strict dial errors have the fixed form `MCPL server "<id>": <code>`:
+
+| Code | Meaning |
+| --- | --- |
+| `provider-failed` | The provider is absent, throws, or returns an empty or non-sendable value. No connection is made. |
+| `credential-rejected` | The server answers the WebSocket upgrade with HTTP 401 or 403. |
+| `engine-unsupported` | A refused upgrade has no finite numeric status available from the client runtime. |
+| `connection-failed` | Any other upgrade status, socket/TLS error, open timeout, cancellation, or strict configuration refusal at dial time. |
+
+Redirects are not followed. Refused upgrades are classified only by the
+`unexpected-response` event's numeric `statusCode`, never by error text or response
+bodies; runtime support is determined by that capability, not a version list.
+Leaving `credentialRequired` out, or setting it to `false` or `null`, keeps optional
+credential behavior. Diagnostic filtering and credential retention are unchanged;
+this option controls dialing, not a guarantee that all diagnostics hide secrets.
 
 A modern server's tools get the same prefix, `enabledTools`/`disabledTools`,
 class overrides and dispatch as an MCPL server's, and `listMcplServers()`
@@ -614,7 +647,7 @@ static tools are listed like any server's.
 2. **Drive**: Framework iterates stream events (tokens, tool-calls, complete, error)
 3. **Tool yield**: Stream yields tool calls → framework dispatches concurrently → collects results
 4. **Resume**: All results in → stream resumes with tool results
-5. **Budget restart**: If input tokens exceed `maxStreamTokens`, the stream is cancelled, context is recompressed, and a fresh stream starts. An agent whose model binds its thinking (`thinkingBinding.binds`) with `physicalWindowTokens` set skips this, and the window projection restarts it instead before a request the window can't hold
+5. **Budget restart**: If input tokens exceed `maxStreamTokens`, the stream is cancelled, context is recompressed (the turn's opening messages kept whole, as Context Management says), and a fresh stream starts. An agent whose model binds its thinking (`thinkingBinding.binds`) with `physicalWindowTokens` set skips this, and the window projection restarts it instead before a request the window can't hold
 6. **Complete**: Final response saved to context, agent returns to idle
 
 ### Inference bounds
