@@ -4251,11 +4251,12 @@ export class EventGate {
   private flushInferenceBufferIfClear(): void {
     if (this.quiesced) return;
     if (this.inferring.size === 0 && this.inferenceBuffer.length > 0) {
-      const events = this.inferenceBuffer.splice(0);
       // Defer to avoid re-entrancy inside trace callbacks. A delivery that
       // throws drops what was held, named in the log, as fireDebounce drops a
       // batch: thrown in the microtask, it would be uncaught.
       queueMicrotask(() => {
+        if (this.quiesced || this.inferring.size > 0) return;
+        const events = this.inferenceBuffer.splice(0);
         try {
           this.deliverEvents(events);
         } catch (err) {
