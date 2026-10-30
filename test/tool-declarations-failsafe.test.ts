@@ -1,11 +1,3 @@
-/**
- * toolDeclarations' fail-safe: a request whose system change the
- * provider refused, or that a 400 ended while it carried one (a 400 membrane
- * files as context overflow or an account refusal aside), goes again at
- * once on the agent's head, which it keeps to until it's built again; a 400
- * membrane doesn't recognise raises an operator line too. The refusal never
- * reaches the error policy, and the resend continues the same turn.
- */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -17,7 +9,6 @@ import type { ContentBlock, NormalizedRequest, NormalizedResponse, StreamEvent, 
 import { AgentFramework, type EventResponse, type Module, type ModuleContext, type ProcessEvent, type ToolCall, type TraceEvent } from '../src/index.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 
-/** Tools the test can change between turns. */
 class ChangingTools implements Module {
   readonly name = 'changing';
   names = ['a'];
@@ -30,8 +21,8 @@ class ChangingTools implements Module {
   async handleToolCall(_call: ToolCall) { return { success: true, data: {} }; }
 }
 
-/** A stream that ends in an error event, as membrane's yielding stream
- *  reports every failure of its request, the provider's refusals included. */
+// membrane's yielding stream reports every failure of its request, the
+// provider's refusals included, as an error event.
 class RefusedStream implements YieldingStream {
   isWaitingForTools = false;
   pendingToolCallIds: string[] = [];
@@ -81,13 +72,11 @@ class RefusedAfterChange extends MockYieldingStream {
   }
 }
 
-/** A provider's 400, in a wording membrane recognises or not. */
 const refusal = (recognised: boolean) => Object.assign(
   new MembraneError({ type: 'invalid_request', retryable: false, message: 'role system not accepted here', rawError: { status: 400 } }),
   { httpStatus: 400 },
   recognised ? { systemChangeRefused: true } : {},
 );
-/** Membrane's own refusal before sending: recognised, with no HTTP status. */
 const refusedBeforeSending = () => Object.assign(
   new MembraneError({ type: 'invalid_request', retryable: false, message: 'this adapter sends no system changes', rawError: null }),
   { systemChangeRefused: true },
@@ -96,7 +85,6 @@ const filed400 = (type: 'context_length' | 'auth', message: string) => Object.as
   new MembraneError({ type, retryable: false, message, rawError: { status: 400 } }),
   { httpStatus: 400 },
 );
-/** A failure that isn't a 400. */
 const serverError = () => Object.assign(
   new MembraneError({ type: 'server', retryable: false, message: 'the provider broke', rawError: { status: 500 } }),
   { httpStatus: 500 },
@@ -105,7 +93,6 @@ const serverError = () => Object.assign(
 const carriesChange = (request: NormalizedRequest) =>
   request.messages.some((m) => m.content.some((b) => (b as { type?: string }).type === 'system_change'));
 
-/** Hands each message the test sends to the resident, and asks it to answer. */
 class Input implements Module {
   readonly name = 'input';
   async start() {}
@@ -124,17 +111,9 @@ async function pollUntil(cond: () => boolean, timeoutMs = 10_000): Promise<boole
   return cond();
 }
 
-/** What the nth answer reports as its usage: fresh input, a cache write and a cache read, each distinct. */
 const usageOf = (n: number) => ({ inputTokens: 10 + n, outputTokens: 5, cacheCreationTokens: 200 + n, cacheReadTokens: 3000 + n });
 const inputOf = (n: number) => { const u = usageOf(n); return u.inputTokens + u.cacheCreationTokens + u.cacheReadTokens; };
 
-/**
- * A resident's first turn adopts its head; its tools then change (to
- * `second`), and the provider answers the second turn's requests with what
- * `refuse` returns, an error to fail it with or nothing. A third turn
- * follows when `third` is set. The error policy is a spy that records the
- * attempt of each call and never retries.
- */
 async function turns(opts: { binds: boolean; refuse: (request: NormalizedRequest) => Error | undefined; second?: string[]; third?: boolean }) {
   const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-failsafe-'));
   const membrane = new MockMembrane();
@@ -186,7 +165,6 @@ async function turns(opts: { binds: boolean; refuse: (request: NormalizedRequest
   }
 }
 
-/** The module's tool `b`, as the framework names it, by its module. */
 const B = 'changing--b';
 const toolNames = (request: NormalizedRequest) => (request.tools ?? []).map((t) => t.name);
 const resends = (traces: TraceEvent[]) => traces.filter((t) => t.type === 'head:resend').length;
@@ -281,19 +259,11 @@ describe("toolDeclarations' fail-safe", () => {
   });
 });
 
-/** A failure the provider recovers from: a re-arm sends the turn again after it. */
 const overloaded = () => Object.assign(
   new MembraneError({ type: 'server', retryable: true, message: 'the provider is overloaded', rawError: { status: 503 } }),
   { httpStatus: 503 },
 );
 
-/**
- * A resident's first turn adopts its head, and its tools then change. The
- * second turn's one send fails with `overloaded`, so that turn is re-armed;
- * the provider answers each request after that with what `later` returns.
- * The error policy would retry a refusal, and nothing else, so a retry the
- * re-arm's one-send rule refuses would show as a send.
- */
 async function rearmed(later: () => Error | undefined) {
   const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-failsafe-rearm-'));
   const membrane = new MockMembrane();

@@ -1,9 +1,3 @@
-/**
- * System changes' pure part: a change is recognised by its block, an agent's
- * own by the metadata of the rows a compile names as its sources, changes fold
- * onto the head in order, and the difference from what the agent
- * advertises now is one more change, nothing, or a replacement of the head.
- */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { SystemChangeContent, ToolDefinition } from '@animalabs/membrane';
@@ -148,8 +142,6 @@ describe('system changes', () => {
   });
 
   it('reads an addition the head already holds as a replacement, as after a rewind past a consolidation', () => {
-    // The record absorbed the addition, and a rewind brought its change back:
-    // applied twice, the text would be there twice, so only a new head says it.
     const absorbed = head([tool('a')], ['prompt', 'added']);
     const broughtBack: SystemChangeContent[] = [{ type: 'system_change', defineTools: [tool('a')], addSystem: ['added'] }];
     assert.deepEqual(differenceFrom(absorbed, broughtBack, head([tool('a')], ['prompt', 'added'])), { kind: 'replace' });
@@ -167,7 +159,6 @@ describe('system changes', () => {
     const result = (...ids: string[]) => ids.map((id) => ({ type: 'tool_result', toolUseId: id, content: 'ok' }));
     const change = { content: [{ type: 'system_change', defineTools: [tool('b')] }] };
     const text = (t: string) => ({ content: [{ type: 'text', text: t }] });
-    /** The check, given rows oldest first, read newest first as a tail scan gives them. */
     const splits = (rows: Row[]) => {
       const check = changeWriteCheck();
       for (let i = rows.length - 1; i >= 0; i--) if (check.visit(rows[i] as never)) break;

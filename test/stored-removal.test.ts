@@ -1,14 +1,8 @@
-/**
- * The tail scan the stored-row lookups share: newest first, in blob-free
- * windows that grow from 16 rows to 500, across window boundaries, stopping
- * where its caller is done.
- */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { locateMessageIndices, scanFromTail } from '../src/stored-removal.js';
 
-/** A stand-in store of `count` rows, `r0` to `r<count - 1>`, that records each window read. */
 function rows(count: number) {
   const reads: Array<{ offset: number; limit: number; resolveBlobs?: boolean }> = [];
   const cm = {

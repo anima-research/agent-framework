@@ -1,10 +1,3 @@
-/**
- * toolDeclarations where the framework meets it: the recorded heads
- * outlive a restart, residents sharing one message slot each read only their
- * own system changes, a fork starts from its template's head and changes,
- * host `/undo N` counts the conversation's messages, the poisoned-history
- * shed leaves a change row be, and history's tools label one.
- */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -58,7 +51,6 @@ async function withFramework<T>(
   }
 }
 
-/** The assembly, for what it returns beside the request: the compile it was built from and the binding its stream notes with. */
 type Assembling = {
   assembleActivationRequest(tools: ToolDefinition[]): Promise<{
     request: { messages: NormalizedMessage[] };
@@ -141,10 +133,6 @@ describe('toolDeclarations in the framework', () => {
 
   it('raises an operator line when the changes force the head to move, naming the thinking it sets aside as `binds` says', async () => {
     const hasThinking = (messages: readonly NormalizedMessage[]) => messages.some((m) => m.content.some((b) => (b as { type?: string }).type === 'thinking'));
-    // Left out, `binds` counts as a model that may bind, and the context manager keeps no
-    // record, so the compile keeps the reply's thinking. With `binds: true` and the drop
-    // control, the record keeps a reply stored before it began, and a move of the head
-    // changes the digests the compile is told, so that compile leaves the thinking out.
     for (const [binding, clause] of [
       [undefined, /: one whole write, and the thinking the request held set aside if its model binds it$/],
       [{ binds: true, dropBlock: true }, /: one whole write, and the thinking the request held set aside$/],
@@ -154,7 +142,6 @@ describe('toolDeclarations in the framework', () => {
         framework.onTrace((event) => { traces.push(event); });
         const alpha = framework.getAgent('alpha')!;
         say(alpha, 'user', 'hello');
-        // A reply's thinking before the change, so no compile is free for a binding model.
         alpha.getContextManager().addMessage('alpha', [{ type: 'thinking', thinking: 'why', signature: 's' } as ContentBlock, { type: 'text', text: 'so' } as ContentBlock]);
         await alpha.buildActivationRequest([tool('a')]);
         const declared = await alpha.buildActivationRequest([tool('a'), tool('b')]);
@@ -186,7 +173,6 @@ describe('toolDeclarations in the framework', () => {
         say(alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
         await alpha.buildActivationRequest([tool('a'), tool('b')]);
-        // Past a fifth with no free compile: the declared change is in the last committing compile, so nothing re-renders it.
         alpha.noteResponseInput(10);
         await alpha.buildActivationRequest([tool('a'), tool('b')]);
         const share = traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-consolidated') as { message: string }[];
@@ -198,7 +184,6 @@ describe('toolDeclarations in the framework', () => {
       const traces: TraceEvent[] = [];
       framework.onTrace((event) => { traces.push(event); });
       const alpha = framework.getAgent('alpha')!;
-      // The move the budget forces, as the agent reports it.
       (alpha as unknown as { onHeadEvent(e: unknown): void }).onHeadEvent({ type: 'head:moved', why: 'consolidated', changesRemoved: 2, forced: 'budget' });
       const alerts = traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-consolidated') as { message: string; data?: Record<string, unknown> }[];
       assert.equal(alerts.length, 1);
@@ -230,7 +215,6 @@ describe('toolDeclarations in the framework', () => {
         await alpha.buildActivationRequest([tool('a')]);
         await alpha.buildActivationRequest([tool('a'), tool('b')]);
       }, storePath);
-      // The same agent built on its head: its change row from the 'entries' period goes.
       await withFramework([{ ...resident('alpha'), toolDeclarations: 'head', thinkingBinding: binding }], async (framework) => {
         const alpha = framework.getAgent('alpha')!;
         const heads = framework as unknown as { headDeclarations: { read(name: string): unknown } };
@@ -240,7 +224,6 @@ describe('toolDeclarations in the framework', () => {
         const cm = alpha.getContextManager();
         assert.equal(cm.getAllMessages().filter(isChange).length, 0, 'the change row went');
         assert.equal(heads.headDeclarations.read('alpha'), null, 'and its record');
-        // The reply, as its stream stores it and notes it.
         const reply = cm.addMessage('alpha', [{ type: 'thinking', thinking: 'why', signature: 's' } as ContentBlock, { type: 'text', text: 'so' } as ContentBlock]);
         assert.equal(cm.noteRequestSent([reply], assembled.binding.identity as never, assembled.compiled.provenance!.compileId!), true);
         const next = await alpha.buildActivationRequest([tool('a'), tool('b')]);
@@ -334,7 +317,6 @@ describe('toolDeclarations in the framework', () => {
       await alpha.buildActivationRequest([tool('a')]);
       await alpha.buildActivationRequest([tool('a'), tool('b')]);
       const { messages } = await alpha.getContextManager().compile(undefined, undefined, { dryRun: true });
-      // A fork shares its parent's system prompt.
       const { agent: child } = await framework.createEphemeralAgent({ ...resident(name), systemPrompt: 'You are alpha.', ...parentConfig } as never, spec);
       for (const m of messages) {
         if (isSystemChangeMessage(m)) child.getContextManager().addMessage(m.participant, m.content, systemChangeMetadata(name) as never);
@@ -397,7 +379,7 @@ describe('toolDeclarations in the framework', () => {
         assert.deepEqual(heads.headDeclarations.read('alpha')!.tools.map((t) => t.name), ['a'], "the child's change left the parent's record");
         const system = (text: string) => [{ namespace: 'm', position: 'system', content: [{ type: 'text', text }] }] as never;
         await alpha.buildActivationRequest([tool('a'), tool('b')], system('v1'));
-        await alpha.buildActivationRequest([tool('a'), tool('b')], system('v2')); // a replacement moves the parent's head
+        await alpha.buildActivationRequest([tool('a'), tool('b')], system('v2'));
         assert.deepEqual(heads.headDeclarations.read('alpha')!.tools.map((t) => t.name), ['a', 'b'], 'the parent moved its head');
         const again = await child.buildActivationRequest([tool('a'), tool('b'), tool('c')]);
         assert.deepEqual(again.tools, [tool('a')], "and the child's record stayed as it was copied");
@@ -409,10 +391,8 @@ describe('toolDeclarations in the framework', () => {
         const alpha = framework.getAgent('alpha')!;
         say(alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
-        // A record left from an earlier 'entries' period, not yet deleted by a request on the head.
         const heads = framework as unknown as { headDeclarations: { write(name: string, head: unknown): void } };
         heads.headDeclarations.write('alpha', { tools: [tool('old')], system: ['You are alpha.'] });
-        // Both children share the parent's system prompt, as forks do.
         const seeded = (await framework.createEphemeralAgent({ ...resident('seeded'), systemPrompt: 'You are alpha.' } as never, inheriting('seeded', 'alpha'))).agent;
         const unseeded = (await framework.createEphemeralAgent({ ...resident('unseeded'), systemPrompt: 'You are alpha.' } as never)).agent;
         for (const child of [seeded, unseeded]) child.getContextManager().addMessage('user', [{ type: 'text', text: 'hello' } as ContentBlock]);
@@ -534,8 +514,6 @@ describe('toolDeclarations in the framework', () => {
       say(alpha, 'user', 'three');
       say(alpha, 'alpha', 'four');
       const host = framework as unknown as { handleHostCommand(server: string, params: Record<string, unknown>): Promise<{ ok: boolean; error?: string; lastVisible?: { participant?: string; preview?: string } | null }> };
-      // The preview after the undo ends on 'three', then the change declaring the framework's own
-      // tools (none) where the recorded head has `a`.
       const result = await host.handleHostCommand('test', { command: 'undo', agentName: 'alpha', messages: 1 });
       assert.equal(result.ok, true, result.error);
       assert.equal(result.lastVisible?.participant, 'user', JSON.stringify(result.lastVisible));
@@ -667,7 +645,6 @@ describe('toolDeclarations in the framework', () => {
       say(alpha, 'user', 'hello');
       await beta.buildActivationRequest([tool('x')]);
       cm.addMessage('alpha', [{ type: 'tool_use', id: 'call-1', name: 'a', input: {} } as ContentBlock]);
-      // A change right after a call, whoever made it, would stand between it and its result: beta's waits.
       await beta.buildActivationRequest([tool('x'), tool('y')]);
       assert.equal(cm.getAllMessages().filter(isSystemChangeMessage).length, 0, 'nothing declared while the call waits');
       cm.addMessage('user', [{ type: 'tool_result', toolUseId: 'call-1', content: 'ok' } as ContentBlock]);
@@ -683,7 +660,6 @@ describe('toolDeclarations in the framework', () => {
     type Store = { setStateJson(id: string, value: unknown): unknown; getStateJson(id: string): unknown };
     type Internals = { store: Store; headDeclarationCache: unknown; headDeclarations: { read(name: string): unknown; write(name: string, head: unknown): void } };
     const system = (text: string) => [{ namespace: 'm', position: 'system', content: [{ type: 'text', text }] }] as never;
-    /** The ids of the states written while `run` runs. */
     async function statesWritten(store: Store, run: () => Promise<unknown>): Promise<string[]> {
       const written: string[] = [];
       const set = store.setStateJson.bind(store);

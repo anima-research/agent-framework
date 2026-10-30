@@ -1,38 +1,14 @@
-/**
- * System changes: an agent's tools and system text, declared once at the head
- * of its requests and changed afterwards by messages placed where each change
- * took effect.
- *
- * Under `toolDeclarations: 'entries'` a request's `tools` and `system` are the
- * agent's recorded head, its baseline, and each later change to its tools, or
- * addition to its system text, is a `system_change` block stored in its own
- * message. The provider then reads the cached prefix whole: a change is a few
- * appended bytes instead of a rewrite from the head. This module is the pure
- * part: recognising a change, folding the changes onto the head, and the
- * difference between that and what the agent advertises now.
- */
 import { continuesBody, type CompileResult } from '@animalabs/context-manager';
 import { isSystemChangeContent, type ContentBlock, type SystemChangeContent, type ToolDefinition } from '@animalabs/membrane';
 
-/** What a request's head declares: its tools, and its system text as blocks,
- *  the agent's prompt first, then each system injection's text. A request's
- *  `system` is the blocks joined by line breaks, as Agent.buildSystemPrompt
- *  joins them. */
 export interface HeadDeclaration {
   tools: ToolDefinition[];
   system: string[];
 }
 
-/** Where agents' head declarations are kept between requests. The framework
- *  keeps them in its store's state, which follows the store's branches, so a
- *  branch's record goes with that branch's context; an agent built alone
- *  keeps its own in memory. A head that disagrees with the context costs at
- *  most one write, since every request compares before it goes. */
 export interface HeadDeclarationStore {
   read(agentName: string): HeadDeclaration | null;
-  /** Whether the head is now stored. */
   write(agentName: string, head: HeadDeclaration): boolean;
-  /** Whether no record is left: false for one it couldn't clear. */
   delete(agentName: string): boolean;
 }
 
@@ -45,21 +21,14 @@ export function memoryHeadDeclarations(): HeadDeclarationStore {
   };
 }
 
-/** Who a change row is stored as. Membrane renders a change by its block, so
- *  the name only keeps it apart from every speaker. */
+// membrane renders a change by its block, whatever its participant.
 export const SYSTEM_CHANGE_PARTICIPANT = 'system';
 
-/** The last message that isn't a system change: what a request ends on, since
- *  a change isn't a turn. */
 export function lastConversational<M extends { content: readonly ContentBlock[] }>(messages: readonly M[]): M | undefined {
   for (let i = messages.length - 1; i >= 0; i--) if (!isSystemChangeMessage(messages[i]!)) return messages[i];
   return undefined;
 }
 
-/** Whether the agent's own last turn made calls still waiting for their
- *  results: a change appended now would separate the calls from them. Other
- *  participants' messages may follow the calls in a shared slot, so the
- *  results are looked for by the calls' ids, after that turn. */
 export function endsOnUnansweredCalls(
   messages: readonly { participant: string; content: readonly ContentBlock[] }[],
   agentName: string,
@@ -75,34 +44,22 @@ export function endsOnUnansweredCalls(
   return false;
 }
 
-/** A stored row as a read of the store's tail gives it: its blocks, and the
- *  body it's a shard of, if any. */
 export interface TailRow {
   content: readonly ContentBlock[];
   bodyGroupId?: string;
   shardIndex?: number;
 }
 
-/**
- * Whether a system change written at the end of the store would stand
- * between a tool call and its result, where a fold can part them, so
- * context-manager refuses the write. This is context-manager 0.22.0's rule
- * for it (MessageStore.refuseToolPairSplit): back over change rows and rows
- * of results, each body read whole across its shards, to the nearest body
- * that holds a call. The write splits a call of that body when neither the
- * body's own later blocks (a bundled cycle) nor a result read on the way
- * answers it. Any other row, or the store's start, ends the walk with
- * nothing split. In a shared slot the call can be another resident's.
- *
- * Give `visit` the stored rows newest first, until it returns true, when
- * it has decided; then `splits` answers, deciding at the store's start if
- * the rows ran out first.
- */
+// context-manager 0.22.0's MessageStore.refuseToolPairSplit refuses a change
+// written between a tool call and its result. Its walk: back over change rows
+// and rows of results, each body read whole across its shards, to the nearest
+// body that holds a call. The write splits a call of that body when neither
+// the body's own later blocks nor a result read on the way answers it. Any
+// other row, or the store's start, ends the walk with nothing split.
 export function changeWriteCheck(): { visit(row: TailRow): boolean; splits(): boolean } {
   let body: TailRow[] = [];
   const answered = new Set<string>();
   let split: boolean | undefined;
-  // Read the body in hand, in store order: true once the walk ends there.
   const readBody = (): boolean => {
     const content = body.flatMap((row) => row.content);
     body = [];
@@ -153,7 +110,6 @@ export function isSystemChangeNotOwn(message: { content: readonly ContentBlock[]
   return isSystemChangeMessage(message) && (stamp === undefined || !isOwn(stamp));
 }
 
-/** Whether a stored value reads as a head: tools by name, and system text as strings. */
 export function isHeadDeclaration(value: unknown): value is HeadDeclaration {
   if (!value || typeof value !== 'object') return false;
   const { tools, system } = value as { tools?: unknown; system?: unknown };
@@ -169,8 +125,6 @@ export function systemChangeMetadata(agentName: string): { system: true; kind: '
   return { system: true, kind: 'system-change', agent: agentName };
 }
 
-/** What a request's assembly did to its agent's head: the framework traces
- *  it as is, with the agent's name (types/trace.ts). */
 export type HeadEvent =
   | { type: 'head:declared'; removed: string[]; defined: string[]; addedSystem: number }
   | {
@@ -179,16 +133,12 @@ export type HeadEvent =
       changesRemoved: number;
       changeTokens?: number;
       inputTokens?: number;
-      /** A consolidation no compile made free: past a fifth of the input, or a compile refused over budget. */
       forced?: 'share' | 'budget';
     };
 
-/** The difference between a head with its changes and what the agent advertises now. */
 export type DeclarationDifference =
   | { kind: 'none' }
-  /** Expressible as one more change: tools added, removed or redefined, and blocks added. */
   | { kind: 'change'; block: SystemChangeContent }
-  /** A block of system text changed, went or was cut: only a new head says that. */
   | { kind: 'replace' };
 
 /** A message that holds system changes. context-manager refuses one that mixes
@@ -219,22 +169,14 @@ export function ownSystemChanges(compiled: Pick<CompileResult, 'messages' | 'pro
   return own;
 }
 
-/** A copy of a head: what's recorded, so a tool definition its caller later
- *  changes in place is declared as a change rather than changing the head
- *  unseen, and what a request carries, so a change made to the request in
- *  place leaves the record as it was. A record is never changed in place, so
- *  two agents' records may be one object, as a fork's and its template's. */
 export function copyHead(head: HeadDeclaration): HeadDeclaration {
   return { tools: JSON.parse(JSON.stringify(head.tools)) as ToolDefinition[], system: [...head.system] };
 }
 
-/** The system text a head's blocks make, as Agent.buildSystemPrompt joins them. */
 export function systemTextOf(blocks: readonly string[]): string {
   return blocks.join('\n');
 }
 
-/** A value's JSON with every object's keys sorted, so two definitions that
- *  differ only in key order compare equal. */
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
   if (value && typeof value === 'object') {
@@ -246,8 +188,6 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value) ?? 'null';
 }
 
-/** The head with every change folded on, in order: for each change, its
- *  removals, then its definitions, then its text. */
 export function effectiveDeclaration(
   head: HeadDeclaration,
   changes: readonly SystemChangeContent[],
@@ -262,16 +202,6 @@ export function effectiveDeclaration(
   return { tools, system };
 }
 
-/**
- * What it takes to go from `effective` to `current`.
- *
- * System text is compared by blocks, counted as a multiset: it's an addition
- * when every block of the effective text is still there, and the blocks left
- * over, in current order, are what's added. Anything else, a block changed,
- * gone or cut, is a replacement. A reorder of the same blocks changes nothing:
- * the head keeps its order. Tools are compared by name and canonical
- * definition, ignoring order.
- */
 export function declarationDifference(
   effective: { tools: ReadonlyMap<string, ToolDefinition>; system: readonly string[] },
   current: HeadDeclaration,

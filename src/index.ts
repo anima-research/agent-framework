@@ -5,8 +5,6 @@ export * from './types/index.js';
 export { AgentFramework, AgentStoppedError, BudgetPreflightError, DefaultErrorPolicy, ProviderWaitNotSleptError, QuiesceBlockedError, ResumeBlockedError } from './framework.js';
 export type { RuntimeSettingsPreview, HostModeStatus, DeriveAgentOptions } from './framework.js';
 export { Agent } from './agent.js';
-// A stored system change (toolDeclarations 'entries'): how a host's own readers recognise one, and
-// the metadata that makes a copied one an agent's own, as for an ephemeral agent that continues another's context (`spec.inherit`).
 export { isSystemChangeMessage, systemChangeMetadata } from './system-changes.js';
 export { FLAT_MINIMUM_MS, type InferenceBoundsOptions } from './inference-bounds.js';
 export { storedInjectionMarkOf, type StoredInjectionMark } from './stored-injections.js';

@@ -2452,12 +2452,6 @@ function projectMessage(msg: StoredMessage, format: 'text' | 'raw'): Record<stri
   };
 }
 
-/**
- * A system change (toolDeclarations 'entries') as history shows it: that one
- * was made, not what it declared. In the residents' shared slot it may be
- * another agent's, whose tool definitions and system text (a live AGENTS.md,
- * say) are that agent's alone, and history reads the slot as it is stored.
- */
 function withoutDeclarations(block: ContentBlock): ContentBlock {
   return block.type === 'system_change' ? ({ type: 'system_change' } as ContentBlock) : block;
 }
@@ -2492,8 +2486,6 @@ function blockLabel(block: ContentBlock): string {
     case 'video':
       return '[video]';
     case 'system_change':
-      // That an agent's tools or system text changed, never what to: see
-      // withoutDeclarations.
       return '[system change]';
     default:
       // Exhaustiveness guard: a future ContentBlock variant falls back to a

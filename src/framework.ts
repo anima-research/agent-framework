@@ -1171,10 +1171,6 @@ function describeDeferredWrite(msg: { id: string; participant: string; content: 
   return `${msg.id} (${msg.participant}: ${[...new Set(msg.content.map(kind))].join('+') || 'empty'})`;
 }
 
-/** The index of the stored row just before the last `n` messages of the
- *  conversation, counting back from the tail past system changes, which
- *  aren't messages anyone sent. Where fewer than `n + 1` messages are stored,
- *  -(their count) - 1 instead, so the caller can say how many there are. */
 function indexBeforeLastMessages(cm: Pick<ContextManager, 'getMessageCount' | 'getMessageWindow'>, n: number): number {
   let counted = 0;
   let before: number | undefined;
@@ -2873,9 +2869,8 @@ const derivedView = (source: StoreView, name: string, isOwn: (agentName: string)
 
 const KEEP_EVERY = (): boolean => true;
 
-// By configuration, once a manager opens: context-manager keeps one filtered
-// listing per listing and predicate, taking the predicate as a pure function
-// of the message (filterMessageStoreView), so it can't follow the fail-safe.
+// context-manager keeps one filtered listing per listing and predicate, taking
+// the predicate as a pure function of the message (filterMessageStoreView).
 const compiledView = (
   keeps: ((row: ViewedRow) => boolean) | undefined,
   toolDeclarations: AgentConfig['toolDeclarations'],
@@ -14208,8 +14203,6 @@ export class AgentFramework {
       }
       const n = Math.max(1, Math.min(50, Math.floor(params.messages)));
       const cm = agent.getContextManager();
-      // The n are messages of the conversation: a system change isn't one an
-      // operator counts, and one among them goes with them.
       const targetIndex = indexBeforeLastMessages(cm, n);
       if (targetIndex < 0) {
         return {
@@ -14218,8 +14211,6 @@ export class AgentFramework {
         };
       }
       const target = cm.getMessageWindow(targetIndex, 1, { resolveBlobs: false }).messages[0];
-      // The reply counts the conversation's messages, as n does: the system
-      // changes among them go with them uncounted.
       const after = cm.getMessageCount() - targetIndex - 1;
       const changesAmong = cm.getMessageWindow(targetIndex + 1, after, { resolveBlobs: false }).messages.filter(isSystemChangeMessage).length;
       try {
@@ -14292,8 +14283,6 @@ export class AgentFramework {
     try {
       const preview = await this.previewActivation(agentName);
       const messages = ((preview as { messages?: unknown[] }).messages ?? []) as { content: ContentBlock[] }[];
-      // A system change isn't a turn: the last message the agent sees is the
-      // last conversational one.
       const last = lastConversational(messages) as
         | { role?: string; participant?: string; content?: unknown }
         | undefined;
@@ -16059,22 +16048,12 @@ export class AgentFramework {
     }
   }
 
-  /** Each agent's recorded head (system-changes.ts), each in a state of its
-   *  own in the store, kept in memory after its first read on a branch, since
-   *  the framework is its only writer. The state is the branch's, so a switch
-   *  (undo, redo, a rollback, a fork) reads it again: kept across one, it
-   *  answered with the other branch's head and its next write stored it over
-   *  this branch's. Null where nothing is recorded, or what is isn't a head. */
+  // chronicle's state is the branch's: after a switch (undo, redo, a rollback,
+  // a fork) a read gives the other branch's.
   private headDeclarationCache: { branch: string; heads: Map<string, HeadDeclaration | null> } | null = null;
-  /** The states registered so far: each before its first write, since a
-   *  branch made from another (an undo's) carries registered states only, and
-   *  a state never written holds nothing to carry. Registrations last for good
-   *  and each costs a lookup at every branch made, so an agent that records no
-   *  head, as on 'head', registers none; a state never registered reads as
-   *  null. */
+  // chronicle: a branch made from another carries only registered states, and
+  // each registration costs a lookup at every branch made.
   private readonly registeredHeadStates = new Set<string>();
-  /** Each agent whose recorded head couldn't be read, on the branch by its
-   *  id, so that's said once a branch, though every request on the head asks. */
   private readonly headDeclarationsUnreadable = new Map<string, string>();
 
   private readonly headDeclarations: HeadDeclarationStore = {
@@ -16092,19 +16071,12 @@ export class AgentFramework {
     return id;
   }
 
-  /** The recorded heads read on the current branch, by agent. The branch is
-   *  known by its id: a name can be used again by a branch made later. */
   private headsOnBranch(): Map<string, HeadDeclaration | null> {
     const branch = this.store.currentBranch().id;
     if (this.headDeclarationCache?.branch !== branch) this.headDeclarationCache = { branch, heads: new Map() };
     return this.headDeclarationCache.heads;
   }
 
-  /** An agent's recorded head on the current branch: null where none is
-   *  recorded, and undefined where its state couldn't be read. Then the agent
-   *  sends its current head, as on 'head', and its next write replaces the
-   *  record. A record that isn't a head is set aside: the agent adopts again,
-   *  one write. */
   private readHeadDeclaration(agentName: string): HeadDeclaration | null | undefined {
     const heads = this.headsOnBranch();
     if (heads.has(agentName)) return heads.get(agentName);
@@ -16123,10 +16095,6 @@ export class AgentFramework {
     }
   }
 
-  /** Record an agent's head, or with null, record none, and say whether it's
-   *  stored. A write that would change nothing isn't made. One that can't be
-   *  stored is logged, not thrown, and memory keeps what it held, so the next
-   *  read finds the record as it was and a later write tries again. */
   private storeHeadDeclaration(agentName: string, head: HeadDeclaration | null): boolean {
     const recorded = this.readHeadDeclaration(agentName);
     if (recorded !== undefined && JSON.stringify(recorded) === JSON.stringify(head)) return true;
@@ -16140,10 +16108,6 @@ export class AgentFramework {
     return true;
   }
 
-  /** What an operator line says of the thinking a move of an agent's head
-   *  sets aside: `said` outright where the host declares that the model binds
-   *  its thinking (`thinkingBinding.binds: true`), on that condition where
-   *  `binds` is left out, and nothing where the host says it doesn't. */
   private thinkingSetAside(agent: Agent, said: string): string {
     if (!agent.mayBindThinking) return '';
     return agent.thinkingBindingOption() ? `, ${said}` : `, ${said} if its model binds it`;
@@ -16165,11 +16129,8 @@ export class AgentFramework {
     return true;
   }
 
-  /** Each agent's head store, for an ephemeral agent that continues another's context (`spec.inherit`). */
   private readonly headStores = new WeakMap<Agent, HeadDeclarationStore>();
 
-  /** Give an agent the recorded heads, and trace what moves its head. An
-   *  ephemeral agent keeps its own in memory: it doesn't outlive its run. */
   private attachHeads(agent: Agent, store: HeadDeclarationStore = this.headDeclarations): void {
     this.headStores.set(agent, store);
     agent.attachHeadDeclarations(store, (event: HeadEvent) => {
@@ -18057,10 +18018,6 @@ export class AgentFramework {
         logSeedOmissions(name, template.name, compiledWhole.length - compiled.length, compiled, withoutReasoning, withoutNotices, seed);
         for (const msg of seed) {
           const participant = msg.participant === template.name ? name : msg.participant;
-          // The template's own system changes, as its compile shows them, become
-          // the fork's, with the template's head beside them, so the fork's
-          // head matches its template's and its first start declares only its
-          // own difference.
           if (isSystemChangeMessage(msg) && msg.content.every((block) => templatesOwnChanges.has(block))) {
             contextManager.addMessage(participant, msg.content, systemChangeMetadata(name) as never);
           } else contextManager.addMessage(participant, msg.content);

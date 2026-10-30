@@ -34,15 +34,9 @@ export function assertBooleanSetting(setting: string, value: unknown, whatItDoes
   throw new Error(`${setting} must be ${wanted} not ${kindOf(value)}: ${whatItDoes}`);
 }
 
-/**
- * Refuse a setting that holds anything but one of `allowed`. null counts as
- * not set, as leaving it out does. `whatItDoes` ends the refusal: what each
- * value does, and what leaving it out does.
- */
 export function assertOneOfSetting(setting: string, value: unknown, allowed: readonly string[], whatItDoes: string): void {
   if (value === undefined || value === null) return;
   if (typeof value === 'string' && allowed.includes(value)) return;
-  // Never the value itself: it could be a secret pasted into the wrong field.
   const shown = typeof value === 'string' ? 'another string' : kindOf(value);
   throw new Error(`${setting} must be ${allowed.map((v) => `'${v}'`).join(' or ')}, not ${shown}: ${whatItDoes}`);
 }

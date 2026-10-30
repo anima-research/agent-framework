@@ -1,12 +1,3 @@
-/**
- * toolDeclarations: under 'entries' a
- * request carries the agent's recorded head, and each later change to its
- * tools or addition to its system text is a system change stored where it
- * took effect; under 'head', the default, a request is as before, with any
- * change rows left out. The fake context manager keeps rows in order, as the
- * store would, and compiles them back whole, naming each row as its message's
- * source, as a compile's provenance does.
- */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -20,12 +11,6 @@ import type { AgentConfig } from '../src/types/index.js';
 
 interface Row { id: string; participant: string; content: ContentBlock[]; metadata?: Record<string, unknown>; bodyGroupId?: string; shardIndex?: number }
 
-/** A context whose compile returns every stored row, with the system
- *  injections it's given, and which records each compile's options. A
- *  committing compile's `firstChanged` is read when it's read, as
- *  context-manager's is, counted in `firstChangedReads`: `opts.firstChanged()`,
- *  or with 'compare', the first message that differs from the last committing
- *  compile's, as context-manager compares them. A dry compile has none. */
 function fakeContext(rows: Row[] = [], opts: { kvUnified?: boolean; firstChanged?: (() => number | null) | 'compare'; overBudget?: (rows: Row[]) => boolean; fail?: () => Error | undefined } = {}) {
   let next = rows.length;
   const compiles: Array<{ kvUnifiedImmutablePrefixHash?: string; dryRun?: boolean } | undefined> = [];
@@ -41,7 +26,6 @@ function fakeContext(rows: Row[] = [], opts: { kvUnified?: boolean; firstChanged
       const result = {
         messages: rows.map((r) => ({ participant: r.participant, content: r.content })),
         systemInjections: (injections ?? []).filter((i) => i.position === 'system').flatMap((i) => i.content),
-        // Each message a raw copy of its row, which the compile read with its metadata.
         provenance: { messages: rows.map((r, sequence) => ({ kind: 'raw', bodies: [{ messageId: r.id, sequence, complete: true }] })), branch: { id: 'main', created: 0 } },
         rawBodies: new Map(rows.map((r) => [r.id, [{ ...r }]])),
       };
@@ -112,9 +96,7 @@ const changeRow = (tools: ToolDefinition[]): Row => ({
   metadata: { system: true, kind: 'system-change', agent: 'agent' },
 });
 const lastMessage = (messages: NormalizedMessage[]) => messages.at(-1)!;
-/** A change's price, as context-manager prices one: from its JSON at the dense rate. */
 const priceOf = (block: unknown) => jsonTokenEstimator(JSON.stringify(block));
-/** A digest as a request's JSON carries the value, each object's keys sorted, as the agent takes one. */
 function digest(wire: unknown): string {
   const encode = (item: unknown): string => {
     if (Array.isArray(item)) return `[${item.map(encode).join(',')}]`;
@@ -177,8 +159,6 @@ describe('toolDeclarations', () => {
     assert.deepEqual(changeRows(context.rows)[0]!.metadata, { system: true, kind: 'system-change', agent: 'agent' });
     assert.deepEqual(events.at(-1), { type: 'head:declared', removed: [], defined: ['b'], addedSystem: 0 });
 
-    // Built again on the same store and record, as after a restart: the
-    // stored change reads back as declared, and nothing new is appended.
     const restarted = await agentOn(context, { toolDeclarations: 'entries' }, heads).buildActivationRequest([tool('b'), tool('a')]);
     assert.deepEqual(restarted.tools, [tool('a')]);
     assert.deepEqual(restarted.messages, request.messages);
@@ -247,7 +227,6 @@ describe('toolDeclarations', () => {
   });
 
   it("goes out as membrane renders it: a system message after the user turn, the [Continue] one included", async () => {
-    // What membrane's native formatter puts on the wire for each request.
     const wire = (request: NormalizedRequest) => new NativeFormatter().buildMessages(request.messages, {
       participantMode: 'simple', assistantParticipant: 'agent', humanParticipant: 'user', tools: request.tools,
     }).messages.map((m) => `${m.role}:${(m.content as Array<{ type: string }>).map((b) => b.type).join('+')}`);
@@ -395,7 +374,7 @@ describe('toolDeclarations', () => {
     const context = fakeContext([said('user', 'hello')]);
     const agent = agentOn(context, { toolDeclarations: 'entries' });
     await agent.buildActivationRequest([tool('a')]);
-    await agent.buildActivationRequest([tool('a'), tool('b')]); // stored; say its request was never sent
+    await agent.buildActivationRequest([tool('a'), tool('b')]);
     const next = await agent.buildActivationRequest([tool('a'), tool('b')]);
     assert.equal(changeRows(context.rows).length, 1, 'nothing new stored');
     assert.deepEqual(next.messages.filter((m) => m.participant === 'system').map((m) => m.content), [[{ type: 'system_change', defineTools: [tool('b')] }]], 'sent once');
@@ -488,13 +467,11 @@ describe('toolDeclarations', () => {
     assert.deepEqual(first.tools, [tool('a')], 'the recorded head');
     assert.deepEqual(changesIn(first.messages), [host.content, changeRow([tool('b')]).content], "the host's row goes out as stored, beside the agent's own");
     assert.deepEqual(changeRows(context.rows).map((r) => r.id), ['host', 'c-b'], "nothing declared: the agent's own row says its difference, and the host's isn't counted");
-    // Past a tenth of this input the agent's own row isn't, and the host's alone is past a fifth.
     const [own, hosts] = [priceOf(changeRow([tool('b')]).content[0]), priceOf(host.content[0])];
     assert.ok(hosts * 5 >= own * 10 + 1);
     agent.noteResponseInput(own * 10 + 1);
     await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('v1')]);
     assert.deepEqual(events, [], "no consolidation priced from the host's row");
-    // A replacement moves the head, taking the agent's own row and leaving the host's, as a dry run shows first.
     const preview = await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('v2')], undefined, undefined, { dryRun: true });
     assert.deepEqual(changesIn(preview.messages), [host.content]);
     await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('v2')]);
@@ -616,7 +593,7 @@ describe('toolDeclarations', () => {
     const heads = memoryHeadDeclarations();
     heads.write('agent', { tools: [withExtra(null)], system: ['You are an agent.'] });
     const agent = agentOn(context, { toolDeclarations: 'entries', thinkingBinding: { binds: true } }, heads);
-    agent.noteResponseInput(1); // the change past a fifth: a forced move, which a dry run shows
+    agent.noteResponseInput(1);
     const before = context.compiles.length;
     const preview = await agent.buildActivationRequest([withExtra(undefined)], undefined, undefined, undefined, { dryRun: true });
     assert.equal(context.compiles.length - before, 2, 'compiled again for the new head');
@@ -670,8 +647,6 @@ describe('toolDeclarations', () => {
   });
 
   describe('consolidation', () => {
-    /** An agent with one change declared, and a response of `input` tokens
-     *  reported since; the next compile's `firstChanged` is `at()`. */
     async function withOneChange(input: number, at: () => number | null, config: Partial<AgentConfig> = {}, rows: Row[] = [said('user', 'hello')]) {
       const context = fakeContext(rows, { firstChanged: at });
       const heads = memoryHeadDeclarations();
@@ -683,8 +658,6 @@ describe('toolDeclarations', () => {
       return { agent, context, heads, events };
     }
     const changeIndex = (rows: Row[]) => rows.findIndex((r) => r.participant === 'system');
-    // The change `withOneChange` declares, priced: at a tenth of `tenth`, and
-    // at a tenth but short of a fifth of `short`.
     const price = priceOf({ type: 'system_change', defineTools: [tool('b')] });
     const [tenth, short] = [price * 10, price * 5 + 1];
 
@@ -707,7 +680,6 @@ describe('toolDeclarations', () => {
     });
 
     it("starts the changes at its own first one, past a host's change row before it", async () => {
-      // The host's row at 1, the agent's own at 2; the compile re-renders from 2. At a tenth of the input, not a fifth.
       const host: Row = { id: 'host', participant: 'system', content: [{ type: 'system_change', defineTools: [tool('x')] } as never] };
       const context = fakeContext([said('user', 'hello'), host, changeRow([tool('b')])], { firstChanged: () => 2 });
       const heads = memoryHeadDeclarations();
@@ -751,7 +723,6 @@ describe('toolDeclarations', () => {
     });
 
     it('moves the head when a compile is refused over budget with changes kept, and compiles once more', async () => {
-      // Refused while a change row is kept; fits once the head has taken it.
       const rows = [said('user', 'hello')];
       let refuse = false;
       const context = fakeContext(rows, { overBudget: (r) => refuse && r.some((row) => row.participant === 'system') });
@@ -805,7 +776,6 @@ describe('toolDeclarations', () => {
     });
 
     it('takes the changes into the head when the compile after a declared change is refused over budget, and compiles once more', async () => {
-      // The first compile fits; once the change is stored, it doesn't.
       const rows = [said('user', 'hello')];
       const context = fakeContext(rows, { kvUnified: true, overBudget: (r) => r.some((row) => row.participant === 'system') });
       const heads = memoryHeadDeclarations();
@@ -818,7 +788,6 @@ describe('toolDeclarations', () => {
       assert.deepEqual(heads.read('agent')!.tools, [tool('a'), tool('b')]);
       assert.deepEqual(events.slice(1).map((e) => (e.type === 'head:moved' ? [e.type, e.why, e.changesRemoved, e.forced] : [e.type])),
         [['head:declared'], ['head:moved', 'consolidated', 1, 'budget']]);
-      // The compile the request is built from was made for the new head, as an adoption of it hashes it.
       const fresh = fakeContext([said('user', 'hello')], { kvUnified: true });
       await agentOn(fresh, { toolDeclarations: 'entries' }).buildActivationRequest([tool('a'), tool('b')]);
       assert.equal(context.compiles.at(-1)?.kvUnifiedImmutablePrefixHash, fresh.compiles[0]?.kvUnifiedImmutablePrefixHash);
@@ -834,7 +803,6 @@ describe('toolDeclarations', () => {
       refuse = true;
       await agent.buildActivationRequest([tool('a'), tool('b')]);
       const hashes = context.compiles.slice(-2).map((o) => o?.kvUnifiedImmutablePrefixHash);
-      // A fresh agent adopting the same head hashes it as the head that goes out.
       const fresh = fakeContext([said('user', 'hello')], { kvUnified: true });
       await agentOn(fresh, { toolDeclarations: 'entries' }).buildActivationRequest([tool('a'), tool('b')]);
       assert.notEqual(hashes[0], hashes[1], 'the refused compile hashed the recorded head');
@@ -930,8 +898,6 @@ describe('toolDeclarations', () => {
     });
 
     it('reads a change it declared as sent, not as rewritten, at the next compile', async () => {
-      // context-manager's own comparison: the declared change is in the last committing compile,
-      // so a compile with nothing new re-renders nothing and nothing is free.
       const context = fakeContext([said('user', 'hello')], { firstChanged: 'compare' });
       const events: HeadEvent[] = [];
       const agent = agentOn(context, { toolDeclarations: 'entries' }, memoryHeadDeclarations(), events);
@@ -967,7 +933,6 @@ describe('toolDeclarations', () => {
       const thought = (block: ContentBlock): Row => ({ id: `t-${block.type}`, participant: 'agent', content: [block, { type: 'text', text: 'so' }] });
       const thinking = { type: 'thinking', thinking: 'why', signature: 's' } as ContentBlock;
       const redacted = { type: 'redacted_thinking', data: 'x' } as ContentBlock;
-      // Thinking from firstChanged on is set aside by the compile's own change: it holds nothing back.
       {
         const rows = [said('user', 'hello'), thought(thinking), said('user', 'and then')];
         const { agent } = await withOneChange(short, () => 1, { thinkingBinding: { binds: true } }, rows);
@@ -1032,7 +997,6 @@ describe('toolDeclarations', () => {
     const moved = await assemble([tool('a'), tool('b')], 'v2');
     carried(moved.request, lastIdentity(), 'moved');
     assert.notEqual(lastIdentity().tools, adopted.binding.identity!.tools, 'a move: the new head\'s digests');
-    // A replacement that takes no change row still compiles again for the new head.
     const replaced = await assemble([tool('a'), tool('b')], 'v3');
     carried(replaced.request, lastIdentity(), 'replaced, with no change row to take');
     for (const { binding } of [adopted, declared, moved, replaced]) assert.ok(binding.identity, 'the stream notes with the binding');

@@ -1603,8 +1603,6 @@ test("a suppression's resume record that could not be closed is logged, and a cl
 
 /** A framework stub whose agent context is a plain list (ids i0..), for host/command. */
 function hostCommandFramework(outbox: DiscordAwarenessOutbox | null, given: Array<{ id: string; metadata: Record<string, unknown> }>) {
-  // A stored row always carries its content, which host/command undo reads
-  // to count past system changes.
   const messages = given.map((m) => ({ ...m, content: [] }));
   let currentBranch = 'main';
   const removed = new Set<string>();

@@ -178,9 +178,7 @@ function endsOnOwnMessage(messages: NormalizedMessage[], agentName: string, cont
     && messages.slice(messages.length - contextTail).every((m) => m.participant.startsWith('system_context:') || isSystemChangeMessage(m));
 }
 
-/** kv-unified's hash of a request's immutable prefix: its head's tools as
- *  the wire carries them (a field left undefined goes, as a request's copy of
- *  the head and the binding's digests leave it out), and its system text. */
+// membrane's request leaves out a tool field whose value is undefined.
 function headHash(head: HeadDeclaration): string {
   const tools = head.tools.length > 0 ? JSON.parse(JSON.stringify(head.tools)) as ToolDefinition[] : undefined;
   return stableHash({ tools, system: systemTextOf(head.system) });
@@ -215,20 +213,10 @@ export function assertThinkingBinding(setting: string, value: AgentConfig['think
   }
 }
 
-/**
- * `thinkingBinding.binds` as a choice that could set kept thinking aside
- * reads it: the model may bind unless the host says it doesn't (`false`), so
- * left out, it counts as binding (AgentConfig.thinkingBinding.binds).
- */
 export function mayBindThinking(config: Pick<AgentConfig, 'thinkingBinding'>): boolean {
   return (config.thinkingBinding || undefined)?.binds !== false;
 }
 
-/**
- * `thinkingBinding.binds` as what relies on the declaration reads it: on only
- * where the host says the model binds (`true`), so left out, it's off
- * (AgentConfig.thinkingBinding.binds).
- */
 export function declaresBinding(config: Pick<AgentConfig, 'thinkingBinding'>): boolean {
   return (config.thinkingBinding || undefined)?.binds === true;
 }
@@ -360,8 +348,6 @@ export class Agent {
   /** Whether requests ask the provider to drop signed thinking whose earlier
    *  conversation changed (see AgentConfig.thinkingBinding.dropBlock). */
   private readonly thinkingDropBlock: boolean;
-  /** Whether the host declares that the model binds its signed thinking, so
-   *  compiles tell the context manager (declaresBinding). */
   private readonly declaresBinding: boolean;
   /** Refusal auto-rewind policy (see AgentConfig.refusalHandling). */
   readonly refusalHandling: AgentConfig['refusalHandling'];
@@ -386,16 +372,9 @@ export class Agent {
   /** Whether the model may bind its thinking, as a choice that could set kept
    *  thinking aside reads it (mayBindThinking). */
   readonly mayBindThinking: boolean;
-  /** Set by the framework's fail-safe once the provider refused a system
-   *  change: this agent then declares on its head until it's built again. */
   private headUntilBuiltAgain = false;
-  /** Where the recorded head is kept (system-changes.ts). The framework
-   *  gives its store's state; an agent built alone keeps it in memory. */
   private headDeclarations: HeadDeclarationStore = memoryHeadDeclarations();
   private onHeadEvent: ((event: HeadEvent) => void) | undefined;
-  /** The last response's reported input: its fresh tokens and its cache's
-   *  reads and writes, which consolidation measures the changes against.
-   *  Unknown until a response after this agent was built. */
   private lastResponseInputTokens: number | undefined;
   /** Prefill scaffold user message (see AgentConfig.prefillUserMessage). */
   readonly prefillUserMessage?: string;
@@ -1991,12 +1970,8 @@ export class Agent {
     const prospectiveSystemInjections = (injections ?? [])
       .filter((injection) => injection.position === 'system')
       .flatMap((injection) => injection.content);
-    // The head that goes out: under 'entries' the recorded one, and what's
-    // current otherwise or before one is recorded (system-changes.ts).
     const entries = this.declaresEntries();
     let recorded = entries ? this.headDeclarations.read(this.name) : null;
-    // Each compile is told of the head it's made for: kv-unified's hash of it,
-    // and the thinking binding's digests of it, the head the request carries.
     const compile = (head: HeadDeclaration) => {
       const immutablePrefixHash = kvUnified ? headHash(head) : undefined;
       const binding = this.bindingCompileOptions(head);
@@ -2101,9 +2076,6 @@ export class Agent {
       .filter((m) => m.content.length > 0);
     // The framework's own pricing stamp never goes out (thinking-token-stamp.ts).
     messages = withoutTokenEstimates(messages);
-    // On the head, the context's system changes stay out of the request, since
-    // its tools and system text are already current. Under 'entries', the
-    // change this assembly declares follows the compiled ones.
     if (!entries) messages = messages.filter((m) => !isSystemChangeMessage(m));
     if (settled.declared) {
       messages = [...messages, settled.declared];
@@ -2164,14 +2136,11 @@ export class Agent {
     const request: NormalizedRequest = {
       messages: this.toolResultGuard.prepareRequest(messages),
       system: systemTextOf(settled.head.system),
-      // A copy, so a hook or a caller that changes what the request carries,
-      // in place, leaves the recorded head as it is.
       tools: settled.head.tools.length > 0 ? copyHead(settled.head).tools : undefined,
       ...this.requestSettings(),
       ...(kvUnified ? { cacheMarkers: 'cm-owned' as const } : {}),
     };
     if (options.dryRun) dryCompileStats.set(request, renderStats);
-    // The binding of the compile the request is built from, which was made for its head.
     const binding = this.bindingCompileOptions(settled.head);
     return { request, ...(continuePrompt ? { continuePrompt } : {}), compiled, binding };
   }
@@ -2286,10 +2255,6 @@ export class Agent {
    * store changes). */
   private requestOnlyIndex: { source: readonly unknown[]; index: RequestOnlyRowIndex } | null = null;
 
-  /** Whether a change written now would stand between a call and its
-   * result, which context-manager refuses (changeWriteCheck): read from the
-   * store's tail, every agent's rows included, in blob-free windows, as far
-   * as the rule reads. Then the change waits for the result. */
   private changeWouldSplitCall(): boolean {
     const check = changeWriteCheck();
     scanFromTail(this.contextManager, (row) => check.visit(row as unknown as TailRow));
@@ -2638,7 +2603,6 @@ export class Agent {
     return systemTextOf(this.systemBlocks(systemInjections));
   }
 
-  /** The system text as blocks: the prompt, then each injected block (see buildSystemPrompt). */
   private systemBlocks(systemInjections: ContentBlock[]): string[] {
     return [
       this.systemPrompt,
@@ -2649,7 +2613,6 @@ export class Agent {
     ];
   }
 
-  /** What the agent advertises now, as a head would declare it. */
   private currentHead(tools: ToolDefinition[], systemInjections: ContentBlock[]): HeadDeclaration {
     return { tools, system: this.systemBlocks(systemInjections) };
   }
@@ -2675,26 +2638,6 @@ export class Agent {
     this.headUntilBuiltAgain = true;
   }
 
-  /**
-   * The head this request declares, and the change it adds, after the
-   * committing compile (system-changes.ts). It folds and consolidates only
-   * the agent's own change rows (ownSystemChanges): one a host stored without
-   * the agent's metadata is neither folded onto the head nor consolidated,
-   * and what any other row the request carries already says is left out of
-   * the change. On the head,
-   * what's current goes out, and while a record left from an earlier
-   * 'entries' period is there, or the compile holds changes of the agent's
-   * own, the record goes and then those changes; a record the store can't
-   * clear stays, with them, until it can.
-   * Under 'entries': with no record, the current head is adopted; a
-   * replacement of system text moves the head to what's current; a
-   * difference a change can say is declared at the end, unless the agent's
-   * own last calls are still waiting for their results, or a change written
-   * now would stand between any call and its result (changeWouldSplitCall);
-   * then it waits for the next assembly. A dry run computes the same and
-   * stores nothing, except that a dry compile has no `firstChanged`, so it
-   * shows a consolidation only once one is forced, never a free one.
-   */
   private async settleHead(
     compiled: CompileResult,
     compiledWith: HeadDeclaration | null,
@@ -2707,13 +2650,8 @@ export class Agent {
     const current = this.currentHead(availableTools, compiled.systemInjections);
     const own = ownSystemChanges(compiled, (name) => this.ownParticipants.has(name));
     if (!entries) {
-      // A compile that held the agent's own rows (as one through a manager
-      // that keeps change rows does, an 'entries' agent's kept to its head)
-      // runs again without them: what it committed
-      // (context-manager's comparison baseline, and with `binds: true` its
-      // thinking-binding record) would hold rows no later compile has, so the
-      // next would differ from it there and leave out the thinking minted
-      // since.
+      // context-manager's comparison baseline for `firstChanged`, and with
+      // `binds: true` its thinking-binding record, are the last committing compile's.
       if (!dryRun && (own.size > 0 || this.headDeclarations.read(this.name)) && this.headDeclarations.delete(this.name)) {
         const changesRemoved = this.removeOwnChanges();
         if (changesRemoved > 0) {
@@ -2743,14 +2681,8 @@ export class Agent {
       defined: (difference.block.defineTools ?? []).map((tool) => tool.name),
       addedSystem: difference.block.addSystem?.length ?? 0,
     });
-    // The compile runs again, so the request carries the change as the
-    // compile renders it, and context-manager's last committing compile, which
-    // the next one's `firstChanged` compares with, and its thinking-binding
-    // record both hold it: the next compile then reads the change as already
-    // sent, not as rewritten from there. The change now counts in the budget,
-    // so this compile can be refused where the first fitted; then the head
-    // takes the changes, this one with them, as at the first compile, and
-    // the compile runs once more for it.
+    // context-manager's comparison baseline for `firstChanged`, and with
+    // `binds: true` its thinking-binding record, are the last committing compile's.
     try {
       return { compiled: await compile(recorded), head: recorded };
     } catch (error) {
@@ -2759,19 +2691,6 @@ export class Agent {
     }
   }
 
-  /**
-   * The changes this agent keeps may be what no longer fits: after a compile
-   * refused over budget (`error`) with change rows of its own kept, take them
-   * out, and give the head to compile with once more. On the head, whose
-   * requests leave them out, that's the removal settleHead makes after a
-   * compile. Under 'entries' the head moves to `current`, taking them: with
-   * a record, a move forced by the budget; without one, settleHead's
-   * adoption. If that compile is refused too, the error goes on and the move
-   * stands: the rows are gone and the head is current, as after any move.
-   * Any other error, a refusal with no change row of the agent's kept, a
-   * head that isn't stored, or on the head a record that can't be cleared,
-   * goes on as it was. Never for a dry run.
-   */
   private takeChangesOverBudget(error: unknown, entries: boolean, recorded: HeadDeclaration | null, current: HeadDeclaration): HeadDeclaration {
     if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError') throw error;
     const rows = this.ownChangeRows();
@@ -2789,21 +2708,6 @@ export class Agent {
     return current;
   }
 
-  /**
-   * Move the head to what's current: record a copy of it, then remove the
-   * changes it now holds, in that order. A record that isn't stored moves
-   * nothing: the request goes on the recorded head, or with none recorded on
-   * what's current, the rows stay, and a later assembly moves again. The
-   * compile runs again
-   * when what it read changed, or when it was told something of its head
-   * (`compiledWith`, null when it was told nothing) that differs for this
-   * one: kv-unified's hash and the thinking binding's digests are both of
-   * the head's tools as the wire carries them and its system text, which
-   * headHash compares. A dry run shows the same, compiling again (dry) for
-   * another head, and changes nothing. It can't remove the rows before it
-   * compiles, so it compiles with them and leaves them out of what it
-   * shows: under a tight budget, its window can hold less than the move's.
-   */
   private async moveHead(
     compiled: CompileResult,
     compiledWith: HeadDeclaration | null,
@@ -2818,7 +2722,6 @@ export class Agent {
       const shown = compiledWith !== null && headHash(compiledWith) !== headHash(current) ? await compile(current) : compiled;
       const own = ownSystemChanges(shown, (name) => this.ownParticipants.has(name));
       const kept = (_: unknown, index: number) => !own.has(index);
-      // Its sources stay index for index with its messages.
       const provenance = shown.provenance && { ...shown.provenance, messages: shown.provenance.messages.filter(kept) };
       return { compiled: { ...shown, messages: shown.messages.filter(kept), ...(provenance ? { provenance } : {}) }, head: current };
     }
@@ -2829,45 +2732,19 @@ export class Agent {
     return { compiled: again ? await compile(current) : compiled, head: current };
   }
 
-  /**
-   * Whether this compile is where the agent's own changes (`own`, from
-   * ownSystemChanges) go into the head, and if so, their price and the input
-   * they reached a share of. Once the changes, priced from their JSON as
-   * context-manager prices a change (jsonTokenEstimator), reach a tenth of the last
-   * response's reported input, at the first committing compile whose
-   * `firstChanged` (context-manager's: the first compiled message whose bytes
-   * differ from the previous committing compile's) is at or before the first
-   * change. That compile already rewrites every change, so moving the head
-   * adds the head and any messages before `firstChanged`, never more than
-   * the whole prompt. On a binding model, also only where no thinking sits
-   * before `firstChanged`: moving the head sets aside every thinking block
-   * in the request, and the thinking the compile kept before `firstChanged`
-   * would go by our choice. A strategy that keeps changes ahead of its
-   * window (the passthrough strategies, once over budget) re-renders from
-   * the first change only at the compile where its window first passes it:
-   * after that the change stays first and unchanged, and `firstChanged`
-   * falls after it. `firstChanged` is null after a start, before the
-   * manager's first committing compile, when nothing says what the provider
-   * still holds, and nothing consolidates for free then.
-   *
-   * Such a compile may never come: a binding model's head window keeps its
-   * first replies' thinking, and a passthrough window passes the first
-   * change before the changes reach a tenth. So past a fifth of the input,
-   * with no free compile having taken them, the head moves at this compile
-   * anyway (`forced: 'share'`): one whole write, and on a binding model the
-   * thinking the request held. That bounds what every request carries, once
-   * per crossing, since the move takes every change. (A compile refused over
-   * budget with changes kept moves the head too, at the assembly: `forced:
-   * 'budget'`.)
-   */
+  // context-manager: `firstChanged` is the first compiled message whose bytes
+  // differ from the previous committing compile's, and null before a manager's
+  // first committing compile; a change is priced as `jsonTokenEstimator` prices
+  // it; and a passthrough strategy over budget, which keeps changes ahead of its
+  // window, re-renders from the first change only at the compile where its
+  // window first passes it.
   private consolidation(compiled: CompileResult, own: ReadonlySet<number>, blocks: SystemChangeContent[]): { changeTokens: number; inputTokens: number; forced?: 'share' } | undefined {
     const firstChange = own.values().next().value;
     const inputTokens = this.lastResponseInputTokens;
     if (firstChange === undefined || inputTokens === undefined) return undefined;
     const changeTokens = blocks.reduce((sum, block) => sum + jsonTokenEstimator(JSON.stringify(block)), 0);
     if (changeTokens * 10 < inputTokens) return undefined;
-    // Read only once consolidation is in question: context-manager compares
-    // it when it's read.
+    // context-manager compares `firstChanged` when it's read.
     const { firstChanged } = compiled;
     const free = firstChanged != null && firstChanged <= firstChange && !(this.mayBindThinking && compiled.messages.slice(0, firstChanged)
       .some((message) => message.content.some((block) => block.type === 'thinking' || block.type === 'redacted_thinking')));
