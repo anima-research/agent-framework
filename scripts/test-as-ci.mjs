@@ -1,6 +1,3 @@
-// Runs the test suite as CI runs it: `npm test` with AF_TEST_CONCURRENCY at
-// twice this machine's cores, whatever the environment sets, exiting as
-// `npm test` does.
 import { spawnSync } from "node:child_process";
 import { availableParallelism, cpus } from "node:os";
 import { npmCommand } from "./single-threaded.mjs";

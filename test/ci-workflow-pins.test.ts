@@ -2,13 +2,11 @@
  * Two things ci.yml decides from what a test can read:
  *
  * - How many test files run at once. ci.yml's Build & Test and publish.yml's
- *   Test step run the suite through scripts/test-as-ci.mjs, which runs npm
- *   test with AF_TEST_CONCURRENCY at twice the machine's cores, and npm test
- *   passes it on as --test-concurrency only when it is set. If a workflow ran
- *   npm test another way, or either side dropped the variable, the suite would
- *   go back to Node's default of one file fewer than the cores, and nothing
- *   else would fail: these tests do. The script exits as npm test does, so a
- *   failing suite fails the step.
+ *   Test step run the suite through scripts/test-as-ci.mjs, which sets
+ *   AF_TEST_CONCURRENCY, and npm test passes it on as --test-concurrency only
+ *   when it is set. A step that ran npm test itself would set its width
+ *   somewhere else or not at all, and nothing else would fail: these tests do.
+ *   The script exits as npm test does, so a failing suite fails the step.
  * - When a pull request runs code_execution's Bun legs on macOS. The
  *   `changes` job runs them when the diff matches a filter. Every file those
  *   tests import or load by path, directly or through others, must match it,
@@ -26,8 +24,9 @@ const ROOT = new URL('../../', import.meta.url);
 const read = (path: string) => readFileSync(new URL(path, ROOT), 'utf8');
 const exists = (path: string) => existsSync(new URL(path, ROOT));
 
-/** A line that runs npm test, however it's spelled: `npm test`, `npm run test`, `npm t`, with arguments or not. */
-const NPM_TEST_LINE = /^\s*(?:run: )?npm (?:run )?(?:test|t)\b(?!:)/m;
+/** A line that runs npm test, however it's spelled: `npm test`, `npm run test`, `npm t`, after `env` or variable
+ *  assignments or not, with arguments or not. */
+const NPM_TEST_LINE = /^\s*(?:run: )?(?:env\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*npm (?:run )?(?:test|t)\b(?!:)/m;
 
 /** The steps of a workflow file that run `npm test`, each as its text from its `- name:` line to the next step's. */
 function npmTestSteps(workflow: string): string[] {
@@ -51,15 +50,13 @@ for (const workflow of ['.github/workflows/ci.yml', '.github/workflows/publish.y
   });
 }
 
-/** Runs scripts/test-as-ci.mjs with an `npm` ahead of PATH that writes its arguments and AF_TEST_CONCURRENCY to a
- *  file, then runs `then`; and returns how the script ended and what that npm saw. */
 function testAsCi(then: string, callerWidth?: string) {
   const dir = mkdtempSync(join(tmpdir(), 'test-as-ci-'));
   try {
     const seen = join(dir, 'seen');
-    writeFileSync(join(dir, 'npm'), `#!/bin/sh\nprintf '%s|%s' "$*" "$AF_TEST_CONCURRENCY" > '${seen}'\n${then}\n`);
+    writeFileSync(join(dir, 'npm'), `#!/bin/sh\nprintf '%s|%s' "$*" "$AF_TEST_CONCURRENCY" > "$TEST_AS_CI_SEEN"\n${then}\n`);
     chmodSync(join(dir, 'npm'), 0o755);
-    const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${dir}${delimiter}${process.env.PATH ?? ''}` };
+    const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${dir}${delimiter}${process.env.PATH ?? ''}`, TEST_AS_CI_SEEN: seen };
     if (callerWidth === undefined) delete env.AF_TEST_CONCURRENCY;
     else env.AF_TEST_CONCURRENCY = callerWidth;
     const run = spawnSync(process.execPath, [fileURLToPath(new URL('scripts/test-as-ci.mjs', ROOT))], { cwd: dir, env, encoding: 'utf8' });
