@@ -73,6 +73,10 @@ export type AdmittedEnvelope = Readonly<{ connection: ConnectionKey; mayWake: bo
 export function attachAdmission(event: object, envelope: AdmittedEnvelope): void {
   Object.defineProperty(event, admittedEnvelope, { value: envelope, enumerable: true });
 }
+/** Read the host-only, immutable receipt; wire metadata never supplies it. */
+export function admissionOf(event: object): AdmittedEnvelope | undefined {
+  return (event as { [admittedEnvelope]?: AdmittedEnvelope })[admittedEnvelope];
+}
 export function wakeForbidden(event: object): boolean {
   const envelope = (event as { [admittedEnvelope]?: AdmittedEnvelope })[admittedEnvelope];
   return !!envelope && (envelope.mayWake === false || (event as { triggerInference?: boolean }).triggerInference === false);
