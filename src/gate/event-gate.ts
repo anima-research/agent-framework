@@ -1,3 +1,4 @@
+import { carryWork, workOf, replyWork, type ReplyWork } from '../mcpl/reply-routing.js';
 /**
  * EventGate — file-driven inference gating with per-policy debounce.
  *
@@ -163,7 +164,7 @@ export interface WritePlacement {
  * "who woke the agent" from it). Ids only, never content or display names,
  * except `line`, which is the batch's own text for the agent's window.
  */
-export interface WakeProvenance {
+export interface WakeProvenance extends ReplyWork {
   /** Composite channel id of the chosen event — telemetry only, never a
    *  speech locus. Omitted for `mcpl:push-event` events, whose channel ids
    *  are raw server ids (unroutable and a second spelling of the same
@@ -317,12 +318,14 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     if (e.addressed && (!newestAddressed || e.timestamp >= newestAddressed.timestamp)) newestAddressed = e;
   }
   const pick = newestAddressed ?? newest;
-  if (!pick) return undefined;
+  const work = events.flatMap(workOf);
+  if (!pick) return work.length ? { [replyWork]: work } : undefined;
   // push-event channel ids are the adapter's raw ids (a Discord snowflake):
   // not a composite channel id, so not reported as one
   const channelId = pick.channelId && pick.eventType !== 'mcpl:push-event' ? pick.channelId : undefined;
   const ns = pick.serverId || (pick.channelId ? pick.channelId.split(':')[0] : '') || 'channel';
   return {
+    ...(work.length ? { [replyWork]: work } : {}),
     ...(channelId ? { channelId } : {}),
     ...(pick.authorId ? { counterparty: `${ns}:user:${pick.authorId}` } : {}),
     ...(pick.addressed ? { addressed: true } : {}),
@@ -3687,6 +3690,7 @@ export class EventGate {
     const judge = typeof policy.behavior === 'object' && 'judge' in policy.behavior ? policy.behavior.judge : undefined;
 
     const event: PendingEvent = {
+      ...carryWork(info),
       policyName: policy.name,
       content: info.content.length > MAX_CONTENT_SNIPPET
         ? safeSlice(info.content, 0, MAX_CONTENT_SNIPPET) + '...'

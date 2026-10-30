@@ -1,3 +1,4 @@
+import { replyConsumer, replyWork, replyOwner, workOf, carryWork, sameWork, sameDestination, shareReplyTurn, turnReply, privateReplyNotice, replyBindingCurrent, workKey, type ReplyBinding, type ReplyWork } from './mcpl/reply-routing.js';
 import { admissionConnectErrorOf, admittedEnvelope, attachAdmission, wakeForbidden, type RequiredIngress } from './mcpl/inbound-admission.js';
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { presentAuthor } from './author-presentation.js';
@@ -1367,6 +1368,8 @@ const SCRIPT_VIEW_CLAIMS = new WeakMap<object, { claims: ResultClaims } | { erro
  * that queued it.
  */
 interface TurnRouting {
+  reply?: ReplyBinding;
+  replyWorks?: readonly ReplyBinding[];
   /**
    * The turn's id, numbered when its routing is made, so every stream of the
    * turn shares it and the agent's next turn (or a silent start, which has
@@ -1538,6 +1541,15 @@ let lastHeardAt = 0;
 /** Record that a channel has been the turn's trigger or its locus (TurnRouting.wasIn). */
 function noteTurnChannel(routing: TurnRouting, channel: ChannelRef | undefined): void {
   if (channel && !routing.wasIn.some((c) => sameChannel(c, channel))) routing.wasIn.push(channel);
+}
+
+/** A new logical turn inherits the admitted work, never the settled turn's id. */
+function replyForNextTurn(routing: TurnRouting | undefined): ReplyWork {
+  return routing?.reply ? { [replyWork]: routing.replyWorks ?? [routing.reply] } : {};
+}
+
+function ownedReply(routing: TurnRouting | undefined): ReplyWork {
+  return routing?.reply ? { ...replyForNextTurn(routing), [replyOwner]: routing.turnId } : {};
 }
 
 function freshTurnRouting(): TurnRouting {
@@ -3671,6 +3683,7 @@ export class AgentFramework {
   private errorPolicy: ErrorPolicy;
   private pendingRequests: InferenceRequest[] = [];
   private readonly exhaustedTurns = new Map<string, { roundsRan: boolean; callsCutOff: boolean; liveSpeech: boolean; speechRouting: boolean }>();
+  private readonly replyStreamOwners = new WeakMap<object, TurnRouting>();
   private readonly roundTurns = new WeakMap<ContentBlock[], TurnRouting>();
   private running = false;
   private loopPromise: Promise<void> | null = null;
@@ -4849,7 +4862,8 @@ export class AgentFramework {
         addMessage: (p, c, m, forAgent, placement) => framework.addMessage(p, c, m as MessageMetadata,
           forAgent || placement ? { ...(forAgent ? { forAgent } : {}), ...(placement ? { placement } : {}) } : undefined),
         requestInference: (agentName, reason, source, provenance, after) => {
-          framework.pendingRequests.push({
+          const causes = workOf(provenance);
+          for (const cause of causes.length ? causes : [undefined]) framework.pendingRequests.push({
             agentName, reason, source, timestamp: Date.now(),
             ...framework.readsWriteFor(after, agentName),
             // gate-requested wakes carry where/who (EventGate wakeProvenance)
@@ -4881,6 +4895,7 @@ export class AgentFramework {
                 ? { channelId: route.channelId, channelServerId: route.serverId, addressed: true }
                 : {};
             })(),
+            ...(cause ? { [replyWork]: [cause], ...(cause.destination ? { channelId: cause.destination.channelId, channelServerId: cause.destination.serverId } : {}) } : {}),
           });
         },
         getAgentNames: () => framework.registry.gateRecipients(),
@@ -6473,7 +6488,7 @@ export class AgentFramework {
    *  without. (coalescingBatch is set only beside one of the first two.) */
   private sameInferenceRequest(a: InferenceRequest, b: InferenceRequest): boolean {
     const batchSubjects = (r: InferenceRequest) => (r.coalescingBatchSubjects ?? []).join('\n');
-    return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
+    return sameWork(a, b) && a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
       a.timestamp === b.timestamp && a.channelId === b.channelId && a.channelServerId === b.channelServerId &&
       a.coalescingSubject === b.coalescingSubject && batchSubjects(a) === batchSubjects(b) &&
       a.readsDeferredWrite === b.readsDeferredWrite && a.readsStoredMessage === b.readsStoredMessage &&
@@ -16901,6 +16916,7 @@ export class AgentFramework {
             // for its continuation, with nothing left of the stream to end.
             const continuation = withTurnCarry({
               agentName: agent.name,
+              ...ownedReply((currentState.stream ? this.replyStreamOwners.get(currentState.stream) : undefined) ?? this.openLogical.get(agent.name)),
               reason: 'context_budget_restart',
               source: 'framework',
               timestamp: Date.now(),
@@ -17011,6 +17027,7 @@ export class AgentFramework {
             // turn's properties, as the budget restart does.
             this.pendingRequests.push({
               agentName: agent.name,
+              ...ownedReply(currentState.stream ? this.replyStreamOwners.get(currentState.stream) : this.openLogical.get(agent.name)),
               reason: 'tool_results_ready',
               source: 'framework',
               timestamp: Date.now(),
@@ -17242,6 +17259,7 @@ export class AgentFramework {
         const agent = this.agents.get(agentName);
         if (agent && agent.canBeTriggeredBy(source)) {
           this.pendingRequests.push({
+            ...carryWork(event),
             agentName,
             reason: event.type,
             source,
@@ -17403,6 +17421,7 @@ export class AgentFramework {
     // consumes `decision`; none re-asks the policy.
     const addressed = isAddressedMessage(event.tags);
     const decision = this.admitInbound({
+      ...carryWork(event),
       lane: 'channel',
       serverId: event.serverId,
       channelId: event.channelId,
@@ -17469,6 +17488,7 @@ export class AgentFramework {
         this.emitTrace({ type: 'message:added', messageId: placement.messageId ?? '', source: 'mcpl:channel-incoming' });
         if (decision.wake) {
           this.pendingRequests.push({
+            ...carryWork(event),
             agentName: target.name, reason: 'mcpl:channel-incoming', source: event.serverId, timestamp: Date.now(),
             channelId: event.channelId, channelServerId: event.serverId,
             counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
@@ -17529,6 +17549,7 @@ export class AgentFramework {
       for (const agentName of decision.recipients) {
         if (!this.agents.has(agentName)) continue;
         this.pendingRequests.push({
+        ...carryWork(event),
           agentName,
           reason: 'mcpl:channel-incoming',
           source: event.serverId,
@@ -17652,6 +17673,7 @@ export class AgentFramework {
 
     if (trigger) {
       this.pendingRequests.push({
+        ...carryWork(event),
         agentName: agent.name,
         reason: 'mcpl:channel-incoming',
         source: event.serverId,
@@ -18949,6 +18971,7 @@ export class AgentFramework {
     // the gate decide now; its materialized delivery at assembly is vetoed
     // (`triggerInference: false`) and so is not shown to the gate again.
     const decision = this.admitInbound({
+      ...carryWork(push),
       lane: 'push',
       serverId: occ.serverId,
       channelId,
@@ -18993,6 +19016,7 @@ export class AgentFramework {
     if (!decision.wake) return;
     for (const agentName of await this.coalescedAudience(occ)) {
       this.pendingRequests.push({
+        ...carryWork(push),
         agentName,
         reason: 'mcpl:push-event',
         source: occ.serverId,
@@ -19269,6 +19293,7 @@ export class AgentFramework {
     // arrives here, so this is where tuning out a DM takes effect (#232 gap
     // 1). An event with no channel provenance cannot be held.
     const decision = this.admitInbound({
+      ...carryWork(event),
       lane: 'push',
       serverId: event.serverId,
       channelId: triggerChannel?.channelId,
@@ -19312,6 +19337,7 @@ export class AgentFramework {
     if (decision.wake) {
       for (const agentName of decision.recipients) {
         this.pendingRequests.push({
+        ...carryWork(event),
           agentName,
           reason: 'mcpl:push-event',
           source: event.serverId,
@@ -19484,6 +19510,21 @@ export class AgentFramework {
 
   /** One scheduler pass, whose requests stay visible as on their way until
    *  it takes their agent up (passRequests). */
+  private pendingRequestKey(request: InferenceRequest): string {
+    const base = `${request.reason}|${request.addressed ? 'a' : 'n'}|${isHeartbeatWake(request) ? 'h' : ''}|${request.coalescingSubject ?? ''}|${request.readsDeferredWrite ?? ''}|${request.readsStoredMessage ?? ''}`;
+    return workOf(request).length ? JSON.stringify([base, workKey(request), (request as ReplyWork)[replyOwner] ?? null]) : base;
+  }
+
+  private replyStartDisposition(agentName: string, request: InferenceRequest | undefined): 'run' | 'defer' | 'stale' {
+    if (request?.suppressProse) return 'run';
+    const open = this.openLogical.get(agentName);
+    const work = workOf(request)[0];
+    const owner = (request as ReplyWork | undefined)?.[replyOwner];
+    if (work && owner !== undefined && open?.turnId !== owner) return 'stale';
+    if (!open || (!open.reply && !work)) return 'run';
+    return owner === open.turnId && sameDestination(open.reply, work) ? 'run' : 'defer';
+  }
+
   private async processInferenceRequests(): Promise<void> {
     if (this.pendingRequests.length === 0) {
       return;
@@ -19502,6 +19543,38 @@ export class AgentFramework {
     const STALE_REQUEST_MS = 30_000;
     const now = Date.now();
     const state = this.createFrameworkState();
+
+    // Both busy and reply-deferred requests retain their age and share one
+    // trace/stderr throttle. Quiesce is an expected wait, not a wedge.
+    const warnStaleRequests = (agentName: string, requests: InferenceRequest[], shownStatus: string): void => {
+      const oldest = Math.min(...requests.map(r => r.timestamp));
+      if (
+        !this.quiesced &&
+        now - oldest > STALE_REQUEST_MS &&
+        (this.staleWarnAt.get(agentName) ?? 0) < now - 60_000
+      ) {
+        // Trace and stderr share the throttle. The old code throttled only
+        // stderr, so a long-running tool call generated one trace per poll
+        // (up to 100/sec after the scheduler backoff), adding avoidable work
+        // precisely while the agent was already under pressure.
+        this.staleWarnAt.set(agentName, now);
+        // Surface turn-alive separately from the state machine: status can
+        // read 'idle' while a turn's teardown is pending, and a LEAKED turn
+        // token would look exactly like this — permanently requeued wakes.
+        // This line is the wedge's tell (idle+turn-alive, forever).
+        this.emitTrace({
+          type: 'inference:request_stale',
+          agentName,
+          agentStatus: shownStatus,
+          requestCount: requests.length,
+          oldestRequestAge: now - oldest,
+        });
+        console.error(
+          `[inference-stale] agent=${agentName} busy (${shownStatus}) — ` +
+          `${requests.length} request(s) waiting ${Math.round((now - oldest) / 1000)}s`,
+        );
+      }
+    };
 
     // Group requests by agent
     for (const req of this.pendingRequests) {
@@ -19540,6 +19613,38 @@ export class AgentFramework {
           this.endContinuedTurn(agentName, { kind: 'dropped', why: 'its agent is gone' });
         }
         continue;
+      }
+
+      if (this.openLogical.get(agentName)?.reply || requests.some(r => workOf(r).length)) {
+        const runnable: InferenceRequest[] = [];
+        for (const request of requests) {
+          const disposition = this.replyStartDisposition(agentName, request);
+          if (disposition === 'defer') this.pendingRequests.push(request);
+          else if (disposition === 'stale') {
+            if (continuesTurn(request)) {
+              this.endContinuedTurn(agentName, { kind: 'dropped', why: 'its admitted reply owner ended' });
+            }
+            this.emitTrace({ type: 'inference:request_dropped', agentName, reason: 'reply_owner_ended', requestCount: 1 });
+          } else runnable.push(request);
+        }
+        if (this.pendingRequests.some(r => r.agentName === agentName)) {
+          const status = this.surgeryHold && agent.state.status === 'idle'
+            ? `idle+surgery(${this.surgeryHold.verb})`
+            : this.hasTurn(agentName) && agent.state.status === 'idle' ? 'idle+turn-alive' : agent.state.status;
+          // Show the whole still-pending snapshot, including a runnable
+          // continuation, so the shared throttle cannot conceal older siblings.
+          warnStaleRequests(agentName, [...this.pendingRequests.filter(r => r.agentName === agentName), ...runnable],
+            `${status}+reply-deferred`);
+        }
+        const first = runnable[0];
+        if (!first) {
+          if (!this.pendingRequests.some(r => r.agentName === agentName)) this.endPendingPrimary(agentName);
+          continue;
+        }
+        // Compatible causes share a turn; publication rechecks every original authority.
+        const selected = runnable.filter(r => workOf(first).length ? shareReplyTurn(first, r) : !workOf(r).length);
+        this.pendingRequests.push(...runnable.filter(r => !selected.includes(r)));
+        requests = selected;
       }
 
       const providerCooldown = this.providerAccelerationCooldowns?.get(agentName);
@@ -19645,7 +19750,7 @@ export class AgentFramework {
           // A heartbeat's wake keeps its own key, so a later channel-less wake
           // can't absorb it: resumed together, they make a heartbeat's batch
           // (heartbeatTurn), as they would have without the quiesce.
-          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${isHeartbeatWake(request) ? 'h' : ''}|${request.coalescingSubject ?? ''}|${request.readsDeferredWrite ?? ''}|${request.readsStoredMessage ?? ''}`;
+          const key = this.pendingRequestKey(request);
           const prev = newestByKey.get(key);
           const kept = !prev || request.timestamp >= prev.timestamp ? request : prev;
           // The wake it absorbs hands on its lines (WakeLine): each event's
@@ -19700,41 +19805,12 @@ export class AgentFramework {
       // added later) leave the slot undefined, which must read as "not held".
       const surgeryHeld = !!this.surgeryHold;
       if (surgeryHeld || providerPrimaryWaiting || turnAlive || agent.state.status === 'inferring' || agent.state.status === 'streaming' || agent.state.status === 'waiting_for_tools') {
-        // Re-queue requests, but warn if they've been pending too long.
-        // Suppressed while quiesced: a drain-phase busy requeue is expected,
-        // not a wedge tell.
-        const oldest = Math.min(...requests.map(r => r.timestamp));
-        if (
-          !this.quiesced &&
-          now - oldest > STALE_REQUEST_MS &&
-          (this.staleWarnAt.get(agentName) ?? 0) < now - 60_000
-        ) {
-          // Trace and stderr share the throttle. The old code throttled only
-          // stderr, so a long-running tool call generated one trace per poll
-          // (up to 100/sec after the scheduler backoff), adding avoidable work
-          // precisely while the agent was already under pressure.
-          this.staleWarnAt.set(agentName, now);
-          // Surface turn-alive separately from the state machine: status can
-          // read 'idle' while a turn's teardown is pending, and a LEAKED turn
-          // token would look exactly like this — permanently requeued wakes.
-          // This line is the wedge's tell (idle+turn-alive, forever).
-          const shownStatus = surgeryHeld && agent.state.status === 'idle'
-            ? `idle+surgery(${this.surgeryHold!.verb})`
-            : turnAlive && agent.state.status === 'idle'
-              ? 'idle+turn-alive'
-              : agent.state.status;
-          this.emitTrace({
-            type: 'inference:request_stale',
-            agentName,
-            agentStatus: shownStatus,
-            requestCount: requests.length,
-            oldestRequestAge: now - oldest,
-          });
-          console.error(
-            `[inference-stale] agent=${agentName} busy (${shownStatus}) — ` +
-            `${requests.length} request(s) waiting ${Math.round((now - oldest) / 1000)}s`,
-          );
-        }
+        const shownStatus = surgeryHeld && agent.state.status === 'idle'
+          ? `idle+surgery(${this.surgeryHold!.verb})`
+          : turnAlive && agent.state.status === 'idle'
+            ? 'idle+turn-alive'
+            : agent.state.status;
+        warnStaleRequests(agentName, requests, shownStatus);
         this.pendingRequests.push(...requests);
         continue;
       }
@@ -19752,6 +19828,7 @@ export class AgentFramework {
       // wake was for, as for a chat:system notice. One with neither tag is
       // judged as addressed.
       const read = requests.filter((r) => {
+        if (workOf(r).length) return false;
         // A chat:system notice asks nothing either, ambient or not, and no
         // speech is routed by it, so waiting for one in its channel would
         // keep its wake forever.
@@ -19915,6 +19992,7 @@ export class AgentFramework {
       const batchOnly = !budgetRestart && requests.every((r) => r.coalescingBatch === true && !!r.coalescingSubject);
       const merged: InferenceRequest = {
         ...trigger,
+        ...(requests.some(r => workOf(r).length) ? { [replyWork]: [...new Set(requests.flatMap(workOf))] } : {}),
         coalescingBatch: batchOnly || undefined,
         coalescingBatchSubjects: batchOnly
           ? [...new Set(requests.flatMap((r) => r.coalescingBatchSubjects ?? [r.coalescingSubject!]))]
@@ -20978,7 +21056,7 @@ export class AgentFramework {
       this.holdHeartbeatProse(agent, [text], round);
       return null;
     }
-    return this.channelRegistry!.routeSpeech(agent.name, text, locus);
+    return this.channelRegistry!.routeSpeech(agent.name, text, locus, round.routing.reply);
   }
 
   /** The mark a framework wake takes from a heartbeat's turn with no locus
@@ -21696,7 +21774,7 @@ export class AgentFramework {
     channel: ChannelRef,
     cause: string,
   ): { participant: string; content: ContentBlock[]; metadata: MessageMetadata; id: MessageId } | undefined {
-    if (sameChannel(routing.locus, channel)) return undefined;
+    if (routing.reply || sameChannel(routing.locus, channel)) return undefined;
     const prevPin = routing.locus ?? null;
     routing.locus = channel;
     noteTurnChannel(routing, channel);
@@ -22210,6 +22288,7 @@ export class AgentFramework {
     console.error(`[prose] ${agent.name}: '!' continuation — requesting immediate next turn`);
     this.pendingRequests.push({
       agentName: agent.name,
+      ...replyForNextTurn(routing),
       reason: 'prose-continuation',
       source: 'framework',
       timestamp: Date.now(),
@@ -22300,6 +22379,7 @@ export class AgentFramework {
         : {};
     this.pendingRequests.push({
       agentName: name,
+      ...replyForNextTurn(routing),
       reason: AUTO_CONTINUE_REASON,
       source: 'framework',
       timestamp: Date.now(),
@@ -22616,6 +22696,7 @@ export class AgentFramework {
     body: string,
     channel: ChannelRef,
     unsent: Draft | undefined,
+    binding?: ReplyBinding,
   ): Promise<PublishOutcome> {
     const registry = this.channelRegistry!;
     let attemptId: string | undefined;
@@ -22641,7 +22722,7 @@ export class AgentFramework {
     try {
       // Both callers hold a failed delivery's words as a bounce draft, whose
       // notice says what happened, so the registry writes no second marker.
-      outcome = await registry.deliverSpeech(agent.name, body, channel, { heldOnFailure: true });
+      outcome = await registry.deliverSpeech(agent.name, body, channel, { heldOnFailure: true, binding });
     } finally {
       if (flight) {
         this.draftsInFlight.delete(flight);
@@ -22737,7 +22818,7 @@ export class AgentFramework {
         return;
       }
       try {
-        const outcome = await this.deliverWithUnsent(agent, body, pinned, unsent.draft);
+        const outcome = await this.deliverWithUnsent(agent, body, pinned, unsent.draft, routing.reply);
         this.recordProseDelivery(routing, outcome.status === 'delivered' ? { delivered: true, ...outcome.destination! } : null);
         if (outcome.status === 'delivered') {
           routing.liveSpeech = true;
@@ -22781,7 +22862,7 @@ export class AgentFramework {
     }
     const target = sticky ?? locus;
     try {
-      const outcome = await this.channelRegistry!.routeSpeech(agent.name, envelope, target);
+      const outcome = await this.channelRegistry!.routeSpeech(agent.name, envelope, target, routing.reply);
       this.recordProseDelivery(routing, outcome);
       if (outcome?.delivered) {
         routing.liveSpeech = true;
@@ -22930,7 +23011,7 @@ export class AgentFramework {
 
     let delivered = false;
     try {
-      const outcome = await this.deliverWithUnsent(agent, body, targetChannel, unsent.draft);
+      const outcome = await this.deliverWithUnsent(agent, body, targetChannel, unsent.draft, round.routing.reply);
       delivered = outcome.status === 'delivered';
       if (delivered) {
         this.proseBounceStreaks.delete(name);
@@ -23214,6 +23295,19 @@ export class AgentFramework {
   ): Promise<void> {
     if (attempt === 0) this.deadlineCuts.delete(agent.name);
     const ownsProviderGate = this.registry.ownsProviderScheduling(agent.name);
+    const replyDisposition = this.replyStartDisposition(agent.name, trigger);
+    if (replyDisposition !== 'run') {
+      if (ownsProviderGate && providerGateAlreadyHeld) this.releasePrimaryProviderGate(agent.name);
+      if (replyDisposition === 'defer' && trigger) this.pendingRequests.push(trigger);
+      else {
+        if (trigger && continuesTurn(trigger)) {
+          this.endContinuedTurn(agent.name, { kind: 'dropped', why: 'its admitted reply owner ended' });
+        }
+        this.emitTrace({ type: 'inference:request_dropped', agentName: agent.name, reason: 'reply_owner_ended', requestCount: 1 });
+      }
+      return;
+    }
+
     // A stopping framework starts no turn, whoever owns provider admission
     // (conversation agents and ephemeral runs do not take the gate).
     if (this.providerAdmissionClosed) {
@@ -23749,6 +23843,7 @@ export class AgentFramework {
      *  operator's abandon. */
     checkWindow: CheckWindow,
   ): Promise<boolean> {
+    const requestedTrigger = trigger;
     const resumesTurn = resumesLogicalTurn(trigger?.reason);
     let carry = turnCarryOf(trigger);
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
@@ -23979,6 +24074,16 @@ export class AgentFramework {
         opensTurn = true;
       }
     }
+    if (opensTurn && workOf(trigger).length) {
+      routing.replyWorks = Object.freeze([...workOf(trigger)]);
+      routing.reply = turnReply(routing.replyWorks);
+    }
+    if (routing.reply && trigger) {
+      Object.assign(trigger, ownedReply(routing));
+      // A merged start may have shed its batch wrapper before opening. Its
+      // caller still holds that wrapper for setup retries and provider waits.
+      if (requestedTrigger && requestedTrigger !== trigger) Object.assign(requestedTrigger, ownedReply(routing));
+    }
     if (opensTurn) {
       const head = agent.branchHead();
       if (head) routing.start = head;
@@ -24028,9 +24133,9 @@ export class AgentFramework {
       // pair exactly, registered or not (channelNamed), as every selector
       // with a server does; while it isn't registered, the turn's speech to
       // it is refused, with no fallback either.
-      routing.triggerChannel = trigger?.channelId
+      routing.triggerChannel = routing.reply?.destination ?? (trigger?.channelId
         ? this.channelNamed(trigger.channelId, trigger.channelServerId)
-        : undefined;
+        : undefined);
       noteTurnChannel(routing, routing.triggerChannel);
       const unresolvedTrigger = !!trigger?.channelId && routing.triggerChannel === undefined;
       if (unresolvedTrigger) routing.noChannel = true;
@@ -24056,7 +24161,7 @@ export class AgentFramework {
       // stability).
       if (turnProseRouting !== 'explicit' && turnProseRouting !== 'disabled') {
         // None for a turn with no channel (noChannel), unless it's a fork's.
-        const locus = this.channelRegistry?.resolveLocus(agent.name) ?? null;
+        const locus = routing.reply?.destination ?? this.channelRegistry?.resolveLocus(agent.name) ?? null;
         if (locus !== null) {
           routing.locus = locus;
           noteTurnChannel(routing, locus);
@@ -24226,6 +24331,9 @@ export class AgentFramework {
         return false;
       }
       this.nameUnpostedSpeech(agent, routing);
+      if (routing.reply && !replyBindingCurrent(routing.reply)) {
+        injections = [...(injections ?? []), { namespace: 'automatic-reply', position: 'afterUser', content: [{ type: 'text', text: `[${NOTICE_TAG.proseRouting}] ${privateReplyNotice}` }] }];
+      }
 
       // The subconscious's standing dispositions ride a fixed system-position
       // injection (antra, #tuneout-talk): never repeated in its timeline, and
@@ -24692,6 +24800,7 @@ export class AgentFramework {
     // The turn-alive guard also keeps this turn's routing current at entry.
     // Retain it for queued deliveries and receipts after a tool ends the turn.
     const streamRouting = this.routingOf(agent.name);
+    this.replyStreamOwners.set(stream, streamRouting);
     let hadToolCalls = false;
     let generationLost = false;
 
@@ -25552,7 +25661,7 @@ export class AgentFramework {
                 // Restart inference inside this logical turn. No tool is
                 // executed again and no settle/checkpoint/locus reset occurs.
                 await this.startAgentStream(agent, withTurnCarry({
-                  ...trigger, agentName: agent.name, reason: 'tool_result_guard_retry',
+                  ...trigger, ...ownedReply(streamRouting), agentName: agent.name, reason: 'tool_result_guard_retry',
                   source: trigger?.source ?? 'framework', timestamp: Date.now(),
                 }, { silence, sends: turnSends, read: carry.read }), attempt);
                 return;
@@ -25863,6 +25972,7 @@ export class AgentFramework {
                 if (forced) forced.removed.push(rec);
                 this.pendingRequests.push({
                   agentName: agent.name,
+                  ...replyForNextTurn(streamRouting),
                   reason: forced ? 'unstick-retry' : 'refusal-rewind-retry',
                   source: 'framework',
                   timestamp: Date.now(),
@@ -32019,6 +32129,7 @@ export class AgentFramework {
     // Retry immediately on the repaired history (bounded by the cap above).
     this.pendingRequests.push({
       agentName: agent.name,
+      ...replyForNextTurn(this.turnRouting.get(agent.name)),
       reason: 'inference-failure-rewind-retry',
       source: 'framework',
       timestamp: Date.now(),
@@ -34830,6 +34941,18 @@ export class AgentFramework {
    * Push events and inference requests are deferred to Steps 6/7.
    */
   private wireMcplEvents(connection: McplServerConnection, config: McplServerConfig): void {
+    if (config.replyAuthority) {
+      const registrations = new WeakMap<object, object>();
+      connection.postAdmissionConsumer = replyConsumer(config.replyAuthority, (key, target) => {
+        const descriptor = this.channelRegistry?.getDescriptor(target);
+        if (!descriptor || this.mcplServerRegistry?.getServer(connection.id) !== connection ||
+          connection.requiredAdmission?.isCurrent(key) !== true || !connection.grant.has('channels.publish')) return false;
+        const original = registrations.get(target);
+        if (original && original !== descriptor) return false;
+        registrations.set(target, descriptor);
+        return true;
+      });
+    }
     const recorded = serverTextRedactor(config);
     type Responder = InboundResponder;
 
@@ -36501,7 +36624,7 @@ export class AgentFramework {
           const opened = data?.channelId && data.serverId
             ? { serverId: data.serverId, channelId: data.channelId }
             : asked?.channelId ? this.channelNamed(asked.channelId, asked.serverId) : undefined;
-          if (opened && callingTurn) {
+          if (opened && callingTurn && !callingTurn.reply) {
             callingTurn.triggerChannel = opened;
             noteTurnChannel(callingTurn, opened);
             const openerAgent = this.agents.get(agentName);
@@ -36941,7 +37064,7 @@ export class AgentFramework {
       const speaker = this.agents.get(agentName);
       const home = this.homeOf(agentName);
       const open = turn && this.openLogical.get(agentName) === turn ? turn : undefined;
-      if (open && open.locus == null && !open.noChannel && !open.heartbeat && !home
+      if (open && !open.reply && open.locus == null && !open.noChannel && !open.heartbeat && !home
         && (speaker?.proseRouting === 'locus' || speaker?.proseRouting === 'hybrid')) {
         open.locus = resolved;
         noteTurnChannel(open, resolved);
@@ -37028,6 +37151,7 @@ export class AgentFramework {
    */
   private admitInbound(env: InboundEnvelope): AdmissionDecision {
     const gateInfo = (e: InboundEnvelope) => ({
+      ...carryWork(e),
       content: e.gateContent,
       eventType: String(e.gateMetadata.eventType ?? 'unknown'),
       serverId: String(e.gateMetadata.serverId ?? e.serverId),
@@ -37200,7 +37324,7 @@ export class AgentFramework {
         // model has set one; otherwise stay quiet — never guess a channel.
         const target = callingTurn.pin;
         if (target) {
-          registry.routeSpeech(agentName, announcement(target), target).then(noted).catch((err) => {
+          registry.routeSpeech(agentName, announcement(target), target, callingTurn.reply).then(noted).catch((err) => {
             console.error('[sleep] announce failed:', err instanceof Error ? err.message : err);
           });
         } else {
@@ -37210,7 +37334,7 @@ export class AgentFramework {
         console.error(`[sleep] ${agentName}: a heartbeat turn has no channel — sleep announcement not posted`);
       } else {
         const locus = callingTurn.locus ?? null;
-        registry.routeSpeech(agentName, announcement(locus), locus).then(noted).catch((err) => {
+        registry.routeSpeech(agentName, announcement(locus), locus, callingTurn.reply).then(noted).catch((err) => {
           console.error('[sleep] announce failed:', err instanceof Error ? err.message : err);
         });
       }
