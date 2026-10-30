@@ -1,1 +1,1 @@
-- Where a failed tool's result held no `error`, for the `heartbeat`, `channels`, `gate`, `workspace` and `agent` modules' tools, its `tool:failed` trace had `error` `undefined`, against its type. It's now `tool returned an error`, as an MCPL tool's already was (#899).
+- Where a failed tool's result held no `error`, for the `heartbeat`, `channels`, `workspace` and `agent` modules' tools and the gate's wake-rule tools, its `tool:failed` trace had `error` `undefined`, against its type. It's now `tool returned an error`, as an MCPL tool's already was (#899).

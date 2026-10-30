@@ -1,4 +1,4 @@
-import type { TraceEventInput } from '../src/types/trace.js';
+import type { TraceEvent, TraceEventInput } from '../src/types/trace.js';
 import type { AgentFramework } from '../src/framework.js';
 import type { EventGate } from '../src/gate/event-gate.js';
 import type { ChannelRegistry } from '../src/mcpl/channel-registry.js';
@@ -19,6 +19,8 @@ function raisesOnlyListedTraces(raise: (event: TraceEventInput) => void): void {
   raise({ type: 'tool:failed' });
   // @ts-expect-error a field its member doesn't declare
   raise({ type: 'mcpl:coalescing', kind: 'revoked', subject: 's', eventId: 'e', unlisted: true });
+  // @ts-expect-error a timestamp, which the framework's emitTrace stamps
+  raise({ type: 'module:added', moduleName: 'm', timestamp: 0 });
 }
 void raisesOnlyListedTraces;
 
@@ -30,3 +32,6 @@ type CheckpointHook = Holds<Takes<ConstructorParameters<typeof CheckpointManager
 type InferenceHook = Holds<Takes<ConstructorParameters<typeof InferenceRouter>[4]>>;
 type FeatureSetHook = Holds<Takes<NonNullable<ConstructorParameters<typeof FeatureSetManager>[0]>>>;
 type TuneOutHook = Holds<Takes<TuneOutFrameworkHooks['emitTrace']>>;
+
+type NotCastable = { [Name in TraceEvent['type']]: Extract<TraceEvent, { type: Name }> extends Record<string, unknown> ? never : Name }[TraceEvent['type']];
+type EveryMemberTakesTheCast = Holds<Is<NotCastable, never>>;
