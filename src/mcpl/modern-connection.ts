@@ -66,7 +66,7 @@ import {
   type TransportSendOptions,
 } from '@modelcontextprotocol/client';
 
-import { STDERR_END_WAIT_MS, StdioTransport, type McplTransport, type TransportCloseInfo } from './transport.js';
+import { HeldStderr, STDERR_END_WAIT_MS, StdioTransport, type McplTransport, type TransportCloseInfo } from './transport.js';
 import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError, stderrTailOf, withStderr } from './server-connection.js';
 import { LEGACY_MCP_PROTOCOL_VERSION, MAX_TIMER_MS, MODERN_MCP_PROTOCOL_VERSION, checkServerConfig, describeCredentialError, logDroppedLine, maskedError, noteDialSent, redactServerText, redactedData, serverTextRedactor, type ServerTextRedactor } from './protocol-family.js';
 import type { McplServerConfig, McpToolDefinition } from './types.js';
@@ -79,8 +79,6 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 const CONNECT_TIMEOUT_MS = 30_000;
 /** Inventory listing has its own bound: it is host work, not a resident's call. */
 const LIST_TIMEOUT_MS = 30_000;
-/** Startup stderr kept for the first listener. */
-const STDERR_BACKLOG_LINES = 200;
 
 /** A modern tool result as the framework consumes it. `structuredContent` is
  *  kept by presence: `false`, `0` and `null` are values, not absence. */
@@ -463,10 +461,7 @@ export class ModernMcpConnection extends EventEmitter {
   /** A lost session's reap in flight: the reconnect follows it, and
    *  close() waits for it. */
   private losing: { session: Session; done: Promise<void> } | null = null;
-  /** Child stderr from before anyone listens (the caller attaches only once
-   *  connect() returns), delivered to the first listener. Bounded: the
-   *  newest lines are kept. */
-  private stderrBacklog: string[] = [];
+  private readonly heldStderr = new HeldStderr();
   private redactor?: ServerTextRedactor;
 
   /** The server's text with its configuration's credentials replaced, for
@@ -492,9 +487,8 @@ export class ModernMcpConnection extends EventEmitter {
       if (this.listenerCount('error') === 1) console.error(`[mcp] ${this.id}: ${redactServerText(error.message, this.config)}`);
     });
     this.on('newListener', (event: string | symbol) => {
-      if (event !== 'stderr' || this.stderrBacklog.length === 0) return;
-      const pending = this.stderrBacklog;
-      this.stderrBacklog = [];
+      if (event !== 'stderr' || this.heldStderr.empty) return;
+      const pending = this.heldStderr.take();
       // After the listener is added (newListener fires just before).
       queueMicrotask(() => { for (const line of pending) this.emit('stderr', { line }); });
     });
@@ -505,8 +499,7 @@ export class ModernMcpConnection extends EventEmitter {
       this.emit('stderr', { line });
       return;
     }
-    this.stderrBacklog.push(line);
-    if (this.stderrBacklog.length > STDERR_BACKLOG_LINES) this.stderrBacklog.shift();
+    this.heldStderr.hold(line);
   }
 
   /** The per-call deadline: `requestTimeoutMs`, validated positive. */

@@ -865,6 +865,7 @@ test('a stderr line of exactly the bound in UTF-16 code units, three times that 
   const transport = await StdioTransport.spawn({ id: 'stderr-at-bound', command: process.execPath, args: ['-e', script] });
   t.after(() => transport.close());
   await transport.stderrEnded(5_000);
+  assert.equal((transport as unknown as { stderrDone: boolean }).stderrDone, true, "the child's stderr ended before anything listened");
   const lines: string[] = [];
   transport.on('stderr', (line: string) => { lines.push(line); });
   await new Promise<void>((resolve) => { setImmediate(resolve); });
@@ -890,6 +891,7 @@ test('stderr that arrives before anything listens is held to the bound, each lin
   const transport = await StdioTransport.spawn({ id: 'stderr-flood', command: process.execPath, args: ['-e', script] });
   t.after(() => transport.close());
   await transport.stderrEnded(5_000);
+  assert.equal((transport as unknown as { stderrDone: boolean }).stderrDone, true, "the child's stderr ended before anything listened");
   const lines: string[] = [];
   transport.on('stderr', (line: string) => { lines.push(line); });
   await new Promise<void>((resolve) => { setImmediate(resolve); });

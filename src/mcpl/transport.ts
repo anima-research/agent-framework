@@ -57,24 +57,13 @@ export interface TransportCloseInfo {
  *  - `'unreaped'` `(failure: Error)`        a stdio child this transport was
  *    ending outlived SIGKILL too: the transport stays open, owning the
  *    child, and close() retries the reap (never WS)
- *
- * Inbound `'line'`/`'stderr'` events are buffered until the first matching
- * listener attaches (and re-buffered whenever there are none), so no `'line'`
- * is lost across the handshake→routing handoff regardless of attach timing.
- * Unread `'stderr'` lines are held to the line bound, each counted as its
- * length plus a per-line charge: past it the oldest whole lines are dropped,
- * the newest is always kept, and the first line a listener then gets says how
- * many were dropped.
  */
 export abstract class McplTransport extends EventEmitter {
   abstract readonly kind: 'stdio' | 'websocket';
 
   private _closed = false;
   private lineBuffer: string[] = [];
-  private stderrBuffer: string[] = [];
-  private stderrHead = 0;
-  private stderrBuffered = 0;
-  private stderrDropped = 0;
+  private readonly heldStderr = new HeldStderr();
 
   /** The server's id from its config, so a line the transport logs names it.
    *  The stdio and WebSocket transports always give it; a test's stand-in
@@ -87,15 +76,8 @@ export abstract class McplTransport extends EventEmitter {
         const pending = this.lineBuffer;
         this.lineBuffer = [];
         queueMicrotask(() => { for (const l of pending) this.emit('line', l); });
-      } else if (event === 'stderr' && (this.stderrBuffer.length > this.stderrHead || this.stderrDropped > 0)) {
-        const held = this.stderrBuffer.slice(this.stderrHead);
-        const pending = this.stderrDropped > 0
-          ? [`[${this.stderrDropped.toLocaleString('en-US')} earlier stderr line${this.stderrDropped === 1 ? ' was' : 's were'} dropped: unread stderr is held to ${(testLineBound ?? MAX_LINE_CHARS).toLocaleString('en-US')} UTF-16 code units, each line counted as its length plus ${STDERR_LINE_CHARGE}]`, ...held]
-          : held;
-        this.stderrBuffer = [];
-        this.stderrHead = 0;
-        this.stderrBuffered = 0;
-        this.stderrDropped = 0;
+      } else if (event === 'stderr' && !this.heldStderr.empty) {
+        const pending = this.heldStderr.take();
         queueMicrotask(() => { for (const l of pending) this.emit('stderr', l); });
       }
     });
@@ -151,22 +133,8 @@ export abstract class McplTransport extends EventEmitter {
 
   /** Deliver a diagnostic line, buffering it if nobody is listening yet. */
   protected pushStderr(line: string): void {
-    if (this.listenerCount('stderr') > 0) {
-      this.emit('stderr', line);
-      return;
-    }
-    this.stderrBuffer.push(line);
-    this.stderrBuffered += line.length + STDERR_LINE_CHARGE;
-    const ceiling = testLineBound ?? MAX_LINE_CHARS;
-    while (this.stderrBuffered > ceiling && this.stderrHead < this.stderrBuffer.length - 1) {
-      this.stderrBuffered -= this.stderrBuffer[this.stderrHead].length + STDERR_LINE_CHARGE;
-      this.stderrBuffer[this.stderrHead++] = '';
-      this.stderrDropped++;
-    }
-    if (this.stderrHead > 1024 && this.stderrHead * 2 > this.stderrBuffer.length) {
-      this.stderrBuffer = this.stderrBuffer.slice(this.stderrHead);
-      this.stderrHead = 0;
-    }
+    if (this.listenerCount('stderr') > 0) this.emit('stderr', line);
+    else this.heldStderr.hold(line);
   }
 
   /**
@@ -631,6 +599,46 @@ let testLineBound: number | undefined;
 // times the ceiling in memory. Charging each held line 16 code units more
 // keeps what unread stderr holds within about 3 bytes a counted code unit.
 const STDERR_LINE_CHARGE = 16;
+
+export class HeldStderr {
+  private lines: string[] = [];
+  private head = 0;
+  private counted = 0;
+  private dropped = 0;
+
+  get empty(): boolean {
+    return this.head === this.lines.length && this.dropped === 0;
+  }
+
+  hold(line: string): void {
+    // V8 can make a line split from a longer string a slice that keeps the
+    // whole string alive, so a held line is copied to own only its characters.
+    this.lines.push(Buffer.from(line, 'utf16le').toString('utf16le'));
+    this.counted += line.length + STDERR_LINE_CHARGE;
+    const ceiling = testLineBound ?? MAX_LINE_CHARS;
+    while (this.counted > ceiling && this.head < this.lines.length - 1) {
+      this.counted -= this.lines[this.head].length + STDERR_LINE_CHARGE;
+      this.lines[this.head++] = '';
+      this.dropped++;
+    }
+    if (this.head > 1024 && this.head * 2 > this.lines.length) {
+      this.lines = this.lines.slice(this.head);
+      this.head = 0;
+    }
+  }
+
+  take(): string[] {
+    const held = this.lines.slice(this.head);
+    const taken = this.dropped > 0
+      ? [`[${this.dropped.toLocaleString('en-US')} earlier stderr line${this.dropped === 1 ? ' was' : 's were'} dropped: unread stderr is held to ${(testLineBound ?? MAX_LINE_CHARS).toLocaleString('en-US')} UTF-16 code units, each line counted as its length plus ${STDERR_LINE_CHARGE}]`, ...held]
+      : held;
+    this.lines = [];
+    this.head = 0;
+    this.counted = 0;
+    this.dropped = 0;
+    return taken;
+  }
+}
 
 /** @internal */
 export function setStdioLineBoundForTests(maxChars: number | undefined): void {
