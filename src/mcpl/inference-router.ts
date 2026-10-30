@@ -224,13 +224,14 @@ export class InferenceRouter {
     params: McplInferenceRequestParams,
     responder: Responder,
     admission?: RequiredIngress,
+    dispatched?: () => void,
   ): Promise<void> {
     const stop = new AbortController();
     let ended!: () => void;
     const entry = { serverId, stop, answered: new Promise<void>((resolve) => { ended = resolve; }) };
     this.running.add(entry);
     try {
-      await this.answer(serverId, params, responder, stop.signal, admission);
+      await this.answer(serverId, params, responder, stop.signal, admission, dispatched);
     } finally {
       this.running.delete(entry);
       ended();
@@ -250,6 +251,7 @@ export class InferenceRouter {
     responder: Responder,
     stopped: AbortSignal,
     admission?: RequiredIngress,
+    dispatched?: () => void,
   ): Promise<void> {
     // 1. Validate feature set
     try {
@@ -416,9 +418,14 @@ export class InferenceRouter {
     try {
       // 5. Run inference. Both modes end in membrane's response, and one
       // builder makes the result from it.
-      const response = chunkRequestId != null
-        ? await this.streamResponse(request, chunkRequestId, sendChunk!, signal)
-        : await this.membrane.complete(request, { ...this.wholeCallBound(request), signal });
+      const pending = chunkRequestId != null
+        ? this.streamResponse(request, chunkRequestId, sendChunk!, signal)
+        : this.membrane.complete(request, { ...this.wholeCallBound(request), signal });
+      // Admission and synchronous dispatch are complete. A held-data drain
+      // may continue without waiting for model latency; this router and the
+      // contained handler still own cancellation, failure and the final reply.
+      dispatched?.();
+      const response = await pending;
       if (settled()) return;
 
       // 6. Answer

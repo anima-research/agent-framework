@@ -34842,7 +34842,7 @@ export class AgentFramework {
       handler: (params: T, responder?: Responder) => void | Promise<void>,
     ): void => {
       const trackCompletion = connection.requiredAdmission && ['push-event', 'channels-incoming', 'inference-request'].includes(event)
-        ? (params: T, completion: Promise<void>) => connection.trackHeldHandler(params, completion)
+        ? (_params: T, completion: Promise<void>) => connection.trackHeldHandler(event, completion)
         : undefined;
       connection.on(event, this.containedInboundHandler(connection.id, event, handler, recorded, trackCompletion));
     };
@@ -34959,7 +34959,7 @@ export class AgentFramework {
             respond: responder.respond, respondError: responder.respondError, requestId: responder.id,
             ...(responder.sendChunk ? { sendChunk: responder.sendChunk } : {}),
             ...(responder.signal ? { signal: responder.signal } : {}),
-          }, admission);
+          }, admission, connection.heldInferenceDispatch());
           return;
         }
         await this.inferenceRouter.handleInferenceRequest(connection.id, params, {

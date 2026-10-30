@@ -462,11 +462,23 @@ export class McplServerConnection extends EventEmitter {
   private requiredFlushActive = false;
   private requiredFlushItem?: HeldItem;
   private requiredFlushCompletion?: Promise<void>;
+  private requiredFlushDispatched?: Promise<void>;
 
   /** @internal The contained framework handler supplies completion for the
-   * currently flushed item, including notifications and whole channel batches. */
-  trackHeldHandler(params: unknown, completion: void | Promise<void>): void {
-    if (this.requiredFlushItem && this.requiredFlushItem.args[0] === params) this.requiredFlushCompletion = completion || undefined;
+   * currently flushed event, including notifications and whole channel batches.
+   * Pair by synchronous dispatch, not by potentially cloned handler params. */
+  trackHeldHandler(event: string, completion: void | Promise<void>): void {
+    if (this.requiredFlushItem?.event === event) this.requiredFlushCompletion = completion || undefined;
+  }
+
+  /** @internal Capture the current held inference's dispatch milestone before
+   * its first await. The full contained handler remains the fallback for
+   * refusals/errors before dispatch, and still owns the eventual reply. */
+  heldInferenceDispatch(): (() => void) | undefined {
+    if (this.requiredFlushItem?.event !== 'inference-request') return undefined;
+    let dispatched!: () => void;
+    this.requiredFlushDispatched = new Promise<void>(resolve => { dispatched = resolve; });
+    return dispatched;
   }
 
   private readonly admissionEpochs = new WeakMap<object, number>();
@@ -922,7 +934,7 @@ export class McplServerConnection extends EventEmitter {
     }
   }
 
-  /** Required backlogs release one complete data handler at a time. Control
+  /** Required backlogs release one admission and dispatch at a time. Control
    * traffic and RPC responses stay live; new data joins the bounded backlog. */
   private async flushRequiredHeld(): Promise<void> {
     try {
@@ -941,15 +953,18 @@ export class McplServerConnection extends EventEmitter {
         const ended = this.transportEnded.signal;
         this.requiredFlushItem = item;
         this.requiredFlushCompletion = undefined;
+        this.requiredFlushDispatched = undefined;
         try { this.dispatchInboundEvent(item.event, ...item.args); }
         finally { this.requiredFlushItem = undefined; }
         const completion = this.requiredFlushCompletion;
+        const dispatched = this.requiredFlushDispatched;
         this.requiredFlushCompletion = undefined;
+        this.requiredFlushDispatched = undefined;
         if (completion && !ended.aborted) {
           let release!: () => void;
           const boundary = new Promise<void>(resolve => { release = resolve; });
           ended.addEventListener('abort', release, { once: true });
-          try { await Promise.race([completion, boundary]); }
+          try { await Promise.race(dispatched ? [completion, dispatched, boundary] : [completion, boundary]); }
           finally { ended.removeEventListener('abort', release); }
         }
       }

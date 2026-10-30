@@ -44,12 +44,18 @@ Required traffic is authorized before admission. Data received after initialize
 is held during startup staging, policy exchange and quiesce just like unconfigured
 traffic. At flush it is authorized against the current grant and admitted under
 the current key. Superseded-epoch items are refused as `admission_stale`, never
-rebound. Required backlogs drain one complete data handler at a time in arrival
-order, including every item of a channel batch. A flush waits for any pre-pause
+rebound. Required backlogs drain one admission and its synchronous dispatch/storage
+effects at a time in arrival order, including every item of a channel batch. A held
+inference releases the drain after provider dispatch, not after the model finishes;
+its handler still owns cancellation, failures and the eventual reply. A flush waits for any pre-pause
 callbacks still occupying all admission slots instead of refusing held work as
 overload. New data arriving during the drain joins the same bounded hold buffer;
-control traffic and RPC responses remain live. A slow handler delays later held
-data, and time waiting in the hold buffer is outside the admission timeout.
+control traffic and RPC responses remain live. Time waiting in the hold buffer is
+outside the admission timeout. While a backlog drains, required data (held and
+newly arriving) is admitted one at a time, so sustained ingress above roughly one
+item per callback latency accumulates and is dropped/refused at the existing hold
+bounds. A bounded-concurrency ordered drain is a possible follow-up, at the
+maintainer's discretion; it is not implemented here.
 
 Without a backlog, independently sent live items still run admission concurrently:
 callback latency can reorder them. Items within a channel batch remain sequential.
