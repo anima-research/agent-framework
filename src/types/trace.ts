@@ -945,8 +945,9 @@ export type TraceEvent =
     })
 
   // Dendrite: agent registry and lifecycle.
-  // `agent-created` is the consent event: it names the kind of agent, what
-  // ends it, and what happens to it when its spawner ends.
+  // `agent-created` is the creation event: it names the kind of agent, what
+  // ends it, and what happens to it when its spawner ends, for whatever a
+  // host records or decides on them.
   | (TraceEventBase & {
       type: 'dendrite:agent-created';
       agentName: string;

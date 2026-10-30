@@ -11317,7 +11317,7 @@ export class AgentFramework {
 
   /**
    * The default wording for the call that derived a child: who it is, what
-   * kind, and how long — the fields the consent event names, so the fork
+   * kind, and how long — the fields the creation event names, so the fork
    * never has to infer its own lifetime from context (Linn, 10-09).
    */
   private derivedNote(parentName: string, options: DeriveAgentOptions): string {
@@ -12154,10 +12154,9 @@ export class AgentFramework {
   }
 
   /**
-   * The creation ("consent") event: names what kind of agent this is, what
-   * ends it and what happens to it when its spawner ends. A derived agent's
-   * creation is also told to the agent it was derived from (#270, Linn:
-   * "told when the body changes" as a property, not a courtesy): one
+   * The creation event: names what kind of agent this is, what ends it and
+   * what happens to it when its spawner ends. A derived agent's creation is
+   * also told to the agent it was derived from by default (#270): one
    * host-framed line in the source's context, built from the same facts as
    * the trace, with no wake; a host's derivationNotice can replace the line
    * or send none. Both derivation paths announce after the
@@ -17369,9 +17368,10 @@ export class AgentFramework {
           'class and configuration to reuse its fold state and rendering',
       );
     }
-    // Whose weights read the resident's prefix is never defaulted. The
-    // resident's own model is the copy; another is allowed when stated, so
-    // the resident's consent can name it (architecture channel, 10-09).
+    // Whose weights read the resident's prefix is never defaulted: the
+    // resident's own model, or another when stated, so the configuration
+    // says which, and the trace and beforeDerive carry it (architecture
+    // channel, 10-09).
     if (typeof cfg.model !== 'string' || cfg.model.length === 0) {
       throw new Error(
         `subconscious.reader "forks": a reader fork holds the whole prefix of "${primaryName}", so \`model\` ` +

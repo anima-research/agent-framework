@@ -215,9 +215,10 @@ export interface ForkReaderConfig extends SubconsciousConfigBase {
   reader: 'forks';
   /**
    * Whose weights run the fork. Required, never defaulted: a fork holds the
-   * resident's whole prefix, and which model reads it is the one fact the
-   * resident's consent names. The resident's own model is the copy; another
-   * model is allowed when stated here. `create` refuses the omission.
+   * resident's whole prefix, and which model reads it is recorded on each
+   * fork's `dendrite:agent-created` trace and is what a host's
+   * `dendrite.beforeDerive` can decide on. The resident's own model, or
+   * another model stated here. `create` refuses the omission.
    */
   model: string;
   /**

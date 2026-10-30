@@ -263,9 +263,10 @@ export interface AgentSpec {
   kind: AgentKind;
   /**
    * The model the agent runs on — "whose weights", next to `inherit.from`
-   * for "whose context". Together they are what a consent decision about a
-   * derived agent is made on. Filled by the framework from the agent's
-   * configuration.
+   * for "whose context". Both are on the `dendrite:agent-created` trace and
+   * in the spec a host's `dendrite.beforeDerive` decides on, which the
+   * framework gives no meaning of its own. Filled by the framework from the
+   * agent's configuration.
    */
   model?: string;
   roles: AgentRoles;
