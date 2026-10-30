@@ -1,4 +1,5 @@
 import { admissionRoutingFields } from './reply-admission.js';
+import { isReplyBinding, replyBindingCurrent, privateReplyNotice, type ReplyBinding } from './reply-routing.js';
 /**
  * ChannelRegistry — manages MCPL channel lifecycle, incoming messages, and
  * synthesized channel tools.
@@ -5952,13 +5953,37 @@ export class ChannelRegistry {
        *  for this publish is logged under `[routeSpeech]`, with speech
        *  routing's other lines. */
       routed?: boolean;
+      binding?: ReplyBinding;
     },
     openSource: 'opened-by-delivery' | 'opened-by-reply' = 'opened-by-delivery',
   ): Promise<PublishOutcome> {
+    target = { ...target };
     const at = (): number => Date.now();
+    const routingRefusal = (): string | undefined => {
+      const peer = target.serverId ? this.serverRegistry.getServer(target.serverId) : undefined;
+      const binding = target.binding;
+      if (target.routed && (binding || peer?.requiresReplyBinding)) {
+        if (!isReplyBinding(binding)) return 'automatic_reply_binding_missing';
+        if (!binding.destination) return 'automatic_reply_destination_missing';
+        if (!sameChannel(binding.destination, target as ChannelRef)) return 'automatic_reply_target_mismatch';
+        if (!peer?.requiredAdmission?.isCurrent(binding.connection) || !replyBindingCurrent(binding)) return 'automatic_reply_stale';
+        if (!CapabilityGrant.of(peer).has('channels.publish')) return 'automatic_reply_ungranted';
+      }
+    };
+    const refused = (): PublishOutcome | undefined => {
+      const reason = routingRefusal();
+      return reason ? { status: 'failed', reason, at: at() } : undefined;
+    };
+    const initialRefusal = refused();
+    if (initialRefusal) return initialRefusal;
     const found = this.findExactEntry(target);
     if ('error' in found) return { status: 'failed', reason: found.error, at: at() };
     let entry = found.entry;
+    target.serverId = entry.serverId;
+    const resolvedRefusal = refused();
+    if (resolvedRefusal) return resolvedRefusal;
+    const boundEntry = target.binding ? entry : undefined;
+    const boundDescriptor = boundEntry?.descriptor;
     const destination: PublishDestination = {
       serverId: entry.serverId,
       channelId: entry.descriptor.id,
@@ -6015,6 +6040,9 @@ export class ChannelRegistry {
     // transport is still open (a close that failed), as a reply would engage
     // it, wherever an open can succeed, unless that close is the agent's or
     // a module's own.
+    const beforeOpen = refused();
+    if (beforeOpen) return beforeOpen;
+    if (boundEntry && (this.channels.get(destinationKey(destination)) !== boundEntry || boundEntry.descriptor !== boundDescriptor)) return { status: 'failed', destination, reason: 'automatic_reply_stale', at: at() };
     if (this.speechOpens(refOf(entry))) {
       try {
         const { opened } = await this.openChannelNow(entry, openSource);
@@ -6098,6 +6126,9 @@ export class ChannelRegistry {
       return { status: 'failed', destination, reason: this.sendRefusal(entry.serverId, server), at: at() };
     }
 
+    const beforeSend = refused();
+    if (beforeSend) return beforeSend;
+    if (boundEntry && (current !== boundEntry || current.descriptor !== boundDescriptor || this.serverRegistry.getServer(entry.serverId) !== server)) return { status: 'failed', destination, reason: 'automatic_reply_stale', at: at() };
     let result: unknown;
     try {
       result = await server.sendChannelsPublish({
@@ -6139,7 +6170,7 @@ export class ChannelRegistry {
     /** `heldOnFailure`: the caller holds a `failed` delivery's words as a
      *  draft with its own notice, so no failure marker is written for it.
      *  An `unknown` outcome still gets its marker. */
-    opts?: { heldOnFailure?: boolean },
+    opts?: { heldOnFailure?: boolean; binding?: ReplyBinding },
   ): Promise<PublishOutcome> {
     // `logged` is what the log line and the trace say, where it isn't the
     // agent's reason (the two no-locus reasons below).
@@ -6165,7 +6196,7 @@ export class ChannelRegistry {
           reason, textLen: text.length, outcome: status, ...(detail !== undefined ? { detail } : {}),
         });
       }
-      return outcome;
+      return outcome.reason?.startsWith('automatic_reply_') ? { ...outcome, reason } : outcome;
     };
 
     // These two reasons are the only ones whose log line and trace keep the
@@ -6177,6 +6208,9 @@ export class ChannelRegistry {
     // Runtime backstop for JS callers the compiler can't see: an omitted
     // locus is a routing bug at the call site, never something to paper over
     // with a live re-resolution.
+    if (opts?.binding && !opts.binding.destination) {
+      return fail(null, privateReplyNotice, { status: 'failed', reason: 'automatic_reply_destination_missing', at: Date.now() }, 'automatic_reply_destination_missing');
+    }
     if (locus === undefined) {
       const reason = 'the host lost track of which channel this reply was for; if this keeps happening, ask whoever runs this host';
       return fail(null, reason, { status: 'failed', reason, at: Date.now() },
@@ -6199,10 +6233,10 @@ export class ChannelRegistry {
         'turn has no locus (no home/trigger channel; nothing to deliver into)');
     }
 
-    const outcome = await this.publish(conversationId, text, { serverId: locus.serverId, channelId: locus.channelId, routed: true });
+    const outcome = await this.publish(conversationId, text, { serverId: locus.serverId, channelId: locus.channelId, routed: true, binding: opts?.binding });
     const channelId = outcome.destination?.channelId ?? locus.channelId;
     if (outcome.status !== 'delivered') {
-      return fail(outcome.destination ?? locus, outcome.reason ?? 'delivery not confirmed', outcome);
+      return fail(outcome.destination ?? locus, outcome.reason?.startsWith('automatic_reply_') ? privateReplyNotice : outcome.reason ?? 'delivery not confirmed', outcome, outcome.reason);
     }
 
     console.error(`[routeSpeech] ${conversationId}: routed ${text.length} chars -> ${logValue(channelId)} (server=${outcome.destination!.serverId}, delivered=true)`);
@@ -6227,8 +6261,9 @@ export class ChannelRegistry {
     conversationId: string,
     text: string,
     locus: ChannelRef | null,
+    binding?: ReplyBinding,
   ): Promise<{ delivered: boolean; serverId: string; channelId: string; messageId?: string } | null> {
-    const outcome = await this.deliverSpeech(conversationId, text, locus);
+    const outcome = await this.deliverSpeech(conversationId, text, locus, { binding });
     if (outcome.status !== 'delivered') return null;
     return {
       delivered: true,

@@ -221,3 +221,4 @@ export {
 export type { InboundAdmissionConfig, AdmissionInput, AdmissionVerdict, AdmitInbound, AdmissionLane, ConnectionKey, RefusalCode } from './mcpl/inbound-admission.js';
 
 export { admissionOf, AdmissionConnectError, MAX_ADMISSION_TIMEOUT_MS, MAX_PENDING_ADMISSIONS, type AdmittedEnvelope } from './mcpl/inbound-admission.js';
+export type { ReplyDestination, ReplyAuthorityConfig } from './mcpl/reply-routing.js';

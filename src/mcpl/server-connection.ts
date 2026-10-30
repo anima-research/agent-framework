@@ -486,6 +486,7 @@ export class McplServerConnection extends EventEmitter {
   private readonly admissionEpochs = new WeakMap<object, number>();
   /** Installed by the framework before the ready planes open. */
   postAdmissionConsumer?: PostAdmissionConsumer;
+  requiresReplyBinding = false;
   private readonly admissionReceipts = new WeakMap<object, RequiredIngress>();
 
   /** Only transport receipt creates an ingress key; never reconstruct one downstream. */
@@ -1362,11 +1363,20 @@ export class McplServerConnection extends EventEmitter {
    *  (and warned about) once. `signal` ends the connect at once, its launch
    *  reaped as for any failed handshake: its caller's stop() or a
    *  disconnect of its id. */
+  private static snapshotReplyConfig(config: McplServerConfig): McplServerConfig {
+    if (config.replyAuthority === undefined) return config;
+    return {
+      ...config,
+      ...(config.replyAuthority ? { replyAuthority: Object.freeze({ ...config.replyAuthority }) } : {}),
+    };
+  }
+
   private static async connectChecked(
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
     signal?: AbortSignal,
   ): Promise<McplServerConnection> {
+    config = McplServerConnection.snapshotReplyConfig(config);
     const admission = config.inboundAdmission === undefined ? undefined : new RequiredAdmission(config.inboundAdmission, config.id);
     let established: Awaited<ReturnType<typeof McplServerConnection.handshake>>;
     try {
@@ -1382,6 +1392,7 @@ export class McplServerConnection extends EventEmitter {
     const { transport, capabilities, droppedCapabilities, mcpToolsAdvertised, protocolVersion, toolsetDeclarations } = established;
 
     const connection = new McplServerConnection(config.id, capabilities, transport, admission);
+    connection.requiresReplyBinding = config.replyAuthority !== undefined;
     connection.toolsetDeclarations = toolsetDeclarations;
     connection.droppedCapabilities = droppedCapabilities;
     connection.mcpToolsAdvertised = mcpToolsAdvertised;
@@ -1678,6 +1689,7 @@ export class McplServerConnection extends EventEmitter {
   ): Promise<McplServerConnection> {
     // Outside the retry path below: a configuration error is never retried.
     McplServerConnection.checkConfig(config);
+    config = McplServerConnection.snapshotReplyConfig(config);
     try {
       return await McplServerConnection.connectChecked(config, hostCapabilities, signal);
     } catch (error) {
@@ -1717,6 +1729,7 @@ export class McplServerConnection extends EventEmitter {
     stub.closed = true;
     stub.requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     stub.config = config;
+    stub.requiresReplyBinding = config.replyAuthority !== undefined;
     stub.hostCapabilities = hostCapabilities;
     stub.reconnectEnabled = config.reconnect === true;
     stub.reconnectIntervalMs = config.reconnectIntervalMs ?? 5000;
