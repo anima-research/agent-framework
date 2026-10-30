@@ -410,6 +410,16 @@ export interface ModuleContext {
    * Writes a release before #291 held and kept across a restart are
    * stored once create() imports them, which is after every module's
    * start().
+   * A write whose store throws after rows of it landed is answered by the
+   * first of them, as stored (context-manager's WriteLandedError names
+   * them). One whose store throws where the store can't be read to tell
+   * what of it landed throws context-manager's WriteOutcomeUnknownError,
+   * which names the rows it knows are stored (`landed`, presented as a
+   * stored write's rows are) and counts those it can't (`unknown`,
+   * `unnamed`): the write may be stored, in part or whole, or not at all,
+   * and isn't answered as stored. A read of the store tells, once the store
+   * reads: queryMessages, or findMessageByExternalId for a write that
+   * carried `metadata.external`. Any other error means none of it is stored.
    *
    * With `opts.forAgent`, it's added to the named agent's window instead: a
    * conversation fork's or a running sub-agent's own store, or, for an
@@ -472,9 +482,10 @@ export interface ModuleContext {
    * Find the message for an external ID this context added a message under:
    * the row it added, while the store holds it. For a write whose id this
    * context doesn't keep (one kept in memory, by an operator's surgery or
-   * for its agent's recovery, or one a release
-   * before #291 held, whose map it kept as ''), the first row the store
-   * shows under that external ID. Null when this context added none under
+   * for its agent's recovery, one whose store threw where context-manager
+   * couldn't tell whether it landed (WriteOutcomeUnknownError), or one a
+   * release before #291 held, whose map it kept as ''), the first row the
+   * store shows under that external ID. Null when this context added none under
    * it, when the row it added is gone, or when the store shows none for
    * such a write, as for one an earlier release left queued, looked up in
    * start() before create() imports it.

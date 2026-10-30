@@ -18,7 +18,18 @@
   write path the release replays (an inbound channel message or push, a fork's channel message, a module's write):
   context-manager names those rows (`WriteLandedError`), and the write is placed, presented and answered by them as
   if its store hadn't thrown, the throw logged. So a coalesced occurrence stored that way isn't stored again as its
-  fallback, and a surgery's release traces such a write as stored; any other throw means none of the write landed.
+  fallback, and a surgery's release traces such a write as stored. One whose store throws where the store can't be
+  read to tell what of it landed (`WriteOutcomeUnknownError`, which names the rows context-manager knows are stored
+  and counts those it can't name) is answered by that error, not as stored, on the same paths, the rows it names
+  presented and the throw logged. A module's `addMessage` throws it, and a write that carried `metadata.external` is
+  then looked up in the store by `findMessageByExternalId`. A surgery's release counts such a write as one that may
+  be lost: it traces the first row named as stored, and its `store-held-lost` alert says the write may be lost,
+  naming the rows the store holds and may hold (`data.mayBeStored`: `count`, `landed`, `unknown`, `unnamed`). A
+  coalesced render's delivery stores nothing then: its batch's recovery wake delivers it again saying it may be
+  stored, and the agent's store is read back first for the occurrence's rows, by the subject and event id they carry.
+  Rows found are placed as the delivery, and no fallback is stored; with none found, the fallback is stored; and
+  where the store still can't be read, the fallback is stored and a line logged names the occurrence the agent may
+  then see twice. Any other throw means none of the write landed.
   A tune-out's cancel asked for meanwhile (its end time passing, a wake past its budget, a tool's or a host's
   cancel), or while the primary's or the subconscious's context manager refuses its work before anything is kept for
   it, waits, the tune-out in force, until the release has stored the writes, or told of those it couldn't, then runs,

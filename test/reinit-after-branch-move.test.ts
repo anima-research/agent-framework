@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { cpSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { AutobiographicalStrategy, ContextManager as StoreWindow, PassthroughStrategy } from '@animalabs/context-manager';
+import { AutobiographicalStrategy, ContextManager as StoreWindow, PassthroughStrategy, WriteOutcomeUnknownError } from '@animalabs/context-manager';
 import { JsStore } from '@animalabs/chronicle';
 import type {
   ContextEntry,
@@ -927,6 +927,156 @@ describe('after a branch move, every agent on the store compiles without a resta
     assert.equal(readBack, 0, "the store isn't read back");
   });
   }
+
+  // Where the store can't be read to tell what of a write landed,
+  // context-manager says so (WriteOutcomeUnknownError), naming the rows it
+  // knows are stored and counting those it can't name: a sharded write whose
+  // own listener fails after its second shard's append, whose landing the
+  // store's tail can't be read to tell, and whose removal of the first shard
+  // fails too, as in its own write-landed tests. The release counts the write
+  // as one that may be lost, not as lost or stored: the row named as stored is
+  // presented and traced, and the alert names it and the row the store may
+  // hold besides.
+  it("a held write whose store throws at the release where context-manager can't tell what of it landed may be lost: the row it names as stored is presented and traced, and the alert says the write may be lost, naming that row and the one the store may hold", async () => {
+    const added = addedTraces();
+    const cm = cmOf('b') as unknown as {
+      handleMessageStoreEvent: (event: { type: string }) => void;
+      messageStore: { getTail: (...args: unknown[]) => unknown; removeBodyGroup: (...args: unknown[]) => unknown };
+    };
+    const store = cm.messageStore;
+    const { handleMessageStoreEvent } = cm;
+    const { getTail, removeBodyGroup } = store;
+    // Over twice the strategy's chunk size (adaptive resolution), so it is stored in shards.
+    const body = 'for b, during the hold: ' + 'heldbody lorem ipsum. '.repeat(1_500);
+    let adds = 0;
+    let threw = 0;
+    let tailUnreadable = false;
+    let removalFails = false;
+    const quiet = console.error;
+    const logged: string[] = [];
+    console.error = (...args: unknown[]) => { logged.push(args.map((a) => (a instanceof Error ? a.message : String(a))).join(' ')); };
+    try {
+      const pass = gatedSwitch('a');
+      await pass.reached;
+      holdFor('b', body);
+      cm.handleMessageStoreEvent = (event: { type: string }) => {
+        handleMessageStoreEvent.call(cm, event);
+        if (threw === 0 && event.type === 'add' && JSON.stringify(event).includes('heldbody') && ++adds === 2) {
+          threw++;
+          tailUnreadable = true;
+          removalFails = true;
+          throw new Error('injected failure after the second shard landed');
+        }
+      };
+      store.getTail = (...args: unknown[]) => {
+        if (tailUnreadable) {
+          tailUnreadable = false;
+          throw new Error('injected unreadable store');
+        }
+        return getTail.apply(store, args);
+      };
+      store.removeBodyGroup = (...args: unknown[]) => {
+        if (removalFails) {
+          removalFails = false;
+          throw new Error('injected removal failure');
+        }
+        return removeBodyGroup.apply(store, args);
+      };
+      pass.open();
+      await pass.switched;
+    } finally {
+      cm.handleMessageStoreEvent = handleMessageStoreEvent;
+      store.getTail = getTail;
+      store.removeBodyGroup = removeBodyGroup;
+      console.error = quiet;
+    }
+    assert.equal(threw, 1, "premise: context-manager's own listener failed after the second shard landed");
+    const rows = cmOf('b').getAllMessages().filter((m) => JSON.stringify(m.content).includes('heldbody'));
+    assert.equal(rows.length, 2, 'premise: the first shard stayed, and so did the second, whose landing the store could not be read to tell');
+    const [first] = rows;
+    const lost = traces.filter((t): t is Extract<TraceEvent, { type: 'ops:alert' }> => t.type === 'ops:alert' && t.kind === 'store-held-lost');
+    assert.equal(lost.length, 1, 'told of once');
+    says(lost[0]!.message, '1 write for b, accepted and kept in memory', 'threw when stored there', 'injected failure after the second shard landed',
+      "The store couldn't be read back to tell whether it landed, so it may be lost.",
+      `Of it, row ${first!.id} is stored, presented and traced, and the store may hold a row it has no id for.`,
+      'The writes after it went on.');
+    assert.ok(!lost[0]!.message.includes('It is lost') && !lost[0]!.message.includes('not stored'), lost[0]!.message);
+    assert.deepEqual(lost[0]!.data, {
+      count: 1, keptForRecovery: 0, heldBySurgery: 1, kinds: { message: 1 }, mail: 0,
+      mayBeStored: { count: 1, landed: [first!.id], unknown: [], unnamed: 1 },
+    });
+    assert.equal(cmOf('b').windowStatusOf(first!.id), 'in', "the row named as stored is presented to b, whose turn isn't alive");
+    assert.deepEqual(added.filter((a) => a.source === 'surgery-release'), [{ messageId: first!.id, source: 'surgery-release' }], 'and traced');
+    assert.ok(
+      logged.some((line) => line.includes("context-manager can't tell what of it landed") && line.includes(`row ${first!.id} of it is stored`)
+        && line.includes('a row it has no id for') && line.includes('so it may be lost')),
+      logged.join('\n'),
+    );
+    await framework.switchBranch(framework.getStore().currentBranch().name);
+  });
+
+  // The same failure outside a hold, for a module's write: it is answered by
+  // context-manager's error, not as stored, the row the error names as stored
+  // presented, and the write's external id is looked up in the store.
+  it("a module's write whose store can't tell what of it landed throws context-manager's error: the row it names as stored is presented, and findMessageByExternalId finds the write's first row in the store", async () => {
+    const cm = cmOf('a') as unknown as {
+      handleMessageStoreEvent: (event: { type: string }) => void;
+      messageStore: { getTail: (...args: unknown[]) => unknown; removeBodyGroup: (...args: unknown[]) => unknown };
+    };
+    const store = cm.messageStore;
+    const { handleMessageStoreEvent } = cm;
+    const { getTail, removeBodyGroup } = store;
+    const body = 'for a, from a module: ' + 'modulebody lorem ipsum. '.repeat(1_500);
+    let adds = 0;
+    let tailUnreadable = false;
+    let removalFails = false;
+    cm.handleMessageStoreEvent = (event: { type: string }) => {
+      handleMessageStoreEvent.call(cm, event);
+      if (adds < 2 && event.type === 'add' && JSON.stringify(event).includes('modulebody') && ++adds === 2) {
+        tailUnreadable = true;
+        removalFails = true;
+        throw new Error('injected failure after the second shard landed');
+      }
+    };
+    store.getTail = (...args: unknown[]) => {
+      if (tailUnreadable) {
+        tailUnreadable = false;
+        throw new Error('injected unreadable store');
+      }
+      return getTail.apply(store, args);
+    };
+    store.removeBodyGroup = (...args: unknown[]) => {
+      if (removalFails) {
+        removalFails = false;
+        throw new Error('injected removal failure');
+      }
+      return removeBodyGroup.apply(store, args);
+    };
+    const quiet = console.error;
+    const logged: string[] = [];
+    console.error = (...args: unknown[]) => { logged.push(args.map((a) => (a instanceof Error ? a.message : String(a))).join(' ')); };
+    let thrown: unknown;
+    try {
+      courier.addMessage('courier', text(body), { external: { source: 'zz-source', id: 'zz-1' } });
+    } catch (error) {
+      thrown = error;
+    } finally {
+      cm.handleMessageStoreEvent = handleMessageStoreEvent;
+      store.getTail = getTail;
+      store.removeBodyGroup = removeBodyGroup;
+      console.error = quiet;
+    }
+    assert.ok(thrown instanceof WriteOutcomeUnknownError, `answered by context-manager's error, not as stored: ${String(thrown)}`);
+    const rows = cmOf('a').getAllMessages().filter((m) => JSON.stringify(m.content).includes('modulebody'));
+    assert.equal(rows.length, 2, 'premise: the first shard stayed, and so did the second');
+    assert.deepEqual(thrown.landed, [rows[0]!.id]);
+    assert.equal(courier.findMessageByExternalId('zz-source', 'zz-1'), rows[0]!.id, "the write's external id finds its first row in the store");
+    assert.equal(cmOf('a').windowStatusOf(rows[0]!.id), 'in', "the row named as stored is presented to a, whose turn isn't alive");
+    assert.ok(
+      logged.some((line) => line.includes(`row ${rows[0]!.id} of it is stored`) && line.includes('so the write is answered as failed')),
+      logged.join('\n'),
+    );
+  });
 
   it('a hold let go before its threshold says nothing after it', async () => {
     shortenHoldAlert(1_000);

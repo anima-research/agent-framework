@@ -54,6 +54,9 @@ export interface McplPushEvent {
   /** The coalescer's mark: the agent's first view of the subject (see
    *  CoalescedOccurrence.firstView). */
   firstView?: boolean;
+  /** A batch's recovery after a delivery that may have stored the push (the
+   *  framework's FrameworkWriteOptions.mayBeStored). */
+  mayBeStored?: true;
   /** Host acceptance time (epoch ms), stamped where the push is admitted. */
   acceptedAt?: number;
   /** Framework-owned source envelope, frozen at a coalesced occurrence's

@@ -9,6 +9,7 @@ import type {
   StoredMessage,
   WindowStatus,
 } from '@animalabs/context-manager';
+import { WriteOutcomeUnknownError } from '@animalabs/context-manager';
 import type {
   Module,
   ModuleContext,
@@ -986,7 +987,25 @@ class ModuleContextImpl implements ModuleContext {
       throw new Error(`A message for agent ${JSON.stringify(opts.forAgent)} can't carry metadata.external: `
         + "its external id would be looked up in the primary's window. Leave forAgent out, or the external id.");
     }
-    const id = this.addMessageFn(participant, content, metadata, opts);
+    let id: MessageId;
+    try {
+      id = this.addMessageFn(participant, content, metadata, opts);
+    } catch (error) {
+      // A write whose store threw where context-manager can't tell whether
+      // it landed (WriteOutcomeUnknownError, which the write is answered by)
+      // may be stored: its external id maps to '', as a write kept in memory
+      // does, so findMessageByExternalId looks it up in the store. A mapping
+      // that can't be persisted is logged, and the write's own error thrown.
+      if (metadata?.external && error instanceof WriteOutcomeUnknownError) {
+        this.externalIdMap.set(`${metadata.external.source}:${metadata.external.id}`, '');
+        try {
+          this.persistExternalIdMap();
+        } catch (persist) {
+          console.error(`[module:${this.moduleName}] the external id of a write that may be stored could not be persisted:`, persist);
+        }
+      }
+      throw error;
+    }
 
     // Track external ID if provided: the stored id the write was given
     // (#291 stores every write at once), or '' for one kept in memory (a

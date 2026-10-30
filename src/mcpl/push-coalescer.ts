@@ -139,8 +139,19 @@ interface DeferredBatch<E> {
    *  acceptance receipt, which doesn't carry it, reads as not all ambient:
    *  the side that keeps a wake. */
   allAmbient?: true;
-  /** Set on a batch restored from a snapshot whose render may have started. */
+  /** Set on a batch restored from a snapshot whose render may have started,
+   *  and on one whose render's delivery threw: its recovery delivers the
+   *  fallback, without asking the server again. */
   noRender?: boolean;
+  /** Set, to the event id the delivery carried, on a batch whose render's
+   *  delivery threw where the host can't tell whether it stored the
+   *  occurrence (CoalescerHost.mayHaveStored). Its recovery's delivery of
+   *  that event says so (DeliveryOptions.mayBeStored), so the host stores the
+   *  fallback only where it doesn't find the occurrence stored. A later
+   *  notice that joins the batch moves its latest event on, and the recovery
+   *  then delivers that one as any fallback. In memory only: a restored
+   *  batch that may have rendered is settled by wasPublished. */
+  mayBeStored?: string;
   /** The batch opened on the agent's first view of its subject: a fresh
    *  `initial` birth, or a first-view occupant it displaced that nothing had
    *  shown. Its first delivery is a first view too, while nothing of the
@@ -316,11 +327,23 @@ export interface CoalescerHost<E> {
   /** Ordinary delivery of the event; undefined when routing delivered nowhere.
    *  A replacement is delivered as a fresh message after the unread prior was
    *  removed: it lands where a fresh event lands (§4.1 allows either place).
-   *  A throw is taken as a delivery that stored none of the occurrence, and
-   *  the coalescer stores its batch again, as its fallback: so a delivery
-   *  whose store threw after rows of the occurrence landed answers as stored
-   *  by them, as the framework's does (context-manager's WriteLandedError). */
-  deliver(occurrence: CoalescedOccurrence<E>, materialized?: McplContentBlock[], assemblingFor?: string): Promise<CoalescingPlacement | undefined>;
+   *  A render's delivery that throws keeps its batch for its recovery wake,
+   *  which delivers the fallback. A throw is taken as a delivery that stored
+   *  none of the occurrence, unless mayHaveStored says the host can't tell:
+   *  so a delivery whose store threw after rows of the occurrence landed
+   *  answers as stored by them, as the framework's does (context-manager's
+   *  WriteLandedError). Where the host can't tell (the framework: context-
+   *  manager's WriteOutcomeUnknownError), the recovery's delivery carries
+   *  `options.mayBeStored`: the host looks for the occurrence's rows first,
+   *  by the delivery identity they carry (subject and event id, as
+   *  wasPublished), and answers the placement of those it finds, storing
+   *  nothing. It stores the fallback where it finds none, and also where
+   *  its store can't be read to tell, saying it may then be stored twice. */
+  deliver(occurrence: CoalescedOccurrence<E>, materialized?: McplContentBlock[], assemblingFor?: string, options?: DeliveryOptions): Promise<CoalescingPlacement | undefined>;
+  /** Whether a delivery's throw leaves the host unable to tell whether it
+   *  stored the occurrence (the framework's: context-manager's
+   *  WriteOutcomeUnknownError). Absent, or false, a throw stored none of it. */
+  mayHaveStored?(error: unknown): boolean;
   /** Queue a wake for a batch that has no model-visible content yet. */
   wakeForBatch(occurrence: CoalescedOccurrence<E>): Promise<void>;
   /** Queue an ordinary push wake for the placement's agent, under the
@@ -367,6 +390,15 @@ export interface CoalescerHost<E> {
    *  restarts at the head), whatever a stale record says about its history. */
   wasPublished?(subject: string, eventId: string): boolean;
   now?(): number;
+}
+
+/** What the coalescer tells the host of a delivery (CoalescerHost.deliver). */
+export interface DeliveryOptions {
+  /** A render's recovery, after a delivery of this event whose throw left the
+   *  host unable to tell whether it stored the occurrence (mayHaveStored):
+   *  the host looks for its rows first, and stores it where it finds none,
+   *  or can't read its store to tell. */
+  mayBeStored?: true;
 }
 
 export interface CoalescerOptions {
@@ -1178,21 +1210,39 @@ export class PushCoalescer<E = unknown> {
         const firstView = batch.firstView === true && state.history === 'none' && !state.occupant;
         let placement: CoalescingPlacement | undefined;
         try {
-          placement = await this.deliver({ ...occurrence, timestamp, content, ...(firstView ? { firstView: true } : {}) }, content, assemblingFor);
+          placement = await this.deliver(
+            { ...occurrence, timestamp, content, ...(firstView ? { firstView: true } : {}) }, content, assemblingFor,
+            batch.mayBeStored === occurrence.eventId ? { mayBeStored: true } : undefined,
+          );
         } catch (error) {
-          // A delivery that throws stored nothing (the host's deliver), so
-          // its batch goes to its recovery as its fallback. A store that
-          // threw after the occurrence's rows landed (context-manager's own
+          // A delivery that throws goes to its batch's recovery, which
+          // delivers the fallback (the host's deliver). A store that threw
+          // after the occurrence's rows landed (context-manager's own
           // listener failing after its append, or a sharded append whose
           // clean-up failed too) doesn't come here: context-manager names
           // the rows (WriteLandedError), and the framework's delivery takes
           // the occurrence as stored by them, placed, presented and woken
-          // for, so no fallback is stored beside them.
+          // for, so no fallback is stored beside them. Any other throw stored
+          // nothing, unless the host can't tell (mayHaveStored: the store
+          // couldn't be read to tell whether a row landed). Then nothing is
+          // stored at once: the recovery's delivery says the occurrence may
+          // be stored (mayBeStored), and the host, its store read again,
+          // places the rows it finds and stores no fallback, stores the
+          // fallback where it finds none, and where its store still can't
+          // be read, stores the fallback and logs that the agent may see the
+          // occurrence twice. A batch opened while this render ran (§5.4
+          // rule 1) has its own fallback delivered at the recovery, which
+          // isn't this occurrence and isn't looked for: this render, if it
+          // landed, stays where it is, unplaced. The mark stays on a batch
+          // whose recovery's delivery throws again, so the next one looks
+          // again.
           failed = true;
-          this.host.audit({ kind: 'deliver-failed', subject, eventId: occurrence.eventId, error: String(error) });
+          const mayHaveStored = this.host.mayHaveStored?.(error) === true;
+          this.host.audit({ kind: 'deliver-failed', subject, eventId: occurrence.eventId, error: String(error), ...(mayHaveStored ? { mayBeStored: true } : {}) });
           if (state.batch) state.batch.noRender = true;
           else {
             batch.noRender = true;
+            if (mayHaveStored) batch.mayBeStored = occurrence.eventId;
             state.batch = batch;
           }
           // Saved now, not only once the assembly's other renders settle: a

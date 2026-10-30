@@ -3,8 +3,9 @@
   identity-stamped batched append (`appendManyToStateJsonWithIdentity`, with `appendManyToStateJson`,
   `getStateItemsJson` and `getRecords`), and the context-manager release that keeps each agent's window
   (`windowStatusOf`, `presentRows`, `retractRows`, `getPresentedMessages`), writes a window write of several rows
-  as one record through that append (context-manager's 291-chronicle-0.6 and 291-window-batches entries), and
-  names the rows of an add that failed after storing them (`WriteLandedError`, which the framework imports). Neither
+  as one record through that append (context-manager's 291-chronicle-0.6 and 291-window-batches entries), names
+  the rows of an add that failed after storing them (`WriteLandedError`), and says when the store can't be read to
+  tell what of a failed add landed (`WriteOutcomeUnknownError`), both of which the framework imports. Neither
   floor can be lower. The published chronicle 0.5.0 (0.30.0's branch views) has none of the batched calls, and the
   published context-manager 0.23.x and 0.24.0 have no window index. Context-manager has no one-record-per-row path:
   on a store handle without the batched append, the first window write-down of a record that holds a row throws, and

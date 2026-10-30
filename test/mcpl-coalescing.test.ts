@@ -2735,6 +2735,185 @@ for (const when of ['after', 'before'] as const) {
   });
 }
 
+// A store that throws where context-manager can't read the store to tell
+// whether the render's row landed (its own listener failing after the append,
+// and the read of the store's tail throwing, as in its own write-landed tests)
+// throws WriteOutcomeUnknownError, which the framework answers the delivery by.
+// The coalescer stores nothing then: the batch's recovery delivers it saying
+// it may be stored, and the host reads its store back for the occurrence's
+// row first. Read again, the store holds the row, which is placed, presented
+// and read, and no fallback is stored. Still unreadable, the fallback is
+// stored beside it, and the line logged names the duplicate.
+for (const atRecovery of ['readable', 'unreadable'] as const) {
+  test(`a render whose store can't tell whether its row landed stores no fallback at once, and its recovery, the store ${atRecovery} again, ${atRecovery === 'readable' ? 'finds the row and stores nothing' : 'stores the fallback and logs the possible duplicate'}`, { timeout: 120_000 }, async (t) => {
+    const f = await fixture(); t.after(f.close);
+    const coalescer = (f.framework as unknown as {
+      pushCoalescer: { options: { recoveryBackoffMs?: number }; pendingBatches(): number; host: { deliver: (...args: unknown[]) => Promise<unknown> } };
+    }).pushCoalescer;
+    coalescer.options.recoveryBackoffMs = 20;
+    const internals = f.framework as unknown as { pendingRequests: unknown[] };
+    f.alwaysRespond();
+    f.renderer(async () => ({ content: [{ type: 'text', text: 'unknown_render' }] }));
+    const cm = f.framework.getAgent('agent')!.getContextManager();
+    const own = cm as unknown as {
+      handleMessageStoreEvent: (event: { type: string }) => void;
+      messageStore: { getTail: (...args: unknown[]) => unknown };
+      getMessageWindow: (...args: unknown[]) => unknown;
+    };
+    // The manager's own listener fails after the render's row landed, and the
+    // one read that would tell (the store's tail) throws.
+    const handle = own.handleMessageStoreEvent.bind(cm);
+    const getTail = own.messageStore.getTail.bind(own.messageStore);
+    const getMessageWindow = own.getMessageWindow.bind(cm);
+    let threw = 0;
+    let tailUnreadable = false;
+    let readBackUnreadable = false;
+    let readBackFailed = 0;
+    let fallbackAdded = false;
+    own.messageStore.getTail = (...args: unknown[]) => {
+      if (tailUnreadable) {
+        tailUnreadable = false;
+        throw new Error('zz-store-unreadable');
+      }
+      return getTail(...args);
+    };
+    own.handleMessageStoreEvent = (event) => {
+      if (event.type === 'add' && JSON.stringify(event).includes('unknown_fallback')) {
+        readBackUnreadable = false;
+        fallbackAdded = true;
+      }
+      handle(event);
+      if (threw === 0 && event.type === 'add' && JSON.stringify(event).includes('unknown_render')) {
+        threw++;
+        tailUnreadable = true;
+        throw new Error('zz-own-listener-failed-after-append');
+      }
+    };
+    // Unreadable at the recovery: the store's blob-free reads throw from the
+    // recovery's delivery until its fallback is stored.
+    // What the store held as the recovery's delivery began: nothing was
+    // stored as the fallback before it, whenever its timer fires.
+    const deliver = coalescer.host.deliver;
+    const recoveries: unknown[] = [];
+    let beforeRecovery: string | undefined;
+    coalescer.host.deliver = (...args: unknown[]) => {
+      const options = args[3] as { mayBeStored?: true } | undefined;
+      if (options?.mayBeStored) {
+        recoveries.push(options);
+        beforeRecovery ??= f.context();
+        if (atRecovery === 'unreadable') readBackUnreadable = true;
+      }
+      return deliver(...args);
+    };
+    own.getMessageWindow = (...args: unknown[]) => {
+      if (readBackUnreadable && (args[2] as { resolveBlobs?: boolean } | undefined)?.resolveBlobs === false) {
+        readBackFailed++;
+        throw new Error('zz-read-back-unreadable');
+      }
+      return getMessageWindow(...args);
+    };
+    const audits: Array<{ kind: string; mayBeStored?: unknown }> = [];
+    f.framework.onTrace((e) => { if (e.type === 'mcpl:coalescing') audits.push(e as unknown as { kind: string; mayBeStored?: unknown }); });
+    const logged: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map((a) => (a instanceof Error ? a.message : String(a))).join(' ')); };
+    try {
+      await f.send('push/event', f.params('1', 'unknown_fallback', { deferred: true, initial: true }));
+      await settles(f.framework.runUntilIdle(), 'the first drain');
+      for (let pass = 0; coalescer.pendingBatches() > 0 || internals.pendingRequests.length > 0; pass++) {
+        assert(pass < 100, 'the batch was settled within 100 passes');
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        await settles(f.framework.runUntilIdle(), `the drain after pass ${pass + 1}`);
+      }
+    } finally {
+      console.error = error;
+      own.handleMessageStoreEvent = handle;
+      own.messageStore.getTail = getTail;
+      own.getMessageWindow = getMessageWindow;
+    }
+    assert.equal(threw, 1, "premise: the store threw after the render's row landed");
+    assert(!(beforeRecovery ?? '').includes('unknown_fallback'), 'no fallback is stored at once: none before its recovery');
+    const context = f.context();
+    const requests = f.membrane.calls.map((c) => JSON.stringify((c as { messages?: unknown }).messages));
+    assert.equal(context.split('unknown_render').length - 1, 1, 'the render is stored once');
+    const row = cm.getAllMessages().find((m) => JSON.stringify(m.content).includes('unknown_render'))!;
+    assert.equal(cm.windowStatusOf(row.id), 'in', 'it is presented');
+    if (atRecovery === 'readable') {
+      assert(!context.includes('unknown_fallback'), "its fallback isn't stored: the recovery found the row");
+      assert(requests.some((r) => r.includes('unknown_render')), 'and a request reads it');
+      assert(!logged.some((l) => l.includes('may see the occurrence twice')), logged.join('\n'));
+    } else {
+      assert(fallbackAdded, 'its fallback is stored');
+      assert.equal(context.split('unknown_fallback').length - 1, 1, 'once');
+      assert.ok(
+        logged.some((l) => l.includes('eventId=1') && l.includes("its store can't be read now to tell") && l.includes('may see the occurrence twice')),
+        `the possible duplicate is logged:\n${logged.join('\n')}`,
+      );
+      assert(readBackFailed > 0, "the recovery's read-back couldn't read the store");
+    }
+    const failed = audits.filter((a) => a.kind === 'deliver-failed');
+    assert.equal(failed.length, 1, JSON.stringify(audits));
+    assert.equal(failed[0]!.mayBeStored, true, 'the delivery is taken as one that may have stored it');
+    assert.equal(recoveries.length, 1, 'its recovery delivers it saying it may be stored');
+    assert(beforeRecovery !== undefined);
+    assert.ok(logged.some((l) => l.includes("context-manager can't tell what of it landed") && l.includes('a row it has no id for')),
+      `the store's throw is logged as one context-manager can't tell of:\n${logged.join('\n')}`);
+    assert.equal(coalescer.pendingBatches(), 0);
+  });
+}
+
+// The coalescer's side of a delivery whose throw leaves the host unable to
+// tell whether it stored the occurrence (mayHaveStored): it stores nothing
+// then, and its recovery delivers that event saying it may be stored, so the
+// host looks for it first. A plain throw stored nothing, and a notice that
+// joined the batch since moves its latest event on: either recovery delivers
+// its fallback as any is.
+test("a render's delivery that may have stored it is redelivered at its recovery saying so, for that event alone", async () => {
+  class MayBeStored extends Error {}
+  const occurrence = (eventId: string): CoalescedOccurrence<null> => ({
+    serverId: 'editor', binding: 'binding', scope: { kind: 'featureSet', id: 'doc' }, key: 'document', eventId, timestamp: TS,
+    retract: false, deferred: true, initial: false, content: [{ type: 'text', text: `fallback ${eventId}` }], event: null,
+  });
+  for (const [thrown, joins, flagged] of [
+    [new MayBeStored('the store could not be read to tell'), false, true],
+    [new Error('the store refused it'), false, false],
+    [new MayBeStored('the store could not be read to tell'), true, false],
+  ] as const) {
+    const delivered: Array<{ eventId: string; text: string; options?: unknown }> = [];
+    const audits: Array<Record<string, unknown>> = [];
+    let throws = 1;
+    const host: CoalescerHost<null> = {
+      isUnread: () => true, isUnshown: () => true, remove: () => true,
+      deliver: async (occ, materialized, _assemblingFor, options) => {
+        delivered.push({ eventId: occ.eventId, text: JSON.stringify(materialized ?? occ.content), ...(options ? { options } : {}) });
+        if (throws-- > 0) throw thrown;
+        return { agent: 'agent', messageId: `row-${occ.eventId}` };
+      },
+      mayHaveStored: (error) => error instanceof MayBeStored,
+      wakeForBatch: async () => {}, wakeToRead: async () => {},
+      cancelWake: () => {}, authorized: () => true, audience: async () => ['agent'],
+      render: async () => ({ content: [{ type: 'text', text: 'rendered' }] }),
+      audit: (record) => { audits.push(record); }, save: () => {},
+    };
+    const coalescer = new PushCoalescer<null>(host, { recoveryBackoffMs: 3_600_000 });
+    await coalescer.accept(occurrence('e1'));
+    await coalescer.assemble('agent');
+    assert.equal(delivered.length, 1, 'the render was delivered, and its delivery threw');
+    assert.equal(coalescer.pendingBatches(), 1, 'nothing is stored at once: the batch waits for its recovery');
+    const failed = audits.find((a) => a.kind === 'deliver-failed');
+    assert.equal(failed?.mayBeStored, thrown instanceof MayBeStored ? true : undefined, String(thrown));
+    if (joins) await coalescer.accept(occurrence('e2'));
+    await coalescer.assemble('agent');
+    assert.equal(delivered.length, 2, 'the recovery delivers the fallback');
+    const recovery = delivered[1]!;
+    assert.equal(recovery.eventId, joins ? 'e2' : 'e1');
+    assert.ok(recovery.text.includes(`fallback ${recovery.eventId}`), recovery.text);
+    assert.deepEqual(recovery.options, flagged ? { mayBeStored: true } : undefined,
+      `${String(thrown)}${joins ? ', a notice joining since' : ''}: ${flagged ? 'says it may be stored' : 'says nothing'}`);
+    assert.equal(coalescer.pendingBatches(), 0);
+  }
+});
+
 test("a render cancelled while it runs leaves the recovery wake of a batch opened after it", async () => {
   let failPersist = false;
   const audits: Array<{ kind?: unknown; eventId?: unknown }> = [];

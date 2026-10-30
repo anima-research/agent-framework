@@ -13,7 +13,7 @@ import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, Yie
 import { MembraneError } from '@animalabs/membrane';
 import { classifyFailure, retryDecision, MEMBRANE_RETRY_SETTINGS, type RetrySettings } from '@animalabs/membrane/retry';
 import { deadlineCut, isDeadlineExpiry, resolveInferenceBounds, wholeCallMs, type InferenceBounds } from './inference-bounds.js';
-import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn, WriteLandedError } from '@animalabs/context-manager';
+import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn, WriteLandedError, WriteOutcomeUnknownError } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SILENT_HEARTBEAT_SEPARATOR, type RequestOnlyPrompt, type RequestOnlyStamps } from './silent-heartbeat.js';
 import {
@@ -112,7 +112,7 @@ import { convertBlocks } from './mcpl/convert-block.js';
 import {
   PushCoalescer, CoalesceError, PUSH_COALESCING_SUPPORT, validateCoalesceMember, validateCoalescedContent,
   coalescingSubjectKey, type AssemblyResult, type CoalescedOccurrence, type CoalescingPlacement, type CoalescingSnapshot,
-  type CoalescingReceiptRecord,
+  type CoalescingReceiptRecord, type DeliveryOptions,
 } from './mcpl/push-coalescer.js';
 import type { ChannelIncomingMessage, ChannelIncomingMessageResult, McplContentBlock, McpToolResultContent, PushEventResult } from './mcpl/types.js';
 import { isSilentHeartbeatMarker, isVisiblyEmptyContent, NON_STRING_TEXT_PLACEHOLDER } from './mcpl/visible-content.js';
@@ -1019,6 +1019,9 @@ interface CoalescedChannelEvent {
   /** The coalescer's mark: the agent's first view of the message (see
    *  CoalescedOccurrence.firstView). */
   firstView?: boolean;
+  /** A batch's recovery after a delivery that may have stored the message
+   *  (FrameworkWriteOptions.mayBeStored). */
+  mayBeStored?: true;
   /** Host acceptance time (epoch ms), stamped where the message was admitted. */
   acceptedAt?: number;
   /** Framework-owned source envelope, frozen at a coalesced occurrence's
@@ -1896,7 +1899,8 @@ interface SurgeryHeldWrite {
   content: ContentBlock[];
   metadata?: MessageMetadata;
   opts?: FrameworkWriteOptions;
-  direct?: { agentName: string };
+  /** `mayBeStored`: storeInFork's, as FrameworkWriteOptions.mayBeStored. */
+  direct?: { agentName: string; mayBeStored?: true };
   /** The agent the write was kept for, as registered then: the incarnation
    *  its name meant. Another agent registered under that name since isn't
    *  the write's (heldWriteTargetGone). */
@@ -2442,6 +2446,20 @@ interface FrameworkWriteOptions {
    * (untargetedAudience): every resident on a residents' host.
    */
   audience?: readonly string[];
+  /**
+   * Set on a coalesced occurrence's delivery at its batch's recovery, after
+   * a delivery whose store couldn't tell whether the occurrence landed
+   * (context-manager's WriteOutcomeUnknownError; CoalescerHost.mayHaveStored):
+   * the agent's store is read back first for the occurrence's rows, by the
+   * delivery identity its metadata carries (`coalescingSubject` and
+   * `eventId`), as wasPublished reads it at a restore. Rows found are the
+   * write: it is stored as them, placed, presented and answered by them, as
+   * a landed write's rows are, and nothing is stored. With none found, the
+   * write is stored. With a store that can't be read to tell, it is stored
+   * too, and the line logged names the duplicate it may make
+   * (storedOccurrenceRows).
+   */
+  mayBeStored?: true;
 }
 
 /** A body of an agent's window, by the row that names it (AgentFramework.windowBodiesFrom). */
@@ -3736,19 +3754,67 @@ function refusesUntilReinitialized(error: unknown): boolean {
 }
 
 /**
- * The rows of a write that are stored though context-manager's addMessage
- * threw (WriteLandedError: its own listener failed after the append, or a
- * sharded write's clean-up failed too), in store order, with the throw
- * logged; undefined for any other error, which means none of the write is
- * stored. A write so stored counts as stored by these rows: they are out of
- * every window until presented, as any row stored, and a writer that took
- * the throw as nothing stored would store it again beside them.
+ * What of a write is stored though context-manager's addMessage threw, as
+ * the error it threw says (addMessage's three answers), with the throw
+ * logged:
+ * - `{ landed }`, for a WriteLandedError (its own listener failed after the
+ *   append, or a sharded write's clean-up failed too): the store holds these
+ *   rows of the write, in store order, and no others. The write counts as
+ *   stored by them: they are out of every window until presented, as any
+ *   row stored, and a writer that took the throw as nothing stored would
+ *   store it again beside them.
+ * - `{ unknown }`, for a WriteOutcomeUnknownError (the read of the store
+ *   that would tell whether a row of it landed threw): the store holds the
+ *   rows its `landed` names, and may hold those its `unknown` names and the
+ *   `unnamed` ones it has no id for. The write is answered as failed, by
+ *   that error, since it may be stored in part or not at all; the rows it
+ *   names are presented as a landed write's are (presentedThoughUnknown). A
+ *   writer that would store it another way can't tell from the error whether
+ *   that stores it twice: a read of the store, once it reads, tells
+ *   (storedOccurrenceRows).
+ * - undefined, for any other error: none of the write is stored.
  */
-function landedThoughThrown(error: unknown, agentName: string): readonly MessageId[] | undefined {
+function landedThoughThrown(error: unknown, agentName: string): { landed: readonly MessageId[] } | { unknown: WriteOutcomeUnknownError } | undefined {
+  if (error instanceof WriteOutcomeUnknownError) {
+    console.error(
+      `[store] agent=${agentName}: a write's store threw, and context-manager can't tell what of it landed ` +
+        `(${outcomeUnknownText(error)}), so the write is answered as failed:`,
+      error.cause,
+    );
+    return { unknown: error };
+  }
   if (!(error instanceof WriteLandedError) || error.landed.length === 0) return undefined;
   const rows = error.landed.length === 1 ? `its row ${error.landed[0]}` : `${error.landed.length} of its rows (${error.landed.join(', ')})`;
   console.error(`[store] agent=${agentName}: a write's store threw after ${rows} landed, so the write counts as stored:`, error.cause);
-  return error.landed;
+  return { landed: error.landed };
+}
+
+/** Rows by id, as a log line or an alert names them. */
+function rowsNamed(ids: readonly MessageId[]): string {
+  return ids.length === 1 ? `row ${ids[0]}` : `rows ${ids.join(', ')}`;
+}
+
+/**
+ * What a WriteOutcomeUnknownError says of the write's rows, in words: those
+ * stored (`landed`), and those the store may hold, by id (`unknown`, which a
+ * removal that threw may have taken out) and without one (`unnamed`).
+ */
+function outcomeUnknownText(error: WriteOutcomeUnknownError): string {
+  const may = [
+    ...(error.unknown.length > 0 ? [`${rowsNamed(error.unknown)}, which a removal that threw may have taken out`] : []),
+    ...(error.unnamed > 0 ? [error.unnamed === 1 ? 'a row it has no id for' : `${error.unnamed} rows it has no ids for`] : []),
+  ];
+  return (error.landed.length > 0 ? `${rowsNamed(error.landed)} of it ${error.landed.length === 1 ? 'is' : 'are'} stored, and ` : '') +
+    `the store may hold ${may.length > 0 ? may.join(' and ') : 'more of it'}`;
+}
+
+/** The rows of a write whose store couldn't tell what of it landed that
+ *  are, or may be, stored, by id (WriteOutcomeUnknownError: `landed`, then
+ *  `unknown`): what its writer presents, as a landed write's rows are.
+ *  afterStore reads the rows the store holds of them, and where one of them
+ *  isn't found, presents each reader what it is owed at rest. */
+function presentedThoughUnknown(error: WriteOutcomeUnknownError): MessageId[] {
+  return [...error.landed, ...error.unknown];
 }
 
 /** Whether a stored message or queued write is a module's write for an
@@ -15586,23 +15652,49 @@ export class AgentFramework {
   }
 
   /**
-   * The writes for `agentName` a surgery's release couldn't store (their
-   * store threw, and context-manager found no row of theirs stored: it names
-   * one that landed, WriteLandedError, and such a write counts as stored),
-   * told of once: a log line and an ops alert of kind `store-held-lost`.
-   * Each was accepted with no id and kept in memory until the release, and
-   * is lost. The writes after them went on.
+   * The writes for `agentName` a surgery's release couldn't store, told of
+   * once: a log line and an ops alert of kind `store-held-lost`. Each was
+   * accepted with no id and kept in memory until the release, where its
+   * store threw. One context-manager found none of stored is lost (one it
+   * names rows of as stored, WriteLandedError, counts as stored and isn't
+   * here). One whose store couldn't be read to tell what of it landed
+   * (WriteOutcomeUnknownError: `unknown` holds one per such write) may be
+   * lost: the alert names the rows the errors name as stored, which the
+   * release presented and traced, and the rows the store may hold besides,
+   * by id and by count, and its data counts them (`mayBeStored`). The writes
+   * after them went on.
    */
-  private tellHeldWritesLost(agentName: string, writes: readonly SurgeryHeldWrite[], reason: string): void {
+  private tellHeldWritesLost(agentName: string, writes: readonly SurgeryHeldWrite[], unknown: readonly WriteOutcomeUnknownError[], reason: string): void {
     const { kinds, mail, told } = heldWritesTold(writes);
     const one = writes.length === 1;
+    const known = writes.length - unknown.length;
     const threw = `(${one ? '' : 'the first: '}${reason})`;
+    const landed = unknown.flatMap((error) => error.landed);
+    const byId = unknown.flatMap((error) => error.unknown);
+    const unnamed = unknown.reduce((sum, error) => sum + error.unnamed, 0);
+    const may = [
+      ...(byId.length > 0 ? [`${rowsNamed(byId)}, which a removal that threw may have taken out`] : []),
+      ...(unnamed > 0 ? [unnamed === 1 ? 'a row it has no id for' : `${unnamed} rows it has no ids for`] : []),
+    ];
+    const rows = unknown.length === 0
+      ? ''
+      : (landed.length > 0 ? ` Of ${unknown.length === 1 ? 'it' : 'them'}, ${rowsNamed(landed)} ${landed.length === 1 ? 'is' : 'are'} stored, presented and traced, and` : ' The')
+        + ` the store may hold ${may.length > 0 ? may.join(' and ') : 'more'}.`;
     const message = `${one ? '1 write' : `${writes.length} writes`} for ${agentName}, accepted and kept in memory until a ` +
-      `surgery's release, ${one ? 'was' : 'were'} not stored: storing ${one ? 'it' : 'them'} there threw ${threw}. ` +
-      `${one ? 'It is' : 'They are'} lost, and the writes after ${one ? 'it' : 'them'} went on. ${told}`;
+      `surgery's release, ` +
+      (unknown.length === 0
+        ? `${one ? 'was' : 'were'} not stored: storing ${one ? 'it' : 'them'} there threw ${threw}. ${one ? 'It is' : 'They are'} lost`
+        : `threw when stored there ${threw}. ` +
+          (known > 0 ? `${known} of them ${known === 1 ? 'was' : 'were'} not stored, and ${known === 1 ? 'is' : 'are'} lost. ` : '') +
+          `The store couldn't be read back to tell whether ${unknown.length === writes.length ? (one ? 'it' : 'they') : `the other ${unknown.length}`} ` +
+          `landed, so ${unknown.length === 1 ? 'it' : 'they'} may be lost.${rows} The writes after ${one ? 'it' : 'them'} went on`) +
+      (unknown.length === 0 ? `, and the writes after ${one ? 'it' : 'them'} went on. ` : '. ') + told;
     console.error(`[surgery] agent=${agentName}: ${message}`);
     this.opsAlert('store-held-lost', agentName, message, {
-      data: { count: writes.length, keptForRecovery: 0, heldBySurgery: writes.length, kinds, mail },
+      data: {
+        count: writes.length, keptForRecovery: 0, heldBySurgery: writes.length, kinds, mail,
+        ...(unknown.length > 0 ? { mayBeStored: { count: unknown.length, landed, unknown: byId, unnamed } } : {}),
+      },
     });
   }
 
@@ -18375,6 +18467,8 @@ export class AgentFramework {
     assemblingFor?: string;
     deliverTo?: string;
     firstView?: boolean;
+    /** FrameworkWriteOptions.mayBeStored, for the message's store. */
+    mayBeStored?: true;
     acceptedAt?: number;
     inboundSource?: InboundSource;
   }): Promise<CoalescingPlacement | undefined> {
@@ -18504,7 +18598,7 @@ export class AgentFramework {
           this.storeDueClock(target, 'event');
         }
         // The stored copy carries the author as the fork reads them (presentAuthor), and its digest is of that copy.
-        const placement = this.writeToFork(target, content, AgentFramework.withStoredDigest(metadata, content));
+        const placement = this.writeToFork(target, content, AgentFramework.withStoredDigest(metadata, content), event.mayBeStored);
         // Delivered to the fork, so it is the latest delivered inbound too
         // (the channel context's `incoming`; the fallback locus under the
         // legacy rule), as a resident's delivery is below.
@@ -18575,7 +18669,7 @@ export class AgentFramework {
     // The row is for the recipients admission delivered it to, and for none
     // of them when a tune-out holds it (inboundAudience).
     const id = this.addMessage('user', incomingContent, AgentFramework.withStoredDigest(metadata, incomingContent), {
-      placement, audience: AgentFramework.inboundAudience(decision),
+      placement, audience: AgentFramework.inboundAudience(decision), ...(event.mayBeStored ? { mayBeStored: true as const } : {}),
     });
     // A write kept in memory (no id yet) is traced once, as it is stored.
     if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
@@ -18624,6 +18718,7 @@ export class AgentFramework {
       tags?: string[];
       triggerInference?: boolean;
       coalescingSubject?: string;
+      mayBeStored?: true;
     },
     messageMetadata: Record<string, unknown>,
     admission: AdmissionDecision,
@@ -18698,7 +18793,7 @@ export class AgentFramework {
     if (!this.logicalTurnAlive(agent) && takesClockBefore('user', event.content, messageMetadata, agent.name)) {
       this.storeDueClock(agent, 'event');
     }
-    const placement = this.writeToFork(agent, event.content, AgentFramework.withStoredDigest(messageMetadata, event.content));
+    const placement = this.writeToFork(agent, event.content, AgentFramework.withStoredDigest(messageMetadata, event.content), event.mayBeStored);
     // Delivered to the channel's fork: the latest delivered inbound, as for a
     // resident (the channel context's `incoming`; the fallback locus under
     // the legacy rule). A held or dropped message never is.
@@ -18735,10 +18830,10 @@ export class AgentFramework {
    * (surgeryHeldWrites) and the hold's release stores it, and while the
    * fork's context manager refuses its work it keeps it for the move that
    * re-initializes it (heldForRecovery), so the placement names the fork
-   * alone, with no id yet.
+   * alone, with no id yet. `mayBeStored`: storeInFork's.
    */
-  private writeToFork(agent: Agent, content: ContentBlock[], metadata: Record<string, unknown>): CoalescingPlacement {
-    const id = this.storeInFork(agent, content, metadata as MessageMetadata);
+  private writeToFork(agent: Agent, content: ContentBlock[], metadata: Record<string, unknown>, mayBeStored?: boolean): CoalescingPlacement {
+    const id = this.storeInFork(agent, content, metadata as MessageMetadata, mayBeStored);
     return id ? { agent: agent.name, messageId: id } : { agent: agent.name };
   }
 
@@ -19587,7 +19682,12 @@ export class AgentFramework {
       isUnread: (p) => this.isUnreadPlacement(p),
       isUnshown: (p) => this.isUnreadPlacement(p, 'shown'),
       remove: (p) => this.removePlacement(p),
-      deliver: (occ, materialized, assemblingFor) => this.deliverCoalesced(occ, materialized, assemblingFor),
+      deliver: (occ, materialized, assemblingFor, options) => this.deliverCoalesced(occ, materialized, assemblingFor, options),
+      // A store that couldn't be read to tell whether the occurrence's row
+      // landed (context-manager's WriteOutcomeUnknownError, which addMessage
+      // and storeInFork answer by): its batch's recovery looks for the row
+      // before it stores the fallback (FrameworkWriteOptions.mayBeStored).
+      mayHaveStored: (error) => error instanceof WriteOutcomeUnknownError,
       wakeForBatch: (occ) => this.wakeForCoalescedBatch(occ),
       wakeToRead: (occ, placement, allAmbient) => this.queueCoalescedWakes(
         { ...occ, deliverTo: placement.agent }, true, this.readsRowFor(placement, placement.agent).readsRow, allAmbient,
@@ -19944,15 +20044,19 @@ export class AgentFramework {
     return this.registry.untargetedRecipients();
   }
 
-  /** Deliver through the lane's ordinary path; report where it landed. */
+  /** Deliver through the lane's ordinary path; report where it landed.
+   *  `options.mayBeStored` rides the event to its store, which looks for the
+   *  occurrence's rows first (FrameworkWriteOptions.mayBeStored). */
   private async deliverCoalesced(
     occ: CoalescedOccurrence<CoalescedDelivery>,
     materialized?: McplContentBlock[],
     assemblingFor?: string,
+    options?: DeliveryOptions,
   ): Promise<CoalescingPlacement | undefined> {
     const coalescingSubject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
     const narrowing = occ.deliverTo ? { deliverTo: occ.deliverTo } : {};
     const firstViewMark = occ.firstView ? { firstView: true } : {};
+    const mayBeStored = options?.mayBeStored ? { mayBeStored: true as const } : {};
     // The envelope frozen at acceptance travels unchanged; this delivery only
     // adds the fact that it carries the rendered body.
     const frozenSource = (source: InboundSource | undefined): { inboundSource?: InboundSource } =>
@@ -19960,7 +20064,7 @@ export class AgentFramework {
         ? { inboundSource: materialized && source.kind !== 'surface' ? { ...source, materialized: true } : source }
         : {};
     if (occ.event.lane === 'channel') {
-      const event = { ...occ.event.event, coalescingSubject, ...narrowing, ...firstViewMark, ...(assemblingFor ? { assemblingFor } : {}) };
+      const event = { ...occ.event.event, coalescingSubject, ...narrowing, ...firstViewMark, ...mayBeStored, ...(assemblingFor ? { assemblingFor } : {}) };
       const placement = await this.handleMcplChannelIncoming(event);
       await this.dispatchAfterDelivery(event as unknown as ProcessEvent, occ);
       return placement;
@@ -19991,6 +20095,7 @@ export class AgentFramework {
         eventId: occ.eventId,
         ...narrowing,
         ...firstViewMark,
+        ...mayBeStored,
         ...(assemblingFor ? { assemblingFor } : {}),
         ...frozenSource(push.inboundSource),
       };
@@ -20009,6 +20114,7 @@ export class AgentFramework {
       ...(assemblingFor ? { assemblingFor, triggerInference: false } : {}),
       ...(occ.deliverTo ? { targetAgents: [occ.deliverTo] } : {}),
       ...firstViewMark,
+      ...mayBeStored,
       ...frozenSource(occ.event.event.inboundSource),
     };
     const placement = this.handleMcplPushEvent(event);
@@ -20442,7 +20548,7 @@ export class AgentFramework {
     const placement: CoalescingPlacement = { agent: '' };
     if (!silentHeartbeat) {
       const id = this.addMessage('user', content, AgentFramework.withStoredDigest(metadata, content), {
-        placement, audience: AgentFramework.inboundAudience(decision),
+        placement, audience: AgentFramework.inboundAudience(decision), ...(event.mayBeStored ? { mayBeStored: true as const } : {}),
       });
       // A write kept in memory (no id yet) is traced once, as it is stored.
       if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
@@ -22637,11 +22743,18 @@ export class AgentFramework {
    * re-initialization (heldForRecovery, as addMessage keeps a write);
    * stored, it enters the fork's window at once when no turn of the fork's
    * is alive, else at the fork's next point (afterStore). One whose store
-   * threw after its row landed is stored as that row (landedThoughThrown).
+   * threw after its row landed is stored as that row, and one whose store
+   * can't tell what of it landed throws that error, the rows it names
+   * presented (landedThoughThrown), as addMessage's. `mayBeStored`: as
+   * FrameworkWriteOptions.mayBeStored, read back in the fork's store.
    */
-  private storeInFork(target: Agent, content: ContentBlock[], metadata: MessageMetadata): MessageId {
+  private storeInFork(target: Agent, content: ContentBlock[], metadata: MessageMetadata, mayBeStored?: boolean): MessageId {
     const presents = this.presents(target);
-    const kept = (): SurgeryHeldWrite => ({ participant: 'user', content, metadata, direct: { agentName: target.name }, heldFor: target, heldAt: Date.now() });
+    const kept = (): SurgeryHeldWrite => ({
+      participant: 'user', content, metadata,
+      direct: { agentName: target.name, ...(mayBeStored ? { mayBeStored: true as const } : {}) },
+      heldFor: target, heldAt: Date.now(),
+    });
     if (this.surgeryHold) {
       this.surgeryHeldWrites.push(kept());
       return '' as MessageId;
@@ -22652,20 +22765,31 @@ export class AgentFramework {
     }
     let id: MessageId;
     // Its one id, or the rows a store that threw after they landed names,
-    // which the write is stored as (landedThoughThrown), as addMessage's is.
+    // which the write is stored as (landedThoughThrown), or those found of a
+    // delivery that may be stored already (mayBeStored), as addMessage's.
     let rows: readonly MessageId[];
-    try {
-      id = target.getContextManager().addMessage('user', content, withAudience(metadata, [target.name]));
-      rows = [id];
-    } catch (error) {
-      const landed = landedThoughThrown(error, target.name);
-      if (!landed) {
-        if (!refusesUntilReinitialized(error)) throw error;
-        this.keepForRecovery(target.name, kept(), error);
-        return '' as MessageId;
+    const found = mayBeStored ? this.storedOccurrenceRows(target, metadata) : undefined;
+    if (found !== undefined && found.length > 0) {
+      id = found[0]!;
+      rows = found;
+    } else {
+      try {
+        id = target.getContextManager().addMessage('user', content, withAudience(metadata, [target.name]));
+        rows = [id];
+      } catch (error) {
+        const thrown = landedThoughThrown(error, target.name);
+        if (!thrown) {
+          if (!refusesUntilReinitialized(error)) throw error;
+          this.keepForRecovery(target.name, kept(), error);
+          return '' as MessageId;
+        }
+        if ('unknown' in thrown) {
+          if (presents) this.presentation!.afterStore(target, presentedThoughUnknown(thrown.unknown));
+          throw error;
+        }
+        id = thrown.landed[0]!;
+        rows = thrown.landed;
       }
-      id = landed[0]!;
-      rows = landed;
     }
     if (presents) this.presentation!.afterStore(target, rows);
     return id;
@@ -22699,15 +22823,20 @@ export class AgentFramework {
    * by an ops alert. A write whose store threw after its rows landed
    * (context-manager's WriteLandedError) is stored as those rows by
    * addMessage and storeInFork, presented and traced as any write stored
-   * here. Any other throw stored none of the write: it is logged and lost,
-   * and the rest go on. Each agent's lost writes are told of once, by a log
+   * here. One whose store threw where context-manager can't tell what of it
+   * landed (WriteOutcomeUnknownError) may be lost: the rows the error names
+   * as stored are presented (by addMessage and storeInFork) and traced, the
+   * first by its id, and the write is counted as one that may be lost, the
+   * rows the store may hold besides named. Any other throw stored none of
+   * the write: it is logged and lost. The rest go on either way. Each
+   * agent's lost writes, and those that may be, are told of once, by a log
    * line and an ops alert of kind `store-held-lost`.
    */
   private releaseSurgeryHeldWrites(): void {
     // Read defensively: a framework built from its prototype, as some
     // suites build one, holds none.
     const held = this.surgeryHeldWrites?.splice(0) ?? [];
-    const lost = new Map<string, { writes: SurgeryHeldWrite[]; reason: string }>();
+    const lost = new Map<string, { writes: SurgeryHeldWrite[]; unknown: WriteOutcomeUnknownError[]; reason: string }>();
     for (const write of held) {
       const target = write.direct ? this.agents.get(write.direct.agentName) : this.deliveryAgent(write.opts?.forAgent);
       try {
@@ -22722,26 +22851,40 @@ export class AgentFramework {
           if (!this.logicalTurnAlive(target) && takesClockBefore(write.participant, write.content, write.metadata, target.name)) {
             this.storeDueClock(target, 'event');
           }
-          id = this.storeInFork(target, write.content, write.metadata ?? {});
+          id = this.storeInFork(target, write.content, write.metadata ?? {}, write.direct.mayBeStored);
         } else {
           id = this.addMessage(write.participant, write.content, write.metadata, write.opts);
         }
         if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'surgery-release' });
       } catch (error) {
         // A write whose rows landed though its store threw is stored, and
-        // answered, by addMessage and storeInFork (landedThoughThrown): a
-        // throw that reaches here stored none of it.
-        console.error(`[surgery] a write held while the store was held couldn't be stored at its release, so it is lost:`, error);
+        // answered, by addMessage and storeInFork (landedThoughThrown). One
+        // whose store can't tell what of it landed is answered by
+        // context-manager's error, the rows it names presented: it may be
+        // lost, and the rows it names as stored are traced. Any other throw
+        // stored none of it.
+        const unknown = error instanceof WriteOutcomeUnknownError ? error : undefined;
+        if (unknown) {
+          console.error(
+            `[surgery] a write held while the store was held threw at its release, and context-manager can't tell what of ` +
+              `it landed (${outcomeUnknownText(unknown)}), so it may be lost:`,
+            error,
+          );
+          if (unknown.landed.length > 0) this.emitTrace({ type: 'message:added', messageId: unknown.landed[0]!, source: 'surgery-release' });
+        } else {
+          console.error(`[surgery] a write held while the store was held couldn't be stored at its release, so it is lost:`, error);
+        }
         const agentName = target?.name ?? write.direct?.agentName ?? write.opts?.forAgent ?? 'the primary';
-        const entry = lost.get(agentName) ?? { writes: [], reason: thrownText(error) };
+        const entry = lost.get(agentName) ?? { writes: [], unknown: [], reason: thrownText(error) };
         entry.writes.push(write);
+        if (unknown) entry.unknown.push(unknown);
         lost.set(agentName, entry);
       }
     }
     if (held.length > 0) {
       console.error(`[surgery] ${held.length} write(s) held while the store was held were replayed in arrival order`);
     }
-    for (const [agentName, { writes, reason }] of lost) this.tellHeldWritesLost(agentName, writes, reason);
+    for (const [agentName, { writes, unknown, reason }] of lost) this.tellHeldWritesLost(agentName, writes, unknown, reason);
     // A tune-out's cancel asked for while the writes were held waited for
     // them (writesHeld): with them stored, or told of where storing one
     // failed, its release is stored too, before the epoch's end is
@@ -31155,29 +31298,44 @@ export class AgentFramework {
     let stored: MessageId;
     // The rows the write stored: its one id, or those a store that threw
     // after they landed names (landedThoughThrown), which the write is
-    // stored as, placed, presented and answered by, as if it hadn't thrown.
+    // stored as, placed, presented and answered by, as if it hadn't thrown;
+    // or, for a delivery that may be stored already (mayBeStored), the rows
+    // the store is found to hold of it, which it is stored as so too.
     let rows: readonly MessageId[];
-    try {
-      stored = agent.getContextManager().addMessage(
-        participant,
-        content,
-        opts?.imported ? withDeferredWriteId(metadata, opts.imported.writeId) : metadata,
-      );
-      rows = [stored];
-    } catch (error) {
-      const landed = landedThoughThrown(error, agent.name);
-      if (landed) {
-        stored = landed[0]!;
-        rows = landed;
-      } else {
-        // context-manager's initialization fence: the manager refuses every
-        // write until a re-initialization succeeds, so this one waits for it
-        // (above). An imported write stays queued for the next boot, as any
-        // the importer can't store.
-        if (opts?.imported || !refusesUntilReinitialized(error)) throw error;
-        this.keepForRecovery(agent.name, kept(), error);
-        if (opts?.placement) opts.placement.agent = agent.name;
-        return '' as MessageId;
+    const found = opts?.mayBeStored ? this.storedOccurrenceRows(agent, metadata) : undefined;
+    if (found !== undefined && found.length > 0) {
+      stored = found[0]!;
+      rows = found;
+    } else {
+      try {
+        stored = agent.getContextManager().addMessage(
+          participant,
+          content,
+          opts?.imported ? withDeferredWriteId(metadata, opts.imported.writeId) : metadata,
+        );
+        rows = [stored];
+      } catch (error) {
+        const thrown = landedThoughThrown(error, agent.name);
+        if (thrown && 'landed' in thrown) {
+          stored = thrown.landed[0]!;
+          rows = thrown.landed;
+        } else if (thrown) {
+          // Context-manager can't tell what of the write landed: it is
+          // answered by that error, not as stored, and the rows the error
+          // names are presented as a landed write's are (an imported write's
+          // by the boot's pass, and its next boot finds it by its id).
+          if (!opts?.imported && this.presents(agent)) this.presentation!.afterStore(agent, presentedThoughUnknown(thrown.unknown));
+          throw error;
+        } else {
+          // context-manager's initialization fence: the manager refuses every
+          // write until a re-initialization succeeds, so this one waits for it
+          // (above). An imported write stays queued for the next boot, as any
+          // the importer can't store.
+          if (opts?.imported || !refusesUntilReinitialized(error)) throw error;
+          this.keepForRecovery(agent.name, kept(), error);
+          if (opts?.placement) opts.placement.agent = agent.name;
+          return '' as MessageId;
+        }
       }
     }
     if (opts?.placement) {
@@ -31552,7 +31710,15 @@ export class AgentFramework {
    * is absent, and a write taken as absent is stored again.
    */
   private landedPositions(cm: ContextManager, deferredWriteId: string): number[] {
-    const at: number[] = [];
+    return this.rowsWhere(cm, (metadata) => metadata?.deferredWriteId === deferredWriteId).map((row) => row.at);
+  }
+
+  /** The rows on `cm`'s current branch whose metadata `match` picks, by
+   *  position and id, in store order, scanned as landedPositions says: in
+   *  blob-free windows, throwing where a window can't be read or comes back
+   *  short. */
+  private rowsWhere(cm: ContextManager, match: (metadata: Record<string, unknown> | undefined) => boolean): Array<{ at: number; id: MessageId }> {
+    const rows: Array<{ at: number; id: MessageId }> = [];
     const total = cm.getMessageCount();
     for (let start = 0; start < total; start += LANDED_SCAN_WINDOW) {
       const want = Math.min(LANDED_SCAN_WINDOW, total - start);
@@ -31561,10 +31727,41 @@ export class AgentFramework {
         throw new Error(`the store gave ${messages.length} of the ${want} messages from position ${start} it was asked for`);
       }
       messages.forEach((m, i) => {
-        if ((m.metadata as { deferredWriteId?: unknown } | undefined)?.deferredWriteId === deferredWriteId) at.push(start + i);
+        if (match(m.metadata as Record<string, unknown> | undefined)) rows.push({ at: start + i, id: m.id });
       });
     }
-    return at;
+    return rows;
+  }
+
+  /**
+   * The rows of the coalesced occurrence `metadata` is a delivery of (its
+   * `coalescingSubject` and `eventId`, the delivery identity wasPublished
+   * reads at a restore) that `agent`'s store holds on its current branch, in
+   * store order: [] for none, or for a write that carries no such identity.
+   * A delivery's recovery reads them before it stores the occurrence again
+   * (FrameworkWriteOptions.mayBeStored), after a delivery whose store
+   * couldn't tell whether it landed: context-manager gives the row of an
+   * append that threw no id, so it is found by what it carries, as
+   * findMessageByExternalId finds a module's write. Scanned blob-free
+   * (rowsWhere), so a blob missing from some row can't hide them. Undefined
+   * when the store can't be read to tell, which is logged, naming the
+   * occurrence and the duplicate its store may then make: the one case the
+   * recovery can't tell.
+   */
+  private storedOccurrenceRows(agent: Agent, metadata: MessageMetadata | undefined): MessageId[] | undefined {
+    const { coalescingSubject: subject, eventId } = (metadata ?? {}) as { coalescingSubject?: unknown; eventId?: unknown };
+    if (typeof subject !== 'string' || typeof eventId !== 'string') return [];
+    try {
+      return this.rowsWhere(agent.getContextManager(), (m) => m?.coalescingSubject === subject && m?.eventId === eventId).map((row) => row.id);
+    } catch (error) {
+      console.error(
+        `[coalescing] agent=${agent.name} subject=${logValue(subject)} eventId=${logValue(eventId)}: a delivery of this ` +
+          `occurrence threw where the store couldn't tell whether its row landed, and its store can't be read now to tell ` +
+          `either, so its fallback is stored, and the agent may see the occurrence twice:`,
+        error,
+      );
+      return undefined;
+    }
   }
 
   /**
@@ -32004,7 +32201,10 @@ export class AgentFramework {
    * surgery's hold keeps it until its release stores it, and an agent whose
    * context manager refuses its work after a failed re-initialization has
    * it kept until a move re-initializes the agent and its release stores
-   * it (heldForRecovery).
+   * it (heldForRecovery). A write whose store throws where context-manager
+   * can't tell what of it landed throws its WriteOutcomeUnknownError, the
+   * rows it names presented (addMessage): the write may be stored, and isn't
+   * answered as stored.
    *
    * With `forAgent`, the write is for the named agent's window, which must
    * be registered when the write is made: a name that isn't, or the empty
