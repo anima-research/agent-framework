@@ -2223,6 +2223,75 @@ describe('conversation forks and a branch move', () => {
     });
   });
 
+  // storeInFork's twin of the module's-write case above (addMessage's): a
+  // channel message routed to a fork, stored there in shards, whose own
+  // listener fails after its second shard's append, whose landing the
+  // store's tail can't be read to tell, and whose removal of the first shard
+  // fails too, as in context-manager's own write-landed tests. It is answered
+  // by context-manager's error, not as stored, and the row the error names as
+  // stored is presented to the fork, whose turn isn't alive.
+  it("a channel message routed to a fork whose store can't tell what of it landed throws context-manager's error, and the row it names as stored is presented to the fork's window", { timeout: 30_000 }, async () => {
+    await withForks('reinit-fork-outcome-unknown-', async (framework, forkInternals, logged) => {
+      const internals = forkInternals as unknown as HoldInternals;
+      await internals.createConversationAgent('a-chan-g1', { serverId: 'world', channelId: 'world:chan' });
+      framework.getConversationRouter()!.bind({ serverId: 'world', channelId: 'world:chan' }, 'a-chan-g1', 1);
+      const forkCm = framework.getAgent('a-chan-g1')!.getContextManager();
+      const cm = forkCm as unknown as {
+        handleMessageStoreEvent: (event: { type: string }) => void;
+        messageStore: { getTail: (...args: unknown[]) => unknown; removeBodyGroup: (...args: unknown[]) => unknown };
+      };
+      const store = cm.messageStore;
+      const { handleMessageStoreEvent } = cm;
+      const { getTail, removeBodyGroup } = store;
+      // Over twice the strategy's chunk size (adaptive resolution), so it is stored in shards.
+      const body = 'for the fork: ' + 'forkbody lorem ipsum. '.repeat(1_500);
+      let adds = 0;
+      let tailUnreadable = false;
+      let removalFails = false;
+      cm.handleMessageStoreEvent = (event: { type: string }) => {
+        handleMessageStoreEvent.call(cm, event);
+        if (adds < 2 && event.type === 'add' && JSON.stringify(event).includes('forkbody') && ++adds === 2) {
+          tailUnreadable = true;
+          removalFails = true;
+          throw new Error('injected failure after the second shard landed');
+        }
+      };
+      store.getTail = (...args: unknown[]) => {
+        if (tailUnreadable) {
+          tailUnreadable = false;
+          throw new Error('injected unreadable store');
+        }
+        return getTail.apply(store, args);
+      };
+      store.removeBodyGroup = (...args: unknown[]) => {
+        if (removalFails) {
+          removalFails = false;
+          throw new Error('injected removal failure');
+        }
+        return removeBodyGroup.apply(store, args);
+      };
+      let thrown: unknown;
+      try {
+        await internals.handleMcplChannelIncoming(channelMessage('world:chan', body, { messageId: 'm-forkbody' }));
+      } catch (error) {
+        thrown = error;
+      } finally {
+        cm.handleMessageStoreEvent = handleMessageStoreEvent;
+        store.getTail = getTail;
+        store.removeBodyGroup = removeBodyGroup;
+      }
+      assert.ok(thrown instanceof WriteOutcomeUnknownError, `answered by context-manager's error, not as stored: ${String(thrown)}`);
+      const rows = forkCm.getAllMessages().filter((m) => JSON.stringify(m.content).includes('forkbody'));
+      assert.equal(rows.length, 2, 'premise: the first shard stayed, and so did the second');
+      assert.deepEqual(thrown.landed, [rows[0]!.id], 'premise: the error names the first shard as stored');
+      assert.equal(forkCm.windowStatusOf(rows[0]!.id), 'in', "the row named as stored is presented to the fork, whose turn isn't alive");
+      assert.ok(
+        logged.some((line) => line.includes(`row ${rows[0]!.id} of it is stored`) && line.includes('so the write is answered as failed')),
+        logged.join('\n'),
+      );
+    });
+  });
+
   it("while a move holds the store, a kept fork's idle-TTL closure waits for the release, and its prompt lands after it", { timeout: 30_000 }, async () => {
     // The sweep waits for a hold's release here (it writes the closure prompt
     // as the fork's own row), where main's wrote the prompt through the hold.
