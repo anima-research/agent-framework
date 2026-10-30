@@ -21,6 +21,7 @@ import {
 } from '../src/index.js';
 import type { AgentRecord, ContextManagerOpenOptions } from '../src/index.js';
 import { STORED_INJECTION_KEY } from '../src/stored-injections.js';
+import { persistentReaderName } from '../src/tune-out/tools.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 const text = (t: string) => ({ type: 'text', text: t }) as ContentBlock;
@@ -97,6 +98,22 @@ describe('the open shapes of a resident and the subconscious (#291, AF-5)', () =
     assert.deepEqual(sub.auxiliaryMessageViews, [{}], "the residents' slot merged in: the record its window is presented from");
     assert.ok(sub.strategy instanceof WindowedPassthroughStrategy);
     assert.notEqual(subconsciousContextOptions({ serves: 'mira' }).strategy, sub.strategy, 'a strategy of its own each time');
+  });
+
+  // The audit of #291's mind-neutrality, D6: the export wrote the default
+  // reader name a second time. The name is the configured reader's, which
+  // the host passes; left out, it is the one the framework runs an unnamed
+  // reader under, persistentReaderName's, not one this export chooses.
+  it("names the view by the reader's configured name, and left out, by the name an unnamed reader runs under", () => {
+    const injectionBy = (agent: string) => ({ metadata: { [STORED_INJECTION_KEY]: { agent, namespace: 'n', contentHash: 'h', part: 0, parts: 1 } } }) as never;
+    const named = subconsciousContextOptions({ serves: 'mira', name: 'Muse' }).viewFilter!;
+    assert.deepEqual([named(injectionBy('Muse')), named(injectionBy('Subconscious'))], [true, false],
+      "the reader named Muse keeps its own injection and leaves out another agent's");
+    const unnamed = subconsciousContextOptions({ serves: 'mira' }).viewFilter!;
+    const runsUnder = persistentReaderName({});
+    assert.deepEqual([unnamed(injectionBy(runsUnder)), unnamed(injectionBy('Muse'))], [true, false],
+      'left out, the name is the one persistentReaderName gives an unnamed reader');
+    assert.equal(persistentReaderName({ name: 'Muse' }), 'Muse');
   });
 
   // Presentation is mandatory since #291 (AF-6), so the case without the

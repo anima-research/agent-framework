@@ -156,12 +156,22 @@ interface SubconsciousConfigBase {
   thinkingBinding?: AgentConfig['thinkingBinding'];
 }
 
+/**
+ * The name a persistent reader runs under: its configuration's `name`, or,
+ * where the host gave none, `'Subconscious'` (PersistentReaderConfig.name).
+ * The one place the framework names a reader the host didn't: everything
+ * that needs the name of an unnamed reader asks this.
+ */
+export function persistentReaderName(config: { name?: string }): string {
+  return config.name ?? 'Subconscious';
+}
+
 export interface PersistentReaderConfig extends SubconsciousConfigBase {
   reader?: 'persistent';
   /**
    * Registry + participant name. Default 'Subconscious' — following the
    * Context Manager precedent: a title-case functional voice, not an
-   * agent-prefixed identifier.
+   * agent-prefixed identifier. persistentReaderName applies the default.
    */
   name?: string;
   /** Model id; defaults to the primary agent's (same-model side-process).

@@ -26,6 +26,7 @@
  */
 import { WindowedPassthroughStrategy, type ContextManagerConfig, type StoredMessage } from '@animalabs/context-manager';
 import { heldFromResidents } from './dendrite/audience.js';
+import { persistentReaderName } from './tune-out/tools.js';
 import { isAnotherAgentsInjection } from './stored-injections.js';
 
 /** ContextManager.open's options over a store the caller gives: everything but the store. */
@@ -55,7 +56,11 @@ export function residentContextOptions(agentName: string): ContextManagerOpenOpt
  * its own slot, the residents' merged beside it, its view, and a new
  * windowed passthrough strategy with `reAnchorFraction` and
  * `maxMessageTokens` (the framework mirrors the primary's). `name` is the
- * subconscious's own name, `Subconscious` by default, as its configuration's.
+ * name the subconscious runs under, its configuration's `name`, which the
+ * host gives it: pass that. Left out, it is the name the framework runs a
+ * reader the host didn't name under (persistentReaderName), so a host that
+ * left its reader unnamed opens the view the live one reads; this export
+ * doesn't choose a name of its own.
  */
 export function subconsciousContextOptions(options: {
   serves: string;
@@ -63,7 +68,7 @@ export function subconsciousContextOptions(options: {
   reAnchorFraction?: number;
   maxMessageTokens?: number;
 }): ContextManagerOpenOptions {
-  const name = options.name ?? 'Subconscious';
+  const name = persistentReaderName(options);
   return {
     namespace: `subconscious/${options.serves}`,
     isolate: true,

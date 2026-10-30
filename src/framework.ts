@@ -20,6 +20,7 @@ import {
   SUBCONSCIOUS_TOOLS,
   SUBCONSCIOUS_TOOL_NAMES,
   defaultReaderFraming,
+  persistentReaderName,
   type SubconsciousConfig,
   type PersistentReaderConfig,
   type ForkReaderConfig,
@@ -5083,7 +5084,7 @@ export class AgentFramework {
     framework.restoreUsageState([
       ...config.agents.map((agent) => String(agent.name)),
       // A forks reader has no agent of its own; its forks are bounded jobs.
-      ...(config.subconscious && config.subconscious.reader !== 'forks' ? [String(config.subconscious.name ?? 'Subconscious')] : []),
+      ...(config.subconscious && config.subconscious.reader !== 'forks' ? [String(persistentReaderName(config.subconscious))] : []),
     ]);
 
     framework.announceOrphans = config.dendrite?.announceOrphans ?? true;
@@ -17188,7 +17189,7 @@ export class AgentFramework {
     if (!primaryName || !primaryConfig) {
       throw new Error('subconscious requires a primary agent to attend to');
     }
-    const name = cfg.name ?? 'Subconscious';
+    const name = persistentReaderName(cfg);
     if (this.agents.has(name)) {
       throw new Error(`subconscious name "${name}" collides with a registered agent`);
     }

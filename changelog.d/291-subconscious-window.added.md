@@ -33,4 +33,5 @@
   maxMessageTokens? })`, `residentViewFilter(name)`, `subconsciousViewFilter(name)` and the
   `ContextManagerOpenOptions` type: how the framework opens a resident's context and the subconscious's, for a host
   that opens one itself (an audit of the store): `ContextManager.open({ store, ...subconsciousContextOptions({
-  serves }) })` reads what the live subconscious reads.
+  serves, name }) })` reads what the live subconscious reads. `name` is the name the host gave the reader
+  (`subconscious.name`); left out, it is the one the framework runs a reader the host didn't name under.
