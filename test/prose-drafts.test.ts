@@ -1843,6 +1843,79 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
+  it('an empty string marks an unused field, a digit string is read trimmed, and a value in use is still checked', async () => {
+    const h = await harness();
+    try {
+      await h.turn([
+        createMockResponse([text('words'), explicitSend('s1')], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      const [draft] = h.drafts();
+      await h.turn([
+        createMockResponse([
+          // A caller whose provider presents every property as required, filling
+          // the fields it isn't using with empty strings.
+          drafts('a', { action: 'list', draftIds: '', destination: '', confirmDuplicate: '', offset: '' }),
+          drafts('e', { action: 'list', destination: '' }),
+          drafts('b', { action: 'read', draftIds: [draft!.id], destination: '', confirmDuplicate: '', offset: '' }),
+          drafts('c', { action: 'list', offset: ' 0 ' }),
+          drafts('d', { action: 'list', offset: ' ' }),
+        ], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      const [listed, oneEmpty, read, padded, blank] = h.toolResults();
+      // The call a review named: one empty field, the rest null.
+      assert.match(oneEmpty!, /^1 open draft, newest first:/);
+      assert.ok(oneEmpty!.includes(draft!.id), oneEmpty);
+      assert.equal(listed, oneEmpty, 'every unused field empty lists the same');
+      assert.match(read!, /words/);
+      assert.equal(padded, listed, 'a padded offset reads as its digits');
+      assert.match(blank!, /offset must be a whole number of drafts to skip/, 'whitespace alone is a value, and not a number');
+
+      // A value in use is still checked, by the guards the rule now feeds.
+      await h.turn([
+        createMockResponse([
+          drafts('f', { action: 'read', draftIds: '' }),
+          drafts('g', { action: 'list', destination: '#elsewhere' }),
+          drafts('h', { action: 'list', confirmDuplicate: true }),
+          drafts('i', { action: 'read', draftIds: [draft!.id], offset: 1 }),
+          drafts('j', { action: 'list', offset: ' 1 ' }),
+          drafts('k', { action: 'list', offset: -1 }),
+          // Past the integers a number holds exactly, digits would read as another number.
+          drafts('m', { action: 'list', offset: '9007199254740993' }),
+          // false is "don't confirm", what list already does: it lists.
+          drafts('l', { action: 'list', confirmDuplicate: false }),
+        ], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      const [noIds, destUsed, confirmUsed, offsetUsed, pastOne, negative, unsafe, confirmFalse] = h.toolResults();
+      assert.match(noIds!, /action "read" needs draftIds/);
+      assert.match(destUsed!, /destination is not used by action "list"/);
+      assert.match(confirmUsed!, /confirmDuplicate is not used by action "list"/);
+      assert.match(offsetUsed!, /offset is not used by action "read"/);
+      assert.match(pastOne!, /^1 open draft, newest first \(showing 0 from #2\):/, 'a padded offset of 1 skips the one draft');
+      assert.match(negative!, /offset must be a whole number of drafts to skip/);
+      assert.match(unsafe!, /offset must be a whole number of drafts to skip/);
+      assert.equal(confirmFalse, listed, 'confirmDuplicate: false lists, as an omitted one does');
+
+      // resend: an empty destination is unused (and this resident has no home to
+      // fall back to), and an empty confirmDuplicate is unused, so the send goes.
+      await h.turn([
+        createMockResponse([
+          drafts('r1', { action: 'resend', draftIds: [draft!.id], destination: '', confirmDuplicate: '' }),
+          drafts('r2', { action: 'resend', draftIds: [draft!.id], destination: ROOM, confirmDuplicate: '' }),
+        ], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      const [noDest, resent] = h.toolResults();
+      assert.match(noDest!, /resend needs a destination/);
+      assert.match(resent!, new RegExp(`${draft!.id}: delivered to`));
+      assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note', 'words']);
+    } finally {
+      await h.close();
+    }
+  });
+
   it('refuses unusable calls before sending anything', async () => {
     const h = await harness();
     try {
