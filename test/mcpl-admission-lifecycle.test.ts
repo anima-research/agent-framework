@@ -427,3 +427,20 @@ test('required solicited tools/list still supplies presence and revision over We
   assert.equal(membrane.calls.length, 0);
   assert.equal(JSON.stringify(framework.getAgent('assistant')!.getContextManager().getAllMessages()), before);
 });
+
+
+test('required handshake drops null, refuses all data lanes, and buffers a same-chunk ping', async t => {
+  let hooks = 0;
+  const connection = await McplServerConnection.connect({
+    id: 'endpoint-a', command: process.execPath, args: [peer], env: { EARLY: '1' },
+    inboundAdmission: config(() => { hooks++; return allow; }),
+  }, { version: '0.5' });
+  t.after(() => connection.close());
+  const answers = await connection.sendToolsCall('answers', {}) as any;
+  for (const method of ['channels/incoming', 'push/event', 'inference/request']) {
+    assert.deepEqual(answers.find((r: any) => r.id === method)?.error,
+      { code: -32002, message: 'capability_denied' });
+  }
+  assert.deepEqual(answers.find((r: any) => r.id === 'same-chunk')?.result, {});
+  assert.equal(hooks, 0);
+});

@@ -64,7 +64,13 @@ Pending inference admission belongs to the request lifetime: stop cancels it and
 answers once with the existing stopped-request error while the transport is live.
 Transport closure cancels it without a router answer. Both release the admission
 slot even if the callback ignores cancellation; late verdicts start no model call.
-Admission refusals are itemwise channel results, push `{ accepted: false, reason }`
+While the initialize reader is installed, required data-lane requests receive
+JSON-RPC -32002 `capability_denied` (notifications are discarded); this is the
+handshake capability refusal, before an admission key exists. Malformed lines
+use the normal decoder. Once initialize settles, subsequent lines are buffered
+for ordinary dispatch, including a ping in the same read chunk.
+
+Admission refusals after the handshake are itemwise channel results, push `{ accepted: false, reason }`
 results, or inference JSON-RPC errors with code -32600 and the fixed reason.
 Notifications have no wire receipt; no application status is sent for a refusal.
 
