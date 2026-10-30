@@ -11,7 +11,10 @@
     release recorded, whose rows carry no audience stamp, a row stored under the agent's name, or one holding only
     results of its own calls, is its own. Neither writes the
     record or moves a branch, so neither reverts the workspace or `_config` mounts, MCPL checkpoints or the
-    inference log any more: `rollbackToMessage` is the record-level revert. The result's `fromBranch` and `toBranch`
+    inference log any more: `rollbackToMessage` is the record-level revert. Neither marks the Discord messages it
+    takes out of the window as removed, as no turn undo has since 0.24.0 made awareness marks one-shot; a host that
+    wants them marked rolls back instead, with `rollbackToMessage`'s `marks` or a `host/command` undo by messages
+    with `marks`. The result's `fromBranch` and `toBranch`
     are both the store's branch and its `window` says how many rows left or entered; the `undo:completed` and
     `redo:completed` traces are removed in favour of `window:undone`, and the API server broadcasts `window:undone`
     in place of `branch:switched` for them. Both are refused while a turn of the agent's is alive, and for an agent
