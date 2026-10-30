@@ -53,10 +53,11 @@ function fire(f: Fixture) {
     gate.fireDebounce(name);
   }
 }
-async function setup(debounce = 200, failing = false, beforeComplete?: (f: Fixture) => Promise<void>, agents?: unknown[]) {
+async function setup(debounce = 200, failing = false, beforeComplete?: (f: Fixture) => Promise<void>, agents?: unknown[], conversations = false) {
   const module = new ReminderModule();
   const f = await fixture({ agents, framework: {
     modules: [module],
+    ...(conversations ? { conversations: { templateAgent: 'agent', bind: { channel: 'mention' as const } } } : {}),
     errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
     gate: { config: { policies: [{ name: 'batch', match: { scope: ['clock:reminder', 'mcpl:channel-incoming', 'mcpl:push-event'] }, behavior: { debounce } }], default: 'always' } },
   } });
@@ -80,8 +81,13 @@ async function setup(debounce = 200, failing = false, beforeComplete?: (f: Fixtu
   };
   return { f, module, streams, start };
 }
-async function send(f: Fixture, lane: 'module' | 'channel' | 'push', body = 'new event', id = 'mid') {
-  if (lane === 'module') {
+async function send(f: Fixture, lane: 'module' | 'channel' | 'push' | 'heartbeat' | 'reminder', body = 'new event', id = 'mid') {
+  if (lane === 'heartbeat' || lane === 'reminder') {
+    (f.framework as unknown as { deliverHeartbeat(wake: import('../src/heartbeat/heartbeat.js').HeartbeatWake): void }).deliverHeartbeat(
+      lane === 'heartbeat'
+        ? { kind: 'heartbeat', reason: 'schedule', silent: false, text: body, eventId: id }
+        : { kind: 'reminder', reminderId: id, recurring: false, text: body, eventId: id });
+  } else if (lane === 'module') {
     f.framework.pushEvent({ type: 'clock:reminder', source: 'clock', content: body } as unknown as ProcessEvent);
   } else if (lane === 'channel') {
     await incoming(f, 'work', id, body, MENTION);
@@ -95,7 +101,7 @@ function deferred(f: Fixture, body: string) {
 function heard(stream: MockYieldingStream) { return JSON.stringify(stream.receivedToolResultOptions); }
 
 describe('debounced writes already read and answered', () => {
-  for (const lane of ['module', 'channel', 'push'] as const) {
+  for (const lane of ['module', 'channel', 'push', 'heartbeat', 'reminder'] as const) {
     for (const held of [false, true]) {
       it(`${lane}: a 200 ms batch ${held ? 'held for inference' : 'firing after the turn'} starts no second call`, async () => {
         const { f, module, streams, start } = await setup();
@@ -164,7 +170,7 @@ describe('debounced writes already read and answered', () => {
     } finally { off(); await f.close(); }
   });
 
-  it('two unsatisfied residents share one remainder line in their real message slot', async () => {
+  it('unsatisfied residents retain stored content without re-presenting it in a shared summary', async () => {
     const { f, module, start } = await setup(60_000, false, undefined,
       ['agent', 'other', 'third'].map((name) => ({ name, model: 'test', systemPrompt: 'test' })));
     try {
@@ -178,10 +184,42 @@ describe('debounced writes already read and answered', () => {
         .getAllMessages().filter((row) => row.metadata?.source === 'gate:debounce');
       const other = linesFor('other');
       const third = linesFor('third');
-      assert.equal(other.length, 1);
-      assert.deepEqual(third, other, 'one stored line is visible to both residents; two writes would duplicate it');
+      assert.equal(other.length, 0, 'a shared summary must not re-present the event to its answered owner');
+      assert.deepEqual(third, other);
+      for (const name of ['other', 'third']) {
+        assert.match(JSON.stringify(f.framework.getAgent(name)!.getContextManager().getAllMessages()), /new event/, 'original stored content is still in each resident window');
+      }
       await f.framework.runUntilIdle();
       assert.equal(f.membrane.calls.length, 3, 'both unsatisfied recipients wake');
+      for (const request of f.membrane.calls.slice(1)) assert.match(JSON.stringify(request), /new event/, 'each request actually includes the original input');
+    } finally { await f.close(); }
+  });
+
+  it('a conversation fork gets its own summary without adding it to the residents shared slot', async () => {
+    const { f, module, start } = await setup(60_000, false, undefined,
+      ['agent', 'other'].map((name) => ({ name, model: 'test', systemPrompt: 'test' })), true);
+    try {
+      const fork = await (f.framework as unknown as {
+        createConversationAgent(name: string, home: { serverId: string; channelId: string }): Promise<{ name: string }>;
+      }).createConversationAgent('isolated', { serverId: 'editor', channelId: 'work' });
+      const forkContext = f.framework.getAgent(fork.name)!.getContextManager();
+      const registry = (f.framework as unknown as { registry: { get(name: string): { roles: { receivesGateWakes: boolean } } } }).registry;
+      registry.get('isolated').roles.receivesGateWakes = true;
+      const { loop } = await start();
+      await send(f, 'module');
+      await eventually(() => deferred(f, 'new event'), 'event deferred');
+      module.release('first'); await loop;
+      assert.doesNotMatch(JSON.stringify(forkContext.getAllMessages()), /new event/, 'the isolated copy did not receive the later shared write');
+      fire(f);
+      const forkLines = forkContext.getAllMessages().filter((row) => row.metadata?.source === 'gate:debounce');
+      assert.equal(forkLines.length, 1);
+      assert.match(JSON.stringify(forkLines), /new event/);
+      for (const name of ['agent', 'other']) {
+        const sharedLines = f.framework.getAgent(name)!.getContextManager().getAllMessages().filter((row) => row.metadata?.source === 'gate:debounce');
+        assert.deepEqual(sharedLines, [], 'the fork-only summary never enters the shared slot');
+      }
+      const requests = (f.framework as unknown as { pendingRequests: Array<{ agentName: string }> }).pendingRequests;
+      assert.deepEqual(requests.map((r) => r.agentName).sort(), ['isolated', 'other']);
     } finally { await f.close(); }
   });
 
@@ -237,12 +275,20 @@ describe('debounced writes already read and answered', () => {
     } finally { await f.close(); }
   });
 
-  for (const outcome of ['throws', 'refuses', 'stops', 'disposes'] as const) {
+  for (const outcome of ['throws', 'refuses', 'stops', 'disposes', 'loses its gate role'] as const) {
     it(`a final publication that ${outcome} releases its held debounce`, async () => {
       const { f, module, start } = await setup(60_000);
       const registry = (f.framework as unknown as {
         channelRegistry: { routeSpeech: (...args: unknown[]) => Promise<unknown> };
       }).channelRegistry;
+      const gate = gateOf(f) as unknown as {
+        requestInferenceFn: (...args: unknown[]) => void;
+        addMessageFn: (...args: unknown[]) => unknown;
+      };
+      const requests: unknown[][] = [], writes: unknown[][] = [];
+      const request = gate.requestInferenceFn, write = gate.addMessageFn;
+      gate.requestInferenceFn = (...args) => { requests.push(args); request(...args); };
+      gate.addMessageFn = (...args) => { writes.push(args); return write(...args); };
       const original = registry.routeSpeech.bind(registry);
       let publishing = false;
       let release!: () => void;
@@ -267,13 +313,20 @@ describe('debounced writes already read and answered', () => {
           (f.framework as unknown as { disposeConversationAgent(name: string): void }).disposeConversationAgent('agent');
           assert.equal(f.framework.getAgent('agent'), null);
         }
+        if (outcome === 'loses its gate role') {
+          (f.framework as unknown as { registry: { get(name: string): { roles: { receivesGateWakes: boolean } } } }).registry.get('agent').roles.receivesGateWakes = false;
+        }
         const stopping = outcome === 'stops' ? f.framework.stop() : undefined;
         release();
         await loop;
         await stopping;
-        if (outcome !== 'stops' && outcome !== 'disposes') {
+        if (outcome === 'throws' || outcome === 'refuses') {
           await f.framework.runUntilIdle();
           assert.equal(f.membrane.calls.length, 2, 'failed publication leaves a chance to reply');
+        }
+        if (outcome === 'disposes' || outcome === 'loses its gate role') {
+          assert.deepEqual(requests, [], 'no request for a removed gate recipient');
+          assert.deepEqual(writes, [], 'no write for a removed gate recipient');
         }
         assert.equal(gateOf(f).inferenceDiagnostics().bufferedEvents, 0, 'no batch stays wedged');
       } finally { release(); await f.close(); }

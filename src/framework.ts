@@ -4885,6 +4885,7 @@ export class AgentFramework {
           });
         },
         getAgentNames: () => framework.registry.gateRecipients(),
+        getSharedSlotReaders: () => framework.registry.sharedSlotReaders(),
         isWriteDone: (agentName, after, replyTo) => framework.gateWriteDone(agentName, after, replyTo),
         isHeld: (serverId, channelId) =>
           !!(serverId && channelId && framework.tuneOutCoordinator?.holdFor(serverId, channelId)),
@@ -31159,14 +31160,8 @@ export class AgentFramework {
     // Settled first, so a write that landed is judged by its stored row; one
     // still a doubt stays queued, which keeps the wake.
     this.settleUnknownLandings((m) => m.id === writeId);
-    if (this.deferredMessages.some((m) => m.id === writeId)) return false;
     try {
-      const cm = agent.getContextManager();
-      const row = this.landedRow(cm, writeId);
-      // No row yet for a write drained from the queue and still to be stored
-      // (un-acked); one stored and awaiting a sync is judged by its row.
-      if (!row) return !this.unackedDeferredWrites.some((m) => m.id === writeId);
-      return this.writeAnswered(agent, cm, row, to);
+      return this.writeDoneFromEvidence(agent, { readsDeferredWrite: writeId }, to);
     } catch (error) {
       console.error(`[wake] ${agent.name}: could not read whether deferred write ${writeId} was read, so its wake stays:`, error);
       return false;
@@ -31175,10 +31170,7 @@ export class AgentFramework {
 
   private storedMessageDone(agent: Agent, messageId: string, to: PublishDestination | undefined): boolean {
     try {
-      const cm = agent.getContextManager();
-      const row = cm.getMessage(messageId);
-      if (!row) return true;
-      return this.writeAnswered(agent, cm, row, to);
+      return this.writeDoneFromEvidence(agent, { readsStoredMessage: messageId }, to);
     } catch (error) {
       console.error(`[wake] ${agent.name}: could not read whether stored message ${messageId} was read, so its wake stays:`, error);
       return false;
@@ -31199,16 +31191,28 @@ export class AgentFramework {
   private gateWriteDone(agentName: string, after: import('./gate/event-gate.js').WritePlacement, to?: PublishDestination): boolean {
     const agent = this.agents.get(agentName);
     if (!agent) return false;
-    const mark = this.readsWriteFor(after, agentName);
-    const cm = agent.getContextManager();
+    return this.writeDoneFromEvidence(agent, this.readsWriteFor(after, agentName), to);
+  }
+
+  /** Pure evidence lookup shared by scheduler and debounce checks. Only the
+   *  scheduler wrapper settles unknown landings; each caller keeps its own
+   *  fault policy (including the gate's throttled warning). */
+  private writeDoneFromEvidence(
+    agent: Agent,
+    mark: Pick<InferenceRequest, 'readsDeferredWrite' | 'readsStoredMessage'>,
+    to: PublishDestination | undefined,
+  ): boolean {
     if (mark.readsDeferredWrite !== undefined) {
       const id = mark.readsDeferredWrite;
       if (this.deferredMessages.some((m) => m.id === id)) return false;
+      const cm = agent.getContextManager();
       const row = this.landedRow(cm, id);
+      // A drained, un-acked write without a stored row remains wakeable.
       if (!row) return !this.unackedDeferredWrites.some((m) => m.id === id);
       return this.writeAnswered(agent, cm, row, to);
     }
     if (mark.readsStoredMessage !== undefined) {
+      const cm = agent.getContextManager();
       const row = cm.getMessage(mark.readsStoredMessage);
       return !row || this.writeAnswered(agent, cm, row, to);
     }

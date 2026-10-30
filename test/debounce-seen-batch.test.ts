@@ -212,7 +212,7 @@ describe('debounce final-publication fences', () => {
     try {
       f.gate.onInferenceEnded('one', publication);
       for (let i = 0; i < 125; i++) {
-        f.channel(`event-${i}`, { messageId: String(i) }); f.fire();
+        f.channel(`event-${i}`, { agent: 'one', messageId: String(i) }); f.fire();
       }
       assert.equal(f.gate.inferenceDiagnostics().bufferedEvents, 125);
       assert.equal(f.gate.inferenceDiagnostics().droppedBufferedEvents, 0);
@@ -233,7 +233,7 @@ describe('debounce final-publication fences', () => {
     const f = harness(() => false, ['one', 'two']);
     try {
       f.gate.onInferenceEnded('one', publication);
-      f.channel('event', { messageId: 'a' }); f.fire();
+      f.channel('event', { agent: 'one', messageId: 'a' }); f.fire();
       assert.deepEqual(f.wakes.map((w) => w.agent), ['two']);
       assert.equal(f.writes[0].forAgent, 'two');
       release(); await tick(); await tick();
@@ -249,11 +249,11 @@ describe('debounce final-publication fences', () => {
     const f = harness((_agent, p) => { checked.push(p.messageId!); return false; });
     try {
       f.gate.onInferenceEnded('one', publication);
-      f.add('module', { messageId: 'module' });
-      f.channel('ambient', { messageId: 'ambient' }, ['chat:ambient']);
-      f.channel('system', { messageId: 'system' }, ['chat:system']);
+      f.add('module', { agent: 'one', messageId: 'module' });
+      f.channel('ambient', { agent: 'one', messageId: 'ambient' }, ['chat:ambient']);
+      f.channel('system', { agent: 'one', messageId: 'system' }, ['chat:system']);
       f.channel('no placement');
-      f.channel('addressed', { messageId: 'addressed' });
+      f.channel('addressed', { agent: 'one', messageId: 'addressed' });
       f.fire();
       assert.deepEqual(checked, ['module', 'ambient', 'system']);
       assert.equal(f.wakes.length, 1);
@@ -275,7 +275,7 @@ describe('debounce final-publication fences', () => {
     const f = harness(() => { checks++; return true; });
     try {
       f.gate.onInferenceEnded('one', publication);
-      f.channel('event', { messageId: 'a' }); f.fire();
+      f.channel('event', { agent: 'one', messageId: 'a' }); f.fire();
       t.mock.timers.tick(64_999); await tick();
       assert.equal(f.wakes.length, 0);
       t.mock.timers.tick(1); await tick(); await tick();
@@ -298,12 +298,12 @@ describe('debounce final-publication fences', () => {
     const f = harness(() => false);
     try {
       f.gate.onInferenceEnded('one', new Promise<void>(() => {}));
-      f.channel('first', { messageId: 'first' }); f.fire();
+      f.channel('first', { agent: 'one', messageId: 'first' }); f.fire();
       t.mock.timers.tick(30_000);
       f.gate.onInferenceEnded('one', new Promise<void>(() => {}));
       t.mock.timers.tick(35_000); await tick(); await tick();
       assert.equal(f.wakes.length, 1);
-      f.channel('second', { messageId: 'second' }); f.fire();
+      f.channel('second', { agent: 'one', messageId: 'second' }); f.fire();
       assert.equal(f.wakes.length, 1);
       t.mock.timers.tick(30_000); await tick(); await tick();
       assert.equal(f.wakes.length, 2);
@@ -318,7 +318,7 @@ describe('debounce final-publication fences', () => {
     const f = harness(() => { checks++; return false; });
     try {
       f.gate.onInferenceEnded('one', publication);
-      for (let i = 0; i < 125; i++) f.channel(`event-${i}`, { messageId: String(i) });
+      for (let i = 0; i < 125; i++) f.channel(`event-${i}`, { agent: 'one', messageId: String(i) });
       f.fire();
       f.gate.onInferenceStarted('one');
       f.gate.setQuiesced(true);
@@ -343,7 +343,7 @@ describe('debounce final-publication fences', () => {
     const f = harness(() => false);
     try {
       f.gate.onInferenceEnded('one', publication);
-      f.channel('event', {}); f.fire();
+      f.channel('event', { agent: 'one' }); f.fire();
       f.gate.dispose();
       t.mock.timers.tick(65_000); await tick();
       release(); await tick();
