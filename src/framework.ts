@@ -7068,18 +7068,20 @@ export class AgentFramework {
         }
         const holding = () => this.budgetHolds.get(agentName)?.state === 'holding';
         while ((by === 'hold' ? holding() : ticks < 8) && !this.providerAdmissionClosed && !this.surgeryHold && this.agents.get(agentName) === agent) {
+          const looking = by === 'hold' ? this.budgetHolds.get(agentName)?.checking : undefined;
+          if (looking) {
+            await looking;
+            await this.checkBudgetHold(agentName);
+            continue;
+          }
           const calls = by === 'hold' ? this.budgetHolds.get(agentName)?.managerCalls : undefined;
           await cm.tick();
           ticks++;
           if (by === 'breaker') continue;
           if (this.budgetHolds.get(agentName)?.managerCalls === calls) break;
           await this.checkBudgetHold(agentName);
-          const looking = this.budgetHolds.get(agentName)?.checking;
-          if (looking) {
-            await looking;
-            await this.checkBudgetHold(agentName);
-          }
         }
+        if (by === 'hold' && ticks > 0) this.maintenanceFailureReported.delete(agentName);
         const stopped = by === 'breaker' && ticks >= 8 ? ''
           : this.agents.get(agentName) !== agent ? ', stopped as the agent was disposed'
           : this.providerAdmissionClosed ? ', stopped as the framework stops'

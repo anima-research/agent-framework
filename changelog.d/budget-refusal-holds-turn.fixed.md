@@ -7,8 +7,8 @@
   agent's turn is held while its context manager has compression pending, and
   later wakes join it. The hold leaves the provider gate open and drives
   compression itself: from its start it ticks the agent's context manager
-  while each tick starts a compression call, so it doesn't wait for a
-  maintenance pass, and it drives it again after each pass (with the
+  while a call of that manager's starts during each tick, so it doesn't wait
+  for a maintenance pass, and it drives it again after each pass (with the
   maintenance timer off, every 5 seconds). A tick that starts no call, as
   while compression is paused after a failure, ends that drive. An ephemeral
   run, a turn in a framework that `start()` hasn't started (only

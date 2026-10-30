@@ -36,9 +36,10 @@
     work, and a turn held again after a release logs a line saying so. A
     compression call that fails in a tick the hold drives is reported as one
     that fails in a maintenance pass is, as `context-maintenance-failed` for
-    the agent, under maintenance's rule for repeats. The hold's first drive of
-    compression logs a `[budget-hold]` line with its tick count, and a later
-    one only when it stops early.
+    the agent, under maintenance's rule for repeats; a drive that ends without
+    a failure counts as a pass without one. The hold's first drive of
+    compression logs a `[budget-hold]` line with its tick count unless a call
+    fails in it, and a later drive logs one only when it stops early.
 - **Agents:** the turn's next start once its hold ends, with a fit or without,
   stores a note in the agent's history saying why it waited, where the turn
   reads it, as an `afterUser` context injection is stored (while the window is

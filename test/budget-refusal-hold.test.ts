@@ -920,14 +920,52 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         c.dryRunGate = new Promise<void>((resolve) => { letLook = resolve; });
         (holdOf(t) as unknown as { lookedAt?: string }).lookedAt = undefined;
         void fw.checkBudgetHold('prime');
+        assert.ok((holdOf(t) as unknown as { checking?: unknown }).checking, 'the look\'s dry compile waits at its gate');
         letGo();
-        await new Promise((r) => setTimeout(r, 100));
+        assert.ok(await pollUntil(() => c.landed === 3, 3_000), 'the third call landed');
+        for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+        assert.equal(c.started, 3, 'no call while the look was pending');
         letLook();
         assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000));
+        assert.ok(await pollUntil(() => t.internal.overBudgetDrains.size === 0, 3_000), 'the drive ended');
         assert.equal(c.landed, 3, 'no call after the one that made it fit');
         assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
       } finally {
         letGo();
+        letLook();
+        await t.close();
+      }
+    });
+  });
+
+  it('waits for a look in flight before the first tick of a drive', async () => {
+    await withCompressionCalls({ fitAt: 2, workUntil: 6, previewless: true, pauseAfter: 1 }, async (c) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
+      const fw = t.framework as unknown as {
+        checkBudgetHold: (agentName: string) => Promise<void>;
+        compressForBudgetHold: (agent: unknown) => void;
+      };
+      let letLook = () => {};
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => c.ticks >= 2 && t.internal.overBudgetDrains.size === 0, 3_000),
+          'a first drive made one call, then ended at a tick that started none');
+        assert.equal(c.started, 1);
+        c.fitAt = 1;
+        c.dryRunGate = new Promise<void>((resolve) => { letLook = resolve; });
+        (holdOf(t) as unknown as { lookedAt?: string }).lookedAt = undefined;
+        void fw.checkBudgetHold('prime');
+        assert.ok((holdOf(t) as unknown as { checking?: unknown }).checking, 'the look\'s dry compile waits at its gate');
+        c.pauseAfter = Infinity;
+        fw.compressForBudgetHold(t.framework.getAgent('prime'));
+        for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+        assert.equal(c.started, 1, 'the new drive started no call while the look was pending');
+        letLook();
+        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000));
+        assert.ok(await pollUntil(() => t.internal.overBudgetDrains.size === 0, 3_000), 'the drive ended');
+        assert.equal(c.started, 1, 'and none after it');
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
+      } finally {
         letLook();
         await t.close();
       }
@@ -956,25 +994,53 @@ describe('a compile refused for budget holds its turn (#304)', () => {
 
   it('reports a compression call that fails in a tick it drives as a maintenance pass reports one, and holds on', async () => {
     await withCompressionCalls({ fitAt: 12, workUntil: 12 }, async (c) => {
-      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
+      await errorLines(async (lines) => {
+        const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
+        const failures = () => t.of('ops:alert').filter((e) => e.kind === 'context-maintenance-failed');
+        const complete = t.membrane.complete.bind(t.membrane);
+        let calls = 0;
+        t.membrane.complete = async (request: NormalizedRequest) => {
+          if (++calls === 2) throw new Error('zz compression call failed');
+          return complete(request);
+        };
+        try {
+          t.send('Are you there?');
+          assert.ok(await pollUntil(() => failures().length === 1, 3_000), 'the failure reached the operator');
+          assert.equal(failures()[0]!.agentName, 'prime');
+          assert.match(String(failures()[0]!.message), /zz compression call failed/);
+          assert.equal((failures()[0]!.data as { scope?: string }).scope, 'agent');
+          assert.ok(await pollUntil(() => t.internal.overBudgetDrains.size === 0, 3_000));
+          assert.equal(c.ticks, 2, 'the failing tick ended the drive');
+          assert.equal(c.landed, 1);
+          assert.equal(failures().length, 1);
+          assert.deepEqual(lines.filter((l) => l.includes('drain kick failed')), [], 'the drive writes no failure line of its own');
+          assert.equal(holdOf(t)?.state, 'holding', 'the turn stays held');
+        } finally {
+          await t.close();
+        }
+      });
+    });
+  });
+
+  it('counts a drive that ends without a failure as maintenance counts a pass without one, so the same failure after it is reported again', async () => {
+    await withCompressionCalls({ fitAt: 12, workUntil: 12, pauseAfter: 3 }, async (c) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 0, recheckMs: 50 });
       const failures = () => t.of('ops:alert').filter((e) => e.kind === 'context-maintenance-failed');
       const complete = t.membrane.complete.bind(t.membrane);
       let calls = 0;
       t.membrane.complete = async (request: NormalizedRequest) => {
-        if (++calls === 2) throw new Error('zz compression call failed');
+        calls++;
+        if (calls === 2 || calls === 4) throw new Error('zz compression call failed');
         return complete(request);
       };
       try {
         t.send('Are you there?');
-        assert.ok(await pollUntil(() => failures().length === 1, 3_000), 'the failure reached the operator');
-        assert.equal(failures()[0]!.agentName, 'prime');
-        assert.match(String(failures()[0]!.message), /zz compression call failed/);
-        assert.equal((failures()[0]!.data as { scope?: string }).scope, 'agent');
-        assert.ok(await pollUntil(() => t.internal.overBudgetDrains.size === 0, 3_000));
-        assert.equal(c.ticks, 2, 'the failing tick ended the drive');
-        assert.equal(c.landed, 1);
-        assert.equal(failures().length, 1);
-        assert.equal(holdOf(t)?.state, 'holding', 'the turn stays held');
+        assert.ok(await pollUntil(() => failures().length === 1, 3_000), 'the first failure is reported');
+        assert.ok(await pollUntil(() => c.started === 3 && c.landed === 2 && t.internal.overBudgetDrains.size === 0, 3_000),
+          'a later drive\'s call landed, and that drive ended at a tick that started none');
+        c.pauseAfter = Infinity;
+        assert.ok(await pollUntil(() => failures().length === 2, 3_000), 'the same failure after it is reported again');
+        assert.equal(calls, 4);
       } finally {
         await t.close();
       }
