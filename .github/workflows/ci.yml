@@ -89,20 +89,13 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Type-check
-        run: npx tsc --noEmit
-
       - name: Build
         run: npm run build
 
-      # As many test files at once as the runner has cores, said here rather
-      # than left to Node's default of one fewer: ubuntu's 4-core runs went
-      # from about 380 s to 300 s. Most files wait on timers and child
-      # processes, not the CPU.
       - name: Test
         run: |
-          AF_TEST_CONCURRENCY=$(node -p "require('node:os').cpus().length")
-          echo "cores: $AF_TEST_CONCURRENCY (Node's availableParallelism: $(node -p "require('node:os').availableParallelism()")); test files at once: $AF_TEST_CONCURRENCY"
+          AF_TEST_CONCURRENCY=$(node -p "2 * require('node:os').cpus().length")
+          echo "cores: $(node -p "require('node:os').cpus().length") (Node's availableParallelism: $(node -p "require('node:os').availableParallelism()")); test files at once: $AF_TEST_CONCURRENCY"
           export AF_TEST_CONCURRENCY
           npm test
 

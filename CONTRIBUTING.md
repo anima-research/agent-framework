@@ -212,12 +212,12 @@ minutes; the slowest file, `mcpl-runtime-lifecycle`, takes about three.
 Each job in `ci.yml` also has a `timeout-minutes` limit, which ends a hang
 the test timeout doesn't reach.
 
-CI (`ci.yml`'s Build & Test, and `publish.yml`) runs as many test files at
-once as the runner has cores, by setting `AF_TEST_CONCURRENCY`; `npm test`
+CI (`ci.yml`'s Build & Test, and `publish.yml`) runs twice as many test files
+at once as the runner has cores, by setting `AF_TEST_CONCURRENCY`; `npm test`
 passes it on as `--test-concurrency` only when it's set. Unset, as it is
 locally, Node's default of one file fewer than the cores applies. To run the
 suite as CI schedules it, for example to chase a failure that shows only
-under load, set it: `AF_TEST_CONCURRENCY=$(node -p "require('node:os').cpus().length") npm test`.
+under load, set it: `AF_TEST_CONCURRENCY=$(node -p "2 * require('node:os').cpus().length") npm test`.
 
 Push-time CI (`ci.yml`) builds, typechecks and runs the whole suite once on
 every pull request and every push to main, on ubuntu at the engines floor

@@ -2,10 +2,12 @@
  * Two things ci.yml decides from what a test can read:
  *
  * - How many test files run at once. ci.yml's Build & Test and publish.yml's
- *   Test step export AF_TEST_CONCURRENCY (the runner's core count), and npm
- *   test passes it on as --test-concurrency only when it is set. If either
- *   side is renamed or dropped, the suite goes back to Node's default of one
- *   file fewer than the cores, and nothing fails: these tests do.
+ *   Test step export AF_TEST_CONCURRENCY (twice the runner's core count),
+ *   computed the same way in both, and npm test passes it on as
+ *   --test-concurrency only when it is set. If either side is renamed or
+ *   dropped, the suite goes back to Node's default of one file fewer than the
+ *   cores, and if the two workflows differ, a release's gate runs the suite in
+ *   a way no pull request's run checked. Nothing else fails: these tests do.
  * - When a pull request runs code_execution's Bun legs on macOS. The
  *   `changes` job runs them when the diff matches a filter. Every file those
  *   tests import or load by path, directly or through others, must match it,
@@ -48,6 +50,15 @@ for (const workflow of ['.github/workflows/ci.yml', '.github/workflows/publish.y
     }
   });
 }
+
+test("ci.yml and publish.yml compute AF_TEST_CONCURRENCY the same way", () => {
+  const computed = (workflow: string) => {
+    const lines = npmTestSteps(read(workflow)).flatMap((step) => step.match(/^\s*(?:export\s+)?AF_TEST_CONCURRENCY=.*$/gm) ?? []);
+    assert.equal(lines.length, 1, `${workflow}'s npm test step sets AF_TEST_CONCURRENCY once`);
+    return lines[0]!.trim();
+  };
+  assert.equal(computed('.github/workflows/publish.yml'), computed('.github/workflows/ci.yml'));
+});
 
 /** The ERE the `changes` job matches the pull request's changed paths against for Bun's macOS legs. */
 function bunMacosFilter(): RegExp {
