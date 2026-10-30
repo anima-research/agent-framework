@@ -747,6 +747,9 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     assert.deepStrictEqual(admitted.map((event) => event.messageId), ['kept-1']);
   });
 
+  const fromServer = <T extends { event: string }>(items: T[]): T[] =>
+    items.filter((item) => item.event !== 'reconnect-failed' && item.event !== 'connect-failed');
+
   // #387's budget of 10,000 held requests is for requests a live server
   // waits on. A request a transport boundary keeps has no server waiting, its
   // answer bound to a transport that's gone, so it's counted apart, with a
@@ -776,7 +779,7 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     const transport = (connection as unknown as { transport: { writeLine(line: string): void } }).transport;
     const writeLine = transport.writeLine.bind(transport);
     transport.writeLine = (line: string) => { written.push(line); writeLine(line); };
-    const held = () => (connection as unknown as { bufferedEvents: Array<{ event: string }> }).bufferedEvents.map((item) => item.event);
+    const held = () => fromServer((connection as unknown as { bufferedEvents: Array<{ event: string }> }).bufferedEvents).map((item) => item.event);
     const lateSends = (message: Record<string, unknown>) => dead.emit('line', JSON.stringify({ jsonrpc: '2.0', ...message }));
     return { serverSends, lateSends, logged, written, held };
   }

@@ -1278,10 +1278,12 @@ test('a reconnect that meets a revision the client does not share stops for good
   const failures: Array<{ error: string; permanent?: boolean }> = [];
   connection.on('reconnect-failed', (f) => failures.push(f));
   await connection.callTool('die', {});
-  await until(() => failures.length > 0, 'the reconnect failing');
-  assert.equal(failures.length, 1);
-  assert.equal(failures[0]!.permanent, true);
-  assert.match(failures[0]!.error, /does not support MCP 2026-07-28 \(it supports: 2099-01-01\)/);
+  await until(() => failures.some((f) => f.permanent), 'the reconnect failing');
+  assert.equal(failures.length, 2);
+  assert.match(failures[0]!.error, /^connected, then closed after/);
+  assert.equal(failures[0]!.permanent, undefined);
+  assert.equal(failures[1]!.permanent, true);
+  assert.match(failures[1]!.error, /does not support MCP 2026-07-28 \(it supports: 2099-01-01\)/);
   assert.equal(connection.willReconnect, false);
   assert.equal((connection as unknown as { reconnectTimer: unknown }).reconnectTimer, null, 'no further attempt scheduled');
   assert.equal(wire(log).filter((e) => e.event === 'start').length, 2);

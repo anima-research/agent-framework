@@ -109,17 +109,19 @@ test('a version verdict on reconnect stops the backoff loop', async () => {
   // The first process answers 2024-11-05; make it exit so the loop runs.
   await assert.rejects(connection.sendToolsCall('die', {}));
   const deadline = Date.now() + 5_000;
-  while (failures.length === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
-  assert.equal(failures.length, 1, 'one failed reconnect');
-  assert.equal(failures[0]!.permanent, true);
-  assert.match(failures[0]!.error, /does not support MCP 2024-11-05/);
+  while (!failures.some((f) => f.permanent) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+  assert.equal(failures.length, 2, 'the short-lived connection, then one failed reconnect');
+  assert.match(failures[0]!.error, /^connected, then closed after/);
+  assert.equal(failures[0]!.permanent, undefined);
+  assert.equal(failures[1]!.permanent, true);
+  assert.match(failures[1]!.error, /does not support MCP 2024-11-05/);
   assert.equal(connection.willReconnect, false);
 
   // No further attempts: the start count stays at 2 (original + one retry).
   await new Promise((r) => setTimeout(r, 300));
   const starts = existsSync(startLog) ? readFileSync(startLog, 'utf8').split('\n').filter(Boolean).length : 0;
   assert.equal(starts, 2);
-  assert.equal(failures.length, 1);
+  assert.equal(failures.length, 2);
 });
 
 test('a version verdict at startup raises the ops alert at once, as on reconnect', async () => {

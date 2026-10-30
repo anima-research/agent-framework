@@ -237,10 +237,10 @@ test("the mcpl-down ops alert names a failed handshake without the server's stde
   assert.equal(trace?.error, error);
   // The trace is a record, so the server's credential is redacted in it.
   assert.equal(trace?.stderrTail, 'fatal: token redacted was refused');
-  assert.equal(traces.find((event) => event.type === 'ops:alert')?.message, `MCPL server unreachable (attempt 5): ${error}`);
+  assert.equal(traces.find((event) => event.type === 'ops:alert')?.message, `MCPL server down (attempt 5): ${error}`);
   // What the operator's webhook is sent, which posts outside the process.
   assert.equal(posted.length, 1);
-  assert.ok(posted[0]!.endsWith(`mcpl-down: MCPL server unreachable (attempt 5): ${error}`), posted[0]);
+  assert.ok(posted[0]!.endsWith(`mcpl-down: MCPL server down (attempt 5): ${error}`), posted[0]);
   assert.ok(!posted[0]!.includes('sk-0123456789abcdef'));
 });
 
@@ -256,7 +256,7 @@ test('a reconnect failure with no stderr, such as a spawn error, is traced with 
   const error = 'MCPL server "needs-token" could not be started: spawn not-a-command ENOENT';
   connection.emit('reconnect-failed', { error, attempt: 5 });
   assert.equal('stderrTail' in (traces.find((event) => event.type === 'mcpl:server-connect-failed') ?? {}), false);
-  assert.equal(traces.find((event) => event.type === 'ops:alert')?.message, `MCPL server unreachable (attempt 5): ${error}`);
+  assert.equal(traces.find((event) => event.type === 'ops:alert')?.message, `MCPL server down (attempt 5): ${error}`);
 });
 
 test("at startup, a failed connect's trace and log line carry the server's stderr with its credentials redacted", { timeout: 30_000 }, async (t) => {

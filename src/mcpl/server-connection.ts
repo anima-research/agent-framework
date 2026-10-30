@@ -21,7 +21,11 @@ import {
   LEGACY_MCP_PROTOCOL_VERSION,
   MODERN_MCP_PROTOCOL_VERSION,
   checkServerConfig,
+  connectionEnded,
+  endedTooSoon,
   logDroppedLine,
+  reconnectDelay,
+  reconnectTimings,
   redactServerText,
   redactedData,
   serverTextRedactor,
@@ -416,7 +420,11 @@ function unmatchedResponse(
  *   `{ error, stderrTail?, attempt }`. `stderrTail` is the last of the
  *   server's stderr when its handshake failed by its transport closing, a
  *   transport error or its timeout and it had written any; `error` never
- *   carries it.
+ *   carries it. With reconnect on, a connection that ended before it lasted
+ *   (`lastingAfterMs`, #375) is reported here too, as the failure of the
+ *   attempt that made it, with `error` "connected, then closed after N s"
+ *   and no `stderrTail`, unless its launch can't be reaped, which is
+ *   reported once, as the permanent halt.
  * - `'reconnect'`          — Background reconnect succeeded. The new transport
  *                            starts with an empty grant and both planes
  *                            closed, as at initial connect: whoever owns the
@@ -736,9 +744,8 @@ export class McplServerConnection extends EventEmitter {
   private reconnectIntervalMs = 5000;
   private reconnectMaxIntervalMs = 300_000;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  /** Consecutive failed connect attempts since the last successful handshake.
-   *  Drives the exponential backoff and is reported on reconnect events. */
   private reconnectAttempts = 0;
+  private connectedAt = 0;
   /** The reconnect attempt in flight, so close() can abort it and wait for
    *  its cleanup. */
   private reconnecting: { abort: AbortController; done: Promise<void> } | null = null;
@@ -1272,8 +1279,7 @@ export class McplServerConnection extends EventEmitter {
     if (config.reconnect === true) {
       connection.hostCapabilities = hostCapabilities;
       connection.reconnectEnabled = true;
-      connection.reconnectIntervalMs = config.reconnectIntervalMs ?? 5000;
-      connection.reconnectMaxIntervalMs = config.reconnectMaxIntervalMs ?? 300_000;
+      ({ intervalMs: connection.reconnectIntervalMs, maxIntervalMs: connection.reconnectMaxIntervalMs } = reconnectTimings(config));
     }
 
     return connection;
@@ -1593,8 +1599,7 @@ export class McplServerConnection extends EventEmitter {
     stub.config = config;
     stub.hostCapabilities = hostCapabilities;
     stub.reconnectEnabled = config.reconnect === true;
-    stub.reconnectIntervalMs = config.reconnectIntervalMs ?? 5000;
-    stub.reconnectMaxIntervalMs = config.reconnectMaxIntervalMs ?? 300_000;
+    ({ intervalMs: stub.reconnectIntervalMs, maxIntervalMs: stub.reconnectMaxIntervalMs } = reconnectTimings(config));
     stub.reconnectAttempts = 1; // the initial connect already failed
     return stub;
   }
@@ -2044,23 +2049,17 @@ export class McplServerConnection extends EventEmitter {
     };
   }
 
-  /**
-   * Schedule a background reconnection attempt.
-   *
-   * Delay grows exponentially with consecutive failures (base
-   * `reconnectIntervalMs`, doubling per failure, capped at
-   * `reconnectMaxIntervalMs`) with ±25% jitter so a fleet of servers that
-   * died together doesn't thundering-herd the same instant. The counter
-   * resets on a successful handshake, so a later disconnect starts over at
-   * the base interval.
-   */
+  private printFailedAttempt(attempt: number, error: string): void {
+    const redacted = redactServerText(error, this.config ?? {});
+    console.error(attempt === 0
+      ? `MCPL server "${this.id}" initial connect failed, will retry: ${redacted}`
+      : `MCPL server "${this.id}" reconnect failed: ${redacted}`);
+  }
+
   private scheduleReconnect(): void {
     if (!this.reconnectEnabled || this.reconnectTimer) return;
 
-    const exponent = Math.max(0, Math.min(this.reconnectAttempts - 1, 30));
-    const uncapped = this.reconnectIntervalMs * 2 ** exponent;
-    const capped = Math.min(uncapped, this.reconnectMaxIntervalMs);
-    const delay = capped * (0.75 + Math.random() * 0.5);
+    const delay = reconnectDelay(this.reconnectAttempts, this.reconnectIntervalMs, this.reconnectMaxIntervalMs);
 
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
@@ -2182,7 +2181,7 @@ export class McplServerConnection extends EventEmitter {
     this.wireTransport(transport);
 
     console.error(`MCPL server "${this.id}" reconnected successfully`);
-    this.reconnectAttempts = 0;
+    this.reconnectAttempts = attempt;
     this.emit('reconnect', { attempts: attempt });
   }
 
@@ -2421,6 +2420,7 @@ export class McplServerConnection extends EventEmitter {
    * a new transport is adopted.
    */
   private wireTransport(transport: McplTransport): void {
+    this.connectedAt = performance.now();
     this.setupMessageRouting(transport);
     this.setupLifecycle(transport);
     // Surface transport diagnostics (stdio child stderr) as 'stderr' events,
@@ -2846,6 +2846,9 @@ export class McplServerConnection extends EventEmitter {
     const lost = (info: TransportCloseInfo) => {
       if (!this.closed) {
         this.closed = true;
+        const lived = performance.now() - this.connectedAt;
+        const ended = connectionEnded(lived, this.reconnectAttempts, this.reconnectMaxIntervalMs);
+        this.reconnectAttempts = ended.failures;
         this.resetPolicyForTransportBoundary();
         // A teardown the host asked for via reconnectAfterFailure() arrives
         // here too; it's reported as such below.
@@ -2893,6 +2896,11 @@ export class McplServerConnection extends EventEmitter {
 
         // Schedule reconnect if enabled (unexpected disconnect triggers auto-reconnect)
         if (this.reconnectEnabled) {
+          if (ended.attempt !== undefined) {
+            const error = endedTooSoon(lived, closeInfo);
+            this.printFailedAttempt(ended.attempt, error);
+            this.emit('reconnect-failed', { error, attempt: ended.attempt });
+          }
           this.scheduleReconnect();
         }
       }

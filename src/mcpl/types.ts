@@ -433,15 +433,33 @@ export interface McplServerConfig {
 
   /**
    * Base interval between reconnection attempts in milliseconds.
-   * The actual delay doubles with each consecutive failure (with ±25% jitter)
-   * up to `reconnectMaxIntervalMs`, and resets after a successful handshake.
-   * Default: 5000 (5 seconds).
+   * The actual delay doubles with each consecutive failed attempt up to
+   * `reconnectMaxIntervalMs`, then takes ±25% jitter. With `reconnect: true`,
+   * a connection that ends before it has lived as long as
+   * `reconnectMaxIntervalMs` (at most about 24.8 days, and never under 5
+   * minutes) is a failed attempt too, reported by `reconnect-failed` with how
+   * long it lived, unless its launch can't be reaped, which is the permanent
+   * failure that halts reconnecting; the count starts afresh only once a
+   * connection lasts that long.
+   * The modern engine also backs off reopening a lost tool-list
+   * subscription by it and `reconnectMaxIntervalMs`, whether or not it
+   * reconnects. Default: 5000 (5 seconds). With `reconnect: true`, or on a
+   * server the modern engine runs, a value read as 0, below 0 or not a
+   * number is refused by `create()`, `connectMcplServer`,
+   * `restartMcplServer` and `serverConfigProblems`; `null` means the default.
    */
   reconnectIntervalMs?: number;
 
   /**
-   * Ceiling for the exponential reconnect backoff in milliseconds.
-   * Default: 300000 (5 minutes).
+   * Ceiling for the exponential reconnect backoff in milliseconds, before
+   * jitter, which is also how long a connection must live to count as
+   * lasting (never under 5 minutes, and never over a timer's limit, about
+   * 24.8 days). A ceiling below `reconnectIntervalMs`
+   * holds every wait at the ceiling, give or take the jitter. Waits never
+   * exceed a timer's limit (2³¹−1 ms, about 24.8 days), so Infinity is
+   * accepted; with a ceiling near that limit, a server whose connections each
+   * live days counts each end as a failure.
+   * Default: 300000 (5 minutes). Refused as `reconnectIntervalMs` is.
    */
   reconnectMaxIntervalMs?: number;
 

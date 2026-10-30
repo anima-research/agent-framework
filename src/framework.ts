@@ -38514,7 +38514,7 @@ export class AgentFramework {
           // The failure, redacted, and not the server's stderr
           // (params.stderrTail): the webhook posts outside the process, and a
           // server's stderr is its own text.
-          `MCPL server unreachable (attempt ${params.attempt}): ${recorded(params.error)}`,
+          `MCPL server down (attempt ${params.attempt}): ${recorded(params.error)}`,
         );
       }
       // Halted for good: its tools leave the agents' list, since it won't
@@ -38677,7 +38677,7 @@ export class AgentFramework {
       // server's tools leave the agents' list: it won't serve again on its
       // own.
       if (params.permanent || params.attempt >= 5) {
-        this.opsAlert('mcpl-down', connection.id, `MCP server unreachable (attempt ${params.attempt}): ${recorded(params.error)}`);
+        this.opsAlert('mcpl-down', connection.id, `MCP server down (attempt ${params.attempt}): ${recorded(params.error)}`);
       }
       if (params.permanent) this.handleToolsListChanged(connection.id);
     };
