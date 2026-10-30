@@ -460,6 +460,7 @@ export class McplServerConnection extends EventEmitter {
   readonly requiredAdmission?: RequiredAdmission;
   private readonly admissionRefusals = new AdmissionRefusals();
   private requiredFlushActive = false;
+  private requiredFlushDispatching = false;
   private requiredFlushItem?: HeldItem;
   private requiredFlushCompletion?: Promise<void>;
   private requiredFlushDispatched?: Promise<void>;
@@ -954,8 +955,12 @@ export class McplServerConnection extends EventEmitter {
         this.requiredFlushItem = item;
         this.requiredFlushCompletion = undefined;
         this.requiredFlushDispatched = undefined;
+        this.requiredFlushDispatching = true;
         try { this.dispatchInboundEvent(item.event, ...item.args); }
-        finally { this.requiredFlushItem = undefined; }
+        finally {
+          this.requiredFlushDispatching = false;
+          this.requiredFlushItem = undefined;
+        }
         const completion = this.requiredFlushCompletion;
         const dispatched = this.requiredFlushDispatched;
         this.requiredFlushCompletion = undefined;
@@ -1112,7 +1117,7 @@ export class McplServerConnection extends EventEmitter {
   override emit(event: string | symbol, ...args: unknown[]): boolean {
     const name = typeof event === 'string' ? event : '';
     if (this.requiredAdmission && this.requiredFlushActive && McplServerConnection.REQUIRED_DATA_EVENTS.has(name)
-      && !(this.requiredFlushItem?.event === name && this.requiredFlushItem.args[0] === args[0])) {
+      && !(this.requiredFlushDispatching && this.requiredFlushItem?.event === name)) {
       return this.hold(name, args);
     }
     if (this.planeReadyFor(name)) {
@@ -1194,6 +1199,14 @@ export class McplServerConnection extends EventEmitter {
    * keeps it for the next transport's grant (afterBoundary).
    */
   private hold(name: string, args: unknown[], kept?: true): true {
+    // A dispatch-path wrapper or re-entrant plane change must not put the
+    // current data item back into this same drain: with no handler promise,
+    // that would be a synchronous re-dispatch loop starving the event loop.
+    if (this.requiredAdmission && this.requiredFlushDispatching
+      && this.requiredFlushItem?.event === name && McplServerConnection.REQUIRED_DATA_EVENTS.has(name)) {
+      this.refuseAdmission(name, args[0], args[1], 'admission_not_ready');
+      return true;
+    }
     // Held until the plane opens. A long pause (a quiesce, say) on a busy or a
     // runaway server would otherwise grow this array without bound, so
     // requests and notifications each have a bound, counted apart. A request

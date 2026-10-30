@@ -47,7 +47,9 @@ the current key. Superseded-epoch items are refused as `admission_stale`, never
 rebound. Required backlogs drain one admission and its synchronous dispatch/storage
 effects at a time in arrival order, including every item of a channel batch. A held
 inference releases the drain after provider dispatch, not after the model finishes;
-its handler still owns cancellation, failures and the eventual reply. A flush waits for any pre-pause
+its handler still owns cancellation, failures and the eventual reply. A held
+inference backlog reaches the provider concurrently (one call per held item, as
+on the unconfigured path), because the drain releases at dispatch. A flush waits for any pre-pause
 callbacks still occupying all admission slots instead of refusing held work as
 overload. New data arriving during the drain joins the same bounded hold buffer;
 control traffic and RPC responses remain live. Time waiting in the hold buffer is

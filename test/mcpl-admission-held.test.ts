@@ -218,3 +218,72 @@ test('live data arriving during a drain is captured behind held data in the same
   await Promise.all(replies); await eventually(() => !connection.requiredFlushActive);
   assert.equal(peak, 1); assert.deepEqual(queued, Array.from({ length: 22 }, (_, i) => i));
 });
+
+for (const wrapper of ['clone', 'rehold'] as const) test(`held dispatch ${wrapper} cannot spin or block later data`, async t => {
+  const calls: string[] = [];
+  const f = await fixture({ server: { inboundAdmission: {
+    timeoutMs: 5000, bind: (connection: unknown) => ({ connection, admit: (input: any) => {
+      calls.push(input.item.eventId); return allow;
+    } }), isReplyIntent: () => true,
+  } } }); t.after(f.close);
+  const connection = (f.framework as any).mcplServerRegistry.getServer('editor');
+  const emit = connection.emit.bind(connection); let dispatches = 0;
+  connection.emit = (event: string, ...args: any[]) => {
+    if (connection.requiredFlushItem && event === 'push-event' && args[0].eventId === '0') {
+      // Bound the reproduction synchronously: on the old guard a timer cannot
+      // fire because the repeated re-hold starves the event loop.
+      if (++dispatches > 4) {
+        args[1]?.respondError(-32603, 'a flushed item was repeatedly re-held');
+        assert.fail('a flushed item was repeatedly re-held');
+      }
+      if (wrapper === 'rehold') return connection.hold(event, args);
+      args[0] = { ...args[0] };
+    }
+    return emit(event, ...args);
+  };
+  await f.framework.quiesce({ reason: 'test' });
+  const first = f.send('push/event', params('push/event', 0));
+  const later = f.send('push/event', params('push/event', 1));
+  await eventually(() => connection.bufferedEvents.length === 2);
+  await f.framework.resume();
+  const [refused, accepted] = await Promise.all([first, later]);
+  await eventually(() => !connection.requiredFlushActive);
+  assert.equal(dispatches, 1);
+  // A clone without its transport-issued receipt must fail closed, not spin.
+  assert.deepEqual(refused.result, { accepted: false, reason: wrapper === 'clone' ? 'admission_missing' : 'admission_not_ready' });
+  assert.equal(accepted.result.accepted, true); assert.deepEqual(calls, ['1']);
+  assert.equal(connection.bufferedEvents.length, 0);
+});
+
+test('held inference admission timeout releases the drain for later stored data', async t => {
+  const calls: string[] = []; let inferenceSignal: AbortSignal | undefined;
+  const f = await fixture({ featureSets: { doc: { description: 'doc', uses: ['pushEvents', 'inferenceRequest'] } }, server: { inboundAdmission: {
+    timeoutMs: 50, bind: (connection: unknown) => ({ connection, admit: (input: any) => {
+      calls.push(input.lane);
+      if (input.lane === 'inference/request') {
+        inferenceSignal = input.signal;
+        return new Promise(() => {}); // Non-cooperative: only the deadline can release it.
+      }
+      return allow;
+    } }), isReplyIntent: () => true,
+  } } }); t.after(f.close); await f.register();
+  const inner = f.framework as any; const connection = inner.mcplServerRegistry.getServer('editor');
+  let resolutions = 0;
+  inner.inferenceRouter.resolveModel = () => { resolutions++; return 'test'; };
+  await f.framework.quiesce({ reason: 'test' });
+  const inference = f.send('inference/request', { featureSet: 'doc', messages: [{ role: 'user', content: 'times_out' }] });
+  const push = f.send('push/event', params('push/event', 0));
+  const channel = f.send('channels/incoming', params('channels/incoming', 1));
+  await eventually(() => connection.bufferedEvents.length === 3);
+  await f.framework.resume();
+  const [failure, pushed, delivered] = await Promise.all([inference, push, channel]);
+  assert.deepEqual(failure.error, { code: -32600, message: 'admission_timeout' });
+  assert.equal(pushed.result.accepted, true); assert.equal(delivered.result.results[0].accepted, true);
+  await eventually(() => !connection.requiredFlushActive);
+  assert.deepEqual(calls, ['inference/request', 'push/event', 'channels/incoming']);
+  assert.equal(inferenceSignal?.aborted, true); assert.equal(resolutions, 0);
+  assert.equal(inner.inferenceRouter.running.size, 0); assert.equal(connection.requiredAdmission.pending.size, 0);
+  assert.equal(connection.bufferedEvents.length, 0);
+  await f.framework.runUntilIdle(); assert.equal(f.membrane.calls.length, 0);
+  assert(f.context().includes('held_0')); assert(f.context().includes('held_1'));
+});
