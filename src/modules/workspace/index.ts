@@ -2393,7 +2393,7 @@ export class WorkspaceModule implements Module {
   /**
    * Write binary content (e.g. an image pulled from the agent's context) to a
    * mount, through the same Chronicle-tree + auto-materialize path as the
-   * `write` tool. Public API for the framework's synthesized `save_image`
+   * `write` tool. Public API for the framework's synthesized `save_recent_image`
    * tool and other peer callers that hold bytes rather than text.
    *
    * `branch`, when given, ties the write to that branch: the store's current

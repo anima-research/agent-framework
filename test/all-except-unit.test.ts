@@ -15,7 +15,8 @@ function harness(stored: Array<{ participant: string; content: Array<{ type: str
   const wakes: string[] = [];
   const messages: Array<{ participant: string; text: string; forAgent?: string }> = [];
   const traces: string[] = [];
-  const fail = { read: false, write: false, addMessage: false };
+  const fail = { read: false, write: false, addMessage: false, commit: false, wake: false };
+  const anchors: number[] = [];
   const registry = {
     getTuneOutState: () => null,
     // Each channel is shown by its id where no other server registers it,
@@ -36,24 +37,29 @@ function harness(stored: Array<{ participant: string; content: Array<{ type: str
   } as unknown as ChannelRegistry;
   const servers = { getServer: () => undefined } as unknown as McplServerRegistry;
   const hooks = {
-    addMessage: (participant: string, content: Array<{ type: string; text?: string }>, _m: unknown, forAgent?: string) => {
+    addMessage: (participant: string, content: Array<{ type: string; text?: string }>, metadata: Record<string, unknown> | undefined, forAgent?: string) => {
       if (fail.addMessage) throw new Error('context write failed');
       messages.push({ participant, text: content.map((b) => b.text ?? '').join(''), forAgent });
+      if (!forAgent && metadata) stored.push({ participant, content, metadata });
       return 'id';
     },
-    requestInference: (agentName: string) => { wakes.push(agentName); },
+    commitDeliveries: () => !fail.commit,
+    requestInference: (agentName: string) => {
+      if (fail.wake) throw new Error('the wake request failed');
+      wakes.push(agentName);
+    },
     subconsciousName: () => 'Subconscious',
     primaryName: () => 'scout',
     getStoredMessages: () => stored,
     currentSequence: () => 1,
-    setSubconsciousAnchor: () => {},
+    setSubconsciousAnchor: (sequence: number) => { anchors.push(sequence); },
     isForkBound: () => false,
     isPrivilegedAuthor: () => false,
     allowChannelSpeech: () => false,
     emitTrace: (e: { type: string }) => { traces.push(e.type); },
   } as unknown as TuneOutFrameworkHooks;
   const make = () => new TuneOutCoordinator(registry, servers, hooks);
-  return { make, state, wakes, messages, traces, fail, stored };
+  return { make, state, wakes, messages, traces, fail, stored, anchors };
 }
 
 describe('all-except scope on the coordinator', () => {
@@ -94,6 +100,56 @@ describe('all-except scope on the coordinator', () => {
     assert.ok(release.includes('two on disc') && release.includes('one on slack'), 'each channel keeps its own cap of one');
     assert.ok(!release.includes('one on disc'), "disc's older message is past its cap");
     c.stop();
+  });
+
+  it('a scope whose deadline passed while the process was down and whose release fails at the start stays in force, arms its retry, and the start goes on', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+    t.mock.method(console, 'error', () => {});
+    const h = harness();
+    const first = h.make();
+    assert.ok(first.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool').ok);
+    first.stop();
+    const id = [...h.state.keys()].find((k) => k.endsWith('/all-except'))!;
+    const record = h.state.get(id) as { params: { expiresAtMs: number } };
+    record.params.expiresAtMs = Date.now() - 1000;
+    h.fail.commit = true;
+    const second = h.make();
+    assert.doesNotThrow(() => second.resumeActiveEpochs());
+    assert.ok(second.getAllExcept(), 'the hold stays in force');
+    h.fail.commit = false;
+    t.mock.timers.tick(60_000);
+    assert.equal(second.getAllExcept(), null, 'its retry released it');
+    const releases = h.messages.filter((m) => /all channels except work released — duration elapsed/.test(m.text));
+    assert.equal(releases.length, 1, 'the resident got the release once');
+    second.stop();
+  });
+
+  it('a scope whose deadline passed while the process was down and whose release ends it at the start but then fails a later step is treated as ended, with no retry, and the start goes on', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+    const errors = t.mock.method(console, 'error', () => {});
+    const h = harness();
+    const first = h.make();
+    assert.ok(first.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool').ok);
+    first.stop();
+    const id = [...h.state.keys()].find((k) => k.endsWith('/all-except'))!;
+    const record = h.state.get(id) as { params: { expiresAtMs: number } };
+    record.params.expiresAtMs = Date.now() - 1000;
+    h.fail.wake = true;
+    h.anchors.length = 0;
+    const second = h.make();
+    let releases = 0;
+    const release = second.cancelAllExcept.bind(second);
+    second.cancelAllExcept = (...args: Parameters<TuneOutCoordinator['cancelAllExcept']>) => { releases++; return release(...args); };
+    assert.doesNotThrow(() => second.resumeActiveEpochs());
+    assert.equal(second.getAllExcept(), null, 'its end was recorded');
+    assert.deepEqual(h.anchors, [], 'no hold in force anchors the subconscious');
+    const said = errors.mock.calls.map((c) => String(c.arguments[0])).join('\n');
+    assert.match(said, /its release ended it, but a step after the end failed/);
+    assert.ok(!/stays in force/.test(said), said);
+    h.fail.wake = false;
+    t.mock.timers.tick(10 * 60_000);
+    second.stop();
+    assert.equal(releases, 1, 'nothing tries to release it again');
   });
 
   it('a scope whose deadline passed while the process was down is released at resume', () => {
@@ -172,6 +228,97 @@ describe('all-except scope on the coordinator', () => {
     assert.throws(() => c.cancelAllExcept('duration', 'duration elapsed'), /store write failed/);
     assert.ok(c.getAllExcept(), 'the hold is still in force while its end is not recorded');
     h.fail.write = false;
+    assert.ok(c.cancelAllExcept('duration', 'duration elapsed').ok);
+    assert.equal(c.getAllExcept(), null);
+    const releases = h.messages.filter((m) => /all channels except work released/.test(m.text));
+    assert.equal(releases.length, 1, 'the resident got the release once');
+    c.stop();
+  });
+
+  it('a message held while the clear keeps failing reaches the resident once, and every message the first release showed is shown once', () => {
+    const stored: Parameters<typeof harness>[0] = [];
+    const h = harness(stored);
+    const c = h.make();
+    assert.ok(c.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool').ok);
+    const epochId = c.getAllExcept()!.params.epochId;
+    const row = (id: string, text: string) => ({
+      id,
+      participant: 'user',
+      content: [{ type: 'text', text }],
+      metadata: { author: { name: 'Bo' }, serverId: 'disc', channelId: 'noisy', tuneOut: { epochId } },
+    });
+    stored.push(row('s1', 'first held'));
+    h.fail.write = true;
+    assert.throws(() => c.cancelAllExcept('duration', 'duration elapsed'), /store write failed/);
+    assert.deepEqual(
+      h.messages.filter((m) => /all channels except work released/.test(m.text)).map((m) => m.text.includes('first held')),
+      [true],
+      'the first release was written before the clear threw',
+    );
+    stored.push(row('s2', 'held after the first release'));
+    h.fail.write = false;
+    assert.ok(c.cancelAllExcept('duration', 'duration elapsed').ok);
+    const all = h.messages.filter((m) => /all channels except work released/.test(m.text)).map((m) => m.text).join('\n');
+    for (const line of ['first held', 'held after the first release']) {
+      assert.equal(all.split(line).length - 1, 1, `the resident is shown "${line}" once: ${all}`);
+    }
+    c.stop();
+  });
+
+  it('after a restart between a written release and a failed clear, the next release shows nothing a second time and clears the hold', () => {
+    const stored: Parameters<typeof harness>[0] = [];
+    const h = harness(stored);
+    const before = h.make();
+    assert.ok(before.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool').ok);
+    const epochId = before.getAllExcept()!.params.epochId;
+    stored.push({
+      id: 's1',
+      participant: 'user',
+      content: [{ type: 'text', text: 'held before the restart' }],
+      metadata: { author: { name: 'Bo' }, serverId: 'disc', channelId: 'noisy', tuneOut: { epochId } },
+    } as NonNullable<Parameters<typeof harness>[0]>[number]);
+    h.fail.write = true;
+    assert.throws(() => before.cancelAllExcept('duration', 'duration elapsed'), /store write failed/);
+    before.stop();
+    h.fail.write = false;
+    const after = h.make();
+    assert.ok(after.getAllExcept(), 'the hold is still on record');
+    assert.ok(after.cancelAllExcept('duration', 'duration elapsed').ok);
+    assert.equal(after.getAllExcept(), null);
+    const shown = h.messages.filter((m) => /all channels except work released/.test(m.text)).map((m) => m.text).join('\n');
+    assert.equal(shown.split('held before the restart').length - 1, 1, shown);
+    after.stop();
+  });
+
+  it("the release's record says how many held messages it covered and how many its dumps left out", () => {
+    const stored: Parameters<typeof harness>[0] = [];
+    const h = harness(stored);
+    const c = h.make();
+    assert.ok(c.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120, backlogCap: 1 }, 'agent-tool').ok);
+    const epochId = c.getAllExcept()!.params.epochId;
+    for (const [i, channelId] of ['noisy', 'noisy', 'noisy', 'general'].entries()) {
+      stored.push({
+        id: `s${i}`,
+        participant: 'user',
+        content: [{ type: 'text', text: `held ${i}` }],
+        metadata: { author: { name: 'Bo' }, serverId: 'disc', channelId, tuneOut: { epochId } },
+      } as NonNullable<Parameters<typeof harness>[0]>[number]);
+    }
+    assert.ok(c.cancelAllExcept('duration', 'duration elapsed').ok);
+    const release = stored.find((m) => m.metadata.kind === 'tune-out-cancel');
+    const record = release?.metadata.released as { total: number; truncated: number } | undefined;
+    assert.deepEqual({ total: record?.total, truncated: record?.truncated }, { total: 4, truncated: 2 });
+    c.stop();
+  });
+
+  it('a release that could not be made durable leaves the hold in force, and its retry clears it with the release written once', () => {
+    const h = harness();
+    const c = h.make();
+    assert.ok(c.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool').ok);
+    h.fail.commit = true;
+    assert.throws(() => c.cancelAllExcept('duration', 'duration elapsed'), /could not be made durable/);
+    assert.ok(c.getAllExcept(), 'the hold is still in force');
+    h.fail.commit = false;
     assert.ok(c.cancelAllExcept('duration', 'duration elapsed').ok);
     assert.equal(c.getAllExcept(), null);
     const releases = h.messages.filter((m) => /all channels except work released/.test(m.text));
