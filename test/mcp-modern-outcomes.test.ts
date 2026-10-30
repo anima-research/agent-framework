@@ -18,7 +18,7 @@
  */
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import type { ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -30,6 +30,7 @@ import { StdioTransport, setStdioExitGraceForTests } from '../src/mcpl/transport
 import { McplProtocolVersionError, McplRequestError } from '../src/mcpl/server-connection.js';
 import { MAX_TIMER_MS } from '../src/mcpl/protocol-family.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
+import { jsonLines } from './helpers/json-lines.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SERVER = join(here, 'fixtures', 'modern-raw-server.mjs');
@@ -66,8 +67,7 @@ function scratchLog(): string {
   return join(dir, 'wire.jsonl');
 }
 
-const wire = (log: string): LogEntry[] =>
-  existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as LogEntry) : [];
+const wire = (log: string): LogEntry[] => jsonLines<LogEntry>(log);
 const calls = (log: string, tool: string) => wire(log).filter((e) => e.method === 'tools/call' && e.tool === tool).length;
 
 /**

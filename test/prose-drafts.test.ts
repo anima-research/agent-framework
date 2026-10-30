@@ -9,7 +9,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { MembraneError, type ContentBlock, type NormalizedRequest, type NormalizedResponse, type StreamEvent, type YieldingStream } from '@animalabs/membrane';
@@ -18,6 +18,7 @@ import type { Module } from '../src/index.js';
 import { ProseDraftStore, draftState, PROSE_DRAFT_RECORD_TYPE } from '../src/prose-drafts.js';
 import { destinationKey } from '../src/mcpl/channel-registry.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { jsonLines } from './helpers/json-lines.js';
 
 const ROOM = 'discord:g1:room';
 const GENERAL = 'discord:g1:general';
@@ -497,21 +498,16 @@ async function harness(opts: {
     get framework() { return framework; },
     until,
     command: (c: Record<string, unknown>) => appendFileSync(commandPath, JSON.stringify(c) + '\n'),
-    publishes: (): Publish[] => existsSync(statusPath)
-      ? readFileSync(statusPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as Publish)
-        .filter((e) => e.event === 'publish' || e.event === 'publish-refused' || e.event === 'publish-error')
-      : [],
+    publishes: (): Publish[] => jsonLines<Publish>(statusPath)
+      .filter((e) => e.event === 'publish' || e.event === 'publish-refused' || e.event === 'publish-error'),
     sendMode: async (mode: string, answers?: string) => {
-      const logged = () => existsSync(statusPath) ? readFileSync(statusPath, 'utf8').split('\n').filter(Boolean)
-        .filter((l) => (JSON.parse(l) as { event: string }).event === 'send-mode').length : 0;
+      const logged = () => jsonLines<{ event: string }>(statusPath).filter((e) => e.event === 'send-mode').length;
       const before = logged();
       h.command({ op: 'send-mode', mode, ...(answers ? { answers } : {}) });
       await until(() => logged() > before, 'the send mode');
     },
-    sends: (): Array<{ channelId: string; text: string }> => existsSync(statusPath)
-      ? readFileSync(statusPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as { event: string; channelId: string; text: string })
-        .filter((e) => e.event === 'send')
-      : [],
+    sends: (): Array<{ channelId: string; text: string }> => jsonLines<{ event: string; channelId: string; text: string }>(statusPath)
+      .filter((e) => e.event === 'send'),
     /** One addressed message in #room starts a turn (or, with `request`, a
      *  direct inference request for just that resident); resolves when it settles. */
     turn: async (responses: Array<ReturnType<typeof createMockResponse>>, agentName = 'scout', via: 'incoming' | 'request' | 'silent' | 'heartbeat' = 'incoming') => {

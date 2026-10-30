@@ -12,7 +12,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync, appendFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
@@ -23,6 +23,7 @@ import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { ToolResult } from '../src/types/events.js';
 import type { PushEventParams, PushEventResult } from '../src/mcpl/types.js';
 import { MockMembrane, HeldStream, createMockResponse } from './helpers/mock-membrane.js';
+import { jsonLines } from './helpers/json-lines.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/speech-route-mcpl-server.mjs');
 // These tests were written to the latest-inbound speech rule: a message
@@ -55,8 +56,7 @@ describe("a push naming another server's channel, through two real servers", () 
   let framework: AgentFramework;
   let membrane: MockMembrane;
   const paths = (id: string) => ({ status: join(dir, `${id}-status.jsonl`), command: join(dir, `${id}-commands.jsonl`) });
-  const lines = (path: string): Array<Record<string, unknown>> =>
-    existsSync(path) ? readFileSync(path, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [];
+  const lines = (path: string): Array<Record<string, unknown>> => jsonLines(path);
   const command = (id: string, c: Record<string, unknown>) => appendFileSync(paths(id).command, JSON.stringify(c) + '\n');
   const registry = () => (framework as unknown as { channelRegistry: ChannelRegistry }).channelRegistry;
   const rows = (id: string) => registry().listChannelsRaw().filter((e) => e.descriptor.id === id)
@@ -167,8 +167,7 @@ describe("a turn's replies go out through the server whose message triggered it"
   let started = 0;
   let restoreErrors: () => void = () => {};
   const paths = (id: string) => ({ status: join(dir, `${id}-status.jsonl`), command: join(dir, `${id}-commands.jsonl`) });
-  const lines = (path: string): Array<Record<string, unknown>> =>
-    existsSync(path) ? readFileSync(path, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [];
+  const lines = (path: string): Array<Record<string, unknown>> => jsonLines(path);
   const command = (id: string, c: Record<string, unknown>) => appendFileSync(paths(id).command, JSON.stringify(c) + '\n');
   const registry = () => (framework as unknown as { channelRegistry: ChannelRegistry }).channelRegistry;
   const holders = (id: string) => registry().listChannelsRaw().filter((e) => e.descriptor.id === id).map((e) => e.serverId).sort();
@@ -516,8 +515,7 @@ describe('in explicit and hybrid mode, a reply goes out through no server but th
   let started = 0;
   let restoreErrors: () => void = () => {};
   const paths = (id: string) => ({ status: join(dir, `${id}-status.jsonl`), command: join(dir, `${id}-commands.jsonl`) });
-  const lines = (path: string): Array<Record<string, unknown>> =>
-    existsSync(path) ? readFileSync(path, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [];
+  const lines = (path: string): Array<Record<string, unknown>> => jsonLines(path);
   const command = (id: string, c: Record<string, unknown>) => appendFileSync(paths(id).command, JSON.stringify(c) + '\n');
   const registry = () => (framework as unknown as { channelRegistry: ChannelRegistry }).channelRegistry;
   const published = (text: string) => ['discord', 'slack'].flatMap((id) =>
@@ -744,8 +742,7 @@ describe("a script's call, through a real code_execution run", () => {
   let membrane: MockMembrane;
   let restoreErrors: () => void = () => {};
   const paths = (id: string) => ({ status: join(dir, `${id}-status.jsonl`), command: join(dir, `${id}-commands.jsonl`) });
-  const lines = (path: string): Array<Record<string, unknown>> =>
-    existsSync(path) ? readFileSync(path, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [];
+  const lines = (path: string): Array<Record<string, unknown>> => jsonLines(path);
   const command = (id: string, c: Record<string, unknown>) => appendFileSync(paths(id).command, JSON.stringify(c) + '\n');
   const registry = () => (framework as unknown as { channelRegistry: ChannelRegistry }).channelRegistry;
   const published = (text: string) => ['discord', 'slack'].flatMap((id) =>
@@ -880,8 +877,7 @@ describe("with conversation routing, each server's channel is its own conversati
     await waitFor(() => holders('from slack').length > 0, "slack's message reached a fork");
     await framework!.runUntilIdle();
     const [discordFork] = holders('from discord');
-    const via = (text: string) => ['discord', 'slack'].filter((id) => existsSync(paths(id).status) && readFileSync(paths(id).status, 'utf8')
-      .split('\n').filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>)
+    const via = (text: string) => ['discord', 'slack'].filter((id) => jsonLines(paths(id).status)
       .some((l) => l.event === 'publish' && String(l.text ?? '').includes(text)));
     const result = await framework!.executeToolCall({ id: 'h-1', name: 'channel_publish', input: { content: 'zz-home-post' }, callerAgentName: discordFork } as never);
     assert.ok(result.success, result.error);

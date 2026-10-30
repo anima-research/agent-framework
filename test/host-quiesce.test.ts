@@ -28,6 +28,7 @@ import { setAbandonGraceForTests } from '../src/framework.js';
 import type { TraceEvent } from '../src/types/trace.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { schedulerPasses } from './helpers/scheduler-passes.js';
+import { jsonLines } from './helpers/json-lines.js';
 
 async function waitFor(
   description: string,
@@ -807,10 +808,7 @@ test('MCPL: pushes buffer while quiesced; host/command resume reopens and flushe
   const statusPath = join(dir, 'status.jsonl');
   const pushPath = join(dir, 'push');
   const resumePath = join(dir, 'resume');
-  const records = (): Array<{ event: string; [key: string]: unknown }> =>
-    existsSync(statusPath)
-      ? readFileSync(statusPath, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l))
-      : [];
+  const records = (): Array<{ event: string; [key: string]: unknown }> => jsonLines(statusPath);
 
   const membrane = new MockMembrane();
   const framework = await AgentFramework.create({

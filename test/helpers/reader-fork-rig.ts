@@ -7,7 +7,7 @@
 import { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync, appendFileSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, appendFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
 import { AgentFramework } from '../../src/index.js';
@@ -15,6 +15,7 @@ import type { TraceEvent } from '../../src/index.js';
 import type { Module } from '../../src/types/index.js';
 import { MockYieldingStream, createMockResponse } from './mock-membrane.js';
 import type { TuneOutCoordinator } from '../../src/tune-out/coordinator.js';
+import { jsonLines } from './json-lines.js';
 
 const FIXTURE = join(import.meta.dirname, '..', 'fixtures/tune-out-mcpl-server.mjs');
 export const CHANNEL = 'disc:guild:noisy';
@@ -84,7 +85,7 @@ export function rig(name: string, allowChannelSpeech: boolean, opts: { modules?:
     debug('after: stopped');
     rmSync(state.tempDir, { recursive: true, force: true });
   });
-  const published = () => readFileSync(state.statusPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as { event: string; channelId?: string }).filter((e) => e.event === 'publish');
+  const published = () => jsonLines<{ event: string; channelId?: string }>(state.statusPath).filter((e) => e.event === 'publish');
   return {
     state,
     waitFor,

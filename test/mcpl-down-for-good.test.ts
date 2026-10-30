@@ -1,6 +1,6 @@
 import { after, before, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,6 +11,7 @@ import { AgentFramework } from '../src/framework.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 import { setStdioLineBoundForTests } from '../src/mcpl/transport.js';
 import { createMockResponse, HeldStream, MockMembrane } from './helpers/mock-membrane.js';
+import { jsonLines } from './helpers/json-lines.js';
 
 const LEGACY_FIXTURE = fileURLToPath(new URL('./fixtures/reregistering-mcpl-server.mjs', import.meta.url));
 const MODERN_FIXTURE = fileURLToPath(new URL('./fixtures/modern-mcp-server.mjs', import.meta.url));
@@ -97,8 +98,8 @@ async function waitFor(what: string, predicate: () => boolean, ms = 15_000): Pro
 }
 
 async function legacyPid(events: string): Promise<number> {
-  await waitFor("the fixture's first event", () => existsSync(events) && readFileSync(events, 'utf8').trim() !== '');
-  return (JSON.parse(readFileSync(events, 'utf8').trim().split('\n')[0]!) as { pid: number }).pid;
+  await waitFor("the fixture's first event", () => jsonLines(events).length > 0);
+  return jsonLines<{ pid: number }>(events)[0]!.pid;
 }
 
 const lastStarted = (startLog: string) => Number(readFileSync(startLog, 'utf8').trim().split('\n').at(-1)!.split(' ')[1]);

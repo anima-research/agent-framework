@@ -16,7 +16,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
@@ -24,6 +24,7 @@ import { AgentFramework } from '../src/index.js';
 import { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 import { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
+import { jsonLines } from './helpers/json-lines.js';
 
 const FIXTURE = fileURLToPath(new URL('./fixtures/reregistering-mcpl-server.mjs', import.meta.url));
 
@@ -35,8 +36,7 @@ interface ServerEvent {
 }
 
 function serverEvents(path: string): ServerEvent[] {
-  if (!existsSync(path)) return [];
-  return readFileSync(path, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as ServerEvent);
+  return jsonLines<ServerEvent>(path);
 }
 
 async function waitFor(description: string, predicate: () => boolean, timeoutMs = 10_000): Promise<void> {

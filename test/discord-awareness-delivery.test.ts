@@ -22,12 +22,12 @@ import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework } from '../src/framework.js';
 import { DiscordAwarenessOutbox, defaultDiscordAwarenessOutboxPath } from '../src/recovery/discord-awareness-outbox.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
+import { jsonLines } from './helpers/json-lines.js';
 
 const FIXTURE = fileURLToPath(new URL('./fixtures/surgery-marks-mcpl-server.mjs', import.meta.url));
 
 function jsonl(path: string): Array<Record<string, unknown>> {
-  if (!existsSync(path)) return [];
-  return readFileSync(path, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  return jsonLines(path);
 }
 
 /** Resolve with the promise's value, or fail if it is still pending after ms: a hang detector. */

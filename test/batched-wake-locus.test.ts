@@ -19,12 +19,13 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync, appendFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
 import { conversationForkSpec } from '../src/dendrite/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { appendInTwoParts } from './helpers/command-file.js';
+import { jsonLines } from './helpers/json-lines.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/wake-locus-mcpl-server.mjs');
 const ROOM = 'discord:g1:room';
@@ -95,12 +96,8 @@ function batchedWakeRig(speech?: { locus: 'delivery' | 'latest-inbound' }) {
   const dmInTwoParts = (text: string): Promise<void> => appendInTwoParts(commandPath, dmLine(text), 200);
   const incoming = (channelId: string, mode: 'ambient' | 'addressed', text: string): void =>
     command(`incoming ${channelId} m-${++n} ${mode} ${text}`);
-  const sent = (event: string): number => !existsSync(statusPath) ? 0
-    : readFileSync(statusPath, 'utf8').split('\n').filter(Boolean)
-      .filter((l) => (JSON.parse(l) as { event: string }).event === event).length;
-  const publishes = (): string[] => !existsSync(statusPath) ? []
-    : readFileSync(statusPath, 'utf8').split('\n').filter(Boolean)
-      .map((l) => JSON.parse(l) as { event: string; channelId?: string })
+  const sent = (event: string): number => jsonLines<{ event: string }>(statusPath).filter((e) => e.event === event).length;
+  const publishes = (): string[] => jsonLines<{ event: string; channelId?: string }>(statusPath)
       .filter((e) => e.event === 'publish')
       .map((e) => e.channelId!);
 
