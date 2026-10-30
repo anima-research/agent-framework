@@ -1300,17 +1300,23 @@ describe('a compile refused for budget holds its turn (#304)', () => {
 
   it('holds a released turn again with its first refusal\'s start when its own compile still refuses', async () => {
     await withBacklog({ fit: true, alwaysPending: true, refuseCompiles: 3 }, async () => {
-      const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      try {
-        t.send('Are you there?');
-        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
-        const held = t.of('inference:held');
-        assert.equal(held.length, 3, 'each refusal of the released turn held it again');
-        assert.ok(held.every((e) => e.since === held[0]!.since), 'with the first refusal\'s start');
-        assert.deepEqual(t.of('inference:exhausted'), []);
-      } finally {
-        await t.close();
-      }
+      await errorLines(async (lines) => {
+        const t = await residentTurn({ maintenanceIntervalMs: 50 });
+        try {
+          t.send('Are you there?');
+          assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
+          const held = t.of('inference:held');
+          assert.equal(held.length, 3, 'each refusal of the released turn held it again');
+          assert.ok(held.every((e) => e.since === held[0]!.since), 'with the first refusal\'s start');
+          assert.deepEqual(t.of('inference:exhausted'), []);
+          assert.equal(t.of('ops:alert').filter((e) => e.kind === 'context-refusal').length, 1, 'one alert, at the hold\'s start');
+          assert.equal(lines.filter((l) => l.includes('— Held: this turn runs once')).length, 1, 'one start line in the log');
+          assert.equal(lines.filter((l) => /\[budget-hold\] agent=prime released turn refused again \(over_budget\): .* — held again, as of its first hold \d+ s ago$/.test(l)).length, 2,
+            'and a line for each time it was held again');
+        } finally {
+          await t.close();
+        }
+      });
     });
   });
 
