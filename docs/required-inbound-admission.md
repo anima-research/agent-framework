@@ -10,7 +10,8 @@ after initialize/optional attestation and again on every reconnect. Keys contain
 a framework-issued instance token and transport epoch, not merely a server id.
 A missing/wrong binding fails connection setup and aborts framework startup;
 removing it never disables the requirement. Attestation refusal likewise aborts
-startup. Ordinary transport failures retain the existing log-and-continue startup
+startup, including when handshake cleanup also fails (the admission error remains
+in the cause chain). Ordinary transport failures retain the existing log-and-continue startup
 policy and configured reconnect behavior; an unavailable connection admits nothing. Modern MCP connections reject this configuration before connecting.
 
 `admit` receives a detached, deeply frozen raw lane item, its original connection
