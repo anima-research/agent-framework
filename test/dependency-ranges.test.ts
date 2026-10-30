@@ -44,9 +44,17 @@ function floorOf(range: string): [number, number, number] {
   return [Number(parts[1]), Number(parts[2]), Number(parts[3])];
 }
 
-/** Whether the caret `range` admits the release `version`, as npm reads it:
- *  at or above the floor, below the next change of its first nonzero part. */
+/** The caret ranges a declared range is the union of (`^0.8.0 || ^0.9.0` is two). */
+const alternatives = (range: string): string[] => range.split('||').map((part) => part.trim());
+
+/** Whether the declared `range` admits the release `version`, as npm reads it:
+ *  for some caret range of its union, at or above the floor, below the next
+ *  change of its first nonzero part. */
 function admits(range: string, version: string): boolean {
+  return alternatives(range).some((caret) => caretAdmits(caret, version));
+}
+
+function caretAdmits(range: string, version: string): boolean {
   const [major, minor, patch] = floorOf(range);
   const [vMajor, vMinor, vPatch] = version.split('.').map(Number) as [number, number, number];
   const atOrAbove = vMajor > major || (vMajor === major && (vMinor > minor || (vMinor === minor && vPatch >= patch)));
@@ -56,9 +64,11 @@ function admits(range: string, version: string): boolean {
   return vMajor === 0 && vMinor === 0 && vPatch === patch;
 }
 
-/** Whether every release the caret range `inner` admits, `outer` admits:
- *  caret ranges nest or are apart, so it is whether `outer` takes `inner`'s floor. */
-const within = (inner: string, outer: string): boolean => admits(outer, floorOf(inner).join('.'));
+/** Whether every release `inner` admits, `outer` admits: caret ranges nest or
+ *  are apart, so it is whether `outer` takes the floor of each caret range in
+ *  `inner`'s union. */
+const within = (inner: string, outer: string): boolean =>
+  alternatives(inner).every((caret) => admits(outer, floorOf(caret).join('.')));
 
 describe("agent-framework's dependency ranges (#291's release set)", () => {
   it('the caret reading', () => {
@@ -70,6 +80,11 @@ describe("agent-framework's dependency ranges (#291's release set)", () => {
     assert.equal(within('^0.8.2', '^0.8.0'), true);
     assert.equal(within('^0.7.1', '^0.8.0'), false);
     assert.equal(within('^0.8.0', '^0.8.2'), false);
+    // A union, as context-manager 0.24.2 declares membrane (`^0.8.0 || ^0.9.0`).
+    assert.equal(admits('^0.8.0 || ^0.9.0', '0.9.0'), true);
+    assert.equal(admits('^0.8.0 || ^0.9.0', '0.10.0'), false);
+    assert.equal(within('^0.8.0', '^0.8.0 || ^0.9.0'), true);
+    assert.equal(within('^0.8.0 || ^0.9.0', '^0.8.0'), false);
   });
 
   it("takes context-manager only at a release with the window APIs: not main's 0.23.0 or 0.24.0, which have none", (t) => {
