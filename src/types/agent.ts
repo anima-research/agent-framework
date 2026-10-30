@@ -132,7 +132,8 @@ export interface AgentConfig {
    *
    * - `'head'` (default): every request carries the current tools and system
    *   text, as before. A change to either rewrites the provider's cache from
-   *   the head.
+   *   the head. Every change row in the agent's context is left out of the
+   *   request.
    * - `'entries'`: a request carries a fixed head, recorded once, and each
    *   later change to the tools, or addition to the system text, goes into
    *   the context as a system change at the point it took effect, which the
@@ -145,15 +146,31 @@ export interface AgentConfig {
    *   `systemChangeMetadata(name)`, or with one of its `selfParticipants`'
    *   (see `selfParticipants`). A change row a host writes without such
    *   metadata goes out as written, and the agent neither folds it onto its
-   *   head nor consolidates it, but declares nothing such a row already
-   *   carries.
-   *   On the head, every change row is left out of the request.
+   *   head, consolidates it nor removes it, but declares nothing such a row
+   *   already carries: it's the host's to remove. System text is compared
+   *   block by block, in any order: an added block is declared as a change,
+   *   and a block already declared that's dropped or edited is a
+   *   replacement. So this saves writes only while the blocks already
+   *   declared stay as they are: a block whose text changes every request,
+   *   such as one carrying a timestamp, moves the head at every request,
+   *   rewriting the cache as on `'head'`, storing the whole head again and,
+   *   with kv-unified or `thinkingBinding.binds: true`, compiling again.
    *
-   * What the framework adds: it keeps each agent's recorded head in its
-   * store, so a restart keeps the head; and when a request carrying a change
-   * ends with a 400 or a refusal membrane recognises, whether or not the
-   * change caused it, the request goes again on the agent's head, which it
-   * keeps to until it's built again. An Agent used without the framework
+   * What the framework adds: it leaves change rows out of the compile of an
+   * agent configured `'head'`, so they take none of its budget (the
+   * subconscious's compile, which leaves out every change row but its own,
+   * holds its own until a request on the head clears its record, if any, and
+   * takes them out); it keeps
+   * each agent's recorded head in its store, so a restart keeps the head;
+   * and when a request carrying a change
+   * ends with a refusal membrane recognises, or with a 400 it doesn't file
+   * as context overflow or an account refusal (`type` `context_length` or
+   * `auth`), whether or not the change caused it, the request goes again on
+   * the agent's head, which it keeps to until it's built again. Kept to its
+   * head, it leaves every change row out of its request, and takes its own
+   * out of its context once its record is cleared (a record the store can't
+   * clear keeps them until it can), while its compile, made as an
+   * `'entries'` agent's, holds a host's until then. An Agent used without the framework
    * keeps its head in memory and has no such resend. The direct API
    * (runInference) declares nothing: it sends the tools its caller passes
    * and the current system text, and leaves the context's changes out.
