@@ -11,10 +11,14 @@
   `mail`, `agentEnded: true`); a release that still meets a write for an agent gone, or for a name another agent is
   registered under since, does the same, so a new agent of that name never gets an ended one's writes. A
   crash during the surgery, or before the recovery, loses such a write; earlier releases kept a quiesced host's queue
-  on disk, and a surgery's deferred writes with it. So does a release whose store throws for one, its row not
+  on disk, and a surgery's deferred writes with it. So does a release whose store throws for one, none of its rows
   landing: the writes after it go on, and the release logs the loss and raises an `ops:alert` of kind
   `store-held-lost` for the agent, with the counts and kinds as at a stop, where earlier releases kept such a write
-  queued for the next drain. One whose row landed though its store threw counts as stored.
+  queued for the next drain. A write whose store throws after its rows landed counts as stored, here and on the
+  write path the release replays (an inbound channel message or push, a fork's channel message, a module's write):
+  context-manager names those rows (`WriteLandedError`), and the write is placed, presented and answered by them as
+  if its store hadn't thrown, the throw logged. So a coalesced occurrence stored that way isn't stored again as its
+  fallback, and a surgery's release traces such a write as stored; any other throw means none of the write landed.
   A tune-out's cancel asked for meanwhile (its end time passing, a wake past its budget, a tool's or a host's
   cancel), or while the primary's or the subconscious's context manager refuses its work before anything is kept for
   it, waits, the tune-out in force, until the release has stored the writes, or told of those it couldn't, then runs,

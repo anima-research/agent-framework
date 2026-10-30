@@ -2665,6 +2665,76 @@ test("a render whose store write is refused keeps its batch, which its recovery 
   assert.equal(coalescer.pendingBatches(), 0);
 });
 
+// A store that throws after the render's row landed (context-manager's own
+// listener failing after its append, as in its own tests) names the row
+// (WriteLandedError), and the delivery is taken as stored by it: placed,
+// presented and read once, with no fallback beside it. One that throws before
+// the row lands stored nothing, and the batch's recovery stores its fallback.
+for (const when of ['after', 'before'] as const) {
+  test(`a render whose store throws ${when} its row lands is ${when === 'after' ? "stored, presented and read once, and its fallback isn't stored" : 'stored as its fallback'}`, { timeout: 120_000 }, async (t) => {
+    const f = await fixture(); t.after(f.close);
+    const coalescer = (f.framework as unknown as { pushCoalescer: { options: { recoveryBackoffMs?: number }; pendingBatches(): number } }).pushCoalescer;
+    coalescer.options.recoveryBackoffMs = 20;
+    const internals = f.framework as unknown as { pendingRequests: unknown[] };
+    f.alwaysRespond();
+    f.renderer(async () => ({ content: [{ type: 'text', text: 'throwing_render' }] }));
+    const cm = f.framework.getAgent('agent')!.getContextManager();
+    let threw = 0;
+    if (when === 'after') {
+      const own = cm as unknown as { handleMessageStoreEvent: (event: { type: string }) => void };
+      const handle = own.handleMessageStoreEvent.bind(cm);
+      own.handleMessageStoreEvent = (event) => {
+        handle(event);
+        if (threw === 0 && event.type === 'add' && JSON.stringify(event).includes('throwing_render')) {
+          threw++;
+          throw new Error('zz-own-listener-failed-after-append');
+        }
+      };
+    } else {
+      const add = cm.addMessage.bind(cm);
+      (cm as unknown as { addMessage: typeof add }).addMessage = (...args) => {
+        if (threw === 0 && JSON.stringify(args[1]).includes('throwing_render')) {
+          threw++;
+          throw new Error('zz-store-throws-before-append');
+        }
+        return add(...args);
+      };
+    }
+    const kinds: string[] = [];
+    f.framework.onTrace((e) => { if (e.type === 'mcpl:coalescing') kinds.push((e as { kind: string }).kind); });
+    const error = console.error;
+    console.error = () => {};
+    try {
+      await f.send('push/event', f.params('1', 'throwing_fallback', { deferred: true, initial: true }));
+      await settles(f.framework.runUntilIdle(), 'the first drain');
+      for (let pass = 0; coalescer.pendingBatches() > 0 || internals.pendingRequests.length > 0; pass++) {
+        assert(pass < 100, 'the batch was settled within 100 passes');
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        await settles(f.framework.runUntilIdle(), `the drain after pass ${pass + 1}`);
+      }
+    } finally {
+      console.error = error;
+    }
+    assert.equal(threw, 1, `premise: the store threw ${when} the render's row landed`);
+    const context = f.context();
+    const requests = f.membrane.calls.map((c) => JSON.stringify((c as { messages?: unknown }).messages));
+    if (when === 'after') {
+      assert.equal(context.split('throwing_render').length - 1, 1, 'the render is stored once');
+      assert(!context.includes('throwing_fallback'), "its fallback isn't stored");
+      const row = cm.getAllMessages().find((m) => JSON.stringify(m.content).includes('throwing_render'))!;
+      assert.equal(cm.windowStatusOf(row.id), 'in', 'it is presented');
+      assert.equal(f.window().split('throwing_render').length - 1, 1, 'once');
+      assert(requests.some((r) => r.includes('throwing_render')), 'and a request reads it');
+      assert(!kinds.includes('deliver-failed'), 'the delivery is not taken as failed');
+    } else {
+      assert(!context.includes('throwing_render'), 'the render is not stored');
+      assert.equal(context.split('throwing_fallback').length - 1, 1, 'its fallback is stored once');
+      assert(kinds.includes('deliver-failed'), 'the delivery is taken as failed');
+    }
+    assert.equal(coalescer.pendingBatches(), 0);
+  });
+}
+
 test("a render cancelled while it runs leaves the recovery wake of a batch opened after it", async () => {
   let failPersist = false;
   const audits: Array<{ kind?: unknown; eventId?: unknown }> = [];

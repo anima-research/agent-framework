@@ -836,26 +836,30 @@ describe('after a branch move, every agent on the store compiles without a resta
     await framework.switchBranch(framework.getStore().currentBranch().name);
   });
 
-  it("a held write whose store throws at the release, and whose store then can't be read back, is told of as possibly lost, not as unstored", async () => {
+  // context-manager names the rows a failed write stored (WriteLandedError),
+  // so the release goes by its error: any other means none landed, and the
+  // store isn't read back to tell.
+  it("a held write whose store throws at the release, none of it landing, is told of as lost without a read-back of the store, even one that couldn't be read", async () => {
     const quiet = console.error;
     console.error = () => {};
     const cm = cmOf('b') as unknown as { addMessage: (...args: unknown[]) => unknown; getMessageWindow: (...args: unknown[]) => unknown };
     const { addMessage, getMessageWindow } = cm;
-    let unreadable = false;
+    let failed = false;
+    let readBack = 0;
     try {
       const pass = gatedSwitch('a');
       await pass.reached;
       holdFor('b', 'for b, during the hold');
       cm.addMessage = (...args: unknown[]) => {
         if (JSON.stringify(args[1]).includes('during the hold')) {
-          unreadable = true;
+          failed = true;
           throw new Error('injected release write failure');
         }
         return addMessage.apply(cm, args);
       };
       cm.getMessageWindow = (...args: unknown[]) => {
-        if (unreadable) {
-          unreadable = false;
+        if (failed) {
+          readBack++;
           throw new Error('injected read-back failure');
         }
         return getMessageWindow.apply(cm, args);
@@ -867,41 +871,60 @@ describe('after a branch move, every agent on the store compiles without a resta
       cm.getMessageWindow = getMessageWindow;
       console.error = quiet;
     }
+    assert.ok(failed, "premise: the held write's store threw");
+    assert.equal(readBack, 0, "the store isn't read back");
     const lost = traces.filter((t): t is Extract<TraceEvent, { type: 'ops:alert' }> => t.type === 'ops:alert' && t.kind === 'store-held-lost');
     assert.equal(lost.length, 1, 'told of once');
-    says(lost[0]!.message, '1 write for b, accepted and kept in memory', 'injected release write failure',
-      "couldn't be read back to tell whether it landed", 'may be lost');
-    assert.ok(!lost[0]!.message.includes('not stored') && !lost[0]!.message.includes('It is lost'),
-      `it says no more than the read-back knows:\n${lost[0]!.message}`);
+    says(lost[0]!.message, '1 write for b, accepted and kept in memory', 'was not stored', 'injected release write failure', 'It is lost');
+    assert.ok(!lost[0]!.message.includes('may be lost'), lost[0]!.message);
     await framework.switchBranch(framework.getStore().currentBranch().name);
   });
 
   for (const [whose, participant] of [['', 'courier'], [', from a writer whose name the store makes well formed,', 'courier\uD800']] as const) {
-  it(`a held write${whose} whose store throws at the release after its row landed counts as stored: traced once with its id, and no alert`, async () => {
+  it(`a held write${whose} whose store throws at the release after its row landed counts as stored by the row context-manager names: presented, traced once with its id, no alert, and no read-back`, async () => {
     const added = addedTraces();
-    const cm = cmOf('b') as unknown as { addMessage: (...args: unknown[]) => unknown };
-    const addMessage = cm.addMessage;
+    // context-manager's own listener fails after the append, as in its own
+    // tests: the row stays, and its error names it (WriteLandedError).
+    const cm = cmOf('b') as unknown as {
+      handleMessageStoreEvent: (event: { type: string }) => void;
+      getMessageWindow: (...args: unknown[]) => unknown;
+    };
+    const { handleMessageStoreEvent, getMessageWindow } = cm;
+    let threw = 0;
+    let readBack = 0;
     const quiet = console.error;
-    console.error = () => {};
+    const logged: string[] = [];
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
     try {
       const pass = gatedSwitch('a');
       await pass.reached;
       holdFor('b', 'for b, during the hold', participant);
-      cm.addMessage = (...args: unknown[]) => {
-        const id = addMessage.apply(cm, args);
-        if (JSON.stringify(args[1]).includes('during the hold')) throw new Error('injected failure after the row landed');
-        return id;
+      cm.handleMessageStoreEvent = (event: { type: string }) => {
+        handleMessageStoreEvent.call(cm, event);
+        if (threw === 0 && event.type === 'add' && JSON.stringify(event).includes('for b, during the hold')) {
+          threw++;
+          throw new Error('injected failure after the row landed');
+        }
+      };
+      cm.getMessageWindow = (...args: unknown[]) => {
+        if (threw > 0) readBack++;
+        return getMessageWindow.apply(cm, args);
       };
       pass.open();
       await pass.switched;
     } finally {
-      cm.addMessage = addMessage;
+      cm.handleMessageStoreEvent = handleMessageStoreEvent;
+      cm.getMessageWindow = getMessageWindow;
       console.error = quiet;
     }
+    assert.equal(threw, 1, "premise: context-manager's own listener failed after the row landed");
+    assert.ok(logged.some((line) => line.includes('so the write counts as stored') && line.includes('injected failure after the row landed')), logged.join('\n'));
     const rows = cmOf('b').getAllMessages().filter((m) => JSON.stringify(m.content).includes('for b, during the hold'));
     assert.equal(rows.length, 1, 'stored once');
+    assert.equal(cmOf('b').windowStatusOf(rows[0]!.id), 'in', "presented to b, whose turn isn't alive");
     assert.deepEqual(added.filter((a) => a.source === 'surgery-release'), [{ messageId: rows[0]!.id, source: 'surgery-release' }]);
     assert.equal(traces.filter((t) => t.type === 'ops:alert' && t.kind === 'store-held-lost').length, 0, 'nothing is told as lost');
+    assert.equal(readBack, 0, "the store isn't read back");
   });
   }
 

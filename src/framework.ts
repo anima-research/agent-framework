@@ -13,7 +13,7 @@ import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, Yie
 import { MembraneError } from '@animalabs/membrane';
 import { classifyFailure, retryDecision, MEMBRANE_RETRY_SETTINGS, type RetrySettings } from '@animalabs/membrane/retry';
 import { deadlineCut, isDeadlineExpiry, resolveInferenceBounds, wholeCallMs, type InferenceBounds } from './inference-bounds.js';
-import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn } from '@animalabs/context-manager';
+import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn, WriteLandedError } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SILENT_HEARTBEAT_SEPARATOR, type RequestOnlyPrompt, type RequestOnlyStamps } from './silent-heartbeat.js';
 import {
@@ -3733,6 +3733,22 @@ function passesToPrimary(metadata: unknown): boolean {
  *  the writer's to hear. */
 function refusesUntilReinitialized(error: unknown): boolean {
   return error instanceof Error && /^ContextManager\.addMessage requires successful strategy initialization\b/.test(error.message);
+}
+
+/**
+ * The rows of a write that are stored though context-manager's addMessage
+ * threw (WriteLandedError: its own listener failed after the append, or a
+ * sharded write's clean-up failed too), in store order, with the throw
+ * logged; undefined for any other error, which means none of the write is
+ * stored. A write so stored counts as stored by these rows: they are out of
+ * every window until presented, as any row stored, and a writer that took
+ * the throw as nothing stored would store it again beside them.
+ */
+function landedThoughThrown(error: unknown, agentName: string): readonly MessageId[] | undefined {
+  if (!(error instanceof WriteLandedError) || error.landed.length === 0) return undefined;
+  const rows = error.landed.length === 1 ? `its row ${error.landed[0]}` : `${error.landed.length} of its rows (${error.landed.join(', ')})`;
+  console.error(`[store] agent=${agentName}: a write's store threw after ${rows} landed, so the write counts as stored:`, error.cause);
+  return error.landed;
 }
 
 /** Whether a stored message or queued write is a module's write for an
@@ -15571,26 +15587,19 @@ export class AgentFramework {
 
   /**
    * The writes for `agentName` a surgery's release couldn't store (their
-   * store threw, and no row of theirs landed, or the store couldn't be read
-   * back to tell), told of once: a log line and an ops alert of kind
-   * `store-held-lost`. Each was accepted with no id and kept in memory until
-   * the release; one known not to have landed is lost, and one the store
-   * couldn't be read back for may be. The writes after them went on.
+   * store threw, and context-manager found no row of theirs stored: it names
+   * one that landed, WriteLandedError, and such a write counts as stored),
+   * told of once: a log line and an ops alert of kind `store-held-lost`.
+   * Each was accepted with no id and kept in memory until the release, and
+   * is lost. The writes after them went on.
    */
-  private tellHeldWritesLost(agentName: string, writes: readonly SurgeryHeldWrite[], unknown: number, reason: string): void {
+  private tellHeldWritesLost(agentName: string, writes: readonly SurgeryHeldWrite[], reason: string): void {
     const { kinds, mail, told } = heldWritesTold(writes);
     const one = writes.length === 1;
-    const known = writes.length - unknown;
     const threw = `(${one ? '' : 'the first: '}${reason})`;
     const message = `${one ? '1 write' : `${writes.length} writes`} for ${agentName}, accepted and kept in memory until a ` +
-      `surgery's release, ` +
-      (unknown === 0
-        ? `${one ? 'was' : 'were'} not stored: storing ${one ? 'it' : 'them'} there threw ${threw}. ${one ? 'It is' : 'They are'} lost`
-        : `threw when stored there ${threw}. ` +
-          (known > 0 ? `${known} of them ${known === 1 ? 'was' : 'were'} not stored, and ${known === 1 ? 'is' : 'are'} lost. ` : '') +
-          `The store couldn't be read back to tell whether ${unknown === writes.length ? (one ? 'it' : 'they') : `the other ${unknown}`} ` +
-          `landed, so ${unknown === 1 ? 'it' : 'they'} may be lost`) +
-      `, and the writes after ${one ? 'it' : 'them'} went on. ${told}`;
+      `surgery's release, ${one ? 'was' : 'were'} not stored: storing ${one ? 'it' : 'them'} there threw ${threw}. ` +
+      `${one ? 'It is' : 'They are'} lost, and the writes after ${one ? 'it' : 'them'} went on. ${told}`;
     console.error(`[surgery] agent=${agentName}: ${message}`);
     this.opsAlert('store-held-lost', agentName, message, {
       data: { count: writes.length, keptForRecovery: 0, heldBySurgery: writes.length, kinds, mail },
@@ -22627,7 +22636,8 @@ export class AgentFramework {
    * is it while the fork's context manager refuses its work after a failed
    * re-initialization (heldForRecovery, as addMessage keeps a write);
    * stored, it enters the fork's window at once when no turn of the fork's
-   * is alive, else at the fork's next point (afterStore).
+   * is alive, else at the fork's next point (afterStore). One whose store
+   * threw after its row landed is stored as that row (landedThoughThrown).
    */
   private storeInFork(target: Agent, content: ContentBlock[], metadata: MessageMetadata): MessageId {
     const presents = this.presents(target);
@@ -22641,14 +22651,23 @@ export class AgentFramework {
       return '' as MessageId;
     }
     let id: MessageId;
+    // Its one id, or the rows a store that threw after they landed names,
+    // which the write is stored as (landedThoughThrown), as addMessage's is.
+    let rows: readonly MessageId[];
     try {
       id = target.getContextManager().addMessage('user', content, withAudience(metadata, [target.name]));
+      rows = [id];
     } catch (error) {
-      if (!refusesUntilReinitialized(error)) throw error;
-      this.keepForRecovery(target.name, kept(), error);
-      return '' as MessageId;
+      const landed = landedThoughThrown(error, target.name);
+      if (!landed) {
+        if (!refusesUntilReinitialized(error)) throw error;
+        this.keepForRecovery(target.name, kept(), error);
+        return '' as MessageId;
+      }
+      id = landed[0]!;
+      rows = landed;
     }
-    if (presents) this.presentation!.afterStore(target, [id]);
+    if (presents) this.presentation!.afterStore(target, rows);
     return id;
   }
 
@@ -22677,20 +22696,20 @@ export class AgentFramework {
    * agent gone, or for a name another agent is registered under since
    * (heldWriteTargetGone), goes on to the primary if it is one the primary
    * takes in its place, and is dropped otherwise (passHeldWritesOn), told of
-   * by an ops alert. A write that
-   * throws now is logged, and the rest go on: one whose row landed counts as
-   * stored, traced with the landed id; one whose row didn't is lost, and one
-   * whose store can't be read back to tell may be. Each agent's are told of
-   * once, by a log line and an ops alert of kind `store-held-lost`.
+   * by an ops alert. A write whose store threw after its rows landed
+   * (context-manager's WriteLandedError) is stored as those rows by
+   * addMessage and storeInFork, presented and traced as any write stored
+   * here. Any other throw stored none of the write: it is logged and lost,
+   * and the rest go on. Each agent's lost writes are told of once, by a log
+   * line and an ops alert of kind `store-held-lost`.
    */
   private releaseSurgeryHeldWrites(): void {
     // Read defensively: a framework built from its prototype, as some
     // suites build one, holds none.
     const held = this.surgeryHeldWrites?.splice(0) ?? [];
-    const lost = new Map<string, { writes: SurgeryHeldWrite[]; unknown: number; reason: string }>();
+    const lost = new Map<string, { writes: SurgeryHeldWrite[]; reason: string }>();
     for (const write of held) {
       const target = write.direct ? this.agents.get(write.direct.agentName) : this.deliveryAgent(write.opts?.forAgent);
-      const before = target ? this.storedCountOf(target) : undefined;
       try {
         const gone = this.heldWriteTargetGone(write);
         if (gone !== undefined) {
@@ -22709,26 +22728,20 @@ export class AgentFramework {
         }
         if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'surgery-release' });
       } catch (error) {
-        console.error(`[surgery] a write held while the store was held couldn't be stored at its release:`, error);
-        const landed = target && before !== undefined
-          ? this.storedSince(target, before, (m) => m.participant === nameAsStored(write.participant) && clockStampOf(m.metadata) === undefined,
-            'surgery', 'a held write')
-          : undefined;
-        if (landed && landed.length > 0) {
-          this.emitTrace({ type: 'message:added', messageId: landed[0]!.id, source: 'surgery-release' });
-          continue;
-        }
+        // A write whose rows landed though its store threw is stored, and
+        // answered, by addMessage and storeInFork (landedThoughThrown): a
+        // throw that reaches here stored none of it.
+        console.error(`[surgery] a write held while the store was held couldn't be stored at its release, so it is lost:`, error);
         const agentName = target?.name ?? write.direct?.agentName ?? write.opts?.forAgent ?? 'the primary';
-        const entry = lost.get(agentName) ?? { writes: [], unknown: 0, reason: thrownText(error) };
+        const entry = lost.get(agentName) ?? { writes: [], reason: thrownText(error) };
         entry.writes.push(write);
-        if (!landed) entry.unknown++;
         lost.set(agentName, entry);
       }
     }
     if (held.length > 0) {
       console.error(`[surgery] ${held.length} write(s) held while the store was held were replayed in arrival order`);
     }
-    for (const [agentName, { writes, unknown, reason }] of lost) this.tellHeldWritesLost(agentName, writes, unknown, reason);
+    for (const [agentName, { writes, reason }] of lost) this.tellHeldWritesLost(agentName, writes, reason);
     // A tune-out's cancel asked for while the writes were held waited for
     // them (writesHeld): with them stored, or told of where storing one
     // failed, its release is stored too, before the epoch's end is
@@ -31140,21 +31153,32 @@ export class AgentFramework {
       this.storeDueClock(agent, 'event');
     }
     let stored: MessageId;
+    // The rows the write stored: its one id, or those a store that threw
+    // after they landed names (landedThoughThrown), which the write is
+    // stored as, placed, presented and answered by, as if it hadn't thrown.
+    let rows: readonly MessageId[];
     try {
       stored = agent.getContextManager().addMessage(
         participant,
         content,
         opts?.imported ? withDeferredWriteId(metadata, opts.imported.writeId) : metadata,
       );
+      rows = [stored];
     } catch (error) {
-      // context-manager's initialization fence: the manager refuses every
-      // write until a re-initialization succeeds, so this one waits for it
-      // (above). An imported write stays queued for the next boot, as any
-      // the importer can't store.
-      if (opts?.imported || !refusesUntilReinitialized(error)) throw error;
-      this.keepForRecovery(agent.name, kept(), error);
-      if (opts?.placement) opts.placement.agent = agent.name;
-      return '' as MessageId;
+      const landed = landedThoughThrown(error, agent.name);
+      if (landed) {
+        stored = landed[0]!;
+        rows = landed;
+      } else {
+        // context-manager's initialization fence: the manager refuses every
+        // write until a re-initialization succeeds, so this one waits for it
+        // (above). An imported write stays queued for the next boot, as any
+        // the importer can't store.
+        if (opts?.imported || !refusesUntilReinitialized(error)) throw error;
+        this.keepForRecovery(agent.name, kept(), error);
+        if (opts?.placement) opts.placement.agent = agent.name;
+        return '' as MessageId;
+      }
     }
     if (opts?.placement) {
       opts.placement.agent = agent.name;
@@ -31171,7 +31195,7 @@ export class AgentFramework {
     // Each reader of the row's slot whose turn isn't alive is presented it
     // now (present at rest); the others at their next point. An imported
     // write is presented by the boot's pass after the import (repairAndRest).
-    if (!opts?.imported && this.presents(agent)) this.presentation!.afterStore(agent, [stored]);
+    if (!opts?.imported && this.presents(agent)) this.presentation!.afterStore(agent, rows);
     return stored;
   }
 

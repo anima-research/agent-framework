@@ -315,7 +315,11 @@ export interface CoalescerHost<E> {
   remove(placement: CoalescingPlacement): boolean;
   /** Ordinary delivery of the event; undefined when routing delivered nowhere.
    *  A replacement is delivered as a fresh message after the unread prior was
-   *  removed: it lands where a fresh event lands (§4.1 allows either place). */
+   *  removed: it lands where a fresh event lands (§4.1 allows either place).
+   *  A throw is taken as a delivery that stored none of the occurrence, and
+   *  the coalescer stores its batch again, as its fallback: so a delivery
+   *  whose store threw after rows of the occurrence landed answers as stored
+   *  by them, as the framework's does (context-manager's WriteLandedError). */
   deliver(occurrence: CoalescedOccurrence<E>, materialized?: McplContentBlock[], assemblingFor?: string): Promise<CoalescingPlacement | undefined>;
   /** Queue a wake for a batch that has no model-visible content yet. */
   wakeForBatch(occurrence: CoalescedOccurrence<E>): Promise<void>;
@@ -1176,17 +1180,14 @@ export class PushCoalescer<E = unknown> {
         try {
           placement = await this.deliver({ ...occurrence, timestamp, content, ...(firstView ? { firstView: true } : {}) }, content, assemblingFor);
         } catch (error) {
-          // A delivery that throws is taken as one that stored nothing, and
-          // its batch goes to its recovery as its fallback. The limit that
-          // leaves (71daeae6): a store that throws after the occurrence's
-          // row landed, context-manager's own listener failing after its
-          // append or a sharded append whose clean-up failed too, has the
-          // recovery store the fallback beside that row, and the agent sees
-          // the occurrence twice. It stays so until context-manager's error
-          // carries the ids it landed, which would let this take a landed
-          // write as stored. A duplicate the agent can see is kept over a
-          // loss it couldn't: taking every throw as stored would lose the
-          // batch where nothing landed.
+          // A delivery that throws stored nothing (the host's deliver), so
+          // its batch goes to its recovery as its fallback. A store that
+          // threw after the occurrence's rows landed (context-manager's own
+          // listener failing after its append, or a sharded append whose
+          // clean-up failed too) doesn't come here: context-manager names
+          // the rows (WriteLandedError), and the framework's delivery takes
+          // the occurrence as stored by them, placed, presented and woken
+          // for, so no fallback is stored beside them.
           failed = true;
           this.host.audit({ kind: 'deliver-failed', subject, eventId: occurrence.eventId, error: String(error) });
           if (state.batch) state.batch.noRender = true;
