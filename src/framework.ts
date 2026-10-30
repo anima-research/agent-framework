@@ -6787,6 +6787,10 @@ export class AgentFramework {
     });
     if (this.budgetHolds.get(agent.name) !== hold || hold.state !== 'holding') return true;
     if (!existing) this.alertBudgetHold(agent, hold, 'Held');
+    else {
+      console.error(`[budget-hold] agent=${agent.name} released turn refused again (${errorType}): ${hold.reason} \u2014 ` +
+        `held again, as of its first hold ${describeWait(now - hold.startedAt)} ago`);
+    }
     const kick = setTimeout(() => this.compressForBudgetHold(agent), 0);
     kick.unref?.();
     return true;

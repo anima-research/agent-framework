@@ -29,7 +29,8 @@
     `healthSnapshot()` gives each agent's `budgetHold` (or null).
   - The `context-refusal` ops alert goes out when the hold starts, unless an
     `inference:held` listener has already ended it (a turn held again after a
-    release raises none), and once more at the first check after the hold has
+    release raises none, and logs a `[budget-hold]` line saying so), and once
+    more at the first check after the hold has
     waited an hour that keeps it held, the hour after which stated provider
     waits in a row alert too (its `ops:alert` trace each time,
     its webhook post at most once per 15 minutes for an agent). Each says the
