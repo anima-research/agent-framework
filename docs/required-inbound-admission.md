@@ -86,7 +86,12 @@ refusal. `mayWake: false` skips wake policy and caps downstream wake requests;
 `mayWake: true` does not override gate declines: their decision remains visible,
 but a module may request inference just as on an unconfigured connection. The cap
 is only `mayWake: false`. It is **not** context-only delivery and does not suppress existing open/locus
-maintenance. Pushes run preflight after feature authorization, before deduplication,
+maintenance.
+
+Admitted work goes out with the round's results only on a stream that declares
+`supportsInjectedMessages: true`; otherwise it arrives at turn end.
+
+Pushes run preflight after feature authorization, before deduplication,
 notices or queueing. Inference requests run admission after feature and loop checks, before model
 resolution; false `mayWake` is `admission_denied` and sends no chunks.
 Pending inference admission belongs to the request lifetime: stop cancels it and
