@@ -673,11 +673,11 @@ export class TuneOutCoordinator {
     this.channelRegistry.enterTuneOut(serverId, channelId, params, source);
     this.armExpiry(serverId, channelId, params);
 
-    // Window anchor: start of the OLDEST active tune-out. Never move the
-    // anchor forward here — an older active epoch owns it.
+    // Never move the anchor past the start of an epoch still in force, a
+    // tune-out's or the all-except hold's.
     const oldest = this.listActive().reduce(
       (min, e) => Math.min(min, e.params.startedAtSequence),
-      params.startedAtSequence,
+      scope ? Math.min(params.startedAtSequence, scope.params.startedAtSequence) : params.startedAtSequence,
     );
     this.hooks.setSubconsciousAnchor(oldest);
 
