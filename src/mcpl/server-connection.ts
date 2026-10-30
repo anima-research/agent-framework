@@ -1352,15 +1352,6 @@ export class McplServerConnection extends EventEmitter {
       console.error(`[mcpl] ${config.id}: transport error after the handshake settled: ${redactServerText(err.message, config)}`);
     };
 
-    const refuseEarly = (line: string) => {
-      if (!admission) return;
-      let request: any;
-      try { request = JSON.parse(line); } catch { return; }
-      if (['channels/incoming', 'push/event', 'inference/request'].includes(request.method) && request.id != null) {
-        transport.writeLine(JSON.stringify({ jsonrpc: '2.0', id: request.id, error: { code: CAPABILITY_DISABLED, message: 'capability_denied' } }));
-      }
-    };
-    if (admission) transport.on('line', refuseEarly);
     try {
       if (signal?.aborted) throw closedWhileConnecting();
       const initId = 0; // use id=0 for the handshake
@@ -1415,6 +1406,8 @@ export class McplServerConnection extends EventEmitter {
             const request = msg as unknown as JsonRpcRequest;
             if (request.method === 'ping' && request.id != null) {
               transport.writeLine(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: {} }));
+            } else if (admission && ['channels/incoming', 'push/event', 'inference/request'].includes(request.method) && request.id != null) {
+              transport.writeLine(JSON.stringify({ jsonrpc: '2.0', id: request.id, error: { code: CAPABILITY_DISABLED, message: 'capability_denied' } }));
             }
             return;
           }
@@ -1543,13 +1536,12 @@ export class McplServerConnection extends EventEmitter {
       // listener of its own, in the continuation of this return, before any
       // I/O callback can emit.
       transport.off('error', logAfterSettled);
-      if (admission) transport.off('line', refuseEarly);
       return {
         transport, capabilities: scoped, droppedCapabilities: new Set(dropped), mcpToolsAdvertised, protocolVersion,
         toolsetDeclarations: toolsetDeclarationsOf(rawCapabilities),
       };
     } catch (err) {
-      if (admission) { admission.invalidate(); transport.off('line', refuseEarly); }
+      admission?.invalidate();
       // Never leak the child / socket if the handshake fails. A cleanup that
       // can't confirm the child exited is part of the failure, never
       // swallowed: the launch may still be running, so the caller keeps it.
