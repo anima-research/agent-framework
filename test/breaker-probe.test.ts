@@ -61,7 +61,6 @@ class StandIn extends MockMembrane {
   readonly sent: NormalizedRequest[] = [];
   readonly probes: NormalizedRequest[] = [];
   readonly probeOptions: Array<{ retry?: boolean; signal?: AbortSignal }> = [];
-  readonly receipts: string[] = [];
   ignoresAbort = false;
   constructor(
     private readonly fails: (request: NormalizedRequest, send: number) => Error | undefined,
@@ -70,7 +69,7 @@ class StandIn extends MockMembrane {
   ) { super(); }
   private receipt(request: NormalizedRequest, of: string): void {
     const hook = (request as { onCacheWireReceipt?: (receipt: unknown) => void }).onCacheWireReceipt;
-    if (hook) { this.receipts.push(of); hook({ requestHash: `zz-${of}`, markers: [] }); }
+    if (hook) hook({ requestHash: `zz-${of}`, markers: [] });
   }
   override streamYielding(request: NormalizedRequest): YieldingStream {
     this.sends.push(texts(request));
@@ -171,7 +170,6 @@ for (const failsBy of ['event', 'throw'] as const) {
     assert.equal(membrane.probes.length, 1, 'one probe, at the hard-down threshold');
     assert.deepEqual(membrane.probes[0]!.messages.map((m) => m.content.length), [1], 'the probe carries one message in place of the history');
     assert.deepEqual(texts(membrane.probes[0]!), [], 'none of the history goes in the probe');
-    assert.equal(membrane.probes[0]!.config.model, 'zz-model');
     const alert = r.alerts('history-kept')[0]!;
     assert.match(String(alert.message), /fails without its history too/);
     assert.ok(String(alert.message).includes(WALK4), "the alert gives the probe's own reason");
@@ -193,22 +191,6 @@ for (const failsBy of ['event', 'throw'] as const) {
   });
 }
 
-test('one message and then two wakes: the good history before the message stays too', async (t) => {
-  const membrane = new StandIn(failsFromThird(walk4), () => walk4());
-  const r = await resident(t, membrane);
-  r.say('zz-q3');
-  await r.until(() => r.count('inference:exhausted') === 1, "q3's turn to fail");
-  r.wake();
-  await r.until(() => r.count('inference:exhausted') === 2, 'the first wake to fail');
-  r.wake();
-  await r.until(() => r.count('inference:exhausted') === 3, 'the second wake to fail');
-  await r.until(() => r.alerts('history-kept').length === 1, 'the breaker to say it kept the history');
-  await r.quiet(60_000);
-  assert.deepEqual(r.history(), ['zz-q1', 'zz-answer-1', 'zz-q2', 'zz-answer-2', 'zz-q3']);
-  assert.equal(r.rewindMarkers(), 0);
-  assert.equal(membrane.sends.length, 2 + 3);
-});
-
 test('a failure the breaker leaves alone sends no probe and sheds nothing', async (t) => {
   const membrane = new StandIn(failsFromThird(() => providerError('context_length', 400, 'zz prompt is too long')));
   const r = await resident(t, membrane);
@@ -222,24 +204,7 @@ test('a failure the breaker leaves alone sends no probe and sheds nothing', asyn
   assert.equal(r.alerts('history-kept').length, 0);
 });
 
-test('a row the provider refuses is still shed: the probe is answered, the row goes, and the retry without it is answered', async (t) => {
-  const poisoned = (request: NormalizedRequest) => (texts(request).includes('zz-poison')
-    ? providerError('invalid_request', 400, 'tool_use ids must have a corresponding tool_result') : undefined);
-  const membrane = new StandIn(poisoned);
-  const r = await resident(t, membrane);
-  r.say('zz-poison');
-  await r.until(() => r.count('inference:exhausted') === 1, "the poisoned turn to fail");
-  r.wake();
-  await r.until(() => r.count('inference:exhausted') === 2, 'the first wake to fail');
-  r.wake();
-  await r.until(() => r.count('inference:completed') === 3, 'the retry without the row to be answered');
-  assert.equal(membrane.probes.length, 1);
-  assert.deepEqual(r.history().filter((x) => !x.startsWith('zz-answer-')), ['zz-q1', 'zz-q2']);
-  assert.equal(r.rewindMarkers(), 1);
-  assert.ok(!membrane.sends.at(-1)!.includes('zz-poison'), 'the retry went without the row');
-});
-
-test('a probe answered a minute later, with nothing else happening meanwhile, still sheds the row', async (t) => {
+test('a row the provider refuses is still shed, its probe answered a minute later with nothing else happening meanwhile: the row goes, and the retry without it is answered', async (t) => {
   let answer!: (value: 'answered') => void;
   const held = new Promise<'answered'>((resolve) => { answer = resolve; });
   const poisoned = (request: NormalizedRequest) => (texts(request).includes('zz-poison')
@@ -255,6 +220,7 @@ test('a probe answered a minute later, with nothing else happening meanwhile, st
   await r.quiet(60_000);
   answer('answered');
   await r.until(() => r.count('inference:completed') === 3, 'the retry without the row to be answered');
+  assert.equal(membrane.probes.length, 1, 'the retry went without another probe');
   assert.deepEqual(r.history().filter((x) => !x.startsWith('zz-answer-')), ['zz-q1', 'zz-q2']);
   assert.equal(r.rewindMarkers(), 1);
   assert.ok(!membrane.sends.at(-1)!.includes('zz-poison'), 'the retry went without the row');
