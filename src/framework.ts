@@ -9510,20 +9510,21 @@ export class AgentFramework {
    * itself before it changes the host's mode, and refuses instead, unless
    * the call has `abandon` (writeDeferredWritesForQuiesce).
    */
-  private persistDeferredWrites(): void {
+  private persistDeferredWrites(): boolean {
     let outcome: DeferredWritesOutcome;
     try {
       outcome = this.writeDeferredWrites(this.quiesced);
     } catch (err) {
       console.error('[host-mode] failed to persist deferred context writes:', err);
       this.deferredWritesFellBehind({ error: err });
-      return;
+      return false;
     }
     if (outcome === 'over-cap') {
       this.deferredWritesFellBehind('over-cap');
-    } else if (outcome !== 'nothing') {
-      this.deferredWritesCaughtUp();
+      return false;
     }
+    if (outcome !== 'nothing') this.deferredWritesCaughtUp();
+    return true;
   }
 
   /**
@@ -32050,7 +32051,13 @@ export class AgentFramework {
           if (!coordinator) return undefined;
           const scope = coordinator.getAllExcept();
           if (!scope || scope.params.except.serverId !== serverId || scope.params.except.channelId !== channelId) return undefined;
-          coordinator.cancelAllExcept('channel-close', 'the excepted channel was closed');
+          let released: ReturnType<typeof coordinator.cancelAllExcept>;
+          try {
+            released = coordinator.cancelAllExcept('channel-close', 'the excepted channel was closed');
+          } catch (err) {
+            throw new Error(`The close wasn't recorded: ${err instanceof Error ? err.message : String(err)}`);
+          }
+          if (!released.ok) throw new Error(`The close wasn't recorded: ${released.error}`);
           return 'The focus on it ended all the same, and what the other channels held was delivered.';
         },
         focusChannelResolver: () => this.tuneOutCoordinator?.focusChannel() ?? null,
@@ -36929,21 +36936,19 @@ export class AgentFramework {
     return decision;
   }
 
-  /**
-   * Make delivered messages durable now, including those the delivery left
-   * in the deferred queue: a tune-out release flips durable epoch state
-   * first, so its dump must not be lost to a crash in between (#232 gap 6).
-   */
-  private commitDeliveries(): void {
+  private commitDeliveries(): boolean {
+    let durable = true;
     if (this.deferredMessages.length > 0) {
       this.deferredWritesPersisted = true;
-      this.persistDeferredWrites();
+      durable = this.persistDeferredWrites();
     }
     try {
       this.store.sync();
     } catch (err) {
       console.error('[tune-out] could not sync the store after a release:', err);
+      return false;
     }
+    return durable;
   }
 
   /** The history-reading tool the primary resident actually has, if any (#232 gap 11). */
