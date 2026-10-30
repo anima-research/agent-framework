@@ -1337,8 +1337,9 @@ export class Agent {
 
   /** Note a publish into `destination` (its key), made having read through
    *  `readThrough`: the consumed watermark when its words were written, or
-   *  its call made. A later mark on the same branch replaces an earlier one;
-   *  one on another branch replaces whatever was noted. */
+   *  its call made. A later mark on the same branch (markAtOrAfter: of two
+   *  at one head, the one whose window reached further) replaces an earlier
+   *  one; one on another branch replaces whatever was noted. */
   notePublished(destination: string, readThrough: ReadMark | null): void {
     if (!readThrough) return;
     const noted = this.publishedThrough.get(destination);
@@ -1441,8 +1442,9 @@ export class Agent {
    * mark's branch, so a boundary's mark is never rolled back by a compile
    * that started before it (a committing compile, such as compileContext's,
    * run during a live turn; a dry run, such as previewActivation's, never
-   * reaches here). Marks are ordered by the store's head, which only grows
-   * on a branch, whatever the context's window mode.
+   * reaches here). Marks are ordered by markAtOrAfter: by the window's
+   * index length where both keep one, else by the store's head, each of
+   * which only grows on a branch.
    */
   private applyCompileWatermark(watermark: ReadMark, marksBefore: number): void {
     const current = this.consumedWatermark;

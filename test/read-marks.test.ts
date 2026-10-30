@@ -13,9 +13,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, PassthroughStrategy, type StoredMessage } from '@animalabs/context-manager';
-import type { ContentBlock } from '@animalabs/membrane';
+import type { ContentBlock, Membrane } from '@animalabs/membrane';
+import { Agent } from '../src/agent.js';
+import type { AgentConfig } from '../src/types/index.js';
 import {
-  coverTest, covers, describeReadMark, markAtOrAfter, readMarkForTest, readMarkOf, type MarkCm, type ReadMark,
+  coverTest, covers, describeReadMark, markAtOrAfter, readMarkForTest, readMarkOf, readMarkThrough, type MarkCm, type ReadMark,
 } from '../src/read-marks.js';
 import { positionIn, windowEnd, windowMarkOf, type Position } from '../src/presentation.js';
 
@@ -203,6 +205,49 @@ describe('read marks', () => {
     assert.equal(markAtOrAfter(late, readMarkForTest('fork', 1, null)), 'other-branch');
     assert.deepEqual(readMarkForTest('main', 4, null), early, 'two marks of one place are deep-equal');
     assert.equal(describeReadMark(null), 'no mark');
+    // Two marks that both keep a length: the greater is the later, at one
+    // head too; equal lengths fall back to the head.
+    assert.equal(markAtOrAfter(readMarkForTest('main', 9, 5), readMarkForTest('main', 9, 3)), true);
+    assert.equal(markAtOrAfter(readMarkForTest('main', 9, 3), readMarkForTest('main', 9, 5)), false, 'one head, a shorter window');
+    assert.equal(markAtOrAfter(readMarkForTest('main', 8, 5), readMarkForTest('main', 9, 5)), false, 'one length: by head');
+    assert.equal(markAtOrAfter(readMarkForTest('main', 9, 3), readMarkForTest('main', 8, null)), true, 'one without a length: by head');
+    // A double without a store reads its head from its last row, which a
+    // presentation doesn't move: two marks at one head with one between.
+    let length = 3;
+    const double = {
+      currentBranch: () => ({ name: 'main' }), getAllMessages: () => [{ id: 'x', sequence: 7 }],
+      windowMode: () => 'presented' as const, indexLength: () => length,
+    } as never;
+    const before = readMarkOf(double)!;
+    length = 4;
+    const after = readMarkOf(double)!;
+    assert.deepEqual([describeReadMark(before), describeReadMark(after)], ['main@7#3', 'main@7#4']);
+    assert.deepEqual([markAtOrAfter(after, before), markAtOrAfter(before, after)], [true, false]);
+  });
+
+  it("of two publish marks at one head, the one whose window reached further is kept, so the rows presented between count as read before the publish", async () => {
+    const r = await rig();
+    try {
+      r.cm.presentRows([]);
+      const a = r.cm.addMessage('user', text('a'));
+      r.cm.presentRows([a]);
+      const b = r.cm.addMessage('user', text('b'));
+      r.cm.presentRows([b]);
+      // A redo's mark (readMarkThrough) covers the window below b; one taken
+      // at the same head covers it all.
+      const through = readMarkThrough(r.cm, r.cm.ordinalOf(b)!)!;
+      const now = readMarkOf(r.cm)!;
+      assert.equal(describeReadMark(through).split('#')[0], describeReadMark(now).split('#')[0], 'one head');
+      assert.deepEqual([covers(through, r.cm, r.row(b)), covers(now, r.cm, r.row(b))], ['not-covered', 'covered']);
+      const agent = new Agent({ name: 'mira', model: 'test-model', systemPrompt: 'sys' } as AgentConfig, r.cm, {} as Membrane);
+      const room = 'chat:room';
+      agent.notePublished(room, through);
+      assert.equal(agent.publishedAfterReading(room, r.row(b), r.cm), false, 'noted before b was read');
+      agent.notePublished(room, now);
+      assert.equal(agent.publishedAfterReading(room, r.row(b), r.cm), true, 'the later mark replaces it');
+      agent.notePublished(room, through);
+      assert.equal(agent.publishedAfterReading(room, r.row(b), r.cm), true, 'and the earlier one does not replace the later');
+    } finally { r.cleanup(); }
   });
 
   it('readMarkOf is null for a double that has no branch, and reads the last row where there is no store', () => {

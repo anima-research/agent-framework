@@ -17,6 +17,9 @@
     would: a row stored after it, taken out of the window, or presented
     again after it isn't covered. (A `MarkCm` double without
     `getPresentedMessages` and `branchSequenceOf` is read by sequence.)
+    `markAtOrAfter(a, b)` orders two marks on one branch by their index
+    lengths when both keep one, and by the store's head otherwise or where
+    the lengths are equal.
     `markAnswered` and `notePublished` take a `ReadMark`, and
     `publishedAfterReading(destination, row, cm)` takes the row and the
     agent's context in place of a branch and a sequence.

@@ -287,10 +287,20 @@ export function covers(mark: ReadMark | null, reader: MarkCm, row: MarkedRow, ac
 
 /**
  * Whether mark `a` was taken at or after mark `b`: on one branch, by the
- * store's head, which only grows there; `'other-branch'` when they are on two.
+ * window's index length when both keep one, which only grows there and
+ * grows at every presentation, and by the store's head, which only grows
+ * there too, where the lengths are equal or either mark keeps none;
+ * `'other-branch'` when they are on two. Two marks at one head can keep two
+ * lengths: a mark readMarkThrough gives (a redo's) covers less of the window
+ * than one taken at the same head, and a double without a store reads its
+ * head from its last row, which no presentation moves. The one with the
+ * greater length is the later: a publish noted with it (Agent.notePublished)
+ * is credited with the rows presented between.
  */
 export function markAtOrAfter(a: ReadMark, b: ReadMark): boolean | 'other-branch' {
   if (a.branch !== b.branch) return 'other-branch';
+  const [aLength, bLength] = [a[LENGTH], b[LENGTH]];
+  if (aLength !== null && bLength !== null && aLength !== bLength) return aLength > bLength;
   return a[HEAD] >= b[HEAD];
 }
 
