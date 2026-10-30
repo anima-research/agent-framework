@@ -1,19 +1,23 @@
 import type { ThinkingBindingEntry } from '@animalabs/membrane';
 import type { ProcessEvent } from './events.js';
 import type { ModuleProcessResponse } from './framework.js';
-import type { SessionUsage } from '../usage/types.js';
+import type { UsageUpdatedEvent } from '../usage/types.js';
 import type { DraftReason } from '../prose-drafts.js';
+import type { RecipeChanges } from '../gate/recipe-reconcile.js';
+import type { DesiredChannelState } from '../mcpl/channel-registry.js';
+import type { PushEventResult } from '../mcpl/types.js';
+import type { CoalescingAudit } from '../mcpl/push-coalescer.js';
 
 /**
  * Base for all trace events.
  * TraceEvents are observability-only — they NEVER drive logic.
  */
-export interface TraceEventBase {
+export type TraceEventBase = {
   /** When this trace was emitted */
   timestamp: number;
   /** Optional correlation ID for distributed tracing */
   traceId?: string;
-}
+};
 
 /**
  * Observability events emitted by the framework.
@@ -324,6 +328,7 @@ export type TraceEvent =
       module: string;
       tool: string;
       callId: string;
+      durationMs?: number;
       error: string;
       stack?: string;
     })
@@ -414,6 +419,13 @@ export type TraceEvent =
       channelId?: string;
       detail?: string;
     })
+  | (TraceEventBase & {
+      type: 'mcpl:push_event';
+      serverId: string;
+      eventId: string;
+      featureSet: string;
+      coalesce?: PushEventResult['coalesce'];
+    })
   /** A channels/incoming message refused at the MCPL boundary: an
    *  unregistered channel (`unknown-channel`, §14.5), visibly-empty content
    *  (`empty-content`), or a coalesced item the host refused
@@ -432,6 +444,67 @@ export type TraceEvent =
       reason: string;
       field?: string;
       detail?: string;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:channels-register';
+      serverId: string;
+      channelIds: string[];
+      count: number;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:channels-changed';
+      serverId: string;
+      added: string[];
+      removed: string[];
+      updated: string[];
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:channels-incoming';
+      serverId: string;
+      messageCount: number;
+      channelIds: string[];
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:channel-descriptor-rejected';
+      serverId: string;
+      channelId?: string;
+      reason: string;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:channel-lazy-registered';
+      serverId: string;
+      channelId: string;
+      label: string;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:channel-opened-by-send';
+      serverId: string;
+      channelId: string;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:channel-open-failed';
+      serverId: string;
+      channelId: string;
+      error: string;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:channel-open-substituted';
+      serverId: string;
+      channelId: string;
+      answeredFor: string;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:channel-reconcile-failed';
+      serverId: string;
+      channelId: string;
+      desired?: DesiredChannelState;
+      attempts?: number;
+      error: string;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:channel-reconcile-skipped';
+      serverId: string;
+      reason: string;
     })
   /** MCPL content that context-manager won't store, because it doesn't
    *  match ContentBlock, reached the store/wake site and was refused there:
@@ -455,20 +528,30 @@ export type TraceEvent =
       channelId?: string;
       messageId?: string;
     })
-  /** RFC-006 coalescing decision record (received / displaced / removed /
-   *  rendered / revoked / render-cancelled / late-render / render-failed).
+  /** RFC-006 coalescing decision record, by `kind`.
    *  A late-render whose push/render had already timed out, its fallback
    *  materialized, is recorded by the connection's wiring rather than the
    *  coalescer: it names `serverId`, `featureSet`, `key` and, for a
    *  channel-scoped subject, `channelId` instead of `subject`, carries a late
    *  JSON-RPC error as `error` (`[code] message`, bounded), and its `eventId`
    *  links it to the batch's render-failed. */
+  | (TraceEventBase & { type: 'mcpl:coalescing' } & CoalescingAudit)
   | (TraceEventBase & {
       type: 'mcpl:coalescing';
-      kind: string;
-      subject?: string;
+      kind: 'late-render';
+      serverId: string;
       eventId?: string;
-      [key: string]: unknown;
+      featureSet?: string;
+      key?: string;
+      channelId?: string;
+      discarded: true;
+      error?: string;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:coalescing';
+      kind: 'turn-withdrawn';
+      agentName: string;
+      subjects: string[];
     })
 
   // EventGate lifecycle
@@ -525,6 +608,8 @@ export type TraceEvent =
       type: 'gate:config-reloaded';
       configPath: string;
       policyCount: number;
+      removedPolicies?: string[];
+      stateClearedPolicies?: string[];
     })
   | (TraceEventBase & {
       type: 'gate:decision';
@@ -534,15 +619,32 @@ export type TraceEvent =
       matchedPolicy: string | null;
       trigger: boolean;
       behavior: string;
+      observed?: string[];
+    })
+  | (TraceEventBase & Fields<RecipeChanges> & {
+      type: 'gate:config-reconciled';
+      configPath: string;
+      addedPolicies: string[];
+    })
+  | (TraceEventBase & {
+      type: 'gate:policy-added';
+      configPath: string;
+      policyName: string;
+      replaced: boolean;
+    })
+  | (TraceEventBase & {
+      type: 'gate:policy-removed';
+      configPath: string;
+      policyName: string;
+    })
+  | (TraceEventBase & {
+      type: 'gate:shadow-warnings';
+      reason: string;
+      warnings: string[];
     })
 
   // Usage lifecycle
-  | (TraceEventBase & {
-      type: 'usage:updated';
-      totals: SessionUsage;
-      agentName: string;
-      inferenceCount: number;
-    })
+  | (TraceEventBase & Fields<UsageUpdatedEvent>)
 
   // Undo/redo lifecycle
   | (TraceEventBase & {
@@ -774,6 +876,51 @@ export type TraceEvent =
       missing?: string[];
     })
   | (TraceEventBase & {
+      type: 'mcpl:inference_start';
+      serverId: string;
+      featureSet: string;
+      model: string;
+      stream: boolean;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:inference_complete';
+      serverId: string;
+      model: string;
+      actualModel?: string;
+      inputTokens: number;
+      outputTokens: number;
+      streamed: boolean;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:inference_fail';
+      serverId: string;
+      model: string | null;
+      error: string;
+      streamed: boolean;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:state_registered';
+      serverId: string;
+      featureSet: string;
+      hostState: boolean;
+      rollback: boolean;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:checkpoint_recorded';
+      serverId: string;
+      featureSet: string;
+      checkpoint: string;
+      parent: string | null;
+      hasData: boolean;
+      hasPatch: boolean;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:state_rollback';
+      serverId: string;
+      featureSet: string;
+      checkpoint: string;
+    })
+  | (TraceEventBase & {
       /** An operator tool-name pattern matches no model-facing tool. Emitted
        *  once per pattern, after the servers it could name have listed. */
       type: 'mcpl:tool-pattern-unmatched';
@@ -886,6 +1033,62 @@ export type TraceEvent =
       type: 'host:quiesced_boot';
       reason?: string;
       since?: number;
+    })
+
+  | (TraceEventBase & {
+      type: 'tune-out:entered';
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      scope?: 'all-except';
+      reader: boolean;
+      expiresAtMs?: number;
+    })
+  | (TraceEventBase & {
+      type: 'tune-out:cancelled';
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      scope?: 'all-except';
+      reason: string;
+      wakeCount: number;
+    })
+  | (TraceEventBase & {
+      type: 'tune-out:announced';
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      kind: 'entered' | 'released';
+    })
+  | (TraceEventBase & {
+      type: 'tune-out:announce-failed';
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      kind: 'entered' | 'released';
+      error: string;
+    })
+  | (TraceEventBase & {
+      type: 'tune-out:ack-failed';
+      serverId: string;
+      channelId: string;
+      error: string;
+    })
+  | (TraceEventBase & {
+      type: 'tune-out:timer-failed';
+      timer: 'wake' | 'cadence' | 'expiry';
+      serverId: string;
+      channelId: string;
+      error: string;
+    })
+  | (TraceEventBase & {
+      type: 'tune-out:wake-budget-paused';
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      scope: 'all-except';
+      wakeCount: number;
+      maxWakes: number;
     })
 
   /** A reader fork ended in prose without `deliver_summary`; its final prose was delivered as its report. */
@@ -1076,3 +1279,15 @@ export type TraceEvent =
  * Listener for trace events.
  */
 export type TraceEventListener = (event: TraceEvent) => void;
+
+/**
+ * A trace as raised, before `emitTrace` stamps its `timestamp`: one of the
+ * union's members without that field.
+ */
+export type TraceEventInput = WithoutTimestamp<TraceEvent>;
+
+type Fields<Shape> = { [Key in keyof Shape]: Shape[Key] };
+
+type WithoutTimestamp<Event> = Event extends unknown
+  ? { [Key in keyof Event as Key extends 'timestamp' ? never : Key]: Event[Key] }
+  : never;

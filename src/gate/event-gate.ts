@@ -22,6 +22,7 @@ import { MAX_TIMER_MS } from '../deadline-timer.js';
 import { safeSlice } from '../safe-slice.js';
 
 import type { ToolDefinition } from '../types/events.js';
+import type { TraceEventInput } from '../types/trace.js';
 import type {
   GateConfig,
   GatePolicy,
@@ -257,15 +258,6 @@ interface CompiledPolicy {
 interface PolicyStats {
   matchCount: number;
   lastMatchTimestamp: number | null;
-}
-
-// ---------------------------------------------------------------------------
-// Trace event shape (subset — avoids importing the full TraceEvent union)
-// ---------------------------------------------------------------------------
-
-interface TraceEventLike {
-  type: string;
-  [key: string]: unknown;
 }
 
 // ---------------------------------------------------------------------------
@@ -2172,7 +2164,7 @@ export class EventGate {
   private lastPrivilegedCheck = 0;
 
   // Dependency-injected callbacks
-  private emitTrace: (event: TraceEventLike) => void;
+  private emitTrace: (event: TraceEventInput) => void;
   private addMessageFn: (
     participant: string,
     content: Array<{ type: 'text'; text: string }>,
@@ -2197,7 +2189,7 @@ export class EventGate {
     configPath: string;
     initialConfig?: GateConfig;
     privilegedUsersPath?: string;
-    emitTrace: (event: TraceEventLike) => void;
+    emitTrace: (event: TraceEventInput) => void;
     addMessage: (
       participant: string,
       content: Array<{ type: 'text'; text: string }>,
@@ -2541,7 +2533,6 @@ export class EventGate {
         ...changes,
         // Every name the start added to gate.json, as an append's trace gave.
         addedPolicies: names,
-        timestamp: Date.now(),
       });
     }
     if (!appended && (!last.recipe || canonical({ rules: last.recipe.rules, default: last.recipe.default }) !== canonical({ rules: starting.rules.map((rule) => rule.raw), default: given.default }))) {
@@ -2652,7 +2643,6 @@ export class EventGate {
         type: 'gate:config-error',
         error: why,
         configPath: this.configPath,
-        timestamp: Date.now(),
       });
     }
     this.configError = problem;
@@ -2851,7 +2841,6 @@ export class EventGate {
         removedPolicies: removedPolicies.length > 0 ? removedPolicies : undefined,
         stateClearedPolicies:
           stateClearedPolicies.length > 0 ? stateClearedPolicies : undefined,
-        timestamp: now,
       });
     } catch {
       // The rules in force stay, and the next check tries again.
@@ -2977,7 +2966,6 @@ export class EventGate {
       configPath: this.configPath,
       policyName: policy.name,
       replaced: idx >= 0,
-      timestamp: Date.now(),
     });
     if (ignored.length > 0) {
       // A caller that doesn't take the notes still gets them said, in the log.
@@ -3020,7 +3008,6 @@ export class EventGate {
       type: 'gate:policy-removed',
       configPath: this.configPath,
       policyName: name,
-      timestamp: Date.now(),
     });
     return true;
   }
@@ -3223,7 +3210,6 @@ export class EventGate {
           matchedPolicy: 'asleep',
           trigger: false,
           behavior: 'skip',
-          timestamp: this.now(),
         });
         return { trigger: false, policyName: 'asleep', behavior: 'skip' };
       }
@@ -3281,7 +3267,6 @@ export class EventGate {
       trigger: decision.trigger,
       behavior: formatBehavior(decision.behavior),
       ...(observed.length > 0 ? { observed } : {}),
-      timestamp: this.now(),
     });
 
     return decision;
@@ -3306,7 +3291,6 @@ export class EventGate {
       behavior: formatBehavior(policy.behavior),
       eventType: info.eventType,
       source: info.serverId || undefined,
-      timestamp: this.now(),
     });
 
     if (policy.behavior === 'defer' || policy.behavior === 'skip') {
@@ -3642,7 +3626,6 @@ export class EventGate {
         type: 'gate:shadow-warnings',
         reason,
         warnings: warnings.map(formatShadowWarning),
-        timestamp: this.now(),
       });
     }
   }
@@ -3774,7 +3757,6 @@ export class EventGate {
       type: 'gate:debounce-delivered',
       policyName,
       eventCount: events.length,
-      timestamp: Date.now(),
     });
   }
 
@@ -3796,7 +3778,6 @@ export class EventGate {
         type: 'gate:held-dropped',
         dropped: batched.length - events.length,
         channels: [...new Set(batched.filter((e) => !events.includes(e)).map(heldAt))],
-        timestamp: this.now(),
       });
     }
     if (events.length === 0) return;
@@ -4131,7 +4112,6 @@ export class EventGate {
       ...(!failed && typeof verdict.inputTokens === 'number' ? { inputTokens: verdict.inputTokens } : {}),
       ...(!failed && typeof verdict.cacheReadTokens === 'number' ? { cacheReadTokens: verdict.cacheReadTokens } : {}),
       ...(!failed && typeof verdict.outputTokens === 'number' ? { outputTokens: verdict.outputTokens } : {}),
-      timestamp: Date.now(),
     });
     if (this.disposed) return;
     const judge = this.currentJudge(policyName, state.judge);
@@ -4347,7 +4327,6 @@ export class EventGate {
       matchedPolicy: 'asleep',
       trigger: false,
       behavior: 'skip',
-      timestamp: this.now(),
     });
     return { until: this.sleepUntil };
   }
@@ -4405,7 +4384,6 @@ export class EventGate {
         matchedPolicy: 'self-wake',
         trigger: true,
         behavior: 'always',
-        timestamp: this.now(),
       });
       // Compact in-window notice: without it the wake turn contains nothing
       // new, so the agent can't tell WHAT woke it (its own timer vs. a
@@ -4440,7 +4418,6 @@ export class EventGate {
       matchedPolicy: 'self-wake',
       trigger: false,
       behavior: 'skip',
-      timestamp: this.now(),
     });
     return { inMs: ms, armed: true };
   }
@@ -4483,7 +4460,6 @@ export class EventGate {
       matchedPolicy: 'asleep',
       trigger: true,
       behavior: 'always',
-      timestamp: this.now(),
     });
     const detail = note ? `${reason}: ${note}` : reason;
     const targets = agent ? [agent] : this.getAgentNamesFn();

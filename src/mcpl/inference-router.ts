@@ -29,6 +29,7 @@ import { hostStoppedWhileHandling } from './errors.js';
 import type { HookOrchestrator } from './hook-orchestrator.js';
 import { logValue } from './log-value.js';
 import { streamBounds, wholeCallMs, withHostSetting, type InferenceBounds } from '../inference-bounds.js';
+import type { TraceEventInput } from '../types/trace.js';
 
 // ============================================================================
 // Responder interface
@@ -184,7 +185,7 @@ export class InferenceRouter {
   private hookOrchestrator: HookOrchestrator;
   private featureSetManager: FeatureSetManager;
   private routingPolicy: InferenceRoutingPolicy | null;
-  private emitTraceFn: (event: { type: string; [key: string]: unknown }) => void;
+  private emitTraceFn: (event: TraceEventInput) => void;
   /** The refusals for want of a model that have been logged: one line per
    *  server with no policy, and per server and feature set with one, so a
    *  server that keeps asking doesn't flood the operator's log. */
@@ -196,7 +197,7 @@ export class InferenceRouter {
     hookOrchestrator: HookOrchestrator,
     featureSetManager: FeatureSetManager,
     routingPolicy: InferenceRoutingPolicy | null,
-    emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
+    emitTraceFn: (event: TraceEventInput) => void,
     private readonly inferenceBounds: () => InferenceBounds | null = () => null,
   ) {
     this.membrane = membrane;
