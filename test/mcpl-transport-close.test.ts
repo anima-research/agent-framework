@@ -836,10 +836,10 @@ test('a request made after a line longer than the bound is refused as not sent, 
 
 const STDERR_DROPPED_NOTICE = '[a stderr line longer than 65,536 UTF-16 code units was dropped]';
 
-test('a stderr line is dropped from the read that takes it past the bound, before its line end: one notice comes then, the rest of the line goes, the next line arrives whole, and the transport stays open', { timeout: 15_000 }, async (t) => {
+test('a stderr line is dropped from the read that takes it past the bound, before its line end: the line before it arrives whole, one notice comes then, the rest of the line goes, the next line arrives whole, and the transport stays open', { timeout: 15_000 }, async (t) => {
   setStdioLineBoundForTests(65_536);
   t.after(() => setStdioLineBoundForTests(undefined));
-  const script = "process.stderr.write('x'.repeat(65_537)); process.stdin.once('data', () => process.stderr.write('tail of it\\nnext\\n')); setInterval(() => {}, 1 << 30);";
+  const script = "process.stderr.write('before\\n' + 'x'.repeat(65_537)); process.stdin.once('data', () => process.stderr.write('tail of it\\nnext\\n')); setInterval(() => {}, 1 << 30);";
   const transport = await StdioTransport.spawn({ id: 'long-stderr', command: process.execPath, args: ['-e', script] });
   t.after(() => transport.close());
   const lines: string[] = [];
@@ -855,7 +855,20 @@ test('a stderr line is dropped from the read that takes it past the bound, befor
   assert.equal(await within(notice.then(() => 'notice'), 'no notice within 5 s, with the line end not yet written'), 'notice');
   transport.writeLine('go');
   assert.equal(await within(next.then(() => 'next'), 'no next line within 5 s'), 'next');
-  assert.deepEqual({ lines, closed: transport.closed }, { lines: [STDERR_DROPPED_NOTICE, 'next'], closed: false });
+  assert.deepEqual({ lines, closed: transport.closed }, { lines: ['before', STDERR_DROPPED_NOTICE, 'next'], closed: false });
+});
+
+test('a stderr line of exactly the bound in UTF-16 code units, three times that in UTF-8, is held whole until something listens, as the newest held line', { timeout: 15_000 }, async (t) => {
+  setStdioLineBoundForTests(65_536);
+  t.after(() => setStdioLineBoundForTests(undefined));
+  const script = "process.stderr.write('\u20ac'.repeat(65_536) + '\\n');";
+  const transport = await StdioTransport.spawn({ id: 'stderr-at-bound', command: process.execPath, args: ['-e', script] });
+  t.after(() => transport.close());
+  await transport.stderrEnded(5_000);
+  const lines: string[] = [];
+  transport.on('stderr', (line: string) => { lines.push(line); });
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.deepEqual(lines, ['\u20ac'.repeat(65_536)]);
 });
 
 test('a stderr line whose line end comes in the read that takes it past the bound is dropped with one notice, and the next line arrives whole', { timeout: 15_000 }, async (t) => {
@@ -870,18 +883,18 @@ test('a stderr line whose line end comes in the read that takes it past the boun
   assert.deepEqual({ lines, closed: transport.closed }, { lines: [STDERR_DROPPED_NOTICE, 'last'], closed: false });
 });
 
-test('stderr that arrives before anything listens is held to the bound in total: the oldest whole lines go, with one notice saying how many, and the newest arrive', { timeout: 15_000 }, async (t) => {
+test('stderr that arrives before anything listens is held to the bound, each line counted as its length plus 16: the oldest whole lines go, with one notice saying how many, and the newest arrive in order', { timeout: 15_000 }, async (t) => {
   setStdioLineBoundForTests(65_536);
   t.after(() => setStdioLineBoundForTests(undefined));
-  const script = "for (let i = 1; i <= 100; i++) process.stderr.write(String(i).padStart(3, '0') + 'x'.repeat(997) + '\\n');";
+  const script = "for (let i = 1; i <= 3000; i++) process.stderr.write(String(i).padStart(4, '0') + 'x'.repeat(96) + '\\n');";
   const transport = await StdioTransport.spawn({ id: 'stderr-flood', command: process.execPath, args: ['-e', script] });
   t.after(() => transport.close());
   await transport.stderrEnded(5_000);
   const lines: string[] = [];
   transport.on('stderr', (line: string) => { lines.push(line); });
   await new Promise<void>((resolve) => { setImmediate(resolve); });
-  const kept = Array.from({ length: 65 }, (_, k) => String(36 + k).padStart(3, '0') + 'x'.repeat(997));
-  assert.deepEqual(lines, ['[35 earlier stderr lines were dropped, to hold at most 65,536 UTF-16 code units of unread stderr]', ...kept]);
+  const kept = Array.from({ length: 564 }, (_, k) => String(2437 + k).padStart(4, '0') + 'x'.repeat(96));
+  assert.deepEqual(lines, ['[2,436 earlier stderr lines were dropped: unread stderr is held to 65,536 UTF-16 code units, each line counted as its length plus 16]', ...kept]);
 });
 
 test("a legacy server whose stdin fails and whose child outlives SIGKILL is held as a launch it can't reap: a permanent failure, and close() retries", { timeout: 60_000 }, async (t) => {

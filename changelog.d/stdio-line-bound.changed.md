@@ -14,8 +14,11 @@
   its place saying so, `[a stderr line longer than 104,857,600 UTF-16 code
   units was dropped]`, and the connection stays up. Stderr lines that arrive
   before anything listens for them, as during a handshake, are held to the
-  same bound in total: past it the oldest whole lines go, and the first line
-  handed on says how many went.
+  same bound, each line counted as its length plus 16: past it the oldest
+  whole lines go, the newest is always kept, and the first line handed on
+  says how many went, `[N earlier stderr lines were dropped: unread stderr is
+  held to 104,857,600 UTF-16 code units, each line counted as its length plus
+  16]`.
 - **`McpServer.start()`, and so the `agent-framework-mcp` command, exits the
   process with code 1** when a line on its stdin is longer than the same
   bound, after one stderr line naming it.

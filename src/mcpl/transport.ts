@@ -59,8 +59,12 @@ export interface TransportCloseInfo {
  *    child, and close() retries the reap (never WS)
  *
  * Inbound `'line'`/`'stderr'` events are buffered until the first matching
- * listener attaches (and re-buffered whenever there are none), so no message is
- * lost across the handshake→routing handoff regardless of attach timing.
+ * listener attaches (and re-buffered whenever there are none), so no `'line'`
+ * is lost across the handshake→routing handoff regardless of attach timing.
+ * Unread `'stderr'` lines are held to the line bound, each counted as its
+ * length plus a per-line charge: past it the oldest whole lines are dropped,
+ * the newest is always kept, and the first line a listener then gets says how
+ * many were dropped.
  */
 export abstract class McplTransport extends EventEmitter {
   abstract readonly kind: 'stdio' | 'websocket';
@@ -86,7 +90,7 @@ export abstract class McplTransport extends EventEmitter {
       } else if (event === 'stderr' && (this.stderrBuffer.length > this.stderrHead || this.stderrDropped > 0)) {
         const held = this.stderrBuffer.slice(this.stderrHead);
         const pending = this.stderrDropped > 0
-          ? [`[${this.stderrDropped} earlier stderr line${this.stderrDropped === 1 ? ' was' : 's were'} dropped, to hold at most ${(testLineBound ?? MAX_LINE_CHARS).toLocaleString('en-US')} UTF-16 code units of unread stderr]`, ...held]
+          ? [`[${this.stderrDropped.toLocaleString('en-US')} earlier stderr line${this.stderrDropped === 1 ? ' was' : 's were'} dropped: unread stderr is held to ${(testLineBound ?? MAX_LINE_CHARS).toLocaleString('en-US')} UTF-16 code units, each line counted as its length plus ${STDERR_LINE_CHARGE}]`, ...held]
           : held;
         this.stderrBuffer = [];
         this.stderrHead = 0;
@@ -152,10 +156,11 @@ export abstract class McplTransport extends EventEmitter {
       return;
     }
     this.stderrBuffer.push(line);
-    this.stderrBuffered += line.length;
+    this.stderrBuffered += line.length + STDERR_LINE_CHARGE;
     const ceiling = testLineBound ?? MAX_LINE_CHARS;
-    while (this.stderrBuffered > ceiling) {
-      this.stderrBuffered -= this.stderrBuffer[this.stderrHead++].length;
+    while (this.stderrBuffered > ceiling && this.stderrHead < this.stderrBuffer.length - 1) {
+      this.stderrBuffered -= this.stderrBuffer[this.stderrHead].length + STDERR_LINE_CHARGE;
+      this.stderrBuffer[this.stderrHead++] = '';
       this.stderrDropped++;
     }
     if (this.stderrHead > 1024 && this.stderrHead * 2 > this.stderrBuffer.length) {
@@ -377,11 +382,15 @@ export class StdioTransport extends McplTransport {
         dropping = false;
         rest = rest.slice(end + 1);
       }
-      const lines = (carry + rest).split('\n');
-      carry = lines.pop() ?? '';
-      for (const l of lines) {
-        if (l.length > lineBound) this.pushStderr(dropped);
-        else if (l.length > 0) this.pushStderr(l);
+      if (rest.includes('\n')) {
+        const lines = (carry + rest).split('\n');
+        carry = lines.pop() ?? '';
+        for (const l of lines) {
+          if (l.length > lineBound) this.pushStderr(dropped);
+          else if (l.length > 0) this.pushStderr(l);
+        }
+      } else {
+        carry += rest;
       }
       if (carry.length > lineBound) {
         carry = '';
@@ -616,6 +625,12 @@ export function setStdioExitGraceForTests(child: ChildProcess, ms: number): void
 }
 
 let testLineBound: number | undefined;
+
+// V8 keeps up to about 45 bytes beside a held line's characters (its string's
+// header and its array slot), so a flood of short lines would take several
+// times the ceiling in memory. Charging each held line 16 code units more
+// keeps what unread stderr holds within about 3 bytes a counted code unit.
+const STDERR_LINE_CHARGE = 16;
 
 /** @internal */
 export function setStdioLineBoundForTests(maxChars: number | undefined): void {
