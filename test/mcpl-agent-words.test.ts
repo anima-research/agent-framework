@@ -208,7 +208,7 @@ test("a request refused as not sent is refused through its promise when the host
     readonly kind = 'stdio' as const;
     failed: Error | undefined;
     writeFails: Error | undefined;
-    override get pipeFailure(): Error | undefined { return this.failed; }
+    override get stdioStopCause(): Error | undefined { return this.failed; }
     writeLine(): void { if (this.writeFails) throw this.writeFails; }
     async close(): Promise<void> {}
   }
