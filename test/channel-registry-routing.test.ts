@@ -11,7 +11,7 @@ import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 const discord = (channelId: string): ChannelRef => ({ serverId: 'discord', channelId });
 const body = (channelId: string): ChannelRef => ({ serverId: 'body', channelId });
 
-type RouteFailure = { conversationId: string; channelId: string | null; reason: string; textLen: number; outcome?: 'failed' | 'unknown'; detail?: string };
+type RouteFailure = { conversationId: string; channelId: string | null; reason: string; textLen: number; outcome?: 'failed' | 'unknown'; detail?: string; byDesign?: true };
 
 /**
  * Build a registry with a mock server whose publish result is configurable,
@@ -303,11 +303,34 @@ test('routeSpeech surfaces a failure when there is no locus at all', async () =>
   assert.ok(lines.some((line) => line.startsWith('[routeSpeech]') && line.includes('no locus')), lines.join('\n'));
   assert.equal(failures.length, 1);
   assert.equal(failures[0].channelId, null);
+  assert.equal(failures[0].byDesign, undefined, 'a turn with no channel at all may be a misconfiguration');
   assert.equal(failures[0].reason, 'this turn came from no channel, and it had no home or recent channel to reply in; if it ' +
     'should have had one, ask whoever runs this host');
   // The trace, like the log line connectome-doctor reads, keeps "no locus".
   const failed = traces.filter((e) => e.type === 'mcpl:speech-route-failed');
   assert.deepEqual(failed.map((e) => e.reason), ['turn has no locus (no home/trigger channel; nothing to deliver into)']);
+});
+
+test("routeSpeech names a batch's channels when it has no locus, and its log line keeps \"no locus\"", async () => {
+  const { registry, failures, traces } = makeRegistry({ delivered: true });
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  let res;
+  try {
+    res = await registry.routeSpeech('cairn', 'joining in', registry.resolveLocus('cairn'), { cameFrom: ['#room (discord:g1:room)'] });
+  } finally {
+    console.error = original;
+  }
+  assert.equal(res, null);
+  // connectome-doctor reads the [routeSpeech] line for "no locus".
+  assert.ok(lines.some((line) => line.startsWith('[routeSpeech]') && line.includes('no locus')), lines.join('\n'));
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].reason, "this turn came from #room (discord:g1:room), and what came from there didn't address you, " +
+    'and no channel was chosen for its reply; to reply there, send your reply to that channel explicitly');
+  assert.equal(failures[0].byDesign, true);
+  const failed = traces.filter((e) => e.type === 'mcpl:speech-route-failed');
+  assert.ok(failed.length > 0 && failed.every((e) => String(e.reason).includes('no locus')), JSON.stringify(traces));
 });
 
 // ── item-3 redux: single TRUNK agents route to the turn's triggering channel ──
