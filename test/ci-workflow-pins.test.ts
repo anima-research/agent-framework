@@ -53,7 +53,7 @@ for (const workflow of ['.github/workflows/ci.yml', '.github/workflows/publish.y
 
 test("ci.yml and publish.yml compute AF_TEST_CONCURRENCY the same way", () => {
   const computed = (workflow: string) => {
-    const lines = npmTestSteps(read(workflow)).flatMap((step) => step.match(/^\s*AF_TEST_CONCURRENCY=.*$/gm) ?? []);
+    const lines = npmTestSteps(read(workflow)).flatMap((step) => step.match(/^\s*(?:export\s+)?AF_TEST_CONCURRENCY=.*$/gm) ?? []);
     assert.equal(lines.length, 1, `${workflow}'s npm test step sets AF_TEST_CONCURRENCY once`);
     return lines[0]!.trim();
   };

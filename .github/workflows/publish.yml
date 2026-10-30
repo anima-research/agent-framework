@@ -46,9 +46,6 @@ jobs:
       - name: Build
         run: npm run build
 
-      # Twice as many test files at once as the runner has cores, as ci.yml's
-      # Build & Test runs them, so a release's gate runs the suite as a pull
-      # request's did.
       - name: Test
         run: |
           AF_TEST_CONCURRENCY=$(node -p "2 * require('node:os').cpus().length")

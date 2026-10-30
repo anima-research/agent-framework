@@ -92,12 +92,6 @@ jobs:
       - name: Build
         run: npm run build
 
-      # Twice as many test files at once as the runner has cores, said here
-      # rather than left to Node's default of one fewer than the cores: most
-      # files wait on timers and child processes, not the CPU. On four pinned
-      # CPUs of a Linux host the suite took about 317 s at four files at
-      # once, using 1.85 of the cores, and 208 s at eight, using 3.05 (216 s
-      # in a second run).
       - name: Test
         run: |
           AF_TEST_CONCURRENCY=$(node -p "2 * require('node:os').cpus().length")
