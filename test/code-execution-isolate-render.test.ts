@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import { strict as assert } from 'node:assert';
 import { bounded, formatMs, glimpse, renderList, renderReturn, VALUE_CHARS } from '../src/code-execution/isolate/render.js';
 import type { CallSummary } from '../src/code-execution/isolate/calls.js';
-import type { ScriptReturn } from '../src/code-execution/isolate/scripts.js';
+import type { ScriptListing, ScriptReturn } from '../src/code-execution/isolate/scripts.js';
 import { renderOutput } from '../src/code-execution/isolate/output.js';
 
 const noCalls: CallSummary = { made: 0, answered: 0, failed: 0, refused: 0, unsent: 0, running: 0, waiting: 0, named: [], more: {} };
@@ -52,11 +52,10 @@ test('each call whose answer the script did not see is named, as it was left', (
   assert.match(text, /- answered, but the script ended before it read the answer: tools\["echo"\]\(\{\}\)/);
 });
 
-test("at a yield, a too-large answer isn't called a timeout", () => {
+test("at a yield, a too-large answer is counted as one whose answer it didn't see", () => {
   const calls: CallSummary = { ...noCalls, made: 2, running: 1, named: [{ tool: 'big', args: '{}', state: 'too-large' }] };
   const text = renderReturn(ret({ running: true, ending: null, calls }), options);
   assert.match(text, /Its calls so far: 2 \(1 still running; 1 whose answer it didn't see\)\./);
-  assert.doesNotMatch(text, /timed out/);
 });
 
 test('a crash says what it means for the agent, and a failure gives its stack after its line', () => {
@@ -65,14 +64,14 @@ test('a crash says what it means for the agent, and a failure gives its stack af
   // The ending's stack is the script's frames alone (GuestError.stack): they follow the ending's line.
   const failed = renderReturn(ret({ ending: { how: 'failed', error: { name: 'TypeError', message: 'boom', stack: '    at anonymous (script:2:1)' } } }), options);
   assert.match(failed, /^Script s1-test failed: TypeError: boom\n    at anonymous \(script:2:1\)\nIt made no tool calls\./);
-  // A message of several lines is given once, by the ending's line.
+  // A message of several lines is given once, on the ending's one line.
   const multi = renderReturn(ret({ ending: { how: 'failed', error: { name: 'Error', message: 'first\nsecond', stack: '    at f (script:3:5)' } } }), options);
   assert.equal(multi.split('second').length - 1, 1, multi);
-  assert.match(multi, /^Script s1-test failed: Error: first\nsecond\n    at f \(script:3:5\)\n/);
-  // A message line that reads like a frame is the message's, given once.
+  assert.match(multi, /^Script s1-test failed: Error: first second\n    at f \(script:3:5\)\n/);
+  // A message line that reads like a frame is the message's, given once, and stays on the ending's line.
   const framed = renderReturn(ret({ ending: { how: 'failed', error: { name: 'Error', message: 'first\n    at note', stack: '    at f (script:3:5)' } } }), options);
   assert.equal(framed.split('at note').length - 1, 1, framed);
-  assert.match(framed, /^Script s1-test failed: Error: first\n    at note\n    at f \(script:3:5\)\n/);
+  assert.match(framed, /^Script s1-test failed: Error: first {5}at note\n    at f \(script:3:5\)\n/);
   // No frames, no stack: the ending's line alone.
   const bare = renderReturn(ret({ ending: { how: 'failed', error: { name: 'InternalError', message: 'out of memory' } } }), options);
   assert.match(bare, /^Script s1-test failed: InternalError: out of memory\nIt made no tool calls\./);
@@ -133,24 +132,44 @@ test('durations at their sites are said exactly: a yield, a lifetime', () => {
   assert.match(limit, /was stopped at its limit of 1\.5 s\./);
 });
 
+test("a script's ending reads on one line in a wait's and a list's result, a stop's reason cut as a failure's message is", () => {
+  const LINE_BREAK = /[\r\n\u000b\u000c\u0085\u2028\u2029]/;
+  const why = `its turn ended before the script returned (rate\nlimited ${'x'.repeat(400)})`;
+  const stopped = renderReturn(ret({ ending: { how: 'stopped', reason: 'limit', why } }), options);
+  const stoppedLine = stopped.split('\n').find((line) => line.includes('was stopped:'))!;
+  const cut = `${why.slice(0, 300).replace('\n', ' ')}…`;
+  assert.equal(stoppedLine, `Script s1-test was stopped: ${cut}.`);
+  const failed = renderReturn(ret({ ending: { how: 'failed', error: { name: 'Bad\u2028Name', message: 'broke\nhere' } } }), options);
+  assert.match(failed, /^Script s1-test failed: Bad Name: broke here$/m);
+  const crashed = renderReturn(ret({ ending: { how: 'crashed', detail: 'its process exited before the script ended: first\nsecond' } }), options);
+  assert.match(crashed, /^Script s1-test crashed: its process exited before the script ended: first second\. A crash/m);
+  const listing = (ending: ScriptListing['ending']): string =>
+    renderList([{ scriptId: 's1-test', running: false, startedAt: 0, endedAt: 0, ending, wakes: 0 }], 60_000);
+  for (const text of [
+    listing({ how: 'stopped', reason: 'limit', why }),
+    listing({ how: 'failed', error: { name: 'Bad\u2028Name', message: 'broke\nhere' } }),
+  ]) {
+    assert.ok(!text.split('\n').some((line) => line.includes('ago:') && LINE_BREAK.test(line)), text);
+  }
+  assert.ok(listing({ how: 'stopped', reason: 'limit', why }).split('\n').includes(`- s1-test: stopped 1 min ago: ${cut}`));
+  assert.match(listing({ how: 'failed', error: { name: 'Bad\u2028Name', message: 'broke\nhere' } }), /failed 1 min ago: Bad Name: broke here/);
+});
+
+test("a timed-out call's late answer is written on one line, as JSON that gives the answer back", () => {
+  const answer = 'first\u2028second\u0085third';
+  const calls: CallSummary = { ...noCalls, made: 1, named: [{ tool: 'slow', args: '{}', state: 'timed-out-answered', answer }] };
+  const text = renderReturn(ret({ calls, ending: { how: 'finished' } }), options);
+  const line = text.split('\n').find((l) => l.includes('its answer came later'))!;
+  assert.ok(!/[\u0085\u2028\u2029]/.test(line), JSON.stringify(line));
+  assert.equal(JSON.parse(line.slice(line.indexOf(', answer ') + ', answer '.length)), answer);
+});
+
 test('calls waiting their turn in the host are among those a yield counts', () => {
   const text = renderReturn(ret({ running: true, ending: null, calls: { ...noCalls, made: 19, running: 16, waiting: 3 } }), options);
   assert.match(text, /Its calls so far: 19 \(16 still running; 3 waiting their turn in the host\)\./);
 });
 
-test("bounded's cut, from the text's first and last halves (cutOf), is its cut as first written, over the whole text", () => {
-  // The cut as it was first written, over the whole text.
-  const whole = (text: string, max: number): string => {
-    if (text.length <= max) return text;
-    const half = Math.floor(max / 2);
-    let head = half;
-    const last = text.charCodeAt(head - 1);
-    if (last >= 0xd800 && last <= 0xdbff) head -= 1;
-    let tail = text.length - half;
-    const first = text.charCodeAt(tail);
-    if (first >= 0xdc00 && first <= 0xdfff) tail += 1;
-    return `${text.slice(0, head)}\n[… ${tail - head} characters dropped here …]\n${text.slice(tail)}`;
-  };
+test("bounded keeps both ends of a long text within its max, drops the middle with its count, and splits no surrogate pair", () => {
   // mulberry32, whose 32-bit steps lose nothing in a JavaScript number.
   let seed = 7;
   const next = (n: number) => {
@@ -159,12 +178,29 @@ test("bounded's cut, from the text's first and last halves (cutOf), is its cut a
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return Math.floor((((t ^ (t >>> 14)) >>> 0) / 4294967296) * n);
   };
+  const high = (c: number) => c >= 0xd800 && c <= 0xdbff;
+  const low = (c: number) => c >= 0xdc00 && c <= 0xdfff;
   // Surrogate pairs, so a cut falls inside one, and lone halves too, at bounds from none up.
   const alphabet = ['a', 'b', '\n', '\u{1F600}', '\u00e9', '\ud800', '\udc00'];
   for (let round = 0; round < 500; round++) {
     const max = next(41);
     const text = Array.from({ length: next(120) }, () => alphabet[next(alphabet.length)]).join('');
-    assert.equal(bounded(text, max), whole(text, max), JSON.stringify({ max, text }));
+    const at = JSON.stringify({ max, text });
+    const out = bounded(text, max);
+    if (text.length <= max) {
+      assert.equal(out, text, at);
+      continue;
+    }
+    const cut = /^([\s\S]*)\n\[… (\d+) characters dropped here …\]\n([\s\S]*)$/.exec(out);
+    assert.ok(cut, at);
+    const [, head, dropped, tail] = cut;
+    assert.ok(text.startsWith(head!) && text.endsWith(tail!), at);
+    assert.equal(head!.length + Number(dropped) + tail!.length, text.length, at);
+    assert.ok(head!.length + tail!.length <= max, at);
+    if (max >= 4) assert.ok(head!.length > 0 && tail!.length > 0, `both ends kept: ${at}`);
+    const tailStart = text.length - tail!.length;
+    assert.ok(!(high(text.charCodeAt(head!.length - 1)) && low(text.charCodeAt(head!.length))), `no pair split at the head: ${at}`);
+    assert.ok(!(high(text.charCodeAt(tailStart - 1)) && low(text.charCodeAt(tailStart))), `no pair split at the tail: ${at}`);
   }
 });
 

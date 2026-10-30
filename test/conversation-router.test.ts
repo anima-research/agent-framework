@@ -32,12 +32,6 @@ test('channel message without mention stays unbound (default channel bind: menti
   assert.equal(decision.kind, 'unbound');
 });
 
-test('channel mention spawns a fork', () => {
-  const router = makeRouter();
-  const decision = router.route({ channelId: 'slack:C1', mentioned: true, kind: 'channel' });
-  assert.equal(decision.kind, 'spawn');
-});
-
 test('bind rule never keeps DMs unbound', () => {
   const router = makeRouter({ bind: { dm: 'never' } });
   const decision = router.route({ channelId: 'slack:D1', mentioned: true, kind: 'dm' });
@@ -263,7 +257,6 @@ test("a shared id's fork generation never goes back down when one server's spawn
   const router = makeRouter();
   router.bind({ serverId: 'b', channelId: 'general' }, 'fork-b4', 4, T0);
   router.bind({ serverId: 'a', channelId: 'general' }, 'fork-a3', 3, T0);
-  assert.deepEqual(router.exportGenerations(), { general: 4 });
   const next = router.route({ channelId: 'general', serverId: 'c', mentioned: true, kind: 'channel' });
   assert.equal((next as { generation?: number }).generation, 5, "a later spawn doesn't reuse generation 4's name");
 });

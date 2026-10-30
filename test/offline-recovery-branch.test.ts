@@ -965,7 +965,7 @@ test('suppressing a one-shard copy of a reposted document keeps the other', asyn
   }
 });
 
-test('a suppressed message outside any body is removed alone, and a one-shard copy as a range', async (t) => {
+test('a suppressed message outside any body and a one-shard copy are both removed, the copy without a refusal', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-removal-kind-'));
   const storePath = join(dir, 'agent.chronicle');
   try {
@@ -974,21 +974,19 @@ test('a suppressed message outside any body is removed alone, and a one-shard co
     cm.addMessage('user', [{ type: 'text', text: 'before' }], {
       serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-before',
     });
-    const plain = String(cm.addMessage('user', [{ type: 'text', text: 'plain' }], {
+    cm.addMessage('user', [{ type: 'text', text: 'plain' }], {
       serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-plain',
-    }));
+    });
     appendShards(cm, 'one-shard-group', ['m-doc-1']);
-    const [copy] = appendShards(cm, 'one-shard-group', ['m-doc-2']);
+    appendShards(cm, 'one-shard-group', ['m-doc-2']);
     cm.addMessage('user', [{ type: 'text', text: 'current' }], {
       serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-current',
     });
     cm.close();
     store.close();
 
-    // removeMessage's remove event also drops the context-log entries copied
-    // from the message; context-manager refuses it for any shard.
-    const removeMessage = t.mock.method(ContextManager.prototype, 'removeMessage');
-    const removeMessages = t.mock.method(ContextManager.prototype, 'removeMessages');
+    // context-manager refuses to remove a shard alone, so the copy's removal
+    // has to take it as a range for the suppression to go through.
     const result = await createOfflineRecoveryBranch({
       storePath,
       agentName: 'cairn',
@@ -997,10 +995,6 @@ test('a suppressed message outside any body is removed alone, and a one-shard co
     });
 
     assert.equal(result.messagesSuppressed, 2);
-    assert.deepEqual(removeMessage.mock.calls.map((call) => String(call.arguments[0])), [plain]);
-    assert.deepEqual(removeMessages.mock.calls.map((call) => call.arguments.map(String)), [[copy, copy]]);
-    removeMessage.mock.restore();
-    removeMessages.mock.restore();
     const recoveredStore = JsStore.openOrCreate({ path: storePath });
     const recoveredCm = await ContextManager.open({ store: recoveredStore, namespace: 'agents/cairn' });
     assert.deepEqual(

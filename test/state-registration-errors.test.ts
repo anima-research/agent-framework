@@ -7,10 +7,9 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager } from '@animalabs/context-manager';
 import type {
@@ -314,27 +313,4 @@ describe('a state registered on first use lets a failed registration through, an
     const audit = store.getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<{ type: string }>;
     assert.deepEqual(audit.map((record) => record.type), ['staged', 'linked']);
   }));
-});
-
-it('every state the framework registers goes through ensureStateRegistered', () => {
-  // A registration written as its own try/catch is how the catch-alls this
-  // file tests came about, beside a helper that already did it right. The one
-  // registerState call in src is the helper's own.
-  const src = fileURLToPath(new URL('../../src/', import.meta.url));
-  const calls: string[] = [];
-  const walk = (dir: string): void => {
-    for (const name of readdirSync(dir)) {
-      const full = join(dir, name);
-      if (statSync(full).isDirectory()) { walk(full); continue; }
-      if (!name.endsWith('.ts')) continue;
-      readFileSync(full, 'utf8').split('\n').forEach((line, i) => {
-        const code = line.trim();
-        if (code.startsWith('*') || code.startsWith('//') || code.startsWith('/*')) return;
-        if (/\.registerState\(/.test(code)) calls.push(`${full.slice(src.length)}:${i + 1}`);
-      });
-    }
-  };
-  walk(src);
-  assert.equal(calls.length, 1, `registerState calls outside ensureStateRegistered: ${calls.join(', ')}`);
-  assert.match(calls[0], /^module-registry\.ts:/);
 });

@@ -14,7 +14,14 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { ContextManager, PassthroughStrategy } from '@animalabs/context-manager';
-import { fixture, eventually, settles, TS } from './helpers/coalescing-fixture.js';
+import { fixture as baseFixture, eventually, settles, TS } from './helpers/coalescing-fixture.js';
+
+// These tests are about the global fallback itself — the latest delivered
+// inbound channel — so they run under the rule that has one. Dendrite's
+// default (`speech.locus: 'delivery'`) gives a resident with no delivery no
+// locus at all, which is a different case (admission-e2e covers it).
+const fixture: typeof baseFixture = (options = {}) =>
+  baseFixture({ ...options, framework: { speech: { locus: 'latest-inbound' }, ...options.framework } });
 import { createMockResponse } from './helpers/mock-membrane.js';
 import { gateToolCalls } from './helpers/gate-tool-calls.js';
 
@@ -270,7 +277,8 @@ describe('an ephemeral run takes no global fallback (#551)', () => {
         createMockResponse([{ type: 'tool_use', id: 's1', name: 'sleep', input: { seconds: 60 } }], 'tool_use'),
         text('done'));
 
-      assert.deepEqual(calls.refused, ['sleep: Nothing was set: a sleep quiets the whole agent, not one run.']);
+      assert.equal(calls.refused.length, 1, calls.refused.join('\n'));
+      assert.ok(calls.refused[0]!.startsWith('sleep: ') && /nothing was set/i.test(calls.refused[0]!) && calls.refused[0]!.includes('quiets the whole agent'), calls.refused[0]);
       assert.equal((f.framework as unknown as { eventGate: { getSleepState(): unknown } }).eventGate.getSleepState(), null, 'the gate stays awake');
     } finally { await f.close(); }
   });

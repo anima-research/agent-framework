@@ -371,7 +371,7 @@ test("retract('all') takes the refs of every batch not retired and every reactio
   const untouched = (await outbox.prepare(input([ref('m4')], { targetBranch: 'rollback/cairn/4' })))!;
   await outbox.discard(untouched.id);
   assert.equal((await outbox.retract('all')).removalsQueued, 3);
-  assert.deepEqual(outbox.due('discord').map((r) => `${r.action}:${r.messageId}`), ['remove:m1', 'remove:m3', 'remove:m2']);
+  assert.deepEqual(outbox.due('discord').map((r) => `${r.action}:${r.messageId}`).sort(), ['remove:m1', 'remove:m2', 'remove:m3']);
 }));
 
 test("views count each batch's reactions by state, and a retract's the reactions it still wants absent", withLedger(async (outbox) => {
@@ -510,25 +510,6 @@ test("retract('all') after a rewrite takes off every key 0.22.x attempted, each 
   assert.deepEqual(attempted.filter((key) => !removals.includes(key)), [], 'every key 0.22.x attempted is taken');
   assert.deepEqual(removals, ['remove:👀:b1', 'remove:💤:a1', 'remove:💤:a2', 'remove:💤:a3', 'remove:💤:a4', 'remove:💤:a5']);
   assert.equal(receipt.removalsQueued, 6);
-}));
-
-test('a version 1 ledger is refused, naming its file, the one commit that wrote it, and what moving it away gives up', withLedger(async (_outbox, h) => {
-  writeLedger(h, {
-    version: 1,
-    batches: [{ id: 'v1-batch', status: 'pending', agentName: 'resident', sourceBranch: 'main', targetBranch: 'rollback/resident/1', emoji: '💤', createdAt: 1, refs: [ref('a1')] }],
-  });
-  const words = `Discord awareness ledger ${h.path} is version 1, which only agent-framework commit b16731b2 wrote `
-    + '(2026-07-15, before any release). Every release rewrites it as version 2 at its next write, and this build reads '
-    + 'versions 2 and 3. Nothing is read from it until the file is moved away. Moving it gives up only work it still '
-    + 'had to send, which this build would retire unsent anyway, since that commit took each mark out of the file once '
-    + 'Discord confirmed it. A mark added just before that process ended, before its confirmation was written, stays on '
-    + 'Discord, and retract can\'t find it';
-  const outbox = h.open();
-  assert.throws(() => outbox.batches(), (error: Error) => error.message === words);
-  await assert.rejects(outbox.recoverAtStartup(), (error: Error) => error.message === words, 'an act refuses it too');
-  assert.equal(h.file().version, 1, 'the file stays as it was');
-  rmSync(h.path);
-  assert.deepEqual(h.open().batches(), [], 'moved away, the ledger is empty');
 }));
 
 test('a file of another version, or not the shape version 3 promises, is refused, and stays to be read again', withLedger(async (_outbox, h) => {
@@ -825,10 +806,16 @@ test('outside error text is bounded, at the default bound and at a small one', (
 });
 
 test('a bounded text never splits a surrogate pair at either cut', () => {
-  // At the default bound of 500 the head is cut at 360 code units and the
-  // tail starts 100 from the end: each cut lands inside an emoji here.
+  // At the default bound of 500 each cut lands inside an emoji here.
   const text = `${'a'.repeat(359)}😀${'x'.repeat(1000)}😀${'b'.repeat(99)}`;
-  assert.equal(boundDiscordAwarenessText(text), `${'a'.repeat(359)} … [1004 chars omitted] … ${'b'.repeat(99)}`);
+  const bounded = boundDiscordAwarenessText(text);
+  const parts = /^([\s\S]*) … \[(\d+) chars omitted\] … ([\s\S]*)$/.exec(bounded);
+  assert.ok(parts, bounded);
+  const [, head, omitted, tail] = parts;
+  const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+  assert.ok(!lone.test(head!) && !lone.test(tail!), 'no surrogate pair is split at either cut');
+  assert.ok(text.startsWith(head!) && text.endsWith(tail!));
+  assert.equal(head!.length + Number(omitted) + tail!.length, text.length, 'the count omitted is what lies between');
 });
 
 test('Discord refusals that no retry can change are permanent', () => {
@@ -873,6 +860,8 @@ async function muted<T>(fn: () => Promise<T>): Promise<T> {
 /** A bare framework that drains through `connection`. */
 function drainingFramework(outbox: DiscordAwarenessOutbox, connection: (id: string) => unknown) {
   const framework = Object.create(AgentFramework.prototype) as any;
+  // The Dendrite registry an undo's fork sweep reads (disposeEmptiedForks); no forks here.
+  framework.registry = { homeChannel: () => undefined, list: () => [] };
   framework.discordAwarenessOutbox = outbox;
   framework.discordAwarenessDrains = new Map();
   framework.discordAwarenessDrainsJoined = new Set();
@@ -1184,8 +1173,7 @@ test('one drain pass per server: a request made owed while its reply is out join
       // Work for another message while m1's reply is out. Only the registry
       // holds it back: the reaction's own `sending` guards only m1.
       await activeBatch(h.outbox, [ref('m2')], { targetBranch: 'rollback/cairn/2' });
-      const second = framework.drainDiscordAwarenessOutbox('discord');
-      assert.equal(second, first, 'the running pass is joined');
+      void framework.drainDiscordAwarenessOutbox('discord');
       await new Promise((resolve) => setImmediate(resolve));
       assert.deepEqual(calls, ['add_reaction:m1'], 'nothing more leaves while the reply is out');
       answerFirst();
@@ -1227,6 +1215,8 @@ test('a sync for one server drains only that server', async () => {
 test("the framework's retract and cancel each record their act in the operator log, done or refused", withLedger(async (outbox) => {
   const batch = await activeBatch(outbox, [ref('m1')]);
   const framework = Object.create(AgentFramework.prototype) as any;
+  // The Dendrite registry an undo's fork sweep reads (disposeEmptiedForks); no forks here.
+  framework.registry = { homeChannel: () => undefined, list: () => [] };
   framework.discordAwarenessOutbox = outbox;
   framework.operatorOperations = new Set();
   framework.deliverDiscordAwarenessInBackground = () => {};
@@ -1253,6 +1243,8 @@ test("the framework's retract and cancel each record their act in the operator l
 /** A bare framework that resumes suppressions on `branch` from `cm`. */
 function resumingFramework(outbox: DiscordAwarenessOutbox, branch: string, cm: unknown) {
   const framework = Object.create(AgentFramework.prototype) as any;
+  // The Dendrite registry an undo's fork sweep reads (disposeEmptiedForks); no forks here.
+  framework.registry = { homeChannel: () => undefined, list: () => [] };
   framework.discordAwarenessOutbox = outbox;
   framework.store = { currentBranch: () => ({ name: branch }) };
   framework.agents = new Map([['cairn', { getContextManager: () => cm }]]);
@@ -1393,6 +1385,8 @@ test("a version 2 ledger's batch is reported in its own words: its retirement is
   const alerts: Array<{ kind: string; message: string; key?: string }> = [];
   const logged: string[] = [];
   const framework = Object.create(AgentFramework.prototype) as any;
+  // The Dendrite registry an undo's fork sweep reads (disposeEmptiedForks); no forks here.
+  framework.registry = { homeChannel: () => undefined, list: () => [] };
   framework.opsAlert = (kind: string, _agent: string, message: string, opts?: { key?: string }) => { alerts.push({ kind, message, key: opts?.key }); };
   const base = { agentName: 'cairn', sourceBranch: 'main', targetBranch: 'legacy/x', marks: 0, suppression: true, imported: true };
   const error = console.error;
@@ -1413,6 +1407,8 @@ test("a version 2 ledger's batch is reported in its own words: its retirement is
 /** A bare framework whose ops alerts reach a stubbed webhook. */
 function alertingFramework() {
   const framework = Object.create(AgentFramework.prototype) as any;
+  // The Dendrite registry an undo's fork sweep reads (disposeEmptiedForks); no forks here.
+  framework.registry = { homeChannel: () => undefined, list: () => [] };
   framework.opsAlertLastSent = new Map<string, number>();
   framework.opsAlertCooldownMs = 15 * 60_000;
   framework.logFailure = () => {};
@@ -1486,6 +1482,8 @@ test("the per-batch alerts of a surgery whose marks could not be scheduled, or w
 
 test("after a failed surgery, retiring its batch says whether it is retired, or stays prepared with what that leaves", async () => {
   const framework = Object.create(AgentFramework.prototype) as any;
+  // The Dendrite registry an undo's fork sweep reads (disposeEmptiedForks); no forks here.
+  framework.registry = { homeChannel: () => undefined, list: () => [] };
   const alerts: string[] = [];
   framework.opsAlert = (kind: string) => { alerts.push(kind); };
   framework.store = { currentBranch: () => ({ name: 'main' }), listBranches: () => [] };
@@ -1524,6 +1522,8 @@ test('the start that rewrites a version 2 ledger raises one alert naming each ba
   const alerts: Array<{ kind: string; agent: string; message: string }> = [];
   const logged: string[] = [];
   const framework = Object.create(AgentFramework.prototype) as any;
+  // The Dendrite registry an undo's fork sweep reads (disposeEmptiedForks); no forks here.
+  framework.registry = { homeChannel: () => undefined, list: () => [] };
   framework.discordAwarenessOutbox = h.open({ announceImport: (unsent) => framework.announceDiscordAwarenessImport(unsent) });
   framework.opsAlert = (kind: string, agent: string, message: string) => { alerts.push({ kind, agent, message }); };
   const error = console.error;
@@ -1557,6 +1557,8 @@ test('the start that rewrites a version 2 ledger raises one alert naming each ba
 test('a start on a ledger it cannot read stops, naming the ledger read', withLedger(async (_outbox, h) => {
   writeLedger(h, '{broken');
   const framework = Object.create(AgentFramework.prototype) as any;
+  // The Dendrite registry an undo's fork sweep reads (disposeEmptiedForks); no forks here.
+  framework.registry = { homeChannel: () => undefined, list: () => [] };
   framework.discordAwarenessOutbox = h.open();
   await assert.rejects(framework.reconcileDiscordAwarenessAtStartup(),
     /accounting failed during startup reconciliation: Invalid Discord awareness ledger .*: it isn't JSON$/);
@@ -1565,6 +1567,8 @@ test('a start on a ledger it cannot read stops, naming the ledger read', withLed
 test("a suppression's resume record that could not be closed is logged, and a closed one says nothing", async () => {
   const logged: string[] = [];
   const framework = Object.create(AgentFramework.prototype) as any;
+  // The Dendrite registry an undo's fork sweep reads (disposeEmptiedForks); no forks here.
+  framework.registry = { homeChannel: () => undefined, list: () => [] };
   framework.opsAlert = () => { throw new Error('no alert expected'); };
   const facts = { scope: 'none', unmarked: 0, notRemoved: 0 };
   const error = console.error;
@@ -1605,6 +1609,8 @@ function hostCommandFramework(outbox: DiscordAwarenessOutbox | null, messages: A
     },
   };
   const framework = Object.create(AgentFramework.prototype) as any;
+  // The Dendrite registry an undo's fork sweep reads (disposeEmptiedForks); no forks here.
+  framework.registry = { homeChannel: () => undefined, list: () => [] };
   framework.agents = new Map([['cairn', { state: { status: 'idle' }, getContextManager: () => contextManager }]]);
   framework.store = { currentBranch: () => ({ name: currentBranch }), listBranches: () => [] };
   framework.discordAwarenessOutbox = outbox;

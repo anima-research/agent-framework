@@ -115,6 +115,7 @@ for (const guard of [false, true]) for (const [shape, result] of SHAPES) {
 async function directRound(result: ToolResult, agentConfig: Partial<AgentConfig>, check: (sent: unknown[], f: AgentFramework) => void) {
   const membrane = new MockMembrane();
   const requests: NormalizedRequest[] = [];
+  const unscripted: number[] = [];
   const responses: NormalizedResponse[] = [
     createMockResponse([{ type: 'tool_use', id: 'one', name: 'canned--fetch', input: {} }], 'tool_use'),
     createMockResponse([{ type: 'text', text: 'Handled.' }]),
@@ -122,7 +123,10 @@ async function directRound(result: ToolResult, agentConfig: Partial<AgentConfig>
   (membrane as unknown as { stream: (request: NormalizedRequest) => Promise<NormalizedResponse> }).stream = async (request) => {
     requests.push(structuredClone(request));
     const response = responses.shift();
-    assert.ok(response, 'no more inference than scripted');
+    if (!response) {
+      unscripted.push(requests.length);
+      throw new Error('no more inference than scripted');
+    }
     return response;
   };
   const f = await framework({ success: true, data: 'unused' }, membrane, agentConfig);
@@ -137,6 +141,7 @@ async function directRound(result: ToolResult, agentConfig: Partial<AgentConfig>
       .map((b) => (b as { content: unknown }).content);
     assert.equal(sent.length, 1, 'the second request carries the tool result');
     check(sent, f);
+    assert.deepEqual(unscripted, [], 'every inference the framework asked for was one the test scripted');
   } finally {
     await f.stop();
   }

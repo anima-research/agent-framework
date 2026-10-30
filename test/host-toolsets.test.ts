@@ -200,11 +200,11 @@ describe('the built-in toolset', () => {
     const h = await makeFramework({ dir });
     try {
       await call(h.framework, 'toolsets--open', { toolset: 'settings' });
-      const files = readdirSync(join(dir, 'store', 'config'));
-      const aside = files.find((f) => f.startsWith('toolsets.json.unreadable-'));
-      assert.ok(aside, files.join(', '));
-      assert.equal(readFileSync(join(dir, 'store', 'config', aside!), 'utf8'), 'not json at all', 'kept as it was');
-      assert.equal(JSON.parse(readFileSync(join(dir, 'store', 'config', 'toolsets.json'), 'utf8')).version, 1);
+      const config = join(dir, 'store', 'config');
+      const aside = readdirSync(config, { withFileTypes: true })
+        .filter((e) => e.isFile() && e.name !== 'toolsets.json' && readFileSync(join(config, e.name), 'utf8') === 'not json at all');
+      assert.equal(aside.length, 1, 'the unreadable file is kept as it was, beside the new one');
+      assert.equal(JSON.parse(readFileSync(join(config, 'toolsets.json'), 'utf8')).version, 1);
     } finally { await h.stop(); }
   });
 
@@ -414,6 +414,30 @@ async function pingServer() {
 
 const isOpenSocket = (ws: { readyState: number }) => ws.readyState === 1;
 
+describe("a server's tool description in the host toolsets' listings", () => {
+  it('reads on one line, as the tool lists everywhere else show it', async () => {
+    const server = await startScriptedServer({
+      advert: { featureSets: { 'srv.tools': { description: 'tools', uses: ['tools'] } } },
+      tools: [{ name: 'ping', description: 'Pings the server.\u0085 It answers pong.', inputSchema: { type: 'object' } }],
+      on: (msg, peer) => { if (msg.id !== undefined) peer.error(msg.id, -32601, 'Method not found'); },
+    });
+    const h = await makeFramework({ servers: [{ id: 'srv', url: server.url, toolPrefix: 'srv' }] });
+    try {
+      await h.framework.start();
+      await waitFor(() => h.framework.getAllTools().some((t) => t.name === 'srv--ping'), 'srv connected');
+      await call(h.framework, 'toolsets--close', { server: 'srv' });
+      const opened = resultText(await call(h.framework, 'toolsets--open', { server: 'srv' }));
+      const looked = resultText(await call(h.framework, 'toolsets--look', { server: 'srv' }));
+      for (const text of [opened, looked]) {
+        const line = text.split('\n').find((l) => l.includes('srv--ping('));
+        assert.ok(line !== undefined, text);
+        assert.ok(!/[\u000b\u000c\u0085\u2028\u2029]/.test(line!), JSON.stringify(line));
+        assert.ok(line!.endsWith(' — Pings the server.  It answers pong.'), JSON.stringify(line));
+      }
+    } finally { await h.stop(); await server.close(); }
+  });
+});
+
 describe('server tabs', () => {
   it('switch full → hidden tab → open → closed tab → open (reconnected) → full', async () => {
     const { server, calls } = await pingServer();
@@ -494,6 +518,10 @@ describe('server tabs', () => {
     } finally { await h.stop(); await server.close(); }
   });
 
+  /** How long a start is watched for a connection it mustn't make. Nothing
+   *  marks a connect that never comes, so this is a window, not a wait. */
+  const NO_CONNECT_WINDOW_MS = 200;
+
   it('keeps an agent\'s tab, and a closed tab, across a restart; a configured closed tab starts unconnected', async () => {
     const { server } = await pingServer();
     const first = await makeFramework({ servers: [{ id: 'srv', url: server.url, toolPrefix: 'srv' }] });
@@ -512,7 +540,7 @@ describe('server tabs', () => {
     const third = await makeFramework({ dir: first.dir, servers: [{ id: 'srv', url: server.url, toolPrefix: 'srv' }] });
     try {
       await third.framework.start();
-      await new Promise((r) => setTimeout(r, 200));
+      await new Promise((r) => setTimeout(r, NO_CONNECT_WINDOW_MS));
       assert.equal(server.peers.length, peersBefore, 'a closed tab isn\'t connected at start');
       assert.ok(!third.framework.getAllTools().some((t) => t.name === 'srv--ping'));
     } finally { await third.stop(); }
@@ -520,7 +548,7 @@ describe('server tabs', () => {
     const configured = await makeFramework({ servers: [{ id: 'cfg', url: server.url, toolPrefix: 'cfg', presentation: 'closed-tab' }] });
     try {
       await configured.framework.start();
-      await new Promise((r) => setTimeout(r, 200));
+      await new Promise((r) => setTimeout(r, NO_CONNECT_WINDOW_MS));
       assert.equal(server.peers.length, peersBefore, 'presentation: closed-tab starts unconnected');
       assert.match(resultText(await call(configured.framework, 'toolsets--open', { server: 'cfg' })), /cfg connected/);
       await waitFor(() => configured.framework.getAllTools().some((t) => t.name === 'cfg--ping'), 'opened: connected');
@@ -842,7 +870,8 @@ describe('server tabs', () => {
       await h.framework.connectMcplServer(config);
       assert.doesNotMatch(resultText(await call(h.framework, 'toolsets--look')), /closed tab/, 'not a closed tab once connected');
       await h.framework.disconnectMcplServer('srv');
-      assert.doesNotMatch(resultText(await call(h.framework, 'toolsets--look')), /\[tab srv\]/, 'forgotten once removed');
+      const doc = JSON.parse(readFileSync(join(h.dir, 'store', 'config', 'toolsets.json'), 'utf8'));
+      assert.equal(doc.closed?.srv, undefined, 'forgotten once removed: no closed tab is kept for it');
     } finally { await h.stop(); await server.close(); }
   });
 

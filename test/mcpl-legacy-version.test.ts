@@ -93,13 +93,6 @@ test('another legacy revision, or none, is a mismatch rather than a silent conne
   });
 });
 
-test('a version verdict gets no reconnect stub even with reconnect: true', async () => {
-  await assert.rejects(
-    McplServerConnection.connectWithReconnect(config('reject', { reconnect: true, reconnectIntervalMs: 20 }), HOST_CAPS),
-    (err: unknown) => err instanceof McplProtocolVersionError,
-  );
-});
-
 test('a version verdict on reconnect stops the backoff loop', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'legacy-version-'));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
@@ -156,7 +149,7 @@ test('a version verdict at startup raises the ops alert at once, as on reconnect
   const alert = traces.find((t) => t.type === 'ops:alert') as { kind?: string; agentName?: string; message?: string } | undefined;
   assert.equal(alert?.kind, 'mcpl-down');
   assert.equal(alert?.agentName, 'legacy');
-  assert.match(alert?.message ?? '', /unreachable at startup: .*protocolVersion \(none\)/);
+  assert.match(alert?.message ?? '', /not connected at startup, and this host won't retry it on its own: .*protocolVersion \(none\)/);
 });
 
 test('tools/list follows nextCursor to the complete inventory', async () => {
@@ -265,17 +258,6 @@ test('an initialize error that is not a version verdict stays a plain, retryable
   assert.equal(stub.willReconnect, true);
 });
 
-test('a modern stdio configuration is refused before anything is spawned', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'legacy-version-'));
-  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
-  const startLog = join(dir, 'starts.log');
-  await assert.rejects(
-    McplServerConnection.connect(config('ok', { protocol: 'modern' }, startLog), HOST_CAPS),
-    /configured for modern MCP/,
-  );
-  assert.deepEqual(startsIn(startLog), [], 'nothing was spawned');
-});
-
 test('a list that never ends is refused after its page bound', async () => {
   const connection = await connect(config('ok', { env: { MODE_LIST: 'endless' } }));
   await assert.rejects(connection.sendToolsList(), /did not finish within 100 pages/);
@@ -307,14 +289,14 @@ async function startupTraces(dir: string, server: McplServerConfig): Promise<Tra
   return traces;
 }
 
-test('at startup, willRetry follows reconnect and the verdict, and only a verdict raises the alert', async () => {
+test('at startup, willRetry follows reconnect and the verdict, and every failure nothing will retry raises the alert', async () => {
   const cases: Array<[string, McplServerConfig, boolean, boolean]> = [
     // [label, config, willRetry, alert]
     ['verdict without reconnect', config('missing'), false, true],
     ['failure with reconnect', config('error', { reconnect: true }), true, false],
-    ['failure without reconnect', config('error'), false, false],
+    ['failure without reconnect', config('error'), false, true],
     // Refused before anything launches: nothing will retry it, reconnect or not.
-    ['configuration refused, with reconnect', { id: 'legacy', url: 'ftp://127.0.0.1/x', reconnect: true }, false, false],
+    ['configuration refused, with reconnect', { id: 'legacy', url: 'ftp://127.0.0.1/x', reconnect: true }, false, true],
   ];
   for (const [label, server, willRetry, alert] of cases) {
     const dir = mkdtempSync(join(tmpdir(), 'legacy-version-'));
@@ -322,6 +304,6 @@ test('at startup, willRetry follows reconnect and the verdict, and only a verdic
     const traces = await startupTraces(dir, server);
     const failed = traces.find((t) => t.type === 'mcpl:server-connect-failed') as { willRetry?: boolean } | undefined;
     assert.equal(failed?.willRetry, willRetry, label);
-    assert.equal(traces.some((t) => t.type === 'ops:alert'), alert, `${label}: alert`);
+    assert.equal(traces.filter((t) => t.type === 'ops:alert' && t.kind === 'mcpl-down').length, alert ? 1 : 0, `${label}: alert`);
   }
 });

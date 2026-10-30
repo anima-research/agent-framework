@@ -28,7 +28,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule, WorkspaceReadError } from '../src/modules/workspace/index.js';
-import { ROOT_REPLACED, ROOT_UNAVAILABLE } from '../src/modules/workspace/observe.js';
+import { ROOT_ON_ANOTHER_DEVICE, ROOT_REPLACED, ROOT_UNAVAILABLE } from '../src/modules/workspace/observe.js';
 import { changedAfterFstat, countingLoads, withFileHandle } from './helpers/file-handle.js';
 
 /** A valid 1x1 PNG, for read_image. */
@@ -497,6 +497,22 @@ for (const replacement of ['link', 'directory'] as const) {
     assert.equal((await workspace.readFileFromDisk('work/secret.txt')).bytes.toString(), 'SECRET');
   });
 }
+
+test('a root with the recorded inode on another device, and no birth time recorded, is refused by a disk reader in those words, with no errno, until a sync accepts it', async (t) => {
+  const { mountDir, workspace } = await recorded(t);
+  const now = statSync(mountDir, { bigint: true });
+  const agreement = (workspace as unknown as { agreement: { write(entry: unknown, opts: object): void } }).agreement;
+  agreement.write({ t: 'root', mount: 'work', identity: { dev: String(now.dev + 1n), ino: String(now.ino) } }, {});
+
+  const err = await expectRefusal(workspace.readFileFromDisk('work/a.txt'), 'mount_unavailable');
+  assert.equal(err.message, `Mount unavailable: work: ${ROOT_ON_ANOTHER_DEVICE}`);
+  assert.equal(err.stage, 'root');
+  assert.equal(err.errno, undefined, 'no errno: a directory is there');
+
+  const accepted = await workspace.handleToolCall({ id: 'accept', name: 'sync', input: { mount: 'work', acceptRoot: true } });
+  assert.equal(accepted.success, true, accepted.error);
+  assert.equal((await workspace.readFileFromDisk('work/a.txt')).bytes.toString(), 'inside');
+});
 
 test('a root replaced by another directory between its check and the open is refused, not read', async (t) => {
   const { root, mountDir, workspace } = await recorded(t);

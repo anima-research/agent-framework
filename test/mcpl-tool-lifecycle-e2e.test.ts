@@ -17,7 +17,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { AgentFramework } from '../src/index.js';
@@ -31,6 +31,8 @@ import type {
   ToolResult,
 } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { bindAsConversationFork } from './helpers/dendrite.js';
+import { jsonLines } from './helpers/json-lines.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/tool-lifecycle-mcpl-server.mjs');
 
@@ -64,8 +66,7 @@ async function waitFor(cond: () => boolean, what: string, timeoutMs = 15_000): P
 }
 
 type Logged = { event: string; params?: Record<string, unknown>; [k: string]: unknown };
-const readLog = (path: string): Logged[] =>
-  existsSync(path) ? readFileSync(path, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [];
+const readLog = (path: string): Logged[] => jsonLines<Logged>(path);
 
 describe('tool lifecycle end to end (RFC-007)', () => {
   let tempDir: string;
@@ -214,7 +215,6 @@ describe('tool lifecycle end to end (RFC-007)', () => {
     const internals = framework as unknown as {
       mcplServerRegistry: { getServer(id: string): unknown } | null;
       describeToolForLifecycle(tool: string): { class: string[] };
-      conversationAgentHomes: Map<string, { serverId: string; channelId: string }>;
     };
     assert.deepEqual(internals.describeToolForLifecycle('prov--click').class, ['computer'], 'classed while alive');
 
@@ -243,10 +243,9 @@ describe('tool lifecycle end to end (RFC-007)', () => {
     assert.equal(after, before, 'a call the host refused (provider gone) produces no events');
   });
   it('a host-tool refusal (conversation-bound channel guard) is never reported (re-review #1)', async () => {
-    const internals = framework as unknown as { conversationAgentHomes: Map<string, { serverId: string; channelId: string }> };
     // Make scout a conversation fork bound to one channel: the guard in
     // dispatchChannelToolCall refuses channel_open before it runs.
-    internals.conversationAgentHomes.set('scout', { serverId: 'obs', channelId: 'disc:guild:home' });
+    const unbind = bindAsConversationFork(framework, 'scout', { serverId: 'obs', channelId: 'disc:guild:home' });
     try {
       const before = readLog(obsLog).filter((e) => e.event === 'lifecycle').length;
       const callsBefore = membrane.calls.length;
@@ -271,7 +270,7 @@ describe('tool lifecycle end to end (RFC-007)', () => {
       const after = readLog(obsLog).filter((e) => e.event === 'lifecycle').length;
       assert.equal(after, before, 'a refused host-tool call produces no events');
     } finally {
-      internals.conversationAgentHomes.delete('scout');
+      unbind();
     }
   });
 });

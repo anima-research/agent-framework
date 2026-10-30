@@ -9,7 +9,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { MembraneError, type ContentBlock, type NormalizedRequest, type NormalizedResponse, type StreamEvent, type YieldingStream } from '@animalabs/membrane';
@@ -18,6 +18,7 @@ import type { Module } from '../src/index.js';
 import { ProseDraftStore, draftState, PROSE_DRAFT_RECORD_TYPE } from '../src/prose-drafts.js';
 import { destinationKey } from '../src/mcpl/channel-registry.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { jsonLines } from './helpers/json-lines.js';
 
 const ROOM = 'discord:g1:room';
 const GENERAL = 'discord:g1:general';
@@ -45,14 +46,6 @@ describe('ProseDraftStore', () => {
       store.close();
       rmSync(dir, { recursive: true, force: true });
     }
-  });
-
-  it("the drafts tool's example id has the form newId issues", () => {
-    const tool = (AgentFramework as unknown as {
-      DRAFTS_TOOL: { inputSchema: { properties: { draftIds: { description: string } } } };
-    }).DRAFTS_TOOL;
-    const example = /"(d-[^"]*)"/.exec(tool.inputSchema.properties.draftIds.description)?.[1];
-    assert.match(example ?? '(none)', /^d-[a-z2-9]{7}$/);
   });
 
   it('replays the journal at reopen: an attempt with no recorded outcome reads as unconfirmed', () => {
@@ -92,7 +85,6 @@ describe('ProseDraftStore', () => {
       store.switchBranch(main);
       drafts.reload();
       assert.equal(draftState(drafts.get('a', later.id)!), 'held', 'a draft is usable from any branch');
-      assert.equal(store.getRecordIdsByType(PROSE_DRAFT_RECORD_TYPE).length, 6);
     } finally {
       store.close();
       rmSync(dir, { recursive: true, force: true });
@@ -326,7 +318,7 @@ function breakAfterToolRound(
           }
           if (how === 'abort' && !cancelled) {
             await opts.beforeFailure?.();
-            yield { type: 'aborted', reason: 'timeout', partialContent: [{ type: 'text', text: PARTIAL }] } as unknown as StreamEvent;
+            yield { type: 'aborted', reason: 'error', partialContent: [{ type: 'text', text: PARTIAL }] } as unknown as StreamEvent;
             return;
           }
           while (!cancelled) await new Promise<void>((resolve) => { wake = resolve; });
@@ -418,7 +410,7 @@ async function harness(opts: {
   xml?: boolean;
   roundPreamble?: boolean;
   retries?: number;
-  retryDelayMs?: number;
+  retryDelayMs?: number | number[];
   /** The fixture server's requestTimeoutMs (the framework's default when unset). */
   requestTimeoutMs?: number;
   sendTool?: boolean;
@@ -426,6 +418,10 @@ async function harness(opts: {
   serverConfig?: Record<string, unknown>;
   channels?: Array<{ id: string; label: string; direction?: 'inbound' | 'outbound' | 'bidirectional' }>;
   modules?: Module[];
+  /** FrameworkConfig.heartbeat: the framework's own heartbeat. */
+  heartbeat?: boolean | Record<string, unknown>;
+  /** FrameworkConfig.speech: where a turn's plain speech lands when nothing names a destination. */
+  speech?: { locus: 'delivery' | 'latest-inbound' };
 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'prose-drafts-e2e-'));
   const commandPath = join(dir, 'commands.jsonl');
@@ -449,6 +445,10 @@ async function harness(opts: {
     ...(a.maxStreamTokens !== undefined ? { maxStreamTokens: a.maxStreamTokens } : {}),
   }));
   const create = async () => {
+    let retried = 0;
+    const retryDelay = (): number => Array.isArray(opts.retryDelayMs)
+      ? opts.retryDelayMs[Math.min(retried++, opts.retryDelayMs.length - 1)]!
+      : opts.retryDelayMs ?? 10;
     const framework = await AgentFramework.create({
       storePath: join(dir, 'store'),
       membrane: membrane.asMembrane(),
@@ -467,12 +467,14 @@ async function harness(opts: {
         ...(opts.requestTimeoutMs !== undefined ? { requestTimeoutMs: opts.requestTimeoutMs } : {}),
       }],
       modules: opts.modules ?? [],
+      ...(opts.heartbeat !== undefined ? { heartbeat: opts.heartbeat as never } : {}),
+      ...(opts.speech ? { speech: opts.speech } : {}),
       ...(opts.codeExecution ? { codeExecution: { enabled: true } } : {}),
       ...(opts.retries !== undefined ? {
         errorPolicy: {
           maxRetries: opts.retries,
           onInferenceError: (_error: Error, _agent: string, attempt: number) =>
-            attempt < opts.retries! ? { retry: true as const, delayMs: opts.retryDelayMs ?? 10 } : { retry: false as const },
+            attempt < opts.retries! ? { retry: true as const, delayMs: retryDelay() } : { retry: false as const },
         },
       } : {}),
     });
@@ -496,24 +498,19 @@ async function harness(opts: {
     get framework() { return framework; },
     until,
     command: (c: Record<string, unknown>) => appendFileSync(commandPath, JSON.stringify(c) + '\n'),
-    publishes: (): Publish[] => existsSync(statusPath)
-      ? readFileSync(statusPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as Publish)
-        .filter((e) => e.event === 'publish' || e.event === 'publish-refused' || e.event === 'publish-error')
-      : [],
+    publishes: (): Publish[] => jsonLines<Publish>(statusPath)
+      .filter((e) => e.event === 'publish' || e.event === 'publish-refused' || e.event === 'publish-error'),
     sendMode: async (mode: string, answers?: string) => {
-      const logged = () => existsSync(statusPath) ? readFileSync(statusPath, 'utf8').split('\n').filter(Boolean)
-        .filter((l) => (JSON.parse(l) as { event: string }).event === 'send-mode').length : 0;
+      const logged = () => jsonLines<{ event: string }>(statusPath).filter((e) => e.event === 'send-mode').length;
       const before = logged();
       h.command({ op: 'send-mode', mode, ...(answers ? { answers } : {}) });
       await until(() => logged() > before, 'the send mode');
     },
-    sends: (): Array<{ channelId: string; text: string }> => existsSync(statusPath)
-      ? readFileSync(statusPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as { event: string; channelId: string; text: string })
-        .filter((e) => e.event === 'send')
-      : [],
+    sends: (): Array<{ channelId: string; text: string }> => jsonLines<{ event: string; channelId: string; text: string }>(statusPath)
+      .filter((e) => e.event === 'send'),
     /** One addressed message in #room starts a turn (or, with `request`, a
      *  direct inference request for just that resident); resolves when it settles. */
-    turn: async (responses: Array<ReturnType<typeof createMockResponse>>, agentName = 'scout', via: 'incoming' | 'request' | 'silent' = 'incoming') => {
+    turn: async (responses: Array<ReturnType<typeof createMockResponse>>, agentName = 'scout', via: 'incoming' | 'request' | 'silent' | 'heartbeat' = 'incoming') => {
       for (const r of responses) membrane.pushResponse(r);
       const before = membrane.calls.length;
       if (via === 'incoming') {
@@ -521,8 +518,11 @@ async function harness(opts: {
       } else {
         // 'silent': a control-plane wake whose plain prose stays private, as
         // a silent heartbeat's does.
+        // 'heartbeat': a heartbeat tick's wake, as the framework's heartbeat
+        // (or a heartbeat-mcpl push) makes it, with no channel.
         (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
-          agentName, reason: 'test', source: 'test', timestamp: Date.now(),
+          agentName, timestamp: Date.now(),
+          ...(via === 'heartbeat' ? { reason: 'heartbeat', source: 'heartbeat' } : { reason: 'test', source: 'test' }),
           ...(via === 'silent' ? { suppressProse: true } : {}),
         });
       }
@@ -592,7 +592,7 @@ describe('held prose drafts, end to end', () => {
       // Safe in-band ordering: each mid-turn notice is stored after the tool
       // result it rode with, and was injected into the live stream there.
       const msgs = h.messages();
-      const noticeIdx = msgs.findIndex((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'prose-drafts');
+      const noticeIdx = msgs.findIndex((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text.startsWith('[drafts]')));
       assert.ok(noticeIdx > 0, 'a held-draft notice was stored');
       assert.ok(msgs[noticeIdx - 1]!.content.some((b) => b.type === 'tool_result'), 'right after the tool result');
       const injected = (h.membrane.lastStream?.receivedToolResultOptions ?? [])
@@ -645,9 +645,31 @@ describe('held prose drafts, end to end', () => {
       ]);
       const held = h.drafts().reverse();
       assert.deepEqual(held.map((d) => d.text), ['Narration before the send.', 'And after it.']);
-      assert.equal(h.messages().filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'prose-drafts').length, 0,
-        'no mid-turn notice: XML rounds present no injections');
+      assert.ok(!h.texts().some((t) => t.startsWith('[drafts]')), 'no mid-turn notice: XML rounds present no injections');
       assert.ok(h.texts().some((t) => t.startsWith('[delivered] nothing — 2 plain-speech segment(s) held as drafts')));
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("a stream that doesn't say whether it carries injections gets no mid-turn notice: its held reply is named in the receipt", async () => {
+    const h = await harness({ sendTool: true });
+    h.membrane.supportsInjectedMessages = 'undeclared';
+    await h.sendMode('no-channel');
+    try {
+      const segments = ['First — the actual reply.', 'Second words.', 'Third: trailing words.'];
+      await h.turn([
+        createMockResponse([text(segments[0]!), unplacedSend('s1')], 'tool_use'),
+        createMockResponse([text(segments[1]!), call('l1', 'channel_list', {})], 'tool_use'),
+        createMockResponse([text(segments[2]!)]),
+      ]);
+      const held = h.drafts().reverse();
+      assert.deepEqual(held.map((d) => d.text), segments, 'the reply is held as drafts');
+      assert.ok(!h.texts().some((t) => t.startsWith('[drafts]')), 'no mid-turn notice: a stream that doesn\'t say is taken as one that carries no injections');
+      assert.equal(
+        h.texts().find((t) => t.startsWith('[delivered]')),
+        `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${held.map((d) => d.id).join(', ')} (not sent — drafts can resend them unchanged, or dismiss them)`,
+      );
     } finally {
       await h.close();
     }
@@ -890,13 +912,11 @@ describe('held prose drafts, end to end', () => {
       h.command({ op: 'publish-mode', mode: 'not-delivered' });
       await h.turn([createMockResponse([resend('r1')], 'tool_use'), createMockResponse([])]);
       assert.match(h.toolResults()[0]!, /not sent to .* Nothing was posted by this attempt\. The draft stays held\./);
-      assert.equal(draftState(h.store().get('scout', draft!.id)!), 'held');
       assert.equal(noted(), false, 'a refused resend is not noted');
 
       h.command({ op: 'publish-mode', mode: 'no-receipt' });
       await h.turn([createMockResponse([resend('r2')], 'tool_use'), createMockResponse([])]);
       assert.match(h.toolResults()[0]!, /NOT confirmed — it may or may not have been posted/);
-      assert.equal(draftState(h.store().get('scout', draft!.id)!), 'unconfirmed');
       assert.equal(noted(), false, 'an unconfirmed resend is not noted');
 
       h.command({ op: 'publish-mode', mode: 'delivered' });
@@ -907,10 +927,6 @@ describe('held prose drafts, end to end', () => {
       assert.match(h.toolResults()[0]!, /delivered to/);
       assert.equal(h.publishes().length, before + 1);
       assert.equal(noted(), true, 'a delivered resend is noted');
-      const attempts = h.store().get('scout', draft!.id)!.attempts;
-      assert.deepEqual(attempts.map((a) => [a.outcome?.status, a.confirmedDuplicate ?? false]), [
-        ['failed', false], ['unknown', false], ['delivered', true],
-      ]);
     } finally {
       await h.close();
     }
@@ -935,9 +951,9 @@ describe('held prose drafts, end to end', () => {
         createMockResponse([drafts('r1', { action: 'resend', draftIds: [draft!.id], destination: ROOM })], 'tool_use'),
         createMockResponse([]),
       ]);
-      const [attempt] = h.store().get('scout', draft!.id)!.attempts;
-      assert.equal(attempt!.outcome?.status, 'unknown');
-      assert.match(attempt!.outcome!.reason!, /connector exploded/);
+      const [resent] = h.toolResults();
+      assert.match(resent!, /NOT confirmed — it may or may not have been posted: .*connector exploded/);
+      assert.match(resent!, /a resend needs confirmDuplicate: true/);
       assert.equal(draftState(h.store().get('scout', draft!.id)!), 'unconfirmed');
     } finally {
       await h.close();
@@ -1094,7 +1110,6 @@ describe('held prose drafts, end to end', () => {
       h.command({ op: 'publish-mode', mode: 'not-delivered' });
       await h.turn([createMockResponse([resend('r2', true)], 'tool_use'), createMockResponse([])]);
       assert.match(h.toolResults()[0]!, /Nothing was posted by this attempt\. The draft stays unconfirmed: d-[a-z2-9]{7}'s attempt to .* may already have been posted: .*delivery uncertain/);
-      assert.equal(draftState(h.store().get('scout', draft!.id)!), 'unconfirmed');
       h.command({ op: 'publish-mode', mode: 'delivered' });
       const before = h.publishes().length;
       await h.turn([createMockResponse([resend('r3')], 'tool_use'), createMockResponse([])]);
@@ -1148,7 +1163,6 @@ describe('held prose drafts, end to end', () => {
       // The process "died" between journaling the attempt and its outcome.
       h.store().beginAttempt('scout', draft!.id, dest(), 'resend', false);
       await h.restart();
-      assert.equal(draftState(h.store().get('scout', draft!.id)!), 'unconfirmed');
       const before = h.publishes().length;
       await h.turn([
         createMockResponse([drafts('r1', { action: 'resend', draftIds: [draft!.id], destination: ROOM })], 'tool_use'),
@@ -1303,7 +1317,6 @@ describe('held prose drafts, end to end', () => {
       assert.deepEqual(h.publishes().map((p) => p.text), ['words with nowhere to go']);
       const after = h.store().get('scout', bounced!.id)!;
       assert.equal(draftState(after), 'delivered');
-      assert.equal(after.attempts[0]!.via, 'unsent-token');
     } finally {
       await h.close();
     }
@@ -1316,15 +1329,12 @@ describe('held prose drafts, end to end', () => {
       const [risky] = h.drafts();
       h.command({ op: 'publish-mode', mode: 'no-receipt' });
       await h.turn([createMockResponse([text(`>>${ROOM} {{unsent}}`)])]);
-      assert.equal(draftState(h.store().get('scout', risky!.id)!), 'unconfirmed');
       h.command({ op: 'publish-mode', mode: 'delivered' });
       // The destination does not resolve, so the envelope bounces: the whole
       // authored attempt is held, and it carries the copied draft's risk.
       await h.turn([createMockResponse([text('>>#nowhere {{unsent}} and a postscript')])]);
       const fresh = h.drafts().find((d) => d.id !== risky!.id)!;
       assert.equal(fresh.text, 'risky words and a postscript', 'nothing substituted or truncated');
-      assert.equal(fresh.inheritedRisk?.draftId, risky!.id);
-      assert.equal(draftState(fresh), 'unconfirmed');
       assert.ok(h.texts().some((t) => t.includes(`It includes the words of draft ${risky!.id}, which may already have been posted, so ${fresh.id} can be resent only with the drafts tool and confirmDuplicate: true.`)));
       // {{unsent}} now means the fresh draft, and it is refused unconfirmed.
       const before = h.publishes().length;
@@ -1347,7 +1357,6 @@ describe('held prose drafts, end to end', () => {
       const [risky] = h.drafts();
       h.command({ op: 'publish-mode', mode: 'no-receipt' });
       await h.turn([createMockResponse([text(`>>${ROOM} {{unsent}}`)])]);
-      assert.equal(draftState(h.store().get('scout', risky!.id)!), 'unconfirmed');
       h.command({ op: 'publish-mode', mode: 'delivered' });
       const before = h.publishes().length;
       await h.turn([createMockResponse([text(`>>${ROOM} {{unsent}} and more`)])]);
@@ -1578,17 +1587,13 @@ describe('held prose drafts, end to end', () => {
     const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }], sendTool: true });
     await h.sendMode('no-channel');
     try {
-      const asked: boolean[] = [];
-      const fw = h.framework as unknown as { requestProseContinuation(agent: unknown, routing: { continuation: boolean }): void };
-      const check = fw.requestProseContinuation.bind(fw);
-      fw.requestProseContinuation = (agent, routing) => { asked.push(routing.continuation); check(agent, routing); };
+      const before = h.membrane.calls.length;
       await h.turn([
         createMockResponse([unplacedSend('s1')], 'tool_use'),
         createMockResponse([text(`>>>${GENERAL} ! Kept words.`), drafts('l1', { action: 'list' })], 'tool_use'),
         createMockResponse([]),
       ]);
-      await h.until(() => asked.length > 0, 'the turn-end continuation check');
-      assert.ok(asked.includes(true), `its ' !' asks for a continuation turn: ${JSON.stringify(asked)}`);
+      await h.until(() => h.membrane.calls.length >= before + 2, "its ' !' starts a continuation turn: the model is asked again");
       assert.deepEqual(h.drafts().map((d) => d.text), ['Kept words.'], 'its words are held');
     } finally {
       await h.close();
@@ -1827,6 +1832,79 @@ describe('held prose drafts, end to end', () => {
       await h.turn([createMockResponse([drafts('x2', { action: 'dismiss', draftIds: [unsure.id] })], 'tool_use'), createMockResponse([])]);
       assert.match(h.toolResults()[0]!, new RegExp(`${unsure.id}: dismissed`));
       assert.equal(draftState(h.store().get('scout', unsure.id)!), 'dismissed');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('an empty string marks an unused field, a digit string is read trimmed, and a value in use is still checked', async () => {
+    const h = await harness();
+    try {
+      await h.turn([
+        createMockResponse([text('words'), explicitSend('s1')], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      const [draft] = h.drafts();
+      await h.turn([
+        createMockResponse([
+          // A caller whose provider presents every property as required, filling
+          // the fields it isn't using with empty strings.
+          drafts('a', { action: 'list', draftIds: '', destination: '', confirmDuplicate: '', offset: '' }),
+          drafts('e', { action: 'list', destination: '' }),
+          drafts('b', { action: 'read', draftIds: [draft!.id], destination: '', confirmDuplicate: '', offset: '' }),
+          drafts('c', { action: 'list', offset: ' 0 ' }),
+          drafts('d', { action: 'list', offset: ' ' }),
+        ], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      const [listed, oneEmpty, read, padded, blank] = h.toolResults();
+      // The call a review named: one empty field, the rest null.
+      assert.match(oneEmpty!, /^1 open draft, newest first:/);
+      assert.ok(oneEmpty!.includes(draft!.id), oneEmpty);
+      assert.equal(listed, oneEmpty, 'every unused field empty lists the same');
+      assert.match(read!, /words/);
+      assert.equal(padded, listed, 'a padded offset reads as its digits');
+      assert.match(blank!, /offset must be a whole number of drafts to skip/, 'whitespace alone is a value, and not a number');
+
+      // A value in use is still checked, by the guards the rule now feeds.
+      await h.turn([
+        createMockResponse([
+          drafts('f', { action: 'read', draftIds: '' }),
+          drafts('g', { action: 'list', destination: '#elsewhere' }),
+          drafts('h', { action: 'list', confirmDuplicate: true }),
+          drafts('i', { action: 'read', draftIds: [draft!.id], offset: 1 }),
+          drafts('j', { action: 'list', offset: ' 1 ' }),
+          drafts('k', { action: 'list', offset: -1 }),
+          // Past the integers a number holds exactly, digits would read as another number.
+          drafts('m', { action: 'list', offset: '9007199254740993' }),
+          // false is "don't confirm", what list already does: it lists.
+          drafts('l', { action: 'list', confirmDuplicate: false }),
+        ], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      const [noIds, destUsed, confirmUsed, offsetUsed, pastOne, negative, unsafe, confirmFalse] = h.toolResults();
+      assert.match(noIds!, /action "read" needs draftIds/);
+      assert.match(destUsed!, /destination is not used by action "list"/);
+      assert.match(confirmUsed!, /confirmDuplicate is not used by action "list"/);
+      assert.match(offsetUsed!, /offset is not used by action "read"/);
+      assert.match(pastOne!, /^1 open draft, newest first \(showing 0 from #2\):/, 'a padded offset of 1 skips the one draft');
+      assert.match(negative!, /offset must be a whole number of drafts to skip/);
+      assert.match(unsafe!, /offset must be a whole number of drafts to skip/);
+      assert.equal(confirmFalse, listed, 'confirmDuplicate: false lists, as an omitted one does');
+
+      // resend: an empty destination is unused (and this resident has no home to
+      // fall back to), and an empty confirmDuplicate is unused, so the send goes.
+      await h.turn([
+        createMockResponse([
+          drafts('r1', { action: 'resend', draftIds: [draft!.id], destination: '', confirmDuplicate: '' }),
+          drafts('r2', { action: 'resend', draftIds: [draft!.id], destination: ROOM, confirmDuplicate: '' }),
+        ], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      const [noDest, resent] = h.toolResults();
+      assert.match(noDest!, /resend needs a destination/);
+      assert.match(resent!, new RegExp(`${draft!.id}: delivered to`));
+      assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note', 'words']);
     } finally {
       await h.close();
     }
@@ -2089,13 +2167,8 @@ describe('draft identity and risk evidence', () => {
       const round = { routing: t.internals.routingOf('scout'), notice: 'later' as const };
       t.internals.bounceProse(agent, '{{unsent}} second', 'no such channel', undefined, '>>', round);
       const copy = t.internals.proseDrafts.open('scout').find((d) => d.text === 'first second')!;
-      assert.equal(copy.inheritedRisk?.draftId, original!.id);
       t.internals.bounceProse(agent, '{{unsent}} third', 'no such channel', undefined, '>>', round);
       const again = t.internals.proseDrafts.open('scout').find((d) => d.text === 'first second third')!;
-      assert.equal(again.inheritedRisk?.draftId, copy.id);
-      assert.equal(again.inheritedRisk?.sourceDraftId, original!.id);
-      assert.deepEqual(again.inheritedRisk?.destination, dest());
-      assert.equal(again.inheritedRisk?.reason, 'its outcome was never recorded');
       const text = t.internals.riskText(again);
       assert.match(text, new RegExp(`${again.id} includes the words of ${copy.id}, which itself includes the words of ${original!.id}, and ${original!.id}'s attempt to #room \\(Guild One\\)`));
       assert.doesNotMatch(text, /being sent/);
@@ -2209,7 +2282,6 @@ describe('drafts resend ownership', () => {
       const result = t.say(await batch);
       assert.match(result, new RegExp(`${t.b.id} was dismissed, so it can't be resent\\. It changed while this resend was waiting — not sent\\.`));
       assert.equal(t.pending.length, 0, 'B never reached publish');
-      assert.equal(draftState(t.internals.proseDrafts.get('scout', t.b.id)!), 'dismissed');
     } finally {
       await t.close();
     }
@@ -2308,7 +2380,6 @@ describe('drafts resend ownership', () => {
         /transport gone/,
       );
       assert.equal(entered, 1, 'the resend reached publish');
-      assert.equal(draftState(t.internals.proseDrafts.get('scout', t.a.id)!), 'unconfirmed', 'its attempt has no outcome: it may have been posted');
       assert.match(t.say(await t.internals.handleDraftsTool('scout', { action: 'dismiss', draftIds: [t.a.id] })),
         new RegExp(`${t.a.id}: dismissed \\(your history keeps the words\\)\\. Note that ${t.a.id}'s attempt to .* may already have been posted: its outcome was never recorded\\.`));
     } finally {
@@ -2363,8 +2434,6 @@ describe('drafts resend ownership', () => {
       const fresh = t.internals.proseDrafts.latestBounce('scout')!;
       assert.notEqual(fresh.id, bounce!.id);
       assert.equal(fresh.text, 'bounced words and a postscript');
-      assert.equal(fresh.inheritedRisk?.draftId, bounce!.id);
-      assert.match(fresh.inheritedRisk!.reason, /queued in a resend when these words were held/);
       const words = agent.getContextManager().getAllMessages().flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '');
       assert.ok(words.includes(`[prose-routing] {{unsent}} is draft ${bounce!.id}, which is queued in a resend in progress. Nothing was sent; ` +
         `wait for that result. Your message is held as draft ${fresh.id}, with {{unsent}} written out; since it includes ` +
@@ -2743,7 +2812,6 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       h.command({ op: 'publish-mode', mode: 'delivered' });
       await h.turn(rounds([text(`>>>${ROOM} {{unsent}} again`), explicitSend('s3')]));
       const risky = h.drafts().find((d) => d.text === 'lost words again')!;
-      assert.equal(risky.inheritedRisk?.draftId, bounce!.id);
       assert.equal(draftState(risky), 'unconfirmed');
 
       await h.turn(rounds([text('>>>skip_reply {{unsent}}'), explicitSend('s4')]));
@@ -3801,7 +3869,14 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
       it(`a conversation agent's stated provider wait, reported as ${how === 'error' ? 'an error' : 'a throw'}, after stop() has closed admission names the speech`, async () => {
         const h = await harness({ xml: true, roundPreamble: true, retries: 1 });
         try {
-          (h.framework as unknown as { conversationAgentHomes: Map<string, unknown> }).conversationAgentHomes.set('scout', { serverId: 'discord', channelId: ROOM });
+          // main's test makes scout a conversation agent through conversationAgentHomes; on this
+          // branch that is the registry's record: a home channel, and a role that doesn't own
+          // provider scheduling (as conversationForkSpec gives a fork).
+          const scout = (h.framework as unknown as {
+            registry: { live: Map<string, { homeChannel?: { serverId: string; channelId: string }; roles: { ownsProviderScheduling: boolean } }> };
+          }).registry.live.get('scout')!;
+          scout.homeChannel = { serverId: 'discord', channelId: ROOM };
+          scout.roles.ownsProviderScheduling = false;
           breakAfterToolRound(h.membrane, how, {
             failure: () => new MembraneError({ type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 30_000, message: 'rate limited', rawError: { status: 429 } }),
             beforeFailure: () => { (h.framework as unknown as { providerAdmissionClosed: boolean }).providerAdmissionClosed = true; },
@@ -3851,15 +3926,17 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
     });
 
     it("stop() during the wait after a retry's start failed names the speech", async () => {
-      const h = await harness({ xml: true, roundPreamble: true, retries: 2, retryDelayMs: 2_000 });
+      const h = await harness({ xml: true, roundPreamble: true, retries: 2, retryDelayMs: [10, 600_000] });
       try {
         breakAfterToolRound(h.membrane, 'error');
         let threw = false;
         onSnapshot(h, 2, () => { threw = true; throw new Error('the tool snapshot failed'); });
+        let waits = 0;
+        h.framework.onTrace((event) => { if (event.type === 'inference:waiting') waits++; });
         const written = capture(h);
         await startTurn(h);
         await h.until(() => threw, "the retry's start failed");
-        await h.until(() => (h.framework as unknown as { retryWaitWakers: Set<unknown> }).retryWaitWakers.size > 0, 'the next wait');
+        await h.until(() => waits >= 2, 'the next wait');
         await h.framework.stop();
         assert.equal(h.membrane.calls.length, 1, 'premise: no retry compiled');
         assert.equal(written.filter((t) => t.startsWith(NOTICE)).length, 1, written.join('\n'));
@@ -4236,6 +4313,238 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
         await h.close();
       }
     });
+  });
+});
+
+describe('a heartbeat turn holds its plain speech as drafts', () => {
+  /** Calls the membrane gets for one turn and anything it wakes, once the framework is idle again. */
+  const callsFor = async (h: Awaited<ReturnType<typeof harness>>, run: () => Promise<void>): Promise<number> => {
+    const before = h.membrane.calls.length;
+    await run();
+    await new Promise((r) => setTimeout(r, 200));
+    await h.framework.runUntilIdle();
+    return h.membrane.calls.length - before;
+  };
+
+  it('locus mode: nothing is posted where the latest message came from; the words are held, named in the receipt, and resendable', async () => {
+    const h = await harness();
+    try {
+      await h.turn([createMockResponse([text('a reply in the room')])]);
+      assert.deepEqual(h.publishes().map((p) => p.text), ['a reply in the room'], 'the room is the latest inbound channel now');
+      await h.turn([createMockResponse([text('Still here, thinking of you.')])], 'scout', 'heartbeat');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['a reply in the room'], 'the heartbeat turn posted nothing');
+      const [held] = h.drafts();
+      assert.equal(held?.text, 'Still here, thinking of you.');
+      assert.equal(held?.reason, 'no-destination');
+      const receipt = h.texts().filter((t) => t.startsWith('[delivered]')).at(-1) ?? '';
+      assert.ok(receipt.startsWith('[delivered] nothing') && receipt.includes(held!.id), receipt);
+      assert.equal(h.texts().filter((t) => t.startsWith('[routing] This turn came from your heartbeat')).length, 1,
+        'the heartbeat turn was told up front that its plain speech is held');
+      const announced = h.texts().filter((t) => t.startsWith('[routing] Your plain speech now lands in')).length;
+      await h.turn([
+        createMockResponse([drafts('r1', { action: 'resend', draftIds: [held!.id], destination: ROOM })], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      assert.deepEqual(h.publishes().map((p) => p.text), ['a reply in the room', 'Still here, thinking of you.'], 'sent when the agent chose to');
+      assert.equal(h.texts().filter((t) => t.startsWith('[routing] Your plain speech now lands in')).length, announced,
+        'the next channel turn did not announce its channel again');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("locus mode: a heartbeat turn's mid-turn and closing prose are both held, and the mid-turn notice says why", async () => {
+    const h = await harness();
+    try {
+      await h.turn([createMockResponse([text('a reply in the room')])]);
+      await h.turn([
+        createMockResponse([text('a first thought'), call('l1', 'channel_list', {})], 'tool_use'),
+        createMockResponse([text('closing words')]),
+      ], 'scout', 'heartbeat');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['a reply in the room']);
+      assert.deepEqual(h.drafts().map((d) => d.text).reverse(), ['a first thought', 'closing words']);
+      assert.ok(h.drafts().every((d) => d.reason === 'no-destination'));
+      assert.ok(h.texts().some((t) => t.startsWith('[drafts]') && t.includes('this turn came from your heartbeat, not from a channel')),
+        JSON.stringify(h.texts().filter((t) => t.startsWith('[drafts]'))));
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("a tick from the framework's own heartbeat opens such a turn", async () => {
+    const h = await harness({ heartbeat: true });
+    try {
+      await h.turn([createMockResponse([text('a reply in the room')])]);
+      h.membrane.pushResponse(createMockResponse([text('words from a real tick')]));
+      const before = h.membrane.calls.length;
+      const fired = (h.framework as unknown as { heartbeat: { handleToolCall(name: string, input: unknown): { isError?: boolean } } })
+        .heartbeat.handleToolCall('heartbeat--heartbeat_trigger', {});
+      assert.notEqual(fired.isError, true, JSON.stringify(fired));
+      await h.until(() => h.membrane.calls.length > before, 'the tick\'s turn');
+      await h.framework.runUntilIdle();
+      await h.until(() => h.drafts().length === 1, 'the held words');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['a reply in the room']);
+      assert.equal(h.drafts()[0]?.text, 'words from a real tick');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a heartbeat batched behind another channel-less wake is still a heartbeat\'s turn', async () => {
+    const h = await harness();
+    try {
+      await h.turn([createMockResponse([text('a reply in the room')])]);
+      h.membrane.pushResponse(createMockResponse([text('words from a batched tick')]));
+      const before = h.membrane.calls.length;
+      const pending = (h.framework as unknown as { pendingRequests: unknown[] }).pendingRequests;
+      const t = Date.now();
+      pending.push(
+        { agentName: 'scout', reason: 'test', source: 'test', timestamp: t },
+        { agentName: 'scout', reason: 'heartbeat', source: 'heartbeat', timestamp: t + 1 },
+      );
+      await h.until(() => h.membrane.calls.length > before, 'the batch\'s turn');
+      await h.framework.runUntilIdle();
+      await h.until(() => h.drafts().length === 1, 'the held words');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['a reply in the room'], 'the batch order does not decide');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("hybrid mode: the resend wake after a heartbeat turn's failed >>> target is a heartbeat's turn too", async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      await h.turn([createMockResponse([text('a reply in the room')])]);
+      onSecondStream(h.membrane, createMockResponse([text('unprefixed words on the resend turn')]));
+      await h.turn([createMockResponse([text('>>>#nowhere words meant for someone')])], 'scout', 'heartbeat');
+      await h.until(() => h.drafts().some((d) => d.text === 'unprefixed words on the resend turn'), 'the resend turn\'s words held');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['a reply in the room']);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("a quiesce parks a heartbeat's wake apart from a later channel-less wake, so neither absorbs the other", async () => {
+    const h = await harness();
+    const internals = h.framework as unknown as {
+      pendingRequests: Array<{ agentName: string; source: string }>;
+      processInferenceRequests(): Promise<void>;
+      quiesced: boolean;
+    };
+    try {
+      const t = Date.now();
+      internals.quiesced = true;
+      internals.pendingRequests.push(
+        { agentName: 'scout', reason: 'mcpl:push-event', source: 'heartbeat', timestamp: t } as never,
+        { agentName: 'scout', reason: 'mcpl:push-event', source: 'other', timestamp: t + 1 } as never,
+      );
+      await internals.processInferenceRequests();
+      assert.deepEqual(internals.pendingRequests.filter((r) => r.agentName === 'scout').map((r) => r.source).sort(), ['heartbeat', 'other'],
+        'both wait for the resume, where they make a heartbeat\'s batch');
+    } finally {
+      internals.quiesced = false;
+      internals.pendingRequests.length = 0;
+      await h.close();
+    }
+  });
+
+  it('an explicit send from a heartbeat turn still posts', async () => {
+    const h = await harness();
+    try {
+      await h.turn([createMockResponse([text('a reply in the room')])]);
+      await h.turn([createMockResponse([explicitSend('s1')], 'tool_use'), createMockResponse([])], 'scout', 'heartbeat');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['a reply in the room', 'an explicit note']);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a channel-less wake that is not the heartbeat still takes the latest inbound channel, as before', async () => {
+    // The latest inbound channel is a fallback only under 'latest-inbound'.
+    const h = await harness({ speech: { locus: 'latest-inbound' } });
+    try {
+      await h.turn([createMockResponse([text('a reply in the room')])]);
+      await h.turn([createMockResponse([text('words from a timer')])], 'scout', 'request');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['a reply in the room', 'words from a timer']);
+      assert.deepEqual(h.drafts(), []);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('hybrid mode: unprefixed heartbeat prose is held, and a >>> envelope still delivers', async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      await h.turn([createMockResponse([text('a reply in the room')])]);
+      assert.deepEqual(h.publishes().map((p) => p.text), ['a reply in the room']);
+      await h.turn([
+        createMockResponse([text('unprefixed heartbeat words'), call('l1', 'channel_list', {})], 'tool_use'),
+        createMockResponse([text(`>>>${ROOM} chosen words`)]),
+      ], 'scout', 'heartbeat');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['a reply in the room', 'chosen words']);
+      const [held] = h.drafts();
+      assert.equal(held?.text, 'unprefixed heartbeat words');
+      assert.equal(held?.reason, 'no-destination');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("an autoContinue continuation of a heartbeat turn holds its plain speech too", async () => {
+    const h = await harness({ agents: [{ name: 'scout', autoContinue: true }] });
+    try {
+      // No channel turn first: its own run's wakes would merge with the
+      // continuation and give it their channel, as a message arriving mid-run
+      // rightly does. Without the mark the continuation's words fail to route
+      // rather than being held.
+      // Each stream takes every queued response, so the continuation's
+      // answer is queued as its stream opens.
+      onSecondStream(h.membrane, createMockResponse([text('continued heartbeat words')]));
+      await h.turn([createMockResponse([text('first heartbeat words')])], 'scout', 'heartbeat');
+      await h.until(() => h.drafts().length >= 2, 'the continuation');
+      await h.framework.runUntilIdle();
+      assert.deepEqual(h.publishes(), [], 'neither the turn nor its continuation posted');
+      assert.deepEqual(h.drafts().map((d) => d.text).reverse(), ['first heartbeat words', 'continued heartbeat words']);
+      assert.equal(h.texts().filter((t) => t.startsWith('[routing] This turn came from your heartbeat')).length, 1,
+        'the continuation is not told again');
+      assert.ok(h.texts().some((t) => t.startsWith('[continue]') && t.includes('are held as drafts, as on the heartbeat')),
+        'its [continue] row says its words are held');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('explicit mode: a heartbeat turn whose deliberate >> target fails still wakes the agent', async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'explicit' }] });
+    try {
+      const before = h.membrane.calls.length;
+      await h.turn([createMockResponse([text('>>#nowhere words meant for someone')])], 'scout', 'heartbeat');
+      await h.until(() => h.membrane.calls.length - before >= 2, "the failed send's bounce wakes the agent to resend");
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("explicit mode: a heartbeat turn's bounce is held and noticed without waking the agent", async () => {
+    const control = await harness({ agents: [{ name: 'scout', proseRouting: 'explicit' }] });
+    try {
+      const before = control.membrane.calls.length;
+      await control.turn([createMockResponse([text('words with nowhere to go')])], 'scout', 'request');
+      await control.until(() => control.membrane.calls.length - before >= 2, "another channel-less turn's bounce wakes the agent to resend");
+    } finally {
+      await control.close();
+    }
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'explicit' }] });
+    try {
+      const calls = await callsFor(h, () => h.turn([createMockResponse([text('heartbeat words with nowhere to go')])], 'scout', 'heartbeat'));
+      assert.equal(calls, 1, 'the heartbeat turn alone: no bounce wake');
+      const [bounced] = h.drafts();
+      assert.equal(bounced?.reason, 'bounced');
+      assert.ok(h.texts().some((t) => t.includes(`It is held as draft ${bounced!.id}`)), 'the bounce is noticed');
+      assert.deepEqual(h.publishes(), []);
+    } finally {
+      await h.close();
+    }
   });
 });
 

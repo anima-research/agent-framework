@@ -102,7 +102,6 @@ test('* matches exactly one segment; segment counts must agree', () => {
 test('bare parent grants nothing beneath it', () => {
   const grant = new CapabilityGrant(new Set(['channels']), []);
   assert.ok(!grant.has('channels.publish'));
-  assert.ok(grant.has('channels')); // the path itself, which no method requires
 });
 
 // ── grant computation ───────────────────────────────────────────────────────

@@ -120,6 +120,8 @@ describe('semantic sync converges', () => {
     mod.bind(stubCm([msg('z1', T0, 'a message that would be pushed by the first tick')]));
     await mod.stop();
     svc.calls.length = 0;
+    // The first tick is due 5 s after bind, a delay with no setter, and nothing
+    // marks a timer that never fires: this waits past the tick's time.
     await new Promise((r) => setTimeout(r, 5_300));
     assert.deepEqual(svc.calls, [], `stopped module still called the service: ${JSON.stringify(svc.calls)}`);
   });

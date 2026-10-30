@@ -22,7 +22,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ChildProcess } from 'node:child_process';
 
-import { STDERR_TAIL_CHARS, StdioTransport } from '../src/mcpl/transport.js';
+import { STDERR_TAIL_CHARS, StdioTransport, setStdioExitGraceForTests } from '../src/mcpl/transport.js';
 import { McplServerConnection, McplUnreapedLaunchError, stderrTailOf, withStderr } from '../src/mcpl/server-connection.js';
 import { AgentFramework } from '../src/framework.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
@@ -38,9 +38,9 @@ function within<T, F>(promise: Promise<T>, fallback: F, ms = 15_000): Promise<T 
 /** A server script's last step: it exits once the host's initialize line
  *  arrives, before answering it. A server that exits at once races the host's
  *  initialize write instead: a write that meets the closed pipe fails with
- *  EPIPE, and the close's reason names that failure ("…, and its pipe failed
- *  with write EPIPE") whenever it is handled before the exit, which only
- *  scheduling decides. Exiting after the line arrives leaves the host nothing
+ *  EPIPE, and the close's reason names that failure ("…, and this host had
+ *  stopped using the server's stdio (write EPIPE)") whenever it is handled
+ *  before the exit, which only scheduling decides. Exiting after the line arrives leaves the host nothing
  *  to write once the server is gone. */
 const EXIT_ON_INITIALIZE = "process.stdin.once('data', () => process.exit(1))";
 
@@ -341,6 +341,7 @@ test("at startup, a failed connect whose launch can't be reaped still traces and
     const child = (transport as unknown as { child: ChildProcess }).child;
     const realKill = child.kill.bind(child);
     child.kill = () => true;
+    setStdioExitGraceForTests(child, 50);
     const exited = new Promise<void>((resolve) => {
       if (child.exitCode !== null || child.signalCode !== null) resolve();
       else child.once('exit', () => resolve());

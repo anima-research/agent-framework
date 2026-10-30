@@ -400,7 +400,7 @@ test("the startup alert for a server with no common protocol revision carries th
     });
     const alert = traces.find(e => e.type === 'ops:alert');
     assert.ok(alert, JSON.stringify(traces.map(e => e.type)));
-    assert.match(String(alert!.message), /MCPL server unreachable at startup: .*refused at \/api\/mcp\/s\/redacted\/mcp/);
+    assert.match(String(alert!.message), /MCPL server not connected at startup, and this host won't retry it on its own: .*refused at \/api\/mcp\/s\/redacted\/mcp/);
     assert.ok(!JSON.stringify(traces).includes(secret));
   } finally {
     await framework?.stop();
@@ -880,12 +880,25 @@ test("a redaction from a place in the text gives what lies from there on, a cred
 
 test("an error answer's data is redacted through and through: its keys, keeping every entry, its numbers, and plain objects, to a depth past which it's withheld", () => {
   const redact = serverTextRedactor(config);
-  assert.deepEqual(
-    redactedData({ [secret]: [secret, { deep: `at ${secret}` }], [config.token]: 'kept', count: 2, none: null }, redact),
-    { redacted: ['redacted', { deep: 'at redacted' }], 'redacted (2)': 'kept', count: 2, none: null },
-  );
+  // Keys that redact alike are numbered, each entry kept under a name of its
+  // own; the doc leaves the number's form to the code, so the names are
+  // checked for being distinct and free of credentials.
+  const besides = (data: unknown, ...names: string[]) =>
+    Object.entries(data as Record<string, unknown>).filter(([key]) => !names.includes(key));
+  const free = (key: string) => !key.includes(secret) && !key.includes(config.token);
+  const both = redactedData({ [secret]: [secret, { deep: `at ${secret}` }], [config.token]: 'kept', count: 2, none: null }, redact) as Record<string, unknown>;
+  assert.deepEqual([both.count, both.none], [2, null]);
+  const alike = besides(both, 'count', 'none');
+  assert.equal(alike.length, 2, `each redacted key keeps its entry: ${JSON.stringify(both)}`);
+  assert.ok(alike.every(([key]) => free(key)), JSON.stringify(both));
+  assert.deepEqual(alike.find(([, value]) => Array.isArray(value))?.[1], ['redacted', { deep: 'at redacted' }]);
+  assert.ok(alike.some(([, value]) => value === 'kept'), JSON.stringify(both));
   // A key of the server's own that reads `redacted` keeps its name.
-  assert.deepEqual(redactedData({ [secret]: 'diagnostic', redacted: false }, redact), { 'redacted (2)': 'diagnostic', redacted: false });
+  const own = redactedData({ [secret]: 'diagnostic', redacted: false }, redact) as Record<string, unknown>;
+  assert.equal(own.redacted, false);
+  const moved = besides(own, 'redacted');
+  assert.equal(moved.length, 1, JSON.stringify(own));
+  assert.ok(free(moved[0]![0]) && moved[0]![1] === 'diagnostic', JSON.stringify(own));
   // A number whose digits are a credential.
   assert.deepEqual(redactedData({ pin: 9876543210123, count: 2 }, serverTextRedactor({ url: 'https://h/mcp', token: '9876543210123' })), { pin: 'redacted', count: 2 });
   // An object with no prototype is walked; an instance of a class is not.
@@ -918,19 +931,27 @@ test("an error answer's data is redacted through and through: its keys, keeping 
   }
 });
 
-test("an error answer's data with many keys that redact alike is numbered in time that grows with the keys, not with their square", () => {
+test("an error answer's data with many keys that redact alike is numbered with name probes that grow with the keys, not with their square", () => {
   // Every key that starts with "k" redacts to "x" here, so all of them come
   // out as one name, as copies of one credential in a server's keys can.
   const alike = (text: unknown) => (typeof text === 'string' && text.startsWith('k') ? 'x' : String(text));
-  const keys = 16_384;
-  const data = Object.fromEntries(Array.from({ length: keys }, (_, i) => [`k${i}`, i]));
-  const started = performance.now();
-  const names = Object.keys(redactedData(data, alike) as object);
-  const ms = performance.now() - started;
-  assert.deepEqual(names, ['x', ...Array.from({ length: keys - 1 }, (_, i) => `x (${i + 2})`)]);
-  // Numbering in one pass takes tens of milliseconds for this many keys;
-  // searching each name's numbers from 2 again takes seconds.
-  assert.ok(ms < 2_000, `${ms.toFixed(0)} ms`);
+  const numbered = (keys: number) => {
+    const data = Object.fromEntries(Array.from({ length: keys }, (_, i) => [`k${i}`, i]));
+    const has = Set.prototype.has;
+    let probes = 0;
+    Set.prototype.has = function (this: Set<unknown>, value: unknown) { probes++; return has.call(this, value); };
+    try {
+      return { names: Object.keys(redactedData(data, alike) as object), probes };
+    } finally {
+      Set.prototype.has = has;
+    }
+  };
+  const small = numbered(1_024);
+  const large = numbered(4_096);
+  assert.deepEqual(large.names, ['x', ...Array.from({ length: 4_095 }, (_, i) => `x (${i + 2})`)]);
+  assert.ok(small.probes >= 1_024, `${small.probes} name probes for 1,024 keys`);
+  assert.ok(large.probes < 8 * small.probes, `${small.probes} name probes for 1,024 keys and ${large.probes} for 4,096: ` +
+    'four times the keys should take about four times the probes, not sixteen');
 });
 
 test("an error built from a server's words and data reads a configuration that can't be read once, in either engine", async (t) => {

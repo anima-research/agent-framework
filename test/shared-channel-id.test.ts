@@ -15,9 +15,10 @@ import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { AgentFramework } from '../src/index.js';
+import { AgentFramework, conversationForkSpec } from '../src/index.js';
 import type { ChannelRef, InferenceRequest, ProcessEvent } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { bindAsConversationFork } from './helpers/dendrite.js';
 import { isProseTargetToken } from '../src/mcpl/prose-grammar.js';
 import { ChannelRegistry, destinationKey } from '../src/mcpl/channel-registry.js';
 import { HookOrchestrator } from '../src/mcpl/hook-orchestrator.js';
@@ -61,6 +62,9 @@ function fixture(channels: Array<[serverId: string, channelId: string, label?: s
     () => {},
     (e) => { traces.push(e); },
     {
+      // The latest delivered inbound is the fallback locus and the default
+      // channel, as on main: these tests were written to that rule.
+      latestInboundLocus: true,
       onRouteFailure: (info) => { failures.push(info); },
       sendTypingFn: (serverId, channelId, metadata, op) => {
         calls.push({ server: serverId, what: op === 'stop' ? 'typing-stop' : 'typing', channelId, ...(metadata ? { metadata } : {}) });
@@ -151,7 +155,6 @@ for (const order of orders) {
     f.registry.removeServer('b');
     assert.deepEqual(f.registry.getDefaultPublishChannel(), b, "b's channel stays the default's ref, so a call that would default to it is refused as the default gone");
     assert.equal(f.registry.incomingFor(), undefined, "b's message went with its server, so none is given as the one replied to");
-    assert.deepEqual([internal.defaultPublishMessageId, internal.defaultPublishThreadId], [null, undefined]);
   });
 
   test(`channel_close stops typing in the channel it closes, and the other server's channel with its id goes on typing (${registered})`, async () => {
@@ -305,6 +308,8 @@ for (const order of orders) {
     f.registry.handleIncoming('b', {
       messages: [{ channelId: 'general', messageId: 'in1', author: { id: 'u', name: 'U' }, timestamp: '2026-10-19T00:00:00.000Z', content: [{ type: 'text', text: 'hi' }] }],
     });
+    // Admission records the delivered message as the latest (noteDelivered).
+    f.registry.noteDelivered(b, 'in1');
     assert.deepEqual(f.registry.buildChannelContext('agent', 'b'), {
       incoming: { channelId: 'general', messageId: 'in1', threadId: undefined },
       defaultOutgoing: { channelId: 'general' },
@@ -368,8 +373,7 @@ test("a fork's qualified-name refusal quotes its home's name as an id is quoted,
   (f.i.channelRegistry as unknown as { channels: Map<string, unknown> }).channels.set(destinationKey(odd), {
     serverId: 'b', descriptor: { id: 'q"x', type: 'chat', label: 'q"x' }, open: true,
   });
-  (f.framework as unknown as { conversationAgentHomes: Map<string, ChannelRef> }).conversationAgentHomes.set('scout', odd);
-  t.after(() => { (f.framework as unknown as { conversationAgentHomes: Map<string, ChannelRef> }).conversationAgentHomes.delete('scout'); });
+  t.after(bindAsConversationFork(f.framework, 'scout', odd));
   const results = toolResults(t, f.framework);
   const dispatch = (f.framework as unknown as { dispatchChannelToolCall: Dispatcher }).dispatchChannelToolCall.bind(f.framework);
   dispatch('scout', { id: 'q', name: 'channel_publish', input: { channelId: 'b:q"x', serverId: 'b', content: 'x' } });
@@ -616,7 +620,7 @@ test("a default channel whose server disconnected is refused as the default gone
   const internal = f.registry as unknown as { defaultPublishChannel: ChannelRef | null };
   internal.defaultPublishChannel = a;
   f.registry.removeServer('a');
-  assert.deepEqual(internal.defaultPublishChannel, a, "removeServer keeps the default's ref, as a withdrawal does");
+  assert.deepEqual(f.registry.getDefaultPublishChannel(), a, "removeServer keeps the default's ref, as a withdrawal does");
   const gone = await f.registry.handleChannelToolCall('channel_publish', { content: 'x' });
   assert.equal(gone.error, 'The channel this would default to, "a:general", isn\'t registered now, so nothing was posted.');
   assert.deepEqual(f.take().filter((c) => c.what === 'publish'), []);
@@ -678,20 +682,24 @@ test("channel_open, channel_close and channel_decline naming the turn's own chan
     + 'server "d" (its server no longer registers it)), so nothing was posted. Call again with channelId set to one of "a:general", "b:general".');
 });
 
+const offered = (route: string): string[] =>
+  [...route.matchAll(/channelId ("(?:[^"\\]|\\.)*")/g)].map((m) => JSON.parse(m[1]!) as string);
+
 test("a refusal names the channelId channel_publish reaches a channel it shows by id and server by, or says none reaches it alone", async () => {
   // Server "a"'s "b\"x:room" is the only channel with that id, though its qualified name is server "a:b\"x"'s "room"'s too.
   const f = fixture([['a', 'b"x:room'], ['a:b"x', 'room']]);
   for (const candidate of ['"b\\"x:room" on server "a"', '#lounge = "b\\"x:room" on server "a"']) {
-    assert.equal(f.registry.publishRouteFor([candidate]), ' For a channel shown by its id and server: channel_publish reaches '
-      + '"b\\"x:room" on server "a" with channelId "b\\"x:room".', candidate);
+    assert.deepEqual(offered(f.registry.publishRouteFor([candidate])), ['b"x:room'], candidate);
   }
   const posted = await f.registry.handleChannelToolCall('channel_publish', { channelId: 'b"x:room', content: 'hello' });
   assert.equal(posted.success, true, posted.error);
   assert.deepEqual(f.take().filter((c) => c.what === 'publish').map((c) => `${c.server} ${c.channelId}`), ['a b"x:room']);
   // Server "a"'s "b:room": its id is server "c"'s too, and its qualified name server "a:b"'s "room"'s.
   const odd = fixture([['a', 'b:room'], ['a:b', 'room'], ['c', 'b:room']]);
-  assert.equal(odd.registry.publishRouteFor(['"b:room" on server "a"']),
-    ' For a channel shown by its id and server: no channelId reaches "b:room" on server "a" alone.');
+  const none = odd.registry.publishRouteFor(['"b:room" on server "a"']);
+  assert.deepEqual(offered(none), [], none);
+  assert.match(none, /no channelId reaches .+ alone/);
+  assert.ok(none.includes('"b:room"') && none.includes('"a"'), none);
   assert.equal(odd.registry.publishRouteFor(['"b:room" on server "a" (no channelId reaches it alone)', 'c:b:room']), '');
 });
 
@@ -701,9 +709,8 @@ test("the route a refusal names is the qualified name first, which a turn's own 
   const own: ChannelRef[] = [{ serverId: 'a', channelId: 'x"y' }, { serverId: 'b', channelId: 'x"y' }];
   const inTurn = { kind: 'agent', agentName: 'scout', own } as never;
   const route = f.registry.publishRouteFor(['"x\\"y" on server "a"']);
-  assert.equal(route, ' For a channel shown by its id and server: channel_publish reaches "x\\"y" on server "a" with channelId "a:x\\"y".');
-  const offered = JSON.parse(/with channelId (".*")\.$/.exec(route)![1]!) as string;
-  const posted = await f.registry.handleChannelToolCall('channel_publish', { channelId: offered, content: 'hello' }, inTurn);
+  assert.deepEqual(offered(route), ['a:x"y'], route);
+  const posted = await f.registry.handleChannelToolCall('channel_publish', { channelId: offered(route)[0]!, content: 'hello' }, inTurn);
   assert.equal(posted.success, true, posted.error);
   assert.deepEqual(f.take().filter((c) => c.what === 'publish').map((c) => `${c.server} ${c.channelId}`), ['a x"y']);
   // The bare id would mean both of the turn's channels, and be refused.
@@ -712,7 +719,7 @@ test("the route a refusal names is the qualified name first, which a turn's own 
   // A channel whose id is empty is reached by its qualified name; channel_publish refuses an empty channelId.
   const empty = fixture([['a', '']]);
   const emptyRoute = empty.registry.publishRouteFor(['"" on server "a"']);
-  assert.equal(emptyRoute, ' For a channel shown by its id and server: channel_publish reaches "" on server "a" with channelId "a:".');
+  assert.deepEqual(offered(emptyRoute), ['a:'], emptyRoute);
   const reached = await empty.registry.handleChannelToolCall('channel_publish', { channelId: 'a:', content: 'hello' });
   assert.equal(reached.success, true, reached.error);
   assert.deepEqual(empty.take().filter((c) => c.what === 'publish').map((c) => `${c.server} ${c.channelId}`), ['a ']);
@@ -733,14 +740,15 @@ test("a turn's channels sharing an id whose qualified names don't show as themse
   // A `>>` target can't take JSON: the prose resolver lists them by id and server, and says what channel_publish takes.
   const resolved = f.registry.resolveProseTarget('x"y', { forSpeech: true, own }) as { error?: string; candidates?: string[] };
   assert.deepEqual(resolved.candidates, ['"x\\"y" on server "a"', '"x\\"y" on server "b"']);
-  assert.equal(f.registry.publishRouteFor(resolved.candidates!), ' For a channel shown by its id and server: channel_publish reaches '
-    + '"x\\"y" on server "a" with channelId "a:x\\"y"; channel_publish reaches "x\\"y" on server "b" with channelId "b:x\\"y".');
+  assert.deepEqual(offered(f.registry.publishRouteFor(resolved.candidates!)), ['a:x"y', 'b:x"y']);
 });
 
 test("a default channel's reply anchors survive a withdrawal, as on main, and go with its server's disconnect, as on main, while its ref stays", async () => {
   const f = fixture(both(['a', 'b']));
   f.registry.handleIncoming('a', { messages: [{ channelId: 'general', messageId: 'm-a', threadId: 't-a', author: { id: 'u', name: 'u' },
     timestamp: new Date().toISOString(), content: [{ type: 'text', text: 'hi' }] }] } as never);
+  // Admission records the delivered message as the latest (noteDelivered).
+  f.registry.noteDelivered(a, 'm-a', 't-a');
   const before = f.registry.incomingFor();
   assert.deepEqual(before, { channel: a, messageId: 'm-a', threadId: 't-a' });
   await f.registry.handleChanged('a', { removed: ['general'] });
@@ -830,26 +838,26 @@ test("a name that reads two ways is refused with a line per channel, each with i
   assert.equal(f.registry.nameShown({ serverId: 'a', channelId: 'b:room' }), '"b:room" on server "a"');
   assert.equal(f.registry.nameShown({ serverId: 'c', channelId: 'b:room' }), 'c:b:room');
   assert.equal(f.registry.nameShown({ serverId: 'a:b', channelId: 'room' }), 'room');
-  // tune_out takes a name, so a tuned-out channel no name picks can't be
-  // cancelled by it, and the refusal says how its tune-out ends instead.
+  // tune_out takes a serverId, so the refusal names a tuned-out channel no
+  // name picks by its id and server for the cancel.
   f.registry.enterTuneOut('a', 'b:room', { epochId: 'e', cadenceSeconds: 300, backlogCap: 50, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
   const tuned = await f.registry.handleChannelToolCall('channel_open', { channelId: 'b:room', serverId: 'a' });
   assert.ok(tuned.error?.startsWith('Channel "b:room" on server "a" is tuned out'), tuned.error);
-  assert.ok(tuned.error?.includes("No channelId names it alone, so tune_out can't cancel it"), tuned.error);
-  // channel_close refuses it too, and says the close can come once the
-  // tune-out has ended by itself.
+  assert.ok(tuned.error?.includes('Call tune_out with channelId "b:room", serverId "a" and mode "cancel"'), tuned.error);
+  // channel_close refuses it too, and says the close can come after the cancel.
   const closing = await f.registry.handleChannelToolCall('channel_close', { channelId: 'b:room', serverId: 'a' });
   assert.ok(closing.error?.startsWith('Channel "b:room" on server "a" is tuned out'), closing.error);
-  assert.ok(closing.error?.endsWith('and its backlog is delivered then. Once it has ended, channel_close can close it.'), closing.error);
-  // An open the tune-out overtook during its round-trip says the same, not
-  // to call tune_out with a name none is.
+  assert.ok(closing.error?.endsWith('cancelling delivers the diverted backlog, and channel_close closes it after that.'), closing.error);
+  assert.ok(closing.error?.includes('channelId "b:room", serverId "a"'), closing.error);
+  // An open the tune-out overtook during its round-trip says the same: the
+  // cancel by id and server.
   const registry = f.registry as unknown as {
     entryAt(ref: ChannelRef): unknown;
     lifecycleFailureText(action: 'open', entry: unknown, err: unknown): string;
   };
   const overtaken = registry.lifecycleFailureText('open', registry.entryAt({ serverId: 'a', channelId: 'b:room' }), new Error('the wire dropped'));
   assert.ok(overtaken.startsWith('Channel "b:room" on server "a" was tuned out meanwhile'), overtaken);
-  assert.ok(overtaken.includes("No channelId names it alone, so tune_out can't cancel it") && !overtaken.includes('Call tune_out'), overtaken);
+  assert.ok(overtaken.includes('Call tune_out with channelId "b:room", serverId "a" and mode "cancel"'), overtaken);
   // channel_list gives a name only where one picks the channel alone.
   const rows = (await f.registry.handleChannelToolCall('channel_list', {})).data as Array<{ id: string; name?: string; serverId: string }>;
   assert.deepEqual(rows.map((r) => [r.serverId, r.id, r.name]), [['a', 'b:room', undefined], ['c', 'b:room', 'c:b:room'], ['a:b', 'room', undefined]]);
@@ -863,10 +871,11 @@ test("a name one server's two channels answer to is refused without offering the
   assert.equal(close.error, 'Channel "s:room" could mean more than one channel on server "s" ("s:s:room", "room"), so nothing ran. ' +
     'Call again with channelId set to one of them.');
   // A >> target and the publish resolver say the same of it.
-  const target = f.registry.resolveProseTarget('s:room');
-  assert.deepEqual(target, { error: 'channel id "s:room" names more than one channel on server "s"', candidates: ['s:s:room', 'room'] });
-  assert.deepEqual(f.registry.resolveDestination({ channelId: 's:room' }),
-    { error: 'channel id "s:room" names more than one channel on server "s" ("s:s:room", "room")' });
+  const target = f.registry.resolveProseTarget('s:room') as { error?: string; candidates?: string[] };
+  assert.ok(target.error, 'refused');
+  assert.deepEqual(target.candidates, ['s:s:room', 'room']);
+  const destination = f.registry.resolveDestination({ channelId: 's:room' }) as { error?: string };
+  assert.ok(destination.error?.includes('"s:s:room"') && destination.error.includes('"room"'), destination.error);
   // With no id shared at all: server `a`'s `b:room` and server `b`'s `room`.
   const g = fixture([['a', 'b:room'], ['b', 'room']]);
   const publish = await g.registry.handleChannelToolCall('channel_publish', { channelId: 'b:room', content: 'x' });
@@ -926,8 +935,9 @@ test("a DM is listed by its label only where the label, given as a target, picks
       metadata: { channelType: 'dm', recipientId: '42', recipientName: 'antra' },
     }] } as never);
   }
-  assert.deepEqual(f.registry.resolveProseTarget('<@42>'),
-    { error: '"<@42>" matches several DMs', candidates: ['discord:dm:a', 'inbox-b'] });
+  const mention = f.registry.resolveProseTarget('<@42>') as { error?: string; candidates?: string[] };
+  assert.ok(mention.error, 'refused');
+  assert.deepEqual(mention.candidates, ['discord:dm:a', 'inbox-b']);
   // Each candidate, given as a target, names its own DM.
   for (const [candidate, serverId] of [['discord:dm:a', 'a'], ['inbox-b', 'b']] as const) {
     const named = f.registry.resolveProseTarget(candidate);
@@ -1049,7 +1059,23 @@ test("a fork's turn whose wake names no channel still has its home, so it's repl
     defaultPublishMessageId: 'm-latest',
   });
   assert.equal(f.registry.incomingFor('scout'), undefined, 'a turn with no channel at all has none');
-  assert.deepEqual(f.registry.incomingFor('fork'), { channel: a, messageId: 'm-latest', threadId: undefined });
+  const replyingTo = f.registry.incomingFor('fork');
+  assert.deepEqual([replyingTo?.channel, replyingTo?.messageId], [a, 'm-latest']);
+});
+
+test("a fork's home is its channel on its server, and one kept as a bare id is read as a wake without its server is: the one registered channel with that id, or the home on no server", async (t) => {
+  const { i } = await frameworkWith(t, ['slack', 'discord']);
+  const map = (i.channelRegistry as unknown as { channels: Map<string, unknown> }).channels;
+  map.set(destinationKey({ serverId: 'slack', channelId: 'lobby' }), {
+    serverId: 'slack', descriptor: { id: 'lobby', type: 'chat', label: '#lobby' }, open: true,
+  });
+  const home = (stored: ChannelRef | string | undefined) =>
+    (i as unknown as { channelOfHome(home: ChannelRef | string | undefined): ChannelRef | undefined }).channelOfHome(stored);
+  assert.deepEqual(home({ serverId: 'discord', channelId: 'general' }), { serverId: 'discord', channelId: 'general' }, 'a home with its server is that channel');
+  assert.deepEqual(home('lobby'), { serverId: 'slack', channelId: 'lobby' }, 'one server registers the id: its channel');
+  assert.deepEqual(home('general'), { serverId: '', channelId: 'general' }, 'two servers do: the home on no server');
+  assert.deepEqual(home('gone'), { serverId: '', channelId: 'gone' }, 'no server does: the home on no server');
+  assert.equal(home(undefined), undefined, 'no home');
 });
 
 test('beforeInference gives each server its own channel context in place of the shared one', async (t) => {
@@ -1118,6 +1144,7 @@ async function frameworkWith(
   const servers = new Map(order.map((id) => [id, {
     id,
     isConnected: true,
+    stopReconnecting() {},
     policyEstablished: true,
     grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
     sendChannelsPublish: async (p: { channelId: string; content: Array<{ text: string }> }) => {
@@ -1392,8 +1419,6 @@ for (const order of orders) {
     f.i.pendingRequests.push({ agentName: 'scout', reason: 'host:nudge', source: 'host', timestamp: Date.now(), channelId: 'general' });
     await f.framework.runUntilIdle();
     assert.equal(f.membrane.calls.length, 1, 'the wake ran one turn');
-    assert.equal(f.i.turnRouting.get('scout')?.triggerChannel, undefined);
-    assert.equal(f.i.turnRouting.get('scout')?.locus, undefined);
     assert.deepEqual(f.calls.filter((c) => c.includes('publish')), [], 'nothing is published on either server');
     // Nor is the fallback what the registry resolves for the turn, or what
     // the fallback's server is told the turn's outgoing channel is.
@@ -1509,11 +1534,10 @@ test("a message moves the turn's locus to its own server's channel, by the serve
 test("a gate wake's route goes to a fork only where it's the fork's own home, on its server", async (t) => {
   const f = await frameworkWith(t, ['a', 'b']);
   const fw = f.framework as unknown as {
-    conversationAgentHomes: Map<string, ChannelRef>;
+    registry: { register(spec: ReturnType<typeof conversationForkSpec>): unknown };
     mayTakeGateRoute(agentName: string, route: ChannelRef): boolean;
   };
-  fw.conversationAgentHomes.set('fork-a', a);
-  t.after(() => { fw.conversationAgentHomes.delete('fork-a'); });
+  fw.registry.register(conversationForkSpec('fork-a', { template: 'scout', homeChannel: a, idleTtlMs: 60_000 }));
   assert.equal(fw.mayTakeGateRoute('fork-a', a), true, "the fork's home");
   assert.equal(fw.mayTakeGateRoute('fork-a', b), false, "b's general is another channel, though it shares the id");
   assert.equal(fw.mayTakeGateRoute('scout', a), false, "a's general is the fork's conversation");
@@ -1524,14 +1548,12 @@ test("what an agent is told of a destination or a channel names it apart where i
   const f = await frameworkWith(t, ['a', 'b']);
   const fw = f.framework as unknown as {
     destinationText(d: ChannelRef & { label?: string }): string;
-    conversationAgentHomes: Map<string, ChannelRef>;
     recordReplyOpenFailedNotice(agent: string, serverId: string, channel: { channelId: string; label?: string }, selected?: 'subscription-policy'): void;
   };
   assert.equal(fw.destinationText({ ...b, label: '#general' }), '#general (b:general)');
   // A fork's channel_close is refused for any channel but its home: a
   // notice offers it only for that one, on its server.
-  fw.conversationAgentHomes.set('scout', a);
-  t.after(() => { fw.conversationAgentHomes.delete('scout'); });
+  t.after(bindAsConversationFork(f.framework, 'scout', a));
   fw.recordReplyOpenFailedNotice('scout', b.serverId, { channelId: b.channelId, label: '#general' }, 'subscription-policy');
   fw.recordReplyOpenFailedNotice('scout', a.serverId, { channelId: a.channelId, label: '#general' }, 'subscription-policy');
   const notices = f.framework.getAgent('scout')!.getContextManager().queryMessages({}).messages
@@ -1565,12 +1587,10 @@ test("a resend to a shared id lists its candidates in registration order, and on
 test("a fork's resend goes home on its server, and another server's channel with that id is refused, both named apart", async (t) => {
   const f = await frameworkWith(t, ['a', 'b']);
   const fw = f.framework as unknown as {
-    conversationAgentHomes: Map<string, ChannelRef>;
     proseDrafts: { hold(agent: string, segments: Array<{ text: string }>, reason: 'bounced'): { held: Array<{ id: string }> } };
     handleDraftsTool(agent: string, input: unknown): Promise<unknown>;
   };
-  fw.conversationAgentHomes.set('scout', b);
-  t.after(() => { fw.conversationAgentHomes.delete('scout'); });
+  t.after(bindAsConversationFork(f.framework, 'scout', b));
   const [draft] = fw.proseDrafts.hold('scout', [{ text: 'held words' }], 'bounced').held;
   const refused = ((await fw.handleDraftsTool('scout', { action: 'resend', draftIds: [draft!.id], destination: 'a:general' })) as
     { error?: string }).error ?? '';
@@ -1639,7 +1659,7 @@ for (const order of orders) {
 
   test(`a fork homed on b's general publishes there by the bare id, and a's channel is foreign to it (${registered})`, async (t) => {
     const f = await frameworkWith(t, order);
-    (f.framework as unknown as { conversationAgentHomes: Map<string, ChannelRef> }).conversationAgentHomes.set('scout', b);
+    bindAsConversationFork(f.framework, 'scout', b);
     const results = toolResults(t, f.framework);
     const dispatch = (f.framework as unknown as { dispatchChannelToolCall: Dispatcher }).dispatchChannelToolCall.bind(f.framework);
 
@@ -1741,6 +1761,7 @@ for (const order of orders) {
         return { ok: true, params: { cadenceSeconds: 300, backlogCap: 50, maxWakes: 3 } };
       },
       cancel: (serverId: string, channelId: string) => { entered.push(`cancel ${serverId} ${channelId}`); return { ok: true }; },
+      hasReader: () => true,
       stop: () => {},
     };
     // The tune-out's transport is another test's (tune-out-transport): here
@@ -1751,19 +1772,30 @@ for (const order of orders) {
     const results = toolResults(t, f.framework);
     const dispatch = (f.framework as unknown as { dispatchTuneOutToolCall: Dispatcher }).dispatchTuneOutToolCall.bind(f.framework);
 
+    // Every answer, a refusal too, comes once the handler's body settles.
+    const answered = async (id: string) => { for (let i = 0; i < 20 && !results.has(id); i++) await new Promise((r) => setImmediate(r)); };
     dispatch('scout', { id: 'shared', name: 'tune_out', input: { channelId: 'general' } });
+    await answered('shared');
+    // tune_out takes a serverId, so the refusal offers one.
     assert.equal(results.get('shared')?.error,
       `Channel "general" is on more than one server (${order.map((s) => `"${s}:general"`).join(', ')}), so nothing ran. ` +
-        'Call again with channelId set to one of them.');
+        `Call again with channelId set to one of them, or with serverId set to ${order.map((s) => `"${s}"`).join(' or ')}.`);
     dispatch('scout', { id: 'one', name: 'tune_out', input: { channelId: 'b:general' } });
     // A tune-out's answer waits for its transport (openForTuneOut).
     for (let i = 0; i < 20 && !results.has('one'); i++) await new Promise((r) => setImmediate(r));
     assert.deepEqual(results.get('one')?.data, { tunedOut: 'b:general', cadenceSeconds: 300, backlogCap: 50, maxWakes: 3 },
       'the result names the channel as the agent can name it back');
     dispatch('scout', { id: 'cancel', name: 'tune_out', input: { channelId: 'b:general', mode: 'cancel' } });
+    await answered('cancel');
     assert.deepEqual(results.get('cancel')?.data, { cancelled: 'b:general' });
     assert.deepEqual(entered, ['b general', 'cancel b general']);
     assert.deepEqual(opened, ['b general'], "the tune-out's transport is opened on b's channel");
+    // A cancel by id and server takes that server's channel: the form the
+    // tuned-out refusals give for a channel no name picks alone.
+    dispatch('scout', { id: 'pair', name: 'tune_out', input: { channelId: 'general', serverId: 'a', mode: 'cancel' } });
+    await answered('pair');
+    assert.equal(results.get('pair')?.error, undefined);
+    assert.deepEqual(entered.at(-1), 'cancel a general');
   });
 
   test(`tune_out inside the turn reads the id of the turn's own channel as that channel, and refuses it once its server withdrew it (${registered})`, async (t) => {
@@ -1775,6 +1807,7 @@ for (const order of orders) {
         return { ok: true, params: { cadenceSeconds: 300, backlogCap: 50, maxWakes: 3 } };
       },
       cancel: () => ({ ok: true }),
+      hasReader: () => true,
       stop: () => {},
     };
     (f.i.channelRegistry as unknown as { openForTuneOut(serverId: string, channelId: string): Promise<string | undefined> })
@@ -1791,6 +1824,7 @@ for (const order of orders) {
       "the turn's own channel, not a shared-id refusal");
     await (f.i.channelRegistry as unknown as ChannelRegistry).handleChanged('b', { removed: ['general'] });
     dispatch('scout', { id: 'gone', name: 'tune_out', input: { channelId: 'general' }, callerTurnId: 9 } as never);
+    for (let i = 0; i < 20 && !results.has('gone'); i++) await new Promise((r) => setImmediate(r));
     assert.equal(results.get('gone')?.error, '"general" is this turn\'s channel on server "b", which no longer registers it, so nothing ran, '
       + 'and nothing can run on it until that server registers it again.');
     assert.deepEqual(entered, ['b general'], "a's general isn't taken for it");
@@ -1803,6 +1837,7 @@ for (const order of orders) {
     (f.framework as unknown as { tuneOutCoordinator: unknown }).tuneOutCoordinator = {
       enter: () => ({ ok: true, params: { cadenceSeconds: 300, backlogCap: 50, maxWakes: 3 } }),
       cancel: () => ({ ok: true }),
+      hasReader: () => true,
       stop: () => {},
     };
     reg.openForTuneOut = async () => {
@@ -1859,7 +1894,7 @@ for (const order of orders) {
 
 test("a fork whose home its server no longer registers is told so, and not offered another server's channel", async (t) => {
   const f = await frameworkWith(t, ['a', 'b']);
-  (f.framework as unknown as { conversationAgentHomes: Map<string, ChannelRef> }).conversationAgentHomes.set('scout', b);
+  bindAsConversationFork(f.framework, 'scout', b);
   const results = toolResults(t, f.framework);
   const dispatch = (f.framework as unknown as { dispatchChannelToolCall: Dispatcher }).dispatchChannelToolCall.bind(f.framework);
   // b's general goes; a's general keeps the id.

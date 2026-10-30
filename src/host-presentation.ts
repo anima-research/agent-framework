@@ -29,7 +29,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { ToolDefinition } from './types/events.js';
-import { checkArgs, firstSentence, renderToolDefinition, signature } from './mcpl/tool-signature.js';
+import { checkArgs, renderToolDefinition, toolLine } from './mcpl/tool-signature.js';
 import { META_TOOL_NAMES } from './mcpl/toolset-host.js';
 
 /** The built-in toolset's name, as agents address it (`toolsets--open {toolset: "settings"}`). */
@@ -72,6 +72,8 @@ export interface HostPresentationDeps {
   isUtility(toolName: string): boolean;
   /** The resident agents of this host (no forks, ephemeral runs or the subconscious). */
   residents(): string[];
+  /** The agent whose presentation this one is shown: a derived agent that shows its parent's tool list, its parent; anyone else, itself. */
+  ownerOf?(agentName: string): string;
 }
 
 interface AgentState {
@@ -198,10 +200,15 @@ export class HostPresentation {
     return server?.configured === 'closed-tab' && !server.connected;
   }
 
+  /** The agent whose presentation `agentName` is shown (HostPresentationDeps.ownerOf). */
+  ownerOf(agentName: string): string {
+    return this.deps.ownerOf?.(agentName) ?? agentName;
+  }
+
   /** How a server is presented to an agent now. */
   presentation(agentName: string, serverId: string): ServerPresentation {
     if (this.isClosedTab(serverId)) return 'closed-tab';
-    const chosen = this.doc.agents[agentName]?.servers[serverId];
+    const chosen = this.doc.agents[this.ownerOf(agentName)]?.servers[serverId];
     if (chosen) return chosen;
     const configured = this.server(serverId)?.configured ?? 'full';
     return configured === 'closed-tab' ? 'tab' : configured;
@@ -218,7 +225,7 @@ export class HostPresentation {
   }
 
   isOpen(agentName: string, key: string): boolean {
-    return this.doc.agents[agentName]?.open.includes(key) ?? false;
+    return this.doc.agents[this.ownerOf(agentName)]?.open.includes(key) ?? false;
   }
 
   private setOpen(agentName: string, key: string, open: boolean): void {
@@ -267,10 +274,7 @@ export class HostPresentation {
   private announce(label: string, tools: ToolDefinition[], closeHint: string): string {
     const lines = [`${label} open: call these with ${META_TOOL_NAMES.act} {tool, args}; they aren't in your tool list.`];
     if (!tools.length) lines.push('  (none right now)');
-    for (const t of tools) {
-      const sentence = firstSentence(t.description);
-      lines.push(`  ${signature(t)}${sentence ? ` — ${sentence}` : ''}`);
-    }
+    for (const t of tools) lines.push(toolLine(t));
     lines.push(`${closeHint} closes it.`);
     return lines.join('\n');
   }
@@ -311,7 +315,7 @@ export class HostPresentation {
       const open = this.isOpen(agentName, BUILTIN_TOOLSET);
       return [
         `${this.builtinLabel} ${open ? 'open' : 'closed'}${open ? '' : ` — ${META_TOOL_NAMES.open} {toolset:"${BUILTIN_TOOLSET}"} opens it`}`,
-        ...tools.map((t) => `  ${signature(t)}${firstSentence(t.description) ? ` — ${firstSentence(t.description)}` : ''}`),
+        ...tools.map((t) => toolLine(t)),
       ].join('\n');
     }
     const { serverId } = which;
@@ -322,7 +326,7 @@ export class HostPresentation {
     const head = mode === 'full'
       ? `${this.tabLabel(serverId)} in your tool list${tools.length ? `; its hidden tools (${open ? 'open' : 'closed'}):` : '.'}`
       : `${this.tabLabel(serverId)} a tab, connected, ${open ? 'open' : `hidden — ${META_TOOL_NAMES.open} {server:"${serverId}"} opens it`}:`;
-    return [head, ...tools.map((t) => `  ${signature(t)}${firstSentence(t.description) ? ` — ${firstSentence(t.description)}` : ''}`)].join('\n');
+    return [head, ...tools.map((t) => toolLine(t))].join('\n');
   }
 
   /** `toolsets--look {tool}` for a host toolset's tool, or null when no host toolset has it. */
@@ -578,7 +582,7 @@ export class HostPresentation {
   openMarkers(agentName: string): Array<{ marker: string; reminder: () => string; dueWhenAbsent: true }> {
     if (!this.active(agentName)) return [];
     const out: Array<{ marker: string; reminder: () => string; dueWhenAbsent: true }> = [];
-    for (const key of this.doc.agents[agentName]?.open ?? []) {
+    for (const key of this.doc.agents[this.ownerOf(agentName)]?.open ?? []) {
       if (key === BUILTIN_TOOLSET) {
         out.push({
           marker: `${this.builtinLabel} open`,

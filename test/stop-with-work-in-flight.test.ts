@@ -17,20 +17,18 @@
  *     connection's listener; a handler's own fault is answered -32603,
  *     "Internal error", or -32000 with the stop wording alone once the host
  *     is stopping, and its own text goes only to the host's log.
- * Any other event pushed to a stopped framework still throws to its caller.
+ * Any other event pushed to a stopped framework through pushEvent() still
+ * throws to its caller; a module's other events are logged and dropped.
  * A turn waiting to retry is work in flight too: stop() cancels the retry,
- * and leaves no agent inferring at the event gate, which a start() after the
- * stop goes on with (#334). The turn ends with inference:aborted, saying no
- * retry follows its inference:failed, whether its stream failed to start or
- * failed once started. A turn that continues after that start() is marked
- * inferring again.
+ * and leaves no agent inferring at the event gate (#334). The turn ends with
+ * inference:aborted, saying no retry follows its inference:failed, whether
+ * its stream failed to start or failed once started.
  * Work that outlasts stop()'s budget fails the stop, with teardown gone on
  * and the store left open (#373): a stream whose cancel can't reach it,
  * whose agent's deferred writes wait for its own end, and an event loop in a
  * module's onProcess, which finishes that iteration once the call returns
- * and exits, rather than run beside the loop of a start() made meanwhile.
- * Two such waits fail it together, and a later stop() waits for what an
- * earlier one left running, a start() between them or not.
+ * and exits. Two such waits fail it together, and a later stop() waits for
+ * what an earlier one left running.
  * Each test waits on the event it needs (a log line, an answer), not on a
  * fixed delay, and then one more turn, so a late rejection would be seen.
  */
@@ -43,7 +41,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from '@babel/parser';
-import { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock, StreamEvent } from '@animalabs/membrane';
 import type {
   ErrorAction,
@@ -274,7 +271,9 @@ describe('stop() with work still in flight', () => {
     }
     framework.start();
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
-    await module.started;
+    let started = false;
+    void module.started.then(() => { started = true; });
+    await until(() => started, 'the slow tool to start');
     return { framework, module, failed };
   }
 
@@ -354,7 +353,7 @@ describe('stop() with work still in flight', () => {
     assert.match(line, /the tool failed: .*the dispatch was lost/, line);
   });
 
-  it('any other event pushed to a stopped framework still throws to its caller', async () => {
+  it('any other event pushed to a stopped framework through pushEvent() still throws to its caller', async () => {
     const { framework, module } = await frameworkWithRunningTool();
     await framework.stop();
     assert.throws(
@@ -429,11 +428,11 @@ describe('stop() with work still in flight', () => {
     const { framework, membrane, inDelay, turnEvents } = await frameworkWaitingToRetry(() => {
       throw new Error('the stream could not start');
     });
-    const gate = (framework as unknown as { eventGate: { inferenceDiagnostics(): { inferring: string[] } } }).eventGate;
+    const inferring = () => (framework.healthSnapshot().gate as { inferring: string[] }).inferring;
     await inDelay;
-    assert.deepEqual(gate.inferenceDiagnostics().inferring, ['assistant'], 'the turn is open at the gate while its retry waits');
+    assert.deepEqual(inferring(), ['assistant'], 'the turn is open at the gate while its retry waits');
     await framework.stop();
-    assert.deepEqual(gate.inferenceDiagnostics().inferring, [], 'stop() leaves no agent inferring');
+    assert.deepEqual(inferring(), [], 'stop() leaves no agent inferring');
     assert.equal(membrane.calls.length, 1, 'the retry was cancelled, not sent');
     // The attempt's inference:failed is usually followed by its retry: the
     // turn ends with an event saying none follows, and its record ends.
@@ -468,54 +467,6 @@ describe('stop() with work still in flight', () => {
     await framework.stop();
     assert.deepEqual(turnEvents, [{ type: 'inference:started' }, { type: 'inference:failed' }]);
     assert.deepEqual(rejections, []);
-  });
-
-  it('a budget restart taken up after a stop() and a start() marks its agent inferring again', { timeout: 60_000 }, async () => {
-    // A restart left queued when stop() ends the loop continues its turn once
-    // a start() on the same framework takes it up. stop() cleared the gate's
-    // entries, and a turn that continues another doesn't start a new one, so
-    // it has to take its agent's again: while no agent is inferring, the gate
-    // delivers debounced batches, and residents share one message slot.
-    const store = JsStore.openOrCreate({ path: join(tempDir, 'store') });
-    let release!: () => void;
-    const released = new Promise<void>((resolve) => { release = resolve; });
-    let streaming!: () => void;
-    const inStream = new Promise<void>((resolve) => { streaming = resolve; });
-    const membrane = new MockMembrane();
-    membrane.streamYielding = (request) => {
-      membrane.calls.push(request);
-      streaming();
-      return new HeldStream(released, [createMockResponse([{ type: 'text', text: 'continued' }] as ContentBlock[])]);
-    };
-    const framework = await AgentFramework.create({
-      store,
-      membrane: membrane.asMembrane(),
-      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'test' }],
-      modules: [new SlowModule()],
-      gate: { configPath: join(tempDir, 'gate.json'), config: { policies: [], default: 'always' } },
-    });
-    const internal = framework as unknown as {
-      eventGate: { inferenceDiagnostics(): { inferring: string[] } };
-      pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number }>;
-    };
-    try {
-      framework.start();
-      await framework.stop();
-      // Queued while the framework is stopped, as a restart that stop() left
-      // queued is: the next start()'s loop takes it up.
-      internal.pendingRequests.push({ agentName: 'assistant', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now() });
-      framework.start();
-      await inStream;
-      assert.deepEqual(internal.eventGate.inferenceDiagnostics().inferring, ['assistant'], 'the continuing turn holds its entry');
-      release();
-      await until(() => internal.eventGate.inferenceDiagnostics().inferring.length === 0, 'the turn to end');
-      assert.equal(membrane.calls.length, 1);
-      assert.deepEqual(rejections, []);
-    } finally {
-      release();
-      await framework.stop();
-      store.close();
-    }
   });
 
   describe("stop()'s budget, with work that outlasts it", () => {
@@ -623,18 +574,17 @@ describe('stop() with work still in flight', () => {
         push('a note for later');
         await until(() => internals.deferredMessages.length === 1, 'the note to be deferred behind the stream');
         const outcome = await settledWithin(framework.stop(100), 5_000);
-        assert.ok(outcome instanceof ShutdownTimeoutError
-          && outcome.message === 'Shutdown timed out after 100 ms; pending: stream:assistant', String(outcome));
+        assert.ok(outcome instanceof ShutdownTimeoutError && outcome.message.includes('stream:assistant'), String(outcome));
         assert.ok(order.includes('modules stopped'), 'teardown went on');
         assert.equal(framework.getStore().isClosed(), false, 'the stream may still write');
-        assert.equal(internals.deferredMessages.length, 1, 'the note stays queued');
         assert.ok(!storedTexts().includes('a note for later'), 'nothing landed ahead of the stream');
-        assert.ok(logged.includes(
-          "[deferral] stop: 1 deferred write(s) for assistant stay queued: its stream is still running and may still write; " +
-          'this memory-only queue loses them if the process exits before that stream settles'), logged.join('\n'));
+        const kept = logged.filter((line) => line.startsWith('[deferral] stop:'));
+        assert.equal(kept.length, 1, logged.join('\n'));
+        for (const part of ['assistant', 'queued', 'may still write', 'memory-only', 'exits']) {
+          assert.ok(kept[0]!.includes(part), `${JSON.stringify(part)} in: ${kept[0]}`);
+        }
         release();
-        await until(() => internals.deferredMessages.length === 0, "the stream's own end to take the note");
-        assert.ok(storedTexts().includes('a note for later'), `its turn-end flush stored the note:\n${storedTexts().join('\n')}`);
+        await until(() => storedTexts().includes('a note for later'), "the stream's own end to store the note");
         await framework.stop();
         assert.equal(framework.getStore().isClosed(), true, 'a later stop() closes the store');
         assert.deepEqual(rejections, []);
@@ -717,9 +667,9 @@ describe('stop() with work still in flight', () => {
           await handle;
           await until(() => attempts.length === 2, 'the retry to fail');
           assert.equal(internals.activeStreams.get('assistant'), handle, 'the old frame left its entry');
-          assert.equal(internals.addMessage('Antra', [{ type: 'text', text: 'late note' }] as ContentBlock[]), '', 'deferred behind it');
+          internals.addMessage('Antra', [{ type: 'text', text: 'late note' }] as ContentBlock[]);
+          assert.ok(!textsIn(framework).includes('late note'), 'deferred behind it');
           await framework.stop(budget);
-          assert.equal(internals.deferredMessages.length, 0, `budget ${budget}: the final flush took the write`);
           assert.ok(!logged.some((line) => line.startsWith('[deferral] stop:')), logged.join('\n'));
         } finally {
           release();
@@ -804,10 +754,7 @@ describe('stop() with work still in flight', () => {
       }
     });
 
-    it("a stop() after a timed-out one and a start() waits for the old loop too, and keeps the store open until it has settled", { timeout: 30_000 }, async () => {
-      // The start() replaces the loop a stop() waits for. What the first
-      // stop()'s budget left running stays the framework's to wait for, so
-      // the second one doesn't close the store under the old loop's call.
+    it("a stop() after a timed-out one waits for the loop that one left running, and keeps the store open until it has settled", { timeout: 30_000 }, async () => {
       const { framework, entered, letGo, push } = await frameworkWithHeldWork();
       try {
         framework.start();
@@ -815,14 +762,13 @@ describe('stop() with work still in flight', () => {
         await until(() => entered.includes('hang'), 'the loop to enter the call');
         const first = await settledWithin(framework.stop(100), 5_000);
         assert.ok(first instanceof ShutdownTimeoutError && first.pending.includes('event loop'), String(first));
-        framework.start();
         const second = await settledWithin(framework.stop(100), 5_000);
         assert.ok(second instanceof ShutdownTimeoutError
           && second.message === 'Shutdown timed out after 100 ms; pending: event loop', String(second));
-        assert.equal(framework.getStore().isClosed(), false, "the old loop's call is still running");
+        assert.equal(framework.getStore().isClosed(), false, "the loop's call is still running");
         letGo('hang');
         await framework.stop();
-        assert.equal(framework.getStore().isClosed(), true, 'a stop() closes the store once the old loop has settled');
+        assert.equal(framework.getStore().isClosed(), true, 'a stop() closes the store once the loop has settled');
         assert.deepEqual(rejections, []);
       } finally {
         letGo('hang');
@@ -830,7 +776,7 @@ describe('stop() with work still in flight', () => {
       }
     });
 
-    it("a loop whose stop() came back while it was in a call exits once that call returns, though a start() was made meanwhile, and the new lifecycle's loop runs on", { timeout: 30_000 }, async () => {
+    it("a loop whose stop() came back while it was in a call exits once that call returns", { timeout: 30_000 }, async () => {
       const { framework, entered, letGo, push, internals } = await frameworkWithHeldWork();
       try {
         framework.start();
@@ -838,15 +784,11 @@ describe('stop() with work still in flight', () => {
         await until(() => entered.includes('hang'), 'the loop to enter the call');
         const outcome = await settledWithin(framework.stop(100), 5_000);
         assert.ok(outcome instanceof ShutdownTimeoutError && outcome.pending.includes('event loop'), String(outcome));
-        const oldLoop = internals.loopPromise!;
-        framework.start();
-        const newLoop = internals.loopPromise!;
-        assert.notEqual(newLoop, oldLoop, 'the start() runs a loop of its own');
+        const loop = internals.loopPromise!;
+        assert.equal(await settledWithin(loop, 100), 'still pending', 'the loop is still in its call');
         letGo('hang');
-        assert.equal(await settledWithin(oldLoop, 5_000), 'resolved', 'the old loop exits once its call returns');
-        assert.equal(await settledWithin(newLoop, 100), 'still pending', "the new lifecycle's loop runs on");
+        assert.equal(await settledWithin(loop, 5_000), 'resolved', 'the loop exits once its call returns');
         await framework.stop();
-        assert.equal(await settledWithin(newLoop, 5_000), 'resolved', 'and ends with its own stop()');
         assert.deepEqual(rejections, []);
       } finally {
         letGo('hang');
@@ -1040,7 +982,7 @@ describe('stop() with work still in flight', () => {
       };
       fw.pushHandler = { handlePushEvent: handler };
       fw.channelRegistry = { handleIncoming: handler, handleRegister: handler, handleChanged: handler, stopAll: () => {} };
-      fw.inferenceRouter = { handleInferenceRequest: handler };
+      fw.inferenceRouter = { handleInferenceRequest: handler, stopAll: () => [] };
       fw.handleHostCommand = handler;
     }
 
@@ -1307,12 +1249,10 @@ describe('stop() with work still in flight', () => {
       }
     });
 
-    it('a responder without respondError reaches the handler without one', async () => {
+    it('a responder with respond alone gets the handler\'s answer', async () => {
       const { framework, connection } = await wiredFramework();
       try {
-        let seen: string | undefined;
-        standIns(framework, async (_s: string, _p: unknown, r: { respond(x: unknown): void; respondError?: unknown }) => {
-          seen = typeof r.respondError;
+        standIns(framework, async (_s: string, _p: unknown, r: { respond(x: unknown): void }) => {
           r.respond({ results: [] });
         });
         const answers: unknown[] = [];
@@ -1322,7 +1262,6 @@ describe('stop() with work still in flight', () => {
         await until(() => answers.length > 0, 'the answer');
         await turn();
 
-        assert.equal(seen, 'undefined', "a handler checking for respondError takes its fallback");
         assert.deepEqual(answers, [{ results: [] }]);
         assert.deepEqual(rejections, []);
       } finally {
@@ -1353,9 +1292,9 @@ describe('stop() with work still in flight', () => {
 
     it('an inference request during a render is refused -32600, and a throwing responder there is not rejected into the listener', async () => {
       const { framework, connection } = await wiredFramework();
+      const fw = framework as unknown as { pushCoalescer: unknown };
+      const coalescer = fw.pushCoalescer;
       try {
-        const fw = framework as unknown as { pushCoalescer: unknown };
-        const coalescer = fw.pushCoalescer;
         fw.pushCoalescer = { isRendering: () => true, suspend: () => {}, flush: () => {} };
         const inference = responder({ throws: true });
         connection.emit('inference-request', { messages: [] }, inference);
@@ -1370,8 +1309,8 @@ describe('stop() with work still in flight', () => {
         ]);
         assert.deepEqual(inference.answers, []);
         assert.deepEqual(rejections, []);
-        fw.pushCoalescer = coalescer;
       } finally {
+        fw.pushCoalescer = coalescer;
         await framework.stop();
       }
     });

@@ -1,12 +1,47 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { CONTEXT_MANAGER_TAGS, NOTICE_TAG } from '../src/notice-tags.js';
-import { cutToFit, markedText, markedTexts, markNoticeOpenings, nameToTypeBack, quotedValue, suppliedValue } from '../src/supplied-text.js';
+import { cutToFit, markedText, markedTexts, holdersOf, markNoticeOpenings, nameToTypeBack, quotedJson, quotedValue, suppliedValue } from '../src/supplied-text.js';
 import { convertBlocks } from '../src/mcpl/convert-block.js';
 import type { McplContentBlock } from '../src/mcpl/types.js';
 
 const BREAKS = ['\r\n', '\r', '\n', '\u000b', '\u000c', '\u0085', '\u2028', '\u2029'];
 const LINE_BREAK = /[\r\n\u000b\u000c\u0085\u2028\u2029]/;
+
+describe('marking many texts', () => {
+  it('marks each of many tagged texts as it marks one alone', () => {
+    const texts = Array.from({ length: 10_000 }, (_, i) => (i % 2 ? `[${NOTICE_TAG.routing}] ${i}` : `plain ${i}`));
+    const marked = markedTexts(texts);
+    assert.equal(marked.length, texts.length);
+    for (let i = 0; i < texts.length; i++) {
+      assert.equal(marked[i], i % 2 ? `\\${texts[i]}` : texts[i], String(i));
+    }
+    assert.deepEqual(markedTexts(['a', '', `[${NOTICE_TAG.routing}] b`]), ['a', '', `\\[${NOTICE_TAG.routing}] b`]);
+  });
+
+  it("finds the text that holds each of many openings with at most 2n·⌈log₂ n⌉ reads of the texts' starts, a bound that grows as n log n", () => {
+    const n = 2_000;
+    let reads = 0;
+    const starts = new Proxy(Array.from({ length: n }, (_, i) => i * 10), {
+      get(target, key, receiver) {
+        if (typeof key === 'string' && /^\d+$/.test(key)) reads++;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const places = Array.from({ length: n }, (_, i) => i * 10 + 3);
+    assert.deepEqual(holdersOf(starts, places), places.map((_, i) => i));
+    assert.ok(reads <= 2 * n * Math.ceil(Math.log2(n)), `${reads} reads of the starts for ${n} places`);
+  });
+});
+
+describe('JSON text written again', () => {
+  it('gives back JSON nested deeper than JSON.stringify can recurse, each string escaped as quotedValue escapes it', () => {
+    const depth = 20_000;
+    const json = `${'['.repeat(depth)}"a\u2028b"${']'.repeat(depth)}`;
+    assert.equal(quotedJson(json), `${'['.repeat(depth)}"a\\u2028b"${']'.repeat(depth)}`);
+    assert.equal(quotedJson('{"k":"[routing] x\u0085y","n":1.50}'), '{"k":"\\u005brouting] x\\u0085y","n":1.50}');
+  });
+});
 
 describe('notice openings in text the framework did not write', () => {
   it('marks the opening of every listed tag, as a notice writes it, wherever it stands', () => {

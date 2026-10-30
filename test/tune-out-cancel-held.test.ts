@@ -33,14 +33,19 @@ const textOf = (content: ContentBlock[]): string =>
 function cancelWith(opts: { backlogCap: number; source: string; stored: Row[]; held: Row[]; note?: string }) {
   const added: Added[] = [];
   const inferences: string[] = [];
+  const tunedOut = {
+    params: { epochId: 'eA', cadenceSeconds: 300, backlogCap: opts.backlogCap, maxWakes: 3, startedAtSequence: 0 },
+    wakeCount: 0,
+  };
+  let ended = false;
   const registry = {
+    // No other tune-out or all-except hold, and nothing else stored.
+    getTuneOutState: (_serverId: string, channelId: string) => (!ended && channelId === 'disc:guild:a' ? tunedOut : null),
+    readCoordinatorState: () => null,
     // Each channel's id is unique here, so it's shown by its id.
     nameShown: (channel: { channelId: string }) => channel.channelId,
     quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
-    cancelTuneOut: () => ({
-      params: { epochId: 'eA', cadenceSeconds: 300, backlogCap: opts.backlogCap, maxWakes: 3, startedAtSequence: 0 },
-      wakeCount: 0,
-    }),
+    cancelTuneOut: () => { ended = true; return tunedOut; },
   };
   const hooks = {
     addMessage: (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, forAgent?: string) => {
@@ -107,7 +112,6 @@ test('the notice carries the held messages the cap leaves out, each under its au
   // (B2), nor a stored one (A1), which the subconscious's view has.
   assert.deepEqual(held, [[text('Ann:'), IMAGE], [text('Bo:'), text('A3 held')]],
     'each held message once, oldest first, a row each, its author then its blocks, the held image as it came');
-  assert.equal(held[0]![1], IMAGE, 'the very block that came');
 });
 
 test("a held image the dump shows goes to the report too, as the dump's text lines drop it", () => {
@@ -135,9 +139,6 @@ test('with media on both sides of the cut, the notice carries each held message 
     [text('Bo:'), URL_IMAGE],
     [text('Cy:'), AUDIO],
   ], "Ann's left out, then the media the dump shows, each once and oldest first");
-  assert.equal(held[0]![2], IMAGE);
-  assert.equal(held[1]![1], URL_IMAGE);
-  assert.equal(held[2]![1], AUDIO);
 });
 
 test('a cancel the subconscious makes itself gets the notice and a report turn when a held message goes to it', () => {

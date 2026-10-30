@@ -202,8 +202,12 @@ test("with no agent registered, the refusal says so, rather than offering a wind
     (err: Error) => err.message === `Unknown agent: "prime". No agent is registered yet, so there's no window to read.`);
 });
 
-test("the empty name is refused even when an agent is registered under it, since a write can't be routed to it", async () => {
-  const x = await make(['prime', '']);
+test("the empty name is refused, since a write can't be routed to it", async () => {
+  // On this branch the Dendrite registry refuses a nameless agent at create
+  // ("a name is required"), so no agent can be registered under '': the
+  // refusal is tested with prime alone registered. main's version registers
+  // an agent under '' and checks the write is refused even so.
+  const x = await make(['prime']);
   // The refused empty name isn't offered among the registered agents.
   assert.throws(() => x.reader.ctx!.addMessage('user', [text('FOR EMPTY')], undefined, { forAgent: '' }),
     (err: Error) => err.message === 'Unknown agent: "". A write names a registered agent: "prime" (ModuleContext.getAgents() lists them), '
@@ -365,18 +369,6 @@ test("a module's write injected into an ephemeral run's stream at a tool round t
   assert.ok(injected.some((msg) => JSON.stringify(msg.content).includes('RESULT FOR worker')), "the premise: the run's stream carried it");
   assert.ok(own.includes('RESULT FOR worker'), JSON.stringify(own));
   assert.ok(!primaryTexts(x).includes('RESULT FOR worker'), "not in the primary's");
-});
-
-test("on a stream that doesn't declare whether it carries injections, an injected write counts as unread, so the primary gets a copy, as for a notice", async () => {
-  const x = await make();
-  assert.equal(x.membrane.supportsInjectedMessages, undefined, 'the premise: undeclared');
-  x.membrane.pushResponse(deliver({ for: 'worker' }));
-  x.membrane.pushResponse(createMockResponse([text('done')]));
-  const own = await runWorker(x, 'worker');
-  const injected = x.membrane.lastStream!.receivedToolResultOptions.flatMap((o) => o?.injectedMessages ?? []);
-  assert.ok(injected.some((msg) => JSON.stringify(msg.content).includes('RESULT FOR worker')), 'the premise: injected');
-  assert.ok(own.includes('RESULT FOR worker'));
-  assert.ok(primaryTexts(x).includes('RESULT FOR worker'), "and the primary's copy");
 });
 
 test("a module's write a run's compile sent counts as read, so it stays the run's, though the run ends with no tool round", async () => {

@@ -35,11 +35,15 @@ export function autoContinueNotice(opts: {
   stop: string;
   last: boolean;
   heldAfterSend?: boolean;
+  /** The run began with a heartbeat's turn, whose plain speech is held as drafts. */
+  heartbeat?: boolean;
 }): string {
   return `[${NOTICE_TAG.continue}] ${opts.agentName}, another turn starts now.` +
     (opts.heldAfterSend
       ? ' Some or all of your closing words last turn were held, not sent: a send that turn may already have posted where they were going.'
       : '') +
-    ` If you're done, ${opts.stop}; anything you write without it is sent as usual.` +
+    (opts.heartbeat
+      ? ` If you're done, ${opts.stop}; plain words you write without it and with no destination are held as drafts, as on the heartbeat's turn, and an explicit send reaches a channel.`
+      : ` If you're done, ${opts.stop}; anything you write without it is sent as usual.`) +
     (opts.last ? ' This is the last continuation in a row: after this turn you wait for the next event either way.' : '');
 }

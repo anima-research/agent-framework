@@ -33,6 +33,8 @@ export const NOTICE_TAG = {
   tuneOutWake: 'Tune-out wake',
   tuneOutCadence: 'Tune-out cadence',
   tuneOutCancelled: 'Tune-out cancelled',
+  focus: 'Focus',
+  agentLifecycle: 'Agent lifecycle',
   standingDispositions: 'Standing dispositions',
   channelInvitation: 'Channel invitation',
   system: 'system',

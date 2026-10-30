@@ -62,10 +62,10 @@ export class MockYieldingStream implements YieldingStream {
 
   /**
    * @param supportsInjectedMessages what each tool-calls event declares, as
-   *   membrane does after 0.5.87 (true on its native path, false on its XML
-   *   prefill path); left out, the event doesn't say, as on 0.5.87.
+   *   membrane does: true on its native path, the default here, and false on
+   *   its XML prefill path; 'undeclared' leaves the field out.
    */
-  constructor(private responses: NormalizedResponse[], private supportsInjectedMessages?: boolean) {
+  constructor(private responses: NormalizedResponse[], private supportsInjectedMessages: boolean | 'undeclared' = true) {
     this.processResponse(0);
   }
 
@@ -122,9 +122,7 @@ export class MockYieldingStream implements YieldingStream {
           // provider order — lets the framework store the assistant turn
           // verbatim and (≥0.5.72) route the round's prose live.
           roundContent: response.content,
-          ...(this.supportsInjectedMessages !== undefined
-            ? { supportsInjectedMessages: this.supportsInjectedMessages }
-            : {}),
+          ...(this.supportsInjectedMessages === 'undeclared' ? {} : { supportsInjectedMessages: this.supportsInjectedMessages }),
         },
       } as StreamEvent);
     } else {
@@ -201,7 +199,7 @@ export class MockMembrane {
   calls: NormalizedRequest[] = [];
   lastStream: MockYieldingStream | null = null;
   /** What the streams' tool-calls events declare (see MockYieldingStream). */
-  supportsInjectedMessages: boolean | undefined = undefined;
+  supportsInjectedMessages: boolean | 'undeclared' = true;
   private responseIndex = 0;
 
   pushResponse(response: NormalizedResponse): void {

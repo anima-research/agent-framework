@@ -315,6 +315,13 @@ export class ToolsetsModule implements Module {
     const args = isObj(call.input) ? call.input : {};
     try {
       checkSelectors(args);
+      // An agent shown another's tool list can't switch it: what it opened
+      // or closed would change its owner's list, or nothing it is shown.
+      const caller = call.callerAgentName;
+      const owner = caller && this.host ? this.host.ownerOf(caller) : caller;
+      if ((call.name === 'open' || call.name === 'close') && caller && owner !== caller) {
+        fail(`${caller} is shown ${owner}'s tools and can't ${call.name} a toolset; it reaches the toolsets ${owner} has open. Nothing changed.`);
+      }
       const hosted = await this.hostCall(call.name, args, call.callerAgentName);
       if (hosted) return hosted;
       const take = this.takerFor(call);

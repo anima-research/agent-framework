@@ -436,6 +436,11 @@ export interface MountState {
   /** Branch ID that was active when this mount last materialized */
   lastMaterializedBranchId: string | null;
   /**
+   * What the mount's last pass found of its root, as of `at` (an ISO time):
+   * the words it listed for a root it couldn't use, or null where it used it.
+   */
+  lastPassRoot?: { at: string; listed: string | null };
+  /**
    * The last on-agent-action scan, as of `at`: `complete` when it has
    * finished at all, `withinDeadline` when it finished before the deadline
    * released the round, `reason` for a miss or a failure, and `incomplete`

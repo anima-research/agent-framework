@@ -258,17 +258,10 @@ export interface AgentConfig {
      *   `thinking-binding-loss` ops alert, once per incident and again if a
      *   call drops more. The provider reports drops only on a request that
      *   carries the drop control; without it, such a block is refused;
-     * - the agent is told, in a `[reasoning] <agent>:` system notice of kind
-     *   `reasoning-loss` stored for it as the framework's other notices are,
-     *   when a committing compile leaves out a stored reply's reasoning at a
-     *   change of the request's head, at a branch's first compile, or in a
-     *   fold or other change to an earlier message that takes a reply of the
-     *   current turn, and, with `dropBlock` set too, when the provider drops
-     *   blocks it can place as the agent's stored replies or the stream's
-     *   rounds, once per incident and again when a call drops more. The
-     *   framework hears compiles through `Agent.onThinkingStrip` from the
-     *   agent's first stream on, unless a host has set its own, so an agent
-     *   driven only through the direct API is never told.
+     * - the agent is told nothing of reasoning left out or dropped: no line
+     *   about the mechanics of its own memory or reasoning is put in its
+     *   context. Hosts can observe compiles' strips through
+     *   `Agent.onThinkingStrip`;
      * The record and the notes
      * vouch for requests as agent-framework hands them to membrane, so a
      * membrane `beforeRequest` hook that changes a request must change every
@@ -339,6 +332,34 @@ export interface AgentConfig {
    *   speech ends with a private `[delivered] plain speech → no channel` receipt.
    */
   proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled';
+
+  /**
+   * Stored participants that are this agent's own voice, in addition to its
+   * name: their turns are presented to the model as this agent's assistant
+   * turns. A derived agent sets this to the agent it inherited from, so the
+   * parent's turns read as its own history. Model-facing role assignment
+   * only, applied at request assembly — stored authorship is never rewritten.
+   */
+  selfParticipants?: string[];
+
+  /**
+   * The participant name this agent's own turns are presented under at
+   * request assembly. Defaults to `name`. A derived agent that should share
+   * its parent's provider prefix sets the parent's name, so the two
+   * requests are identical in formatters that render participant names as
+   * well as in those that only assign roles. New turns are still STORED
+   * under the agent's own name.
+   */
+  presentAs?: string;
+
+  /**
+   * Tools refused when this agent calls them, although they stay advertised.
+   * Restricts a derived agent without changing the tool block at the front
+   * of its request — removing a tool from `allowedTools` instead would
+   * change those bytes and forfeit the provider prefix it shares with its
+   * parent.
+   */
+  denyToolsAtDispatch?: string[];
 
   /**
    * Fail-closed containment for a text response whose entire visible prose is
@@ -511,7 +532,8 @@ export interface InferenceOptions {
  * `supportsInjectedMessages` is what the stream declared with the round's
  * tool calls (membrane's `ToolContext.supportsInjectedMessages`): whether it
  * can carry messages injected with that round's results. It's absent when
- * the stream doesn't say, as on membrane 0.5.87 and earlier.
+ * the stream doesn't say, which reads as a stream that can't, and when there
+ * is no stream, as for the direct API.
  */
 export type AgentState =
   | { status: 'idle' }
@@ -582,8 +604,9 @@ export interface InferenceRequest {
    * the turn's auto-published plain-text speech here so a single TRUNK agent
    * replies in the channel it is answering — not the process-global most-recent-
    * inbound locus, which a concurrent message elsewhere can hijack (item-3
-   * redux). Undefined for non-channel wakes (heartbeat, timers, module events),
-   * which correctly fall back to the global default channel, except an
+   * redux). Undefined for non-channel wakes (heartbeat, timers, module events).
+   * A heartbeat's turn takes no channel at all, and holds its plain speech as
+   * drafts; any other falls back to the global default channel, except an
    * ephemeral run's (a subagent's), which takes no global fallback.
    */
   channelId?: string;
@@ -606,6 +629,17 @@ export interface InferenceRequest {
    * it starts. Hosts don't set it.
    */
   autoContinueRun?: AutoContinueRun;
+  /**
+   * Framework-set: whether this wake's turn is a heartbeat's, which has no
+   * channel and holds its plain speech as drafts. True on a wake that
+   * continues a heartbeat's turn with no channel of its own (an autoContinue
+   * continuation, a bounce's resend wake, a ` !` continuation, and a re-arm,
+   * which copies its trigger), and on a merged batch whose causes include a
+   * heartbeat's wake and name no channel; false on a merged batch with none,
+   * so the batch's first request doesn't decide it. Unset, a wake is a
+   * heartbeat's when its `source` is `heartbeat`. Hosts don't set it.
+   */
+  heartbeatTurn?: boolean;
   /**
    * True when the triggering message explicitly addressed the agent (mention,
    * reply-to-bot, DM — `chat:addressed` in MCPL RFC-001 terms). When a wake

@@ -50,7 +50,6 @@ export interface ReferenceTestimony {
   name?: string;
   disposition?: ReferenceDisposition;
   rejectedFields: string[];
-  truncatedFields: string[];
   /** Set when the testimony is an MCP resource_link's, which claims no
    *  digest, expiry or disposition. A link is registered but never fetched
    *  on the side, and its testimony never replaces a record's (register). */
@@ -182,8 +181,8 @@ function parseReferenceFields(block: Record<string, unknown>): BlockClassificati
   if (block.uri.length > REFERENCE_LIMITS.uri) {
     return { kind: 'invalid', shown: REFERENCE_LINK_TOO_LONG_TEXT };
   }
-  const out = { rejected: [] as string[], truncated: [] as string[] };
-  const t: ReferenceTestimony = { uri: block.uri, rejectedFields: out.rejected, truncatedFields: out.truncated };
+  const out = { rejected: [] as string[] };
+  const t: ReferenceTestimony = { uri: block.uri, rejectedFields: out.rejected };
   t.mimeType = takeString(block.mimeType, 'mimeType', out);
   t.name = takeString(block.name, 'name', out);
   t.expiresAt = takeString(block.expiresAt, 'expiresAt', out);
@@ -835,7 +834,7 @@ export class ReferenceRegistry {
    *  entry for the id, if any, is in force again; with none, a stub reads the
    *  id's references as an unknown server's. After a removal, that framework's
    *  fetch refuses them too. A stopped framework keeps its configs, so its
-   *  fetcher, called before it starts again, can still dial them. */
+   *  fetcher can still dial them. */
   forgetServerAddress(serverId: string, owner: object): void {
     const entries = (this.addresses.get(serverId) ?? []).filter((e) => e.owner !== owner);
     if (entries.length > 0) this.addresses.set(serverId, entries);

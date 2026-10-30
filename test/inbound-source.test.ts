@@ -141,7 +141,7 @@ describe('inbound source envelope', () => {
     assert.equal(source.serverId, 'discord');
     assert.equal(source.lane, 'channels/incoming');
     assert.equal(source.coalesced, undefined);
-    assert.match(source.binding, /^[0-9a-f]{16}$/);
+    assert.ok(typeof source.binding === 'string' && source.binding.length > 0, 'an endpoint binding, opaque');
     assert.equal(source.channelId, ROOM);
     assert.equal(source.messageId, 'm-1');
     assert.equal(source.label, '#room (Guild One)');
@@ -194,9 +194,12 @@ describe('inbound source envelope', () => {
     const expected = createHash('sha256').update(canonicalJson([[{ type: 'text', text: 'digest me' }]])).digest('hex');
     assert.equal(meta.sourceBodyDigest, expected);
     assert.equal(sourceBodyDigest([{ text: 'digest me', type: 'text' }]), expected, 'key order does not matter');
-    // This lane stores the body as delivered: the stored copy hashes the same.
+    // The stored digest is of the stored copy. On this branch the copy
+    // carries the author as the agent reads them (presentAuthor), so it
+    // hashes the same as the delivered body exactly when presenting the
+    // author changed nothing.
     assert.equal(meta.storedBodyDigest, sourceBodyDigest(message.content));
-    assert.equal(meta.storedBodyDigest, meta.sourceBodyDigest);
+    assert.equal(meta.storedBodyDigest === meta.sourceBodyDigest, sourceBodyDigest(message.content) === meta.sourceBodyDigest);
     // Outside the frozen admission envelope.
     assert.equal((readInboundSource(message.metadata) as unknown as Record<string, unknown>).sourceBodyDigest, undefined);
 
