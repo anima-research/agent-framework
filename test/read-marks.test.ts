@@ -1,9 +1,10 @@
 /**
  * Read marks (src/read-marks.ts, #291): a mark taken in legacy mode covers
- * a row by its own sequence, as the `{ branch, sequence }` watermarks did;
- * one taken in presented mode covers a row by its index ordinal, strictly
- * below the index length taken with it. Run over a real ContextManager on a
- * temp chronicle store.
+ * a row by its own sequence, as the `{ branch, sequence }` watermarks did,
+ * while the window is the record, and once it is written down, the rows the
+ * window held by its head where they still stand; one taken in presented
+ * mode covers a row by its index ordinal, strictly below the index length
+ * taken with it. Run over a real ContextManager on a temp chronicle store.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -14,7 +15,7 @@ import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, PassthroughStrategy, type StoredMessage } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import {
-  coverTest, covers, describeReadMark, markAtOrAfter, readMarkForTest, readMarkOf, type ReadMark,
+  coverTest, covers, describeReadMark, markAtOrAfter, readMarkForTest, readMarkOf, type MarkCm, type ReadMark,
 } from '../src/read-marks.js';
 import { positionIn, windowEnd, windowMarkOf, type Position } from '../src/presentation.js';
 
@@ -104,16 +105,59 @@ describe('read marks', () => {
     } finally { sub.close(); r.cleanup(); }
   });
 
-  it('a legacy mark taken before the write-down still covers by sequence after it', async () => {
+  it('a legacy mark read after the write-down covers the rows the window held by its head, where they still stand, as a presented mark through them would', async () => {
     const r = await rig();
     try {
-      const a = r.cm.addMessage('user', text('a'));
+      const add = (t: string) => r.cm.addMessage('user', text(t));
+      const [a, b, c] = [add('a'), add('b'), add('c')];
       const mark = readMarkOf(r.cm)!;
-      const b = r.cm.addMessage('user', text('b'));
+      const d = add('d, stored after the mark, before the write-down');
       r.cm.presentRows([]);
       assert.equal(r.cm.windowMode(), 'presented');
-      assert.equal(covers(mark, r.cm, r.row(a)), 'covered');
-      assert.equal(covers(mark, r.cm, r.row(b)), 'not-covered');
+      const e = add('e');
+      r.cm.presentRows([e]);
+      // What a mark taken in presented mode as the write-down left the
+      // window, through the legacy mark's head, covers: the rows below d.
+      const throughHead = readMarkForTest('main', r.store.currentSequence(), r.cm.ordinalOf(d)!);
+      const reads = (m: ReadMark) => [a, b, c, d, e].map((id) => covers(m, r.cm, r.row(id)));
+      assert.deepEqual(reads(mark), ['covered', 'covered', 'covered', 'not-covered', 'not-covered']);
+      assert.deepEqual(reads(mark), reads(throughHead));
+      r.cm.retractRows([b]);
+      assert.equal(covers(mark, r.cm, r.row(b)), 'not-covered', 'taken out of the window');
+      r.cm.presentRows([b]);
+      assert.ok(r.cm.ordinalOf(b)! > r.cm.ordinalOf(e)!, 'b is presented again, after e');
+      assert.deepEqual(reads(mark), ['covered', 'not-covered', 'covered', 'not-covered', 'not-covered'],
+        "presented again after the mark's head: not covered, where a compare by sequence would cover it");
+      assert.deepEqual(reads(mark), reads(throughHead));
+      const atWriteDown = coverTest(mark, { currentBranch: () => r.cm.currentBranch(), windowMode: () => 'legacy' as const });
+      assert.equal(atWriteDown(r.row(b)), 'covered', 'read against a window that is the record, it covers by sequence');
+    } finally { r.cleanup(); }
+  });
+
+  it("a legacy mark's reading of a presented window reads where the window holds a row a few times per test, whatever the window's length", async () => {
+    const r = await rig();
+    try {
+      const ids = Array.from({ length: 64 }, (_, i) => r.cm.addMessage('user', text(`row ${i}`)));
+      const mark = readMarkForTest('main', r.row(ids[39]!).sequence, null);
+      r.cm.presentRows([]);
+      let reads = 0;
+      const counting: MarkCm = {
+        currentBranch: () => r.cm.currentBranch(), windowMode: () => r.cm.windowMode(),
+        ordinalOf: (id) => r.cm.ordinalOf(id), indexLength: () => r.cm.indexLength(),
+        getPresentedMessages: () => r.cm.getPresentedMessages(),
+        branchSequenceOf: (id) => { reads++; return r.cm.branchSequenceOf(id); },
+      };
+      const test = coverTest(mark, counting);
+      const covered = ids.filter((id) => test(r.row(id)) === 'covered');
+      assert.deepEqual(covered, ids.slice(0, 40), 'the rows at or below the head');
+      assert.ok(reads <= 7, `a binary search over the window: ${reads} reads`);
+      const failing: MarkCm = { ...counting, branchSequenceOf: () => { throw new Error('closed'); } };
+      const failed = coverTest(mark, failing);
+      assert.equal(failed(r.row(ids[0]!)), 'doubt', "a read of the window that throws can't say");
+      assert.equal(failed(r.row(ids[63]!)), 'not-covered', 'a row stored after the head needs no read');
+      // A double that can't say where its window holds a row is read by sequence.
+      const bare = coverTest(mark, { currentBranch: () => r.cm.currentBranch(), windowMode: () => 'presented' as const, ordinalOf: () => 99 });
+      assert.deepEqual([bare(r.row(ids[39]!)), bare(r.row(ids[40]!))], ['covered', 'not-covered']);
     } finally { r.cleanup(); }
   });
 
@@ -128,6 +172,16 @@ describe('read marks', () => {
       const presented = readMarkForTest('elsewhere', 100, 3);
       assert.equal(covers(presented, r.cm, r.row(a), { partAt: 100 }), 'doubt', 'a presented mark across a branch point');
       assert.equal(covers(null, r.cm, r.row(a)), 'doubt', 'no mark');
+      // Read across against a presented window: the rows it held, where they
+      // stand, through the lower of the head and the branch point.
+      const b = r.cm.addMessage('user', text('b'));
+      r.cm.presentRows([]);
+      const across = { partAt: r.row(b).sequence };
+      assert.deepEqual([a, b].map((id) => covers(mark, r.cm, r.row(id), across)), ['covered', 'covered']);
+      r.cm.retractRows([a]);
+      r.cm.presentRows([a]);
+      assert.deepEqual([a, b].map((id) => covers(mark, r.cm, r.row(id), across)), ['not-covered', 'covered'],
+        'a row presented again after the branch point is not covered');
     } finally { r.cleanup(); }
   });
 

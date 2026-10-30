@@ -217,7 +217,7 @@ import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type Stream
 import { asNextRequestCarries, roundRows, type RoundRow, type SentRow } from './sent-rows.js';
 import { ReasoningLossTeller } from './reasoning-loss.js';
 import { AgentPresentation, asCompiled, bearingOf, heldFromResidents, isInjectableMidTurn, readerFacts, recordedReaderFacts, type PresentationOccasion, type ReaderFacts } from './presentation.js';
-import { coverTest, covers, coversByOrdinal, readMarkThrough, type MarkedRow, type ReadMark } from './read-marks.js';
+import { coverTest, covers, readMarkThrough, type MarkedRow, type ReadMark } from './read-marks.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
 import { STORED_INJECTION_KEY, STORED_INJECTION_KIND, asStoredRow, hasRenderedContent, isAnotherAgentsInjection, isOwnInjection, isStoredKind, storedInjectionMarkOf, unitHash, type StoredInjectionMark } from './stored-injections.js';
 
@@ -1481,14 +1481,17 @@ function freshTurnRouting(): TurnRouting {
  * presented to it, in their order, once its context presents rows, #291; in
  * legacy mode the record), through the rows its consumed mark doesn't cover
  * (coverTest: in presented mode, a row at or past the index length the mark
- * took; a mark taken in legacy mode, a row stored after its head) and that it
- * sees, up to the newest row the mark covers or the newest it sees under its
- * own name; from the oldest of them that holds more than tool results to the
- * newest. A row it doesn't see is passed over. Undefined when there is none,
- * and when the mark can't say (none, one on another branch, or one taken in
- * presented mode read against a manager that no longer presents). The ids
- * name a range of the window: a strategy reads a pin by its rows' positions
- * in its message view, which is the window, in its order (pinRange).
+ * took, or, for a mark taken before the window was written down, a row the
+ * window didn't hold where it stands by the mark's head, such as an older row
+ * presented again since; in legacy mode, a row stored after the head) and
+ * that it sees, up to the newest row the mark covers or the newest it sees
+ * under its own name; from the oldest of them that holds more than tool
+ * results to the newest. A row it doesn't see is passed over. Undefined when
+ * there is none, and when the mark can't say (none, one on another branch,
+ * or one taken in presented mode read against a manager that no longer
+ * presents). The ids name a range of the window: a strategy reads a pin by
+ * its rows' positions in its message view, which is the window, in its order
+ * (pinRange).
  */
 function turnInputs(
   cm: ContextManager, mark: ReadMark | null, agentName: string, sees: (metadata: unknown) => boolean,
@@ -14956,17 +14959,18 @@ export class AgentFramework {
   /**
    * The agent's marks (Agent.heldReadMarks) that cover rows of `tail` by
    * their ordinals in its window, read before an undo takes them out, each
-   * with the bodies it covers. A mark taken in legacy mode covers by
-   * sequence, which a redo leaves as it was, and one on another branch
-   * can't say, so neither is kept. A failure to read them is logged and
-   * keeps none: the redone rows then read as unread until the agent's
-   * next mark, as they did before redo gave marks again.
+   * with the bodies it covers. A mark taken in legacy mode is one of them
+   * where it covers such rows: the window is presented (undo refuses one
+   * that isn't), and there it covers the rows the window held by its head
+   * where they stand (coverTest), which a redo puts back at new ordinals
+   * past it. One on another branch can't say, and isn't kept. A failure to
+   * read them is logged and keeps none: the redone rows then read as unread
+   * until the agent's next mark, as they did before redo gave marks again.
    */
   private marksOverTail(agent: Agent, cm: ContextManager, tail: readonly WindowBody[]): RedoEntry['marks'] {
     const marks: RedoEntry['marks'] = [];
     try {
       for (const mark of agent.heldReadMarks()) {
-        if (!coversByOrdinal(mark)) continue;
         const cover = coverTest(mark, cm);
         const covered = new Set(tail.filter((row) => cover(row) === 'covered').map((row) => row.id));
         if (covered.size > 0) marks.push({ mark, covered });

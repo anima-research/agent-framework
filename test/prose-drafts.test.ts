@@ -18,7 +18,7 @@ import type { Module } from '../src/index.js';
 import { ProseDraftStore, draftState, PROSE_DRAFT_RECORD_TYPE } from '../src/prose-drafts.js';
 import { destinationKey } from '../src/mcpl/channel-registry.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
-import { headOf, legacyMarkFrom, newestCovered, rowAt } from './helpers/read-mark-rows.js';
+import { bySequence, headOf, legacyMarkFrom, newestCovered, rowAt } from './helpers/read-mark-rows.js';
 
 const ROOM = 'discord:g1:room';
 const GENERAL = 'discord:g1:general';
@@ -829,7 +829,8 @@ describe('held prose drafts, end to end', () => {
         scriptToolCall(agent: string, tool: string, argsJson: string, context: Record<string, unknown>): Promise<{ ok: boolean; json: string }>;
       };
       const scout = h.framework.getAgent('scout')!;
-      const cm = scout.getContextManager();
+      // Its marks are asked of rows built from a sequence (rowAt): read by sequence.
+      const cm = bySequence(scout.getContextManager());
       const room = destinationKey({ serverId: 'discord', channelId: ROOM });
       const now = scout.getConsumedWatermark()!;
       // What the agent had read when the script started: a mark just before now's.

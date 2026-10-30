@@ -15,10 +15,27 @@
  * next row will take).
  *
  * A mark keeps both: the head, as before, and the index length when the
- * manager was in presented mode. A mark taken in legacy mode covers by
- * sequence, whatever the manager's mode is when it is read, since the window
- * it stood for was the record up to its head; so a mark taken before a
- * write-down still reads right after it, and nothing has to be converted.
+ * manager was in presented mode. A mark taken in legacy mode stands for a
+ * window that was the record up to its head. Read against a manager still
+ * in legacy mode, it covers by sequence. Read once the branch's window is
+ * written down (presented mode), it covers the rows the window has held,
+ * where they stand now, since its head or before: the rows a branch cut at
+ * the head would keep in its window (ContextManager.branchSequenceOf at or
+ * below the head). That sequence is a row's own for a row the write-down put
+ * in the window, and the write that presented it for any other, so it only
+ * grows along the window: the rows a cut at the head keeps are the window's
+ * first ones, and the mark reads as one taken in presented mode whose length
+ * is the ordinal of the first row past them (windowLengthAt). For a mark taken
+ * before the write-down, which lists the record in record order, those are
+ * the rows the write-down put in the window at or below the head that are
+ * still where it put them. A row stored after the head isn't covered, and
+ * neither is a row taken out of the window since, or one presented again,
+ * at a new ordinal past the write-down, which a compare by sequence would
+ * cover: a reader walking the window back from its newest row (the turn's
+ * inputs, turnInputs) would stop at that older row and leave the rows the
+ * agent hadn't read before it out. Nothing is converted in place: every
+ * reader reads a mark through coverTest, which makes the same reading for
+ * each.
  *
  * The mark is opaque: its fields are keyed by symbols this module keeps, so
  * a `mark.sequence` read, a hand-built `{ branch, sequence }`, or a compare
@@ -47,7 +64,10 @@ const LENGTH: unique symbol = Symbol('read-mark length');
 /**
  * Where an agent had read to on one branch: the store's head then, and the
  * window's index length when the agent's manager was in presented mode (null
- * in legacy mode). Read only through this module.
+ * in legacy mode). Read only through this module (coverTest): a mark taken in
+ * legacy mode covers by sequence while its window is the record, and, once
+ * the window is written down, as a mark taken in presented mode that covers
+ * the rows the window held by its head where they still stand.
  */
 export interface ReadMark {
   readonly branch: string;
@@ -65,7 +85,8 @@ export type Cover = 'covered' | 'not-covered' | 'doubt';
 
 /** What a mark is taken from and read against: a context manager, or a double of one. */
 export type MarkCm = Partial<Pick<ContextManager,
-  'currentBranch' | 'getStore' | 'getAllMessages' | 'getMessageCount' | 'windowMode' | 'indexLength' | 'ordinalOf'>>;
+  'currentBranch' | 'getStore' | 'getAllMessages' | 'getMessageCount' | 'windowMode' | 'indexLength' | 'ordinalOf'
+  | 'getPresentedMessages' | 'branchSequenceOf'>>;
 
 /** A row as a cover reads it. */
 export type MarkedRow = Pick<StoredMessage, 'id' | 'sequence'>;
@@ -133,10 +154,13 @@ export function readMarkThrough(cm: MarkCm, length: number): ReadMark | null {
 }
 
 /**
- * Whether a mark covers rows by their ordinals in a window (one taken in
- * presented mode): a row taken out of the window and presented again, at a
- * new ordinal past its length, leaves it. A mark taken in legacy mode
- * covers by sequence, which no presentation moves.
+ * Whether a mark was taken in presented mode: it keeps the window's index
+ * length, and covers rows by their ordinals there, so a row taken out of the
+ * window and presented again, at a new ordinal past its length, leaves it.
+ * A mark taken in legacy mode keeps none: it covers by sequence while its
+ * window is the record, and, once the window is written down, by ordinal
+ * too, below the first row the window didn't hold by its head (coverTest),
+ * so a row presented again after it leaves it in the same way.
  */
 export function coversByOrdinal(mark: ReadMark | null): boolean {
   return !!mark && mark[LENGTH] !== null;
@@ -150,10 +174,20 @@ export function coversByOrdinal(mark: ReadMark | null): boolean {
  * - no mark: doubt;
  * - a mark on another branch than the reader's: doubt, except that a mark
  *   taken in legacy mode, read `across` a branch point (`partAt`, the last
- *   sequence the two branches share), covers a row at or below both its head
- *   and the branch point, and no other;
- * - a mark taken in legacy mode: a row at or below its head is covered,
- *   whatever the reader's mode is now;
+ *   sequence the two branches share), reads as one on the reader's branch
+ *   (below) through the lower of its head and the branch point;
+ * - a mark taken in legacy mode, read against a reader in legacy mode: a
+ *   row at or below its head is covered;
+ * - a mark taken in legacy mode, read against a reader in presented mode:
+ *   a row the window has held where it stands since the head or before is
+ *   covered (windowLengthAt: the window's rows below the ordinal of its first
+ *   row a branch cut at the head wouldn't keep), and no other: not a row
+ *   stored after the head, out of the window, or presented after the head,
+ *   again or for the first time. A reader that can't say where its window
+ *   held a row (a double without ordinalOf, getPresentedMessages,
+ *   branchSequenceOf or indexLength) is read by sequence, as in legacy
+ *   mode; a read of the window that throws is doubt for the rows at or
+ *   below the head;
  * - a mark taken in presented mode, read against a reader no longer in it:
  *   doubt;
  * - else a row is covered when its ordinal is below the mark's length:
@@ -174,16 +208,76 @@ export function coverTest(mark: ReadMark | null, reader: MarkCm, across?: { part
   const length = mark[LENGTH];
   if (branch !== mark.branch) {
     if (!across || length !== null) return () => 'doubt';
-    const through = Math.min(head, across.partAt);
-    return (row) => (row.sequence <= through ? 'covered' : 'not-covered');
+    return legacyCover(reader, presented, Math.min(head, across.partAt));
   }
-  if (length === null) return (row) => (row.sequence <= head ? 'covered' : 'not-covered');
+  if (length === null) return legacyCover(reader, presented, head);
   if (!presented || typeof reader.ordinalOf !== 'function') return () => 'doubt';
-  const ordinalOf = reader.ordinalOf.bind(reader);
+  return byOrdinal(reader.ordinalOf.bind(reader), length);
+}
+
+function byOrdinal(ordinalOf: (id: MarkedRow['id']) => number | undefined, length: number): (row: MarkedRow) => Cover {
   return (row) => {
     const ordinal = ordinalOf(row.id);
     return ordinal !== undefined && ordinal < length ? 'covered' : 'not-covered';
   };
+}
+
+/**
+ * How a mark taken in legacy mode covers through `through` (its head, or the
+ * lower of its head and a branch point): by sequence against a reader in
+ * legacy mode, or one that can't say where its window held a row; against
+ * one in presented mode, by ordinal below windowLengthAt(reader, through),
+ * read once, at the first row that needs it. A row stored after `through`
+ * entered the window after it, wherever it stands, so it is not covered
+ * without that read.
+ */
+function legacyCover(reader: MarkCm, presented: boolean, through: number): (row: MarkedRow) => Cover {
+  const bySequence = (row: MarkedRow): Cover => (row.sequence <= through ? 'covered' : 'not-covered');
+  if (!presented || typeof reader.ordinalOf !== 'function' || typeof reader.getPresentedMessages !== 'function'
+    || typeof reader.branchSequenceOf !== 'function' || typeof reader.indexLength !== 'function') {
+    return bySequence;
+  }
+  let cover: ((row: MarkedRow) => Cover) | undefined;
+  return (row) => {
+    if (row.sequence > through) return 'not-covered';
+    if (!cover) {
+      const length = windowLengthAt(reader, through);
+      cover = length === null ? () => 'doubt' : byOrdinal(reader.ordinalOf!.bind(reader), length);
+    }
+    return cover(row);
+  };
+}
+
+/**
+ * The index length a mark taken in presented mode would hold to cover the
+ * rows `reader`'s window (in presented mode) has held, where they stand
+ * now, since sequence `through` or before: the ordinal of the window's first
+ * row that a branch cut at `through` wouldn't keep in its window, or the
+ * index length when such a cut keeps them all. A cut keeps a row when its
+ * branchSequenceOf (the sequence a cut has to reach for its window to hold
+ * the row) is at or below `through`: a row's own sequence (its body's last
+ * shard's) for a row the write-down put in the window, which lists the
+ * record in record order, and the write that presented it for any other,
+ * which comes after the write-down and after every write that presented a
+ * row before it. So that sequence only grows along the window, and the
+ * first row past `through` is found by a binary search over it: a few reads
+ * per mark, whatever the window's length. Null when a read throws.
+ */
+function windowLengthAt(reader: MarkCm, through: number): number | null {
+  try {
+    const window = reader.getPresentedMessages!();
+    let low = 0;
+    let high = window.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (reader.branchSequenceOf!(window[middle]!.id) <= through) low = middle + 1;
+      else high = middle;
+    }
+    if (low === window.length) return reader.indexLength!();
+    return reader.ordinalOf!(window[low]!.id) ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /** Whether `mark` covers `row` in `reader`'s window (see coverTest for the rules). */

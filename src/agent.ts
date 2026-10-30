@@ -1196,8 +1196,12 @@ export class Agent {
    * While the context is in legacy mode, its window is the record, and the
    * mark covers every row stored on the branch by then, as it always did:
    * a prefix of the record, so it also covers stored messages the agent
-   * wasn't given, such as another slot's. A mark taken in legacy mode keeps
-   * that meaning after the window is written down.
+   * wasn't given, such as another slot's. Once the window is written down
+   * (an agent registered on a branch its window was never written down on
+   * holds such a mark until its first compile), a mark taken in legacy mode
+   * covers the rows its window held by the mark where they still stand, as
+   * a mark taken in presented mode then would: a row stored after it, taken
+   * out of the window since, or presented to the agent again, isn't.
    *
    * A message above it may still be replaced or withdrawn in place by its
    * sender, though it may already have been in one of the agent's requests.
@@ -1221,10 +1225,12 @@ export class Agent {
    * shown, though: for one, a live stream carries each round's own content
    * and results, stored at a boundary that injected nothing, into its next
    * request. A compile that throws assembled nothing, and gives its move
-   * back where it can (unshowFailedCompile). A mark taken in legacy mode
-   * counts a prefix of the record, so a message stored below it without
-   * having been shown counts as shown, which errs toward a marker; one taken
-   * in presented mode covers the window as it stood.
+   * back where it can (unshowFailedCompile). A mark taken in legacy mode,
+   * read while the window is the record, counts a prefix of the record, so a
+   * message stored below it without having been shown counts as shown, which
+   * errs toward a marker; one taken in presented mode, and one taken in
+   * legacy mode read once the window is written down, cover the window as it
+   * stood.
    */
   private shownWatermark: ReadMark | null = null;
 

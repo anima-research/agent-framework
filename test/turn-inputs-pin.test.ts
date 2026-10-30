@@ -12,7 +12,7 @@ import type { AgentConfig, EventResponse, Module, ProcessEvent, ToolDefinition, 
 import { AgentFramework } from '../src/index.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
 import { GateModule, RoutedMembrane, say, until, waitCall } from './helpers/dendrite.js';
-import { coversByOrdinal } from '../src/read-marks.js';
+import { coverTest, covers, coversByOrdinal, describeReadMark, readMarkOf, type ReadMark } from '../src/read-marks.js';
 
 const PIN = 'agent-framework:turn-inputs';
 type ProtectedRange = ReturnType<ContextManager['listPins']>[number];
@@ -621,6 +621,123 @@ test("in presented mode, a turn's pin runs, in its window's order, over the rows
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// A real switch from legacy to presented mode (#291, #844's known gap): a
+// store an earlier release wrote holds prime's context with no window index,
+// so its manager opens in legacy mode, and the consumed mark prime takes at
+// its registration, before the presentation module writes its window down
+// (adopt), has no index length. The window is then written down, as the
+// record stood, and two rows arrive. Where an older row is taken out of the
+// window and presented again after the write-down, the agent hasn't read it
+// where it now stands, and the rows past it haven't been read either: the
+// walk under the legacy mark gives the range a mark taken in presented mode
+// right after the write-down gives, and pins no row the window held as of
+// the legacy mark. The write-down is the framework's own, at prime's
+// registration, and so is every presentation after it, at its point at rest
+// (presentAtEndOf); the older row is taken out as a host takes one out
+// (retractRows), and the turn's start is called directly, as above.
+type PresentedAgain = 'as the newest row' | 'between the new rows' | 'not at all';
+
+async function walkAfterTheSwitch(again: PresentedAgain): Promise<{
+  window: string[]; withLegacy: string[]; withPresented: string[]; heldAsOfTheMark: string[]; readApart: string[];
+}> {
+  const dir = mkdtempSync(join(tmpdir(), 'turn-inputs-pin-'));
+  const storePath = join(dir, 'store');
+  const labels = new Map<string, string>();
+  const label = (id: string) => labels.get(id) ?? id;
+  try {
+    // The earlier release's store: prime's last reply, then three rows it read.
+    const store = JsStore.openOrCreate({ path: storePath });
+    const earlier = await ContextManagerClass.open({ store, namespace: 'agents/prime', strategy: new PassthroughStrategy() });
+    const stored: Record<string, string> = {};
+    for (const [name, participant, t] of [
+      ['P', 'prime', 'My answer to the last request.'], ['L1', 'Dana', 'An older note, one.'],
+      ['L2', 'Dana', 'An older note, two.'], ['L3', 'Dana', 'An older note, three.'],
+    ] as const) {
+      stored[name] = earlier.addMessage(participant, text(t));
+      labels.set(stored[name]!, name);
+    }
+    assert.equal(earlier.windowMode(), 'legacy', 'no window index: the window is the record');
+    earlier.close();
+    store.close();
+
+    const framework = await AgentFramework.create({
+      storePath, membrane: new TurnMembrane([]).asMembrane(), agents: [agentConfig()], modules: [], syncIntervalMs: 0,
+    });
+    try {
+      const starts = framework as unknown as { pinTurnInputs(agent: unknown, routing: object): void };
+      const prime = framework.getAgent('prime')!;
+      const cm = prime.getContextManager();
+      const legacy = prime.getConsumedWatermark()!;
+      assert.ok(legacy && !coversByOrdinal(legacy), `prime's mark was taken in legacy mode (${describeReadMark(legacy)})`);
+      assert.equal(cm.windowMode(), 'presented', 'its registration wrote the window down');
+      assert.deepEqual(cm.getPresentedMessages().map((m) => label(m.id)), ['P', 'L1', 'L2', 'L3'],
+        'as the record stood, in record order');
+      const presented = readMarkOf(cm)!;
+      assert.ok(coversByOrdinal(presented), 'the mark taken right after the write-down covers by ordinal');
+
+      const arrive = (name: string, t: string) => { const id = cm.addMessage('Dana', text(t)); labels.set(id, name); return id; };
+      const presentAgain = () => { cm.retractRows([stored.L1!]); presentTo(framework); };
+      arrive('N1', 'Read the pages, please.');
+      if (again === 'between the new rows') {
+        presentTo(framework);
+        presentAgain();
+        arrive('N2', 'And one more line.');
+        presentTo(framework);
+      } else {
+        arrive('N2', 'And one more line.');
+        presentTo(framework);
+        if (again === 'as the newest row') presentAgain();
+      }
+      const window = cm.getPresentedMessages();
+      const ids = window.map((m) => m.id);
+      const pinWith = (mark: ReadMark): string[] => {
+        const current = prime.getConsumedWatermark();
+        prime.replaceReadMarks(new Map([[current!, mark]]));
+        assert.equal(prime.getConsumedWatermark(), mark, 'the agent reads the mark put in place');
+        starts.pinTurnInputs(prime, {});
+        const pins = inputPins(framework);
+        assert.ok(pins.length <= 1, 'at most one pin of the name');
+        if (pins.length === 0) return [];
+        const from = ids.indexOf(pins[0]!.firstMessageId), to = ids.indexOf(pins[0]!.lastMessageId);
+        assert.ok(from >= 0 && to >= from, 'the pin names a range of the window, in its order');
+        return ids.slice(from, to + 1).map(label);
+      };
+      const withLegacy = pinWith(legacy);
+      const withPresented = pinWith(presented);
+      // Every reader of the marks gets the same answer of each row, not the walk alone.
+      const readApart = window.filter((row) => covers(legacy, cm, row) !== covers(presented, cm, row)).map((m) => label(m.id));
+      // The rows the legacy mark covers in both senses: by sequence (read as
+      // against a window that is the record), and in the window's order, from
+      // its start up to the first row it doesn't cover so.
+      const bySequence = coverTest(legacy, { currentBranch: () => cm.currentBranch(), windowMode: () => 'legacy' as const });
+      const past = window.findIndex((m) => bySequence(m) !== 'covered');
+      const heldAsOfTheMark = window.slice(0, past === -1 ? window.length : past).map((m) => label(m.id));
+      return { window: ids.map(label), withLegacy, withPresented, heldAsOfTheMark, readApart };
+    } finally {
+      await framework.stop();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+for (const [again, window, range] of [
+  ['as the newest row', ['P', 'L2', 'L3', 'N1', 'N2', 'L1'], ['N1', 'N2', 'L1']],
+  ['between the new rows', ['P', 'L2', 'L3', 'N1', 'L1', 'N2'], ['N1', 'L1', 'N2']],
+  ['not at all', ['P', 'L1', 'L2', 'L3', 'N1', 'N2'], ['N1', 'N2']],
+] as const) {
+  test(`after a switch from legacy mode, with an older row presented again ${again}, a turn's pin under the mark taken in legacy mode is the range a mark taken in presented mode gives`, async () => {
+    const r = await walkAfterTheSwitch(again);
+    assert.deepEqual(r.window, window, 'the window, in its order');
+    assert.deepEqual(r.withPresented, range, 'the mark taken right after the write-down pins the rows presented since');
+    assert.deepEqual(r.withLegacy, r.withPresented, 'the legacy mark pins the same range');
+    assert.deepEqual(r.heldAsOfTheMark, again === 'not at all' ? ['P', 'L1', 'L2', 'L3'] : ['P', 'L2', 'L3']);
+    for (const name of r.heldAsOfTheMark) assert.ok(!r.withLegacy.includes(name), `${name}, read where it stands, isn't pinned`);
+    for (const name of ['N1', 'N2']) assert.ok(r.withLegacy.includes(name), `${name}, never read, is pinned`);
+    assert.deepEqual(r.readApart, [], 'the two marks read every row of the window alike (covers)');
+  });
+}
 
 test("a pin starts at the first row the agent sees, past rows it never sees under any name, its own included, and such rows inside it, such as a tuned-out message, stay out of its request and its budget", async () => {
   const module = new PagesModule();

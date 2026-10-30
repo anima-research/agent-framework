@@ -1761,17 +1761,22 @@ test("a wake to read a render starts its turn until the render's row is at or be
     getAnsweredWatermark(): ReadMark | null;
     answeredWatermark: ReadMark | null;
   };
-  // A legacy-mode mark (no index length) at a row's sequence on the current
-  // branch: the store's head when that row was the newest.
+  // A legacy-mode mark (no index length) at a store head on the current
+  // branch. Read against the agent's window, which is presented (#291), it
+  // covers the rows the window held by that head, where they stand.
   const markAt = (sequence: number): ReadMark => readMarkForTest(agent.getContextManager().currentBranch().name, sequence, null);
-  // A render stored for the agent while its wake to read it waits, by name.
+  // A render stored for the agent while its wake to read it waits, by name,
+  // and presented to it at once: `placed` is the store's head after the
+  // write that presented it, the first head a mark covers it at.
   const rows = new Map<string, string>();
-  const land = (id: string): { id: string; sequence: number } => {
-    const stored = agent.getContextManager().addMessage('editor', [{ type: 'text', text: `${id}_text` }]);
+  const land = (id: string): { id: string; sequence: number; placed: number } => {
+    const cm = f.framework.getAgent('agent')!.getContextManager();
+    const stored = cm.addMessage('editor', [{ type: 'text', text: `${id}_text` }]);
     rows.set(id, stored);
-    const row = agent.getContextManager().getMessage(stored);
+    cm.presentRows([stored]);
+    const row = cm.getMessage(stored);
     assert(row, `${id} landed on the current branch`);
-    return row;
+    return { id: row.id, sequence: row.sequence, placed: (cm.getStore() as { currentSequence(): number }).currentSequence() };
   };
   // The pass starts whatever turns are left.
   const pass = async (id: string): Promise<number> => {
@@ -1790,23 +1795,23 @@ test("a wake to read a render starts its turn until the render's row is at or be
   // was answered. (The agent's creation answers nothing, so without this the
   // pass would read no watermark at all.)
   const before = land('render_before');
-  agent.answeredWatermark = markAt(before.sequence);
+  agent.answeredWatermark = markAt(before.placed);
   land('render_0');
   assert.equal(await pass('render_0'), 1, 'above the watermark on its branch, the wake starts the turn');
   // At the watermark itself: read, as a compile whose newest row it was.
   const atMark = land('render_at');
-  agent.answeredWatermark = markAt(atMark.sequence);
+  agent.answeredWatermark = markAt(atMark.placed);
   assert.equal(await pass('render_at'), 0, 'at the watermark on its branch, the wake starts no turn');
   // Below it: read, by a compile that read what followed it too.
   land('render_below');
   const after = land('render_after');
-  agent.answeredWatermark = markAt(after.sequence);
+  agent.answeredWatermark = markAt(after.placed);
   assert.equal(await pass('render_below'), 0, 'below the watermark on its branch, the wake starts no turn');
   // With no watermark (a store that couldn't be read when it was taken): in doubt.
   const noMark = land('render_null');
   agent.answeredWatermark = null;
   assert.equal(await pass('render_null'), 1, 'with no watermark, the wake starts the turn');
-  agent.answeredWatermark = markAt(noMark.sequence);
+  agent.answeredWatermark = markAt(noMark.placed);
   await f.send('push/event', f.params('a', 'turn_one', { key: 'a', initial: true }));
   await f.framework.runUntilIdle();
   // An operator's rollback switches the store to a new branch (an undo, on
@@ -1962,12 +1967,18 @@ test("a wake to read a render that carries a channel starts its turn until the a
     answeredWatermark: ReadMark | null;
     notePublished(destination: string, readThrough: ReadMark | null): void;
   };
-  const row = agent.getContextManager().getMessage(agent.getContextManager().addMessage('editor', [{ type: 'text', text: 'render_room_text' }]));
+  const cm = f.framework.getAgent('agent')!.getContextManager();
+  const row = cm.getMessage(cm.addMessage('editor', [{ type: 'text', text: 'render_room_text' }]));
   assert(row, 'the render landed on the current branch');
+  // Presented to the agent at once (#291): the store's head after the write
+  // that presented it is the first head a legacy-mode mark covers it at, read
+  // against the agent's presented window.
+  cm.presentRows([row.id]);
+  const placed = (cm.getStore() as { currentSequence(): number }).currentSequence();
   const branch = agent.getContextManager().currentBranch().name;
   // Legacy-mode marks (no index length), by branch and the store's head.
   const at = (onBranch: string, sequence: number): ReadMark => readMarkForTest(onBranch, sequence, null);
-  agent.answeredWatermark = at(branch, row.sequence);
+  agent.answeredWatermark = at(branch, placed);
   const pass = async (tagged?: 'addressed' | 'ambient' | 'untagged' | 'notice'): Promise<number> => {
     internals.pendingRequests.push({
       agentName: 'agent', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), channelId: 'editor:room', readsRow: row.id,
@@ -1996,24 +2007,24 @@ test("a wake to read a render that carries a channel starts its turn until the a
   // Neither tag is doubt: such a render waits for an answer, as an
   // addressed one does.
   assert.equal(await pass('untagged'), 1, 'with neither tag, read but not answered in its channel, the wake starts the turn');
-  agent.notePublished(room, at(branch, row.sequence - 1));
+  agent.notePublished(room, at(branch, placed - 1));
   assert.equal(await pass(), 1, 'answered in its channel only before reading it, the wake starts the turn');
-  agent.notePublished(destinationKey({ serverId: 'editor', channelId: 'editor:general' }), at(branch, row.sequence));
+  agent.notePublished(destinationKey({ serverId: 'editor', channelId: 'editor:general' }), at(branch, placed));
   assert.equal(await pass(), 1, 'spoken in another channel having read it, the wake starts the turn');
-  agent.notePublished(destinationKey({ serverId: 'other', channelId: 'editor:room' }), at(branch, row.sequence));
+  agent.notePublished(destinationKey({ serverId: 'other', channelId: 'editor:room' }), at(branch, placed));
   assert.equal(await pass(), 1, "spoken in another server's channel of the same id, the wake starts the turn");
-  agent.notePublished(room, at(branch, row.sequence));
+  agent.notePublished(room, at(branch, placed));
   assert.equal(await pass(), 0, 'spoken in its channel having read it, the wake starts no turn');
-  agent.notePublished(room, at(branch, row.sequence - 1));
+  agent.notePublished(room, at(branch, placed - 1));
   assert.equal(await pass(), 0, "an earlier round's words landing later leave the newer publish standing");
-  agent.notePublished(room, at(`${branch}-other`, row.sequence + 5));
+  agent.notePublished(room, at(`${branch}-other`, placed + 5));
   assert.equal(await pass(), 1, 'spoken there last on another branch, the wake starts the turn');
-  agent.notePublished(room, at(branch, row.sequence));
+  agent.notePublished(room, at(branch, placed));
   assert.equal(await pass(), 0, 'spoken there again on this branch having read it, the wake starts no turn');
   // A publish on another branch replaces the record whatever its sequence,
   // since a branch an undo made can carry lower sequences than the one it
   // left.
-  agent.notePublished(room, at(`${branch}-other`, row.sequence - 3));
+  agent.notePublished(room, at(`${branch}-other`, placed - 3));
   assert.equal(await pass(), 1, 'spoken there last on another branch at a lower sequence, the wake starts the turn');
 });
 

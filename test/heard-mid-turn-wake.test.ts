@@ -32,7 +32,7 @@ import { AgentFramework } from '../src/index.js';
 import type { GateConfig } from '../src/gate/types.js';
 import { destinationKey } from '../src/mcpl/channel-registry.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
-import { headOf, legacyMarkFrom, newestCovered, rowAt } from './helpers/read-mark-rows.js';
+import { bySequence, headOf, legacyMarkFrom, newestCovered, rowAt } from './helpers/read-mark-rows.js';
 import type { MarkCm, MarkedRow, ReadMark } from '../src/read-marks.js';
 import type { ContentBlock, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 
@@ -872,7 +872,8 @@ describe('a wake for a write heard mid-turn', () => {
       push(event as never);
     };
     const agent = framework.getAgent('assistant')!;
-    const cm = agent.getContextManager();
+    // Its marks are asked of rows built from a sequence (rowAt): read by sequence.
+    const cm = bySequence(agent.getContextManager());
     const room = destinationKey({ serverId: 'chat', channelId: ROOM });
 
     // The agent is in a turn, which the script's call isn't made in.
@@ -901,7 +902,8 @@ describe('a wake for a write heard mid-turn', () => {
       scriptToolCall(agent: string, tool: string, argsJson: string, context: Record<string, unknown>): Promise<{ ok: boolean; json: string; held?: true }>;
     };
     const agent = framework.getAgent('assistant')!;
-    const cm: MarkCm = agent.getContextManager();
+    // Its marks are asked of rows built from a sequence (rowAt): read by sequence.
+    const cm: MarkCm = bySequence(agent.getContextManager());
     const room = destinationKey({ serverId: 'chat', channelId: ROOM });
     const now = agent.getConsumedWatermark()!;
     // What the agent had read when the script started: a mark just before now's.
@@ -931,7 +933,8 @@ describe('a wake for a write heard mid-turn', () => {
       scriptToolCall(agent: string, tool: string, argsJson: string, context: Record<string, unknown>): Promise<{ ok: boolean; json: string; held?: true }>;
     };
     const agent = framework.getAgent('assistant')!;
-    const cm: MarkCm = agent.getContextManager();
+    // Its marks are asked of rows built from a sequence (rowAt): read by sequence.
+    const cm: MarkCm = bySequence(agent.getContextManager());
     const room = destinationKey({ serverId: 'chat', channelId: ROOM });
     const now = agent.getConsumedWatermark()!;
     // What the agent had read when the script started: a mark just before now's.
@@ -979,7 +982,8 @@ describe('a wake for a write heard mid-turn', () => {
         : (target as Record<string, unknown>)[prop],
     });
     const agent = framework.getAgent('assistant')!;
-    const cm: MarkCm = agent.getContextManager();
+    // Its marks are asked of rows built from a sequence (rowAt): read by sequence.
+    const cm: MarkCm = bySequence(agent.getContextManager());
     const room = destinationKey({ serverId: 'chat', channelId: ROOM });
     const now = agent.getConsumedWatermark()!;
     // What the agent had read when the script started: a mark just before now's.

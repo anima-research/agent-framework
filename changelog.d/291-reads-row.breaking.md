@@ -10,7 +10,13 @@
     a row with `covers(mark, agent.getContextManager(), row)`: `'covered'`,
     `'not-covered'`, or `'doubt'` for no mark or a mark on another branch.
     A mark taken in legacy mode covers a row by its own sequence, as `<=`
-    did, so a host that never presents gets the answers it got.
+    did, while the context's window is the record, so a host whose window
+    is never written down gets the answers it got. Once the window is
+    written down, the same mark covers the rows the window held as of the
+    mark, where they still stand, as a mark taken then in presented mode
+    would: a row stored after it, taken out of the window, or presented
+    again after it isn't covered. (A `MarkCm` double without
+    `getPresentedMessages` and `branchSequenceOf` is read by sequence.)
     `markAnswered` and `notePublished` take a `ReadMark`, and
     `publishedAfterReading(destination, row, cm)` takes the row and the
     agent's context in place of a branch and a sequence.

@@ -3,8 +3,10 @@
  * opaque, so a test that needs where one was taken reads the store head
  * from its description (describeReadMark), and one that asks of a row a
  * legacy-mode mark covers builds the row from its sequence, as a cover
- * reads it. A mark taken in presented mode covers a row by its place in the
- * agent's window, so a test asks it of a real row (newestCovered).
+ * reads it, and reads the mark against bySequence(cm). A mark taken in
+ * presented mode, and one taken in legacy mode read against a presented
+ * window, cover a row by its place in the agent's window, so a test asks
+ * them of a real row (newestCovered).
  */
 import type { StoredMessage } from '@animalabs/context-manager';
 import { covers, describeReadMark, readMarkForTest, type MarkCm, type MarkedRow, type ReadMark } from '../../src/read-marks.js';
@@ -19,6 +21,17 @@ export function headOf(mark: ReadMark | null): number {
 /** A row stored at `sequence`, as a mark taken in legacy mode covers it: by its own sequence. */
 export function rowAt(sequence: number, id = `row@${sequence}`): MarkedRow {
   return { id, sequence };
+}
+
+/**
+ * A reader on `cm`'s branch whose window is the record (legacy mode), which
+ * reads a mark taken in legacy mode by sequence: what a test asks a row
+ * built from its sequence (rowAt) against. Against the agent's own context
+ * once its window is presented, such a mark covers the rows the window held
+ * by its head, where they stand, and a built row is in no window.
+ */
+export function bySequence(cm: MarkCm): MarkCm {
+  return { currentBranch: () => cm.currentBranch!(), windowMode: () => 'legacy' };
 }
 
 /** A mark taken in legacy mode on `mark`'s branch, `by` past its head (`-1`: just before it). */
