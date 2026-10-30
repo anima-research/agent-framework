@@ -130,16 +130,23 @@ test('core: a route resolved under an invalidated epoch is discarded without rer
   assert.equal(result.verdict.store, true); assert.equal(result.binding.destination, undefined); assert.equal(resolves, 1);
 });
 
-test('core: authority throws log once with bounded detail and never expose the exception', async () => {
+test('core: persistent authority throws log once per minute without exception details', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 100_000 });
   const original = console.error, logs: unknown[][] = [];
   console.error = (...args: unknown[]) => { logs.push(args); };
   try {
     const x = fixture({ authorize: () => { throw Error('sensitive detail'.repeat(1000)); } });
-    for (let i = 0; i < 2; i++) {
+    const run = async () => {
       const result = await x.run();
       assert.equal(result.verdict.store, true); assert.equal(result.binding.destination, undefined);
-    }
-    assert.equal(logs.length, 1); assert(JSON.stringify(logs).length < 200);
+    };
+    await run(); await run();
+    assert.equal(logs.length, 1);
+    t.mock.timers.tick(59_999); await run();
+    assert.equal(logs.length, 1);
+    t.mock.timers.tick(1); await run();
+    assert.equal(logs.length, 2);
+    assert(logs.every(line => JSON.stringify(line).length < 200));
     assert(!JSON.stringify(logs).includes('sensitive detail'));
   } finally { console.error = original; }
 });
@@ -196,4 +203,27 @@ test('core: setup throws release the reply consumer pending slot', async () => {
   }
   const live = await consume({ connection: x.ingress.key, lane: 'channels/incoming', item: {} as any, signal: x.transport.signal }, { store: true, mayWake: true });
   assert.equal(resolves, 1); assert(isReplyBinding(live.routing)); assert.equal(replyBindingCurrent(live.routing), true);
+});
+
+test('core: failure diagnostics share a connection window across paths and reconnects, not connections', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 100_000 });
+  const a = fixture(), b = fixture(), scope = {}, original = console.error, logs: unknown[][] = [];
+  const throwing = async () => { throw Error('private failure'); };
+  const authority = replyConsumer({ timeoutMs: 100, resolve: throwing, authorize: () => true }, () => true, scope);
+  const runAuthority = () => authority({ connection: a.ingress.key, lane: 'channels/incoming', item: {} as any, signal: a.transport.signal }, { store: true, mayWake: true });
+  console.error = (...args: unknown[]) => { logs.push(args); };
+  try {
+    await runAuthority();
+    await withReplyConsumer(a.ingress, throwing, a.transport.signal, scope).admit('channels/incoming', {});
+    assert.equal(logs.length, 1, 'both failure paths share the same connection throttle');
+    a.admission.bind(2);
+    await withReplyConsumer(a.admission.capture(() => undefined), throwing, a.transport.signal, scope).admit('channels/incoming', {});
+    assert.equal(logs.length, 1, 'a reconnect does not reset the connection diagnostic window');
+    await withReplyConsumer(b.ingress, throwing, b.transport.signal, {}).admit('channels/incoming', {});
+    assert.equal(logs.length, 2, 'another connection has an independent window');
+    t.mock.timers.tick(60_000);
+    await withReplyConsumer(a.admission.capture(() => undefined), throwing, a.transport.signal, scope).admit('channels/incoming', {});
+    await runAuthority();
+    assert.equal(logs.length, 3, 'one new line for the still-failing connection');
+  } finally { console.error = original; }
 });

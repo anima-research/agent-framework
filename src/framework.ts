@@ -34953,7 +34953,7 @@ export class AgentFramework {
         if (original && original !== descriptor) return false;
         registrations.set(target, descriptor);
         return true;
-      });
+      }, connection);
     }
     const recorded = serverTextRedactor(config);
     type Responder = InboundResponder;

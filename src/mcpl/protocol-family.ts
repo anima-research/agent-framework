@@ -698,8 +698,11 @@ export function serverConfigProblems(config: McplServerConfig): string[] {
   }
   const problems: string[] = credentialRequiredProblems(config);
   if (config.replyAuthority !== undefined) {
-    if (!config.inboundAdmission || typeof config.replyAuthority?.resolve !== 'function' ||
-      typeof config.replyAuthority.authorize !== 'function' || !Number.isInteger(config.replyAuthority.timeoutMs) || config.replyAuthority.timeoutMs < 1 || config.replyAuthority.timeoutMs > 60_000) problems.push('replyAuthority requires inboundAdmission, resolve, synchronous authorize, and timeoutMs in 1..60000');
+    if (!config.inboundAdmission) problems.push('replyAuthority requires inboundAdmission');
+    if (typeof config.replyAuthority?.resolve !== 'function') problems.push('replyAuthority.resolve must be a function');
+    if (typeof config.replyAuthority?.authorize !== 'function') problems.push('replyAuthority.authorize must be a synchronous function');
+    if (!Number.isInteger(config.replyAuthority?.timeoutMs)) problems.push('replyAuthority.timeoutMs must be an integer');
+    if (config.replyAuthority?.timeoutMs < 1 || config.replyAuthority?.timeoutMs > 60_000) problems.push('replyAuthority.timeoutMs must be in 1..60000');
   }
   if (config.inboundAdmission !== undefined) {
     const problem = admissionConfigProblem(config.inboundAdmission);

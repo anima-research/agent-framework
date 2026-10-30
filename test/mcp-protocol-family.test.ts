@@ -643,14 +643,20 @@ const replyAdmission = {
   isReplyIntent: () => true,
 };
 const replyAuthority = { timeoutMs: 1000, resolve: () => ({ channelId: 'room' }), authorize: () => true };
-for (const [name, config] of [
-  ['missing inboundAdmission', { inboundAdmission: undefined }],
-  ...[0, 60001, 1.5, NaN, '1000'].map(timeoutMs => [`timeoutMs=${String(timeoutMs)} (${typeof timeoutMs})`, { replyAuthority: { ...replyAuthority, timeoutMs } }] as const),
-  ['non-function resolve', { replyAuthority: { ...replyAuthority, resolve: 'resolve' } }],
-  ['non-function authorize', { replyAuthority: { ...replyAuthority, authorize: true } }],
+for (const [name, config, expected] of [
+  ['missing inboundAdmission', { inboundAdmission: undefined }, ['replyAuthority requires inboundAdmission']],
+  ...[
+    [0, 'replyAuthority.timeoutMs must be in 1..60000'],
+    [60001, 'replyAuthority.timeoutMs must be in 1..60000'],
+    [1.5, 'replyAuthority.timeoutMs must be an integer'],
+    [NaN, 'replyAuthority.timeoutMs must be an integer'],
+    ['1000', 'replyAuthority.timeoutMs must be an integer'],
+  ].map(([timeoutMs, problem]) => [`timeoutMs=${String(timeoutMs)} (${typeof timeoutMs})`, { replyAuthority: { ...replyAuthority, timeoutMs } }, [problem]] as const),
+  ['non-function resolve', { replyAuthority: { ...replyAuthority, resolve: 'resolve' } }, ['replyAuthority.resolve must be a function']],
+  ['non-function authorize', { replyAuthority: { ...replyAuthority, authorize: true } }, ['replyAuthority.authorize must be a synchronous function']],
 ] as const) test(`reply authority config rejects ${name}`, () => {
   const problems = serverConfigProblems(cfg({ command: 'srv', inboundAdmission: replyAdmission, replyAuthority, ...config } as any));
-  assert(problems.some(p => p.includes('replyAuthority requires')), JSON.stringify(problems));
+  assert.deepEqual(problems, expected);
 });
 for (const timeoutMs of [1, 60000]) test(`reply authority config accepts timeout boundary ${timeoutMs}`, () => {
   assert.deepEqual(serverConfigProblems(cfg({ command: 'srv', inboundAdmission: replyAdmission, replyAuthority: { ...replyAuthority, timeoutMs } })), []);

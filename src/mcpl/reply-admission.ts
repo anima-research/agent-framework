@@ -1,10 +1,9 @@
 /** Additive ingress wrapper: required inbound admission completes before route resolution. */
-import { privateReplyBinding } from './reply-routing.js';
+import { privateReplyBinding, reportReplyFailure } from './reply-routing.js';
 import type { AdmissionInput, AdmissionLane, AdmissionVerdict, RequiredIngress } from './inbound-admission.js';
 export type PostAdmissionConsumer = (input: AdmissionInput, verdict: Extract<AdmissionVerdict, { store: true }>) =>
   Promise<{ routing?: unknown }>;
 const receipts = new WeakMap<object, unknown>();
-const failedConsumers = new WeakSet<PostAdmissionConsumer>();
 export function admissionRoutingFields(verdict: AdmissionVerdict): { routing?: unknown } {
   return receipts.has(verdict) ? { routing: receipts.get(verdict) } : {};
 }
@@ -26,7 +25,7 @@ function detach(value: unknown, seen = new Set<object>()): any {
   seen.delete(value);
   return Object.freeze(out);
 }
-export function withReplyConsumer(admission: RequiredIngress, consume: PostAdmissionConsumer | undefined, transportSignal: AbortSignal): RequiredIngress {
+export function withReplyConsumer(admission: RequiredIngress, consume: PostAdmissionConsumer | undefined, transportSignal: AbortSignal, diagnosticConnection: object = admission.key): RequiredIngress {
   if (!consume) return admission;
   return Object.freeze({ key: admission.key, check: admission.check,
     async admit(lane: AdmissionLane, item: unknown, signal?: AbortSignal) {
@@ -39,10 +38,7 @@ export function withReplyConsumer(admission: RequiredIngress, consume: PostAdmis
           if (Object.hasOwn(result, 'routing')) receipts.set(verdict, result.routing);
         } catch {
           receipts.set(verdict, privateReplyBinding(admission.key));
-          if (!failedConsumers.has(consume)) {
-            failedConsumers.add(consume);
-            console.error('[automatic-reply] post-admission consumer threw; automatic prose stays private');
-          }
+          reportReplyFailure(diagnosticConnection, 'consumer');
         }
       }
       return verdict;

@@ -90,14 +90,22 @@ export function workKey(value: object): unknown[] {
     work.connection.transportEpoch, work.destination?.serverId ?? null, work.destination?.channelId ?? null, identity(work)]);
 }
 
-export function replyConsumer(config: ReplyAuthorityConfig, valid: (key: ConnectionKey, target: ReplyDestination) => boolean): PostAdmissionConsumer {
+/** Keep persistent fail-closed faults visible without exposing callback details.
+ * The live connection object shares the window across epochs and failure paths. */
+const failureLines = new WeakMap<object, number>();
+export function reportReplyFailure(connection: object, kind: 'authority' | 'consumer'): void {
+  const now = Date.now();
+  const last = failureLines.get(connection);
+  if (last !== undefined && now - last < 60_000) return;
+  failureLines.set(connection, now);
+  console.error(kind === 'consumer'
+    ? '[automatic-reply] post-admission consumer threw; automatic prose stays private'
+    : '[automatic-reply] host reply authority threw; automatic prose stays private');
+}
+
+export function replyConsumer(config: ReplyAuthorityConfig, valid: (key: ConnectionKey, target: ReplyDestination) => boolean, diagnosticConnection?: object): PostAdmissionConsumer {
   const { resolve, authorize, timeoutMs } = config;
   let pending = 0;
-  let loggedThrow = false;
-  const failed = (): void => {
-    // One bounded diagnostic per configured connection; never expose callback details.
-    if (!loggedThrow) { loggedThrow = true; console.error('[automatic-reply] host reply authority threw; automatic prose stays private'); }
-  };
   return async (input, verdict) => {
     if (!verdict.mayWake) return {};
     const privateWork = () => ({ routing: privateReplyBinding(input.connection) });
@@ -116,7 +124,7 @@ export function replyConsumer(config: ReplyAuthorityConfig, valid: (key: Connect
         timer = setTimeout(() => { done(null); controller.abort(); }, timeoutMs);
         if (controller.signal.aborted) done(null);
       });
-      const operation = Promise.resolve().then(() => controller.signal.aborted ? null : resolve(approvedInput)).catch(() => { failed(); return null; });
+      const operation = Promise.resolve().then(() => controller.signal.aborted ? null : resolve(approvedInput)).catch(() => { reportReplyFailure(diagnosticConnection ?? input.connection, 'authority'); return null; });
       const raw = await Promise.race([operation, cancelled]);
       if (controller.signal.aborted || !raw || typeof raw !== 'object' ||
         ![Object.prototype, null].includes(Object.getPrototypeOf(raw))) return privateWork();
@@ -127,11 +135,11 @@ export function replyConsumer(config: ReplyAuthorityConfig, valid: (key: Connect
       const destination = Object.freeze({ serverId: input.connection.connectionId, channelId: channel.value });
       const current = (): boolean => {
         try { return valid(input.connection, destination) && authorize(approvedInput, destination) === true; }
-        catch { failed(); return false; }
+        catch { reportReplyFailure(diagnosticConnection ?? input.connection, 'authority'); return false; }
       };
       return current() ? { routing: mint(input.connection, destination, current) } : privateWork();
     } catch {
-      failed(); return privateWork();
+      reportReplyFailure(diagnosticConnection ?? input.connection, 'authority'); return privateWork();
     } finally {
       pending--; clearTimeout(timer);
       if (abort) input.signal.removeEventListener('abort', abort);

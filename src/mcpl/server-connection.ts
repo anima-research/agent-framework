@@ -1170,7 +1170,7 @@ export class McplServerConnection extends EventEmitter {
           if (!this.controlPlaneReady || !this.dataPlaneReady) return 'admission_not_ready';
         });
         this.admissionReceipts.set(params as object, this.postAdmissionConsumer && name !== 'inference-request'
-          ? withReplyConsumer(admission, this.postAdmissionConsumer, this.transportEnded.signal) : admission);
+          ? withReplyConsumer(admission, this.postAdmissionConsumer, this.transportEnded.signal, this) : admission);
       }
       // §6.6: a request that will never be answered MUST get an error. A
       // request whose event nothing on this host listens for would never be.
