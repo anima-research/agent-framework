@@ -5,7 +5,9 @@
   Required traffic is held during startup staging and quiesce, then admitted at
   flush sequentially, preserving held-data order without overflowing admission
   slots. Held inference releases the drain after admission and synchronous provider
-  dispatch, not after the full inference. New data joins an active drain; controls
+  dispatch, not after the full inference. A held inference backlog reaches the
+  provider concurrently (one call per held item, as on the unconfigured path),
+  because the drain releases at dispatch. New data joins an active drain; controls
   and RPC responses stay live. While a backlog drains, required data (held and
   newly arriving) is admitted one at a time, so sustained ingress above roughly one
   item per callback latency accumulates and is dropped/refused at the existing hold
