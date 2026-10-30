@@ -63,7 +63,9 @@ coalesced work before enabling this profile on an existing configured binding.
 The channel adapter checks actual registration before preflight and rechecks the
 entry, connection, epoch, readiness and grant afterward. No effect runs on a
 refusal. `mayWake: false` skips wake policy and caps downstream wake requests;
-it is **not** context-only delivery and does not suppress existing open/locus
+`mayWake: true` does not override gate declines: their decision remains visible,
+but a module may request inference just as on an unconfigured connection. The cap
+is only `mayWake: false`. It is **not** context-only delivery and does not suppress existing open/locus
 maintenance. Pushes run preflight after feature authorization, before deduplication,
 notices, coalescing or queueing. Inference requests run admission after feature and loop checks, before model
 resolution; false `mayWake` is `admission_denied` and sends no chunks.

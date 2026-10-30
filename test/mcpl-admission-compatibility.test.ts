@@ -53,26 +53,26 @@ test('required admission runtime AST has no connector vocabulary or platform gra
   visit(tree);
 });
 
-for (const lane of ['channels/incoming', 'push/event'] as const) test(`required ${lane}: true verdict cannot let a module override an existing false gate`, async t => {
+for (const lane of ['channels/incoming', 'push/event'] as const) test(`required ${lane}: mayWake true preserves module wakes despite an existing false gate`, async t => {
   const requester: any = { name: 'requester', start: async () => {}, stop: async () => {}, getTools: () => [], handleToolCall: async () => ({ success: true }), onProcess: async (event: any) => event.type.startsWith('mcpl:') ? { requestInference: true } : {} };
   const f = await fixture({ framework: { modules: [requester] }, server: { shouldTriggerInference: () => false, inboundAdmission: { timeoutMs: 5000, bind: (connection: unknown) => ({ connection, admit: () => ({ store: true, mayWake: true }) }), isReplyIntent: () => true } } }); t.after(f.close); f.alwaysRespond(); await f.register();
   await f.send(lane, lane === 'channels/incoming' ? { messages: [message] } : { ...f.params('one', 'stored'), coalesce: undefined });
-  await f.framework.runUntilIdle(); assert.equal(f.membrane.calls.length, 0);
+  await f.framework.runUntilIdle(); assert(f.membrane.calls.length > 0);
 });
 
-for (const lane of ['channels/incoming', 'push/event'] as const) test(`required ${lane}: a later policy veto downgrades the module-visible event`, async t => {
+for (const mayWake of [true, false]) for (const lane of ['channels/incoming', 'push/event'] as const) test(`required ${lane}: later gate decline stays visible, only mayWake=${mayWake} caps modules`, async t => {
   let observed: boolean | undefined;
   const requester: any = { name: 'requester', start: async () => {}, stop: async () => {}, getTools: () => [], handleToolCall: async () => ({ success: true }), onProcess: async (event: any) => {
     if (!event.type.startsWith('mcpl:')) return {};
     observed = event.triggerInference; return { requestInference: true };
   } };
-  const f = await fixture({ framework: { modules: [requester] }, server: { shouldTriggerInference: () => true, inboundAdmission: { timeoutMs: 5000, bind: (connection: unknown) => ({ connection, admit: () => ({ store: true, mayWake: true }) }), isReplyIntent: () => true } } }); t.after(f.close); f.alwaysRespond(); await f.register();
-  // Labelled policy-boundary scaffold: the first gate and envelope both allow;
-  // a distinct later host policy veto must survive dispatch to modules.
+  const f = await fixture({ framework: { modules: [requester] }, server: { shouldTriggerInference: () => true, inboundAdmission: { timeoutMs: 5000, bind: (connection: unknown) => ({ connection, admit: () => ({ store: true, mayWake }) }), isReplyIntent: () => true } } }); t.after(f.close); f.alwaysRespond(); await f.register();
+  // Labelled policy-boundary scaffold: the later gate decision is visible to modules,
+  // but only the admission ceiling can prohibit a module-driven wake.
   const inner = f.framework as any; const admit = inner.admitInbound.bind(inner);
   let decisions = 0;
-  inner.admitInbound = (env: any) => { assert.equal(env.vetoed, false); decisions++; return { ...admit(env), wake: false }; };
+  inner.admitInbound = (env: any) => { assert.equal(env.vetoed, !mayWake); decisions++; return { ...admit(env), wake: false }; };
   await f.send(lane, lane === 'channels/incoming' ? { messages: [message] } : { ...f.params('one', 'stored'), coalesce: undefined });
   await f.framework.runUntilIdle();
-  assert.equal(decisions, 1); assert.equal(observed, false); assert.equal(f.membrane.calls.length, 0);
+  assert.equal(decisions, 1); assert.equal(observed, false); assert.equal(f.membrane.calls.length > 0, mayWake);
 });
