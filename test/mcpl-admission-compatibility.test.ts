@@ -38,7 +38,7 @@ for (const lane of ['channels/incoming', 'push/event'] as const) for (const coal
 test('required admission runtime AST has no connector vocabulary or platform grammar', () => {
   const source = readFileSync('src/mcpl/inbound-admission.ts', 'utf8');
   const tree = parse(source, { sourceType: 'module', plugins: ['typescript'] });
-  const forbidden = /slack|telegram|discord|zulip|supportRecipientBridge|supportRecipientReplyRoot|supportRecipientTurnId/i;
+  const forbidden = /slack|telegram|discord|zulip|eidoverse|supportRecipientBridge|supportRecipientReplyRoot|supportRecipientTurnId/i;
   const visit = (node: any): void => {
     if (!node || typeof node !== 'object') return;
     if (['Identifier', 'StringLiteral', 'RegExpLiteral', 'TemplateElement'].includes(node.type)) {
