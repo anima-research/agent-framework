@@ -12921,6 +12921,15 @@ export class AgentFramework {
     },
   ];
 
+  private static readonly WAKE_ADD_RULE_FIELDS: Readonly<Record<string, string>> = {
+    'behavior.debounce': 'debounceMs',
+    'behavior.rate_limit': 'rateLimit',
+    'behavior.passive_sample': 'passiveSample',
+    'behavior.judge': 'judge',
+    'position.before': 'insertBefore',
+    'position.after': 'insertAfter',
+  };
+
   /** Synthesized wake-rule tools: add/remove a gate.json policy at runtime.
    *  Present when a gate is wired. They write validated policies into the
    *  hot-reloaded gate.json (same validation as load), so a rule takes effect
@@ -36443,7 +36452,16 @@ export class AgentFramework {
       if (call.name === 'wake_remove_rule') {
         const input = (call.input ?? {}) as { name?: unknown };
         if (typeof input.name !== 'string' || !input.name) {
-          finish({ success: false, error: 'wake_remove_rule: `name` (string) is required', isError: true });
+          const edit = this.eventGate!.ruleNamesForChange();
+          const names = 'names' in edit ? edit.names.map((name) => quotedValue(name)) : [];
+          finish({
+            success: false,
+            error: `wake_remove_rule: name is ${shownValue(input.name)}, where the name of a rule is needed, so nothing was removed. `
+              + ('refused' in edit
+                ? edit.refused
+                : (names.length > 0 ? `The rules a change edits are ${names.join(', ')}.` : 'There is no rule to remove.') + edit.note),
+            isError: true,
+          });
           return;
         }
         const removed = this.removeGatePolicy(input.name);
@@ -36480,9 +36498,8 @@ export class AgentFramework {
       if (behaviorSources.length === 0) {
         finish({
           success: false,
-          error: this.judgeWired
-            ? 'wake_add_rule: specify exactly one behavior — `behavior` ("always"/"defer"/"skip"), `debounceMs`, `rateLimit`, `passiveSample`, or `judge`.'
-            : 'wake_add_rule: specify exactly one behavior — `behavior` ("always"/"defer"/"skip"), `debounceMs`, `rateLimit`, or `passiveSample`.',
+          error: 'wake_add_rule got no behavior, so nothing was saved. Give one of behavior ("always", "defer" or "skip"), '
+            + (this.judgeWired ? 'debounceMs, rateLimit, passiveSample or judge.' : 'debounceMs, rateLimit or passiveSample.'),
           isError: true,
         });
         return;
@@ -36490,7 +36507,7 @@ export class AgentFramework {
       if (behaviorSources.length > 1) {
         finish({
           success: false,
-          error: `wake_add_rule: give only one behavior, got [${behaviorSources.join(', ')}].`,
+          error: `wake_add_rule got more than one behavior (${behaviorSources.join(', ')}), so nothing was saved. Give only one of them.`,
           isError: true,
         });
         return;
@@ -36533,7 +36550,7 @@ export class AgentFramework {
       if (placementSources.length > 1) {
         finish({
           success: false,
-          error: `wake_add_rule: give at most one placement, got [${placementSources.join(', ')}].`,
+          error: `wake_add_rule got more than one placement (${placementSources.join(', ')}), so nothing was saved. Give only one of them.`,
           isError: true,
         });
         return;
@@ -36553,10 +36570,18 @@ export class AgentFramework {
       for (const field of ['insertBefore', 'insertAfter'] as const) {
         const anchor = input[field];
         if (anchor !== undefined && (typeof anchor !== 'string' || anchor.length === 0)) {
+          const edit = this.eventGate!.ruleNamesForChange();
+          const names = 'names' in edit ? edit.names.filter((name) => name !== input.name).map((name) => quotedValue(name)) : [];
           finish({
             success: false,
-            error: `wake_add_rule: ${field} must be the name of a rule, and it's ${shownValue(anchor)}, so nothing `
-              + `was saved. The rules are: [${this.getGatePolicyNames().join(', ')}].`,
+            error: `wake_add_rule: ${field} must be the name of a rule, and it's ${shownValue(anchor)}, so nothing was saved. `
+              + ('refused' in edit
+                ? edit.refused
+                : (names.length > 0
+                  ? `The other rules a change edits are ${names.join(', ')}. Give ${field} one of them to place the rule beside it, or leave it out`
+                  : `There is no other rule to place it beside, so leave ${field} out`)
+                  + ' to add the rule at the end, or, where a rule already has its name, to replace that rule where it is.'
+                  + edit.note),
             isError: true,
           });
           return;
@@ -36586,9 +36611,12 @@ export class AgentFramework {
       const before = new Map(
         this.eventGate!.probeTable().map((r) => [r.probe, r]),
       );
-      const policy = this.addGatePolicy(rawPolicy, {
+      const fieldNames = Object.fromEntries(Object.entries(AgentFramework.WAKE_ADD_RULE_FIELDS)
+        .filter(([field]) => !(field.startsWith('behavior.') && typeof input.behavior === 'object')));
+      const policy = this.eventGate!.addPolicy(rawPolicy, {
         ...(position ? { position } : {}),
         onIgnoredFields: (notes) => { ignored.push(...notes); },
+        fieldNames,
       });
       const after = this.eventGate!.probeTable();
       const probes = after.map((r) => {
