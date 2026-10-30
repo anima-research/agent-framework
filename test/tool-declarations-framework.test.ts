@@ -867,6 +867,62 @@ describe('toolDeclarations in the framework', () => {
     }
   });
 
+  describe('a reader fork', () => {
+    const forkOf = async (framework: AgentFramework): Promise<Agent> => {
+      const derive = framework.deriveAgent.bind(framework);
+      let derived: Promise<Agent> | undefined;
+      framework.deriveAgent = (options) => {
+        const fork = derive(options);
+        derived = fork.then((made) => made.agent);
+        return fork;
+      };
+      framework.runEphemeralToCompletion = async () => ({ speech: '', toolCallsCount: 0 });
+      (framework as unknown as { invokeReaderFork(invocation: unknown): void }).invokeReaderFork({
+        serverId: 'disc', channelId: 'disc:guild:noisy', epochId: 'epoch-0001', trigger: 'wake',
+        notice: '[Tune-out wake]', backlog: [], queued: [], dispositions: null,
+      });
+      assert.ok(derived, 'the invocation derives a fork');
+      return derived;
+    };
+    const declared = async (alpha: Agent) => {
+      say(alpha, 'user', 'hello');
+      await alpha.buildActivationRequest([tool('a')]);
+      await alpha.buildActivationRequest([tool('a'), tool('b')]);
+    };
+    const changeB = [[{ type: 'system_change', defineTools: [tool('b')] }]];
+
+    it("on another model than its principal sends no change row, and the principal's change stays where it was", async () => {
+      await withFramework([resident('alpha')], async (framework) => {
+        const alpha = framework.getAgent('alpha')!;
+        await declared(alpha);
+        const request = await (await forkOf(framework)).buildActivationRequest([tool('a'), tool('b')]);
+        assert.deepEqual(changesIn(request.messages), [], "no change row goes to the other model");
+        assert.deepEqual(request.tools, [tool('a'), tool('b')], 'its head carries the tools as they are');
+        assert.deepEqual(changesIn((await alpha.buildActivationRequest([tool('a'), tool('b')])).messages), changeB, "the principal's next request still carries its change");
+      }, undefined, { subconscious: { enabled: true, reader: 'forks', voice: 'v', model: 'another-model' } });
+    });
+
+    it("on its principal's own model sends the principal's change as stored", async () => {
+      await withFramework([resident('alpha')], async (framework) => {
+        await declared(framework.getAgent('alpha')!);
+        const request = await (await forkOf(framework)).buildActivationRequest([tool('a'), tool('b')]);
+        assert.deepEqual(changesIn(request.messages), changeB);
+        assert.deepEqual(request.tools, [tool('a')], "the principal's recorded head");
+      }, undefined, { subconscious: { enabled: true, reader: 'forks', voice: 'v', model: 'test-model' } });
+    });
+
+    it('of a principal on its head, on its own model, declares on its head too', async () => {
+      await withFramework([{ ...resident('alpha'), toolDeclarations: 'head' }], async (framework) => {
+        say(framework.getAgent('alpha')!, 'user', 'hello');
+        const fork = await forkOf(framework);
+        await fork.buildActivationRequest([tool('a')]);
+        const request = await fork.buildActivationRequest([tool('a'), tool('b')]);
+        assert.deepEqual(changesIn(request.messages), [], 'no change row');
+        assert.deepEqual(request.tools, [tool('a'), tool('b')], 'the tools as they are, on its head');
+      }, undefined, { subconscious: { enabled: true, reader: 'forks', voice: 'v', model: 'test-model' } });
+    });
+  });
+
   it("shows a change in history's tools as made, never what it declared, raw or as text", async () => {
     const at = (i: number) => new Date(Date.UTC(2026, 9, 20, 6, i));
     const rows = [

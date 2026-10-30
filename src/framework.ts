@@ -16239,6 +16239,7 @@ export class AgentFramework {
             model: cfg.model,
             proseRouting: 'disabled',
             ...readerModelFields(cfg),
+            ...(cfg.model != null && cfg.model !== this.agents.get(primary)!.model ? { toolDeclarations: 'head' as const } : {}),
           },
           inheritRefusals: true,
           onParentEnd: 'end',
