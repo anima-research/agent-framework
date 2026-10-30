@@ -12,6 +12,653 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.31.0 — 2026-10-30
+
+### Breaking
+
+- **Hosts that call `start()` or `addModule()` on an `AgentFramework` after its `stop()`:** a stop now ends its instance (#315). Once a `stop()` is admitted, `start()` throws and `addModule()` rejects, for good, whether that stop completed or failed. Before, both were allowed once the stop had settled (0.22.0: "A `start()` after a finished `stop()` starts a new lifecycle"; 0.24.0 left what it should do as #315's open question), and the lifecycle they began didn't work. Its event queue stayed closed, so an event passed to `pushEvent()` threw `Queue is closed` and a tool call's result couldn't be delivered, failing the turn that made it. Operator operations and MCPL connects were refused as "the framework is stopping". The push coalescer, the liveness watchdog and the MCPL servers stayed stopped, and events the queue held when the stop closed it ran in the new lifecycle. What did run was a turn woken outside the queue that called no tool: a sleep's wake, a heartbeat's, or a budget restart left pending.
+  - **Migration:** create a new `AgentFramework` on the store, with the same borrowed `store` or the same `storePath`. After a failed `stop()`, call `stop()` again first, until one resolves. The refusal says which applies. After a completed stop it reads `start() refused: this framework has stopped, and a stopped framework doesn't start again. Create a new AgentFramework on its store to go on, with its storePath if it opened the store itself.`, and `addModule()`'s the same with its own name. After a failed one, it says to call `stop()` again. After a failed one that left its owned store closed, so it can't be tried again, its `cause` is that stop's failure. These texts replace `Cannot start a new lifecycle: owned store is closed` and `Cannot start a new lifecycle: stop() closed its context managers, and then failed to close its owned store`, and once a `stop()` is admitted, `addModule()` now refuses before it checks the module's name against servers' tool prefixes, while that stop runs as well as after. A turn begun through `runUntilIdle()` before the first `start()`, and still being assembled when that `start()` comes, now goes on rather than being dropped.
+  - **What a new instance keeps:** what the store holds, and, with the heartbeat on and the same heartbeat state file, the heartbeat's schedule as it reads it from that file, so a tick or a reminder that fell due meanwhile fires once, shortly after it starts. What the old instance held only in memory is lost with it, as on a process restart: an agent's sleep and its wake, a self-wake, the inference requests still queued (a budget restart, a heartbeat's wake, a nudge), a re-armed turn's wait and count, and the redo stack. #627 is about keeping a sleep and a self-wake across a restart. To pause and resume one framework in place, use `quiesce()` and `resume()`.
+  - **Unchanged:** a `start()` or `addModule()` made while a `stop()` runs is refused as before, with `… refused: the framework is stopping`. `stop()` keeps its cleanup and retry: a failed `stop()` can be called again, and that call waits for what the failed one left running; a completed one called again resolves without tearing down again; one that failed and closed an owned store rejects again with its original error; its waits have no default bound; and a timed-out wait ends the caller's wait while teardown goes on. A `stop()` whose budget is refused, with a `RangeError`, isn't admitted and changes nothing. No sibling package needs a new version.
+- **Code that calls `EventGate.resumeSleep()`:** it's removed. It armed a disposed gate's timers again for a lifecycle after a `stop()`, which a framework no longer has, and the framework no longer calls it. A gate's `dispose()` is now for good: it keeps the sleep, as before, and nothing arms a sleep's or a self-wake's timer after it. To go on, create a new `AgentFramework`, whose gate is its own.
+
+- **Hosts:** a model call that stops making progress is now cut
+  (agent-framework#378). On an adapter whose stream reports content
+  (`AnthropicAdapter`, `BedrockAdapter`), a resident's streamed call, and an
+  MCPL server's, gets membrane's progress bounds: before content, 60 s from
+  its send, or, once a thinking block has started, the later of that and the
+  block's allowance (its `max_tokens` at 87 tokens a second); after content,
+  150 s from its last provider event, or the allowance when that event was a
+  thinking block's start and the allowance is longer. On every adapter a
+  streamed call also ends once the larger of a setup term (the larger of the
+  before-content and between-events bounds, 150 s) plus that allowance and
+  1,862 s passes with no provider event; an SSE keepalive comment isn't one.
+  A compression's, the reply judge's and an MCPL server's non-streamed call
+  ends the setup term plus its allowance after its send, or at the larger of
+  the setup term and 1,862 s when it names no `max_tokens`, unless its caller
+  passed a `progressTimeoutMs` of its own; on an adapter whose `complete()`
+  streams under the hood, such as membrane's OpenAI Responses adapter in
+  subscription mode, that bound runs from the last provider event instead.
+  Before, a call ended only at the Anthropic adapter's own 600 s watchdogs,
+  the SDK's request timeout or the runtime's fetch timeout, which still apply,
+  and a call kept open with keepalives didn't end. A call that would have run
+  past one of these bounds and then completed now fails as a `timeout`.
+  **Migration:** `inferenceBounds` raises them, and `inferenceBounds: false`
+  sets none of them. The phase bounds act only when the `Membrane` passed in
+  comes from membrane 0.8.0 or later; with an older one only the flat bound
+  acts, so a host that builds its own `Membrane` raises its membrane to
+  `^0.8.0` with this release.
+- **Hosts:** `DefaultErrorPolicy` gives a deadline expiry one fresh call,
+  1 s later. An expiry is a bound's cut, the Anthropic adapter's watchdogs,
+  the SDK's request timeout or a runtime's fetch timeout; the last three were
+  thrown as retryable timeouts and got the base schedule's three tries. For a
+  deadline expiry the framework passes an `errorPolicy` the count of that
+  call's consecutive expiries as `attempt`, in place of the turn's failures,
+  so each call a deadline cuts gets its fresh call; a host's own policy reads
+  that count too. A quiet call on an adapter without progress bounds now ends
+  after two of the runtime's fetch timeouts (on Bun, 360 s each) rather than
+  three. **Migration:** settings passed to `new DefaultErrorPolicy(settings)`
+  with no `deadline` schedule give an expiry their base schedule, counted the
+  same way.
+
+- **Hosts that run `DiscordModule` or `ApiModule`:** a sender's name from
+  outside the framework is now stored with each of the framework's notice
+  openings in it marked with a backslash before its bracket, as in the text a
+  participant or a server supplies, ahead of the name's ` (Discord)` or
+  ` (API)`. A name with none of those openings is stored as before. This
+  corrects 0.29.0's entry for these modules where it gives the stored form as
+  `<username> (Discord)` and `<name> (API)`: from this release, a name holding
+  one of those openings is stored in its marked form, and that is the form the
+  `ApiServer`'s message list shows wherever it lists such a message. 0.29.0's
+  entry on supplied text ends "This change doesn't mark these openings in the
+  name a message is stored under, which a formatter writes before the
+  message." This release does, for these two modules.
+
+  **Who needs to act:** code that matches senders by a stored message's exact
+  participant. As 0.29.0's entry says, read a row's `metadata.author` when it
+  has one, which this change leaves as it was.
+
+  **Unchanged:** rows stored before this change keep the name they were
+  stored with: a history sync or an edit through these modules may change a
+  stored message's content, never the name it is stored under. The generic
+  name `user`, in any capitalization, is stored as given.
+
+### Added
+
+- `FrameworkConfig.inferenceBounds` sets how long a model call may go without
+  progress: `progressBounds`, membrane's `beforeContentMs`, `betweenEventsMs`
+  and `thinkTokensPerSecond`, from which the flat and whole-call bounds also
+  derive, and `flatMinimumMs`, by default `FLAT_MINIMUM_MS` (exported). `false`
+  sets none. A value it can't use is refused at `create()`, naming the field
+  under `inferenceBounds`. One setting covers every agent, so a host with one
+  slower model raises the bounds for all of them.
+- Settings passed to `new DefaultErrorPolicy(settings)` can carry a
+  `deadline` schedule for deadline expiries.
+
+- A host's `executeToolCall` reaches the framework's own tools that the
+  agent has, as the agent's own call does (see the Fixed entry on awaited
+  tool calls).
+
+- **`workspace--status` for one mount that isn't direct shows its root's
+  identity**, whether or not a sync can use the root: `root` carries
+  `recorded` and `now` (`recorded` left out where the store's record of disk
+  can't be read back), each its device and inode and, where it has one, its
+  birth time as an ISO time in UTC to the nanosecond, so whoever upgraded
+  can see whether the root's birth time was recorded. Where the root is
+  usable and nothing is recorded yet, or no birth time is while the
+  directory has one, `root.note` says so, what can pass as the root until
+  then, and which call records it (a read-only mount's names no materialize,
+  which writes nothing there); while the store awaits reopening it says
+  nothing. Where the store's record of disk can't be read back, `status` for
+  a mount with no files still answers, as it did, its `root` saying the
+  recorded root can't be read, why, and the step that reopens the store.
+  `status` for every mount reads no disk: it carries `root` only where the
+  mount's last pass couldn't use the root, with `unavailable`, the words
+  that pass listed, and `lastPassAt`, when it ran, and none where the last
+  pass used it or no pass has run since start.
+
+- WebSocket servers can opt into `credentialRequired: true` with
+  `tokenTransport: 'header'` and a host-attached `accessProvider`. Missing,
+  throwing, empty or non-sendable providers stop the dial without fallback;
+  sendable credentials have no minimum length. Static tokens, URL token
+  parameters, userinfo, fragments, non-WebSocket bindings and cleartext
+  connections to anything but `localhost` or a literal loopback address are
+  refused. Redirects are not followed.
+  Dial failures distinguish `provider-failed`, `credential-rejected` (401/403),
+  `engine-unsupported` (no numeric upgrade status) and `connection-failed`.
+  Runtime support uses structured status capability rather than version pins.
+  Optional credential behavior and diagnostic filtering are unchanged.
+
+- `subconscious.physicalWindowTokens` and `subconscious.thinkingBinding`, with
+  the same types as an agent's and the same meaning where set, set the
+  subconscious reader's own window and thinking binding in place of the
+  resident's, on its own model or the resident's: the persistent reader's,
+  and each reader fork's. A reader whose `subconscious.model` names another
+  model can now have the window projection and the binding its model needs.
+  Left out, nothing changes: on the resident's model a reader inherits the
+  resident's two fields; on another model the persistent reader has neither,
+  and a reader fork has the resident's. `null` counts as left out, and so does
+  `false` for the binding, as in an agent's config. An enabled subconscious's
+  malformed binding is refused before anything opens, whichever its reader,
+  as an agent's is.
+
+### Changed
+
+- A turn that ends on a timeout says so in its `[inference-failed]` note: the
+  model call timed out, or its last call did, with the reason, which for a
+  bound's cut names the bound that ran out. When that call was a fresh call made for an earlier cut and a
+  deadline ended it too, the note says so: "The call was made again, and it timed out again." The cause in parentheses
+  is left out when it's only `timeout`. Its closing line says that if a reply
+  is still owed from that turn, it can be given now. Other failures keep their
+  wording and advice.
+- An MCPL server's streamed inference request that ends early is answered
+  with the reason and, when membrane gives one, its message, such as the
+  bound that ran out: ``The inference stopped before it finished (timeout:
+  No content within 60s of the send: … (the host's setting for this bound:
+  `inferenceBounds.progressBounds.beforeContentMs`))``.
+- A stream cut's reason, in a turn's error and note and in an MCPL server's
+  answer, ends by naming the host setting for the bound it hit, such as
+  ``(the host's setting for this bound:
+  `inferenceBounds.progressBounds.beforeContentMs`)``.
+
+- **Hosts:** a re-armed turn's send (agent-framework#838) that fails with a
+  deadline marked as run out, membrane's or a bound the host sets on the
+  call (`inferenceBounds`), as when a provider's stream stalls, now counts
+  as a transient failure, so a turn that ends on it is re-armed as for a
+  transient failure, unless it follows another such cut with no transient
+  failure, answered round or message said to the agent between them: two
+  such cuts in a row end the re-arming, and the second gets no retry from
+  the error policy, even in a re-armed turn that got partway. A transient
+  failure or an answered round in any of the agent's turns clears an earlier
+  cut, and so does a message said to the agent. Every such cut counts,
+  including one the error policy retries or a host's provider hold takes.
+  0.29.0 listed a deadline, whether the host set it or membrane marks one as
+  run out, among what the re-arm leaves unchanged; that still holds for a
+  turn that isn't itself a re-arm.
+
+- **A module's `stop()` now waits for its `start()` to settle** (#882). A
+  `stop()` of the framework, or a `removeModule()`, made while an
+  `addModule()` was still running the module's `start()` used to call the
+  module's `stop()` at once, so whatever the rest of its `start()` set up,
+  such as its own timers, outlived the stop that should have ended it. Now
+  the module's `stop()` is called once its `start()` has settled, fulfilled
+  or rejected, including for a `removeModule()` the `start()` itself makes.
+  The framework's `stop()` waits for that within its wait on modules, so a
+  `start()` that outlasts `stop()`'s budget fails the `stop()` as a slow
+  `stop()` does, and the module's `stop()` runs once the `start()` settles;
+  if it never settles, the module's `stop()` is never called. A
+  `removeModule()` has no budget and waits for the `start()` as long as it
+  runs. So a module's `start()` mustn't await its own removal or the
+  framework's `stop()`: both now wait for it, where before its `stop()` ran
+  beside it. A `removeModule()` made during a `start()` that then fulfils,
+  with no framework `stop()` admitted meanwhile, now announces the module
+  added, then removed; before, it was announced removed, then added.
+
+- **Importing agent-framework no longer loads discord.js.** It loads when the first `DiscordJsClient` is constructed, so a process that never makes one doesn't pay for it. On one 12-core machine at a one-minute load of about 17–23, 15 fresh processes each, importing the package took a median 0.37 s where it took 0.66 s under Bun 1.4.4, which loads `src` (run with its transpiler cache off), and 0.65 s where it took 1.00 s under Node 24.22.1, which loads `dist`. discord.js is no longer a static import, so `bun build` leaves it out of a bundle and keeps the call that requires it when a client is constructed: a bundled host that makes a `DiscordJsClient` needs discord.js to be resolvable then, and under `bun --no-install` a bundle with no `node_modules` at or above it can't find it. No export changes.
+
+- **The gate's refusals and file errors say what didn't happen, name each field as its caller wrote it, and say what to do.**
+  - **"Rule":** a refusal of a rule's fields opens `Rule "x" wasn't saved`, where it opened `Policy "x"`, and gate_status's notes and the gate's log lines call a rule a rule too.
+  - **A placement that names no rule:** `Rule "x" wasn't saved: insertBefore is "y", and no rule has that name.`, with the other rules and the way on, replacing `addPolicy: no policy named "y" to anchor on — have: [...]`. An `insertBefore` or `insertAfter` that isn't a rule's name gets the other rules a change edits and the way on too, or, where a change is refused, that refusal. Over a gate.json the gate doesn't use, these lists and the placement refusals add that gate.json, at its path, isn't in force, that a change is saved only if it brings it into force, and what would.
+  - **`passthrough` on a behavior that can't use it** names that behavior as given and says to leave `passthrough` out, replacing `passthrough is only valid with rate_limit or passive_sample behaviors — for "debounce:60000" …`. **A regular expression the gate can't read** says to fix it, or to give `match.filter.type` `"text"`.
+  - **`wake_add_rule`'s own refusals** of no behavior, more than one behavior and more than one placement say nothing was saved, and `wake_remove_rule`'s refusal of a missing `name` says nothing was removed and names the rules a change edits, or, where a change is refused, gives that refusal.
+  - **A gate.json the gate can't use:** where it can't be read, isn't JSON, or is JSON the gate refuses (neither an object nor a list, a `default` other than the three, a rule left out that could wake the agent under a `default` that holds events back), gate_status's error opens `gate.json, at <path>, …`, says what the gate runs meanwhile as before, and ends with what to do. Where it can't be read or isn't JSON, the error opened with the bare filesystem or parse error, and where it was refused, it named no path and nothing to do. The `[gate]` line ends with what to do too, and a change refused over gate.json names its path; a write that fails gives the filesystem's error, as before.
+  - **The privileged-users file:** a file that can't be read, isn't JSON or holds no list gets an error naming the file's path, how many ids of the list that last loaded stay privileged meanwhile, or that no one is, what makes it load, and that replacing it with a file holding `[]`, or removing it, makes no one privileged at the gate's next check for changes. Each of these used to read `Failed to load privileged-users file: …`. The error naming entries that aren't user ids names the path, how many ids did load and are privileged, and that the gate reads the file again once those entries are user ids.
+  - **Supplied text is escaped once, with the framework's escaping for it (`quotedValue`):** text from gate.json or the privileged-users file that a refusal, gate_status or a `[gate]` log line quotes, such as a parse error's excerpt, a rule's or a field's name, a value, a scope's event types in a shadow warning, or the rule names in a start's recipe line, and a value a refusal shows, including one the agent sent. So a UTF-16 file's NULs reach the agent and the log as `\u0000`, where they came through raw. An error from reading or parsing either file is now quoted, in double quotes, in these texts, and gate.json's in the `gate:config-error` trace's `error` too.
+
+- A stream whose tool calls don't declare `supportsInjectedMessages` is read
+  as one that doesn't carry injected messages: what's queued for the agent
+  waits for the turn's end, as on membrane's XML path. membrane's yielding
+  stream, the only one the framework continues across tool rounds, declares
+  it on both paths, true on the native path and false on the XML path. A
+  tool boundary with no stream, as the direct API's, stores what's queued as
+  before.
+
+- **Operators:** an MCPL server this host won't connect again on its own now
+  raises the `mcpl-down` ops alert once: a `failures.log` record, an
+  `ops:alert` trace, and the webhook within its 15-minute throttle.
+  - A startup connect that fails, leaving nothing connected and nothing to
+    retry it: a server without `reconnect: true`, a configuration refused
+    before anything launches, a protocol-version verdict, or a launch that
+    couldn't be reaped. 0.28.0 alerted only for the last two, so a stdio
+    server that exited before its handshake, as one started before the
+    network is up does, left one stderr line and its traces, and no alert.
+    The alert now reads "MCPL server not connected at startup, and this host
+    won't retry it on its own: <error>", where 0.28.0's read "MCPL server
+    unreachable at startup: <error>". A startup failure that leaves a
+    retrying connection raises nothing at startup: its fifth failed retry
+    raises the alert, or a retry that fails for good does, as before.
+  - A connected server that closes on its own with no reconnect coming: "MCPL
+    server closed (<reason>, code <n>), and this host won't reconnect it on its
+    own", with the transport's own reason and its exit or close code or signal
+    (a WebSocket peer's close text is left out, as the trace leaves it out), or
+    "MCP server closed (<reason>, code <n>), …" for a modern server. 0.28.0
+    raised nothing. A close this host makes (`stop()`, `disconnectMcplServer`,
+    `restartMcplServer`) raises none, and neither does a loss once `stop()` has
+    begun, whatever its cause, since it is part of the close the host is
+    making. Nor does a loss that reconnects, nor one whose launch couldn't be
+    reaped, which already raises the alert.
+  - A child that ends the way a server ends when asked to is taken as stopped,
+    not lost, and raises none: an exit with code 0, death by SIGTERM, SIGINT
+    or SIGHUP, or a shell's report of such a death, exit code 143, 130 or 129.
+    A service manager's stop (systemd's default, for one) signals the host and
+    its children together, so a child can go before the host's `stop()` closes
+    it, and a server that catches SIGTERM may exit 0 instead. So a connected
+    server that exits 0, or with one of those codes, on its own isn't
+    reported. Any other exit code, SIGKILL, SIGABRT or any other signal still
+    alerts, and so does a child the stdio transport ended itself after an
+    error on the child's stdin or stdout, whatever its code or signal. After
+    such an error the transport now waits up to 2 seconds for the child to
+    exit on its own before ending it, so a child that was already gone, as
+    one a stop's signal reaches while the host is writing to it, closes with
+    its own code and signal. A live child whose pipe failed is ended up to 2
+    seconds later than in 0.28.0; its connection is unusable by then.
+- **Operators:** a modern stdio server's loss now carries its child's exit
+  code and signal, as a legacy server's does: the `mcpl:server-closed` trace
+  carries them, where 0.28.0 gave `null` for both, and its `reason`, which
+  0.28.0 left out, is "child process exited" where the loss read "transport
+  closed".
+- **Operators:** a modern stdio server whose connect fails now carries the
+  last of the child's stderr, redacted, as a legacy server's failure does. A
+  failed first connect's "Failed to connect MCPL server" or "initial connect
+  failed, will retry" line prints it, and the `mcpl:server-connect-failed`
+  trace carries it as `stderrTail`, for the first connect and for each failed
+  retry. The alert leaves it out, since the webhook posts outside the process.
+  0.28.0's lines gave only the SDK's error, such as "Version negotiation probe
+  failed: Connection closed during the version negotiation probe", and the
+  child's stderr only as `mcpl:server-stderr` traces.
+- **Hosts:** `restartMcplServer`'s doc no longer says that `reconnect: true`
+  doesn't respawn a stdio child: each reconnect attempt spawns the child
+  afresh, once the connection has failed or the child has exited.
+
+- **A line longer than 104,857,600 UTF-16 code units (100 Mi) on a stdio
+  MCPL server's stdout now ends that server's connection.** This host
+  refuses the line as soon as a read takes it past the bound, takes no line
+  from stdout after it, writes nothing more to the child, and ends it at
+  once with SIGTERM, then SIGKILL if it outlives that. Requests in flight
+  fail with the disconnect when the child exits, unless their own deadline
+  comes first, and a request made after the line and before the exit is
+  refused as not sent.
+  The close's `pipeFailed` is `true`, so a server that doesn't reconnect
+  raises `mcpl-down`, as after a pipe failure. Each UTF-16 code unit is at
+  least one byte of UTF-8, so such a line is also longer than 100 MiB, the
+  per-message bound `ws` 8.22.0's client sets on the WebSocket path by
+  default.
+- **A stderr line longer than the same bound is dropped,** with one line in
+  its place saying so, `[a stderr line longer than 104,857,600 UTF-16 code
+  units was dropped]`, and the connection stays up. Stderr lines that arrive
+  before anything listens for them, on either engine, are held to the newest
+  200 lines and to the same bound in total: past either, the oldest whole
+  lines go, and the first line handed on says how many went, `[N earlier
+  stderr lines were dropped: unread stderr is held to 200 lines and
+  104,857,600 UTF-16 code units]`. On the modern engine that replaces a hold
+  of the newest 200 lines with no bound on their length, which dropped older
+  ones with no notice. Two holds are as before: the legacy
+  connection's own queue, which while its control plane is closed (until
+  it first opens, and from each reconnect until it reopens) holds up to
+  1,000 events that need no answer, stderr lines among them;
+  and the transport's stdout lines, held with no count bound whenever no
+  `'line'` listener is attached.
+- **The bound counts characters, not memory.** An unfinished line that
+  arrives in very small reads takes more memory than its characters until
+  its line end: up to about 32 bytes a character at one character a read.
+- **`McpServer.start()`, and so the `agent-framework-mcp` command, exits the
+  process with code 1** when a line on its stdin is longer than the same
+  bound, after one stderr line naming it.
+- **The words for a stdio server whose stdio this host stopped using have
+  changed.** Where this host's messages said "its pipe failed with X" or
+  "stdio pipe failed with X", they now say "this host stopped using the
+  server's stdio (X)". A close's reason reads `child process exited, and this
+  host had stopped using the server's stdio (write EPIPE)`, and so do the
+  `mcpl:server-closed` trace's `reason` and the `mcpl-down` alert that quotes
+  it. For a line past the bound, X is "the server wrote a line on stdout
+  longer than 104,857,600 UTF-16 code units". A loss whose child outlived
+  SIGKILL ended "and its child outlived SIGKILL", and now ends "and the
+  server's process outlived SIGKILL". A host that matches the old words
+  needs the new ones.
+
+- The workspace wake notice writes a changed or conflicting path that doesn't show as itself as one line of JSON, which parses back to the path. A path that shows as itself is written as before.
+- A script's ending gives a failure's name and message, a crash's detail and a stop's reason on one line, with any of the framework's openings in them marked, in the notice sent when a script the agent left running ends and in the code-execution tool's own results. A stop's reason is cut to 300 characters, as the script list already cut a failure's message.
+- A timed-out call whose answer came later is listed in the code-execution tool's results with that answer as JSON that gives it back on one line, with NEL, U+2028, U+2029 and any of the framework's openings escaped. A `wake_agent()` payload is written into its notice the same way.
+- The tool lines that opening or looking at the built-in toolset or a tab show give each tool's first sentence as a toolset's listing does: on one line, with any of the framework's openings marked.
+
+- **A turn keeps the messages it opened with whole.** At a start that opens a turn, the framework pins raw, with context-manager's `pinRange` and the name `agent-framework:turn-inputs`, the rows the agent sees that were stored after both the newest of its own messages that it sees and its consumed watermark (the store's head as of its last committing compile, or of its last tool boundary whose injected messages its stream carries), starting at the first such row that holds more than tool results. Until the turn ends, or a compile drops the pin as the next bullet says, its compiles, a `maxStreamTokens` restart's included, render those rows raw, where 0.30.0 lets compression fold them once they leave the recent window, so a long turn whose older rounds are summarised no longer loses the request it is answering. Their tokens count against the budget. A row inside the range that the agent doesn't see, such as a tuned-out message, stays out of its view, as before.
+- **When a committing compile refuses as over budget (`OverBudgetError`) while a pin of that name is held,** the pin is removed, a `[turn-inputs]` line is logged, and the compile runs once more, so the turn goes on as it would have without the pin, a refusal included. A dry run never removes it.
+- **The pin is removed** when the turn ends, whether it settles or its start or continuation is dropped, at `stop()`, and otherwise at the agent's next start that opens a turn, which first removes any pin of that name, one left by a process that crashed included. A silent heartbeat tick's start removes one too, and pins nothing. While the turn holds the pin, `listPins()` on the agent's context manager shows it. An agent whose strategy has no pins gets none.
+
+- Two readings kept for inputs no supported dependency produces are gone.
+  In XML tool mode, a round's persisted text is its `roundPreamble`, which
+  every membrane from 0.5.79 sends (the floor is 0.8.0); a round without one
+  no longer falls back to the cumulative `preamble`. A Discord awareness
+  ledger at version 1, which only an unreleased commit wrote, is refused with
+  the message any version but 2 and 3 gets.
+
+### Fixed
+
+- **An `addModule()` whose `start()` is still running when the framework's
+  `stop()` is admitted is refused** (#882). Once that `start()` fulfils, the
+  `addModule()` rejects with the refusal an `addModule()` made at that
+  moment gets, which follows the stop's state then, and no `module:added` is
+  emitted for the module; before, it resolved and the module was announced
+  after the framework had already stopped it. A `start()` that rejects
+  rejects the `addModule()` with its own error, as before.
+
+- An agent that's stopped, ended with its parent, or disposed as a fork now takes its failure accounting with it: its consecutive-failure streak, its poison-history rewind count, its refusal streak, rewind count and rewind episode, the mark that its last timed-out call was made again, and an open `/unstick` session, which it says on stderr has ended. That holds for a bounded job stopped, or its activation cancelled, while it runs, too. A new agent created under the name, or a job resumed after such an end, meets its first failed request as its first, so it isn't reported hard-down, and the poison-history breaker doesn't set aside its own message, on one refusal. A job whose run ended on its own, by a failure, a refused turn, its deadline or an abort of its call, keeps what failure accounting it has when it's resumed in the same process, since a resume reopens the same history and a history refused across resumes is what the streak is for; of that accounting, only the made-again mark goes at its end.
+
+- **An awaited tool call now goes where the agent's own call of the tool
+  goes.** The admin puppet (`puppetToolCall`), a host's `executeToolCall`
+  and a module's `ModuleContext.callTool` take the routing the turn's
+  dispatch takes, in its order. Before, an awaited call of `agent_settings`,
+  `save_recent_image`, `read_image`, `fetch_reference`, `gate_status`,
+  `event_tags`, `wake_add_rule`, `wake_remove_rule`, `sleep`, `wake`,
+  `think`, `journal`, `skip_reply` or `prose_help` reached the module
+  registry and failed with "Invalid tool name format", and the puppet stored
+  that failure in the agent's window as a call the agent had made. Now,
+  for each of these tools the framework has (the gate tools only with an
+  event gate, and `think`, `journal` and `skip_reply` only with a channel
+  registry, which an MCPL server brings):
+  - a call of one with agent origin (the puppet's, and a host's) runs the
+    handler the agent's own call runs and gets its answer, except
+    `skip_reply`, which ends the turn it's called in, while an awaited
+    call isn't made in a turn: a host's call of it gets a refusal
+    and does nothing, and the puppet refuses it, by name or through a
+    `toolsets--act` that reaches it, before anything runs or is stored, as
+    it refuses a tool that isn't on the agent's surface. A `sleep` made off
+    a turn posts no announcement, as a script's sleep after its turn
+    already doesn't;
+  - a module's call of the agent's own tools, `think`, `journal`,
+    `skip_reply` and `drafts`, is refused with a reason that says so, and
+    does nothing, and a module's call of the others runs for the agent its
+    `callerAgentName` names;
+  - where the dispatcher would answer one of these calls with a refusal
+    (such as a conversation fork's `sleep`), the awaited call gets it
+    without `refused`, which `ToolResult.refused` says a programmatic call
+    never carries;
+  - the puppet's check that a tool is on the agent's surface reads the
+    tools the agent may call, so an explicit-prose agent's `prose_help` is
+    on it;
+  - a `fetch_reference` whose work throws before it answers, such as one
+    whose `ref_id` has no text form, now answers with the error, on the
+    turn's path too, where before no result came from it;
+  - a `save_recent_image` that isn't one of its round's own calls, such as
+    a module's from inside its own pending tool call, doesn't wait on that
+    round's other calls, which would include the call that made it.
+
+- **agent-framework now asks for `@animalabs/chronicle` `^0.5.1`**, where it asked for `^0.5.0`. chronicle 0.5.1 stores JSON objects with their keys in the order they were written (in a JavaScript object, its own property order) and hands them back that way, where 0.5.0 sorted them. Where agent-framework opens a store itself, from `storePath` or in offline recovery, it does so with its own copy of chronicle, so asking for `^0.5.1` makes every install of agent-framework take that fix for those stores, whatever range the host or another package asks for. A store the host opens and passes in as `store` follows the host's copy of chronicle, which this range moves only where the installer shares one copy of chronicle between the host and agent-framework. Nothing is migrated: as chronicle 0.5.1's changelog says, objects written before through its JSON-writing methods keep their sorted keys, and objects stored before as raw bytes now come back in the order of their bytes (in a JavaScript object, its own property order), so a request built from them can change once after the upgrade.
+
+- **Hosts with a `providerHold`:** a wake parked on provider admission behind
+  an auxiliary call (compression's kind) now goes back to the scheduler if a
+  provider hold is pending for its agent when the auxiliary work it waited
+  for has settled, and the scheduler judges it as it judges a new wake: a
+  hold that stands keeps it, and it starts with that hold's other kept wakes
+  once the hold releases. Before, it went on into its turn's call: when the
+  auxiliary call's failure had armed the host's hold, that call went into the
+  quota the host had just said was spent.
+
+- A wake the scheduler merged from several wakes and took back before its
+  turn started (held by a provider's stated wait recorded after it was
+  scheduled, or sent back from its wait for an auxiliary call by a quiesce or
+  a turn still alive) is merged again from the wakes it took in, each as it
+  was. It was merged again as one wake, which lost what its first merge had
+  decided:
+  - Merged from two or more deferred coalescing batches, it no longer counted
+    as batch-only. When none of its batches had anything for it by then (each
+    retracted, displaced, or taken by another agent's assembly), its turn
+    called the model with nothing new to read, where the turn is withdrawn
+    with `turn-withdrawn`.
+  - It kept its first wake's time, so merged with a later-queued wake for an
+    older message, such as a gate's batched wake, it gave the turn that
+    message's channel instead of the newer addressed message's it stood for.
+- A merged wake whose every wake is withdrawn while it waits in the queue, in
+  a provider hold or in a scheduler pass is withdrawn with them, and starts
+  no turn. If it still waits as one wake, not yet taken back apart by a
+  scheduler pass, and its wakes were deferred batches of more than one
+  subject, it traces `turn-withdrawn` naming them as the last goes, with the
+  stderr line `[coalescing] <agent>: its deferred batches were withdrawn
+  while its wake waited; turn not started (no wake cause left)`.
+  `HostModeStatus.gatedRequests` counts a merged wake as the wakes it took in.
+- A provider hold whose kept wakes are all withdrawn while it holds them, as
+  a deferred batch's wake is when the batch is retracted, now releases
+  without starting a turn, with the stderr line `[provider-cooldown]
+  agent=<agent> hold, its held wakes withdrawn, released after <ms>ms`. Its
+  release queued a wake of its own (`provider-acceleration-retry`), whose
+  turn called the model with nothing new to read.
+
+- **`wake_add_rule`'s refusals named fields the agent never sent.** A refusal of a `debounceMs`, `rateLimit`, `passiveSample` or `judge` now names it so, and its fields as, for example, `rateLimit.tokens`, where it named gate.json's `behavior.debounce`, `behavior.rate_limit.tokens` and `behavior.passive_sample`. A behavior given as an object, in gate.json's form, is named as written there.
+- **A placement naming the rule it replaces** was refused as naming no rule, though a rule had that name. It now says a rule can't be placed beside itself, and gives the other rules and the way on.
+
+- **`workspace--status` names a mount whose root a sync can't use**, where
+  it said nothing while `sync` and `materialize` skipped every file of the
+  mount. Asked for that mount, its entry carries `root`: `unavailable`, the
+  words `sync` lists under `incomplete` for the mount's root; `recorded`,
+  the root identity disk last agreed under (`dev`, `ino`, and `born` where
+  one was recorded), or null, and left out where the store's record of disk
+  can't be read back; and `now`, the identity of the directory at the root's
+  path, or null where no directory could be checked there. That covers
+  nothing at the path, something there that isn't a directory, another
+  directory, and the recorded inode on another device. A root this process
+  can resolve but not list is named by `sync`'s and `ls`'s walk, as before,
+  and not by `status`. `canMaterialize` is false wherever that entry's
+  `root` has `unavailable`, since `materialize` writes nothing there.
+  `status` for one mount checks its root on disk, so a root on a network
+  mount that doesn't answer holds that call, as it holds that mount's
+  `sync`, `ls` and reads. `status` for every mount reads no disk: an entry
+  whose mount's last pass couldn't use the root carries `root` with
+  `unavailable`, the words that pass listed, and `lastPassAt`, when it ran.
+  An entry with no `root` is one whose last pass used the root, or a mount
+  with no pass since start: one watched `always` runs a pass when its
+  watcher is ready, and others when a call does.
+- **A directory made again where the mount root was removed, born after it,
+  is another directory** where the root's filesystem keeps a birth time
+  fixed: on Linux, ext2/3/4, xfs, btrfs, tmpfs, f2fs or zfs, as `statfs`
+  names it. It passed as the root when it had the old one's inode, as ext4
+  gives it, and is now refused in the replaced-root words. On any other
+  filesystem, overlayfs included, and off Linux, the rule before this change
+  decides: the same device and inode, or on another device the same birth
+  time below the second: overlayfs gives a directory it copies up from a
+  lower layer a later birth time under the same device and inode. A birth
+  time earlier than the recorded one still passes on its device. A birth
+  time equal to the ctime counts as none, so it is neither recorded nor
+  compared: Node reports one where `statx` is unavailable, such as under a
+  seccomp filter that blocks it, and a directory nothing has changed since
+  it was made has one too. So where either side has no birth time, a
+  directory with the old device and inode still passes, as before: anywhere
+  `statx` is unavailable; where the record has none, as releases before 0.28
+  left it; and for a directory just made in the root's place until something
+  changes in it after the clock's first tick.
+- **A mount root with the inode disk last agreed with, on another device
+  number, is named as that** where the birth times can't tell the two apart
+  (either side has none, as releases before 0.28 recorded roots; or the
+  root's is no later than the recorded one, or its filesystem doesn't keep a
+  birth time fixed, without both being the same time to below the second):
+  "the mount root has the inode disk last agreed with, but another device
+  number: a reboot can renumber a volume, and another volume mounted at the
+  same place can have a root with the same inode; whoever runs this host can
+  say which, and if it is the same directory, a sync of the mount with
+  acceptRoot takes it as it is now; if not, they can mount the right
+  volume". It was named as an unmounted drive or a replaced directory.
+  `status`, `sync`, `ls`, `materialize` and `read` give the new words, and
+  so does `readFileFromDisk`'s `Mount unavailable:` message, whose code is
+  unchanged.
+- **The replaced-root refusal says who can act on it**: "the mount root is
+  not the directory disk last agreed with (an unmounted drive, a directory
+  moved aside, or a replaced one); whoever runs this host can say which: a
+  drive they can reconnect, a directory moved aside they can put back, and a
+  replaced directory a sync of the mount with acceptRoot takes as it is
+  now", where it ended "reconnect it; if it was replaced on purpose, sync
+  the mount with acceptRoot to take it as it is now". Its code and fields
+  are unchanged.
+
+- **Operators:** once `stop()` has begun, no MCPL server with `reconnect: true`
+  is launched or dialed again on its own. A server lost just before or during
+  a stop, as when a service manager signals the host and its children
+  together, kept its retry timer, so when `stop()`'s waits (a stream, a
+  script, an operator operation) outlasted the retry's delay, 3.75 to 6.25
+  seconds at the defaults, its stdio command was started again and could
+  reconnect before the teardown closed it. A server such as a Discord bridge
+  logs in to its service before it serves, so that start did outward work for
+  nothing. Now `stop()`'s first step stops every connection reconnecting: a
+  retry already scheduled starts nothing, none is scheduled after, and a
+  legacy retry already under way is aborted, so one still waiting on its
+  access provider never dials. A modern retry already under way has spawned
+  its child or opened its connection, and is ended by the teardown's close,
+  as before. This covers a server whose first connect failed too: its
+  background retries stop as well.
+
+- **MCPL server authors:** a server's `inference/request` still running when
+  the host calls `stop()` is now answered `-32000` "the host stopped while
+  handling this request" (#418). Before, it got no answer, and failed on the
+  server's side when the connection closed. It's the answer a request whose
+  handler fails while the host is stopping already gets, so the server can
+  send the request again to the host's next run. The host writes it before it
+  closes the connection; a stdio server, which the close sends SIGTERM, may
+  exit before it reads it.
+- **Hosts:** `stop()` now aborts the provider call of each MCPL server's
+  `inference/request` still running, in the step after it closes its queue.
+  Before, the call ran on, and billed, until it finished or timed out, and its
+  answer was dropped. The request's `mcpl:inference_fail` trace carries the
+  stop answer's text. `stop()` then waits for each request to end, within its
+  wait on modules and MCPL, so with a budget a `stop()` still takes up to six
+  waits. A streamed request ends when membrane ends its stream, which
+  membrane 0.8.0 does at the abort. A non-streamed one ends when its
+  `complete()` settles, which with membrane 0.8.0 is at the abort too. A
+  `complete()` that ignores the signal now holds `stop()` until that wait's
+  budget runs out, or without a budget until the call ends, where before
+  `stop()` didn't wait for it; the timeout names
+  `inference/request:<server id>`.
+- **Hosts:** when the transport an MCPL server's `inference/request` came on
+  closes while its inference runs (the server's process exits, its connection
+  drops, or the host closes or removes the server), the provider call is
+  aborted, rather than running to its end for an answer nothing can receive.
+  The host answers nothing, and when the abort ends the call, the request's
+  `mcpl:inference_fail` trace says the transport the request came on closed;
+  a call that completed before the abort reached it is traced as completed.
+
+- **A module no longer acts once its `stop()` has completed,** through
+  `removeModule()` or the framework's `stop()`, except that after
+  `removeModule()` the result its `handleToolCall` returns for a call it was
+  already running is still delivered while the framework runs (below).
+  Before, a removed module's context could go on writing its state and log
+  state, which a later module of the same name
+  then read as its own, adding and editing messages in an agent's window,
+  calling other modules' tools with module origin, pushing events that
+  every remaining module processed, registering or removing speech
+  handlers under its name, sending ops alerts, and receiving traces. And
+  an event already being dispatched could still call the removed module's
+  `onProcess`, with a later namesake's context, apply its response,
+  writing its state update into a namesake's state, and call its speech
+  handler on a namesake; and a turn whose context was being gathered when
+  its removal completed still took its `gatherContext` answer. Now, once a
+  module's `stop()` has completed (a module added again under its name,
+  even the same object, is a new registration, which none of this
+  touches):
+  - each push through its context is dropped with a log line, as a push
+    after the framework's `stop()` is: per push, since a tool result's line
+    names the call, the tool where the event names one, and whether it
+    succeeded, which an operator reconciles call by call;
+  - `setState`, `registerLogState`, `appendToLog`, `editLogItem`,
+    `editMessage`, `removeMessage`, `notifyOps`, `registerSpeechHandler` and
+    `unregisterSpeechHandler` do nothing; `addMessage` returns `''` and adds
+    nothing; `callTool` resolves with an error result and runs nothing;
+    `getModule` returns `null`; and `onTrace` subscribes nothing, while the
+    subscriptions made through the context end, and do nothing even if the
+    registry's unsubscribe throws. None of these throws, so a
+    late callback can't fail the host, and the first call of each method
+    logs one line naming the module and the method;
+  - `findMessageByExternalId` answers without updating its mapping; reads
+    answer, and fail, as before;
+  - its `onProcess`, `onAgentSpeech` and `onToolBatchComplete` aren't called
+    again, and a response of its that hadn't been applied is dropped whole,
+    with a line naming what it asked for if it asked for anything. A push it
+    made while registered still runs, since a push is its message to the
+    others, made while it was there, whereas applying a response would act on
+    its behalf after it's gone;
+  - its `gatherContext` answer is left out of a turn whose answers the
+    registry hadn't merged when its `stop()` completed, with a line if it
+    held injections; a stop that completes after the merge leaves that
+    turn's context as it was;
+  - a module added later under its name has its `onToolBatchComplete`
+    called, even while the stopped module's own hook is still running past
+    its bound.
+- **After `removeModule()`, the result a module's `handleToolCall` returns
+  for a call it was running when its `stop()` completed is still delivered
+  while the framework runs,** like a push it made while registered: the
+  agent asked while the module was there, and the result is the true
+  answer to what ran. An error in its place would
+  tell the agent a tool that ran didn't, and dropping it would leave the
+  call unanswered. A response differs because the framework applies a
+  response for the module, after it's gone. A result the module pushes
+  through its context after its stop completes is a push like any other:
+  it's dropped, with the line that names the call, the tool and whether it
+  succeeded. The framework's `stop()` closes its event queue before it
+  stops any module, so through it that result is dropped, with the line any
+  tool result arriving after the framework's `stop()` gets, as before.
+- **A module may still write from inside its own `stop()`,** and a module
+  whose `stop()` fails stays registered with a working context, for the
+  retry.
+- **A push dropped after the framework's `stop()` keeps today's line.** A
+  `ModuleRegistry` a host builds itself, such as one its tests build, drops
+  a stopped module's pushes too, with a line of its own for each, and
+  doesn't queue them.
+
+- **`save_recent_image` takes null or an empty string for the selector a caller isn't using.**
+  `ref` is now advertised as string-or-null and `index`/`count` as integer-or-null, and
+  null, an empty string and omission all mean the selector isn't used. Callers whose
+  provider presents every property as required can therefore save by `ref` or by
+  `index`/`count`; before, `ref: null`, `ref: ""` and `count: null` were all refused, so
+  neither selector worked for them. Any other supplied value is checked, never read as
+  absent: a whitespace or malformed `ref` is refused, and an `index` or `count` given as a
+  whitespace string, a boolean, an array, or a numeric string other than decimal digits
+  (`"2.0"`, `"+2"`, `"1e0"`, `"0x2"`) is refused, as an out-of-range one is, instead of
+  being coerced. Before, `Number()` read such an `index`: `" "`, `false` and `[]` as 0,
+  which saved the newest image, `true` as 1 and `[2]` as 2, which saved the second- and
+  third-newest, and `"2.0"` or `"+2"` as 2; a `count` was read the same way, then
+  range-checked. Integer numbers and decimal-digit strings, with surrounding whitespace
+  trimmed, are accepted within each selector's range (`index` from 0, `count` 1..20) and
+  within the integers a number holds exactly, so a value past them is refused rather
+  than read as a different number. A malformed `ref` beside an `index` or `count` in use is
+  refused with a note that null, or leaving the selector out, marks one that isn't used, as
+  the conflict refusal of a well-formed `ref` beside them says. A refusal of one selector on
+  its own carries no such note: dropping a lone `ref` would save the newest image, and
+  dropping `index` or `count`, which together are one selector, would save other images than
+  the call named.
+- **`drafts` reads its nullable fields by the same rule.** An empty string now means
+  `draftIds`, `destination`, `confirmDuplicate` or `offset` isn't in use, as null and
+  omission already did, so a caller that fills the fields it isn't using with `""` can
+  use the tool. Before, `{action: "list", destination: ""}` was refused as passing a
+  field `list` doesn't use. `confirmDuplicate: false` is now taken as "don't confirm" on
+  `list`, `read` and `dismiss` too, as the field's description already offered. `offset`
+  is read as `index` is, so one past the integers a number holds exactly is refused;
+  before, it was read as a rounded number, past every draft.
+- **The selectors' schema uses JSON Schema type arrays** (`["integer", "null"]`,
+  `["string", "null"]`), as `drafts` and `set_tool_description` already did. Membrane 0.7.0
+  and later send a tool's schema to Gemini as `parametersJsonSchema`, so the arrays reach it
+  as JSON Schema. A host whose own membrane is older than 0.7.0 still sends them as the
+  function declaration's `parameters`, where Gemini's `Schema.type` takes a single type.
+
+- A server's listing in `toolsets--look` writes an openable toolset's options as an object of its parameters again, such as `{size?: 9|13|19 =9}`. 0.29.0 and 0.30.0 wrote a stray `"(` after the opening brace, as `{"(size?: 9|13|19 =9}`.
+
+- A tuned-out channel's cancel writes its backlog dump and makes it
+  durable before it records the tune-out's end, as the all-except hold's
+  release already ordered them. A cancel that failed between the two, from
+  a write that threw or a process that died, left the tune-out ended with
+  no dump: its held messages stay out of every resident's window, so
+  nothing delivered them, at a restart either. Now a failure before the
+  end record, a dump that couldn't be made durable included, leaves the
+  tune-out (or the all-except hold) in force, and a later cancel, in this
+  process or after a restart, dumps the stored held messages no earlier
+  dump covered. Each dump records the held messages it covered, those its
+  cap left out among them, so a retried cancel shows none of them twice. A
+  tune-out whose writes keep failing stays in force past its end time, its
+  cancel tried again every minute, and so does one whose queue of writes
+  waiting to be stored is over its cap, until the queue is back under it;
+  one that reached its end time while the process was down is tried the
+  same way, and the start goes on. A tune-out past its wake budget is
+  cancelled at the start too, and its cancel, like an end time's, is tried
+  again every minute while it fails. A tool close of the excepted channel
+  whose release fails is refused and not recorded: when the release fails
+  before the hold's end is recorded, the hold stays in force; when it
+  fails after, the hold has ended.
+
 ## 0.30.0 — 2026-10-29
 
 ### Breaking
