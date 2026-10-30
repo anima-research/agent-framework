@@ -305,7 +305,7 @@ export class ToolResultGuard {
     // A retry must not undo an operator's later edit/removal/rollback.
     // Reapplying our own payload is safe if an earlier edit wrote the
     // message and then failed while propagating to context entries.
-    // Chronicle normalizes object-key order and drops undefined fields.
+    // Chronicle drops undefined fields.
     if (!sameBranch || !current ||
       (!isDeepStrictEqual(current.content, JSON.parse(JSON.stringify(expected)))
         && !isDeepStrictEqual(current.content, JSON.parse(JSON.stringify(content))))) {
