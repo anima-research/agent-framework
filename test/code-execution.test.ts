@@ -872,6 +872,10 @@ describe('code_execution through the framework', () => {
     // Turns 2 and 3, the wakes, get their responses just before each starts:
     // the stand-in membrane gives a stream every response queued when it opens.
     await withFramework('ce-wake-', { membrane, module, resident: true, codeExecution: { wakeMinIntervalMs: 0 } }, async (framework) => {
+      let turnsEnded = 0;
+      framework.onTrace((event) => {
+        if (event.type === 'inference:completed' && event.agentName === 'prime') turnsEnded++;
+      });
       framework.start();
       framework.pushEvent({
         type: 'external-message', source: 'test', content: [{ type: 'text', text: 'arm a watcher' }], metadata: {}, triggerInference: true,
@@ -880,6 +884,7 @@ describe('code_execution through the framework', () => {
         content: Array<{ text?: string }>; metadata?: { source?: string; tags?: string[]; scriptId?: string };
       }>).filter((m) => m.metadata?.source === 'code-execution-script');
       await until(() => module.waiting === 1, 'the first slow call');
+      await until(() => turnsEnded === 1, 'the first turn to end, so the wake finds the agent at rest');
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Woke and handled.' }]));
       module.release();
       await until(() => wakes().length === 1, 'the wake_agent() wake');
