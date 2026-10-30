@@ -594,6 +594,9 @@ export interface InferenceRequest {
    *  published into that channel having read it, or once the message isn't
    *  on its store's current branch, the wake starts no turn. */
   readsStoredMessage?: string;
+  /** @internal The messages of every wake this request stands for, each
+   *  as its stored id or a held write's handle. */
+  openingMessages?: string[];
   agentName: string;
   reason: string;
   source: string;

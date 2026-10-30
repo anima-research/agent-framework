@@ -114,9 +114,12 @@ interface Module {
 
   // Optional
   onAgentSpeech?(agentName: string, content: ContentBlock[], context: SpeechContext): Promise<void>;
+  onSpeechRouted?(agentName: string, text: string, context: SpeechRoutedContext): Promise<SpeechSent>;
   gatherContext?(agentName: string): Promise<ModuleContextInjection[]>;
 }
 ```
+
+As a turn routes each piece of its plain speech (prose routing by locus or hybrid, with a channel registry), every module with `onSpeechRouted` is asked about that text. A module that showed it to someone, such as the terminal or page whose message opened the turn (`context.openedBy.messages` names the turn's messages), resolves to `{ sentTo: '…' }`: the turn's `[delivered]` receipt says "sent to …", beside any channel the text went to, and a turn with no channel gets no `[send-undeliverable]` notice for that text. The modules are asked together, and their answers about each piece are waited for at most `SPEECH_RECEIPT_WAIT_MS` (5 s), so a turn of several pieces can wait that long for each; a module that throws or hasn't answered by then counts as having shown nothing. A piece with a channel posts without waiting for its own answers, and a failed post's notice stands whatever the modules answer; since a turn's pieces route in order, a post that follows a piece with no channel waits behind that piece's answers, only while a module hasn't answered. The turn's receipt waits up to the same bound for answers still due. A module answers `{ sentTo }` where it showed the text, and `{}` otherwise, as for a turn none of its surfaces opened. A piece with no channel that no module named a place for gets `[send-undeliverable]`, which names the piece by its opening words and says another surface may have shown it. Private envelopes, explicit sends and a heartbeat's held prose are never asked about.
 
 An `EventResponse` can add/edit/remove messages, update module state, request inference, and signal tool changes. The framework applies its message changes, then its state update, then its inference request; when one of these throws, what came before it stays applied, that step may have taken effect in part, and the rest of that response isn't:
 

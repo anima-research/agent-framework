@@ -1043,6 +1043,8 @@ interface ChannelRegistryOptions {
     serverId?: string;
     reason: string;
     textLen: number;
+    /** The words routed, whichever the outcome. */
+    text: string;
     /** `failed`: nothing was posted; `unknown`: the request was dispatched
      *  and no valid receipt came back, so it may or may not have been. */
     outcome?: 'failed' | 'unknown';
@@ -6099,10 +6101,8 @@ export class ChannelRegistry {
     text: string,
     /** The turn's FROZEN locus, with its server, snapshotted once by the caller (resolveLocus
      *  at turn start) and passed to every segment of the turn. Mandatory:
-     *  there is deliberately no live-resolution fallback here — a late
-     *  dispatch resolving live can read the NEXT turn's trigger state or a
-     *  stale global default and land the reply in the wrong channel (item-3,
-     *  PR #32, and the 2026-07-22 Sol DM misroute). Explicit `null` means
+     *  there is deliberately no live-resolution fallback here (item-3,
+     *  PR #32). Explicit `null` means
      *  "this turn is pinned to no locus": fail loudly rather than guess,
      *  except for an ephemeral run, whose speech is then its caller's
      *  result. */
@@ -6133,7 +6133,7 @@ export class ChannelRegistry {
       if (status === 'unknown' || !opts?.heldOnFailure) {
         this.onRouteFailure?.({
           conversationId, channelId, ...(channel ? { serverId: channel.serverId } : {}),
-          reason, textLen: text.length, outcome: status, ...(detail !== undefined ? { detail } : {}),
+          reason, textLen: text.length, text, outcome: status, ...(detail !== undefined ? { detail } : {}),
         });
       }
       return outcome;
@@ -6161,8 +6161,8 @@ export class ChannelRegistry {
         return { status: 'failed', reason: "an ephemeral run's plain speech with no channel of its own is its caller's result", at: Date.now() };
       }
       // The turn froze with no locus (no home, no triggering channel, no
-      // global inbound ever seen) — the agent was told its prose stays in
-      // the archive; honor that.
+      // global inbound ever seen) — the agent was told no channel posts
+      // its prose; honor that.
       // The locus froze at the turn's start, so this says what the turn had.
       const reason = 'this turn came from no channel, and it had no home or recent channel to reply in; if it should have ' +
         'had one, ask whoever runs this host';

@@ -55,6 +55,14 @@ export function splitProseRuns(content: readonly ContentBlock[]): string[] {
   return runs;
 }
 
+export function trailingRunCount(content: readonly ContentBlock[], unyielded: ReadonlySet<string> = new Set()): number {
+  let last = content.length - 1;
+  const endsRun = (block: ContentBlock): boolean => (block.type as string) === 'tool_result'
+    || (block.type === 'tool_use' && !unyielded.has(block.id));
+  while (last >= 0 && !endsRun(content[last]!)) last--;
+  return splitProseRuns(content.slice(last + 1)).length;
+}
+
 /**
  * A turn's content without the prose of some of its tool rounds, the turn's
  * rounds counted from 0 in order. A round's prose is its text
