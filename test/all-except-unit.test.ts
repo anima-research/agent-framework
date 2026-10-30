@@ -13,8 +13,10 @@ import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 
 type Held = { participant: string; content: Array<{ type: string; text?: string }>; metadata?: Record<string, unknown> };
 
-/** `stored`: the primary's stored messages; `kept`: the writes a surgery's hold keeps in memory. */
-function harness(held: { stored?: Held[]; kept?: Held[] } = {}) {
+/** `stored`: the primary's stored messages; `kept`: the writes a surgery's
+ *  hold keeps in memory; `writesHeld`: the framework's hook, which a
+ *  surgery's hold makes true (left out, no write is taken to be held). */
+function harness(held: { stored?: Held[]; kept?: Held[]; writesHeld?: () => boolean } = {}) {
   const stored = held.stored ?? [];
   const kept = held.kept ?? [];
   const state = new Map<string, unknown>();
@@ -58,6 +60,7 @@ function harness(held: { stored?: Held[]; kept?: Held[] } = {}) {
     isPrivilegedAuthor: () => false,
     allowChannelSpeech: () => false,
     emitTrace: (e: { type: string }) => { traces.push(e.type); },
+    ...(held.writesHeld ? { writesHeld: held.writesHeld } : {}),
   } as unknown as TuneOutFrameworkHooks;
   const make = () => new TuneOutCoordinator(registry, servers, hooks);
   return { make, state, wakes, messages, traces, fail, stored };
@@ -122,11 +125,14 @@ describe('all-except scope on the coordinator', () => {
 
   // Review 2, J-AF29: the hold's writes are stored only at its release, so
   // the scope read the record alone and left them out of its counts and its
-  // release.
-  it("counts and releases a held message a surgery's hold keeps in memory, after those stored", () => {
+  // release. A check during the hold counts them. A framework cancel waits
+  // for the release (writesHeld, the next test); one goes on during the
+  // hold only where asking whether writes are held throws, and it is that
+  // release that reads the writes the hold keeps beside those stored.
+  it("counts a held message a surgery's hold keeps in memory, and a cancel that goes on during the hold, asking whether writes are held having thrown, releases it after those stored", () => {
     const stored: Held[] = [];
     const kept: Held[] = [];
-    const h = harness({ stored, kept });
+    const h = harness({ stored, kept, writesHeld: () => { throw new Error('the hold could not be asked about'); } });
     const c = h.make();
     const r = c.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120, backlogCap: 10 }, 'agent-tool');
     assert.ok(r.ok);
@@ -142,6 +148,33 @@ describe('all-except scope on the coordinator', () => {
     const release = h.messages.find((m) => /all channels except work released/.test(m.text))!.text;
     assert.match(release, /2 messages held in 1 channel/, 'the release counts it');
     assert.match(release, /messages=2>\nantra: N1 stored\nantra: N2 kept by the hold/, 'and lists it, after the stored one');
+    c.stop();
+  });
+
+  it("a cancel of the scope asked for during a surgery's hold waits, the hold in force, and at the release counts and lists what the hold kept, stored by then", () => {
+    const stored: Held[] = [];
+    const kept: Held[] = [];
+    let held = true;
+    const h = harness({ stored, kept, writesHeld: () => held });
+    const c = h.make();
+    assert.ok(c.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120, backlogCap: 10 }, 'agent-tool').ok);
+    const epochId = c.getAllExcept()!.params.epochId;
+    const message = (t: string): Held => ({
+      participant: 'user', content: [{ type: 'text', text: t }],
+      metadata: { tuneOut: { epochId }, channelId: 'noisy', serverId: 'disc', author: { name: 'antra' } },
+    });
+    stored.push(message('N1 stored'));
+    kept.push(message('N2 kept by the hold'));
+    assert.deepEqual(c.cancelAllExcept('duration', 'duration elapsed'), { ok: true, deferred: true }, 'it waits');
+    assert.ok(c.getAllExcept(), 'the hold stays in force');
+    assert.ok(!h.messages.some((m) => /all channels except work released/.test(m.text)), 'and nothing is released during the surgery');
+    // The release stores what the hold kept, then runs the cancels that waited.
+    held = false;
+    stored.push(...kept.splice(0));
+    c.runDeferredCancels();
+    assert.equal(c.getAllExcept(), null, 'it ends at the release');
+    const release = h.messages.find((m) => /all channels except work released/.test(m.text))!.text;
+    assert.match(release, /messages=2>\nantra: N1 stored\nantra: N2 kept by the hold/, 'it lists the kept message, stored by then, after the stored one');
     c.stop();
   });
 

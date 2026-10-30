@@ -28,8 +28,9 @@ const textOf = (content: ContentBlock[]): string =>
 /** Cancels epoch eA of disc:guild:a with the given cap and source, over the
  *  given stored messages, of which the subconscious hasn't seen `unseen`,
  *  and those a surgery's hold keeps in memory (`kept`), and returns what the
- *  coordinator added and whose inference it requested. */
-function cancelWith(opts: { backlogCap: number; source: string; stored: Row[]; kept?: Row[]; unseen?: number; note?: string }) {
+ *  coordinator added and whose inference it requested. `writesHeld` is the
+ *  framework's hook; left out, the coordinator takes no write to be held. */
+function cancelWith(opts: { backlogCap: number; source: string; stored: Row[]; kept?: Row[]; unseen?: number; note?: string; writesHeld?: () => boolean }) {
   const added: Added[] = [];
   const inferences: string[] = [];
   const registry = {
@@ -55,6 +56,7 @@ function cancelWith(opts: { backlogCap: number; source: string; stored: Row[]; k
     getSurgeryHeldMessages: () => opts.kept ?? [],
     unseenBySubconscious: () => opts.unseen ?? 0,
     emitTrace: () => {},
+    ...(opts.writesHeld ? { writesHeld: opts.writesHeld } : {}),
   };
   const coordinator = new TuneOutCoordinator(registry as never, {} as never, hooks as never);
   assert.deepEqual(coordinator.cancel('disc', 'disc:guild:a', opts.source, 'test', opts.note), { ok: true });
@@ -134,15 +136,62 @@ test('a cancel the subconscious makes itself with no note gets the notice and a 
 // Review 2, J-AF29 (#232 gap 7): a write while a surgery holds the store is
 // kept in memory until the hold's release, so a cancel during the hold read
 // the record alone and its dump left the message out.
-test("a cancel during a surgery's hold lists the held messages the hold keeps in memory, after those stored, and counts them against the cap", () => {
+// A framework cancel waits while a surgery's hold is up (writesHeld: the
+// test below), so its dump reads the hold's writes stored. One goes on
+// during the hold only where asking whether writes are held throws, and it
+// is that dump that reads the writes the hold keeps beside those stored.
+test("a cancel that goes on during a surgery's hold, asking whether writes are held having thrown, lists the held messages the hold keeps in memory, after those stored, and counts them against the cap", () => {
   const { dump, notice } = cancelWith({
     backlogCap: 2,
     source: 'duration',
     stored: [row('Ann', [text('A1 stored')], 'eA'), row('Ann', [text('A2 stored')], 'eA'), ...OTHERS],
     kept: [row('Ann', [text('A3 kept by the hold')], 'eA'), row('Bo', [text('B2 kept by the hold')], 'eB')],
+    writesHeld: () => { throw new Error('the hold could not be asked about'); },
   });
   assert.ok(dump.includes('messages=3') && dump.includes('truncated=1'), `the kept message is counted, and the cap leaves the oldest out: ${dump}`);
   assert.ok(dump.includes('Ann: A2 stored\nAnn: A3 kept by the hold'), 'it is the newest, shown last');
   assert.ok(!dump.includes('A1 stored') && !dump.includes('B2'), "the oldest is left out, and another epoch's kept message isn't the dump's");
   assert.ok(notice && textOf(notice.content).includes("1 of 3 diverted messages, the oldest, weren't delivered raw"), 'and the report is told so');
+});
+
+test("a cancel asked for during a surgery's hold waits, the tune-out in force, and at the release lists what the hold kept, stored by then, in arrival order", () => {
+  const stored: Row[] = [row('Ann', [text('A1 stored')], 'eA'), ...OTHERS];
+  const kept: Row[] = [row('Ann', [text('A2 kept by the hold')], 'eA')];
+  let held = true;
+  let inForce = true;
+  const added: Added[] = [];
+  const params = { epochId: 'eA', cadenceSeconds: 300, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 };
+  const registry = {
+    getTuneOutState: () => (inForce ? { params, wakeCount: 0 } : null),
+    readCoordinatorState: () => null,
+    nameShown: (channel: { channelId: string }) => channel.channelId,
+    quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
+    cancelTuneOut: () => { if (!inForce) return null; inForce = false; return { params, wakeCount: 0 }; },
+  };
+  const hooks = {
+    addMessage: (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, forAgent?: string) => {
+      added.push({ participant, content, metadata, forAgent });
+    },
+    requestInference: () => {},
+    subconsciousName: () => 'Subconscious',
+    primaryName: () => 'scout',
+    getStoredMessages: () => stored,
+    getSurgeryHeldMessages: () => (held ? kept : []),
+    unseenBySubconscious: () => 0,
+    emitTrace: () => {},
+    writesHeld: () => held,
+  };
+  const coordinator = new TuneOutCoordinator(registry as never, {} as never, hooks as never);
+  assert.deepEqual(coordinator.cancel('disc', 'disc:guild:a', 'duration', 'test'), { ok: true, deferred: true }, 'it waits');
+  assert.ok(inForce, 'the tune-out stays in force');
+  assert.equal(added.length, 0, 'and nothing is released during the hold');
+  // The release stores what the hold kept, then runs the cancels that waited.
+  held = false;
+  stored.push(...kept);
+  coordinator.runDeferredCancels();
+  assert.ok(!inForce, 'it ends at the release');
+  const dump = added.find((m) => m.metadata?.kind === 'tune-out-cancel');
+  assert.ok(dump, 'the cancel adds its dump');
+  assert.ok(textOf(dump.content).includes('messages=2') && textOf(dump.content).includes('Ann: A1 stored\nAnn: A2 kept by the hold'),
+    `it lists the message the hold kept, stored by then, after the one stored before: ${textOf(dump.content)}`);
 });

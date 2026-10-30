@@ -216,6 +216,22 @@ describe('admission: the hold is decided once, before any side effect', () => {
     } finally { await f.close(); }
   });
 
+  // docs/dendrite.md: "A cancel that runs stores and syncs its release
+  // before it returns" (commitDeliveries).
+  it('gap 6 — a cancel that runs syncs its release before it returns', async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enter(f, 'noisy', { backlogCap: 10 });
+      const store = (f.framework as unknown as { store: { sync: () => void } }).store;
+      const sync = store.sync.bind(store);
+      let syncedWithRelease = 0;
+      store.sync = () => { if (has(f, '<tuned-out-backlog')) syncedWithRelease++; sync(); };
+      assert.deepEqual(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test'), { ok: true });
+      assert.ok(syncedWithRelease > 0, 'the store was synced with the release in it before the cancel returned');
+    } finally { await f.close(); }
+  });
+
   // Review 2, J-AF29: a surgery's hold keeps a write in memory until the
   // hold's release stores it. A check during the hold reads those writes
   // beside the record (getSurgeryHeldMessages), as it once read the
