@@ -226,8 +226,12 @@ export type RowSlot = 'own' | MessageSlotRef;
  *
  * In its own slot, with `stamp = audienceOf(metadata)`:
  * - its own row (`ownRowOf` names it): own;
- * - another agent's own row: elsewhere (decision 1: another agent's rounds
- *   reach an agent only through an observe edge);
+ * - another agent's own row: an arrival when one of the reader's edges
+ *   names that agent and reads this slot (observesOwnRows: a resident's
+ *   `AgentConfig.observes`, the relationship decision 1 says another
+ *   agent's rounds reach an agent only through), unless it is that agent's
+ *   stored context injection, which the reader's view leaves out;
+ *   elsewhere otherwise, as it is for every resident by default;
  * - a row whose audience names it: an arrival, unless it is held and the
  *   reader leaves held rows out, or it is another agent's stored injection,
  *   which the reader's view leaves out too (what the reader's own view
@@ -259,7 +263,10 @@ export function bearingOf(
   }
   const stamp = audienceOf(metadata);
   if (stamp) {
-    if (stamp.ownRowOf !== undefined) return stamp.ownRowOf === reader.name ? 'own' : 'elsewhere';
+    if (stamp.ownRowOf !== undefined) {
+      if (stamp.ownRowOf === reader.name) return 'own';
+      return observesInOwnSlot(reader, stamp.ownRowOf) && !isAnotherAgentsInjection(metadata, reader.name) ? 'arrival' : 'elsewhere';
+    }
     if (!stamp.audience.includes(reader.name)) return 'elsewhere';
     if (isAnotherAgentsInjection(metadata, reader.name)) return 'elsewhere';
     return reader.hidesHeld && heldFromResidents(metadata) ? 'elsewhere' : 'arrival';
@@ -268,6 +275,25 @@ export function bearingOf(
   if (reader.hidesHeld && heldFromResidents(metadata)) return 'elsewhere';
   if (isAnotherAgentsInjection(metadata, reader.name)) return 'elsewhere';
   return 'arrival';
+}
+
+/** Whether one of the reader's edges names `owner` and reads the reader's own slot: a co-resident it observes. */
+function observesInOwnSlot(reader: ReaderFacts, owner: AgentName): boolean {
+  return reader.observed.some((seen) => seen.edge.agent === owner && sameSlot(seen.slot, reader.ownSlot));
+}
+
+/**
+ * Whether a reader is shown `owner`'s own rows through an observe edge, as
+ * bearingOf reads its edges: an edge on another slot that `owner` owns, or
+ * an edge that names `owner` and reads the reader's own slot (a resident
+ * observing a co-resident, AgentConfig.observes). An edge on the reader's
+ * own slot shows only the agent it names, though every resident owns that
+ * slot.
+ */
+export function observesOwnRows(reader: ReaderFacts, owner: AgentName): boolean {
+  return reader.observed.some((seen) => (sameSlot(seen.slot, reader.ownSlot)
+    ? seen.edge.agent === owner
+    : seen.owners.includes(owner)));
 }
 
 /**

@@ -1,5 +1,5 @@
 export { AgentRegistry, AgentSpecError, RESIDENTS_SLOT, sameSlot, observedSlot } from './registry.js';
-export type { AgentRegistryOptions, RestoreOutcome, ReconcileOutcome } from './registry.js';
+export type { AgentRegistryOptions, RegisterOptions, RestoreOutcome, ReconcileOutcome } from './registry.js';
 export {
   residentSpec,
   subconsciousSpec,

@@ -147,7 +147,11 @@ export interface ObserveEdge {
   /**
    * The agent whose slot is read. With no `slot`, the edge reads that
    * agent's own slot (its `ownSlot`), on whatever branch that slot is, not
-   * the residents' shared slot. It must be registered when the edge is.
+   * the residents' shared slot. Where that slot is the observer's own too (a
+   * resident observing another, AgentConfig.observes), the edge shows the
+   * observer that agent's own rows there, and no other agent's. It must be
+   * registered when the edge is, or declared with it
+   * (AgentRegistry.register's `declaredWith`).
    */
   agent?: AgentName;
   /**

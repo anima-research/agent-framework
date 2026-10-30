@@ -544,10 +544,13 @@ export interface ModuleContext {
 
   /**
    * Whether `observer` reads `observed`'s own rows through an observe edge
-   * (dendrite's relationships): one of its edges reads a slot `observed`
-   * owns. Seeing another agent's rounds is a declared relationship (#291,
-   * decision 1), so a tool that reads the record for an agent leaves out
-   * another agent's own rows it isn't shown unless this is true.
+   * (dendrite's relationships): one of its edges reads another slot
+   * `observed` owns, or names `observed` and reads the observer's own slot
+   * (a resident's `AgentConfig.observes`). Seeing another agent's rounds is
+   * a declared relationship (#291, decision 1): an observe edge, which a
+   * resident's configuration declares with `observes`, so a tool that reads
+   * the record for an agent leaves out another agent's own rows it isn't
+   * shown unless this is true.
    * False for a name the registry doesn't know. Optional, as
    * windowStatusOf is, and offered with it.
    */

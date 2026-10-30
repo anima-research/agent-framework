@@ -8,7 +8,8 @@
   the shed removes the rows from it, as before.
 - For an agent's call, the history tools (`extract`, `search`, `semantic_search`) leave out another agent's own rows
   (its rounds, its notes, its stored context injections, a puppeted call) that the caller isn't shown, unless the
-  caller observes that agent (#291, decision 1: seeing another agent's thread is a declared relationship), and count
+  caller observes that agent (#291, decision 1: seeing another agent's thread is a declared relationship, which a
+  resident declares with `AgentConfig.observes`), and count
   them as `leftOut`. A row the caller is shown is one its window holds and its view keeps: another agent's stored
   injection, or a row a tune-out holds, in a resident's window written down from the shared record is never in its
   requests, so the injection is left out and the held row is marked `not-shown`. A stored injection from before the

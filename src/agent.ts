@@ -14,7 +14,7 @@ import { injectionsAsStored } from './text-as-stored.js';
 import { stableHash } from './stable-hash.js';
 import { hasRenderedContent, storedInjectionMarkOf } from './stored-injections.js';
 import { covers, markAtOrAfter, readMarkOf, storeHeadOf, type MarkCm, type MarkedRow, type ReadMark } from './read-marks.js';
-import { assertBooleanSetting, holdsSettings, kindOf } from './config-checks.js';
+import { assertBooleanSetting, assertOneOfSetting, holdsSettings, kindOf } from './config-checks.js';
 import {
   CONTINUE_ROW,
   continueTurn,
@@ -194,7 +194,9 @@ export function assertThinkingBinding(setting: string, value: AgentConfig['think
  * `thinkingBinding.binds` or `refusalHandling.autoRewind` holds anything but true or false
  * (assertBooleanSetting, where null counts as left out), or whose `thinking`, `thinkingBinding` or
  * `refusalHandling` is anything but an object, null or false (holdsSettings),
- * or whose `autoContinue` resolveAutoContinue refuses. The constructor runs it
+ * or whose `autoContinue` resolveAutoContinue refuses, or whose `observes`
+ * is anything but a list of names, or whose `foreignRounds` is neither of
+ * its modes (assertOneOfSetting). The constructor runs it
  * first, so the rule holds wherever an Agent is built. `create()` also runs it
  * for each of its agents before anything opens, and `createEphemeralAgent`
  * before it reserves the name, so a refusal there leaves nothing behind.
@@ -235,6 +237,21 @@ export function assertAgentSwitches(config: AgentConfig): void {
     config.toolWrapperProseGuard,
     'true keeps a response whose whole prose is a tool-call-shaped wrapper from running or entering the agent\'s history, ' +
       'and false or leaving it out doesn\'t',
+  );
+  const observes: unknown = config.observes;
+  if (observes !== undefined && observes !== null
+    && (!Array.isArray(observes) || !observes.every((name) => typeof name === 'string'))) {
+    throw new Error(
+      `${agent} observes must be a list of agent names, such as ["nova"], not ${Array.isArray(observes) ? 'a list holding something else' : kindOf(observes)}: ` +
+        'each names another configured agent whose own rows this agent\'s window takes',
+    );
+  }
+  assertOneOfSetting(
+    `${agent} foreignRounds`,
+    config.foreignRounds,
+    ['transcript', 'raw'],
+    '\'transcript\' or leaving it out sends the rounds of an agent it observes as a line per call and result, ' +
+      'without their thinking, and \'raw\' sends them as stored',
   );
   resolveAutoContinue(config);
 }
@@ -558,10 +575,12 @@ export class Agent {
    * How another agent's rounds go out in this agent's requests (#291, answer
    * 13): `'raw'`, as stored, or `'transcript'` (foreign-rounds.ts), a line
    * per call and per result and no thinking, the same in every compile and
-   * in what a tool boundary injects. The framework sets the persistent
-   * subconscious's once its window follows the presentation index, as its
-   * configuration's `foreignRounds` says (`'transcript'` by default); every
-   * other agent reads no other agent's rounds.
+   * in what a tool boundary injects. The framework sets it, once the
+   * agent's window follows the presentation index, for the persistent
+   * subconscious and for a resident that observes another
+   * (AgentConfig.observes), as their configurations' `foreignRounds` say
+   * (`'transcript'` by default); every other agent reads no other agent's
+   * rounds.
    */
   private foreignRounds: 'raw' | 'transcript' = 'raw';
 

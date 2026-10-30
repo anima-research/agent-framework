@@ -216,7 +216,7 @@ import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type StreamThinkingDrops } from './thinking-drops.js';
 import { asNextRequestCarries, roundRows, type RoundRow, type SentRow } from './sent-rows.js';
 import { ReasoningLossTeller } from './reasoning-loss.js';
-import { AgentPresentation, asCompiled, bearingOf, heldFromResidents, isInjectableMidTurn, readerFacts, recordedReaderFacts, type PresentationOccasion, type ReaderFacts } from './presentation.js';
+import { AgentPresentation, asCompiled, bearingOf, heldFromResidents, isInjectableMidTurn, observesOwnRows, readerFacts, recordedReaderFacts, type PresentationOccasion, type ReaderFacts } from './presentation.js';
 import { coverTest, covers, readMarkThrough, type MarkedRow, type ReadMark } from './read-marks.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
 import { STORED_INJECTION_KEY, STORED_INJECTION_KIND, asStoredRow, hasRenderedContent, isAnotherAgentsInjection, isOwnInjection, isStoredKind, storedInjectionMarkOf, unitHash, type StoredInjectionMark } from './stored-injections.js';
@@ -2061,6 +2061,28 @@ function assertAgentNamesUnique(agents: readonly AgentConfig[]): void {
     `${sentences.join(' ')} Each configured agent needs a name of its own: keep one agent of each name, and rename or remove the others. ` +
       'An agent that keeps its name keeps its context log and runtime settings, and one you rename starts both afresh.',
   );
+}
+
+/**
+ * Refuse a config where an agent's `observes` names itself or no configured
+ * agent: the edge would read nothing, and the window it was meant to widen
+ * would stay as it is without a word. Names compare exactly, as agents' do.
+ */
+function assertObservedAgentsConfigured(agents: readonly AgentConfig[]): void {
+  const names = new Set(agents.map((agent) => String(agent.name)));
+  for (const agent of agents) {
+    for (const observed of agent.observes ?? []) {
+      if (observed === String(agent.name)) {
+        throw new Error(`Agent "${agent.name}" observes itself: its window takes its own rows already, so leave its name out of its observes.`);
+      }
+      if (!names.has(observed)) {
+        throw new Error(
+          `Agent "${agent.name}" observes ${JSON.stringify(observed)}, which is no configured agent's name: ` +
+            'observes names other agents in `agents`, whose own rows this one\'s window takes.',
+        );
+      }
+    }
+  }
 }
 
 /** Messages copied into another conversation (a fork's seed) without their
@@ -4803,6 +4825,7 @@ export class AgentFramework {
     assertFrameworkSwitches(config);
     for (const agentConfig of config.agents) assertAgentSwitches(agentConfig);
     assertAgentNamesUnique(config.agents);
+    assertObservedAgentsConfigured(config.agents);
 
     // Create or use existing store
     let store: JsStore;
@@ -5095,8 +5118,9 @@ export class AgentFramework {
     const interruptedAgents = framework.restoreAgentRegistry();
 
     // Create agents
+    const configured = config.agents.map((agent) => String(agent.name));
     for (const agentConfig of config.agents) {
-      await framework.createAgent(agentConfig);
+      await framework.createAgent(agentConfig, configured);
       if (agentConfig.toolPresentation) framework.toolPresentations.set(agentConfig.name, new ToolPresentation(agentConfig.toolPresentation));
     }
 
@@ -17047,7 +17071,13 @@ export class AgentFramework {
     }
   }
 
-  private async createAgent(config: AgentConfig): Promise<Agent> {
+  /**
+   * A configured agent (a resident). `configured` is every configured
+   * agent's name: an agent its `observes` names may be registered after it,
+   * in this same pass, so its edge on that agent is admitted before then
+   * (AgentRegistry.register's `declaredWith`).
+   */
+  private async createAgent(config: AgentConfig, configured: readonly string[] = []): Promise<Agent> {
     // The residents' shared slot, through a resident's view
     // (residentViewFilter: held rows out, read by heldFromResidents, and
     // another agent's stored context injections out). Main's boundary and
@@ -17086,9 +17116,13 @@ export class AgentFramework {
     this.adoptToolResultGuard(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     this.sharedSlotAgents.add(agent);
-    // The first resident declared owns default delivery.
+    // The first resident declared owns default delivery. Its observe edges
+    // are its configuration's `observes`, each on another configured agent.
     this.announceAgentCreated(
-      this.registry.register({ ...residentSpec(config.name, { primary: !this.primaryAgentName }), model: config.model }),
+      this.registry.register(
+        { ...residentSpec(config.name, { primary: !this.primaryAgentName, observes: config.observes }), model: config.model },
+        { declaredWith: configured },
+      ),
     );
     let restoredSettings: AgentRuntimeSettingsOverrides | null;
     try {
@@ -17117,6 +17151,10 @@ export class AgentFramework {
     agent.onContextBudgetCompiled((budget, fit) => this.recordCompiledContextBudget(config.name, budget, fit));
     this.agents.set(config.name, agent);
     this.adoptPresentation(agent);
+    // An agent that observes another is sent its rounds as its
+    // configuration's foreignRounds says, a transcript by default, as the
+    // persistent subconscious is (foreign-rounds.ts).
+    if ((config.observes?.length ?? 0) > 0 && this.presents(agent)) agent.setForeignRounds(config.foreignRounds ?? 'transcript');
     this.agentConfigs.set(config.name, config);
 
     // First non-ephemeral agent becomes the primary for message routing
@@ -32424,11 +32462,11 @@ export class AgentFramework {
   }
 
   /** Whether `observer` reads `observed`'s own rows through an observe edge
-   *  (ModuleContext.observes, #291): one of its edges reads a slot
-   *  `observed` owns, as the presentation index reads its edges. */
+   *  (ModuleContext.observes, #291), as the presentation index reads its
+   *  edges (observesOwnRows). */
   private observesOwnRowsOf(observer: string, observed: string): boolean {
     if (observer === observed) return false;
-    return readerFacts(this.registry, observer).observed.some((slot) => slot.owners.includes(observed));
+    return observesOwnRows(readerFacts(this.registry, observer), observed);
   }
 
   /**

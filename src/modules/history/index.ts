@@ -958,7 +958,8 @@ export class HistoryModule implements Module {
    * (`window`); for an agent's call, another agent's own row (its rounds,
    * its notes, its stored injections) that it isn't shown is left out,
    * unless it observes that agent: seeing another agent's thread is a
-   * declared relationship (decision 1). Each row's status is read once per
+   * declared relationship (decision 1), an observe edge, such as a
+   * resident's `AgentConfig.observes`. Each row's status is read once per
    * call.
    *
    * The bound context's summaries fold its agent's window, that agent's own

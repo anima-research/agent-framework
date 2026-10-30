@@ -79,6 +79,13 @@ function clone<T>(value: T): T {
   return value === undefined ? value : (JSON.parse(JSON.stringify(value)) as T);
 }
 
+/** AgentRegistry.register's options (see there). */
+export interface RegisterOptions {
+  resume?: boolean;
+  after?: number;
+  declaredWith?: readonly AgentName[];
+}
+
 /** The residents' shared un-namespaced slot, on the host's current branch. */
 export const RESIDENTS_SLOT: Readonly<MessageSlotRef> = Object.freeze({ namespace: null });
 
@@ -227,13 +234,17 @@ export class AgentRegistry {
    * spawner's orphan, as if it had been live when the spawner ended.
    * `after` is the incarnation a resumption continues from: the new one is
    * past it, since the counter of a name that aged out of memory isn't kept.
+   * `declaredWith` names the agents declared with this one, such as a
+   * configuration's residents, which register one after another: an observe
+   * edge may name one of them before it is registered (two residents may
+   * observe each other). The edge reads that agent's slot once it is.
    */
-  register(spec: AgentSpec, options: { resume?: boolean; after?: number } = {}): AgentRecord {
+  register(spec: AgentSpec, options: RegisterOptions = {}): AgentRecord {
     return this.requested(() => this.registerUnguarded(spec, options));
   }
 
-  private registerUnguarded(spec: AgentSpec, options: { resume?: boolean; after?: number } = {}): AgentRecord {
-    this.validate(spec, options.resume === true);
+  private registerUnguarded(spec: AgentSpec, options: RegisterOptions = {}): AgentRecord {
+    this.validate(spec, options.resume === true, options.declaredWith ?? []);
     const previous = this.awaiting.get(spec.name);
     this.awaiting.delete(spec.name);
 
@@ -288,7 +299,7 @@ export class AgentRegistry {
     return record;
   }
 
-  private validate(spec: AgentSpec, resume = false): void {
+  private validate(spec: AgentSpec, resume = false, declaredWith: readonly AgentName[] = []): void {
     const fail = (problem: string): never => {
       throw new AgentSpecError(spec.name || '(unnamed)', problem);
     };
@@ -336,7 +347,7 @@ export class AgentRegistry {
       fail(`context source "${spec.inherit.from}" is not a registered agent`);
     }
     for (const edge of spec.observes ?? []) {
-      if (edge.agent !== undefined && !this.live.has(edge.agent)) {
+      if (edge.agent !== undefined && !this.live.has(edge.agent) && !declaredWith.includes(edge.agent)) {
         fail(`observed agent "${edge.agent}" is not a registered agent`);
       }
     }

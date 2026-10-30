@@ -13,9 +13,12 @@ export const DEFAULT_TASK_IDLE_TIMEOUT_MS = 15 * 60_000;
 /**
  * A resident: persistent, declared in configuration, its own rows stored in
  * the residents' shared message slot. The first one declared owns default
- * delivery.
+ * delivery. `observes` names the other agents whose own rows its window
+ * takes (AgentConfig.observes): an observe edge on each, `{ agent }`, which
+ * reads that agent's own slot, the residents' slot it shares, and shows it
+ * that agent's own rows there (bearingOf). None by default.
  */
-export function residentSpec(name: AgentName, options: { primary: boolean }): AgentSpec {
+export function residentSpec(name: AgentName, options: { primary: boolean; observes?: readonly AgentName[] }): AgentSpec {
   return {
     name,
     kind: 'resident',
@@ -26,6 +29,7 @@ export function residentSpec(name: AgentName, options: { primary: boolean }): Ag
       ownsProviderScheduling: true,
     },
     lifetime: { kind: 'persistent' },
+    ...(options.observes?.length ? { observes: options.observes.map((agent) => ({ agent })) } : {}),
     ownSlot: { namespace: null },
     // Deprecated: kept for one release beside ownSlot, which the registry
     // reads first, for a host that reads the flag off a preset's spec or
