@@ -10,7 +10,7 @@ import {
 } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, DetailedUsage, ToolParameter, ToolResult as MembraneToolResult, ToolResultContentBlock, StreamEvent } from '@animalabs/membrane';
-import { MembraneError } from '@animalabs/membrane';
+import { MembraneError, isAbortedResponse } from '@animalabs/membrane';
 import { classifyFailure, retryDecision, MEMBRANE_RETRY_SETTINGS, type RetrySettings } from '@animalabs/membrane/retry';
 import { deadlineCut, isDeadlineExpiry, resolveInferenceBounds, wholeCallMs, type InferenceBounds } from './inference-bounds.js';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn } from '@animalabs/context-manager';
@@ -3391,6 +3391,38 @@ export function shedMayHelp(errorType: string | undefined, httpStatus: number | 
   return errorType === 'invalid_request' && (httpStatus === undefined || httpStatus === 400 || httpStatus === 422);
 }
 
+const PROBE_FIELDS = {
+  messages: 'replaced',
+  onCacheWireReceipt: 'left out',
+  shedOversizeImages: 'kept',
+  system: 'kept',
+  config: 'kept',
+  tools: 'kept',
+  toolMode: 'kept',
+  stopSequences: 'kept',
+  maxParticipantsForStop: 'kept',
+  promptCaching: 'kept',
+  cacheMarkers: 'kept',
+  cacheTtl: 'kept',
+  floatingCacheMarker: 'kept',
+  contextPrefix: 'kept',
+  prefillUserMessage: 'kept',
+  assistantParticipant: 'kept',
+  streaming: 'kept',
+  providerParams: 'kept',
+} as const satisfies Record<keyof NormalizedRequest, 'kept' | 'left out' | 'replaced'>;
+
+function withoutHistory(request: NormalizedRequest): NormalizedRequest {
+  const probe: Record<string, unknown> = {
+    messages: [{ participant: 'User', content: [{ type: 'text', text: 'Reply with one word.' }] }],
+  };
+  for (const [field, use] of Object.entries(PROBE_FIELDS)) {
+    const value = request[field as keyof NormalizedRequest];
+    if (use === 'kept' && value !== undefined) probe[field] = value;
+  }
+  return probe as unknown as NormalizedRequest;
+}
+
 function responseParts(response: EventResponse | undefined): string {
   return [
     response?.addMessages?.length ? `${response.addMessages.length} message(s) to add` : '',
@@ -3671,6 +3703,7 @@ export class AgentFramework {
   private errorPolicy: ErrorPolicy;
   private pendingRequests: InferenceRequest[] = [];
   private readonly exhaustedTurns = new Map<string, { roundsRan: boolean; callsCutOff: boolean; liveSpeech: boolean; speechRouting: boolean }>();
+  private readonly failedRequests = new Map<string, NormalizedRequest>();
   private readonly roundTurns = new WeakMap<ContentBlock[], TurnRouting>();
   private running = false;
   private loopPromise: Promise<void> | null = null;
@@ -12033,6 +12066,7 @@ export class AgentFramework {
     this.rearmDeadlineCuts.delete(name);
     this.exhaustingRearms.delete(name);
     this.exhaustedTurns.delete(name);
+    this.failedRequests.delete(name);
     this.endStatedWaitRun(name);
     if (name === this.subconsciousAgentName) {
       this.tuneOutCoordinator?.stopReader();
@@ -24526,12 +24560,7 @@ export class AgentFramework {
           type: 'inference:exhausted',
           agentName: agent.name,
           error: err.message,
-          // Drives the poison-history breaker (shedMayHelp: an
-          // `invalid_request` at HTTP 400, 413 or 422 or with no status, or a
-          // `context_length` at 413, suggests the provider refused the
-          // request's content or size, which a shed of the newest exchange may
-          // fix; auth/abort and other context_length failures are also
-          // non-retryable but must NOT cost history) and the OverBudget drain breaker
+          // Drives the OverBudget drain breaker
           // (`over_budget`: compile refused to fit the hard budget — this is
           // the site that sees it, since compile runs before the stream
           // exists). `retryable` is kept for observability.
@@ -26361,6 +26390,7 @@ export class AgentFramework {
                 ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
               }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined, streamRouting);
               if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
+              if (compiledRequest) this.failedRequests.set(agent.name, compiledRequest);
               this.emitTrace({
                 type: 'inference:exhausted',
                 agentName: agent.name,
@@ -26748,6 +26778,7 @@ export class AgentFramework {
         ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
       }, streamRouting);
       if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
+      if (compiledRequest) this.failedRequests.set(agent.name, compiledRequest);
       this.emitTrace({
         type: 'inference:exhausted',
         agentName: agent.name,
@@ -31427,7 +31458,8 @@ export class AgentFramework {
    *      tool_use/tool_result pairing or an oversized attachment), retrying
    *      the same context is likely to fail the same way, and every new push
    *      event would wake the agent onto that same history. At the hard-down
-   *      threshold, automatically quarantine: shed the newest complete
+   *      threshold, it first sends the failed request without its history,
+   *      and only if that is answered does it quarantine: shed the newest complete
    *      exchange (the same forced-rewind primitive `/unstick` uses —
    *      shedNewestTurn never orphans a tool_use/thinking block) and retry,
    *      bounded by the same rewind cap so the breaker can never eat the
@@ -31776,6 +31808,8 @@ export class AgentFramework {
   ): void {
     const ended = this.exhaustedTurns?.get(agentName);
     this.exhaustedTurns?.delete(agentName);
+    const failedRequest = this.failedRequests?.get(agentName);
+    this.failedRequests?.delete(agentName);
     const rearmed = this.exhaustingRearms?.delete(agentName) === true;
     const madeAgain = this.freshCallsCut?.delete(agentName) === true;
     // The reason is the failure's own message, and a provider can echo the
@@ -31959,8 +31993,9 @@ export class AgentFramework {
         `inferences — it cannot complete a turn. Last reason: ${reason}`,
       );
 
-      // Ops alert (webhook + ops:alert trace), throttled per (agent, kind) —
-      // a hard-down agent re-posts every ~15 min, not on every failed retry.
+      // Ops alert: its trace goes out on every call, and only its webhook post
+      // is throttled per (agent, kind), so a hard-down agent re-posts there
+      // every ~15 min, not on every failed retry.
       // failures.log already got the per-exhaustion record above.
       // The excerpt leaves room for the prefix, so the alert's own bound
       // never cuts it a second time.
@@ -31987,9 +32022,65 @@ export class AgentFramework {
       // `retryable` is kept only for the trace.
       void retryable;
       if (agent && shedMayHelp(errorType, httpStatus)) {
-        this.quarantinePoisonedHistory(agent, wholeReason);
+        if ((this.exhaustionRewinds.get(agent.name) ?? 0) > 0) this.quarantinePoisonedHistory(agent, wholeReason);
+        else this.probeBeforeShed(agent, failedRequest, wholeReason, { errorType, httpStatus });
       }
     }
+  }
+
+  private probeBeforeShed(
+    agent: Agent,
+    request: NormalizedRequest | undefined,
+    wholeReason: string,
+    failure: { errorType?: string; httpStatus?: number },
+  ): void {
+    const name = agent.name;
+    if (!request) {
+      console.error(`[inference-rewind] agent=${name} sheds nothing: no request reached the breaker to send without its history.`);
+      return;
+    }
+    const cm = agent.getContextManager();
+    const newest = (): string => {
+      const count = cm.getMessageCount();
+      return count === 0 ? '0' : `${count}:${String(cm.getMessageWindow(count - 1, 1, { resolveBlobs: false }).messages[0]?.id)}`;
+    };
+    const sent = {
+      streak: this.consecutiveInferenceFailures.get(name),
+      history: newest(),
+      turn: this.activeTurnTokens.get(name),
+      branch: this.store.currentBranch().name,
+    };
+    void this.auxiliaryMembraneFor(name).complete(withoutHistory(request), { retry: false }).then(
+      (response): Error | null => (isAbortedResponse(response)
+        ? new Error(`the probe was aborted (${String((response as { reason?: unknown }).reason ?? 'no reason given')})`)
+        : null),
+      (error: unknown): Error => (error instanceof Error ? error : new Error(failureDescription(error))),
+    ).then((probeFailure) => {
+      const turn = this.activeTurnTokens.get(name);
+      if (this.agents.get(name) !== agent || this.providerAdmissionClosed || this.surgeryHold
+        || this.consecutiveInferenceFailures.get(name) !== sent.streak
+        || (turn !== undefined && turn !== sent.turn)
+        || this.store.currentBranch().name !== sent.branch
+        || newest() !== sent.history) {
+        console.error(`[inference-rewind] agent=${name}: its probe's answer is set aside, since the agent moved on while it ` +
+          'was out; the next failure decides.');
+        return;
+      }
+      if (probeFailure === null) {
+        this.quarantinePoisonedHistory(agent, wholeReason);
+        return;
+      }
+      const probe = this.classifyInferenceError(probeFailure);
+      const same = probe.errorType === failure.errorType && probe.httpStatus === failure.httpStatus;
+      const answer = `The probe's answer: ${boundFailureText(probeFailure.message, FAILURE_SUMMARY_MAX_CHARS)}`;
+      const message = same
+        ? `the request fails without its history too, so the history isn't the cause, and none of it was shed. ${answer}`
+        : `a probe without its history couldn't tell whether the history is the cause, so none of it was shed. ${answer}`;
+      console.error(`[inference-rewind] agent=${name} kept its history: ${message}`);
+      this.opsAlert('history-kept', name, message, { data: { probe: same ? 'fails-without-history' : 'could-not-tell', ...probe } });
+    }).catch((error: unknown) => {
+      console.error(`[inference-rewind] agent=${name}: the breaker's probe failed: ${describeFailureWithFrames(error)}`);
+    });
   }
 
   /**
