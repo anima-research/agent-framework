@@ -730,3 +730,25 @@ test('stale continuations retain frame-owned tokens just as the agent-gone drop 
   }
   assert.deepEqual(remainingTokens, [99, 99, 99], 'only the owning frame releases its token');
 });
+
+for (const kind of ['deferred', 'stored'] as const) test(`an admitted reply wake survives an already-satisfied ${kind} write; an unbound wake is dropped`, async () => {
+  const x = await frameworkFor();
+  try {
+    const agent = x.framework.getAgent('assistant')!, cm = agent.getContextManager();
+    const writeId = 'already-answered-write';
+    const messageId = cm.addMessage('user', [{ type: 'text', text: 'already answered content' }], { deferredWriteId: writeId });
+    agent.markContextConsumed(); agent.markAnswered(agent.getConsumedWatermark());
+    agent.notePublished(destinationKey(at()), agent.getConsumedWatermark());
+    const satisfied = () => kind === 'deferred' ? x.f.deferredWriteDone(agent, writeId, at()) : x.f.storedMessageDone(agent, messageId, at());
+    assert.equal(satisfied(), true, 'the real read/publication watermarks would consume an ordinary wake');
+    const request = { ...await x.request(reply()), ...(kind === 'deferred' ? { readsDeferredWrite: writeId } : { readsStoredMessage: messageId }) };
+    x.f.pendingRequests.push(request);
+    await x.framework.runUntilIdle();
+    assert.equal(x.membrane.calls.length, 1); assert.equal(x.publishes.length, 1, 'private admitted authority retains its turn');
+    assert.equal(satisfied(), true);
+    const { [replyWork]: _work, ...unbound } = request;
+    x.f.pendingRequests.push(unbound);
+    await x.framework.runUntilIdle();
+    assert.equal(x.membrane.calls.length, 1, 'the existing redundant-wake drop still applies without admitted work');
+  } finally { await x.close(); }
+});

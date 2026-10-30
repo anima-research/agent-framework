@@ -65,6 +65,10 @@ function mint(connection: ConnectionKey, destination?: ReplyDestination, current
   bindings.add(binding); liveBindings.set(binding, current);
   return binding;
 }
+/** A failed consumer must retain private work, not become an unbound wake. */
+export function privateReplyBinding(connection: ConnectionKey): ReplyBinding {
+  return mint(connection);
+}
 /** Publication checks all original causes, never just the routing winner. */
 export function turnReply(works: readonly ReplyBinding[]): ReplyBinding | undefined {
   if (!works.length) return;
@@ -96,16 +100,17 @@ export function replyConsumer(config: ReplyAuthorityConfig, valid: (key: Connect
   };
   return async (input, verdict) => {
     if (!verdict.mayWake) return {};
-    const privateWork = () => ({ routing: mint(input.connection) });
+    const privateWork = () => ({ routing: privateReplyBinding(input.connection) });
     if (pending >= 64) return privateWork();
-    pending++;
-    const controller = new AbortController();
-    const abort = () => controller.abort();
-    input.signal.addEventListener('abort', abort, { once: true });
-    if (input.signal.aborted) abort();
-    const approvedInput = Object.freeze({ ...input, signal: controller.signal, replyIntent: verdict.replyIntent });
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let abort: (() => void) | undefined;
     try {
+      pending++;
+      const controller = new AbortController();
+      abort = () => controller.abort();
+      input.signal.addEventListener('abort', abort, { once: true });
+      if (input.signal.aborted) abort();
+      const approvedInput = Object.freeze({ ...input, signal: controller.signal, replyIntent: verdict.replyIntent });
       const cancelled = new Promise<null>(done => {
         controller.signal.addEventListener('abort', () => done(null), { once: true });
         timer = setTimeout(() => { done(null); controller.abort(); }, timeoutMs);
@@ -128,7 +133,8 @@ export function replyConsumer(config: ReplyAuthorityConfig, valid: (key: Connect
     } catch {
       failed(); return privateWork();
     } finally {
-      clearTimeout(timer); input.signal.removeEventListener('abort', abort); pending--;
+      pending--; clearTimeout(timer);
+      if (abort) input.signal.removeEventListener('abort', abort);
     }
   };
 }

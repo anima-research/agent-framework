@@ -73,7 +73,7 @@ test('real stdio: two opted-in connections freeze their own channel and register
   }
 });
 
-test('real stdio: unconfigured connections keep slice-A automatic routing', async t => {
+test('real stdio: unconfigured connections keep existing automatic routing', async t => {
   const x = await wire({ replyAuthority: undefined }); t.after(x.close);
   assert.equal((await x.send('channels/incoming', { messages: [incoming('ordinary')] })).result.results[0].accepted, true);
   await x.framework.runUntilIdle();
@@ -535,5 +535,17 @@ for (const lane of ['channels/incoming', 'push/event'] as const) test(`real stdi
   await x.framework.runUntilIdle();
   assert.equal(x.membrane.calls.length, 1);
   assert(JSON.stringify(x.membrane.calls).includes('prose stays private'));
+  assert.equal((await x.seen()).filter(e => e.method === 'channels/publish').length, 0);
+});
+
+test('real stdio: a throwing post-admission consumer keeps the wake accepted and private with notice', async t => {
+  const x = await wire(); t.after(x.close);
+  x.connection().postAdmissionConsumer = async () => { throw Error('private consumer detail'); };
+  const r = await x.send('channels/incoming', { messages: [incoming('consumer-failed')] });
+  assert.equal(r.result.results[0].accepted, true);
+  await x.framework.runUntilIdle();
+  assert.equal(x.membrane.calls.length, 1);
+  const context = JSON.stringify(x.framework.getAgent('assistant')!.getContextManager().getAllMessages());
+  assert(context.includes('prose stays private')); assert(!context.includes('private consumer detail'));
   assert.equal((await x.seen()).filter(e => e.method === 'channels/publish').length, 0);
 });

@@ -17027,7 +17027,7 @@ export class AgentFramework {
             // turn's properties, as the budget restart does.
             this.pendingRequests.push({
               agentName: agent.name,
-              ...ownedReply(currentState.stream ? this.replyStreamOwners.get(currentState.stream) : this.openLogical.get(agent.name)),
+              ...ownedReply((currentState.stream ? this.replyStreamOwners.get(currentState.stream) : undefined) ?? this.openLogical.get(agent.name)),
               reason: 'tool_results_ready',
               source: 'framework',
               timestamp: Date.now(),
@@ -19828,6 +19828,8 @@ export class AgentFramework {
       // wake was for, as for a chat:system notice. One with neither tag is
       // judged as addressed.
       const read = requests.filter((r) => {
+        // Private admitted work must not lose its cause or publication authority
+        // to a channel-level read/publication watermark.
         if (workOf(r).length) return false;
         // A chat:system notice asks nothing either, ambient or not, and no
         // speech is routed by it, so waiting for one in its channel would

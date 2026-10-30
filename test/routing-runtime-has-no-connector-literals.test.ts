@@ -1,4 +1,4 @@
-/** B's new runtime must be connector-neutral; existing modules are covered behaviorally. */
+/** Automatic-reply runtime must be connector-neutral; existing modules are covered behaviorally. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
