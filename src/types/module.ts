@@ -120,7 +120,10 @@ export interface Module {
 
   /**
    * Start the module.
-   * Called when the framework starts or when the module is added.
+   * Called when the module is added: create() adds the modules it is given,
+   * so for those it runs before create() returns. Its own removal and the
+   * framework's stop() wait for it to settle before the module's stop()
+   * runs, so it mustn't await either.
    */
   start(ctx: ModuleContext): Promise<void>;
 
@@ -132,6 +135,8 @@ export interface Module {
    * a host wires up after create() returns, such as a WorkspaceModule's
    * initStore(). A stop() that saves state can therefore run before that
    * wiring, and shouldn't then save over state it was handed and hasn't used.
+   * It isn't called before the module's start() has settled, so it can end
+   * what start() set up.
    */
   stop(): Promise<void>;
 
