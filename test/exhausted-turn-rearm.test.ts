@@ -966,6 +966,17 @@ test("a re-armed turn opens where its turn's plain speech was going after a re-p
   }
 });
 
+test("a re-armed continuation keeps the messages that opened the turn it continues", async (t) => {
+  const membrane = new ScriptedMembrane((n) => (n >= 2 && n <= 4 ? serverError : undefined));
+  const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100] });
+  queue(r, { reason: 'zz-console-message', openingMessages: ['zz-opening'] });
+  await waitFor(() => r.count('inference:completed') === 1, 'the turn to answer');
+  queue(r, { reason: 'context_budget_restart', source: 'framework' });
+  await waitFor(() => r.count('inference:completed') === 2, 'the re-armed restart to answer');
+  assert.equal(membrane.sends.length, 5, "premise: the turn, the restart's window, then the re-armed send");
+  assert.deepEqual((routingOf(r) as { openingMessages?: string[] } | undefined)?.openingMessages, ['zz-opening']);
+});
+
 test('a continuation of a turn that found a channel after it had none is re-armed there', async (t) => {
   const membrane = new ScriptedMembrane((n) => (n >= 2 && n <= 4 ? serverError : undefined));
   const r = await resident(t, membrane, { exhaustedTurnRearmMs: [100] });

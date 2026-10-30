@@ -212,7 +212,7 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(primary.mock.callCount(), 1);
       assert.equal(secondary.mock.callCount(), 0);
       assert.equal(primary.mock.calls[0]!.arguments[2]?.kind, 'discord-send-failed');
-      assert.match(JSON.stringify(primary.mock.calls[0]!.arguments[1]), /\[send-undeliverable\] Your previous reply \(5 chars\) had no channel to go to/);
+      assert.match(JSON.stringify(primary.mock.calls[0]!.arguments[1]), /\[send-undeliverable\] Your plain speech \\"hello\\" \(5 chars\) had no channel to go to/);
       assert.equal(internals(framework).pendingRequests.length, 0);
     });
 
@@ -340,7 +340,7 @@ describe('notices about an agent\'s own action', () => {
       assert.ok(archived.some((m) => m.participant === 'worker' && JSON.stringify(m.content).includes(speech)), 'the run\'s reply is archived');
       assert.equal(count(archived, UNDELIVERABLE), 0, 'no no-locus notice in its own window');
       const { messages } = await framework.getAgent('primary')!.getContextManager().compile();
-      assert.equal(count(messages, 'Your previous reply'), 0, 'the primary did not write that reply');
+      assert.equal(count(messages, 'Your plain speech'), 0, 'the primary did not write that reply');
       assert.equal(count(messages, 'A reply by worker'), 0);
       assert.ok(!errors.some((e) => /not a registered agent/.test(e)));
       assert.ok(!errors.some((e) => e.includes('[route-failure] worker')), 'no route failure is logged');

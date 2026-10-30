@@ -190,6 +190,30 @@ export interface Module {
   ): Promise<void>;
 
   /**
+   * Asked as a turn routes a piece of the agent's plain speech, `text`,
+   * as it goes to the turn's channel, or, when the turn has no channel,
+   * before the turn is told it had nowhere to go. There are two answers:
+   * - a `SpeechSent` naming a place, `{ sentTo }`, when this module showed
+   *   that text to someone, such as the person whose message opened the
+   *   turn: the turn's `[delivered]` receipt names the place, and a turn
+   *   with no channel writes no `[send-undeliverable]` notice for it;
+   * - `{}` otherwise: it can't say the text reached someone, as for a turn
+   *   none of its surfaces opened. A turn with no channel's notice then
+   *   still says another surface may have shown it.
+   *
+   * Asked only where the turn routes plain speech (prose routing by locus or
+   * hybrid, on a host with a channel registry), in the order it routes the
+   * pieces, and never about private envelopes, explicit sends or a
+   * heartbeat's held prose. A module that throws, or hasn't answered within
+   * `SPEECH_RECEIPT_WAIT_MS`, names no place, as `{}` does.
+   */
+  onSpeechRouted?(
+    agentName: string,
+    text: string,
+    context: SpeechRoutedContext
+  ): Promise<SpeechSent>;
+
+  /**
    * Gather context injections before agent inference.
    * Called before each inference to collect data (e.g., HUD overlays, game state)
    * that should be injected into the compiled context.
@@ -738,6 +762,57 @@ export interface SpeechContext {
    * of the process.
    */
   turnId?: number;
+}
+
+/**
+ * What a module is told with plain speech a turn is routing
+ * (`Module.onSpeechRouted`).
+ */
+export interface SpeechRoutedContext {
+  /**
+   * Whether the text is the turn's final speech: the speech after its last
+   * tool call, which a relay that starts a new speech at each
+   * `inference:tool_calls_yielded` writes as the turn's reply. A refused XML
+   * tool attempt traces no `inference:tool_calls_yielded`, and neither does a
+   * call a round cut off at the output limit left unrun, so neither ends a
+   * speech: the speech on both sides of one is final when no later tool call
+   * follows it.
+   */
+  final: boolean;
+
+  /** The turn, as `SpeechContext.turnId` names it. */
+  turnId?: number;
+
+  /**
+   * The request that opened the turn, kept across its streams: after a
+   * context-budget restart the turn's current request is the framework's
+   * continuation, and this is still the one that started it. `messages`
+   * are the messages added by the module answers whose wakes the turn took,
+   * and, for a turn the framework queued to carry another on (a `!`
+   * continuation, an autoContinue run, a bounce's wake), the messages that
+   * opened that turn, each as its stored id or a held write's handle, either
+   * of which a module context's `getMessage` takes.
+   */
+  openedBy?: {
+    reason: string;
+    source: string;
+    timestamp: number;
+    messages: string[];
+  };
+}
+
+/**
+ * What a module did with plain speech it was asked about
+ * (`Module.onSpeechRouted`).
+ */
+export interface SpeechSent {
+  /**
+   * Where it showed the text, as the agent reads it in its `[delivered]`
+   * receipt: "sent to <sentTo>", such as "the terminal that sent this turn".
+   * Whitespace runs read as one space, and a long place is cut. Left out
+   * (`{}`) when the module can't say the text reached someone.
+   */
+  sentTo?: string;
 }
 
 /**
