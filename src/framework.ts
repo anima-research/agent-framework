@@ -22550,7 +22550,16 @@ export class AgentFramework {
    * re-initialized after it refused its work (recoverHeldWrites). Each is
    * traced once, as it is stored (`message:added`, source
    * `surgery-release`, with its stored id): its arrival named none, and
-   * wasn't traced. A write for an agent whose context manager refuses its
+   * wasn't traced. The trace is emitted synchronously, right after that
+   * write's store and before the next write is stored, inside this call,
+   * which no await interrupts: a listener that edits or removes the row
+   * does so before any turn compiles a request with it in, though the row
+   * may be in an idle reader's window by then (each reader takes it as it
+   * is stored). The Discord module relies on that to apply the edits and
+   * deletes it kept for a message whose create the hold kept, which no
+   * module can reach before it lands (ModuleContext.addMessage). Keep it so,
+   * or give such a module a callback the release calls in its place. A
+   * write for an agent whose context manager refuses its
    * work is kept in memory for it again (heldForRecovery), never dropped,
    * and is traced when a later move stores it. A write for an agent gone
    * since goes on to the primary if it is one the primary takes in its

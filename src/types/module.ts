@@ -393,6 +393,15 @@ export interface ModuleContext {
    * after a failed re-initialization, stored when a switchBranch()
    * re-initializes it (a restart loses it; if the agent ends first, it goes
    * to the primary when it is a write the primary takes in its place).
+   * Until it lands, such a write can't be read, edited or removed through
+   * this context: it has no id, getMessage, editMessage and removeMessage
+   * take none for it, and queryMessages and findMessageByExternalId read
+   * the store, which doesn't hold it yet. Its release stores it as it was
+   * given here. A module that must change it keeps the change and applies
+   * it to the row once the row is stored, which the release traces
+   * synchronously as `message:added` with source `surgery-release` and the
+   * stored id, as the Discord module does for an edit or a delete of a
+   * message whose create was kept.
    * Writes a release before #291 held and kept across a restart are
    * stored once create() imports them, which is after every module's
    * start().

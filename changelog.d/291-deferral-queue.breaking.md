@@ -36,7 +36,13 @@
   release; the rest, such as its channel's messages, are dropped, logged. A write made while quiesced is on the
   branch the store was on when it was made: a rollback or a branch switch later in the same quiesce leaves it there,
   where it used to land on the branch chosen by resume.
-  - **Module authors:** `ModuleContext.addMessage` answers the stored id, never a `held:` handle. `ModuleMessage.held`
+  - **Module authors:** `ModuleContext.addMessage` answers the stored id, never a `held:` handle. A write kept in
+    memory (by a surgery's hold, or for a manager refusing its work) is answered `''`, and until it lands it can't be
+    read, edited or removed through the module's context: `getMessage`, `editMessage` and `removeMessage` have no id
+    for it, `queryMessages` and `findMessageByExternalId` read the store, and its release stores it as it was first
+    given. A module that must change such a write keeps the change and applies it once the row is stored: the release
+    traces each write synchronously as it stores it, `message:added` with source `surgery-release` and the stored id,
+    as the Discord module does for an edit or a delete of a message whose create was kept. `ModuleMessage.held`
     keeps its name with a new meaning: the row is stored and not in the window of the agent the read is for (not yet
     presented to it, or taken out as an undone turn's); its `id`, `sequence` and `timestamp` are the store's. It is
     never set on an agent whose window is the record. `queryMessages` answers the stored rows in store order, each
