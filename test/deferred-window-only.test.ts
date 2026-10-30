@@ -289,6 +289,43 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     await framework.stop();
   });
 
+  // Ported from 0.30.0 (630e2a3a07): a writer that stores straight into the
+  // context, past the framework's addMessage, as an older route does. Its
+  // row is stored at once and stays out of the live turn's window, as any
+  // write does: its next point takes it in. A stream that can't carry
+  // injections gets nothing at the boundary, so the row waits for the
+  // turn's end and stays unread; one that declares it carries them hears it
+  // at the boundary, where the window takes it, and it is read.
+  for (const carries of [false, true]) it(carries
+    ? 'a message stored straight into the context during a round is out of the window until the boundary, which injects it into a stream that carries injections, and it is read'
+    : 'a message stored straight into the context during a round, with nothing injected at the boundary, stays out of the window until the turn ends, and stays unread', async () => {
+    membrane.supportsInjectedMessages = carries;
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Moving.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: {} },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse(text('Done.')));
+    const framework = await createFramework();
+    const cm = framework.getAgent('assistant')!.getContextManager();
+    let during: string | undefined;
+    module.duringTool = () => {
+      const bypassed = cm.addMessage('Antra', text('bypassed'));
+      during = cm.windowStatusOf(bypassed);
+    };
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
+    await framework.runUntilIdle();
+    assert.equal(during, 'out', 'stored, and out of the live turn\'s window');
+    if (carries) {
+      assert.deepEqual(injected(), ['Antra: bypassed'], 'heard at the boundary');
+      assert.deepEqual(windowOf(framework).slice(2), ['user: <tool_result>', 'Antra: bypassed', 'assistant: Done.'], 'where the stream heard it');
+    } else {
+      assert.equal(membrane.lastStream!.receivedToolResultOptions[0], undefined, 'nothing was injected');
+      assert.deepEqual(windowOf(framework).slice(2), ['user: <tool_result>', 'assistant: Done.', 'Antra: bypassed'], 'it entered at the turn\'s end');
+    }
+    assert.equal(unread(framework, 'bypassed'), !carries, carries ? 'what the stream carried is read' : 'a boundary that injected nothing marks nothing read');
+    await framework.stop();
+  });
+
   it('a message that enters the window at a boundary that ends the turn was never carried, and stays unread', async () => {
     const framework = await runTurn('halt', [{ participant: 'Antra', content: text('too late') }]);
     assert.equal(unread(framework, 'too late'), true);
