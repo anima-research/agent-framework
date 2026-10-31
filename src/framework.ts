@@ -3716,6 +3716,8 @@ export class AgentFramework {
   private maintenanceRunId = 0;
   private currentMaintenanceRun: ContextMaintenanceRun | null = null;
   private maintenanceHistory: ContextMaintenanceRun[] = [];
+  private readonly maintenanceApart = new Map<Agent, Promise<void>>();
+  private readonly maintenanceParked = new Map<string, () => void>();
   /** Each agent's last reported maintenance failure, its whole text and when
    *  it was alerted, until its maintenance goes without one
    *  (reportMaintenanceFailure). */
@@ -5346,8 +5348,9 @@ export class AgentFramework {
    * A timed-out wait lets teardown go on while what it waited for may still
    * act on what is being torn down.
    * @param teardownTimeoutMs Optional budget for each of stop()'s waits, in
-   * turn: on the streams it cancels, on maintenance in flight (a pass or an
-   * over-budget drain kick), on the event loop, on an operator's operations
+   * turn: on the streams it cancels, on maintenance in flight (a pass, a tick
+   * that left its pass when its call parked, or an over-budget drain kick), on
+   * the event loop, on an operator's operations
    * already running, on modules and MCPL (its servers and the inference
    * requests they made) together, where a module whose start() is still
    * running counts until that start() has settled and its stop() returned,
@@ -6086,6 +6089,7 @@ export class AgentFramework {
     // is still closed parks again.
     while (this.providerGateBlocked(agentName)) {
       gate.deferredAuxiliary++;
+      this.maintenanceParked.get(agentName)?.();
       try {
         await new Promise<void>((resolve) => gate.auxiliaryWaiters.push(resolve));
       } finally {
@@ -7131,14 +7135,15 @@ export class AgentFramework {
     );
   }
 
-  /** Whether maintenance work is running: a pass, or an over-budget drain kick. */
+  /** Whether maintenance work is running: a pass, an over-budget drain kick, or a tick that left its pass when its call parked. */
   private maintenanceRunning(): boolean {
-    return this.maintenancePass !== null || this.overBudgetDrains.size > 0;
+    return this.maintenancePass !== null || this.overBudgetDrains.size > 0 || this.maintenanceApart.size > 0;
   }
 
   /** Wait for the maintenance work that is running, whatever its outcome. */
   private async settleMaintenancePass(): Promise<void> {
     await Promise.allSettled([...(this.maintenancePass ? [this.maintenancePass] : []), ...this.overBudgetDrains]);
+    while (this.maintenanceApart.size > 0) await Promise.allSettled([...this.maintenanceApart.values()]);
   }
 
   private async runQueuedMaintenance(): Promise<void> {
@@ -7194,7 +7199,7 @@ export class AgentFramework {
         cm = agent.getContextManager();
         const tools = this.compressionToolsForAgent(agent.name);
         cm.setToolDefinitions(tools);
-        if (this.providerGateBlocked(agent.name)) return [];
+        if (this.maintenanceApart.has(agent) || this.providerGateBlocked(agent.name)) return [];
         state = this.contextReadiness(cm);
       } catch (error) {
         return failedAgent(error);
@@ -7232,7 +7237,6 @@ export class AgentFramework {
 
     try {
       const running = queued.filter((item): item is Extract<Queued, { failed: false }> => !item.failed);
-      // Settled, not all: the pass ends only when every agent's work has.
       const outcomes = await Promise.allSettled(running.map(async ({ agent, cm, record }) => {
         // A tick whose provider call a surgery or stop() withdrew ends this
         // agent's work for the pass, as the hold or the stop would have before
@@ -7241,6 +7245,40 @@ export class AgentFramework {
         // as a conversation fork closed after it went idle, takes no further
         // tick, since the framework runs no further turn for it.
         let withdrawn = false;
+        let left = false;
+        const finishAgent = (tickWithdrawn: boolean): void => {
+          record.finishedAt = Date.now();
+          const state = this.contextReadiness(cm);
+          if ('error' in state) {
+            // A run records an agent's first failure: a readiness refusal
+            // after a tick that failed is read again by the next pass.
+            if (record.error === undefined && !tickWithdrawn && !(this.syncMoveReinit && refusedForMovedBranch(state.error))) {
+              this.reportMaintenanceFailure(agent.name, record, state.error);
+            }
+          } else {
+            record.readyAfter = state.ready;
+            if (state.pending) record.pendingAfter = state.pending;
+            if (record.error === undefined && !tickWithdrawn) this.maintenanceFailureReported.delete(agent.name);
+          }
+          const progress = this.contextProgress(cm);
+          if (progress) record.progressAfter = progress;
+        };
+        const tickFailed = (error: unknown): boolean => {
+          if (error instanceof MaintenanceWithdrawnError) {
+            console.error(`[context-maintenance] agent=${agent.name} stopped: ${error.message}`);
+            return true;
+          }
+          if (this.syncMoveReinit && error instanceof Error && refusedForMovedBranch(error.message)) {
+            console.error(`[context-maintenance] agent=${agent.name} stopped: ${this.syncMoveReinit.after === 'undo' ? 'an undo' : 'a redo'} moved the store under the tick: ${error.message}`);
+            return true;
+          }
+          this.reportMaintenanceFailure(
+            agent.name,
+            record,
+            error instanceof Error ? String(error.message) : failureDescription(error),
+          );
+          return false;
+        };
         try {
           for (
             let i = 0;
@@ -7248,39 +7286,42 @@ export class AgentFramework {
               && this.agents.get(agent.name) === agent && !cm.isReady();
             i++
           ) {
-            await cm.tick();
+            let leave!: () => void;
+            const parked = new Promise<false>((resolve) => { leave = () => resolve(false); });
+            this.maintenanceParked.set(agent.name, leave);
+            const tick = cm.tick();
+            let ticked: boolean;
+            try {
+              ticked = await Promise.race([tick.then(() => true), parked]);
+            } finally {
+              this.maintenanceParked.delete(agent.name);
+            }
+            if (!ticked) {
+              left = true;
+              const apart = (async () => {
+                let tickWithdrawn = false;
+                try {
+                  await tick;
+                  record.ticks++;
+                } catch (error) {
+                  tickWithdrawn = tickFailed(error);
+                } finally {
+                  finishAgent(tickWithdrawn);
+                }
+              })()
+                .catch((error: unknown) => {
+                  console.error('[context-maintenance] reporting an agent\'s failure failed:', describeFailureWithFrames(error));
+                })
+                .finally(() => { this.maintenanceApart.delete(agent); });
+              this.maintenanceApart.set(agent, apart);
+              break;
+            }
             record.ticks++;
           }
         } catch (error) {
-          if (error instanceof MaintenanceWithdrawnError) {
-            withdrawn = true;
-            console.error(`[context-maintenance] agent=${agent.name} stopped: ${error.message}`);
-          } else if (this.syncMoveReinit && error instanceof Error && refusedForMovedBranch(error.message)) {
-            withdrawn = true;
-            console.error(`[context-maintenance] agent=${agent.name} stopped: ${this.syncMoveReinit.after === 'undo' ? 'an undo' : 'a redo'} moved the store under the tick: ${error.message}`);
-          } else {
-            this.reportMaintenanceFailure(
-              agent.name,
-              record,
-              error instanceof Error ? String(error.message) : failureDescription(error),
-            );
-          }
+          withdrawn = tickFailed(error);
         } finally {
-          record.finishedAt = Date.now();
-          const state = this.contextReadiness(cm);
-          if ('error' in state) {
-            // A run records an agent's first failure: a readiness refusal
-            // after a tick that failed is read again by the next pass.
-            if (record.error === undefined && !withdrawn && !(this.syncMoveReinit && refusedForMovedBranch(state.error))) {
-              this.reportMaintenanceFailure(agent.name, record, state.error);
-            }
-          } else {
-            record.readyAfter = state.ready;
-            if (state.pending) record.pendingAfter = state.pending;
-            if (record.error === undefined && !withdrawn) this.maintenanceFailureReported.delete(agent.name);
-          }
-          const progress = this.contextProgress(cm);
-          if (progress) record.progressAfter = progress;
+          if (!left) finishAgent(withdrawn);
         }
       }));
       for (const outcome of outcomes) {
