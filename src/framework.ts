@@ -2,7 +2,7 @@ import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogu
 import { presentAuthor } from './author-presentation.js';
 import { constants as bufferConstants } from 'node:buffer';
 import { dirname, join } from 'node:path';
-import { EXPIRY_REASON, REFERENCE_LIMITS, claimedExpiry, classifyBlock, isReferenceExpired, referenceBlockForScript, referenceRegistry, sanitizeLabel, type RegistryJournal, type ResultClaims, type ScriptLine, type ServerAddress } from './mcpl/references.js';
+import { EXPIRY_REASON, REFERENCE_LIMITS, claimedExpiry, classifyBlock, contentClaims, isReferenceExpired, referenceBlockForScript, referenceRegistry, sanitizeLabel, type RegistryJournal, type ResultClaims, type ScriptLine, type ServerAddress } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES } from './mcpl/reference-fetcher.js';
 import {
   appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync,
@@ -201,6 +201,14 @@ import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type Stream
 import { asNextRequestCarries, roundRows, type RoundRow, type SentRow } from './sent-rows.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
 import { STORED_INJECTION_KEY, STORED_INJECTION_KIND, asStoredRow, hasRenderedContent, isAnotherAgentsInjection, isOwnInjection, isStoredKind, storedInjectionMarkOf, unitHash, type StoredInjectionMark } from './stored-injections.js';
+
+function neverClaims(content: unknown[]): ResultClaims | undefined {
+  try {
+    return scriptViewClaims(content, true);
+  } catch {
+    return undefined;
+  }
+}
 
 /** An MCPL tool call refused because its server isn't in the registry: one
  *  closed for good, one removed, or one whose connect failed without
@@ -7929,6 +7937,23 @@ export class AgentFramework {
           console.error(`[refs] couldn't store ${path}: ${res.error ?? 'unknown error'}`);
           return null;
         },
+        {
+          remove: async (path) => {
+            const failed = (why: string) => console.error(
+              `[refs] couldn't delete ${path} from the workspace, a copy whose payload a server marked never (RFC-005), so the agent's tools can still open it there: ${why}`);
+            const workspace = this.getWorkspaceModule();
+            if (!workspace) {
+              failed('this host has no workspace');
+              return;
+            }
+            try {
+              const res = await workspace.handleToolCall({ id: `refs-withheld-${randomUUID()}`, name: 'delete', input: { path } });
+              if (!res.success) failed(res.error ?? 'unknown error');
+            } catch (e) {
+              failed(e instanceof Error ? e.message : String(e));
+            }
+          },
+        },
       );
     }
     return this.referenceFetcherInstance;
@@ -7964,7 +7989,9 @@ export class AgentFramework {
    *  A uri the result calls expired is fetched in no mode: by its blocks, or
    *  by `claims` where given, those of everything a script's view of it
    *  shows (scriptViewClaims), nested fields included, as the module
-   *  route's demand fetch reads them (Ada-1017, room-203 #201013). */
+   *  route's demand fetch reads them (Ada-1017, room-203 #201013). Nor is a
+   *  reference a `never` marked (payloadNever), and a result whose blocks
+   *  can't be read for a nested `never` is fetched from in no mode at all. */
   private async autoFetchReferences(content: unknown, serverId: string, mode: 'register' | 'model' | 'script', claims?: ResultClaims): Promise<void> {
     if (!Array.isArray(content)) return;
     // Register every block first, then judge each uri once, by its latest
@@ -7983,20 +8010,28 @@ export class AgentFramework {
     const byUri = new Map<string, {
       record: import('./mcpl/references.js').ReferenceRecord; expiredHere: boolean; linkOnly: boolean;
     }>();
+    const read = claims ?? neverClaims(content);
+    const nevers = read ?? contentClaims(content);
+    referenceRegistry.markNevers(nevers);
     for (const block of content) {
       const c = classifyBlock(block);
       if (c.kind !== 'reference') continue;
-      const record = referenceRegistry.register(c.testimony, serverId);
+      const record = referenceRegistry.register(c.testimony, serverId, nevers);
       const prior = byUri.get(c.testimony.uri);
       const expiredHere = prior?.expiredHere === true || isReferenceExpired(c.testimony);
       const linkOnly = (prior?.linkOnly ?? true) && c.testimony.fromLink === true;
       byUri.set(c.testimony.uri, { record, expiredHere, linkOnly });
     }
     if (mode === 'register') return;
+    // A nested `never` the walk couldn't read may name any of these.
+    if (read === undefined) {
+      if (byUri.size > 0) console.error(`[rfc005] fetched nothing for a result from ${serverId}: its blocks couldn't be read for a nested \`never\``);
+      return;
+    }
     const fetcher = this.getReferenceFetcher();
     const nowMs = Date.now();
     const live = [...byUri.values()]
-      .filter(({ record, expiredHere, linkOnly }) => !expiredHere && !linkOnly
+      .filter(({ record, expiredHere, linkOnly }) => !expiredHere && !linkOnly && !record.payloadNever
         && (claims === undefined || Boolean(record.fetchedPath) || claimedExpiry(record, claims, nowMs) === null))
       .map(({ record }) => record);
     // Parallel with a count cap: N small fetches cost one round-trip of
@@ -8005,13 +8040,13 @@ export class AgentFramework {
     const eligible = live.filter((record) => fetcher.isEagerEligible(record));
     await Promise.all(eligible.slice(0, MAX_EAGER_PER_RESULT).map(async (record) => {
       const outcome = await fetcher.fetchEager(record);
-      if (!outcome.ok) console.error(`[rfc005] eager fetch of ${record.refId} failed: ${outcome.error}`);
+      if (!outcome.ok && !record.payloadNever) console.error(`[rfc005] eager fetch of ${record.refId} failed: ${outcome.error}`);
     }));
     if (mode !== 'script') return;
     // A record the eager pass saved returns at once.
     for (const record of live) {
       const outcome = await fetcher.fetch(record);
-      if (!outcome.ok) console.error(`[rfc005] script-demand fetch of ${record.refId} failed: ${outcome.error}`);
+      if (!outcome.ok && !record.payloadNever) console.error(`[rfc005] script-demand fetch of ${record.refId} failed: ${outcome.error}`);
     }
   }
 
@@ -27482,6 +27517,9 @@ export class AgentFramework {
       // in process.
       const direct = AgentFramework.directToolResult(result, serverId, call.name);
       if (direct.isError) {
+        if (server && server.capabilities !== null && Array.isArray(result.content)) {
+          referenceRegistry.markNevers(neverClaims(result.content) ?? contentClaims(result.content));
+        }
         const { data: blocks, ...failure } = direct;
         let shown: ToolResult = failure;
         if (taken && !(Array.isArray(blocks) && blocks.length) && direct.structured != null) {
@@ -28434,6 +28472,7 @@ export class AgentFramework {
         } catch (err) {
           return failed(err);
         }
+        referenceRegistry.markNevers(claims);
         // The loop's registrations are the line's own only where the line
         // renders these blocks: a content array's, block by block at the top
         // level, and not a failure's, whose line is its error. There the loop
@@ -28459,7 +28498,7 @@ export class AgentFramework {
           // replace a link's, or a stale reference's, before the fetch reads
           // them, as on any other path, while the record isn't fetched yet. A
           // record its uri already has keeps the server it's bound to.
-          const record = referenceRegistry.register(c.testimony);
+          const record = referenceRegistry.register(c.testimony, undefined, claims);
           // A link of blocks the line renders is registered too, in the
           // result's order, and not fetched: the registry then holds its
           // records in the order the model's own render makes, so a
@@ -28468,6 +28507,7 @@ export class AgentFramework {
           // route, which reads the live registry, decides each link's uri as
           // the model's line does (Ada-1017, room-203 #203000).
           if (c.testimony.fromLink) continue;
+          if (record.payloadNever) continue;
           // A uri any of the result's references gives an expiry that counts
           // isn't fetched, as autoFetchReferences passes over one that any block
           // of an MCPL result marks expired.
@@ -28477,7 +28517,7 @@ export class AgentFramework {
             continue;
           }
           const outcome = await fetcher.fetch(record);
-          if (!outcome.ok) console.error(`[rfc005] script-demand fetch of ${record.refId} failed: ${outcome.error}`);
+          if (!outcome.ok && !record.payloadNever) console.error(`[rfc005] script-demand fetch of ${record.refId} failed: ${outcome.error}`);
         }
         // Where the loop's registrations are the ones the model's line makes,
         // the treatment's, below, are the script lane's own, which the

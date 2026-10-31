@@ -14,6 +14,7 @@ import {
   INLINE_WITHHELD_TEXT,
   classifyBlock,
   isInlineContradiction,
+  referenceRegistry,
   referenceStubOrNull,
   unknownBlockText,
 } from './references.js';
@@ -61,6 +62,9 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
         } as ContentBlock;
       }
       if (isFilledString(block.uri)) {
+        if (referenceRegistry.findByUri(block.uri)?.payloadNever) {
+          return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? `[${NOTICE_TAG.reference}]` };
+        }
         return {
           type: 'image',
           source: { type: 'url', url: block.uri },
