@@ -1,6 +1,6 @@
 /**
- * A derived agent is registered — and its source told — when it starts
- * running, so these tests run each fork to completion.
+ * A derived agent is registered — and its source told, when the host asks —
+ * when it starts running, so these tests run each fork to completion.
  *
  * The host's two hooks over derivations (docs/dendrite.md): beforeDerive
  * refuses any derivation or spawn with its own reason before the agent
@@ -115,7 +115,7 @@ describe('dendrite.derivationNotice', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it('text replaces the default line; absent, the default is used', async () => {
+  it("text replaces the framework's line; absent, the source is told nothing", async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hooks-'));
     try {
       const membrane = new RoutedMembrane();
@@ -126,10 +126,13 @@ describe('dendrite.derivationNotice', () => {
       assert.match(lines(custom)[0] ?? '', /^\[scout: own-1 exists; the default would have said \d+ characters\]$/);
       await custom.stop();
       const plain = await boot(dir, {}, membrane);
+      const traces: string[] = [];
+      plain.onTrace((e) => { if (e.type === 'dendrite:agent-created') traces.push((e as { agentName: string }).agentName); });
       membrane.script('plain-1', say('plain-1 done'));
       const g = await plain.deriveAgent({ name: 'plain-1', from: 'scout', mode: 'copy' });
       await plain.runEphemeralToCompletion(g.agent, g.contextManager);
-      assert.match(lines(plain)[0] ?? '', /^\[Agent lifecycle: plain-1 was derived from you as a task-fork/);
+      assert.ok(traces.includes('plain-1'), 'the trace is emitted either way');
+      assert.deepEqual(lines(plain).filter((l) => l.includes('plain-1')), []);
       await plain.stop();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });

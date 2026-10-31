@@ -4594,7 +4594,7 @@ export class AgentFramework {
   private collapseDerivationNoticesAfter = 10;
   /** The host's say over each derivation, ephemeral spawn and resume (config.dendrite.beforeDerive). */
   private beforeDerive?: (spec: AgentSpec) => void | { refuse: string };
-  /** What a source is told of a derivation (config.dendrite.derivationNotice); absent, the default line. */
+  /** What a source is told of a derivation (config.dendrite.derivationNotice); absent, nothing. */
   private derivationNoticeHook?: (record: AgentRecord, from: string, defaultText: string) => string | null;
   /** Per source agent, per kind: how many derivations, since when, and at which count the last note went. */
   private derivationTallies: Map<string, Map<string, { count: number; since: number }>> = new Map();
@@ -12154,12 +12154,14 @@ export class AgentFramework {
   /**
    * The creation event: names what kind of agent this is, what ends it and
    * what happens to it when its spawner ends. A derived agent's creation is
-   * also told to the agent it was derived from by default (#270): one
-   * host-framed line in the source's context, built from the same facts as
-   * the trace, with no wake; a host's derivationNotice can replace the line
-   * or send none. Both derivation paths announce after the
-   * fork's branch or copy exists, so a fork never inherits the notice about
-   * itself; a source that has ended is told nothing (lifecycleNotice).
+   * told to the agent it was derived from only when the host asks for it
+   * with a derivationNotice and that returns text: one host-framed line in
+   * the source's context, with no wake, given the framework's line built
+   * from the same facts as the trace. Without one the source is told
+   * nothing; the trace is emitted either way. Both derivation paths announce
+   * after the fork's branch or copy exists, so a fork never inherits the
+   * notice about itself; a source that has ended is told nothing
+   * (lifecycleNotice).
    */
   private announceAgentCreated(record: AgentRecord): void {
     this.emitTrace({
@@ -12176,7 +12178,8 @@ export class AgentFramework {
       ...(record.inherit ? { inherit: record.inherit } : {}),
     });
     const from = record.inherit?.from;
-    if (!from || from === record.name) return;
+    if (!from || from === record.name || !this.derivationNoticeHook) return;
+    const hook = this.derivationNoticeHook;
     const detail = {
       event: 'derived',
       agent: record.name,
@@ -12187,15 +12190,16 @@ export class AgentFramework {
       ...(record.relationships.resultTo ? { resultTo: record.relationships.resultTo } : {}),
       lifetime: record.lifetime,
     };
-    // A resumption is rare and always said. A first incarnation is tallied:
-    // past the threshold, a reader loop that forks a hundred times a session
-    // would fill its source's context with stamps (Linn, 2026-10-15), so
-    // the source hears a count line every `threshold` forks instead, with
-    // the latest described; every derivation still emits its trace.
+    // With the host's hook: a resumption is rare and always passed to it. A
+    // first incarnation is tallied: past the threshold, a reader loop that
+    // forks a hundred times a session would fill its source's context with
+    // stamps, so the hook is given a count line every `threshold` forks
+    // instead, with the latest described; every derivation still emits its
+    // trace.
     const threshold = this.collapseDerivationNoticesAfter;
     const tell = (defaultText: string, extra: Record<string, unknown> = {}) => {
       try {
-        const text = this.derivationNoticeHook ? this.derivationNoticeHook(record, from, defaultText) : defaultText;
+        const text = hook(record, from, defaultText);
         if (text !== null) this.lifecycleNotice(from, text, { ...detail, ...extra });
       } catch (error) {
         console.error(`[dendrite] ${record.name} was created, but ${from} could not be told:`, error);
