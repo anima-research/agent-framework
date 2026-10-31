@@ -11,12 +11,14 @@
   for a maintenance pass, and it drives it again after each pass (with the
   maintenance timer off, every 5 seconds) and when a call of that manager's
   lands while the turn is held, unless a drive of the hold's own or a drain it
-  joined is under way, whose end looks again. A tick that starts no call, as
-  while compression is paused after a failure, ends that drive. An ephemeral
-  run, a turn in a framework that `start()` hasn't started (only
-  `runUntilIdle()` runs its turns, so nothing would run a released one), and a
-  refusal with nothing pending fail as before. What a held turn changes for
-  hosts is under Changed.
+  joined is under way, whose end looks again; for a call that lands during
+  another drain, such as the OverBudget drain breaker's, the hold looks and
+  drives once that drain ends. A tick that starts no call, as while
+  compression is paused after a failure, ends that drive. An ephemeral run, a
+  turn in a framework that `start()` hasn't started (only `runUntilIdle()`
+  runs its turns, so nothing would run a released one), and a refusal with
+  nothing pending fail as before. What a held turn changes for hosts is under
+  Changed.
   - **When it runs:** as one fresh compile, once context-manager's preview of
     that compile, at its budget and with its thinking binding, says it fits. A
     dry compile can't say so, since it can resolve a plan the turn's compile
@@ -26,14 +28,15 @@
     for one that does, the dry compile decides. The hold looks after each tick
     it drives that starts a compression call, so a call that makes the context
     fit releases the turn at once, and looks again when each drive, or drain
-    it joined, ends, when a call of that manager's lands outside them, and
-    after each maintenance pass. After a compression call returns, its chunk's
-    quarantine clean-up can still run under the compression-state lock; a hold
-    that looked during that clean-up, with more compression still needed, is
-    looked at again at the next maintenance pass, at the hold's recheck with
-    the maintenance timer off, or when another call of that manager's lands.
-    With the maintenance timer on, once the hold's own drive has ended, the
-    hold drives compression again at a pass's end or when a later call of that
+    it joined, ends, when a call of that manager's lands outside them (during
+    a drain it hasn't joined, once that drain ends), and after each
+    maintenance pass. After a compression call returns, its chunk's quarantine
+    clean-up can still run under the compression-state lock; a hold that
+    looked during that clean-up, with more compression still needed, is looked
+    at again at the next maintenance pass, at the hold's recheck with the
+    maintenance timer off, or when another call of that manager's lands. With
+    the maintenance timer on, once the hold's own drive has ended, the hold
+    drives compression again at a pass's end or when a later call of that
     manager's lands, so a pass that never ends, with no other call of that
     manager's landing, keeps the turn held until the turn is ended, as by an
     abandoning quiesce, `abortInference()` or a stop; with the timer off, so
