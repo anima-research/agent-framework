@@ -18,6 +18,7 @@ import type {
   ExternalIdRef,
   SpeechContext,
   SpeechHandlerOptions,
+  SpeechRoutedContext,
   ProcessEvent,
   ToolResultEvent,
   TraceEventListener,
@@ -31,6 +32,7 @@ import type { Agent } from './agent.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from './shutdown.js';
 import { logValue } from './mcpl/log-value.js';
 import { asCalled, markedInputRefusal, toolArgsProblems } from './tool-args.js';
+import { safeSlice } from './safe-slice.js';
 
 /** How the registry queues a module's event: its push names the module. A
  * `ProcessQueue` serves too, ignoring the name. */
@@ -99,6 +101,18 @@ const MAX_CONTEXT_TIMEOUT_MS = 30_000;
  * below this one, so it can record the miss itself.
  */
 export const TOOL_BATCH_HOOK_TIMEOUT_MS = 30_000;
+
+/**
+ * How long the modules' answers about one piece of plain speech a turn
+ * routes (Module.onSpeechRouted), all asked at once, are waited for: by the
+ * piece itself when it has no channel, and by the turn's receipt. A piece's
+ * own channel post never waits for its answers; pieces route in order, so a
+ * post that follows a piece with no channel waits behind that piece's
+ * answers, only while a module hasn't answered.
+ */
+export const SPEECH_RECEIPT_WAIT_MS = 5_000;
+
+const SPEECH_PLACE_MAX = 200;
 
 /**
  * Registered speech handler.
@@ -722,6 +736,57 @@ export class ModuleRegistry {
         }
       }
     }
+  }
+
+  /**
+   * Ask every module with onSpeechRouted, all at once, whether it showed
+   * `text` to someone. Resolves, once every module has answered or
+   * SPEECH_RECEIPT_WAIT_MS has passed, to the places they named, in module
+   * registration order. A module that throws, answers after the wait, is
+   * replaced while asked, or names no place (`{}`, "can't tell") names none.
+   */
+  async askSpeechRouted(agentName: string, text: string, context: SpeechRoutedContext): Promise<string[]> {
+    const asked = [...this.modules.values()].filter((module) => module.onSpeechRouted)
+      .map((module) => ({ module, registration: this.moduleContexts.get(module.name) }));
+    const answers = await Promise.all(asked.map(({ module }) => new Promise<unknown>((resolve) => {
+      let settled = false;
+      let call: Promise<unknown>;
+      try {
+        call = Promise.resolve(module.onSpeechRouted!(agentName, text, context));
+      } catch (error) {
+        call = Promise.reject(error);
+      }
+      const timer = setTimeout(() => {
+        settled = true;
+        console.error(`Speech-routed module ${module.name} hadn't answered within ${SPEECH_RECEIPT_WAIT_MS / 1000} s: counted as having sent nothing`);
+        resolve(undefined);
+      }, SPEECH_RECEIPT_WAIT_MS);
+      call.then((answer) => {
+        if (settled) {
+          console.error(`Speech-routed module ${module.name} answered after the ${SPEECH_RECEIPT_WAIT_MS / 1000} s wait: its answer counts for nothing`);
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        resolve(answer);
+      }, (error: unknown) => {
+        console.error(`Speech-routed module ${module.name} error${settled ? ' after the wait' : ''}:`, error);
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(undefined);
+      });
+    })));
+    const places: string[] = [];
+    answers.forEach((answer, i) => {
+      const { module, registration } = asked[i]!;
+      if (this.moduleContexts.get(module.name) !== registration) return;
+      const named = (answer as { sentTo?: unknown } | null | undefined)?.sentTo;
+      const flat = typeof named === 'string' ? named.replace(/\s+/g, ' ').trim() : '';
+      if (!flat) return;
+      places.push(flat.length > SPEECH_PLACE_MAX ? `${safeSlice(flat, 0, SPEECH_PLACE_MAX)}…` : flat);
+    });
+    return places;
   }
 
   private getStateId(moduleName: string): string {
