@@ -6348,7 +6348,8 @@ export class AgentFramework {
     if (hold) hold.managerCalls++;
   }
   private managerCallSettled(agentName: string): void {
-    if (this.budgetHolds?.get(agentName)?.state !== 'holding' || this.overBudgetDrainInFlight.has(agentName)) return;
+    const hold = this.budgetHolds?.get(agentName);
+    if (hold?.state !== 'holding' || hold.checkQueued) return;
     const look = setTimeout(() => {
       const agent = this.agents.get(agentName);
       if (agent) this.compressForBudgetHold(agent);
