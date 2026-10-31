@@ -167,6 +167,25 @@ const ROWS: Row[] = [
   },
   { step: "cancelling provider admission", inject: (fw, e) => patchMethod(fw, 'cancelProviderAdmission', e) },
   {
+    step: "a budget hold's drop",
+    inject: (fw, e) => {
+      // Two turns' hold records: the first one's drop throws.
+      const holds = internals(fw).budgetHolds as Map<string, unknown>;
+      holds.set('first', { state: 'released', heldRequests: [] });
+      holds.set('second', { state: 'released', heldRequests: [] });
+      const owner = fw as unknown as Record<string, unknown>;
+      const usual = (owner.dropBudgetHold as (name: string) => void).bind(fw);
+      owner.dropBudgetHold = (name: string) => {
+        if (name === 'first') throw e;
+        usual(name);
+      };
+      return () => { delete owner.dropBudgetHold; };
+    },
+    check: (fw) => {
+      assert.equal((internals(fw).budgetHolds as Map<string, unknown>).has('second'), false, "the other hold's drop still ran");
+    },
+  },
+  {
     step: "a stream's waiting outgoing complete",
     inject: (fw, e) => {
       // Two streams' completes wait: the first one's throws.
