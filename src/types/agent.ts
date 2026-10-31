@@ -83,12 +83,50 @@ export interface AgentConfig {
   /** Temperature for inference */
   temperature?: number;
 
-  /** Max input tokens before framework breaks a yielding stream and
-   *  restarts with recompiled (compressed) context. Default: 150000. Not
-   *  checked mid-turn for an agent whose model binds its thinking
+  /** The `inputTokens` total above which framework breaks a yielding
+   *  stream and restarts with recompiled (compressed) context. Default:
+   *  150000. The total runs over the stream's calls, as membrane's usage
+   *  events report it, and doesn't add the cache reads and writes they
+   *  report beside it. Where membrane knows the provider's cache convention
+   *  (one other than `'unknown'`), `inputTokens` leaves those out, so there,
+   *  where a prompt is mostly cached, this setting doesn't bound the
+   *  request's size: `physicalWindowTokens`, when set, does. The restart is
+   *  declined when context-manager's preview of its compile says it won't
+   *  fit, or the preview fails (a strategy with no preview, or with no fold
+   *  plan to preview as on the hierarchical path, restarts as before), and
+   *  each boundary that declines it emits an
+   *  `inference:restart_declined` trace; a preview that fails other than
+   *  with an `UncoveredDropError` is also logged. The stream goes on, and
+   *  the next tool boundary over this budget considers the restart again.
+   *  It previews anew only once what the last preview rested on has
+   *  changed (the budget, the compression holds, the live context settings,
+   *  the strategy's compression state, the pins and document marks other than
+   *  the turn's own, or a stored row edited or removed),
+   *  unless that preview said a newer message could make room, failed, or
+   *  met a drop no summary covers: each of those every boundary previews.
+   *  With `toolResultGuard` on, no remembered decline is taken: the guard
+   *  holds each round's stored results from compression and edits them as
+   *  it settles them, so what a preview rests on changes at every round,
+   *  and each boundary past this budget that would restart previews anew. A
+   *  decline whose preview names only compression as what would make room
+   *  isn't cleared by a compression whose model call hasn't started: the
+   *  stream keeps the agent's provider gate, and that call waits behind it
+   *  until the stream ends. A summary adopted with no call, or a call
+   *  already under way, can still land. With
+   *  `physicalWindowTokens` unset, nothing else then bounds the stream: it
+   *  can go on until the provider refuses a request at its own window, and
+   *  the turn then ends with its `context_length` failure row, which raises
+   *  the `context-refusal` ops alert and kicks the compression drain, as a
+   *  refused compile does.
+   *  The preview can't count the rows
+   *  the restart's start then stores (such as new or changed afterUser
+   *  injections, or a routing notice for an arrival the turn heard), so a
+   *  restart whose preview leaves less room than those rows take can still
+   *  be refused, and the turn then ends with its failure row. Not checked
+   *  mid-turn for an agent whose model binds its thinking
    *  (`thinkingBinding.binds`) with `physicalWindowTokens` set: a new stream
-   *  there would take the turn's own earlier reasoning out of the request, and
-   *  the window projection still guards the provider's hard cap. */
+   *  there would take the turn's own earlier reasoning out of the request,
+   *  and the window projection still guards the provider's hard cap. */
   maxStreamTokens?: number;
 
   /**
@@ -101,7 +139,10 @@ export interface AgentConfig {
    * request the provider will 400 (issue #92: a legal compile can walk past
    * the physical window mid-turn). The projection runs once a call on the
    * stream has reported its prompt. Unset → no projection; only the
-   * maxStreamTokens restart applies. A value is converted to a number as a
+   * maxStreamTokens restart applies. Where membrane knows the provider's
+   * cache convention, the count that restart compares leaves out cache reads
+   * and writes, so a turn's requests can then grow past the window while
+   * most of their prompt is cached. A value is converted to a number as a
    * comparison converts it, so a string such as "200000" reads as its number;
    * one whose number isn't finite, such as null, reads as unset.
    */
@@ -314,7 +355,10 @@ export interface AgentConfig {
   /** Opt-in tool-output admission and one guarded retry after a provider
    * refusal. Agents can persistently override this via agent_settings
    * tool_result_guard. Full originals remain in Chronicle's audit history.
-   * Default false. Disabling does not restore previously withheld output. */
+   * Default false. Disabling does not restore previously withheld output.
+   * Past `maxStreamTokens`, an agent with it on takes no remembered
+   * decline: each boundary that would restart previews the compile anew
+   * (see `maxStreamTokens`). */
   toolResultGuard?: boolean;
 
   /**
