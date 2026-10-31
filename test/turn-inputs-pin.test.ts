@@ -426,8 +426,9 @@ test('when the compile refuses without the pin too, the pin is dropped once and 
       };
       ask(framework);
       await waitUntil('the turn to end', () => failureRows(framework).length > 0 || storedText(framework).includes(FINAL));
-      assert.deepEqual(refusals, [{ pinned: 1, name: 'OverBudgetError' }, { pinned: 0, name: 'OverBudgetError' }],
-        'the compile refused with the pin, then once more without it');
+      assert.ok(refusals.length >= 2 && refusals.every((r) => r.name === 'OverBudgetError'), 'every compile refused');
+      assert.deepEqual(refusals.map((r) => r.pinned), [1, ...refusals.slice(1).map(() => 0)],
+        'the compile refused with the pin, then only without it');
       assert.equal(failureRows(framework)[0]?.errorType, 'over_budget', "the turn ended with the compile's refusal");
       assert.equal(membrane.streams.length, 0, 'no request was sent');
       assert.deepEqual(inputPins(framework), [], 'no pin is left');
