@@ -66,15 +66,13 @@ function harness(opts?: { privileged?: boolean }) {
 describe('duration expiry', () => {
   it('an expired deadline at resume cancels immediately via the standard flow', () => {
     const cancels: string[] = [];
+    const expired = { ...PARAMS, expiresAtMs: Date.now() - 5_000 };
     const registry = {
       // Each channel's id is unique here, so it's shown by its id.
       nameShown: (channel: { channelId: string }) => channel.channelId,
       quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
-      listChannelsRaw: () => [{ serverId: 'disc', descriptor: { id: '#a' } }],
-      getTuneOutState: () => ({
-        params: { ...PARAMS, expiresAtMs: Date.now() - 5_000 },
-        wakeCount: 0,
-      }),
+      tuneOutsOnRecord: () => [{ serverId: 'disc', channelId: '#a', params: expired, source: 'agent-tool' }],
+      getTuneOutState: () => ({ params: expired, wakeCount: 0 }),
       readCoordinatorState: () => null,
       cancelTuneOut: (_s: string, c: string) => {
         cancels.push(c);
@@ -144,7 +142,7 @@ describe('duration expiry', () => {
       // Each channel's id is unique here, so it's shown by its id.
       nameShown: (channel: { channelId: string }) => channel.channelId,
       quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
-      listChannelsRaw: () => [],
+      tuneOutsOnRecord: () => [],
       getTuneOutState: () => null,
       readCoordinatorState: () => null,
       enterTuneOut: (_s: string, _c: string, p: TuneOutParams) => { entered.push(p); },
