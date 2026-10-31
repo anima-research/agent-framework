@@ -6,8 +6,9 @@
  *
  * Now, at the hard-down threshold, when the failure suggests the provider
  * refused the request's content or size (shedMayHelp: an invalid_request at
- * HTTP 400, 413 or 422 or with no status, or a context_length at 413), the
- * breaker auto-quarantines: sheds the newest complete exchange (the same
+ * HTTP 400, 413 or 422 or with no status, or a context_length at 413), and
+ * the failed request sent without its history is answered, the breaker
+ * auto-quarantines: sheds the newest complete exchange (the same
  * shedNewestTurn primitive the refusal auto-rewind and /unstick use — never
  * orphaning a tool_use/thinking block), drops ONE consolidated marker, and
  * queues a retry — bounded by the refusalHandling.maxRewinds cap so it can
@@ -16,7 +17,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { errorFromProviderStatus } from '@animalabs/membrane';
+import type { NormalizedRequest } from '@animalabs/membrane';
 import { AgentFramework, shedMayHelp } from '../src/framework.js';
+import { createMockResponse } from './helpers/mock-membrane.js';
+
+const settle = async () => { for (let i = 0; i < 8; i++) await new Promise<void>((resolve) => setImmediate(resolve)); };
 
 function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   const messages: any[] = opts?.messages ?? [
@@ -26,12 +31,16 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   ];
   const removed: string[] = [];
   const added: Array<{ content: any[]; meta: any }> = [];
+  const listeners = new Set<(event: unknown) => void>();
+  const heard = (event: unknown) => { for (const listener of listeners) listener(event); };
   const cm = {
     getAllMessages: () => messages,
+    onMessage: (listener: (event: unknown) => void) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
     removeMessage: (id: string) => {
       removed.push(id);
       const i = messages.findIndex((m) => m.id === id);
       if (i >= 0) messages.splice(i, 1);
+      heard({ type: 'remove', messageId: id });
     },
     // A range by its two ends, inclusive, as context-manager's removeMessages.
     removeMessages: (fromId: string, toId: string) => {
@@ -39,16 +48,19 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
       const to = messages.findIndex((m) => m.id === toId);
       if (from < 0 || to < from) throw new Error(`no range ${fromId}..${toId}`);
       for (const m of messages.splice(from, to - from + 1)) removed.push(m.id);
+      heard({ type: 'removeRange', fromId, toId });
     },
     addMessage: (_p: string, content: any[], meta: any) => {
       const id = `marker-${added.length}`;
       added.push({ content, meta });
       messages.push({ id, participant: 'user', content, metadata: meta });
+      heard({ type: 'add', message: messages.at(-1) });
       return id;
     },
     editMessage: (id: string, content: any[]) => {
       const m = messages.find((x) => x.id === id);
       if (m) m.content = content;
+      heard({ type: 'edit', messageId: id, newContent: content });
     },
   };
 
@@ -65,19 +77,25 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
     refusalHandling: { maxRewinds: opts?.maxRewinds ?? 3 },
     getContextManager: () => cm,
   }]]);
+  const onTheWire = { messages: [], config: { model: 'zz-model', maxTokens: 100 } };
+  fw.failedRequests = { get: () => onTheWire, delete: () => true };
+  fw.activeTurnTokens = new Map();
+  fw.breakerProbes = new Set();
+  fw.store = { currentBranch: () => ({ name: 'main' }) };
+  fw.auxiliaryMembraneFor = () => ({ complete: async () => createMockResponse([{ type: 'text', text: 'ok' }]) });
 
   const errs: string[] = [];
   const orig = console.error;
   console.error = (...a: unknown[]) => { errs.push(a.join(' ')); };
   const restore = () => { console.error = orig; };
 
-  return { fw, messages, removed, added, errs, restore };
+  return { fw, cm, messages, removed, added, errs, restore };
 }
 
 const REASON = '400 invalid_request: tool_use ids must have a corresponding tool_result';
 const isRewindMarker = (m: { content: any[] }) => /kept refusing the requests that carried them/.test(m.content[0]?.text ?? '');
 
-test('at the threshold, an invalid_request with no status (shedMayHelp) triggers an automatic rewind + retry', () => {
+test('at the threshold, an invalid_request with no status (shedMayHelp) triggers an automatic rewind + retry', async () => {
   const { fw, removed, added, errs, restore } = makeHarness();
   try {
     fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request'); // 1
@@ -85,6 +103,7 @@ test('at the threshold, an invalid_request with no status (shedMayHelp) triggers
     assert.equal(removed.length, 0, 'no rewind before the threshold');
 
     fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request'); // 3 → breaker trips
+    await settle();
   } finally { restore(); }
 
   // The poisoned tool exchange was shed as a COMPLETE pair (no orphans).
@@ -104,7 +123,7 @@ test('at the threshold, an invalid_request with no status (shedMayHelp) triggers
   assert.ok(errs.some((e) => e.includes('[inference-rewind]') && e.includes('auto-quarantined')));
 });
 
-test('at the threshold, a row that carries nothing is passed over, uncounted, and the newest turn shed', () => {
+test('at the threshold, a row that carries nothing is passed over, uncounted, and the newest turn shed', async () => {
   const { fw, messages, added, restore } = makeHarness({ messages: [
     { id: 'u0', participant: 'human', content: [{ type: 'text', text: 'earlier' }], metadata: { messageId: '0' } },
     { id: 'a0', participant: 'agent', content: [{ type: 'text', text: 'an answer' }] },
@@ -113,6 +132,7 @@ test('at the threshold, a row that carries nothing is passed over, uncounted, an
   ] });
   try {
     for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    await settle();
   } finally { restore(); }
   assert.deepEqual(messages.filter((m) => !m.metadata?.system).map((m) => m.id), ['u0', 'a0', 'a1'],
     'the newest message is gone, and the empty row after it stays with what came before');
@@ -154,7 +174,7 @@ test('non-retryable but NON-poison failures (auth/context_length/abort) NEVER sh
   }
 });
 
-test('the breaker is capped: repeated failures stop shedding at maxRewinds', () => {
+test('the breaker is capped: repeated failures stop shedding at maxRewinds', async () => {
   const { fw, removed, errs, restore } = makeHarness({
     maxRewinds: 2,
     messages: [
@@ -166,8 +186,11 @@ test('the breaker is capped: repeated failures stop shedding at maxRewinds', () 
   });
   try {
     // 10 consecutive non-retryable failures: the breaker fires from streak 3 on,
-    // but only sheds up to the cap (2), then holds.
-    for (let i = 0; i < 10; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    // its probe answered before the fourth, but only sheds up to the cap (2),
+    // then holds.
+    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    await settle();
+    for (let i = 3; i < 10; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
   } finally { restore(); }
 
   assert.equal(removed.length, 2, `cap of 2 respected, shed: ${removed.join(', ')}`);
@@ -175,7 +198,7 @@ test('the breaker is capped: repeated failures stop shedding at maxRewinds', () 
   assert.ok(errs.some((e) => e.includes('rewind cap 2 reached')));
 });
 
-test('a successful inference resets both the streak and the rewind budget', () => {
+test('a successful inference resets both the streak and the rewind budget', async () => {
   const { fw, removed, restore } = makeHarness({
     maxRewinds: 1,
     messages: [
@@ -188,6 +211,7 @@ test('a successful inference resets both the streak and the rewind budget', () =
   });
   try {
     for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    await settle();
     assert.deepEqual([...removed].sort(), ['a2', 'r2']);
 
     fw.emitTrace({ type: 'inference:completed', agentName: 'cairn' });
@@ -195,11 +219,12 @@ test('a successful inference resets both the streak and the rewind budget', () =
     fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
     assert.equal(removed.length, 2, 'a fresh streak: two failures shed nothing');
     fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    await settle();
     assert.deepEqual([...removed].sort(), ['a1', 'a2', 'r1', 'r2'], 'a fresh budget: the third sheds again');
   } finally { restore(); }
 });
 
-test('nothing left to shed: the breaker degrades to logging, no crash, no loop', () => {
+test('nothing left to shed: the breaker degrades to logging, no crash, no loop', async () => {
   const { fw, removed, errs, restore } = makeHarness({
     messages: [
       { id: 'mk', participant: 'user', content: [{ type: 'text', text: 'sys' }], metadata: { system: true } },
@@ -207,6 +232,7 @@ test('nothing left to shed: the breaker degrades to logging, no crash, no loop',
   });
   try {
     for (let i = 0; i < 5; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    await settle();
   } finally { restore(); }
   assert.equal(removed.length, 0);
   assert.equal(fw.pendingRequests.length, 0, 'no retry queued when nothing was repaired');
@@ -222,7 +248,7 @@ test('nothing left to shed: the breaker degrades to logging, no crash, no loop',
 // the provider refused the request's content or size (a heuristic: other
 // refusals come back the same way), and for a context_length at 413, the
 // label #56 gives a 413; an error without a status keeps the type-only rule.
-test('the breaker reads the status: a 404 invalid_request never sheds, a 400 does', () => {
+test('the breaker reads the status: a 404 invalid_request never sheds, a 400 does', async () => {
   const missingModel = makeHarness();
   const alerts: any[] = [];
   missingModel.fw.onTrace((e: any) => { if (e.type === 'ops:alert') alerts.push(e); });
@@ -244,11 +270,12 @@ test('the breaker reads the status: a 404 invalid_request never sheds, a 400 doe
       rejected.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request',
         { httpStatus: 400, providerErrorCode: 'invalid_request_error' });
     }
+    await settle();
   } finally { rejected.restore(); }
   assert.deepEqual([...rejected.removed].sort(), ['a1', 'r1'], 'a 400 at the threshold sheds, as before');
 });
 
-test('the current failure decides the shed, whatever failed before it in the streak', () => {
+test('the current failure decides the shed, whatever failed before it in the streak', async () => {
   // 400, 400, then a 404 at the threshold: nothing is shed.
   const ending404 = makeHarness();
   try {
@@ -265,11 +292,12 @@ test('the current failure decides the shed, whatever failed before it in the str
     for (const httpStatus of [404, 404, 400]) {
       ending400.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request', { httpStatus });
     }
+    await settle();
   } finally { ending400.restore(); }
   assert.deepEqual([...ending400.removed].sort(), ['a1', 'r1'], '404, 404, 400: the 400 sheds at the third failure');
 });
 
-test('a 413 sheds under either label it arrives with, and a context_length at 400 or 422 keeps the history', () => {
+test('a 413 sheds under either label it arrives with, and a context_length at 400 or 422 keeps the history', async () => {
   // membrane 0.5.86's Responses adapter files a 413 as invalid_request, and
   // membrane #56 as context_length: the arm takes both.
   for (const errorType of ['invalid_request', 'context_length']) {
@@ -278,6 +306,7 @@ test('a 413 sheds under either label it arrives with, and a context_length at 40
       for (let i = 0; i < 3; i++) {
         tooLarge.fw.noteInferenceExhausted('cairn', '413 request too large', false, errorType, { httpStatus: 413 });
       }
+      await settle();
     } finally { tooLarge.restore(); }
     assert.deepEqual([...tooLarge.removed].sort(), ['a1', 'r1'], `${errorType} at 413 sheds at the threshold`);
   }
@@ -307,7 +336,7 @@ test('the status reaches the breaker from the inference:exhausted trace', () => 
   assert.ok(h.errs.some((e) => e.includes('[inference-hard-down]')));
 });
 
-test("a membrane error's type and status reach the gate through the exhausted trace's classification", () => {
+test("a membrane error's type and status reach the gate through the exhausted trace's classification", async () => {
   const rows: Array<[string, number, unknown, boolean]> = [
     ['a model that does not exist', 404, { type: 'error', error: { type: 'not_found_error', message: 'model: claude-typo' } }, false],
     ['an unpaired tool result', 400, { type: 'error', error: { type: 'invalid_request_error', message: 'messages.3.content.0: unexpected `tool_use_id` found in `tool_result` blocks: toolu_01.' } }, true],
@@ -322,9 +351,146 @@ test("a membrane error's type and status reach the gate through the exhausted tr
       for (let i = 0; i < 3; i++) {
         h.fw.emitTrace({ type: 'inference:exhausted', agentName: 'cairn', error: error.message, ...fields });
       }
+      await settle();
     } finally { h.restore(); }
     assert.equal(h.removed.length > 0, sheds, `${name}: ${sheds ? 'sheds' : 'keeps the history'}`);
   }
+});
+
+test('a probe answered after the agent moved on sets its answer aside: nothing is shed, and the next failure decides', async () => {
+  const moves: Array<[string, (h: ReturnType<typeof makeHarness>) => void]> = [
+    ['nothing (the control)', () => {}],
+    ['the agent replaced', (h) => { h.fw.agents.set('cairn', { ...h.fw.agents.get('cairn') }); }],
+    ['the framework stopping', (h) => { h.fw.providerAdmissionClosed = true; }],
+    ['a surgery holding the store', (h) => { h.fw.surgeryHold = { verb: 'undo', agentName: 'cairn' }; }],
+    ['another failure counted', (h) => { h.fw.consecutiveInferenceFailures.set('cairn', 4); }],
+    ['another turn holding the agent', (h) => { h.fw.activeTurnTokens.set('cairn', 42); }],
+    ['the branch moved', (h) => { h.fw.store = { currentBranch: () => ({ name: 'undo/cairn/1' }) }; }],
+    ['a row edited', (h) => { h.cm.editMessage('u1', [{ type: 'text', text: 'edited' }]); }],
+    ['an older row removed', (h) => { h.cm.removeMessage('u1'); h.removed.length = 0; }],
+  ];
+  for (const [what, move] of moves) {
+    const h = makeHarness();
+    let answer!: () => void;
+    let probes = 0;
+    h.fw.auxiliaryMembraneFor = () => ({
+      complete: () => {
+        probes++;
+        return new Promise((resolve) => { answer = () => resolve(createMockResponse([{ type: 'text', text: 'ok' }])); });
+      },
+    });
+    let setAside = false;
+    try {
+      for (let i = 0; i < 3; i++) h.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+      await settle();
+      move(h);
+      answer();
+      await settle();
+      setAside = h.errs.some((e) => e.includes("its probe's answer is set aside"));
+      if (what !== 'nothing (the control)') {
+        h.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+        await settle();
+      }
+    } finally { h.restore(); }
+    if (what === 'nothing (the control)') {
+      assert.deepEqual([...h.removed].sort(), ['a1', 'r1'], 'the control sheds');
+      continue;
+    }
+    assert.deepEqual(h.removed, [], `${what}: nothing is shed`);
+    assert.equal(h.fw.pendingRequests.length, 0, `${what}: no retry is queued`);
+    assert.ok(setAside, `${what}: it says the answer was set aside`);
+    assert.equal(probes, what === 'the framework stopping' ? 1 : 2,
+      `${what}: the next failure ${what === 'the framework stopping' ? 'sends no probe, once stopping' : 'sends a probe of its own'}`);
+  }
+});
+
+test('a failure with no request on the wire sends no probe and sheds nothing, in a run whose history a probe already implicated too', async () => {
+  for (const implicated of [false, true]) {
+    const h = makeHarness();
+    h.fw.failedRequests = { get: () => undefined, delete: () => true };
+    if (implicated) h.fw.exhaustionRewinds.set('cairn', 1);
+    let probes = 0;
+    h.fw.auxiliaryMembraneFor = () => ({ complete: async () => { probes++; return createMockResponse([{ type: 'text', text: 'ok' }]); } });
+    try {
+      for (let i = 0; i < 3; i++) h.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+      await settle();
+    } finally { h.restore(); }
+    assert.equal(probes, 0, `implicated ${implicated}: no probe`);
+    assert.deepEqual(h.removed, [], `implicated ${implicated}: nothing shed`);
+    assert.ok(h.errs.some((e) => e.includes('sheds nothing: no request reached the breaker')), `implicated ${implicated}: it says why`);
+  }
+});
+
+test('a trip once stop() has begun, or after the agent was let go or replaced, sends no probe and sheds nothing, in a run whose history a probe already implicated too', async () => {
+  for (const [what, implicated] of [['stopping', false], ['let go', false], ['replaced', false], ['stopping', true], ['let go', true], ['replaced', true]] as const) {
+    const h = makeHarness();
+    if (implicated) h.fw.exhaustionRewinds.set('cairn', 1);
+    let probes = 0;
+    h.fw.auxiliaryMembraneFor = () => ({ complete: async () => { probes++; return createMockResponse([{ type: 'text', text: 'ok' }]); } });
+    h.fw.onTrace((e: any) => {
+      if (e.type !== 'ops:alert' || e.kind !== 'hard-down') return;
+      if (what === 'stopping') h.fw.providerAdmissionClosed = true;
+      else if (what === 'replaced') h.fw.agents.set('cairn', { ...h.fw.agents.get('cairn') });
+      else h.fw.agents.delete('cairn');
+    });
+    try {
+      for (let i = 0; i < 3; i++) h.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+      await settle();
+    } finally { h.restore(); }
+    assert.equal(probes, 0, `${what}, implicated ${implicated}: no probe`);
+    assert.deepEqual(h.removed, [], `${what}, implicated ${implicated}: nothing shed`);
+    assert.equal(h.fw.pendingRequests.length, 0, `${what}, implicated ${implicated}: no retry queued`);
+  }
+});
+
+test("the probe carries every field of the failed request but its messages and its wire-receipt hook, and asks as the request's newest participant other than the agent", async () => {
+  const full = {
+    onCacheWireReceipt: () => {},
+    shedOversizeImages: true,
+    messages: [
+      { participant: 'nissa', content: [{ type: 'text', text: 'zz-first' }] },
+      { participant: 'sam', content: [{ type: 'text', text: 'zz-second' }] },
+      { participant: 'cairn', content: [{ type: 'text', text: 'zz-own' }] },
+    ],
+    system: 'zz-system',
+    config: { model: 'zz-model', maxTokens: 100, temperature: 0.5 },
+    tools: [{ name: 'zz_tool', description: 'zz', inputSchema: { type: 'object', properties: {} } }] as NonNullable<NormalizedRequest['tools']>,
+    toolMode: 'native',
+    stopSequences: ['zz-stop'],
+    maxParticipantsForStop: 3,
+    promptCaching: true,
+    cacheMarkers: 'cm-owned',
+    cacheTtl: '5m',
+    floatingCacheMarker: true,
+    contextPrefix: 'zz-prefix',
+    prefillUserMessage: 'zz-prefill',
+    assistantParticipant: 'cairn',
+    streaming: true,
+    providerParams: { zz: 1 },
+  } satisfies Required<NormalizedRequest>;
+  const presentedAsUser: NormalizedRequest = {
+    messages: [{ participant: 'User', content: [{ type: 'text', text: 'zz-own' }] }],
+    config: { model: 'zz-model', maxTokens: 100 },
+    assistantParticipant: 'User',
+  };
+  const probes: NormalizedRequest[] = [];
+  for (const request of [full, presentedAsUser]) {
+    const h = makeHarness();
+    h.fw.failedRequests = { get: () => request, delete: () => true };
+    h.fw.auxiliaryMembraneFor = () => ({
+      complete: async (probe: NormalizedRequest) => { probes.push(probe); return createMockResponse([{ type: 'text', text: 'ok' }]); },
+    });
+    try {
+      for (let i = 0; i < 3; i++) h.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+      await settle();
+    } finally { h.restore(); }
+  }
+  const { messages: _messages, onCacheWireReceipt: _hook, ...kept } = full;
+  const { messages: asked, ...carried } = probes[0]!;
+  assert.deepEqual(carried, kept, 'every other field, as the failed request had it');
+  assert.equal(asked.length, 1);
+  assert.equal(asked[0]!.participant, 'sam', "as the failed request's newest participant other than the agent");
+  assert.notEqual(probes[1]!.messages[0]!.participant, 'User', "an agent presented as 'User' isn't asked as itself");
 });
 
 test('shedMayHelp: an invalid_request at 400, 413 or 422 or with no status, or a context_length at 413, and nothing else', () => {
