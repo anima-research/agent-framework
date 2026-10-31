@@ -1144,12 +1144,12 @@ test("a fresh turn starts new routing state in every mode, and leaves the earlie
     const h = await harness([[answer()]], { proseRouting: mode });
     type Channel = { serverId: string; channelId: string };
     type Routing = { pin?: Channel; hybridHold?: 'private' | 'failed';
-      continuation: boolean; deliveries: Channel[]; suppressed: number; drafts: unknown[]; keptPrivate: number;
+      continuation: boolean; deliveries: Channel[]; suppressed: number; drafts: unknown[]; keptPrivate: Partial<Record<string, number>>;
       triggerChannel?: Channel; locus?: Channel; engaged: Set<string>; wasIn: Channel[]; arrivals: Array<{ messageId: string; channel: Channel }> };
     const internals = h.framework as unknown as { turnRouting: Map<string, Routing> };
     const earlierChannel = { serverId: 'stub', channelId: 'chan-earlier' };
     const earlierFields = (): Routing => ({ pin: earlierChannel, hybridHold: 'failed',
-      continuation: true, deliveries: [earlierChannel], suppressed: 2, drafts: [{ id: 'd-earlier' }], keptPrivate: 1,
+      continuation: true, deliveries: [earlierChannel], suppressed: 2, drafts: [{ id: 'd-earlier' }], keptPrivate: { skip_reply: 1 },
       triggerChannel: earlierChannel, locus: earlierChannel, engaged: new Set([destinationKey(earlierChannel)]), wasIn: [earlierChannel], arrivals: [{ messageId: 'earlier-message', channel: earlierChannel }] });
     const earlier = earlierFields();
     internals.turnRouting.set('assistant', earlier);
@@ -1163,7 +1163,7 @@ test("a fresh turn starts new routing state in every mode, and leaves the earlie
       assert.deepEqual(now?.deliveries, [], `${mode}: no deliveries carried into the new turn`);
       assert.equal(now?.suppressed, 0, `${mode}: no suppression carried into the new turn`);
       assert.deepEqual(now?.drafts, [], `${mode}: no drafts carried into the new turn`);
-      assert.equal(now?.keptPrivate, 0, `${mode}: no private count carried into the new turn`);
+      assert.deepEqual(now?.keptPrivate, {}, `${mode}: no private count carried into the new turn`);
       assert.equal(now?.triggerChannel, undefined, `${mode}: no trigger channel carried into the new turn`);
       assert.notEqual(now?.locus, 'chan-earlier', `${mode}: no locus carried into the new turn`);
       assert.deepEqual([...(now?.engaged ?? [])], [], `${mode}: no engaged channels carried into the new turn`);

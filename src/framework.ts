@@ -1491,8 +1491,7 @@ interface TurnRouting {
    * noticed once the turn has ended and its notices are written.
    */
   drafts: Draft[];
-  /** Plain-speech segments the turn kept private by the resident's own choice (skip_reply, or a same-round private think beside a send), or by a round that calls `drafts`, and sends nothing else, after a send: counted, never drafted. */
-  keptPrivate: number;
+  keptPrivate: Partial<Record<KeptPrivateCause, number>>;
   /** Segments that should have been held as drafts but could not be journaled: their words remain in the resident's history only. */
   draftFailures?: { count: number; error: string };
   /**
@@ -1545,12 +1544,19 @@ function noteTurnChannel(routing: TurnRouting, channel: ChannelRef | undefined):
   if (channel && !routing.wasIn.some((c) => sameChannel(c, channel))) routing.wasIn.push(channel);
 }
 
+const KEPT_PRIVATE_CAUSES = ['skip_reply', '>>>skip_reply', 'a drafts call', 'a private think'] as const;
+type KeptPrivateCause = (typeof KEPT_PRIVATE_CAUSES)[number];
+
+const countKeptPrivate = (routing: TurnRouting, cause: KeptPrivateCause, count: number): void => {
+  if (count > 0) routing.keptPrivate[cause] = (routing.keptPrivate[cause] ?? 0) + count;
+};
+
 function freshTurnRouting(): TurnRouting {
   return {
     turnId: ++lastTurnId,
     engaged: new Set(),
     wasIn: [],
-    continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [], heard: new Map(),
+    continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: {}, arrivals: [], heard: new Map(),
     addressedElsewhere: new Set(),
   };
 }
@@ -20142,7 +20148,7 @@ export class AgentFramework {
           }
         }
       }
-      routing.keptPrivate += segments.length;
+      countKeptPrivate(routing, cause === 'private' ? 'skip_reply' : privateThink ? 'a private think' : 'a drafts call', segments.length);
       return false;
     }
     const note = at.target ? `written for ${this.channelShown(at.target)}` : undefined;
@@ -20247,7 +20253,7 @@ export class AgentFramework {
         }
       }
     }
-    routing.keptPrivate += privateCount;
+    countKeptPrivate(routing, '>>>skip_reply', privateCount);
     let heldAny = false;
     for (const { hold: sendHold, target, parts } of runs) {
       const because = this.sendHoldText(sendHold, target, when);
@@ -20255,7 +20261,7 @@ export class AgentFramework {
       const held = draftsCause
         ? this.holdProseDrafts(agent, parts.filter((p) => p.deliberate), 'explicit-send', { ...round, notice: 'later', because, ...at })
         : this.holdProseDrafts(agent, parts, 'explicit-send', { ...round, because, ...at });
-      if (draftsCause) routing.keptPrivate += parts.filter((p) => !p.deliberate).length;
+      if (draftsCause) countKeptPrivate(routing, 'a drafts call', parts.filter((p) => !p.deliberate).length);
       heldAny = held.length > 0 || heldAny;
     }
     // The turn's receipt names them by their state at turn end; each was
@@ -20598,7 +20604,7 @@ export class AgentFramework {
   private settleTurnDrafts(agent: Agent, logical: TurnRouting): void {
     const held = logical.drafts;
     logical.drafts = [];
-    logical.keptPrivate = 0;
+    logical.keptPrivate = {};
     delete logical.draftFailures;
     if (held.length === 0) return;
     this.recordDraftNotices(agent, this.draftsNamedInHistory(agent, held.map((d) => d.id)));
@@ -21076,9 +21082,13 @@ export class AgentFramework {
     // The drafts stay for settleTurnDrafts, which records the ones this
     // receipt names as noticed.
     const drafts = routing.drafts;
-    const kept = routing.keptPrivate;
+    const kept = KEPT_PRIVATE_CAUSES.flatMap((cause) => {
+      const count = routing.keptPrivate[cause] ?? 0;
+      return count > 0 ? [{ cause, count }] : [];
+    });
+    const keptCount = kept.reduce((sum, k) => sum + k.count, 0);
     const notHeld = routing.draftFailures;
-    if (list.length === 0 && suppressed === 0 && drafts.length === 0 && kept === 0 && !notHeld) return;
+    if (list.length === 0 && suppressed === 0 && drafts.length === 0 && keptCount === 0 && !notHeld) return;
     routing.deliveries = [];
     routing.suppressed = 0;
     const seen = new Set<string>();
@@ -21153,7 +21163,10 @@ export class AgentFramework {
         'the words remain only in your history',
       );
     }
-    if (kept > 0) notes.push(`${kept} plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)`);
+    if (keptCount > 0) {
+      const why = kept.length === 1 ? kept[0]!.cause : kept.map((k) => `${k.count} by ${k.cause}`).join(', ');
+      notes.push(`${keptCount} plain-speech segment(s) kept private (${why})`);
+    }
     if (suppressed > 0) {
       notes.push(agent.proseRouting === 'disabled'
         ? `${suppressed} plain-speech segment(s) kept in the transcript (proseRouting=disabled — post to a channel only with an explicit send tool)`
@@ -22817,7 +22830,7 @@ export class AgentFramework {
       return;
     }
     if (routing.hybridHold === 'private') {
-      routing.keptPrivate++;
+      countKeptPrivate(routing, '>>>skip_reply', 1);
       return;
     }
     const sticky = routing.pin;
