@@ -1,3 +1,4 @@
+import type { ReplyAuthorityConfig } from './reply-routing.js';
 /**
  * MCPL (MCP Live) Protocol Types — v0.4.0-draft
  *
@@ -11,6 +12,7 @@
  *   - All other types use plain names — they live in the mcpl/ module and are
  *     unambiguous when imported from here.
  */
+import type { InboundAdmissionConfig } from './inbound-admission.js';
 
 // ============================================================================
 // JSON-RPC 2.0 (Transport Layer)
@@ -225,6 +227,10 @@ export interface McplChannelCapabilities {
  * a restart with the new configuration).
  */
 export interface McplServerConfig {
+  /** Opt-in, fail-closed admission for every inbound data lane. */
+  inboundAdmission?: InboundAdmissionConfig;
+  /** Host-only automatic-reply consumer; requires inboundAdmission. */
+  replyAuthority?: ReplyAuthorityConfig;
   /** Unique server identifier */
   id: string;
 

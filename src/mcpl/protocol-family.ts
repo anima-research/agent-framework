@@ -22,6 +22,7 @@
  * isn't `initialize`), the SDK's stdio probe launches the server twice, and a
  * server's era is a stable fact its configuration can state.
  */
+import { admissionConfigProblem } from './inbound-admission.js';
 import { NOTICE_TAG } from '../notice-tags.js';
 import { DENY_BY_DEFAULT, capabilityPatternMatches } from './capability-grant.js';
 import { DEFAULT_EAGER_FETCH_MAX_BYTES, DEFAULT_MAX_TOTAL_BYTES } from './reference-fetcher.js';
@@ -696,6 +697,18 @@ export function serverConfigProblems(config: McplServerConfig): string[] {
     return [(error as Error).message];
   }
   const problems: string[] = credentialRequiredProblems(config);
+  if (config.replyAuthority !== undefined) {
+    if (!config.inboundAdmission) problems.push('replyAuthority requires inboundAdmission');
+    if (typeof config.replyAuthority?.resolve !== 'function') problems.push('replyAuthority.resolve must be a function');
+    if (typeof config.replyAuthority?.authorize !== 'function') problems.push('replyAuthority.authorize must be a synchronous function');
+    if (!Number.isInteger(config.replyAuthority?.timeoutMs)) problems.push('replyAuthority.timeoutMs must be an integer');
+    if (config.replyAuthority?.timeoutMs < 1 || config.replyAuthority?.timeoutMs > 60_000) problems.push('replyAuthority.timeoutMs must be in 1..60000');
+  }
+  if (config.inboundAdmission !== undefined) {
+    const problem = admissionConfigProblem(config.inboundAdmission);
+    if (problem) problems.push(problem);
+    if (binding.family !== 'legacy') problems.push('inboundAdmission is unsupported by the modern protocol family');
+  }
   if (binding.transport === 'http') {
     // fetch refuses a url with userinfo, and its error quotes the whole url,
     // password included, into the connect failure's log line, trace and

@@ -1,3 +1,5 @@
+import { admissionRoutingFields } from './reply-admission.js';
+import { AdmissionRefusals, attachAdmission, type AdmittedEnvelope, type RequiredIngress } from './inbound-admission.js';
 /**
  * PushHandler — handles push/event messages from MCPL servers.
  *
@@ -146,10 +148,46 @@ export class PushHandler {
    * 6. Emit trace
    * 7. Respond with accepted + inferenceId
    */
+  private readonly admissionRefusals = new AdmissionRefusals();
+
+  /** Required-only preflight: the framework calls this before toolset notices. */
+  async handleRequiredPushEvent(serverId: string, params: PushEventParams, responder: Responder | undefined, admission: RequiredIngress): Promise<void> {
+    try {
+      this.featureSetManager.validateInbound(serverId, params.featureSet);
+    } catch (err) {
+      if (err instanceof McplFeatureSetError && responder?.respondError) responder.respondError(err.code, err.message, { featureSet: err.featureSet });
+      else responder?.respond({ accepted: false, reason: 'Feature set validation failed' });
+      return;
+    }
+    const refuse = (reason: import('./inbound-admission.js').RefusalCode) => {
+      this.admissionRefusals.report(this.emitTraceFn, serverId, 'push/event', reason, params);
+      responder?.respond({ accepted: false, reason });
+    };
+    // Acceptance would promise durable work across reconnect/recovery, but
+    // this profile has no durable re-admission yet. Refuse before accepting.
+    if (params.coalesce !== undefined) {
+      refuse('admission_unsupported');
+      return;
+    }
+    const before = admission.check();
+    if (before) { refuse(before); return; }
+    const verdict = await admission.admit('push/event', params);
+    let reason = admission.check();
+    try { this.featureSetManager.validateInbound(serverId, params.featureSet); } catch { reason ??= 'admission_stale'; }
+    if (reason || !verdict.store) {
+      refuse(reason ?? (!verdict.store ? verdict.reason : 'admission_stale'));
+      return;
+    }
+    const envelope = Object.freeze({ connection: admission.key, mayWake: verdict.mayWake, ...admissionRoutingFields(verdict), ...(Object.hasOwn(verdict, 'replyIntent') ? { replyIntent: verdict.replyIntent } : {}) });
+    // No await between the final check and the admitted continuation's first effect.
+    return this.handlePushEvent(serverId, params, responder, envelope);
+  }
+
   async handlePushEvent(
     serverId: string,
     params: PushEventParams,
     responder?: Responder,
+    envelope?: AdmittedEnvelope,
   ): Promise<void> {
     // §16.3: expand the normative chat:* core closure once, at entry, so
     // every downstream consumer (wake matching, metadata, the queued event)
@@ -223,8 +261,8 @@ export class PushHandler {
     }
 
     // 4. Check shouldTriggerInference callback
-    let triggerInference = true;
-    if (this.shouldTriggerInference) {
+    let triggerInference = envelope?.mayWake !== false;
+    if (triggerInference && this.shouldTriggerInference) {
       const textContent = content
         .filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text')
         .map((b) => b.text)
@@ -260,6 +298,7 @@ export class PushHandler {
       triggerInference,
       acceptedAt: Date.now(),
     };
+    if (envelope) attachAdmission(pushEvent, envelope);
     if (coalesced) {
       // RFC-006: the coalescer decides whether this occurrence replaces an
       // unread one, appends, or withdraws; it delivers through the same event
