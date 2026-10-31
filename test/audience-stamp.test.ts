@@ -136,6 +136,9 @@ describe('the audience stamp (#291)', () => {
       modules: [gates, new PingModule(), surface],
       syncIntervalMs: 0,
       maintenanceIntervalMs: 0,
+      // The source is told of a derivation only when the host asks (#954);
+      // this suite checks the stamp on that row, so it asks for the line.
+      dendrite: { derivationNotice: (_record: unknown, _from: string, line: string) => line },
       ...(options.subconscious ? { subconscious: { enabled: true, systemPrompt: 'You notice.' } } : {}),
     } as never);
     frameworks.push(framework);
