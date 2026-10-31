@@ -4697,10 +4697,10 @@ export class EventGate {
       // change as servers connect, with no change to the rules.
       shadowWarnings: this.lintShadows().map(formatShadowWarning),
       ...((): Pick<GateStatus, 'catchAll'> => {
-        const rule = firstCatchAll(this.config.policies);
+        const rule = firstCatchAll(this.config.policies, { lettingBy: true });
         return rule ? { catchAll: {
           rule,
-          note: `${JSON.stringify(rule)} takes MCPL events without naming a server, a channel or a tag, so a server connected later is handled by it until a rule for that server goes ahead of it.`,
+          note: `${JSON.stringify(rule)} lets MCPL events by without waking you and without naming a server, a channel or a tag, so a server connected later is handled by it until a rule for that server goes ahead of it.`,
         } } : {};
       })(),
       totalEvaluations: this.totalEvaluations,

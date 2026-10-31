@@ -27,11 +27,14 @@ export function ruleDecides(policy: GatePolicy): boolean {
 
 /**
  * The first rule that takes MCPL events without deciding about them, or null.
- * A rule whose scope names no `mcpl:` event type never sees them.
+ * A rule whose scope names no `mcpl:` event type never sees them. With
+ * `lettingBy`, only one that lets them by without waking (`defer`/`skip`):
+ * the rule that leaves a new server's events undecided.
  */
-export function firstCatchAll(policies: readonly GatePolicy[]): string | null {
+export function firstCatchAll(policies: readonly GatePolicy[], opts: { lettingBy?: boolean } = {}): string | null {
   for (const p of policies) {
     if (ruleDecides(p)) continue;
+    if (opts.lettingBy && p.behavior !== 'defer' && p.behavior !== 'skip') continue;
     const scope = p.match?.scope;
     if (scope && !scope.some((s) => s.startsWith('mcpl:'))) continue;
     return p.name;

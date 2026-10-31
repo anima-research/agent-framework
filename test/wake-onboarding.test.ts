@@ -10,7 +10,7 @@ import { mkdtempSync, readFileSync, writeFileSync, existsSync, readdirSync } fro
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  ATTENTION_TAGS, OFFER_FLOOR_MS, WakeDecisions, carriesAttention, isUndecided, offerFor, placementFor, ruleDecides,
+  ATTENTION_TAGS, OFFER_FLOOR_MS, WakeDecisions, carriesAttention, isSuggestedRuleOf, isUndecided, offerFor, placementFor, ruleDecides,
   rulesToWrite, translateBehavior,
 } from '../src/gate/wake-onboarding.js';
 import type { GatePolicy } from '../src/gate/types.js';
@@ -65,6 +65,13 @@ describe('wake onboarding: the pure parts', () => {
     assert.notEqual(offer.digest, 'none');
     assert.equal(offerFor('games', { games: { tagOntology: GAMES_ONTOLOGY } }).digest, offerFor('games', { games: { tagOntology: structuredClone(GAMES_ONTOLOGY) } }).digest);
     assert.notEqual(offerFor('games', { games: { tagOntology: GAMES_ONTOLOGY } }).digest, offer.digest, 'a changed ontology is a new question');
+  });
+
+  it('orders per-tag suggestions by tag, whatever order the declaration\'s object holds them in', () => {
+    const offer = offerFor('s', { fs: { tagOntology: { tags: {
+      'zz:last': { suggestedTreatment: 'immediate' }, 'aa:first': { suggestedTreatment: 'mute' }, 'mm:mid': { suggestedTreatment: 'immediate' },
+    } } } });
+    assert.deepEqual(offer.rules.map((r) => r.match.tagsAny![0]), ['aa:first', 'mm:mid', 'zz:last']);
   });
 
   it('reads the deprecated defaultTreatment, refuses a rule that names no tag, and sets aside what it can\'t translate', () => {
@@ -122,7 +129,12 @@ describe('wake onboarding: the pure parts', () => {
       { name: 'discord-explicit-mention', match: { scope: ['mcpl:push-event'], metadataTrue: ['isExplicitMention'] }, behavior: 'always' },
       CATCH_ALL,
     ];
-    assert.equal(placementFor(rules), 'discord-explicit-mention', 'a metadata rule takes events without naming a server either');
+    assert.equal(placementFor(rules), 'discord-ambient', 'a mention rule that wakes keeps its place: a muted suggestion can\'t swallow a mention');
+    assert.equal(placementFor([{ name: 'quiet-bots', match: { metadataTrue: ['isBot'] }, behavior: 'skip' }, CATCH_ALL]), 'quiet-bots', 'one that lets events by is a catch-all');
+    assert.equal(isSuggestedRuleOf('suggested:games:1', 'games'), true);
+    assert.equal(isSuggestedRuleOf('suggested:games:beta:1', 'games'), false, 'another server whose id extends this one');
+    assert.equal(isSuggestedRuleOf('suggested:games:beta:1', 'games:beta'), true);
+    assert.equal(isSuggestedRuleOf('suggested:games:x', 'games'), false);
     assert.equal(placementFor(rules.slice(0, 3)), null, 'none: the rule goes last, ahead of the default');
     const offer = offerFor('games', { games: { tagOntology: GAMES_ONTOLOGY } });
     assert.deepEqual(rulesToWrite(offer, offer.rules.slice(0, 1)), [
@@ -143,6 +155,10 @@ describe('wake onboarding: the pure parts', () => {
     assert.equal(d.mayOfferSoon('games', t0 + 1000), false, 'the cheap check: nothing can be offered within the floor');
     assert.equal(d.mayOfferSoon('games', t0 + OFFER_FLOOR_MS), true);
     assert.equal(d.mayOfferSoon('docs', t0), true);
+    d.markShown('games', 'c');
+    assert.equal(d.get('games')!.shown, 'c');
+    assert.equal(d.get('games')!.at, new Date(t0).toISOString(), 'showing again doesn\'t restart the floor');
+    assert.equal(d.mayOffer('games', 'c', t0 + 10 * OFFER_FLOOR_MS), false, 'what was shown is not offered again');
     d.set('games', { digest: 'a', state: 'accepted', rules: ['suggested:games:1'] }, t0);
     const again = new WakeDecisions(path);
     assert.deepEqual(again.get('games'), { digest: 'a', state: 'accepted', rules: ['suggested:games:1'], at: new Date(t0).toISOString() });
@@ -313,6 +329,7 @@ describe('wake onboarding: the host', () => {
       await eventually(() => g.notices().length === 1, 'the onboarding notice');
       assert.equal(g.traces.find((t) => t.type === 'gate:onboarding-offered')!.wake, true);
       assert.ok(g.woke());
+      assert.ok(g.f.published.some((p) => p.channelId === 'chat'), 'the turn it woke speaks in the channel that addressed the agent');
     } finally { await g.f.close(); }
   });
 
@@ -331,7 +348,7 @@ describe('wake onboarding: the host', () => {
   it('offers only what the host enabled; a bare * tag rule is a catch-all; an invite alone doesn\'t wake; short spans read in ms', { timeout: 60_000 }, async () => {
     const h = await games({
       policies: [{ name: 'all-tags', match: { tagsAny: ['*'] }, behavior: 'skip' }],
-      ontology: { suggestedTreatment: [{ tagsAny: ['games:chat'], behavior: { debounce: 250 } }] },
+      ontology: { suggestedTreatment: [{ tagsAny: ['games:chat'], behavior: { debounce: 250 } }, { tagsAny: ['games:spam'], behavior: { sample: { every: 3 } } }] },
       extraFeatureSets: { extra: { description: 'not enabled', uses: ['pushEvents'], tagOntology: { suggestedTreatment: [{ tagsAny: ['extra:ping'], behavior: 'immediate' }] } } },
     });
     try {
@@ -341,7 +358,11 @@ describe('wake onboarding: the host', () => {
       assert.match(notice, /by your rule "all-tags"/);
       assert.match(notice, /wake you once, 250 ms after a burst goes quiet/);
       assert.doesNotMatch(notice, /extra:ping/, 'a feature set the host never enabled is not offered');
+      assert.match(notice, /2\. Events tagged any of "games:spam": wake you for one in every 3\./);
       assert.equal(h.woke(), false);
+      const tags = await h.tool('event_tags', {});
+      const offers = (tags.data as { onboarding: { offers: Record<string, { rules: Array<{ n: number; match: unknown }> }> } }).onboarding.offers;
+      assert.deepEqual(offers.editor!.rules.map((r) => [r.n, r.match]), [[1, { tagsAny: ['games:chat'] }], [2, { tagsAny: ['games:spam'] }]], 'event_tags numbers as the notice does');
     } finally { await h.f.close(); }
   });
 
@@ -357,7 +378,8 @@ describe('wake onboarding: the host', () => {
       assert.equal(drifted.isError, true);
       assert.match(drifted.error!, /suggestions changed since you were told about them, so nothing was written\. They are now:\n  1\. Events tagged any of "surface:turn"/);
       assert.deepEqual(h.gateJson().policies.map((p) => p.name), ['discord-ambient']);
-      assert.equal(h.decisions().get('editor')!.digest, shown, 'asked again, about what it declares now');
+      assert.equal(h.decisions().get('editor')!.shown, shown, 'shown again: what it declares now');
+      assert.equal(h.decisions().get('editor')!.digest, 'an-older-ontology', 'the decision on record stays as it was');
       assert.equal((await h.tool('wake_accept_suggestions', { server: 'editor', rules: [1] })).success, true);
 
       const original = h.f.framework.addGatePolicy.bind(h.f.framework);
@@ -371,6 +393,29 @@ describe('wake onboarding: the host', () => {
       assert.match(failed.error!, /nothing was accepted: disk full/);
       assert.deepEqual(h.gateJson().policies.map((p) => p.name), ['suggested:editor:1', 'discord-ambient'], 'the earlier set is back where it was');
       assert.deepEqual(h.decisions().get('editor')!.rules, ['suggested:editor:1']);
+      (h.f.framework as unknown as { addGatePolicy: typeof original }).addGatePolicy = original;
+
+      // A drift refusal leaves an acceptance on record, and its time.
+      const current = h.decisions().get('editor')!.digest;
+      const then = Date.now() - 60_000;
+      h.decisions().set('editor', { digest: 'an-older-ontology', state: 'accepted', rules: ['suggested:editor:1'] }, then);
+      const refused = await h.tool('wake_accept_suggestions', { server: 'editor' });
+      assert.match(refused.error!, /changed since you were told/);
+      assert.deepEqual({ ...h.decisions().get('editor') }, { digest: 'an-older-ontology', state: 'accepted', rules: ['suggested:editor:1'], shown: current, at: new Date(then).toISOString() });
+      assert.equal((await h.tool('wake_accept_suggestions', { server: 'editor' })).success, true, 'now shown: accepted');
+      assert.deepEqual(h.gateJson().policies.map((p) => p.name), ['suggested:editor:1', 'suggested:editor:2', 'discord-ambient']);
+
+      // Decline is one change too.
+      const remove = h.f.framework.removeGatePolicy.bind(h.f.framework);
+      let removals = 0;
+      (h.f.framework as unknown as { removeGatePolicy: typeof remove }).removeGatePolicy = (name) => {
+        if (++removals === 2) throw new Error('disk full');
+        return remove(name);
+      };
+      const declineFailed = await h.tool('wake_decline', { server: 'editor' });
+      assert.match(declineFailed.error!, /nothing was declined: disk full/);
+      assert.deepEqual(h.gateJson().policies.map((p) => p.name), ['suggested:editor:1', 'suggested:editor:2', 'discord-ambient'], 'what was removed is back');
+      assert.equal(h.decisions().get('editor')!.state, 'accepted');
     } finally { await h.f.close(); }
   });
 

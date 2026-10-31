@@ -41,7 +41,9 @@ export const ATTENTION_TAGS: readonly string[] = ['chat:addressed', 'surface:tur
 /** Accepted rules are named `suggested:<server>:<n>`: the name is the attribution. */
 export const SUGGESTED_RULE_PREFIX = 'suggested:';
 export const suggestedRuleName = (server: string, n: number): string => `${SUGGESTED_RULE_PREFIX}${server}:${n}`;
-export const isSuggestedRuleOf = (name: string, server: string): boolean => name.startsWith(`${SUGGESTED_RULE_PREFIX}${server}:`);
+/** Exactly `suggested:<server>:<n>`: a server id that another extends (`games`, `games:beta`) never claims the other's rules. */
+export const isSuggestedRuleOf = (name: string, server: string): boolean =>
+  name.startsWith(`${SUGGESTED_RULE_PREFIX}${server}:`) && /^\d+$/.test(name.slice(SUGGESTED_RULE_PREFIX.length + server.length + 1));
 
 /** One of a server's suggestions as the host offers it: the server's words and the rule it becomes. */
 export interface OfferedRule {
@@ -111,8 +113,8 @@ const tagList = (v: unknown): string[] | undefined => {
 
 /**
  * A server's suggestions from its declared feature sets (null: none declared).
- * Ordered rules first (in each feature set's order), then per-tag suggestions
- * no ordered rule already makes. A server that suggests nothing the host can
+ * Feature sets in name order; in each, its ordered rules as declared, then
+ * per-tag suggestions no ordered rule already makes, by tag. A server that suggests nothing the host can
  * use gets one host-written rule: wake for its events tagged as addressed to
  * the agent or waiting on it, nothing else.
  */
@@ -153,7 +155,11 @@ export function offerFor(server: string, declared: Record<string, { tagOntology?
       if (!match.tagsAny && !match.tagsAll) { untranslated.push({ featureSet, ...r }); continue; }
       add(featureSet, match, r.behavior, r.rationale);
     }
-    for (const [tag, descriptor] of Object.entries(tags)) {
+    // Per-tag suggestions in tag order (UTF-8 bytes, as MCPL RFC-001 §5.2 and SPEC §16.5 order them):
+    // a JSON object's key order is no order at all.
+    const byTag = Object.keys(tags).sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
+    for (const tag of byTag) {
+      const descriptor = tags[tag];
       const d = descriptor as Record<string, unknown> | null;
       if (!d || typeof d !== 'object') continue;
       if (typeof d.desc === 'string') tagDescriptions[tag] = d.desc;
@@ -192,13 +198,15 @@ export function isUndecided(decision: GateDecision, policy: GatePolicy | undefin
 export const carriesAttention = (tags: readonly string[] | undefined): boolean => (tags ?? []).some((t) => ATTENTION_TAGS.includes(t));
 
 /**
- * Where an accepted rule goes: ahead of the first rule that would take the
- * server's events without deciding about them (a catch-all), so the rules the
- * agent wrote for this server, or for a channel or tags, keep their place
- * before it. Null: there is none; the rule goes last, ahead of the default.
- * (Accepted rules name their source, so they are never the catch-all.)
+ * Where an accepted rule goes: ahead of the first rule that would let the
+ * server's events by without deciding about them (a catch-all that defers or
+ * skips), so the rules the agent wrote for this server, or for a channel or
+ * tags, keep their place before it, and so do catch-alls that wake (a mention
+ * rule on metadata): a muted suggestion can't swallow an explicit mention.
+ * Null: there is none; the rule goes last, ahead of the default. (Accepted
+ * rules name their source, so they are never the catch-all.)
  */
-export const placementFor = (policies: readonly GatePolicy[]): string | null => firstCatchAll(policies);
+export const placementFor = (policies: readonly GatePolicy[]): string | null => firstCatchAll(policies, { lettingBy: true });
 
 /** The gate rules accepting `rules` of `offer` writes. */
 export function rulesToWrite(offer: ServerOffer, accepted: readonly OfferedRule[]): GatePolicy[] {
@@ -218,8 +226,10 @@ export type DecisionState = 'offered' | 'accepted' | 'declined';
 export interface DecisionRecord {
   digest: string;
   state: DecisionState;
-  /** Accepted: the rule names written. */
+  /** The rule names an acceptance wrote (kept while a newer ontology is being asked about). */
   rules?: string[];
+  /** The digest whose numbered list the agent was last shown, when newer than `digest` (a drift refusal re-showed it). */
+  shown?: string;
   at: string;
 }
 
@@ -264,7 +274,7 @@ export class WakeDecisions {
   mayOffer(server: string, digest: string, now = Date.now()): boolean {
     const r = this.records[server];
     if (!r) return true;
-    if (r.digest === digest) return false;
+    if (r.digest === digest || r.shown === digest) return false;
     const at = Date.parse(r.at);
     return !Number.isFinite(at) || now - at >= OFFER_FLOOR_MS;
   }
@@ -274,6 +284,14 @@ export class WakeDecisions {
     this.records[server] = r;
     this.write();
     return r;
+  }
+
+  /** Record that the agent was shown `digest`'s list, leaving the decision and its time as they are (the floor doesn't restart). */
+  markShown(server: string, digest: string): void {
+    const r = this.records[server];
+    if (!r) return;
+    this.records[server] = { ...r, shown: digest };
+    this.write();
   }
 
   all(): Readonly<Record<string, DecisionRecord>> { return this.records; }

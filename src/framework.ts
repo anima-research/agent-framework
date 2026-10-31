@@ -17578,7 +17578,7 @@ export class AgentFramework {
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
     if (decision.locus) this.noteDeliveredOrPark(event);
     if (!decision.held) {
-      this.considerWakeOnboarding({ serverId: event.serverId, tags: event.tags, gateDecision: decision.gateDecision, recipients: decision.recipients });
+      this.considerWakeOnboarding({ serverId: event.serverId, tags: event.tags, gateDecision: decision.gateDecision, recipients: decision.recipients, channelId: event.channelId });
     }
 
     if (decision.wake) {
@@ -19356,7 +19356,7 @@ export class AgentFramework {
       console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${logValue(event.eventId ?? '')}`);
     }
     if (!silentHeartbeat && !decision.held) {
-      this.considerWakeOnboarding({ serverId: event.serverId, tags: event.tags, gateDecision: decision.gateDecision, recipients: decision.recipients });
+      this.considerWakeOnboarding({ serverId: event.serverId, tags: event.tags, gateDecision: decision.gateDecision, recipients: decision.recipients, channelId: triggerChannel?.channelId });
     }
 
     if (decision.wake) {
@@ -36596,10 +36596,32 @@ export class AgentFramework {
     const before = this.eventGate.policiesInForce();
     const earlier = before.filter((p) => isSuggestedRuleOf(p.name, server));
 
+    // Back where they stood: the earlier accepted set, ahead of the rule that followed it (after a failed change).
+    const restoreEarlier = (): string | null => {
+      try {
+        const present = new Set(this.eventGate!.policiesInForce().map((p) => p.name));
+        // Last first, each ahead of the rule that followed it before and is in force now.
+        for (const p of earlier.filter((q) => !present.has(q.name)).reverse()) {
+          const at = before.findIndex((q) => q.name === p.name);
+          const next = before.slice(at + 1).find((q) => present.has(q.name))?.name;
+          this.addGatePolicy(p, next ? { position: { before: next } } : undefined);
+          present.add(p.name);
+        }
+        return null;
+      } catch (undo) {
+        return `Putting the earlier rules back failed too (${undo instanceof Error ? undo.message : String(undo)}); gate_status shows what is in force.`;
+      }
+    };
+
     if (call.name === 'wake_decline') {
       // A disconnected server's declaration can't be read: the decline stands for what it was last asked about.
       const digest = connected ? this.wakeOffer(server).digest : record!.digest;
-      for (const p of earlier) this.removeGatePolicy(p.name);
+      try {
+        for (const p of earlier) this.removeGatePolicy(p.name);
+      } catch (error) {
+        const undo = restoreEarlier();
+        return fail([`nothing was declined: ${error instanceof Error ? error.message : String(error)}`, undo].filter(Boolean).join(' '));
+      }
       this.wakeDecisions.set(server, { digest, state: 'declined' });
       this.emitTrace({ type: 'gate:onboarding-decided', serverId: server, digest, state: 'declined', rules: [] });
       return {
@@ -36613,9 +36635,10 @@ export class AgentFramework {
 
     if (!connected) return fail(`${quotedValue(server)} isn't connected, so its suggestions can't be read now. wake_decline still records a decline.`);
     const offer = this.wakeOffer(server);
-    if (record && record.digest !== offer.digest) {
+    if (record && (record.shown ?? record.digest) !== offer.digest) {
       // The numbers the agent was shown may not mean what they mean now: show them again, and ask again.
-      this.wakeDecisions.set(server, { digest: offer.digest, state: 'offered' });
+      // The decision on record (and its time, which the daily floor counts from) stays as it is.
+      this.wakeDecisions.markShown(server, offer.digest);
       return fail(`${quotedValue(server)}'s suggestions changed since you were told about them, so nothing was written. They are now:\n`
         + offer.rules.map((r) => `  ${r.n}. ${this.describeOfferedRule(r, offer)}`).join('\n')
         + '\nCall again to accept these (all, or rules: [numbers]), or wake_decline.');
@@ -36641,20 +36664,15 @@ export class AgentFramework {
         written.push(policy.name);
       }
     } catch (error) {
-      const rollback: string[] = [];
+      let undo: string | null = null;
       try {
         for (const name of written) this.removeGatePolicy(name);
-        if (earlier.length > 0) {
-          // Back where they stood: ahead of the rule that followed them.
-          const at = before.findIndex((p) => p.name === earlier[0]!.name);
-          const next = before.slice(at).find((p) => !isSuggestedRuleOf(p.name, server))?.name;
-          for (const p of earlier) this.addGatePolicy(p, next ? { position: { before: next } } : undefined);
-        }
-      } catch (undo) {
-        rollback.push(`Putting the earlier rules back failed too (${undo instanceof Error ? undo.message : String(undo)}); gate_status shows what is in force.`);
+      } catch (e) {
+        undo = `Removing what was written failed too (${e instanceof Error ? e.message : String(e)}); gate_status shows what is in force.`;
       }
+      undo ??= restoreEarlier();
       const why = error instanceof Error ? error.message : String(error);
-      return fail([`nothing was accepted: ${why}`, ...rollback].join(' '));
+      return fail([`nothing was accepted: ${why}`, undo].filter(Boolean).join(' '));
     }
     this.wakeDecisions.set(server, { digest: offer.digest, state: 'accepted', rules: written });
     this.emitTrace({ type: 'gate:onboarding-decided', serverId: server, digest: offer.digest, state: 'accepted', rules: written });
@@ -36666,6 +36684,8 @@ export class AgentFramework {
         placedBefore,
         replaced: earlier.map((p) => p.name).filter((name) => !written.includes(name)),
         policies: this.getGatePolicyNames(),
+        // As wake_add_rule reports them: an accepted rule that takes events a later rule was written for.
+        shadowWarnings: this.eventGate.getStatus().shadowWarnings.filter((w) => written.some((name) => w.includes(name))),
         note: placedBefore
           ? `Written ahead of ${quotedValue(placedBefore)}, the first rule that took ${server}'s events without naming it.`
           : 'Written last, ahead of the default.',
@@ -37201,6 +37221,8 @@ export class AgentFramework {
     tags?: readonly string[];
     gateDecision?: GateDecision;
     recipients: readonly string[];
+    /** Where the event came from, so a turn it wakes speaks there (as the lane's own wake would). */
+    channelId?: string;
   }): void {
     try {
       const d = event.gateDecision;
@@ -37222,7 +37244,9 @@ export class AgentFramework {
         { placement },
       );
       // Recorded once the notice is stored: a notice that failed to be written is offered again.
-      this.wakeDecisions.set(event.serverId, { digest: offer.digest, state: 'offered' });
+      // An earlier acceptance's rule names stay on record while the new question is open.
+      const prior = this.wakeDecisions.get(event.serverId);
+      this.wakeDecisions.set(event.serverId, { digest: offer.digest, state: 'offered', ...(prior?.rules ? { rules: prior.rules } : {}) });
       this.emitTrace({
         type: 'gate:onboarding-offered',
         serverId: event.serverId,
@@ -37234,11 +37258,14 @@ export class AgentFramework {
       if (!wake) return;
       const targets = event.recipients.length > 0 ? event.recipients : this.registry.untargetedRecipients();
       for (const agentName of targets) {
+        if (!this.agents.has(agentName)) continue;
         this.pendingRequests.push({
           agentName,
           reason: 'wake-onboarding',
           source: event.serverId,
           timestamp: Date.now(),
+          ...(event.channelId ? { channelId: event.channelId, channelServerId: event.serverId } : {}),
+          addressed: isAddressedMessage(event.tags as string[] | undefined),
           ...this.readsWriteFor(placement, agentName),
         });
       }
@@ -37309,7 +37336,7 @@ export class AgentFramework {
       : b === 'defer' || b === 'skip' ? 'don\'t wake you (they still enter your context)'
       : typeof b === 'object' && 'debounce' in b ? `wake you once, ${spanOf(b.debounce)} after a burst goes quiet`
       : typeof b === 'object' && 'rate_limit' in b ? `wake you at most once every ${spanOf(b.rate_limit.refillIntervalMs)}`
-      : typeof b === 'object' && 'passive_sample' in b ? `wake you on every ${b.passive_sample.every}th one`
+      : typeof b === 'object' && 'passive_sample' in b ? (b.passive_sample.every === 1 ? 'wake you' : `wake you for one in every ${b.passive_sample.every}`)
       : 'wake you as the server says';
     const described = [...(r.match.tagsAny ?? []), ...(r.match.tagsAll ?? [])]
       .filter((t) => offer.tagDescriptions[t])
@@ -38336,7 +38363,8 @@ export class AgentFramework {
     const onboarding = this.wakeDecisions
       ? {
           offers: Object.fromEntries((this.mcplServerRegistry?.getAllServers() ?? []).map((conn) => {
-            const offer = offerFor(conn.id, this.featureSetManager?.getDeclaredFeatureSets(conn.id) ?? null);
+            // The same offer the notice and wake_accept_suggestions number (enabled feature sets only).
+            const offer = this.wakeOffer(conn.id);
             return [conn.id, { rules: offer.rules, ...(offer.untranslated.length ? { untranslated: offer.untranslated } : {}) }];
           })),
           decisions: this.wakeDecisions.all(),

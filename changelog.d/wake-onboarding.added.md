@@ -15,13 +15,15 @@
   once a day per server. `gate.onboarding: false` turns it off.
 - `wake_accept_suggestions { server, rules? }` writes the chosen suggestions as
   `suggested:<server>:<n>` rules matching only that server's events, ahead of
-  the first catch-all, replacing any accepted before, as one change (a failed
-  write puts the earlier set back); it refuses, and shows the list again, when
-  the server's suggestions changed since the agent was told. `wake_decline
-  { server }` removes them and records the decline. Both are in the built-in
-  settings toolset. Nothing a server suggests is applied without one of them
-  (RFC-001 §5.2).
-- `gate_status` names the first rule that takes MCPL events without naming a
+  the first catch-all that lets events by (rules that wake, such as a mention
+  rule, keep their place), replacing any accepted before, as one change (a
+  failed write puts the earlier set back), and reports any shadow warnings; it
+  refuses, and shows the list again, when the server's suggestions changed
+  since the agent was told. `wake_decline { server }` removes them, as one
+  change too, and records the decline. Both are in the built-in settings
+  toolset. Nothing a server suggests is applied without one of them (RFC-001
+  §5.2).
+- `gate_status` names the first rule that lets MCPL events by without naming a
   server, a channel or a tag (`catchAll`); `event_tags` shows each connected
   server's offer and the decisions recorded (`onboarding`). The `tagOntology`
   declaration type reads `suggestedTreatment`.
