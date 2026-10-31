@@ -1048,6 +1048,9 @@ interface ChannelRegistryOptions {
     outcome?: 'failed' | 'unknown';
     /** Bounded display of the connector's structured error data, when present. */
     detail?: string;
+    /** The turn had no channel by design, as for a batch of messages none
+     *  of which addressed the agent: nothing is misconfigured. */
+    byDesign?: true;
   }) => void;
   /**
    * Announces either a durable subscription-policy admission (before its
@@ -6109,12 +6112,15 @@ export class ChannelRegistry {
     locus: ChannelRef | null,
     /** `heldOnFailure`: the caller holds a `failed` delivery's words as a
      *  draft with its own notice, so no failure marker is written for it.
-     *  An `unknown` outcome still gets its marker. */
-    opts?: { heldOnFailure?: boolean },
+     *  An `unknown` outcome still gets its marker. `cameFrom`: with no
+     *  locus, the channels the turn's batch of messages came from when none
+     *  of them addressed the agent, as the agent is shown them; the failure's
+     *  reason names them. */
+    opts?: { heldOnFailure?: boolean; cameFrom?: readonly string[] },
   ): Promise<PublishOutcome> {
     // `logged` is what the log line and the trace say, where it isn't the
-    // agent's reason (the two no-locus reasons below).
-    const fail = (channel: ChannelRef | null, reason: string, outcome: PublishOutcome, logged = reason): PublishOutcome => {
+    // agent's reason (the three no-locus reasons below).
+    const fail = (channel: ChannelRef | null, reason: string, outcome: PublishOutcome, logged = reason, byDesign = false): PublishOutcome => {
       const status = outcome.status === 'unknown' ? 'unknown' : 'failed';
       const channelId = channel?.channelId ?? null;
       const detail = outcome.detail !== undefined ? connectorText(outcome.detail) : undefined;
@@ -6134,17 +6140,19 @@ export class ChannelRegistry {
         this.onRouteFailure?.({
           conversationId, channelId, ...(channel ? { serverId: channel.serverId } : {}),
           reason, textLen: text.length, outcome: status, ...(detail !== undefined ? { detail } : {}),
+          ...(byDesign ? { byDesign: true as const } : {}),
         });
       }
       return outcome;
     };
 
-    // These two reasons are the only ones whose log line and trace keep the
+    // These three reasons are the only ones whose log line and trace keep the
     // operator's words rather than the agent's: connectome-host's
     // connectome-doctor reads the last [routeSpeech] line for "no locus". Keep
-    // "no locus" in both logged texts. Each names no tool: whether one the
+    // "no locus" in each logged text. Each names no tool: whether one the
     // agent may call could post the words isn't known here, and the notice
-    // calls it a routing or configuration situation.
+    // calls it a routing or configuration situation, or for a batch none of
+    // whose messages addressed the agent a routing one (byDesign).
     // Runtime backstop for JS callers the compiler can't see: an omitted
     // locus is a routing bug at the call site, never something to paper over
     // with a live re-resolution.
@@ -6164,6 +6172,15 @@ export class ChannelRegistry {
       // global inbound ever seen) — the agent was told its prose stays in
       // the archive; honor that.
       // The locus froze at the turn's start, so this says what the turn had.
+      const from = opts?.cameFrom ?? [];
+      if (from.length > 0) {
+        const where = from.length === 1 ? from[0] : `${from.slice(0, -1).join(', ')} and ${from.at(-1)}`;
+        const reason = `this turn came from ${where}, and what came from ${from.length === 1 ? 'there' : 'those'} didn't ` +
+          `address you, and no channel was chosen for its reply; to reply ${from.length === 1 ? 'there' : 'in one of them'}, ` +
+          'send your reply to that channel explicitly';
+        return fail(null, reason, { status: 'failed', reason, at: Date.now() },
+          'turn has no locus (its batch addressed the agent from none of its channels)', true);
+      }
       const reason = 'this turn came from no channel, and it had no home or recent channel to reply in; if it should have ' +
         'had one, ask whoever runs this host';
       return fail(null, reason, { status: 'failed', reason, at: Date.now() },
@@ -6198,8 +6215,9 @@ export class ChannelRegistry {
     conversationId: string,
     text: string,
     locus: ChannelRef | null,
+    opts?: { cameFrom?: readonly string[] },
   ): Promise<{ delivered: boolean; serverId: string; channelId: string; messageId?: string } | null> {
-    const outcome = await this.deliverSpeech(conversationId, text, locus);
+    const outcome = await this.deliverSpeech(conversationId, text, locus, opts);
     if (outcome.status !== 'delivered') return null;
     return {
       delivered: true,

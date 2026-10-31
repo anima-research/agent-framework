@@ -103,6 +103,75 @@ describe('Turn trigger provenance', () => {
     await framework.stop();
   });
 
+  it('a turn merged from several ambient batches names every channel they came from, each once', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi' }]));
+    const framework = await makeFramework();
+    const i = internals(framework);
+    const captured = spy(framework);
+    const t = Date.now();
+    const room = { serverId: 'discord', channelId: 'discord:g:room' };
+    const general = { serverId: 'discord', channelId: 'discord:g:general' };
+    const feed = { serverId: 'discord', channelId: 'discord:g:feed' };
+    i.pendingRequests.push(
+      { agentName: 'scout', reason: 'timer', source: 'clock', timestamp: t },
+      { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: t + 1, wakeChannels: [room, general] },
+      { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: t + 2, wakeChannels: [general, feed] },
+    );
+    await i.processInferenceRequests();
+    await framework.runUntilIdle();
+    assert.equal(captured.exposed?.channelId, undefined);
+    assert.deepEqual(captured.exposed?.wakeChannels, [room, general, feed]);
+    await framework.stop();
+  });
+
+  for (const [what, other, keeps] of [
+    ['a wake that names a channel', { reason: 'mcpl:channel-incoming', source: 'discord', channelId: 'discord:g:feed', channelServerId: 'discord' }, false],
+    ['an addressed wake that names none', { reason: 'mcpl:push-event', source: 'discord', addressed: true }, true],
+    ['an addressed chat:system notice', { reason: 'mcpl:channel-incoming', source: 'discord', channelId: 'discord:dm:5', channelServerId: 'discord', addressed: true, systemNotice: true }, true],
+  ] as const) {
+    it(`a turn merged from an ambient batch and ${what} ${keeps ? 'keeps' : 'names no'} batch channels`, async () => {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi' }]));
+      const framework = await makeFramework();
+      const i = internals(framework);
+      const captured = spy(framework);
+      const t = Date.now();
+      i.pendingRequests.push(
+        { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: t, wakeChannels: [{ serverId: 'discord', channelId: 'discord:g:room' }] },
+        { agentName: 'scout', timestamp: t + 1, ...other },
+      );
+      await i.processInferenceRequests();
+      await framework.runUntilIdle();
+      assert.ok(captured.exposed, 'the merged turn started');
+      assert.deepEqual(captured.exposed.wakeChannels, keeps ? [{ serverId: 'discord', channelId: 'discord:g:room' }] : undefined,
+        keeps ? 'only a wake that names a channel takes the batch channels away' : 'the turn has a channel');
+      await framework.stop();
+    });
+  }
+
+  it("a gate wake names a batch channel even when another conversation fork calls it home", async () => {
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'gated.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      modules: [],
+      gate: { config: { policies: [{ name: 'batch', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 50 } }], default: 'skip' } },
+    });
+    const f = framework as unknown as {
+      eventGate: { requestInferenceFn(agent: string, reason: string, source: string, provenance?: object): void } | null;
+      channelNamed(channelId: string, serverId?: string): { serverId: string; channelId: string } | undefined;
+      mayTakeGateRoute(agentName: string, route: { serverId: string; channelId: string }): boolean;
+    };
+    assert.ok(f.eventGate, 'premise: the framework has a gate');
+    f.channelNamed = (channelId, serverId) => ({ serverId: serverId ?? 'discord', channelId });
+    f.mayTakeGateRoute = (_agent, route) => route.channelId !== 'discord:g:fork-home';
+    f.eventGate.requestInferenceFn('scout', 'gate:debounce', 'gate', { at: Date.now(), batchChannels: [
+      { channelId: 'discord:g:fork-home', serverId: 'discord' },
+    ] });
+    assert.deepEqual(internals(framework).pendingRequests.at(-1)?.wakeChannels, [{ serverId: 'discord', channelId: 'discord:g:fork-home' }],
+      'the agent is told where its batch came from, and may send there explicitly');
+    await framework.stop();
+  });
+
   it('a gate wake queued after a NEWER addressed direct wake does not take the turn', async () => {
     // The agent was busy: Alice's DM sat in the gate's buffer while Bob's
     // newer mention queued a direct wake. The gate flushed at turn end, so its

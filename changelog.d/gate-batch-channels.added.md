@@ -1,0 +1,2 @@
+- `WakeProvenance.batchChannels`: the registered channels of a debounced batch in which no message addressed the agent, those the host resolved; before, nothing named them.
+- `InferenceRequest.wakeChannels`: those channels on the gate wake for such a batch, those the framework names, set by the framework for hosts to read rather than set; before, no request carried them.
