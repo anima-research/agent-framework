@@ -6133,6 +6133,7 @@ export class AgentFramework {
     finally {
       gate.auxiliaryInFlight = Math.max(0, gate.auxiliaryInFlight - 1);
       if (gate.auxiliaryInFlight === 0) for (const resolve of gate.idleWaiters.splice(0)) resolve();
+      this.managerCallSettled(agentName);
     }
   }
   /**
@@ -6346,6 +6347,14 @@ export class AgentFramework {
     const hold = this.budgetHolds?.get(agentName);
     if (hold) hold.managerCalls++;
   }
+  private managerCallSettled(agentName: string): void {
+    if (this.budgetHolds?.get(agentName)?.state !== 'holding' || this.overBudgetDrainInFlight.has(agentName)) return;
+    const look = setTimeout(() => {
+      const agent = this.agents.get(agentName);
+      if (agent) this.compressForBudgetHold(agent);
+    }, 0);
+    look.unref?.();
+  }
   /**
    * The reply judge's calls. None waits: under the agent's holds a call is
    * refused without being made, and the agent's turn stops the judge. A call
@@ -6404,6 +6413,7 @@ export class AgentFramework {
         if (model !== undefined && error instanceof Error) this.recordProviderWait(agentName, model, error);
         throw error;
       }
+      finally { this.managerCallSettled(agentName); }
     });
   }
   private ephemeralAuxiliaryMembraneFor(agentName: string, release: ManagerRelease): Membrane {
