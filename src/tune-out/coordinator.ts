@@ -29,6 +29,11 @@ import { armAfter, armAt } from '../deadline-timer.js';
 /** The options a tune-out call can give. */
 type TuneOutOption = 'durationSeconds' | 'cadenceSeconds' | 'backlogCap' | 'maxWakes';
 
+/** A hold asked for with no reader to watch it: there is none (a reader ended, or none was configured). */
+const NO_READER_REFUSAL = 'Nothing was tuned out: this host has no subconscious resident to watch a channel, so tune_out '
+  + "isn't available here, and calling it again won't change that. If you need channels diverted, ask "
+  + 'whoever runs this host.';
+
 /** Defaults for tune_out tool params. */
 export const TUNE_OUT_DEFAULTS = {
   cadenceSeconds: 1800,
@@ -303,12 +308,6 @@ export interface TuneOutFrameworkHooks {
   isPrivilegedAuthor: (authorId: string | null | undefined) => boolean;
   /** speak_in_channel master switch (recipe-side, canary-gated). */
   allowChannelSpeech: () => boolean;
-  /**
-   * Whether a tune-out may hold a channel with no reader at all — a silent
-   * hold (issue #232 §3.3), which the host opts into (`tuneOut.enabled`).
-   * Left out, or false, a hold with no reader is refused.
-   */
-  holdWithoutReader?: () => boolean;
   /**
    * Post a line into a channel under the resident's name. Used for the
    * all-except scope's entry and release announcements in the excepted
@@ -612,19 +611,9 @@ export class TuneOutCoordinator {
     opts: { cadenceSeconds?: unknown; backlogCap?: unknown; maxWakes?: unknown; durationSeconds?: unknown },
     source: string,
   ): { ok: true; params: TuneOutParams } | { ok: false; error: string; alreadyTunedOut?: true } {
-    // No reader (issue #232 §3.3): a silent hold, where the host opted into
-    // one. Nothing summarizes, nothing wakes, mentions are still
-    // acknowledged, the backlog is released on cancel; the resident is told
-    // so in the tool result. A host that didn't opt in has no tune_out
-    // without a reader.
-    if (!this.readerAvailable() && this.hooks.holdWithoutReader?.() !== true) {
-      return {
-        ok: false,
-        error: 'Nothing was tuned out: this host has no subconscious resident to watch a channel, so tune_out '
-          + "isn't available here, and calling it again won't change that. If you need channels diverted, ask "
-          + 'whoever runs this host.',
-      };
-    }
+    // No reader: no hold. One nothing summarizes would hand the resident an
+    // undated backlog all at once when it ends.
+    if (!this.readerAvailable()) return { ok: false, error: NO_READER_REFUSAL };
     if (this.hooks.isForkBound({ serverId, channelId })) {
       return {
         ok: false,
@@ -958,6 +947,36 @@ export class TuneOutCoordinator {
     return `tune-out/${this.hooks.primaryName() ?? 'default'}/all-except`;
   }
 
+  /**
+   * End every hold on record and deliver each backlog to the resident: the
+   * per-channel holds, then the all-except scope. For a host with no reader
+   * (AgentFramework.releaseTuneOutsWithoutReader) and a reader that ended; a
+   * hold whose end fails stays on record, and says so in the log. A
+   * per-channel hold ends under its own source, so an agent's tune-out keeps
+   * the agent's provenance (the housekeeping guard reads it); `source` is the
+   * all-except scope's.
+   */
+  releaseAll(source: string, reason: string): void {
+    // What the registry has on record, registered or not: at a start the
+    // channels aren't registered yet, so listActive() would find none.
+    for (const { serverId, channelId, source: recorded } of this.channelRegistry.tuneOutsOnRecord()) {
+      try {
+        const r = this.cancel(serverId, channelId, recorded, reason);
+        if (!r.ok) console.error(`[tune-out] ${this.shown(serverId, channelId)} could not be ended with no reader configured, so it stays on record: ${r.error}`);
+      } catch (err) {
+        console.error(`[tune-out] ${this.shown(serverId, channelId)} could not be ended with no reader configured, so it stays on record:`, err);
+      }
+    }
+    if (this.getAllExcept()) {
+      try {
+        const r = this.cancelAllExcept(source, reason);
+        if (!r.ok) console.error(`[tune-out] the all-except hold could not be ended with no reader configured, so it stays on record: ${r.error}`);
+      } catch (err) {
+        console.error('[tune-out] the all-except hold could not be ended with no reader configured, so it stays on record:', err);
+      }
+    }
+  }
+
   getAllExcept(): AllExceptState | null {
     if (this.scopeCache !== undefined) return this.scopeCache;
     // A record that can't be read, or isn't a hold's, is not taken for no
@@ -983,6 +1002,7 @@ export class TuneOutCoordinator {
     opts: { cadenceSeconds?: unknown; backlogCap?: unknown; maxWakes?: unknown; durationSeconds?: unknown },
     source: string,
   ): { ok: true; params: AllExceptParams } | { ok: false; error: string } {
+    if (!this.readerAvailable()) return { ok: false, error: NO_READER_REFUSAL };
     const read = this.readOptions(opts, {
       durationSeconds: null,
       cadenceSeconds: `for the default, ${TUNE_OUT_DEFAULTS.cadenceSeconds}`,
