@@ -202,11 +202,13 @@ interface CompressionCalls {
   pauseAfter: number;
   gate?: Promise<void>; gateCall?: number;
   previewless: boolean; dryRunGate?: Promise<void>;
+  exclusive: boolean; inFlight: number;
 }
 
 async function withCompressionCalls<T>(state: Partial<CompressionCalls>, run: (c: CompressionCalls) => Promise<T>): Promise<T> {
   const c: CompressionCalls = {
-    landed: 0, fitAt: Infinity, workUntil: Infinity, ticks: 0, started: 0, refused: false, pauseAfter: Infinity, previewless: false, ...state,
+    landed: 0, fitAt: Infinity, workUntil: Infinity, ticks: 0, started: 0, refused: false, pauseAfter: Infinity, previewless: false,
+    exclusive: false, inFlight: 0, ...state,
   };
   const fitsNow = () => c.landed >= c.fitAt;
   const working = () => c.refused && c.landed < c.workUntil;
@@ -228,8 +230,14 @@ async function withCompressionCalls<T>(state: Partial<CompressionCalls>, run: (c
     if (!c.refused) return;
     c.ticks++;
     if (c.started >= c.pauseAfter || !working()) return;
+    if (c.exclusive && c.inFlight > 0) return;
     const call = ++c.started;
-    await this.membrane.complete({ messages: [], config: { model: 'test-model', maxTokens: 100 } });
+    c.inFlight++;
+    try {
+      await this.membrane.complete({ messages: [], config: { model: 'test-model', maxTokens: 100 } });
+    } finally {
+      c.inFlight--;
+    }
     if (c.gate && (c.gateCall === undefined || c.gateCall === call)) await c.gate;
     c.landed++;
   };
@@ -870,6 +878,83 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.equal(c.landed, 12);
         assert.deepEqual(t.of('inference:hold_ended').map((e) => [e.agentName, e.outcome]), [[fork, 'fit']]);
       } finally {
+        fw.conversationRouter = undefined;
+        await t.close();
+      }
+    });
+  });
+
+  it('looks again when a call it didn\'t make lands, so compression under way at its start releases it with no pass', async () => {
+    let ownTick: (() => Promise<void>) | undefined;
+    let ticked = false;
+    await withCompressionCalls({ fitAt: 1, workUntil: 1, exclusive: true }, async (c) => {
+      const t = await residentTurn({
+        maintenanceIntervalMs: 3_600_000,
+        context: () => {
+          if (!ticked && ownTick) { ticked = true; void ownTick(); }
+          return 'status';
+        },
+      });
+      let land = () => {};
+      try {
+        const cm = t.framework.getAgent('prime')!.getContextManager() as unknown as { tick(): Promise<void> };
+        const landing = new Promise<void>((resolve) => { land = resolve; });
+        const complete = t.membrane.complete.bind(t.membrane);
+        t.membrane.complete = async (request) => { await landing; return complete(request); };
+        c.refused = true;
+        ownTick = () => cm.tick();
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && c.started === 1 && c.ticks >= 2
+          && t.internal.overBudgetDrains.size === 0 && t.looks() >= 1, 3_000),
+          'held, with the call begun during its turn still in flight, and the drive over at a tick that started none');
+        for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+        assert.equal(storedText(t.framework).includes('Answered once it fit'), false, 'still held before the call lands');
+        land();
+        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000),
+          'the call landing made the context fit, and the hold looked again with no maintenance pass');
+        assert.equal(c.started, 1);
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
+      } finally {
+        land();
+        await t.close();
+      }
+    });
+  });
+
+  it('looks again when a call it didn\'t make lands for a conversation agent too', async () => {
+    await withCompressionCalls({ fitAt: 0, workUntil: 1, exclusive: true }, async (c) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
+      const fw = t.framework as unknown as {
+        conversationRouter: unknown;
+        agents: Map<string, { getContextManager(): { tick(): Promise<void> } }>;
+        createConversationAgent: (name: string, home: { serverId: string; channelId: string }) => Promise<unknown>;
+      };
+      const fork = 'prime--chanA';
+      let land = () => {};
+      try {
+        fw.conversationRouter = {
+          templateAgent: 'prime', idleTtlMs: 60_000, expired: () => [], channelForAgent: () => 'chanA', touch: () => {},
+          getBinding: () => undefined, closurePrompt: () => undefined,
+        };
+        await fw.createConversationAgent(fork, { serverId: 'stub', channelId: 'chanA' });
+        const landing = new Promise<void>((resolve) => { land = resolve; });
+        const complete = t.membrane.complete.bind(t.membrane);
+        t.membrane.complete = async (request) => { await landing; return complete(request); };
+        c.fitAt = 1;
+        c.refused = true;
+        void fw.agents.get(fork)!.getContextManager().tick();
+        assert.equal(c.started, 1, 'the fork\'s own compression call is in flight');
+        t.internal.pendingRequests.push({ agentName: fork, reason: 'external-message', source: 'test', timestamp: Date.now() } as never);
+        assert.ok(await pollUntil(() => t.of('inference:held').some((e) => e.agentName === fork) && c.ticks >= 2
+          && t.internal.overBudgetDrains.size === 0, 3_000), 'the fork\'s turn is held, and its drive is over');
+        for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+        assert.equal(t.of('inference:completed').some((e) => e.agentName === fork), false, 'still held before the call lands');
+        land();
+        assert.ok(await pollUntil(() => t.of('inference:completed').some((e) => e.agentName === fork), 3_000),
+          'the fork\'s turn ran once the call landed, with no maintenance pass');
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => [e.agentName, e.outcome]), [[fork, 'fit']]);
+      } finally {
+        land();
         fw.conversationRouter = undefined;
         await t.close();
       }
