@@ -1,6 +1,6 @@
 /**
- * A derived agent is registered — and its source told — when it starts
- * running, so these tests run each fork to completion.
+ * A derived agent is registered — and its source told, when the host asks —
+ * when it starts running, so these tests run each fork to completion.
  *
  * The host's two hooks over derivations (docs/dendrite.md): beforeDerive
  * refuses any derivation or spawn with its own reason before the agent

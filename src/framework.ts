@@ -11831,11 +11831,12 @@ export class AgentFramework {
       ...(record.relationships.resultTo ? { resultTo: record.relationships.resultTo } : {}),
       lifetime: record.lifetime,
     };
-    // A resumption is rare and always said. A first incarnation is tallied:
-    // past the threshold, a reader loop that forks a hundred times a session
-    // would fill its source's context with stamps (Linn, 2026-10-15), so
-    // the source hears a count line every `threshold` forks instead, with
-    // the latest described; every derivation still emits its trace.
+    // With the host's hook: a resumption is rare and always passed to it. A
+    // first incarnation is tallied: past the threshold, a reader loop that
+    // forks a hundred times a session would fill its source's context with
+    // stamps, so the hook is given a count line every `threshold` forks
+    // instead, with the latest described; every derivation still emits its
+    // trace.
     const threshold = this.collapseDerivationNoticesAfter;
     const tell = (defaultText: string, extra: Record<string, unknown> = {}) => {
       try {
