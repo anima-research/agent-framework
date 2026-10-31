@@ -6352,7 +6352,7 @@ export class AgentFramework {
     if (hold?.state !== 'holding' || hold.checkQueued) return;
     const look = setTimeout(() => {
       const agent = this.agents.get(agentName);
-      if (agent) this.compressForBudgetHold(agent);
+      if (agent) void this.checkBudgetHold(agentName).then(() => this.compressForBudgetHold(agent));
     }, 0);
     look.unref?.();
   }
@@ -6786,7 +6786,9 @@ export class AgentFramework {
     hold.budget = typeof figures.budget === 'number' ? figures.budget : undefined;
     hold.actual = typeof figures.actual === 'number' ? figures.actual : undefined;
     if (this.maintenanceIntervalMs <= 0) {
-      hold.recheck = setInterval(() => this.compressForBudgetHold(agent), this.budgetHoldRecheckMs);
+      hold.recheck = setInterval(() => {
+        void this.checkBudgetHold(agent.name).then(() => this.compressForBudgetHold(agent));
+      }, this.budgetHoldRecheckMs);
       hold.recheck.unref?.();
     }
     this.budgetHolds.set(agent.name, hold);
