@@ -16,6 +16,7 @@ import { cutToFit, quotedJson, quotedValue, suppliedValue } from '../supplied-te
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
+import { firstCatchAll } from './rule-scope.js';
 import { canonical, duplicateName, lastRecipePath, noChanges, reconcileLine, reconcileWithRecipe, ruleName, type WrittenConfig } from './recipe-reconcile.js';
 import { closestNames, isNearMiss } from '../closest-names.js';
 import { MAX_TIMER_MS } from '../deadline-timer.js';
@@ -3059,6 +3060,17 @@ export class EventGate {
     return current.policies.map((p) => p.name);
   }
 
+  /** The rules in force, in order (copies): what the last decision was made by. */
+  policiesInForce(): GatePolicy[] {
+    return this.config.policies.map((p) => structuredClone(p));
+  }
+
+  /** The rule in force by this name (a copy), or undefined. */
+  policyInForce(name: string): GatePolicy | undefined {
+    const p = this.config.policies.find((x) => x.name === name);
+    return p ? structuredClone(p) : undefined;
+  }
+
   /** @internal For `wake_add_rule`'s and `wake_remove_rule`'s refusals; not a host API. */
   ruleNamesForChange(): { names: string[]; note: string } | { refused: string } {
     const edit = this.rulesForChange();
@@ -4733,6 +4745,13 @@ export class EventGate {
       // Fresh, not the cache: the sources the host knows (eventTypesFrom)
       // change as servers connect, with no change to the rules.
       shadowWarnings: this.lintShadows().map(formatShadowWarning),
+      ...((): Pick<GateStatus, 'catchAll'> => {
+        const rule = firstCatchAll(this.config.policies, { lettingBy: true });
+        return rule ? { catchAll: {
+          rule,
+          note: `${JSON.stringify(rule)} lets MCPL events by without waking you and without naming a server, a channel or a tag, so a server connected later is handled by it until a rule for that server goes ahead of it.`,
+        } } : {};
+      })(),
       totalEvaluations: this.totalEvaluations,
       defaultDecisions: {
         triggered: this.defaultTriggered,

@@ -223,6 +223,14 @@ export interface GateOptions {
    *  null), the judge is wired with its defaults; it runs only for `judge`
    *  rules, so a gate with none makes no judge calls. */
   judge?: ReplyJudgeOptions | null;
+  /**
+   * Wake onboarding (gate/wake-onboarding.ts): the first event from an MCPL
+   * server that the agent's rules let go by without deciding about it brings
+   * the agent that server's suggested treatment (MCPL RFC-001 §5), once per
+   * declared ontology, with `wake_accept_suggestions` / `wake_decline` to
+   * answer. On unless set to false.
+   */
+  onboarding?: boolean;
 }
 
 /**
@@ -510,6 +518,13 @@ export interface GateStatus {
    * same hazards wake_add_rule warns about at install time.
    */
   shadowWarnings: string[];
+  /**
+   * The first rule that takes MCPL servers' events without naming a server, a
+   * channel or a tag (gate/wake-onboarding.ts placementFor): every server
+   * connected later is handled by it until a rule for that server goes ahead of
+   * it. Absent when there is none.
+   */
+  catchAll?: { rule: string; note: string };
   /** Total events the gate has evaluated since startup. */
   totalEvaluations: number;
   /**

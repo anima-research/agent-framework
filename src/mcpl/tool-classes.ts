@@ -87,6 +87,8 @@ export const BUILTIN_TOOL_CLASSES: Readonly<Record<string, readonly ToolClass[]>
   wake: ['control'],
   wake_add_rule: ['control'],
   wake_remove_rule: ['control'],
+  wake_accept_suggestions: ['control'],
+  wake_decline: ['control'],
   event_tags: ['control'],
   prose_help: ['control'],
   // Files and blobs in the agent's own stores.

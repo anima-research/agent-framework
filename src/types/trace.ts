@@ -540,6 +540,24 @@ export type TraceEvent =
       trigger: boolean;
       behavior: string;
     })
+  /** Wake onboarding offered a server's suggestions after an undecided event
+   *  (gate/wake-onboarding.ts): `policy` let it go by (null: the default). */
+  | (TraceEventBase & {
+      type: 'gate:onboarding-offered';
+      serverId: string;
+      digest: string;
+      policy: string | null;
+      rules: number;
+      wake: boolean;
+    })
+  /** The agent answered an offer: rules accepted (the names written), or declined. */
+  | (TraceEventBase & {
+      type: 'gate:onboarding-decided';
+      serverId: string;
+      digest: string;
+      state: 'accepted' | 'declined';
+      rules: string[];
+    })
 
   // Usage lifecycle
   | (TraceEventBase & {

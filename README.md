@@ -514,8 +514,25 @@ tool list itself (RFC-014 §8.5 host-made toolsets, §8.1 surface presentation;
 and works for every server, with or without RFC-014. The `toolsets--` tools
 are registered for every agent, MCPL or none, unless a module holds the name.
 
+- **Wake onboarding** (`src/gate/wake-onboarding.ts`). An MCPL server's
+  events are often let by, without waking the agent, by a rule written for
+  something else (a catch-all with no `source`) or by the gate's default. The
+  first such event from a server is followed by a `[wake onboarding]` notice:
+  the rule that let it by, and the server's suggested treatment (MCPL RFC-001
+  §5), numbered, with each rule's rationale, presented as the claims of a
+  server that may not be trustworthy. An event tagged `chat:addressed`,
+  `surface:turn` or `surface:alert` wakes the agent to decide.
+  `wake_accept_suggestions { server, rules? }` writes the chosen suggestions as
+  `suggested:<server>:<n>` rules scoped to that server, ahead of the first
+  catch-all; `wake_decline { server }` removes them. Decisions are kept in
+  `wake-decisions.json` beside `gate.json`, keyed to the server's declared
+  ontology, so the agent is asked again only when it changes (and at most once
+  a day per server). `gate_status.catchAll` names the catch-all; `event_tags`
+  shows each server's offer. `gate.onboarding: false` turns it off.
+
 - **The built-in toolset, `settings`.** The host tools an agent reaches for
   rarely: `agent_settings`, `wake_add_rule`, `wake_remove_rule`,
+  `wake_accept_suggestions`, `wake_decline`,
   `gate_status`, `event_tags`, `set_tool_visibility`, `set_tool_description`,
   `heartbeat--heartbeat_status`, `heartbeat--heartbeat_trigger`,
   `workspace--status`, every module utility (`Module.getUtilities`), and a
