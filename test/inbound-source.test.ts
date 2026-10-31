@@ -615,19 +615,24 @@ describe('inbound source envelope under RFC-006 coalescing', () => {
     assert.deepEqual(observed, [stored]);
   });
 
-  it('a channel message deferred mid-turn and stored at the boundary still hashes to its stored digest', async (t) => {
+  // Ported for #291: the message is stored at once while the turn runs, out
+  // of the window, where it was once deferred and stored at the boundary's
+  // flush; its digest is the stored copy's either way.
+  it('a channel message stored mid-turn, out of the window, still hashes to its stored digest', async (t) => {
     const f = await fixture(); t.after(f.close);
     await f.register('chat');
-    const internals = f.framework as unknown as { activeTurnTokens: Map<string, number>; flushDeferredWrites(label: string): Promise<void> };
+    const internals = f.framework as unknown as { activeTurnTokens: Map<string, number>; presentAtEndOf(agent: unknown): void };
     internals.activeTurnTokens.set('agent', 100);
     await f.send('channels/incoming', { messages: [f.channel('e1', 'deferred_words', { initial: true })] });
-    assert.ok(!f.context().includes('deferred_words'), 'held until the boundary');
+    await eventually(() => f.context().includes('deferred_words'), 'stored while the turn runs');
+    const cm = f.framework.getAgent('agent')!.getContextManager();
+    const copy = cm.getAllMessages().find((m) => JSON.stringify(m.content).includes('deferred_words'))!;
+    assert.equal(cm.ordinalOf(copy.id), undefined, 'out of the window until the turn ends');
     internals.activeTurnTokens.delete('agent');
-    await internals.flushDeferredWrites('test');
-    const copy = f.framework.getAgent('agent')!.getContextManager().getAllMessages()
-      .find((m) => JSON.stringify(m.content).includes('deferred_words'))!;
+    internals.presentAtEndOf(f.framework.getAgent('agent'));
+    assert.notEqual(cm.ordinalOf(copy.id), undefined, 'in it once the turn has ended');
     const meta = copy.metadata as Record<string, unknown>;
-    assert.equal(meta.storedBodyDigest, sourceBodyDigest(copy.content), 'the copy stored at the boundary matches');
+    assert.equal(meta.storedBodyDigest, sourceBodyDigest(copy.content), 'the stored copy matches');
     assert.equal(meta.sourceBodyDigest, sourceBodyDigest([{ type: 'text', text: 'deferred_words' }]), 'the delivered body, unchanged');
   });
 

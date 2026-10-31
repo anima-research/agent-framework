@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { AutobiographicalStrategy, PassthroughStrategy } from '@animalabs/context-manager';
+import { JsStore } from '@animalabs/chronicle';
+import { AutobiographicalStrategy, ContextManager as ContextManagerClass, PassthroughStrategy } from '@animalabs/context-manager';
 import type { ContextManager } from '@animalabs/context-manager';
 import { MembraneError } from '@animalabs/membrane';
 import type { ContentBlock, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
@@ -11,6 +12,7 @@ import type { AgentConfig, EventResponse, Module, ProcessEvent, ToolDefinition, 
 import { AgentFramework } from '../src/index.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
 import { GateModule, RoutedMembrane, say, until, waitCall } from './helpers/dendrite.js';
+import { coverTest, covers, coversByOrdinal, describeReadMark, readMarkOf, type ReadMark } from '../src/read-marks.js';
 
 const PIN = 'agent-framework:turn-inputs';
 type ProtectedRange = ReturnType<ContextManager['listPins']>[number];
@@ -189,6 +191,13 @@ async function withFramework(
 }
 
 const cmOf = (framework: AgentFramework) => framework.getAgent('prime')!.getContextManager();
+/** Read onto #291: an agent's context compresses the rows of its window, and
+ *  a row written past the framework (cm.addMessage) enters that window at
+ *  the agent's next presentation point. A test that compresses such rows
+ *  before the turn presents them first (presentAtEndOf, a point at rest),
+ *  where main compressed the record they were written to. */
+const presentTo = (framework: AgentFramework, name = 'prime'): void =>
+  (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent(name));
 const rows = (framework: AgentFramework) => cmOf(framework).queryMessages({}).messages;
 const storedText = (framework: AgentFramework) => JSON.stringify(rows(framework).map((message) => message.content));
 const rowWith = (framework: AgentFramework, t: string) => rows(framework).findIndex((message) => JSON.stringify(message.content).includes(t));
@@ -346,6 +355,7 @@ for (const kind of ['hierarchical', 'kv-unified'] satisfies Kind[]) {
       await withFramework(membrane, module, agent, async (framework) => {
         const cm = cmOf(framework);
         for (let i = 1; i <= 30; i++) cm.addMessage('Dana', text(`[a${i}] ${PAGE}`));
+        presentTo(framework);
         for (let tick = 0; tick < 600 && cm.getPendingWork(); tick++) await cm.tick();
         assert.equal(cm.getPendingWork(), null, 'the rows before the request are compressed');
         ask(framework);
@@ -412,6 +422,7 @@ test('when the compile refuses without the pin too, the pin is dropped once and 
     await withFramework(membrane, module, agent, async (framework) => {
       const cm = cmOf(framework);
       for (let i = 1; i <= 16; i++) cm.addMessage('Dana', text(`[a${i}] ${PAGE}`));
+      presentTo(framework);
       for (let tick = 0; tick < 300 && cm.getPendingWork(); tick++) await cm.tick();
       const compile = cm.compile.bind(cm);
       const refusals: Array<{ pinned: number; name: unknown }> = [];
@@ -443,6 +454,7 @@ test("two committing compiles that refuse at once with the turn's pin held each 
   await withFramework(membrane, module, agentConfig({ contextBudgetTokens: 60_000, strategy: strategy('kv-unified') }), async (framework) => {
     const cm = cmOf(framework);
     for (let i = 1; i <= 30; i++) cm.addMessage('Dana', text(`[a${i}] ${PAGE}`));
+    presentTo(framework);
     for (let tick = 0; tick < 600 && cm.getPendingWork(); tick++) await cm.tick();
     let held = 0;
     let outcomes: string[] = [];
@@ -545,6 +557,8 @@ test("one resident's opening, and its turn's end, leave another resident's pin i
   const pinsOf = (agent: typeof prime) => agent.getContextManager().listPins().filter((pin) => pin.name === PIN).map((pin) => pin.id);
   try {
     prime.getContextManager().addMessage('Dana', text('A request for both.'));
+    // Into both residents' windows, as their starts' presentation points put it.
+    for (const name of ['prime', 'helper']) presentTo(framework, name);
     const primeTurn = {};
     const helperTurn = {};
     starts.pinTurnInputs(prime, primeTurn);
@@ -561,6 +575,169 @@ test("one resident's opening, and its turn's end, leave another resident's pin i
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// Read onto #291: what an agent has read is a place in its window, not in
+// the record, so the rows that opened its turn are the rows presented to it
+// after its consumed mark, in the window's order. A row stored before the
+// mark and presented after it is one of them; a row stored and not
+// presented isn't in the window, and a pin naming it would name a row the
+// strategy's view doesn't hold. The test calls the framework's internal
+// step directly, as the residents' test does, so no presentation point runs
+// between its writes.
+test("in presented mode, a turn's pin runs, in its window's order, over the rows presented to the agent after its mark, one stored before the mark included, and over no row stored and not presented", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'turn-inputs-pin-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'), membrane: new TurnMembrane([]).asMembrane(), agents: [agentConfig()], modules: [], syncIntervalMs: 0,
+  });
+  const starts = framework as unknown as { pinTurnInputs(agent: unknown, routing: object): void };
+  const prime = framework.getAgent('prime')!;
+  const cm = prime.getContextManager();
+  try {
+    assert.equal(cm.windowMode(), 'presented', "prime's window follows its presentation index");
+    const early = cm.addMessage('Dana', text('Stored before the mark, presented after it.'));
+    assert.equal(cm.windowStatusOf(early), 'out', 'a row written past the framework waits out of the window');
+    prime.markContextConsumed();
+    assert.ok(coversByOrdinal(prime.getConsumedWatermark()), "prime's mark covers its window by ordinal");
+    const stray = cm.addMessage('Dana', text('Stored after the mark, never presented.'));
+    const asked = cm.addMessage('Dana', text(OPENING));
+    // Presented out of the record's order: the request, then the older row.
+    cm.presentRows([asked]);
+    cm.presentRows([early]);
+    const newest = cm.addMessage('Dana', text('Stored last, never presented.'));
+    starts.pinTurnInputs(prime, {});
+    const pins = inputPins(framework);
+    assert.equal(pins.length, 1, 'the opening pinned');
+    assert.deepEqual([pins[0].firstMessageId, pins[0].lastMessageId], [asked, early],
+      'the pin runs from the first row presented after the mark to the last, in window order');
+    const window = cm.getPresentedMessages().map((message) => message.id);
+    const pinned = window.slice(window.indexOf(pins[0].firstMessageId), window.indexOf(pins[0].lastMessageId) + 1);
+    assert.deepEqual(pinned, [asked, early], "the pin's rows in the window are the two presented after the mark");
+    for (const id of [stray, newest]) {
+      assert.equal(cm.windowStatusOf(id), 'out', 'a row stored and not presented is out of the window');
+      assert.ok(!pinned.includes(id), 'and out of the pin');
+    }
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A real switch from legacy to presented mode (#291, #844's known gap): a
+// store an earlier release wrote holds prime's context with no window index,
+// so its manager opens in legacy mode, and the consumed mark prime takes at
+// its registration, before the presentation module writes its window down
+// (adopt), has no index length. The window is then written down, as the
+// record stood, and two rows arrive. Where an older row is taken out of the
+// window and presented again after the write-down, the agent hasn't read it
+// where it now stands, and the rows past it haven't been read either: the
+// walk under the legacy mark gives the range a mark taken in presented mode
+// right after the write-down gives, and pins no row the window held as of
+// the legacy mark. The write-down is the framework's own, at prime's
+// registration, and so is every presentation after it, at its point at rest
+// (presentAtEndOf); the older row is taken out as a host takes one out
+// (retractRows), and the turn's start is called directly, as above.
+type PresentedAgain = 'as the newest row' | 'between the new rows' | 'not at all';
+
+async function walkAfterTheSwitch(again: PresentedAgain): Promise<{
+  window: string[]; withLegacy: string[]; withPresented: string[]; heldAsOfTheMark: string[]; readApart: string[];
+}> {
+  const dir = mkdtempSync(join(tmpdir(), 'turn-inputs-pin-'));
+  const storePath = join(dir, 'store');
+  const labels = new Map<string, string>();
+  const label = (id: string) => labels.get(id) ?? id;
+  try {
+    // The earlier release's store: prime's last reply, then three rows it read.
+    const store = JsStore.openOrCreate({ path: storePath });
+    const earlier = await ContextManagerClass.open({ store, namespace: 'agents/prime', strategy: new PassthroughStrategy() });
+    const stored: Record<string, string> = {};
+    for (const [name, participant, t] of [
+      ['P', 'prime', 'My answer to the last request.'], ['L1', 'Dana', 'An older note, one.'],
+      ['L2', 'Dana', 'An older note, two.'], ['L3', 'Dana', 'An older note, three.'],
+    ] as const) {
+      stored[name] = earlier.addMessage(participant, text(t));
+      labels.set(stored[name]!, name);
+    }
+    assert.equal(earlier.windowMode(), 'legacy', 'no window index: the window is the record');
+    earlier.close();
+    store.close();
+
+    const framework = await AgentFramework.create({
+      storePath, membrane: new TurnMembrane([]).asMembrane(), agents: [agentConfig()], modules: [], syncIntervalMs: 0,
+    });
+    try {
+      const starts = framework as unknown as { pinTurnInputs(agent: unknown, routing: object): void };
+      const prime = framework.getAgent('prime')!;
+      const cm = prime.getContextManager();
+      const legacy = prime.getConsumedWatermark()!;
+      assert.ok(legacy && !coversByOrdinal(legacy), `prime's mark was taken in legacy mode (${describeReadMark(legacy)})`);
+      assert.equal(cm.windowMode(), 'presented', 'its registration wrote the window down');
+      assert.deepEqual(cm.getPresentedMessages().map((m) => label(m.id)), ['P', 'L1', 'L2', 'L3'],
+        'as the record stood, in record order');
+      const presented = readMarkOf(cm)!;
+      assert.ok(coversByOrdinal(presented), 'the mark taken right after the write-down covers by ordinal');
+
+      const arrive = (name: string, t: string) => { const id = cm.addMessage('Dana', text(t)); labels.set(id, name); return id; };
+      const presentAgain = () => { cm.retractRows([stored.L1!]); presentTo(framework); };
+      arrive('N1', 'Read the pages, please.');
+      if (again === 'between the new rows') {
+        presentTo(framework);
+        presentAgain();
+        arrive('N2', 'And one more line.');
+        presentTo(framework);
+      } else {
+        arrive('N2', 'And one more line.');
+        presentTo(framework);
+        if (again === 'as the newest row') presentAgain();
+      }
+      const window = cm.getPresentedMessages();
+      const ids = window.map((m) => m.id);
+      const pinWith = (mark: ReadMark): string[] => {
+        const current = prime.getConsumedWatermark();
+        prime.replaceReadMarks(new Map([[current!, mark]]));
+        assert.equal(prime.getConsumedWatermark(), mark, 'the agent reads the mark put in place');
+        starts.pinTurnInputs(prime, {});
+        const pins = inputPins(framework);
+        assert.ok(pins.length <= 1, 'at most one pin of the name');
+        if (pins.length === 0) return [];
+        const from = ids.indexOf(pins[0]!.firstMessageId), to = ids.indexOf(pins[0]!.lastMessageId);
+        assert.ok(from >= 0 && to >= from, 'the pin names a range of the window, in its order');
+        return ids.slice(from, to + 1).map(label);
+      };
+      const withLegacy = pinWith(legacy);
+      const withPresented = pinWith(presented);
+      // Every reader of the marks gets the same answer of each row, not the walk alone.
+      const readApart = window.filter((row) => covers(legacy, cm, row) !== covers(presented, cm, row)).map((m) => label(m.id));
+      // The rows the legacy mark covers in both senses: by sequence (read as
+      // against a window that is the record), and in the window's order, from
+      // its start up to the first row it doesn't cover so.
+      const bySequence = coverTest(legacy, { currentBranch: () => cm.currentBranch(), windowMode: () => 'legacy' as const });
+      const past = window.findIndex((m) => bySequence(m) !== 'covered');
+      const heldAsOfTheMark = window.slice(0, past === -1 ? window.length : past).map((m) => label(m.id));
+      return { window: ids.map(label), withLegacy, withPresented, heldAsOfTheMark, readApart };
+    } finally {
+      await framework.stop();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+for (const [again, window, range] of [
+  ['as the newest row', ['P', 'L2', 'L3', 'N1', 'N2', 'L1'], ['N1', 'N2', 'L1']],
+  ['between the new rows', ['P', 'L2', 'L3', 'N1', 'L1', 'N2'], ['N1', 'L1', 'N2']],
+  ['not at all', ['P', 'L1', 'L2', 'L3', 'N1', 'N2'], ['N1', 'N2']],
+] as const) {
+  test(`after a switch from legacy mode, with an older row presented again ${again}, a turn's pin under the mark taken in legacy mode is the range a mark taken in presented mode gives`, async () => {
+    const r = await walkAfterTheSwitch(again);
+    assert.deepEqual(r.window, window, 'the window, in its order');
+    assert.deepEqual(r.withPresented, range, 'the mark taken right after the write-down pins the rows presented since');
+    assert.deepEqual(r.withLegacy, r.withPresented, 'the legacy mark pins the same range');
+    assert.deepEqual(r.heldAsOfTheMark, again === 'not at all' ? ['P', 'L1', 'L2', 'L3'] : ['P', 'L2', 'L3']);
+    for (const name of r.heldAsOfTheMark) assert.ok(!r.withLegacy.includes(name), `${name}, read where it stands, isn't pinned`);
+    for (const name of ['N1', 'N2']) assert.ok(r.withLegacy.includes(name), `${name}, never read, is pinned`);
+    assert.deepEqual(r.readApart, [], 'the two marks read every row of the window alike (covers)');
+  });
+}
 
 test("a pin starts at the first row the agent sees, past rows it never sees under any name, its own included, and such rows inside it, such as a tuned-out message, stay out of its request and its budget", async () => {
   const module = new PagesModule();
@@ -640,4 +817,31 @@ test("a shared fork's opening and its end leave its parent's turn-inputs pin in 
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// The audit of #291's mind-neutrality, D4: the turn-opening pin had no off
+// switch. `turnInputsPin: false` places none, and a pin of the name left
+// from before goes at the next start, as a silent start's does.
+test('with turnInputsPin false, a turn places no pin, listPins is empty while it runs, and a pin of the name left from before is gone once it starts', async () => {
+  const module = new PagesModule();
+  const membrane = new TurnMembrane([[...toolRounds(2), answer(FINAL)]]);
+  await withFramework(membrane, module, agentConfig({ turnInputsPin: false }), async (framework) => {
+    const old = cmOf(framework).addMessage('Dana', text('An old message.'));
+    cmOf(framework).pinRange(old, old, { name: PIN });
+    assert.equal(inputPins(framework).length, 1, "premise: a pin of the turn's name from before");
+    const during: Array<readonly ProtectedRange[]> = [];
+    module.onCall = () => { during.push(cmOf(framework).listPins()); };
+    ask(framework);
+    await waitUntil('the turn to end', () => storedText(framework).includes(FINAL));
+    assert.equal(during.length, 2, "premise: the pins were read during the turn's two rounds");
+    assert.deepEqual(during, [[], []], 'no pin of any name while the turn runs');
+    assert.deepEqual(cmOf(framework).listPins(), [], 'and none after it');
+  });
+});
+
+test('turnInputsPin takes true or false and nothing else', async () => {
+  await assert.rejects(
+    AgentFramework.create({ agents: [agentConfig({ turnInputsPin: 'false' as never })], membrane: new MockMembrane().asMembrane(), modules: [] }),
+    /Agent "prime" turnInputsPin must be true or false, unquoted, not a string/,
+  );
 });

@@ -4,9 +4,11 @@
  * other in a millisecond get a branch each (`…/<ms>` and `…/<ms>-2`), where
  * the second used to be refused, its name being the first one's branch: as
  * the active branch ("must differ from the active branch") or as a branch the
- * store holds ("Branch already exists", for a turn undone again after a
- * redo). A name the store holds from elsewhere counts as taken too. Each case
- * pins Date.now so the changes share a millisecond.
+ * store holds ("Branch already exists"). A name the store holds from
+ * elsewhere counts as taken too. Each case pins Date.now so the changes
+ * share a millisecond. (Since #291 a turn's undo is on the window and makes
+ * no branch, so the case of a turn undone again after a redo went with the
+ * branch undo.)
  */
 import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
@@ -27,7 +29,6 @@ function pinNow(): void {
 
 interface Internals {
   handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<Record<string, unknown>>;
-  saveTurnCheckpoints(name: string, checkpoints: unknown[]): void;
 }
 
 describe('default operator branch names', () => {
@@ -47,12 +48,19 @@ describe('default operator branch names', () => {
       modules: [],
     });
     ids = [];
+    // Written straight to the context manager, each seed row enters the
+    // window at a point of its own (#291), as a row presented at its write
+    // does; a cut keeps whole the rows one point presented. The operator
+    // changes below cut the window, which the tests count: the record keeps
+    // what the presenting write holds.
+    const present = (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf.bind(framework);
     for (let i = 1; i <= 5; i++) {
       ids.push(cm().addMessage(i % 2 ? 'user' : 'scout', [{ type: 'text', text: `m${i}` }], {
         serverId: 'discord',
         channelId: 'discord:g1:c1',
         messageId: `d${i}`,
       }));
+      present(framework.getAgent('scout'));
     }
   });
 
@@ -79,7 +87,7 @@ describe('default operator branch names', () => {
     assert.equal(first.targetBranch, `rollback/scout/${T}`);
     assert.equal(second.targetBranch, `rollback/scout/${T}-2`);
     assert.equal(cm().currentBranch().name, second.targetBranch);
-    assert.equal(cm().getMessageCount(), 2);
+    assert.equal(cm().getPresentedMessages().length, 2, 'the window, cut at the message');
   });
 
   it("two of the host command's message undos in one millisecond each get a branch", async () => {
@@ -91,22 +99,7 @@ describe('default operator branch names', () => {
     const second = await internals.handleHostCommand('discord', { command: 'undo', agentName: 'scout', messages: 1 });
     assert.equal(second.ok, true, String(second.error));
     assert.equal(cm().currentBranch().name, `undo-msgs/scout/${T}-2`);
-    assert.equal(cm().getMessageCount(), 3);
-  });
-
-  it('a turn undone, redone and undone again in one millisecond gets a second branch', () => {
-    const internals = framework as unknown as Internals;
-    const sequenceBefore = framework.getStore().currentSequence();
-    cm().addMessage('user', [{ type: 'text', text: 'turn 6' }]);
-    cm().addMessage('scout', [{ type: 'text', text: 'reply 6' }]);
-    internals.saveTurnCheckpoints('scout', [{ agentName: 'scout', turnIndex: 6, sequenceBefore, branchName: 'main', timestamp: T }]);
-    pinNow();
-    assert.equal(framework.undoLastTurn('scout').undone, true);
-    assert.equal(framework.getStore().currentBranch().name, `undo/scout/6-${T}`);
-    assert.equal(framework.redo('scout').redone, true);
-    assert.equal(framework.getStore().currentBranch().name, 'main');
-    assert.equal(framework.undoLastTurn('scout').undone, true);
-    assert.equal(framework.getStore().currentBranch().name, `undo/scout/6-${T}-2`);
+    assert.equal(cm().getPresentedMessages().length, 3, 'the window, less two messages');
   });
 
   it('a default name the store already holds, on a branch the framework did not make, takes the next free name', async () => {

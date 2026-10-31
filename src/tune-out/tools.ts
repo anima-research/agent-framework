@@ -156,12 +156,22 @@ interface SubconsciousConfigBase {
   thinkingBinding?: AgentConfig['thinkingBinding'];
 }
 
+/**
+ * The name a persistent reader runs under: its configuration's `name`, or,
+ * where the host gave none, `'Subconscious'` (PersistentReaderConfig.name).
+ * The one place the framework names a reader the host didn't: everything
+ * that needs the name of an unnamed reader asks this.
+ */
+export function persistentReaderName(config: { name?: string }): string {
+  return config.name ?? 'Subconscious';
+}
+
 export interface PersistentReaderConfig extends SubconsciousConfigBase {
   reader?: 'persistent';
   /**
    * Registry + participant name. Default 'Subconscious' — following the
    * Context Manager precedent: a title-case functional voice, not an
-   * agent-prefixed identifier.
+   * agent-prefixed identifier. persistentReaderName applies the default.
    */
   name?: string;
   /** Model id; defaults to the primary agent's (same-model side-process).
@@ -178,15 +188,37 @@ export interface PersistentReaderConfig extends SubconsciousConfigBase {
   systemPrompt: string;
   /** WindowedPassthroughStrategy re-anchor fraction (default 0.5). */
   reAnchorFraction?: number;
+  /**
+   * How a resident's rounds go out in the subconscious's requests once its
+   * window follows the presentation index (#291, answer 13). Its own rounds go
+   * as stored either way.
+   *
+   * - `'transcript'` (the default): a line per tool call (the tool's name and
+   *   its input in brief) and per result (its outcome in brief), the text as
+   *   stored, and none of the resident's thinking (foreign-rounds.ts).
+   * - `'raw'`: as stored, as 0.30.0 sent them: the resident's thinking
+   *   blocks, its tool calls and their results, in the subconscious's
+   *   requests under the resident's name. A provider pairs tool blocks only
+   *   in the turns of the agent that made the call, so it may refuse them, or
+   *   the formatter may move them into the subconscious's own turns, where
+   *   they read as calls it made.
+   *
+   * A thinking block's signature binds the block to the prefix the resident
+   * was sent, so the block can't be sent as part of another agent's prefix;
+   * its text could be. Leaving the text out is the transcript's choice, not
+   * the provider's.
+   */
+  foreignRounds?: 'transcript' | 'raw';
 }
 
 export interface ForkReaderConfig extends SubconsciousConfigBase {
   reader: 'forks';
   /**
    * Whose weights run the fork. Required, never defaulted: a fork holds the
-   * resident's whole prefix, and which model reads it is the one fact the
-   * resident's consent names. The resident's own model is the copy; another
-   * model is allowed when stated here. `create` refuses the omission.
+   * resident's whole prefix, and which model reads it is recorded on each
+   * fork's `dendrite:agent-created` trace and is what a host's
+   * `dendrite.beforeDerive` can decide on. The resident's own model, or
+   * another model stated here. `create` refuses the omission.
    */
   model: string;
   /**
@@ -232,13 +264,18 @@ export interface ReaderFramingContext {
   /** Standing dispositions recorded on the epoch, or null. */
   dispositions: string | null;
   /**
-   * The traffic held since the last look, oldest first; empty when nothing
-   * arrived. It includes the messages still queued behind the resident's
-   * turn (admitted, not yet stored), last: their ids are held handles and
-   * their sequences provisional, as a module's held rows are.
+   * The traffic held since the last look, oldest first, as stored; empty
+   * when nothing arrived. A held message is stored as it arrives, the
+   * resident's turn alive or not (#291), so the stored rows are all of it.
    */
   backlog: StoredMessage[];
-  /** How many of `backlog`'s last entries are still queued behind the resident's turn. Absent is none. */
+  /**
+   * Was how many of `backlog`'s last entries were still queued behind the
+   * resident's turn. Since #291 nothing is queued, so the framework never
+   * sets it.
+   *
+   * @deprecated Never set since #291; removed in a later release.
+   */
   queuedCount?: number;
 }
 
@@ -259,15 +296,11 @@ export function defaultReaderFraming(ctx: ReaderFramingContext): ContentBlock[] 
     return content;
   }
   const n = ctx.backlog.length;
-  const q = Math.min(Math.max(0, Math.floor(ctx.queuedCount ?? 0)), n);
   const lines: string[] = [`\n[Held in ${ctx.channelId} since your last look: ${n} message${n === 1 ? '' : 's'}]`];
   const flush = () => {
     if (lines.length > 0) content.push({ type: 'text', text: lines.splice(0).join('\n') });
   };
-  const which = q === n ? (q === 1 ? 'It' : 'They') : (q === 1 ? 'The last one' : `The last ${q}`);
-  const queuedNote = `[${which} arrived while ${ctx.resident}'s turn was running, so ${q === 1 ? 'it is' : 'they are'} still queued, not yet stored.]`;
-  for (const [i, message] of ctx.backlog.entries()) {
-    if (q > 0 && i === n - q) lines.push(queuedNote);
+  for (const message of ctx.backlog) {
     const author = (message.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? message.participant;
     const text = message.content
       .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')

@@ -252,9 +252,13 @@ test("a removed module's findMessageByExternalId() answers as before without cha
   await withFramework([gone.module, stays.module], async (framework) => {
     const ctx = gone.ctx();
     const stale = ctx.addMessage('user', text('removed later'), { external: { source: 'probe', id: 'stale' } } as never);
-    await framework.quiesce({ reason: 'test' });
+    // A write kept in memory maps to '' (#291 stores every other write at
+    // once, a quiesce's included): a surgery's hold keeps it, and its
+    // release stores it.
+    const release = (framework as unknown as { reserveStoreForSurgery(verb: string, agentName: string): () => void })
+      .reserveStoreForSurgery('test-surgery', 'assistant');
     ctx.addMessage('user', text('held'), { external: { source: 'probe', id: 'held' } } as never);
-    await framework.resume();
+    release();
     stays.ctx().removeMessage(stale);
     const landed = stays.ctx().queryMessages({ source: 'probe', externalIds: ['held'] }).messages[0]!.id;
     await framework.removeModule('gone');

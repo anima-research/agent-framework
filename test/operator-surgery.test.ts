@@ -54,6 +54,12 @@ describe('live operator surgery', () => {
         channelId: 'discord:g1:c1',
         messageId: `d${i}`,
       }));
+      // Each enters scout's window as it is stored, as a write for an idle
+      // agent does (#291): a rollback cuts at the write that presented its
+      // target (AF-7), so one to m3 removes m4 and m5, stored after it. Rows
+      // stored and never presented would all enter at the next boot in one
+      // presentation, and a rollback to any of them would remove nothing.
+      cm().presentRows([ids[ids.length - 1] as never]);
     }
   });
 
@@ -229,7 +235,10 @@ describe('live operator surgery', () => {
     }
   });
 
-  it('a write deferred behind the surgery lands with its durable id, as every flush from the queue does', async () => {
+  // Ported for #291: the surgery's hold keeps a write in memory, and its
+  // release stores it; the deferral queue, whose durable id this test once
+  // checked on the landed row, is gone, and so is the id.
+  it('a write held behind the surgery is kept in memory and stored when the hold releases, with no deferred-write id', async () => {
     const c = cm() as unknown as { switchBranch: (name: string) => Promise<void> };
     const originalSwitch = c.switchBranch;
     let releaseSwitch!: () => void;
@@ -237,28 +246,29 @@ describe('live operator surgery', () => {
     c.switchBranch = async (name: string) => { await gate; return originalSwitch.call(c, name); };
     const internals = framework as unknown as {
       surgeryHold: unknown;
-      deferredMessages: Array<{ id: string }>;
+      surgeryHeldWrites: unknown[];
       addMessage(participant: string, content: unknown[], metadata?: Record<string, unknown>): string;
     };
     try {
       const rollback = framework.rollbackToMessage('scout', { messageId: ids[2] });
       await new Promise((resolve) => setImmediate(resolve));
       assert.ok(internals.surgeryHold, 'store hold is up while the switch is awaited');
-      assert.equal(internals.addMessage('user', [{ type: 'text', text: 'arrived mid-surgery' }]), '', 'deferred');
-      const queuedId = internals.deferredMessages.at(-1)!.id;
+      assert.equal(internals.addMessage('user', [{ type: 'text', text: 'arrived mid-surgery' }]), '', 'held');
+      assert.equal(internals.surgeryHeldWrites.length, 1, 'kept in memory');
       releaseSwitch();
       await rollback;
       const landed = cm().getAllMessages().find((m) => (m.content[0] as { text?: string }).text === 'arrived mid-surgery');
-      assert.ok(landed, 'flushed when the hold released');
-      // The id makes a queued pair's tool_result re-defer with its tool_use
-      // rather than land alone, and lets boot recovery skip a replay.
-      assert.equal((landed!.metadata as { deferredWriteId?: string } | undefined)?.deferredWriteId, queuedId);
+      assert.ok(landed, 'stored when the hold released');
+      assert.equal(internals.surgeryHeldWrites.length, 0, 'nothing left held');
+      assert.equal((landed!.metadata as { deferredWriteId?: string } | undefined)?.deferredWriteId, undefined, 'no deferred-write id');
     } finally {
       c.switchBranch = originalSwitch;
     }
   });
 
-  it("the post-surgery flush lands what waited behind the hold while another agent's tool cycle is pending, and acknowledges it", { timeout: 60_000 }, async () => {
+  // Ported for #291: what the hold keeps is in memory, so there is no
+  // recovery queue to acknowledge, which this test once checked.
+  it("the hold's release stores what waited behind it while another agent's tool cycle is pending", { timeout: 60_000 }, async () => {
     const c = cm() as unknown as { switchBranch: (name: string) => Promise<void> };
     const originalSwitch = c.switchBranch;
     let releaseSwitch!: () => void;
@@ -268,30 +278,28 @@ describe('live operator surgery', () => {
     c.switchBranch = async (name: string) => { entered(); await gate; return originalSwitch.call(c, name); };
     const internals = framework as unknown as {
       surgeryHold: unknown;
-      deferredWritesPersisted: boolean;
-      unackedDeferredWrites: unknown[];
+      surgeryHeldWrites: unknown[];
       pendingAssistantBlocks: Map<string, unknown[]>;
       addMessage(participant: string, content: unknown[], metadata?: Record<string, unknown>): string;
     };
-    internals.deferredWritesPersisted = true;
     try {
       const rollback = framework.rollbackToMessage('scout', { messageId: ids[2] });
       await inSwitch;
       assert.ok(internals.surgeryHold, 'store hold is up while the switch is awaited');
-      assert.equal(internals.addMessage('user', [{ type: 'text', text: 'waited for the hold' }]), '', 'deferred');
+      assert.equal(internals.addMessage('user', [{ type: 'text', text: 'waited for the hold' }]), '', 'held');
       // Another agent's tool cycle says nothing about scout's window.
       internals.pendingAssistantBlocks.set('builder', [{ type: 'tool_use', id: 'b1', name: 'x', input: {} }]);
       releaseSwitch();
       await rollback;
-      assert.ok(remainingTexts().includes('waited for the hold'), 'flushed when the hold released');
-      assert.equal(internals.unackedDeferredWrites.length, 0, 'and acknowledged, so the recovery queue no longer holds it');
+      assert.ok(remainingTexts().includes('waited for the hold'), 'stored when the hold released');
+      assert.equal(internals.surgeryHeldWrites.length, 0, 'nothing left held');
     } finally {
       internals.pendingAssistantBlocks.delete('builder');
       c.switchBranch = originalSwitch;
     }
   });
 
-  it("the post-surgery flush stores several agents' writes in the order they arrived", { timeout: 60_000 }, async () => {
+  it("the hold's release stores several agents' writes in the order they arrived", { timeout: 60_000 }, async () => {
     // Residents share one message slot, so the order writes arrived in is the
     // order every resident reads.
     await framework.stop();
@@ -317,9 +325,9 @@ describe('live operator surgery', () => {
     try {
       const rollback = framework.rollbackToMessage('scout', { messageId: ids[2] });
       await inSwitch;
-      assert.equal(add('user', [{ type: 'text', text: 'one' }]), '', 'deferred');
-      assert.equal(add('user', [{ type: 'text', text: 'two' }], undefined, { forAgent: 'builder' }), '', 'deferred');
-      assert.equal(add('user', [{ type: 'text', text: 'three' }]), '', 'deferred');
+      assert.equal(add('user', [{ type: 'text', text: 'one' }]), '', 'held');
+      assert.equal(add('user', [{ type: 'text', text: 'two' }], undefined, { forAgent: 'builder' }), '', 'held');
+      assert.equal(add('user', [{ type: 'text', text: 'three' }]), '', 'held');
       releaseSwitch();
       await rollback;
       assert.deepEqual(remainingTexts().filter((t) => ['one', 'two', 'three'].includes(t)), ['one', 'two', 'three']);
@@ -675,18 +683,24 @@ describe('live operator surgery', () => {
     assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
   });
 
+  // Ported for #291 (AF-7): scout's window is presented, so a shed takes the
+  // body out of the window, as an undone turn's, and the record keeps it.
+  // The shed of a window that is still the record (refusal-rewind.test.ts's
+  // stubs) removes it from the record, as these tests once checked here.
   it('a rewind whose newest message is the last shard of a body takes the whole body', async () => {
     const [s0, s1, s2] = appendShards('g-doc', ['d0', 'd1', 'd2']);
+    cm().presentRows([s0 as never]);
     const internals = framework as unknown as {
       shedNewestTurn(agent: unknown): { descriptor: string; removedIds: string[] } | null;
     };
     const record = internals.shedNewestTurn(framework.getAgent('scout'));
     assert.ok(record);
     assert.deepEqual(record.removedIds, [s2, s1, s0]);
-    assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
+    for (const id of [s0, s1, s2]) assert.equal(cm().windowStatusOf(id as never), 'undone', `${id} left the window whole`);
+    assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5', 'd0', 'd1', 'd2'], 'the record keeps the body');
   });
 
-  it('a rewind of a tool result takes its tool_use turn whole, a turn stored as a body, in one removal', async () => {
+  it('a rewind of a tool result takes its tool_use turn whole, a turn stored as a body, in one retract', async () => {
     // As context-manager's chunker stores them: the tool_use block on the
     // turn's first shard, text after it; then the result, also a body.
     const store = (cm() as unknown as ShardStore).messageStore;
@@ -698,10 +712,18 @@ describe('live operator surgery', () => {
       store.append('user', [{ type: 'tool_result', toolUseId: 't9', content: 'r0' }], {}, undefined, { bodyGroupId: 'g-result', shardIndex: 0 }).id,
       store.append('user', [{ type: 'text', text: 'r1' }], {}, undefined, { bodyGroupId: 'g-result', shardIndex: 1 }).id,
     ];
-    const c = cm() as unknown as { removeMessages: (a: string, b: string) => void };
+    cm().presentRows([turn[0] as never]);
+    cm().presentRows([result[0] as never]);
+    const c = cm() as unknown as {
+      removeMessages: (a: string, b: string) => void;
+      retractRows: (ids: string[], options?: { undone?: boolean }) => void;
+    };
     const ranges: Array<[string, string]> = [];
+    const retracts: Array<[string[], { undone?: boolean } | undefined]> = [];
     const original = c.removeMessages.bind(c);
+    const originalRetract = c.retractRows.bind(c);
     c.removeMessages = (a: string, b: string) => { ranges.push([a, b]); original(a, b); };
+    c.retractRows = (ids: string[], options?: { undone?: boolean }) => { retracts.push([[...ids], options]); originalRetract(ids, options); };
     try {
       const internals = framework as unknown as {
         shedNewestTurn(agent: unknown): { descriptor: string; removedIds: string[] } | null;
@@ -710,11 +732,17 @@ describe('live operator surgery', () => {
       assert.ok(record);
       assert.equal(record.descriptor, 'a tool exchange (~1KB)');
       assert.deepEqual(record.removedIds, [result[1], result[0], turn[1], turn[0]]);
-      assert.deepEqual(ranges, [[turn[0], result[1]]], "one removal, from the turn's first shard to the result's last");
+      // Ported for #291 (AF-7): on a presented window the exchange leaves
+      // the window in one call, each body by its first shard, as an undone
+      // turn's; the record keeps it.
+      assert.deepEqual(retracts, [[[turn[0], result[0]], { undone: true }]], "one retract, the turn's body and the result's");
+      assert.deepEqual(ranges, [], 'nothing removed from the record');
     } finally {
       c.removeMessages = original;
+      c.retractRows = originalRetract;
     }
-    assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
+    for (const id of [...turn, ...result]) assert.equal(cm().windowStatusOf(id as never), 'undone');
+    assert.equal(cm().getMessageCount(), 9, 'the record keeps the exchange');
   });
 
   // --- failure path ----------------------------------------------------------

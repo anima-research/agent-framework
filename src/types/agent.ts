@@ -424,6 +424,51 @@ export interface AgentConfig {
    *   view.
    */
   clock?: import('../clock-rows.js').ClockConfig;
+
+  /**
+   * Keep the rows that open a turn raw for the whole turn (on when left out):
+   * at a start that opens a turn, the framework pins raw the rows of the
+   * agent's window after its newest own message and its consumed mark
+   * (`pinRange`, named `agent-framework:turn-inputs`; the README says
+   * which rows exactly), and removes the pin when the turn ends, so the
+   * strategy doesn't compress the rows the turn opened with while it runs. `false` places no pin:
+   * the turn's opening rows are compressed as any others, and a pin of the
+   * name left from before (a crash's) is removed at the next start that opens
+   * a turn, as a silent start removes one.
+   */
+  turnInputsPin?: boolean;
+
+  /**
+   * The other configured agents whose own rows this agent's window takes
+   * (none when left out). Residents share one slot, and each is shown only
+   * its own rows and the rows meant for it: another resident's rounds,
+   * replies, tool results and notes stay out of its window (#291, decision
+   * 1). A name here is an observe edge in this agent's registry record, on
+   * that agent (`{ agent: name }`, the path the subconscious's edge takes),
+   * and the presentation index presents that agent's own rows to this one
+   * at its points, as it does any arrival (bearingOf); the history tools
+   * leave them in for its calls (ModuleContext.observes). That agent's own
+   * rows this one's window doesn't hold yet, those stored before the edge
+   * was declared included, enter it at its next presentation point, after
+   * what it holds: an edge declared on a store with history hands the
+   * observer that agent's earlier rows at once, at the end of its window
+   * (`ObserveEdge.fromMessageId`, which would start the edge at a row, is
+   * read by nothing yet). Only own rows: mail and channel traffic meant for that agent, and its stored
+   * context injections, stay out. One way: `nova` observing `mira` shows
+   * nova mira's rows, not mira nova's. `create()` refuses a name that is
+   * this agent's own or no configured agent's. Read when a configured agent
+   * is created; a derived agent's spec carries its own edges.
+   */
+  observes?: string[];
+
+  /**
+   * How the rounds of an agent it observes (`observes`) go out in this
+   * agent's requests, as `PersistentReaderConfig.foreignRounds` for the
+   * persistent subconscious: `'transcript'` (the default), a line per tool
+   * call and per result and none of their thinking, or `'raw'`, as stored.
+   * Unread for an agent that observes no one.
+   */
+  foreignRounds?: 'transcript' | 'raw';
 }
 
 /** The intentionally small set of agent settings that may change in-process. */
@@ -578,22 +623,19 @@ export interface InferenceRequest {
    *  all of them without materializing content, the turn has no cause left
    *  and does not run. */
   coalescingBatchSubjects?: string[];
-  /** Host-owned: this wake's sole cause is this write, deferred for its
-   *  agent while a turn was alive: a coalesced render placed in its queue
+  /** Host-owned: this wake's sole cause is this row, by the stored row's
+   *  id: one stored for its agent as it arrived, or one stored and not
+   *  presented to its agent at its write, because a turn of the agent's was
+   *  alive: a coalesced render its turn being assembled doesn't read
    *  (wakeToRead), or a message, notice or event whose wake was queued with
-   *  it. Once a request that carried the write was answered and, for a wake
-   *  that carries a channel and isn't marked `ambient`, the agent has since
-   *  published into that channel having read it, or once the write is in
-   *  neither the agent's queue nor its store's current branch, the wake
-   *  starts no turn. */
-  readsDeferredWrite?: string;
-  /** Host-owned: this wake's sole cause is this message, stored in its
-   *  agent's store as it arrived, not deferred (its row's id). Once a
-   *  request that carried the message was answered and, for a wake that
-   *  carries a channel and isn't marked `ambient`, the agent has since
-   *  published into that channel having read it, or once the message isn't
-   *  on its store's current branch, the wake starts no turn. */
-  readsStoredMessage?: string;
+   *  it. Once a request that carried the row was answered (an answered
+   *  request's consumed watermark covers it, in the agent's window once its
+   *  context presents rows) and, for a wake that carries a channel and isn't
+   *  marked `ambient`, the agent has since published into that channel
+   *  having read it, or once the row is not on its store's current branch,
+   *  the wake starts no turn. A row stored and not yet presented to the
+   *  agent keeps its wake. */
+  readsRow?: string;
   agentName: string;
   reason: string;
   source: string;
@@ -653,10 +695,9 @@ export interface InferenceRequest {
    * (`chat:ambient`). A coalesced push's wake carries it only to read a
    * render, and only when every notice the render stands for was. Such a
    * message asked nothing of the agent, so a wake for it that carries
-   * `readsDeferredWrite` or `readsStoredMessage` is dropped once a request
-   * that carried the message was answered, with no publish asked of the
-   * agent. A message with neither tag is in doubt, and is judged as an
-   * addressed one.
+   * `readsRow` is dropped once a request that carried the message
+   * was answered, with no publish asked of the agent. A message with neither
+   * tag is in doubt, and is judged as an addressed one.
    */
   ambient?: true;
   /**

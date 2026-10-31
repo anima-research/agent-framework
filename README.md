@@ -148,7 +148,7 @@ Each agent has a `ContextManager` (from `@connectome/context-manager`) that main
 - **PassthroughStrategy** - No compression, raw message replay up to budget
 - **AutobiographicalStrategy** - Chunks old messages and summarizes them into diary entries, preserving recent context uncompressed
 
-A turn keeps the messages it opened with whole: at a start that opens a turn, the framework pins raw (`pinRange`, named `agent-framework:turn-inputs`) the rows the agent sees that were stored after both the newest of its own messages that it sees and its consumed watermark, starting at the first such row that holds more than tool results, and removes the pin when the turn ends. The pinned rows' tokens count against the budget. If a committing compile refuses as over budget with the pin held, the pin is removed and the compile runs once more, so the turn goes on as it would have without it. A silent heartbeat tick pins nothing, and neither does a strategy without pins.
+A turn keeps the messages it opened with whole: at a start that opens a turn, the framework pins raw (`pinRange`, named `agent-framework:turn-inputs`) the rows of the agent's window (#291) that it sees after both the newest of its own messages there and its consumed watermark, in the window's order, starting at the first such row that holds more than tool results, and removes the pin when the turn ends. Those are the rows presented to it since the mark, a row stored before the mark and presented after it included, and a row presented to it again, also when the mark was taken before its window was written down; a row stored and not yet presented is in neither its window nor the pin. The pinned rows' tokens count against the budget. If a committing compile refuses as over budget with the pin held, the pin is removed and the compile runs once more, so the turn goes on as it would have without it. A silent heartbeat tick pins nothing, and neither does a strategy without pins, or an agent whose configuration sets `turnInputsPin: false`.
 
 Before inference, modules and MCPL hooks can inject additional context via `gatherContext()`. An `afterUser` injection is stored in the agent's window, as the message `compile()` would have placed after the last user message, so it stays where the agent saw it: the replies after it keep their thinking, and the cache keeps the turns before it. A source's unchanged content isn't stored again while the copy the agent will read as current has it whole: the one its last request held, or a newer one a start stored whose compile then didn't record (it threw, or the start failed before it); once a fold has summarized it or the strategy's window has passed it, it's stored again, as one more row. Where a changed one lands right after the agent's own latest message, with no one else's message between, `[Continue]` still ends the request, after it. A stored row is history to the strategy, capped, sharded, budgeted and folded like any message. Its metadata carries `system: true`, `kind: 'context-injection'` and `contextInjection: { agent, namespace, contentHash, part, parts }`, which `storedInjectionMarkOf` reads, and every other agent's view leaves it out. A module's injection can set `placedEachCompile: true` to be placed by `compile()` at each start instead, near the end, at the cost of the thinking of every reply after its old place.
 
@@ -455,8 +455,8 @@ a tool boundary that injects messages into a stream declaring it carries them,
 as membrane's native path does from 0.6.0), on the current branch, not a
 sharded message, and not folded into a summary by compression. A stream that
 doesn't say whether it carries injections is taken as one that doesn't: at a
-tool boundary nothing is injected into it, and what's queued waits for the
-turn's end. On any doubt — restart, branch switch, eviction — the host
+tool boundary nothing is injected into it, and what arrived for the agent
+waits out of its window for the turn's end. On any doubt — restart, branch switch, eviction — the host
 appends, as it does today. There is no per-subject cap: a busy channel's unread
 backlog is simply its unread backlog. Receipts and subject history are kept in
 the `mcpl/coalescing` state (retry window 1 h); audit lines are
@@ -691,10 +691,12 @@ Pause the inference thread and MCPL data planes while keeping the framework,
 context managers, and membrane hot — so compression/refold/quarantine work runs
 through the live machinery instead of offline scripts (issue #122). Quiesce
 persists across restarts; `resume` gates on a fresh per-agent feasibility
-preview of the current runtime settings (`force` overrides).
+preview of the current runtime settings (`force` overrides). While quiesced, a
+context write (a module event, an API `message.send`) is stored at once, and
+enters the agents' windows at `resume` (#291).
 
 ```typescript
-await framework.quiesce({ reason: 'refold', timeoutMs: 120_000, abandon: false });  // throws QuiesceBlockedError if the deferred writes can't reach disk
+await framework.quiesce({ reason: 'refold', timeoutMs: 120_000, abandon: false });
 await framework.maintenanceTick();   // drain quarantine / advance merges
 await framework.resume();            // throws ResumeBlockedError if the layout won't compile
 ```
@@ -715,7 +717,8 @@ for deployments that front the port with a proxy.
 message and switches to the fork; `suppressMessages(agent, { messageIds })`
 forks at the head and removes the chosen messages on the fork. The source
 branch stays intact either way. Removing Discord messages from an agent's
-context is local to that agent unless the operator also chooses to mark them:
+context marks nothing on Discord unless the operator also chooses to mark
+them:
 
 ```typescript
 const preview = framework.previewSurgeryMarks('cairn', { rollbackTo: messageId });
@@ -726,6 +729,23 @@ const result = await framework.rollbackToMessage('cairn', {
 });
 // result.markers: { status: 'none' | 'queued' | 'not-scheduled', ... }
 ```
+
+An agent's context follows its own window (#291), so the cut is the write
+that presented the target: a rollback removes only the rows stored after
+that write, and the rows stored before it that the window took after the
+target leave the window and wait outside it until the agent's next turn
+start, so the cut holds until the agent speaks again (`returnedToArrivals`,
+on the result and the preview). Rows that one write presented together with
+the target stay after it (`keptInWindowAfterTarget`), since no branch cut
+separates them from it: a rollback that only they follow is refused and
+names them, and `suppressMessages`, or the host's `hide` by Discord message
+id, takes them out. The preview's `neverPresented` counts the messages it
+removes that no agent's window holds. The host command's `/undo n` counts
+back over the rows of the agent's own slot in its window. A removal in place
+(a `hide`, a suppression on its fork, a module's or the coalescer's removal)
+takes the rows out of every other live agent's window on that branch that
+held them too, each at its own place; a window on a branch whose record
+still holds them keeps them.
 
 - **`marks`** is `'none'` (the default), or `{ scope: 'addressed' | 'all', refs? }`.
   `addressed` covers messages tagged `chat:addressed` (mentions, replies to

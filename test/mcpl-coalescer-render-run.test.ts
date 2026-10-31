@@ -14,14 +14,15 @@ interface Options {
   unremovable?: Set<string>;
 }
 
-/** A host whose every delivery waits, unread, in the deferred queue of
- *  'other', an agent whose turn is alive, until it's removed, read, or gone,
- *  whichever agent assembled it. CoalescerHost leaves placement to the host,
- *  so this is one it allows; the framework stores the assembling agent's own
- *  render directly while its assembly runs, after what is queued for it,
- *  which mcpl-coalescing's tests run. Its removal, like the
- *  framework's, doesn't refuse a message a request has read. Each render says
- *  which notices it covers, as a notice-only server's does. */
+/** A host whose every delivery is stored for 'other', an agent whose turn is
+ *  alive, and not presented to it (#291), where it waits unread until it's
+ *  removed, read, or gone, whichever agent assembled it. CoalescerHost leaves
+ *  placement to the host, so this is one it allows; the framework presents
+ *  the assembling agent's own render before its turn's compile, which
+ *  mcpl-coalescing's tests run. Its removal, like the framework's, doesn't
+ *  refuse a message a request has read. Each render says which notices it
+ *  covers, as a notice-only server's does. (Before #291 such a delivery
+ *  waited in the framework's deferred queue, under a `deferredId`.) */
 function makeHost(options: Options = {}) {
   const queue: Array<{ id: string; text: string }> = [];
   const read = new Set<string>();
@@ -34,11 +35,11 @@ function makeHost(options: Options = {}) {
   let renderStarted: (eventId: string) => void = () => {};
   let saved: () => CoalescingSnapshot = () => { throw new Error('nothing saved'); };
   const host: CoalescerHost<null> = {
-    isUnread: (placement) => queue.some((m) => m.id === placement.deferredId) && !read.has(placement.deferredId ?? ''),
+    isUnread: (placement) => queue.some((m) => m.id === placement.messageId) && !read.has(placement.messageId ?? ''),
     // Nothing here shows a render without a request reading it.
-    isUnshown: (placement) => queue.some((m) => m.id === placement.deferredId) && !read.has(placement.deferredId ?? ''),
+    isUnshown: (placement) => queue.some((m) => m.id === placement.messageId) && !read.has(placement.messageId ?? ''),
     remove: (placement) => {
-      const id = placement.deferredId ?? '';
+      const id = placement.messageId ?? '';
       if (options.unremovable?.has(id)) return false;
       const at = queue.findIndex((m) => m.id === id);
       if (at < 0) return false;
@@ -47,10 +48,10 @@ function makeHost(options: Options = {}) {
       return true;
     },
     deliver: async (occurrence, materialized) => {
-      const id = `deferred-${deliveries.length + 1}`;
+      const id = `row-${deliveries.length + 1}`;
       deliveries.push({ eventId: occurrence.eventId, deliverTo: occurrence.deliverTo });
       queue.push({ id, text: (materialized ?? occurrence.content).map((block) => (block.type === 'text' ? block.text : '')).join('') });
-      return { agent: occurrence.deliverTo ?? 'other', deferredId: id };
+      return { agent: occurrence.deliverTo ?? 'other', messageId: id, presented: false };
     },
     wakeForBatch: async (occurrence) => { wakes.push(`${occurrence.eventId}>${occurrence.deliverTo ?? 'routing'}`); },
     wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
@@ -115,7 +116,7 @@ test("a render settling while an earlier render is unread lands after it, and a 
   await renderAfterRender(h, coalescer);
   assert.deepEqual(h.texts(), ['changes in n1', 'changes in n2'], "n1's render stays, and n2's lands after it");
   const result = await coalescer.accept(retraction());
-  assert.deepEqual(h.removed, ['deferred-2', 'deferred-1'], 'the retraction removes the run, newest first');
+  assert.deepEqual(h.removed, ['row-2', 'row-1'], 'the retraction removes the run, newest first');
   assert.deepEqual(h.audits, ['removed:n2', 'removed:n1']);
   assert.deepEqual(h.texts(), []);
   assert.equal(result.coalesce?.outcome, 'retracted', 'nothing of the subject was read');
@@ -154,7 +155,7 @@ test("a notice after a render still unread leaves it in place, and its batch ren
   await coalescer.assemble('other');
   assert.deepEqual(h.texts(), ['changes in n1', 'changes in n2'], "n2's render lands after the render it builds on");
   const withdrawn = await coalescer.accept(retraction());
-  assert.deepEqual(h.removed, ['deferred-2', 'deferred-1']);
+  assert.deepEqual(h.removed, ['row-2', 'row-1']);
   assert.equal(withdrawn.coalesce?.outcome, 'retracted');
 });
 
@@ -162,7 +163,7 @@ test('a notice over an unread render names, as its prior, an earlier render a re
   const h = makeHost();
   const coalescer = new PushCoalescer<null>(h.host);
   await renderAfterRender(h, coalescer);
-  h.read.add('deferred-1');
+  h.read.add('row-1');
   const result = await coalescer.accept(notice('n3'));
   assert.equal(result.coalesce?.priorEventId, 'n1', "n1's render was found consumed; n2's, still unread, isn't the prior");
   assert.deepEqual(h.removed, [], "n2's render stays");
@@ -175,14 +176,14 @@ test("a plain occurrence displaces the whole run, newest first, and takes its pl
   const result = await coalescer.accept(occurrence('p1'));
   assert.equal(result.coalesce?.outcome, 'replaced');
   assert.equal(result.coalesce?.priorEventId, 'n2');
-  assert.deepEqual(h.removed, ['deferred-2', 'deferred-1'], 'a complete snapshot supersedes every render');
+  assert.deepEqual(h.removed, ['row-2', 'row-1'], 'a complete snapshot supersedes every render');
   assert.deepEqual(h.audits, ['displaced:n2', 'displaced:n1']);
   assert.deepEqual(h.texts(), ['p1']);
   assert.equal(h.deliveries.at(-1)?.deliverTo, 'other', 'it goes where the run was (§3.2)');
 });
 
 test("a plain occurrence over a run whose newest render can't be removed is appended, as after a consumed version", async () => {
-  const h = makeHost({ unremovable: new Set(['deferred-2']) });
+  const h = makeHost({ unremovable: new Set(['row-2']) });
   const coalescer = new PushCoalescer<null>(h.host);
   await renderAfterRender(h, coalescer);
   const result = await coalescer.accept(occurrence('p1'));
@@ -194,7 +195,7 @@ test("a plain occurrence over a run whose newest render can't be removed is appe
 });
 
 test("a retraction stops at a render it can't remove, so that render keeps the renders it builds on, and the notice follows", async () => {
-  const h = makeHost({ unremovable: new Set(['deferred-2']) });
+  const h = makeHost({ unremovable: new Set(['row-2']) });
   const coalescer = new PushCoalescer<null>(h.host);
   await renderAfterRender(h, coalescer);
   const result = await coalescer.accept(retraction('n1 and n2 withdrawn'));
@@ -204,11 +205,11 @@ test("a retraction stops at a render it can't remove, so that render keeps the r
 });
 
 test("a retraction that can't remove an earlier render of the run appends its notice", async () => {
-  const h = makeHost({ unremovable: new Set(['deferred-1']) });
+  const h = makeHost({ unremovable: new Set(['row-1']) });
   const coalescer = new PushCoalescer<null>(h.host);
   await renderAfterRender(h, coalescer);
   const result = await coalescer.accept(retraction('withdrawn'));
-  assert.deepEqual(h.removed, ['deferred-2']);
+  assert.deepEqual(h.removed, ['row-2']);
   assert.deepEqual(h.audits, ['removed:n2', 'removed:n1', 'remove-failed:n1']);
   assert.deepEqual(h.texts(), ['changes in n1', 'withdrawn']);
   assert.equal(result.coalesce?.outcome, 'noted', "n1's render may be read, so the notice follows it");
@@ -218,9 +219,9 @@ test('an earlier render of the run that a request read is history: a retraction 
   const h = makeHost();
   const coalescer = new PushCoalescer<null>(h.host);
   await renderAfterRender(h, coalescer);
-  h.read.add('deferred-1');
+  h.read.add('row-1');
   const result = await coalescer.accept(retraction('withdrawn'));
-  assert.deepEqual(h.removed, ['deferred-2'], 'the render the model read stays');
+  assert.deepEqual(h.removed, ['row-2'], 'the render the model read stays');
   assert.deepEqual(h.texts(), ['changes in n1', 'withdrawn']);
   assert.equal(result.coalesce?.outcome, 'noted');
 });
@@ -231,9 +232,9 @@ test('a run of three renders stays in placement order, and a retraction removes 
   await threeRenders(coalescer);
   assert.deepEqual(h.texts(), ['changes in n1', 'changes in n2', 'changes in n3']);
   const stored = h.snapshot().subjects.find((s) => s.occupant)?.occupant;
-  assert.deepEqual(stored, { eventId: 'n3', placement: { agent: 'other', deferredId: 'deferred-3' } }, 'a snapshot keeps the occupant as restore() reads it, without its run');
+  assert.deepEqual(stored, { eventId: 'n3', placement: { agent: 'other', messageId: 'row-3', presented: false } }, 'a snapshot keeps the occupant as restore() reads it, without its run');
   const result = await coalescer.accept(retraction());
-  assert.deepEqual(h.removed, ['deferred-3', 'deferred-2', 'deferred-1']);
+  assert.deepEqual(h.removed, ['row-3', 'row-2', 'row-1']);
   assert.equal(result.coalesce?.outcome, 'retracted');
 });
 
@@ -241,9 +242,9 @@ test("a render of the run that's gone without the coalescer leaves the rest of t
   const h = makeHost();
   const coalescer = new PushCoalescer<null>(h.host);
   await threeRenders(coalescer);
-  h.gone('deferred-2');
+  h.gone('row-2');
   const result = await coalescer.accept(retraction('withdrawn'));
-  assert.deepEqual(h.removed, ['deferred-3', 'deferred-1'], 'the renders around the gone one are still removed');
+  assert.deepEqual(h.removed, ['row-3', 'row-1'], 'the renders around the gone one are still removed');
   assert.deepEqual(h.texts(), ['withdrawn']);
   assert.equal(result.coalesce?.outcome, 'noted', 'a gone render may have been read');
 });
@@ -252,12 +253,12 @@ test("a render left unread after a later one was read stays a render: a notice l
   const h = makeHost();
   const coalescer = new PushCoalescer<null>(h.host);
   await renderAfterRender(h, coalescer);
-  h.read.add('deferred-2');
+  h.read.add('row-2');
   const result = await coalescer.accept(notice('n3'));
   assert.equal(result.coalesce?.outcome, 'first');
   assert.deepEqual(h.removed, [], "n1's render, still unread, isn't displaced as if it were a plain occurrence");
   assert.deepEqual(h.texts(), ['changes in n1', 'changes in n2']);
   const withdrawn = await coalescer.accept(retraction('withdrawn'));
-  assert.deepEqual(h.removed, ['deferred-1'], "n1's render is still tracked, so the retraction removes it");
+  assert.deepEqual(h.removed, ['row-1'], "n1's render is still tracked, so the retraction removes it");
   assert.equal(withdrawn.coalesce?.outcome, 'noted', "n2's render was read");
 });

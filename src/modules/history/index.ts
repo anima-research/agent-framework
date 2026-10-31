@@ -32,6 +32,31 @@
  * Kept deliberately read-only, same posture as HealthModule: no side
  * effects, no message mutation. `onProcess` is a no-op.
  *
+ * The tools read the record, not an agent's window (#291): an agent's
+ * window is the rows its requests were given, which once agents share a
+ * slot is not the whole record. Where the framework offers the window
+ * lookup (ModuleContext.windowStatusOf), each entry `extract`, `search` and
+ * `semantic_search` return for a row the caller isn't shown says so
+ * (`window: "not-shown" | "undone"`), relative to the agent whose call it
+ * is, or to the delivery agent for a call no agent made. A row the caller
+ * is shown is one its window holds and its view keeps
+ * (ModuleContext.viewKeeps): a window written down from the shared record
+ * can hold another agent's stored context injection or a held row, which
+ * its requests never carry. For an agent's call, another agent's own rows
+ * (its rounds, its notes, its stored injections) that it isn't shown are
+ * left out unless it observes that agent (decision 1), counted as
+ * `leftOut`. The summaries `overview` and `semantic_search` read fold the
+ * bound context's agent's window (ModuleContext.agentNameOf says whose), so
+ * for another agent's call that doesn't observe that agent they are left
+ * out too: `overview` keeps each summarized span's time, level and counts
+ * and leaves out its text (`content: null`, `contentLeftOut: true`,
+ * counted as `summariesLeftOut`), and `semantic_search` leaves out summary
+ * hits, counted in `index.leftOut`. That is for now; serving such a caller
+ * its own context's summaries is later work. An operator's call stays
+ * record-wide, and so does the bound agent's own. `stats` stays an
+ * aggregate over the record, unmarked, as do overview's counts. Without
+ * the lookup every tool and every answer is as it was before the index.
+ *
  * Every query dispatch collapses onto `queryMessagesByTimeAndChannel` — its
  * own implementation already handles "only a time range", "only a channel",
  * or "neither" by delegating to the single-filter native queries (see
@@ -42,7 +67,7 @@
 import { Worker } from 'node:worker_threads';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import type { ContextManager, StoredMessage, ChannelCount, ChannelTokenStats, TimeRangeSummaryEntry } from '@animalabs/context-manager';
+import type { ContextManager, StoredMessage, ChannelCount, ChannelTokenStats, TimeRangeSummaryEntry, WindowStatus } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { Module, ModuleContext } from '../../types/module.js';
 import type { ToolDefinition, ToolCall, ToolResult, ProcessEvent } from '../../types/events.js';
@@ -52,6 +77,8 @@ import type { ChannelRegistry } from '../../mcpl/channel-registry.js';
 import { EmbedServiceError, SemanticIndexClient, SemanticIndexer, messageIndexText, parseSummaryKey, summaryIndexText, type SearchResponse, type SemanticIndexConfig, type SyncReport, type PendingChanges, type SyncCursors } from './semantic.js';
 import { unknownToolMessage } from '../unknown-tool.js';
 import { safeSlice } from '../../safe-slice.js';
+import { audienceOf } from '../../dendrite/audience.js';
+import { storedInjectionMarkOf } from '../../stored-injections.js';
 
 // ============================================================================
 // Tool input shapes
@@ -672,6 +699,13 @@ export class HistoryModule implements Module {
   }
 
   getTools(): ToolDefinition[] {
+    // With the framework's window lookup (#291), entries say which rows the
+    // caller isn't being shown, and another agent's own rows are left out
+    // for an agent that doesn't observe it: one sentence more in each
+    // description that returns rows, and in overview's, whose summaries'
+    // text is left out the same way. Without it, the tools are as they were.
+    const windowed = !!this.ctx?.windowStatusOf;
+    const windowNote = windowed ? WINDOW_NOTE : '';
     return [
       {
         name: 'stats',
@@ -704,7 +738,8 @@ export class HistoryModule implements Module {
           'authors; this is filtered in-process over at most maxScan messages of the window, so a response ' +
           'may report truncated:true with a `resume` object ({windowOffset, offset, afterId}) — repeat the call with ' +
           'those fields added to continue exactly where it stopped. If messages were added or removed in the window ' +
-          'meanwhile, the resume re-anchors on afterId and says so (windowChanged), or fails loudly when it can\'t.',
+          'meanwhile, the resume re-anchors on afterId and says so (windowChanged), or fails loudly when it can\'t.' +
+          windowNote,
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -742,7 +777,8 @@ export class HistoryModule implements Module {
           'wholeWord:true stops "mission" from matching inside "uncommissioned". Each match carries an `id` ' +
           'you can hand to extract({aroundId}) to read the conversation around it. ' +
           'regex:true matching runs under a wall-clock deadline and is cleanly failed ' +
-          `(not silently empty) if a pattern is too slow — avoid nested-quantifier patterns like (a+)+.`,
+          `(not silently empty) if a pattern is too slow — avoid nested-quantifier patterns like (a+)+.` +
+          windowNote,
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -790,7 +826,8 @@ export class HistoryModule implements Module {
           'with a clear error rather than silently returning no spans. An entry marked boundaryUncertain:true ' +
           'had a millisecond-timestamp collision at its edge with another span (rare — two distinct messages ' +
           'landing in the same millisecond); its messageCount is still exact but tokensEstimate may be off by ' +
-          'a small, bounded amount.',
+          'a small, bounded amount.' +
+          (windowed ? WINDOW_NOTE_OVERVIEW : ''),
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -817,6 +854,9 @@ export class HistoryModule implements Module {
   }
 
   private semanticSearchTool(): ToolDefinition {
+    // An undo moves no branch since #291, so with the window lookup an
+    // undone message is a hit, marked, rather than dropped off the branch.
+    const windowed = !!this.ctx?.windowStatusOf;
     return {
       name: 'semantic_search',
       description:
@@ -831,12 +871,13 @@ export class HistoryModule implements Module {
         'searching (bounded, so a huge backlog is reported as `index.behind` rather than blocking; if a ' +
         'background sync is already running, the search waits for that run to finish instead). ' +
         'Purely a read: nothing is written to your history. Hits are checked against your current branch ' +
-        'before they come back: a message you undid or a summary from a branch you left is dropped and ' +
+        `before they come back: ${windowed ? 'a message or ' : 'a message you undid or '}a summary from a branch you left is dropped and ` +
         'counted in index.droppedOffBranch; a message edited down to nothing searchable is dropped and ' +
         'counted in index.droppedStale. When that leaves fewer than `limit` hits and the index may hold more, it ' +
         'searches again, deeper, down to its first 200 hits; if a search after the first fails, the hits found so ' +
         'far come back, with why in index.searchAgainError. Message snippets ' +
-        'always show the current text of the message.',
+        'always show the current text of the message.' +
+        (windowed ? WINDOW_NOTE_SEMANTIC : ''),
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -869,13 +910,13 @@ export class HistoryModule implements Module {
         case 'stats':
           return this.handleStats((call.input ?? {}) as StatsInput);
         case 'extract':
-          return this.handleExtract((call.input ?? {}) as ExtractInput);
+          return this.handleExtract((call.input ?? {}) as ExtractInput, this.viewFor(call));
         case 'search':
-          return await this.handleSearch((call.input ?? {}) as SearchInput);
+          return await this.handleSearch((call.input ?? {}) as SearchInput, this.viewFor(call));
         case 'overview':
-          return this.handleOverview((call.input ?? {}) as OverviewInput);
+          return this.handleOverview((call.input ?? {}) as OverviewInput, this.viewFor(call));
         case 'semantic_search':
-          return await this.handleSemanticSearch((call.input ?? {}) as SemanticSearchInput);
+          return await this.handleSemanticSearch((call.input ?? {}) as SemanticSearchInput, this.viewFor(call));
         default:
           return { success: false, isError: true, error: unknownToolMessage(this.name, call.name, this.getTools()) };
       }
@@ -901,6 +942,118 @@ export class HistoryModule implements Module {
 
   async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
     return {};
+  }
+
+  /**
+   * How one call's caller sees the record (#291), when the framework offers
+   * the window lookup (ModuleContext.windowStatusOf); undefined otherwise,
+   * and then every entry is as it was before the presentation index. The
+   * caller is the agent whose call it is (callerAgentName), or, for a call
+   * no agent made (an operator's, a host's), the delivery agent, for marks
+   * only. A row the caller is shown is one its window holds and its view
+   * keeps (ModuleContext.viewKeeps): a window written down from the record
+   * the residents share can hold another agent's stored context injection,
+   * or a row a tune-out holds from the residents, which the caller's
+   * requests never carry. A row the caller isn't shown is marked
+   * (`window`); for an agent's call, another agent's own row (its rounds,
+   * its notes, its stored injections) that it isn't shown is left out,
+   * unless it observes that agent: seeing another agent's thread is a
+   * declared relationship (decision 1), an observe edge, such as a
+   * resident's `AgentConfig.observes`. Each row's status is read once per
+   * call.
+   *
+   * The bound context's summaries fold its agent's window, that agent's own
+   * rounds and notes among it, so for another agent's call that doesn't
+   * observe that agent they are left out too (`leavesSummaries`). That is
+   * for now: serving such a caller summaries of its own context is later
+   * work. An agent's call where the framework can't say whose context the
+   * module is bound to (ModuleContext.agentNameOf missing, or answering
+   * that it is no live agent's) leaves them out as well. A call no agent
+   * made, and the bound agent's own, read them as before.
+   */
+  private viewFor(call: ToolCall): CallerView | undefined {
+    const ctx = this.ctx;
+    if (!ctx?.windowStatusOf) return undefined;
+    const caller = call.callerAgentName;
+    const forCaller = caller === undefined ? undefined : { forAgent: caller };
+    const statuses = new Map<string, WindowStatus | null>();
+    // Set once a lookup throws: an agent the framework no longer knows. Its
+    // rows carry no mark, and its window is taken as holding nothing.
+    let unknown = false;
+    const statusOf = (msg: StoredMessage): WindowStatus | null => {
+      if (unknown) return null;
+      const id = String(msg.id);
+      let status = statuses.get(id);
+      if (status === undefined) {
+        try {
+          status = ctx.windowStatusOf!(msg.id, forCaller);
+        } catch {
+          unknown = true;
+          return null;
+        }
+        statuses.set(id, status);
+      }
+      return status;
+    };
+    // Whether the caller's view keeps a row its window holds. Without the
+    // lookup, every row its window holds is taken as shown, as before it.
+    const kept = new Map<string, boolean>();
+    const keeps = (msg: StoredMessage): boolean => {
+      if (!ctx.viewKeeps) return true;
+      const id = String(msg.id);
+      let keep = kept.get(id);
+      if (keep === undefined) {
+        try {
+          keep = ctx.viewKeeps(msg, forCaller);
+        } catch {
+          unknown = true;
+          return false;
+        }
+        kept.set(id, keep);
+      }
+      return keep;
+    };
+    const shown = (msg: StoredMessage): boolean => statusOf(msg) === 'in' && keeps(msg);
+    const observed = new Map<string, boolean>();
+    const observes = (owner: string): boolean => {
+      let sees = observed.get(owner);
+      if (sees === undefined) {
+        try {
+          sees = ctx.observes?.(caller!, owner) ?? false;
+        } catch {
+          sees = false;
+        }
+        observed.set(owner, sees);
+      }
+      return sees;
+    };
+    let leavesSummaries = false;
+    if (caller !== undefined) {
+      let bound: string | undefined;
+      try {
+        bound = this.cm ? ctx.agentNameOf?.(this.cm) : undefined;
+      } catch {
+        bound = undefined;
+      }
+      leavesSummaries = bound === undefined || (bound !== caller && !observes(bound));
+    }
+    return {
+      mark: (msg) => {
+        const status = statusOf(msg);
+        if (status === 'undone') return 'undone';
+        if (status === 'out' || status === 'absent') return 'not-shown';
+        return status === 'in' && !keeps(msg) ? 'not-shown' : undefined;
+      },
+      leaves: (msg) => {
+        if (caller === undefined) return false;
+        // A stored injection from before the audience stamp names its agent
+        // in its own mark: it is that agent's context, as every view reads it.
+        const owner = audienceOf(msg.metadata)?.ownRowOf ?? storedInjectionMarkOf(msg.metadata)?.agent;
+        if (owner === undefined || owner === caller) return false;
+        return !shown(msg) && !observes(owner);
+      },
+      leavesSummaries,
+    };
   }
 
   // ==========================================================================
@@ -944,8 +1097,8 @@ export class HistoryModule implements Module {
   // extract
   // ==========================================================================
 
-  private handleExtract(input: ExtractInput): ToolResult {
-    if (input.aroundId !== undefined) return this.handleExtractAround(input);
+  private handleExtract(input: ExtractInput, view?: CallerView): ToolResult {
+    if (input.aroundId !== undefined) return this.handleExtractAround(input, view);
     const aroundOnly = (['before', 'after', 'allChannels'] as const).filter((k) => input[k] !== undefined);
     if (aroundOnly.length > 0) {
       const one = aroundOnly.length === 1;
@@ -976,6 +1129,15 @@ export class HistoryModule implements Module {
     }
 
     if (authorFilter) {
+      // A row left out for the caller (viewFor) is one the filter doesn't
+      // keep, counted in leftOut.
+      let leftOut = 0;
+      const keeps = (m: StoredMessage): boolean => {
+        if (!authorFilter(m)) return false;
+        if (!view?.leaves(m)) return true;
+        leftOut++;
+        return false;
+      };
       // No native author index: page through the time/channel window and
       // filter here. offset/limit apply to the FILTERED sequence. Stop as
       // soon as the requested page is full; otherwise scan to maxScan. Only
@@ -992,7 +1154,7 @@ export class HistoryModule implements Module {
       );
       const requestedOffset = clampCount(input.windowOffset, 0, NATIVE_OFFSET_MAX, 'windowOffset', 'read');
       // A position is only meaningful against the window it was taken in:
-      // a removal before it (every discord:delete, host hide, /undo) shifts
+      // a removal before it (every discord:delete, host hide) shifts
       // later positions left, and a message inserted before it (a
       // time-ordered window with backfill) shifts them right. Either would
       // silently skip or repeat a message. afterId pins the position to the
@@ -1053,7 +1215,7 @@ export class HistoryModule implements Module {
         for (const m of chunk) {
           scanned++;
           lastScanned = m;
-          if (!authorFilter(m)) continue;
+          if (!keeps(m)) continue;
           if (kept >= offset && page.length < limit) {
             page.push(m);
             afterPage = windowOffset + scanned;
@@ -1096,6 +1258,7 @@ export class HistoryModule implements Module {
             return { [exhausted ? base : `${base}AtLeast`]: n };
           })(),
           returned: page.length,
+          ...(leftOut > 0 ? { leftOut } : {}),
           scanned,
           truncated: !exhausted,
           ...(shift !== 0 || missed.length > 0 || unverified
@@ -1115,7 +1278,7 @@ export class HistoryModule implements Module {
                     ? {
                         addedBefore: missed.length,
                         // the ones this filter would have kept — fetch them with extract({aroundId})
-                        missedIds: missed.filter(authorFilter).map((m) => String(m.id)),
+                        missedIds: missed.filter((m) => authorFilter(m) && !view?.leaves(m)).map((m) => String(m.id)),
                       }
                     : {}),
                   note:
@@ -1157,7 +1320,7 @@ export class HistoryModule implements Module {
                 };
               })()
             : {}),
-          messages: page.map((msg) => projectMessage(msg, format)),
+          messages: page.map((msg) => projectMessage(msg, format, view?.mark(msg))),
         },
       };
     }
@@ -1173,15 +1336,20 @@ export class HistoryModule implements Module {
       limit: limit + 1,
       offset,
     });
-    const page = result.messages.slice(0, limit);
+    const fetched = result.messages.slice(0, limit);
+    // Rows left out for the caller (viewFor) leave the page; the page's
+    // place in the window, and so offset and hasMore, stay the window's.
+    const page = view ? fetched.filter((msg) => !view.leaves(msg)) : fetched;
+    const leftOut = fetched.length - page.length;
 
     return {
       success: true,
       data: {
         ...(channelId !== undefined ? { matchedCount: result.matchedCount } : {}),
         returned: page.length,
+        ...(leftOut > 0 ? { leftOut } : {}),
         hasMore: result.messages.length > limit,
-        messages: page.map((msg) => projectMessage(msg, format)),
+        messages: page.map((msg) => projectMessage(msg, format, view?.mark(msg))),
       },
     };
   }
@@ -1193,7 +1361,7 @@ export class HistoryModule implements Module {
    * side still needs, the nearest messages strictly before/after it (both
    * via edgeWindow, which is exact by timestamp).
    */
-  private handleExtractAround(input: ExtractInput): ToolResult {
+  private handleExtractAround(input: ExtractInput, view?: CallerView): ToolResult {
     const windowFields = (['from', 'to', 'offset', 'windowOffset', 'limit'] as const).filter((k) => input[k] !== undefined);
     if (windowFields.length > 0) {
       throw new Error(
@@ -1230,7 +1398,9 @@ export class HistoryModule implements Module {
             : 'the "id" of a history--search or history--extract result.'),
       );
     }
-    const anchor = cm.getMessage(rawId.replace(/^msg:/, ''));
+    const found = cm.getMessage(rawId.replace(/^msg:/, ''));
+    // A row left out for the caller (viewFor) is answered as one not there.
+    const anchor = found && !view?.leaves(found) ? found : null;
     if (!anchor) {
       throw new Error(
         `Nothing was read: no message in your history has the id ${shown(input.aroundId)}. Pass the "id" ` +
@@ -1275,15 +1445,18 @@ export class HistoryModule implements Module {
     const earlier =
       needBefore > 0 ? this.edgeWindow({ toMs: t - 1, channelId, n: needBefore, side: 'newest' }).messages.reverse() : [];
     const later = needAfter > 0 ? this.edgeWindow({ fromMs: t + 1, channelId, n: needAfter, side: 'oldest' }).messages : [];
-    const window = [...earlier, ...tiesBefore, ties[idx]!, ...tiesAfter, ...later];
+    const around = [...earlier, ...tiesBefore, ties[idx]!, ...tiesAfter, ...later];
+    const window = view ? around.filter((m) => !view.leaves(m)) : around;
+    const leftOut = around.length - window.length;
     return {
       success: true,
       data: {
         anchorId,
         channelId: channelId ?? null,
         returned: window.length,
+        ...(leftOut > 0 ? { leftOut } : {}),
         messages: window.map((m) => ({
-          ...projectMessage(m, format),
+          ...projectMessage(m, format, view?.mark(m)),
           ...(String(m.id) === anchorId ? { anchor: true } : {}),
         })),
       },
@@ -1294,7 +1467,7 @@ export class HistoryModule implements Module {
   // search
   // ==========================================================================
 
-  private async handleSearch(input: SearchInput): Promise<ToolResult> {
+  private async handleSearch(input: SearchInput, view?: CallerView): Promise<ToolResult> {
     // A finite number is searched as its text, as a regular expression made
     // from it reads it; any other value that isn't text is refused.
     const given: unknown = input.query;
@@ -1386,10 +1559,14 @@ export class HistoryModule implements Module {
       if (w.total !== undefined) unscanned = w.total - (w.messages.length - pool.length) - windowMessages.length;
     }
     const candidatePoolSize = windowMessages.length;
-    const candidates = authorFilter ? windowMessages.filter(authorFilter) : windowMessages;
+    const byAuthor = authorFilter ? windowMessages.filter(authorFilter) : windowMessages;
+    // A row left out for the caller (viewFor) is no candidate.
+    const candidates = view ? byAuthor.filter((m) => !view.leaves(m)) : byAuthor;
+    const leftOut = byAuthor.length - candidates.length;
     const poolInfo = {
       candidatePoolSize,
-      ...(authorFilter ? { afterAuthorFilter: candidates.length } : {}),
+      ...(authorFilter ? { afterAuthorFilter: byAuthor.length } : {}),
+      ...(leftOut > 0 ? { leftOut } : {}),
       order,
     };
     // Where the scan stopped, when it stopped before the end of the window
@@ -1458,7 +1635,7 @@ export class HistoryModule implements Module {
       // through a worker thread instead, which can be forcibly terminated
       // on a deadline. See search-regex-worker.ts's header for the full
       // rationale.
-      const { matches, scanned } = await this.searchWithRegexWorker(candidates, query, flags, limit);
+      const { matches, scanned } = await this.searchWithRegexWorker(candidates, query, flags, limit, view);
       return { success: true, data: { scanned, ...poolInfo, truncated, ...resumeInfo(scanned, matches.length), matches } };
     }
 
@@ -1485,6 +1662,7 @@ export class HistoryModule implements Module {
         participant: msg.participant,
         author: authorName(msg),
         channelId: getChannelId(msg) ?? null,
+        ...windowField(view?.mark(msg)),
         snippet: snippetAround(text, hit.index, hit.length),
       });
     }
@@ -1514,6 +1692,7 @@ export class HistoryModule implements Module {
     pattern: string,
     flags: string,
     limit: number,
+    view?: CallerView,
   ): Promise<{ matches: SearchMatch[]; scanned: number }> {
     const texts = candidates.map((msg) => flattenContent(msg.content));
     let worker: Worker | undefined;
@@ -1563,6 +1742,7 @@ export class HistoryModule implements Module {
           participant: msg.participant,
           author: authorName(msg),
           channelId: getChannelId(msg) ?? null,
+          ...windowField(view?.mark(msg)),
           snippet: snippetAround(text, matchIndex, matchLength),
         };
       });
@@ -1579,7 +1759,7 @@ export class HistoryModule implements Module {
   // overview
   // ==========================================================================
 
-  private async handleSemanticSearch(input: SemanticSearchInput): Promise<ToolResult> {
+  private async handleSemanticSearch(input: SemanticSearchInput, view?: CallerView): Promise<ToolResult> {
     if (!this.semanticCfg || !this.semanticClient) {
       throw new Error(
         "Nothing was searched: this host has no semantic index set up, so history--semantic_search isn't available " +
@@ -1692,16 +1872,23 @@ export class HistoryModule implements Module {
       };
     };
     // The remote index is append-only and knows nothing about branches: a
-    // message removed from the agent's reach by /undo, /checkout, /restore or
-    // /newtopic keeps its id (a new message gets a fresh one) and stays
-    // indexed. Check every hit against the CURRENT branch before it goes back
-    // to the model — getMessage/getSummary rebuild on branch switch, so an
-    // undone message, or a summary this branch doesn't hold, answers null.
-    // A branch made from an earlier point, as an undo makes one, can mint a
-    // summary id another branch already used, so a summary's key carries its
-    // creation time too, and a hit whose time isn't this branch's summary's
-    // is another branch's. k is small, so this is at most `limit` local
-    // lookups.
+    // message removed from the agent's reach by a rollback, /checkout,
+    // /restore or /newtopic keeps its id (a new message gets a fresh one) and
+    // stays indexed. Check every hit against the CURRENT branch before it goes
+    // back to the model — getMessage/getSummary rebuild on branch switch, so a
+    // message, or a summary, this branch doesn't hold answers null. An undo
+    // works on the agent's window since #291 and moves no branch, so an
+    // undone message stays on it and comes back, marked `window: "undone"`
+    // for the caller when the framework offers the window lookup (viewFor),
+    // as is one the caller wasn't shown; another agent's own row the caller
+    // doesn't observe is left out (index.leftOut), and so is a summary hit
+    // for another agent's call that doesn't observe the agent whose context
+    // the summaries fold (viewFor's leavesSummaries).
+    // A branch made from an earlier point, as a rollback makes one, can mint
+    // a summary id another branch already used, so a summary's key carries
+    // its creation time too, and a hit whose time isn't this branch's
+    // summary's is another branch's. k is small, so this is at most `limit`
+    // local lookups.
     // A message hit whose current text has nothing left to index (edited
     // blank, delete not yet applied) is dropped too, so its stale snippet is
     // never served. Dropped hits are replaced by over-fetching: when the
@@ -1715,12 +1902,17 @@ export class HistoryModule implements Module {
     // A summary hit's snippet is rebuilt from the local summary too, so a
     // service that keeps only vectors and ids (no text) still yields one.
     const currentText = new Map<string, string>();
-    const keep = (h: { id: string }): 'ok' | 'offBranch' | 'stale' | 'superseded' => {
+    // Each message hit's mark for the caller (viewFor), by the hit's id.
+    const marks = new Map<string, WindowMark>();
+    const keep = (h: { id: string }): 'ok' | 'offBranch' | 'stale' | 'superseded' | 'leftOut' => {
       const msgId = /^msg:(.+)$/.exec(h.id)?.[1];
       const sum = parseSummaryKey(h.id);
       if (msgId !== undefined) {
         const m = cm.getMessage(msgId);
         if (!m) return 'offBranch';
+        if (view?.leaves(m)) return 'leftOut';
+        const mark = view?.mark(m);
+        if (mark !== undefined) marks.set(h.id, mark);
         const text = safeSlice(messageIndexText(m, includePrivate), 0, this.semanticCfg!.maxChars ?? 32_000);
         if (!text) return 'stale';
         currentText.set(h.id, text);
@@ -1738,6 +1930,7 @@ export class HistoryModule implements Module {
         if (!s) return 'offBranch';
         if (sum.createdMs === null) return 'superseded';
         if (s.created !== sum.createdMs) return 'offBranch';
+        if (view?.leavesSummaries) return 'leftOut';
         const text = summaryIndexText(s, this.semanticCfg!);
         // An empty text here is mostly defensive: context-manager drops a
         // summary that's empty after trimming when it loads, and refuses to
@@ -1760,23 +1953,28 @@ export class HistoryModule implements Module {
     }
     let droppedOffBranch = 0;
     let droppedStale = 0;
+    let leftOut = 0;
     // Why searching again for more hits failed, when it did. The search
     // before it answered, so its hits on this branch are returned.
     let searchAgainError: string | null = null;
     let onBranch: typeof res.hits = [];
     // The last answer's hits on this branch, checked as they are now.
     const check = (): void => {
-      droppedOffBranch = 0; droppedStale = 0;
+      droppedOffBranch = 0; droppedStale = 0; leftOut = 0;
       onBranch = res.hits.filter((h) => {
         const v = keep(h);
         if (v === 'offBranch') droppedOffBranch++;
         else if (v === 'stale') droppedStale++;
+        else if (v === 'leftOut') leftOut++;
         return v === 'ok';
       });
     };
+    // A search of summaries alone, for a caller they're left out for, keeps
+    // no hit however deep it goes, so it isn't searched again.
+    const keepsNone = wantsSummariesOnly && view?.leavesSummaries === true;
     for (;;) {
       check();
-      if (onBranch.length >= limit || res.hits.length < k || k >= SEMANTIC_MAX_FETCH) break;
+      if (keepsNone || onBranch.length >= limit || res.hits.length < k || k >= SEMANTIC_MAX_FETCH) break;
       k = Math.min(SEMANTIC_MAX_FETCH, k * 4);
       try {
         res = await runSearch(k);
@@ -1819,6 +2017,7 @@ export class HistoryModule implements Module {
         score: h.score,
         timestamp,
         channelId: h.channel,
+        ...windowField(marks.get(h.id)),
         participant: meta?.participant ?? null,
         author: meta?.author ?? null,
         snippet: currentText.has(h.id) ? snippetOf(currentText.get(h.id)!) : (h.text ?? ''),
@@ -1844,6 +2043,8 @@ export class HistoryModule implements Module {
           droppedOffBranch,
           /** Hits for messages whose current text has nothing indexable (edited blank; the index keeps such a message until its delete goes through, and on a service without /delete it never does). */
           droppedStale,
+          /** Hits left out for the caller (#291): another agent's own rows it isn't shown and doesn't observe, and, for another agent's call that doesn't observe the agent whose context the summaries fold, summary hits; only when there were any. */
+          ...(leftOut > 0 ? { leftOut } : {}),
           /** When too few hits were on this branch and searching again for more failed: why, and whether calling again can help. */
           searchAgainError,
         },
@@ -1852,7 +2053,7 @@ export class HistoryModule implements Module {
     };
   }
 
-  private handleOverview(input: OverviewInput): ToolResult {
+  private handleOverview(input: OverviewInput, view?: CallerView): ToolResult {
     const channelId = this.resolveChannel(input.channelId);
     const fromMs = parseIsoDate(input.from, 'from');
     const toMs = parseIsoDate(input.to, 'to');
@@ -2171,6 +2372,14 @@ export class HistoryModule implements Module {
     // `filtered.length - limit` has no such cliff, at limit:0 it's
     // `slice(filtered.length)` -> `[]`, the honest answer.
     const capped = truncated ? filtered.slice(filtered.length - limit) : filtered;
+    // The summaries fold the bound context's agent's window, its own rounds
+    // and notes among it (#291). For another agent's call that doesn't
+    // observe that agent (viewFor's leavesSummaries) a summarized span keeps
+    // its time, level and counts, which are the record's, and leaves out its
+    // text: `content: null` and `contentLeftOut: true`, counted at the top as
+    // `summariesLeftOut`.
+    const leavesContent = view?.leavesSummaries === true;
+    const summariesLeftOut = leavesContent ? capped.filter((e) => e.summarized).length : 0;
 
     return {
       success: true,
@@ -2188,6 +2397,7 @@ export class HistoryModule implements Module {
         ...(input.level !== undefined ? { level: input.level } : { maxLevelAvailable: cm.getMaxSummaryLevel() }),
         truncated,
         totalSpans,
+        ...(summariesLeftOut > 0 ? { summariesLeftOut } : {}),
         entries: capped.map((e) => {
           // When channelId narrows the response, the numbers an agent will
           // actually reason over (messageCount/tokensEstimate) are scoped
@@ -2205,7 +2415,11 @@ export class HistoryModule implements Module {
             from: new Date(e.startMs).toISOString(),
             to: new Date(e.endMs).toISOString(),
             summarized: e.summarized,
-            ...(e.summarized ? { content: e.content, level: e.level } : {}),
+            ...(e.summarized
+              ? leavesContent
+                ? { content: null, contentLeftOut: true, level: e.level }
+                : { content: e.content, level: e.level }
+              : {}),
             // Set only when this entry's boundary-tie disambiguation (see
             // the correction pass above) found and corrected a
             // millisecond-timestamp collision at its edge. messageCount is
@@ -2440,13 +2654,57 @@ function mergeForeignIntoGap(
   }
 }
 
-function projectMessage(msg: StoredMessage, format: 'text' | 'raw'): Record<string, unknown> {
+/** The sentence extract's and search's descriptions gain with the window lookup (getTools). */
+const WINDOW_NOTE =
+  ' A message that isn\'t in your context carries `window`: "undone" for one an undo or a refusal rewind took ' +
+  'out of it, "not-shown" for one you were never shown; another agent\'s own turns and notes are left out unless ' +
+  'you observe that agent, and how many were is `leftOut`.';
+
+/** semantic_search's form of it. */
+const WINDOW_NOTE_SEMANTIC =
+  ' A message hit that isn\'t in your context carries `window` ("undone" for one an undo or a refusal rewind took ' +
+  'out of it, "not-shown" for one you were never shown); another agent\'s own turns and notes are left out unless ' +
+  'you observe that agent, and so are summary hits when the summaries fold another agent\'s context (the one this ' +
+  'history is bound to) and you don\'t observe that agent, all counted in index.leftOut.';
+
+/** overview's form of it: its entries are spans, and only a summary's text is the bound agent's. */
+const WINDOW_NOTE_OVERVIEW =
+  ' The summaries fold one agent\'s context, the one this history is bound to: when that isn\'t yours and you don\'t ' +
+  'observe that agent, a summarized span comes back with its time, level and counts but not its text ' +
+  '(content:null, contentLeftOut:true), and summariesLeftOut says how many did.';
+
+/**
+ * Where a row an entry returns stands with the caller's window (#291), when
+ * it isn't in it: `undone` for a row an undo or a refusal rewind took out
+ * of it, `not-shown` for one it was never shown (stored and not presented
+ * to it, taken back to arrived, or in a slot it doesn't read). An entry for
+ * a row in the window carries none.
+ */
+type WindowMark = 'not-shown' | 'undone';
+
+/** How one call's caller sees the record (HistoryModule.viewFor). */
+interface CallerView {
+  /** The row's mark for the caller, or undefined for a row it is shown (its window holds it and its view keeps it). */
+  mark(msg: StoredMessage): WindowMark | undefined;
+  /** Whether the row is left out for the caller: another agent's own row it isn't shown and whose agent it doesn't observe. */
+  leaves(msg: StoredMessage): boolean;
+  /** Whether the bound context's summaries are left out for the caller: another agent's call that doesn't observe the agent whose context it is. */
+  readonly leavesSummaries: boolean;
+}
+
+/** `{ window }` for a defined mark, nothing otherwise, so an entry in the caller's window is as it always was. */
+function windowField(mark: WindowMark | undefined): { window?: WindowMark } {
+  return mark === undefined ? {} : { window: mark };
+}
+
+function projectMessage(msg: StoredMessage, format: 'text' | 'raw', mark?: WindowMark): Record<string, unknown> {
   return {
     id: String(msg.id),
     timestamp: msg.timestamp.toISOString(),
     participant: msg.participant,
     author: authorName(msg),
     channelId: getChannelId(msg) ?? null,
+    ...windowField(mark),
     content: format === 'raw' ? msg.content : flattenContent(msg.content),
   };
 }
@@ -2501,6 +2759,8 @@ interface SearchMatch {
   /** Display name from metadata.author (null when absent — e.g. the agent's own turns; see participant). */
   author: string | null;
   channelId: string | null;
+  /** Set only for a row the caller's window doesn't hold (#291; WindowMark). */
+  window?: WindowMark;
   snippet: string;
 }
 

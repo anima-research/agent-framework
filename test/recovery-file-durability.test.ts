@@ -1,8 +1,10 @@
 /**
- * The recovery files (host mode, deferred writes) are written as a temp file
- * synced and renamed over the record, with the directory and its parent
- * synced after the rename. These drive both records through the framework,
- * recording the node:fs calls each write makes.
+ * The recovery files (host mode here) are written as a temp file synced and
+ * renamed over the record, with the directory and its parent synced after
+ * the rename. These drive the record through the framework, recording the
+ * node:fs calls each write makes. (#291 took the deferral queue away, and
+ * with it the deferred-writes record this file once drove too, rewritten
+ * at each write made while quiesced.)
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -128,28 +130,6 @@ test('quiesce syncs the host-mode record\'s temp file before renaming it over th
     assertEachClosed(calls, (path) => isTemporaryOf(record, path) || path === recovery || path === dirname(recovery));
     assert.equal(statSync(record).mode & 0o777, 0o600);
     assert.equal(JSON.parse(readFileSync(record, 'utf8')).quiesced, true);
-  });
-});
-
-test('each context write deferred while quiesced rewrites the deferred-writes record, synced the same way', async () => {
-  await withFramework(async (framework, recovery) => {
-    await framework.quiesce({ reason: 'test' });
-    const add = (framework as unknown as { addMessage(participant: string, content: unknown[]): unknown }).addMessage.bind(framework);
-    const record = join(recovery, 'deferred-writes.json');
-    const calls = await recordingFs(async () => {
-      add('user', [{ type: 'text', text: 'held' }]);
-      add('user', [{ type: 'text', text: 'held too' }]);
-    });
-    const renames = calls.flatMap((c, i) => (c.call === 'rename' && c.to === record ? [i] : []));
-    assert.equal(renames.length, 2, `a rewrite for each deferred write: ${JSON.stringify(calls)}`);
-    renames.forEach((_at, k) => {
-      // This rewrite's calls: from the rename before it to the one after.
-      const write = calls.slice(k === 0 ? 0 : renames[k - 1]! + 1, renames[k + 1] ?? calls.length);
-      assertSyncedAround(write, record, recovery);
-      assertSyncedAround(write, record, dirname(recovery));
-    });
-    const pending = (JSON.parse(readFileSync(record, 'utf8')) as { pending: Array<{ content: Array<{ text: string }> }> }).pending;
-    assert.deepEqual(pending.map((entry) => entry.content[0]!.text), ['held', 'held too']);
   });
 });
 

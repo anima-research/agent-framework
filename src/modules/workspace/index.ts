@@ -1052,6 +1052,9 @@ export class WorkspaceModule implements Module {
   /** Whether an agent's history holds a message, as the framework hands it over (useHistory). */
   private historyLookup: ((agentName: string, messageId: string) => boolean) | null = null;
 
+  /** Whether an agent's window still holds what it did after a place in the record, as the framework hands it over (useWindow). */
+  private windowLookup: ((agentName: string, afterSequence: number) => boolean) | null = null;
+
   constructor(config: WorkspaceConfig) {
     for (const mount of config.mounts) {
       const cap: unknown = mount.walkCap;
@@ -5132,7 +5135,19 @@ export class WorkspaceModule implements Module {
    * leaves the next start to decide (headMoveNotice).
    */
   private historyHoldsWrites(agentName: string, head: DirectHead): boolean | null {
-    if (this.holdsPosition(head)) return true;
+    if (this.holdsPosition(head)) {
+      // The branch holds the write, but an undo on the agent's window (the
+      // framework's presentation index) moves no branch: it takes the turn
+      // that wrote out of the window, which the framework's lookup says.
+      let held: boolean;
+      try {
+        held = this.windowLookup?.(agentName, head.after) !== false;
+      } catch (err) {
+        console.error('[workspace] window lookup for the head-move notice failed:', err);
+        return null;
+      }
+      if (held) return true;
+    }
     if (head.notice === null) return false;
     try {
       return this.historyLookup?.(agentName, head.notice) === true;
@@ -5201,12 +5216,25 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * How the module asks whether an agent's history holds a message, as the
-   * framework judges its own notices (`cm.getMessage(id) !== null`): handed
-   * over once, when the module is added. Without it, no notice is held.
+   * How the module asks whether an agent's history holds a message: its
+   * record holds it, and, on a window the framework presents, no undo has
+   * taken it out of the window. Handed over once, when the module is added.
+   * Without it, no notice is held.
    */
   useHistory(lookup: (agentName: string, messageId: string) => boolean): void {
     this.historyLookup = lookup;
+  }
+
+  /**
+   * How the module asks whether an agent's window still holds what the
+   * agent did after a place in the record (`afterSequence`, the store's head
+   * when it wrote a mount direct): false once an undo on its window took
+   * that turn out, though the branch still holds the write. Handed over
+   * once, by a framework with the presentation index. Without it, the
+   * branch's position alone decides.
+   */
+  useWindow(lookup: (agentName: string, afterSequence: number) => boolean): void {
+    this.windowLookup = lookup;
   }
 
   private async handleDelete(input: DeleteInput, callerAgentName?: string): Promise<ToolResult> {
@@ -6250,10 +6278,11 @@ export class WorkspaceModule implements Module {
     mount.lastMaterializedBranchId = null;
     mount.lastMaterializedSeq = 0;
 
-    // force: this path only runs after a deliberate undo/redo/branch switch
-    // on the framework's own _config mount — restoring disk to the branch
-    // state IS the operator intent, so the freshness guard yields. named:
-    // the whole tree is that deliberate scope, entries without evidence too.
+    // force: this path only runs after a deliberate branch switch, rollback
+    // or suppression on the framework's own _config mount — restoring disk
+    // to the branch state IS the operator intent, so the freshness guard
+    // yields. named: the whole tree is that deliberate scope, entries
+    // without evidence too.
     const pushed = await this.withMount(mount, () => {
       const branchId = store.currentBranch().id;
       return this.pushUnlocked(mount, store.treeList(mount.treeStateId).map((e) => e.path), { force: true, named: true, branchId });

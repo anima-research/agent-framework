@@ -16,8 +16,11 @@ import type {
   AgentRecord,
   AgentRef,
   AgentSpec,
+  ContextInheritance,
   EndOutcome,
   HeldMail,
+  MessageSlotRef,
+  ObserveEdge,
   RegistrySnapshot,
 } from './types.js';
 
@@ -76,6 +79,109 @@ function clone<T>(value: T): T {
   return value === undefined ? value : (JSON.parse(JSON.stringify(value)) as T);
 }
 
+/** AgentRegistry.register's options (see there). */
+export interface RegisterOptions {
+  resume?: boolean;
+  after?: number;
+  declaredWith?: readonly AgentName[];
+}
+
+/** The residents' shared un-namespaced slot, on the host's current branch. */
+export const RESIDENTS_SLOT: Readonly<MessageSlotRef> = Object.freeze({ namespace: null });
+
+/** Whether two refs name one slot: the same namespace on the same branch. */
+export function sameSlot(a: MessageSlotRef | undefined, b: MessageSlotRef | undefined): boolean {
+  return !!a && !!b && a.namespace === b.namespace && a.branch === b.branch;
+}
+
+/**
+ * The slot an observe edge reads. An edge that names a slot reads that
+ * namespace on the host's current branch. One that names an agent and no
+ * slot reads that agent's own slot, wherever it is (a shared fork's is on its
+ * own branch), as `ownSlotOf` looks it up: undefined where the lookup doesn't
+ * know the agent, or none is given. The registry's `observedSlotOf` passes its
+ * records. An edge that names neither reads the residents' shared slot.
+ */
+export function observedSlot(
+  edge: ObserveEdge,
+  ownSlotOf?: (agent: AgentName) => MessageSlotRef | undefined,
+): MessageSlotRef | undefined {
+  if (edge.slot !== undefined) return { namespace: edge.slot };
+  if (edge.agent === undefined) return { namespace: null };
+  const own = ownSlotOf?.(edge.agent);
+  return own ? { namespace: own.namespace, ...(own.branch !== undefined ? { branch: own.branch } : {}) } : undefined;
+}
+
+/**
+ * The slot a shared derivation's own rows are stored in: the parent's
+ * message slot, as context-manager's derivation record names it, on the
+ * child's own branch. Undefined for any other inheritance, or one whose
+ * record doesn't say.
+ */
+function derivedSlot(inherit: ContextInheritance | undefined): MessageSlotRef | undefined {
+  if (inherit?.mode !== 'shared' || typeof inherit.ownBranch !== 'string') return undefined;
+  const slots = (inherit.derivation as { slots?: { messageNamespace?: unknown } } | undefined)?.slots;
+  const namespace = slots?.messageNamespace;
+  if (namespace !== null && typeof namespace !== 'string') return undefined;
+  return { namespace, branch: inherit.ownBranch };
+}
+
+/**
+ * The own slot a spec or record declares, or, where it declares none (one
+ * written before `ownSlot` existed), the slot it meant: the shared slot for
+ * one that reads that slot with no observe edge on it, which is how a
+ * resident was declared; a shared derivation's slot; else the isolated slot
+ * of its namespace. A subconscious declared its reading of the shared slot
+ * as an observe edge from the start (subconsciousSpec), so it reads as
+ * isolated, as it was opened. An edge on the shared slot here is one that
+ * names neither a slot nor an agent. One that names an agent reads that
+ * agent's slot, which isn't looked up here, so a spec reads as the same
+ * record does when it is restored, where that agent's record may not be
+ * loaded yet.
+ */
+function resolveOwnSlot(declared: {
+  ownSlot?: MessageSlotRef;
+  readsSharedSlot?: boolean;
+  observes?: ObserveEdge[];
+  inherit?: ContextInheritance;
+  namespace?: string;
+}): MessageSlotRef | undefined {
+  const own = declared.ownSlot;
+  if (own) return { namespace: own.namespace, ...(own.branch !== undefined ? { branch: own.branch } : {}) };
+  const derived = derivedSlot(declared.inherit);
+  if (derived) return derived;
+  if (declared.readsSharedSlot === true && !(declared.observes ?? []).some((edge) => sameSlot(observedSlot(edge), RESIDENTS_SLOT))) {
+    return { namespace: null };
+  }
+  return typeof declared.namespace === 'string' ? { namespace: declared.namespace } : undefined;
+}
+
+/** What a record's deprecated `readsSharedSlot` says: it owns the residents' slot or observes it. */
+function readsResidentsSlot(
+  ownSlot: MessageSlotRef | undefined,
+  observes: ObserveEdge[],
+  ownSlotOf: (agent: AgentName) => MessageSlotRef | undefined,
+): boolean {
+  return sameSlot(ownSlot, RESIDENTS_SLOT) || observes.some((edge) => sameSlot(observedSlot(edge, ownSlotOf), RESIDENTS_SLOT));
+}
+
+/**
+ * A restored record with its own slot: one written before `ownSlot` existed
+ * gets the slot its `readsSharedSlot`, observe edges, inheritance and
+ * namespace meant (resolveOwnSlot). Its `readsSharedSlot` is kept as written.
+ */
+function withOwnSlot(record: AgentRecord): AgentRecord {
+  if (record.ownSlot !== undefined) return record;
+  const ownSlot = resolveOwnSlot({
+    readsSharedSlot: record.readsSharedSlot,
+    observes: record.relationships?.observes,
+    inherit: record.inherit,
+    namespace: record.namespace,
+  });
+  if (ownSlot) record.ownSlot = ownSlot;
+  return record;
+}
+
 export class AgentRegistry {
   private readonly live = new Map<AgentName, AgentRecord>();
   /** Ended records, oldest first. */
@@ -128,19 +234,25 @@ export class AgentRegistry {
    * spawner's orphan, as if it had been live when the spawner ended.
    * `after` is the incarnation a resumption continues from: the new one is
    * past it, since the counter of a name that aged out of memory isn't kept.
+   * `declaredWith` names the agents declared with this one, such as a
+   * configuration's residents, which register one after another: an observe
+   * edge may name one of them before it is registered (two residents may
+   * observe each other). The edge reads that agent's slot once it is.
    */
-  register(spec: AgentSpec, options: { resume?: boolean; after?: number } = {}): AgentRecord {
+  register(spec: AgentSpec, options: RegisterOptions = {}): AgentRecord {
     return this.requested(() => this.registerUnguarded(spec, options));
   }
 
-  private registerUnguarded(spec: AgentSpec, options: { resume?: boolean; after?: number } = {}): AgentRecord {
-    this.validate(spec, options.resume === true);
+  private registerUnguarded(spec: AgentSpec, options: RegisterOptions = {}): AgentRecord {
+    this.validate(spec, options.resume === true, options.declaredWith ?? []);
     const previous = this.awaiting.get(spec.name);
     this.awaiting.delete(spec.name);
 
     const incarnation = Math.max(this.incarnations.get(spec.name) ?? 0, options.after ?? 0) + 1;
     this.incarnations.set(spec.name, incarnation);
 
+    const observes = (spec.observes ?? []).map((edge) => ({ ...edge }));
+    const ownSlot = resolveOwnSlot({ ...spec, observes });
     const record: AgentRecord = {
       name: spec.name,
       kind: spec.kind,
@@ -152,7 +264,7 @@ export class AgentRegistry {
       onParentEnd: spec.onParentEnd ?? 'orphan',
       relationships: {
         ...(spec.spawnedBy ? { spawnedBy: spec.spawnedBy } : {}),
-        observes: (spec.observes ?? []).map((edge) => ({ ...edge })),
+        observes,
         // Explicit message paths accumulate over an identity's life.
         messagePeers: previous ? [...previous.relationships.messagePeers] : [],
         ...(spec.resultTo ? { resultTo: { ...spec.resultTo } } : {}),
@@ -161,7 +273,9 @@ export class AgentRegistry {
       ...(spec.selfParticipants?.length ? { selfParticipants: [...spec.selfParticipants] } : {}),
       ...(spec.presentAs ? { presentAs: spec.presentAs } : {}),
       ...(spec.homeChannel ? { homeChannel: { serverId: spec.homeChannel.serverId, channelId: spec.homeChannel.channelId } } : {}),
-      readsSharedSlot: spec.readsSharedSlot ?? false,
+      ...(ownSlot ? { ownSlot } : {}),
+      // Kept for readers of the record from before the split: derived from it.
+      readsSharedSlot: readsResidentsSlot(ownSlot, observes, (name) => this.recordedSlotOf(name)),
       ...(spec.namespace ? { namespace: spec.namespace } : {}),
       ...(spec.metadata ? { metadata: clone(spec.metadata) } : {}),
       createdAt: previous?.createdAt ?? this.now(),
@@ -185,7 +299,7 @@ export class AgentRegistry {
     return record;
   }
 
-  private validate(spec: AgentSpec, resume = false): void {
+  private validate(spec: AgentSpec, resume = false, declaredWith: readonly AgentName[] = []): void {
     const fail = (problem: string): never => {
       throw new AgentSpecError(spec.name || '(unnamed)', problem);
     };
@@ -233,7 +347,7 @@ export class AgentRegistry {
       fail(`context source "${spec.inherit.from}" is not a registered agent`);
     }
     for (const edge of spec.observes ?? []) {
-      if (edge.agent !== undefined && !this.live.has(edge.agent)) {
+      if (edge.agent !== undefined && !this.live.has(edge.agent) && !declaredWith.includes(edge.agent)) {
         fail(`observed agent "${edge.agent}" is not a registered agent`);
       }
     }
@@ -265,7 +379,9 @@ export class AgentRegistry {
     for (const { ended } of this.interruptedPending.values()) {
       if (ended.name === name && (!newest || ended.incarnation > newest.incarnation)) newest = ended;
     }
-    return newest ?? this.findEnded?.(name);
+    if (newest) return newest;
+    const logged = this.findEnded?.(name);
+    return logged && withOwnSlot(clone(logged));
   }
 
   /** Flat list of agents — the discovery surface. Ended ones on request. */
@@ -322,13 +438,63 @@ export class AgentRegistry {
     return this.live.get(name)?.roles.ownsProviderScheduling === true;
   }
 
-  /** Agents reading the residents' shared message slot. */
+  /**
+   * Agents reading the residents' shared message slot.
+   *
+   * @deprecated Use `readersOf(RESIDENTS_SLOT)`, or `slotOwners` and
+   * `observersOf` where owning and observing differ.
+   */
   sharedSlotReaders(): AgentName[] {
     return this.namesWhere((r) => r.readsSharedSlot);
   }
 
+  /** @deprecated Use `ownSlotOf` and `observersOf`. */
   readsSharedSlot(name: AgentName): boolean {
     return this.live.get(name)?.readsSharedSlot === true;
+  }
+
+  /** The slot a live agent's own rows are stored in, if it names one. */
+  ownSlotOf(name: AgentName): MessageSlotRef | undefined {
+    const slot = this.live.get(name)?.ownSlot;
+    return slot ? { ...slot } : undefined;
+  }
+
+  /** Live agents whose own rows are stored in `slot`, in registration order. */
+  slotOwners(slot: MessageSlotRef): AgentName[] {
+    return this.namesWhere((r) => sameSlot(r.ownSlot, slot));
+  }
+
+  /**
+   * The slot an observe edge reads (observedSlot): an edge that names an
+   * agent and no slot reads that agent's own slot, as its record names it,
+   * the live one, else the one awaiting re-declaration, else its newest
+   * ended one, so an edge on an agent that ended still reads the slot it
+   * read. Undefined for an agent the registry doesn't know.
+   */
+  observedSlotOf(edge: ObserveEdge): MessageSlotRef | undefined {
+    return observedSlot(edge, (name) => this.recordedSlotOf(name));
+  }
+
+  /**
+   * Live agents that read `slot` through an observe edge, in registration
+   * order. With `held`, only those whose edge shows held (policy-diverted)
+   * traffic.
+   */
+  observersOf(slot: MessageSlotRef, options: { held?: boolean } = {}): AgentName[] {
+    return this.namesWhere((r) => r.relationships.observes.some(
+      (edge) => sameSlot(this.observedSlotOf(edge), slot) && (!options.held || edge.includeHeld === true),
+    ));
+  }
+
+  /** Every live agent that reads `slot`, as its own or through an observe edge, in registration order. */
+  readersOf(slot: MessageSlotRef): AgentName[] {
+    return this.namesWhere((r) => sameSlot(r.ownSlot, slot)
+      || r.relationships.observes.some((edge) => sameSlot(this.observedSlotOf(edge), slot)));
+  }
+
+  /** The own slot an agent's record names: live, else awaiting re-declaration, else its newest ended record. */
+  private recordedSlotOf(name: AgentName): MessageSlotRef | undefined {
+    return (this.live.get(name) ?? this.awaiting.get(name) ?? this.inspect(name))?.ownSlot;
   }
 
   /** The channel an agent is bound to, if it has one. */
@@ -598,7 +764,7 @@ export class AgentRegistry {
   restore(snapshot: RegistrySnapshot | null | undefined, endedHistory: AgentRecord[] = []): RestoreOutcome {
     const interrupted: AgentRecord[] = [];
     for (const raw of endedHistory.slice(-this.endedRetention)) {
-      if (raw && typeof raw === 'object' && raw.ended) this.ended.push(clone(raw));
+      if (raw && typeof raw === 'object' && raw.ended) this.ended.push(withOwnSlot(clone(raw)));
     }
     if (!snapshot) return { interrupted };
     if (snapshot.version !== 1) {
@@ -623,7 +789,7 @@ export class AgentRegistry {
     const endedKeys = new Set(this.ended.map((record) => `${record.name}#${record.incarnation}`));
     let dropped = false;
     for (const raw of snapshot.records) {
-      const record = clone(raw);
+      const record = withOwnSlot(clone(raw));
       if (record.ended) continue; // history lives in the ended log
       if (record.lifetime.kind === 'persistent') {
         this.awaiting.set(record.name, record);

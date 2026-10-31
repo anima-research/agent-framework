@@ -317,13 +317,18 @@ describe('Dendrite lifecycle', () => {
     assert.equal(landed[0]!.text, 'the answer is 42');
     const stamp = landed[0]!.metadata.dendrite as Record<string, unknown>;
     assert.equal(typeof stamp.producedAt, 'number', 'when it was produced, apart from when it is read');
+    // The stamp names its recipient too (`to`, #291): in the residents'
+    // shared slot the recipient's store holds every resident's mail.
     assert.deepEqual({ ...stamp, producedAt: undefined }, {
       mailId: delivery.mailId,
       kind: 'result',
       from: { agent: 'fork-1', incarnation: 1 },
+      to: 'oren',
       causedBy: ['task-7'],
       producedAt: undefined,
     });
+    assert.deepEqual(landed[0]!.metadata.audience, ['oren'], 'stamped for its recipient');
+    assert.equal(landed[0]!.metadata.ownRowOf, undefined, 'and as nobody\'s own row: the sender\'s words, meant for oren');
     assert.deepEqual(framework.listHeldMail(), [], 'a delivered result is no longer held');
     // (Co-residents share one message slot today, so mira can read it too;
     // what the route decides is who it is addressed to and who is woken.)
@@ -371,10 +376,12 @@ describe('Dendrite lifecycle', () => {
     for (const fact of ['fork-1', 'task-fork', 'your weights', 'copy of your context', 'returns to you', 'it ends when its task does (idle 10 min)', 'orphaned']) {
       assert.ok(line.text.includes(fact), `the notice names ${JSON.stringify(fact)}: ${line.text}`);
     }
+    // A lifecycle notice's detail names who it is for (`to`, #291), as mail's does.
     assert.deepEqual(line.metadata.dendrite, {
       event: 'derived', agent: 'fork-1', kind: 'task-fork', incarnation: 1, model: 'test-model',
       inherit: { from: 'oren', mode: 'copy' }, resultTo: { to: 'oren', as: 'message' },
       lifetime: { kind: 'task', idleTimeoutMs: 600_000 },
+      to: 'oren',
     });
     assert.ok(
       !fork.contextManager.getAllMessages().some((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'agent-lifecycle'),
@@ -770,6 +777,31 @@ describe('Dendrite restart', () => {
     return framework;
   }
 
+  /** The wakes a boot asked for, as [agent, reason, source]. */
+  const wakesOf = (framework: AgentFramework): string[][] =>
+    (framework as unknown as { pendingRequests: Array<{ agentName: string; reason: string; source: string }> })
+      .pendingRequests.map((r) => [r.agentName, r.reason, r.source]);
+
+  /** Put mira in a turn that blocks on a tool, until the test is done with it. */
+  async function miraMidTurn(framework: AgentFramework, gates: GateModule): Promise<void> {
+    membrane.script('mira', waitCall('mira-busy'), say('mira done'));
+    (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+      agentName: 'mira', reason: 'test', source: 'test', timestamp: Date.now(),
+    });
+    await until(() => gates.entered.has('mira-busy'), 'mira to be mid-turn');
+  }
+
+  /** Start `framework` and wait for a request of mira's that carries `text`. */
+  async function miraReads(framework: AgentFramework, text: string): Promise<void> {
+    const before = membrane.callsFor('mira').length;
+    framework.start();
+    await until(
+      () => membrane.callsFor('mira').slice(before).some((call) => JSON.stringify(call).includes(text)),
+      `a request of mira's carrying ${JSON.stringify(text)}`,
+    );
+    await until(() => textsIn(framework, 'mira').some((m) => m.text === 'read it'), "mira's turn to end");
+  }
+
   async function blockedJob(framework: AgentFramework, gates: GateModule, name: string, spec: Omit<AgentSpec, 'name'>) {
     membrane.script(name, waitCall(name), say(`${name} done`));
     const { agent, contextManager } = await framework.createEphemeralAgent(
@@ -877,34 +909,35 @@ describe('Dendrite restart', () => {
     assert.deepEqual((landed[0]!.metadata.dendrite as { from: unknown }).from, { agent: 'job', incarnation: 2 });
   });
 
-  it('delivers a result held across a crash exactly once', async () => {
+  // Ported for #291: mira is mid-turn when the result arrives, and its
+  // message is stored at once, out of her window until her turn's end. This
+  // test once had it deferred in memory, held mail until a boundary stored
+  // it, the window in which a crash would have lost it; now no such window
+  // is left, and the crash below still finds it delivered once. Its mail is
+  // released as it is stored, so the next boot has nothing to deliver: the
+  // wake the delivery asked for, lost with the process, is asked again for
+  // the stored result still out of her window (review2 J-AF8, whose probe
+  // found her never woken for it).
+  it('delivers a result to a recipient mid-turn at once, out of her window, and exactly once across a crash', async () => {
     const gates1 = new GateModule();
     const first = await process(gates1);
     first.start();
     await blockedJob(first, gates1, 'job', workerSpec('job', { spawnedBy: 'mira', resultTo: { to: 'mira', as: 'message' } }));
-
-    // mira is mid-turn when the result arrives, so its message is deferred
-    // in memory — exactly the window in which a crash would lose it.
-    membrane.script('mira', waitCall('mira-busy'), say('mira done'));
-    (first as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
-      agentName: 'mira', reason: 'test', source: 'test', timestamp: Date.now(),
-    });
-    await until(() => gates1.entered.has('mira-busy'), 'mira to be mid-turn');
+    await miraMidTurn(first, gates1);
 
     const traces: TraceEvent[] = [];
     first.onTrace((event) => traces.push(event));
     const delivery = first.deliverAgentResult('job', [{ type: 'text', text: 'survives the crash' }]);
-    assert.equal(delivery.delivered, true, 'queued for mira');
-    assert.equal(first.listHeldMail().length, 1, 'still held: the message has not entered the store');
-    // Published is not delivered: queued for a boundary is a deferral.
+    assert.equal(delivery.delivered, true, 'delivered to mira');
+    assert.equal(first.listHeldMail().length, 0, 'released: the message has entered the store');
     assert.deepEqual(
       traces.filter((t) => t.type.startsWith('dendrite:mail-')).map((t) => t.type),
-      ['dendrite:mail-deferred'],
+      ['dendrite:mail-delivered'],
     );
-    assert.equal(
-      textsIn(first, 'mira').some((m) => m.metadata.kind === 'agent-result'),
-      false,
-    );
+    const stored = first.getAgent('mira')!.getContextManager().getAllMessages()
+      .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'agent-result');
+    assert.equal(stored.length, 1, 'stored while her turn runs');
+    assert.equal(first.getAgent('mira')!.getContextManager().ordinalOf(stored[0]!.id), undefined, 'out of her window until it ends');
 
     const second = await process(new GateModule());
     const results = (framework: AgentFramework) =>
@@ -918,8 +951,93 @@ describe('Dendrite restart', () => {
     assert.deepEqual(second.listHeldMail(), []);
     // The job handed its result over before the crash: no "ended without a result" notice.
     assert.equal(textsIn(second, 'mira').some((m) => m.metadata.kind === 'agent-lifecycle'), false);
+    assert.deepEqual(wakesOf(second), [['mira', 'agent-result:job', 'dendrite']], 'the wake the crash lost is asked again');
+    membrane.script('mira', say('read it'));
+    await miraReads(second, 'survives the crash');
 
     const third = await process(new GateModule());
     assert.equal(results(third).length, 1, 'never delivered a second time');
+    assert.deepEqual(wakesOf(third), [], 'in her window since: no wake a second time');
+  });
+
+  // The same for an agent's message: mail of either kind is released as it
+  // is stored, and a boot wakes its recipient for it while it is out of her
+  // window.
+  it('wakes a recipient after a crash for a message that reached her mid-turn', async () => {
+    const gates1 = new GateModule();
+    const first = await process(gates1);
+    first.start();
+    // A sender whose result goes back as a tool result: the restart that
+    // ends it tells mira nothing of its own.
+    await blockedJob(first, gates1, 'job', workerSpec('job', { spawnedBy: 'mira', resultTo: { to: 'mira', as: 'tool-result' } }));
+    await miraMidTurn(first, gates1);
+    const sent = first.sendAgentMessage('job', 'mira', [{ type: 'text', text: 'a word mid-turn' }]);
+    assert.equal(sent.delivered, true);
+    assert.equal(first.listHeldMail().length, 0, 'released: the message has entered the store');
+    const cm1 = first.getAgent('mira')!.getContextManager();
+    const [row] = cm1.getAllMessages().filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'agent-message');
+    assert.equal(cm1.ordinalOf(row!.id), undefined, 'out of her window while her turn runs');
+
+    const second = await process(new GateModule());
+    assert.equal(textsIn(second, 'mira').filter((m) => m.metadata.kind === 'agent-message').length, 1);
+    assert.equal(textsIn(second, 'mira').some((m) => m.metadata.kind === 'agent-lifecycle'), false);
+    assert.deepEqual(wakesOf(second), [['mira', 'agent-message:job', 'dendrite']]);
+    membrane.script('mira', say('read it'));
+    await miraReads(second, 'a word mid-turn');
+  });
+
+  // A result delivered while mira had no turn alive was presented to her
+  // window at once, and its wake ran then: a crash after that leaves the
+  // boot nothing to wake her for.
+  it('asks no wake at boot for a result already in its recipient\'s window before the crash', async () => {
+    const gates1 = new GateModule();
+    const first = await process(gates1);
+    first.start();
+    await blockedJob(first, gates1, 'job', workerSpec('job', { spawnedBy: 'mira', resultTo: { to: 'mira', as: 'message' } }));
+    membrane.script('mira', say('read it'));
+    const before = membrane.callsFor('mira').length;
+    first.deliverAgentResult('job', [{ type: 'text', text: 'read before the crash' }]);
+    const cm1 = first.getAgent('mira')!.getContextManager();
+    const [row] = cm1.getAllMessages().filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'agent-result');
+    assert.notEqual(cm1.ordinalOf(row!.id), undefined, 'presented at rest');
+    await until(
+      () => membrane.callsFor('mira').slice(before).some((call) => JSON.stringify(call).includes('read before the crash')),
+      'mira to be woken for it',
+    );
+    await until(() => textsIn(first, 'mira').some((m) => m.text === 'read it'), "mira's turn to end");
+
+    const second = await process(new GateModule());
+    assert.deepEqual(wakesOf(second), [], 'no second wake for it');
+    assert.equal(textsIn(second, 'mira').filter((m) => m.metadata.kind === 'agent-result').length, 1);
+  });
+
+  it("passes to the primary, once, a module's write for a job that the crash ended before its window held it", async () => {
+    const gates1 = new GateModule();
+    const first = await process(gates1);
+    first.start();
+    membrane.script('job', waitCall('job-1'), waitCall('job-2'), say('job done'));
+    const { agent, contextManager } = await first.createEphemeralAgent(
+      { name: 'job', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all' },
+      workerSpec('job', { spawnedBy: 'mira', resultTo: { to: 'mira', as: 'tool-result' } }),
+    );
+    contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+    first.runEphemeralToCompletion(agent, contextManager).catch(() => { /* abandoned */ });
+    const write = (text: string) => (first as unknown as {
+      addModuleMessage(participant: string, content: Array<{ type: 'text'; text: string }>, metadata?: Record<string, unknown>, opts?: { forAgent?: string }): string;
+    }).addModuleMessage('user', [{ type: 'text', text }], { kind: 'test-note' }, { forAgent: 'job' });
+    await until(() => gates1.entered.has('job-1'), 'the job to block in its first call');
+    const read = write('READ-BY-THE-JOB');
+    gates1.release('job-1');
+    await until(() => gates1.entered.has('job-2'), 'the job to block in its second call');
+    const unread = write('NEVER-READ-BY-THE-JOB');
+    assert.equal(contextManager.windowStatusOf(read), 'in', 'the first write entered the window at the tool boundary');
+    assert.equal(contextManager.windowStatusOf(unread), 'out', 'the second is stored and out of the window');
+
+    const told = (framework: AgentFramework, text: string) => textsIn(framework, 'mira').filter((m) => m.text === text).length;
+    const second = await process(new GateModule());
+    assert.equal(told(second, 'NEVER-READ-BY-THE-JOB'), 1, 'the write its window never held goes to the primary');
+    assert.equal(told(second, 'READ-BY-THE-JOB'), 0, 'one its window held stays with it');
+    const third = await process(new GateModule());
+    assert.equal(told(third, 'NEVER-READ-BY-THE-JOB'), 1, 'and goes once');
   });
 });

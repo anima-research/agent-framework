@@ -148,7 +148,6 @@ test("two servers' tune-outs of one channel id are named apart, and cancel_tuneo
     requestInference: (agentName: string, reason: string) => { wakes.push(`${agentName}: ${reason}`); },
     primaryName: () => 'scout',
     getStoredMessages: () => [],
-    getDeferredMessages: () => [],
     emitTrace: () => {},
   } as never);
   const already = coordinator.enter('b', 'general', {}, 'agent-tool');
@@ -202,7 +201,6 @@ test("cancel_tuneout inside the subconscious's turn reads the id of the turn's o
     addMessage: () => {},
     requestInference: () => {},
     getStoredMessages: () => [],
-    getDeferredMessages: () => [],
     emitTrace: () => {},
   } as never);
   const own = [{ serverId: 'b', channelId: 'general' }];

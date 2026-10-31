@@ -1,8 +1,9 @@
 /**
  * The all-except scope's own rules, on the coordinator alone: exhausting the
  * wake budget pauses the reader rather than ending the hold (#232 §3.2, the
- * decision carried from the issue), and a scope whose deadline passed while
- * the process was down is released at resume.
+ * decision carried from the issue), a scope whose deadline passed while
+ * the process was down is released at resume, and a message a surgery's hold
+ * keeps in memory is counted and released with those stored (#232 gap 7).
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -10,7 +11,14 @@ import { TuneOutCoordinator, type TuneOutFrameworkHooks } from '../src/tune-out/
 import type { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 
-function harness(stored: Array<{ participant: string; content: Array<{ type: string; text?: string }>; metadata: Record<string, unknown> }> = []) {
+type Held = { id?: string; participant: string; content: Array<{ type: string; text?: string }>; metadata?: Record<string, unknown> };
+
+/** `stored`: the primary's stored messages; `kept`: the writes a surgery's
+ *  hold keeps in memory; `writesHeld`: the framework's hook, which a
+ *  surgery's hold makes true (left out, no write is taken to be held). */
+function harness(held: { stored?: Held[]; kept?: Held[]; writesHeld?: () => boolean } = {}) {
+  const stored = held.stored ?? [];
+  const kept = held.kept ?? [];
   const state = new Map<string, unknown>();
   const wakes: string[] = [];
   const messages: Array<{ participant: string; text: string; forAgent?: string }> = [];
@@ -51,12 +59,14 @@ function harness(stored: Array<{ participant: string; content: Array<{ type: str
     subconsciousName: () => 'Subconscious',
     primaryName: () => 'scout',
     getStoredMessages: () => stored,
+    getSurgeryHeldMessages: () => kept,
     currentSequence: () => 1,
-    setSubconsciousAnchor: (sequence: number) => { anchors.push(sequence); },
+    setSubconsciousAnchor: (start: { sequence: number }) => { anchors.push(start.sequence); },
     isForkBound: () => false,
     isPrivilegedAuthor: () => false,
     allowChannelSpeech: () => false,
     emitTrace: (e: { type: string }) => { traces.push(e.type); },
+    ...(held.writesHeld ? { writesHeld: held.writesHeld } : {}),
   } as unknown as TuneOutFrameworkHooks;
   const make = () => new TuneOutCoordinator(registry, servers, hooks);
   return { make, state, wakes, messages, traces, fail, stored, anchors };
@@ -80,8 +90,8 @@ describe('all-except scope on the coordinator', () => {
   });
 
   it("two servers' channels that share an id are counted and released apart", () => {
-    const stored: Parameters<typeof harness>[0] = [];
-    const h = harness(stored);
+    const stored: Held[] = [];
+    const h = harness({ stored });
     const c = h.make();
     const r = c.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120, backlogCap: 1 }, 'agent-tool');
     assert.ok(r.ok);
@@ -169,6 +179,61 @@ describe('all-except scope on the coordinator', () => {
     second.stop();
   });
 
+  // Review 2, J-AF29: the hold's writes are stored only at its release, so
+  // the scope read the record alone and left them out of its counts and its
+  // release. A check during the hold counts them. A framework cancel waits
+  // for the release (writesHeld, the next test); one goes on during the
+  // hold only where asking whether writes are held throws, and it is that
+  // release that reads the writes the hold keeps beside those stored.
+  it("counts a held message a surgery's hold keeps in memory, and a cancel that goes on during the hold, asking whether writes are held having thrown, releases it after those stored", () => {
+    const stored: Held[] = [];
+    const kept: Held[] = [];
+    const h = harness({ stored, kept, writesHeld: () => { throw new Error('the hold could not be asked about'); } });
+    const c = h.make();
+    const r = c.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120, backlogCap: 10 }, 'agent-tool');
+    assert.ok(r.ok);
+    const epochId = c.getAllExcept()!.params.epochId;
+    const message = (t: string): Held => ({
+      participant: 'user', content: [{ type: 'text', text: t }],
+      metadata: { tuneOut: { epochId }, channelId: 'noisy', serverId: 'disc', author: { name: 'antra' } },
+    });
+    stored.push(message('N1 stored'));
+    kept.push(message('N2 kept by the hold'));
+    assert.deepEqual(c.check().allExcept?.held, { noisy: 2 }, 'a check counts the kept one with the stored one');
+    assert.ok(c.cancelAllExcept('duration', 'duration elapsed').ok);
+    const release = h.messages.find((m) => /all channels except work released/.test(m.text))!.text;
+    assert.match(release, /2 messages held in 1 channel/, 'the release counts it');
+    assert.match(release, /messages=2>\nantra: N1 stored\nantra: N2 kept by the hold/, 'and lists it, after the stored one');
+    c.stop();
+  });
+
+  it("a cancel of the scope asked for during a surgery's hold waits, the hold in force, and at the release counts and lists what the hold kept, stored by then", () => {
+    const stored: Held[] = [];
+    const kept: Held[] = [];
+    let held = true;
+    const h = harness({ stored, kept, writesHeld: () => held });
+    const c = h.make();
+    assert.ok(c.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120, backlogCap: 10 }, 'agent-tool').ok);
+    const epochId = c.getAllExcept()!.params.epochId;
+    const message = (t: string): Held => ({
+      participant: 'user', content: [{ type: 'text', text: t }],
+      metadata: { tuneOut: { epochId }, channelId: 'noisy', serverId: 'disc', author: { name: 'antra' } },
+    });
+    stored.push(message('N1 stored'));
+    kept.push(message('N2 kept by the hold'));
+    assert.deepEqual(c.cancelAllExcept('duration', 'duration elapsed'), { ok: true, deferred: true }, 'it waits');
+    assert.ok(c.getAllExcept(), 'the hold stays in force');
+    assert.ok(!h.messages.some((m) => /all channels except work released/.test(m.text)), 'and nothing is released during the surgery');
+    // The release stores what the hold kept, then runs the cancels that waited.
+    held = false;
+    stored.push(...kept.splice(0));
+    c.runDeferredCancels();
+    assert.equal(c.getAllExcept(), null, 'it ends at the release');
+    const release = h.messages.find((m) => /all channels except work released/.test(m.text))!.text;
+    assert.match(release, /messages=2>\nantra: N1 stored\nantra: N2 kept by the hold/, 'it lists the kept message, stored by then, after the stored one');
+    c.stop();
+  });
+
   it('a stored hold that can\'t be read is not taken for no hold, and the next read tries again', () => {
     const h = harness();
     const first = h.make();
@@ -236,8 +301,8 @@ describe('all-except scope on the coordinator', () => {
   });
 
   it('a message held while the clear keeps failing reaches the resident once, and every message the first release showed is shown once', () => {
-    const stored: Parameters<typeof harness>[0] = [];
-    const h = harness(stored);
+    const stored: Held[] = [];
+    const h = harness({ stored });
     const c = h.make();
     assert.ok(c.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool').ok);
     const epochId = c.getAllExcept()!.params.epochId;
@@ -266,8 +331,8 @@ describe('all-except scope on the coordinator', () => {
   });
 
   it('after a restart between a written release and a failed clear, the next release shows nothing a second time and clears the hold', () => {
-    const stored: Parameters<typeof harness>[0] = [];
-    const h = harness(stored);
+    const stored: Held[] = [];
+    const h = harness({ stored });
     const before = h.make();
     assert.ok(before.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool').ok);
     const epochId = before.getAllExcept()!.params.epochId;
@@ -276,7 +341,7 @@ describe('all-except scope on the coordinator', () => {
       participant: 'user',
       content: [{ type: 'text', text: 'held before the restart' }],
       metadata: { author: { name: 'Bo' }, serverId: 'disc', channelId: 'noisy', tuneOut: { epochId } },
-    } as NonNullable<Parameters<typeof harness>[0]>[number]);
+    });
     h.fail.write = true;
     assert.throws(() => before.cancelAllExcept('duration', 'duration elapsed'), /store write failed/);
     before.stop();
@@ -291,8 +356,8 @@ describe('all-except scope on the coordinator', () => {
   });
 
   it("the release's record says how many held messages it covered and how many its dumps left out", () => {
-    const stored: Parameters<typeof harness>[0] = [];
-    const h = harness(stored);
+    const stored: Held[] = [];
+    const h = harness({ stored });
     const c = h.make();
     assert.ok(c.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120, backlogCap: 1 }, 'agent-tool').ok);
     const epochId = c.getAllExcept()!.params.epochId;
@@ -302,11 +367,11 @@ describe('all-except scope on the coordinator', () => {
         participant: 'user',
         content: [{ type: 'text', text: `held ${i}` }],
         metadata: { author: { name: 'Bo' }, serverId: 'disc', channelId, tuneOut: { epochId } },
-      } as NonNullable<Parameters<typeof harness>[0]>[number]);
+      });
     }
     assert.ok(c.cancelAllExcept('duration', 'duration elapsed').ok);
-    const release = stored.find((m) => m.metadata.kind === 'tune-out-cancel');
-    const record = release?.metadata.released as { total: number; truncated: number } | undefined;
+    const release = stored.find((m) => m.metadata?.kind === 'tune-out-cancel');
+    const record = release?.metadata?.released as { total: number; truncated: number } | undefined;
     assert.deepEqual({ total: record?.total, truncated: record?.truncated }, { total: 4, truncated: 2 });
     c.stop();
   });

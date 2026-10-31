@@ -19,7 +19,6 @@ export type Internals = {
     channels: Map<string, unknown>;
   };
   eventGate: { debounceTimers: Map<string, unknown> } | null;
-  deferredMessages: Array<{ content: Array<{ type: string; text?: string }>; metadata?: Record<string, unknown> }>;
   pendingRequests: Array<{ agentName: string; reason: string }>;
   handleTuneOutTool(agentName: string, input: Record<string, unknown>): { success: boolean; error?: string; data?: unknown };
 };
@@ -33,6 +32,9 @@ export const stored = (f: Fixture, agent = 'agent'): Stored[] =>
   f.framework.getAgent(agent)!.getContextManager().getAllMessages() as unknown as Stored[];
 export const held = (m: Stored): boolean => !!(m.metadata as { tuneOut?: unknown } | undefined)?.tuneOut;
 export const has = (f: Fixture, text: string) => stored(f).some((m) => textOf(m).includes(text));
+/** Whether the agent's window holds a row with `text` (#291: a row is stored at once, and enters the window at a point). */
+export const inWindow = (f: Fixture, text: string, agent = 'agent'): boolean =>
+  (f.framework.getAgent(agent)!.getContextManager().getPresentedMessages() as unknown as Stored[]).some((m) => textOf(m).includes(text));
 export const find = (f: Fixture, text: string) => stored(f).find((m) => textOf(m).includes(text))!;
 export const AMBIENT = ['chat:ambient', 'chat:from-human'];
 export const MENTION = ['chat:mention', 'chat:addressed', 'chat:from-human'];
