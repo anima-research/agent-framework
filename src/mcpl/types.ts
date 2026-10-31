@@ -22,7 +22,8 @@
 export interface JsonRpcRequest {
   jsonrpc: '2.0';
   method: string;
-  id?: string | number;
+  /** A request's id; null is allowed, though JSON-RPC 2.0 discourages it. */
+  id?: string | number | null;
   params?: Record<string, unknown>;
 }
 
@@ -31,7 +32,8 @@ export interface JsonRpcRequest {
  */
 export interface JsonRpcResponse {
   jsonrpc: '2.0';
-  id: string | number;
+  /** The request's id, or null when the request's own couldn't be read. */
+  id: string | number | null;
   result?: unknown;
   error?: JsonRpcError;
 }
