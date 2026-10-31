@@ -26,15 +26,17 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { stableHash } from '../stable-hash.js';
+import { firstCatchAll, ruleDecides } from './rule-scope.js';
 import type { GateBehavior, GateDecision, GatePolicy } from './types.js';
 
 /**
  * Tags that say an event is addressed to the agent or waiting on it (MCPL
- * RFC-001 `chat:addressed`, RFC-014 `surface:turn`/`alert`/`invite`). The first
- * undecided event carrying one wakes the agent to decide; any other undecided
- * event leaves its offer for the agent's next turn.
+ * RFC-001 `chat:addressed`, RFC-014 `surface:turn`/`surface:alert`; not
+ * `surface:invite`, which only suggests). The first undecided event carrying
+ * one wakes the agent to decide; any other undecided event leaves its offer
+ * for the agent's next turn.
  */
-export const ATTENTION_TAGS: readonly string[] = ['chat:addressed', 'surface:turn', 'surface:alert', 'surface:invite'];
+export const ATTENTION_TAGS: readonly string[] = ['chat:addressed', 'surface:turn', 'surface:alert'];
 
 /** Accepted rules are named `suggested:<server>:<n>`: the name is the attribution. */
 export const SUGGESTED_RULE_PREFIX = 'suggested:';
@@ -171,13 +173,7 @@ export function offerFor(server: string, declared: Record<string, { tagOntology?
   return { server, digest, rules, tagDescriptions, untranslated };
 }
 
-/** Whether a rule's match is a decision about an event from `server` with these tags: it names the source, a channel, or a tag. */
-export function ruleDecides(policy: GatePolicy): boolean {
-  const m = policy.match ?? {};
-  if (typeof m.source === 'string' && m.source !== '*' && m.source !== '') return true;
-  if (typeof m.channel === 'string' && m.channel !== '*' && m.channel !== '') return true;
-  return (m.tagsAny?.length ?? 0) > 0 || (m.tagsAll?.length ?? 0) > 0;
-}
+export { ruleDecides } from './rule-scope.js';
 
 /**
  * Whether the gate let an event go by without anyone having decided to: it did
@@ -200,16 +196,9 @@ export const carriesAttention = (tags: readonly string[] | undefined): boolean =
  * server's events without deciding about them (a catch-all), so the rules the
  * agent wrote for this server, or for a channel or tags, keep their place
  * before it. Null: there is none; the rule goes last, ahead of the default.
+ * (Accepted rules name their source, so they are never the catch-all.)
  */
-export function placementFor(policies: readonly GatePolicy[]): string | null {
-  for (const p of policies) {
-    if (ruleDecides(p) || p.name.startsWith(SUGGESTED_RULE_PREFIX)) continue;
-    const scope = p.match?.scope;
-    if (scope && !scope.some((s) => s.startsWith('mcpl:'))) continue;
-    return p.name;
-  }
-  return null;
-}
+export const placementFor = (policies: readonly GatePolicy[]): string | null => firstCatchAll(policies);
 
 /** The gate rules accepting `rules` of `offer` writes. */
 export function rulesToWrite(offer: ServerOffer, accepted: readonly OfferedRule[]): GatePolicy[] {
@@ -264,6 +253,14 @@ export class WakeDecisions {
    * last offer or decision even when its ontology changed — a server can't
    * buy itself a stream of questions by editing what it declares.
    */
+  /** Whether an offer for `server` could go out at all, before its digest is known: not within the floor of the last one. */
+  mayOfferSoon(server: string, now = Date.now()): boolean {
+    const r = this.records[server];
+    if (!r) return true;
+    const at = Date.parse(r.at);
+    return !Number.isFinite(at) || now - at >= OFFER_FLOOR_MS;
+  }
+
   mayOffer(server: string, digest: string, now = Date.now()): boolean {
     const r = this.records[server];
     if (!r) return true;

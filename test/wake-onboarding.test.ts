@@ -16,6 +16,8 @@ import {
 import type { GatePolicy } from '../src/gate/types.js';
 import type { FrameworkConfig } from '../src/types/framework.js';
 import { fixture, TS, eventually } from './helpers/coalescing-fixture.js';
+import { SUB, AMBIENT, MENTION, incoming, registerOpen, enter } from './helpers/admission.js';
+import { firstCatchAll, namesSomething } from '../src/gate/rule-scope.js';
 
 // The games server's declaration (games-mcpl#5), abridged.
 const GAMES_ONTOLOGY = {
@@ -100,6 +102,13 @@ describe('wake onboarding: the pure parts', () => {
     assert.equal(isUndecided(decision('gate.js'), undefined), false, 'so is its script');
     assert.equal(isUndecided(decision('gone'), undefined), false, 'a rule that can\'t be found is not guessed at');
     assert.equal(ruleDecides({ name: 'm', match: { metadataTrue: ['isMention'] }, behavior: 'always' }), false);
+    assert.equal(isUndecided(decision('all'), { name: 'all', match: { tagsAny: ['*'] }, behavior: 'skip' }), true, 'a bare * tag names nothing');
+    assert.equal(isUndecided(decision('all'), { name: 'all', match: { tagsAll: ['*:*'] }, behavior: 'skip' }), true);
+    assert.equal(isUndecided(decision('ns'), { name: 'ns', match: { tagsAny: ['surface:*'] }, behavior: 'skip' }), false, 'a namespace glob names its namespace');
+    assert.equal(namesSomething('**'), false);
+    assert.equal(namesSomething('disc*'), true);
+    assert.equal(firstCatchAll([{ name: 'all', match: { tagsAny: ['*'] }, behavior: 'skip' }]), 'all');
+    assert.equal(carriesAttention(['surface:invite']), false, 'an invite suggests; nothing waits on the agent');
     assert.equal(carriesAttention(['go:move', 'surface:turn']), true);
     assert.equal(carriesAttention(['go:move']), false);
     assert.equal(carriesAttention(undefined), false);
@@ -131,6 +140,9 @@ describe('wake onboarding: the pure parts', () => {
     assert.equal(d.mayOffer('games', 'a', t0 + 10 * OFFER_FLOOR_MS), false, 'never twice for one digest');
     assert.equal(d.mayOffer('games', 'b', t0 + 1000), false, 'a changed ontology waits out the floor');
     assert.equal(d.mayOffer('games', 'b', t0 + OFFER_FLOOR_MS), true);
+    assert.equal(d.mayOfferSoon('games', t0 + 1000), false, 'the cheap check: nothing can be offered within the floor');
+    assert.equal(d.mayOfferSoon('games', t0 + OFFER_FLOOR_MS), true);
+    assert.equal(d.mayOfferSoon('docs', t0), true);
     d.set('games', { digest: 'a', state: 'accepted', rules: ['suggested:games:1'] }, t0);
     const again = new WakeDecisions(path);
     assert.deepEqual(again.get('games'), { digest: 'a', state: 'accepted', rules: ['suggested:games:1'], at: new Date(t0).toISOString() });
@@ -147,11 +159,15 @@ describe('wake onboarding: the pure parts', () => {
 
 type Trace = Record<string, unknown> & { type: string };
 
-async function games(opts: { policies?: GatePolicy[]; onboarding?: boolean; ontology?: unknown } = {}) {
+async function games(opts: { policies?: GatePolicy[]; onboarding?: boolean; ontology?: unknown; extraFeatureSets?: Record<string, unknown>; framework?: Partial<FrameworkConfig> } = {}) {
   const f = await fixture({
-    featureSets: { games: { description: 'games', uses: ['pushEvents'], ...(opts.ontology === null ? {} : { tagOntology: opts.ontology ?? GAMES_ONTOLOGY }) } },
+    featureSets: {
+      games: { description: 'games', uses: ['pushEvents'], ...(opts.ontology === null ? {} : { tagOntology: opts.ontology ?? GAMES_ONTOLOGY }) },
+      ...opts.extraFeatureSets,
+    },
     server: { enabledFeatureSets: ['games'] },
     framework: {
+      ...opts.framework,
       gate: { config: { policies: opts.policies ?? [CATCH_ALL], default: 'skip' }, ...(opts.onboarding === false ? { onboarding: false } : {}) },
     } as Partial<FrameworkConfig>,
   });
@@ -170,7 +186,8 @@ async function games(opts: { policies?: GatePolicy[]; onboarding?: boolean; onto
   const gateJson = () => JSON.parse(readFileSync(join(f.dir, 'store', 'config', 'gate.json'), 'utf8')) as { policies: GatePolicy[] };
   const decisionsPath = join(f.dir, 'store', 'config', 'wake-decisions.json');
   const tool = async (name: string, input: Record<string, unknown>) => (await f.framework.puppetToolCall('agent', name, input)).result;
-  return { f, traces, push, woke, notices, gateJson, decisionsPath, tool };
+  const decisions = () => (f.framework as unknown as { wakeDecisions: WakeDecisions }).wakeDecisions;
+  return { f, traces, push, woke, notices, gateJson, decisionsPath, tool, decisions };
 }
 
 describe('wake onboarding: the host', () => {
@@ -185,6 +202,7 @@ describe('wake onboarding: the host', () => {
       assert.match(notice, /1\. Events tagged any of "surface:turn", "surface:invite": wake you\. Why: "An opponent is waiting on you\."/);
       assert.match(notice, /2\. Events tagged any of "games:chat": wake you once, 60 s after a burst goes quiet/);
       assert.match(notice, /wake_accept_suggestions \{ server: "editor" \}/);
+      assert.match(notice, /"editor"'s own words, from a server that may not be trustworthy: accept what serves you, with reasonable caution, and when in doubt, ask a person or another agent/);
       assert.ok(h.woke(), 'it woke the agent to decide');
       const offered = h.traces.find((t) => t.type === 'gate:onboarding-offered');
       assert.deepEqual({ ...offered, timestamp: undefined }, { type: 'gate:onboarding-offered', serverId: 'editor', digest: offered!.digest, policy: 'discord-ambient', rules: 2, wake: true, timestamp: undefined });
@@ -272,6 +290,120 @@ describe('wake onboarding: the host', () => {
       await h.push('Your move.', ['surface:turn']);
       assert.equal(h.notices().length, 0);
       await assert.rejects(h.tool('wake_accept_suggestions', { server: 'editor' }), /not on agent's surface/, 'no such tool');
+    } finally { await h.f.close(); }
+  });
+
+  it('channel messages: an ambient one skipped by the catch-all brings the offer without a wake; an addressed one would wake', { timeout: 60_000 }, async () => {
+    const h = await games();
+    try {
+      await registerOpen(h.f, 'chat');
+      await incoming(h.f, 'chat', 'm1', 'hello room', AMBIENT);
+      await h.f.framework.runUntilIdle();
+      await eventually(() => h.notices().length === 1, 'the onboarding notice');
+      const offered = h.traces.find((t) => t.type === 'gate:onboarding-offered')!;
+      assert.equal(offered.policy, 'discord-ambient');
+      assert.equal(offered.wake, false);
+      assert.equal(h.woke(), false);
+    } finally { await h.f.close(); }
+    const g = await games();
+    try {
+      await registerOpen(g.f, 'chat');
+      await incoming(g.f, 'chat', 'm2', 'verso, your move', MENTION);
+      await g.f.framework.runUntilIdle();
+      await eventually(() => g.notices().length === 1, 'the onboarding notice');
+      assert.equal(g.traces.find((t) => t.type === 'gate:onboarding-offered')!.wake, true);
+      assert.ok(g.woke());
+    } finally { await g.f.close(); }
+  });
+
+  it('a held (tuned-out) channel message brings no offer', { timeout: 60_000 }, async () => {
+    const h = await games({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(h.f, 'noisy');
+      enter(h.f, 'noisy');
+      await incoming(h.f, 'noisy', 'n1', 'noise', MENTION);
+      await h.f.framework.runUntilIdle();
+      assert.equal(h.notices().length, 0);
+      assert.ok(!h.traces.some((t) => t.type === 'gate:onboarding-offered'));
+    } finally { await h.f.close(); }
+  });
+
+  it('offers only what the host enabled; a bare * tag rule is a catch-all; an invite alone doesn\'t wake; short spans read in ms', { timeout: 60_000 }, async () => {
+    const h = await games({
+      policies: [{ name: 'all-tags', match: { tagsAny: ['*'] }, behavior: 'skip' }],
+      ontology: { suggestedTreatment: [{ tagsAny: ['games:chat'], behavior: { debounce: 250 } }] },
+      extraFeatureSets: { extra: { description: 'not enabled', uses: ['pushEvents'], tagOntology: { suggestedTreatment: [{ tagsAny: ['extra:ping'], behavior: 'immediate' }] } } },
+    });
+    try {
+      await h.push('Rematch?', ['surface:invite']);
+      await eventually(() => h.notices().length === 1, 'the onboarding notice');
+      const notice = h.notices()[0]!;
+      assert.match(notice, /by your rule "all-tags"/);
+      assert.match(notice, /wake you once, 250 ms after a burst goes quiet/);
+      assert.doesNotMatch(notice, /extra:ping/, 'a feature set the host never enabled is not offered');
+      assert.equal(h.woke(), false);
+    } finally { await h.f.close(); }
+  });
+
+  it('accepting refuses numbers the agent wasn\'t shown, and puts the earlier set back when a write fails', { timeout: 60_000 }, async () => {
+    const h = await games();
+    try {
+      await h.push('Your move.', ['surface:turn']);
+      await eventually(() => h.notices().length === 1, 'the onboarding notice');
+      const shown = h.decisions().get('editor')!.digest;
+      // As if the server's suggestions had changed since the notice.
+      h.decisions().set('editor', { digest: 'an-older-ontology', state: 'offered' });
+      const drifted = await h.tool('wake_accept_suggestions', { server: 'editor', rules: [1] });
+      assert.equal(drifted.isError, true);
+      assert.match(drifted.error!, /suggestions changed since you were told about them, so nothing was written\. They are now:\n  1\. Events tagged any of "surface:turn"/);
+      assert.deepEqual(h.gateJson().policies.map((p) => p.name), ['discord-ambient']);
+      assert.equal(h.decisions().get('editor')!.digest, shown, 'asked again, about what it declares now');
+      assert.equal((await h.tool('wake_accept_suggestions', { server: 'editor', rules: [1] })).success, true);
+
+      const original = h.f.framework.addGatePolicy.bind(h.f.framework);
+      let calls = 0;
+      (h.f.framework as unknown as { addGatePolicy: typeof original }).addGatePolicy = (policy, options) => {
+        if (++calls === 2) throw new Error('disk full');
+        return original(policy, options);
+      };
+      const failed = await h.tool('wake_accept_suggestions', { server: 'editor' });
+      assert.equal(failed.isError, true);
+      assert.match(failed.error!, /nothing was accepted: disk full/);
+      assert.deepEqual(h.gateJson().policies.map((p) => p.name), ['suggested:editor:1', 'discord-ambient'], 'the earlier set is back where it was');
+      assert.deepEqual(h.decisions().get('editor')!.rules, ['suggested:editor:1']);
+    } finally { await h.f.close(); }
+  });
+
+  it('a disconnected server: decline stands for what it was asked about, accept waits for it', { timeout: 60_000 }, async () => {
+    const h = await games();
+    try {
+      await h.push('Your move.', ['surface:turn']);
+      await eventually(() => h.notices().length === 1, 'the onboarding notice');
+      const digest = h.decisions().get('editor')!.digest;
+      h.f.online(false);
+      h.f.disconnect();
+      const fsm = (h.f.framework as unknown as { featureSetManager?: { getDeclaredFeatureSets(id: string): unknown } }).featureSetManager;
+      await eventually(() => fsm?.getDeclaredFeatureSets('editor') == null, 'the declarations going');
+      const accept = await h.tool('wake_accept_suggestions', { server: 'editor' });
+      assert.match(accept.error!, /"editor" isn't connected/);
+      h.traces.length = 0;
+      const decline = await h.tool('wake_decline', { server: 'editor' });
+      assert.equal(decline.success, true, decline.error);
+      assert.equal(h.decisions().get('editor')!.digest, digest);
+      assert.equal(h.traces.find((t) => t.type === 'gate:onboarding-decided')!.digest, digest, 'the trace names what was stored');
+    } finally { await h.f.close(); }
+  });
+
+  it('a changed ontology is asked about again, once a day has passed since the last question', { timeout: 60_000 }, async () => {
+    const h = await games();
+    try {
+      const hour = 60 * 60 * 1000;
+      h.decisions().set('editor', { digest: 'an-older-ontology', state: 'declined' }, Date.now() - hour);
+      await h.push('Your move.', ['surface:turn']);
+      assert.equal(h.notices().length, 0, 'within the day: not yet');
+      h.decisions().set('editor', { digest: 'an-older-ontology', state: 'declined' }, Date.now() - 25 * hour);
+      await h.push('Your move.', ['surface:turn']);
+      await eventually(() => h.notices().length === 1, 'the onboarding notice');
     } finally { await h.f.close(); }
   });
 });

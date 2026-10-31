@@ -16,7 +16,7 @@ import { cutToFit, quotedJson, quotedValue, suppliedValue } from '../supplied-te
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
-import { placementFor } from './wake-onboarding.js';
+import { firstCatchAll } from './rule-scope.js';
 import { canonical, duplicateName, lastRecipePath, noChanges, reconcileLine, reconcileWithRecipe, ruleName, type WrittenConfig } from './recipe-reconcile.js';
 import { closestNames, isNearMiss } from '../closest-names.js';
 import { MAX_TIMER_MS } from '../deadline-timer.js';
@@ -3043,6 +3043,12 @@ export class EventGate {
     return this.config.policies.map((p) => structuredClone(p));
   }
 
+  /** The rule in force by this name (a copy), or undefined. */
+  policyInForce(name: string): GatePolicy | undefined {
+    const p = this.config.policies.find((x) => x.name === name);
+    return p ? structuredClone(p) : undefined;
+  }
+
   /** @internal For `wake_add_rule`'s and `wake_remove_rule`'s refusals; not a host API. */
   ruleNamesForChange(): { names: string[]; note: string } | { refused: string } {
     const edit = this.rulesForChange();
@@ -4691,10 +4697,10 @@ export class EventGate {
       // change as servers connect, with no change to the rules.
       shadowWarnings: this.lintShadows().map(formatShadowWarning),
       ...((): Pick<GateStatus, 'catchAll'> => {
-        const rule = placementFor(this.config.policies);
+        const rule = firstCatchAll(this.config.policies);
         return rule ? { catchAll: {
           rule,
-          note: `${JSON.stringify(rule)} takes MCPL events without naming a server, a channel or a tag, so a server connected later is handled by it until a rule for that server goes ahead of it. Wake onboarding offers such a server's suggestions the first time this lets one of its events go by.`,
+          note: `${JSON.stringify(rule)} takes MCPL events without naming a server, a channel or a tag, so a server connected later is handled by it until a rule for that server goes ahead of it.`,
         } } : {};
       })(),
       totalEvaluations: this.totalEvaluations,
