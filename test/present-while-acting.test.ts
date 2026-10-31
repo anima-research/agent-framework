@@ -222,7 +222,7 @@ describe('present while acting', () => {
       type: 'external-message',
       source: 'test',
       content: 'go',
-      metadata: {},
+      metadata: { channelId: 'test:channel' },
     } as unknown as ProcessEvent);
   }
 
@@ -453,6 +453,33 @@ describe('present while acting', () => {
       wired.some((s) => s.includes('[routing] The conversation moved to discord:dm:antra')),
       'the re-pin notice was injected alongside it',
     );
+
+    await framework.stop();
+  });
+
+  it("an ADDRESSED mid-turn injection moves no private turn's locus", async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Station four, proceeding.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Still answering the operator.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    module.toolDelayMs = 25;
+    module.interjection = 'hey, quick question over here?';
+    module.interjectionMetadata = { channelId: 'discord:dm:antra', tags: ['chat:addressed'] };
+
+    framework.pushEvent({ type: 'external-message', source: 'tui', content: 'go', metadata: {} } as unknown as ProcessEvent);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [], 'nothing is routed');
+    const wired = membrane.lastStream!.receivedToolResultOptions
+      .flatMap((o) => o?.injectedMessages ?? []).map((m) => JSON.stringify(m.content));
+    assert.ok(wired.some((w) => w.includes('quick question')), 'control: the addressed message was injected');
+    assert.ok(!wired.some((w) => w.includes('[routing] The conversation moved to')), 'with no re-pin notice');
 
     await framework.stop();
   });
@@ -1882,6 +1909,8 @@ describe('present while acting', () => {
     framework.openLogical = new Map();
     framework.scriptCallStarts = new Map();
     framework.agents = new Map();
+    framework.privateTurnIds = new Set();
+    framework.privateTurnsFloor = 0;
     return framework;
   }
   const until = async (done: () => boolean, label: string): Promise<void> => {
@@ -2114,15 +2143,18 @@ describe('present while acting', () => {
   // result moves that turn's locus and tells the agent. Once the turn has
   // ended, the tool-result handler drops the result, so the agent never reads
   // it, and nothing moves, whether or not a later start has come yet.
-  for (const [label, after, moves] of [
-    ['moves the locus of its turn, still open, when a silent start\'s routing is the live one', 'silent start', true],
-    ['moves no locus once its turn has ended and the next turn has opened', 'next turn', false],
-    ['moves no locus once its turn has settled, before any later start', 'settled', false],
+  for (const [label, after, moves, privateSuccessor] of [
+    ['moves the locus of its turn, still open, when a silent start\'s routing is the live one', 'silent start', true, false],
+    ['moves no locus once its turn has ended and the next turn has opened', 'next turn', false, false],
+    ['cannot redirect a newer private logical turn', 'next turn', false, true],
+    ['moves no locus once its turn has settled, before any later start', 'settled', false, false],
   ] as const) {
     it(`a channel_open whose result lands late ${label}`, async () => {
-      type Routing = { turnId: number; engaged: Set<string>; wasIn: Ref[]; triggerChannel?: Ref; locus?: Ref };
+      type Routing = { turnId: number; engaged: Set<string>; wasIn: Ref[]; triggerChannel?: Ref; locus?: Ref; nonChannelOrigin?: boolean };
       const calling: Routing = { turnId: 41, engaged: new Set(), wasIn: [], locus: stub('chan-before') };
-      const other: Routing = { turnId: 42, engaged: new Set(), wasIn: [], locus: stub('chan-next') };
+      const other: Routing = privateSuccessor
+        ? { turnId: 42, engaged: new Set(), wasIn: [], nonChannelOrigin: true }
+        : { turnId: 42, engaged: new Set(), wasIn: [], locus: stub('chan-next') };
       let resolveOpen!: (result: { success: boolean; data: { channelId: string; serverId: string } }) => void;
       const framework = bareFramework();
       framework.agents = new Map([['assistant', { proseRouting: 'locus' }]]);
@@ -2153,7 +2185,9 @@ describe('present while acting', () => {
       const observatory = { serverId: 'discord', channelId: 'discord:guild:observatory' };
       assert.deepEqual(calling.triggerChannel, observatory, 'the turn that called records the channel it opened, with its server');
       assert.deepEqual(calling.locus, moves ? observatory : stub('chan-before'));
-      assert.deepEqual(other, { turnId: 42, engaged: new Set(), wasIn: [], locus: stub('chan-next') }, 'the other routing state is untouched');
+      assert.deepEqual(other, privateSuccessor
+        ? { turnId: 42, engaged: new Set(), wasIn: [], nonChannelOrigin: true }
+        : { turnId: 42, engaged: new Set(), wasIn: [], locus: stub('chan-next') }, 'the other routing state is untouched');
       assert.deepEqual((framework.lastAnnouncedLocus as Map<string, Ref>).get('assistant'),
         moves ? observatory : undefined, "the announce baseline moves with the locus, for a move the agent is told");
       assert.equal(results[0]!.result.data?.routing !== undefined, moves, 'and the result says so only then');
@@ -2492,6 +2526,56 @@ describe('present while acting', () => {
       'routing note present in the channel_open tool result',
     );
 
+    await framework.stop();
+  });
+
+  for (const mode of ['locus', 'hybrid'] as const) {
+    it(`${mode}: channel_open keeps a private turn private, so its speech after the open goes to no channel`, async () => {
+      membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'c-private', name: 'channel_open', input: { channelId: 'discord:guild:observatory' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Still private after open.' }] as ContentBlock[]));
+      const framework = await createFramework({ proseRouting: mode });
+      const routed = stubChannelRegistry(framework);
+      const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+      (registry as { handleChannelToolCall?: unknown }).handleChannelToolCall = async () =>
+        ({ success: true, data: { channelId: 'discord:guild:observatory', opened: true } });
+      const agent = framework.getAgent('assistant')!;
+      const internals = framework as unknown as { pushEvent(event: unknown): void };
+      const pushed: unknown[] = [];
+      const push = internals.pushEvent.bind(framework);
+      internals.pushEvent = (event: unknown) => { pushed.push(event); push(event); };
+      await (framework as unknown as { startAgentStream(agent: unknown, trigger: unknown): Promise<void> })
+        .startAgentStream(agent, {
+          agentName: 'assistant', reason: 'external-message', source: 'tui', timestamp: Date.now(), nonChannelOrigin: true,
+        });
+      await framework.runUntilIdle();
+      assert.deepEqual(routed, []);
+      const said = JSON.stringify(pushed);
+      assert.ok(said.includes('plain speech stays private'), said);
+      assert.equal(said.includes('or a >>> envelope'), mode === 'hybrid', `hybrid names its envelopes, locus doesn't: ${said}`);
+      await framework.stop();
+    });
+  }
+
+  it("channel_open of an inbound-only channel in a private turn says plain speech there is refused, and offers no way to publish there", async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'channel_open', input: { channelId: 'body:ears' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Listening.' }] as ContentBlock[]));
+    const framework = await createFramework({ proseRouting: 'hybrid' });
+    stubChannelRegistry(framework);
+    const registry = declareEarsInboundOnly(framework);
+    registry.handleChannelToolCall = async () => ({ success: true, data: { channelId: 'body:ears', opened: true } });
+    await (framework as unknown as { startAgentStream(agent: unknown, trigger: unknown): Promise<void> })
+      .startAgentStream(framework.getAgent('assistant')!, {
+        agentName: 'assistant', reason: 'external-message', source: 'tui', timestamp: Date.now(), nonChannelOrigin: true,
+      });
+    await framework.runUntilIdle();
+    const results = JSON.stringify(membrane.lastStream!.receivedToolResults.flat());
+    assertSaysRefused(results, 'the channel_open result');
+    assert.ok(results.includes('plain speech stays private'), results);
+    assert.ok(!results.includes('>>> envelope'), `no envelope is offered for a channel that takes no speech: ${results}`);
     await framework.stop();
   });
 
@@ -2871,7 +2955,7 @@ describe('present while acting', () => {
     assert.equal(stream.receivedToolResults.length, 1);
     const options = stream.receivedToolResultOptions[0];
     assert.ok(options?.injectedMessages, 'tool-result resume carried injected messages');
-    assert.equal(options!.injectedMessages!.length, 1);
+    assert.equal(options!.injectedMessages!.length, 2);
     const injected = options!.injectedMessages![0]!;
     assert.equal(injected.participant, 'Antra');
     const text = (injected.content as Array<{ type: string; text?: string }>)
@@ -2879,6 +2963,7 @@ describe('present while acting', () => {
       .map((b) => b.text)
       .join('\n');
     assert.equal(text, 'look left!');
+    assert.match(JSON.stringify(options!.injectedMessages![1]!.content), /\[routing\] Private input came into this turn/);
 
     await framework.stop();
   });

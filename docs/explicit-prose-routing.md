@@ -46,7 +46,10 @@ them the same way.
   provider-capacity hold defers the turn to. A round kept private (one that
   calls `skip_reply`, or has a same-round private think) sets no target. A
   target its server declared inbound-only is refused and clears the turn's
-  target, so later unprefixed segments bounce until a new `>>` target.
+  target, so later unprefixed segments bounce until a new `>>` target. So
+  does private-surface input that makes the turn private (a TUI or WebUI
+  message it takes in): its target is dropped, and while the turn is
+  private a `>>` envelope posts its own body but sets no target.
   Cross-turn, nothing is implicit.
 - **Continuation modifier:** ` !` immediately after the target
   (`>>#ops !` / `>>skip_reply !`) requests an immediate re-wake after this turn
@@ -63,6 +66,10 @@ Unprefixed prose with no sticky target is **never delivered**. It is held as a
 draft (src/prose-drafts.ts) — never published except by the agent's own
 resend — and a system notice naming the draft tells
 the agent how to resend: `>>#channel {{unsent}}`, or the `drafts` tool by id.
+A private turn (one that took in private input, such as an operator's message
+from a private surface) has no sticky target, and its unprefixed prose isn't
+bounced: it is kept private, with no draft and no wake, and a notice says so
+and how to publish.
 The notice requests inference so the resend can happen immediately — capped at
 2 consecutive bounce-wakes per agent (then notices append without waking,
 breaking any loop).

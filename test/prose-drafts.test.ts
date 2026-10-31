@@ -510,7 +510,7 @@ async function harness(opts: {
       .filter((e) => e.event === 'send'),
     /** One addressed message in #room starts a turn (or, with `request`, a
      *  direct inference request for just that resident); resolves when it settles. */
-    turn: async (responses: Array<ReturnType<typeof createMockResponse>>, agentName = 'scout', via: 'incoming' | 'request' | 'silent' | 'heartbeat' = 'incoming') => {
+    turn: async (responses: Array<ReturnType<typeof createMockResponse>>, agentName = 'scout', via: 'incoming' | 'request' | 'silent' | 'private' | 'heartbeat' = 'incoming') => {
       for (const r of responses) membrane.pushResponse(r);
       const before = membrane.calls.length;
       if (via === 'incoming') {
@@ -524,6 +524,7 @@ async function harness(opts: {
           agentName, timestamp: Date.now(),
           ...(via === 'heartbeat' ? { reason: 'heartbeat', source: 'heartbeat' } : { reason: 'test', source: 'test' }),
           ...(via === 'silent' ? { suppressProse: true } : {}),
+          ...(via === 'private' ? { nonChannelOrigin: true } : {}),
         });
       }
       await until(() => membrane.calls.length > before, 'turn start');
@@ -759,6 +760,134 @@ describe('held prose drafts, end to end', () => {
       await h.close();
     }
   });
+
+  it("a private turn's words beside a send to a known place, and after it, are kept private, since they were going nowhere the send posted", async () => {
+    for (const proseRouting of ['locus', 'hybrid'] as const) {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting }] });
+      try {
+        await h.turn([
+          createMockResponse([text('Beside the send.'), explicitSend('s1')], 'tool_use'),
+          createMockResponse([text('And one after the send.')]),
+        ], 'scout', 'private');
+        assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note'], `${proseRouting}: only the explicit send went out`);
+        assert.deepEqual(h.drafts(), [], `${proseRouting}: nothing is held`);
+        const receipt = h.texts().find((t) => t.startsWith('[delivered]')) ?? '';
+        assert.match(receipt, /2 plain-speech segment\(s\) kept private \(private turn/, `${proseRouting}: ${receipt}`);
+      } finally {
+        await h.close();
+      }
+    }
+  });
+
+  it("hybrid mode: a private turn's envelope a send held sets no target, so its later plain speech stays private", async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      await h.turn([
+        createMockResponse([text(`>>>${ROOM} Words for the room.`), explicitSend('s1')], 'tool_use'),
+        createMockResponse([text('Plain words after.')]),
+      ], 'scout', 'private');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note'], 'only the explicit send went out');
+      assert.deepEqual(h.drafts().map((d) => [d.text, d.note]), [['Words for the room.', `written for >>>${ROOM}`]],
+        'the envelope the send held is a draft, and the plain words after it are not');
+      const receipt = h.texts().find((t) => t.startsWith('[delivered]')) ?? '';
+      assert.match(receipt, /1 plain-speech segment\(s\) kept private \(private turn/, receipt);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("hybrid mode: a private turn's envelope that names a channel that does not resolve, beside a send to a known place, keeps its words private, with no draft", async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      await h.turn([
+        createMockResponse([text('>>>#nowhere lost words'), explicitSend('s1')], 'tool_use'),
+        createMockResponse([text('Done.')]),
+        createMockResponse([]),
+      ], 'scout', 'private');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note'], 'only the explicit send went out');
+      assert.deepEqual(h.drafts(), [], 'nothing holds the words to resend');
+      const notice = h.texts().find((t) => t.startsWith('[prose-routing]') && t.includes('was not delivered'));
+      assert.ok(notice?.includes('It was kept private') && !notice.includes('{{unsent}}'), `the resident is told the words were kept private: ${notice}`);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("a private turn's words beside a send whose place the framework can't read, and after it, are kept private too, since they were going nowhere", async () => {
+    for (const proseRouting of ['locus', 'hybrid'] as const) {
+      for (const via of ['private', 'incoming'] as const) {
+        const h = await harness({ agents: [{ name: 'scout', proseRouting }], sendTool: true });
+        await h.sendMode('no-channel');
+        try {
+          await h.turn([
+            createMockResponse([text('Beside the send.'), unplacedSend('s1')], 'tool_use'),
+            createMockResponse([text('And one after the send.')]),
+          ], 'scout', via);
+          assert.ok(!h.publishes().some((p) => p.text.includes('the send.')), `${proseRouting}, ${via}: no plain speech went out: ${JSON.stringify(h.publishes())}`);
+          if (via === 'incoming') {
+            assert.deepEqual(h.drafts().map((d) => d.text).sort(), ['And one after the send.', 'Beside the send.'],
+              `${proseRouting}: control, a channel turn's words beside the send are held, since it may have posted where they were going`);
+            continue;
+          }
+          assert.deepEqual(h.drafts(), [], `${proseRouting}: nothing is held`);
+          const receipt = h.texts().find((t) => t.startsWith('[delivered]')) ?? '';
+          assert.match(receipt, /2 plain-speech segment\(s\) kept private \(private turn/, `${proseRouting}: ${receipt}`);
+        } finally {
+          await h.close();
+        }
+      }
+    }
+  });
+
+  it("a private turn's budget restart after a send whose place the framework can't read keeps the restart's words private, where a channel turn's are held", async () => {
+    for (const via of ['private', 'incoming'] as const) {
+      const h = await harness({ agents: [{ name: 'scout', maxStreamTokens: 5 }], sendTool: true });
+      await h.sendMode('no-channel');
+      try {
+        onSecondStream(h.membrane, createMockResponse([text('After the restart.')]));
+        await h.turn([createMockResponse([unplacedSend('s1')], 'tool_use')], 'scout', via);
+        assert.equal(h.membrane.calls.length, 2, `${via}: premise, the stream restarted once`);
+        assert.ok(!h.publishes().some((p) => p.text.includes('After the restart.')), `${via}: the restart's words went nowhere: ${JSON.stringify(h.publishes())}`);
+        if (via === 'incoming') {
+          assert.deepEqual(h.drafts().map((d) => d.text), ['After the restart.'], "control: the restart carries a channel turn's hold");
+          continue;
+        }
+        assert.deepEqual(h.drafts(), [], 'nothing is held');
+        const receipt = h.texts().find((t) => t.startsWith('[delivered]')) ?? '';
+        assert.match(receipt, /1 plain-speech segment\(s\) kept private \(private turn/, receipt);
+      } finally {
+        await h.close();
+      }
+    }
+  });
+
+  for (const [label, envelope, held] of [
+    ['names no destination', '>>>\nlost words', false],
+    ['names a channel that does not resolve', '>>>#nowhere lost words', false],
+    ['names a channel', `>>>${ROOM} words for the room`, true],
+  ] as const) {
+    it(`hybrid mode: beside a send whose place the framework can't read, a private turn's envelope that ${label} ${held ? 'is held as a draft, since the send may have posted there' : 'keeps its words private, with no draft'}`, async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }], sendTool: true });
+      await h.sendMode('no-channel');
+      try {
+        await h.turn([
+          createMockResponse([text(envelope), unplacedSend('s1')], 'tool_use'),
+          createMockResponse([text('Done.')]),
+          createMockResponse([]),
+        ], 'scout', 'private');
+        assert.ok(!h.publishes().some((p) => p.text.includes('words')), `nothing the envelope says went out: ${JSON.stringify(h.publishes())}`);
+        if (held) {
+          assert.deepEqual(h.drafts().map((d) => [d.text, d.note]), [['words for the room', `written for >>>${ROOM}`]], 'the envelope is held, and the plain words after it are not');
+        } else {
+          assert.deepEqual(h.drafts(), [], 'nothing holds the words to resend');
+          const notice = h.texts().find((t) => t.startsWith('[prose-routing]') && t.includes('was not delivered'));
+          assert.ok(notice?.includes('It was kept private') && !notice.includes('{{unsent}}'), `the resident is told the words were kept private: ${notice}`);
+        }
+      } finally {
+        await h.close();
+      }
+    });
+  }
 
   it('disabled mode stays draft-free: its narration is private by configuration', async () => {
     const h = await harness({ agents: [{ name: 'scout', proseRouting: 'disabled' }] });
@@ -2040,6 +2169,31 @@ describe('draft notices and turn-end settlement', () => {
     }
   });
 
+  it("a private turn whose draft may already have been posted says nothing is confirmed, not that its speech reached no channel", async () => {
+    const h = await catchUpFixture();
+    const f = h.framework as unknown as {
+      proseDrafts: ProseDraftStore;
+      holdProseDrafts(agent: unknown, texts: Array<{ text: string }>, reason: string, options: unknown): Array<{ id: string }>;
+      appendProseDeliveryReceipt(agent: unknown, routing: unknown): void;
+    };
+    const routing = h.internals.routingOf('scout') as unknown as { nonChannelOrigin: boolean; privateSuppressed: number };
+    try {
+      const d = f.holdProseDrafts(h.agent, [{ text: 'earlier words' }], 'explicit-send', { routing, notice: 'later' })[0]!;
+      const attempt = f.proseDrafts.beginAttempt('scout', d.id, dest(), 'resend', false);
+      f.proseDrafts.recordOutcome('scout', d.id, attempt, { status: 'unknown', reason: 'connection lost', at: Date.now(), destination: dest() });
+      routing.nonChannelOrigin = true;
+      routing.privateSuppressed = 1;
+      f.appendProseDeliveryReceipt(h.agent, routing);
+      const receipt = h.cm.getAllMessages().flatMap((m) => m.content)
+        .filter((b) => b.type === 'text').map((b) => (b as { text: string }).text)
+        .find((text) => text.startsWith('[delivered]'))!;
+      assert.ok(receipt.includes('kept private (private turn'), `control: the private speech is counted: ${receipt}`);
+      assert.ok(receipt.startsWith('[delivered] nothing confirmed —'), receipt);
+    } finally {
+      await h.close();
+    }
+  });
+
   // Arthur-2378's probe: with retention shortened, the journal lets the
   // turn's older draft go before the receipt is written.
   it('the receipt reports a draft that retention let go during the turn as let go, not as held', async (t) => {
@@ -2962,6 +3116,22 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
         createMockResponse([]),
       ]);
       assert.deepEqual(h.publishes().slice(-2).map((p) => p.text), [before, after]);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("XML tool mode: a private turn's refused channel_publish silences nothing, so its round's envelope is delivered", async () => {
+    const h = await harness({ xml: true, agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      const round = [text(`>>>${GENERAL} the envelope's words`), call('p1', 'channel_publish', { content: 'no channel named' })];
+      await h.turn([
+        createMockResponse(round, 'tool_use'),
+        { ...createMockResponse(round), toolCalls: [] },
+      ], 'scout', 'private');
+      assert.ok(h.toolResults().some((r) => r.includes('channel_publish requires an explicit channelId')), `control: the publish was refused: ${JSON.stringify(h.toolResults())}`);
+      assert.deepEqual(h.drafts().map((d) => d.text), [], 'nothing is held');
+      assert.deepEqual(h.publishes().map((p) => p.text), ["the envelope's words"]);
     } finally {
       await h.close();
     }
@@ -4546,6 +4716,96 @@ describe('a heartbeat turn holds its plain speech as drafts', () => {
       await h.close();
     }
   });
+});
+
+describe('a heartbeat turn that takes in private input keeps its plain speech private, as any private turn does', () => {
+  /** Stores a private surface's message, as a host's TUI does; it wakes nothing. */
+  const surface = (): Module => ({
+    name: 'surface',
+    async start() {}, async stop() {},
+    getTools: () => [],
+    async handleToolCall() { return { success: false, error: 'no tools' }; },
+    async onProcess(event: { type: string; content?: unknown }) {
+      if (event.type !== 'external-message') return {};
+      return { addMessages: [{ participant: 'user', content: [{ type: 'text', text: String(event.content) }] }], requestInference: false };
+    },
+  }) as unknown as Module;
+  /** A tool during whose call the operator speaks on that surface, when `speaks` says so. */
+  const robot = (speaks: () => AgentFramework | undefined): Module => ({
+    name: 'robot',
+    async start() {}, async stop() {},
+    getTools: () => [{ name: 'move', description: 'Move', inputSchema: { type: 'object', properties: {} } }],
+    async handleToolCall() {
+      speaks()?.pushEvent({ type: 'external-message', source: 'tui', content: 'for your eyes only', metadata: {} } as never);
+      await new Promise((r) => setTimeout(r, 30));
+      return { success: true, data: 'moved' };
+    },
+    async onProcess() { return {}; },
+  }) as unknown as Module;
+  const heldNotice = (h: Awaited<ReturnType<typeof harness>>) => h.texts().filter((t) => t.startsWith('[routing] This turn came from your heartbeat'));
+
+  for (const proseRouting of ['locus', 'hybrid', 'explicit'] as const) {
+    for (const operator of ['wake', 'stored', 'none'] as const) {
+      it(`${proseRouting} mode: a heartbeat ${{
+        wake: "batched with an operator's private wake keeps its words private, with no draft and no notice that they are held",
+        stored: "whose start reads an operator's stored message keeps its words private, with no draft and no notice that they are held",
+        none: 'with no private input holds its words as a draft, as on main',
+      }[operator]}`, async () => {
+        const h = await harness({ agents: [{ name: 'scout', proseRouting }], modules: [surface()] });
+        try {
+          if (operator === 'stored') {
+            h.framework.pushEvent({ type: 'external-message', source: 'tui', content: 'for your eyes only', metadata: {} } as never);
+            await h.until(() => h.texts().includes('for your eyes only'), 'the operator message stored, waking nothing');
+          }
+          h.membrane.pushResponse(createMockResponse([text('Words of the heartbeat turn.')]));
+          const before = h.membrane.calls.length;
+          const now = Date.now();
+          (h.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push(
+            { agentName: 'scout', reason: 'heartbeat', source: 'heartbeat', timestamp: now },
+            ...(operator === 'wake' ? [{ agentName: 'scout', reason: 'external-message', source: 'tui', timestamp: now, nonChannelOrigin: true }] : []),
+          );
+          await h.until(() => h.membrane.calls.length > before, 'turn start');
+          await h.framework.runUntilIdle();
+          await h.until(() => !(h.framework as unknown as { activeTurnTokens: Map<string, unknown> }).activeTurnTokens.has('scout'), 'turn end');
+          await h.framework.runUntilIdle();
+          assert.equal(h.membrane.calls.length, before + 1, 'control: one start took every wake');
+          assert.deepEqual(h.publishes(), []);
+          if (operator !== 'none') {
+            assert.deepEqual(h.drafts(), [], 'nothing is held as a draft');
+            assert.deepEqual(heldNotice(h), [], 'the turn is not told its words are held');
+          } else {
+            assert.deepEqual(h.drafts().map((d) => d.text), ['Words of the heartbeat turn.']);
+            if (proseRouting !== 'explicit') assert.equal(heldNotice(h).length, 1, "control: a heartbeat's turn is told its words are held");
+          }
+        } finally {
+          await h.close();
+        }
+      });
+    }
+
+    for (const operator of [true, false]) {
+      it(`${proseRouting} mode: a heartbeat turn ${operator
+        ? "that an operator's message makes private at a tool boundary keeps the words after it private, with no draft"
+        : 'with no private input holds its words before and after a tool call as drafts, as on main'}`, async () => {
+        let framework: AgentFramework | undefined;
+        const h = await harness({ agents: [{ name: 'scout', proseRouting }], modules: [surface(), robot(() => (operator ? framework : undefined))] });
+        framework = h.framework;
+        try {
+          await h.turn([
+            createMockResponse([text('Before the operator spoke.'), call('m1', 'robot--move', {})], 'tool_use'),
+            createMockResponse([text('After the operator spoke.')]),
+          ], 'scout', 'heartbeat');
+          assert.deepEqual(h.publishes(), []);
+          const held = h.drafts().map((d) => d.text);
+          assert.ok(held.includes('Before the operator spoke.'), `control: the heartbeat turn's words before the call are held: ${JSON.stringify(held)}`);
+          if (operator) assert.ok(!held.includes('After the operator spoke.'), `the words after the operator spoke are not held: ${JSON.stringify(held)}`);
+          else assert.ok(held.includes('After the operator spoke.'), JSON.stringify(held));
+        } finally {
+          await h.close();
+        }
+      });
+    }
+  }
 });
 
 describe('plain speech whose turn\'s channel is tuned out', () => {

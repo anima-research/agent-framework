@@ -2,7 +2,7 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { existsSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { EventGate, wakeLineText } from '../src/gate/event-gate.js';
+import { EventGate, wakeLineText, wakeProvenance } from '../src/gate/event-gate.js';
 import type { GateConfig, GateEntryRef, GateEventInfo, WakeLine } from '../src/gate/types.js';
 
 // ---------------------------------------------------------------------------
@@ -37,7 +37,7 @@ function makeGate(configPath: string, opts?: {
 }) {
   const traces: TraceEntry[] = [];
   const messages: Array<{ participant: string; content: unknown; metadata?: unknown }> = [];
-  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean; at?: number; routeChannelId?: string; routeServerId?: string; line?: WakeLine }> = [];
+  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean; at?: number; routeChannelId?: string; routeServerId?: string; nonChannelOrigin?: boolean; line?: WakeLine }> = [];
 
   const gate = new EventGate({
     configPath,
@@ -1217,6 +1217,27 @@ describe('quiesce suppression', () => {
   });
 });
 
+describe("a window that holds a private surface's message", () => {
+  afterEach(() => rmSync(TMP_DIR, { recursive: true, force: true }));
+  type Pending = { policyName: string; content: string; eventType: string; timestamp: number; inContext: boolean;
+    channelId?: string; serverId?: string; authorId?: string; nonChannelOrigin?: boolean; addressed?: boolean; routeChannelId?: string };
+  const tui = (timestamp: number): Pending => ({ policyName: 'p', content: 'operator', eventType: 'external-message', timestamp, inContext: false, serverId: 'tui', nonChannelOrigin: true });
+  const room = (timestamp: number): Pending => ({
+    policyName: 'p', content: 'room', eventType: 'mcpl:channel-incoming', timestamp, inContext: true,
+    channelId: 'discord:g:room', serverId: 'discord', authorId: 'u1', addressed: true, routeChannelId: 'discord:g:room',
+  });
+  async function flush(buffer: Pending[]) {
+    const { gate, inferenceRequests } = makeGate(writeConfig('window.json', { policies: [], default: 'skip' }));
+    const internals = gate as unknown as { inferenceBuffer: Pending[] };
+    gate.onInferenceStarted('elsewhere');
+    internals.inferenceBuffer.push(...buffer);
+    gate.onInferenceEnded('elsewhere');
+    await new Promise((resolve) => setImmediate(resolve));
+    return inferenceRequests;
+  }
+
+});
+
 describe('sleep', () => {
   // While asleep, only the agent's own heartbeat and a privileged author
   // rouse it. The heartbeat is the server the host knows as `heartbeat`: a
@@ -1406,4 +1427,7 @@ describe('a batched wake writes its line only when it says something', () => {
     fire(plain.gate, 'chat');
     assert.strictEqual(plain.messages.length, 1);
   });
+});
+
+describe('wakeProvenance: what a window carries without a pick', () => {
 });

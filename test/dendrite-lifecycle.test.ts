@@ -19,7 +19,10 @@ import {
 } from '../src/index.js';
 import type {
   AgentSpec,
+  EventResponse,
+  Module,
   ProcessEvent,
+  ProcessState,
   TraceEvent,
 } from '../src/index.js';
 import { GateModule, RoutedMembrane, say, until, waitCall } from './helpers/dendrite.js';
@@ -732,6 +735,18 @@ describe('Dendrite lifecycle', () => {
   });
 });
 
+class SurfaceModule implements Module {
+  readonly name = 'surface';
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools() { return []; }
+  async handleToolCall() { return { success: false, error: 'no tools' }; }
+  async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
+    if (event.type !== 'external-message') return {};
+    return { addMessages: [{ participant: 'user', content: [{ type: 'text', text: String(event.content) }] }], requestInference: true };
+  }
+}
+
 describe('Dendrite restart', () => {
   let tempDir: string;
   let store: JsStore;
@@ -779,6 +794,53 @@ describe('Dendrite restart', () => {
     contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
     framework.runEphemeralToCompletion(agent, contextManager).catch(() => { /* abandoned */ });
     await until(() => gates.entered.has(name), `${name} to block`);
+  }
+
+  for (const privateTurn of [true, false]) {
+    it(`a fork a restart interrupted wakes its parent ${privateTurn ? 'into a private turn, when it was derived while a private turn was open' : 'into an ordinary turn, when it was derived in another turn'}`, async () => {
+      const boot = async (gates: GateModule) => {
+        const framework = await AgentFramework.create({
+          store,
+          membrane: membrane.asMembrane(),
+          agents: [{ name: 'mira', model: 'test-model', systemPrompt: 'You are mira.' }],
+          modules: [gates, new SurfaceModule()],
+          syncIntervalMs: 0,
+        });
+        frameworks.push(framework);
+        return framework;
+      };
+      const gates1 = new GateModule();
+      const first = await boot(gates1);
+      first.start();
+      membrane.script('mira', waitCall('g-mira'), say('mira done'));
+      if (privateTurn) first.pushEvent({ type: 'external-message', source: 'tui', content: 'for your eyes only', metadata: {}, triggerInference: true } as never);
+      else (first as unknown as { pendingRequests: unknown[] }).pendingRequests.push({ agentName: 'mira', reason: 'test', source: 'test', timestamp: Date.now() });
+      await until(() => gates1.entered.has('g-mira'), "mira's turn to block in a tool");
+      membrane.script('job', waitCall('job'), say('job done'));
+      const { agent, contextManager } = await first.deriveAgent({ name: 'job', from: 'mira', mode: 'copy', resultTo: { to: 'mira', as: 'message' } });
+      contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+      first.runEphemeralToCompletion(agent, contextManager).catch(() => { /* abandoned */ });
+      await until(() => gates1.entered.has('job'), 'job to block');
+
+      membrane.script('mira', say('noted'), say('noted again'));
+      const second = await boot(new GateModule());
+      const notices = textsIn(second, 'mira').filter((m) => m.metadata.kind === 'agent-lifecycle' && /restarted while "job"/.test(m.text));
+      assert.equal(notices.length, 1, 'control: the restart is told');
+      const starts: Array<{ reason: string; private: boolean }> = [];
+      const internalsOf = second as unknown as {
+        startAgentStream(agent: unknown, trigger?: { reason: string }, ...rest: unknown[]): Promise<unknown>;
+        turnRouting: Map<string, { nonChannelOrigin?: boolean }>;
+      };
+      const start = internalsOf.startAgentStream.bind(second);
+      internalsOf.startAgentStream = async (a, trigger, ...rest) => {
+        const started = await start(a, trigger, ...rest);
+        if (trigger) starts.push({ reason: trigger.reason, private: internalsOf.turnRouting.get('mira')?.nonChannelOrigin === true });
+        return started;
+      };
+      second.start();
+      await until(() => starts.some((s) => s.reason === 'agent-interrupted') && second.getAgent('mira')!.state.status === 'idle', "mira's turn on the notice");
+      assert.deepEqual(starts.filter((s) => s.reason === 'agent-interrupted').map((s) => s.private), [privateTurn], JSON.stringify(starts));
+    });
   }
 
   it('a graceful stop leaves bounded work for the next boot to report as interrupted', async () => {
