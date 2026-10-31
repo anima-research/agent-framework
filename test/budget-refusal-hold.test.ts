@@ -846,6 +846,30 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
+  it('with the maintenance timer off, looks before each drive it paces, so a context that now fits runs without waiting for another call', async () => {
+    let release = () => {};
+    const further = new Promise<void>((resolve) => { release = resolve; });
+    await withCompressionCalls({ fitAt: 2, workUntil: 5, pauseAfter: 1 }, async (c) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 0, recheckMs: 50 });
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && c.started === 1 && c.ticks >= 2
+          && t.internal.overBudgetDrains.size === 0, 3_000), 'held, after a drive that made one call and ended at a tick that started none');
+        c.gate = further;
+        c.gateCall = 2;
+        c.pauseAfter = Infinity;
+        c.landed = 2;
+        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000),
+          'the context fit by the next firing, and the turn ran with a further call\'s landing still held back');
+        assert.equal(c.landed, 2, 'no further call landed before the turn ran');
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
+      } finally {
+        release();
+        await t.close();
+      }
+    });
+  });
+
   it('drives compression itself from the hold\'s start, looking after each call, and runs the turn as soon as one makes it fit', async () => {
     await withCompressionCalls({ fitAt: 12, workUntil: 20 }, async (c) => {
       await errorLines(async (lines) => {
@@ -971,10 +995,48 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
-  it('looks when a call lands during a breaker\'s drain it hasn\'t joined, once that drain ends', async () => {
+  it('looks before it drives when a call it didn\'t make lands, so a context that call made fit runs without waiting for another', async () => {
     let ownTick: (() => Promise<void>) | undefined;
     let ticked = false;
-    await withCompressionCalls({ fitAt: 1, workUntil: 1, exclusive: true }, async (c) => {
+    let release = () => {};
+    const further = new Promise<void>((resolve) => { release = resolve; });
+    await withCompressionCalls({ fitAt: 1, workUntil: 3, exclusive: true, gate: further, gateCall: 2 }, async (c) => {
+      const t = await residentTurn({
+        maintenanceIntervalMs: 3_600_000,
+        context: () => {
+          if (!ticked && ownTick) { ticked = true; void ownTick(); }
+          return 'status';
+        },
+      });
+      let land = () => {};
+      try {
+        const cm = t.framework.getAgent('prime')!.getContextManager() as unknown as { tick(): Promise<void> };
+        const landing = new Promise<void>((resolve) => { land = resolve; });
+        const complete = t.membrane.complete.bind(t.membrane);
+        t.membrane.complete = async (request) => { await landing; return complete(request); };
+        c.refused = true;
+        ownTick = () => cm.tick();
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && c.started === 1 && c.ticks >= 2
+          && t.internal.overBudgetDrains.size === 0 && t.looks() >= 1, 3_000),
+          'held, with the call begun during its turn still in flight, and the drive over');
+        land();
+        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000),
+          'the call that landed made the context fit, and the turn ran with a further call\'s landing still held back');
+        assert.equal(c.landed, 1, 'no further call landed before the turn ran');
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
+      } finally {
+        land();
+        release();
+        await t.close();
+      }
+    });
+  });
+
+  it('joins a breaker\'s drain a call lands during, when that call leaves it short, and looks once that drain ends', async () => {
+    let ownTick: (() => Promise<void>) | undefined;
+    let ticked = false;
+    await withCompressionCalls({ fitAt: 2, workUntil: 2, exclusive: true }, async (c) => {
       const t = await residentTurn({
         maintenanceIntervalMs: 3_600_000,
         context: () => {
@@ -985,6 +1047,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
       const fw = t.framework as unknown as { kickOverBudgetDrain(agentName: string, agent: unknown): string };
       let land = () => {};
       let letTick = () => {};
+      let letRest = () => {};
       try {
         const cm = t.framework.getAgent('prime')!.getContextManager() as unknown as { tick(): Promise<void> };
         const landing = new Promise<void>((resolve) => { land = resolve; });
@@ -1004,15 +1067,23 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.ok(await pollUntil(() => c.landed === 1, 3_000), 'the call landed during the breaker\'s drain');
         for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
         assert.equal(storedText(t.framework).includes('Answered once it fit'), false, 'still held while that drain runs');
-        c.tickGate = undefined;
+        c.tickGate = new Promise<void>((resolve) => { letRest = resolve; });
         letTick();
+        assert.ok(await pollUntil(() => c.landed === 2 && c.ticks === ticks + 2, 3_000),
+          'the breaker\'s drain made call 2, the one that fits, and waits at its next tick');
+        await new Promise((r) => setTimeout(r, 20));
+        assert.deepEqual(t.of('inference:hold_ended'), [],
+          'still held after a later timer than any look call 2\'s landing could start: the hold joined that drain, so the fit waits for its end');
+        c.tickGate = undefined;
+        letRest();
         assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000),
-          'the hold looked once the breaker\'s drain ended, with no maintenance pass');
-        assert.equal(c.started, 1);
+          'the hold looked once that drain ended, with no maintenance pass');
+        assert.equal(c.started, 2);
         assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
       } finally {
         land();
         letTick();
+        letRest();
         await t.close();
       }
     });
