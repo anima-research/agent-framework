@@ -29,6 +29,7 @@ function makeHarness(tick: () => Promise<void>) {
   const fw = Object.create(AgentFramework.prototype) as any;
   fw.consecutiveInferenceFailures = new Map();
   fw.exhaustionRewinds = new Map();
+  fw.turnRouting = new Map();
   fw.rewindEpisode = new Map();
   fw.lastInferenceAt = new Map();
   fw.overBudgetDrainInFlight = new Set();
