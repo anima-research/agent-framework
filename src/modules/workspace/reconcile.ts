@@ -94,6 +94,7 @@ import {
 } from './observe.js';
 import { EffectFailed, type Expect, callFailed, chainOf, chmodContained, narrowedTo, syncDirectories, unlinkContained, writeContained } from './effects.js';
 import { OUTSIDE_STEP, RESOLVED_OUTSIDE_STEP, UNFOLLOWED_STEP, errnoClause, errnoWords } from './answers.js';
+import { appendAll } from '../../append-all.js';
 
 export type EntryState =
   | 'synced'
@@ -1150,8 +1151,8 @@ export async function reconcilePass(
     return result;
   }
   const { walk, facts } = gathered;
-  result.dirs.push(...gathered.dirs);
-  result.incomplete.push(...gathered.incomplete);
+  appendAll(result.dirs, gathered.dirs);
+  appendAll(result.incomplete, gathered.incomplete);
 
   // Decide and apply — synchronously, so nothing interleaves.
   const branchId = store.currentBranch().id;
