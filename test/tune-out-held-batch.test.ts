@@ -9,13 +9,16 @@ import assert from 'node:assert/strict';
 import { fixture, eventually } from './helpers/coalescing-fixture.js';
 import type { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
 
+/** Tune-out needs a reader (0.33.0); a persistent subconscious with this prompt is it. */
+const READER_PROMPT = 'You are the Subconscious. Report briefly.';
+
 type Internals = {
   tuneOutCoordinator: TuneOutCoordinator | null;
 };
 type Listing = { listActive(): Array<{ serverId: string; channelId: string; params: { epochId: string } }> };
 
 test('a held deferred batch is stored under its hold, released in the dump, and read once after', async (t) => {
-  const f = await fixture({ framework: { tuneOut: { enabled: true, announce: false } } as never });
+  const f = await fixture({ framework: { subconscious: { enabled: true, systemPrompt: READER_PROMPT }, tuneOut: { announce: false } } as never });
   t.after(f.close);
   await f.register('chat');
   const coordinator = (f.framework as unknown as Internals).tuneOutCoordinator!;
@@ -41,13 +44,15 @@ test('a held deferred batch is stored under its hold, released in the dump, and 
 
   await f.framework.runUntilIdle();
   assert.equal(f.renders.length, 1, 'no second render');
-  const request = f.lastRequest();
+  // The reader takes turns too; the resident's is the last call not made under the reader's prompt.
+  const residentCalls = (f.membrane.calls as Array<{ system?: unknown; messages?: unknown }>).filter((c) => c.system !== READER_PROMPT);
+  const request = JSON.stringify(residentCalls.at(-1)?.messages);
   assert.equal(request.split('document_diff').length - 1, 1, "the resident's next turn reads the batch once");
 });
 
 test('a hold that ends while its batch renders leaves the batch stored unheld, with the wake an unheld push gets, for every recipient', async (t) => {
   const f = await fixture({
-    framework: { tuneOut: { enabled: true, announce: false } } as never,
+    framework: { subconscious: { enabled: true, systemPrompt: READER_PROMPT }, tuneOut: { announce: false } } as never,
     agents: [
       { name: 'agent', model: 'test', systemPrompt: 'I am agent.' },
       { name: 'other', model: 'test', systemPrompt: 'I am other.' },
@@ -76,7 +81,7 @@ test('a hold that ends while its batch renders leaves the batch stored unheld, w
 });
 
 test('a held batch that opens while an earlier one renders is stored under the hold too, and released in the dump', async (t) => {
-  const f = await fixture({ framework: { tuneOut: { enabled: true, announce: false } } as never });
+  const f = await fixture({ framework: { subconscious: { enabled: true, systemPrompt: READER_PROMPT }, tuneOut: { announce: false } } as never });
   t.after(f.close);
   await f.register('chat');
   let release!: () => void;

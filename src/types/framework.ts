@@ -169,16 +169,12 @@ export interface FrameworkConfig {
   subconscious?: import('../tune-out/tools.js').SubconsciousConfig;
 
   /**
-   * Tune-out without a reader (issue #232 §3.3). The hold machinery always
-   * runs when MCPL channels exist, so a persisted epoch is resumed and
-   * released whatever the configuration; this switch only decides whether
-   * residents are offered `tune_out` when no reader is configured. Without
-   * a reader a tune-out is a silent hold: no cadence, no wake budget,
-   * mentions are acknowledged, the backlog is released on cancel.
+   * Tune-out settings. Residents are offered `tune_out` only with a reader
+   * (`subconscious`): a hold nothing summarizes would hand the resident an
+   * undated backlog all at once when it ends. `enabled`, which offered one
+   * without a reader, was removed in 0.33.0 and is refused.
    */
   tuneOut?: {
-    /** Offer `tune_out` without a subconscious. Default: only with one. */
-    enabled?: boolean;
     /**
      * Announce the all-except scope in the excepted channel: one bracketed
      * line under the resident's name when it opens (who, for how long) and

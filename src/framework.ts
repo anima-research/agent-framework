@@ -1912,6 +1912,13 @@ function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
  * `thinkingBinding` left unchecked, since nothing reads them then.
  */
 function assertFrameworkSwitches(config: FrameworkConfig): void {
+  if ((config.tuneOut as { enabled?: unknown } | null | undefined)?.enabled === true) {
+    throw new Error(
+      'tuneOut.enabled was removed in agent-framework 0.33.0: residents are offered tune_out only with a reader ' +
+        '(subconscious), since a hold nothing summarizes hands the resident an undated backlog all at once. ' +
+        'Remove tuneOut.enabled, or configure a subconscious.',
+    );
+  }
   if (holdsSettings('subconscious', config.subconscious, '{ enabled: true }')) {
     assertBooleanSetting(
       'subconscious.enabled',
@@ -3953,7 +3960,7 @@ export class AgentFramework {
   private subconsciousConfig: SubconsciousConfig | null = null;
   /** Tune-out coordinator (issue #77); non-null iff a reader is configured + channels. */
   private tuneOutCoordinator: TuneOutCoordinator | null = null;
-  /** Residents are offered `tune_out` (a reader is configured, or `tuneOut.enabled`). */
+  /** Residents are offered `tune_out` (a reader is configured). */
   private tuneOutOffered = false;
   /**
    * The reply anchor a coalesced delivery would set, parked until the
@@ -4717,7 +4724,7 @@ export class AgentFramework {
     framework.beforeDerive = config.dendrite?.beforeDerive;
     framework.derivationNoticeHook = config.dendrite?.derivationNotice;
     framework.speechLocus = config.speech?.locus ?? 'delivery';
-    framework.tuneOutOffered = !!config.subconscious?.enabled || config.tuneOut?.enabled === true;
+    framework.tuneOutOffered = !!config.subconscious?.enabled;
     framework.tuneOutAnnounce = config.tuneOut?.announce !== false;
 
     // What the previous process left in the agent registry. Read before any
@@ -5128,13 +5135,13 @@ export class AgentFramework {
       await framework.ensureToolsetsModule();
     }
 
-    // Tune-out coordinator (issue #77, #232 §3.3): the hold machinery exists
-    // wherever tune_out is offered — with a reader (persistent subconscious
-    // or reader forks) it summarizes and wakes; with `tuneOut.enabled` alone
-    // it is a silent hold, and a persisted epoch is resumed and released
-    // (#232 gap 10). Where neither is configured nothing could ever cancel a
-    // tune-out on record, so each one ends at the start instead
-    // (endTuneOutsWithoutCoordinator), as main has it.
+    // Tune-out coordinator (issue #77): the hold machinery exists wherever
+    // tune_out is offered, which is only with a reader (persistent
+    // subconscious or reader forks): it summarizes and wakes, and a persisted
+    // epoch is resumed and released (#232 gap 10). Without a reader nothing
+    // could ever cancel a tune-out on record, so each one ends at the start
+    // instead (endTuneOutsWithoutCoordinator), a hold that 0.32's
+    // `tuneOut.enabled` left included.
     if (framework.channelRegistry && framework.tuneOutOffered) {
       framework.tuneOutCoordinator = new TuneOutCoordinator(
         framework.channelRegistry,
@@ -5189,7 +5196,6 @@ export class AgentFramework {
           isPrivilegedAuthor: (authorId) =>
             framework.eventGate?.isPrivilegedUser(authorId) ?? false,
           allowChannelSpeech: () => framework.subconsciousConfig?.allowChannelSpeech === true,
-          holdWithoutReader: () => framework.tuneOutOffered,
           ...(framework.tuneOutAnnounce
             ? {
                 // The excepted channel on its server: a bare id two servers
@@ -12879,9 +12885,7 @@ export class AgentFramework {
       'its messages will reach your subconscious where that\'s known. ' +
       'Calling tune_out again for a channel already tuned out keeps its ' +
       'settings, and, where this host can open the channel, tries the open ' +
-      'again if it isn\'t open. Without a subconscious it is a silent hold: ' +
-      'nothing summarizes or wakes you; the backlog is delivered when you ' +
-      'cancel. scope "all-except" holds EVERY channel (DMs and new channels ' +
+      'again if it isn\'t open. scope "all-except" holds EVERY channel (DMs and new channels ' +
       'included) except channelId, for durationSeconds (required); your plain ' +
       'speech lands in that channel meanwhile; the reader pauses rather than ' +
       'cancels when its wake budget is spent. mode "check" reports what is ' +
@@ -37097,9 +37101,7 @@ export class AgentFramework {
           cadenceSeconds: r.params.cadenceSeconds,
           backlogCap: r.params.backlogCap,
           maxWakes: r.params.maxWakes,
-          note: coordinator.hasReader()
-            ? `${speech} Reader wakes pause, not cancel, when the budget is spent.`
-            : `No subconscious is configured: this is a silent hold. ${speech} The backlog is delivered per channel when you cancel or the duration ends.`,
+          note: `${speech} Reader wakes pause, not cancel, when the budget is spent.`,
         },
       };
     }
@@ -37147,9 +37149,6 @@ export class AgentFramework {
         backlogCap: r.params.backlogCap,
         maxWakes: r.params.maxWakes,
         ...(openError ? { openError } : {}),
-        ...(coordinator.hasReader()
-          ? {}
-          : { note: 'No subconscious is configured: this is a silent hold. Nothing summarizes or wakes you; the backlog is delivered when you cancel.' }),
       },
     };
   }

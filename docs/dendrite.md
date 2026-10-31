@@ -275,7 +275,7 @@ Under both rules a held message is never "the latest inbound".
 
 ### Tune-out without a reader
 
-The tune-out coordinator exists whenever MCPL channels do. With a reader (the persistent subconscious or reader forks) it summarizes on a cadence and wakes the reader on addressed traffic. Without one a tune-out is a *silent hold*: nothing summarizes, nothing wakes, suppressed mentions are still acknowledged, and the backlog is released on cancel; the tool result says so. A persisted epoch is therefore always resumed and released, whatever the configuration (gap 10). Residents are offered `tune_out` when a reader is configured or `tuneOut.enabled` is set.
+The tune-out coordinator exists wherever residents are offered `tune_out`, which is only with a reader (the persistent subconscious or reader forks): it summarizes on a cadence and wakes the reader on addressed traffic, and a persisted epoch is resumed and released (gap 10). Without a reader there is no hold: a hold nothing summarizes would hand the resident an undated backlog all at once when it ends, so `tuneOut.enabled`, which offered one, was removed in 0.33.0 and is refused, and a tune-out still on record from it ends at the next start. A hold asked for after its reader ended is refused the same way.
 
 ### What a release is
 

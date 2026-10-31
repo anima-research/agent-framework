@@ -29,6 +29,11 @@ import { armAfter, armAt } from '../deadline-timer.js';
 /** The options a tune-out call can give. */
 type TuneOutOption = 'durationSeconds' | 'cadenceSeconds' | 'backlogCap' | 'maxWakes';
 
+/** A hold asked for with no reader to watch it: there is none (a reader ended, or none was configured). */
+const NO_READER_REFUSAL = 'Nothing was tuned out: this host has no subconscious resident to watch a channel, so tune_out '
+  + "isn't available here, and calling it again won't change that. If you need channels diverted, ask "
+  + 'whoever runs this host.';
+
 /** Defaults for tune_out tool params. */
 export const TUNE_OUT_DEFAULTS = {
   cadenceSeconds: 1800,
@@ -303,12 +308,6 @@ export interface TuneOutFrameworkHooks {
   isPrivilegedAuthor: (authorId: string | null | undefined) => boolean;
   /** speak_in_channel master switch (recipe-side, canary-gated). */
   allowChannelSpeech: () => boolean;
-  /**
-   * Whether a tune-out may hold a channel with no reader at all — a silent
-   * hold (issue #232 §3.3), which the host opts into (`tuneOut.enabled`).
-   * Left out, or false, a hold with no reader is refused.
-   */
-  holdWithoutReader?: () => boolean;
   /**
    * Post a line into a channel under the resident's name. Used for the
    * all-except scope's entry and release announcements in the excepted
@@ -612,19 +611,9 @@ export class TuneOutCoordinator {
     opts: { cadenceSeconds?: unknown; backlogCap?: unknown; maxWakes?: unknown; durationSeconds?: unknown },
     source: string,
   ): { ok: true; params: TuneOutParams } | { ok: false; error: string; alreadyTunedOut?: true } {
-    // No reader (issue #232 §3.3): a silent hold, where the host opted into
-    // one. Nothing summarizes, nothing wakes, mentions are still
-    // acknowledged, the backlog is released on cancel; the resident is told
-    // so in the tool result. A host that didn't opt in has no tune_out
-    // without a reader.
-    if (!this.readerAvailable() && this.hooks.holdWithoutReader?.() !== true) {
-      return {
-        ok: false,
-        error: 'Nothing was tuned out: this host has no subconscious resident to watch a channel, so tune_out '
-          + "isn't available here, and calling it again won't change that. If you need channels diverted, ask "
-          + 'whoever runs this host.',
-      };
-    }
+    // No reader: no hold. One nothing summarizes would hand the resident an
+    // undated backlog all at once when it ends.
+    if (!this.readerAvailable()) return { ok: false, error: NO_READER_REFUSAL };
     if (this.hooks.isForkBound({ serverId, channelId })) {
       return {
         ok: false,
@@ -990,6 +979,7 @@ export class TuneOutCoordinator {
       maxWakes: `for the default, ${TUNE_OUT_DEFAULTS.maxWakes}`,
     });
     if (!read.ok) return read;
+    if (!this.readerAvailable()) return { ok: false, error: NO_READER_REFUSAL };
     const { given, expiresAtMs } = read;
     if (expiresAtMs === undefined) {
       return { ok: false, error: 'an all-except hold needs `durationSeconds`: it always ends on its own' };
