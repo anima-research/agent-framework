@@ -38,8 +38,10 @@ import { streamBounds, wholeCallMs, withHostSetting, type InferenceBounds } from
 interface Responder {
   respond(result: McplInferenceRequestResult): void;
   respondError(code: number, message: string, data?: unknown): void;
-  /** The JSON-RPC request ID, used for streaming chunk correlation. */
-  requestId?: string | number;
+  /** The JSON-RPC request ID, used for streaming chunk correlation: a
+   *  request sent with id null is answered whole, since its chunks couldn't
+   *  name it. */
+  requestId?: string | number | null;
   /** Sends a streamed chunk on the transport the request came on, as its
    *  answer is sent. */
   sendChunk?(params: InferenceChunkParams): void;
