@@ -83,6 +83,8 @@ test('the puppet\'s gate tools answer as the agent\'s own calls do', { timeout: 
     ['event_tags', {}],
     ['wake_add_rule', {}],
     ['wake_remove_rule', { name: 'zz-none' }],
+    ['wake_accept_suggestions', { server: 'zz-none' }],
+    ['wake_decline', { server: 'zz-none' }],
     ['sleep', { seconds: 0 }],
     ['wake', {}],
   ]);

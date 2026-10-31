@@ -86,6 +86,10 @@ describe('a batched wake writes its line only when it says something', () => {
           }],
           default: 'skip',
         },
+        // Wake onboarding would follow the first ambient message with an offer
+        // for this server (its events are let by the default), and the cases
+        // here count on exactly which message is newest.
+        onboarding: false,
       },
       mcplServers: [{
         id: 'discord',
@@ -269,7 +273,7 @@ describe('isNewestContextEntry', () => {
       membrane: new MockMembrane().asMembrane(),
       agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
       // Stored at arrival, and nothing wakes: the window holds still.
-      gate: { config: { policies: [], default: 'skip' } },
+      gate: { onboarding: false, config: { policies: [], default: 'skip' } },
       mcplServers: [{
         id: 'discord',
         command: process.execPath,
@@ -731,7 +735,7 @@ describe('a handed line across readers, a flush, a quiesce and a hold', () => {
       storePath: join(dir, 'test.chronicle'),
       membrane: new MockMembrane().asMembrane(),
       agents: ['scout', 'mira'].map((name) => ({ name, model: 'test-model', systemPrompt: `You are ${name}.` })),
-      gate: { config: { policies: [], default: 'skip' } },
+      gate: { onboarding: false, config: { policies: [], default: 'skip' } },
       modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0,
     } as never);
     try {
@@ -893,7 +897,7 @@ describe('a same-turn retry', () => {
       membrane: membrane.asMembrane(),
       agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
       errorPolicy: { onInferenceError: (_e: Error, _a: string, attempt: number) => attempt === 0 ? { retry: true, delayMs: 20 } : { retry: false } },
-      gate: { config: { policies: [{ name: 'addressed', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'], tagsAny: ['chat:addressed'] }, behavior: { debounce: 100 } }], default: 'skip' } },
+      gate: { onboarding: false, config: { policies: [{ name: 'addressed', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'], tagsAny: ['chat:addressed'] }, behavior: { debounce: 100 } }], default: 'skip' } },
       mcplServers: [{ id: 'discord', command: process.execPath, args: [FIXTURE], env: { STATUS_PATH: join(tempDir, 'status.jsonl'), COMMAND_PATH: commandPath } }],
       modules: [],
     } as never);

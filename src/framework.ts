@@ -806,6 +806,8 @@ export const BUILTIN_TOOLSET_TOOLS: ReadonlySet<string> = new Set([
   'agent_settings',
   'wake_add_rule',
   'wake_remove_rule',
+  'wake_accept_suggestions',
+  'wake_decline',
   'gate_status',
   'event_tags',
   'set_tool_visibility',
@@ -894,8 +896,12 @@ import { asCalled, cutOffRefusal, markedInputRefusal, toolArgsProblems } from '.
 import { cutOffRound, type CutOffCall } from './cut-off-round.js';
 import { EventGate, MCPL_GATE_EVENT_TYPES, checkToolInput, formatShadowWarning, shownValue, wakeLineText } from './gate/event-gate.js';
 import { ReplyJudge } from './gate/reply-judge.js';
+import {
+  WakeDecisions, carriesAttention, isSuggestedRuleOf, isUndecided, offerFor, placementFor, rulesToWrite,
+  type OfferedRule, type ServerOffer,
+} from './gate/wake-onboarding.js';
 import { HEARTBEAT_CHANGING_TOOLS, Heartbeat, isHeartbeatMcplServer, type HeartbeatScheduledWake, type HeartbeatWake } from './heartbeat/heartbeat.js';
-import type { GateEntryRef, GateEventInfo, WakeLine } from './gate/types.js';
+import type { GateDecision, GateEntryRef, GateEventInfo, WakeLine } from './gate/types.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import { McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
@@ -4399,6 +4405,8 @@ export class AgentFramework {
   // EventGate (null when FrameworkConfig.gate is omitted)
   private eventGate: EventGate | null = null;
   private judgeWired = false;
+  /** Wake onboarding's record of the agent's decisions (null: onboarding off, or no gate). */
+  private wakeDecisions: WakeDecisions | null = null;
   /** The heartbeat (FrameworkConfig.heartbeat), when the host turns it on. */
   private heartbeat: Heartbeat | null = null;
 
@@ -4913,6 +4921,14 @@ export class AgentFramework {
           return undefined;
         },
       });
+      // Wake onboarding: the agent's decisions about servers' suggested
+      // treatment, beside gate.json (gate/wake-onboarding.ts).
+      if (config.gate.onboarding !== false) {
+        framework.wakeDecisions = new WakeDecisions(
+          join(dirname(configPath), 'wake-decisions.json'),
+          (message) => console.error(`[gate] ${message}`),
+        );
+      }
     }
 
     // The heartbeat, when the host turns it on: the agent's own schedule of
@@ -7860,6 +7876,7 @@ export class AgentFramework {
           this.eventGate.getToolDefinition(),
           ...AgentFramework.SLEEP_TOOLS,
           ...(this.judgeWired ? AgentFramework.JUDGED_WAKE_RULE_TOOLS : AgentFramework.WAKE_RULE_TOOLS),
+          ...(this.wakeDecisions ? AgentFramework.WAKE_ONBOARDING_TOOLS : []),
           AgentFramework.EVENT_TAGS_TOOL,
         ]
       : [];
@@ -13112,6 +13129,44 @@ export class AgentFramework {
     },
   ];
 
+  /** Wake onboarding's answers (gate/wake-onboarding.ts): accept an MCPL
+   *  server's suggested treatment (MCPL RFC-001 §5), all of it or some, or
+   *  decline it. Present when a gate is wired and onboarding is on. */
+  private static readonly WAKE_ONBOARDING_TOOLS: import('./types/index.js').ToolDefinition[] = [
+    {
+      name: 'wake_accept_suggestions',
+      description:
+        'Accept an MCPL server\'s suggestions for how its events should wake you (the ones a ' +
+        '[wake onboarding] notice listed, numbered as there). They are the server\'s claims, and the server may not be ' +
+        'trustworthy: accept what serves you, and when in doubt ask a person or another agent first. Each accepted suggestion becomes a wake rule ' +
+        'named "suggested:<server>:<n>" that matches only that server\'s events with those tags, placed ahead of your ' +
+        'catch-all rules, so the rules you wrote for the server, a channel or tags keep their place. Accepting ' +
+        'again replaces the earlier set; wake_remove_rule takes one out; wake_decline takes them all out.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          server: { type: 'string', description: 'The MCPL server id, as the notice named it.' },
+          rules: { type: 'array', items: { type: 'number' }, description: 'Which suggestions, by number. Left out: all of them.' },
+        },
+        required: ['server'],
+      },
+    },
+    {
+      name: 'wake_decline',
+      description:
+        'Decline an MCPL server\'s suggestions: your wake rules stay as they are for its events, and any ' +
+        '"suggested:<server>:<n>" rules you accepted before are removed. You won\'t be asked about the server again ' +
+        'unless its suggestions change. wake_add_rule still writes any rule of your own for it.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          server: { type: 'string', description: 'The MCPL server id, as the notice named it.' },
+        },
+        required: ['server'],
+      },
+    },
+  ];
+
   private static readonly JUDGED_WAKE_RULE_TOOLS: import('./types/index.js').ToolDefinition[] =
     AgentFramework.WAKE_RULE_TOOLS.map((tool) => {
       if (tool.name === 'wake_remove_rule') {
@@ -17522,6 +17577,9 @@ export class AgentFramework {
     const id = this.addMessage('user', incomingContent, AgentFramework.withStoredDigest(metadata, incomingContent), { placement, bypassDeferralFor: event.assemblingFor });
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
     if (decision.locus) this.noteDeliveredOrPark(event);
+    if (!decision.held) {
+      this.considerWakeOnboarding({ serverId: event.serverId, tags: event.tags, gateDecision: decision.gateDecision, recipients: decision.recipients, channelId: event.channelId });
+    }
 
     if (decision.wake) {
       for (const agentName of decision.recipients) {
@@ -19296,6 +19354,9 @@ export class AgentFramework {
       this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
     } else {
       console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${logValue(event.eventId ?? '')}`);
+    }
+    if (!silentHeartbeat && !decision.held) {
+      this.considerWakeOnboarding({ serverId: event.serverId, tags: event.tags, gateDecision: decision.gateDecision, recipients: decision.recipients, channelId: triggerChannel?.channelId });
     }
 
     if (decision.wake) {
@@ -29179,7 +29240,7 @@ export class AgentFramework {
     if ((SUBCONSCIOUS_TOOL_NAMES as readonly string[]).includes(name)) return { kind: 'subconscious' };
     if ((name === 'sleep' || name === 'wake') && this.eventGate) return { kind: 'sleep' };
     if (this.heartbeat?.ownsTool(name)) return { kind: 'heartbeat' };
-    if ((name === 'wake_add_rule' || name === 'wake_remove_rule') && this.eventGate) return { kind: 'wake-rule' };
+    if ((name === 'wake_add_rule' || name === 'wake_remove_rule' || name === 'wake_accept_suggestions' || name === 'wake_decline') && this.eventGate) return { kind: 'wake-rule' };
     if (name === 'event_tags' && this.eventGate) return { kind: 'event-tags' };
     if ((name === 'think' || name === 'journal' || name === 'skip_reply') && this.channelRegistry) return { kind: 'agent-verb' };
     if (name === CODE_EXECUTION_TOOL_NAME && this.codeExecution) return { kind: 'code-execution' };
@@ -36508,6 +36569,131 @@ export class AgentFramework {
   }
 
   /**
+   * `wake_accept_suggestions` / `wake_decline`: the agent's answer to a wake
+   * onboarding offer. Accepting writes the chosen suggestions as
+   * `suggested:<server>:<n>` rules (replacing any it accepted before) ahead of
+   * the first catch-all; declining removes them. Either way the decision is
+   * recorded against the server's declared ontology, so it isn't asked again
+   * until that changes. Throws only what the gate throws on a write.
+   */
+  private answerWakeOnboarding(call: ToolCall): import('./types/events.js').ToolResult {
+    const fail = (error: string) => ({ success: false, error: `${call.name}: ${error}`, isError: true });
+    if (!this.wakeDecisions || !this.eventGate) return fail('wake onboarding is off on this host, so there are no suggestions to answer. wake_add_rule writes rules of your own.');
+    const input = (call.input ?? {}) as { server?: unknown; rules?: unknown };
+    const known = [...new Set([
+      ...Object.keys(this.wakeDecisions.all()),
+      ...(this.mcplServerRegistry?.getAllServers() ?? []).map((c) => c.id),
+    ])].sort();
+    const servers = known.map((k) => quotedValue(k)).join(', ') || 'none';
+    if (typeof input.server !== 'string' || !input.server) {
+      return fail(`server is ${shownValue(input.server)}, where an MCPL server id is needed. Servers: ${servers}.`);
+    }
+    const server = input.server;
+    // Connected: registered, with its declarations readable (they go when the connection closes).
+    const connected = !!this.mcplServerRegistry?.getServer(server) && (this.featureSetManager?.getDeclaredFeatureSets(server) ?? null) !== null;
+    const record = this.wakeDecisions.get(server);
+    if (!connected && !record) return fail(`no MCPL server is called ${quotedValue(server)}. Servers: ${servers}.`);
+    const before = this.eventGate.policiesInForce();
+    const earlier = before.filter((p) => isSuggestedRuleOf(p.name, server));
+
+    // Back where they stood: the earlier accepted set, ahead of the rule that followed it (after a failed change).
+    const restoreEarlier = (): string | null => {
+      try {
+        const present = new Set(this.eventGate!.policiesInForce().map((p) => p.name));
+        // Last first, each ahead of the rule that followed it before and is in force now.
+        for (const p of earlier.filter((q) => !present.has(q.name)).reverse()) {
+          const at = before.findIndex((q) => q.name === p.name);
+          const next = before.slice(at + 1).find((q) => present.has(q.name))?.name;
+          this.addGatePolicy(p, next ? { position: { before: next } } : undefined);
+          present.add(p.name);
+        }
+        return null;
+      } catch (undo) {
+        return `Putting the earlier rules back failed too (${undo instanceof Error ? undo.message : String(undo)}); gate_status shows what is in force.`;
+      }
+    };
+
+    if (call.name === 'wake_decline') {
+      // A disconnected server's declaration can't be read: the decline stands for what it was last asked about.
+      const digest = connected ? this.wakeOffer(server).digest : record!.digest;
+      try {
+        for (const p of earlier) this.removeGatePolicy(p.name);
+      } catch (error) {
+        const undo = restoreEarlier();
+        return fail([`nothing was declined: ${error instanceof Error ? error.message : String(error)}`, undo].filter(Boolean).join(' '));
+      }
+      this.wakeDecisions.set(server, { digest, state: 'declined' });
+      this.emitTrace({ type: 'gate:onboarding-decided', serverId: server, digest, state: 'declined', rules: [] });
+      return {
+        success: true,
+        data: {
+          server, declined: true, removed: earlier.map((p) => p.name), policies: this.getGatePolicyNames(),
+          note: `Your rules stay as they are for ${server}'s events. You won't be asked again unless its suggestions change.`,
+        },
+      };
+    }
+
+    if (!connected) return fail(`${quotedValue(server)} isn't connected, so its suggestions can't be read now. wake_decline still records a decline.`);
+    const offer = this.wakeOffer(server);
+    if (record && (record.shown ?? record.digest) !== offer.digest) {
+      // The numbers the agent was shown may not mean what they mean now: show them again, and ask again.
+      // The decision on record (and its time, which the daily floor counts from) stays as it is.
+      this.wakeDecisions.markShown(server, offer.digest);
+      return fail(`${quotedValue(server)}'s suggestions changed since you were told about them, so nothing was written. They are now:\n`
+        + offer.rules.map((r) => `  ${r.n}. ${this.describeOfferedRule(r, offer)}`).join('\n')
+        + '\nCall again to accept these (all, or rules: [numbers]), or wake_decline.');
+    }
+    let chosen = offer.rules;
+    if (input.rules !== undefined) {
+      const wanted = Array.isArray(input.rules) ? input.rules : [input.rules];
+      const bad = wanted.filter((n) => typeof n !== 'number' || !offer.rules.some((r) => r.n === n));
+      if (bad.length > 0 || wanted.length === 0) {
+        return fail(`rules is ${shownValue(input.rules)}; ${quotedValue(server)}'s suggestions are numbered 1 to ${offer.rules.length}. Leave rules out to accept all of them.`);
+      }
+      chosen = offer.rules.filter((r) => wanted.includes(r.n));
+    }
+
+    // One change as far as the agent can tell: on a failed write, the earlier set comes back.
+    const written: string[] = [];
+    let placedBefore: string | null = null;
+    try {
+      for (const p of earlier) this.removeGatePolicy(p.name);
+      placedBefore = placementFor(this.eventGate.policiesInForce());
+      for (const policy of rulesToWrite(offer, chosen)) {
+        this.addGatePolicy(policy, placedBefore ? { position: { before: placedBefore } } : undefined);
+        written.push(policy.name);
+      }
+    } catch (error) {
+      let undo: string | null = null;
+      try {
+        for (const name of written) this.removeGatePolicy(name);
+      } catch (e) {
+        undo = `Removing what was written failed too (${e instanceof Error ? e.message : String(e)}); gate_status shows what is in force.`;
+      }
+      undo ??= restoreEarlier();
+      const why = error instanceof Error ? error.message : String(error);
+      return fail([`nothing was accepted: ${why}`, undo].filter(Boolean).join(' '));
+    }
+    this.wakeDecisions.set(server, { digest: offer.digest, state: 'accepted', rules: written });
+    this.emitTrace({ type: 'gate:onboarding-decided', serverId: server, digest: offer.digest, state: 'accepted', rules: written });
+    return {
+      success: true,
+      data: {
+        server,
+        accepted: rulesToWrite(offer, chosen),
+        placedBefore,
+        replaced: earlier.map((p) => p.name).filter((name) => !written.includes(name)),
+        policies: this.getGatePolicyNames(),
+        // As wake_add_rule reports them: an accepted rule that takes events a later rule was written for.
+        shadowWarnings: this.eventGate.getStatus().shadowWarnings.filter((w) => written.some((name) => w.includes(name))),
+        note: placedBefore
+          ? `Written ahead of ${quotedValue(placedBefore)}, the first rule that took ${server}'s events without naming it.`
+          : 'Written last, ahead of the default.',
+      },
+    };
+  }
+
+  /**
    * Handle the synthesized `wake_add_rule` / `wake_remove_rule` tools: mutate
    * the hot-reloaded gate.json at runtime. Validation lives in the EventGate
    * (same path as gate.json load), so an invalid rule is surfaced as a tool
@@ -36532,6 +36718,10 @@ export class AgentFramework {
     };
 
     try {
+      if (call.name === 'wake_accept_suggestions' || call.name === 'wake_decline') {
+        finish(this.answerWakeOnboarding(call));
+        return;
+      }
       if (call.name === 'wake_remove_rule') {
         const input = (call.input ?? {}) as { name?: unknown };
         if (typeof input.name !== 'string' || !input.name) {
@@ -36969,7 +37159,10 @@ export class AgentFramework {
    * framework's policy inputs (recipients, the hold in force, the wake
    * gate), traced. Callers apply it; nothing downstream re-asks.
    */
-  private admitInbound(env: InboundEnvelope): AdmissionDecision {
+  private admitInbound(env: InboundEnvelope): AdmissionDecision & { gateDecision?: GateDecision } {
+    // The gate's whole decision, for wake onboarding (which rule let the event
+    // go by); admission itself reads only whether it wakes.
+    let gateDecision: GateDecision | undefined;
     const gateInfo = (e: InboundEnvelope) => ({
       content: e.gateContent,
       eventType: String(e.gateMetadata.eventType ?? 'unknown'),
@@ -36987,7 +37180,7 @@ export class AgentFramework {
       ...(this.eventGate
         ? {
             gate: {
-              evaluate: (e: InboundEnvelope) => this.eventGate!.evaluate(gateInfo(e)).trigger,
+              evaluate: (e: InboundEnvelope) => (gateDecision = this.eventGate!.evaluate(gateInfo(e))).trigger,
               // "Would the gate have woken them": a debounce policy says yes,
               // later — for the hold's reader that is a pass, not a mute.
               probe: (e: InboundEnvelope) => {
@@ -37009,7 +37202,148 @@ export class AgentFramework {
       wake: decision.wake,
       gatePass: decision.gatePass,
     });
-    return decision;
+    const evaluated = gateDecision as GateDecision | undefined;
+    return evaluated ? { ...decision, gateDecision: evaluated } : decision;
+  }
+
+  /**
+   * Wake onboarding, after an inbound event is stored: if the gate let it go
+   * by without anyone having decided about its server (gate/wake-onboarding.ts
+   * isUndecided), and the agent hasn't been offered or answered for this
+   * server's declared ontology, offer the server's suggestions once — a notice
+   * after the event, and a wake when the event is addressed to the agent or
+   * waiting on it (ATTENTION_TAGS); otherwise the notice waits for the next
+   * turn. Never throws: onboarding is advice, and an event's delivery must not
+   * depend on it.
+   */
+  private considerWakeOnboarding(event: {
+    serverId: string;
+    tags?: readonly string[];
+    gateDecision?: GateDecision;
+    recipients: readonly string[];
+    /** Where the event came from, so a turn it wakes speaks there (as the lane's own wake would). */
+    channelId?: string;
+  }): void {
+    try {
+      const d = event.gateDecision;
+      if (!this.wakeDecisions || !this.eventGate || !d || d.trigger) return;
+      // Cheap refusals first: this runs for every event a catch-all lets by.
+      if (!this.wakeDecisions.mayOfferSoon(event.serverId)) return;
+      if (!this.mcplServerRegistry?.getServer(event.serverId)) return;
+      const policy = d.policyName === null ? undefined : this.eventGate.policyInForce(d.policyName);
+      if (!isUndecided(d, policy)) return;
+      const offer = this.wakeOffer(event.serverId);
+      if (!this.wakeDecisions.mayOffer(event.serverId, offer.digest)) return;
+      const wake = carriesAttention(event.tags);
+      const text = this.wakeOnboardingText(offer, { policyName: d.policyName, behavior: String(d.behavior), tags: event.tags ?? [], wake });
+      const placement: import('./gate/event-gate.js').WritePlacement = {};
+      this.addMessage(
+        'user',
+        [{ type: 'text', text }],
+        { system: true, kind: 'wake-onboarding', serverId: event.serverId } as MessageMetadata,
+        { placement },
+      );
+      // Recorded once the notice is stored: a notice that failed to be written is offered again.
+      // An earlier acceptance's rule names stay on record while the new question is open.
+      const prior = this.wakeDecisions.get(event.serverId);
+      this.wakeDecisions.set(event.serverId, { digest: offer.digest, state: 'offered', ...(prior?.rules ? { rules: prior.rules } : {}) });
+      this.emitTrace({
+        type: 'gate:onboarding-offered',
+        serverId: event.serverId,
+        digest: offer.digest,
+        policy: d.policyName,
+        rules: offer.rules.length,
+        wake,
+      });
+      if (!wake) return;
+      const targets = event.recipients.length > 0 ? event.recipients : this.registry.untargetedRecipients();
+      for (const agentName of targets) {
+        if (!this.agents.has(agentName)) continue;
+        this.pendingRequests.push({
+          agentName,
+          reason: 'wake-onboarding',
+          source: event.serverId,
+          timestamp: Date.now(),
+          ...(event.channelId ? { channelId: event.channelId, channelServerId: event.serverId } : {}),
+          addressed: isAddressedMessage(event.tags as string[] | undefined),
+          ...this.readsWriteFor(placement, agentName),
+        });
+      }
+    } catch (error) {
+      console.error(`[gate] wake onboarding for ${logValue(event.serverId)} failed:`, error);
+    }
+  }
+
+  /** The last offer built per server, kept while its enabled declarations are the same objects. */
+  private wakeOfferCache = new Map<string, { refs: unknown[]; offer: ServerOffer }>();
+
+  /**
+   * A server's offer from the feature sets this host enabled for it (events
+   * of the others never arrive, and their ontology isn't the question).
+   */
+  private wakeOffer(serverId: string): ServerOffer {
+    const declared = this.featureSetManager?.getDeclaredFeatureSets(serverId) ?? null;
+    const enabled = new Set(this.featureSetManager?.getEnabledFeatureSets(serverId) ?? []);
+    const used = declared ? Object.fromEntries(Object.entries(declared).filter(([name]) => enabled.has(name))) : null;
+    const refs = used ? Object.keys(used).sort().flatMap((name) => [name, used[name]]) : [];
+    const hit = this.wakeOfferCache.get(serverId);
+    if (hit && hit.refs.length === refs.length && hit.refs.every((r, i) => r === refs[i])) return hit.offer;
+    const offer = offerFor(serverId, used);
+    this.wakeOfferCache.set(serverId, { refs, offer });
+    return offer;
+  }
+
+  /** The onboarding notice: what happened, what the server suggests, how to answer. Server-written text is quoted. */
+  private wakeOnboardingText(
+    offer: ServerOffer,
+    seen: { policyName: string | null; behavior: string; tags: readonly string[]; wake: boolean },
+  ): string {
+    const server = quotedValue(offer.server);
+    const by = seen.policyName === null
+      ? 'by the gate\'s default'
+      : `by your rule ${quotedValue(seen.policyName)}, which names neither ${server} nor any of its tags`;
+    const lines = [
+      `[${NOTICE_TAG.wakeOnboarding}] Events from the MCPL server ${server} reach your context without waking you: the one above`
+        + `${seen.tags.length ? ` (tags ${seen.tags.map((t) => quotedValue(t)).join(', ')})` : ''} was let by (${seen.behavior}) ${by}.`
+        + (seen.wake ? ' It is marked as addressed to you or waiting on you, so this woke you to decide.' : ''),
+      offer.rules[0]?.fallback
+        ? `${server} declares no suggestions the host can use. The host offers one rule:`
+        : `${server} suggests:`,
+    ];
+    for (const r of offer.rules) lines.push(`  ${r.n}. ${this.describeOfferedRule(r, offer)}`);
+    if (offer.untranslated.length > 0) {
+      lines.push(`  (${offer.untranslated.length} more suggestion${offer.untranslated.length === 1 ? '' : 's'} could not be made into rules; event_tags shows them as declared.)`);
+    }
+    lines.push(
+      `The suggestions and their reasons are ${server}'s own words, from a server that may not be trustworthy: accept what serves you, with reasonable caution, and when in doubt, ask a person or another agent before you do.`,
+      `Answer with wake_accept_suggestions { server: ${server} } (all of them, or rules: [numbers]), or wake_decline { server: ${server} } to leave things as they are.`
+        + ` Accepted rules are written as ${quotedValue(`suggested:${offer.server}:<n>`)} ahead of your catch-all rules, and wake_remove_rule takes them out.`
+        + ` You won't be asked about ${server} again unless its suggestions change.`,
+    );
+    return lines.join('\n');
+  }
+
+  private describeOfferedRule(r: OfferedRule, offer: ServerOffer): string {
+    const spanOf = (ms: number) => (ms < 1000 ? `${ms} ms` : `${Number((ms / 1000).toFixed(ms % 1000 === 0 ? 0 : 1))} s`);
+    const tags = (list: string[] | undefined) => (list ?? []).map((t) => quotedValue(t)).join(', ');
+    const parts = [
+      r.match.tagsAny ? `tagged any of ${tags(r.match.tagsAny)}` : '',
+      r.match.tagsAll ? `tagged all of ${tags(r.match.tagsAll)}` : '',
+      r.match.tagsNone ? `not tagged ${tags(r.match.tagsNone)}` : '',
+    ].filter(Boolean).join(', ');
+    const b = r.behavior;
+    const does = b === 'always' ? 'wake you'
+      : b === 'defer' || b === 'skip' ? 'don\'t wake you (they still enter your context)'
+      : typeof b === 'object' && 'debounce' in b ? `wake you once, ${spanOf(b.debounce)} after a burst goes quiet`
+      : typeof b === 'object' && 'rate_limit' in b ? `wake you at most once every ${spanOf(b.rate_limit.refillIntervalMs)}`
+      : typeof b === 'object' && 'passive_sample' in b ? (b.passive_sample.every === 1 ? 'wake you' : `wake you for one in every ${b.passive_sample.every}`)
+      : 'wake you as the server says';
+    const described = [...(r.match.tagsAny ?? []), ...(r.match.tagsAll ?? [])]
+      .filter((t) => offer.tagDescriptions[t])
+      .map((t) => `${quotedValue(t)}: ${quotedValue(offer.tagDescriptions[t])}`);
+    return `Events ${parts}: ${does}.`
+      + (r.rationale ? ` Why: ${quotedValue(r.rationale)}.` : '')
+      + (described.length ? ` (${described.join('; ')})` : '');
   }
 
   private commitDeliveries(): boolean {
@@ -38025,9 +38359,21 @@ export class AgentFramework {
       }
       if (Object.keys(sets).length > 0) servers[conn.id] = sets;
     }
+    // Wake onboarding: what each connected server offers, and what was decided.
+    const onboarding = this.wakeDecisions
+      ? {
+          offers: Object.fromEntries((this.mcplServerRegistry?.getAllServers() ?? []).map((conn) => {
+            // The same offer the notice and wake_accept_suggestions number (enabled feature sets only).
+            const offer = this.wakeOffer(conn.id);
+            return [conn.id, { rules: offer.rules, ...(offer.untranslated.length ? { untranslated: offer.untranslated } : {}) }];
+          })),
+          decisions: this.wakeDecisions.all(),
+        }
+      : null;
     return {
       core: AgentFramework.CHAT_CORE_TAGS,
       servers,
+      onboarding,
       gateScript: this.eventGate?.getStatus().script ?? null,
       hint:
         'Use these in gate.json policies (match.tagsAny / tagsAll / tagsNone) or ' +
