@@ -5143,76 +5143,10 @@ export class AgentFramework {
     // instead (endTuneOutsWithoutCoordinator), a hold that 0.32's
     // `tuneOut.enabled` left included.
     if (framework.channelRegistry && framework.tuneOutOffered) {
-      framework.tuneOutCoordinator = new TuneOutCoordinator(
-        framework.channelRegistry,
-        framework.mcplServerRegistry!,
-        {
-          addMessage: (participant, content, metadata, forAgent) =>
-            framework.addMessage(participant, content, metadata as MessageMetadata,
-              forAgent ? { forAgent } : undefined),
-          requestInference: (agentName, reason, source) => {
-            framework.pendingRequests.push({ agentName, reason, source, timestamp: Date.now() });
-          },
-          subconsciousName: () => framework.subconsciousAgentName,
-          ...(framework.readerForks
-            ? {
-                invokeReader: (invocation: ReaderInvocation) => framework.invokeReaderFork(invocation),
-                deliverFromReader: (reader: string, content: ContentBlock[], metadata: Record<string, unknown>) =>
-                  framework.deliverFromReader(reader, content, metadata),
-              }
-            : {}),
-          primaryName: () => framework.primaryAgentName,
-          getStoredMessages: () => {
-            const primary = framework.primaryAgentName
-              ? framework.agents.get(framework.primaryAgentName) : undefined;
-            return primary ? primary.getContextManager().getAllMessages() : [];
-          },
-          commitDeliveries: () => framework.commitDeliveries(),
-          historyTool: () => framework.residentHistoryTool(),
-          getDeferredMessages: () => {
-            const forPrimary = (m: DeferredWrite): boolean => (m.forAgent ?? framework.primaryAgentName) === framework.primaryAgentName;
-            // Settled first, so a write that landed is in the stored rows
-            // alone (settleUnknownLandings).
-            framework.settleUnknownLandings(forPrimary);
-            return framework.deferredMessages.filter(forPrimary)
-              .sort(bySeq)
-              .map((m) => ({ participant: m.participant, content: m.content, metadata: m.metadata as Record<string, unknown> | undefined, writeId: m.id, heldAt: m.heldAt }));
-          },
-          // Every reader of the shared slot compiles the dump with its own
-          // strategy, so the dump fits the smallest of their bounds.
-          residentMessageChars: () => {
-            let chars: number | undefined;
-            for (const reader of framework.sharedSlotAgents) {
-              const bound = framework.strategyDerivedToolResultChars(reader);
-              if (bound !== undefined && (chars === undefined || bound < chars)) chars = bound;
-            }
-            return chars;
-          },
-          currentSequence: () => framework.store.currentSequence(),
-          setSubconsciousAnchor: (sequence) =>
-            framework.subconsciousStrategy?.setAnchor(sequence),
-          isForkBound: (channel) =>
-            framework.registry.list().some((record) => sameChannel(framework.homeOf(record.name), channel)),
-          isPrivilegedAuthor: (authorId) =>
-            framework.eventGate?.isPrivilegedUser(authorId) ?? false,
-          allowChannelSpeech: () => framework.subconsciousConfig?.allowChannelSpeech === true,
-          ...(framework.tuneOutAnnounce
-            ? {
-                // The excepted channel on its server: a bare id two servers
-                // register is refused (publishForAgent).
-                announce: async (serverId: string, channelId: string, text: string) => {
-                  const r = await framework.channelRegistry!.publishForAgent(
-                    { serverId, channelId }, text, framework.primaryAgentName ?? 'resident');
-                  return { success: r.success, ...(r.error ? { error: r.error } : {}) };
-                },
-              }
-            : {}),
-          emitTrace: (e) => framework.emitTrace(e as never),
-        },
-      );
+      framework.tuneOutCoordinator = framework.makeTuneOutCoordinator();
       framework.tuneOutCoordinator.resumeActiveEpochs();
     } else {
-      framework.endTuneOutsWithoutCoordinator();
+      framework.releaseTuneOutsWithoutReader();
     }
 
     // Modules, agents, MCPL servers and the tune-out tool are all in place:
@@ -12060,6 +11994,9 @@ export class AgentFramework {
     if (name === this.subconsciousAgentName) {
       this.tuneOutCoordinator?.stopReader();
       this.subconsciousAgentName = null;
+      // No reader is left, and a hold nothing summarizes isn't kept: each
+      // ends now, its backlog to the resident.
+      if (!this.readerForks) this.tuneOutCoordinator?.releaseAll('reader-ended', 'its reader ended');
     }
   }
 
@@ -34135,8 +34072,11 @@ export class AgentFramework {
     if (!this.mcplServerRegistry || !this.mcplHostCapabilities) {
       await this.initializeMcpl([], this.mcplInferenceRoutingConfig ?? undefined);
       // The lifecycle log's replay restored any tune-out on record, and no
-      // coordinator is made here to carry one.
-      this.endTuneOutsWithoutCoordinator();
+      // coordinator is made here to carry one. With no reader configured,
+      // each ends with its backlog; with one, it ends as before (its backlog
+      // isn't delivered: a coordinator made at this connect would carry it).
+      if (this.tuneOutOffered) this.endTuneOutsWithoutCoordinator();
+      else this.releaseTuneOutsWithoutReader();
     }
 
     const collision = this.mcplPrefixCollision(config, undefined, claim);
@@ -36330,6 +36270,97 @@ export class AgentFramework {
    * messages it diverted are held here, stored or still queued to be
    * written, which nothing will now deliver as its backlog.
    */
+  /** The tune-out coordinator over this framework's channels, with the hooks it acts through. */
+  private makeTuneOutCoordinator(): TuneOutCoordinator {
+    const channelRegistry = this.channelRegistry;
+    if (!channelRegistry) throw new Error('a tune-out coordinator needs the channel registry');
+    return new TuneOutCoordinator(
+      channelRegistry,
+      this.mcplServerRegistry!,
+      {
+        addMessage: (participant, content, metadata, forAgent) =>
+          this.addMessage(participant, content, metadata as MessageMetadata,
+            forAgent ? { forAgent } : undefined),
+        requestInference: (agentName, reason, source) => {
+          this.pendingRequests.push({ agentName, reason, source, timestamp: Date.now() });
+        },
+        subconsciousName: () => this.subconsciousAgentName,
+        ...(this.readerForks
+          ? {
+              invokeReader: (invocation: ReaderInvocation) => this.invokeReaderFork(invocation),
+              deliverFromReader: (reader: string, content: ContentBlock[], metadata: Record<string, unknown>) =>
+                this.deliverFromReader(reader, content, metadata),
+            }
+          : {}),
+        primaryName: () => this.primaryAgentName,
+        getStoredMessages: () => {
+          const primary = this.primaryAgentName
+            ? this.agents.get(this.primaryAgentName) : undefined;
+          return primary ? primary.getContextManager().getAllMessages() : [];
+        },
+        commitDeliveries: () => this.commitDeliveries(),
+        historyTool: () => this.residentHistoryTool(),
+        getDeferredMessages: () => {
+          const forPrimary = (m: DeferredWrite): boolean => (m.forAgent ?? this.primaryAgentName) === this.primaryAgentName;
+          // Settled first, so a write that landed is in the stored rows
+          // alone (settleUnknownLandings).
+          this.settleUnknownLandings(forPrimary);
+          return this.deferredMessages.filter(forPrimary)
+            .sort(bySeq)
+            .map((m) => ({ participant: m.participant, content: m.content, metadata: m.metadata as Record<string, unknown> | undefined, writeId: m.id, heldAt: m.heldAt }));
+        },
+        // Every reader of the shared slot compiles the dump with its own
+        // strategy, so the dump fits the smallest of their bounds.
+        residentMessageChars: () => {
+          let chars: number | undefined;
+          for (const reader of this.sharedSlotAgents) {
+            const bound = this.strategyDerivedToolResultChars(reader);
+            if (bound !== undefined && (chars === undefined || bound < chars)) chars = bound;
+          }
+          return chars;
+        },
+        currentSequence: () => this.store.currentSequence(),
+        setSubconsciousAnchor: (sequence) =>
+          this.subconsciousStrategy?.setAnchor(sequence),
+        isForkBound: (channel) =>
+          this.registry.list().some((record) => sameChannel(this.homeOf(record.name), channel)),
+        isPrivilegedAuthor: (authorId) =>
+          this.eventGate?.isPrivilegedUser(authorId) ?? false,
+        allowChannelSpeech: () => this.subconsciousConfig?.allowChannelSpeech === true,
+        ...(this.tuneOutAnnounce
+          ? {
+              // The excepted channel on its server: a bare id two servers
+              // register is refused (publishForAgent).
+              announce: async (serverId: string, channelId: string, text: string) => {
+                const r = await this.channelRegistry!.publishForAgent(
+                  { serverId, channelId }, text, this.primaryAgentName ?? 'resident');
+                return { success: r.success, ...(r.error ? { error: r.error } : {}) };
+              },
+            }
+          : {}),
+        emitTrace: (e) => this.emitTrace(e as never),
+      },
+    );
+  }
+
+  /**
+   * No reader is configured, so nothing can watch or end a hold: each hold
+   * on record (one 0.32's `tuneOut.enabled` left, or one whose reader the
+   * recipe no longer has) ends now, and its backlog goes to the resident,
+   * the per-channel holds and the all-except scope alike, through a
+   * coordinator made for that alone. One whose end fails is left to
+   * endTuneOutsWithoutCoordinator.
+   */
+  private releaseTuneOutsWithoutReader(): void {
+    if (!this.channelRegistry || this.tuneOutCoordinator) return;
+    try {
+      this.makeTuneOutCoordinator().releaseAll('start', 'no reader is configured');
+    } catch (err) {
+      console.error('[tune-out] the holds on record could not be released with no reader configured:', err);
+    }
+    this.endTuneOutsWithoutCoordinator();
+  }
+
   private endTuneOutsWithoutCoordinator(): void {
     const registry = this.channelRegistry;
     if (!registry || this.tuneOutCoordinator) return;

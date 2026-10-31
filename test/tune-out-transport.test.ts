@@ -1415,14 +1415,18 @@ async function tunedOutStore(t: { after(fn: () => Promise<void>): void }, divert
 const endedLine = `"${CHANNEL}" on the "disc" server was tuned out, and nothing on this host watches or cancels tune-outs, so ` +
   'the tune-out ends here and the channel is decided open again.';
 
-test('a tune-out on record at a start with no subconscious ends there, its channel decided open again, and the log names it and the messages it diverted', async (t) => {
+test('a tune-out on record at a start with no subconscious ends there, its channel decided open again, and its backlog goes to the resident', async (t) => {
   const store = await tunedOutStore(t, 2);
   const second = await store.start(false, true);
   const registry = (second as unknown as RestartInternals).channelRegistry;
   assert.equal(registry.getDesiredState('disc', CHANNEL), 'open', 'decided open again, as a cancel leaves it');
   assert.equal(registry.getTuneOutState('disc', CHANNEL), null);
-  assert.ok(store.logged.includes(`[tune-out] ${endedLine} The 2 messages it diverted stay here, and nothing will deliver them ` +
-    'as its backlog.'), store.logged.join('\n'));
+  const released = second.getAgent('scout')!.getContextManager().getAllMessages()
+    .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'tune-out-cancel');
+  assert.equal(released.length, 1, 'one release');
+  assert.match(JSON.stringify(released[0]!.content), /messages=2/, 'both diverted messages in its backlog');
+  assert.match(JSON.stringify(released[0]!.content), /no reader is configured/);
+  assert.ok(!store.logged.some((l) => l.includes('nothing will deliver')), store.logged.join('\n'));
 });
 
 test('the ending counts a diverted message still queued to be written, and says so in the singular', async (t) => {

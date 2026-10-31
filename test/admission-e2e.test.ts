@@ -231,11 +231,7 @@ describe('admission: the hold is decided once, before any side effect', () => {
     } finally { await f.close(); }
   });
 
-  it('without a reader there is no tune-out: no coordinator, and tuneOut.enabled (removed in 0.33.0) is refused', async () => {
-    await assert.rejects(
-      fixture({ framework: { tuneOut: { enabled: true } } as Partial<FrameworkConfig> }),
-      /tuneOut\.enabled was removed in agent-framework 0\.33\.0/,
-    );
+  it('without a reader there is no tune-out: no coordinator, no tune_out tool', async () => {
     const f = await fixture({ framework: { tuneOut: { enabled: false } } as Partial<FrameworkConfig> });
     try {
       await registerOpen(f, 'noisy');

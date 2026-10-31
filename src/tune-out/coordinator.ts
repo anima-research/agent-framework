@@ -947,6 +947,33 @@ export class TuneOutCoordinator {
     return `tune-out/${this.hooks.primaryName() ?? 'default'}/all-except`;
   }
 
+  /**
+   * End every hold on record and deliver each backlog to the resident: the
+   * per-channel holds, then the all-except scope. For a host with no reader
+   * (AgentFramework.releaseTuneOutsWithoutReader); a hold whose end fails
+   * stays on record, and says so in the log.
+   */
+  releaseAll(source: string, reason: string): void {
+    // What the registry has on record, registered or not: at a start the
+    // channels aren't registered yet, so listActive() would find none.
+    for (const { serverId, channelId } of this.channelRegistry.tuneOutsOnRecord()) {
+      try {
+        const r = this.cancel(serverId, channelId, source, reason);
+        if (!r.ok) console.error(`[tune-out] ${this.shown(serverId, channelId)} could not be ended with no reader configured, so it stays on record: ${r.error}`);
+      } catch (err) {
+        console.error(`[tune-out] ${this.shown(serverId, channelId)} could not be ended with no reader configured, so it stays on record:`, err);
+      }
+    }
+    if (this.getAllExcept()) {
+      try {
+        const r = this.cancelAllExcept(source, reason);
+        if (!r.ok) console.error(`[tune-out] the all-except hold could not be ended with no reader configured, so it stays on record: ${r.error}`);
+      } catch (err) {
+        console.error('[tune-out] the all-except hold could not be ended with no reader configured, so it stays on record:', err);
+      }
+    }
+  }
+
   getAllExcept(): AllExceptState | null {
     if (this.scopeCache !== undefined) return this.scopeCache;
     // A record that can't be read, or isn't a hold's, is not taken for no
@@ -972,6 +999,7 @@ export class TuneOutCoordinator {
     opts: { cadenceSeconds?: unknown; backlogCap?: unknown; maxWakes?: unknown; durationSeconds?: unknown },
     source: string,
   ): { ok: true; params: AllExceptParams } | { ok: false; error: string } {
+    if (!this.readerAvailable()) return { ok: false, error: NO_READER_REFUSAL };
     const read = this.readOptions(opts, {
       durationSeconds: null,
       cadenceSeconds: `for the default, ${TUNE_OUT_DEFAULTS.cadenceSeconds}`,
@@ -979,7 +1007,6 @@ export class TuneOutCoordinator {
       maxWakes: `for the default, ${TUNE_OUT_DEFAULTS.maxWakes}`,
     });
     if (!read.ok) return read;
-    if (!this.readerAvailable()) return { ok: false, error: NO_READER_REFUSAL };
     const { given, expiresAtMs } = read;
     if (expiresAtMs === undefined) {
       return { ok: false, error: 'an all-except hold needs `durationSeconds`: it always ends on its own' };
