@@ -36256,22 +36256,8 @@ export class AgentFramework {
     };
   }
 
-  /**
-   * A tune-out on record where this host has no tune-out coordinator: a
-   * start with no subconscious makes none, and neither does a channel
-   * subsystem brought up after start by connectMcplServer. Nothing then
-   * diverts the channel's traffic or ever cancels its tune-out, tune_out
-   * isn't offered, and channel_open, channel_close and channel_decline
-   * refuse a tuned-out channel, so the channel would stay held by a decision
-   * nothing here can change. Each one ends here instead, its channel decided
-   * open again as a cancel leaves it, under the tune-out's own source, so an
-   * agent's tune-out keeps the agent's provenance (the housekeeping guard
-   * reads it). A log line names the channel and says how many of the
-   * messages it diverted are held here, stored or still queued to be
-   * written, which nothing will now deliver as its backlog.
-   */
   /** The tune-out coordinator over this framework's channels, with the hooks it acts through. */
-  private makeTuneOutCoordinator(): TuneOutCoordinator {
+  private makeTuneOutCoordinator(options: { announce?: boolean } = {}): TuneOutCoordinator {
     const channelRegistry = this.channelRegistry;
     if (!channelRegistry) throw new Error('a tune-out coordinator needs the channel registry');
     return new TuneOutCoordinator(
@@ -36327,7 +36313,7 @@ export class AgentFramework {
         isPrivilegedAuthor: (authorId) =>
           this.eventGate?.isPrivilegedUser(authorId) ?? false,
         allowChannelSpeech: () => this.subconsciousConfig?.allowChannelSpeech === true,
-        ...(this.tuneOutAnnounce
+        ...(this.tuneOutAnnounce && options.announce !== false
           ? {
               // The excepted channel on its server: a bare id two servers
               // register is refused (publishForAgent).
@@ -36354,13 +36340,32 @@ export class AgentFramework {
   private releaseTuneOutsWithoutReader(): void {
     if (!this.channelRegistry || this.tuneOutCoordinator) return;
     try {
-      this.makeTuneOutCoordinator().releaseAll('start', 'no reader is configured');
+      // Nothing is posted in an excepted channel: this runs while the host
+      // starts, before anything is live.
+      this.makeTuneOutCoordinator({ announce: false }).releaseAll('start', 'no reader is configured');
     } catch (err) {
       console.error('[tune-out] the holds on record could not be released with no reader configured:', err);
     }
     this.endTuneOutsWithoutCoordinator();
   }
 
+  /**
+   * A tune-out on record where this host has no tune-out coordinator: a
+   * start with no subconscious makes none, and neither does a channel
+   * subsystem brought up after start by connectMcplServer. Nothing then
+   * diverts the channel's traffic or ever cancels its tune-out, tune_out
+   * isn't offered, and channel_open, channel_close and channel_decline
+   * refuse a tuned-out channel, so the channel would stay held by a decision
+   * nothing here can change. Each one ends here instead, its channel decided
+   * open again as a cancel leaves it, under the tune-out's own source, so an
+   * agent's tune-out keeps the agent's provenance (the housekeeping guard
+   * reads it). A log line names the channel and says how many of the
+   * messages it diverted are held here, stored or still queued to be
+   * written, which nothing will now deliver as its backlog. Where no reader
+   * is configured, releaseTuneOutsWithoutReader ends them first, backlog
+   * delivered; what reaches this is a hold whose release failed, or the
+   * late-connect path of a host that has a reader.
+   */
   private endTuneOutsWithoutCoordinator(): void {
     const registry = this.channelRegistry;
     if (!registry || this.tuneOutCoordinator) return;

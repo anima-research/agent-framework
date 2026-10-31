@@ -950,15 +950,18 @@ export class TuneOutCoordinator {
   /**
    * End every hold on record and deliver each backlog to the resident: the
    * per-channel holds, then the all-except scope. For a host with no reader
-   * (AgentFramework.releaseTuneOutsWithoutReader); a hold whose end fails
-   * stays on record, and says so in the log.
+   * (AgentFramework.releaseTuneOutsWithoutReader) and a reader that ended; a
+   * hold whose end fails stays on record, and says so in the log. A
+   * per-channel hold ends under its own source, so an agent's tune-out keeps
+   * the agent's provenance (the housekeeping guard reads it); `source` is the
+   * all-except scope's.
    */
   releaseAll(source: string, reason: string): void {
     // What the registry has on record, registered or not: at a start the
     // channels aren't registered yet, so listActive() would find none.
-    for (const { serverId, channelId } of this.channelRegistry.tuneOutsOnRecord()) {
+    for (const { serverId, channelId, source: recorded } of this.channelRegistry.tuneOutsOnRecord()) {
       try {
-        const r = this.cancel(serverId, channelId, source, reason);
+        const r = this.cancel(serverId, channelId, recorded, reason);
         if (!r.ok) console.error(`[tune-out] ${this.shown(serverId, channelId)} could not be ended with no reader configured, so it stays on record: ${r.error}`);
       } catch (err) {
         console.error(`[tune-out] ${this.shown(serverId, channelId)} could not be ended with no reader configured, so it stays on record:`, err);

@@ -17,7 +17,11 @@ const READER = { enabled: true, systemPrompt: 'You are the Subconscious. Report 
 type Internals = {
   tuneOutCoordinator: TuneOutCoordinator | null;
   subconsciousAgentName: string | null;
-  channelRegistry: { getTuneOutState(serverId: string, channelId: string): unknown };
+  channelRegistry: {
+    getTuneOutState(serverId: string, channelId: string): unknown;
+    readCoordinatorState(id: string): unknown;
+    desiredStates: Map<string, { state: string; source: string }>;
+  };
 };
 const internals = (f: { framework: AgentFramework }) => f.framework as unknown as Internals;
 const residentRows = (f: { framework: AgentFramework }) =>
@@ -64,6 +68,9 @@ test('a hold on record at a start with no reader ends there, its backlog deliver
   await f.create();
   assert.equal(internals(f).tuneOutCoordinator, null, 'no reader, no coordinator kept');
   assert.equal(internals(f).channelRegistry.getTuneOutState('editor', 'chat'), null, 'the hold ended');
+  const record = internals(f).channelRegistry.desiredStates.get('editor\u0000chat');
+  assert.equal(record?.state, 'open', 'decided open again, as a cancel leaves it');
+  assert.equal(record?.source, 'agent-tool', "under the agent's own source, which the housekeeping guard reads");
   assert.equal(releases(f).length, 1);
   const dump = JSON.stringify(releases(f)[0]!.content);
   assert.match(dump, /document_diff/, 'the held batch is in the backlog');
@@ -85,11 +92,14 @@ test('an all-except hold on record at a start with no reader ends there, its bac
   await eventually(() => residentRows(f).some((m) => m.metadata?.tuneOut && JSON.stringify(m.content).includes('document_diff')), 'the batch held');
 
   await f.framework.stop();
-  options.framework = { tuneOut: { announce: false } };
+  const postedBefore = f.published.length;
+  options.framework = {}; // announce on, as by default
   await f.create();
   const scoped = releases(f).filter((m) => m.metadata?.scope === 'all-except');
   assert.equal(scoped.length, 1, 'the all-except hold was released');
   assert.match(JSON.stringify(scoped[0]!.content), /document_diff/);
+  assert.equal(internals(f).channelRegistry.readCoordinatorState('tune-out/agent/all-except') ?? null, null, 'its record is cleared');
+  assert.equal(f.published.length, postedBefore, 'nothing is posted in the excepted channel while the host starts');
 });
 
 test('when the persistent reader is stopped, its holds end with it and each backlog goes to the resident', async (t) => {
