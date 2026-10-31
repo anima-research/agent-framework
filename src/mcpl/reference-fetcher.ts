@@ -39,7 +39,7 @@
 import { createHash } from 'node:crypto';
 import type { ReferenceRecord, Refusal, ServerAddress } from './references.js';
 import { boundedForLog, describeCause } from './errors.js';
-import { dialCheck, dialServer, FRESH_REFERENCE, NOTHING_TO_DO, REFERENCE_LIMITS, sanitizeLabel, shownServerId } from './references.js';
+import { dialCheck, dialServer, FRESH_REFERENCE, NOTHING_TO_DO, PAYLOAD_NEVER, REFERENCE_LIMITS, sanitizeLabel, shownServerId } from './references.js';
 
 export { normalizedOrigin, type Refusal } from './references.js';
 
@@ -241,7 +241,12 @@ export class ReferenceFetcher {
     /** Persist the payload; returns a mount-prefixed path or null when no
      *  writable mount without an include exists. File name is host-generated (§7.3). */
     private readonly saveFile: (fileName: string, data: Buffer, mimeType: string) => Promise<string | null>,
+    private readonly withhold?: { remove(path: string): Promise<void> },
   ) {}
+
+  private withholds(record: ReferenceRecord): boolean {
+    return this.withhold !== undefined && record.payloadNever === true;
+  }
 
   /** The server a check (dialServer or dialCheck) chose, with its credential
    *  and limits from the same resolver answer whose address the check read:
@@ -279,7 +284,7 @@ export class ReferenceFetcher {
    *  limit enter: the expiry, the budget and the ceiling were checked when
    *  that fetch began. */
   isEagerEligible(record: ReferenceRecord): boolean {
-    if (record.fetchedPath || record.eagerFailed) return false;
+    if (this.withholds(record) || record.fetchedPath || record.eagerFailed) return false;
     const check = this.inFlight.has(record.refId) ? this.serverFor(record) : this.beforeDial(record);
     if ('refusal' in check) return false;
     return record.testimony.sizeBytes !== undefined && record.testimony.sizeBytes <= this.eagerLimit(check.binding);
@@ -372,6 +377,7 @@ export class ReferenceFetcher {
    *  already under way, or dial (where it can still fail), the same three
    *  steps fetch() takes. */
   refusal(record: ReferenceRecord): Refusal | null {
+    if (this.withholds(record)) return PAYLOAD_NEVER;
     if (record.fetchedPath || this.inFlight.has(record.refId)) return null;
     const check = this.beforeDial(record);
     return 'refusal' in check ? check.refusal : null;
@@ -395,12 +401,14 @@ export class ReferenceFetcher {
     const timeoutMs = opts?.timeoutMs ?? FETCH_TIMEOUT_MS;
     const deadline = performance.now() + timeoutMs;
     for (;;) {
+      if (this.withholds(record)) return fail(PAYLOAD_NEVER.error, PAYLOAD_NEVER.remedy);
       if (record.fetchedPath) {
         return { ok: true, path: record.fetchedPath, bytes: record.verifiedBytes,
           mimeType: record.verifiedMimeType, digestVerified: record.digestVerified };
       }
       const flight = this.inFlight.get(record.refId) ?? this.start(record, ceiling, deadline, timeoutMs);
       const ended = await settledBy(flight.ended, deadline);
+      if (this.withholds(record)) return fail(PAYLOAD_NEVER.error, PAYLOAD_NEVER.remedy);
       if (ended === undefined) return tookLonger(timeoutMs);
       const { stoppedBy, atCeiling, ...outcome } = ended;
       if (stoppedBy === 'ceiling') {
@@ -456,6 +464,10 @@ export class ReferenceFetcher {
         // this server read the same total, so none spends what another took.
         const total = (this.totals.get(serverId) ?? 0) + value.byteLength;
         this.totals.set(serverId, total);
+        if (this.withholds(record)) {
+          controller.abort();
+          return fail(PAYLOAD_NEVER.error, PAYLOAD_NEVER.remedy);
+        }
         // The limit nothing lifts first, as before dialing: the host's
         // ceiling, then the budget, then a call's own ceiling.
         if (received > DEFAULT_FETCH_MAX_BYTES) {
@@ -509,6 +521,7 @@ export class ReferenceFetcher {
       // without an include and a failed write, and the hook logs which. A
       // throw is the save's failure too, not the fetch's, so it's logged here.
       const fileName = `${record.refId}.${ext}`;
+      if (this.withholds(record)) return fail(PAYLOAD_NEVER.error, PAYLOAD_NEVER.remedy);
       let path: string | null;
       try {
         path = await this.saveFile(fileName, data, observedMime);
@@ -519,6 +532,15 @@ export class ReferenceFetcher {
       if (path === null) {
         return fail("it was fetched, but this host couldn't store it in its workspace, so nothing was kept",
           'Calling again is likely to fail the same way; whoever runs this host can see why in its log.');
+      }
+      if (this.withholds(record)) {
+        try {
+          await this.withhold!.remove(path);
+        } catch (e) {
+          console.error(`[refs] couldn't remove ${path}, the copy of ${record.refId}, whose payload a server marked never (RFC-005), `
+            + `so the agent's tools may still open it until it's deleted: ${boundedForLog(describeCause(e))}`);
+        }
+        return fail(PAYLOAD_NEVER.error, PAYLOAD_NEVER.remedy);
       }
 
       record.fetchedPath = path;
