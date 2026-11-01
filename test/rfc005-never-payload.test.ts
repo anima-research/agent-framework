@@ -179,7 +179,7 @@ describe('the payload mark', () => {
   });
 
   it("withholds an embedded resource's contents, text or blob, where its uri is `never`, beside a `never` for it in either order, by its own `never`, or by a server's earlier mark: on the lanes, in history and to a script", async () => {
-    const NOTICE = '[Resource not shown: a server asked that its content never reach you or your tools.]';
+    const NOTICE = '[Resource not shown: its content is marked never to reach you or your tools.]';
     const notice = { type: 'text', text: NOTICE };
     const contents = {
       text: (uri: string) => ({ type: 'resource', resource: { uri, text: 'secret contents', mimeType: 'text/plain' } }),
@@ -305,13 +305,13 @@ describe('what a marked record shows', () => {
         { claims: contentClaims([inlineNever(stubbed), { type: 'resource', uri: stubbed }]) });
       const record = referenceRegistry.findByUri(stubbed)!;
       const marked = serverId === undefined ? undefined : true;
-      const resultNever = '[Reference not shown: a tool result asked that its content never reach you or your tools.]';
-      assert.deepEqual([record.payloadNever, stub], [marked, serverId === undefined ? resultNever : `[${record.refId}] v.wav — from tool result — ${NEVER_TEXT}`], String(serverId));
+      const resultNever = (name: string) => `[Reference not shown "${name}": its content is marked never to reach you or your tools.]`;
+      assert.deepEqual([record.payloadNever, stub], [marked, serverId === undefined ? resultNever('v.wav') : `[${record.refId}] v.wav — from tool result — ${NEVER_TEXT}`], String(serverId));
       const saved = referenceRegistry.register(testimonyOf({ type: 'resource', uri: scripted, name: 'w.wav' }), 'zz-never-dialed');
       saved.fetchedPath = `scratch/refs/${saved.refId}.wav`;
       const object = (await quietly(() => referenceBlockForScript({ type: 'resource', uri: scripted, name: 'w.wav' }, serverId,
         contentClaims([inlineNever(scripted), { type: 'resource', uri: scripted }])))).value as Record<string, unknown>;
-      if (serverId === undefined) assert.deepEqual([saved.payloadNever, object], [undefined, { type: 'text', text: resultNever }], 'no id to fetch by');
+      if (serverId === undefined) assert.deepEqual([saved.payloadNever, object], [undefined, { type: 'text', text: resultNever('w.wav') }], 'no id to fetch by');
       else assert.deepEqual([saved.payloadNever, object.unfetchable, object.savedTo], [true, NEVER_TEXT, null], String(serverId));
       assert.equal(saved.fetchedPath, serverId === undefined ? `scratch/refs/${saved.refId}.wav` : undefined, 'only a mark forgets the path; a result\'s own never only withholds it');
     }
@@ -710,7 +710,7 @@ describe("the framework's fetches", () => {
   });
 
   it("give out no id to fetch by for a reference only a module's result calls `never`, so its notice promises nothing the fetcher won't keep, while the id the server's own delivery gave still fetches", async () => {
-    const RESULT_NEVER = '[Reference not shown: a tool result asked that its content never reach you or your tools.]';
+    const RESULT_NEVER = '[Reference not shown "p.wav": its content is marked never to reach you or your tools.]';
     const fw = Object.create(AgentFramework.prototype) as {
       pushEvent(event: unknown): void;
       dispatchFetchReferenceToolCall(agentName: string, call: { id: string; name: string; input: unknown }): void;

@@ -1019,7 +1019,7 @@ describe("MCP's embedded resource, an ordinary inline block (RFC-005 §8.1)", ()
     // Ada-1017, room-203 #206688: its never counts in the result's claims,
     // on the model's line as a content array and at depth.
     const line = toolResultDataToHistoryString([sealed, link]);
-    assert.ok(line.startsWith('[Resource not shown: a server asked that its content never reach you or your tools.]\n') && !line.includes(SEALED_URI), line);
+    assert.ok(line.startsWith('[Resource not shown: its content is marked never to reach you or your tools.]\n') && !line.includes(SEALED_URI), line);
     const nested = toolResultDataToHistoryString({ a: sealed, b: link });
     assert.ok(!nested.includes(SEALED_URI), nested);
     assert.equal(contentClaimsOf([sealed]).get(SEALED_URI)?.never, true);
@@ -1451,10 +1451,11 @@ describe('one answer for every block of a result', () => {
     } finally {
       console.error = error;
     }
-    // A result naming the uri only in a link leaves the earlier never in force.
+    // An earlier result's never, with no server's word on the uri since,
+    // stays in its record's testimony, so a later link alone is withheld.
     const uri = 'https://zz-elsewhere.example/lifted-link-only.csv';
     toolResultDataToHistoryString([{ type: 'resource', uri, name: 'kept.csv', disposition: 'never' }]);
-    assert.equal(toolResultDataToHistoryString([{ type: 'resource_link', uri, name: 'kept.csv' }]), '[Reference not shown: a tool result asked that its content never reach you or your tools.]');
+    assert.equal(toolResultDataToHistoryString([{ type: 'resource_link', uri, name: 'kept.csv' }]), '[Reference not shown "kept.csv": its content is marked never to reach you or your tools.]');
   });
 
   it("finds a never inside inline data's other fields, which showing it descends into, before any block is shown", () => {
@@ -1466,7 +1467,7 @@ describe('one answer for every block of a result', () => {
       ],
     };
     const shown = JSON.parse(toolResultDataToHistoryString(data)) as { items: [string, { _meta: { ref: string } }] };
-    assert.deepEqual([shown.items[0], shown.items[1]._meta.ref], ['[Reference not shown: a tool result asked that its content never reach you or your tools.]', '[Reference not shown: a tool result asked that its content never reach you or your tools.]']);
+    assert.deepEqual([shown.items[0], shown.items[1]._meta.ref], ['[Reference not shown "meta.csv": its content is marked never to reach you or your tools.]', '[Reference not shown "meta.csv": its content is marked never to reach you or your tools.]']);
     // A content array shows an image, not its fields, so there a reference
     // inside them doesn't count, and the link shows its uri.
     const shownUri = 'https://zz-elsewhere.example/meta-in-array.csv';
@@ -1484,7 +1485,7 @@ describe('one answer for every block of a result', () => {
       { type: 'resource', uri, name: 'evicted.csv', disposition: 'never' }, ...many, { type: 'resource_link', uri, name: 'evicted.csv' },
     ]).split('\n');
     assert.equal(lines.length, 2003);
-    assert.deepEqual([lines[0], lines[2002]], ['[Reference not shown: a tool result asked that its content never reach you or your tools.]', '[Reference not shown: a tool result asked that its content never reach you or your tools.]']);
+    assert.deepEqual([lines[0], lines[2002]], ['[Reference not shown "evicted.csv": its content is marked never to reach you or your tools.]', '[Reference not shown "evicted.csv": its content is marked never to reach you or your tools.]']);
   });
 
   it("reads claims through toJSON, as serialization does, so a never toJSON gives counts and a getter it leaves out isn't read", () => {
@@ -1496,7 +1497,7 @@ describe('one answer for every block of a result', () => {
     };
     const shown = JSON.parse(toolResultDataToHistoryString({ link: { type: 'resource_link', uri, name: 'to-json.csv' }, value })) as
       { link: string; value: { ref: string } };
-    assert.deepEqual([shown.link, shown.value.ref], ['[Reference not shown: a tool result asked that its content never reach you or your tools.]', '[Reference not shown: a tool result asked that its content never reach you or your tools.]']);
+    assert.deepEqual([shown.link, shown.value.ref], ['[Reference not shown "to-json.csv": its content is marked never to reach you or your tools.]', '[Reference not shown "to-json.csv": its content is marked never to reach you or your tools.]']);
     assert.equal(reads, 0);
   });
 
@@ -1527,7 +1528,7 @@ describe('one answer for every block of a result', () => {
       data: { files: [{ type: 'resource_link', uri, name: 'kept.csv' }], other: { type: 'resource', uri, name: 'kept.csv', disposition: 'never' } },
       keepWhenWithheld: ['files'],
     }, undefined);
-    assert.equal(kept, JSON.stringify({ files: ['[Reference not shown: a tool result asked that its content never reach you or your tools.]'] }));
+    assert.equal(kept, JSON.stringify({ files: ['[Reference not shown "kept.csv": its content is marked never to reach you or your tools.]'] }));
   });
 
   it("keeps nothing of a withheld result whose claims a value stops the walk of, since what the rest claims is unknown", () => {
