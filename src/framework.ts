@@ -24,6 +24,7 @@ import {
   type SubconsciousConfig,
   type PersistentReaderConfig,
   type ForkReaderConfig,
+  type ReaderRederivedReason,
 } from './tune-out/tools.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, alreadyTunedOutText, cancelWaitsNote, type ReaderInvocation } from './tune-out/coordinator.js';
 import { SubconsciousWindowAnchor } from './tune-out/window-anchor.js';
@@ -3261,6 +3262,60 @@ export interface DeriveAgentOptions {
   metadata?: Record<string, unknown>;
 }
 
+/** resumeAgent's options. */
+export interface ResumeAgentOptions {
+  /**
+   * The new incarnation's record metadata, in place of the ended record's:
+   * what the host records of this run (a reader's epoch, channel and
+   * trigger, say), which `dendrite.beforeDerive` is shown with the rest of
+   * the spec. Left out, the ended record's is kept.
+   */
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * The configuration deriveAgent gives a derived agent: the parent's, with
+ * its live settings (a runtime budget, its think-text policy), the
+ * derivation's overrides, its name and strategy, and for a shared
+ * inheritance the role mapping that presents the parent's turns as the
+ * child's own. A persisted reader's resumption rebuilds it this way too.
+ */
+function derivedAgentConfig(
+  parent: Agent,
+  parentConfig: AgentConfig,
+  options: Pick<DeriveAgentOptions, 'name' | 'strategy' | 'config'>,
+  shared: boolean,
+): AgentConfig {
+  return {
+    ...parentConfig,
+    // The parent's LIVE settings, not just its recipe: a runtime budget or
+    // think-policy override changes what it renders.
+    ...(parent.contextBudgetTokens !== undefined ? { contextBudgetTokens: parent.contextBudgetTokens } : {}),
+    sameRoundThinkTextPolicy: parent.getEffectiveSameRoundThinkTextPolicy(),
+    ...options.config,
+    name: options.name,
+    strategy: options.strategy,
+    // A shared inheritance has no copy step to rename the parent's turns,
+    // so the mapping is declared: the parent's voice is the child's own,
+    // presented under the name the parent's own requests use.
+    ...(shared
+      ? {
+          selfParticipants: [...new Set([
+            parent.name,
+            ...(parentConfig.selfParticipants ?? []),
+            ...(options.config?.selfParticipants ?? []),
+          ])],
+          presentAs: options.config?.presentAs ?? parent.presentAs,
+        }
+      : { selfParticipants: options.config?.selfParticipants, presentAs: options.config?.presentAs }),
+  };
+}
+
+/** Whether two `allowedTools` settings allow the same: the same value, or the same list in the same order. */
+function sameAllowedTools(a: AgentConfig['allowedTools'], b: AgentConfig['allowedTools']): boolean {
+  return a === b || JSON.stringify(a) === JSON.stringify(b);
+}
+
 /** Rejection delivered to the caller awaiting a bounded run that was ended from outside. */
 export class AgentStoppedError extends Error {
   constructor(
@@ -4400,6 +4455,20 @@ export class AgentFramework {
   /** `subconscious.reader: 'forks'`: the reader is a succession of forks (Dendrite). */
   private readerForks = false;
   private readerForkCounter = 0;
+  /**
+   * `subconscious.persist` 'epoch' | 'resident': per reader identity
+   * (`reader/<resident>/<epoch8>` or `reader/<resident>`), the look running
+   * or last asked for. A look waits for the one before it, so one look runs
+   * at a time per identity: resumeAgent refuses a name still registered, and
+   * the all-except hold asks for one look per held channel in one tick.
+   */
+  private readerLooks = new Map<string, Promise<void>>();
+  /**
+   * `subconscious.persist` 'epoch' | 'resident': per reader identity, the
+   * generation its name carries now (`/g<k>`), as this process knows it,
+   * read from the registry at the identity's first look in the process.
+   */
+  private readerGenerations = new Map<string, number>();
 
   /** Agents an abandon could not cancel (token held, no stream) — surfaced
    *  in HostModeStatus until the next quiesce/resume. */
@@ -11263,29 +11332,7 @@ export class AgentFramework {
       throw new Error(`deriveAgent: "${options.name}" was not created: solve is for mode 'shared', and a copy is not solved`);
     }
 
-    const config: AgentConfig = {
-      ...parentConfig,
-      // The parent's LIVE settings, not just its recipe: a runtime budget or
-      // think-policy override changes what it renders.
-      ...(parent.contextBudgetTokens !== undefined ? { contextBudgetTokens: parent.contextBudgetTokens } : {}),
-      sameRoundThinkTextPolicy: parent.getEffectiveSameRoundThinkTextPolicy(),
-      ...options.config,
-      name: options.name,
-      strategy: options.strategy,
-      // A shared inheritance has no copy step to rename the parent's turns,
-      // so the mapping is declared: the parent's voice is the child's own,
-      // presented under the name the parent's own requests use.
-      ...(shared
-        ? {
-            selfParticipants: [...new Set([
-              parent.name,
-              ...(parentConfig.selfParticipants ?? []),
-              ...(options.config?.selfParticipants ?? []),
-            ])],
-            presentAs: options.config?.presentAs ?? parent.presentAs,
-          }
-        : { selfParticipants: options.config?.selfParticipants, presentAs: options.config?.presentAs }),
-    };
+    const config = derivedAgentConfig(parent, parentConfig, options, shared);
 
     const spec = taskForkSpec(options.name, {
       parent: options.from,
@@ -11463,8 +11510,14 @@ export class AgentFramework {
    * incarnation ran before it ended has had its effect, and a call it never
    * received a result for may be made again by the model. Drive the result
    * with `runEphemeralToCompletion`.
+   *
+   * `options.metadata` is the new incarnation's record metadata; left out,
+   * the ended record's is kept. A shared derivation whose source is still
+   * registered, resumed on the source's `allowedTools`, shows the source's
+   * tool presentation, as its derivation did (deriveAgent), so its tool
+   * block is the source's again.
    */
-  async resumeAgent(name: string, config: Omit<AgentConfig, 'name'>): Promise<{
+  async resumeAgent(name: string, config: Omit<AgentConfig, 'name'>, options: ResumeAgentOptions = {}): Promise<{
     agent: Agent;
     contextManager: ContextManager;
     cleanup: () => void;
@@ -11508,7 +11561,7 @@ export class AgentFramework {
       ...(fullConfig.selfParticipants?.length ? { selfParticipants: fullConfig.selfParticipants } : {}),
       ...(fullConfig.presentAs && fullConfig.presentAs !== name ? { presentAs: fullConfig.presentAs } : {}),
       ...(record.namespace ? { namespace: record.namespace } : {}),
-      ...(record.metadata ? { metadata: record.metadata } : {}),
+      ...((options.metadata ?? record.metadata) ? { metadata: options.metadata ?? record.metadata } : {}),
     };
     if (this.beforeDerive) {
       const verdict = this.beforeDerive(spec);
@@ -11547,8 +11600,21 @@ export class AgentFramework {
     this.ephemeralCandidates.set(agent, { contextManager, config: fullConfig, resume: true, after: record.incarnation, spec });
     this.managerReleases.set(agent, release);
     this.resumesPending.set(name, agent);
+    // A shared derivation on its source's tools shows the source's tool
+    // presentation, as deriveAgent set it up (toolSurfaceOwners): its tool
+    // block is the front of the prefix it shares. The run's end clears it,
+    // as it does a derivation's; a cleanup before the run does here.
+    const source = record.inherit?.mode === 'shared' ? record.inherit.from : undefined;
+    const sourceConfig = source !== undefined && this.agents.has(source) ? this.agentConfigs.get(source) : undefined;
+    const surfaceOwner = source !== undefined && sourceConfig && sameAllowedTools(fullConfig.allowedTools, sourceConfig.allowedTools)
+      ? this.toolSurfaceOwners.get(source) ?? source
+      : undefined;
+    if (surfaceOwner !== undefined) this.toolSurfaceOwners.set(name, surfaceOwner);
     const cleanup = () => {
       if (this.resumesPending.get(name) === agent) this.resumesPending.delete(name);
+      if (surfaceOwner !== undefined && !this.agents.has(name) && this.toolSurfaceOwners.get(name) === surfaceOwner) {
+        this.toolSurfaceOwners.delete(name);
+      }
       this.releasedByCleanup.add(agent);
       this.releaseManager(agent);
     };
@@ -17496,6 +17562,11 @@ export class AgentFramework {
     const primary = this.primaryAgentName;
     const cfg = this.subconsciousConfig;
     if (!primary || cfg?.reader !== 'forks' || !this.agents.has(primary)) return;
+    const persist = cfg.persist ?? 'look';
+    if (persist !== 'look') {
+      this.invokePersistedReader(primary, cfg, persist, invocation);
+      return;
+    }
     const name = `reader/${primary}/${invocation.epochId.slice(0, 8)}/${++this.readerForkCounter}`;
 
     void (async () => {
@@ -17619,6 +17690,207 @@ export class AgentFramework {
     })();
   }
 
+
+  /**
+   * A look of a persisted reader (`subconscious.persist` 'epoch' |
+   * 'resident'): one derived identity per scope, `reader/<resident>/<epoch8>`
+   * or `reader/<resident>`, under its generation's name (`/g<k>`). Its looks
+   * run one at a time, each after the one asked for before it
+   * (persistedReaderLook).
+   */
+  private invokePersistedReader(primary: string, cfg: ForkReaderConfig, persist: 'epoch' | 'resident', invocation: ReaderInvocation): void {
+    const identity = persist === 'epoch' ? `reader/${primary}/${invocation.epochId.slice(0, 8)}` : `reader/${primary}`;
+    const before = this.readerLooks.get(identity) ?? Promise.resolve();
+    const look = before
+      .then(() => this.persistedReaderLook(primary, cfg, persist, identity, invocation))
+      .catch((error) => {
+        console.error(`[tune-out] a look of reader ${identity} failed:`, error instanceof Error ? error.message : error);
+      });
+    this.readerLooks.set(identity, look);
+    void look.then(() => {
+      if (this.readerLooks.get(identity) === look) this.readerLooks.delete(identity);
+    });
+  }
+
+  /**
+   * Where a persisted reader's look starts: the identity's current
+   * generation, resumed, when the registry has an ended record of it;
+   * otherwise a derivation under the first generation's name no agent has
+   * had in this process or in the registry. A derivation that follows an
+   * earlier generation says why (`reason`).
+   */
+  private readerPlan(identity: string): { name: string; resume?: AgentRecord; previous?: string; reason?: ReaderRederivedReason } {
+    const nameOf = (k: number): string => `${identity}/g${k}`;
+    let k = this.readerGenerations.get(identity);
+    if (k === undefined) {
+      // The identity's first look in this process: the newest generation
+      // the registry knows of, from an earlier process included.
+      k = 0;
+      while (this.registry.inspect(nameOf(k + 1))) k++;
+      this.readerGenerations.set(identity, k);
+    }
+    const current = k > 0 ? nameOf(k) : undefined;
+    const record = current !== undefined ? this.registry.inspect(current) : undefined;
+    if (current !== undefined && record?.ended) return { name: current, resume: record };
+    let next = Math.max(1, k);
+    const taken = (name: string): boolean =>
+      this.usedEphemeralAgentNames.has(name) || this.agents.has(name) || this.registry.inspect(name) !== undefined;
+    while (taken(nameOf(next))) next++;
+    this.readerGenerations.set(identity, next);
+    // A generation that was used and has no ended record: derived again.
+    // One whose derivation never got its name (a beforeDerive refusal)
+    // is derived under the same name, as the first look was to be.
+    const earlier = current !== undefined && (record !== undefined || this.usedEphemeralAgentNames.has(current));
+    return { name: nameOf(next), ...(earlier ? { previous: current, reason: 'no-record' as const } : {}) };
+  }
+
+  /**
+   * One look of a persisted reader. The identity's first look in its scope
+   * derives it as a reader fork is derived (invokeReaderFork); a later look
+   * resumes it (resumeAgent): a new incarnation on the branch it left, with
+   * the configuration a derivation gives it and this look's epoch, channel
+   * and trigger as its metadata. Either way it is handed this look's
+   * framing as one stored row and runs once. A resumption that fails, a
+   * beforeDerive refusal included, is a failed look: its held rows go back
+   * (readerFailed). Never throws.
+   */
+  private async persistedReaderLook(
+    primary: string,
+    cfg: ForkReaderConfig,
+    persist: 'epoch' | 'resident',
+    identity: string,
+    invocation: ReaderInvocation,
+  ): Promise<void> {
+    // The resident ended while this look waited: it ended the reader with it
+    // (onParentEnd 'end'), and nothing resumes after.
+    const parent = this.agents.get(primary);
+    const parentConfig = this.agentConfigs.get(primary);
+    if (!parent || !parentConfig) return;
+    const resync = cfg.resync ?? 'window';
+    const plan = this.readerPlan(identity);
+    const name = plan.name;
+    let framed = false;
+    let handed = invocation.backlog;
+    let candidate: { agent: Agent; contextManager: ContextManager; cleanup: () => void } | undefined;
+    try {
+      const base = {
+        resident: primary,
+        fork: name,
+        voice: cfg.voice,
+        channelId: invocation.channelId,
+        epochId: invocation.epochId,
+        trigger: invocation.trigger,
+        notice: invocation.notice,
+        dispositions: invocation.dispositions,
+      };
+      const metadata = { epochId: invocation.epochId, channelId: invocation.channelId, trigger: invocation.trigger, persist, resync };
+      const framingRow = (held: StoredMessage[]): MessageMetadata => ({
+        system: true,
+        kind: 'tune-out-reader-framing',
+        channelId: invocation.channelId,
+        epochId: invocation.epochId,
+        trigger: invocation.trigger,
+        heldMessageIds: held.map((m) => m.id),
+      }) as MessageMetadata;
+      const readerConfig = { model: cfg.model, proseRouting: 'disabled' as const, ...readerModelFields(cfg) };
+      let incarnation: number;
+      if (plan.resume) {
+        // The configuration deriveAgent gives a reader, built again: it is
+        // not stored with the agent.
+        candidate = await this.resumeAgent(
+          name,
+          derivedAgentConfig(parent, parentConfig, {
+            name,
+            ...(cfg.strategyFactory ? { strategy: cfg.strategyFactory() } : {}),
+            config: readerConfig,
+          }, true),
+          { metadata },
+        );
+        incarnation = plan.resume.incarnation + 1;
+        const content = (cfg.framing ?? defaultReaderFraming)({ ...base, backlog: handed, resumed: true, incarnation });
+        storeOwnRow(candidate.agent, 'user', content, framingRow(handed));
+      } else {
+        incarnation = 1;
+        const content = (cfg.framing ?? defaultReaderFraming)({
+          ...base,
+          backlog: handed,
+          resumed: false,
+          incarnation,
+          ...(plan.reason ? { rederived: plan.reason } : {}),
+        });
+        candidate = await this.deriveAgent({
+          name,
+          from: primary,
+          kind: 'subconscious-fork',
+          ...(cfg.strategyFactory ? { strategy: cfg.strategyFactory() } : {}),
+          config: readerConfig,
+          inheritRefusals: true,
+          onParentEnd: 'end',
+          resultTo: { to: primary, as: 'message' },
+          idleTimeoutMs: cfg.forkIdleTimeoutMs ?? 10 * 60_000,
+          framing: [{ participant: 'user', content, metadata: framingRow(handed) }],
+          metadata,
+        });
+      }
+      // As a fork's (invokeReaderFork): the held rows it is handed enter its
+      // window when its run takes it on, and it holds them while it lives.
+      framed = true;
+      this.presentation?.noteFramed(candidate.agent, handed
+        .filter((m) => heldFromResidents(m.metadata as Record<string, unknown> | undefined))
+        .map((m) => m.id));
+      this.emitTrace({
+        type: 'tune-out:reader-fork',
+        agentName: name,
+        serverId: invocation.serverId,
+        channelId: invocation.channelId,
+        epochId: invocation.epochId,
+        trigger: invocation.trigger,
+        held: handed.length,
+        incarnation,
+        resumed: plan.resume !== undefined,
+        resynced: 0,
+      });
+      const outcome = await this.runEphemeralToCompletion(candidate.agent, candidate.contextManager);
+      const prose = outcome.speech.trim();
+      if (prose && !this.tuneOutCoordinator?.readerReported(name)) {
+        this.deliverFromReader(name, [{ type: 'text', text: prose }], {
+          kind: 'subconscious-summary',
+          channelId: invocation.channelId,
+          epochId: invocation.epochId,
+          report: 'prose',
+        });
+        this.emitTrace({
+          type: 'tune-out:reader-prose-delivered',
+          agentName: name,
+          serverId: invocation.serverId,
+          channelId: invocation.channelId,
+          epochId: invocation.epochId,
+          chars: prose.length,
+        });
+      }
+    } catch (error) {
+      console.error(`[tune-out] reader ${name} failed:`, error instanceof Error ? error.message : error);
+      // A resumption its run refused before taking it on holds its name as
+      // being resumed until it is cleaned up, and the next look resumes it.
+      candidate?.cleanup();
+      const reported = this.tuneOutCoordinator?.readerReported(name) ?? false;
+      const returned = reported ? 0 : (this.tuneOutCoordinator?.readerFailed({ ...invocation, backlog: handed }) ?? 0);
+      this.emitTrace({
+        type: 'tune-out:reader-fork-failed',
+        agentName: name,
+        serverId: invocation.serverId,
+        channelId: invocation.channelId,
+        epochId: invocation.epochId,
+        trigger: invocation.trigger,
+        error: error instanceof Error ? error.message : String(error),
+        reported,
+        returned,
+      });
+    } finally {
+      if (framed && !this.agents.has(name)) this.presentation?.forgetFramed(name);
+      this.tuneOutCoordinator?.forgetReader(name);
+    }
+  }
 
   /** A reader fork's own words to the resident: attributed mail when it has a route, else under its name. */
   private deliverFromReader(reader: string, content: ContentBlock[], metadata: Record<string, unknown>): void {
