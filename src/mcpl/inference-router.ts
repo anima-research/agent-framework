@@ -7,6 +7,7 @@
  *
  * Spec reference: Section 11 (Server-Initiated Inference).
  */
+import { AdmissionRefusals, type RefusalCode, type RequiredIngress } from './inbound-admission.js';
 
 import type {
   Membrane,
@@ -184,6 +185,7 @@ export class InferenceRouter {
   private hookOrchestrator: HookOrchestrator;
   private featureSetManager: FeatureSetManager;
   private routingPolicy: InferenceRoutingPolicy | null;
+  private readonly admissionRefusals = new AdmissionRefusals();
   private emitTraceFn: (event: { type: string; [key: string]: unknown }) => void;
   /** The refusals for want of a model that have been logged: one line per
    *  server with no policy, and per server and feature set with one, so a
@@ -221,13 +223,15 @@ export class InferenceRouter {
     serverId: string,
     params: McplInferenceRequestParams,
     responder: Responder,
+    admission?: RequiredIngress,
+    dispatched?: () => void,
   ): Promise<void> {
     const stop = new AbortController();
     let ended!: () => void;
     const entry = { serverId, stop, answered: new Promise<void>((resolve) => { ended = resolve; }) };
     this.running.add(entry);
     try {
-      await this.answer(serverId, params, responder, stop.signal);
+      await this.answer(serverId, params, responder, stop.signal, admission, dispatched);
     } finally {
       this.running.delete(entry);
       ended();
@@ -246,6 +250,8 @@ export class InferenceRouter {
     params: McplInferenceRequestParams,
     responder: Responder,
     stopped: AbortSignal,
+    admission?: RequiredIngress,
+    dispatched?: () => void,
   ): Promise<void> {
     // 1. Validate feature set
     try {
@@ -266,6 +272,47 @@ export class InferenceRouter {
         'Cannot process inference request during hook execution',
       );
       return;
+    }
+
+    if (admission) {
+      const report = (reason: RefusalCode) => this.admissionRefusals.report(this.emitTraceFn, serverId, 'inference/request', reason, params);
+      const refuse = (reason: RefusalCode) => { report(reason); responder.respondError(-32600, reason); };
+      // Admission is part of the request's lifetime, not work before the
+      // router starts tracking it. Stop answers while the transport is live;
+      // transport loss answers nothing. Both release a noncooperative hook's
+      // slot without waiting for its deadline or for connection teardown.
+      const signal = responder.signal ? AbortSignal.any([stopped, responder.signal]) : stopped;
+      const cancelled = () => {
+        if (!signal.aborted) return false;
+        if (!stopped.aborted) report('admission_stale');
+        return true;
+      };
+      const answerStop = () => {
+        if (responder.signal?.aborted) return;
+        const answer = hostStoppedWhileHandling();
+        this.emitTraceFn({ type: 'mcpl:inference_fail', serverId, model: null, error: answer.message, streamed: !!params.stream });
+        try { responder.respondError(answer.code, answer.message); } catch {}
+      };
+      stopped.addEventListener('abort', answerStop, { once: true });
+      try {
+        if (stopped.aborted) { answerStop(); return; }
+        if (cancelled()) return;
+        const before = admission.check();
+        if (cancelled()) return;
+        if (before) { refuse(before); return; }
+        const verdict = await admission.admit('inference/request', params, signal);
+        if (cancelled()) return;
+        let reason = admission.check();
+        try { this.featureSetManager.validateInbound(serverId, params.featureSet); } catch { reason ??= 'admission_stale'; }
+        if (this.hookOrchestrator.isInHook) reason ??= 'admission_not_ready';
+        if (cancelled()) return;
+        if (reason || !verdict.store || !verdict.mayWake) {
+          refuse(reason ?? (!verdict.store ? verdict.reason : 'admission_denied'));
+          return;
+        }
+      } finally {
+        stopped.removeEventListener('abort', answerStop);
+      }
     }
 
     // Streaming needs a way to send chunks and an id to tag them with;
@@ -371,9 +418,14 @@ export class InferenceRouter {
     try {
       // 5. Run inference. Both modes end in membrane's response, and one
       // builder makes the result from it.
-      const response = chunkRequestId != null
-        ? await this.streamResponse(request, chunkRequestId, sendChunk!, signal)
-        : await this.membrane.complete(request, { ...this.wholeCallBound(request), signal });
+      const pending = chunkRequestId != null
+        ? this.streamResponse(request, chunkRequestId, sendChunk!, signal)
+        : this.membrane.complete(request, { ...this.wholeCallBound(request), signal });
+      // Admission and synchronous dispatch are complete. A held-data drain
+      // may continue without waiting for model latency; this router and the
+      // contained handler still own cancellation, failure and the final reply.
+      dispatched?.();
+      const response = await pending;
       if (settled()) return;
 
       // 6. Answer

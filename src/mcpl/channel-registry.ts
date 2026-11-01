@@ -12,6 +12,7 @@
  * - Expose synthesized tools: channel_list, channel_open, channel_close, channel_publish
  * - Build channel context for beforeInference params
  */
+import { AdmissionRefusals, attachAdmission, type AdmittedEnvelope, type RequiredIngress } from './inbound-admission.js';
 
 import { NOTICE_TAG } from '../notice-tags.js';
 import type { ContentBlock } from '@animalabs/membrane';
@@ -976,6 +977,8 @@ interface ChannelRegistryOptions {
    * acceptance here; coalesced work is stamped and observed by its own path.
    */
   acceptInbound?: (event: McplChannelIncomingEvent) => InboundSource | undefined;
+  /** Required-only receipt replay, without a new admission decision. */
+  replayCoalescedIncoming?: (serverId: string, message: ChannelIncomingMessage) => Promise<ChannelIncomingMessageResult> | undefined;
   /**
    * RFC-006: an admitted `channels/incoming` message carrying `coalesce`, with
    * the event the ordinary path would have queued. The handler decides
@@ -989,6 +992,7 @@ interface ChannelRegistryOptions {
     serverId: string,
     message: ChannelIncomingMessage,
     event: McplChannelIncomingEvent,
+    check?: RequiredIngress['check'],
   ) => Promise<ChannelIncomingMessageResult & { firstView?: true }>;
   /** Chronicle store used for durable desired channel lifecycle state. */
   store?: JsStore;
@@ -1218,6 +1222,7 @@ export class ChannelRegistry {
 
   /** Holds back repeats of the line for a message refused because its
    *  channel isn't registered (RefusalLines). */
+  private readonly admissionRefusals = new AdmissionRefusals();
   private unknownChannelLines = new RefusalLines();
 
   /**
@@ -1574,6 +1579,7 @@ export class ChannelRegistry {
     return this.channelLifecycleTails.has(this.lifecycleKey(entry.serverId, entry.descriptor.id));
   }
   private handleCoalescedIncoming?: ChannelRegistryOptions['handleCoalescedIncoming'];
+  private replayCoalescedIncoming?: ChannelRegistryOptions['replayCoalescedIncoming'];
   private acceptInbound?: ChannelRegistryOptions['acceptInbound'];
   private channelTools: ToolDefinition[];
 
@@ -1592,6 +1598,7 @@ export class ChannelRegistry {
     },
   ) {
     this.handleCoalescedIncoming = options?.handleCoalescedIncoming;
+    this.replayCoalescedIncoming = options?.replayCoalescedIncoming;
     this.acceptInbound = options?.acceptInbound;
     this.channelTools = CHANNEL_TOOL_DEFINITIONS.map((tool) => {
       if (tool.name !== 'skip_reply' || options?.eventGatePresent === true) return tool;
@@ -1852,6 +1859,7 @@ export class ChannelRegistry {
     serverId: string,
     params: ChannelsIncomingParams,
     responder?: Responder,
+    admission?: RequiredIngress,
   ): Promise<void> {
     const results: ChannelIncomingMessageResult[] = [];
     // Set when a coalesced message was admitted but its acknowledgement
@@ -1860,6 +1868,34 @@ export class ChannelRegistry {
     // The batch came on the transport open now: a close after this point
     // (transportClosed) leaves its traffic nothing to confirm.
     const closesAtArrival = this.transportCloses.get(serverId) ?? 0;
+    const coalesceFailure = (message: ChannelIncomingMessage, error: unknown): boolean => {
+      const err = error as Error & { code?: number; field?: string; admitted?: boolean };
+      // -32602 is answered coalesce_invalid; anything else as its message,
+      // a plain Error standing for an internal error (-32603).
+      const code = typeof err.code === 'number' ? err.code : -32603;
+      this.traceCoalesceRejection(serverId, message, err, code);
+      if (err.admitted && responder?.respondError) {
+        // Admitted, with its effects in: only the acknowledgement failed,
+        // so `accepted: false`, which says the message wasn't admitted,
+        // would be untrue, and a producer would hold it as never
+        // delivered. A per-message result can't say "may have been
+        // admitted" (§14.3); an error for the request is the spec's
+        // answer for that. Nothing after this message is admitted, since
+        // the producer sends the request's messages again: a coalesced
+        // one is answered from its receipt, and an uncoalesced one
+        // before this message is admitted again. (A responder without
+        // respondError, which only an in-process caller passes, gets the
+        // per-message answer below: it can't be told anything else.)
+        requestError = { code, message: err.message, ...(err.field ? { field: err.field } : {}) };
+        return true;
+      }
+      results.push({
+        messageId: message.messageId,
+        accepted: false,
+        reason: err.code === -32602 ? 'coalesce_invalid' : err.message,
+      });
+      return false;
+    };
 
     for (const message of params.messages) {
       if (!message || typeof message.channelId !== 'string' || !message.channelId
@@ -1923,6 +1959,46 @@ export class ChannelRegistry {
           reason: `unknown channel "${message.channelId}" — register it first (§14.5)`,
         });
         continue;
+      }
+
+      let envelope: AdmittedEnvelope | undefined;
+      let checkAdmission: RequiredIngress['check'] | undefined;
+      if (admission) {
+        const refuse = (reason: import('./inbound-admission.js').RefusalCode) => {
+          this.admissionRefusals.report(this.emitTraceFn, serverId, 'channels/incoming', reason, message);
+          results.push({ messageId: message.messageId, accepted: false, reason });
+        };
+        const replay = () => {
+          const receipt = message.coalesce !== undefined ? this.replayCoalescedIncoming?.(serverId, message) : undefined;
+          return receipt?.then(result => {
+            const { firstView: _firstView, ...wire } = result as ChannelIncomingMessageResult & { firstView?: true };
+            results.push(wire);
+          }, error => { coalesceFailure(message, error); });
+        };
+        const receipt = replay();
+        if (receipt) {
+          await receipt;
+          if (requestError) break;
+          continue;
+        }
+        const before = admission.check();
+        if (before) { refuse(before); continue; }
+        const entry = this.channels.get(incomingKey)!;
+        const target = entry.descriptor;
+        checkAdmission = () => admission.check() ?? (this.channels.get(incomingKey) !== entry || entry.descriptor !== target ? 'admission_stale' : undefined);
+        const verdict = await admission.admit('channels/incoming', message);
+        const concurrentReceipt = replay();
+        if (concurrentReceipt) {
+          await concurrentReceipt;
+          if (requestError) break;
+          continue;
+        }
+        const reason = checkAdmission();
+        if (reason || !verdict.store) {
+          refuse(reason ?? (!verdict.store ? verdict.reason : 'admission_stale'));
+          continue;
+        }
+        envelope = Object.freeze({ connection: admission.key, mayWake: verdict.mayWake, ...(Object.hasOwn(verdict, 'replyIntent') ? { replyIntent: verdict.replyIntent } : {}) });
       }
 
       // ACCEPTED from here down: semantic processing only for admitted
@@ -2013,8 +2089,8 @@ export class ChannelRegistry {
       if (!coalesced) markAccepted();
 
       // The server-level veto only; the wake gate runs at admission.
-      let triggerInference = true;
-      if (this.shouldTriggerInference) {
+      let triggerInference = envelope?.mayWake !== false;
+      if (triggerInference && this.shouldTriggerInference) {
         // The text the agent's context gets, as the push lane's filter reads
         // it: the converted text blocks, a placeholder or reference stub
         // among them, NON_STRING_TEXT_PLACEHOLDER included.
@@ -2053,41 +2129,22 @@ export class ChannelRegistry {
         acceptedAt: Date.now(),
       };
 
+      if (envelope) attachAdmission(event, envelope);
+
       if (coalesced) {
         // RFC-006 §14.3: a coalesced message is admitted like any other and
         // then handed, with the event the ordinary path would have queued, to
         // the coalescer, which replaces, appends or withdraws. Malformed
         // `coalesce` is a per-message failure; siblings are unaffected.
         try {
-          const { firstView, ...result } = await this.handleCoalescedIncoming!(serverId, message, event);
+          const { firstView, ...result } = await this.handleCoalescedIncoming!(serverId, message, event, checkAdmission);
+          if (admission && !result.accepted) {
+            this.admissionRefusals.report(this.emitTraceFn, serverId, 'channels/incoming', result.reason as import('./inbound-admission.js').RefusalCode, message);
+          }
           if (result.accepted) markAccepted(firstView === true);
           results.push(result);
         } catch (error) {
-          const err = error as Error & { code?: number; field?: string; admitted?: boolean };
-          // -32602 is answered coalesce_invalid; anything else as its message,
-          // a plain Error standing for an internal error (-32603).
-          const code = typeof err.code === 'number' ? err.code : -32603;
-          this.traceCoalesceRejection(serverId, message, err, code);
-          if (err.admitted && responder?.respondError) {
-            // Admitted, with its effects in: only the acknowledgement failed,
-            // so `accepted: false`, which says the message wasn't admitted,
-            // would be untrue, and a producer would hold it as never
-            // delivered. A per-message result can't say "may have been
-            // admitted" (§14.3); an error for the request is the spec's
-            // answer for that. Nothing after this message is admitted, since
-            // the producer sends the request's messages again: a coalesced
-            // one is answered from its receipt, and an uncoalesced one
-            // before this message is admitted again. (A responder without
-            // respondError, which only an in-process caller passes, gets the
-            // per-message answer below: it can't be told anything else.)
-            requestError = { code, message: err.message, ...(err.field ? { field: err.field } : {}) };
-            break;
-          }
-          results.push({
-            messageId: message.messageId,
-            accepted: false,
-            reason: err.code === -32602 ? 'coalesce_invalid' : err.message,
-          });
+          if (coalesceFailure(message, error)) break;
         }
         continue;
       }
@@ -2382,6 +2439,14 @@ export class ChannelRegistry {
    *  DM classification. */
   getDescriptor(ref: ChannelRef): ChannelDescriptor | undefined {
     return this.entryAt(ref)?.descriptor;
+  }
+
+  /** Required channel-scoped pushes must retain the registration that was
+   * authorized before their asynchronous preflight, just like channel items. */
+  captureRegistration(ref: ChannelRef): () => boolean {
+    const entry = this.entryAt(ref);
+    const descriptor = entry?.descriptor;
+    return () => this.entryAt(ref) === entry && entry?.descriptor === descriptor;
   }
 
   /** The registered label of `channelId` on exactly `serverId` (no

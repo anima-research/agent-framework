@@ -11,6 +11,7 @@
  *   - All other types use plain names — they live in the mcpl/ module and are
  *     unambiguous when imported from here.
  */
+import type { InboundAdmissionConfig } from './inbound-admission.js';
 
 // ============================================================================
 // JSON-RPC 2.0 (Transport Layer)
@@ -225,6 +226,8 @@ export interface McplChannelCapabilities {
  * a restart with the new configuration).
  */
 export interface McplServerConfig {
+  /** Opt-in, fail-closed admission for every inbound data lane. */
+  inboundAdmission?: InboundAdmissionConfig;
   /** Unique server identifier */
   id: string;
 

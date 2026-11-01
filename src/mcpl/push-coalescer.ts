@@ -569,6 +569,16 @@ export class PushCoalescer<E = unknown> {
     return entry && structuredClone(entry.result);
   }
 
+  /** Replay only work already admitted. Pin a live receipt before queueing,
+   * then retain the ordinary durability barrier without repeating effects. */
+  replayReceipt(occurrence: Pick<CoalescedOccurrence<E>, 'serverId' | 'binding' | 'eventId' | 'scope' | 'key'>): Promise<PushEventResult> | undefined {
+    const key = coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId);
+    const entry = this.receiptEntry(key);
+    if (!entry) return undefined;
+    const subject = coalescingSubjectKey(occurrence.serverId, occurrence.binding, occurrence.scope, occurrence.key);
+    return this.locked(() => this.acknowledge(key, entry, subject, occurrence.eventId));
+  }
+
   /** Whether the admission this receipt records delivered its occurrence as
    *  the agent's first view: for the host's own bookkeeping, such as the
    *  channel registry's reply anchor, and never part of the wire result. */
@@ -619,8 +629,21 @@ export class PushCoalescer<E = unknown> {
    * host effects (replace / remove / deliver) synchronously so a create, edit
    * and delete cannot overtake one another.
    */
-  accept(occurrence: CoalescedOccurrence<E>): Promise<PushEventResult> {
-    return this.locked(() => this.admit(occurrence));
+  accept(occurrence: CoalescedOccurrence<E>, check?: () => string | undefined): Promise<PushEventResult> {
+    if (!check) return this.locked(() => this.admit(occurrence));
+    return this.locked(() => {
+      // A concurrent acceptance may have created the receipt since the
+      // lane's lookup. Already-admitted work must not be refused as fresh.
+      if (this.receiptEntry(coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId))) {
+        return this.admit(occurrence);
+      }
+      // Required admission may have waited behind a render or another
+      // acceptance. Recheck at the first effect, under the mutex, before
+      // receipts, subject state or an unread occupant can be touched.
+      const reason = check();
+      if (reason) return Promise.resolve({ accepted: false, reason });
+      return this.admit(occurrence);
+    });
   }
 
   private async admit(occurrence: CoalescedOccurrence<E>): Promise<PushEventResult> {

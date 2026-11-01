@@ -1,3 +1,4 @@
+import { admissionConnectErrorOf, admittedEnvelope, attachAdmission, wakeForbidden, type RequiredIngress } from './mcpl/inbound-admission.js';
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { presentAuthor } from './author-presentation.js';
 import { constants as bufferConstants } from 'node:buffer';
@@ -17269,7 +17270,7 @@ export class AgentFramework {
     }
 
     // Queue inference requests
-    if (response.requestInference) {
+    if (response.requestInference && !wakeForbidden(event)) {
       step.at = 'its inference request';
       const source = 'source' in event ? (event as { source: string }).source : 'unknown';
 
@@ -17481,6 +17482,7 @@ export class AgentFramework {
         ...(event.tags ? { tags: event.tags } : {}),
       },
     });
+    if (admittedEnvelope in event && !decision.wake) event.triggerInference = false;
     metadata.triggered = decision.wake;
     if (decision.held) {
       // The admission record rides the message; the hold's own bookkeeping
@@ -18716,8 +18718,13 @@ export class AgentFramework {
     serverId: string,
     message: ChannelIncomingMessage,
     event: CoalescedChannelEvent,
+    check?: RequiredIngress['check'],
   ): Promise<ChannelIncomingMessageResult> {
     return this.admitCoalesced(async () => {
+      const replay = check && this.replayCoalescedIncoming(serverId, message);
+      if (replay) return replay;
+      const reason = check?.();
+      if (reason) return { messageId: message.messageId, accepted: false, reason };
       if (!this.pushCoalescer) throw new CoalesceError('coalesce', 'coalescing unavailable', -32000);
       validateCoalesceMember(message.coalesce, 'channel');
       if (typeof message.eventId !== 'string' || !message.eventId) {
@@ -18754,29 +18761,56 @@ export class AgentFramework {
         content: message.content,
         identity: { messageId: message.messageId, author: message.author, threadId: message.threadId },
         event: { lane: 'channel', event: { ...event, eventId: message.eventId, inboundSource } },
-      });
-      // The registry's anchor follows a delivery the coalescer marked as the
-      // agent's first view, as the turn's locus does. The receipt says so for
-      // this acceptance, and for a retry it answers, whose first attempt
-      // delivered the message but failed before its acknowledgement. A
-      // receipt restored after a restart carries no mark, so a retry it
-      // answers leaves the anchor where a marker would, as the host already
-      // counts what was stored before a restart as shown: every agent's
-      // shown watermark starts at the head at boot.
-      const firstView = this.pushCoalescer.receiptFirstView(serverId, this.coalescingBinding(serverId), message.eventId);
-      // Acknowledged: the anchor the delivery parked is committed now (and a
-      // retry answered from the receipt commits its first attempt's).
-      const parked = this.parkedAnchors.get(`${serverId}:${message.eventId}`);
-      if (parked) {
-        this.parkedAnchors.delete(`${serverId}:${message.eventId}`);
-        this.channelRegistry?.noteDelivered(parked.channel, parked.messageId, parked.threadId, parked.tags, parked.firstView || firstView === true);
-      }
-      return { messageId: message.messageId, accepted: true, coalesce: result.coalesce, ...(firstView ? { firstView: true as const } : {}) };
+      }, check);
+      if (!result.accepted) return { messageId: message.messageId, ...result };
+      return this.finishCoalescedIncoming(serverId, message, result);
     });
   }
 
-  private handleCoalescedPush(serverId: string, params: PushEventParams, event: McplPushEvent): Promise<PushEventResult> {
+  private replayCoalescedIncoming(serverId: string, message: ChannelIncomingMessage): Promise<ChannelIncomingMessageResult> | undefined {
+    if (typeof message.eventId !== 'string') return undefined;
+    return this.pushCoalescer?.replayReceipt({
+      serverId, binding: this.coalescingBinding(serverId), eventId: message.eventId,
+      scope: { kind: 'channel', id: message.channelId }, key: message.coalesce?.key ?? '',
+    })?.then(result => this.finishCoalescedIncoming(serverId, message, result));
+  }
+
+  private finishCoalescedIncoming(serverId: string, message: ChannelIncomingMessage, result: PushEventResult): ChannelIncomingMessageResult & { firstView?: true } {
+    // The registry's anchor follows a delivery the coalescer marked as the
+    // agent's first view, as the turn's locus does. The receipt says so for
+    // this acceptance, and for a retry it answers, whose first attempt
+    // delivered the message but failed before its acknowledgement. A
+    // receipt restored after a restart carries no mark, so a retry it
+    // answers leaves the anchor where a marker would, as the host already
+    // counts what was stored before a restart as shown: every agent's
+    // shown watermark starts at the head at boot.
+    const firstView = this.pushCoalescer?.receiptFirstView(serverId, this.coalescingBinding(serverId), message.eventId!);
+    // Acknowledged: the anchor the delivery parked is committed now (and a
+    // retry answered from the receipt commits its first attempt's).
+    const parked = this.parkedAnchors.get(`${serverId}:${message.eventId}`);
+    if (parked) {
+      this.parkedAnchors.delete(`${serverId}:${message.eventId}`);
+      this.channelRegistry?.noteDelivered(parked.channel, parked.messageId, parked.threadId, parked.tags, parked.firstView || firstView === true);
+    }
+    return { messageId: message.messageId, accepted: true, coalesce: result.coalesce, ...(firstView ? { firstView: true as const } : {}) };
+  }
+
+  private replayCoalescedPush(serverId: string, params: PushEventParams): Promise<PushEventResult> | undefined {
+    if (typeof params.eventId !== 'string') return undefined;
+    const c = params.coalesce;
+    return this.pushCoalescer?.replayReceipt({
+      serverId, binding: this.coalescingBinding(serverId), eventId: params.eventId,
+      scope: c?.channelId ? { kind: 'channel', id: c.channelId } : { kind: 'featureSet', id: params.featureSet },
+      key: c?.key ?? '',
+    });
+  }
+
+  private handleCoalescedPush(serverId: string, params: PushEventParams, event: McplPushEvent, check?: RequiredIngress['check']): Promise<PushEventResult> {
     return this.admitCoalesced(async () => {
+      const replay = check && this.replayCoalescedPush(serverId, params);
+      if (replay) return replay;
+      const reason = check?.();
+      if (reason) return { accepted: false, reason };
       if (!this.pushCoalescer) throw new CoalesceError('coalesce', 'coalescing unavailable', -32000);
       validateCoalesceMember(params.coalesce, 'push');
       if (typeof params.eventId !== 'string' || !params.eventId) throw new CoalesceError('eventId', 'eventId is required');
@@ -18835,7 +18869,7 @@ export class AgentFramework {
           },
         } : {}),
         event: { lane: 'push', event: { ...event, inboundSource } },
-      });
+      }, check);
     });
   }
 
@@ -18853,6 +18887,12 @@ export class AgentFramework {
   private coalescedAuthorized(occ: CoalescedOccurrence<CoalescedDelivery>): boolean {
     const server = this.mcplServerRegistry?.getServer(occ.serverId);
     if (!server?.isConnected || !server.policyEstablished) return false;
+    if (server.requiredAdmission) {
+      const envelope = (occ.event.event as unknown as { [admittedEnvelope]?: import('./mcpl/inbound-admission.js').AdmittedEnvelope })[admittedEnvelope];
+      // Neither persisted work without a live key nor a previous incarnation
+      // borrows the replacement transport's grant. This is not durable reauthorization.
+      if (!envelope || !server.requiredAdmission.isCurrent(envelope.connection)) return false;
+    }
     // §3.2: work admitted under another binding (the id since reassigned to a
     // different endpoint) never acquires the replacement peer's authority —
     // and its private notice data is never sent to that peer.
@@ -18952,6 +18992,8 @@ export class AgentFramework {
         ...(assemblingFor ? { assemblingFor } : {}),
         ...frozenSource(push.inboundSource),
       };
+      const envelope = (push as unknown as { [admittedEnvelope]?: import('./mcpl/inbound-admission.js').AdmittedEnvelope })[admittedEnvelope];
+      if (envelope) attachAdmission(event, envelope);
       const placement = await this.handleMcplChannelIncoming(event);
       await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
       return placement;
@@ -19339,6 +19381,7 @@ export class AgentFramework {
         ...(event.tags ? { tags: event.tags } : {}),
       },
     });
+    if (admittedEnvelope in event && !decision.wake) event.triggerInference = false;
     metadata.triggered = decision.wake;
     if (decision.held && triggerChannel) {
       metadata.tuneOut = { epochId: decision.held.epochId };
@@ -32131,7 +32174,7 @@ export class AgentFramework {
       (event) => this.pushEvent(event as unknown as ProcessEvent),
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
       triggerFilter,
-      (serverId, params, event) => this.handleCoalescedPush(serverId, params, event),
+      (serverId, params, event, check) => this.handleCoalescedPush(serverId, params, event, check),
       // An ordinary push: freeze its envelope and observe the acceptance at
       // admission, before it is queued.
       (event) => {
@@ -32139,6 +32182,7 @@ export class AgentFramework {
         this.noteInboundAccepted(source);
         return source;
       },
+      (serverId, params) => this.replayCoalescedPush(serverId, params),
     );
 
     // Server-initiated inference router (Step 6)
@@ -32162,8 +32206,9 @@ export class AgentFramework {
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
       {
         store: this.store,
-        handleCoalescedIncoming: (serverId, message, event) =>
-          this.handleCoalescedIncoming(serverId, message, event as CoalescedChannelEvent),
+        replayCoalescedIncoming: (serverId, message) => this.replayCoalescedIncoming(serverId, message),
+        handleCoalescedIncoming: (serverId, message, event, check) =>
+          this.handleCoalescedIncoming(serverId, message, event as CoalescedChannelEvent, check),
         // An ordinary channels/incoming message: freeze its envelope and
         // observe the acceptance at admission, before it is queued.
         acceptInbound: (event) => {
@@ -32351,6 +32396,9 @@ export class AgentFramework {
         // An accounting failure ends startup. create()'s release closes every
         // server connected so far, within its deadline.
         if (error instanceof DiscordAwarenessAccountingError) throw error;
+        // A required binder/attestation refusal is terminal; an ordinary
+        // transport outage retains the existing log-and-continue policy.
+        if (admissionConnectErrorOf(error)) throw error;
         // Fail-open: log and continue with remaining servers
         const err = error instanceof Error ? error : new Error(String(error));
         const message = redactServerText(err.message, config);
@@ -33056,7 +33104,7 @@ export class AgentFramework {
    * for the framework's life.
    */
   private hintsFor(config: McplServerConfig): boolean {
-    if (config.toolHints === false || !isLegacyFamily(config)) return false;
+    if (config.inboundAdmission !== undefined || config.toolHints === false || !isLegacyFamily(config)) return false;
     if (config.toolHints === true) return true;
     if (this.toolsetsNameHeldAtStart !== null) return false;
     if ((config.toolPrefix ?? `mcpl--${config.id}`) === TOOLSETS_MODULE) return false;
@@ -33467,6 +33515,9 @@ export class AgentFramework {
     // and the read tap agree though the state hintsFor reads can change
     // across the awaits below.
     const hints = this.hintsFor(config);
+    if (config.inboundAdmission !== undefined && config.toolHints === true) {
+      console.error(`[mcpl] ${logValue(config.id)}: toolHints: true is disabled by inboundAdmission; connecting without hint support`);
+    }
     try {
       // RFC-014: a hinted server's meta-tools exist before it connects.
       if (hints) await this.ensureToolsetsModule();
@@ -33479,6 +33530,7 @@ export class AgentFramework {
         this.mcplHostCapabilitiesFor(config, hints),
         abort.signal,
         (registering) => {
+          if (registering.requiredAdmission) registering.on('admission-rejected', trace => this.emitTrace(trace));
           registeredEpoch = registering.transportEpoch;
           this.mcplPolicyExchanges.set(registering, registeredEpoch);
           // RFC-014 §6.1: hints apply as the connection reads them, from its
@@ -34710,6 +34762,7 @@ export class AgentFramework {
     event: string,
     handler: (params: T, responder?: InboundResponder) => void | Promise<void>,
     recorded: (text: unknown) => string = asText,
+    trackCompletion?: (params: T, completion: Promise<void>) => void,
   ): (params: T, responder?: InboundResponder) => void {
     return (params: T, responder?: InboundResponder) => {
       // Whether the handler wrote a reply. A reply counts once its write
@@ -34854,11 +34907,12 @@ export class AgentFramework {
           // and logs it on a line of its own, printed through log-value as
           // the report's line is. Nothing catches the backstop, so a failure
           // of its own log is swallowed.
-          void Promise.resolve(result).then(succeeded, failed).catch((reportFailure: unknown) => {
+          const completion = Promise.resolve(result).then(succeeded, failed).catch((reportFailure: unknown) => {
             try {
               console.error(`[mcpl] ${serverId} ${event}: the handler failure's report threw: ${logDetail(describeCause(reportFailure))}`);
             } catch { /* nothing is left to log it to */ }
           });
+          trackCompletion?.(params, completion);
         } else succeeded();
       } catch (error) {
         failed(error);
@@ -34882,7 +34936,10 @@ export class AgentFramework {
       event: string,
       handler: (params: T, responder?: Responder) => void | Promise<void>,
     ): void => {
-      connection.on(event, this.containedInboundHandler(connection.id, event, handler, recorded));
+      const trackCompletion = connection.requiredAdmission && ['push-event', 'channels-incoming', 'inference-request'].includes(event)
+        ? (_params: T, completion: Promise<void>) => connection.trackHeldHandler(event, completion)
+        : undefined;
+      connection.on(event, this.containedInboundHandler(connection.id, event, handler, recorded, trackCompletion));
     };
 
     // Forward subprocess stderr lines as trace events so consumers (conhost,
@@ -34910,6 +34967,20 @@ export class AgentFramework {
       // host refuses it.
       if (this.queue?.isClosed) {
         this.refuseServerItem('push/event', connection.id, responder);
+        return;
+      }
+      if (connection.requiredAdmission) {
+        const original = connection.admissionFor(params);
+        const registration = params.coalesce?.channelId
+          ? this.channelRegistry?.captureRegistration({ serverId: connection.id, channelId: params.coalesce.channelId })
+          : undefined;
+        const admission: RequiredIngress = {
+          ...original,
+          check: () => this.queue?.isClosed ? 'admission_not_ready' :
+            this.mcplServerRegistry?.getServer(connection.id) !== connection ? 'admission_stale' :
+            original.check() ?? (registration && !registration() ? 'admission_stale' : undefined),
+        };
+        await this.pushHandler?.handleRequiredPushEvent(connection.id, params, responder as never, admission);
         return;
       }
       // RFC-014 §6.1 carrier 2: the tool change this push explains was
@@ -34974,6 +35045,20 @@ export class AgentFramework {
         // push, before the router runs.
         if (this.queue?.isClosed) {
           this.refuseServerItem('inference/request', connection.id, responder);
+          return;
+        }
+        if (connection.requiredAdmission) {
+          const original = connection.admissionFor(params);
+          const admission: RequiredIngress = {
+            ...original,
+            check: () => this.queue?.isClosed || this.pushCoalescer?.isRendering(connection.id) ? 'admission_not_ready' :
+              this.mcplServerRegistry?.getServer(connection.id) !== connection ? 'admission_stale' : original.check(),
+          };
+          await this.inferenceRouter.handleInferenceRequest(connection.id, params, {
+            respond: responder.respond, respondError: responder.respondError, requestId: responder.id,
+            ...(responder.sendChunk ? { sendChunk: responder.sendChunk } : {}),
+            ...(responder.signal ? { signal: responder.signal } : {}),
+          }, admission, connection.heldInferenceDispatch());
           return;
         }
         await this.inferenceRouter.handleInferenceRequest(connection.id, params, {
@@ -35077,6 +35162,16 @@ export class AgentFramework {
     ) => {
       if (this.queue?.isClosed) {
         this.refuseServerItem('channels/incoming', connection.id, responder);
+        return;
+      }
+      if (connection.requiredAdmission) {
+        const original = connection.admissionFor(params);
+        const admission: RequiredIngress = {
+          ...original,
+          check: () => this.queue?.isClosed ? 'admission_not_ready' :
+            this.mcplServerRegistry?.getServer(connection.id) !== connection ? 'admission_stale' : original.check(),
+        };
+        await this.channelRegistry?.handleIncoming(connection.id, params, responder as never, admission);
         return;
       }
       await this.channelRegistry?.handleIncoming(connection.id, params, responder as never);

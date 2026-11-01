@@ -1,3 +1,4 @@
+import { AdmissionRefusals, attachAdmission, type AdmittedEnvelope, type RequiredIngress } from './inbound-admission.js';
 /**
  * PushHandler — handles push/event messages from MCPL servers.
  *
@@ -123,11 +124,12 @@ export class PushHandler {
     pushEventFn: (event: McplPushEvent) => void,
     emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
     shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean,
-    private readonly handleCoalesced?: (serverId: string, params: PushEventParams, event: McplPushEvent) => Promise<PushEventResult>,
+    private readonly handleCoalesced?: (serverId: string, params: PushEventParams, event: McplPushEvent, check?: RequiredIngress['check']) => Promise<PushEventResult>,
     /** An ordinary (uncoalesced) push was just admitted, before it is queued
      *  or acknowledged: return its source envelope, frozen now
      *  (mcpl/inbound-source.ts). Coalesced work is stamped by its own path. */
     private readonly acceptInbound?: (event: McplPushEvent) => InboundSource | undefined,
+    private readonly replayCoalesced?: (serverId: string, params: PushEventParams) => Promise<PushEventResult> | undefined,
   ) {
     this.featureSetManager = featureSetManager;
     this.pushEventFn = pushEventFn;
@@ -146,10 +148,72 @@ export class PushHandler {
    * 6. Emit trace
    * 7. Respond with accepted + inferenceId
    */
+  private readonly admissionRefusals = new AdmissionRefusals();
+
+  /** Required-only preflight: the framework calls this before toolset notices. */
+  async handleRequiredPushEvent(serverId: string, params: PushEventParams, responder: Responder | undefined, admission: RequiredIngress): Promise<void> {
+    try {
+      this.featureSetManager.validateInbound(serverId, params.featureSet);
+    } catch (err) {
+      if (err instanceof McplFeatureSetError && responder?.respondError) responder.respondError(err.code, err.message, { featureSet: err.featureSet });
+      else responder?.respond({ accepted: false, reason: 'Feature set validation failed' });
+      return;
+    }
+    const refuse = (reason: import('./inbound-admission.js').RefusalCode) => {
+      this.admissionRefusals.report(this.emitTraceFn, serverId, 'push/event', reason, params);
+      responder?.respond({ accepted: false, reason });
+    };
+    const replay = () => {
+      const receipt = params.coalesce !== undefined ? this.replayCoalesced?.(serverId, params) : undefined;
+      return receipt?.then(result => {
+        this.emitTraceFn({ type: 'mcpl:push_event', serverId, eventId: params.eventId, featureSet: params.featureSet, coalesce: result.coalesce });
+        responder?.respond(result);
+      }, error => {
+        const err = error as Error & { code?: number; field?: string };
+        const code = err.code ?? -32603;
+        this.traceCoalesceRejection(serverId, params, err, code);
+        if (responder?.respondError) responder.respondError(code, err.message, { field: err.field });
+        else responder?.respond({ accepted: false, reason: err.message });
+      });
+    };
+    const receipt = replay();
+    if (receipt) { await receipt; return; }
+    // Deferred notices aggregate into a later push/render batch, which has
+    // no current-key re-admission across reconnect/recovery in this profile.
+    // Plain occurrences, including edits and withdrawals, stand on their
+    // own admission verdict and retain the RFC-006 replacement path.
+    if (params.coalesce?.deferred === true) {
+      refuse('admission_unsupported');
+      return;
+    }
+    const before = admission.check();
+    if (before) { refuse(before); return; }
+    const verdict = await admission.admit('push/event', params);
+    // Another occurrence with this eventId may have been admitted while the
+    // callback ran. Its receipt wins even over a refusal or a stale verdict.
+    const concurrentReceipt = replay();
+    if (concurrentReceipt) { await concurrentReceipt; return; }
+    const check = () => {
+      let reason = admission.check();
+      try { this.featureSetManager.validateInbound(serverId, params.featureSet); } catch { reason ??= 'admission_stale'; }
+      return reason;
+    };
+    const reason = check();
+    if (reason || !verdict.store) {
+      refuse(reason ?? (!verdict.store ? verdict.reason : 'admission_stale'));
+      return;
+    }
+    const envelope = Object.freeze({ connection: admission.key, mayWake: verdict.mayWake, ...(Object.hasOwn(verdict, 'replyIntent') ? { replyIntent: verdict.replyIntent } : {}) });
+    // No await between the final check and the admitted continuation's first effect.
+    return this.handlePushEvent(serverId, params, responder, envelope, check);
+  }
+
   async handlePushEvent(
     serverId: string,
     params: PushEventParams,
     responder?: Responder,
+    envelope?: AdmittedEnvelope,
+    check?: RequiredIngress['check'],
   ): Promise<void> {
     // §16.3: expand the normative chat:* core closure once, at entry, so
     // every downstream consumer (wake matching, metadata, the queued event)
@@ -223,8 +287,8 @@ export class PushHandler {
     }
 
     // 4. Check shouldTriggerInference callback
-    let triggerInference = true;
-    if (this.shouldTriggerInference) {
+    let triggerInference = envelope?.mayWake !== false;
+    if (triggerInference && this.shouldTriggerInference) {
       const textContent = content
         .filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text')
         .map((b) => b.text)
@@ -260,12 +324,18 @@ export class PushHandler {
       triggerInference,
       acceptedAt: Date.now(),
     };
+    if (envelope) attachAdmission(pushEvent, envelope);
     if (coalesced) {
       // RFC-006: the coalescer decides whether this occurrence replaces an
       // unread one, appends, or withdraws; it delivers through the same event
       // the ordinary path would have queued.
       try {
-        const result = await this.handleCoalesced!(serverId, params, pushEvent);
+        const result = await this.handleCoalesced!(serverId, params, pushEvent, check);
+        if (envelope && !result.accepted) {
+          this.admissionRefusals.report(this.emitTraceFn, serverId, 'push/event', result.reason as import('./inbound-admission.js').RefusalCode, params);
+          responder?.respond(result);
+          return;
+        }
         this.emitTraceFn({ type: 'mcpl:push_event', serverId, eventId: params.eventId, featureSet: params.featureSet, coalesce: result.coalesce });
         responder?.respond(result);
       } catch (error) {
