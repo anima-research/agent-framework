@@ -11,9 +11,9 @@
  *    the block and its subtractive `disposition` survive; a bad `uri`
  *    rejects the block whole;
  *  - `disposition:"never"` from a server marks its uri's record (§3.1, §5):
- *    while the mark stands, the framework fetches and saves none of the
- *    payload, and no stub, script object or link names a saved copy or the
- *    uri. A copy saved before the mark stays in the workspace, one whose save
+ *    while the mark stands, the framework starts no fetch of the payload and
+ *    saves none of it, a fetch under way stops at its next chunk, and no
+ *    stub, script object or link names a saved copy or the uri. A copy saved before the mark stays in the workspace, one whose save
  *    finished as the mark came is deleted where the delete succeeds, and the
  *    mark goes with a record lost to eviction or a restart;
  *  - stub size is independent of every server-supplied field length (§5);

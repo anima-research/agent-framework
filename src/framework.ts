@@ -27613,9 +27613,10 @@ export class AgentFramework {
       // and an eager fetch would spend the server's fetch budget, which the
       // agent's own fetch_reference needs, on bytes nobody asked for. A
       // failure keeps only its text, so no stub is made of its references,
-      // and only its `never` references are registered, marked. Only an MCPL peer's blocks are references; a
-      // modern server's and an MCP-only peer's are standard. An MCPL peer's
-      // content is marked as content (dataIsContent), as on the model's path.
+      // and only its `never` references are registered, marked. Only an MCPL
+      // peer's blocks are references; a modern server's and an MCP-only
+      // peer's are standard. An MCPL peer's content is marked as content
+      // (dataIsContent), as on the model's path.
       if (server && server.capabilities !== null) {
         await this.autoFetchReferences(result.content, serverId, 'register')
           .catch((e) => console.error('[rfc005] reference registration error:', (e as Error).message));
