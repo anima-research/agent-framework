@@ -1085,6 +1085,11 @@ export function inlineNeverUri(block: unknown, c: BlockClassification = classify
   return b.disposition === 'never' && typeof uri === 'string' && uri !== '' ? uri : null;
 }
 
+/** A reference a `never` withholds that no server marked: a result's own
+ *  word, which no fetch refuses, so the result gives out no id to fetch it
+ *  by. */
+export const RESULT_NEVER_TEXT = `[${NOTICE_TAG.referenceNotShown}: a tool result asked that its content never reach you or your tools.]`;
+
 /** MCP's embedded resource whose uri a `never` names (embeddedWithheld). */
 export const EMBEDDED_RESOURCE_NEVER_TEXT = `[${NOTICE_TAG.resourceNotShown}: ${PAYLOAD_NEVER.error}.]`;
 
@@ -1166,6 +1171,7 @@ export function shownLinkUri(t: ReferenceTestimony, record: ReferenceRecord, now
  */
 export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, serverId?: string, options?: StubOptions): string {
   const record = referenceRegistry.register(t, serverId, options?.claims);
+  if (record.payloadNever !== true && withheld(record, options?.claims)) return RESULT_NEVER_TEXT;
   // One clock reading for the whole stub, so whether it shows a link's uri
   // and the reason it gives can't disagree across an expiry.
   const nowMs = Date.now();
@@ -1318,6 +1324,7 @@ export function referenceBlockForScript(block: unknown, serverId?: string, claim
     case 'reference': {
       const t = c.testimony;
       const record = referenceRegistry.register(t, serverId, claims);
+      if (record.payloadNever !== true && withheld(record, claims)) return { type: 'text', text: RESULT_NEVER_TEXT };
       // One clock reading for the whole object, so its words can't disagree
       // with each other across an expiry.
       const nowMs = Date.now();

@@ -8,6 +8,18 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { toolResultDataToHistoryString } from '../src/tool-result-history.js';
 import { NON_STRING_TEXT_PLACEHOLDER } from '../src/mcpl/visible-content.js';
+import { classifyBlock as classifyRfc005Block, referenceRegistry as rfc005Registry } from '../src/mcpl/references.js';
+
+/** A server's result as its arrival leaves it: each `never` reference in it
+ *  registered with its server, which marks the record, as a peer's tool
+ *  result is before its history is written. */
+function arrived<T extends readonly unknown[]>(data: T): T {
+  for (const block of data) {
+    const c = classifyRfc005Block(block);
+    if (c.kind === 'reference' && c.testimony.disposition === 'never') rfc005Registry.register(c.testimony, 'vst');
+  }
+  return data;
+}
 
 test('text-only MCP content array: blocks join with newlines', () => {
   const data = [
@@ -68,7 +80,7 @@ test('a text block whose text is not a string shows the placeholder, so a refere
     { type: 'text', text: null },
     { type: 'resource', uri: 'https://signed.example/f?token=RAW_TOKEN', mimeType: 'text/plain', sizeBytes: 10, name: 'f.txt', disposition: 'never' },
   ];
-  const out = toolResultDataToHistoryString(data);
+  const out = toolResultDataToHistoryString(arrived(data));
   assert.ok(out.startsWith(`${NON_STRING_TEXT_PLACEHOLDER}\n[ref_`), out);
   assert.ok(!out.includes('RAW_TOKEN'), out);
 });
@@ -152,7 +164,7 @@ test('RFC-005 resource block becomes a stub, never JSON, never the URI', () => {
     { type: 'text', text: '{"peak":0.6}' },
     RFC005_REF,
   ];
-  const out = toolResultDataToHistoryString(data);
+  const out = toolResultDataToHistoryString(arrived(data));
   assert.ok(out.includes('{"peak":0.6}'));
   assert.ok(out.includes('chord.wav') && out.includes('audio/wav'), out);
   assert.ok(/\[ref_[a-z0-9_]+\]/.test(out), 'stub must carry a reference id');
@@ -175,7 +187,7 @@ test('RFC-005: uri-form audio with disposition stubs like a resource', () => {
 
 test('RFC-005: invalid sizeBytes is dropped as a field, block still stubs (vector 15)', () => {
   const data = [{ ...RFC005_REF, sizeBytes: -1 }];
-  const out = toolResultDataToHistoryString(data);
+  const out = toolResultDataToHistoryString(arrived(data));
   assert.ok(/\[ref_[a-z0-9_]+\]/.test(out));
   assert.ok(!out.includes('claimed'), 'rejected sizeBytes must not be rendered');
   assert.ok(!out.includes('mythoss-mac-mini'), 'never survives field rejection');
@@ -193,8 +205,8 @@ test('RFC-005 vector 2: inline data claiming bulk disposition is withheld', () =
 test('RFC-005: reference ids are stable across serializations (§5)', () => {
   const data = [RFC005_REF];
   const id = (s: string) => s.match(/\[(ref_[a-z0-9_]+)\]/)?.[1];
-  const first = id(toolResultDataToHistoryString(data));
-  const second = id(toolResultDataToHistoryString(data));
+  const first = id(toolResultDataToHistoryString(arrived(data)));
+  const second = id(toolResultDataToHistoryString(arrived(data)));
   assert.ok(first, 'no ref id in stub');
   assert.equal(first, second, 'same reference must keep one id (wire + history serialize twice)');
 });

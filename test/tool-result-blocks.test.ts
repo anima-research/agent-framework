@@ -535,7 +535,13 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
 
   it("in a tool result, never shows a uri a reference withheld with disposition never, whatever a link to it says", () => {
     const uri = 'https://zz-elsewhere.example/withheld.csv';
-    referenceRegistry.register(testimonyOf({ type: 'resource', uri, name: 'withheld.csv', disposition: 'never' }));
+    const error = console.error;
+    console.error = () => {};
+    try {
+      referenceRegistry.register(testimonyOf({ type: 'resource', uri, name: 'withheld.csv', disposition: 'never' }), 'zz-files');
+    } finally {
+      console.error = error;
+    }
     const shown = toolResultDataToHistoryString([TEXT, { type: 'resource_link', uri, name: 'report.csv' }]);
     assert.equal(shown, `zz-text\n[${referenceRegistry.findByUri(uri)!.refId}] report.csv — from tool result — ${referencesModule.PAYLOAD_NEVER.error}`);
     assert.ok(!shown.includes(uri), shown);
@@ -1321,6 +1327,14 @@ describe('one answer for every block of a result', () => {
     const never = { type: 'resource', uri, name: 'order.csv', disposition: 'never' };
     const plain = { type: 'resource', uri, name: 'order.csv' };
     const STUB = /^\[ref_[^\]]+\] order\.csv — from tool result — /;
+    // A server's result, as its arrival leaves it: its never marks the record.
+    const error = console.error;
+    console.error = () => {};
+    try {
+      referenceRegistry.register(testimonyOf(never), 'zz-files');
+    } finally {
+      console.error = error;
+    }
     for (const order of [[link, never, plain], [never, link, plain], [never, plain, link], [plain, never, link], [plain, link, never]]) {
       const what = order.map((b) => (b === link ? 'link' : b === never ? 'never' : 'plain')).join(', ');
       const lines = toolResultDataToHistoryString([TEXT, ...order]).split('\n');
@@ -1440,7 +1454,7 @@ describe('one answer for every block of a result', () => {
     // A result naming the uri only in a link leaves the earlier never in force.
     const uri = 'https://zz-elsewhere.example/lifted-link-only.csv';
     toolResultDataToHistoryString([{ type: 'resource', uri, name: 'kept.csv', disposition: 'never' }]);
-    assert.match(toolResultDataToHistoryString([{ type: 'resource_link', uri, name: 'kept.csv' }]), /^\[ref_[^\]]+\] kept\.csv — from tool result — /);
+    assert.equal(toolResultDataToHistoryString([{ type: 'resource_link', uri, name: 'kept.csv' }]), '[Reference not shown: a tool result asked that its content never reach you or your tools.]');
   });
 
   it("finds a never inside inline data's other fields, which showing it descends into, before any block is shown", () => {
@@ -1452,8 +1466,7 @@ describe('one answer for every block of a result', () => {
       ],
     };
     const shown = JSON.parse(toolResultDataToHistoryString(data)) as { items: [string, { _meta: { ref: string } }] };
-    assert.match(shown.items[0], /^\[ref_[^\]]+\] meta\.csv — from tool result — /);
-    assert.match(shown.items[1]._meta.ref, /^\[ref_[^\]]+\] meta\.csv — from tool result — /);
+    assert.deepEqual([shown.items[0], shown.items[1]._meta.ref], ['[Reference not shown: a tool result asked that its content never reach you or your tools.]', '[Reference not shown: a tool result asked that its content never reach you or your tools.]']);
     // A content array shows an image, not its fields, so there a reference
     // inside them doesn't count, and the link shows its uri.
     const shownUri = 'https://zz-elsewhere.example/meta-in-array.csv';
@@ -1471,7 +1484,7 @@ describe('one answer for every block of a result', () => {
       { type: 'resource', uri, name: 'evicted.csv', disposition: 'never' }, ...many, { type: 'resource_link', uri, name: 'evicted.csv' },
     ]).split('\n');
     assert.equal(lines.length, 2003);
-    assert.match(lines[2002]!, /^\[ref_[^\]]+\] evicted\.csv — from tool result — /);
+    assert.deepEqual([lines[0], lines[2002]], ['[Reference not shown: a tool result asked that its content never reach you or your tools.]', '[Reference not shown: a tool result asked that its content never reach you or your tools.]']);
   });
 
   it("reads claims through toJSON, as serialization does, so a never toJSON gives counts and a getter it leaves out isn't read", () => {
@@ -1483,8 +1496,7 @@ describe('one answer for every block of a result', () => {
     };
     const shown = JSON.parse(toolResultDataToHistoryString({ link: { type: 'resource_link', uri, name: 'to-json.csv' }, value })) as
       { link: string; value: { ref: string } };
-    assert.match(shown.link, /^\[ref_[^\]]+\] to-json\.csv — from tool result — /);
-    assert.match(shown.value.ref, /^\[ref_[^\]]+\] to-json\.csv — from tool result — /);
+    assert.deepEqual([shown.link, shown.value.ref], ['[Reference not shown: a tool result asked that its content never reach you or your tools.]', '[Reference not shown: a tool result asked that its content never reach you or your tools.]']);
     assert.equal(reads, 0);
   });
 
@@ -1515,7 +1527,7 @@ describe('one answer for every block of a result', () => {
       data: { files: [{ type: 'resource_link', uri, name: 'kept.csv' }], other: { type: 'resource', uri, name: 'kept.csv', disposition: 'never' } },
       keepWhenWithheld: ['files'],
     }, undefined);
-    assert.ok(kept !== undefined && /^\{"files":\["\[ref_[^\]]+\] kept\.csv — from tool result — /.test(kept), kept);
+    assert.equal(kept, JSON.stringify({ files: ['[Reference not shown: a tool result asked that its content never reach you or your tools.]'] }));
   });
 
   it("keeps nothing of a withheld result whose claims a value stops the walk of, since what the rest claims is unknown", () => {

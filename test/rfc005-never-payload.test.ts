@@ -298,19 +298,21 @@ describe('what a marked record shows', () => {
     assert.ok(control.endsWith('— from tool zz — fetch with fetch_reference'), control);
   });
 
-  it("a stub and a script's object given the reason by their result's claims, inline data's `never` before the reference included, a server's claims marking the record and others' marking nothing", async () => {
+  it("a stub and a script's object given the reason by their result's claims, inline data's `never` before the reference included, a server's claims marking the record, and others' marking nothing and giving out no id", async () => {
     for (const serverId of [undefined, 'zz-never-dialed']) {
       const [stubbed, scripted] = [uniq('v.wav'), uniq('w.wav')];
       const stub = buildReferenceStub(testimonyOf({ type: 'resource', uri: stubbed, name: 'v.wav' }), 'from tool result', serverId,
         { claims: contentClaims([inlineNever(stubbed), { type: 'resource', uri: stubbed }]) });
       const record = referenceRegistry.findByUri(stubbed)!;
       const marked = serverId === undefined ? undefined : true;
-      assert.deepEqual([record.payloadNever, stub], [marked, `[${record.refId}] v.wav — from tool result — ${NEVER_TEXT}`], String(serverId));
+      const resultNever = '[Reference not shown: a tool result asked that its content never reach you or your tools.]';
+      assert.deepEqual([record.payloadNever, stub], [marked, serverId === undefined ? resultNever : `[${record.refId}] v.wav — from tool result — ${NEVER_TEXT}`], String(serverId));
       const saved = referenceRegistry.register(testimonyOf({ type: 'resource', uri: scripted, name: 'w.wav' }), 'zz-never-dialed');
       saved.fetchedPath = `scratch/refs/${saved.refId}.wav`;
       const object = (await quietly(() => referenceBlockForScript({ type: 'resource', uri: scripted, name: 'w.wav' }, serverId,
         contentClaims([inlineNever(scripted), { type: 'resource', uri: scripted }])))).value as Record<string, unknown>;
-      assert.deepEqual([saved.payloadNever, object.unfetchable, object.savedTo], [marked, NEVER_TEXT, null], String(serverId));
+      if (serverId === undefined) assert.deepEqual([saved.payloadNever, object], [undefined, { type: 'text', text: resultNever }], 'no id to fetch by');
+      else assert.deepEqual([saved.payloadNever, object.unfetchable, object.savedTo], [true, NEVER_TEXT, null], String(serverId));
       assert.equal(saved.fetchedPath, serverId === undefined ? `scratch/refs/${saved.refId}.wav` : undefined, 'only a mark forgets the path; a result\'s own never only withholds it');
     }
   });
@@ -704,6 +706,42 @@ describe("the framework's fetches", () => {
       assert.equal(served, before);
     } finally {
       referenceRegistry.forgetServerAddress('zz-never-dispatch', fw);
+    }
+  });
+
+  it("give out no id to fetch by for a reference only a module's result calls `never`, so its notice promises nothing the fetcher won't keep, while the id the server's own delivery gave still fetches", async () => {
+    const RESULT_NEVER = '[Reference not shown: a tool result asked that its content never reach you or your tools.]';
+    const fw = Object.create(AgentFramework.prototype) as {
+      pushEvent(event: unknown): void;
+      dispatchFetchReferenceToolCall(agentName: string, call: { id: string; name: string; input: unknown }): void;
+      setMcplServerConfig(config: unknown): void;
+    };
+    const saved: string[] = [];
+    Object.assign(fw, {
+      mcplServerConfigs: new Map(),
+      getWorkspaceModule: () => ({ writeBinary: async (path: string) => { saved.push(path); return { success: true }; } }),
+      firstWritableMountName: () => 'scratch',
+      emitTrace: () => {},
+    });
+    fw.setMcplServerConfig({ id: 'zz-never-module', url: BINDING.url });
+    try {
+      const uri = `${ORIGIN}/ok?module-never-${randomUUID()}`;
+      const plain = { type: 'resource', uri, name: 'p.wav' };
+      const delivered = buildReferenceStub(testimonyOf(plain), 'from tool result', 'zz-never-module');
+      const record = referenceRegistry.findByUri(uri)!;
+      assert.ok(delivered.startsWith(`[${record.refId}] `), delivered);
+      const claims = contentClaims([inlineNever(uri), plain]);
+      const stub = buildReferenceStub(testimonyOf(plain), 'from tool result', undefined, { claims });
+      const object = referenceBlockForScript(plain, undefined, claims);
+      assert.deepEqual([stub, object, record.payloadNever], [RESULT_NEVER, { type: 'text', text: RESULT_NEVER }, undefined]);
+      assert.ok(!stub.includes(record.refId) && !JSON.stringify(object).includes(record.refId));
+      const before = served;
+      const answered = new Promise<{ result: { success: boolean } }>((resolve) => { fw.pushEvent = (event) => resolve(event as never); });
+      fw.dispatchFetchReferenceToolCall('prime', { id: `call_${record.refId}`, name: 'fetch_reference', input: { ref_id: record.refId } });
+      const { result } = await within('fetch_reference answering', answered);
+      assert.deepEqual([result.success, served - before, saved.length], [true, 1, 1], "the server's own delivery's id still fetches");
+    } finally {
+      referenceRegistry.forgetServerAddress('zz-never-module', fw);
     }
   });
 

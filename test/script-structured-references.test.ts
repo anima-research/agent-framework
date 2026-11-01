@@ -72,6 +72,9 @@ const blocks = (test: string) => [
   { type: 'image', uri: uris(test).old, mimeType: 'image/png', expiresAt: '2099-12-31T00:00:00Z\u202E' },
 ];
 
+/** What a reference shows that only its result's own claims call `never`, such as a module's: no id to fetch it by. */
+const RESULT_NEVER = { type: 'text', text: '[Reference not shown: a tool result asked that its content never reach you or your tools.]' };
+
 /** A `never` reference, which RFC-005 withholds, with its uri, from every lane the model reads. */
 const never = (test: string) => ({ type: 'resource', uri: `https://files.example.invalid/${test}/sealed.pdf?sig=never-token`, name: 'sealed.pdf', disposition: 'never' });
 
@@ -537,11 +540,9 @@ test("a module's reference deeper in its blocks reaches a script as the model's 
     ];
     const out = await script('fwd--nested');
     assert.ok(!out.includes('never-token') && !out.includes('object-token'), out);
-    const object = JSON.parse(out) as { content: [unknown, { value: { attachment: { refId: string } } }] };
-    const refId = object.content[1].value.attachment.refId;
-    // A reference the module made itself, bound to no server, says why its
-    // fetch would be refused.
-    const stub = { type: 'resource', refId, name: 'sealed.pdf', savedTo: null, unfetchable: PAYLOAD_NEVER.error };
+    const object = JSON.parse(out) as { content: [unknown, unknown] };
+    // A reference only the module's result calls never gives out no id.
+    const stub = RESULT_NEVER;
     assert.deepEqual(object, {
       content: [
         { type: 'text', text: 'one sealed report' },
@@ -609,8 +610,8 @@ test("a module tool's `never` result is passed over and shown with the reason wh
     const out = await script('fwd--deep--nested');
     assert.equal(prefixes.get('fwd--deep'), 'files', 'the prefix arrived while the call ran');
     assert.ok(!out.includes('never-token'), out);
-    const object = JSON.parse(out) as { content: [{ refId: string }] };
-    assert.deepEqual(object.content, [{ type: 'resource', refId: object.content[0].refId, name: 'sealed.pdf', savedTo: null, unfetchable: PAYLOAD_NEVER.error }]);
+    const object = JSON.parse(out) as { content: unknown[] };
+    assert.deepEqual(object.content, [RESULT_NEVER]);
     assert.deepEqual(fetched, [], 'the exit fetches nothing for it');
   });
 });
@@ -620,9 +621,9 @@ test("a module's failed result with structured content reaches a script with its
     forward.nested = [{ type: 'text', text: 'partly attached' }, never('module-failing')];
     const out = await script('fwd--failing');
     assert.ok(!out.includes('never-token'), out);
-    const object = JSON.parse(out) as { content: [unknown, { refId: string }]; structuredContent: unknown; isError: boolean };
+    const object = JSON.parse(out) as { content: unknown[]; structuredContent: unknown; isError: boolean };
     assert.deepEqual(object, {
-      content: [{ type: 'text', text: 'partly attached' }, { type: 'resource', refId: object.content[1].refId, name: 'sealed.pdf', savedTo: null, unfetchable: PAYLOAD_NEVER.error }],
+      content: [{ type: 'text', text: 'partly attached' }, RESULT_NEVER],
       structuredContent: { partial: true },
       isError: true,
     });
@@ -746,6 +747,11 @@ test("a nested never decides over a plain reference to its uri at the top, for a
         assert.equal(object.isError, false, out);
         assert.equal(object.content.length, 3, out);
         const link = (where === 'top' ? object.content[0] : object.content[0]!.link) as Record<string, unknown>;
+        if (out === fromModule) {
+          // Only the module's result says never, so the link gives out no id.
+          assert.deepEqual(link, RESULT_NEVER, out);
+          continue;
+        }
         assert.equal(link.type, 'resource_link', out);
         assert.match(String(link.refId), /^ref_/, out);
         assert.equal(link.uri, undefined, out);
@@ -1149,7 +1155,9 @@ test("a never nested where only the script's view reads it withholds a link whos
     const out = await script('mcpl--files--attach');
     assert.ok(!out.includes('view-cut'), out);
     const link = (JSON.parse(out) as { content: Array<Record<string, unknown>> }).content[1]!;
-    assert.deepEqual(['uri' in link, typeof link.refId], [false, 'string'], out);
+    // The server's never names another uri, which shows as the same text, so
+    // no mark is on the link's record: it gives out no id to fetch by.
+    assert.deepEqual(link, RESULT_NEVER, out);
   });
 });
 

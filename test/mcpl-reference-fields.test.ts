@@ -29,8 +29,9 @@ for (const field of fields) {
       assert.deepEqual(testimony.rejectedFields, [field]);
       assert.equal(testimony.uri, block.uri);
       assert.equal(testimony.disposition, 'never');
-      assert.ok(referenceStubOrNull(block)?.startsWith('[ref_'));
-      assert.ok(!referenceStubOrNull(block)?.includes(block.uri));
+      // From its server, whose own `never` marks the record, as on arrival.
+      assert.ok(referenceStubOrNull(block, undefined, 'srv')?.startsWith('[ref_'));
+      assert.ok(!referenceStubOrNull(block, undefined, 'srv')?.includes(block.uri));
     }
   });
 
