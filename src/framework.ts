@@ -27590,7 +27590,9 @@ export class AgentFramework {
       const direct = AgentFramework.directToolResult(result, serverId, call.name);
       if (direct.isError) {
         if (server && server.capabilities !== null && Array.isArray(result.content)) {
-          referenceRegistry.markNevers(neverClaims(result.content) ?? contentClaims(result.content), serverId);
+          const nevers = neverClaims(result.content) ?? contentClaims(result.content);
+          referenceRegistry.markNevers(nevers, serverId);
+          for (const t of neverReferences(result.content)) referenceRegistry.register(t, serverId, nevers);
         }
         const { data: blocks, ...failure } = direct;
         let shown: ToolResult = failure;

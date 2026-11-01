@@ -981,7 +981,7 @@ export interface StubOptions {
  * mark first. Another result's `never` governs that result alone. A
  * link claims no disposition or expiry, so it adds nothing here, and a
  * result that names a uri only in links leaves its record's testimony in
- * force.
+ * force where a server's word already stands in it.
  */
 export type ResultClaims = ReadonlyMap<string, UriClaims>;
 
@@ -1082,6 +1082,15 @@ export function inlineNeverUri(block: unknown, c: BlockClassification = classify
   const b = block as { uri?: unknown; disposition?: unknown; resource: { uri?: unknown } };
   const uri = c.kind === 'embedded' ? b.resource.uri : b.uri;
   return b.disposition === 'never' && typeof uri === 'string' && uri !== '' ? uri : null;
+}
+
+/** MCP's embedded resource whose uri a `never` names (embeddedWithheld). */
+export const EMBEDDED_RESOURCE_NEVER_TEXT = `[${NOTICE_TAG.resourceNotShown}: ${PAYLOAD_NEVER.error}.]`;
+
+export function embeddedWithheld(block: unknown, claims?: ResultClaims): boolean {
+  const uri = (block as { resource?: { uri?: unknown } }).resource?.uri;
+  return typeof uri === 'string' && uri !== ''
+    && (claims?.get(uri)?.never === true || referenceRegistry.findByUri(uri)?.payloadNever === true);
 }
 
 /** The claims a decision about a record reads: its result's for its uri,
@@ -1301,7 +1310,7 @@ export function referenceBlockForScript(block: unknown, serverId?: string, claim
       // or inline data that claims nothing, as such a block reaches a script;
       // the withheld notice where it claims a disposition; its marker
       // otherwise. Given again, each is as it was.
-      if (c.contents.kind === 'block') return c.contents.block;
+      if (c.contents.kind === 'block') return embeddedWithheld(block, claims) ? { type: 'text', text: EMBEDDED_RESOURCE_NEVER_TEXT } : c.contents.block;
       return { type: 'text', text: c.contents.kind === 'withheld' ? INLINE_WITHHELD_TEXT : c.contents.text };
     case 'reference': {
       const t = c.testimony;

@@ -9,11 +9,13 @@ import type { ContentBlock } from '@animalabs/membrane';
 import {
   AUDIO_NO_DATA_TEXT,
   AUDIO_NO_MEDIA_TYPE_TEXT,
+  EMBEDDED_RESOURCE_NEVER_TEXT,
   IMAGE_NO_DATA_TEXT,
   IMAGE_NO_MEDIA_TYPE_TEXT,
   INLINE_WITHHELD_TEXT,
   classifyBlock,
   contentClaims,
+  embeddedWithheld,
   isInlineContradiction,
   referenceRegistry,
   referenceStubOrNull,
@@ -98,6 +100,7 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
       // show here (RFC-005 §8.1), its uri never.
       const c = classifyBlock(block);
       if (c.kind === 'embedded' && c.contents.kind === 'block') {
+        if (embeddedWithheld(block, claims)) return { type: 'text', text: EMBEDDED_RESOURCE_NEVER_TEXT };
         return convertBlock(c.contents.block as McplContentBlock, provenance, serverId, claims);
       }
       // RFC-005: reference blocks become bounded stubs — never raw URIs
@@ -119,21 +122,21 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
 }
 
 function messageClaims(blocks: readonly McplContentBlock[], serverId: string): ResultClaims {
-  const claims = contentClaims(blocks);
-  referenceRegistry.markNevers(claims, serverId);
-  return claims;
+  const nevers = new Map([...contentClaims(blocks)].filter(([, claim]) => claim.never));
+  referenceRegistry.markNevers(nevers, serverId);
+  return nevers;
 }
 
 export function convertBlocks(blocks: readonly McplContentBlock[], provenance: string, serverId: string): ContentBlock[] {
   const claims = messageClaims(blocks, serverId);
   const converted = blocks.map((block) => convertBlock(block, provenance, serverId, claims));
-  return markNoticeOpenings(converted, (index) => sendersText(blocks[index]));
+  return markNoticeOpenings(converted, (index) => sendersText(blocks[index], claims));
 }
 
-function sendersText(block: McplContentBlock | undefined): boolean {
+function sendersText(block: McplContentBlock | undefined, claims: ResultClaims): boolean {
   if (block?.type === 'text') return typeof block.text === 'string';
   const c = classifyBlock(block);
-  return c.kind === 'embedded' && c.contents.kind === 'block' && c.contents.block.type === 'text';
+  return c.kind === 'embedded' && c.contents.kind === 'block' && c.contents.block.type === 'text' && !embeddedWithheld(block, claims);
 }
 
 /** A string with something in it: the only data, mimeType or uri a block's

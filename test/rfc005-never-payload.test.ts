@@ -11,7 +11,7 @@ import { convertBlock, convertBlocks } from '../src/mcpl/convert-block.js';
 import { ReferenceFetcher } from '../src/mcpl/reference-fetcher.js';
 import * as references from '../src/mcpl/references.js';
 import {
-  ReferenceRegistry, buildReferenceStub, classifyBlock, contentClaims, referenceBlockForScript,
+  EMBEDDED_RESOURCE_NEVER_TEXT, ReferenceRegistry, buildReferenceStub, classifyBlock, contentClaims, referenceBlockForScript,
   referenceRegistry, shownLinkUri, unfetchableReason,
 } from '../src/mcpl/references.js';
 import type { ReferenceRecord, ReferenceTestimony } from '../src/mcpl/references.js';
@@ -171,10 +171,37 @@ describe('the payload mark', () => {
       const fresh = uniq('order-fresh.png');
       const out = convertBlocks([{ type: 'image', uri: fresh }, { type: 'resource', uri: fresh, disposition: 'never' }] as McplContentBlock[], 'attachment on push event', 'zz-never-dialed');
       const made = referenceRegistry.findByUri(fresh)!;
-      assert.deepEqual([out[0]!.type, made.payloadNever, made.serverIds], ['text', true, ['zz-never-dialed']]);
+      assert.deepEqual([out[0], made.payloadNever, made.serverIds], [{ type: 'text', text: `[${made.refId}] attachment on push event — ${NEVER_TEXT}` }, true, ['zz-never-dialed']]);
       const inline = uniq('order-inline.png');
       convertBlocks([inlineNever(inline), { type: 'resource', uri: inline }] as McplContentBlock[], 'attachment on push event', 'zz-never-dialed');
       assert.equal(referenceRegistry.findByUri(inline)?.payloadNever, true, "inline data's `never` before the reference that makes the record");
+    });
+  });
+
+  it("withholds an embedded resource's contents where its uri is `never`, beside a `never` for it in either order or by a server's earlier mark: on the lanes, in history and to a script", async () => {
+    const embedded = (uri: string) => ({ type: 'resource', resource: { uri, text: 'secret contents', mimeType: 'text/plain' } });
+    const neverRef = (uri: string) => ({ type: 'resource', uri, disposition: 'never' });
+    const withheldText = { type: 'text', text: EMBEDDED_RESOURCE_NEVER_TEXT };
+    await quietly(() => {
+      for (const order of ['embedded-first', 'never-first'] as const) {
+        const uri = uniq(`${order}.txt`);
+        const blocks = order === 'embedded-first' ? [embedded(uri), neverRef(uri)] : [neverRef(uri), embedded(uri)];
+        const at = order === 'embedded-first' ? 0 : 1;
+        const lane = convertBlocks(blocks as McplContentBlock[], 'attachment on push event', 'zz-never-dialed');
+        assert.deepEqual(lane[at], withheldText, `lane, ${order}`);
+        const history = toolResultDataToHistoryString(blocks);
+        assert.ok(!history.includes('secret contents') && history.includes(EMBEDDED_RESOURCE_NEVER_TEXT), `history, ${order}: ${history}`);
+        const object = referenceBlockForScript(blocks[at], 'zz-never-dialed', contentClaims(blocks));
+        assert.deepEqual(object, withheldText, `script, ${order}`);
+      }
+      const marked = uniq('marked.txt');
+      referenceRegistry.register(testimonyOf(neverRef(marked)), 'zz-never-dialed');
+      assert.deepEqual(convertBlock(embedded(marked) as McplContentBlock, 'attachment on push event', 'zz-other'), withheldText, 'lane, after a mark');
+      const history = toolResultDataToHistoryString([embedded(marked)]);
+      assert.ok(!history.includes('secret contents') && history.includes(EMBEDDED_RESOURCE_NEVER_TEXT), `history, after a mark: ${history}`);
+      assert.deepEqual(referenceBlockForScript(embedded(marked), 'zz-other', contentClaims([embedded(marked)])), withheldText, 'script, after a mark');
+      const plain = uniq('plain.txt');
+      assert.deepEqual(convertBlock(embedded(plain) as McplContentBlock, 'attachment on push event', 'zz-other'), { type: 'text', text: 'secret contents' }, 'a uri nothing calls `never` shows its contents');
     });
   });
 
@@ -183,6 +210,9 @@ describe('the payload mark', () => {
     referenceRegistry.register(testimonyOf({ type: 'resource', uri, disposition: 'never', digest: `sha256:${'D'.repeat(43)}` }));
     const record = referenceRegistry.register(testimonyOf({ type: 'resource_link', uri, name: 'module-first.pdf' }), 'zz-never-dialed');
     assert.deepEqual([record.payloadNever, record.testimony.disposition, record.testimony.digest, record.serverIds], [undefined, undefined, undefined, ['zz-never-dialed']]);
+    assert.notEqual(unfetchableReason(record), NEVER_TEXT, "a fetch isn't refused on the module's word");
+    const line = toolResultDataToHistoryString([{ type: 'resource_link', uri, name: 'module-first.pdf' }]);
+    assert.ok(!line.includes(NEVER_TEXT), `a later link-only result isn't withheld on the module's word: ${line}`);
     referenceRegistry.register(testimonyOf({ type: 'resource_link', uri, name: 'later.pdf' }), 'zz-other');
     assert.equal(record.testimony.name, 'module-first.pdf', "a later server's link leaves a server's testimony as it was");
   });
@@ -592,16 +622,18 @@ describe("the framework's fetches", () => {
     });
   }
 
-  it("register a server's `never` reference nested in its result, bound to that server and marked, and no plain nested one", async () => {
-    const fetched: string[] = [];
-    const [nested, plain] = [uniq('nested-never.bin'), uniq('nested-plain.bin')];
-    const content = [
-      { type: 'text', text: 'one attachment', attachment: { type: 'resource', uri: nested, disposition: 'never' } },
-      { type: 'text', text: 'another', attachment: { type: 'resource', uri: plain } },
-    ];
-    await quietly(() => framework(fetched).autoFetchReferences(content, 'zz-never-dialed', 'model'));
-    const record = referenceRegistry.findByUri(nested);
-    assert.deepEqual([record?.payloadNever, record?.serverIds, referenceRegistry.findByUri(plain), fetched], [true, ['zz-never-dialed'], undefined, []]);
+  it("register a server's `never` reference nested in its result, bound to that server and marked, and no plain nested one, whatever the call's mode", async () => {
+    for (const mode of ['register', 'model', 'script'] as const) {
+      const fetched: string[] = [];
+      const [nested, plain] = [uniq('nested-never.bin'), uniq('nested-plain.bin')];
+      const content = [
+        { type: 'text', text: 'one attachment', attachment: { type: 'resource', uri: nested, disposition: 'never' } },
+        { type: 'text', text: 'another', attachment: { type: 'resource', uri: plain } },
+      ];
+      await quietly(() => framework(fetched).autoFetchReferences(content, 'zz-never-dialed', mode));
+      const record = referenceRegistry.findByUri(nested);
+      assert.deepEqual([record?.payloadNever, record?.serverIds, referenceRegistry.findByUri(plain), fetched], [true, ['zz-never-dialed'], undefined, []], mode);
+    }
   });
 
   it('log no failure for a record a `never` marks while they run', async () => {

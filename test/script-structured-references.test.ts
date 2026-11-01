@@ -453,7 +453,7 @@ test("a module's structured result, an MCPL peer's it got through ctx.callTool, 
   });
 });
 
-test("an MCPL peer's failure a module gets through ctx.callTool marks, by a `never` in its blocks, the record its uri already has, though its references aren't registered", async () => {
+test("an MCPL peer's failure a module gets through ctx.callTool marks, by a `never` in its blocks, the record its uri already has, and registers its `never` references marked, though its other references aren't registered", async () => {
   await withPeers(async ({ answer, script }) => {
     const uri = `https://files.example.invalid/failure-never/${randomUUID()}.pdf`;
     const c = classifyBlock({ type: 'resource', uri }) as { testimony: ReferenceTestimony };
@@ -461,18 +461,21 @@ test("an MCPL peer's failure a module gets through ctx.callTool marks, by a `nev
     const referenced = `https://files.example.invalid/failure-never/${randomUUID()}-referenced.pdf`;
     const byReference = referenceRegistry.register((classifyBlock({ type: 'resource', uri: referenced }) as { testimony: ReferenceTestimony }).testimony, 'files');
     const unregistered = `https://files.example.invalid/failure-never/${randomUUID()}-other.pdf`;
+    const unregisteredPlain = `https://files.example.invalid/failure-never/${randomUUID()}-other-plain.pdf`;
     answer({
       content: [
         { type: 'text', text: 'the attach failed' },
         { type: 'image', uri, data: 'aGk=', mimeType: 'image/png', disposition: 'never' },
         { type: 'resource', uri: referenced, disposition: 'never' },
         { type: 'resource', uri: unregistered, disposition: 'never' },
+        { type: 'resource', uri: unregisteredPlain },
       ],
       isError: true,
     });
     await script('fwd--whole');
     assert.deepEqual([record.payloadNever, byReference.payloadNever], [true, true]);
-    assert.equal(referenceRegistry.findByUri(unregistered), undefined);
+    const fresh = referenceRegistry.findByUri(unregistered);
+    assert.deepEqual([fresh?.payloadNever, fresh?.serverIds, referenceRegistry.findByUri(unregisteredPlain)], [true, ['files'], undefined]);
     const plainUri = `https://files.example.invalid/failure-never/${randomUUID()}-plain.pdf`;
     const plain = referenceRegistry.register((classifyBlock({ type: 'resource', uri: plainUri }) as { testimony: ReferenceTestimony }).testimony, 'plain');
     answer({ content: [{ type: 'text', text: 'the plain attach failed' }, { type: 'resource', uri: plainUri, disposition: 'never' }], isError: true });
@@ -482,9 +485,11 @@ test("an MCPL peer's failure a module gets through ctx.callTool marks, by a `nev
     assert.equal(plain.payloadNever, undefined);
     const nestedUri = `https://files.example.invalid/failure-never/${randomUUID()}-nested.pdf`;
     const nested = referenceRegistry.register((classifyBlock({ type: 'resource', uri: nestedUri }) as { testimony: ReferenceTestimony }).testimony, 'files');
-    answer({ content: [{ type: 'text', text: 'the attach failed', attachment: { type: 'resource', uri: nestedUri, disposition: 'never' } }], isError: true });
+    const nestedFresh = `https://files.example.invalid/failure-never/${randomUUID()}-nested-fresh.pdf`;
+    answer({ content: [{ type: 'text', text: 'the attach failed', attachment: { type: 'resource', uri: nestedUri, disposition: 'never' }, also: { type: 'resource', uri: nestedFresh, disposition: 'never' } }], isError: true });
     await script('fwd--whole');
     assert.equal(nested.payloadNever, true, 'a `never` nested in a failure\'s block marks as a success\'s would');
+    assert.deepEqual([referenceRegistry.findByUri(nestedFresh)?.payloadNever, referenceRegistry.findByUri(nestedFresh)?.serverIds], [true, ['files']], 'and registers its uri marked where it has no record');
   });
 });
 

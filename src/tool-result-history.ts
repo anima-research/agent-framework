@@ -26,11 +26,13 @@ import {
   AUDIO_NO_DATA_TEXT,
   AUDIO_NO_MEDIA_TYPE_TEXT,
   IMAGE_NO_DATA_TEXT,
+  EMBEDDED_RESOURCE_NEVER_TEXT,
   IMAGE_NO_MEDIA_TYPE_TEXT,
   INLINE_WITHHELD_TEXT,
   buildReferenceStub,
   classifyBlock,
   contentClaims,
+  embeddedWithheld,
   inlineNeverUri,
   referenceBlockForScript,
   referenceStubOrNull,
@@ -171,7 +173,9 @@ function toolResultBlock(raw: unknown, claims: ResultClaims): ToolResultBlock {
     case 'embedded':
       // MCP's embedded resource shows as the block its contents make would
       // show here. Its uri never shows.
-      if (c.contents.kind === 'block') return toolResultBlock(c.contents.block, claims);
+      if (c.contents.kind === 'block') {
+        return embeddedWithheld(raw, claims) ? { kind: 'withheld', text: EMBEDDED_RESOURCE_NEVER_TEXT } : toolResultBlock(c.contents.block, claims);
+      }
       return c.contents.kind === 'withheld'
         ? { kind: 'withheld', text: INLINE_WITHHELD_TEXT }
         : { kind: 'marker', text: c.contents.text };
