@@ -10,8 +10,11 @@
  *  - the one invalid-field rule (§8): a bad optional field is dropped while
  *    the block and its subtractive `disposition` survive; a bad `uri`
  *    rejects the block whole;
- *  - `disposition:"never"` withholds payload AND uri from model context
- *    unconditionally — enforced in code here, not by caller discipline (§5);
+ *  - `disposition:"never"` from a server marks its uri's record (§3.1, §5):
+ *    while the mark stands, the framework fetches and saves none of the
+ *    payload, and no stub, script object or link names a saved copy or the
+ *    uri. A copy saved before the mark stays in the workspace, and the mark
+ *    goes with a record lost to eviction or a restart;
  *  - stub size is independent of every server-supplied field length (§5);
  *  - unparseable `expiresAt` fails closed (§7.4), and so does one rejected
  *    as a field: it's absent as testimony, never read as immortal;
