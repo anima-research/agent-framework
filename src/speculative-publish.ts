@@ -252,12 +252,9 @@ export interface SpeculativeStreamSink {
   /**
    * The channel a call naming this channel publishes to, when that channel
    * takes speculative chunks (it opted in, and its server may stream);
-   * null for any other, or a name that picks no single channel. `partial`:
-   * the call is still being written and has no serverId yet, so one may
-   * follow; only a name that can't come to mean another channel then
-   * resolves.
+   * null for any other, or a name that picks no single channel.
    */
-  target(named: { channelId: string; serverId?: string }, options?: { partial?: boolean }): ChannelRef | null;
+  target(named: { channelId: string; serverId?: string }): ChannelRef | null;
   /** The same, for a finished call that names no channel: where its publish defaults to. */
   defaultTarget(input: Record<string, unknown>): ChannelRef | null;
   chunk(to: ChannelRef, streamId: string, seq: number, content: string): void;
@@ -282,6 +279,17 @@ interface PublishStream {
   finalText?: string;
 }
 
+/**
+ * Where a call's text went (the channel of its first chunk), kept after its
+ * stream ends: the call's publish goes there or nowhere (dispatch).
+ */
+export interface SpokenTo {
+  streamId: string;
+  channel: ChannelRef;
+  /** Its stream is still open, and the publish carries its id and ends it. */
+  live: boolean;
+}
+
 const sameChannel = (a: ChannelRef, b: ChannelRef) => a.serverId === b.serverId && a.channelId === b.channelId;
 
 /**
@@ -304,6 +312,8 @@ const sameChannel = (a: ChannelRef, b: ChannelRef) => a.serverId === b.serverId 
  */
 export class SpeculativePublishStreams {
   private readonly streams = new Map<string, PublishStream>();
+  /** By call id: the channel each call's first chunk went to. */
+  private readonly spoken = new Map<string, ChannelRef>();
 
   constructor(private readonly sink: SpeculativeStreamSink) {}
 
@@ -324,12 +334,16 @@ export class SpeculativePublishStreams {
       return;
     }
     stream.held += text;
-    if (stream.reader.channelId !== undefined) {
-      const serverId = stream.reader.serverId;
+    // The recipient is fixed only once channelId and serverId are both read:
+    // a serverId may follow content and name another server's channel (the
+    // publish takes the exact pair), and channels register meanwhile. Until
+    // then the text is held, and a call that names no serverId sends it as
+    // one chunk once it is finished (onToolCalls), from its final arguments.
+    if (stream.reader.channelId !== undefined && stream.reader.serverId) {
       const now = this.resolve(() => this.sink.target({
         channelId: stream.reader.channelId!,
-        ...(serverId ? { serverId } : {}),
-      }, serverId ? undefined : { partial: true }));
+        serverId: stream.reader.serverId!,
+      }));
       if (!this.retarget(stream, now)) return;
     }
     this.flush(stream);
@@ -383,21 +397,25 @@ export class SpeculativePublishStreams {
     }
   }
 
-  /** Whether a call has a stream still open. */
+  /** Whether a call has a stream still open, or its text went somewhere. */
   has(callId: string): boolean {
-    return this.streams.has(callId);
+    return this.streams.has(callId) || this.spoken.has(callId);
   }
 
   /**
-   * The call's publish is starting: the stream it carries (so the server can
-   * match the publish to the stream), when chunks went out for it, with the
-   * channel they went to.
+   * The call's publish is starting: where its text went, when any did, with
+   * the stream it carries while that is open (so the server can match the
+   * publish to the stream). The publish goes to that channel or nowhere.
    */
-  dispatch(callId: string): { streamId: string; channel: ChannelRef } | undefined {
+  dispatch(callId: string): SpokenTo | undefined {
+    const channel = this.spoken.get(callId);
+    this.spoken.delete(callId);
     const stream = this.streams.get(callId);
-    if (!stream || stream.phase === 'streaming') return undefined;
-    stream.phase = 'dispatched';
-    return stream.seq > 0 && stream.target ? { streamId: stream.streamId, channel: stream.target } : undefined;
+    if (stream && stream.phase !== 'streaming') stream.phase = 'dispatched';
+    if (!channel) return undefined;
+    const live = !!stream && stream.phase === 'dispatched' && !stream.dead && !!stream.target && stream.seq > 0
+      && sameChannel(stream.target, channel);
+    return { streamId: `spec_${callId}`, channel, live };
   }
 
   /**
@@ -491,6 +509,7 @@ export class SpeculativePublishStreams {
     const to = stream.target;
     const content = stream.held;
     stream.held = '';
+    if (!this.spoken.has(stream.toolId)) this.spoken.set(stream.toolId, to);
     this.send(() => this.sink.chunk(to, stream.streamId, stream.seq, content));
     stream.seq++;
   }

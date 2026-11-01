@@ -1153,8 +1153,9 @@ export type ChannelToolOrigin =
     inTurn?: boolean;
     /** A channel_publish whose text went out ahead of it in a speculative
      *  stream (docs/speculative-channel-chunks.md): that stream's id and the
-     *  channel it went to. The publish carries the id when it goes there. */
-    speculativeStream?: { streamId: string; channel: ChannelRef };
+     *  channel it went to. The publish goes to that channel or is refused,
+     *  and carries the id while the stream is open (`live`). */
+    speculativeStream?: { streamId: string; channel: ChannelRef; live?: boolean };
   };
 
 /** The machine decision sources a module-origin channel_close may record.
@@ -5757,29 +5758,14 @@ export class ChannelRegistry {
    * `streaming.speculative: true`, and whose server's grant has
    * `channels.streaming` (§5.4) and `channels.publish`. Null otherwise: such a call streams nothing.
    * `own`: the calling turn's own channels, as the publish reads the name.
-   * `partial`: the call is still being written and names no serverId yet,
-   * and one may follow, which would pick that exact pair. Then only a name
-   * that picks one registered channel by itself, and that the turn's own
-   * channels don't read as another, resolves; the finished call settles the
-   * rest.
    */
-  speculativeTarget(
-    named: { channelId: string; serverId?: string },
-    own?: readonly ChannelRef[],
-    options?: { partial?: boolean },
-  ): ChannelRef | null {
+  speculativeTarget(named: { channelId: string; serverId?: string }, own?: readonly ChannelRef[]): ChannelRef | null {
     // As the publish resolves the name (handleToolPublish): without a
     // serverId, a name the calling turn's own channels answer to by id means
     // that channel, even where its server no longer registers it.
     const ownNamed = named.serverId ? undefined : this.ownChannelNamed(named.channelId, own);
     if (ownNamed && 'neither' in ownNamed) return null;
-    let exact: ChannelRef | undefined = named.serverId ? { serverId: named.serverId, channelId: named.channelId } : ownNamed?.channel;
-    if (options?.partial && !named.serverId) {
-      const byName = this.entriesNamed(named.channelId);
-      if (byName.length !== 1) return null;
-      if (exact && !sameChannel(exact, refOf(byName[0]!))) return null;
-      exact = refOf(byName[0]!);
-    }
+    const exact = named.serverId ? { serverId: named.serverId, channelId: named.channelId } : ownNamed?.channel;
     const matches = exact
       ? [this.entryAt(exact)].filter((e): e is ChannelEntry => !!e)
       : this.entriesNamed(named.channelId);
@@ -6441,14 +6427,24 @@ export class ChannelRegistry {
       }
       return { success: false, error: `Nothing was posted to channel ${quoted}: ${this.sendRefusal(entry.serverId)}.`, isError: true };
     }
+    // A message whose text already went out ahead of it (a speculative
+    // stream) goes where its text went or nowhere: no other recipient gets
+    // it after one already has its words.
+    const spoken = origin?.kind === 'agent' ? origin.speculativeStream : undefined;
+    if (spoken && !sameChannel(spoken.channel, refOf(entry))) {
+      return {
+        success: false,
+        error: `Nothing was posted to channel ${quoted}: this message's text already went to channel `
+          + `${this.quotedShown(spoken.channel)} as it was written, and a message goes only where its text went. `
+          + 'Call channel_publish again to post it.',
+        isError: true,
+      };
+    }
     const publishParams: ChannelsPublishParams = {
       conversationId: '', // Framework will fill this when wired
       channelId,
       content: [{ type: 'text', text: messageText }],
-      ...(origin?.kind === 'agent' && origin.speculativeStream
-        && origin.speculativeStream.channel.serverId === entry.serverId && origin.speculativeStream.channel.channelId === channelId
-        ? { streamId: origin.speculativeStream.streamId }
-        : {}),
+      ...(spoken && spoken.live !== false ? { streamId: spoken.streamId } : {}),
     };
     const destination: PublishDestination = {
       serverId: entry.serverId,

@@ -3834,6 +3834,8 @@ export class AgentFramework {
    * what went out was cancelled, and a publish after it would be heard twice.
    */
   private speculativeStopCancelled: Set<string> = new Set();
+  /** Publishes under way that end an open speculative stream: stop() waits for them before closing MCPL. */
+  private speculativePublishes: Set<Promise<void>> = new Set();
   /**
    * Each agent's open logical turn: its routing state and receipt tallies
    * (TurnRouting). It stays open from the start that opens it until the
@@ -5890,6 +5892,15 @@ export class AgentFramework {
     // deadline isn't waited for here, but the workspace's own stop waits for
     // the mount turn it holds, bounded only by teardownTimeoutMs.
     this.guardSpillsClosed = true;
+
+    // A publish under way that ends a speculative stream gets its answer
+    // before MCPL closes, so a delivered one sends its full `complete`. The
+    // wait takes teardownTimeoutMs when given, else the publish request's
+    // own deadline ends it; one still out then ends as the close leaves it.
+    if (this.speculativePublishes?.size) {
+      await waitForShutdown([...this.speculativePublishes].map((promise) => ({ label: 'speculative publish', promise })), teardownTimeoutMs)
+        .catch(() => { /* not a failure of stop(): the publish ends by the close */ });
+    }
 
     // Stop modules and both engines' MCP servers in parallel
     const shutdownPromises: Promise<void>[] = [this.moduleRegistry.stopAll(teardownTimeoutMs), waitFor(inferences)];
@@ -22533,7 +22544,7 @@ export class AgentFramework {
       return !home || sameChannel(home, to) ? to : null;
     };
     const streams = new SpeculativePublishStreams({
-      target: (channel, options) => allowed(registry.speculativeTarget(channel, own(), options)),
+      target: (channel) => allowed(registry.speculativeTarget(channel, own())),
       defaultTarget: (input) => allowed(named(this.publishInputWithTurnLocus(input, agent.name, routing) as { channelId?: unknown; serverId?: unknown })),
       chunk: (to, streamId, seq, content) => registry.sendSpeculativeChunk(to, agent.name, streamId, seq, content),
       complete: (to, streamId, content, cancelled) => registry.sendSpeculativeComplete(to, agent.name, streamId, content, cancelled),
@@ -36626,7 +36637,7 @@ export class AgentFramework {
       if (this.speculativeCalls?.get(speculativeKey) === speculative) this.speculativeCalls?.delete(speculativeKey);
       speculative.published(call.id, outcome);
     };
-    this.channelRegistry!.handleChannelToolCall(call.name, channelInput, {
+    const publishing = this.channelRegistry!.handleChannelToolCall(call.name, channelInput, {
       kind: 'agent', agentName, own: callingTurn ? this.ownChannels(callingTurn) : [], ...(callingTurn ? { inTurn: true } : {}), ...(earlierWake ? { earlierWake } : {}),
       ...(speculativeStream ? { speculativeStream } : {}),
     }, published)
@@ -36723,6 +36734,11 @@ export class AgentFramework {
           result: { success: false, error: err.message, isError: true },
         });
       });
+    // stop() waits for it before closing MCPL, so its stream ends by its outcome.
+    if (speculativeStream?.live) {
+      this.speculativePublishes?.add(publishing);
+      void publishing.finally(() => this.speculativePublishes?.delete(publishing));
+    }
   }
 
   /**

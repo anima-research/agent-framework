@@ -78,29 +78,38 @@ The stream ends exactly once:
   the host stopped before the publish started. A publish whose stream
   `stop()` cancelled that way is refused, so the text isn't heard again. A
   publish already under way when the host stops ends its stream by its own
-  outcome.
+  outcome: `stop()` waits for it before closing MCPL connections, bounded by
+  the caller's shutdown bound when one is given, else by the publish
+  request's own deadline.
 
 A call that sent no chunk (its channel didn't opt in, or it had no text) sends
 no `complete` either, and its publish carries no `streamId`.
 
 ### Which channel
 
-- `channelId` given: the channel that name picks (its id or server-qualified
-  name; with `serverId`, that exact pair). A name two channels answer to picks
-  none, and nothing streams. While the call is being written and no
-  `serverId` has been read, one may still follow, so the name streams only
-  where it picks one registered channel by itself (a turn's own channel
-  doesn't settle it yet); otherwise the text is held until `serverId` is read
-  or the call is finished.
+Text goes only to the recipient the publish will have, fixed before the
+first chunk:
+
+- `channelId` and `serverId` both read while the call is written: that exact
+  pair, the one the publish takes, and text streams as it is written.
+- `channelId` given without a `serverId`: a `serverId` could still follow the
+  text and name another server's channel, and channels register meanwhile,
+  so nothing goes out while the call is written. Once it is finished, its
+  whole text goes out as one chunk, just before the publish, to the channel
+  its final arguments name. To stream as it writes, a call writes
+  `channelId` and `serverId` before `content` (`channel_publish` takes
+  `serverId` though its schema doesn't list it).
 - `channelId` not given: the channel the publish defaults to (host 0.19: the
   turn's channel, the one whose message woke it). That is known only once the
   call is finished, since a later argument could still name a channel, so the
   call's whole text goes out as one chunk then, just before the publish.
-- `content` written before `channelId` (argument order): the text is held and
-  goes out as one chunk as soon as `channelId` has been read.
+- `content` written before `channelId` and `serverId` (argument order): the
+  text is held and goes out as one chunk as soon as both have been read.
 
-The publish's own resolution is authoritative: if it lands elsewhere than the
-stream's channel, the stream is cancelled.
+A message whose text went to a channel is published there or nowhere: a
+publish that resolves to any other channel (a repeated key, a registration
+that changed in between) is refused, and its stream is cancelled. So no
+channel ever gets text that another channel's publish carries.
 
 ## Notes for servers
 

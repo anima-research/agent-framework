@@ -119,10 +119,10 @@ function sink(opted = new Set(['voice']), fallback: string | null = 'voice') {
 const publishCall = (id: string, input: Record<string, unknown>) => ({ id, name: 'channel_publish', input });
 const voice: ChannelRef = { serverId: 'bosun', channelId: 'voice' };
 
-test('streams: channelId first, each delta goes out at once; a delivered publish completes with the full text', () => {
+test('streams: channelId and serverId first, each delta goes out at once; a delivered publish completes with the full text', () => {
   const { sent, sink: s } = sink();
   const streams = new SpeculativePublishStreams(s);
-  for (const f of ['{"channelId":"voi', 'ce","content":"Hel', 'lo. ', 'Bye."}']) streams.onInputDelta('t1', 'channel_publish', f);
+  for (const f of ['{"channelId":"voi', 'ce","serverId":"bos', 'un","content":"Hel', 'lo. ', 'Bye."}']) streams.onInputDelta('t1', 'channel_publish', f);
   assert.deepEqual(sent, [
     { kind: 'chunk', channelId: 'voice', streamId: 'spec_t1', seq: 0, content: 'Hel' },
     { kind: 'chunk', channelId: 'voice', streamId: 'spec_t1', seq: 1, content: 'lo. ' },
@@ -135,14 +135,26 @@ test('streams: channelId first, each delta goes out at once; a delivered publish
   assert.equal(streams.size, 0);
 });
 
-test('streams: content before channelId is held, then sent at once when the channel is read', () => {
+test('streams: content before the recipient is fixed is held, then sent at once when channelId and serverId are read', () => {
   const { sent, sink: s } = sink();
   const streams = new SpeculativePublishStreams(s);
   streams.onInputDelta('t1', 'channel_publish', '{"content":"Early ');
   streams.onInputDelta('t1', 'channel_publish', 'words.",');
   assert.deepEqual(sent, []);
-  streams.onInputDelta('t1', 'channel_publish', '"channelId":"voice"}');
+  streams.onInputDelta('t1', 'channel_publish', '"channelId":"voice",');
+  assert.deepEqual(sent, [], 'a serverId may still follow');
+  streams.onInputDelta('t1', 'channel_publish', '"serverId":"bosun"}');
   assert.deepEqual(sent, [{ kind: 'chunk', channelId: 'voice', streamId: 'spec_t1', seq: 0, content: 'Early words.' }]);
+});
+
+test('streams: a call that names no serverId sends nothing while it is written, and its text as one chunk once it is finished', () => {
+  const { sent, sink: s } = sink();
+  const streams = new SpeculativePublishStreams(s);
+  for (const f of ['{"channelId":"voice","content":"Hel', 'lo. ', 'Bye."}']) streams.onInputDelta('t1', 'channel_publish', f);
+  assert.deepEqual(sent, []);
+  streams.onToolCalls([publishCall('t1', { channelId: 'voice', content: 'Hello. Bye.' })]);
+  assert.deepEqual(sent, [{ kind: 'chunk', channelId: 'voice', streamId: 'spec_t1', seq: 0, content: 'Hello. Bye.' }]);
+  assert.deepEqual(streams.dispatch('t1'), { streamId: 'spec_t1', channel: voice, live: true });
 });
 
 test('streams: a call naming no channel streams to its default once the call is finished', () => {
@@ -160,8 +172,8 @@ test('streams: a call naming no channel streams to its default once the call is 
 test('streams: a channel that did not opt in, and other tools, get nothing', () => {
   const { sent, sink: s } = sink();
   const streams = new SpeculativePublishStreams(s);
-  streams.onInputDelta('t1', 'channel_publish', '{"channelId":"text-chat","content":"Not spoken."}');
-  streams.onInputDelta('t2', 'send_message', '{"channelId":"voice","content":"Other tool."}');
+  streams.onInputDelta('t1', 'channel_publish', '{"channelId":"text-chat","serverId":"bosun","content":"Not spoken."}');
+  streams.onInputDelta('t2', 'send_message', '{"channelId":"voice","serverId":"bosun","content":"Other tool."}');
   streams.onInputDelta('t3', 'channel_publish', '{"content":"No default."}');
   streams.onToolCalls([publishCall('t1', { channelId: 'text-chat', content: 'Not spoken.' })]);
   assert.equal(streams.dispatch('t1'), undefined);
@@ -195,15 +207,16 @@ test('streams: a name two channels share waits for serverId, however the fragmen
 test('streams: a channel that changes after chunks went out cancels the stream', () => {
   const { sent, sink: s } = sink(new Set(['voice', 'voice2']));
   const streams = new SpeculativePublishStreams(s);
-  streams.onInputDelta('t1', 'channel_publish', '{"channelId":"voice","content":"Spoken ');
+  streams.onInputDelta('t1', 'channel_publish', '{"channelId":"voice","serverId":"bosun","content":"Spoken ');
   streams.onInputDelta('t1', 'channel_publish', 'already.","channelId":"voice2"}');
   assert.deepEqual(sent, [
     { kind: 'chunk', channelId: 'voice', streamId: 'spec_t1', seq: 0, content: 'Spoken ' },
     // The fragment that names another channel sends none of its text.
     { kind: 'complete', channelId: 'voice', streamId: 'spec_t1', content: '', cancelled: true },
   ]);
-  streams.onToolCalls([publishCall('t1', { channelId: 'voice2', content: 'Spoken already.' })]);
-  assert.equal(streams.dispatch('t1'), undefined, 'the publish carries no stream id');
+  streams.onToolCalls([publishCall('t1', { channelId: 'voice2', serverId: 'bosun', content: 'Spoken already.' })]);
+  assert.deepEqual(streams.dispatch('t1'), { streamId: 'spec_t1', channel: voice, live: false },
+    'the publish is held to where its text went, and carries no stream id');
   assert.equal(sent.length, 2);
 });
 
@@ -213,7 +226,7 @@ test('streams: every way a call does not get published cancels its stream, exact
   const begin = () => {
     const h = sink();
     const streams = new SpeculativePublishStreams(h.sink);
-    streams.onInputDelta('t1', 'channel_publish', '{"channelId":"voice","content":"Maybe');
+    streams.onInputDelta('t1', 'channel_publish', '{"channelId":"voice","serverId":"bosun","content":"Maybe');
     return { ...h, streams };
   };
 
@@ -253,7 +266,7 @@ test('streams: every way a call does not get published cancels its stream, exact
   h.streams.onInputDelta('t1', 'channel_publish', 'more');
   assert.deepEqual(h.sent.at(-1), cancelled());
   h.streams.onToolCalls([publishCall('t1', { channelId: 'voice', content: 'Maybe so' })]);
-  assert.equal(h.streams.dispatch('t1'), undefined);
+  assert.deepEqual(h.streams.dispatch('t1'), { streamId: 'spec_t1', channel: voice, live: false }, 'held to where its text went, no stream id');
 
   // stop() while the publish is under way: its outcome ends the stream, delivered here.
   h = begin();
@@ -269,30 +282,31 @@ test('streams: every way a call does not get published cancels its stream, exact
   h = begin();
   h.streams.onToolCalls([{ ...publishCall('t1', {}), unparseableInput: '{"channelId":"voice","content":"Maybe' }]);
   assert.deepEqual(h.sent.at(-1), cancelled());
-  assert.equal(h.streams.dispatch('t1'), undefined);
+  assert.equal(h.streams.dispatch('t1')?.live, false);
 });
 
-test('streams: a name is resolved as partial until a serverId is read', () => {
-  const asked: Array<{ serverId?: string; partial: boolean }> = [];
+test('streams: a name is resolved only once serverId is read, or from the finished call', () => {
+  const asked: Array<{ channelId: string; serverId?: string }> = [];
   const streams = new SpeculativePublishStreams({
-    target: ({ channelId, serverId }, options) => {
-      asked.push({ ...(serverId ? { serverId } : {}), partial: options?.partial === true });
-      return { serverId: serverId ?? 'bosun', channelId };
-    },
+    target: (named) => { asked.push({ ...named }); return { serverId: named.serverId ?? 'bosun', channelId: named.channelId }; },
     defaultTarget: () => null,
     chunk: () => {},
     complete: () => {},
   });
   streams.onInputDelta('t1', 'channel_publish', '{"channelId":"shared","content":"A');
+  assert.deepEqual(asked, []);
   streams.onInputDelta('t1', 'channel_publish', '","serverId":"chat"}');
-  assert.deepEqual(asked, [{ partial: true }, { serverId: 'chat', partial: false }]);
+  assert.deepEqual(asked, [{ channelId: 'shared', serverId: 'chat' }]);
+  streams.onInputDelta('t2', 'channel_publish', '{"channelId":"plain","content":"B"}');
+  streams.onToolCalls([publishCall('t1', { channelId: 'shared', serverId: 'chat', content: 'A' }), publishCall('t2', { channelId: 'plain', content: 'B' })]);
+  assert.deepEqual(asked.slice(1), [{ channelId: 'shared', serverId: 'chat' }, { channelId: 'plain' }]);
 });
 
 test("streams: chunks of other text than the publish posts are cancelled (a text alias before content, a repeated key)", () => {
   for (const [json, input] of [
-    ['{"channelId":"voice","text":"Said first.","content":"Posted."}', { channelId: 'voice', text: 'Said first.', content: 'Posted.' }],
-    ['{"channelId":"voice","content":"Said first.","content":"Posted."}', { channelId: 'voice', content: 'Posted.' }],
-    ['{"channelId":"voice","text":"Said first.","content":""}', { channelId: 'voice', text: 'Said first.', content: '' }],
+    ['{"channelId":"voice","serverId":"bosun","text":"Said first.","content":"Posted."}', { channelId: 'voice', text: 'Said first.', content: 'Posted.' }],
+    ['{"channelId":"voice","serverId":"bosun","content":"Said first.","content":"Posted."}', { channelId: 'voice', content: 'Posted.' }],
+    ['{"channelId":"voice","serverId":"bosun","text":"Said first.","content":""}', { channelId: 'voice', text: 'Said first.', content: '' }],
   ] as const) {
     const { sent, sink: s } = sink();
     const streams = new SpeculativePublishStreams(s);
@@ -300,12 +314,12 @@ test("streams: chunks of other text than the publish posts are cancelled (a text
     assert.equal(sent.filter((e) => e.kind === 'chunk').length, 1, json);
     streams.onToolCalls([publishCall('t1', input)]);
     assert.deepEqual(sent.at(-1), cancelled(), json);
-    assert.equal(streams.dispatch('t1'), undefined, 'the publish carries no stream id');
+    assert.equal(streams.dispatch('t1')?.live, false, 'the publish carries no stream id');
   }
   // An empty content goes first: nothing streams, and the text alias the publish doesn't post isn't sent at the end either.
   const { sent, sink: s } = sink();
   const streams = new SpeculativePublishStreams(s);
-  streams.onInputDelta('t1', 'channel_publish', '{"channelId":"voice","content":"","text":"Not posted."}');
+  streams.onInputDelta('t1', 'channel_publish', '{"channelId":"voice","serverId":"bosun","content":"","text":"Not posted."}');
   streams.onToolCalls([publishCall('t1', { channelId: 'voice', content: '', text: 'Not posted.' })]);
   assert.deepEqual(sent, []);
 });
@@ -313,8 +327,8 @@ test("streams: chunks of other text than the publish posts are cancelled (a text
 test('streams: spokenPending names only the pending calls whose text went out', () => {
   const { sink: s } = sink();
   const streams = new SpeculativePublishStreams(s);
-  streams.onInputDelta('spoken', 'channel_publish', '{"channelId":"voice","content":"Out');
-  streams.onInputDelta('silent', 'channel_publish', '{"channelId":"text-chat","content":"Not out');
+  streams.onInputDelta('spoken', 'channel_publish', '{"channelId":"voice","serverId":"bosun","content":"Out');
+  streams.onInputDelta('silent', 'channel_publish', '{"channelId":"text-chat","serverId":"bosun","content":"Not out');
   streams.onInputDelta('held', 'channel_publish', '{"content":"Held');
   assert.deepEqual(streams.spokenPending(), ['spoken']);
   streams.onToolCalls([publishCall('spoken', { channelId: 'voice', content: 'Out' })]);
@@ -341,7 +355,7 @@ test('streams: a channelId or serverId that is not a string stops the stream, wh
   // Decided when the round's calls arrive too, whatever the fragments showed.
   const { sent, sink: s } = sink();
   const streams = new SpeculativePublishStreams(s);
-  streams.onInputDelta('t1', 'channel_publish', '{"channelId":"voice","content":"Hello"}');
+  streams.onInputDelta('t1', 'channel_publish', '{"channelId":"voice","serverId":"bosun","content":"Hello"}');
   streams.onToolCalls([publishCall('t1', { channelId: 'voice', serverId: 42, content: 'Hello' })]);
   assert.deepEqual(sent.at(-1), cancelled());
 });
@@ -353,7 +367,7 @@ test('streams: a sink that throws never reaches the caller', () => {
     chunk: () => { throw new Error('transport closed'); },
     complete: () => { throw new Error('transport closed'); },
   });
-  streams.onInputDelta('t1', 'channel_publish', '{"channelId":"voice","content":"x"}');
+  streams.onInputDelta('t1', 'channel_publish', '{"channelId":"voice","serverId":"bosun","content":"x"}');
   streams.onToolCalls([publishCall('t1', { channelId: 'voice', content: 'x' })]);
   streams.dispatch('t1');
   streams.published('t1', { delivered: true, destination: voice });
@@ -417,31 +431,47 @@ test('registry: only a channel that opted in, not inbound-only, on a server gran
   assert.equal(h.notifications.length, 0);
 });
 
-test("registry: while a serverId may still follow, a name the turn's channel shares with another server's streams nowhere", async () => {
+test("registry: the reviewer's scenario: only A has the name while content is written, B registers, the call names B; A receives nothing", async () => {
+  for (const serverIdIn of ['fragments', 'finished call'] as const) {
+    const h = streamingRegistry();
+    await h.register('bosun', 'shared', SPECULATIVE);
+    const sent: Array<{ serverId: string; channelId: string; kind: string; content: string }> = [];
+    const streams = new SpeculativePublishStreams({
+      target: (named) => h.registry.speculativeTarget(named, []),
+      defaultTarget: () => null,
+      chunk: (to, streamId, seq, content) => { sent.push({ ...to, kind: 'chunk', content }); h.registry.sendSpeculativeChunk(to, 'Glassy', streamId, seq, content); },
+      complete: (to, streamId, content, c) => { sent.push({ ...to, kind: 'complete', content }); h.registry.sendSpeculativeComplete(to, 'Glassy', streamId, content, c); },
+    });
+    streams.onInputDelta('t1', 'channel_publish', '{"channelId":"shared","content":"For B only');
+    await h.register('chat', 'shared', SPECULATIVE);
+    if (serverIdIn === 'fragments') streams.onInputDelta('t1', 'channel_publish', '","serverId":"chat"}');
+    else streams.onInputDelta('t1', 'channel_publish', '"}');
+    streams.onToolCalls([publishCall('t1', { channelId: 'shared', serverId: 'chat', content: 'For B only' })]);
+    const spoken = streams.dispatch('t1');
+    await h.registry.handleChannelToolCall('channel_publish', { channelId: 'shared', serverId: 'chat', content: 'For B only' },
+      { kind: 'agent', agentName: 'Glassy', ...(spoken ? { speculativeStream: spoken } : {}) });
+    assert.deepEqual(sent.filter((e) => e.serverId === 'bosun'), [], serverIdIn);
+    assert.deepEqual(sent.filter((e) => e.kind === 'chunk').map((e) => [e.serverId, e.content]), [['chat', 'For B only']], serverIdIn);
+    assert.equal(h.publishes.length, 1);
+    assert.equal(h.publishes[0]!.streamId, 'spec_t1');
+  }
+});
+
+test('registry: a publish whose text already went to one channel goes there or nowhere', async () => {
   const h = streamingRegistry();
   await h.register('bosun', 'shared', SPECULATIVE);
   await h.register('chat', 'shared', SPECULATIVE);
-  await h.register('bosun', 'bosun:meeting:1', SPECULATIVE);
   const bosun = { serverId: 'bosun', channelId: 'shared' };
-  const chat = { serverId: 'chat', channelId: 'shared' };
-  assert.equal(h.registry.speculativeTarget({ channelId: 'shared' }, [bosun], { partial: true }), null);
-  assert.deepEqual(h.registry.speculativeTarget({ channelId: 'shared' }, [bosun]), bosun, 'the finished call reads it as the publish does');
-  assert.deepEqual(h.registry.speculativeTarget({ channelId: 'shared', serverId: 'chat' }, [bosun], { partial: true }), chat);
-  assert.deepEqual(h.registry.speculativeTarget({ channelId: 'bosun:meeting:1' }, [], { partial: true }), { serverId: 'bosun', channelId: 'bosun:meeting:1' });
-  // The turn's own channel by that id, gone from its server, while another server's is registered: the publish means the turn's.
-  assert.equal(h.registry.speculativeTarget({ channelId: 'bosun:meeting:1' }, [{ serverId: 'gone', channelId: 'bosun:meeting:1' }], { partial: true }), null);
-
-  // As the streams use it: the text meant for chat's channel never reaches bosun's.
-  const sent: Array<{ channelId: string; serverId: string; content: string }> = [];
-  const streams = new SpeculativePublishStreams({
-    target: (named, options) => h.registry.speculativeTarget(named, [bosun], options),
-    defaultTarget: () => null,
-    chunk: (to, _id, _seq, content) => { sent.push({ ...to, content }); },
-    complete: () => {},
-  });
-  streams.onInputDelta('t1', 'channel_publish', '{"channelId":"shared","content":"For chat');
-  streams.onInputDelta('t1', 'channel_publish', '","serverId":"chat"}');
-  assert.deepEqual(sent, [{ serverId: 'chat', channelId: 'shared', content: 'For chat' }]);
+  const refused = await h.registry.handleChannelToolCall('channel_publish', { channelId: 'shared', serverId: 'chat', content: 'Hi.' },
+    { kind: 'agent', agentName: 'Glassy', speculativeStream: { streamId: 'spec_t1', channel: bosun, live: true } });
+  assert.equal(refused.isError, true);
+  assert.match(String(refused.error), /already went to channel/);
+  assert.equal(h.publishes.length, 0, 'nothing was sent to the other channel');
+  // Where the text went: published, without the stream id once the stream was cancelled.
+  await h.registry.handleChannelToolCall('channel_publish', { channelId: 'shared', serverId: 'bosun', content: 'Hi.' },
+    { kind: 'agent', agentName: 'Glassy', speculativeStream: { streamId: 'spec_t1', channel: bosun, live: false } });
+  assert.equal(h.publishes.length, 1);
+  assert.equal('streamId' in h.publishes[0]!, false);
 });
 
 test('registry: chunk and complete params are the contract, and the publish carries the stream id', async () => {
@@ -463,11 +493,12 @@ test('registry: chunk and complete params are the contract, and the publish carr
     { kind: 'agent', agentName: 'Glassy' });
   assert.equal(h.publishes[0]!.streamId, 'spec_t1');
   assert.equal('streamId' in h.publishes[1]!, false);
-  // A publish that lands elsewhere than its stream's channel carries no stream id.
+  // A publish that would land elsewhere than where its text went is refused.
   await h.register('bosun', 'bosun:plain');
-  await h.registry.handleChannelToolCall('channel_publish', { channelId: 'bosun:plain', content: 'Elsewhere.' },
+  const elsewhere = await h.registry.handleChannelToolCall('channel_publish', { channelId: 'bosun:plain', content: 'Elsewhere.' },
     { kind: 'agent', agentName: 'Glassy', speculativeStream: { streamId: 'spec_t4', channel: to } });
-  assert.equal('streamId' in h.publishes[2]!, false);
+  assert.equal(elsewhere.isError, true);
+  assert.equal(h.publishes.length, 2);
 
   // A channel that didn't opt in gets no chunk, even when asked.
   h.registry.sendSpeculativeChunk({ serverId: 'bosun', channelId: 'bosun:plain' }, 'Glassy', 'spec_t3', 0, 'x');
@@ -611,7 +642,7 @@ async function harness(membrane: ScriptMembrane, config: Partial<AgentConfig> = 
 test('framework: off by default; no tool-input deltas are asked for and nothing streams', async () => {
   const membrane = new ScriptMembrane(
     [[round(call('p1', 'channel_publish', { channelId: 'bosun:meeting:1', content: 'Hi.' })), final(text('done'))]],
-    { p1: ['{"channelId":"bosun:meeting:1","content":"Hi."}'] },
+    { p1: ['{"channelId":"bosun:meeting:1","serverId":"bosun","content":"Hi."}'] },
   );
   const h = await harness(membrane);
   try {
@@ -629,8 +660,8 @@ test('framework: on, the text streams ahead of the publish, which carries the st
       final(text('done')),
     ]],
     {
-      p1: ['{"channelId": "bosun:meet', 'ing:1", "content": "Good ques', 'tion.\\nThe answer', ' is yes."}'],
-      p2: ['{"channelId":"text-chat","content":"Not spoken."}'],
+      p1: ['{"channelId": "bosun:meet', 'ing:1", "serverId": "bosun", "content": "Good ques', 'tion.\\nThe answer', ' is yes."}'],
+      p2: ['{"channelId":"text-chat","serverId":"bosun","content":"Not spoken."}'],
     },
   );
   const h = await harness(membrane, { speculativeChannelChunks: true });
@@ -656,8 +687,8 @@ test('framework: a failed publish and a call cut off before it finished are canc
       round(call('p1', 'channel_publish', { channelId: 'bosun:meeting:1', content: 'Will fail.' })),
       final(text('done')),
     ]],
-    { p1: ['{"channelId":"bosun:meeting:1","content":"Will ', 'fail."}'] },
-    { cut: ['{"channelId":"bosun:meeting:1","content":"Never fin'] },
+    { p1: ['{"channelId":"bosun:meeting:1","serverId":"bosun","content":"Will ', 'fail."}'] },
+    { cut: ['{"channelId":"bosun:meeting:1","serverId":"bosun","content":"Never fin'] },
   );
   const h = await harness(membrane, { speculativeChannelChunks: true });
   h.failing.add('Will fail.');
@@ -692,7 +723,7 @@ test('framework: a call naming no channel streams to the turn default once it is
 test('framework: a stop() before the publish starts cancels the stream, and the publish is refused', async () => {
   const membrane = new ScriptMembrane(
     [[round(call('p1', 'channel_publish', { channelId: 'bosun:meeting:1', content: 'Half said.' })), final(text('done'))]],
-    { p1: ['{"channelId":"bosun:meeting:1","content":"Half ', 'said."}'] },
+    { p1: ['{"channelId":"bosun:meeting:1","serverId":"bosun","content":"Half ', 'said."}'] },
   );
   const h = await harness(membrane, { speculativeChannelChunks: true });
   let stopping: Promise<void> | undefined;
@@ -719,7 +750,7 @@ test('framework: a stop() before the publish starts cancels the stream, and the 
 test("framework: another agent's result with the same call id leaves a stream alone", async () => {
   const membrane = new ScriptMembrane(
     [[round(call('p1', 'channel_publish', { channelId: 'bosun:meeting:1', content: 'Mine.' })), final(text('done'))]],
-    { p1: ['{"channelId":"bosun:meeting:1","content":"Mine."}'] },
+    { p1: ['{"channelId":"bosun:meeting:1","serverId":"bosun","content":"Mine."}'] },
   );
   const h = await harness(membrane, { speculativeChannelChunks: true });
   let release!: () => void;
@@ -741,7 +772,7 @@ test("framework: another agent's result with the same call id leaves a stream al
 test('framework: a stop() while a call to a channel that did not opt in is written leaves its publish alone', async () => {
   const membrane = new ScriptMembrane(
     [[round(call('p1', 'channel_publish', { channelId: 'text-chat', content: 'Plain.' })), final(text('done'))]],
-    { p1: ['{"channelId":"text-chat","content":"Pla', 'in."}'] },
+    { p1: ['{"channelId":"text-chat","serverId":"bosun","content":"Pla', 'in."}'] },
   );
   const h = await harness(membrane, { speculativeChannelChunks: true });
   let stopping: Promise<void> | undefined;
@@ -781,7 +812,7 @@ for (const [name, then] of [
       [[final(text('unused'))], [final(text('done'))], [final(text('done'))]],
       {},
       {},
-      { id: 'x1', fragments: ['{"channelId":"bosun:meeting:1","content":"Interr', 'upted'], then },
+      { id: 'x1', fragments: ['{"channelId":"bosun:meeting:1","serverId":"bosun","content":"Interr', 'upted'], then },
     );
     const h = await harness(membrane, { speculativeChannelChunks: true });
     try {
@@ -799,10 +830,10 @@ for (const [name, then] of [
 test("framework: a refusal retry cancels the refused attempt's stream, and the retried attempt's call streams under its own id", async () => {
   const membrane = new ScriptMembrane(
     [[round(call('p1', 'channel_publish', { channelId: 'bosun:meeting:1', content: 'Second try.' })), final(text('done'))]],
-    { p1: ['{"channelId":"bosun:meeting:1","content":"Second try."}'] },
+    { p1: ['{"channelId":"bosun:meeting:1","serverId":"bosun","content":"Second try."}'] },
     {},
     {
-      id: 'r1', fragments: ['{"channelId":"bosun:meeting:1","content":"Refused ans'],
+      id: 'r1', fragments: ['{"channelId":"bosun:meeting:1","serverId":"bosun","content":"Refused ans'],
       then: { type: 'retrying', attempt: 1, maxAttempts: 2, reason: 'refusal' } as unknown as StreamEvent,
     },
   );
@@ -823,8 +854,8 @@ test("framework: a refusal retry cancels the refused attempt's stream, and the r
 
 test('framework: a call membrane marked as cut off or out of order is cancelled before dispatch refuses it', async () => {
   const membrane = new ScriptMembrane(
-    [[round({ ...call('p1', 'channel_publish', {}), unparseableInput: '{"channelId":"bosun:meeting:1","content":"Half' } as ContentBlock), final(text('done'))]],
-    { p1: ['{"channelId":"bosun:meeting:1","content":"Half'] },
+    [[round({ ...call('p1', 'channel_publish', {}), unparseableInput: '{"channelId":"bosun:meeting:1","serverId":"bosun","content":"Half' } as ContentBlock), final(text('done'))]],
+    { p1: ['{"channelId":"bosun:meeting:1","serverId":"bosun","content":"Half'] },
   );
   const h = await harness(membrane, { speculativeChannelChunks: true });
   try {
@@ -837,7 +868,7 @@ test('framework: a call membrane marked as cut off or out of order is cancelled 
 test("framework: a result for the agent's own streamed call before its publish (refused) cancels the stream", async () => {
   const membrane = new ScriptMembrane(
     [[round(call('p1', 'channel_publish', { channelId: 'bosun:meeting:1', content: 'Refused.' })), final(text('done'))]],
-    { p1: ['{"channelId":"bosun:meeting:1","content":"Refused."}'] },
+    { p1: ['{"channelId":"bosun:meeting:1","serverId":"bosun","content":"Refused."}'] },
   );
   const h = await harness(membrane, { speculativeChannelChunks: true });
   // A refusal on the way to the publish answers the call with a result, as a module's guard does.
@@ -855,7 +886,7 @@ test("framework: a result for the agent's own streamed call before its publish (
 test("framework: a publish that throws cancels its stream", async () => {
   const membrane = new ScriptMembrane(
     [[round(call('p1', 'channel_publish', { channelId: 'bosun:meeting:1', content: 'Lost.' })), final(text('done'))]],
-    { p1: ['{"channelId":"bosun:meeting:1","content":"Lost."}'] },
+    { p1: ['{"channelId":"bosun:meeting:1","serverId":"bosun","content":"Lost."}'] },
   );
   const h = await harness(membrane, { speculativeChannelChunks: true });
   h.throwing.add('Lost.');
@@ -868,7 +899,7 @@ test("framework: a publish that throws cancels its stream", async () => {
 test('framework: nothing streams where dispatch would refuse the publish (denyToolsAtDispatch, allowedTools, a fork bound elsewhere)', async () => {
   const script = () => new ScriptMembrane(
     [[round(call('p1', 'channel_publish', { channelId: 'bosun:meeting:1', content: 'Kept back.' })), final(text('done'))]],
-    { p1: ['{"channelId":"bosun:meeting:1","content":"Kept back."}'] },
+    { p1: ['{"channelId":"bosun:meeting:1","serverId":"bosun","content":"Kept back."}'] },
   );
   for (const config of [
     { denyToolsAtDispatch: ['channel_publish'] },
@@ -892,7 +923,7 @@ test('framework: nothing streams where dispatch would refuse the publish (denyTo
 test("framework: a stop() while the publish is under way leaves the stream to the publish's outcome", async () => {
   const membrane = new ScriptMembrane(
     [[round(call('p1', 'channel_publish', { channelId: 'bosun:meeting:1', content: 'Delivered.' })), final(text('done'))]],
-    { p1: ['{"channelId":"bosun:meeting:1","content":"Delivered."}'] },
+    { p1: ['{"channelId":"bosun:meeting:1","serverId":"bosun","content":"Delivered."}'] },
   );
   const h = await harness(membrane, { speculativeChannelChunks: true });
   let release!: () => void;
@@ -913,4 +944,44 @@ test("framework: a stop() while the publish is under way leaves the stream to th
       ['complete', 'Delivered.', false],
     ]);
   } finally { release(); await (stopping ?? h.framework.stop()); }
+});
+
+test("framework: stop() waits for a publish under way that ends a stream, so a delivered one's complete goes out before it returns", async () => {
+  const membrane = new ScriptMembrane(
+    [[round(call('p1', 'channel_publish', { channelId: 'bosun:meeting:1', content: 'Answered late.' })), final(text('done'))]],
+    { p1: ['{"channelId":"bosun:meeting:1","serverId":"bosun","content":"Answered late."}'] },
+  );
+  const h = await harness(membrane, { speculativeChannelChunks: true });
+  let release!: () => void;
+  h.gate.hold = new Promise<void>((resolve) => { release = resolve; });
+  let stopping: Promise<void> | undefined;
+  try {
+    const running = h.run().catch(() => {});
+    for (let i = 0; i < 200 && !h.log.some((e) => e.kind === 'publish'); i++) await new Promise((r) => setTimeout(r, 5));
+    stopping = h.framework.stop().then(() => { h.log.push({ kind: 'stopped' }); });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(h.log.some((e) => e.kind === 'stopped'), false, 'stop() is still waiting for the publish');
+    release();
+    await stopping;
+    await running;
+    const kinds = h.log.map((e) => e.kind === 'complete' ? `complete:${String(e.content)}` : String(e.kind));
+    assert.ok(kinds.indexOf('complete:Answered late.') >= 0 && kinds.indexOf('complete:Answered late.') < kinds.indexOf('stopped'), kinds.join(' '));
+  } finally { release(); await (stopping ?? h.framework.stop()); }
+});
+
+test("framework: stop()'s wait for such a publish ends at the caller's bound, without failing stop()", async () => {
+  const membrane = new ScriptMembrane(
+    [[round(call('p1', 'channel_publish', { channelId: 'bosun:meeting:1', content: 'Never answered.' })), final(text('done'))]],
+    { p1: ['{"channelId":"bosun:meeting:1","serverId":"bosun","content":"Never answered."}'] },
+  );
+  const h = await harness(membrane, { speculativeChannelChunks: true });
+  let release!: () => void;
+  h.gate.hold = new Promise<void>((resolve) => { release = resolve; });
+  try {
+    void h.run().catch(() => {});
+    for (let i = 0; i < 200 && !h.log.some((e) => e.kind === 'publish'); i++) await new Promise((r) => setTimeout(r, 5));
+    const started = Date.now();
+    await h.framework.stop(300);
+    assert.ok(Date.now() - started < 5000, 'stop() returned at its bound');
+  } finally { release(); }
 });
