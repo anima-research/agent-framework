@@ -39,7 +39,7 @@
 import { createHash } from 'node:crypto';
 import type { ReferenceRecord, Refusal, ServerAddress } from './references.js';
 import { boundedForLog, describeCause } from './errors.js';
-import { dialCheck, dialServer, FRESH_REFERENCE, NOTHING_TO_DO, PAYLOAD_NEVER, REFERENCE_LIMITS, sanitizeLabel, shownServerId } from './references.js';
+import { dialCheck, dialServer, FRESH_REFERENCE, NOTHING_TO_DO, PAYLOAD_NEVER, REFERENCE_LIMITS, referenceRegistry, sanitizeLabel, shownServerId } from './references.js';
 
 export { normalizedOrigin, type Refusal } from './references.js';
 
@@ -245,7 +245,8 @@ export class ReferenceFetcher {
   ) {}
 
   private withholds(record: ReferenceRecord): boolean {
-    return this.withhold !== undefined && record.payloadNever === true;
+    if (this.withhold === undefined) return false;
+    return record.payloadNever === true || referenceRegistry.findByUri(record.testimony.uri)?.payloadNever === true;
   }
 
   /** The server a check (dialServer or dialCheck) chose, with its credential

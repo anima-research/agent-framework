@@ -370,6 +370,28 @@ describe('a fetcher built to withhold', () => {
     assert.deepEqual([saved, removed, record.fetchedPath], [[], [], undefined]);
   });
 
+  it("saves nothing and names no path for a fetch whose record is evicted and its uri delivered again as `never` while it runs", async () => {
+    const saved: string[] = [];
+    const removed: string[] = [];
+    const f = fetcher({ saved, removed });
+    const uri = `${ORIGIN}/hold?evicted-${randomUUID()}`;
+    const record = referenceRegistry.register(testimonyOf({ type: 'resource', uri }), 'srv');
+    const arrived = new Promise<void>((resolve) => { heard = resolve; });
+    const running = f.fetch(record);
+    await within('the request reaching the server', arrived);
+    const response = held.shift()!;
+    try {
+      for (let i = 0; i < 2000; i++) referenceRegistry.register(testimonyOf({ type: 'resource', uri: `https://zz-never.example/evict/${randomUUID()}` }), 'srv');
+      assert.equal(referenceRegistry.findByUri(uri), undefined, 'the record is evicted');
+      const again = (await quietly(() => referenceRegistry.register(testimonyOf({ type: 'resource', uri, disposition: 'never' }), 'srv'))).value;
+      assert.equal(again.payloadNever, true);
+    } finally {
+      response.end();
+    }
+    assert.deepEqual(await within('the evicted download', running), NEVER_FAILURE);
+    assert.deepEqual([saved, removed, record.fetchedPath], [[], [], undefined]);
+  });
+
   it('removes a copy whose payload a `never` marks while it is saved, and refuses', async () => {
     const reg = new ReferenceRegistry();
     const uri = `${ORIGIN}/ok?saving-${randomUUID()}`;
