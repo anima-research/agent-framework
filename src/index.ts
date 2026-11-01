@@ -216,6 +216,8 @@ export {
   type PersistentReaderConfig,
   type ForkReaderConfig,
   type ReaderFramingContext,
+  type ReaderPendingRound,
+  type ReaderRederivedReason,
 } from './tune-out/tools.js';
 export {
   SILENT_HEARTBEAT_SEPARATOR,

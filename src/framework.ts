@@ -1965,7 +1965,9 @@ function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
  * one holds anything but true or false (assertBooleanSetting), or whose
  * subconscious's `thinkingBinding` assertThinkingBinding refuses, whichever
  * its reader, or whose persistent subconscious's `foreignRounds` is neither
- * of its modes (assertOneOfSetting). A subconscious that isn't on has its
+ * of its modes (assertOneOfSetting), or whose reader forks' `persist` or
+ * `resync` is none of its modes, or `pendingRound` neither an object nor a
+ * function. A subconscious that isn't on has its
  * `allowChannelSpeech`, `thinkingBinding` and `foreignRounds` left
  * unchecked, since nothing reads them then.
  */
@@ -1992,6 +1994,28 @@ function assertFrameworkSwitches(config: FrameworkConfig): void {
           '\'transcript\' or leaving it out sends a resident\'s rounds to the subconscious as a line per call and result, ' +
             'without their thinking, and \'raw\' sends them as stored',
         );
+      } else {
+        assertOneOfSetting(
+          'subconscious.persist',
+          config.subconscious.persist,
+          ['look', 'epoch', 'resident'],
+          '\'look\' or leaving it out derives a fork for each look, \'epoch\' derives one reader per tune-out and resumes ' +
+            'it at each later look in it, and \'resident\' derives one reader and resumes it across tune-outs',
+        );
+        assertOneOfSetting(
+          'subconscious.resync',
+          config.subconscious.resync,
+          ['window', 'none'],
+          '\'window\' or leaving it out hands a resumed reader the rows the resident\'s window took since its last look, ' +
+            'and \'none\' hands it the held traffic alone',
+        );
+        const round: unknown = config.subconscious.pendingRound;
+        if (round !== undefined && typeof round !== 'function' && (round === null || typeof round !== 'object' || Array.isArray(round))) {
+          throw new Error(
+            `subconscious.pendingRound must be an object, as deriveAgent's pendingRound takes it, or a function of the look's ` +
+              `framing context that returns one, not ${kindOf(round)}: left out, the framework's default holds`,
+          );
+        }
       }
     }
   }
@@ -3216,7 +3240,8 @@ export interface DeriveAgentOptions {
    */
   pendingRound?: {
     include?: boolean;
-    madeBy?: { toolUseId: string; result: string };
+    /** `toolUseId` left out: the only open call, as by default. */
+    madeBy?: { toolUseId?: string; result: string };
     /** Results, from the child's side, for other calls still open, by tool-use id. */
     results?: Record<string, string>;
   };

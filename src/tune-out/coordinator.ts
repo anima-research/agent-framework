@@ -75,6 +75,13 @@ export interface ReaderInvocation {
   backlog: StoredMessage[];
   /** Standing dispositions, as text, or null when there are none. */
   dispositions: string | null;
+  /**
+   * Set on the one look asked for after its epoch had ended: the late look
+   * that is handed what a reader that failed after the end was handed
+   * (readerFailed). An epoch's cancel looks, asked for as it ends, don't
+   * carry it.
+   */
+  epochEnded?: true;
 }
 
 /**
@@ -2137,6 +2144,7 @@ export class TuneOutCoordinator {
       notice,
       backlog,
       dispositions: entries.length > 0 ? entries.map(([k, v]) => `- ${k}: ${v}`).join('\n') : null,
+      epochEnded: true,
     };
     this.lateForks.add(late);
     this.hooks.invokeReader(late);

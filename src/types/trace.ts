@@ -911,7 +911,12 @@ export type TraceEvent =
       reason: 'host-stop';
     })
 
-  /** A tune-out reader fork was derived for one invocation (subconscious.reader: 'forks'). */
+  /**
+   * A tune-out reader fork was derived for one invocation (subconscious.reader:
+   * 'forks'), or, with `subconscious.persist` 'epoch' or 'resident', derived or
+   * resumed for it: `incarnation`, `resumed` and `resynced` are set then, and
+   * left out with 'look'.
+   */
   | (TraceEventBase & {
       type: 'tune-out:reader-fork';
       agentName: string;
@@ -921,6 +926,35 @@ export type TraceEvent =
       trigger: 'cadence' | 'wake' | 'cancel';
       /** Held messages the fork was handed. */
       held: number;
+      /** The reader's incarnation for this look, 1 at a derivation. */
+      incarnation?: number;
+      /** Whether this look resumed the reader rather than deriving it. */
+      resumed?: boolean;
+      /** How many of the resident's window's rows since the reader's last look it was handed (ReaderFramingContext.residentRows); 0 when none were. */
+      resynced?: number;
+    })
+
+  /**
+   * A persisted reader (`subconscious.persist` 'epoch' or 'resident') is
+   * derived again, under its next name, rather than resumed: `no-record`,
+   * the registry holds no ended record of the identity's name in scope;
+   * `branch-moved`, the derivation's checkpoint is no longer on the host's
+   * branch, or its last look was framed on another branch than the
+   * resident's window reads now; `scope-ended`, its tune-out had ended
+   * before the look was asked for. The `tune-out:reader-fork` of the
+   * derivation follows.
+   */
+  | (TraceEventBase & {
+      type: 'tune-out:reader-rederived';
+      /** The name it is derived under now. */
+      agentName: string;
+      /** The name it had. */
+      previous: string;
+      reason: import('../tune-out/tools.js').ReaderRederivedReason;
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      trigger: 'cadence' | 'wake' | 'cancel';
     })
 
   /**

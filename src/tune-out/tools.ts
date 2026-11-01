@@ -122,8 +122,10 @@ export const SUBCONSCIOUS_TOOLS: ToolDefinition[] = [
  *   the resident's head — the resident's whole prefix, its refusals
  *   included, ending with it — hands it the traffic held since the last
  *   look as the first message after the fork point, and lets it report
- *   back as attributed mail. No agent persists between invocations;
- *   dispositions do, in the coordinator's state. Its `voice` is framing,
+ *   back as attributed mail. By default no agent persists between
+ *   invocations; dispositions do, in the coordinator's state. With
+ *   `persist` `'epoch'` or `'resident'`, the first look derives one
+ *   identity and later looks resume it (ForkReaderConfig.persist). Its `voice` is framing,
  *   not a system prompt, and residents are shown the reader's four tools
  *   in their tool block (refused at dispatch), so the fork's request is
  *   the resident's up to the fork point.
@@ -246,13 +248,69 @@ export interface ForkReaderConfig extends SubconsciousConfigBase {
    * about the fork's prompt is fixed by the path.
    */
   framing?: (context: ReaderFramingContext) => ContentBlock[];
+  /**
+   * Whether the reader is one derived identity across looks, and over what
+   * scope.
+   *
+   * - `'look'` (the default): each look derives a fork of its own,
+   *   `reader/<resident>/<epoch8>/<n>`, which runs once; nothing reads it
+   *   again.
+   * - `'epoch'`: the first look in a tune-out derives
+   *   `reader/<resident>/<epoch8>/g<k>` as `'look'` derives a fork, and each
+   *   later look in that tune-out resumes it (`resumeAgent`): a new
+   *   incarnation on the same branch, which continues from its own last
+   *   round. It is not derived again.
+   * - `'resident'`: the same, one identity across tune-outs,
+   *   `reader/<resident>/g<k>`.
+   *
+   * The framework derives the identity again, under the next `g<k>`, when
+   * it has no ended record of it in scope, when the derivation's checkpoint
+   * is no longer on the host's branch, when (with `resync: 'window'`) its
+   * last look was framed on another branch than the resident's window reads
+   * now, or (with `'epoch'`) when the tune-out had ended before the look was
+   * asked for. Each such derivation is traced (`tune-out:reader-rederived`,
+   * with its reason). One look runs at a time for one identity: a look asked
+   * for while another runs waits for it. `dendrite.beforeDerive` is asked at
+   * every derivation and every resumption; a resumption it refuses is a
+   * failed look, and its held rows go back as any failed look's do.
+   */
+  persist?: 'look' | 'epoch' | 'resident';
+  /**
+   * What a resumed reader is handed besides the held traffic. Read with
+   * `persist` `'epoch'` or `'resident'` only.
+   *
+   * - `'window'` (the default): the rows the resident's window took since
+   *   the reader's last look (ReaderFramingContext.residentRows), read from
+   *   the resident's window index from the place recorded on the reader's
+   *   previous framing row (`metadata.residentThrough`).
+   * - `'none'`: nothing more.
+   */
+  resync?: 'window' | 'none';
+  /**
+   * The resident's tool round in flight when a reader is derived, as
+   * `DeriveAgentOptions.pendingRound` takes it, or a function of the look's
+   * framing context that returns it. Left out, or returning undefined, the
+   * framework's default holds: the round is reproduced on the reader's
+   * branch, its only open call answered with the framework's note of what
+   * the reader is. A resumption reproduces no round.
+   */
+  pendingRound?: ReaderPendingRound | ((context: ReaderFramingContext) => ReaderPendingRound | undefined);
+}
+
+/** The resident's tool round in flight at a reader's derivation, as `DeriveAgentOptions.pendingRound` takes it. */
+export interface ReaderPendingRound {
+  include?: boolean;
+  /** The result for the call the reader is told made it; `toolUseId` left out, the only open call. */
+  madeBy?: { toolUseId?: string; result: string };
+  /** Results for other calls still open, by tool-use id. */
+  results?: Record<string, string>;
 }
 
 /** What a reader fork's framing is built from. */
 export interface ReaderFramingContext {
   /** The resident the fork was derived from. */
   resident: string;
-  /** The fork's own name. */
+  /** The fork's own name: with `persist` `'epoch'` or `'resident'`, the identity's, the same at each look it is resumed for. */
   fork: string;
   /** `ForkReaderConfig.voice`. */
   voice: string;
@@ -277,7 +335,37 @@ export interface ReaderFramingContext {
    * @deprecated Never set since #291; removed in a later release.
    */
   queuedCount?: number;
+  /**
+   * With `persist` `'epoch'` or `'resident'`: whether this look resumes the
+   * reader (true) or derives it (false). Left out with `'look'`.
+   */
+  resumed?: boolean;
+  /**
+   * With `persist` `'epoch'` or `'resident'`: the reader's incarnation for
+   * this look, 1 at a derivation. Left out with `'look'`.
+   */
+  incarnation?: number;
+  /**
+   * With `persist` `'epoch'` or `'resident'`, on a derivation that follows
+   * an earlier one of the identity: why it was derived again. Left out
+   * otherwise.
+   */
+  rederived?: ReaderRederivedReason;
+  /**
+   * With `persist` `'epoch'` or `'resident'` and `resync: 'window'`, on a
+   * resumed look: the rows the resident's window took since this reader's
+   * last look, in window order (the resident's own rounds as stored, what it
+   * was shown, the mail it was sent). Left out are the reader's own mail and
+   * rows under its name, the resident's stored context injections, and held
+   * traffic, which the resident's window doesn't take and which comes as
+   * `backlog`. Left out on any other look, and when the resident's window
+   * isn't presented.
+   */
+  residentRows?: StoredMessage[];
 }
+
+/** Why a persisted reader was derived again rather than resumed (ForkReaderConfig.persist). */
+export type ReaderRederivedReason = 'no-record' | 'branch-moved' | 'scope-ended';
 
 /**
  * The default reader-fork framing: a header naming the channel, epoch and
