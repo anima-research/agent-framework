@@ -38,8 +38,16 @@ async function stopHeld(t: TestContext, engine: 'legacy' | 'modern', lost: Lost,
   // A launch's shell writes its pid once it runs, so one spawned just before
   // stop() may write it after the count is taken: the launches running then
   // are counted too, by their command line.
-  const running = () => execFileSync('ps', ['-A', '-o', 'pid=,args='], { encoding: 'utf8' })
-    .split('\n').filter((line) => line.includes(launchLog)).map((line) => Number(line.trim().split(/\s+/)[0]));
+  const running = (): number[] => {
+    try {
+      return execFileSync('pgrep', ['-f', launchLog.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')], { encoding: 'utf8' })
+        .split('\n').filter(Boolean).map(Number);
+    } catch (err) {
+      // pgrep exits 1 when no process matches.
+      if ((err as { status?: number }).status === 1) return [];
+      throw err;
+    }
+  };
   const launched = new Set<number>();
   const count = (also: number[] = []) => { for (const pid of [...pids(), ...also]) launched.add(pid); return launched.size; };
   t.after(() => {

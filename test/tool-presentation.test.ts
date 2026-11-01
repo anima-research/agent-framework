@@ -79,9 +79,14 @@ test('framework preview, generated workspace read and both edit dispatch paths a
 
 
   // The tool list is the advertised definitions less the host's built-in toolset.
-  assert.deepEqual(preview.tools,(framework as any).headerTools('ada',snapshot.advertised));
-  assert.ok(!preview.tools?.some(t=>t.name==='set_tool_visibility'),'the editing tools are in the built-in toolset');
-  assert.ok((framework as any).getToolsForAgent('ada').some((t:any)=>t.name===target),'execution surface unchanged');
+  const settingsToolset=['agent_settings','wake_add_rule','wake_remove_rule','gate_status','event_tags','set_tool_visibility','set_tool_description','heartbeat--heartbeat_status','heartbeat--heartbeat_trigger','workspace--status'];
+  const listed=(preview.tools??[]).map(t=>t.name);
+  assert.ok(!listed.includes(target),'a hidden tool leaves the tool list');
+  assert.deepEqual(listed.filter(n=>settingsToolset.includes(n)),[],"the built-in toolset's tools are not listed");
+  assert.deepEqual(snapshot.advertised.map(t=>t.name).filter(n=>!settingsToolset.includes(n)&&!listed.includes(n)),[],'every other advertised tool is listed');
+  assert.deepEqual(listed.filter(n=>!snapshot.advertised.some(t=>t.name===n)),[],'and nothing beyond the advertised tools');
+  const hiddenRun=await call(target,{pattern:'*'});
+  assert.equal(hiddenRun.success,true,`a hidden tool still runs: ${hiddenRun.error}`);
   assert.ok(!(await framework.previewActivation('other')).tools?.some(t=>t.name==='set_tool_visibility'));
   const read=await call('workspace--read',{path:'board/tools.md'});
   assert.equal(read.success,true);assert.match(JSON.stringify(read.data),/workspace--glob \(hidden\)/);

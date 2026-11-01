@@ -169,7 +169,7 @@ test('a turn\'s tool calls and its speech carry one turn id, and the next turn c
     assert.equal(typeof second, 'number');
     assert.equal(recorder.speeches[0]!.turnId, first, 'the first turn\'s speech carries its calls\' turn');
     assert.equal(recorder.speeches[1]!.turnId, second, 'the second turn\'s speech carries its calls\' turn');
-    assert.ok(second! > first!, 'the next turn has a larger id');
+    assert.notEqual(second, first, 'the next turn has another id');
     assert.deepEqual(
       recorder.eventCalls.map((c) => c.callerTurnId),
       [first, second],

@@ -12,17 +12,19 @@
  */
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, existsSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { ModernMcpConnection } from '../src/mcpl/modern-connection.js';
 import { McplRequestError } from '../src/mcpl/server-connection.js';
+import { setStdioLineBoundForTests } from '../src/mcpl/transport.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SERVER = join(here, 'fixtures', 'modern-mcp-server.mjs');
+const LONGER_THAN_ANY_START_MS = 60_000;
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => {
@@ -36,10 +38,10 @@ function scratch(): string {
 }
 
 const lines = (file: string) => (existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean) : []);
-const until = async (cond: () => boolean, ms = 5000) => {
-  const deadline = Date.now() + ms;
+const until = async (cond: () => boolean, what: string) => {
+  const deadline = Date.now() + LONGER_THAN_ANY_START_MS;
   while (!cond() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
-  assert.ok(cond(), 'condition reached in time');
+  assert.ok(cond(), `${what}, within ${LONGER_THAN_ANY_START_MS} ms`);
 };
 
 function config(dir: string, extra: Partial<McplServerConfig> = {}): McplServerConfig {
@@ -74,9 +76,22 @@ test('connects once over Connectome\'s spawner and speaks 2026-07-28', async () 
   assert.equal(lines(join(dir, 'starts.log')).length, 1);
   // The child's stderr surfaces as lines, as a legacy child's does,
   // startup lines included: they came before anyone could listen.
-  await until(() => stderr.some((l) => /^modern fixture \d+ up$/.test(l)));
+  await until(() => stderr.some((l) => /^modern fixture \d+ up$/.test(l)), 'the fixture says it is up');
   await connection.callTool('shout', { text: 'hello' });
-  await until(() => stderr.includes('shout: hello'));
+  await until(() => stderr.includes('shout: hello'), "the fixture's stderr line arrives");
+});
+
+test('stderr that arrives before the caller listens is held to its newest 200 lines: the oldest go, with one notice saying how many, and the newest arrive in order', async (t) => {
+  setStdioLineBoundForTests(65_536);
+  t.after(() => setStdioLineBoundForTests(undefined));
+  const connection = await connect(config(scratch(), { env: { FIXTURE_STDERR_FLOOD: '3000' } }));
+  const held = (connection as unknown as { heldStderr: { lines: string[] } }).heldStderr;
+  await until(() => held.lines.at(-1) === 'flood done', "the fixture's last stderr line is held");
+  const stderr: string[] = [];
+  connection.on('stderr', ({ line }: { line: string }) => stderr.push(line));
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  const kept = Array.from({ length: 199 }, (_, k) => String(2802 + k).padStart(4, '0') + 'x'.repeat(96));
+  assert.deepEqual(stderr, ['[2,802 earlier stderr lines were dropped: unread stderr is held to 200 lines and 65,536 UTF-16 code units]', ...kept, 'flood done']);
 });
 
 test('the child gets the env allowlist plus declared env, as legacy children do', async () => {
@@ -105,20 +120,30 @@ test('results are kept by presence: structured-only, falsy structured, tool erro
 
 test('a deadline requests cancellation and reports no-response, outcome unknown', async () => {
   const dir = scratch();
-  const connection = await connect(config(dir, { requestTimeoutMs: 300 }));
+  const settings = config(dir);
+  const connection = await connect(settings);
   await connection.callTool('echo', { text: 'warm' }); // the slow call is not the connection's first request
-  // The tool would run far past the deadline, so the call rejecting while
-  // the tool hasn't finished shows it ended at the deadline, whatever the
-  // runner's load did to the wall clock.
-  await assert.rejects(connection.callTool('slow', { ms: 20_000 }), (err: unknown) => {
-    assert.ok(err instanceof McplRequestError);
-    assert.equal(err.outcome, 'no-response');
-    assert.match(err.message, /^The "modern" server didn't answer within 0\.3 seconds, so whether the request took effect is unknown: this host asked it to cancel/);
-    return true;
-  });
+  settings.requestTimeoutMs = 300;
+  const release = join(dir, 'release');
+  let gaveUp = false;
+  const giveUp = setTimeout(() => { gaveUp = true; writeFileSync(release, ''); }, LONGER_THAN_ANY_START_MS);
+  try {
+    await assert.rejects(connection.callTool('slow', { release }), (err: unknown) => {
+      assert.ok(err instanceof McplRequestError);
+      assert.equal(err.outcome, 'no-response');
+      assert.match(err.message, /^The "modern" server didn't answer within 0\.3 seconds, so whether the request took effect is unknown: this host asked it to cancel/);
+      return true;
+    });
+  } catch (error) {
+    assert.ok(!gaveUp, `the call hadn't ended by ${LONGER_THAN_ANY_START_MS} ms, so the test released the tool`);
+    throw error;
+  } finally {
+    clearTimeout(giveUp);
+  }
+  assert.ok(!gaveUp, `the call hadn't ended by ${LONGER_THAN_ANY_START_MS} ms, so the test released the tool`);
   assert.ok(!lines(join(dir, 'events.log')).includes('slow-finished'), 'rejected at the deadline, not at the tool\'s end');
   // The server saw the cancellation: the request was cancelled, not merely abandoned.
-  await until(() => lines(join(dir, 'events.log')).includes('slow-aborted'));
+  await until(() => lines(join(dir, 'events.log')).includes('slow-aborted'), 'the server saw the cancellation');
 });
 
 test('a list change is announced, and the next listing has the new tool', async () => {
@@ -126,7 +151,7 @@ test('a list change is announced, and the next listing has the new tool', async 
   let changes = 0;
   connection.on('tools-list-changed', () => changes++);
   await connection.callTool('add_tool', {});
-  await until(() => changes > 0);
+  await until(() => changes > 0, 'the list change is announced');
   assert.ok((await connection.listTools()).some((t) => t.name === 'added_1'));
 });
 
@@ -137,7 +162,7 @@ test('a lost child reconnects with backoff, relaunching once, and lists again', 
   connection.on('close', () => events.push('close'));
   connection.on('reconnect', () => events.push('reconnect'));
   await connection.callTool('die', {});
-  await until(() => events.includes('reconnect'));
+  await until(() => events.includes('reconnect'), 'the connection reconnects');
   assert.deepEqual(events, ['close', 'reconnect']);
   assert.equal(connection.isConnected, true);
   assert.ok((await connection.listTools()).some((t) => t.name === 'echo'));
@@ -149,7 +174,7 @@ test('without reconnect a lost child stays down, and calls are refused before se
   let closed = false;
   connection.on('close', () => { closed = true; });
   await connection.callTool('die', {});
-  await until(() => closed);
+  await until(() => closed, 'the connection closes');
   assert.equal(connection.isConnected, false);
   assert.equal(connection.willReconnect, false);
   await assert.rejects(connection.callTool('echo', { text: 'x' }), (err: unknown) => {
@@ -174,7 +199,7 @@ test('a first connect that fails keeps retrying with reconnect, and close stops 
   connection.on('connect-failed', (e) => failures.push(e));
   connection.on('reconnect-failed', (e) => failures.push(e));
   assert.equal(connection.isConnected, false);
-  await until(() => failures.length >= 2);
+  await until(() => failures.length >= 2, 'two reconnect attempts fail');
   await connection.close();
   const count = failures.length;
   await new Promise((r) => setTimeout(r, 200));

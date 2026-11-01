@@ -1,6 +1,6 @@
 import { after, before, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,7 +9,9 @@ import { WebSocketServer } from 'ws';
 
 import { AgentFramework } from '../src/framework.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
+import { setStdioLineBoundForTests } from '../src/mcpl/transport.js';
 import { createMockResponse, HeldStream, MockMembrane } from './helpers/mock-membrane.js';
+import { jsonLines } from './helpers/json-lines.js';
 
 const LEGACY_FIXTURE = fileURLToPath(new URL('./fixtures/reregistering-mcpl-server.mjs', import.meta.url));
 const MODERN_FIXTURE = fileURLToPath(new URL('./fixtures/modern-mcp-server.mjs', import.meta.url));
@@ -64,7 +66,7 @@ async function start(t: TestContext, server: McplServerConfig, hold?: Promise<vo
     agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }],
     modules: [{
       name: 'watcher',
-      async start(ctx: { onTrace(listener: (event: unknown) => void): void }) { ctx.onTrace((event) => traces.push(event as Trace)); },
+      async start() {},
       async stop() {},
       getTools: () => [],
       async handleToolCall() { return { success: false }; },
@@ -77,6 +79,7 @@ async function start(t: TestContext, server: McplServerConfig, hold?: Promise<vo
     maintenanceIntervalMs: 0,
     mcplServers: [server],
   });
+  framework.onTrace((event) => traces.push(event as Trace), { replay: true });
   t.after(async () => {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
@@ -95,8 +98,8 @@ async function waitFor(what: string, predicate: () => boolean, ms = 15_000): Pro
 }
 
 async function legacyPid(events: string): Promise<number> {
-  await waitFor("the fixture's first event", () => existsSync(events) && readFileSync(events, 'utf8').trim() !== '');
-  return (JSON.parse(readFileSync(events, 'utf8').trim().split('\n')[0]!) as { pid: number }).pid;
+  await waitFor("the fixture's first event", () => jsonLines(events).length > 0);
+  return jsonLines<{ pid: number }>(events)[0]!.pid;
 }
 
 const lastStarted = (startLog: string) => Number(readFileSync(startLog, 'utf8').trim().split('\n').at(-1)!.split(' ')[1]);
@@ -472,11 +475,36 @@ test('a connected server whose child the transport ends after a pipe failure is 
     await waitFor(`the loss: ${engine}`, () => traces.some((event) => event.type === 'mcpl:server-closed'));
     const closed = traces.find((event) => event.type === 'mcpl:server-closed');
     assert.equal(closed?.signal, 'SIGTERM', engine);
-    assert.match(String(closed?.reason), /^child process exited, and its pipe failed with /, engine);
+    assert.match(String(closed?.reason), /^child process exited, and this host had stopped using the server's stdio \(/, engine);
     await waitFor(`the alert: ${engine}`, () => downAlerts(traces).length > 0);
     const alerts = downAlerts(traces);
     assert.equal(alerts.length, 1, `${engine}: ${JSON.stringify(alerts)}`);
-    assert.match(String(alerts[0]!.message), /closed \(child process exited, and its pipe failed with .+, signal SIGTERM\), and this host won't reconnect it on its own$/, engine);
+    assert.match(String(alerts[0]!.message), /closed \(child process exited, and this host had stopped using the server's stdio \(.+\), signal SIGTERM\), and this host won't reconnect it on its own$/, engine);
+  }
+});
+
+const LONG_LINE_ON_USR2 = 'process.on("SIGUSR2", () => { process.stdout.write("x".repeat(65_537)); });';
+
+test('a connected server whose child the transport ends after a line on stdout longer than the bound is said to the operator once, though it dies by SIGTERM, in either engine', { timeout: 90_000 }, async (t) => {
+  setStdioLineBoundForTests(65_536);
+  t.after(() => setStdioLineBoundForTests(undefined));
+  for (const engine of ['legacy', 'modern'] as const) {
+    const dir = mkdtempSync(join(tmpdir(), 'mcpl-down-long-line-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const server = connectedServer(engine, `long-line-${engine}`, dir, undefined, LONG_LINE_ON_USR2);
+    const { traces } = await start(t, server.config);
+    process.kill(await server.pid(), 'SIGUSR2');
+    await waitFor(`the loss: ${engine}`, () => traces.some((event) => event.type === 'mcpl:server-closed'));
+    const closed = traces.find((event) => event.type === 'mcpl:server-closed');
+    assert.deepEqual(
+      { signal: closed?.signal, reason: closed?.reason },
+      { signal: 'SIGTERM', reason: 'child process exited, and this host had stopped using the server\'s stdio (the server wrote a line on stdout longer than 65,536 UTF-16 code units)' },
+      engine,
+    );
+    await waitFor(`the alert: ${engine}`, () => downAlerts(traces).length > 0);
+    const alerts = downAlerts(traces);
+    assert.equal(alerts.length, 1, `${engine}: ${JSON.stringify(alerts)}`);
+    assert.equal(alerts[0]!.message, `${engine === 'legacy' ? 'MCPL' : 'MCP'} server closed (child process exited, and this host had stopped using the server's stdio (the server wrote a line on stdout longer than 65,536 UTF-16 code units), signal SIGTERM), and this host won't reconnect it on its own`, engine);
   }
 });
 
@@ -512,38 +540,42 @@ test('a server whose child exits on its own, code 1, after stop() has begun and 
   ]);
 });
 
-/** On SIGUSR1 the child dies by its own SIGTERM while the host is writing to
- *  it, as a stop's signal can reach a busy server: the legacy child stops
- *  reading its stdin and sends a burst of pings whose answers can't all fit
- *  in its pipe, so one of the host's writes is still waiting when it dies
- *  (while it went on reading, a host that had answered every ping before the
- *  signal landed wrote nothing that failed, as on macOS it sometimes did),
- *  and the modern child dies at the first line the test's tool calls bring. */
-const DIES_WHILE_WRITTEN_TO = {
-  legacy: 'process.on("SIGUSR1", () => { process.stdin.pause(); let burst = ""; for (let i = 0; i < 5000; i++) burst += JSON.stringify({ jsonrpc: "2.0", id: "burst-" + i, method: "ping" }) + "\\n"; process.stdout.write(burst, () => process.kill(process.pid, "SIGTERM")); });',
-  modern: 'process.on("SIGUSR1", () => { process.stdin.once("data", () => process.kill(process.pid, "SIGTERM")); process.stderr.write("armed\\n"); });',
-};
+function stdioStopCauseOf(framework: AgentFramework, engine: 'legacy' | 'modern', id: string): Error | undefined {
+  if (engine === 'modern') {
+    type Modern = { session: { stdio: { stdioStopCause?: Error } | null } | null };
+    return (framework as unknown as { modernServers(): Map<string, Modern> }).modernServers().get(id)?.session?.stdio?.stdioStopCause;
+  }
+  type Legacy = { transport: { stdioStopCause?: Error } | null };
+  const registry = (framework as unknown as { mcplServerRegistry: { getServer(id: string): unknown } | null }).mcplServerRegistry;
+  return (registry?.getServer(id) as Legacy | undefined)?.transport?.stdioStopCause;
+}
 
-test('a server that dies by SIGTERM while the host is writing to it raises no alert, though the host\'s write failed, in either engine', { timeout: 60_000 }, async (t) => {
+/** The close names the pipe only if the host has its write's failure before
+ *  it handles the child's exit, so the test sends the SIGTERM itself, once the
+ *  host has recorded that failure. The exit must then be handled within
+ *  STDIO_EXIT_GRACE_MS of the failure, or the transport ends the child itself
+ *  and the close raises an alert. */
+test('a server whose child dies by SIGTERM after the host\'s write to it failed raises no alert, in either engine', { timeout: 60_000 }, async (t) => {
   const seen = [];
   for (const engine of ['legacy', 'modern'] as const) {
     const dir = mkdtempSync(join(tmpdir(), 'mcpl-down-written-'));
     t.after(() => rmSync(dir, { recursive: true, force: true }));
     const id = `written-${engine}`;
-    const server = connectedServer(engine, id, dir, undefined, DIES_WHILE_WRITTEN_TO[engine]);
+    const server = connectedServer(engine, id, dir, undefined, DEAF_ON_USR1);
     const { framework, traces, posted } = await start(t, server.config);
-    process.kill(await server.pid(), 'SIGUSR1');
-    if (engine === 'modern') {
-      await waitFor('the child armed', () => traces.some((event) => event.type === 'mcpl:server-stderr' && event.line === 'armed'));
-      for (let i = 0; i < 200; i++) void framework.executeToolCall({ id: `write-${i}`, name: `mcpl--${id}--echo`, input: { text: 'x' } }).catch(() => {});
-    }
+    const pid = await server.pid();
+    process.kill(pid, 'SIGUSR1');
+    await waitFor(`its stdin closed: ${engine}`, () => traces.some((event) => event.type === 'mcpl:server-stderr' && event.line === 'deaf'));
+    if (engine === 'modern') void framework.executeToolCall({ id: 'write', name: `mcpl--${id}--echo`, input: { text: 'x' } }).catch(() => {});
+    await waitFor(`the host's failed write: ${engine}`, () => stdioStopCauseOf(framework, engine, id) !== undefined);
+    process.kill(pid, 'SIGTERM');
     await waitFor(`the loss: ${engine}`, () => traces.some((event) => event.type === 'mcpl:server-closed'));
     if (engine === 'modern') {
       const servers = (framework as unknown as { modernServers(): Map<string, unknown> }).modernServers();
       await waitFor('its reap', () => !servers.has(id));
     }
     const closed = traces.find((event) => event.type === 'mcpl:server-closed');
-    seen.push({ engine, signal: closed?.signal, writeFailed: /its pipe failed with/.test(String(closed?.reason)), alerts: downAlerts(traces).length, posted: posted.length });
+    seen.push({ engine, signal: closed?.signal, writeFailed: /this host had stopped using the server's stdio/.test(String(closed?.reason)), alerts: downAlerts(traces).length, posted: posted.length });
   }
   assert.deepEqual(seen, [
     { engine: 'legacy', signal: 'SIGTERM', writeFailed: true, alerts: 0, posted: 0 },

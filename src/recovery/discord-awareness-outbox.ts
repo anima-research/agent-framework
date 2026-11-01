@@ -1285,7 +1285,7 @@ function leftPrepared(batch?: DiscordAwarenessBatch): string {
  * Read and check the ledger file: a missing file is an empty ledger. A file
  * this build can't read for its meaning is refused, never guessed at: one
  * it can't read or parse, one that isn't the shape its version promises,
- * and any version but 2 and 3, version 1 with its own reason.
+ * and any version but 2 and 3.
  */
 function readLedger(path: string):
   | { version: 3; state: LedgerState }
@@ -1317,16 +1317,6 @@ function readLedger(path: string):
     // start on its branch still owes.
     if (!isLegacyLedger(parsed)) throw new Error(`Invalid Discord awareness ledger ${path}`);
     return { version: 2, document: parsed as { version: 2; batches: unknown[] } };
-  }
-  if (version === 1) {
-    throw new Error(
-      `Discord awareness ledger ${path} is version 1, which only agent-framework commit b16731b2 wrote ` +
-        '(2026-07-15, before any release). Every release rewrites it as version 2 at its next write, and this ' +
-        'build reads versions 2 and 3. Nothing is read from it until the file is moved away. Moving it gives up ' +
-        'only work it still had to send, which this build would retire unsent anyway, since that commit took each ' +
-        'mark out of the file once Discord confirmed it. A mark added just before that process ended, before its ' +
-        'confirmation was written, stays on Discord, and retract can\'t find it',
-    );
   }
   throw new Error(
     `Discord awareness ledger ${path} is ${version === undefined ? 'of no version' : `version ${JSON.stringify(version)}`}, ` +

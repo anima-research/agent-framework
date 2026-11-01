@@ -166,6 +166,7 @@ function wireDigest(value: unknown): string {
 const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
 const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
+const TURN_INPUTS_PIN = 'agent-framework:turn-inputs';
 
 export function assertThinkingBinding(setting: string, value: AgentConfig['thinkingBinding']): void {
   if (holdsSettings(setting, value, '{ binds: true, dropBlock: true }')) {
@@ -1144,11 +1145,7 @@ export class Agent {
    * A message above it may still be replaced or withdrawn in place by its
    * sender, though it may already have been in one of the agent's requests.
    * A live stream carries each round's own content and results, which it
-   * stores at its tool boundaries, into its next request. It can also carry
-   * the messages injected at a boundary whose stream didn't say whether it
-   * carries injections, as no membrane 0.5.x stream does: its native path
-   * carries them and its XML path drops them, and either way they stay
-   * above it.
+   * stores at its tool boundaries, into its next request.
    */
   private consumedWatermark: { branch: string; sequence: number } | null = null;
   /** Counts marks (markContextConsumed's and applyCompileWatermark's), so a
@@ -1158,8 +1155,7 @@ export class Agent {
    * The newest stored message a compile or a tool boundary may have put in
    * front of the agent, per branch. It moves where the consumed watermark
    * does, and sooner: when a committing compile takes its value, before it
-   * awaits, and at every tool boundary that injects, whether or not the
-   * stream says it carries injected messages. A message above it may still
+   * awaits, and at every tool boundary that injects into its stream. A message above it may still
    * have been shown, though: for one, a live stream carries each round's own
    * content and results, stored at a boundary that injected nothing, into its
    * next request. A compile that throws assembled nothing, and gives its move
@@ -1196,6 +1192,63 @@ export class Agent {
    *  within a branch, so the latest is the newest. */
   markAnswered(watermark: { branch: string; sequence: number } | null): void {
     if (watermark) this.answeredWatermark = watermark;
+  }
+
+  /**
+   * Keep the stored rows from `first` through `last` raw for the turn now
+   * opening, with a raw pin under one name per agent. Any pin of that name
+   * already held is removed first, one a crash left included. Under a
+   * strategy without pins nothing is pinned. A committing compile that
+   * refuses as over budget while a pin of that name is held removes it and
+   * compiles once more, and `unpinTurnInputs` removes it. Returns the pin's
+   * id, or undefined when nothing was pinned.
+   *
+   * @internal For the framework's turn starts; not a host API.
+   */
+  pinTurnInputs(first: MessageId, last: MessageId): string | undefined {
+    if (!this.unpinTurnInputs()) return undefined;
+    const cm = this.contextManager;
+    if (typeof (cm.getStrategy() as { pinRange?: unknown }).pinRange !== 'function') return undefined;
+    try {
+      return cm.pinRange(first, last, { name: TURN_INPUTS_PIN });
+    } catch (error) {
+      console.error(`[turn-inputs] ${this.name}: could not pin the turn's inputs (${first}..${last}), so they may be compressed:`, error);
+      return undefined;
+    }
+  }
+
+  /** Remove the turn's input pin `pinId`, or without one every pin of its
+   *  name. False when a removal threw.
+   *  @internal For the framework's turn starts and ends; not a host API. */
+  unpinTurnInputs(pinId?: string): boolean {
+    try {
+      for (const pin of this.contextManager.listPins()) {
+        if (pin.name === TURN_INPUTS_PIN && (pinId === undefined || pin.id === pinId)) this.contextManager.unpin(pin.id);
+      }
+      return true;
+    } catch (error) {
+      console.error(`[turn-inputs] ${this.name}: could not remove the turn's input pin:`, error);
+      return false;
+    }
+  }
+
+  private async compileUnpinningOnRefusal(compile: () => Promise<CompileResult>): Promise<CompileResult> {
+    const pinned = this.holdsTurnInputsPin();
+    try {
+      return await compile();
+    } catch (error) {
+      if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError' || !pinned || !this.unpinTurnInputs()) throw error;
+      console.error(`[turn-inputs] ${this.name}: the compile refused with the turn's inputs pinned, so they are unpinned and it compiles again`);
+      return compile();
+    }
+  }
+
+  private holdsTurnInputsPin(): boolean {
+    try {
+      return this.contextManager.listPins().some((pin) => pin.name === TURN_INPUTS_PIN);
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -1244,7 +1297,7 @@ export class Agent {
   }
 
   /** Mark everything currently stored as possibly shown (a tool boundary
-   *  that injected messages, whatever its stream says it carries). Without
+   *  that injected messages into its stream). Without
    *  a watermark the coalescer counts a message as shown, as it counts one
    *  read without a consumed watermark. */
   markContextShown(): void {
@@ -1327,7 +1380,9 @@ export class Agent {
    * run. It isn't told the agent's thinking binding (`thinkingBinding.binds`),
    * so a context manager that keeps a thinking-binding record neither reads
    * nor writes the record here, and what it returns keeps thinking whose
-   * earlier conversation changed. */
+   * earlier conversation changed. Called while a turn's input pin is held
+   * (pinTurnInputs), a refusal as over budget removes the pin and compiles
+   * once more, as the turn's own compiles do. */
   async compileContext(budget?: TokenBudget): Promise<CompileResult> {
     // RFC-006 §3.3: consumption is determined at assembly — a compile that
     // fails assembled nothing, so the watermark moves only on success.
@@ -1335,7 +1390,7 @@ export class Agent {
     const marksBefore = this.watermarkMarks;
     const shownBefore = this.shownWatermark;
     if (watermark) this.shownWatermark = watermark;
-    const compile = () => this.contextManager.compile(this.compileBudget(budget));
+    const compile = () => this.compileUnpinningOnRefusal(() => this.contextManager.compile(this.compileBudget(budget)));
     let result: CompileResult;
     try {
       result = budget ? await compile() : await this.compileAtLiveBudget(compile);
@@ -1591,7 +1646,8 @@ export class Agent {
     // agent before the consumed watermark moves, once it returns.
     const shownBefore = this.shownWatermark;
     if (watermark) this.shownWatermark = watermark;
-    const compile = () => this.contextManager.compile(this.compileBudget(budget), injections, opts as never);
+    const select = () => this.contextManager.compile(this.compileBudget(budget), injections, opts as never);
+    const compile = opts?.dryRun ? select : () => this.compileUnpinningOnRefusal(select);
     let result: CompileResult;
     try {
       result = budget || opts?.dryRun ? await compile() : await this.compileAtLiveBudget(compile);

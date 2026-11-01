@@ -12,7 +12,7 @@
  * (held-turn-retry.test.ts, turn-continuation.test.ts).
  */
 
-import { describe, it } from 'node:test';
+import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -35,7 +35,10 @@ import {
 import type { ContextInjection } from '@animalabs/context-manager';
 import type { Agent, EventResponse, Module, ModuleContext, ProcessEvent, ToolResult, TraceEvent } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
+import { setAbandonGraceForTests } from '../src/framework.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+
+const SHORT_ABANDON_GRACE_MS = 50;
 
 function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve!: (value: T) => void;
@@ -408,10 +411,10 @@ describe('a stop before the turn has a stream', () => {
   it("a quiesce's abandon of a turn whose hooks outlast the abandon's grace lists it, and still ends it when they return", async () => {
     const h = await aliveWithoutStream();
     try {
+      setAbandonGraceForTests(h.framework, SHORT_ABANDON_GRACE_MS);
       const reached = abandonReached(h.framework);
       const quiescing = h.framework.quiesce({ timeoutMs: 50, abandon: true });
       await within('the abandon to reach the turn', reached);
-      // The abandon waits up to 10 s for the turns it reached to end.
       const status = await within('the quiesce to return', quiescing, 15_000);
       assert.deepEqual(status.unabandonable, ['prime'], 'the turn still in its hooks is listed');
       assert.deepEqual(status.activeTurnAgents, ['prime'], 'it still holds its turn');
@@ -1267,6 +1270,11 @@ const postThenRead = () => createMockResponse([
   { type: 'tool_use', id: 'one', name: 'gated--read', input: {} },
 ] as ContentBlock[], 'tool_use');
 
+const unscripted: string[] = [];
+afterEach(() => {
+  assert.deepEqual(unscripted.splice(0), [], 'every stream the framework opened was one the test scripted');
+});
+
 /** Scripted streams; `requests` counts the streams made, one per request. */
 class ScriptMembrane {
   readonly requests: NormalizedRequest[] = [];
@@ -1274,7 +1282,11 @@ class ScriptMembrane {
   streamYielding(request: NormalizedRequest, _options: YieldingStreamOptions = {}) {
     this.requests.push(request);
     const script = this.scripts.shift();
-    if (!script) throw new Error('unexpected extra inference');
+    if (!script) {
+      const last = request.messages.at(-1)?.content.map((b) => (b as { text?: string }).text ?? `[${b.type}]`).join(' ') ?? '';
+      unscripted.push(`stream ${this.requests.length}, after: ${last.slice(0, 120)}`);
+      throw new Error('unexpected extra inference');
+    }
     return new MockYieldingStream(script);
   }
   asMembrane(): Membrane { return this as unknown as Membrane; }
@@ -1551,10 +1563,10 @@ describe("a stop while the guard's refusal retry waits", () => {
   it("an abandon of the wait while it still holds the finished stream lists the turn if it outlasts the grace, and still ends it as the abandon", async () => {
     const g = await guardRetryWaiting();
     try {
+      setAbandonGraceForTests(g.framework, SHORT_ABANDON_GRACE_MS);
       const reached = abandonReached(g.framework);
       const quiescing = g.framework.quiesce({ timeoutMs: 50, abandon: true });
       await within('the abandon to reach the turn', reached);
-      // The round's post stays held through the abandon's ten-second grace.
       const status = await within('the quiesce to return', quiescing, 15_000);
       assert.deepEqual(status.unabandonable, ['assistant'], 'the turn still waiting is listed');
       g.releasePost();

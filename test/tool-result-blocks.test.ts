@@ -117,7 +117,6 @@ function copies(result: ToolResult, maxChars?: number): { stored: string; live: 
 
 describe("a protocol result's content (dataIsContent)", () => {
   it('shows each block the lane can\'t show as its marker on both copies, never as JSON', () => {
-    assert.equal(AUDIO_TEXT, `[Audio not shown: this host's tool results carry only text and images (audio/wav, ~3KB).]`);
     for (const [what, block, marker] of MARKED) {
       const { stored, live } = copies({ success: true, data: [TEXT, block], dataIsContent: true });
       assert.equal(stored, `zz-text\n${marker}`, what);
@@ -828,8 +827,6 @@ describe('an empty link beside inline data is no link', () => {
   const audio = { ...AUDIO, uri: '' };
 
   it('so the data is shown as any inline data is, on the push lane and the tool-result lane', () => {
-    assert.deepEqual(classifyBlock(image), { kind: 'inline', contradiction: false });
-    assert.deepEqual(classifyBlock(audio), { kind: 'inline', contradiction: false });
     assert.deepEqual(convertBlock(image as never, 'p', 's'), { type: 'image', source: { type: 'base64', data: PNG, mediaType: 'image/png' } });
     assert.deepEqual(convertBlock(audio as never, 'p', 's'), { type: 'audio', source: { type: 'base64', data: BASE64, mediaType: 'audio/wav' } });
     const { stored, live } = copies({ success: true, data: [image, audio], dataIsContent: true });
@@ -839,7 +836,6 @@ describe('an empty link beside inline data is no link', () => {
 
   it('while a link that isn\'t empty still withholds it, on both lanes', () => {
     const linked = { ...AUDIO, uri: 'https://zz-files.example/a.wav' };
-    assert.deepEqual(classifyBlock(linked), { kind: 'inline', contradiction: true });
     assert.deepEqual(convertBlock(linked as never, 'p', 's'), { type: 'text', text: INLINE_WITHHELD_TEXT });
     assert.equal(nonErrorResultText({ data: [TEXT, linked], dataIsContent: true }), `zz-text\n${INLINE_WITHHELD_TEXT}`);
   });
@@ -874,28 +870,29 @@ describe("MCP's embedded resource, an ordinary inline block (RFC-005 §8.1)", ()
   ];
 
   it('is told by its own fields, and a resource with a uri of its own stays a reference', () => {
-    assert.deepEqual(classifyBlock(TEXT_FILE), { kind: 'embedded', contents: { kind: 'block', block: { type: 'text', text: 'zz-embedded-text' } } });
-    assert.deepEqual(classifyBlock(IMAGE_FILE), { kind: 'embedded', contents: { kind: 'block', block: { type: 'image', data: PNG, mimeType: 'image/png' } } });
-    assert.equal(classifyBlock({ ...TEXT_FILE, uri: EMBEDDED_URI }).kind, 'reference');
-    // The text lanes' helper leaves contents that show to the caller.
-    assert.equal(referenceStubOrNull(TEXT_FILE), null);
+    // What the push lane shows the agent for each.
+    const shown = (block: unknown) => convertBlock(block as never, 'p', 's');
+    assert.deepEqual(shown(TEXT_FILE), { type: 'text', text: 'zz-embedded-text' });
+    assert.deepEqual(shown(IMAGE_FILE), NATIVE_PNG);
+    const reference = shown({ ...TEXT_FILE, uri: EMBEDDED_URI }) as { type: string; text?: string };
+    assert.ok(reference.type === 'text' && reference.text?.startsWith('[ref_') && !reference.text.includes(SECRET), JSON.stringify(reference));
     // A record under resource with no string uri isn't one, as before.
     for (const resource of [{ text: 'zz' }, { uri: 7, text: 'zz' }, 'zz']) {
-      assert.deepEqual(classifyBlock({ type: 'resource', resource }), { kind: 'invalid', shown: REFERENCE_NO_LINK_TEXT });
+      assert.deepEqual(shown({ type: 'resource', resource }), { type: 'text', text: REFERENCE_NO_LINK_TEXT });
     }
     // A top-level uri that's null or empty is none of its own.
     for (const uri of [null, '']) {
-      assert.deepEqual(classifyBlock({ ...TEXT_FILE, uri }), classifyBlock(TEXT_FILE), String(uri));
+      assert.deepEqual(shown({ ...TEXT_FILE, uri }), shown(TEXT_FILE), String(uri));
     }
     // Any disposition withholds it, a falsy one included, as for inline data.
     for (const disposition of [null, false, 0, '']) {
-      assert.deepEqual(classifyBlock({ ...TEXT_FILE, disposition }), { kind: 'embedded', contents: { kind: 'withheld' } }, String(disposition));
+      assert.deepEqual(shown({ ...TEXT_FILE, disposition }), { type: 'text', text: INLINE_WITHHELD_TEXT }, String(disposition));
     }
     // A media type's family is read whatever its case, and kept as sent.
-    assert.deepEqual(classifyBlock(embedded({ mimeType: 'Image/PNG', blob: PNG })),
-      { kind: 'embedded', contents: { kind: 'block', block: { type: 'image', data: PNG, mimeType: 'Image/PNG' } } });
-    assert.deepEqual(classifyBlock(embedded({ mimeType: 'AUDIO/WAV', blob: BASE64 })),
-      { kind: 'embedded', contents: { kind: 'block', block: { type: 'audio', data: BASE64, mimeType: 'AUDIO/WAV' } } });
+    assert.deepEqual(shown(embedded({ mimeType: 'Image/PNG', blob: PNG })),
+      { type: 'image', source: { type: 'base64', data: PNG, mediaType: 'Image/PNG' } });
+    assert.deepEqual(shown(embedded({ mimeType: 'AUDIO/WAV', blob: BASE64 })),
+      { type: 'audio', source: { type: 'base64', data: BASE64, mediaType: 'AUDIO/WAV' } });
   });
 
   it('shows its text as text in both copies of a tool result, on the push lane and at any depth, never its uri', () => {

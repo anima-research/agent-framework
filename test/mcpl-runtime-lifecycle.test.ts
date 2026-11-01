@@ -225,15 +225,15 @@ test('restartMcplServer of an id whose disconnect is in flight is refused before
 
 test("a disconnect removes its server's prefix claim, and leaves one another server holds", async () => {
   await withFramework(true, async (framework) => {
-    const internals = framework as unknown as { mcplPrefixMap: Map<string, string> };
-    assert.equal(internals.mcplPrefixMap.get('mcpl--first'), 'first');
+    await framework.connectMcplServer(serverConfig('second', { toolPrefix: 'held' }) as never);
     await framework.disconnectMcplServer('first');
-    assert.equal(internals.mcplPrefixMap.has('mcpl--first'), false, 'its own claim is released');
-    // As after a restart under a new id: `second` holds the prefix `first` had.
-    await framework.connectMcplServer(serverConfig('first') as never);
-    internals.mcplPrefixMap.set('mcpl--first', 'second');
-    await framework.disconnectMcplServer('first');
-    assert.equal(internals.mcplPrefixMap.get('mcpl--first'), 'second', "the other server's claim stands");
+    // Its own claim is released: another server may take the prefix.
+    await framework.connectMcplServer(serverConfig('third', { toolPrefix: 'mcpl--first' }) as never);
+    // The other server's claim stands.
+    await assert.rejects(
+      framework.connectMcplServer(serverConfig('fourth', { toolPrefix: 'held' }) as never),
+      /toolPrefix "held" collides with server "second"/,
+    );
   });
 });
 
@@ -684,8 +684,9 @@ test('connectMcplServer hot-connects a network-only (WebSocket) MCPL server', as
       let msg: { id?: unknown; method?: string; params?: { arguments?: Record<string, unknown> } };
       try { msg = JSON.parse(String(data)); } catch { return; }
       const reply = (result: unknown) => ws.send(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }));
-      if (msg.method === 'initialize') reply({ protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.4', pushEvents: true } } } });
+      if (msg.method === 'initialize') reply({ protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.5', pushEvents: true } } } });
       else if (msg.method === 'tools/list') reply({ tools: [{ name: 'echo', description: 'e', inputSchema: { type: 'object' } }] });
+      else if (msg.method === 'featureSets/update') reply({ accepted: true });
     });
   });
   await new Promise<void>((resolve) => (wss.address() ? resolve() : wss.once('listening', () => resolve())));

@@ -131,12 +131,12 @@ export interface FrameworkConfig {
      */
     announceOrphans?: boolean;
     /**
-     * By default every derivation tells the agent it was made from, in one
-     * host-framed line. After this many derivations of one kind from one
-     * agent, that agent hears a count line every so many instead of a line
-     * per fork, so a reader loop that forks a hundred times a session doesn't
-     * fill its source's context with stamps; every derivation still emits its
-     * `dendrite:agent-created` trace. Default 10; 0 never collapses.
+     * With a `derivationNotice`, after this many derivations of one kind from
+     * one agent, the line it's given is a count line every so many instead of
+     * a line per fork, so a reader loop that forks a hundred times a session
+     * doesn't fill its source's context with stamps; every derivation still
+     * emits its `dendrite:agent-created` trace. Default 10; 0 never collapses.
+     * Without a `derivationNotice` the source is told nothing.
      */
     collapseDerivationNoticesAfter?: number;
     /**
@@ -152,9 +152,11 @@ export interface FrameworkConfig {
     beforeDerive?: (spec: import('../dendrite/types.js').AgentSpec) => void | { refuse: string };
     /**
      * What an agent is told when something is derived from it. Given the
-     * record, the agent it was derived from and the framework's default line,
-     * return the text to add, or null to add nothing. Absent, the default
-     * line is used. The `dendrite:agent-created` trace is emitted either way.
+     * record, the agent it was derived from and the framework's own line,
+     * return the text to add (that line, or the host's own), or null to add
+     * nothing. Absent, nothing is added: an agent isn't told of derivations
+     * unless the host asks for it. The `dendrite:agent-created` trace is
+     * emitted either way.
      */
     derivationNotice?: (record: import('../dendrite/types.js').AgentRecord, from: string, defaultText: string) => string | null;
   };
@@ -316,7 +318,9 @@ export interface FrameworkConfig {
    * `complete()` streams under the hood, membrane renews it at each parsed
    * provider event. A call a bound cuts fails
    * with type `timeout`, and on an agent's turn DefaultErrorPolicy gives each
-   * such call one fresh call. One setting covers every agent. `false` sets
+   * such call one fresh call, except in a turn that re-arms an exhausted one,
+   * where `exhaustedTurnRearmMs` says what a cut does. One setting covers
+   * every agent. `false` sets
    * none of these bounds. Default: membrane's PROGRESS_BOUNDS and
    * FLAT_MINIMUM_MS.
    */
@@ -360,20 +364,32 @@ export interface FrameworkConfig {
    * channel isn't sent again: one whose turn was woken for a channel id that
    * names no one registered channel and never found one, and whose request
    * names none of its own. A failure that states a wait is held for that wait
-   * first, as any turn's is, and a deadline ends the turn as before, whether
-   * the host set it or membrane marks one as run out: the runtime's or
-   * undici's on a sent request, the Anthropic adapter's watchdogs, or the
-   * Anthropic SDK's timeout, which covers its connect timeout too. Until one
-   * of the re-armed turn's rounds has run or had its tool calls cut off, its
-   * failure gets no retries from the error policy: on another transient
-   * failure the next delay follows, until the list runs out, and a failure of
-   * any other kind ends the re-arming. A wake for the agent while it waits
-   * starts its turn at once, with the re-armed trigger merged in. That turn is
-   * the wake's: the error policy retries its failures. A completed turn starts
-   * the count again, and so does a message said to the agent: not a system
-   * message or notice; not an edit, reaction or deletion, unless an edit is
-   * the first version of a message the agent sees; not a message its own view
-   * leaves out, such as one a tune-out holds from it; and not the agent's own
+   * first, as any turn's is, and a turn that ends on a deadline, whether the
+   * host set it or membrane marks one as run out (the runtime's or undici's
+   * on a sent request, the Anthropic adapter's watchdogs, or the Anthropic
+   * SDK's timeout, which covers its connect timeout too), isn't re-armed,
+   * save the exception below. Until one of the re-armed turn's rounds has run
+   * or had its tool calls cut off, its failure gets no retries from the error
+   * policy: on another transient failure the next delay follows, until the
+   * list runs out, and a failure of any other kind ends the re-arming. The
+   * one exception is a re-armed turn's send that fails with a deadline marked
+   * as run out, membrane's or a bound the host sets on the call
+   * (`inferenceBounds`), as when a stream stalls. Such a cut counts as a
+   * transient failure, so a turn that ends on it is re-armed as for a
+   * transient failure, unless it follows another such cut with no transient
+   * failure, answered round or message said to the agent between them: two
+   * such cuts in a row end the re-arming, and the second gets no retry from
+   * the error policy, even in a re-armed turn that got partway. A transient
+   * failure or an answered round in any of the agent's turns clears an
+   * earlier cut, and so does a message said to the agent, or the agent's end.
+   * Every such cut counts, including one the error policy retries or a host's
+   * provider hold takes. A wake for the agent while it waits starts its turn
+   * at once, with the re-armed trigger merged in. That turn is the
+   * wake's: the error policy retries its failures. A completed turn starts the
+   * count again, and so does a message said to the agent: not a system message
+   * or notice; not an edit, reaction or deletion, unless an edit is the first
+   * version of a message the agent sees; not a message its own view leaves
+   * out, such as one a tune-out holds from it; and not the agent's own
    * schedule, the heartbeat's tick or reminder, a self-wake timer it set, or a
    * script's wake. A notice a module or an MCPL server stores as a message
    * counts. A message in the residents' shared slot counts for each resident

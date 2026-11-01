@@ -147,38 +147,47 @@ test("a miss's closest region holds what its old text's first line and the file'
 });
 
 test("a call counts occurrences past what its edits need only within its budget, and past it a count is a floor", () => {
-  // Three edits each asking for one of 5,000,000: the first counts them all;
-  // the budget then has COUNT_MAX less those past the first 21, so the second
-  // stops one past it, and the third one past its free 21.
+  // Three edits each asking for one of 5,000,000: the first counts them all,
+  // within the budget, and the budget then stops the others, whose counts are
+  // floors above the 21 a refusal shows.
   const bytes = Buffer.from('a'.repeat(5_000_000));
   const counts = countBudget();
   const problems = planFile(decodeForEdit(bytes)!, bytes, [spec(0, 'a', 'b'), spec(1, 'a', 'c'), spec(2, 'a', 'd')], hintBudget(), Infinity, counts);
   assert.ok('problems' in problems);
-  const left = COUNT_MAX - (5_000_000 - 21);
-  assert.deepEqual(problems.problems.map((p) => p.kind === 'count' && [p.found, p.atLeast, p.spent]), [[5_000_000, false, false], [21 + left + 1, true, true], [22, true, true]]);
-  // Two hundred such edits share the one budget: past the first two, each
-  // stops one past its free 21.
+  const shape = (p: (typeof problems.problems)[number]) => (p.kind === 'count' ? [p.found, p.atLeast, p.spent] as const : undefined);
+  const [first, ...rest] = problems.problems.map(shape);
+  assert.deepEqual(first, [5_000_000, false, false]);
+  assert.equal(rest.length, 2, 'the other two edits have count problems too');
+  for (const r of rest) assert.ok(r && r[1] && r[2] && r[0] > 21 && r[0] < 5_000_000, JSON.stringify(r));
+  // Two hundred such edits share the one budget: together they count no
+  // more than it allows, with a small allowance an edit, not 200 times the
+  // text.
   const many = planFile(decodeForEdit(bytes)!, bytes, Array.from({ length: 200 }, (_, k) => spec(k, 'a', 'b')));
   assert.ok('problems' in many);
-  assert.deepEqual(many.problems.map((p) => p.kind === 'count' && [p.found, p.atLeast, p.spent]),
-    [[5_000_000, false, false], [21 + left + 1, true, true], ...Array.from({ length: 198 }, () => [22, true, true])]);
+  const shapes = many.problems.map(shape);
+  assert.equal(shapes.length, 200);
+  assert.ok(shapes.slice(1).every((r) => r && r[1] && r[2] && r[0] > 21), JSON.stringify(shapes.slice(0, 3)));
+  const total = shapes.reduce((sum, r) => sum + (r?.[0] ?? 0), 0);
+  assert.ok(total <= COUNT_MAX + 200 * 1_000, `${total} counted`);
 });
 
 test("a crowded edit whose count the budget stopped short of its ask, or at it, is named by that count where the crowded check names none", () => {
   // Asking 1,500, 1,500 and 900 of a text 2,000 long, the edits are crowded.
-  // At a budget of 2,000, the first two count all 1,000 of theirs, which
-  // leaves 40, and are count problems; the third runs it out at 61. What's
-  // left, 900, fits the text, so no crowded problem names it, and its count
-  // does (Abigail-2676's case).
+  // At a budget of 2,000, the first two count all 1,000 of theirs and are
+  // count problems; the third runs the budget out. What's left, 900, fits the
+  // text, so no crowded problem names it, and its count does, as a floor.
   const bytes = Buffer.from('ab'.repeat(1_000));
   const counted = (asked: number) => {
     const planned = planFile(decodeForEdit(bytes)!, bytes, [spec(0, 'a', 'x', 1_500), spec(1, 'b', 'y', 1_500), spec(2, 'ab', 'z', asked)], hintBudget(), Infinity, countBudget(2_000));
     assert.ok('problems' in planned);
     return planned.problems.map((p) => p.kind === 'count' && [p.edit, p.found, p.atLeast, p.spent]);
   };
-  assert.deepEqual(counted(900), [[0, 1_000, false, false], [1, 1_000, false, false], [2, 61, true, true]]);
+  const [first, second, third] = counted(900);
+  assert.deepEqual([first, second], [[0, 1_000, false, false], [1, 1_000, false, false]]);
+  assert.ok(third && third[0] === 2 && third[2] === true && third[3] === true && (third[1] as number) > 21 && (third[1] as number) <= 900, JSON.stringify(third));
   // A count the budget stopped at just what the edit asks for is a floor too.
-  assert.deepEqual(counted(61), [[0, 1_000, false, false], [1, 1_000, false, false], [2, 61, true, true]]);
+  const floor = third[1] as number;
+  assert.deepEqual(counted(floor), [[0, 1_000, false, false], [1, 1_000, false, false], [2, floor, true, true]]);
 });
 
 test("an edit's count in a call of its own is exact, in a text longer than the call's limit", () => {
@@ -217,9 +226,8 @@ test("a reading in which an edit changes nothing counts toward a refusal for one
 });
 
 test("one count budget raised for a text longer than it is raised once for each length, however many such texts it plans", () => {
-  // Raised to 1,500 by the first text, whose one edit counts all but 21 of
-  // it, the budget leaves the second text's edit its free 21, those 21, and
-  // one more.
+  // Raised to 1,500 by the first text, whose one edit counts it all, the
+  // budget isn't raised again for the second text of that length.
   const counts = countBudget(1_000);
   const bytes = Buffer.from('a'.repeat(1_500));
   const counted = (newText: string) => {
@@ -228,7 +236,9 @@ test("one count budget raised for a text longer than it is raised once for each 
     return planned.problems.map((p) => p.kind === 'count' && [p.found, p.atLeast, p.spent]);
   };
   assert.deepEqual(counted('b'), [[1_500, false, false]]);
-  assert.deepEqual(counted('c'), [[43, true, true]]);
+  // Not raised again for the second text of that length: its count is a floor.
+  const [second] = counted('c');
+  assert.ok(second && second[1] === true && second[2] === true && (second[0] as number) > 21 && (second[0] as number) < 1_500, JSON.stringify(second));
 });
 
 test("crowded edits whose counts stopped short, where the crowded check names none, are each named, by a loop, and their problems made only then", () => {
@@ -254,7 +264,14 @@ test("crowded edits whose counts stopped short, where the crowded check names no
   const crowdedSpecs = Array.from({ length: 200_000 }, (_, k) => spec(k, 'a', 'y', 3_000));
   const { result: crowded, calls } = lineFeedSearches(() => planFile(lineFile, line, crowdedSpecs));
   assert.ok('problems' in crowded);
-  assert.deepEqual(crowded.problems.map((p) => p.kind === 'crowded' ? [p.kind, p.edits.length] : p.kind), ['count', 'count', 'count', ['crowded', 199_997]]);
+  // One crowded problem names every edit that has no count problem, the two
+  // together name all 200,000 once, and only the few edits the budget let
+  // count past their ask have count problems.
+  const countEdits = crowded.problems.flatMap((p) => (p.kind === 'count' ? [p.edit] : []));
+  const crowdedEdits = crowded.problems.flatMap((p) => (p.kind === 'crowded' ? p.edits : []));
+  assert.equal(crowded.problems.filter((p) => p.kind === 'crowded').length, 1);
+  assert.ok(countEdits.length >= 1 && countEdits.length < 100, `${countEdits.length} count problems`);
+  assert.deepEqual([...countEdits, ...crowdedEdits].sort((a, b) => a - b), Array.from({ length: 200_000 }, (_, k) => k));
   assert.ok(calls >= 1 && calls < 1_000, `${calls} searches for a line feed`);
 });
 

@@ -47,9 +47,8 @@ describe('gate channel patterns on both paths', () => {
 
   /** Starts a framework with these policies and returns a function that
    *  sends one fixture command and names the policy the event matched, by
-   *  the policies' match counts. */
-  type GateStatus = { policies: Array<{ name: string; matchCount: number; passiveSampleState?: { counterCount: number; fireCount: number }; rateLimitState?: { bucketCount: number; deniedCount: number } }> };
-  async function gateFor(policies: GatePolicy[]): Promise<((line: string) => Promise<string>) & { status: () => GateStatus }> {
+   *  the gate's decision trace, with the trigger of every decision so far. */
+  async function gateFor(policies: GatePolicy[]): Promise<((line: string) => Promise<string>) & { triggers: () => boolean[] }> {
     tempDir = mkdtempSync(join(tmpdir(), 'gate-channel-ids-'));
     const commandPath = join(tempDir, 'commands.txt');
     writeFileSync(commandPath, '');
@@ -67,25 +66,21 @@ describe('gate channel patterns on both paths', () => {
       modules: [],
     });
     await framework.start();
-    const internal = framework as unknown as {
-      channelRegistry: { listChannelsRaw(): unknown[] };
-      eventGate: { getStatus(): GateStatus } | null;
-    };
+    const internal = framework as unknown as { channelRegistry: { listChannelsRaw(): unknown[] } };
     await waitFor(() => internal.channelRegistry.listChannelsRaw().length >= 2, 'channel registration');
-    const gate = internal.eventGate;
-    assert.ok(gate, 'premise: the framework has a gate');
-    const counts = (): Map<string, number> => new Map(gate.getStatus().policies.map((p) => [p.name, p.matchCount]));
-    const total = (c: Map<string, number>): number => [...c.values()].reduce((a, b) => a + b, 0);
+    // The gate's decision for every event it weighs, as an operator's trace sees it.
+    const decisions: Array<{ matchedPolicy: string | null; trigger: boolean }> = [];
+    framework.onTrace((event) => { if (event.type === 'gate:decision') decisions.push(event); });
     const send = async (line: string): Promise<string> => {
-      const before = counts();
+      const before = decisions.length;
       appendFileSync(commandPath, `${line}\n`);
-      await waitFor(() => total(counts()) > total(before), `a policy matching ${line}`);
-      const after = counts();
-      const hit = [...after.keys()].filter((name) => after.get(name)! > before.get(name)!);
-      assert.equal(hit.length, 1, `one policy matches ${line}`);
-      return hit[0]!;
+      await waitFor(() => decisions.length > before, `the gate's decision on ${line}`);
+      const made = decisions.slice(before);
+      assert.equal(made.length, 1, `one decision on ${line}`);
+      assert.ok(made[0]!.matchedPolicy, `a policy matches ${line}`);
+      return made[0]!.matchedPolicy!;
     };
-    return Object.assign(send, { status: () => gate.getStatus() });
+    return Object.assign(send, { triggers: () => decisions.map((d) => d.trigger) });
   }
 
   /** A push/event the fixture sends as given. */
@@ -198,8 +193,7 @@ describe('gate channel patterns on both paths', () => {
     assert.equal(await send(`incoming ${REGISTERED} m-1 addressed hello`), 'room-sample');
     assert.equal(await send(reaction), 'room-sample');
     assert.equal(await send(voiceReport), 'room-sample');
-    const sample = send.status().policies.find((p) => p.name === 'room-sample')?.passiveSampleState;
-    assert.deepEqual(sample, { counterCount: 1, fireCount: 1 }, 'the third event in the channel is the third on its counter');
+    assert.deepEqual(send.triggers().slice(-3), [false, false, true], 'the third event in the channel is the third on its counter, so it fires');
   });
 
   it("a rate limit keyed by channelId counts a channel's message and reaction in one bucket, whatever its policy matches", async () => {
@@ -208,8 +202,7 @@ describe('gate channel patterns on both paths', () => {
     ]);
     assert.equal(await send(`incoming ${REGISTERED} m-1 addressed hello`), 'limit');
     assert.equal(await send(reaction), 'limit');
-    const limit = send.status().policies.find((p) => p.name === 'limit')?.rateLimitState;
-    assert.deepEqual(limit, { bucketCount: 1, deniedCount: 1 }, "the reaction finds the message's bucket empty");
+    assert.deepEqual(send.triggers().slice(-2), [true, false], "the reaction finds the message's bucket empty");
   });
 
   it("another adapter's push that names no registered id matches by its raw id alone", async () => {
