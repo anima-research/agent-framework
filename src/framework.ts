@@ -21,9 +21,11 @@ import {
   SUBCONSCIOUS_TOOL_NAMES,
   defaultReaderFraming,
   persistentReaderName,
+  tuneOutReachWords,
   type SubconsciousConfig,
   type PersistentReaderConfig,
   type ForkReaderConfig,
+  type TuneOutReader,
 } from './tune-out/tools.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, alreadyTunedOutText, cancelWaitsNote, type ReaderInvocation } from './tune-out/coordinator.js';
 import { SubconsciousWindowAnchor } from './tune-out/window-anchor.js';
@@ -2069,17 +2071,7 @@ function assertAgentNamesUnique(agents: readonly AgentConfig[]): void {
   );
 }
 
-/**
- * Who reads a tuned-out channel's traffic, as the text a resident reads
- * says it: the persistent subconscious by the name it runs under, reader
- * forks, or no reader (a silent hold, where `tuneOut.enabled` offers
- * tune_out without one). A persistent reader's name is a value the host
- * supplied, marked as such (suppliedValue).
- */
-export type TuneOutReader =
-  | { readonly kind: 'persistent'; readonly name: string }
-  | { readonly kind: 'forks' }
-  | { readonly kind: 'none' };
+export type { TuneOutReader };
 
 /**
  * The `tune_out` tool for a host with `reader`. The text says what happens
@@ -13294,7 +13286,8 @@ export class AgentFramework {
 
   /**
    * The reader of a tuned-out channel's traffic, as the text a resident
-   * reads describes it (tuneOutTool, tunedOutSendNote): the persistent
+   * reads describes it (tuneOutTool, tunedOutSendNote, tune_out's answers
+   * and the channel registry's refusals of a tuned-out channel): the persistent
    * subconscious by the name it runs under, which the host gives it, reader
    * forks as forks of the resident's context, or none.
    */
@@ -33474,6 +33467,9 @@ export class AgentFramework {
             : 'The focus on it ended, and what the other channels held was delivered.';
         },
         focusChannelResolver: () => this.tuneOutCoordinator?.focusChannel() ?? null,
+        // Who reads a tuned-out channel's traffic, for the registry's texts
+        // that say where its messages go (tuneOutHeldWords, tuneOutReachWords).
+        tuneOutReader: () => this.tuneOutReader(),
         // Route a conversation fork's plain-text speech to its HOME channel, not
         // the process-global most-recent-inbound locus (item 3). The trunk agent
         // has no home entry, so this returns undefined and routeSpeech falls back
@@ -38304,8 +38300,8 @@ export class AgentFramework {
     }
     // An open that throws is answered too, never left unhandled.
     const openThrew = (err: unknown): string =>
-      'The tune-out is recorded, but its messages may not reach the subconscious, since opening its channel ' +
-      `failed: ${thrownText(err)}`;
+      `The tune-out is recorded, but its messages ${tuneOutReachWords(this.tuneOutReader(), 'may not reach')}, since ` +
+      `opening its channel failed: ${thrownText(err)}`;
     const serverId = typeof input.serverId === 'string' && input.serverId ? input.serverId : undefined;
     const allExcept = input.scope === 'all-except';
 
@@ -38389,7 +38385,7 @@ export class AgentFramework {
           maxWakes: r.params.maxWakes,
           note: coordinator.hasReader()
             ? `${speech} Reader wakes pause, not cancel, when the budget is spent.`
-            : `No subconscious is configured: this is a silent hold. ${speech} The backlog is delivered per channel when you cancel or the duration ends.`,
+            : `No reader is configured here: this is a silent hold. ${speech} The backlog is delivered per channel when you cancel or the duration ends.`,
         },
       };
     }
@@ -38416,7 +38412,7 @@ export class AgentFramework {
         const error = now?.params.epochId === tuneOut.params.epochId
           // A name in a sentence is quoted as tune_out takes it back (main's #852).
           ? alreadyTunedOutText(channelRegistry.quotedShown(resolved), now.params,
-            openError ?? 'Its transport is open now, so its messages reach the subconscious.')
+            openError ?? `Its transport is open now, so its messages ${tuneOutReachWords(this.tuneOutReader(), 'reach')}.`)
           : TUNE_OUT_REPLACED;
         return { success: false, error, isError: true };
       }
@@ -38439,7 +38435,7 @@ export class AgentFramework {
         ...(openError ? { openError } : {}),
         ...(coordinator.hasReader()
           ? {}
-          : { note: 'No subconscious is configured: this is a silent hold. Nothing summarizes or wakes you; the backlog is delivered when you cancel.' }),
+          : { note: 'No reader is configured here: this is a silent hold. Nothing summarizes or wakes you; the backlog is delivered when you cancel.' }),
       },
     };
   }

@@ -24,3 +24,18 @@
   no longer adds "staying silent is allowed". A host that wants a policy for its reader gives it in the reader's
   `systemPrompt` (persistent) or `voice` / `framing` (forks). The four tools are in every reader's tool block, and
   under reader forks in every resident's, so the first request after the upgrade misses the prompt cache there too.
+- **Residents and readers: the rest of the text about a tuned-out channel names the reader this host configures, or
+  says there is none, and a reader's cancel says who made it.** A channel tool's refusal of a tuned-out channel
+  (`channel_open`, `channel_close`, `channel_decline`, a decline a tune-out replaced) said "its messages go to the
+  subconscious"; tune_out's answers about the channel's transport said its messages "may not reach", "don't reach"
+  or "reach the subconscious"; tune_out's silent-hold note began "No subconscious is configured"; and tune_out on a
+  host with no reader and no `tuneOut.enabled` said "this host has no subconscious resident to watch a channel". Now
+  the messages "are held from you and read by <name>" (a persistent reader, by the name it runs under), "… read by
+  forks of your context" (reader forks), or "are held from you, with no reader configured here to read them"; they
+  "reach <name>" or "the reader", or with no reader "are received and held"; and the refusals say "No reader is
+  configured here". A reader's `cancel_tuneout` gave its cancel the reason "subconscious judgment", which the
+  resident read in "[Tune-out: … cancelled — subconscious judgment, N wakes]", the reader in its cancel notice, the
+  excepted channel in an all-except hold's release line, and a host in the `tune-out:cancelled` trace; the reason is
+  now "by <name>", the reader's name or a reader fork's own (or "by the reader" where the call names none). The
+  channel registry takes the reader from the new `tuneOutReader` option, which the framework gives it; a registry
+  made without one says no reader is configured.

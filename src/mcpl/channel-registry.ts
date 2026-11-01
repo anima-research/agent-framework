@@ -49,6 +49,7 @@ import type { InboundSource } from './inbound-source.js';
 import { McplRequestError, type McplServerConnection } from './server-connection.js';
 import { readSkipReplyWake, skipReplyNote, type SkipReplyEarlierWake } from './skip-reply-wake.js';
 import { isProseTargetToken } from './prose-grammar.js';
+import { tuneOutHeldWords, tuneOutReachWords, type TuneOutReader } from '../tune-out/tools.js';
 
 // ============================================================================
 // Typing indicator interval (Discord typing lasts ~10s, so 7s keeps it alive)
@@ -1023,6 +1024,13 @@ interface ChannelRegistryOptions {
    */
   focusChannelResolver?: () => ChannelRef | null;
   /**
+   * Who reads a tuned-out channel's traffic (the framework's reader: the
+   * persistent subconscious by its name, reader forks, or none), for the
+   * texts that tell an agent where a tuned-out channel's messages go.
+   * Left out, the texts say no reader is configured.
+   */
+  tuneOutReader?: () => TuneOutReader;
+  /**
    * Called when a text-only turn's speech was not delivered to its
    * conversational locus (`failed`), or may not have been (`unknown`), for
    * whatever reason deliverSpeech gives, such as no locus, a channel that
@@ -1189,6 +1197,7 @@ export class ChannelRegistry {
   private readonly latestInboundLocus: boolean;
   private onToolClose?: (serverId: string, channelId: string) => string | undefined;
   private focusChannelResolver?: () => ChannelRef | null;
+  private readonly tuneOutReaderFn?: () => TuneOutReader;
   private onRouteFailure?: ChannelRegistryOptions['onRouteFailure'];
   private onChannelAutoOpened?: (info: {
     conversationId?: string;
@@ -1479,17 +1488,17 @@ export class ChannelRegistry {
         (reach === 'gone' ? ' If you need the server back, ask whoever runs this host.' : '') +
         (failure === undefined ? ` ${withStop(lifecycleClause(err))}` : '');
     }
-    // A tune-out sends the channel's messages to the subconscious, and
+    // A tune-out holds the channel's messages for its reader, if any, and
     // channel_open refuses a tuned-out channel.
     if (action === 'open' ? now !== 'open' : now !== 'closed') {
       if (action === 'open' && now === 'tuned-out') {
-        return `Channel ${channel} was tuned out meanwhile: its messages go to the subconscious, and channel_open doesn't ` +
+        return `Channel ${channel} was tuned out meanwhile: its messages ${this.tuneOutHeld()}, and channel_open doesn't ` +
           `change that. ${this.tuneOutEndText(current)}`;
       }
       // channel_close refuses a tuned-out channel too, so calling it again
       // isn't the way: the tune-out's cancel is, and it delivers the backlog.
       if (action === 'close' && now === 'tuned-out') {
-        return `Channel ${channel} was tuned out meanwhile: its messages go to the subconscious, and channel_close doesn't ` +
+        return `Channel ${channel} was tuned out meanwhile: its messages ${this.tuneOutHeld()}, and channel_close doesn't ` +
           `change that. ${this.tuneOutEndText(current, 'channel_close')}`;
       }
       // The later decision's own work settles the transport, and its call
@@ -1620,6 +1629,7 @@ export class ChannelRegistry {
     this.latestInboundLocus = options?.latestInboundLocus === true;
     this.onToolClose = options?.onToolClose;
     this.focusChannelResolver = options?.focusChannelResolver;
+    this.tuneOutReaderFn = options?.tuneOutReader;
     this.onRouteFailure = options?.onRouteFailure;
     this.onChannelAutoOpened = options?.onChannelAutoOpened;
     this.homeChannelResolver = options?.homeChannelResolver;
@@ -3160,7 +3170,7 @@ export class ChannelRegistry {
 
   /**
    * Make a tuned-out channel's transport match its tune-out, which keeps it
-   * open so its traffic reaches the subconscious (TuneOutParams). The
+   * open so its traffic reaches its reader, or is held (TuneOutParams). The
    * tune-out is recorded first (enterTuneOut), and this writes no decision,
    * so the tune-out stands whatever becomes of the open. Lifecycle work
    * queued for the channel goes first, until none is left, since each
@@ -3172,8 +3182,8 @@ export class ChannelRegistry {
    * tune-out as open), and the answer waits for the work queued after it
    * too, such as a registration that came back, and comes from the state
    * that work leaves. Returns nothing where the transport is open, or, for
-   * tune_out's answer, why the channel's messages don't or may not reach the
-   * subconscious yet and when they will, or that the tune-out isn't in
+   * tune_out's answer, why the channel's messages don't or may not reach its
+   * reader yet, or be received, and when they will, or that the tune-out isn't in
    * effect any more. A call while this tune-out's open is in flight, as a
    * repeated tune_out makes, gets that open's answer rather than send
    * another.
@@ -3247,8 +3257,8 @@ export class ChannelRegistry {
     // tune_out again tries the open now: the channel is registered here and
     // its server up.
     const notYet = (later: string, why: string, again = false): string => withStop(
-      `The tune-out is recorded, but its messages may not reach the subconscious until this host opens the channel, ` +
-      `which it does ${later}${again ? ', or now if you call tune_out again' : ''}; ${why}`,
+      `The tune-out is recorded, but its messages ${this.tuneOutReach('may not reach')} until this host opens the ` +
+      `channel, which it does ${later}${again ? ', or now if you call tune_out again' : ''}; ${why}`,
     );
     const nextRegistration = `when the "${serverId}" server next registers this channel, if this host may open and ` +
       'close its channels then';
@@ -3281,17 +3291,17 @@ export class ChannelRegistry {
       const reach = this.serverReach(serverId);
       if (reach !== 'up') {
         return withStop(
-          `The tune-out is recorded, but its messages don't reach the subconscious until the "${serverId}" server is ` +
-          `connected and the channel is open; it can't be opened now: ${unreachableClause(serverId, reach)}` +
+          `The tune-out is recorded, but its messages ${this.tuneOutReach("don't reach")} until the "${serverId}" server ` +
+          `is connected and the channel is open; it can't be opened now: ${unreachableClause(serverId, reach)}` +
           (reach === 'gone' ? unreachableRemedy(reach) : ''),
         );
       }
       const transportOpen = this.tuneOutReadsOpen(entry);
       if (!this.directsLifecycle(serverId)) {
         return transportOpen ? undefined
-          : `The tune-out is recorded, but ${this.lifecycleRefusal(serverId).message}, so its messages reach the ` +
-            'subconscious only as that server sends them, and calling tune_out again won\'t change that. If you need ' +
-            'this host to open it, ask whoever runs this host.';
+          : `The tune-out is recorded, but ${this.lifecycleRefusal(serverId).message}, so its messages ` +
+            `${this.tuneOutReach('reach')} only as that server sends them, and calling tune_out again won't change ` +
+            'that. If you need this host to open it, ask whoever runs this host.';
       }
       if (!entry) return missing;
       // A flag a close that may have taken effect left gets an open.
@@ -4049,6 +4059,21 @@ export class ChannelRegistry {
     return channelOnServer(ref);
   }
 
+  /** The reader of a tuned-out channel's traffic, as the host says (tuneOutReader), or none. */
+  private tuneOutReaderNow(): TuneOutReader {
+    return this.tuneOutReaderFn?.() ?? { kind: 'none' };
+  }
+
+  /** What a tuned-out channel's messages are, after "its messages" (tuneOutHeldWords). */
+  private tuneOutHeld(): string {
+    return tuneOutHeldWords(this.tuneOutReaderNow());
+  }
+
+  /** Whether a tuned-out channel's messages get to its reader, after "its messages" (tuneOutReachWords). */
+  private tuneOutReach(form: Parameters<typeof tuneOutReachWords>[1]): string {
+    return tuneOutReachWords(this.tuneOutReaderNow(), form);
+  }
+
   /**
    * A tool's refusal of a tuned-out channel, whose decision is the tune-out:
    * its cancel is what ends it (tuneOutEndText), and a decision recorded over
@@ -4060,7 +4085,7 @@ export class ChannelRegistry {
       success: false,
       isError: true,
       error:
-        `Channel ${this.quotedShown(refOf(entry))} is tuned out: its messages go to the subconscious, and ${tool} ` +
+        `Channel ${this.quotedShown(refOf(entry))} is tuned out: its messages ${this.tuneOutHeld()}, and ${tool} ` +
         `doesn't change that. ${this.tuneOutEndText(entry, tool)}`,
       data: { refusal: 'tuned-out', channelId: entry.descriptor.id, serverId: entry.serverId },
     };
@@ -5517,8 +5542,8 @@ export class ChannelRegistry {
               `diverted, and then call channel_close.${serverBack}`
             : `. If you still want it closed, call channel_close.${serverBack}`;
       closeError = decided === 'tuned-out'
-        ? `The decline is recorded, but the channel was tuned out meanwhile, and that decision stands: its messages go to ` +
-          `the subconscious${step}`
+        ? `The decline is recorded, but the channel was tuned out meanwhile, and that decision stands: its messages ` +
+          `${this.tuneOutHeld()}${step}`
         : `The decline is recorded, but a later decision to open the channel replaced it, and that decision stands${step}`;
     } else if (closed) {
       // Closed for certain, whatever became of the decline's own close: one

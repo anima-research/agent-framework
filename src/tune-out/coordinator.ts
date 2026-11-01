@@ -119,6 +119,19 @@ export function cancelWaitsNote(what: string, noteDropped = false): string {
     + (noteDropped ? ' Your note isn\'t delivered with it: the cancel already waiting carries a note of its own.' : '');
 }
 
+/**
+ * The reason a reader's cancel_tuneout gives its cancel, which the resident
+ * reads in the cancel's lifecycle line ("[Tune-out: #x cancelled — by Muse,
+ * 2 wakes]"), the reader in its cancel notice, and the excepted channel in
+ * an all-except hold's release line: who cancelled, by the name it runs
+ * under (the persistent reader's, or a reader fork's own), marked as a value
+ * the host supplied, or "the reader" where the call names none. It says who,
+ * never why.
+ */
+function cancelledBy(caller: string | undefined): string {
+  return caller ? `by ${suppliedValue(caller)}` : 'by the reader';
+}
+
 /** A message a cancel reads: a stored row has its id; a write a surgery's hold keeps in memory has none yet. */
 type HeldRow = Pick<StoredMessage, 'participant' | 'content' | 'metadata'> & { id?: string };
 
@@ -913,9 +926,9 @@ export class TuneOutCoordinator {
     if (!this.readerAvailable() && this.hooks.holdWithoutReader?.() !== true) {
       return {
         ok: false,
-        error: 'Nothing was tuned out: this host has no subconscious resident to watch a channel, so tune_out '
-          + "isn't available here, and calling it again won't change that. If you need channels diverted, ask "
-          + 'whoever runs this host.',
+        error: "Nothing was tuned out: no reader is configured here to read a held channel, and this host doesn't "
+          + "hold one without a reader, so tune_out isn't available here, and calling it again won't change that. If "
+          + 'you need channels diverted, ask whoever runs this host.',
       };
     }
     if (this.hooks.isForkBound({ serverId, channelId })) {
@@ -2253,7 +2266,7 @@ export class TuneOutCoordinator {
         // server, which a re-pin reads by name when it weighs the row, as it
         // reads any message without its server.
         if (!subName && !(caller && this.hooks.deliverFromReader)) {
-          return { success: false, error: 'subconscious not configured', isError: true };
+          return { success: false, error: 'Nothing was delivered: no reader is configured here.', isError: true };
         }
         const mine = this.channelRegistry.ownChannelFor(channelId, own, 'deliver');
         if (mine && 'error' in mine) return { success: false, error: mine.error, isError: true };
@@ -2285,7 +2298,7 @@ export class TuneOutCoordinator {
             ? this.forkRefusal(fork, { epochId: scope.params.epochId }, 'cancel', "the all-except hold isn't the hold you were started to read")
             : undefined;
           if (refused) return { success: false, error: refused, isError: true };
-          const result = this.cancelAllExcept('subconscious', 'subconscious judgment', note, caller);
+          const result = this.cancelAllExcept('subconscious', cancelledBy(caller), note, caller);
           if (!result.ok) return { success: false, error: result.error, isError: true };
           return result.deferred
             ? { success: true, data: { waiting: true, scope: 'all-except', note: cancelWaitsNote('The all-except hold', result.noteDropped === true) } }
@@ -2338,7 +2351,7 @@ export class TuneOutCoordinator {
         const refused = fork && this.forkRefusal(fork, { epochId: held.params.epochId }, 'cancel',
           `the tune-out on ${this.quotedShown(channel.serverId, channel.channelId)} isn't the hold you were started to read`);
         if (refused) return { success: false, error: refused, isError: true };
-        const result = this.cancel(channel.serverId, channel.channelId, 'subconscious', 'subconscious judgment', note, caller);
+        const result = this.cancel(channel.serverId, channel.channelId, 'subconscious', cancelledBy(caller), note, caller);
         if (!result.ok) return { success: false, error: result.error, isError: true };
         return result.deferred
           ? { success: true, data: { waiting: true, note: cancelWaitsNote('The tune-out', result.noteDropped === true) } }
@@ -2406,7 +2419,7 @@ export class TuneOutCoordinator {
         return this.channelRegistry.publishForAgent(mine ? mine.channel : channelId, text, this.hooks.subconsciousName() ?? caller ?? 'Subconscious');
       }
       default:
-        return { success: false, error: `unknown subconscious tool: ${name}`, isError: true };
+        return { success: false, error: `unknown reader tool: ${name}`, isError: true };
     }
   }
 
