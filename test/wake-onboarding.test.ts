@@ -21,7 +21,9 @@ import {
 } from '../src/gate/wake-onboarding.js';
 import type { GatePolicy } from '../src/gate/types.js';
 import type { FrameworkConfig } from '../src/types/framework.js';
-import { fixture, TS, eventually } from './helpers/coalescing-fixture.js';
+import type { Module, ToolDefinition, ToolResult } from '../src/index.js';
+import { fixture, TS, eventually, ok } from './helpers/coalescing-fixture.js';
+import { MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { SUB, AMBIENT, MENTION, incoming, registerOpen, enter } from './helpers/admission.js';
 import { firstCatchAll, namesSomething } from '../src/gate/rule-scope.js';
 
@@ -178,6 +180,25 @@ describe('wake onboarding: the pure parts', () => {
 });
 
 // ---------------------------------------------------------------- the host
+
+/** A module whose one tool, hold--wait, holds its round open while `during`
+ *  runs: what that brings is stored while the agent's turn is alive. */
+class HoldRound implements Module {
+  readonly name = 'hold';
+  during: (() => Promise<void>) | null = null;
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] {
+    return [{ name: 'wait', description: 'Wait for something', inputSchema: { type: 'object', properties: {} } }];
+  }
+  async handleToolCall(): Promise<ToolResult> {
+    const during = this.during;
+    this.during = null;
+    await during?.();
+    return { success: true, data: { ok: true } };
+  }
+  async onProcess() { return {}; }
+}
 
 type Trace = Record<string, unknown> & { type: string };
 
@@ -475,6 +496,65 @@ describe('wake onboarding: the host', () => {
       assert.equal(h.decisions().get('editor')!.digest, digest);
       assert.equal(h.traces.find((t) => t.type === 'gate:onboarding-decided')!.digest, digest, 'the trace names what was stored');
     } finally { await h.f.close(); }
+  });
+
+  // The notice's wake reads the notice's row (readsRowFor), as the event's
+  // own wake reads the event's: a turn that heard the notice and was answered
+  // has done what the wake was for, so the wake starts no turn of its own.
+  it('a notice stored mid-turn, heard at the turn\'s tool boundary and answered, drops its wake: it reads the notice\'s row', { timeout: 60_000 }, async () => {
+    const hold = new HoldRound();
+    const h = await games({
+      policies: [{ name: 'go-start', match: { tagsAny: ['go:start'] }, behavior: 'always' }, CATCH_ALL],
+      framework: { modules: [hold] } as Partial<FrameworkConfig>,
+    });
+    // The scheduler's drop of a marked wake, as it logs it.
+    const drops: string[] = [];
+    const consoleError = console.error;
+    console.error = (...args: unknown[]) => {
+      const line = args.map(String).join(' ');
+      if (line.startsWith('[wake] agent: dropped')) drops.push(line);
+      else consoleError(...args);
+    };
+    try {
+      // One turn, on membrane's native path, which carries what a tool
+      // boundary injects into its next round: it waits on hold--wait, then says ok.
+      const streams: MockYieldingStream[] = [];
+      (h.f.membrane as unknown as { streamYielding: (req: unknown) => MockYieldingStream }).streamYielding = (req) => {
+        h.f.membrane.calls.push(req as never);
+        const stream = new MockYieldingStream(streams.length === 0
+          ? [createMockResponse([{ type: 'tool_use', id: 'c1', name: 'hold--wait', input: {} }], 'tool_use'), ok()]
+          : [ok()], true);
+        streams.push(stream);
+        return stream;
+      };
+      const pending = () => (h.f.framework as unknown as { pendingRequests: Array<{ reason: string; readsRow?: string }> }).pendingRequests;
+      let queued: Array<string | undefined> = [];
+      // While the turn waits on its tool, an event the catch-all lets by
+      // brings the offer: its notice is stored out of the live turn's window,
+      // and its wake waits behind the busy agent.
+      hold.during = async () => {
+        await h.f.send('push/event', { featureSet: 'games', eventId: 'mid', timestamp: TS, tags: ['surface:turn'], payload: { content: [{ type: 'text', text: 'White played E5. Your move.' }] } });
+        await eventually(() => h.traces.some((t) => t.type === 'gate:onboarding-offered'), 'the offer, made mid-turn');
+        queued = pending().filter((r) => r.reason === 'wake-onboarding').map((r) => r.readsRow);
+      };
+      await h.f.send('push/event', { featureSet: 'games', eventId: 'start', timestamp: TS, tags: ['go:start'], payload: { content: [{ type: 'text', text: 'verso joined as White.' }] } });
+      await h.f.framework.runUntilIdle();
+
+      const row = (h.f.framework.getAgent('agent')!.getContextManager().getAllMessages() as unknown as Array<{ id: string; content: Array<{ text?: string }> }>)
+        .find((m) => m.content.some((b) => b.text?.startsWith('[wake onboarding]')));
+      assert.ok(row, 'the notice was stored');
+      assert.deepEqual(queued, [row.id], 'its wake reads the notice\'s stored row');
+      assert.equal(h.traces.find((t) => t.type === 'gate:onboarding-offered')!.wake, true, 'the offer woke the agent to decide');
+      assert.ok(JSON.stringify(streams[0]!.receivedToolResultOptions).includes('[wake onboarding] Events from the MCPL server'), 'the turn heard the notice at its tool boundary');
+      assert.equal(h.notices().length, 1, 'the notice is in the window');
+      assert.equal(h.traces.filter((t) => t.type === 'inference:started').length, 1, 'its wake started no turn: the answered turn carried the notice');
+      assert.equal(h.f.membrane.calls.length, 1);
+      assert.ok(drops.length === 1 && drops[0]!.includes('dropped 1 wake(s)') && drops[0]!.endsWith('no turn starts'), `its wake was dropped: ${JSON.stringify(drops)}`);
+      assert.equal(pending().length, 0);
+    } finally {
+      console.error = consoleError;
+      await h.f.close();
+    }
   });
 
   it('a changed ontology is asked about again, once a day has passed since the last question', { timeout: 60_000 }, async () => {
