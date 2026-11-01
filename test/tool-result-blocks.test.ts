@@ -1013,7 +1013,7 @@ describe("MCP's embedded resource, an ordinary inline block (RFC-005 §8.1)", ()
     // Ada-1017, room-203 #206688: its never counts in the result's claims,
     // on the model's line as a content array and at depth.
     const line = toolResultDataToHistoryString([sealed, link]);
-    assert.ok(line.startsWith(`${INLINE_WITHHELD_TEXT}\n`) && !line.includes(SEALED_URI), line);
+    assert.ok(line.startsWith('[Resource not shown: a server asked that its content never reach you or your tools.]\n') && !line.includes(SEALED_URI), line);
     const nested = toolResultDataToHistoryString({ a: sealed, b: link });
     assert.ok(!nested.includes(SEALED_URI), nested);
     assert.equal(contentClaimsOf([sealed]).get(SEALED_URI)?.never, true);

@@ -490,6 +490,26 @@ test("an MCPL peer's failure a module gets through ctx.callTool marks, by a `nev
     await script('fwd--whole');
     assert.equal(nested.payloadNever, true, 'a `never` nested in a failure\'s block marks as a success\'s would');
     assert.deepEqual([referenceRegistry.findByUri(nestedFresh)?.payloadNever, referenceRegistry.findByUri(nestedFresh)?.serverIds], [true, ['files']], 'and registers its uri marked where it has no record');
+    const unreadable = `https://files.example.invalid/failure-never/${randomUUID()}-unreadable.pdf`;
+    answer({ content: [{ type: 'resource', uri: unreadable, disposition: 'never' }, { type: 'text', text: 'the attach failed', count: BigInt(1) }], isError: true });
+    await script('fwd--whole');
+    assert.deepEqual([referenceRegistry.findByUri(unreadable)?.payloadNever, referenceRegistry.findByUri(unreadable)?.serverIds], [true, ['files']], "a top-level `never` registers where the nested walk can't read the result");
+  });
+});
+
+test("an MCPL peer's embedded resource beside a `never` for its uri reaches a script as the `never` notice, in either order, called directly and through a module", async () => {
+  await withPeers(async ({ answer, script }) => {
+    for (const order of ['embedded-first', 'never-first'] as const) {
+      for (const tool of ['mcpl--files--attach', 'fwd--whole'] as const) {
+        const uri = `https://files.example.invalid/embedded-never/${randomUUID()}.txt`;
+        const embedded = { type: 'resource', resource: { uri, mimeType: 'text/plain', text: 'embedded-secret' } };
+        const sealed = { type: 'resource', uri, name: 'sealed.txt', disposition: 'never' };
+        answer({ content: order === 'embedded-first' ? [embedded, sealed] : [sealed, embedded], structuredContent: {} });
+        const out = await script(tool);
+        assert.ok(!out.includes('embedded-secret'), `${order}, ${tool}: ${out}`);
+        assert.ok(out.includes('a server asked that its content never reach you or your tools'), `${order}, ${tool}: ${out}`);
+      }
+    }
   });
 });
 

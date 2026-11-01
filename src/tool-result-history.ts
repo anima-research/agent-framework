@@ -172,10 +172,9 @@ function toolResultBlock(raw: unknown, claims: ResultClaims): ToolResultBlock {
       return { kind: 'marker', text: c.shown };
     case 'embedded':
       // MCP's embedded resource shows as the block its contents make would
-      // show here. Its uri never shows.
-      if (c.contents.kind === 'block') {
-        return embeddedWithheld(raw, claims) ? { kind: 'withheld', text: EMBEDDED_RESOURCE_NEVER_TEXT } : toolResultBlock(c.contents.block, claims);
-      }
+      // show here, unless a `never` names its uri. Its uri never shows.
+      if (embeddedWithheld(raw, claims)) return { kind: 'withheld', text: EMBEDDED_RESOURCE_NEVER_TEXT };
+      if (c.contents.kind === 'block') return toolResultBlock(c.contents.block, claims);
       return c.contents.kind === 'withheld'
         ? { kind: 'withheld', text: INLINE_WITHHELD_TEXT }
         : { kind: 'marker', text: c.contents.text };

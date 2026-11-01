@@ -11,7 +11,7 @@ import { convertBlock, convertBlocks } from '../src/mcpl/convert-block.js';
 import { ReferenceFetcher } from '../src/mcpl/reference-fetcher.js';
 import * as references from '../src/mcpl/references.js';
 import {
-  EMBEDDED_RESOURCE_NEVER_TEXT, ReferenceRegistry, buildReferenceStub, classifyBlock, contentClaims, referenceBlockForScript,
+  ReferenceRegistry, buildReferenceStub, classifyBlock, contentClaims, referenceBlockForScript,
   referenceRegistry, shownLinkUri, unfetchableReason,
 } from '../src/mcpl/references.js';
 import type { ReferenceRecord, ReferenceTestimony } from '../src/mcpl/references.js';
@@ -178,31 +178,53 @@ describe('the payload mark', () => {
     });
   });
 
-  it("withholds an embedded resource's contents where its uri is `never`, beside a `never` for it in either order or by a server's earlier mark: on the lanes, in history and to a script", async () => {
-    const embedded = (uri: string) => ({ type: 'resource', resource: { uri, text: 'secret contents', mimeType: 'text/plain' } });
+  it("withholds an embedded resource's contents, text or blob, where its uri is `never`, beside a `never` for it in either order, by its own `never`, or by a server's earlier mark: on the lanes, in history and to a script", async () => {
+    const NOTICE = '[Resource not shown: a server asked that its content never reach you or your tools.]';
+    const notice = { type: 'text', text: NOTICE };
+    const contents = {
+      text: (uri: string) => ({ type: 'resource', resource: { uri, text: 'secret contents', mimeType: 'text/plain' } }),
+      blob: (uri: string) => ({ type: 'resource', resource: { uri, blob: 'aGk=', mimeType: 'application/pdf' } }),
+    };
     const neverRef = (uri: string) => ({ type: 'resource', uri, disposition: 'never' });
-    const withheldText = { type: 'text', text: EMBEDDED_RESOURCE_NEVER_TEXT };
     await quietly(() => {
-      for (const order of ['embedded-first', 'never-first'] as const) {
-        const uri = uniq(`${order}.txt`);
-        const blocks = order === 'embedded-first' ? [embedded(uri), neverRef(uri)] : [neverRef(uri), embedded(uri)];
-        const at = order === 'embedded-first' ? 0 : 1;
-        const lane = convertBlocks(blocks as McplContentBlock[], 'attachment on push event', 'zz-never-dialed');
-        assert.deepEqual(lane[at], withheldText, `lane, ${order}`);
-        const history = toolResultDataToHistoryString(blocks);
-        assert.ok(!history.includes('secret contents') && history.includes(EMBEDDED_RESOURCE_NEVER_TEXT), `history, ${order}: ${history}`);
-        const object = referenceBlockForScript(blocks[at], 'zz-never-dialed', contentClaims(blocks));
-        assert.deepEqual(object, withheldText, `script, ${order}`);
+      for (const [kind, embedded] of Object.entries(contents)) {
+        for (const order of ['embedded-first', 'never-first'] as const) {
+          const unit = (uri: string) => order === 'embedded-first' ? [embedded(uri), neverRef(uri)] : [neverRef(uri), embedded(uri)];
+          const at = order === 'embedded-first' ? 0 : 1;
+          const label = `${kind}, ${order}`;
+          const lane = uniq(`lane-${kind}-${order}`);
+          assert.deepEqual(convertBlocks(unit(lane) as McplContentBlock[], 'attachment on push event', 'zz-never-dialed')[at], notice, `lane, ${label}`);
+          // A tool result's own claims, with no server's mark: its history registers without a server.
+          const history = uniq(`history-${kind}-${order}`);
+          const shown = toolResultDataToHistoryString(unit(history));
+          assert.ok(!shown.includes('secret contents') && shown.includes(NOTICE), `history, ${label}: ${shown}`);
+          assert.equal(referenceRegistry.findByUri(history)?.payloadNever, undefined, `history, ${label}: no mark`);
+          const script = uniq(`script-${kind}-${order}`);
+          assert.deepEqual(referenceBlockForScript(unit(script)[at], undefined, contentClaims(unit(script))), notice, `script, ${label}`);
+          assert.equal(referenceRegistry.findByUri(script), undefined, `script, ${label}: no record`);
+        }
+        const own = uniq(`own-${kind}`);
+        const ownNever = { ...embedded(own), disposition: 'never' };
+        assert.deepEqual(convertBlocks([ownNever] as McplContentBlock[], 'attachment on push event', 'zz-never-dialed')[0], notice, `lane, ${kind}, its own never`);
+        assert.ok(toolResultDataToHistoryString([ownNever]).includes(NOTICE), `history, ${kind}, its own never`);
+        assert.deepEqual(referenceBlockForScript(ownNever, undefined, contentClaims([ownNever])), notice, `script, ${kind}, its own never`);
+        const marked = uniq(`marked-${kind}`);
+        referenceRegistry.register(testimonyOf(neverRef(marked)), 'zz-never-dialed');
+        assert.deepEqual(convertBlock(embedded(marked) as McplContentBlock, 'attachment on push event', 'zz-other'), notice, `lane, ${kind}, after a mark`);
+        assert.ok(toolResultDataToHistoryString([embedded(marked)]).includes(NOTICE), `history, ${kind}, after a mark`);
+        assert.deepEqual(referenceBlockForScript(embedded(marked), 'zz-other', contentClaims([embedded(marked)])), notice, `script, ${kind}, after a mark`);
       }
-      const marked = uniq('marked.txt');
-      referenceRegistry.register(testimonyOf(neverRef(marked)), 'zz-never-dialed');
-      assert.deepEqual(convertBlock(embedded(marked) as McplContentBlock, 'attachment on push event', 'zz-other'), withheldText, 'lane, after a mark');
-      const history = toolResultDataToHistoryString([embedded(marked)]);
-      assert.ok(!history.includes('secret contents') && history.includes(EMBEDDED_RESOURCE_NEVER_TEXT), `history, after a mark: ${history}`);
-      assert.deepEqual(referenceBlockForScript(embedded(marked), 'zz-other', contentClaims([embedded(marked)])), withheldText, 'script, after a mark');
       const plain = uniq('plain.txt');
-      assert.deepEqual(convertBlock(embedded(plain) as McplContentBlock, 'attachment on push event', 'zz-other'), { type: 'text', text: 'secret contents' }, 'a uri nothing calls `never` shows its contents');
+      assert.deepEqual(convertBlock(contents.text(plain) as McplContentBlock, 'attachment on push event', 'zz-other'), { type: 'text', text: 'secret contents' }, 'a uri nothing calls `never` shows its contents');
     });
+  });
+
+  it("leaves each reference's own expiry on a lane message without a `never`, where two name one uri", async () => {
+    const uri = uniq('two-expiries.csv');
+    const blocks = [{ type: 'resource', uri, name: 'a.csv', expiresAt: '2001-01-01T00:00:00Z' }, { type: 'resource', uri, name: 'b.csv' }];
+    const [first, second] = (await quietly(() => convertBlocks(blocks as McplContentBlock[], 'attachment on push event', 'zz-never-dialed'))).value as Array<{ text: string }>;
+    assert.match(first!.text, /expired/, first!.text);
+    assert.doesNotMatch(second!.text, /expired/, second!.text);
   });
 
   it("is replaced by the first server's word for a record only a module had named, a link included, so a module's `never` or digest doesn't follow the uri once a server speaks for it", () => {

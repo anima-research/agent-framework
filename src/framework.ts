@@ -212,11 +212,16 @@ function neverClaims(content: unknown[]): ResultClaims | undefined {
 }
 
 function neverReferences(content: unknown[]): ReferenceTestimony[] {
+  let found: ReferenceTestimony[];
   try {
-    return scriptViewReferences(content, true).filter((t) => t.disposition === 'never');
+    found = scriptViewReferences(content, true);
   } catch {
-    return [];
+    found = content.flatMap((block) => {
+      const c = classifyBlock(block);
+      return c.kind === 'reference' ? [c.testimony] : [];
+    });
   }
+  return found.filter((t) => t.disposition === 'never');
 }
 
 /** An MCPL tool call refused because its server isn't in the registry: one
@@ -27607,8 +27612,8 @@ export class AgentFramework {
       // fetched here: an in-process caller may never show them to an agent,
       // and an eager fetch would spend the server's fetch budget, which the
       // agent's own fetch_reference needs, on bytes nobody asked for. A
-      // failure keeps only its text, so no stub is made of its references and
-      // they aren't registered. Only an MCPL peer's blocks are references; a
+      // failure keeps only its text, so no stub is made of its references,
+      // and only its `never` references are registered, marked. Only an MCPL peer's blocks are references; a
       // modern server's and an MCP-only peer's are standard. An MCPL peer's
       // content is marked as content (dataIsContent), as on the model's path.
       if (server && server.capabilities !== null) {

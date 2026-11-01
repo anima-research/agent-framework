@@ -97,10 +97,11 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
 
     case 'resource': {
       // MCP's embedded resource shows as the block its contents make would
-      // show here (RFC-005 §8.1), its uri never.
+      // show here (RFC-005 §8.1), its uri never, unless a `never` names its
+      // uri.
       const c = classifyBlock(block);
+      if (c.kind === 'embedded' && embeddedWithheld(block, claims)) return { type: 'text', text: EMBEDDED_RESOURCE_NEVER_TEXT };
       if (c.kind === 'embedded' && c.contents.kind === 'block') {
-        if (embeddedWithheld(block, claims)) return { type: 'text', text: EMBEDDED_RESOURCE_NEVER_TEXT };
         return convertBlock(c.contents.block as McplContentBlock, provenance, serverId, claims);
       }
       // RFC-005: reference blocks become bounded stubs — never raw URIs

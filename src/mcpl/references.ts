@@ -1309,8 +1309,10 @@ export function referenceBlockForScript(block: unknown, serverId?: string, claim
       // its uri or its `resource` record (Ada-1017, room-203 #206688): text,
       // or inline data that claims nothing, as such a block reaches a script;
       // the withheld notice where it claims a disposition; its marker
-      // otherwise. Given again, each is as it was.
-      if (c.contents.kind === 'block') return embeddedWithheld(block, claims) ? { type: 'text', text: EMBEDDED_RESOURCE_NEVER_TEXT } : c.contents.block;
+      // otherwise; and the `never` notice, whatever its contents, where a
+      // `never` names its uri. Given again, each is as it was.
+      if (embeddedWithheld(block, claims)) return { type: 'text', text: EMBEDDED_RESOURCE_NEVER_TEXT };
+      if (c.contents.kind === 'block') return c.contents.block;
       return { type: 'text', text: c.contents.kind === 'withheld' ? INLINE_WITHHELD_TEXT : c.contents.text };
     case 'reference': {
       const t = c.testimony;
