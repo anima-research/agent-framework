@@ -18663,6 +18663,8 @@ export class AgentFramework {
     check?: RequiredIngress['check'],
   ): Promise<ChannelIncomingMessageResult> {
     return this.admitCoalesced(async () => {
+      const replay = check && this.replayCoalescedIncoming(serverId, message);
+      if (replay) return replay;
       const reason = check?.();
       if (reason) return { messageId: message.messageId, accepted: false, reason };
       if (!this.pushCoalescer) throw new CoalesceError('coalesce', 'coalescing unavailable', -32000);
@@ -18703,28 +18705,52 @@ export class AgentFramework {
         event: { lane: 'channel', event: { ...event, eventId: message.eventId, inboundSource } },
       }, check);
       if (!result.accepted) return { messageId: message.messageId, ...result };
-      // The registry's anchor follows a delivery the coalescer marked as the
-      // agent's first view, as the turn's locus does. The receipt says so for
-      // this acceptance, and for a retry it answers, whose first attempt
-      // delivered the message but failed before its acknowledgement. A
-      // receipt restored after a restart carries no mark, so a retry it
-      // answers leaves the anchor where a marker would, as the host already
-      // counts what was stored before a restart as shown: every agent's
-      // shown watermark starts at the head at boot.
-      const firstView = this.pushCoalescer.receiptFirstView(serverId, this.coalescingBinding(serverId), message.eventId);
-      // Acknowledged: the anchor the delivery parked is committed now (and a
-      // retry answered from the receipt commits its first attempt's).
-      const parked = this.parkedAnchors.get(`${serverId}:${message.eventId}`);
-      if (parked) {
-        this.parkedAnchors.delete(`${serverId}:${message.eventId}`);
-        this.channelRegistry?.noteDelivered(parked.channel, parked.messageId, parked.threadId, parked.tags, parked.firstView || firstView === true);
-      }
-      return { messageId: message.messageId, accepted: true, coalesce: result.coalesce, ...(firstView ? { firstView: true as const } : {}) };
+      return this.finishCoalescedIncoming(serverId, message, result);
+    });
+  }
+
+  private replayCoalescedIncoming(serverId: string, message: ChannelIncomingMessage): Promise<ChannelIncomingMessageResult> | undefined {
+    if (typeof message.eventId !== 'string') return undefined;
+    return this.pushCoalescer?.replayReceipt({
+      serverId, binding: this.coalescingBinding(serverId), eventId: message.eventId,
+      scope: { kind: 'channel', id: message.channelId }, key: message.coalesce?.key ?? '',
+    })?.then(result => this.finishCoalescedIncoming(serverId, message, result));
+  }
+
+  private finishCoalescedIncoming(serverId: string, message: ChannelIncomingMessage, result: PushEventResult): ChannelIncomingMessageResult & { firstView?: true } {
+    // The registry's anchor follows a delivery the coalescer marked as the
+    // agent's first view, as the turn's locus does. The receipt says so for
+    // this acceptance, and for a retry it answers, whose first attempt
+    // delivered the message but failed before its acknowledgement. A
+    // receipt restored after a restart carries no mark, so a retry it
+    // answers leaves the anchor where a marker would, as the host already
+    // counts what was stored before a restart as shown: every agent's
+    // shown watermark starts at the head at boot.
+    const firstView = this.pushCoalescer?.receiptFirstView(serverId, this.coalescingBinding(serverId), message.eventId!);
+    // Acknowledged: the anchor the delivery parked is committed now (and a
+    // retry answered from the receipt commits its first attempt's).
+    const parked = this.parkedAnchors.get(`${serverId}:${message.eventId}`);
+    if (parked) {
+      this.parkedAnchors.delete(`${serverId}:${message.eventId}`);
+      this.channelRegistry?.noteDelivered(parked.channel, parked.messageId, parked.threadId, parked.tags, parked.firstView || firstView === true);
+    }
+    return { messageId: message.messageId, accepted: true, coalesce: result.coalesce, ...(firstView ? { firstView: true as const } : {}) };
+  }
+
+  private replayCoalescedPush(serverId: string, params: PushEventParams): Promise<PushEventResult> | undefined {
+    if (typeof params.eventId !== 'string') return undefined;
+    const c = params.coalesce;
+    return this.pushCoalescer?.replayReceipt({
+      serverId, binding: this.coalescingBinding(serverId), eventId: params.eventId,
+      scope: c?.channelId ? { kind: 'channel', id: c.channelId } : { kind: 'featureSet', id: params.featureSet },
+      key: c?.key ?? '',
     });
   }
 
   private handleCoalescedPush(serverId: string, params: PushEventParams, event: McplPushEvent, check?: RequiredIngress['check']): Promise<PushEventResult> {
     return this.admitCoalesced(async () => {
+      const replay = check && this.replayCoalescedPush(serverId, params);
+      if (replay) return replay;
       const reason = check?.();
       if (reason) return { accepted: false, reason };
       if (!this.pushCoalescer) throw new CoalesceError('coalesce', 'coalescing unavailable', -32000);
@@ -32095,6 +32121,7 @@ export class AgentFramework {
         this.noteInboundAccepted(source);
         return source;
       },
+      (serverId, params) => this.replayCoalescedPush(serverId, params),
     );
 
     // Server-initiated inference router (Step 6)
@@ -32118,6 +32145,7 @@ export class AgentFramework {
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
       {
         store: this.store,
+        replayCoalescedIncoming: (serverId, message) => this.replayCoalescedIncoming(serverId, message),
         handleCoalescedIncoming: (serverId, message, event, check) =>
           this.handleCoalescedIncoming(serverId, message, event as CoalescedChannelEvent, check),
         // An ordinary channels/incoming message: freeze its envelope and

@@ -87,6 +87,17 @@ The verdict is checked again against the current connection, epoch, grant and
 channel registration at the coalescer's first effect, after waiting for its lock.
 Its private envelope, including the wake ceiling, follows the admitted delivery.
 
+RFC-006 retries are not new admission decisions. On either lane, an occurrence
+with a live receipt for the same server, binding and `eventId` returns its original
+accepted result without invoking the callback or repeating content effects. A
+receipt created while another callback is running also takes precedence over
+that callback's refusal or stale verdict; the mutex recheck cannot turn already
+admitted work into a refusal. Only admitted work creates receipts. Refusals do
+not reserve an `eventId`, and once the receipt window expires an item goes through
+admission again. Receipt replay retains the durability barrier: an acceptance
+whose acknowledgement failed must still be persisted/committed before replay
+can succeed.
+
 Multi-item `channels/incoming` requests remain itemwise, sequential admissions,
 including coalesced items; they are not an atomic batch. Deferred `push/event`
 notices (`coalesce.deferred: true`) still refuse explicitly with

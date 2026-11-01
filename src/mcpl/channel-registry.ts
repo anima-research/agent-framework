@@ -977,6 +977,8 @@ interface ChannelRegistryOptions {
    * acceptance here; coalesced work is stamped and observed by its own path.
    */
   acceptInbound?: (event: McplChannelIncomingEvent) => InboundSource | undefined;
+  /** Required-only receipt replay, without a new admission decision. */
+  replayCoalescedIncoming?: (serverId: string, message: ChannelIncomingMessage) => Promise<ChannelIncomingMessageResult> | undefined;
   /**
    * RFC-006: an admitted `channels/incoming` message carrying `coalesce`, with
    * the event the ordinary path would have queued. The handler decides
@@ -1577,6 +1579,7 @@ export class ChannelRegistry {
     return this.channelLifecycleTails.has(this.lifecycleKey(entry.serverId, entry.descriptor.id));
   }
   private handleCoalescedIncoming?: ChannelRegistryOptions['handleCoalescedIncoming'];
+  private replayCoalescedIncoming?: ChannelRegistryOptions['replayCoalescedIncoming'];
   private acceptInbound?: ChannelRegistryOptions['acceptInbound'];
   private channelTools: ToolDefinition[];
 
@@ -1595,6 +1598,7 @@ export class ChannelRegistry {
     },
   ) {
     this.handleCoalescedIncoming = options?.handleCoalescedIncoming;
+    this.replayCoalescedIncoming = options?.replayCoalescedIncoming;
     this.acceptInbound = options?.acceptInbound;
     this.channelTools = CHANNEL_TOOL_DEFINITIONS.map((tool) => {
       if (tool.name !== 'skip_reply' || options?.eventGatePresent === true) return tool;
@@ -1864,6 +1868,34 @@ export class ChannelRegistry {
     // The batch came on the transport open now: a close after this point
     // (transportClosed) leaves its traffic nothing to confirm.
     const closesAtArrival = this.transportCloses.get(serverId) ?? 0;
+    const coalesceFailure = (message: ChannelIncomingMessage, error: unknown): boolean => {
+      const err = error as Error & { code?: number; field?: string; admitted?: boolean };
+      // -32602 is answered coalesce_invalid; anything else as its message,
+      // a plain Error standing for an internal error (-32603).
+      const code = typeof err.code === 'number' ? err.code : -32603;
+      this.traceCoalesceRejection(serverId, message, err, code);
+      if (err.admitted && responder?.respondError) {
+        // Admitted, with its effects in: only the acknowledgement failed,
+        // so `accepted: false`, which says the message wasn't admitted,
+        // would be untrue, and a producer would hold it as never
+        // delivered. A per-message result can't say "may have been
+        // admitted" (§14.3); an error for the request is the spec's
+        // answer for that. Nothing after this message is admitted, since
+        // the producer sends the request's messages again: a coalesced
+        // one is answered from its receipt, and an uncoalesced one
+        // before this message is admitted again. (A responder without
+        // respondError, which only an in-process caller passes, gets the
+        // per-message answer below: it can't be told anything else.)
+        requestError = { code, message: err.message, ...(err.field ? { field: err.field } : {}) };
+        return true;
+      }
+      results.push({
+        messageId: message.messageId,
+        accepted: false,
+        reason: err.code === -32602 ? 'coalesce_invalid' : err.message,
+      });
+      return false;
+    };
 
     for (const message of params.messages) {
       if (!message || typeof message.channelId !== 'string' || !message.channelId
@@ -1936,12 +1968,31 @@ export class ChannelRegistry {
           this.admissionRefusals.report(this.emitTraceFn, serverId, 'channels/incoming', reason, message);
           results.push({ messageId: message.messageId, accepted: false, reason });
         };
+        const replay = () => {
+          const receipt = message.coalesce !== undefined ? this.replayCoalescedIncoming?.(serverId, message) : undefined;
+          return receipt?.then(result => {
+            const { firstView: _firstView, ...wire } = result as ChannelIncomingMessageResult & { firstView?: true };
+            results.push(wire);
+          }, error => { coalesceFailure(message, error); });
+        };
+        const receipt = replay();
+        if (receipt) {
+          await receipt;
+          if (requestError) break;
+          continue;
+        }
         const before = admission.check();
         if (before) { refuse(before); continue; }
         const entry = this.channels.get(incomingKey)!;
         const target = entry.descriptor;
         checkAdmission = () => admission.check() ?? (this.channels.get(incomingKey) !== entry || entry.descriptor !== target ? 'admission_stale' : undefined);
         const verdict = await admission.admit('channels/incoming', message);
+        const concurrentReceipt = replay();
+        if (concurrentReceipt) {
+          await concurrentReceipt;
+          if (requestError) break;
+          continue;
+        }
         const reason = checkAdmission();
         if (reason || !verdict.store) {
           refuse(reason ?? (!verdict.store ? verdict.reason : 'admission_stale'));
@@ -2093,31 +2144,7 @@ export class ChannelRegistry {
           if (result.accepted) markAccepted(firstView === true);
           results.push(result);
         } catch (error) {
-          const err = error as Error & { code?: number; field?: string; admitted?: boolean };
-          // -32602 is answered coalesce_invalid; anything else as its message,
-          // a plain Error standing for an internal error (-32603).
-          const code = typeof err.code === 'number' ? err.code : -32603;
-          this.traceCoalesceRejection(serverId, message, err, code);
-          if (err.admitted && responder?.respondError) {
-            // Admitted, with its effects in: only the acknowledgement failed,
-            // so `accepted: false`, which says the message wasn't admitted,
-            // would be untrue, and a producer would hold it as never
-            // delivered. A per-message result can't say "may have been
-            // admitted" (§14.3); an error for the request is the spec's
-            // answer for that. Nothing after this message is admitted, since
-            // the producer sends the request's messages again: a coalesced
-            // one is answered from its receipt, and an uncoalesced one
-            // before this message is admitted again. (A responder without
-            // respondError, which only an in-process caller passes, gets the
-            // per-message answer below: it can't be told anything else.)
-            requestError = { code, message: err.message, ...(err.field ? { field: err.field } : {}) };
-            break;
-          }
-          results.push({
-            messageId: message.messageId,
-            accepted: false,
-            reason: err.code === -32602 ? 'coalesce_invalid' : err.message,
-          });
+          if (coalesceFailure(message, error)) break;
         }
         continue;
       }

@@ -129,6 +129,7 @@ export class PushHandler {
      *  or acknowledged: return its source envelope, frozen now
      *  (mcpl/inbound-source.ts). Coalesced work is stamped by its own path. */
     private readonly acceptInbound?: (event: McplPushEvent) => InboundSource | undefined,
+    private readonly replayCoalesced?: (serverId: string, params: PushEventParams) => Promise<PushEventResult> | undefined,
   ) {
     this.featureSetManager = featureSetManager;
     this.pushEventFn = pushEventFn;
@@ -162,6 +163,21 @@ export class PushHandler {
       this.admissionRefusals.report(this.emitTraceFn, serverId, 'push/event', reason, params);
       responder?.respond({ accepted: false, reason });
     };
+    const replay = () => {
+      const receipt = params.coalesce !== undefined ? this.replayCoalesced?.(serverId, params) : undefined;
+      return receipt?.then(result => {
+        this.emitTraceFn({ type: 'mcpl:push_event', serverId, eventId: params.eventId, featureSet: params.featureSet, coalesce: result.coalesce });
+        responder?.respond(result);
+      }, error => {
+        const err = error as Error & { code?: number; field?: string };
+        const code = err.code ?? -32603;
+        this.traceCoalesceRejection(serverId, params, err, code);
+        if (responder?.respondError) responder.respondError(code, err.message, { field: err.field });
+        else responder?.respond({ accepted: false, reason: err.message });
+      });
+    };
+    const receipt = replay();
+    if (receipt) { await receipt; return; }
     // Deferred notices aggregate into a later push/render batch, which has
     // no current-key re-admission across reconnect/recovery in this profile.
     // Plain occurrences, including edits and withdrawals, stand on their
@@ -173,6 +189,10 @@ export class PushHandler {
     const before = admission.check();
     if (before) { refuse(before); return; }
     const verdict = await admission.admit('push/event', params);
+    // Another occurrence with this eventId may have been admitted while the
+    // callback ran. Its receipt wins even over a refusal or a stale verdict.
+    const concurrentReceipt = replay();
+    if (concurrentReceipt) { await concurrentReceipt; return; }
     const check = () => {
       let reason = admission.check();
       try { this.featureSetManager.validateInbound(serverId, params.featureSet); } catch { reason ??= 'admission_stale'; }
