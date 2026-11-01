@@ -39,6 +39,12 @@ export class PublishArgsReader {
   sendKey?: 'content' | 'text';
   /** Everything streamed of that value so far. */
   sent = '';
+  /**
+   * `channelId` or `serverId` came as something other than a string. Dispatch
+   * reads such a selector its own way (a truthy one names no channel), so
+   * nothing about the call's channel can be told from here.
+   */
+  badSelector = false;
 
   private state: ReaderState = 'start';
   private key = '';
@@ -136,6 +142,7 @@ export class PublishArgsReader {
           this.streaming = this.key === this.sendKey && !this.streamed;
           return '';
         }
+        if (NAME_KEYS.has(this.key)) this.badSelector = true;
         if (ch === '{' || ch === '[') {
           this.state = 'nested';
           this.depth = 1;
@@ -310,8 +317,9 @@ export class SpeculativePublishStreams {
     }
     if (stream.phase !== 'streaming' || stream.dead) return;
     const text = stream.reader.push(fragment);
-    if (stream.reader.failed) {
-      // Not JSON this reader follows: the call won't parse, so it won't run.
+    if (stream.reader.failed || stream.reader.badSelector) {
+      // Not JSON this reader follows (the call won't parse, so it won't run),
+      // or a selector that isn't a string, which the publish reads otherwise.
       this.kill(stream);
       return;
     }
@@ -340,12 +348,13 @@ export class SpeculativePublishStreams {
       const call = byId.get(stream.toolId);
       // A call membrane marked (its block cut off or out of order) is refused
       // at dispatch, so it never publishes.
-      if (!call || call.name !== 'channel_publish' || stream.dead || call.unparseableInput !== undefined) {
+      const input = (call?.input && typeof call.input === 'object' ? call.input : {}) as Record<string, unknown>;
+      const badSelector = (['channelId', 'serverId'] as const).some((k) => input[k] !== undefined && typeof input[k] !== 'string');
+      if (!call || call.name !== 'channel_publish' || stream.dead || call.unparseableInput !== undefined || badSelector) {
         this.cancel(stream);
         continue;
       }
       stream.phase = 'called';
-      const input = (call.input && typeof call.input === 'object' ? call.input : {}) as Record<string, unknown>;
       // The text the publish posts, read as it reads it (content ?? text).
       // Chunks that went out with other text (a text alias before content,
       // a repeated key) are cancelled.

@@ -108,7 +108,14 @@ stream's channel, the stream is cancelled.
   `complete`'s content as the text that was published. This host completes a
   stream only when that text is what the chunks carried; otherwise it cancels
   the stream, and the publish that follows carries no `streamId`.
-- The publish that follows a completed stream carries the same `streamId`.
+- The publish that follows a stream carries the same `streamId`, and it is
+  final for that stream: it holds the published text, whatever comes after.
+  The host sends `complete` once it has the publish's outcome; a host that
+  stops while a publish is under way may close the connection first, so a
+  server should not wait for that `complete` once it has the publish.
+- A stream still open when the connection closes was not published: drop it.
+- A `channelId` or `serverId` that isn't a string stops the stream (the
+  publish reads such a selector its own way), and the publish goes as usual.
 - A host without this option sends §14.3 chunks only, and those carry no
   `speculative` flag.
 

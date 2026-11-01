@@ -323,6 +323,29 @@ test('streams: spokenPending names only the pending calls whose text went out', 
   assert.deepEqual(streams.spokenPending(), [], 'a publish under way ends its own stream');
 });
 
+test('streams: a channelId or serverId that is not a string stops the stream, wherever it comes', () => {
+  for (const [json, input] of [
+    ['{"channelId":"voice","serverId":42,"content":"Hello"}', { channelId: 'voice', serverId: 42, content: 'Hello' }],
+    ['{"channelId":"voice","content":"Hello","serverId":{"id":"bosun"}}', { channelId: 'voice', content: 'Hello', serverId: { id: 'bosun' } }],
+    ['{"serverId":true,"channelId":"voice","content":"Hello"}', { serverId: true, channelId: 'voice', content: 'Hello' }],
+  ] as const) {
+    const { sent, sink: s } = sink();
+    const streams = new SpeculativePublishStreams(s);
+    for (const ch of json) streams.onInputDelta('t1', 'channel_publish', ch);
+    const chunks = sent.filter((e) => e.kind === 'chunk');
+    if (chunks.length) assert.deepEqual(sent.at(-1), cancelled(), json);
+    streams.onToolCalls([publishCall('t1', input as Record<string, unknown>)]);
+    assert.equal(streams.dispatch('t1'), undefined, json);
+    assert.equal(sent.filter((e) => e.kind === 'complete').length, chunks.length ? 1 : 0, json);
+  }
+  // Decided when the round's calls arrive too, whatever the fragments showed.
+  const { sent, sink: s } = sink();
+  const streams = new SpeculativePublishStreams(s);
+  streams.onInputDelta('t1', 'channel_publish', '{"channelId":"voice","content":"Hello"}');
+  streams.onToolCalls([publishCall('t1', { channelId: 'voice', serverId: 42, content: 'Hello' })]);
+  assert.deepEqual(sent.at(-1), cancelled());
+});
+
 test('streams: a sink that throws never reaches the caller', () => {
   const streams = new SpeculativePublishStreams({
     target: () => voice,
