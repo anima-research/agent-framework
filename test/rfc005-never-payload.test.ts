@@ -16,7 +16,7 @@ import {
 } from '../src/mcpl/references.js';
 import type { ReferenceRecord, ReferenceTestimony } from '../src/mcpl/references.js';
 import type { McplContentBlock } from '../src/mcpl/types.js';
-import { scriptViewClaims } from '../src/tool-result-history.js';
+import { scriptViewClaims, toolResultDataToHistoryString } from '../src/tool-result-history.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 const PAYLOAD = Buffer.from('RIFF-zz-never-payload-'.repeat(20));
@@ -103,15 +103,15 @@ describe('the payload mark', () => {
       [true, undefined, undefined, undefined, undefined],
     );
     assert.deepEqual([record.testimony.name, record.testimony.disposition], ['second', 'never']);
-    assert.equal(marked.logged, `[refs] a server marked ${record.refId}'s payload never (RFC-005) after it was saved: its copy stays at scratch/refs/d.wav, where the agent's workspace tools can still find it; no stub, script object or fetch names it from here on`);
+    assert.equal(marked.logged, `[refs] the "one" server marked ${record.refId}'s payload never (RFC-005); the record is bound to "one". It was saved before: its copy stays at scratch/refs/d.wav, where the agent's workspace tools can still find it; no stub, script object or fetch names it from here on`);
     record.fetchedPath = 'scratch/refs/d-again.wav';
     const again = await quietly(() => {
       reg.register(testimonyOf({ type: 'resource', uri, disposition: 'never' }), 'one');
-      reg.markNevers(contentClaims([inlineNever(uri)]));
+      reg.markNevers(contentClaims([inlineNever(uri)]), 'one');
     });
     assert.deepEqual([record.fetchedPath, again.logged], ['scratch/refs/d-again.wav', '']);
     const bare = await quietly(() => reg.register(testimonyOf({ type: 'resource', uri: uniq('e.wav'), disposition: 'never' }), 'one'));
-    assert.deepEqual([bare.value.payloadNever, bare.logged], [true, '']);
+    assert.deepEqual([bare.value.payloadNever, bare.logged], [true, `[refs] the "one" server marked ${bare.value.refId}'s payload never (RFC-005); the record is bound to "one"`]);
   });
 
   it("is made by the result's claims for a plain reference, inline data's `never` before it included", () => {
@@ -122,37 +122,59 @@ describe('the payload mark', () => {
     assert.equal(reg.register(testimonyOf({ type: 'resource', uri: uniq('h.png') }), 'one', contentClaims(blocks)).payloadNever, undefined);
   });
 
-  it("is made by inline data's `never` for the record its uri has wherever the block is read, a later walk of an older result's block included, and makes no record", () => {
+  it("isn't made by classifying a block: inline data's `never` and an embedded resource's leave the record their uri has as it was", () => {
     const uri = uniq('j.png');
     const record = referenceRegistry.register(testimonyOf({ type: 'resource', uri }), 'one');
     classifyBlock(inlineNever(uri));
-    assert.equal(record.payloadNever, true);
-    const later = uniq('ja.png');
-    classifyBlock(inlineNever(later));
-    assert.equal(referenceRegistry.findByUri(later), undefined);
-    const made = referenceRegistry.register(testimonyOf({ type: 'resource', uri: later }), 'one');
-    assert.equal(made.payloadNever, undefined);
-    classifyBlock(inlineNever(later));
-    assert.equal(made.payloadNever, true);
-    const other = uniq('k.wav');
-    const plain = referenceRegistry.register(testimonyOf({ type: 'resource', uri: other }), 'one');
-    classifyBlock({ type: 'audio', uri: other, data: 'aGk=', mimeType: 'audio/wav', disposition: 'ref' });
-    assert.equal(plain.payloadNever, undefined);
+    classifyBlock({ type: 'audio', uri, data: 'aGk=', mimeType: 'audio/wav', disposition: 'never' });
+    assert.equal(classifyBlock({ type: 'resource', disposition: 'never', resource: { uri, text: 'the payload', mimeType: 'text/plain' } }).kind, 'embedded');
+    assert.equal(record.payloadNever, undefined);
   });
 
-  it("is made by an embedded resource's `never` for the record its resource's uri already has, wherever the block is read, and makes no record", () => {
-    const uri = uniq('embedded.txt');
+  it("isn't made by a `never` nested in a tool result's data that the history reads, or by a registration that knows no server", async () => {
+    const uri = uniq('relayed.png');
     const record = referenceRegistry.register(testimonyOf({ type: 'resource', uri }), 'one');
-    const embedded = { type: 'resource', disposition: 'never', resource: { uri, text: 'the payload', mimeType: 'text/plain' } };
-    assert.equal(classifyBlock(embedded).kind, 'embedded');
-    assert.equal(record.payloadNever, true);
-    const other = uniq('embedded-plain.txt');
-    const plain = referenceRegistry.register(testimonyOf({ type: 'resource', uri: other }), 'one');
-    classifyBlock({ type: 'resource', resource: { uri: other, text: 'the payload' } });
-    classifyBlock({ type: 'resource', disposition: 'ref', resource: { uri: other, text: 'the payload' } });
-    const absent = uniq('embedded-absent.txt');
-    classifyBlock({ type: 'resource', disposition: 'never', resource: { uri: absent, text: 'the payload' } });
-    assert.deepEqual([plain.payloadNever, referenceRegistry.findByUri(absent)], [undefined, undefined]);
+    const { logged } = await quietly(() => {
+      toolResultDataToHistoryString({ nested: inlineNever(uri) });
+      toolResultDataToHistoryString({ nested: { type: 'resource', uri, disposition: 'never' } });
+      referenceRegistry.register(testimonyOf({ type: 'resource', uri, disposition: 'never' }));
+    });
+    assert.deepEqual([record.payloadNever, logged], [undefined, '']);
+  });
+
+  it("is made by a server's inline data or embedded resource on a push, channel or injection lane, for the record its uri already has, and makes no record", () => {
+    for (const [name, block] of [
+      ['image', (uri: string) => inlineNever(uri)],
+      ['audio', (uri: string) => ({ type: 'audio', uri, data: 'aGk=', mimeType: 'audio/wav', disposition: 'never' })],
+      ['embedded', (uri: string) => ({ type: 'resource', disposition: 'never', resource: { uri, text: 'the payload', mimeType: 'text/plain' } })],
+    ] as const) {
+      const uri = uniq(`lane-${name}`);
+      const record = referenceRegistry.register(testimonyOf({ type: 'resource', uri }), 'one');
+      convertBlock(block(uri) as McplContentBlock, 'attachment on push event', 'zz-never-dialed');
+      assert.equal(record.payloadNever, true, name);
+      const absent = uniq(`lane-${name}-absent`);
+      convertBlock(block(absent) as McplContentBlock, 'attachment on push event', 'zz-never-dialed');
+      assert.equal(referenceRegistry.findByUri(absent), undefined, name);
+    }
+    const plain = uniq('lane-plain.txt');
+    const unmarked = referenceRegistry.register(testimonyOf({ type: 'resource', uri: plain }), 'one');
+    convertBlock({ type: 'resource', disposition: 'ref', resource: { uri: plain, text: 'the payload' } } as unknown as McplContentBlock, 'attachment on push event', 'zz-never-dialed');
+    assert.equal(unmarked.payloadNever, undefined);
+  });
+
+  it('is logged once, at its first mark, naming the server whose content made it and the servers the record is bound to', async () => {
+    const reg = new ReferenceRegistry();
+    const uri = uniq('logged.bin');
+    const record = reg.register(testimonyOf({ type: 'resource', uri }), 'one');
+    const first = await quietly(() => reg.register(testimonyOf({ type: 'resource', uri, disposition: 'never' }), 'two'));
+    assert.equal(first.logged, `[refs] the "two" server marked ${record.refId}'s payload never (RFC-005); the record is bound to "one", "two"`);
+    const again = await quietly(() => {
+      reg.register(testimonyOf({ type: 'resource', uri, disposition: 'never' }), 'three');
+      reg.markNevers(contentClaims([inlineNever(uri)]), 'three');
+    });
+    assert.equal(again.logged, '');
+    const made = await quietly(() => reg.register(testimonyOf({ type: 'resource', uri: uniq('made.bin'), disposition: 'never' }), 'one'));
+    assert.equal(made.logged, `[refs] the "one" server marked ${made.value.refId}'s payload never (RFC-005); the record is bound to "one"`);
   });
 
   it("is made by a `never` its claims hold for a record a uri already has, for a result nothing else reads, and by no other claim (markNevers)", () => {
@@ -161,12 +183,12 @@ describe('the payload mark', () => {
     const record = reg.register(testimonyOf({ type: 'resource', uri }), 'one');
     const claimed = contentClaims([{ type: 'resource', uri, expiresAt: '2000-01-01T00:00:00Z' }]);
     assert.ok(claimed.has(uri), 'the result claims something for the uri');
-    reg.markNevers(claimed);
+    reg.markNevers(claimed, 'one');
     assert.equal(record.payloadNever, undefined);
-    reg.markNevers(contentClaims([{ type: 'resource', uri, disposition: 'never' }]));
+    reg.markNevers(contentClaims([{ type: 'resource', uri, disposition: 'never' }]), 'one');
     assert.equal(record.payloadNever, true);
     const absent = uniq('i.png');
-    reg.markNevers(contentClaims([{ type: 'resource', uri: absent, disposition: 'never' }]));
+    reg.markNevers(contentClaims([{ type: 'resource', uri: absent, disposition: 'never' }]), 'one');
     assert.equal(reg.findByUri(absent), undefined);
   });
 
@@ -196,15 +218,18 @@ describe('what a marked record shows', () => {
     assert.ok(control.endsWith('— from tool zz — fetch with fetch_reference'), control);
   });
 
-  it("a stub and a script's object marked by their result's claims, inline data's `never` before the reference included", () => {
-    const [stubbed, scripted] = [uniq('v.wav'), uniq('w.wav')];
-    const stub = buildReferenceStub(testimonyOf({ type: 'resource', uri: stubbed, name: 'v.wav' }), 'from tool result', undefined,
-      { claims: contentClaims([inlineNever(stubbed), { type: 'resource', uri: stubbed }]) });
-    const record = referenceRegistry.findByUri(stubbed)!;
-    assert.deepEqual([record.payloadNever, stub], [true, `[${record.refId}] v.wav — from tool result — ${NEVER_TEXT}`]);
-    const object = referenceBlockForScript({ type: 'resource', uri: scripted, name: 'w.wav' }, undefined,
-      contentClaims([inlineNever(scripted), { type: 'resource', uri: scripted }])) as Record<string, unknown>;
-    assert.deepEqual([referenceRegistry.findByUri(scripted)?.payloadNever, object.unfetchable], [true, NEVER_TEXT]);
+  it("a stub and a script's object given the reason by their result's claims, inline data's `never` before the reference included, a server's claims marking the record and others' marking nothing", async () => {
+    for (const serverId of [undefined, 'zz-never-dialed']) {
+      const [stubbed, scripted] = [uniq('v.wav'), uniq('w.wav')];
+      const stub = buildReferenceStub(testimonyOf({ type: 'resource', uri: stubbed, name: 'v.wav' }), 'from tool result', serverId,
+        { claims: contentClaims([inlineNever(stubbed), { type: 'resource', uri: stubbed }]) });
+      const record = referenceRegistry.findByUri(stubbed)!;
+      const marked = serverId === undefined ? undefined : true;
+      assert.deepEqual([record.payloadNever, stub], [marked, `[${record.refId}] v.wav — from tool result — ${NEVER_TEXT}`], String(serverId));
+      const object = (await quietly(() => referenceBlockForScript({ type: 'resource', uri: scripted, name: 'w.wav' }, serverId,
+        contentClaims([inlineNever(scripted), { type: 'resource', uri: scripted }])))).value as Record<string, unknown>;
+      assert.deepEqual([referenceRegistry.findByUri(scripted)?.payloadNever, object.unfetchable, object.savedTo], [marked, NEVER_TEXT, null], String(serverId));
+    }
   });
 
   it("a script's object: no saved path and no uri, and why", () => {
@@ -216,13 +241,13 @@ describe('what a marked record shows', () => {
     assert.deepEqual([link.savedTo, link.unfetchable, 'uri' in link], [null, NEVER_TEXT, false]);
   });
 
-  it("a script's link: no uri where another lane marked its payload after the script lane began, though the line's record, as it stood, shows it", () => {
+  it("a script's link: no uri where another lane marked its payload after the script lane began, though the line's record, as it stood, shows it", async () => {
     const uri = uniq('x.txt');
     const link = { type: 'resource_link', uri, name: 'x.txt' };
     referenceRegistry.register(testimonyOf(link));
     const journal = referenceRegistry.openJournal();
     try {
-      referenceRegistry.register(testimonyOf({ type: 'resource', uri, disposition: 'never' }));
+      await quietly(() => referenceRegistry.register(testimonyOf({ type: 'resource', uri, disposition: 'never' }), 'zz-never-dialed'));
       referenceRegistry.register(testimonyOf({ type: 'resource', uri }));
       const claims = contentClaims([link]);
       assert.equal(shownLinkUri(testimonyOf(link), journal.before(uri)!, Date.now(), claims), uri, "the line's record shows the uri");
@@ -241,7 +266,7 @@ describe('what a marked record shows', () => {
     record.fetchedPath = saved;
     const journal = referenceRegistry.openJournal();
     try {
-      await quietly(() => referenceRegistry.markNevers(contentClaims([inlineNever(uri)])));
+      await quietly(() => referenceRegistry.markNevers(contentClaims([inlineNever(uri)]), 'zz-never-dialed'));
       assert.equal(record.payloadNever, true);
       assert.deepEqual([journal.before(uri)?.payloadNever, journal.before(uri)?.fetchedPath], [undefined, saved], "the line's record as it stood");
       const claims = contentClaims([link]);
@@ -463,17 +488,20 @@ describe("the framework's fetches", () => {
       });
     }
 
-    it(`pass over a marked payload in a module's result a script reads, with the blocks ${order}`, async () => {
+    it(`pass over a payload a module's result calls \`never\`, for that result, with the blocks ${order}`, async () => {
       const fetched: string[] = [];
       const { uris, existing, blocks } = result(reversed);
       await framework(fetched).scriptResultAnswer({ success: true, data: blocks, dataIsContent: true }, 'zz_tool', false);
       assert.deepEqual(fetched, [uris.plain]);
-      assert.equal(existing.payloadNever, true);
+      assert.equal(existing.payloadNever, undefined, "a module's `never` marks no record");
     });
   }
 
   for (const pass of ['the script demand', "a module's demand loop"] as const) {
-    it(`mark the record a \`never\` reference names before awaiting any fetch, in ${pass}, so a fetch of it meanwhile is refused`, async () => {
+    const verdict = pass === 'the script demand'
+      ? 'mark the record a `never` reference names before awaiting any fetch, in the script demand, so a fetch of it meanwhile is refused'
+      : "pass over, in a module's demand loop, a reference its result calls `never`, and leave its record unmarked, so another fetch of it meanwhile isn't refused";
+    it(verdict, async () => {
       const fw = Object.create(AgentFramework.prototype) as Fw;
       const [slow, vetoed] = [uniq('slow.bin'), uniq('vetoed.bin')];
       const record = referenceRegistry.register(testimonyOf({ type: 'resource', uri: vetoed }), 'zz-never-dialed');
@@ -482,7 +510,9 @@ describe("the framework's fetches", () => {
       const gate = new Promise<void>((resolve) => { release = resolve; });
       let downloading!: () => void;
       const started = new Promise<void>((resolve) => { downloading = resolve; });
+      const asked: string[] = [];
       const fetch = async (r: ReferenceRecord) => {
+        asked.push(r.testimony.uri);
         if (r.testimony.uri !== slow) return r.payloadNever ? NEVER_FAILURE : { ok: true, path: r.fetchedPath };
         downloading();
         await gate;
@@ -499,11 +529,14 @@ describe("the framework's fetches", () => {
       }
       try {
         await within('the slow download starting', started);
-        assert.deepEqual(await real.fetch(record), NEVER_FAILURE);
+        const meanwhile = (await quietly(() => real.fetch(record))).value;
+        if (pass === 'the script demand') assert.deepEqual(meanwhile, NEVER_FAILURE);
+        else assert.deepEqual([meanwhile.ok, record.payloadNever], [true, undefined]);
       } finally {
         release();
         await answering;
       }
+      assert.ok(!asked.includes(vetoed), `the ${pass} doesn't fetch it: ${asked.join(', ')}`);
     });
   }
 
@@ -533,7 +566,7 @@ describe("the framework's fetches", () => {
   it('log no failure for a record a `never` marks while they run', async () => {
     const fw = Object.create(AgentFramework.prototype) as Fw;
     const fetch = async (record: ReferenceRecord) => {
-      referenceRegistry.markNevers(contentClaims([inlineNever(record.testimony.uri)]));
+      referenceRegistry.markNevers(contentClaims([inlineNever(record.testimony.uri)]), 'srv');
       return NEVER_FAILURE;
     };
     fw.getReferenceFetcher = () => ({ isEagerEligible: () => true, fetch, fetchEager: fetch });
@@ -542,8 +575,12 @@ describe("the framework's fetches", () => {
       await fw.autoFetchReferences([{ type: 'resource', uri: eager }], 'zz-never-dialed', 'script');
       await fw.scriptResultAnswer({ success: true, data: [{ type: 'resource', uri: module }], dataIsContent: true }, 'zz_tool', false);
     });
-    assert.deepEqual([eager, module].map((u) => referenceRegistry.findByUri(u)?.payloadNever), [true, true]);
-    assert.equal(logged, '');
+    const [eagerRecord, moduleRecord] = [eager, module].map((u) => referenceRegistry.findByUri(u)!);
+    assert.deepEqual([eagerRecord.payloadNever, moduleRecord.payloadNever], [true, true]);
+    assert.equal(logged, [
+      `[refs] the "srv" server marked ${eagerRecord.refId}'s payload never (RFC-005); the record is bound to "zz-never-dialed"`,
+      `[refs] the "srv" server marked ${moduleRecord.refId}'s payload never (RFC-005); the record is bound to no server`,
+    ].join('\n'), 'the marks, and no failure');
   });
 
   it("answer fetch_reference for a marked record with the reason, and fetch nothing", async () => {
@@ -621,18 +658,19 @@ describe("the framework's fetcher", () => {
       const record = reg.register(testimonyOf({ type: 'resource', uri: saving }), 'zz-never-copies');
       const { value, logged } = await quietly(() => fetcher.fetch(record));
       assert.deepEqual([value, record.fetchedPath], [NEVER_FAILURE, undefined]);
-      return { path: `board/refs/${record.refId}.wav`, logged };
+      const marked = `[refs] the "zz-never-copies" server marked ${record.refId}'s payload never (RFC-005); the record is bound to "zz-never-copies"`;
+      return { path: `board/refs/${record.refId}.wav`, logged, marked };
     };
     const fetched = [await fetchOne(), await fetchOne(), await fetchOne()];
     assert.deepEqual(calls, fetched.map(({ path }) => ['delete', { path }]));
     assert.deepEqual(fetched.map(({ logged }) => logged), [
-      '',
-      `[refs] ${failure(fetched[1]!.path, 'zz-delete-refused')}`,
-      `[refs] ${failure(fetched[2]!.path, 'zz-delete-threw')}`,
+      fetched[0]!.marked,
+      `${fetched[1]!.marked}\n[refs] ${failure(fetched[1]!.path, 'zz-delete-refused')}`,
+      `${fetched[2]!.marked}\n[refs] ${failure(fetched[2]!.path, 'zz-delete-threw')}`,
     ]);
     afterSave = () => { fw.getWorkspaceModule = () => undefined; };
     const none = await fetchOne();
-    assert.equal(none.logged, `[refs] ${failure(none.path, 'this host has no workspace')}`);
+    assert.equal(none.logged, `${none.marked}\n[refs] ${failure(none.path, 'this host has no workspace')}`);
     assert.equal(calls.length, 3);
   });
 });

@@ -2,7 +2,7 @@ import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogu
 import { presentAuthor } from './author-presentation.js';
 import { constants as bufferConstants } from 'node:buffer';
 import { dirname, join } from 'node:path';
-import { EXPIRY_REASON, REFERENCE_LIMITS, claimedExpiry, classifyBlock, contentClaims, isReferenceExpired, referenceBlockForScript, referenceRegistry, sanitizeLabel, type RegistryJournal, type ResultClaims, type ScriptLine, type ServerAddress } from './mcpl/references.js';
+import { EXPIRY_REASON, REFERENCE_LIMITS, claimedExpiry, classifyBlock, contentClaims, isReferenceExpired, referenceBlockForScript, referenceRegistry, sanitizeLabel, withheld, type RegistryJournal, type ResultClaims, type ScriptLine, type ServerAddress } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES } from './mcpl/reference-fetcher.js';
 import {
   appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync,
@@ -8029,7 +8029,7 @@ export class AgentFramework {
     }>();
     const read = claims ?? neverClaims(content);
     const nevers = read ?? contentClaims(content);
-    referenceRegistry.markNevers(nevers);
+    referenceRegistry.markNevers(nevers, serverId);
     for (const block of content) {
       const c = classifyBlock(block);
       if (c.kind !== 'reference') continue;
@@ -27579,7 +27579,7 @@ export class AgentFramework {
       const direct = AgentFramework.directToolResult(result, serverId, call.name);
       if (direct.isError) {
         if (server && server.capabilities !== null && Array.isArray(result.content)) {
-          referenceRegistry.markNevers(neverClaims(result.content) ?? contentClaims(result.content));
+          referenceRegistry.markNevers(neverClaims(result.content) ?? contentClaims(result.content), serverId);
         }
         const { data: blocks, ...failure } = direct;
         let shown: ToolResult = failure;
@@ -28533,7 +28533,6 @@ export class AgentFramework {
         } catch (err) {
           return failed(err);
         }
-        referenceRegistry.markNevers(claims);
         // The loop's registrations are the line's own only where the line
         // renders these blocks: a content array's, block by block at the top
         // level, and not a failure's, whose line is its error. There the loop
@@ -28555,10 +28554,11 @@ export class AgentFramework {
         for (const block of result.data) {
           const c = classifyBlock(block);
           if (c.kind !== 'reference' || (c.testimony.fromLink && !blocksAreLines)) continue;
-          // Registered, not only found, so a re-issued reference's claims
-          // replace a link's, or a stale reference's, before the fetch reads
-          // them, as on any other path, while the record isn't fetched yet. A
-          // record its uri already has keeps the server it's bound to.
+          // Registered, not only found, so a uri with no record gets one. A
+          // module's claims don't replace a server's in a record its uri
+          // already has: a reference a module relays was registered with its
+          // server when ctx.callTool's result arrived (executeMcplToolCall).
+          // That record keeps the server it's bound to.
           const record = referenceRegistry.register(c.testimony, undefined, claims);
           // A link of blocks the line renders is registered too, in the
           // result's order, and not fetched: the registry then holds its
@@ -28568,7 +28568,7 @@ export class AgentFramework {
           // route, which reads the live registry, decides each link's uri as
           // the model's line does (Ada-1017, room-203 #203000).
           if (c.testimony.fromLink) continue;
-          if (record.payloadNever) continue;
+          if (withheld(record, claims)) continue;
           // A uri any of the result's references gives an expiry that counts
           // isn't fetched, as autoFetchReferences passes over one that any block
           // of an MCPL result marks expired.

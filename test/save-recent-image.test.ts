@@ -1000,9 +1000,9 @@ describe('save_recent_image provenance (issue #104)', () => {
     // after a restart, with no record at all.
     const uri = 'https://example.invalid/sri-reissued.png';
     const first = classifyBlock({ type: 'image', uri, mimeType: 'image/png' });
-    const record = referenceRegistry.register((first as { testimony: ReferenceTestimony }).testimony);
+    const record = referenceRegistry.register((first as { testimony: ReferenceTestimony }).testimony, 'vst');
     const again = classifyBlock({ type: 'resource', uri, mimeType: 'text/plain' });
-    referenceRegistry.register((again as { testimony: ReferenceTestimony }).testimony);
+    referenceRegistry.register((again as { testimony: ReferenceTestimony }).testimony, 'vst');
     assert.strictEqual(referenceRegistry.get(record.refId)?.testimony.mimeType, 'text/plain');
     const h = await startTurn({
       prefix: 'sri-reference-reissued-',

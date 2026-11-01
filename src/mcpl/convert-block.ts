@@ -13,6 +13,7 @@ import {
   IMAGE_NO_MEDIA_TYPE_TEXT,
   INLINE_WITHHELD_TEXT,
   classifyBlock,
+  inlineNeverUri,
   isInlineContradiction,
   referenceRegistry,
   referenceStubOrNull,
@@ -45,6 +46,7 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
       if (isInlineContradiction(block)) {
         // RFC-005 vector 2: inline data claiming bulk disposition — fail
         // closed, withhold the data (checked BEFORE the data branch).
+        markInlineNever(block, serverId);
         return { type: 'text', text: INLINE_WITHHELD_TEXT };
       }
       if (isFilledString(block.uri) && block.disposition !== undefined) {
@@ -76,6 +78,7 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
       if (isInlineContradiction(block)) {
         // RFC-005 vector 2: inline data claiming bulk disposition — fail
         // closed, withhold the data (checked BEFORE the data branch).
+        markInlineNever(block, serverId);
         return { type: 'text', text: INLINE_WITHHELD_TEXT };
       }
       if (isFilledString(block.uri) && block.disposition !== undefined) {
@@ -96,6 +99,7 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
       // MCP's embedded resource shows as the block its contents make would
       // show here (RFC-005 §8.1), its uri never.
       const c = classifyBlock(block);
+      markInlineNever(block, serverId, c);
       if (c.kind === 'embedded' && c.contents.kind === 'block') {
         return convertBlock(c.contents.block as McplContentBlock, provenance, serverId);
       }
@@ -117,6 +121,11 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
       return { type: 'text', text: unknownBlockText(block) };
     }
   }
+}
+
+function markInlineNever(block: McplContentBlock, serverId: string, c = classifyBlock(block)): void {
+  const uri = inlineNeverUri(block, c);
+  if (uri !== null) referenceRegistry.markNever(uri, serverId);
 }
 
 export function convertBlocks(blocks: readonly McplContentBlock[], provenance: string, serverId: string): ContentBlock[] {

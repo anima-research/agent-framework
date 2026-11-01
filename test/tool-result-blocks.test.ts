@@ -608,7 +608,7 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
     assert.deepEqual(referenceRegistry.findByUri(u('linked'))?.serverIds, ['zz-eager-server']);
   });
 
-  it("isn't fetched for a script on demand, where a reference is", async () => {
+  it("isn't fetched for a script on demand, where a reference is, whose fetch reads what its server said, not what a module's result says", async () => {
     const fw = Object.create(AgentFramework.prototype) as {
       getReferenceFetcher(): unknown;
       scriptResultAnswer(result: ToolResult, toolName: string, toServer: boolean): Promise<ScriptAnswer>;
@@ -617,8 +617,9 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
       type: 'resource', uri: `https://zz-files.example/wanted.pdf?sig=${SECRET}`, name: 'wanted.pdf',
       digest: `sha256:${'C'.repeat(43)}`, expiresAt: '2099-01-01T00:00:00Z',
     };
-    // A link to the same uri came first, so its record holds the link's
-    // claims until the reference's replace them.
+    // The zz-files server delivered a link to the same uri. A module's
+    // result then carries a reference to it with a digest and an expiry,
+    // which aren't the server's word, so the record keeps the server's.
     referenceRegistry.register(testimonyOf({ type: 'resource_link', uri: reference.uri, name: 'linked.pdf' }), 'zz-files');
     const fetched: string[] = [];
     const claims: unknown[] = [];
@@ -641,7 +642,7 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
     assert.equal(result.isError, false);
     const text = answerText(result);
     assert.deepEqual(fetched, [reference.uri]);
-    assert.deepEqual(claims, [['wanted.pdf', reference.digest, reference.expiresAt]]);
+    assert.deepEqual(claims, [['linked.pdf', undefined, undefined]]);
     // The script reads the text history stores for a protocol result's
     // content: the link, which no server delivered, as the stub that says so.
     assert.match(text, new RegExp(`^zz-text\\n${LINK_STUB.source.slice(0, -1)}\\n\\[ref_[^\\]]+\\] wanted\\.pdf — from tool result[^\\n]+\\n`));
@@ -1407,19 +1408,34 @@ describe('one answer for every block of a result', () => {
     assert.equal(after, before);
   });
 
-  it("keeps an earlier result's never on a uri, which marked its payload, so a later result's plain reference doesn't lift it for a link, whatever the order of its link and reference", () => {
+  it("keeps a server's earlier never on a uri, which marked its payload, so a later result's plain reference doesn't lift it for a link, whatever the order of its link and reference; a never from a result no server sent doesn't follow the uri there", () => {
     const orders: Array<[string, (link: unknown, plain: unknown) => unknown[]]> = [
       ['link-first', (link, plain) => [link, plain]],
       ['reference-first', (link, plain) => [plain, link]],
     ];
-    for (const [order, blocks] of orders) {
-      const uri = `https://zz-elsewhere.example/lifted-${order}.csv`;
-      // An earlier result marks the uri never.
-      toolResultDataToHistoryString([{ type: 'resource', uri, name: 'lifted.csv', disposition: 'never' }]);
-      const lines = toolResultDataToHistoryString(blocks(
-        { type: 'resource_link', uri, name: 'lifted.csv' }, { type: 'resource', uri, name: 'lifted.csv' })).split('\n');
-      assert.ok(!lines.some((line) => line.includes(uri)), `${order}: ${lines.join('\n')}`);
-      assert.equal(lines.filter((line) => /^\[ref_[^\]]+\] lifted\.csv — from tool result — a server asked that its content never reach you/.test(line)).length, 2, `${order}: ${lines.join('\n')}`);
+    const error = console.error;
+    console.error = () => {};
+    try {
+      for (const [order, blocks] of orders) {
+        for (const server of ['zz-elsewhere', undefined]) {
+          const uri = `https://zz-elsewhere.example/lifted-${order}-${server ?? 'none'}.csv`;
+          // An earlier result says the uri is never: a server's marks its record.
+          const earlier = { type: 'resource', uri, name: 'lifted.csv', disposition: 'never' };
+          if (server !== undefined) referenceRegistry.register(testimonyOf(earlier), server);
+          toolResultDataToHistoryString([earlier]);
+          const lines = toolResultDataToHistoryString(blocks(
+            { type: 'resource_link', uri, name: 'lifted.csv' }, { type: 'resource', uri, name: 'lifted.csv' })).split('\n');
+          const never = lines.filter((line) => /^\[ref_[^\]]+\] lifted\.csv — from tool result — a server asked that its content never reach you/.test(line)).length;
+          if (server !== undefined) {
+            assert.ok(!lines.some((line) => line.includes(uri)), `${order}: ${lines.join('\n')}`);
+            assert.equal(never, 2, `${order}: ${lines.join('\n')}`);
+          } else {
+            assert.equal(never, 0, `${order}, no server: ${lines.join('\n')}`);
+          }
+        }
+      }
+    } finally {
+      console.error = error;
     }
     // A result naming the uri only in a link leaves the earlier never in force.
     const uri = 'https://zz-elsewhere.example/lifted-link-only.csv';
