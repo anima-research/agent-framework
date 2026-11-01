@@ -14,10 +14,6 @@ for (const lane of ['channels/incoming', 'push/event'] as const) for (const coal
     const item = lane === 'channels/incoming' ? f.channel('one', 'hello', { initial: true }) : f.params('one', 'hello', { initial: true });
     if (!coalesced) delete (item as any).coalesce;
     const result = await f.send(lane, lane === 'channels/incoming' ? { messages: [item] } : item);
-    if (coalesced) {
-      assert.equal(lane === 'channels/incoming' ? result.result.results[0].reason : result.result.reason, 'admission_unsupported');
-      assert.equal(gates, 0); return;
-    }
     assert.equal(lane === 'channels/incoming' ? result.result.results[0].accepted : result.result.accepted, true);
     await f.framework.runUntilIdle();
     assert.equal(gates, mayWake ? 1 : 0);
@@ -32,7 +28,7 @@ for (const lane of ['channels/incoming', 'push/event'] as const) for (const coal
   const item = lane === 'channels/incoming' ? f.channel('one', 'stored', { initial: true }) : f.params('one', 'stored', { initial: true });
   if (!coalesced) delete (item as any).coalesce;
   await f.send(lane, lane === 'channels/incoming' ? { messages: [item] } : item);
-  await f.framework.runUntilIdle(); assert.equal(modules > 0, !coalesced); assert.equal(f.membrane.calls.length, 0);
+  await f.framework.runUntilIdle(); assert.equal(modules > 0, true); assert.equal(f.membrane.calls.length, 0);
 });
 
 test('required admission runtime AST has no connector vocabulary or platform grammar', () => {

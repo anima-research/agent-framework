@@ -73,12 +73,31 @@ Peers need no retry for host-internal staging or quiesce. A verdict is
 not a delivery receipt: existing content checks and downstream failures still
 apply; already admitted siblings are not rolled back.
 
-Required `channels/incoming` items and `push/event` requests carrying `coalesce`
-are refused with `admission_unsupported`, before the hook, dedup or acceptance.
-This profile does not promise durable coalesced acceptance until current-key
-re-admission of restored and prior-epoch batches exists. Unconfigured coalescing
-and its pending batches still survive reconnect/recovery unchanged. Drain pending
-coalesced work before enabling this profile on an existing configured binding.
+Single, non-deferred `channels/incoming` items and `push/event` requests carrying
+`coalesce` go through the admission callback, preserving the RFC-006 subject key.
+Each edit/delete stands on its own verdict: an approved edit replaces an admitted
+unread create for that key, and an approved withdrawal removes it. A refused
+replacement leaves the original untouched. Without an unread target, RFC-006's
+ordinary no-target handling applies: an approved edit is its own delivery, and
+an empty deletion is a no-op. A refused create leaves no stored content, subject
+or receipt for later replacement to revive; an independently approved edit never
+recovers that refused content. This also applies to never-seen subjects and
+already-read or prior-epoch creates. No per-key refusal history is retained.
+The verdict is checked again against the current connection, epoch, grant and
+channel registration at the coalescer's first effect, after waiting for its lock.
+Its private envelope, including the wake ceiling, follows the admitted delivery.
+
+Multi-item `channels/incoming` requests remain itemwise, sequential admissions,
+including coalesced items; they are not an atomic batch. Deferred `push/event`
+notices (`coalesce.deferred: true`) still refuse explicitly with
+`admission_unsupported` before the hook, dedup or acceptance. Their later
+`push/render` aggregates multiple occurrences, and this profile has no current-key
+re-admission for restored or prior-epoch batches. Unconfigured coalescing and its
+pending batches still survive reconnect/recovery unchanged. Drain pending
+**deferred batches** accepted while unconfigured before enabling this profile on
+an existing binding; ordinary coalesced creates, edits and withdrawals need no
+such drain. Restored or prior-epoch deferred work cannot borrow a new admission
+key.
 
 The channel adapter checks actual registration before preflight and rechecks the
 entry, connection, epoch, readiness and grant afterward. No effect runs on a

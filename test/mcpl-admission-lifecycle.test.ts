@@ -236,15 +236,16 @@ for (const required of [true, false]) for (const lane of ['channels/incoming', '
   const item = lane === 'push/event' ? f.params('pending', 'pending_body', { deferred: true }) : f.channel('pending', 'pending_body');
   const response = await f.send(lane, lane === 'push/event' ? item : { messages: [item] });
   const result = lane === 'push/event' ? response.result : response.result.results[0];
-  assert.equal(result.accepted, !required);
-  if (required) assert.equal(result.reason, 'admission_unsupported');
-  assert.equal(calls, 0);
+  const supported = !required || lane === 'channels/incoming';
+  assert.equal(result.accepted, supported);
+  if (!supported) assert.equal(result.reason, 'admission_unsupported');
+  assert.equal(calls, required && supported ? 1 : 0);
   const epoch = connection.transportEpoch;
   f.disconnect();
   await eventually(() => connection.transportEpoch > epoch && connection.isConnected && connection.dataPlaneReady);
   await f.register();
   await f.framework.runUntilIdle();
-  assert.equal(f.context().includes(lane === 'push/event' ? 'document_diff' : 'pending_body'), !required);
+  assert.equal(f.context().includes(lane === 'push/event' ? 'document_diff' : 'pending_body'), supported);
   if (required) assert.equal(f.renders.length, 0);
 });
 

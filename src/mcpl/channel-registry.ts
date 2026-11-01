@@ -990,6 +990,7 @@ interface ChannelRegistryOptions {
     serverId: string,
     message: ChannelIncomingMessage,
     event: McplChannelIncomingEvent,
+    check?: RequiredIngress['check'],
   ) => Promise<ChannelIncomingMessageResult & { firstView?: true }>;
   /** Chronicle store used for durable desired channel lifecycle state. */
   store?: JsStore;
@@ -1929,21 +1930,19 @@ export class ChannelRegistry {
       }
 
       let envelope: AdmittedEnvelope | undefined;
+      let checkAdmission: RequiredIngress['check'] | undefined;
       if (admission) {
         const refuse = (reason: import('./inbound-admission.js').RefusalCode) => {
           this.admissionRefusals.report(this.emitTraceFn, serverId, 'channels/incoming', reason, message);
           results.push({ messageId: message.messageId, accepted: false, reason });
         };
-        if (message.coalesce !== undefined) {
-          refuse('admission_unsupported');
-          continue;
-        }
         const before = admission.check();
         if (before) { refuse(before); continue; }
         const entry = this.channels.get(incomingKey)!;
         const target = entry.descriptor;
+        checkAdmission = () => admission.check() ?? (this.channels.get(incomingKey) !== entry || entry.descriptor !== target ? 'admission_stale' : undefined);
         const verdict = await admission.admit('channels/incoming', message);
-        const reason = admission.check() ?? (this.channels.get(incomingKey) !== entry || entry.descriptor !== target ? 'admission_stale' : undefined);
+        const reason = checkAdmission();
         if (reason || !verdict.store) {
           refuse(reason ?? (!verdict.store ? verdict.reason : 'admission_stale'));
           continue;
@@ -2087,7 +2086,10 @@ export class ChannelRegistry {
         // the coalescer, which replaces, appends or withdraws. Malformed
         // `coalesce` is a per-message failure; siblings are unaffected.
         try {
-          const { firstView, ...result } = await this.handleCoalescedIncoming!(serverId, message, event);
+          const { firstView, ...result } = await this.handleCoalescedIncoming!(serverId, message, event, checkAdmission);
+          if (admission && !result.accepted) {
+            this.admissionRefusals.report(this.emitTraceFn, serverId, 'channels/incoming', result.reason as import('./inbound-admission.js').RefusalCode, message);
+          }
           if (result.accepted) markAccepted(firstView === true);
           results.push(result);
         } catch (error) {
@@ -2410,6 +2412,14 @@ export class ChannelRegistry {
    *  DM classification. */
   getDescriptor(ref: ChannelRef): ChannelDescriptor | undefined {
     return this.entryAt(ref)?.descriptor;
+  }
+
+  /** Required channel-scoped pushes must retain the registration that was
+   * authorized before their asynchronous preflight, just like channel items. */
+  captureRegistration(ref: ChannelRef): () => boolean {
+    const entry = this.entryAt(ref);
+    const descriptor = entry?.descriptor;
+    return () => this.entryAt(ref) === entry && entry?.descriptor === descriptor;
   }
 
   /** The registered label of `channelId` on exactly `serverId` (no

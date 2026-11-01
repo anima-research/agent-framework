@@ -18660,8 +18660,11 @@ export class AgentFramework {
     serverId: string,
     message: ChannelIncomingMessage,
     event: CoalescedChannelEvent,
+    check?: RequiredIngress['check'],
   ): Promise<ChannelIncomingMessageResult> {
     return this.admitCoalesced(async () => {
+      const reason = check?.();
+      if (reason) return { messageId: message.messageId, accepted: false, reason };
       if (!this.pushCoalescer) throw new CoalesceError('coalesce', 'coalescing unavailable', -32000);
       validateCoalesceMember(message.coalesce, 'channel');
       if (typeof message.eventId !== 'string' || !message.eventId) {
@@ -18698,7 +18701,8 @@ export class AgentFramework {
         content: message.content,
         identity: { messageId: message.messageId, author: message.author, threadId: message.threadId },
         event: { lane: 'channel', event: { ...event, eventId: message.eventId, inboundSource } },
-      });
+      }, check);
+      if (!result.accepted) return { messageId: message.messageId, ...result };
       // The registry's anchor follows a delivery the coalescer marked as the
       // agent's first view, as the turn's locus does. The receipt says so for
       // this acceptance, and for a retry it answers, whose first attempt
@@ -18719,8 +18723,10 @@ export class AgentFramework {
     });
   }
 
-  private handleCoalescedPush(serverId: string, params: PushEventParams, event: McplPushEvent): Promise<PushEventResult> {
+  private handleCoalescedPush(serverId: string, params: PushEventParams, event: McplPushEvent, check?: RequiredIngress['check']): Promise<PushEventResult> {
     return this.admitCoalesced(async () => {
+      const reason = check?.();
+      if (reason) return { accepted: false, reason };
       if (!this.pushCoalescer) throw new CoalesceError('coalesce', 'coalescing unavailable', -32000);
       validateCoalesceMember(params.coalesce, 'push');
       if (typeof params.eventId !== 'string' || !params.eventId) throw new CoalesceError('eventId', 'eventId is required');
@@ -18779,7 +18785,7 @@ export class AgentFramework {
           },
         } : {}),
         event: { lane: 'push', event: { ...event, inboundSource } },
-      });
+      }, check);
     });
   }
 
@@ -32081,7 +32087,7 @@ export class AgentFramework {
       (event) => this.pushEvent(event as unknown as ProcessEvent),
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
       triggerFilter,
-      (serverId, params, event) => this.handleCoalescedPush(serverId, params, event),
+      (serverId, params, event, check) => this.handleCoalescedPush(serverId, params, event, check),
       // An ordinary push: freeze its envelope and observe the acceptance at
       // admission, before it is queued.
       (event) => {
@@ -32112,8 +32118,8 @@ export class AgentFramework {
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
       {
         store: this.store,
-        handleCoalescedIncoming: (serverId, message, event) =>
-          this.handleCoalescedIncoming(serverId, message, event as CoalescedChannelEvent),
+        handleCoalescedIncoming: (serverId, message, event, check) =>
+          this.handleCoalescedIncoming(serverId, message, event as CoalescedChannelEvent, check),
         // An ordinary channels/incoming message: freeze its envelope and
         // observe the acceptance at admission, before it is queued.
         acceptInbound: (event) => {
@@ -34876,10 +34882,14 @@ export class AgentFramework {
       }
       if (connection.requiredAdmission) {
         const original = connection.admissionFor(params);
+        const registration = params.coalesce?.channelId
+          ? this.channelRegistry?.captureRegistration({ serverId: connection.id, channelId: params.coalesce.channelId })
+          : undefined;
         const admission: RequiredIngress = {
           ...original,
           check: () => this.queue?.isClosed ? 'admission_not_ready' :
-            this.mcplServerRegistry?.getServer(connection.id) !== connection ? 'admission_stale' : original.check(),
+            this.mcplServerRegistry?.getServer(connection.id) !== connection ? 'admission_stale' :
+            original.check() ?? (registration && !registration() ? 'admission_stale' : undefined),
         };
         await this.pushHandler?.handleRequiredPushEvent(connection.id, params, responder as never, admission);
         return;

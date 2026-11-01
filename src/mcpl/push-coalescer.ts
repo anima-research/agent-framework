@@ -619,8 +619,16 @@ export class PushCoalescer<E = unknown> {
    * host effects (replace / remove / deliver) synchronously so a create, edit
    * and delete cannot overtake one another.
    */
-  accept(occurrence: CoalescedOccurrence<E>): Promise<PushEventResult> {
-    return this.locked(() => this.admit(occurrence));
+  accept(occurrence: CoalescedOccurrence<E>, check?: () => string | undefined): Promise<PushEventResult> {
+    if (!check) return this.locked(() => this.admit(occurrence));
+    return this.locked(() => {
+      // Required admission may have waited behind a render or another
+      // acceptance. Recheck at the first effect, under the mutex, before
+      // receipts, subject state or an unread occupant can be touched.
+      const reason = check();
+      if (reason) return Promise.resolve({ accepted: false, reason });
+      return this.admit(occurrence);
+    });
   }
 
   private async admit(occurrence: CoalescedOccurrence<E>): Promise<PushEventResult> {

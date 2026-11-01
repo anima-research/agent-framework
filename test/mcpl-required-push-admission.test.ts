@@ -17,11 +17,10 @@ for (const coalesced of [false, true]) for (const [name, verdict, reason] of cas
     const params = { ...f.params('one', 'push_content', { initial: true }), ...(!coalesced ? { coalesce: undefined } : {}) };
     const before = f.context();
     const response = await f.send('push/event', params);
-    assert.deepEqual(response.result, { accepted: false, reason: coalesced ? 'admission_unsupported' : reason });
-    assert.equal(calls, coalesced ? 0 : 1); assert.equal(gates, 0);
+    assert.deepEqual(response.result, { accepted: false, reason: reason });
+    assert.equal(calls, 1); assert.equal(gates, 0);
     await f.framework.runUntilIdle();
     assert.equal(f.context(), before); assert.equal(f.membrane.calls.length, 0); assert.equal(f.renders.length, 0);
-    if (coalesced) return; // Unsupported work was never accepted or deduplicated.
     allow = true;
     assert.equal((await f.send('push/event', params)).result.accepted, true, 'refusal did not burn eventId');
     await f.framework.runUntilIdle();
