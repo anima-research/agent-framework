@@ -2234,8 +2234,7 @@ export class TuneOutCoordinator {
         if (!text) {
           return {
             success: false,
-            error: 'Nothing was delivered: deliver_summary needs the summary in "text". If there\'s nothing to '
-              + "report, don't call it: staying silent is allowed.",
+            error: 'Nothing was delivered: deliver_summary needs the summary in "text".',
             isError: true,
           };
         }

@@ -154,8 +154,7 @@ test("the subconscious's refusals reach it as error results", async (t) => {
     { id: 'speak', name: 'speak_in_channel', input: { channelId: CHANNEL, text: 'They are tuned out.' } },
   ]]);
   assert.deepEqual(round!.get('summary'), {
-    content: 'Nothing was delivered: deliver_summary needs the summary in "text". If there\'s nothing to report, '
-      + "don't call it: staying silent is allowed.",
+    content: 'Nothing was delivered: deliver_summary needs the summary in "text".',
     isError: true,
   });
   assert.deepEqual(round!.get('cancel'), {

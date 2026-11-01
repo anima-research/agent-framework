@@ -29,10 +29,8 @@ export const SUBCONSCIOUS_TOOLS: ToolDefinition[] = [
   {
     name: 'deliver_summary',
     description:
-      'Deliver a summary into the resident\'s context, in your own voice, ' +
-      'addressed to them (second person). Use at cadence when the diverted ' +
-      'traffic merits it; staying silent is always allowed — an empty ' +
-      'period needs no report.',
+      'Deliver a summary into the resident\'s context: `text` arrives there ' +
+      'verbatim, under your own name.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -51,11 +49,11 @@ export const SUBCONSCIOUS_TOOLS: ToolDefinition[] = [
   {
     name: 'cancel_tuneout',
     description:
-      'End the tune-out on a channel now — use when something needs the ' +
-      'resident\'s full attention. The diverted backlog is delivered to ' +
-      'them (capped), and normal attention resumes. Add your own note in ' +
-      '`text`; it arrives alongside the backlog, in your voice. If you were ' +
-      'started to read one hold, you can end only that hold.',
+      'End the tune-out on a channel now. The diverted backlog is delivered ' +
+      'to the resident (capped), and the channel\'s traffic reaches them as ' +
+      'it did before the tune-out. A note in `text` arrives alongside the ' +
+      'backlog, verbatim, under your own name. If you were started to read ' +
+      'one hold, you can end only that hold.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -72,10 +70,10 @@ export const SUBCONSCIOUS_TOOLS: ToolDefinition[] = [
   {
     name: 'note_disposition',
     description:
-      'Record a standing disposition for yourself — a durable note that ' +
-      'shapes how you treat future traffic ("antra\'s pings always ' +
-      'escalate", "ignore release-bot"). Replaces any previous note under ' +
-      'the same key.',
+      'Record a standing disposition: a durable note, kept under `key` ' +
+      'across invocations and shown to the reader each time it runs (e.g. ' +
+      'key "<sender>", text "<a note on their messages>"). Replaces any ' +
+      'previous note under the same key.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -91,14 +89,13 @@ export const SUBCONSCIOUS_TOOLS: ToolDefinition[] = [
   {
     name: 'speak_in_channel',
     description:
-      'Post a message into a tuned-out channel, in your own words and ' +
-      'clearly as yourself (not as the resident); it goes out through the ' +
-      'resident\'s publish path, so the channel sees it under their account. ' +
-      'Use sparingly — e.g. to tell someone the resident is tuned out and ' +
-      'when to expect them. If you were started to read one hold, you can ' +
-      'post only into a channel that hold still holds, and a post made once ' +
-      'it has ended is refused; your report can say it instead. Disabled unless ' +
-      'the resident\'s configuration allows it.',
+      'Post `text` into a tuned-out channel, as written. It goes out through ' +
+      'the resident\'s publish path, so the channel sees it under the ' +
+      'resident\'s account; nothing in the post names you. If you were ' +
+      'started to read one hold, you can post only into a channel that hold ' +
+      'still holds, and a post made once it has ended is refused; your report ' +
+      'can say it instead. Disabled unless the resident\'s configuration ' +
+      'allows it.',
     inputSchema: {
       type: 'object',
       properties: {
