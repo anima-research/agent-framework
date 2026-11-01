@@ -255,15 +255,21 @@ test('streams: every way a call does not get published cancels its stream, exact
   h.streams.onToolCalls([publishCall('t1', { channelId: 'voice', content: 'Maybe so' })]);
   assert.equal(h.streams.dispatch('t1'), undefined);
 
-  // stop(): a publish under way too.
+  // stop() while the publish is under way: its outcome ends the stream, delivered here.
   h = begin();
   h.streams.onToolCalls([publishCall('t1', { channelId: 'voice', content: 'Maybe' })]);
   h.streams.dispatch('t1');
   assert.deepEqual(h.streams.cancelPending(), [], 'a publish under way ends its own stream');
-  h.streams.cancelAll();
-  assert.deepEqual(h.sent.at(-1), cancelled());
   h.streams.published('t1', { delivered: true, destination: voice });
-  assert.equal(h.sent.filter((e) => e.kind === 'complete').length, 1, 'ended once');
+  assert.deepEqual(h.sent.filter((e) => e.kind === 'complete'), [
+    { kind: 'complete', channelId: 'voice', streamId: 'spec_t1', content: 'Maybe', cancelled: false },
+  ], 'ended once, completed');
+
+  // A call membrane marked (cut off, or out of order) is refused at dispatch.
+  h = begin();
+  h.streams.onToolCalls([{ ...publishCall('t1', {}), unparseableInput: '{"channelId":"voice","content":"Maybe' }]);
+  assert.deepEqual(h.sent.at(-1), cancelled());
+  assert.equal(h.streams.dispatch('t1'), undefined);
 });
 
 test('streams: a name is resolved as partial until a serverId is read', () => {
@@ -381,6 +387,11 @@ test('registry: only a channel that opted in, not inbound-only, on a server gran
 
   h.server.grant = new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS.filter((p) => p !== 'channels.streaming')), []);
   assert.equal(h.registry.speculativeTarget({ channelId: 'bosun:meeting:1' }), null);
+  // A server that may stream but not publish gets no text the publish would be refused.
+  h.server.grant = new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS.filter((p) => p !== 'channels.publish')), []);
+  assert.equal(h.registry.speculativeTarget({ channelId: 'bosun:meeting:1' }), null);
+  h.registry.sendSpeculativeChunk({ serverId: 'bosun', channelId: 'bosun:meeting:1' }, 'Glassy', 'spec_t9', 0, 'x');
+  assert.equal(h.notifications.length, 0);
 });
 
 test("registry: while a serverId may still follow, a name the turn's channel shares with another server's streams nowhere", async () => {
@@ -464,6 +475,12 @@ class ScriptMembrane {
     readonly scripts: NormalizedResponse[][],
     readonly fragments: Record<string, string[]>,
     readonly cutOff: Record<string, string[]> = {},
+    /**
+     * The first stream starts with a call's fragments, then this: an event
+     * (a `retrying` goes on with the script, as the retried attempt; others
+     * end the stream) or a throw.
+     */
+    readonly interrupt?: { id: string; fragments: string[]; then: StreamEvent | 'throw' },
   ) {}
   streamYielding(_request: NormalizedRequest, options: YieldingStreamOptions = {}) {
     this.options.push(options);
@@ -472,11 +489,18 @@ class ScriptMembrane {
     const stream = new MockYieldingStream(script);
     const iterate = stream[Symbol.asyncIterator].bind(stream);
     const { fragments, cutOff } = this;
+    const interrupt = this.options.length === 1 ? this.interrupt : undefined;
     const deltas = (id: string, name: string, list: string[]) => list.map((content) => ({
       type: 'tokens', content,
       meta: { type: 'tool_call', visible: false, blockIndex: 1, toolCallPart: 'input', toolId: id, toolName: name },
     }) as unknown as StreamEvent);
     async function* wrapped(): AsyncGenerator<StreamEvent> {
+      if (interrupt) {
+        yield* deltas(interrupt.id, 'channel_publish', interrupt.fragments);
+        if (interrupt.then === 'throw') throw new Error('zz stream broke');
+        yield interrupt.then;
+        if (interrupt.then.type !== 'retrying') return;
+      }
       const it = { [Symbol.asyncIterator]: iterate };
       for await (const event of it as AsyncIterable<StreamEvent>) {
         if (event.type === 'tool-calls') {
@@ -521,6 +545,7 @@ async function harness(membrane: ScriptMembrane, config: Partial<AgentConfig> = 
   });
   const log: Array<Record<string, unknown>> = [];
   const failing = new Set<string>();
+  const throwing = new Set<string>();
   /** While set, a publish waits for it. */
   const gate: { hold?: Promise<void> } = {};
   const ref = (channelId: string) => ({ serverId: 'bosun', channelId });
@@ -536,6 +561,7 @@ async function harness(membrane: ScriptMembrane, config: Partial<AgentConfig> = 
       if (name !== 'channel_publish') return { success: true, data: {} };
       log.push({ kind: 'publish', channelId: input.channelId, content: input.content, ...(origin.speculativeStream ? { streamId: origin.speculativeStream.streamId } : {}) });
       await gate.hold;
+      if (throwing.has(input.content ?? '')) throw new Error('zz transport closed');
       const fails = failing.has(input.content ?? '');
       published.outcome = fails
         ? { status: 'failed', destination: ref(input.channelId!), reason: 'the stub reported delivered: false', at: Date.now() }
@@ -556,7 +582,7 @@ async function harness(membrane: ScriptMembrane, config: Partial<AgentConfig> = 
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} });
     await framework.runUntilIdle();
   };
-  return { framework, log, failing, gate, run };
+  return { framework, log, failing, throwing, gate, run };
 }
 
 test('framework: off by default; no tool-input deltas are asked for and nothing streams', async () => {
@@ -716,4 +742,152 @@ test('framework: a stop() while a call to a channel that did not opt in is writt
     assert.deepEqual(failed.filter((e) => /stopping/.test(e)), []);
     assert.deepEqual(h.log.filter((e) => e.kind !== 'publish'), [], 'nothing streamed');
   } finally { await (stopping ?? h.framework.stop()); }
+});
+
+/** The log's entries for one stream, as [kind, content, cancelled]. */
+const streamLog = (log: Array<Record<string, unknown>>, streamId: string) =>
+  log.filter((e) => e.streamId === streamId).map((e) => [e.kind, e.content, e.cancelled ?? false]);
+
+for (const [name, then] of [
+  ['an error event', { type: 'error', error: new Error('zz overloaded') } as unknown as StreamEvent],
+  ['an aborted event', { type: 'aborted', reason: 'timeout', message: 'zz deadline' } as unknown as StreamEvent],
+  ['a stream that throws', 'throw'],
+] as const) {
+  test(`framework: ${name} cancels a stream whose call was being written, once, and nothing publishes`, async () => {
+    const membrane = new ScriptMembrane(
+      [[final(text('unused'))], [final(text('done'))], [final(text('done'))]],
+      {},
+      {},
+      { id: 'x1', fragments: ['{"channelId":"bosun:meeting:1","content":"Interr', 'upted'], then },
+    );
+    const h = await harness(membrane, { speculativeChannelChunks: true });
+    try {
+      await h.run().catch(() => {});
+      assert.deepEqual(streamLog(h.log, 'spec_x1'), [
+        ['chunk', 'Interr', false],
+        ['chunk', 'upted', false],
+        ['complete', '', true],
+      ]);
+      assert.equal(h.log.filter((e) => e.kind === 'publish').length, 0);
+    } finally { await h.framework.stop(); }
+  });
+}
+
+test("framework: a refusal retry cancels the refused attempt's stream, and the retried attempt's call streams under its own id", async () => {
+  const membrane = new ScriptMembrane(
+    [[round(call('p1', 'channel_publish', { channelId: 'bosun:meeting:1', content: 'Second try.' })), final(text('done'))]],
+    { p1: ['{"channelId":"bosun:meeting:1","content":"Second try."}'] },
+    {},
+    {
+      id: 'r1', fragments: ['{"channelId":"bosun:meeting:1","content":"Refused ans'],
+      then: { type: 'retrying', attempt: 1, maxAttempts: 2, reason: 'refusal' } as unknown as StreamEvent,
+    },
+  );
+  const h = await harness(membrane, { speculativeChannelChunks: true });
+  try {
+    await h.run();
+    assert.deepEqual(streamLog(h.log, 'spec_r1'), [['chunk', 'Refused ans', false], ['complete', '', true]]);
+    assert.deepEqual(streamLog(h.log, 'spec_p1'), [
+      ['chunk', 'Second try.', false],
+      ['publish', 'Second try.', false],
+      ['complete', 'Second try.', false],
+    ]);
+    const cancelAt = h.log.findIndex((e) => e.streamId === 'spec_r1' && e.kind === 'complete');
+    const retriedAt = h.log.findIndex((e) => e.streamId === 'spec_p1');
+    assert.ok(cancelAt < retriedAt, 'the cancel goes before the retried attempt streams');
+  } finally { await h.framework.stop(); }
+});
+
+test('framework: a call membrane marked as cut off or out of order is cancelled before dispatch refuses it', async () => {
+  const membrane = new ScriptMembrane(
+    [[round({ ...call('p1', 'channel_publish', {}), unparseableInput: '{"channelId":"bosun:meeting:1","content":"Half' } as ContentBlock), final(text('done'))]],
+    { p1: ['{"channelId":"bosun:meeting:1","content":"Half'] },
+  );
+  const h = await harness(membrane, { speculativeChannelChunks: true });
+  try {
+    await h.run();
+    assert.deepEqual(streamLog(h.log, 'spec_p1'), [['chunk', 'Half', false], ['complete', '', true]]);
+    assert.equal(h.log.filter((e) => e.kind === 'publish').length, 0, 'dispatch refused it');
+  } finally { await h.framework.stop(); }
+});
+
+test("framework: a result for the agent's own streamed call before its publish (refused) cancels the stream", async () => {
+  const membrane = new ScriptMembrane(
+    [[round(call('p1', 'channel_publish', { channelId: 'bosun:meeting:1', content: 'Refused.' })), final(text('done'))]],
+    { p1: ['{"channelId":"bosun:meeting:1","content":"Refused."}'] },
+  );
+  const h = await harness(membrane, { speculativeChannelChunks: true });
+  // A refusal on the way to the publish answers the call with a result, as a module's guard does.
+  const fw = h.framework as unknown as { dispatchChannelToolCall: (agentName: string, c: { id: string; name: string }) => void };
+  fw.dispatchChannelToolCall = (agentName, c) => h.framework.pushEvent({
+    type: 'tool-result', callId: c.id, toolName: c.name, agentName, moduleName: 'channels',
+    result: { success: false, error: 'zz refused', isError: true },
+  } as ProcessEvent);
+  try {
+    await h.run();
+    assert.deepEqual(streamLog(h.log, 'spec_p1'), [['chunk', 'Refused.', false], ['complete', '', true]]);
+  } finally { await h.framework.stop(); }
+});
+
+test("framework: a publish that throws cancels its stream", async () => {
+  const membrane = new ScriptMembrane(
+    [[round(call('p1', 'channel_publish', { channelId: 'bosun:meeting:1', content: 'Lost.' })), final(text('done'))]],
+    { p1: ['{"channelId":"bosun:meeting:1","content":"Lost."}'] },
+  );
+  const h = await harness(membrane, { speculativeChannelChunks: true });
+  h.throwing.add('Lost.');
+  try {
+    await h.run();
+    assert.deepEqual(streamLog(h.log, 'spec_p1'), [['chunk', 'Lost.', false], ['publish', 'Lost.', false], ['complete', '', true]]);
+  } finally { await h.framework.stop(); }
+});
+
+test('framework: nothing streams where dispatch would refuse the publish (denyToolsAtDispatch, allowedTools, a fork bound elsewhere)', async () => {
+  const script = () => new ScriptMembrane(
+    [[round(call('p1', 'channel_publish', { channelId: 'bosun:meeting:1', content: 'Kept back.' })), final(text('done'))]],
+    { p1: ['{"channelId":"bosun:meeting:1","content":"Kept back."}'] },
+  );
+  for (const config of [
+    { denyToolsAtDispatch: ['channel_publish'] },
+    { allowedTools: ['think'] },
+  ] as Array<Partial<AgentConfig>>) {
+    const h = await harness(script(), { speculativeChannelChunks: true, ...config });
+    try {
+      await h.run();
+      assert.deepEqual(h.log.filter((e) => e.kind !== 'publish'), [], JSON.stringify(config));
+    } finally { await h.framework.stop(); }
+  }
+  // A conversation fork bound to another channel: its publish is refused there, so nothing streams there.
+  const h = await harness(script(), { speculativeChannelChunks: true });
+  (h.framework as unknown as { homeOf: () => ChannelRef | undefined }).homeOf = () => ({ serverId: 'bosun', channelId: 'bosun:home' });
+  try {
+    await h.run();
+    assert.deepEqual(h.log.filter((e) => e.kind === 'chunk'), []);
+  } finally { await h.framework.stop(); }
+});
+
+test("framework: a stop() while the publish is under way leaves the stream to the publish's outcome", async () => {
+  const membrane = new ScriptMembrane(
+    [[round(call('p1', 'channel_publish', { channelId: 'bosun:meeting:1', content: 'Delivered.' })), final(text('done'))]],
+    { p1: ['{"channelId":"bosun:meeting:1","content":"Delivered."}'] },
+  );
+  const h = await harness(membrane, { speculativeChannelChunks: true });
+  let release!: () => void;
+  h.gate.hold = new Promise<void>((resolve) => { release = resolve; });
+  let stopping: Promise<void> | undefined;
+  try {
+    const running = h.run().catch(() => {});
+    for (let i = 0; i < 200 && !h.log.some((e) => e.kind === 'publish'); i++) await new Promise((r) => setTimeout(r, 5));
+    assert.ok(h.log.some((e) => e.kind === 'publish'), 'the publish started');
+    stopping = h.framework.stop();
+    await new Promise((r) => setTimeout(r, 20));
+    release();
+    await stopping;
+    await running;
+    assert.deepEqual(streamLog(h.log, 'spec_p1'), [
+      ['chunk', 'Delivered.', false],
+      ['publish', 'Delivered.', false],
+      ['complete', 'Delivered.', false],
+    ]);
+  } finally { release(); await (stopping ?? h.framework.stop()); }
 });

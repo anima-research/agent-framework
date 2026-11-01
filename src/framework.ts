@@ -5590,8 +5590,7 @@ export class AgentFramework {
     step(() => this.flushCoalescingSnapshot());
     // Speculative speech stops before the first wait: a call whose publish
     // hasn't started won't run now, and no stream takes a delta after this.
-    // A publish under way ends its own stream by its outcome, or the cancel
-    // below once the waits are over.
+    // A publish under way ends its own stream by its outcome.
     this.speculativeClosed = true;
     for (const [streams, agentName] of this.speculativeStreams ?? []) {
       step(() => {
@@ -5787,9 +5786,10 @@ export class AgentFramework {
     // ended by now, and one it no longer tracks, such as a disposed
     // ephemeral's, may still be finishing.
     for (const complete of [...this.pendingOutgoingCompletes]) step(complete);
-    // Speculative streams end the same way, cancelled: nothing they carried
-    // is published now.
-    for (const streams of new Set([...this.speculativeStreams?.keys() ?? [], ...this.speculativeCalls?.values() ?? []])) step(() => streams.cancelAll());
+    // Speculative streams whose publish hasn't started are cancelled: it
+    // won't run now. One whose publish is under way ends by that publish's
+    // outcome (dispatchChannelToolCall), which may well be delivered.
+    for (const streams of new Set([...this.speculativeStreams?.keys() ?? [], ...this.speculativeCalls?.values() ?? []])) step(() => streams.cancelPending());
     this.speculativeStreams?.clear();
     this.speculativeCalls?.clear();
 
@@ -22523,9 +22523,18 @@ export class AgentFramework {
         ...(typeof input.serverId === 'string' && input.serverId ? { serverId: input.serverId } : {}),
       }, own())
       : null;
+    // Only where the publish could go, as dispatch would let it: the agent
+    // may call channel_publish (allowedTools, denyToolsAtDispatch, a reader's
+    // rule), and a conversation fork publishes to its home alone. Read at each
+    // resolution, so a change mid-call stops the stream.
+    const allowed = (to: ChannelRef | null): ChannelRef | null => {
+      if (!to || !this.mayCallTool(agent.name, 'channel_publish')) return null;
+      const home = this.homeOf(agent.name);
+      return !home || sameChannel(home, to) ? to : null;
+    };
     const streams = new SpeculativePublishStreams({
-      target: (channel, options) => registry.speculativeTarget(channel, own(), options),
-      defaultTarget: (input) => named(this.publishInputWithTurnLocus(input, agent.name, routing) as { channelId?: unknown; serverId?: unknown }),
+      target: (channel, options) => allowed(registry.speculativeTarget(channel, own(), options)),
+      defaultTarget: (input) => allowed(named(this.publishInputWithTurnLocus(input, agent.name, routing) as { channelId?: unknown; serverId?: unknown })),
       chunk: (to, streamId, seq, content) => registry.sendSpeculativeChunk(to, agent.name, streamId, seq, content),
       complete: (to, streamId, content, cancelled) => registry.sendSpeculativeComplete(to, agent.name, streamId, content, cancelled),
     });

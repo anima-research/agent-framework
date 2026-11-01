@@ -333,12 +333,14 @@ export class SpeculativePublishStreams {
    * finished call's own arguments settle its channel: the one it names, or
    * its default where it names none.
    */
-  onToolCalls(calls: ReadonlyArray<{ id: string; name: string; input?: unknown }>): void {
+  onToolCalls(calls: ReadonlyArray<{ id: string; name: string; input?: unknown; unparseableInput?: string }>): void {
     const byId = new Map(calls.map((c) => [c.id, c]));
     for (const stream of [...this.streams.values()]) {
       if (stream.phase !== 'streaming') continue;
       const call = byId.get(stream.toolId);
-      if (!call || call.name !== 'channel_publish' || stream.dead) {
+      // A call membrane marked (its block cut off or out of order) is refused
+      // at dispatch, so it never publishes.
+      if (!call || call.name !== 'channel_publish' || stream.dead || call.unparseableInput !== undefined) {
         this.cancel(stream);
         continue;
       }
@@ -430,11 +432,6 @@ export class SpeculativePublishStreams {
     return [...this.streams.values()]
       .filter((stream) => stream.phase !== 'dispatched' && stream.seq > 0 && !!stream.target)
       .map((stream) => stream.toolId);
-  }
-
-  /** Stop: every open stream is cancelled, a publish under way included. */
-  cancelAll(): void {
-    for (const stream of [...this.streams.values()]) this.cancel(stream);
   }
 
   get size(): number {

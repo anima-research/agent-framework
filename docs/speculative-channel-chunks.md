@@ -22,8 +22,12 @@ Both sides have to opt in. Other channels and other agents see no change.
   connectome-host's recipe takes it as `agent.speculativeChannelChunks`.
 - **Channel:** its descriptor's capabilities (channels/register,
   channels/changed) declare `streaming: { speculative: true }`. Its server's
-  grant must also have `channels.streaming` (§5.4), and the channel must not
-  be inbound-only.
+  grant must also have `channels.streaming` (§5.4) and `channels.publish`, and
+  the channel must not be inbound-only.
+
+Text streams only where the publish could go, as dispatch would judge it: the
+agent may call `channel_publish` (its `allowedTools`, `denyToolsAtDispatch`, a
+reader's rule), and a conversation fork streams only to its home channel.
 
 It needs native tool mode and a provider that streams tool arguments: Anthropic
 (`input_json_delta`), read through membrane's `emitToolInputDeltas`
@@ -70,9 +74,11 @@ The stream ends exactly once:
   delivered to another channel than the stream's, the call's argument JSON
   stopped parsing, the finished call posts other text than the chunks carried
   (a `text` before a `content`, a repeated key: the publish reads
-  `content ?? text`), or the host stopped. A publish whose stream `stop()`
-  cancelled before the publish started is refused, so the text isn't heard
-  again.
+  `content ?? text`), membrane marked the call (cut off or out of order), or
+  the host stopped before the publish started. A publish whose stream
+  `stop()` cancelled that way is refused, so the text isn't heard again. A
+  publish already under way when the host stops ends its stream by its own
+  outcome.
 
 A call that sent no chunk (its channel didn't opt in, or it had no text) sends
 no `complete` either, and its publish carries no `streamId`.

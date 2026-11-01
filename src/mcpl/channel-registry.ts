@@ -5755,7 +5755,7 @@ export class ChannelRegistry {
    * server-qualified name, or the exact pair with a serverId), not
    * inbound-only, whose descriptor's capabilities have
    * `streaming.speculative: true`, and whose server's grant has
-   * `channels.streaming` (§5.4). Null otherwise: such a call streams nothing.
+   * `channels.streaming` (§5.4) and `channels.publish`. Null otherwise: such a call streams nothing.
    * `own`: the calling turn's own channels, as the publish reads the name.
    * `partial`: the call is still being written and names no serverId yet,
    * and one may follow, which would pick that exact pair. Then only a name
@@ -5818,7 +5818,10 @@ export class ChannelRegistry {
     const entry = this.entryAt(to);
     if (!entry || entry.descriptor.capabilities?.streaming?.speculative !== true) return null;
     const server = this.serverRegistry.getServer(to.serverId);
-    return server && CapabilityGrant.of(server).has('channels.streaming') ? server : null;
+    // The publish needs channels.publish (handleToolPublish): text it would
+    // refuse there doesn't stream there either.
+    const grant = server ? CapabilityGrant.of(server) : undefined;
+    return server && grant!.has('channels.streaming') && grant!.has('channels.publish') ? server : null;
   }
 
   /**
