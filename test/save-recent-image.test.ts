@@ -739,7 +739,7 @@ describe('save_recent_image provenance (issue #104)', () => {
     }
   });
 
-  it("a reference whose payload a `never` marked refuses with that reason, not fetch_reference's, its copy kept nowhere", async () => {
+  it("a reference whose payload a `never` marked refuses with that reason, not fetch_reference's, and saves nothing to the path it was given", async () => {
     const register = (name: string, extra: Record<string, unknown> = {}) => {
       const c = classifyBlock({ type: 'image', uri: `https://example.invalid/${name}`, mimeType: 'image/png', ...extra });
       assert.strictEqual(c.kind, 'reference');

@@ -13,8 +13,9 @@
  *  - `disposition:"never"` from a server marks its uri's record (§3.1, §5):
  *    while the mark stands, the framework fetches and saves none of the
  *    payload, and no stub, script object or link names a saved copy or the
- *    uri. A copy saved before the mark stays in the workspace, and the mark
- *    goes with a record lost to eviction or a restart;
+ *    uri. A copy saved before the mark stays in the workspace, one whose save
+ *    finished as the mark came is deleted where the delete succeeds, and the
+ *    mark goes with a record lost to eviction or a restart;
  *  - stub size is independent of every server-supplied field length (§5);
  *  - unparseable `expiresAt` fails closed (§7.4), and so does one rejected
  *    as a field: it's absent as testimony, never read as immortal;
@@ -744,7 +745,6 @@ export class ReferenceRegistry {
   /** Each open journal's copies (openJournal), by uri. */
   private journals = new Set<Map<string, ReferenceRecord | null>>();
 
-  /** Mark the record a uri has, where `serverId`'s own content says `never`. */
   markNever(uri: string, serverId: string): void {
     const record = this.findByUri(uri);
     if (!record || record.payloadNever) return;
@@ -752,7 +752,6 @@ export class ReferenceRegistry {
     this.markPayload(record, serverId);
   }
 
-  /** Mark each record a `never` in `serverId`'s result's claims names. */
   markNevers(claims: ResultClaims, serverId: string): void {
     for (const [uri, claim] of claims) if (claim.never) this.markNever(uri, serverId);
   }
@@ -812,8 +811,6 @@ export class ReferenceRegistry {
     return this.journals.size;
   }
 
-  /** Only a registration that knows its server is that server's content, so
-   *  only it can mark the record (markNever). */
   register(testimony: ReferenceTestimony, serverId?: string, claims?: ResultClaims): ReferenceRecord {
     this.keepFirst(testimony.uri);
     const markedBy = testimony.disposition === 'never' || claims?.get(testimony.uri)?.never === true ? serverId : undefined;
@@ -821,6 +818,7 @@ export class ReferenceRegistry {
     if (existingId !== undefined) {
       const existing = this.records.get(existingId);
       if (existing) {
+        const firstServer = serverId !== undefined && existing.serverIds.length === 0;
         if (serverId !== undefined && !existing.serverIds.includes(serverId)) {
           existing.serverIds.push(serverId);
         }
@@ -829,9 +827,10 @@ export class ReferenceRegistry {
         // digest/expiry supersedes the stale claims. Once fetched, the record
         // describes verified bytes on disk and keeps the testimony they were
         // verified against. A link claims no digest, expiry or disposition,
-        // so its testimony never replaces a record's claims, and nor does a
-        // registration that knows no server, which isn't a server's word.
-        if (serverId !== undefined && !existing.fetchedPath && !testimony.fromLink) existing.testimony = testimony;
+        // so its testimony replaces a record's claims only where no server
+        // had spoken for the record yet, and a registration that knows no
+        // server replaces none, since it isn't a server's word.
+        if (serverId !== undefined && !existing.fetchedPath && (!testimony.fromLink || firstServer)) existing.testimony = testimony;
         // Newest again, so a uri just mentioned is the last to be evicted.
         this.records.delete(existingId);
         this.records.set(existingId, existing);
@@ -975,10 +974,11 @@ export interface StubOptions {
  * name its uri, a plain one included, and otherwise the
  * record's own testimony, from an earlier result. A reference naming the uri
  * is that result's word on it, the latest, as the registry keeps it
- * (register() replaces a record's testimony with it until the record is
- * fetched), so an earlier result's expiry gives way to it. A `never` doesn't:
- * it marks the uri's record (payloadNever) for as long as the record lives,
- * and the stub, the fetcher and a script's object read that mark first. A
+ * (register() replaces a record's testimony with a server's until the record
+ * is fetched), so an earlier result's expiry gives way to it. A server's
+ * `never` doesn't: it marks the uri's record (payloadNever) for as long as the
+ * record lives, and the stub, the fetcher and a script's object read that
+ * mark first. Another result's `never` governs that result alone. A
  * link claims no disposition or expiry, so it adds nothing here, and a
  * result that names a uri only in links leaves its record's testimony in
  * force.
@@ -1099,10 +1099,6 @@ export function claimedNever(record: ReferenceRecord, claims?: ResultClaims): bo
   return uriClaims(record, claims)?.never === true;
 }
 
-/** Whether a record's payload is kept from this result: a server's `never`
- *  marked it, for every result, or `never` is what this result's own claims
- *  say of its uri, or, where they say nothing of it, the record's own
- *  testimony (claimedNever). */
 export function withheld(record: ReferenceRecord, claims?: ResultClaims): boolean {
   return record.payloadNever === true || claimedNever(record, claims);
 }
@@ -1264,8 +1260,8 @@ export function referenceStubOrNull(block: unknown, provenance?: string, serverI
  * `refId` would be refused, as the result's references claim it, so a link
  * whose line shows its uri, which the host can't fetch, carries them too: its
  * line has no id to fetch with. The fetch itself reads the record, which
- * keeps the latest testimony registered until it's fetched, and then the one
- * its saved copy was verified against (Ada-1017's call). `claims` are those
+ * keeps the latest testimony a server registered until it's fetched, and
+ * then the one its saved copy was verified against. `claims` are those
  * of everything the script's view shows (scriptViewClaims), so its other
  * references count (ResultClaims). The reference is registered bound to
  * `serverId`, the server whose tool returned it, as the model's lanes bind a

@@ -326,7 +326,7 @@ describe("MCP's resource_link, a reference (RFC-005 §8.1)", () => {
     // back to the model, so it holds what the model's own line holds.
     servingFiles();
     const withheldUri = 'https://zz-elsewhere.example/withheld-for-script.csv';
-    referenceRegistry.register(testimonyOf({ type: 'resource', uri: withheldUri, name: 'withheld.csv', disposition: 'never' }));
+    referenceRegistry.register(testimonyOf({ type: 'resource', uri: withheldUri, name: 'withheld.csv', disposition: 'never' }), 'zz-files');
     const thirdParty = "third-party origin: it isn't on its server's own address, so this host doesn't fetch it";
     for (const [what, link, shows, refused] of [
       ["off its server's origin, with no credential", { type: 'resource_link', uri: 'https://zz-elsewhere.example/script-plain.csv', name: 'a.csv' }, true, thirdParty],
@@ -1687,7 +1687,7 @@ describe('one answer for every block of a result', () => {
     // On its server's own origin, so the expiry is the one refusal.
     servingFiles();
     const uri = 'https://zz-files.example/expired-link.csv';
-    referenceRegistry.register(testimonyOf({ type: 'resource', uri, name: 'expired.csv', expiresAt: '2001-01-01T00:00:00Z' }));
+    referenceRegistry.register(testimonyOf({ type: 'resource', uri, name: 'expired.csv', expiresAt: '2001-01-01T00:00:00Z' }), 'zz-files');
     const link = { type: 'resource_link', uri, name: 'expired.csv' };
     const object = referenceBlockForScript(link, 'zz-files') as { uri?: string; refId: string; expired?: string; unfetchable?: string };
     assert.equal(object.uri, uri);

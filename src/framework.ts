@@ -2,7 +2,7 @@ import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogu
 import { presentAuthor } from './author-presentation.js';
 import { constants as bufferConstants } from 'node:buffer';
 import { dirname, join } from 'node:path';
-import { EXPIRY_REASON, REFERENCE_LIMITS, claimedExpiry, classifyBlock, contentClaims, isReferenceExpired, referenceBlockForScript, referenceRegistry, sanitizeLabel, withheld, type RegistryJournal, type ResultClaims, type ScriptLine, type ServerAddress } from './mcpl/references.js';
+import { EXPIRY_REASON, REFERENCE_LIMITS, claimedExpiry, classifyBlock, contentClaims, isReferenceExpired, referenceBlockForScript, referenceRegistry, sanitizeLabel, withheld, type ReferenceTestimony, type RegistryJournal, type ResultClaims, type ScriptLine, type ServerAddress } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES } from './mcpl/reference-fetcher.js';
 import {
   appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync,
@@ -152,6 +152,7 @@ import {
   isContentArray,
   resultClaimsOrThrow,
   scriptViewClaims,
+  scriptViewReferences,
   shownToScript,
   shownToScriptFromServer,
   toolResultDataToHistoryString,
@@ -207,6 +208,14 @@ function neverClaims(content: unknown[]): ResultClaims | undefined {
     return scriptViewClaims(content, true);
   } catch {
     return undefined;
+  }
+}
+
+function neverReferences(content: unknown[]): ReferenceTestimony[] {
+  try {
+    return scriptViewReferences(content, true).filter((t) => t.disposition === 'never');
+  } catch {
+    return [];
   }
 }
 
@@ -8030,6 +8039,9 @@ export class AgentFramework {
     const read = claims ?? neverClaims(content);
     const nevers = read ?? contentClaims(content);
     referenceRegistry.markNevers(nevers, serverId);
+    if (read !== undefined) {
+      for (const t of neverReferences(content)) referenceRegistry.register(t, serverId, nevers);
+    }
     for (const block of content) {
       const c = classifyBlock(block);
       if (c.kind !== 'reference') continue;
@@ -8040,7 +8052,6 @@ export class AgentFramework {
       byUri.set(c.testimony.uri, { record, expiredHere, linkOnly });
     }
     if (mode === 'register') return;
-    // A nested `never` the walk couldn't read may name any of these.
     if (read === undefined) {
       if (byUri.size > 0) console.error(`[rfc005] fetched nothing for a result from ${serverId}: its blocks couldn't be read for a nested \`never\``);
       return;

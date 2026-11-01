@@ -13,11 +13,12 @@ import {
   IMAGE_NO_MEDIA_TYPE_TEXT,
   INLINE_WITHHELD_TEXT,
   classifyBlock,
-  inlineNeverUri,
+  contentClaims,
   isInlineContradiction,
   referenceRegistry,
   referenceStubOrNull,
   unknownBlockText,
+  type ResultClaims,
 } from './references.js';
 import { NON_STRING_TEXT_PLACEHOLDER } from './visible-content.js';
 import type { McplContentBlock } from './types.js';
@@ -34,7 +35,8 @@ import { markNoticeOpenings } from '../supplied-text.js';
  * a tool result's references are, so fetch_reference can fetch it through that
  * server's address, where it has one.
  */
-export function convertBlock(block: McplContentBlock, provenance: string, serverId: string): ContentBlock {
+export function convertBlock(block: McplContentBlock, provenance: string, serverId: string, claims: ResultClaims = messageClaims([block], serverId)): ContentBlock {
+  const stub = (): ContentBlock => ({ type: 'text', text: referenceStubOrNull(block, provenance, serverId, { claims }) ?? `[${NOTICE_TAG.reference}]` });
   switch (block.type) {
     case 'text':
       // Text that isn't a string can't be shown, so the agent reads that a
@@ -46,7 +48,6 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
       if (isInlineContradiction(block)) {
         // RFC-005 vector 2: inline data claiming bulk disposition — fail
         // closed, withhold the data (checked BEFORE the data branch).
-        markInlineNever(block, serverId);
         return { type: 'text', text: INLINE_WITHHELD_TEXT };
       }
       if (isFilledString(block.uri) && block.disposition !== undefined) {
@@ -55,7 +56,7 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
         // is a claim, one the reference rejects included, as classifyBlock
         // and isInlineContradiction read it: a falsy one such as 0, false
         // or '' stubs too, rather than sending the URI as the image's source.
-        return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? `[${NOTICE_TAG.reference}]` };
+        return stub();
       }
       if (isFilledString(block.data) && isFilledString(block.mimeType)) {
         return {
@@ -64,9 +65,7 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
         } as ContentBlock;
       }
       if (isFilledString(block.uri)) {
-        if (referenceRegistry.findByUri(block.uri)?.payloadNever) {
-          return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? `[${NOTICE_TAG.reference}]` };
-        }
+        if (referenceRegistry.findByUri(block.uri)?.payloadNever || claims.get(block.uri)?.never) return stub();
         return {
           type: 'image',
           source: { type: 'url', url: block.uri },
@@ -78,14 +77,13 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
       if (isInlineContradiction(block)) {
         // RFC-005 vector 2: inline data claiming bulk disposition — fail
         // closed, withhold the data (checked BEFORE the data branch).
-        markInlineNever(block, serverId);
         return { type: 'text', text: INLINE_WITHHELD_TEXT };
       }
       if (isFilledString(block.uri) && block.disposition !== undefined) {
         // RFC-005 uri-form media with a disposition claim, a falsy one
         // included, as for an image (above): stub, do not hand the URI to
         // the provider or inline it.
-        return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? `[${NOTICE_TAG.reference}]` };
+        return stub();
       }
       if (isFilledString(block.data) && isFilledString(block.mimeType)) {
         return {
@@ -99,21 +97,18 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
       // MCP's embedded resource shows as the block its contents make would
       // show here (RFC-005 §8.1), its uri never.
       const c = classifyBlock(block);
-      markInlineNever(block, serverId, c);
       if (c.kind === 'embedded' && c.contents.kind === 'block') {
-        return convertBlock(c.contents.block as McplContentBlock, provenance, serverId);
+        return convertBlock(c.contents.block as McplContentBlock, provenance, serverId, claims);
       }
       // RFC-005: reference blocks become bounded stubs — never raw URIs
       // (a signed URL is a bearer credential that looks like a location).
-      return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? `[${NOTICE_TAG.reference}]` };
+      return stub();
     }
 
     default: {
       // MCP's link to a resource isn't one of MCPL's own blocks, but a server
       // can send one, and RFC-005 §8.1 makes it a reference, shown as one.
-      if ((block as { type?: unknown }).type === 'resource_link') {
-        return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? `[${NOTICE_TAG.reference}]` };
-      }
+      if ((block as { type?: unknown }).type === 'resource_link') return stub();
       // Unknown wire block types previously fell off the exhaustive switch
       // and propagated `undefined` into ContentBlock[]. Fail visibly. A type
       // that isn't a string is no type, and is never converted to one: an
@@ -123,13 +118,15 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
   }
 }
 
-function markInlineNever(block: McplContentBlock, serverId: string, c = classifyBlock(block)): void {
-  const uri = inlineNeverUri(block, c);
-  if (uri !== null) referenceRegistry.markNever(uri, serverId);
+function messageClaims(blocks: readonly McplContentBlock[], serverId: string): ResultClaims {
+  const claims = contentClaims(blocks);
+  referenceRegistry.markNevers(claims, serverId);
+  return claims;
 }
 
 export function convertBlocks(blocks: readonly McplContentBlock[], provenance: string, serverId: string): ContentBlock[] {
-  const converted = blocks.map((block) => convertBlock(block, provenance, serverId));
+  const claims = messageClaims(blocks, serverId);
+  const converted = blocks.map((block) => convertBlock(block, provenance, serverId, claims));
   return markNoticeOpenings(converted, (index) => sendersText(blocks[index]));
 }
 
