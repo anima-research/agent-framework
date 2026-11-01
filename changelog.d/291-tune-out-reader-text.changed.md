@@ -39,3 +39,6 @@
   now "by <name>", the reader's name or a reader fork's own (or "by the reader" where the call names none). The
   channel registry takes the reader from the new `tuneOutReader` option, which the framework gives it; a registry
   made without one says no reader is configured.
+- **Hosts: `create()`'s refusal of reader forks with no `model` says what a reader fork is.** It said to give the
+  resident's model "for a copy of the resident"; it now says a reader fork of the resident holds its whole prefix,
+  and `model` is the model the resident runs or another by name.

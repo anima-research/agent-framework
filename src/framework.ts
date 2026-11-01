@@ -17422,9 +17422,9 @@ export class AgentFramework {
     // channel, 10-09).
     if (typeof cfg.model !== 'string' || cfg.model.length === 0) {
       throw new Error(
-        `subconscious.reader "forks": a reader fork holds the whole prefix of "${primaryName}", so \`model\` ` +
-          `must say whose weights run it — "${primaryConfig.model}" for a copy of the resident, or another model ` +
-          'by name. It is not defaulted',
+        `subconscious.reader "forks": a reader fork of "${primaryName}" holds its whole prefix, so \`model\` must ` +
+          `say whose weights run it — "${primaryConfig.model}", the model "${primaryName}" runs, or another model by ` +
+          'name. It is not defaulted',
       );
     }
     if (typeof cfg.voice !== 'string' || cfg.voice.length === 0) {

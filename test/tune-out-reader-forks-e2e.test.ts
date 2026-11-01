@@ -293,7 +293,11 @@ describe('tune-out reader forks: configuration', () => {
           subconscious: { enabled: true, reader: 'forks', voice: 'read' } as never,
           modules: [],
         }),
-        /`model` must say whose weights run it — "test-model" for a copy of the resident, or another model/,
+        // The mechanism, not a copy of the resident: a reader fork of it, on its model or another.
+        {
+          message: 'subconscious.reader "forks": a reader fork of "scout" holds its whole prefix, so `model` must say ' +
+            'whose weights run it — "test-model", the model "scout" runs, or another model by name. It is not defaulted',
+        },
       );
     } finally {
       rmSync(dir, { recursive: true, force: true });
