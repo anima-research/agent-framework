@@ -178,9 +178,9 @@ export interface PersistentReaderConfig extends SubconsciousConfigBase {
    *  `thinkingBinding` set its own. */
   model?: string;
   /**
-   * The voice/criteria mode block — recipe-side and co-authored with the
-   * resident (it is an aspect of their attention). Report-shaped, second
-   * person toward the resident. Canary before fleet use (issue #77).
+   * The persistent reader's system prompt (its AgentConfig.systemPrompt).
+   * Who writes it and what it says, a policy for the reader tools
+   * included, are the host's choice. Canary before fleet use (issue #77).
    */
   systemPrompt: string;
   /** WindowedPassthroughStrategy re-anchor fraction (default 0.5). */
@@ -219,10 +219,12 @@ export interface ForkReaderConfig extends SubconsciousConfigBase {
    */
   model: string;
   /**
-   * The reader's voice block — report-shaped, second person toward the
-   * resident, co-authored with them. Delivered as the first message after
-   * the fork point, with the notice, the standing dispositions and the held
-   * traffic; never a system prompt.
+   * The reader's voice block: text the host supplies, handed to `framing`.
+   * The default framing (defaultReaderFraming) puts it in the one message a
+   * fork receives after the fork point, with the notice, the standing
+   * dispositions and the held traffic; it is never a system prompt. Who
+   * writes it and what it says, a policy for the reader tools included,
+   * are the host's choice.
    */
   voice: string;
   /**
