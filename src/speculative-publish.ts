@@ -259,6 +259,8 @@ export interface SpeculativeStreamSink {
   defaultTarget(input: Record<string, unknown>): ChannelRef | null;
   chunk(to: ChannelRef, streamId: string, seq: number, content: string): void;
   complete(to: ChannelRef, streamId: string, content: string, cancelled: boolean): void;
+  /** A call's first chunk is going to `to`: its publish may go there only. */
+  spoken?(callId: string, to: ChannelRef): void;
 }
 
 type StreamPhase = 'streaming' | 'called' | 'dispatched';
@@ -509,7 +511,10 @@ export class SpeculativePublishStreams {
     const to = stream.target;
     const content = stream.held;
     stream.held = '';
-    if (!this.spoken.has(stream.toolId)) this.spoken.set(stream.toolId, to);
+    if (!this.spoken.has(stream.toolId)) {
+      this.spoken.set(stream.toolId, to);
+      this.send(() => this.sink.spoken?.(stream.toolId, to));
+    }
     this.send(() => this.sink.chunk(to, stream.streamId, stream.seq, content));
     stream.seq++;
   }

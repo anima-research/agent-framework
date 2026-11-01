@@ -600,6 +600,8 @@ async function harness(membrane: ScriptMembrane, config: Partial<AgentConfig> = 
   const log: Array<Record<string, unknown>> = [];
   const failing = new Set<string>();
   const throwing = new Set<string>();
+  /** For each publish: where the call's text went, which it may go to alone (the registry holds it there). */
+  const pins: Array<{ content?: string; pinnedTo?: string }> = [];
   /** While set, a publish waits for it. */
   const gate: { hold?: Promise<void> } = {};
   const ref = (channelId: string) => ({ serverId: 'bosun', channelId });
@@ -610,10 +612,11 @@ async function harness(membrane: ScriptMembrane, config: Partial<AgentConfig> = 
       log.push({ kind: 'chunk', channelId: to.channelId, conversationId, streamId, seq, content }),
     sendSpeculativeComplete: (to: ChannelRef, conversationId: string, streamId: string, content: string, cancelled: boolean) =>
       log.push({ kind: 'complete', channelId: to.channelId, conversationId, streamId, content, ...(cancelled ? { cancelled } : {}) }),
-    handleChannelToolCall: async (name: string, input: { channelId?: string; content?: string }, origin: { speculativeStream?: { streamId: string } },
-      published: { outcome?: unknown }) => {
+    handleChannelToolCall: async (name: string, input: { channelId?: string; content?: string }, origin: { speculativeStream?: { streamId: string; live?: boolean } },
+      published: { outcome?: unknown } = {}) => {
       if (name !== 'channel_publish') return { success: true, data: {} };
-      log.push({ kind: 'publish', channelId: input.channelId, content: input.content, ...(origin.speculativeStream ? { streamId: origin.speculativeStream.streamId } : {}) });
+      log.push({ kind: 'publish', channelId: input.channelId, content: input.content, ...(origin.speculativeStream?.live !== false && origin.speculativeStream ? { streamId: origin.speculativeStream.streamId } : {}) });
+      pins.push({ content: input.content, pinnedTo: (origin.speculativeStream as { channel?: ChannelRef } | undefined)?.channel?.channelId });
       await gate.hold;
       if (throwing.has(input.content ?? '')) throw new Error('zz transport closed');
       const fails = failing.has(input.content ?? '');
@@ -636,7 +639,7 @@ async function harness(membrane: ScriptMembrane, config: Partial<AgentConfig> = 
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} });
     await framework.runUntilIdle();
   };
-  return { framework, log, failing, throwing, gate, run };
+  return { framework, log, failing, throwing, gate, pins, run };
 }
 
 test('framework: off by default; no tool-input deltas are asked for and nothing streams', async () => {
@@ -984,4 +987,40 @@ test("framework: stop()'s wait for such a publish ends at the caller's bound, wi
     await h.framework.stop(300);
     assert.ok(Date.now() - started < 5000, 'stop() returned at its bound');
   } finally { release(); }
+});
+
+test('framework: a result that arrives before the publish keeps the call held to where its text went', async () => {
+  const membrane = new ScriptMembrane(
+    [[round(call('p1', 'channel_publish', { channelId: 'bosun:meeting:1', serverId: 'bosun', content: 'Spoken.' })), final(text('done'))]],
+    { p1: ['{"channelId":"bosun:meeting:1","serverId":"bosun","content":"Spoken."}'] },
+  );
+  const h = await harness(membrane, { speculativeChannelChunks: true });
+  // A refusal on its way, delivered while the publish is being dispatched (as from a trace listener).
+  h.framework.onTrace((e) => {
+    const event = e as unknown as { type: string; tool?: string; callId?: string };
+    if (event.type === 'tool:started' && event.tool === 'channel_publish') {
+      h.framework.pushEvent({
+        type: 'tool-result', callId: event.callId!, toolName: 'channel_publish', agentName: 'Glassy', moduleName: 'channels',
+        result: { success: false, error: 'zz refused', isError: true },
+      } as ProcessEvent);
+    }
+  });
+  try {
+    await h.run();
+    assert.deepEqual(streamLog(h.log, 'spec_p1').slice(0, 2), [['chunk', 'Spoken.', false], ['complete', '', true]]);
+    assert.deepEqual(h.pins, [{ content: 'Spoken.', pinnedTo: 'bosun:meeting:1' }], 'the publish still carries where the text went');
+  } finally { await h.framework.stop(); }
+});
+
+test('framework: executeToolCall with a call whose text went out holds it to where its text went', async () => {
+  const membrane = new ScriptMembrane(
+    [[round(call('p1', 'channel_publish', { channelId: 'bosun:meeting:1', serverId: 'bosun', content: 'Once.' })), final(text('done'))]],
+    { p1: ['{"channelId":"bosun:meeting:1","serverId":"bosun","content":"Once."}'] },
+  );
+  const h = await harness(membrane, { speculativeChannelChunks: true });
+  try {
+    await h.run();
+    await h.framework.executeToolCall({ id: 'p1', name: 'channel_publish', input: { channelId: 'other', content: 'Once.' }, callerAgentName: 'Glassy' });
+    assert.deepEqual(h.pins.map((p) => p.pinnedTo), ['bosun:meeting:1', 'bosun:meeting:1']);
+  } finally { await h.framework.stop(); }
 });

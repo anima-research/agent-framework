@@ -3610,6 +3610,9 @@ function isLegacyFamily(config: McplServerConfig): boolean {
   }
 }
 
+/** How many calls' speculative recipients (speculativePins) are kept. */
+const SPECULATIVE_PINS_KEPT = 1024;
+
 /** A speculative stream's call, by agent and call id: call ids are the provider's, and two agents' may meet. */
 function speculativeCallKey(agentName: string, callId: string): string {
   return `${agentName}\u0000${callId}`;
@@ -3834,6 +3837,12 @@ export class AgentFramework {
    * what went out was cancelled, and a publish after it would be heard twice.
    */
   private speculativeStopCancelled: Set<string> = new Set();
+  /**
+   * By speculativeCallKey: the channel a call's text went to, kept whatever
+   * becomes of its stream or its result, so every path that publishes the
+   * call publishes there or nowhere (bounded: the oldest go first).
+   */
+  private speculativePins: Map<string, ChannelRef> = new Map();
   /** Publishes under way that end an open speculative stream: stop() waits for them before closing MCPL. */
   private speculativePublishes: Set<Promise<void>> = new Set();
   /**
@@ -22548,10 +22557,25 @@ export class AgentFramework {
       defaultTarget: (input) => allowed(named(this.publishInputWithTurnLocus(input, agent.name, routing) as { channelId?: unknown; serverId?: unknown })),
       chunk: (to, streamId, seq, content) => registry.sendSpeculativeChunk(to, agent.name, streamId, seq, content),
       complete: (to, streamId, content, cancelled) => registry.sendSpeculativeComplete(to, agent.name, streamId, content, cancelled),
+      spoken: (callId, to) => this.pinSpeculativeCall(speculativeCallKey(agent.name, callId), to),
     });
     // (Optional chaining: prototype-built harnesses leave the maps unset.)
     this.speculativeStreams?.set(streams, agent.name);
     return streams;
+  }
+
+  private pinSpeculativeCall(key: string, to: ChannelRef): void {
+    const pins = this.speculativePins;
+    if (!pins) return;
+    pins.delete(key);
+    pins.set(key, to);
+    if (pins.size > SPECULATIVE_PINS_KEPT) pins.delete(pins.keys().next().value!);
+  }
+
+  /** Where a call's text went, for its publish: the channel it may go to alone. */
+  private speculativePinOf(agentName: string, callId: string): { streamId: string; channel: ChannelRef; live: false } | undefined {
+    const channel = this.speculativePins?.get(speculativeCallKey(agentName, callId));
+    return channel ? { streamId: `spec_${callId}`, channel, live: false } : undefined;
   }
 
   /** Drops an agent's calls from speculativeCalls, where they still map to that stream set (any, when none is given). */
@@ -27439,7 +27463,10 @@ export class AgentFramework {
         const input = call.name === 'channel_publish' && call.callerAgentName
           ? this.publishInputWithTurnLocus(call.input, call.callerAgentName, turn)
           : call.input;
-        return this.channelRegistry!.handleChannelToolCall(call.name, input, origin.kind === 'agent' && turn ? { ...origin, inTurn: true } : origin);
+        // A call whose text went out ahead of it publishes where it went or nowhere, by this path too.
+        const pin = call.name === 'channel_publish' && origin.kind === 'agent' ? this.speculativePinOf(origin.agentName, call.id) : undefined;
+        const withTurn = origin.kind === 'agent' && turn ? { ...origin, inTurn: true } : origin;
+        return this.channelRegistry!.handleChannelToolCall(call.name, input, pin && withTurn.kind === 'agent' ? { ...withTurn, speculativeStream: pin } : withTurn);
       }
 
       case 'agent-settings':
@@ -36631,7 +36658,11 @@ export class AgentFramework {
       return;
     }
     const speculative = call.name === 'channel_publish' ? this.speculativeCalls?.get(speculativeKey) : undefined;
-    const speculativeStream = speculative?.dispatch(call.id);
+    // Where its text went holds even once its stream is gone (a result that
+    // arrived first settled it): the publish goes there or nowhere.
+    const speculativeStream = call.name === 'channel_publish'
+      ? speculative?.dispatch(call.id) ?? this.speculativePinOf(agentName, call.id)
+      : undefined;
     const endSpeculative = (outcome: { delivered: boolean; destination?: ChannelRef }) => {
       if (!speculative) return;
       if (this.speculativeCalls?.get(speculativeKey) === speculative) this.speculativeCalls?.delete(speculativeKey);
