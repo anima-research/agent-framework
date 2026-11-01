@@ -217,7 +217,7 @@ import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type StreamThinkingDrops } from './thinking-drops.js';
 import { asNextRequestCarries, roundRows, type RoundRow, type SentRow } from './sent-rows.js';
-import { AgentPresentation, asCompiled, bearingOf, heldFromResidents, isInjectableMidTurn, observesOwnRows, readerFacts, recordedReaderFacts, type PresentationOccasion, type ReaderFacts } from './presentation.js';
+import { AgentPresentation, asCompiled, bearingOf, heldFromResidents, isInjectableMidTurn, observesOwnRows, readerFacts, recordedReaderFacts, windowMarkOf, type Position, type PresentationOccasion, type ReaderFacts } from './presentation.js';
 import { coverTest, covers, readMarkThrough, type MarkedRow, type ReadMark } from './read-marks.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
 import { STORED_INJECTION_KEY, STORED_INJECTION_KIND, asStoredRow, hasRenderedContent, isAnotherAgentsInjection, isOwnInjection, isStoredKind, storedInjectionMarkOf, unitHash, type StoredInjectionMark } from './stored-injections.js';
@@ -17783,17 +17783,33 @@ export class AgentFramework {
         notice: invocation.notice,
         dispositions: invocation.dispositions,
       };
-      const metadata = { epochId: invocation.epochId, channelId: invocation.channelId, trigger: invocation.trigger, persist, resync };
-      const framingRow = (held: StoredMessage[]): MessageMetadata => ({
+      // The branch the resident's window reads as the look is made, on its
+      // record, for the next look to compare (readerPlan).
+      const branch = this.residentMark(primary)?.branch;
+      const metadata = {
+        epochId: invocation.epochId,
+        channelId: invocation.channelId,
+        trigger: invocation.trigger,
+        persist,
+        resync,
+        ...(branch !== undefined ? { residentBranch: branch } : {}),
+      };
+      // The framing row says what the reader was handed: the held rows, and
+      // where the resident's window stood (the ordinal of the last row it
+      // held, on its branch), from which the next look reads what it took
+      // since (readerHanded).
+      const framingRow = (held: StoredMessage[], mark: { branch: string; through: number } | undefined): MessageMetadata => ({
         system: true,
         kind: 'tune-out-reader-framing',
         channelId: invocation.channelId,
         epochId: invocation.epochId,
         trigger: invocation.trigger,
         heldMessageIds: held.map((m) => m.id),
+        ...(mark ? { residentThrough: mark.through, residentBranch: mark.branch } : {}),
       }) as MessageMetadata;
       const readerConfig = { model: cfg.model, proseRouting: 'disabled' as const, ...readerModelFields(cfg) };
       let incarnation: number;
+      let residentRows: StoredMessage[] | undefined;
       if (plan.resume) {
         // The configuration deriveAgent gives a reader, built again: it is
         // not stored with the agent.
@@ -17807,8 +17823,26 @@ export class AgentFramework {
           { metadata },
         );
         incarnation = plan.resume.incarnation + 1;
-        const content = (cfg.framing ?? defaultReaderFraming)({ ...base, backlog: handed, resumed: true, incarnation });
-        storeOwnRow(candidate.agent, 'user', content, framingRow(handed));
+        // From here to the stored row nothing waits, so the rows read and
+        // the mark recorded are of one instant of the resident's window.
+        const mark = this.residentMark(primary);
+        const before = this.readerHanded(candidate.contextManager, plan.resume, mark?.branch);
+        // What its own branch holds already, as an earlier framing's, a
+        // failed look's included: not handed again (after a restart the
+        // coordinator's cursor is gone, and an epoch's first look is handed
+        // all it held).
+        handed = invocation.backlog.filter((m) => !before.held.has(m.id));
+        if (resync === 'window' && mark && before.through !== undefined) {
+          residentRows = this.residentRowsSince(primary, name, before.through);
+        }
+        const content = (cfg.framing ?? defaultReaderFraming)({
+          ...base,
+          backlog: handed,
+          resumed: true,
+          incarnation,
+          ...(residentRows ? { residentRows } : {}),
+        });
+        storeOwnRow(candidate.agent, 'user', content, framingRow(handed, mark));
       } else {
         incarnation = 1;
         const content = (cfg.framing ?? defaultReaderFraming)({
@@ -17828,7 +17862,11 @@ export class AgentFramework {
           onParentEnd: 'end',
           resultTo: { to: primary, as: 'message' },
           idleTimeoutMs: cfg.forkIdleTimeoutMs ?? 10 * 60_000,
-          framing: [{ participant: 'user', content, metadata: framingRow(handed) }],
+          // Read as the call is made: deriveAgent waits for nothing before
+          // its checkpoint (context-manager's derive is synchronous up to its
+          // seeded stores), so the mark is the checkpoint's, and the
+          // derivation holds the resident's window up to it.
+          framing: [{ participant: 'user', content, metadata: framingRow(handed, this.residentMark(primary)) }],
           metadata,
         });
       }
@@ -17848,7 +17886,7 @@ export class AgentFramework {
         held: handed.length,
         incarnation,
         resumed: plan.resume !== undefined,
-        resynced: 0,
+        resynced: residentRows?.length ?? 0,
       });
       const outcome = await this.runEphemeralToCompletion(candidate.agent, candidate.contextManager);
       const prose = outcome.speech.trim();
@@ -17890,6 +17928,57 @@ export class AgentFramework {
       if (framed && !this.agents.has(name)) this.presentation?.forgetFramed(name);
       this.tuneOutCoordinator?.forgetReader(name);
     }
+  }
+
+  /**
+   * Where the resident's window stands, for a persisted reader's framing:
+   * the branch it reads and the ordinal of the last row it holds (-1 when
+   * it holds none). Undefined when its window isn't presented, where there
+   * is no index to read it from.
+   */
+  private residentMark(primary: string): { branch: string; through: number } | undefined {
+    const cm = this.agents.get(primary)?.getContextManager();
+    const mark = cm ? windowMarkOf(cm) : null;
+    return mark ? { branch: mark.branch, through: mark.position - 1 } : undefined;
+  }
+
+  /**
+   * What a persisted reader's branch says it was handed, read from its
+   * framing rows past its derivation's checkpoint: every held row any of
+   * them handed it, and the resident's window mark on the last of them
+   * framed on `branch`, or none.
+   */
+  private readerHanded(cm: ContextManager, record: AgentRecord, branch: string | undefined): { held: Set<string>; through?: number } {
+    const checkpoint = record.inherit?.atSequence ?? Number.NEGATIVE_INFINITY;
+    const held = new Set<string>();
+    let through: number | undefined;
+    for (const m of cm.getAllMessages()) {
+      if (m.sequence <= checkpoint) continue;
+      const meta = m.metadata as { kind?: unknown; heldMessageIds?: unknown; residentThrough?: unknown; residentBranch?: unknown } | undefined;
+      if (meta?.kind !== 'tune-out-reader-framing') continue;
+      if (Array.isArray(meta.heldMessageIds)) for (const id of meta.heldMessageIds) if (typeof id === 'string') held.add(id);
+      if (typeof meta.residentThrough === 'number' && branch !== undefined && meta.residentBranch === branch) through = meta.residentThrough;
+    }
+    return { held, ...(through !== undefined ? { through } : {}) };
+  }
+
+  /**
+   * The rows the resident's window took after the ordinal `through`, in
+   * window order, as a persisted reader is handed them: without the
+   * reader's own rows and mail (its reports are its own calls already), the
+   * resident's stored context injections (its context, which the reader's
+   * compiles hold their own of), and held traffic, which the resident's
+   * window doesn't take and the backlog hands.
+   */
+  private residentRowsSince(primary: string, reader: string, through: number): StoredMessage[] {
+    const agent = this.agents.get(primary);
+    if (!agent || !this.presentation) return [];
+    return this.presentation.presentedSince(agent, (through + 1) as Position).filter((m) => {
+      const meta = m.metadata as Record<string, unknown> | undefined;
+      if (storedInjectionMarkOf(meta) !== undefined || heldFromResidents(meta)) return false;
+      if (m.participant === reader) return false;
+      return (meta?.dendrite as { from?: { agent?: unknown } } | undefined)?.from?.agent !== reader;
+    });
   }
 
   /** A reader fork's own words to the resident: attributed mail when it has a route, else under its name. */

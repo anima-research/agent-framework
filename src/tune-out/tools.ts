@@ -1,6 +1,7 @@
 import type { ContentBlock } from '@animalabs/membrane';
-import { authorLine } from '../author-presentation.js';
+import { ANONYMOUS_PARTICIPANT, authorLine } from '../author-presentation.js';
 import type { StoredMessage } from '@animalabs/context-manager';
+import { foreignRowAsSent } from '../foreign-rounds.js';
 /**
  * The subconscious's tool surface (issue #77).
  *
@@ -369,9 +370,12 @@ export type ReaderRederivedReason = 'no-record' | 'branch-moved' | 'scope-ended'
 
 /**
  * The default reader-fork framing: a header naming the channel, epoch and
- * trigger; the notice; the voice block; standing dispositions if any; then
- * the held traffic as `author: text` lines with non-text blocks (images,
- * documents) preserved in order as the source supplied them.
+ * trigger; the notice; the voice block; standing dispositions if any; with
+ * `residentRows` (a resumed persisted reader's), the rows the resident's
+ * context took since the last look, under a count line, each as a line
+ * (residentRowLines); then the held traffic as `author: text` lines with
+ * non-text blocks (images, documents) preserved in order as the source
+ * supplied them.
  */
 export function defaultReaderFraming(ctx: ReaderFramingContext): ContentBlock[] {
   const header =
@@ -379,6 +383,7 @@ export function defaultReaderFraming(ctx: ReaderFramingContext): ContentBlock[] 
     `${ctx.notice}\n\n${ctx.voice}` +
     (ctx.dispositions ? `\n\n[Standing dispositions]\n${ctx.dispositions}` : '');
   const content: ContentBlock[] = [{ type: 'text', text: header }];
+  if (ctx.residentRows !== undefined) content.push(...residentRowLines(ctx.resident, ctx.residentRows));
   if (ctx.backlog.length === 0) {
     content.push({ type: 'text', text: '\n[Nothing new has been held since your last look.]' });
     return content;
@@ -396,6 +401,47 @@ export function defaultReaderFraming(ctx: ReaderFramingContext): ContentBlock[] 
       .join('\n');
     lines.push(authorLine(author, text));
     const media = message.content.filter((b) => b.type !== 'text');
+    if (media.length > 0) {
+      flush();
+      content.push(...media);
+    }
+  }
+  flush();
+  return content;
+}
+
+/**
+ * The rows a resident's context took since a persisted reader's last look,
+ * as the default framing writes them: a count line, then a line per row,
+ * `author: text`, its tool calls and results as the transcript the
+ * persistent subconscious is sent a resident's rounds in (foreignRowAsSent:
+ * the tool's name and its input or outcome in brief, no thinking), and its
+ * non-text blocks as they are. A row's author is its participant, or for a
+ * row under the anonymous participant, the author its metadata names; one
+ * that names none, a tool result's or a notice's, goes with no author.
+ */
+function residentRowLines(resident: string, rows: readonly StoredMessage[]): ContentBlock[] {
+  if (rows.length === 0) return [{ type: 'text', text: `\n[Nothing has entered ${resident}'s context since your last look.]` }];
+  const n = rows.length;
+  const content: ContentBlock[] = [];
+  const lines: string[] = [`\n[In ${resident}'s context since your last look: ${n} message${n === 1 ? '' : 's'}]`];
+  const flush = () => {
+    if (lines.length > 0) content.push({ type: 'text', text: lines.splice(0).join('\n') });
+  };
+  // Each result is named by the call it answers, as the transcript names it.
+  const callNames = new Map<string, string>();
+  for (const row of rows) for (const b of row.content) if (b.type === 'tool_use') callNames.set(b.id, b.name);
+  for (const row of rows) {
+    const sent = foreignRowAsSent(row.content, { callNames });
+    const author = row.participant === ANONYMOUS_PARTICIPANT
+      ? (row.metadata as { author?: { name?: string } } | undefined)?.author?.name
+      : row.participant;
+    const text = sent
+      .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
+      .map((b) => b.text)
+      .join('\n');
+    if (text.length > 0) lines.push(author !== undefined ? authorLine(author, text) : text);
+    const media = sent.filter((b) => b.type !== 'text');
     if (media.length > 0) {
       flush();
       content.push(...media);

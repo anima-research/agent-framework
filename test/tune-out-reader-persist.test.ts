@@ -13,8 +13,8 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { MessageId, StoredMessage } from '@animalabs/context-manager';
 import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
-import { AgentFramework } from '../src/index.js';
-import type { FrameworkConfig, TraceEvent } from '../src/index.js';
+import { AgentFramework, defaultReaderFraming } from '../src/index.js';
+import type { FrameworkConfig, ReaderFramingContext, TraceEvent } from '../src/index.js';
 import type { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 import { WireMembrane, final } from './helpers/wire-membrane.js';
@@ -176,7 +176,10 @@ describe('a persisted reader: one identity, resumed at each look', () => {
     assert.equal(record.inherit?.refusals, true);
     assert.equal(record.onParentEnd, 'end');
     assert.deepEqual(record.relationships.resultTo, { to: 'scout', as: 'message' });
-    assert.deepEqual(record.metadata, { epochId, channelId: CHANNEL, trigger: 'cadence', persist: 'epoch', resync: 'window' }, "this incarnation's metadata");
+    assert.deepEqual(record.metadata, {
+      epochId, channelId: CHANNEL, trigger: 'cadence', persist: 'epoch', resync: 'window',
+      residentBranch: t.internals.store.currentBranch().name,
+    }, "this incarnation's metadata");
 
     // Its second request continues its first: its own first framing and
     // reply, then the second framing.
@@ -241,5 +244,110 @@ describe('a persisted reader: one identity, resumed at each look', () => {
     const request = second.membrane.callsFor('reader')[0]!;
     const body = JSON.stringify(request.messages);
     assert.ok(body.includes('HELD-1 before') && body.includes('Before the restart.'), 'its request holds what it was handed and said before the restart');
+  });
+});
+
+describe('a persisted reader: re-synced by framing', () => {
+  it("hands a resumed look the rows the resident's context took since its last look, and none from before", { timeout: 120_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-resync-'));
+    dirs.push(dir);
+    const contexts: ReaderFramingContext[] = [];
+    const t = await boot(dir, { persist: 'epoch', framing: (ctx: ReaderFramingContext) => { contexts.push(ctx); return defaultReaderFraming(ctx); } });
+    await t.residentTurn('EARLY-1 hello scout', 'EARLY-2 scout hears you');
+    const epochId = t.enter();
+    const name = `reader/scout/${epochId.slice(0, 8)}/g1`;
+    const windowEnd = () => t.scout().getContextManager().indexLength();
+
+    // The first look: derived, its inheritance the resident's whole window.
+    t.membrane.script('reader', final([text('READER-REPORT-1 one held message.')]));
+    t.membrane.script('scout', final([text('LATE-0 noted the report')]));
+    const endAtFirst = windowEnd();
+    t.look(epochId, [t.hold(epochId, 'HELD-1 chatter')]);
+    await t.looked(name, 1);
+    await waitFor("scout's turn on the report", () => t.rows().some((m) => textOf(m) === 'LATE-0 noted the report'));
+    await t.residentTurn('LATE-1 what about the build?', 'LATE-2 the build is green');
+
+    // The second look: resumed, handed what scout's context took since.
+    t.membrane.script('reader', final([text('READER-REPORT-2 nothing more.')]));
+    t.look(epochId, [t.hold(epochId, 'HELD-2 more chatter')]);
+    await t.looked(name, 2);
+
+    assert.equal(contexts[0]!.residentRows, undefined, 'a derivation is handed no rows: it holds the window');
+    assert.equal(contexts[0]!.resumed, false);
+    const framings = (await t.framework.inspectAgentContext(name)).getAllMessages()
+      .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'tune-out-reader-framing');
+    const marks = framings.map((m) => (m.metadata as { residentThrough?: number; residentBranch?: string }));
+    assert.equal(marks[0]!.residentThrough, endAtFirst - 1, "the first framing records the resident's window as derived: the last ordinal it held");
+
+    // Exactly what scout's window took after that mark, up to the second's,
+    // in window order, but the reader's own report mail.
+    const cm = t.scout().getContextManager();
+    const reportMail = (m: StoredMessage) => (m.metadata as { dendrite?: { from?: { agent?: string } } } | undefined)?.dendrite?.from?.agent === name;
+    const expected = cm.getPresentedMessages()
+      .filter((m) => { const at = cm.ordinalOf(m.id) as unknown as number; return at > marks[0]!.residentThrough! && at <= marks[1]!.residentThrough!; });
+    assert.ok(expected.some(reportMail), "premise: the reader's first report entered scout's window between the looks");
+    const handed = contexts[1]!.residentRows!;
+    assert.deepEqual(handed.map((m) => m.id), expected.filter((m) => !reportMail(m)).map((m) => m.id),
+      "scout's window's rows between the marks, in window order, without the reader's own report mail");
+    const texts = handed.map((m) => textOf(m));
+    assert.deepEqual(texts.filter((h) => h.startsWith('LATE-')), ['LATE-0 noted the report', 'LATE-1 what about the build?', 'LATE-2 the build is green']);
+    assert.ok(!texts.some((h) => h.includes('EARLY')), 'and none from before the first look, which its inheritance holds');
+    assert.equal(t.forkTraces()[1]!.resynced, handed.length);
+    assert.equal(marks[0]!.residentBranch, t.internals.store.currentBranch().name);
+    assert.ok(marks[1]!.residentThrough! > marks[0]!.residentThrough!, 'and the second, where it stood at the second look');
+    assert.equal(t.framework.getAgentRecord(name)!.metadata!.residentBranch, t.internals.store.currentBranch().name, 'the record says where the look was framed');
+
+    // The default framing writes them as one factual block.
+    const sent = JSON.stringify(t.membrane.callsFor('reader')[1]!.messages.at(-1));
+    assert.ok(sent.includes(`[In scout's context since your last look: ${handed.length} messages]`), sent);
+    assert.ok(sent.includes('scout: LATE-0 noted the report') && sent.includes('antra: LATE-1 what about the build?') && sent.includes('scout: LATE-2 the build is green'), sent);
+  });
+
+  it('does not hand a resumed look a held row its own branch holds already', { timeout: 120_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-dedupe-'));
+    dirs.push(dir);
+    const t = await boot(dir, { persist: 'epoch' });
+    const epochId = t.enter();
+    const name = `reader/scout/${epochId.slice(0, 8)}/g1`;
+    const first = t.hold(epochId, 'HELD-1 chatter');
+    t.look(epochId, [first]);
+    await t.looked(name, 1);
+    // As after a restart, when the coordinator's cursor is gone: the
+    // epoch's whole backlog, the row handed before included.
+    const second = t.hold(epochId, 'HELD-2 more chatter');
+    t.look(epochId, [first, second]);
+    await t.looked(name, 2);
+    assert.deepEqual(t.forkTraces().map((f) => f.held), [1, 1], 'handed the new row alone');
+    const framings = (await t.framework.inspectAgentContext(name)).getAllMessages()
+      .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'tune-out-reader-framing');
+    assert.deepEqual(framings.map((m) => (m.metadata as { heldMessageIds: string[] }).heldMessageIds), [[first.id], [second.id]]);
+    const last = JSON.stringify(t.membrane.callsFor('reader')[1]!.messages.at(-1));
+    assert.ok(last.includes('HELD-2') && !last.includes('HELD-1'), last);
+  });
+
+  it("writes the resident's rows as a count line and a line per row: calls and results in brief, no thinking", () => {
+    const row = (participant: string, content: unknown[], metadata: Record<string, unknown> = {}) =>
+      ({ id: `r-${Math.random()}`, sequence: 0, participant, content, metadata }) as unknown as StoredMessage;
+    const ctx: ReaderFramingContext = {
+      resident: 'scout', fork: 'reader/scout/g1', voice: 'Read for scout.', channelId: CHANNEL, epochId: 'abcdef0123', trigger: 'cadence',
+      notice: '[Tune-out cadence: test]', dispositions: null, backlog: [], resumed: true, incarnation: 2,
+      residentRows: [
+        row('user', [{ type: 'text', text: 'is the build green?' }], { author: { id: 'u1', name: 'antra' } }),
+        row('scout', [{ type: 'thinking', thinking: 'SECRET-THOUGHT', signature: 's' }, { type: 'text', text: 'checking' }, { type: 'tool_use', id: 'c1', name: 'ci--status', input: { branch: 'main' } }]),
+        row('user', [{ type: 'tool_result', toolUseId: 'c1', content: 'green' }]),
+        row('user', [{ type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'AAAA' } }], { author: { id: 'u1', name: 'antra' } }),
+      ],
+    };
+    const out = defaultReaderFraming(ctx);
+    const all = out.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('\n');
+    assert.ok(all.includes("[In scout's context since your last look: 4 messages]\nantra: is the build green?\nscout: checking\n[ci--status called: {\"branch\":\"main\"}]\n[ci--status returned: green]"), all);
+    assert.ok(!all.includes('SECRET-THOUGHT'), 'no thinking');
+    assert.equal(out.filter((b) => b.type === 'image').length, 1, 'media as it is');
+    assert.ok(all.endsWith('[Nothing new has been held since your last look.]'), 'the held block after it, as before');
+    const none = defaultReaderFraming({ ...ctx, residentRows: [] }).map((b) => (b as { text?: string }).text ?? '').join('\n');
+    assert.ok(none.includes("[Nothing has entered scout's context since your last look.]"), none);
+    const { residentRows: _rows, resumed: _r, incarnation: _i, ...look } = ctx;
+    assert.deepEqual(defaultReaderFraming(look), defaultReaderFraming({ ...look }), 'premise');
+    assert.ok(!JSON.stringify(defaultReaderFraming(look)).includes("scout's context"), "without residentRows there's no block");
   });
 });
