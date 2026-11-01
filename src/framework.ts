@@ -893,6 +893,7 @@ const settingBoolean = (name: string, value: unknown): boolean => {
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
 import { asCalled, cutOffRefusal, markedInputRefusal, toolArgsProblems } from './tool-args.js';
+import { SpeculativePublishStreams } from './speculative-publish.js';
 import { cutOffRound, type CutOffCall } from './cut-off-round.js';
 import { EventGate, MCPL_GATE_EVENT_TYPES, checkToolInput, formatShadowWarning, shownValue, wakeLineText } from './gate/event-gate.js';
 import { ReplyJudge } from './gate/reply-judge.js';
@@ -3609,6 +3610,11 @@ function isLegacyFamily(config: McplServerConfig): boolean {
   }
 }
 
+/** A speculative stream's call, by agent and call id: call ids are the provider's, and two agents' may meet. */
+function speculativeCallKey(agentName: string, callId: string): string {
+  return `${agentName}\u0000${callId}`;
+}
+
 export class AgentFramework {
   private toolPresentations = new Map<string, ToolPresentation>();
   private presentationPreviews = new WeakMap<object, PresentationSnapshot>();
@@ -3810,6 +3816,24 @@ export class AgentFramework {
    * connections.
    */
   private pendingOutgoingCompletes: Set<() => void> = new Set();
+  /**
+   * Speculative channel chunks (docs/speculative-channel-chunks.md): the
+   * streams of each running inference stream whose agent has
+   * speculativeChannelChunks, with that agent's name, and, by agent and call
+   * id (speculativeCallKey), the one a finished channel_publish call's
+   * stream belongs to, until its publish (or another result) ends it.
+   * stop() cancels them all.
+   */
+  private speculativeStreams: Map<SpeculativePublishStreams, string> = new Map();
+  private speculativeCalls: Map<string, SpeculativePublishStreams> = new Map();
+  /** stop() has begun: no speculative stream starts or takes a delta. */
+  private speculativeClosed = false;
+  /**
+   * The calls whose streams stop() cancelled after chunks went out, before
+   * their publish started (by speculativeCallKey). Their publish is refused:
+   * what went out was cancelled, and a publish after it would be heard twice.
+   */
+  private speculativeStopCancelled: Set<string> = new Set();
   /**
    * Each agent's open logical turn: its routing state and receipt tallies
    * (TurnRouting). It stays open from the start that opens it until the
@@ -5564,6 +5588,20 @@ export class AgentFramework {
     });
     step(() => this.pushCoalescer?.suspend());
     step(() => this.flushCoalescingSnapshot());
+    // Speculative speech stops before the first wait: a call whose publish
+    // hasn't started won't run now, and no stream takes a delta after this.
+    // A publish under way ends its own stream by its outcome, or the cancel
+    // below once the waits are over.
+    this.speculativeClosed = true;
+    for (const [streams, agentName] of this.speculativeStreams ?? []) {
+      step(() => {
+        // Only a call whose text went out is refused later; one that sent
+        // nothing publishes as it would without the option.
+        const spoken = streams.spokenPending();
+        this.forgetSpeculativeCalls(agentName, streams.cancelPending(), streams);
+        for (const id of spoken) this.speculativeStopCancelled?.add(speculativeCallKey(agentName, id));
+      });
+    }
     this.running = false;
     // Bounded work this stop cuts off is neither finished nor failed. Its
     // record stays live in the snapshot, so the next boot ends it as
@@ -5749,6 +5787,11 @@ export class AgentFramework {
     // ended by now, and one it no longer tracks, such as a disposed
     // ephemeral's, may still be finishing.
     for (const complete of [...this.pendingOutgoingCompletes]) step(complete);
+    // Speculative streams end the same way, cancelled: nothing they carried
+    // is published now.
+    for (const streams of new Set([...this.speculativeStreams?.keys() ?? [], ...this.speculativeCalls?.values() ?? []])) step(() => streams.cancelAll());
+    this.speculativeStreams?.clear();
+    this.speculativeCalls?.clear();
 
     // A restart ends every conversation fork still live: the router's
     // bindings are in memory, and its generation counters are persisted so
@@ -7415,6 +7458,9 @@ export class AgentFramework {
    * result is dropped, and the drop is logged.
    */
   pushEvent(event: ProcessEvent): void {
+    // A channel_publish call's result that its publish didn't end the
+    // speculative stream of (refused before the publish, never run) cancels it.
+    if (event.type === 'tool-result') this.settleSpeculativeCall(event.agentName, event.callId);
     if (event.type === 'tool-result' && this.queue?.isClosed) {
       console.error(droppedToolResultLine(event, 'after stop'));
       return;
@@ -22459,6 +22505,53 @@ export class AgentFramework {
   }
 
   /**
+   * The speculative streams of an inference stream of this agent's, when it
+   * has speculativeChannelChunks and channels are wired
+   * (docs/speculative-channel-chunks.md). A call naming no channel streams
+   * to where its publish defaults: the turn's locus, as dispatch applies it
+   * (publishInputWithTurnLocus).
+   */
+  private speculativeStreamsFor(agent: Agent, routing: TurnRouting): SpeculativePublishStreams | undefined {
+    const registry = this.channelRegistry;
+    if (!agent.speculativeChannelChunks || !registry || this.speculativeClosed) return undefined;
+    // Names resolve as the publish resolves them: with the turn's own
+    // channels (dispatchChannelToolCall's `own`).
+    const own = () => this.ownChannels(routing);
+    const named = (input: { channelId?: unknown; serverId?: unknown }) => typeof input.channelId === 'string'
+      ? registry.speculativeTarget({
+        channelId: input.channelId,
+        ...(typeof input.serverId === 'string' && input.serverId ? { serverId: input.serverId } : {}),
+      }, own())
+      : null;
+    const streams = new SpeculativePublishStreams({
+      target: (channel, options) => registry.speculativeTarget(channel, own(), options),
+      defaultTarget: (input) => named(this.publishInputWithTurnLocus(input, agent.name, routing) as { channelId?: unknown; serverId?: unknown }),
+      chunk: (to, streamId, seq, content) => registry.sendSpeculativeChunk(to, agent.name, streamId, seq, content),
+      complete: (to, streamId, content, cancelled) => registry.sendSpeculativeComplete(to, agent.name, streamId, content, cancelled),
+    });
+    // (Optional chaining: prototype-built harnesses leave the maps unset.)
+    this.speculativeStreams?.set(streams, agent.name);
+    return streams;
+  }
+
+  /** Drops an agent's calls from speculativeCalls, where they still map to that stream set (any, when none is given). */
+  private forgetSpeculativeCalls(agentName: string, callIds: string[], streams?: SpeculativePublishStreams): void {
+    for (const id of callIds) {
+      const key = speculativeCallKey(agentName, id);
+      if (!streams || this.speculativeCalls?.get(key) === streams) this.speculativeCalls?.delete(key);
+    }
+  }
+
+  /** A call's result arrived: a speculative stream it still has is cancelled. */
+  private settleSpeculativeCall(agentName: string, callId: string): void {
+    const key = speculativeCallKey(agentName, callId);
+    const streams = this.speculativeCalls?.get(key);
+    if (!streams) return;
+    this.speculativeCalls?.delete(key);
+    streams.settle(callId);
+  }
+
+  /**
    * The agent's current turn, where a tool call was made inside it, else
    * none: a call made outside it, such as a script's left running after its
    * turn, carries no turn (ToolCall.callerTurnId), and a script's call in a
@@ -25097,6 +25190,9 @@ export class AgentFramework {
     // The stream's `complete` is pending from here: every exit reaches the
     // finally, which sends it, and a stop() can send it sooner.
     this.pendingOutgoingCompletes.add(completeOutgoing);
+    // Speculative channel chunks: the channel_publish calls this stream's
+    // model writes stream their text ahead of the publish.
+    const speculative = this.speculativeStreamsFor(agent, streamRouting);
     try {
       for await (const event of turnStreamEvents(stream, agent.name)) {
         // Ignore every late event from an Agent generation that no longer owns
@@ -25115,6 +25211,18 @@ export class AgentFramework {
         // image) belong to the round before, and a response with nothing in
         // it moves nothing, so a channel_open just before an empty final
         // response doesn't start typing in a turn that is ending.
+        // A tool call's argument fragment (speculativeChannelChunks) is read
+        // for its speculative stream alone: no trace, no locus move.
+        const toolInput = event.type === 'tokens' && event.meta.type === 'tool_call' && event.meta.toolCallPart === 'input';
+        if (toolInput) {
+          if (!this.speculativeClosed) speculative?.onInputDelta(event.meta.toolId, event.meta.toolName, event.content);
+          continue;
+        }
+        // The stream's end: a call whose publish hasn't started won't run in
+        // it, and its speech stops now, before any retry wait or teardown.
+        if (speculative && (event.type === 'complete' || event.type === 'error' || event.type === 'aborted')) {
+          this.forgetSpeculativeCalls(agent.name, speculative.cancelPending(), speculative);
+        }
         const modelContent = (event.type === 'tokens' && event.meta.type !== 'tool_result')
           || (event.type === 'block' && event.event.block.type !== 'tool_result');
         if (modelContent || event.type === 'retrying') followTurnLocus();
@@ -25154,6 +25262,8 @@ export class AgentFramework {
                 ' — discarding the refused attempt',
             );
             discardGuardHeld();
+            // The refused attempt's calls never run.
+            if (speculative) this.forgetSpeculativeCalls(agent.name, speculative.cancelPending(), speculative);
             this.emitTrace({
               type: 'inference:tokens',
               agentName: agent.name,
@@ -25180,6 +25290,10 @@ export class AgentFramework {
 
           case 'tool-calls': {
             const calls = event.calls.map(asCalled);
+            if (speculative) {
+              speculative.onToolCalls(calls);
+              for (const c of calls) if (speculative.has(c.id)) this.speculativeCalls?.set(speculativeCallKey(agent.name, c.id), speculative);
+            }
             // A tool-call response is a clean physical round: admit its
             // preceding results before storing/dispatching this new round.
             agent.toolResultGuard.accept();
@@ -26697,6 +26811,8 @@ export class AgentFramework {
         }
       }
     } catch (error) {
+      // As at a terminal event: before the failure's handling waits or retries.
+      if (speculative) this.forgetSpeculativeCalls(agent.name, speculative.cancelPending(), speculative);
       // A superseded physical stream may throw after its replacement starts.
       // It has no authority to settle, reset, gate-release, or publish failure.
       if (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId) {
@@ -26801,6 +26917,12 @@ export class AgentFramework {
       agent.reset();
       if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
     } finally {
+      // Calls whose publish never started won't run now: their streams are
+      // cancelled. A publish under way ends its own.
+      if (speculative) {
+        this.forgetSpeculativeCalls(agent.name, speculative.cancelPending(), speculative);
+        this.speculativeStreams?.delete(speculative);
+      }
       // The accounting writes to the store, and a write that fails must not
       // skip the teardown after it.
       try {
@@ -36472,11 +36594,36 @@ export class AgentFramework {
     const channelInput = call.name === 'channel_publish'
       ? this.publishInputWithTurnLocus(call.input, agentName, callingTurn)
       : call.input;
+    // A publish whose text went out ahead of it in a speculative stream
+    // carries the stream's id, and its outcome ends the stream.
+    const speculativeKey = speculativeCallKey(agentName, call.id);
+    if (call.name === 'channel_publish' && this.speculativeStopCancelled?.has(speculativeKey)) {
+      // stop() cancelled the text that went out for it (as from a trace
+      // listener above): the channel was told to drop it, so it isn't sent
+      // again as a publish.
+      this.speculativeStopCancelled.delete(speculativeKey);
+      const error = 'Not published: the framework is stopping, and the speech streamed for this message was cancelled.';
+      this.emitTrace({ type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id, error });
+      this.pushEvent({
+        type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'channels',
+        result: this.refusedResult(agentName, call.id, error),
+      });
+      return;
+    }
+    const speculative = call.name === 'channel_publish' ? this.speculativeCalls?.get(speculativeKey) : undefined;
+    const speculativeStream = speculative?.dispatch(call.id);
+    const endSpeculative = (outcome: { delivered: boolean; destination?: ChannelRef }) => {
+      if (!speculative) return;
+      if (this.speculativeCalls?.get(speculativeKey) === speculative) this.speculativeCalls?.delete(speculativeKey);
+      speculative.published(call.id, outcome);
+    };
     this.channelRegistry!.handleChannelToolCall(call.name, channelInput, {
       kind: 'agent', agentName, own: callingTurn ? this.ownChannels(callingTurn) : [], ...(callingTurn ? { inTurn: true } : {}), ...(earlierWake ? { earlierWake } : {}),
+      ...(speculativeStream ? { speculativeStream } : {}),
     }, published)
       .then((result) => {
         const destination = published.outcome?.status === 'delivered' ? published.outcome.destination : undefined;
+        endSpeculative({ delivered: !!destination, ...(destination ? { destination } : {}) });
         if (publisher && destination) publisher.notePublished(destinationKey(destination), readThrough);
         const durationMs = Date.now() - startTime;
         this.emitTrace({
@@ -36554,6 +36701,7 @@ export class AgentFramework {
         });
       })
       .catch((error) => {
+        endSpeculative({ delivered: false });
         const err = error instanceof Error ? error : new Error(String(error));
         this.emitTrace({ type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id, error: err.message });
         this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);

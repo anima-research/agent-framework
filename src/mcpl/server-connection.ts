@@ -52,6 +52,8 @@ import type {
   ChannelsPublishResult,
   ChannelsOutgoingChunkParams,
   ChannelsOutgoingCompleteParams,
+  ChannelsOutgoingSpeculativeChunkParams,
+  ChannelsOutgoingSpeculativeCompleteParams,
   McpToolDefinition,
   McpToolCallResult,
 } from './types.js';
@@ -1710,6 +1712,16 @@ export class McplServerConnection extends EventEmitter {
 
   /** Send `channels/outgoing/complete` notification. */
   sendChannelsOutgoingComplete(params: ChannelsOutgoingCompleteParams): void {
+    this.sendNotification(McplMethod.ChannelsOutgoingComplete, params as unknown as Record<string, unknown>);
+  }
+
+  /** Send a speculative stream's `channels/outgoing/chunk` (docs/speculative-channel-chunks.md). */
+  sendChannelsOutgoingSpeculativeChunk(params: ChannelsOutgoingSpeculativeChunkParams): void {
+    this.sendNotification(McplMethod.ChannelsOutgoingChunk, params as unknown as Record<string, unknown>);
+  }
+
+  /** Send a speculative stream's `channels/outgoing/complete`. */
+  sendChannelsOutgoingSpeculativeComplete(params: ChannelsOutgoingSpeculativeCompleteParams): void {
     this.sendNotification(McplMethod.ChannelsOutgoingComplete, params as unknown as Record<string, unknown>);
   }
 
