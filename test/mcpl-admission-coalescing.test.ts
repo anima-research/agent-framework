@@ -124,3 +124,77 @@ test('required channel batch admits each coalesced item independently and keeps 
   assert.deepEqual(seen, ['create', 'deny', 'edit']);
   assert(f.context().includes('batch_latest')); assert(!f.context().includes('batch_original')); assert(!f.context().includes('batch_denied'));
 });
+
+for (const lane of lanes) {
+  test(`required ${lane}: acknowledged retry replays its receipt without a second verdict`, async t => {
+    let calls = 0;
+    const f = await fixture({ server: { inboundAdmission: config(() => ++calls === 1 ? allow : deny) } });
+    t.after(f.close); await f.register();
+    const first = await send(f, lane, 'acknowledged', 'already_visible', { initial: true });
+    assert.equal(first.accepted, true); assert(f.context().includes('already_visible'));
+    const before = f.context();
+    const retry = await send(f, lane, 'acknowledged', 'retry_must_not_store', { initial: true });
+    assert.deepEqual(retry, first);
+    assert.equal(calls, 1, 'a live receipt is not re-decided, even if the callback would refuse');
+    assert.equal(f.context(), before);
+    assert.equal((await send(f, lane, 'refused', 'not_admitted')).reason, 'admission_denied');
+    assert.equal((await send(f, lane, 'refused', 'not_admitted')).reason, 'admission_denied');
+    assert.equal(calls, 3, 'refused work never acquires a replayable receipt');
+    assert.equal(f.context(), before);
+  });
+
+  test(`required ${lane}: receipt created during a concurrent callback beats its refusal`, async t => {
+    let calls = 0;
+    let release!: (verdict: AdmissionVerdict) => void;
+    const f = await fixture({ server: { inboundAdmission: config(() => {
+      if (++calls === 1) return new Promise<AdmissionVerdict>(resolve => { release = resolve; });
+      return allow;
+    }) } }); t.after(f.close); await f.register();
+    const pending = send(f, lane, 'same-event', 'pending_must_not_store', { initial: true });
+    await eventually(() => !!release);
+    const accepted = await send(f, lane, 'same-event', 'concurrent_admitted', { initial: true });
+    assert.equal(accepted.accepted, true); assert(f.context().includes('concurrent_admitted'));
+    const before = f.context();
+    release(deny);
+    assert.deepEqual(await pending, accepted);
+    assert.equal(calls, 2); assert.equal(f.context(), before);
+  });
+
+  test(`required ${lane}: receipt wins over a stale mutex recheck without repeating effects`, async t => {
+    const f = await fixture({ server: { inboundAdmission: config(() => allow) } });
+    t.after(f.close); await f.register();
+    const coalescer = (f.framework as any).pushCoalescer;
+    let occurrence: any;
+    const accepted = coalescer.host.accepted;
+    coalescer.host.accepted = (value: any) => { occurrence = value; accepted?.(value); };
+    const first = await send(f, lane, 'mutex-retry', 'visible_before_recheck', { initial: true });
+    assert(occurrence);
+    const before = f.context();
+    const retry = await coalescer.accept(occurrence, () => 'admission_stale');
+    assert.equal(retry.accepted, true); assert.deepEqual(retry.coalesce, first.coalesce);
+    assert.equal(f.context(), before);
+  });
+
+  test(`required ${lane}: receipt replay preserves a failed acknowledgement's durability barrier`, async t => {
+    let calls = 0;
+    const f = await fixture({ server: { inboundAdmission: config(() => ++calls === 1 ? allow : deny) } });
+    t.after(f.close); await f.register();
+    const host = (f.framework as any).pushCoalescer.host;
+    const commit = host.commit;
+    host.commit = () => { throw new Error('commit unavailable'); };
+    const raw = () => {
+      const value = item(f, lane, 'needs-commit', 'admitted_before_ack', { initial: true });
+      return f.send(lane, lane === 'channels/incoming' ? { messages: [value] } : value);
+    };
+    assert.equal((await raw()).error?.code, -32000);
+    assert(f.context().includes('admitted_before_ack'));
+    const before = f.context();
+    assert.equal((await raw()).error?.code, -32000, 'an uncommitted receipt cannot answer success');
+    assert.equal(calls, 1, 'admitted work cannot be re-decided even while acknowledgement fails');
+    host.commit = commit;
+    const result = await raw();
+    assert.equal(result.error, undefined);
+    assert.equal((lane === 'channels/incoming' ? result.result.results[0] : result.result).accepted, true);
+    assert.equal(calls, 1); assert.equal(f.context(), before);
+  });
+}
