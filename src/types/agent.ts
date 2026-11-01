@@ -334,6 +334,18 @@ export interface AgentConfig {
   proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled';
 
   /**
+   * Speculative channel chunks (docs/speculative-channel-chunks.md): while
+   * the model writes a `channel_publish` call to a channel whose
+   * capabilities have `streaming.speculative: true`, the call's text streams
+   * to that channel's server as `channels/outgoing/chunk` deltas, before the
+   * publish, for a voice server to speak at once; the publish's outcome ends
+   * the stream (complete, or cancelled). Needs native tool mode and a
+   * provider that streams tool arguments (Anthropic). Other channels see no
+   * change. Default false.
+   */
+  speculativeChannelChunks?: boolean;
+
+  /**
    * Stored participants that are this agent's own voice, in addition to its
    * name: their turns are presented to the model as this agent's assistant
    * turns. A derived agent sets this to the agent it inherited from, so the
