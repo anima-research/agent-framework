@@ -206,12 +206,15 @@ describe('the payload mark', () => {
         const own = uniq(`own-${kind}`);
         const ownNever = { ...embedded(own), disposition: 'never' };
         assert.deepEqual(convertBlocks([ownNever] as McplContentBlock[], 'attachment on push event', 'zz-never-dialed')[0], notice, `lane, ${kind}, its own never`);
-        assert.ok(toolResultDataToHistoryString([ownNever]).includes(NOTICE), `history, ${kind}, its own never`);
+        const ownShown = toolResultDataToHistoryString([ownNever]);
+        assert.ok(ownShown.includes(NOTICE) && !ownShown.includes('secret contents'), `history, ${kind}, its own never: ${ownShown}`);
+        assert.deepEqual(referenceBlockForScript(ownNever), notice, `script, ${kind}, its own never, without claims`);
         assert.deepEqual(referenceBlockForScript(ownNever, undefined, contentClaims([ownNever])), notice, `script, ${kind}, its own never`);
         const marked = uniq(`marked-${kind}`);
         referenceRegistry.register(testimonyOf(neverRef(marked)), 'zz-never-dialed');
         assert.deepEqual(convertBlock(embedded(marked) as McplContentBlock, 'attachment on push event', 'zz-other'), notice, `lane, ${kind}, after a mark`);
-        assert.ok(toolResultDataToHistoryString([embedded(marked)]).includes(NOTICE), `history, ${kind}, after a mark`);
+        const markedShown = toolResultDataToHistoryString([embedded(marked)]);
+        assert.ok(markedShown.includes(NOTICE) && !markedShown.includes('secret contents'), `history, ${kind}, after a mark: ${markedShown}`);
         assert.deepEqual(referenceBlockForScript(embedded(marked), 'zz-other', contentClaims([embedded(marked)])), notice, `script, ${kind}, after a mark`);
       }
       const plain = uniq('plain.txt');

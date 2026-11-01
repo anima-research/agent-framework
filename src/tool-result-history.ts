@@ -566,7 +566,7 @@ function referencesInHistoryOrThrow(data: unknown): { testimonies: ReferenceTest
  * RFC-005 governs is shown as the script lane shows it, a reference as its
  * stub's facts, a link's uri among them only where the model's line for it
  * would show it, an invalid one as the notice, and MCP's embedded resource as
- * the block its contents make (referenceBlockForScript), and inline data
+ * the block its contents make or its `never` notice (referenceBlockForScript), and inline data
  * that also claims a uri of any type or a disposition as the withheld
  * notice, each notice as a text block. A null, absent or empty uri claims
  * none (hasUri), so inline data beside one is itself. Any other value is

@@ -65,7 +65,8 @@ export type BlockClassification =
   | { kind: 'inline'; contradiction: boolean }
   | { kind: 'reference'; testimony: ReferenceTestimony }
   /** MCP's embedded resource (embeddedResourceContents): each lane shows
-   *  its contents as it shows the block they make. */
+   *  its contents as it shows the block they make, unless a `never` names
+   *  its uri. */
   | { kind: 'embedded'; contents: EmbeddedContents }
   /** `shown` is what the model-visible lanes put in the block's place. */
   | { kind: 'invalid'; shown: string };
@@ -1090,7 +1091,7 @@ export const EMBEDDED_RESOURCE_NEVER_TEXT = `[${NOTICE_TAG.resourceNotShown}: ${
 export function embeddedWithheld(block: unknown, claims?: ResultClaims): boolean {
   const uri = (block as { resource?: { uri?: unknown } }).resource?.uri;
   return typeof uri === 'string' && uri !== ''
-    && (claims?.get(uri)?.never === true || referenceRegistry.findByUri(uri)?.payloadNever === true);
+    && (inlineNeverUri(block) !== null || claims?.get(uri)?.never === true || referenceRegistry.findByUri(uri)?.payloadNever === true);
 }
 
 /** The claims a decision about a record reads: its result's for its uri,
@@ -1282,8 +1283,8 @@ export function referenceStubOrNull(block: unknown, provenance?: string, serverI
  * rejects becomes the notice the model's lanes show, and inline data that
  * also claims a bulk disposition, or a uri of any type but null, absent or
  * empty, the withheld notice, each as a text block. MCP's embedded resource
- * becomes the block its contents make, as the model's lanes show it, never
- * its uri.
+ * becomes the block its contents make, as the model's lanes show it, or the
+ * `never` notice where a `never` names its uri, never its uri.
  * A text block, or inline data that claims nothing, is returned as sent.
  */
 export function referenceBlockForScript(block: unknown, serverId?: string, claims?: ResultClaims, line?: ScriptLine): unknown {

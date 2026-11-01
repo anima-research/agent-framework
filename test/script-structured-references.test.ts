@@ -491,9 +491,11 @@ test("an MCPL peer's failure a module gets through ctx.callTool marks, by a `nev
     assert.equal(nested.payloadNever, true, 'a `never` nested in a failure\'s block marks as a success\'s would');
     assert.deepEqual([referenceRegistry.findByUri(nestedFresh)?.payloadNever, referenceRegistry.findByUri(nestedFresh)?.serverIds], [true, ['files']], 'and registers its uri marked where it has no record');
     const unreadable = `https://files.example.invalid/failure-never/${randomUUID()}-unreadable.pdf`;
-    answer({ content: [{ type: 'resource', uri: unreadable, disposition: 'never' }, { type: 'text', text: 'the attach failed', count: BigInt(1) }], isError: true });
+    const unreadablePlain = `https://files.example.invalid/failure-never/${randomUUID()}-unreadable-plain.pdf`;
+    answer({ content: [{ type: 'resource', uri: unreadable, disposition: 'never' }, { type: 'resource', uri: unreadablePlain }, { type: 'text', text: 'the attach failed', count: BigInt(1) }], isError: true });
     await script('fwd--whole');
     assert.deepEqual([referenceRegistry.findByUri(unreadable)?.payloadNever, referenceRegistry.findByUri(unreadable)?.serverIds], [true, ['files']], "a top-level `never` registers where the nested walk can't read the result");
+    assert.equal(referenceRegistry.findByUri(unreadablePlain), undefined, 'and nothing else does');
   });
 });
 
@@ -507,7 +509,8 @@ test("an MCPL peer's embedded resource beside a `never` for its uri reaches a sc
         answer({ content: order === 'embedded-first' ? [embedded, sealed] : [sealed, embedded], structuredContent: {} });
         const out = await script(tool);
         assert.ok(!out.includes('embedded-secret'), `${order}, ${tool}: ${out}`);
-        assert.ok(out.includes('a server asked that its content never reach you or your tools'), `${order}, ${tool}: ${out}`);
+        const shown = (JSON.parse(out) as { content: unknown[] }).content[order === 'embedded-first' ? 0 : 1];
+        assert.deepEqual(shown, { type: 'text', text: '[Resource not shown: a server asked that its content never reach you or your tools.]' }, `${order}, ${tool}: ${out}`);
       }
     }
   });
