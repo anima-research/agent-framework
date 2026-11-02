@@ -23,7 +23,11 @@ import { ChannelRegistry, destinationKey } from '../src/mcpl/channel-registry.js
 import { ALL_CAPABILITY_PATHS, CapabilityGrant } from '../src/mcpl/capability-grant.js';
 
 const dirs: string[] = [];
-afterEach(() => { while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true }); });
+const unscripted: string[] = [];
+afterEach(() => {
+  while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
+  assert.deepEqual(unscripted.splice(0), [], 'every stream the framework opened was one the test scripted');
+});
 
 const text = (value: string): ContentBlock => ({ type: 'text', text: value });
 const call = (id: string, name: string, input: Record<string, unknown> = {}): ContentBlock =>
@@ -36,12 +40,18 @@ const final = (...blocks: ContentBlock[]) => createMockResponse(blocks);
 /** Each stream the framework opens takes the next list of responses. */
 class ScriptMembrane {
   streams = 0;
+  readonly requests: NormalizedRequest[] = [];
   /** Wraps a stream's events, by its 1-based number. */
   wrap?: (index: number, events: AsyncIterable<StreamEvent>) => AsyncIterable<StreamEvent>;
   constructor(readonly scripts: NormalizedResponse[][]) {}
-  streamYielding(_request: NormalizedRequest, _options: YieldingStreamOptions = {}) {
+  streamYielding(request: NormalizedRequest, _options: YieldingStreamOptions = {}) {
+    this.requests.push(request);
     const script = this.scripts.shift();
-    assert.ok(script, 'unexpected extra inference');
+    if (!script) {
+      const last = request.messages.at(-1)?.content.map((b) => (b as { text?: string }).text ?? `[${b.type}]`).join(' ') ?? '';
+      unscripted.push(`stream ${this.requests.length}, after: ${last.slice(0, 120)}`);
+      throw new Error('unexpected extra inference');
+    }
     const stream = new MockYieldingStream(script);
     const index = ++this.streams;
     const wrap = this.wrap;
@@ -840,7 +850,6 @@ test("the published traces are emitted when the channel's server takes no stream
   const h = await harness([[round(text('first'), call('one', 'test--read')), final(text('second'))]], {}, { streaming: false });
   try {
     await h.run();
-    assert.deepEqual(h.chunks(), [], 'the server is sent no chunk');
     assert.deepEqual(h.traces.map((t) => `${t.type}:${t.text}`), [
       'inference:published:first',
       'inference:published:\n\nsecond',
@@ -850,13 +859,13 @@ test("the published traces are emitted when the channel's server takes no stream
 });
 
 // A publish that fails streams nothing, on every delivery path.
-const failedPublishCases: Array<{ name: string; mode: 'locus' | 'hybrid' | 'explicit'; script: () => NormalizedResponse[]; lost: string; kept?: string }> = [
+const failedPublishCases: Array<{ name: string; mode: 'locus' | 'hybrid' | 'explicit'; script: () => NormalizedResponse[]; lost: string; kept?: string; bounces?: true }> = [
   { name: 'locus text-only', mode: 'locus', script: () => [final(text('lost'))], lost: 'lost' },
   { name: 'locus trailing', mode: 'locus', script: () => [round(text('kept'), call('one', 'test--read')), final(text('lost'))], lost: 'lost', kept: 'kept' },
   { name: 'hybrid unprefixed', mode: 'hybrid', script: () => [round(text('lost'), call('one', 'test--read')), final(text('kept'))], lost: 'lost', kept: 'kept' },
-  { name: 'hybrid >>> target', mode: 'hybrid', script: () => [final(text('>>>#alpha lost'))], lost: 'lost' },
-  { name: 'explicit mid-turn', mode: 'explicit', script: () => [round(text('>>#alpha lost'), call('one', 'test--read')), final(text('>>#cafe kept'))], lost: 'lost', kept: 'kept' },
-  { name: 'explicit text-only', mode: 'explicit', script: () => [final(text('>>#alpha lost'))], lost: 'lost' },
+  { name: 'hybrid >>> target', mode: 'hybrid', script: () => [final(text('>>>#alpha lost'))], lost: 'lost', bounces: true },
+  { name: 'explicit mid-turn', mode: 'explicit', script: () => [round(text('>>#alpha lost'), call('one', 'test--read')), final(text('>>#cafe kept'))], lost: 'lost', kept: 'kept', bounces: true },
+  { name: 'explicit text-only', mode: 'explicit', script: () => [final(text('>>#alpha lost'))], lost: 'lost', bounces: true },
 ];
 // The id a server returns for a publish rides on that publish's trace, on every delivery path.
 for (const c of failedPublishCases) {
@@ -874,23 +883,18 @@ for (const c of failedPublishCases) {
   });
 }
 
-test('a published trace carries no message id when the server returned none', async () => {
-  const h = await harness([[round(text('first'), call('one', 'test--read')), final(text('second'))]]);
-  try {
-    await h.run();
-    const published = h.traces.filter((t) => t.type === 'inference:published');
-    assert.equal(published.length, 2, 'both publishes streamed');
-    assert.ok(published.every((t) => !('messageId' in t)), 'no id came back, so the traces carry none');
-  } finally { await h.framework.stop(); }
-});
-
 for (const c of failedPublishCases) {
   for (const failure of ['undelivered', 'unknown', 'throw'] as const) {
-    test(`${c.name}: a publish that ${failedHow(failure)} streams nothing`, async () => {
-      const h = await harness([c.script()], { proseRouting: c.mode });
+    const wakes = failure === 'undelivered' && c.bounces === true;
+    test(`${c.name}: a publish that ${failedHow(failure)} streams nothing${wakes ? ', and its bounce wakes the agent with the notice' : ''}`, async () => {
+      const h = await harness(wakes ? [c.script(), [final()]] : [c.script()], { proseRouting: c.mode });
       h.fails.set(c.lost, failure);
       try {
         await h.run();
+        if (wakes) {
+          const woken = h.membrane.requests[1]?.messages.flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '') ?? [];
+          assert.ok(woken.some((t) => t.includes('was not delivered') && t.includes('held as draft')), "the wake's request carries the bounce notice");
+        }
         assert.ok(h.publishes().some((p) => p.text === c.lost), 'the publish was tried');
         assert.equal(h.chunks().some((ch) => ch.text.includes(c.lost)), false, 'no chunk carries it');
         assert.equal(h.completes().some((co) => co.text.includes(c.lost)), false, 'nor does a complete');

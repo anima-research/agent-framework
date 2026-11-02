@@ -199,7 +199,6 @@ import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { splitThinkingDrops, ThinkingLossIncidents, type PlacedDrop, type StreamThinkingDrops } from './thinking-drops.js';
 import { asNextRequestCarries, roundRows, type RoundRow, type SentRow } from './sent-rows.js';
-import { ReasoningLossTeller } from './reasoning-loss.js';
 import { contentAsStored, nameAsStored } from './text-as-stored.js';
 import { STORED_INJECTION_KEY, STORED_INJECTION_KIND, asStoredRow, hasRenderedContent, isAnotherAgentsInjection, isOwnInjection, isStoredKind, storedInjectionMarkOf, unitHash, type StoredInjectionMark } from './stored-injections.js';
 
@@ -828,6 +827,8 @@ export const BUILTIN_TOOLSET_TOOLS: ReadonlySet<string> = new Set([
   'agent_settings',
   'wake_add_rule',
   'wake_remove_rule',
+  'wake_accept_suggestions',
+  'wake_decline',
   'gate_status',
   'event_tags',
   'set_tool_visibility',
@@ -916,8 +917,12 @@ import { asCalled, cutOffRefusal, markedInputRefusal, toolArgsProblems } from '.
 import { cutOffRound, type CutOffCall } from './cut-off-round.js';
 import { EventGate, MCPL_GATE_EVENT_TYPES, checkToolInput, formatShadowWarning, shownValue, wakeLineText } from './gate/event-gate.js';
 import { ReplyJudge } from './gate/reply-judge.js';
+import {
+  WakeDecisions, carriesAttention, isSuggestedRuleOf, isUndecided, offerFor, placementFor, rulesToWrite,
+  type OfferedRule, type ServerOffer,
+} from './gate/wake-onboarding.js';
 import { HEARTBEAT_CHANGING_TOOLS, Heartbeat, isHeartbeatMcplServer, type HeartbeatScheduledWake, type HeartbeatWake } from './heartbeat/heartbeat.js';
-import type { GateEntryRef, GateEventInfo, WakeLine } from './gate/types.js';
+import type { GateDecision, GateEntryRef, GateEventInfo, WakeLine } from './gate/types.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import { McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
@@ -3199,9 +3204,9 @@ const splitsPair = (text: string, index: number): boolean =>
  * signal's number (143, 130, 129). A service manager's stop signals the host
  * and its children together, so a child can go before the host's stop()
  * closes it: its loss is that stop, not a failure, and raises no mcpl-down.
- * A child the stdio transport ended itself after a pipe error was ended by
- * that failure, whatever its code or signal. A WebSocket's close codes are
- * 1000 and up, so they never match.
+ * A child the stdio transport ended itself, after a pipe error or a line on
+ * its stdout longer than the bound, was ended by that, whatever its code or
+ * signal. A WebSocket's close codes are 1000 and up, so they never match.
  */
 function endedAsAsked(ended: { code?: number | null; signal?: string | null; pipeFailed?: boolean }): boolean {
   if (ended.pipeFailed) return false;
@@ -3852,7 +3857,6 @@ export class AgentFramework {
    * next turn.
    */
   private turnRouting: Map<string, TurnRouting> = new Map();
-  private readonly reasoningLoss = new ReasoningLossTeller();
   /**
    * The latest link of each agent's chain of queued prose deliveries. Every
    * stream queues its own behind it, a fresh turn's included, so the agent's
@@ -4249,7 +4253,7 @@ export class AgentFramework {
   private collapseDerivationNoticesAfter = 10;
   /** The host's say over each derivation, ephemeral spawn and resume (config.dendrite.beforeDerive). */
   private beforeDerive?: (spec: AgentSpec) => void | { refuse: string };
-  /** What a source is told of a derivation (config.dendrite.derivationNotice); absent, the default line. */
+  /** What a source is told of a derivation (config.dendrite.derivationNotice); absent, nothing. */
   private derivationNoticeHook?: (record: AgentRecord, from: string, defaultText: string) => string | null;
   /** Per source agent, per kind: how many derivations, since when, and at which count the last note went. */
   private derivationTallies: Map<string, Map<string, { count: number; since: number }>> = new Map();
@@ -4465,6 +4469,8 @@ export class AgentFramework {
   // EventGate (null when FrameworkConfig.gate is omitted)
   private eventGate: EventGate | null = null;
   private judgeWired = false;
+  /** Wake onboarding's record of the agent's decisions (null: onboarding off, or no gate). */
+  private wakeDecisions: WakeDecisions | null = null;
   /** The heartbeat (FrameworkConfig.heartbeat), when the host turns it on. */
   private heartbeat: Heartbeat | null = null;
 
@@ -4988,6 +4994,14 @@ export class AgentFramework {
           return undefined;
         },
       });
+      // Wake onboarding: the agent's decisions about servers' suggested
+      // treatment, beside gate.json (gate/wake-onboarding.ts).
+      if (config.gate.onboarding !== false) {
+        framework.wakeDecisions = new WakeDecisions(
+          join(dirname(configPath), 'wake-decisions.json'),
+          (message) => console.error(`[gate] ${message}`),
+        );
+      }
     }
 
     // The heartbeat, when the host turns it on: the agent's own schedule of
@@ -5408,7 +5422,9 @@ export class AgentFramework {
    * turn: on the streams it cancels, on maintenance in flight (a pass or an
    * over-budget drain kick), on the event loop, on an operator's operations
    * already running, on modules and MCPL (its servers and the inference
-   * requests they made) together, then on Discord awareness
+   * requests they made) together, where a module whose start() is still
+   * running counts until that start() has settled and its stop() returned,
+   * then on Discord awareness
    * drains, which send nothing once stop() has begun, recording the call the
    * close ended. With a budget, a stop() can take up to six of them, besides
    * the withheld-spill deadline of a guard's write still under way. Omit to
@@ -7568,7 +7584,10 @@ export class AgentFramework {
    * been admitted, before anything else is checked: while that stop() runs,
    * a module added then would either be stopped by it or, once it has taken
    * its list of modules to stop, stay started past it; once it has settled,
-   * the framework has stopped for good, as start() says.
+   * the framework has stopped for good, as start() says. A stop() admitted
+   * while the module's start() runs stops the module once that start() has
+   * settled; if that start() fulfils, this rejects the same way then, with
+   * no `module:added`, and if it rejects, this rejects with its error.
    */
   async addModule(module: Module): Promise<void> {
     this.refuseOnceStopped('addModule()');
@@ -7590,6 +7609,7 @@ export class AgentFramework {
       }
     }
     await this.moduleRegistry.addModule(module);
+    this.refuseOnceStopped('addModule()');
     // The workspace judges whether an agent's history holds a message as the
     // framework judges its own notices, for its head-move notice
     // (noticeHeadMoves) and the writes it weighs against it. A module taken
@@ -7604,7 +7624,9 @@ export class AgentFramework {
   }
 
   /**
-   * Remove a module at runtime.
+   * Remove a module at runtime. A module whose start() is still running is
+   * stopped once that start() has settled; this waits for that and for its
+   * stop(), with no time limit.
    */
   async removeModule(name: string): Promise<void> {
     await this.moduleRegistry.removeModule(name);
@@ -7929,6 +7951,7 @@ export class AgentFramework {
           this.eventGate.getToolDefinition(),
           ...AgentFramework.SLEEP_TOOLS,
           ...(this.judgeWired ? AgentFramework.JUDGED_WAKE_RULE_TOOLS : AgentFramework.WAKE_RULE_TOOLS),
+          ...(this.wakeDecisions ? AgentFramework.WAKE_ONBOARDING_TOOLS : []),
           AgentFramework.EVENT_TAGS_TOOL,
         ]
       : [];
@@ -9597,8 +9620,9 @@ export class AgentFramework {
    * memory-only: they land within the turn, at a tool boundary or at its
    * end, and a crash before then loses them. That window runs to the turn's
    * end for a message held there and what is queued behind it, and, on a
-   * stream that declares it can't carry injected messages (membrane's XML
-   * prefill path, from 0.6.0), for every message deferred during the turn.
+   * stream that doesn't declare it carries injected messages (membrane's XML
+   * prefill path declares it can't), for every message deferred during the
+   * turn.
    *
    * A write that fails, or a queue over the cap, which writes nothing,
    * leaves the record as it last held it, except that store only, a write
@@ -11030,8 +11054,9 @@ export class AgentFramework {
    * **Inheritance.** `mode: 'shared'` (the default) gives the child the
    * parent's messages and fold state through shared storage: nothing is
    * copied, the child folds with the parent's memory tree, and neither can
-   * alter what the other reads. It needs branch-bound store handles and is
-   * refused, not silently downgraded, where they are missing. `mode: 'copy'`
+   * alter what the other reads. It needs a store that supports derivation
+   * (`ContextManager.supportsDerivation`), and is refused, not silently
+   * downgraded, without one. `mode: 'copy'`
    * is the historical mechanism — the parent's compiled context re-added as
    * the child's own messages — and works everywhere.
    *
@@ -11887,13 +11912,14 @@ export class AgentFramework {
   /**
    * The creation ("consent") event: names what kind of agent this is, what
    * ends it and what happens to it when its spawner ends. A derived agent's
-   * creation is also told to the agent it was derived from (#270, Linn:
-   * "told when the body changes" as a property, not a courtesy): one
-   * host-framed line in the source's context, built from the same facts as
-   * the trace, with no wake; a host's derivationNotice can replace the line
-   * or send none. Both derivation paths announce after the
-   * fork's branch or copy exists, so a fork never inherits the notice about
-   * itself; a source that has ended is told nothing (lifecycleNotice).
+   * creation is told to the agent it was derived from only when the host
+   * asks for it with a derivationNotice and that returns text: one
+   * host-framed line in the source's context, with no wake, given the
+   * framework's line built from the same facts as the trace. Without one the
+   * source is told nothing; the trace is emitted either way. Both derivation
+   * paths announce after the fork's branch or copy exists, so a fork never
+   * inherits the notice about itself; a source that has ended is told
+   * nothing (lifecycleNotice).
    */
   private announceAgentCreated(record: AgentRecord): void {
     this.emitTrace({
@@ -11910,7 +11936,8 @@ export class AgentFramework {
       ...(record.inherit ? { inherit: record.inherit } : {}),
     });
     const from = record.inherit?.from;
-    if (!from || from === record.name) return;
+    if (!from || from === record.name || !this.derivationNoticeHook) return;
+    const hook = this.derivationNoticeHook;
     const detail = {
       event: 'derived',
       agent: record.name,
@@ -11921,15 +11948,16 @@ export class AgentFramework {
       ...(record.relationships.resultTo ? { resultTo: record.relationships.resultTo } : {}),
       lifetime: record.lifetime,
     };
-    // A resumption is rare and always said. A first incarnation is tallied:
-    // past the threshold, a reader loop that forks a hundred times a session
-    // would fill its source's context with stamps (Linn, 2026-10-15), so
-    // the source hears a count line every `threshold` forks instead, with
-    // the latest described; every derivation still emits its trace.
+    // With the host's hook: a resumption is rare and always passed to it. A
+    // first incarnation is tallied: past the threshold, a reader loop that
+    // forks a hundred times a session would fill its source's context with
+    // stamps, so the hook is given a count line every `threshold` forks
+    // instead, with the latest described; every derivation still emits its
+    // trace.
     const threshold = this.collapseDerivationNoticesAfter;
     const tell = (defaultText: string, extra: Record<string, unknown> = {}) => {
       try {
-        const text = this.derivationNoticeHook ? this.derivationNoticeHook(record, from, defaultText) : defaultText;
+        const text = hook(record, from, defaultText);
         if (text !== null) this.lifecycleNotice(from, text, { ...detail, ...extra });
       } catch (error) {
         console.error(`[dendrite] ${record.name} was created, but ${from} could not be told:`, error);
@@ -12080,7 +12108,6 @@ export class AgentFramework {
     this.freshCallsCut.delete(name);
     this.forgetFailureAccounting(name);
     this.thinkingLossIncidents.forget(name);
-    this.reasoningLoss.forget(name);
     // main's manager release: the context manager an ephemeral run or a fork
     // opened is released with the agent (releaseManager).
     this.releaseManager(agent);
@@ -12883,7 +12910,6 @@ export class AgentFramework {
         this.freshCallsCut.delete(agent.name);
         if (run.endedFromOutside) this.forgetFailureAccounting(agent.name);
         this.thinkingLossIncidents.forget(agent.name);
-        this.reasoningLoss.forget(agent.name);
         // Its pending self-wake ends with it, as a fork's does.
         this.eventGate?.agentGone(agent.name);
         this.releaseWindowNowOrAfterResume(agent);
@@ -13204,6 +13230,44 @@ export class AgentFramework {
           name: { type: 'string', description: 'The rule name to remove.' },
         },
         required: ['name'],
+      },
+    },
+  ];
+
+  /** Wake onboarding's answers (gate/wake-onboarding.ts): accept an MCPL
+   *  server's suggested treatment (MCPL RFC-001 §5), all of it or some, or
+   *  decline it. Present when a gate is wired and onboarding is on. */
+  private static readonly WAKE_ONBOARDING_TOOLS: import('./types/index.js').ToolDefinition[] = [
+    {
+      name: 'wake_accept_suggestions',
+      description:
+        'Accept an MCPL server\'s suggestions for how its events should wake you (the ones a ' +
+        '[wake onboarding] notice listed, numbered as there). They are the server\'s claims, and the server may not be ' +
+        'trustworthy: accept what serves you, and when in doubt ask a person or another agent first. Each accepted suggestion becomes a wake rule ' +
+        'named "suggested:<server>:<n>" that matches only that server\'s events with those tags, placed ahead of your ' +
+        'catch-all rules, so the rules you wrote for the server, a channel or tags keep their place. Accepting ' +
+        'again replaces the earlier set; wake_remove_rule takes one out; wake_decline takes them all out.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          server: { type: 'string', description: 'The MCPL server id, as the notice named it.' },
+          rules: { type: 'array', items: { type: 'number' }, description: 'Which suggestions, by number. Left out: all of them.' },
+        },
+        required: ['server'],
+      },
+    },
+    {
+      name: 'wake_decline',
+      description:
+        'Decline an MCPL server\'s suggestions: your wake rules stay as they are for its events, and any ' +
+        '"suggested:<server>:<n>" rules you accepted before are removed. You won\'t be asked about the server again ' +
+        'unless its suggestions change. wake_add_rule still writes any rule of your own for it.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          server: { type: 'string', description: 'The MCPL server id, as the notice named it.' },
+        },
+        required: ['server'],
       },
     },
   ];
@@ -16697,18 +16761,21 @@ export class AgentFramework {
           // compiled prefix and the live request still match without it
           // (#232 gap 5).
           //
-          // A stream that declares it can't carry injected messages
-          // (supportsInjectedMessages false: membrane's XML prefill path,
-          // from membrane 0.6.0) gets none, so nothing is drained here.
-          // Everything queued for the agent waits for the turn-end flush, as
-          // a held message does, rather than sitting in the window between
-          // rounds the stream never showed it.
+          // Only a stream that declares it carries injected messages
+          // (supportsInjectedMessages true: membrane's native path) gets
+          // them. Membrane's XML prefill path declares false, and a stream
+          // that doesn't say is taken as one that doesn't, so nothing is
+          // drained for either: everything queued for the agent waits for
+          // the turn-end flush, as a held message does, rather than sitting
+          // in the window between rounds the stream never showed it. A
+          // boundary with no stream, the direct API's, drains: its
+          // re-inference compiles from the store.
           const midTurnInjections: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata; id?: MessageId }> = [];
           // What this boundary stored for the agent to hear, in store order,
           // for a boundary that leaves it to the turn's next start as
           // arrivals: that start's compile sends it.
           const heard: Array<{ msg: DeferredWrite; id: MessageId; content: ContentBlock[] }> = [];
-          if (currentState.supportsInjectedMessages !== false) {
+          if (currentState.supportsInjectedMessages === true || !currentState.stream) {
             // A clock row due (storeDueClock) goes right after the round's
             // results, ahead of what is drained below, and joins the stream
             // the same way. A boundary that passed during the round can't
@@ -16809,12 +16876,10 @@ export class AgentFramework {
 
           // A live stream handed these messages after the results follows
           // them in its next round, not the tool loop of a reply to
-          // [Continue]: that round's rows carry no prompt. One that doesn't
-          // say whether it carries them (membrane 0.5.x, whose native path
-          // carries them and whose XML path drops them) counts as carrying
-          // them here, as at the drain above. A boundary that ends the turn,
-          // restarts the stream or falls back to a new start below hands
-          // them to no live stream, and a new start reads its own prompt from
+          // [Continue]: that round's rows carry no prompt. A boundary that
+          // ends the turn, restarts the stream or falls back to a new start
+          // below hands them to no live stream, and a new start reads its own
+          // prompt from
           // what it sends. (The routing notice below rides only an injection
           // already here.)
           if (midTurnInjections.length > 0) {
@@ -17072,11 +17137,10 @@ export class AgentFramework {
             }
             // Streaming path: convert results and resume the stream.
             // Mid-turn messages collected above ride along as injected user
-            // messages. Membrane's native path (from 0.5.72) appends them
-            // after the tool_result envelope, so the next round of THIS turn
-            // hears them. Its XML prefill path drops them with a warning on
-            // 0.5.x, and from 0.6.0 declares it can't carry them, so none are
-            // collected for it. Each goes as its participant and content
+            // messages. Membrane's native path appends them after the
+            // tool_result envelope, so the next round of THIS turn hears
+            // them. Its XML prefill path declares it can't carry them, so
+            // none are collected for it. Each goes as its participant and content
             // alone: a stored row's metadata is the host's record, not input
             // for membrane. Each goes with its name and text as the store
             // keeps them, whether it's a heard message, rendered or not, or a
@@ -17107,15 +17171,11 @@ export class AgentFramework {
             // the watermark of the turn's compile and read as unread, so a
             // coalesced replacement could remove a message the agent heard
             // and answered (and that its later replies were minted after).
-            // Only a stream that declares it carries them is marked read
-            // (supportsInjectedMessages true: membrane's native path, from
-            // membrane 0.6.0). One that doesn't say may be membrane 0.5.87's
-            // XML path, which drops them with a warning, and a message marked
-            // read there could no longer be replaced though the agent never
-            // saw it. So without the declaration they stay unread, as before
-            // this mark.
-            // The shown mark moves at every boundary that injects, declared
-            // or not, since there a doubt counts as shown.
+            // Only a stream that declares it carries them gets them, and so
+            // is marked read (supportsInjectedMessages true: membrane's native
+            // path).
+            // The shown mark moves at every boundary that injects into its
+            // stream.
             // The mark is the store's head, a scalar, as a compile's is: it
             // also covers what was stored since the compile without being
             // carried, such as another slot's messages, and a write that
@@ -17127,8 +17187,7 @@ export class AgentFramework {
             // replies after it go without their thinking, whatever the mark
             // says; deferring those writers is the fix.
             if (midTurnInjections.length > 0) {
-              // Possibly shown, whatever the stream declares: the first-view
-              // mark (CoalescerHost.isUnshown) counts a doubt as shown.
+              // Shown: the stream carries them (CoalescerHost.isUnshown).
               agent.markContextShown();
               if (currentState.supportsInjectedMessages === true) agent.markContextConsumed();
             }
@@ -17660,6 +17719,9 @@ export class AgentFramework {
     const id = this.addMessage('user', incomingContent, AgentFramework.withStoredDigest(metadata, incomingContent), { placement, bypassDeferralFor: event.assemblingFor });
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
     if (decision.locus) this.noteDeliveredOrPark(event);
+    if (!decision.held) {
+      this.considerWakeOnboarding({ serverId: event.serverId, tags: event.tags, gateDecision: decision.gateDecision, recipients: decision.recipients, channelId: event.channelId });
+    }
 
     if (decision.wake) {
       for (const agentName of decision.recipients) {
@@ -18110,7 +18172,6 @@ export class AgentFramework {
       this.freshCallsCut.delete(agentName);
       this.forgetFailureAccounting(agentName);
       this.thinkingLossIncidents.forget(agentName);
-      this.reasoningLoss.forget(agentName);
       // A continuation of its turn still on its way goes with it.
       this.dropContinuations(agentName, { kind: 'dropped', why: 'its agent was disposed' });
       this.turnRouting.delete(agentName);
@@ -19434,6 +19495,9 @@ export class AgentFramework {
       this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
     } else {
       console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${logValue(event.eventId ?? '')}`);
+    }
+    if (!silentHeartbeat && !decision.held) {
+      this.considerWakeOnboarding({ serverId: event.serverId, tags: event.tags, gateDecision: decision.gateDecision, recipients: decision.recipients, channelId: triggerChannel?.channelId });
     }
 
     if (decision.wake) {
@@ -22076,25 +22140,6 @@ export class AgentFramework {
     this.writeChannelNotices(this.channelOpenedNotices(agentName, serverId, channels, cause), `auto-open notice (${cause})`, 'recordChannelAutoOpenNotice');
   }
 
-  private tellReasoningLoss(agent: Agent, make: () => string | undefined): void {
-    if (this.agents.get(agent.name) !== agent) return;
-    let line: string | undefined;
-    try {
-      line = make();
-    } catch (err) {
-      console.error(`[reasoning] ${agent.name}: could not tell what reasoning was lost:`, err);
-      return;
-    }
-    if (!line) return;
-    try {
-      this.addMessage('user', [{ type: 'text', text: line }], { system: true, kind: 'reasoning-loss' } as MessageMetadata, { forAgent: agent.name });
-    } catch (err) {
-      console.error(`[reasoning] ${agent.name}: the line for lost reasoning could not be stored:`, err);
-      return;
-    }
-    console.error(`[reasoning] ${agent.name}: told of reasoning no longer in its context`);
-  }
-
   /**
    * Write a builder's channel notices in order, each on its own: one that
    * can't be written is logged, and the rest are still written. A reader's
@@ -24490,10 +24535,6 @@ export class AgentFramework {
         const name = agent.name;
         agent.onCompiledToSend = (messages) => hub.observeCompile(name, messages);
       }
-      if (!agent.onThinkingStrip) {
-        agent.onThinkingStrip = (strip, branch) => this.tellReasoningLoss(agent, () => this.reasoningLoss.forStrip(
-          agent.name, branch, strip, (this.activeTurnTokens.has(agent.name) && this.turnRouting.get(agent.name)) || {}, agent.getContextManager()));
-      }
 
       // Module gatherContext (fail-open, per-module timeout — the module's
       // contextTimeoutMs, else the registry default). Injections are
@@ -25483,7 +25524,7 @@ export class AgentFramework {
                 (b) => b.type !== 'tool_result'
               );
             } else {
-              // Fallback (older membrane / XML tool mode): preamble + calls.
+              // XML tool mode: this round's text and its calls.
               // XML mode: persist the verbatim generation on each tool_use
               // (membrane#36 round-trip fidelity). context.rawText is the
               // parser's fullMatch — the exact <function_calls> block the
@@ -25495,15 +25536,12 @@ export class AgentFramework {
               const rawXml = rawText && /^<(antml:)?function_calls>/.test(rawText)
                 ? rawText
                 : undefined;
-              // Persist THIS round's text only. `roundPreamble` (membrane
-              // ≥0.5.79) is the per-round delta; the legacy `preamble` is
-              // CUMULATIVE in XML mode — persisting it per round stored each
-              // round's text N times and re-persisted injected
-              // <function_results> as the agent's own words (the Evander
-              // 2026-08-08 scaffold-leak pyramid: r1 ×3, r2 ×2).
-              const roundText =
-                (event.context as { roundPreamble?: string }).roundPreamble ??
-                event.context.preamble;
+              // Persist THIS round's text only: `roundPreamble` is the
+              // per-round delta. The `preamble` beside it is CUMULATIVE in XML
+              // mode: persisting it per round would store each round's text N
+              // times and re-persist injected <function_results> as the
+              // agent's own words.
+              const roundText = (event.context as { roundPreamble?: string }).roundPreamble;
               assistantBlocks = [];
               if (roundText) {
                 assistantBlocks.push({ type: 'text', text: roundText });
@@ -25528,9 +25566,7 @@ export class AgentFramework {
 
             // Whether this stream can carry messages injected with the round's
             // results: true on membrane's native path and false on its XML
-            // prefill path, from membrane 0.6.0, and absent on 0.5.x, which
-            // doesn't declare it. The tool boundary reads it from the agent's
-            // state.
+            // prefill path. The tool boundary reads it from the agent's state.
             agent.enterWaitingForTools(
               calls,
               stream,
@@ -25572,13 +25608,11 @@ export class AgentFramework {
             if (liveRound) liveProseRouting = true;
             // Whether this round's tool-result batch (and anything queued
             // with it) will be presented to the model before it speaks
-            // again: the producer says so when it can (membrane from 0.6.0).
-            // Otherwise, as on membrane 0.5.x, every round counts as
-            // presenting it. That holds for 0.5.x's native rounds, while its
-            // XML path drops what's injected, so a 'now' notice there reaches
+            // again: the stream declares it (true on membrane's native path).
+            // On the XML path, which declares false, a 'now' notice reaches
             // the agent at its next compile instead.
             const presentsInjections =
-              (event.context as { supportsInjectedMessages?: boolean }).supportsInjectedMessages ?? true;
+              (event.context as { supportsInjectedMessages?: boolean }).supportsInjectedMessages === true;
             // Queued under this turn's routing, whenever it posts, and
             // streamed by this stream once published.
             // This round's request was answered: what it carried is heard.
@@ -26363,14 +26397,14 @@ export class AgentFramework {
               // active (native roundContent), each mid-turn round's prose was
               // already delivered when that round yielded — only the TRAILING
               // prose (blocks after the last tool round) remains here. On the
-              // fallback path (XML tool mode / older membrane: no roundContent,
-              // so nothing was live-routed) the historical behavior applies:
+              // XML tool path (no roundContent, so nothing was live-routed)
+              // the historical behavior applies:
               // route the whole turn's parsed segments, once, now. The global
               // speech/thoughts split is left untouched (module/TUI rendering
               // unaffected) — this only governs what reaches the channel.
               //
               // Native round routing uses the live sticky flag, which a fresh
-              // injected message can reset. The legacy/fallback path has no
+              // injected message can reset. The XML tool path has no
               // reliable round boundaries, so retain its historical turn-wide
               // scan to avoid double-posting.
               const toolCalls = response.content
@@ -26906,10 +26940,6 @@ export class AgentFramework {
             const placedDrops = thinkingDrops && thinkingReport ? thinkingDrops.place(thinkingReport.dropped) : [];
             if (thinkingDrops?.recordedAfter !== undefined) {
               this.noteThinkingLoss(agent.name, placedDrops, thinkingDrops.recordedAfter);
-            }
-            if (thinkingDrops) {
-              this.tellReasoningLoss(agent, () => this.reasoningLoss.forDrops(agent.name, thinkingDrops.branch ?? '',
-                placedDrops, streamRouting, agent.getContextManager()));
             }
             try {
               if (!thinkingDroppedInStream) {
@@ -29548,7 +29578,7 @@ export class AgentFramework {
     if ((SUBCONSCIOUS_TOOL_NAMES as readonly string[]).includes(name)) return { kind: 'subconscious' };
     if ((name === 'sleep' || name === 'wake') && this.eventGate) return { kind: 'sleep' };
     if (this.heartbeat?.ownsTool(name)) return { kind: 'heartbeat' };
-    if ((name === 'wake_add_rule' || name === 'wake_remove_rule') && this.eventGate) return { kind: 'wake-rule' };
+    if ((name === 'wake_add_rule' || name === 'wake_remove_rule' || name === 'wake_accept_suggestions' || name === 'wake_decline') && this.eventGate) return { kind: 'wake-rule' };
     if (name === 'event_tags' && this.eventGate) return { kind: 'event-tags' };
     if ((name === 'think' || name === 'journal' || name === 'skip_reply') && this.channelRegistry) return { kind: 'agent-verb' };
     if (name === CODE_EXECUTION_TOOL_NAME && this.codeExecution) return { kind: 'code-execution' };
@@ -30970,11 +31000,9 @@ export class AgentFramework {
    * at a tool boundary whose stream declares it carries the messages
    * injected there (markContextConsumed). So a notice such a stream carried
    * is under it. One a boundary stored without sending (a turn a tool ended,
-   * a budget restart) is above it, and so is one injected into a stream that
-   * doesn't declare it carries injections, which may have dropped it:
-   * counted as unread, it goes to the primary even if the agent heard it,
-   * rather than to no one where the stream dropped it. null when the window
-   * can't be read, which is logged.
+   * a budget restart, the direct API's boundary, which has no stream) is
+   * above it until a compile sends it, and counts as unread. null when the
+   * window can't be read, which is logged.
    */
   private releasedWindow(agent: Agent, held: ReadonlySet<string>): ReleasedWindow | null {
     try {
@@ -36907,6 +36935,131 @@ export class AgentFramework {
   }
 
   /**
+   * `wake_accept_suggestions` / `wake_decline`: the agent's answer to a wake
+   * onboarding offer. Accepting writes the chosen suggestions as
+   * `suggested:<server>:<n>` rules (replacing any it accepted before) ahead of
+   * the first catch-all; declining removes them. Either way the decision is
+   * recorded against the server's declared ontology, so it isn't asked again
+   * until that changes. Throws only what the gate throws on a write.
+   */
+  private answerWakeOnboarding(call: ToolCall): import('./types/events.js').ToolResult {
+    const fail = (error: string) => ({ success: false, error: `${call.name}: ${error}`, isError: true });
+    if (!this.wakeDecisions || !this.eventGate) return fail('wake onboarding is off on this host, so there are no suggestions to answer. wake_add_rule writes rules of your own.');
+    const input = (call.input ?? {}) as { server?: unknown; rules?: unknown };
+    const known = [...new Set([
+      ...Object.keys(this.wakeDecisions.all()),
+      ...(this.mcplServerRegistry?.getAllServers() ?? []).map((c) => c.id),
+    ])].sort();
+    const servers = known.map((k) => quotedValue(k)).join(', ') || 'none';
+    if (typeof input.server !== 'string' || !input.server) {
+      return fail(`server is ${shownValue(input.server)}, where an MCPL server id is needed. Servers: ${servers}.`);
+    }
+    const server = input.server;
+    // Connected: registered, with its declarations readable (they go when the connection closes).
+    const connected = !!this.mcplServerRegistry?.getServer(server) && (this.featureSetManager?.getDeclaredFeatureSets(server) ?? null) !== null;
+    const record = this.wakeDecisions.get(server);
+    if (!connected && !record) return fail(`no MCPL server is called ${quotedValue(server)}. Servers: ${servers}.`);
+    const before = this.eventGate.policiesInForce();
+    const earlier = before.filter((p) => isSuggestedRuleOf(p.name, server));
+
+    // Back where they stood: the earlier accepted set, ahead of the rule that followed it (after a failed change).
+    const restoreEarlier = (): string | null => {
+      try {
+        const present = new Set(this.eventGate!.policiesInForce().map((p) => p.name));
+        // Last first, each ahead of the rule that followed it before and is in force now.
+        for (const p of earlier.filter((q) => !present.has(q.name)).reverse()) {
+          const at = before.findIndex((q) => q.name === p.name);
+          const next = before.slice(at + 1).find((q) => present.has(q.name))?.name;
+          this.addGatePolicy(p, next ? { position: { before: next } } : undefined);
+          present.add(p.name);
+        }
+        return null;
+      } catch (undo) {
+        return `Putting the earlier rules back failed too (${undo instanceof Error ? undo.message : String(undo)}); gate_status shows what is in force.`;
+      }
+    };
+
+    if (call.name === 'wake_decline') {
+      // A disconnected server's declaration can't be read: the decline stands for what it was last asked about.
+      const digest = connected ? this.wakeOffer(server).digest : record!.digest;
+      try {
+        for (const p of earlier) this.removeGatePolicy(p.name);
+      } catch (error) {
+        const undo = restoreEarlier();
+        return fail([`nothing was declined: ${error instanceof Error ? error.message : String(error)}`, undo].filter(Boolean).join(' '));
+      }
+      this.wakeDecisions.set(server, { digest, state: 'declined' });
+      this.emitTrace({ type: 'gate:onboarding-decided', serverId: server, digest, state: 'declined', rules: [] });
+      return {
+        success: true,
+        data: {
+          server, declined: true, removed: earlier.map((p) => p.name), policies: this.getGatePolicyNames(),
+          note: `Your rules stay as they are for ${server}'s events. You won't be asked again unless its suggestions change.`,
+        },
+      };
+    }
+
+    if (!connected) return fail(`${quotedValue(server)} isn't connected, so its suggestions can't be read now. wake_decline still records a decline.`);
+    const offer = this.wakeOffer(server);
+    if (record && (record.shown ?? record.digest) !== offer.digest) {
+      // The numbers the agent was shown may not mean what they mean now: show them again, and ask again.
+      // The decision on record (and its time, which the daily floor counts from) stays as it is.
+      this.wakeDecisions.markShown(server, offer.digest);
+      return fail(`${quotedValue(server)}'s suggestions changed since you were told about them, so nothing was written. They are now:\n`
+        + offer.rules.map((r) => `  ${r.n}. ${this.describeOfferedRule(r, offer)}`).join('\n')
+        + '\nCall again to accept these (all, or rules: [numbers]), or wake_decline.');
+    }
+    let chosen = offer.rules;
+    if (input.rules !== undefined) {
+      const wanted = Array.isArray(input.rules) ? input.rules : [input.rules];
+      const bad = wanted.filter((n) => typeof n !== 'number' || !offer.rules.some((r) => r.n === n));
+      if (bad.length > 0 || wanted.length === 0) {
+        return fail(`rules is ${shownValue(input.rules)}; ${quotedValue(server)}'s suggestions are numbered 1 to ${offer.rules.length}. Leave rules out to accept all of them.`);
+      }
+      chosen = offer.rules.filter((r) => wanted.includes(r.n));
+    }
+
+    // One change as far as the agent can tell: on a failed write, the earlier set comes back.
+    const written: string[] = [];
+    let placedBefore: string | null = null;
+    try {
+      for (const p of earlier) this.removeGatePolicy(p.name);
+      placedBefore = placementFor(this.eventGate.policiesInForce());
+      for (const policy of rulesToWrite(offer, chosen)) {
+        this.addGatePolicy(policy, placedBefore ? { position: { before: placedBefore } } : undefined);
+        written.push(policy.name);
+      }
+    } catch (error) {
+      let undo: string | null = null;
+      try {
+        for (const name of written) this.removeGatePolicy(name);
+      } catch (e) {
+        undo = `Removing what was written failed too (${e instanceof Error ? e.message : String(e)}); gate_status shows what is in force.`;
+      }
+      undo ??= restoreEarlier();
+      const why = error instanceof Error ? error.message : String(error);
+      return fail([`nothing was accepted: ${why}`, undo].filter(Boolean).join(' '));
+    }
+    this.wakeDecisions.set(server, { digest: offer.digest, state: 'accepted', rules: written });
+    this.emitTrace({ type: 'gate:onboarding-decided', serverId: server, digest: offer.digest, state: 'accepted', rules: written });
+    return {
+      success: true,
+      data: {
+        server,
+        accepted: rulesToWrite(offer, chosen),
+        placedBefore,
+        replaced: earlier.map((p) => p.name).filter((name) => !written.includes(name)),
+        policies: this.getGatePolicyNames(),
+        // As wake_add_rule reports them: an accepted rule that takes events a later rule was written for.
+        shadowWarnings: this.eventGate.getStatus().shadowWarnings.filter((w) => written.some((name) => w.includes(name))),
+        note: placedBefore
+          ? `Written ahead of ${quotedValue(placedBefore)}, the first rule that took ${server}'s events without naming it.`
+          : 'Written last, ahead of the default.',
+      },
+    };
+  }
+
+  /**
    * Handle the synthesized `wake_add_rule` / `wake_remove_rule` tools: mutate
    * the hot-reloaded gate.json at runtime. Validation lives in the EventGate
    * (same path as gate.json load), so an invalid rule is surfaced as a tool
@@ -36931,6 +37084,10 @@ export class AgentFramework {
     };
 
     try {
+      if (call.name === 'wake_accept_suggestions' || call.name === 'wake_decline') {
+        finish(this.answerWakeOnboarding(call));
+        return;
+      }
       if (call.name === 'wake_remove_rule') {
         const input = (call.input ?? {}) as { name?: unknown };
         if (typeof input.name !== 'string' || !input.name) {
@@ -37373,7 +37530,10 @@ export class AgentFramework {
    * framework's policy inputs (recipients, the hold in force, the wake
    * gate), traced. Callers apply it; nothing downstream re-asks.
    */
-  private admitInbound(env: InboundEnvelope): AdmissionDecision {
+  private admitInbound(env: InboundEnvelope): AdmissionDecision & { gateDecision?: GateDecision } {
+    // The gate's whole decision, for wake onboarding (which rule let the event
+    // go by); admission itself reads only whether it wakes.
+    let gateDecision: GateDecision | undefined;
     const gateInfo = (e: InboundEnvelope) => ({
       content: e.gateContent,
       eventType: String(e.gateMetadata.eventType ?? 'unknown'),
@@ -37391,7 +37551,7 @@ export class AgentFramework {
       ...(this.eventGate
         ? {
             gate: {
-              evaluate: (e: InboundEnvelope) => this.eventGate!.evaluate(gateInfo(e)).trigger,
+              evaluate: (e: InboundEnvelope) => (gateDecision = this.eventGate!.evaluate(gateInfo(e))).trigger,
               // "Would the gate have woken them": a debounce policy says yes,
               // later — for the hold's reader that is a pass, not a mute.
               probe: (e: InboundEnvelope) => {
@@ -37413,7 +37573,148 @@ export class AgentFramework {
       wake: decision.wake,
       gatePass: decision.gatePass,
     });
-    return decision;
+    const evaluated = gateDecision as GateDecision | undefined;
+    return evaluated ? { ...decision, gateDecision: evaluated } : decision;
+  }
+
+  /**
+   * Wake onboarding, after an inbound event is stored: if the gate let it go
+   * by without anyone having decided about its server (gate/wake-onboarding.ts
+   * isUndecided), and the agent hasn't been offered or answered for this
+   * server's declared ontology, offer the server's suggestions once — a notice
+   * after the event, and a wake when the event is addressed to the agent or
+   * waiting on it (ATTENTION_TAGS); otherwise the notice waits for the next
+   * turn. Never throws: onboarding is advice, and an event's delivery must not
+   * depend on it.
+   */
+  private considerWakeOnboarding(event: {
+    serverId: string;
+    tags?: readonly string[];
+    gateDecision?: GateDecision;
+    recipients: readonly string[];
+    /** Where the event came from, so a turn it wakes speaks there (as the lane's own wake would). */
+    channelId?: string;
+  }): void {
+    try {
+      const d = event.gateDecision;
+      if (!this.wakeDecisions || !this.eventGate || !d || d.trigger) return;
+      // Cheap refusals first: this runs for every event a catch-all lets by.
+      if (!this.wakeDecisions.mayOfferSoon(event.serverId)) return;
+      if (!this.mcplServerRegistry?.getServer(event.serverId)) return;
+      const policy = d.policyName === null ? undefined : this.eventGate.policyInForce(d.policyName);
+      if (!isUndecided(d, policy)) return;
+      const offer = this.wakeOffer(event.serverId);
+      if (!this.wakeDecisions.mayOffer(event.serverId, offer.digest)) return;
+      const wake = carriesAttention(event.tags);
+      const text = this.wakeOnboardingText(offer, { policyName: d.policyName, behavior: String(d.behavior), tags: event.tags ?? [], wake });
+      const placement: import('./gate/event-gate.js').WritePlacement = {};
+      this.addMessage(
+        'user',
+        [{ type: 'text', text }],
+        { system: true, kind: 'wake-onboarding', serverId: event.serverId } as MessageMetadata,
+        { placement },
+      );
+      // Recorded once the notice is stored: a notice that failed to be written is offered again.
+      // An earlier acceptance's rule names stay on record while the new question is open.
+      const prior = this.wakeDecisions.get(event.serverId);
+      this.wakeDecisions.set(event.serverId, { digest: offer.digest, state: 'offered', ...(prior?.rules ? { rules: prior.rules } : {}) });
+      this.emitTrace({
+        type: 'gate:onboarding-offered',
+        serverId: event.serverId,
+        digest: offer.digest,
+        policy: d.policyName,
+        rules: offer.rules.length,
+        wake,
+      });
+      if (!wake) return;
+      const targets = event.recipients.length > 0 ? event.recipients : this.registry.untargetedRecipients();
+      for (const agentName of targets) {
+        if (!this.agents.has(agentName)) continue;
+        this.pendingRequests.push({
+          agentName,
+          reason: 'wake-onboarding',
+          source: event.serverId,
+          timestamp: Date.now(),
+          ...(event.channelId ? { channelId: event.channelId, channelServerId: event.serverId } : {}),
+          addressed: isAddressedMessage(event.tags as string[] | undefined),
+          ...this.readsWriteFor(placement, agentName),
+        });
+      }
+    } catch (error) {
+      console.error(`[gate] wake onboarding for ${logValue(event.serverId)} failed:`, error);
+    }
+  }
+
+  /** The last offer built per server, kept while its enabled declarations are the same objects. */
+  private wakeOfferCache = new Map<string, { refs: unknown[]; offer: ServerOffer }>();
+
+  /**
+   * A server's offer from the feature sets this host enabled for it (events
+   * of the others never arrive, and their ontology isn't the question).
+   */
+  private wakeOffer(serverId: string): ServerOffer {
+    const declared = this.featureSetManager?.getDeclaredFeatureSets(serverId) ?? null;
+    const enabled = new Set(this.featureSetManager?.getEnabledFeatureSets(serverId) ?? []);
+    const used = declared ? Object.fromEntries(Object.entries(declared).filter(([name]) => enabled.has(name))) : null;
+    const refs = used ? Object.keys(used).sort().flatMap((name) => [name, used[name]]) : [];
+    const hit = this.wakeOfferCache.get(serverId);
+    if (hit && hit.refs.length === refs.length && hit.refs.every((r, i) => r === refs[i])) return hit.offer;
+    const offer = offerFor(serverId, used);
+    this.wakeOfferCache.set(serverId, { refs, offer });
+    return offer;
+  }
+
+  /** The onboarding notice: what happened, what the server suggests, how to answer. Server-written text is quoted. */
+  private wakeOnboardingText(
+    offer: ServerOffer,
+    seen: { policyName: string | null; behavior: string; tags: readonly string[]; wake: boolean },
+  ): string {
+    const server = quotedValue(offer.server);
+    const by = seen.policyName === null
+      ? 'by the gate\'s default'
+      : `by your rule ${quotedValue(seen.policyName)}, which names neither ${server} nor any of its tags`;
+    const lines = [
+      `[${NOTICE_TAG.wakeOnboarding}] Events from the MCPL server ${server} reach your context without waking you: the one above`
+        + `${seen.tags.length ? ` (tags ${seen.tags.map((t) => quotedValue(t)).join(', ')})` : ''} was let by (${seen.behavior}) ${by}.`
+        + (seen.wake ? ' It is marked as addressed to you or waiting on you, so this woke you to decide.' : ''),
+      offer.rules[0]?.fallback
+        ? `${server} declares no suggestions the host can use. The host offers one rule:`
+        : `${server} suggests:`,
+    ];
+    for (const r of offer.rules) lines.push(`  ${r.n}. ${this.describeOfferedRule(r, offer)}`);
+    if (offer.untranslated.length > 0) {
+      lines.push(`  (${offer.untranslated.length} more suggestion${offer.untranslated.length === 1 ? '' : 's'} could not be made into rules; event_tags shows them as declared.)`);
+    }
+    lines.push(
+      `The suggestions and their reasons are ${server}'s own words, from a server that may not be trustworthy: accept what serves you, with reasonable caution, and when in doubt, ask a person or another agent before you do.`,
+      `Answer with wake_accept_suggestions { server: ${server} } (all of them, or rules: [numbers]), or wake_decline { server: ${server} } to leave things as they are.`
+        + ` Accepted rules are written as ${quotedValue(`suggested:${offer.server}:<n>`)} ahead of your catch-all rules, and wake_remove_rule takes them out.`
+        + ` You won't be asked about ${server} again unless its suggestions change.`,
+    );
+    return lines.join('\n');
+  }
+
+  private describeOfferedRule(r: OfferedRule, offer: ServerOffer): string {
+    const spanOf = (ms: number) => (ms < 1000 ? `${ms} ms` : `${Number((ms / 1000).toFixed(ms % 1000 === 0 ? 0 : 1))} s`);
+    const tags = (list: string[] | undefined) => (list ?? []).map((t) => quotedValue(t)).join(', ');
+    const parts = [
+      r.match.tagsAny ? `tagged any of ${tags(r.match.tagsAny)}` : '',
+      r.match.tagsAll ? `tagged all of ${tags(r.match.tagsAll)}` : '',
+      r.match.tagsNone ? `not tagged ${tags(r.match.tagsNone)}` : '',
+    ].filter(Boolean).join(', ');
+    const b = r.behavior;
+    const does = b === 'always' ? 'wake you'
+      : b === 'defer' || b === 'skip' ? 'don\'t wake you (they still enter your context)'
+      : typeof b === 'object' && 'debounce' in b ? `wake you once, ${spanOf(b.debounce)} after a burst goes quiet`
+      : typeof b === 'object' && 'rate_limit' in b ? `wake you at most once every ${spanOf(b.rate_limit.refillIntervalMs)}`
+      : typeof b === 'object' && 'passive_sample' in b ? (b.passive_sample.every === 1 ? 'wake you' : `wake you for one in every ${b.passive_sample.every}`)
+      : 'wake you as the server says';
+    const described = [...(r.match.tagsAny ?? []), ...(r.match.tagsAll ?? [])]
+      .filter((t) => offer.tagDescriptions[t])
+      .map((t) => `${quotedValue(t)}: ${quotedValue(offer.tagDescriptions[t])}`);
+    return `Events ${parts}: ${does}.`
+      + (r.rationale ? ` Why: ${quotedValue(r.rationale)}.` : '')
+      + (described.length ? ` (${described.join('; ')})` : '');
   }
 
   private commitDeliveries(): boolean {
@@ -38431,9 +38732,21 @@ export class AgentFramework {
       }
       if (Object.keys(sets).length > 0) servers[conn.id] = sets;
     }
+    // Wake onboarding: what each connected server offers, and what was decided.
+    const onboarding = this.wakeDecisions
+      ? {
+          offers: Object.fromEntries((this.mcplServerRegistry?.getAllServers() ?? []).map((conn) => {
+            // The same offer the notice and wake_accept_suggestions number (enabled feature sets only).
+            const offer = this.wakeOffer(conn.id);
+            return [conn.id, { rules: offer.rules, ...(offer.untranslated.length ? { untranslated: offer.untranslated } : {}) }];
+          })),
+          decisions: this.wakeDecisions.all(),
+        }
+      : null;
     return {
       core: AgentFramework.CHAT_CORE_TAGS,
       servers,
+      onboarding,
       gateScript: this.eventGate?.getStatus().script ?? null,
       hint:
         'Use these in gate.json policies (match.tagsAny / tagsAll / tagsNone) or ' +

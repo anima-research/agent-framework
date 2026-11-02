@@ -371,18 +371,6 @@ test("a module's write injected into an ephemeral run's stream at a tool round t
   assert.ok(!primaryTexts(x).includes('RESULT FOR worker'), "not in the primary's");
 });
 
-test("on a stream that doesn't declare whether it carries injections, an injected write counts as unread, so the primary gets a copy, as for a notice", async () => {
-  const x = await make();
-  assert.equal(x.membrane.supportsInjectedMessages, undefined, 'the premise: undeclared');
-  x.membrane.pushResponse(deliver({ for: 'worker' }));
-  x.membrane.pushResponse(createMockResponse([text('done')]));
-  const own = await runWorker(x, 'worker');
-  const injected = x.membrane.lastStream!.receivedToolResultOptions.flatMap((o) => o?.injectedMessages ?? []);
-  assert.ok(injected.some((msg) => JSON.stringify(msg.content).includes('RESULT FOR worker')), 'the premise: injected');
-  assert.ok(own.includes('RESULT FOR worker'));
-  assert.ok(primaryTexts(x).includes('RESULT FOR worker'), "and the primary's copy");
-});
-
 test("a module's write a run's compile sent counts as read, so it stays the run's, though the run ends with no tool round", async () => {
   const x = await make();
   x.membrane.pushResponse(createMockResponse([text('done')]));

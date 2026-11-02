@@ -453,10 +453,10 @@ above the agent's consumed watermark (set when the agent is created, and
 advanced at every compile of a request it sends, which a preview isn't, and at
 a tool boundary that injects messages into a stream declaring it carries them,
 as membrane's native path does from 0.6.0), on the current branch, not a
-sharded message, and not folded into a summary by compression. A message
-injected at a tool boundary whose stream doesn't say whether it carries
-injections, as no membrane 0.5.x stream does, stays unread though the model
-may have seen it. On any doubt — restart, branch switch, eviction — the host
+sharded message, and not folded into a summary by compression. A stream that
+doesn't say whether it carries injections is taken as one that doesn't: at a
+tool boundary nothing is injected into it, and what's queued waits for the
+turn's end. On any doubt — restart, branch switch, eviction — the host
 appends, as it does today. There is no per-subject cap: a busy channel's unread
 backlog is simply its unread backlog. Receipts and subject history are kept in
 the `mcpl/coalescing` state (retry window 1 h); audit lines are
@@ -514,8 +514,25 @@ tool list itself (RFC-014 §8.5 host-made toolsets, §8.1 surface presentation;
 and works for every server, with or without RFC-014. The `toolsets--` tools
 are registered for every agent, MCPL or none, unless a module holds the name.
 
+- **Wake onboarding** (`src/gate/wake-onboarding.ts`). An MCPL server's
+  events are often let by, without waking the agent, by a rule written for
+  something else (a catch-all with no `source`) or by the gate's default. The
+  first such event from a server is followed by a `[wake onboarding]` notice:
+  the rule that let it by, and the server's suggested treatment (MCPL RFC-001
+  §5), numbered, with each rule's rationale, presented as the claims of a
+  server that may not be trustworthy. An event tagged `chat:addressed`,
+  `surface:turn` or `surface:alert` wakes the agent to decide.
+  `wake_accept_suggestions { server, rules? }` writes the chosen suggestions as
+  `suggested:<server>:<n>` rules scoped to that server, ahead of the first
+  catch-all; `wake_decline { server }` removes them. Decisions are kept in
+  `wake-decisions.json` beside `gate.json`, keyed to the server's declared
+  ontology, so the agent is asked again only when it changes (and at most once
+  a day per server). `gate_status.catchAll` names the catch-all; `event_tags`
+  shows each server's offer. `gate.onboarding: false` turns it off.
+
 - **The built-in toolset, `settings`.** The host tools an agent reaches for
   rarely: `agent_settings`, `wake_add_rule`, `wake_remove_rule`,
+  `wake_accept_suggestions`, `wake_decline`,
   `gate_status`, `event_tags`, `set_tool_visibility`, `set_tool_description`,
   `heartbeat--heartbeat_status`, `heartbeat--heartbeat_trigger`,
   `workspace--status`, every module utility (`Module.getUtilities`), and a
@@ -858,8 +875,8 @@ retract of a batch takes off the mark of its emoji from each of its messages,
 whichever batch placed it. 0.22.x reads only versions 1 and 2, and its start
 stops on a version 3 file: to go back to 0.22.x, move the file aside first,
 and 0.22.x then starts with no marks history. A version 1 ledger, which only
-an unreleased commit wrote, is refused until it is moved away, and its error
-says what that gives up.
+an unreleased commit wrote, is refused as any version but 2 and 3 is, until it
+is moved away.
 
 ## Observability
 

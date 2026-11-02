@@ -167,8 +167,8 @@ export function conversationKey(source: InboundSource): string | undefined {
  * well-formed is dropped (the store doesn't keep it). An `undefined` array
  * element is written as `null`, as JSON writes it: the store's append
  * refuses a body holding one, so no stored copy does. So a value
- * hashes alike however its keys were ordered (content read back from the
- * store has them in a different order than it was written), and alike
+ * hashes alike however its keys were ordered (a store on chronicle before
+ * 0.5.1 hands content back with its keys sorted), and alike
  * before and after the store. editMessage writes JSON instead, so an edited
  * copy can keep what an append wouldn't; it has changed anyway.
  *

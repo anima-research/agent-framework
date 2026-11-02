@@ -354,7 +354,8 @@ describe('debounce', () => {
     assert.deepStrictEqual(d.behavior, { debounce: 100 });
   });
 
-  it('batches events and fires after delay', async () => {
+  it('batches events and fires after delay', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const path = writeConfig('debounce-fire.json', {
       policies: [
         { name: 'editor', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 150 } },
@@ -371,7 +372,7 @@ describe('debounce', () => {
     assert.strictEqual(messages.length, 0);
 
     // Wait for debounce to fire
-    await new Promise(r => setTimeout(r, 200));
+    t.mock.timers.tick(200);
 
     assert.strictEqual(messages.length, 1);
     const text = (messages[0].content as Array<{ text: string }>)[0].text;
@@ -488,7 +489,8 @@ describe('debounce', () => {
     assert.ok(!/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(text), 'no half of a pair');
   });
 
-  it('a batched wake carries the newest channel event\'s channel AND author together (provenance)', async () => {
+  it('a batched wake carries the newest channel event\'s channel AND author together (provenance)', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const path = writeConfig('debounce-provenance.json', {
       policies: [
         { name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
@@ -501,7 +503,7 @@ describe('debounce', () => {
       metadata: { author: { id: '111', name: 'alice' } } }));
     gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:bob-room', content: 'b',
       metadata: { authorId: '222' } }));
-    await new Promise(r => setTimeout(r, 150));
+    t.mock.timers.tick(150);
 
     assert.strictEqual(inferenceRequests.length, 1);
     assert.strictEqual(inferenceRequests[0].reason, 'gate:debounce');
@@ -510,7 +512,8 @@ describe('debounce', () => {
     assert.strictEqual(inferenceRequests[0].addressed, undefined);
   });
 
-  it('an older ADDRESSED event outranks newer ambient chatter — channel, author and addressed stay together', async () => {
+  it('an older ADDRESSED event outranks newer ambient chatter — channel, author and addressed stay together', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const path = writeConfig('debounce-addressed.json', {
       policies: [
         { name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
@@ -522,14 +525,15 @@ describe('debounce', () => {
       tags: ['chat:addressed'], metadata: { author: { id: '111' } } }));
     gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:bob-room', content: 'ambient',
       metadata: { authorId: '222' } }));
-    await new Promise(r => setTimeout(r, 150));
+    t.mock.timers.tick(150);
     assert.strictEqual(inferenceRequests.length, 1);
     assert.strictEqual(inferenceRequests[0].channelId, 'discord:g:alice-room');
     assert.strictEqual(inferenceRequests[0].counterparty, 'discord:user:111');
     assert.strictEqual(inferenceRequests[0].addressed, true);
   });
 
-  it('the counterparty is namespaced by the event\'s server id, not the channel id\'s first segment', async () => {
+  it('the counterparty is namespaced by the event\'s server id, not the channel id\'s first segment', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const path = writeConfig('debounce-namespace.json', {
       policies: [
         { name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
@@ -539,13 +543,14 @@ describe('debounce', () => {
     const { gate, inferenceRequests } = makeGate(path);
     gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'beta', channelId: 'shared', content: 'x',
       metadata: { authorId: '42' } }));
-    await new Promise(r => setTimeout(r, 150));
+    t.mock.timers.tick(150);
     assert.strictEqual(inferenceRequests[0].channelId, 'shared');
     assert.strictEqual(inferenceRequests[0].counterparty, 'beta:user:42');
     assert.ok(typeof inferenceRequests[0].at === 'number', 'provenance carries the chosen event\'s timestamp');
   });
 
-  it('a push-event wake (raw adapter channel id) names its author but reports no channel', async () => {
+  it('a push-event wake (raw adapter channel id) names its author but reports no channel', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const path = writeConfig('debounce-push-raw.json', {
       policies: [
         { name: 'all', match: { scope: ['mcpl:push-event', 'mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
@@ -556,14 +561,15 @@ describe('debounce', () => {
     // exactly what PushHandler builds for a discord-mcpl DM push event
     gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'discord', channelId: '123456789012345678', content: 'hi',
       tags: ['chat:dm', 'chat:addressed', 'chat:private'], metadata: { authorId: '42', channelId: '123456789012345678' } }));
-    await new Promise(r => setTimeout(r, 150));
+    t.mock.timers.tick(150);
     assert.strictEqual(inferenceRequests.length, 1);
     assert.strictEqual(inferenceRequests[0].channelId, undefined, 'a raw snowflake is not a composite channel id — not reported');
     assert.strictEqual(inferenceRequests[0].counterparty, 'discord:user:42');
     assert.strictEqual(inferenceRequests[0].addressed, true);
   });
 
-  it('an addressed batch names its registered route channel; ambient-only batches name none', async () => {
+  it('an addressed batch names its registered route channel; ambient-only batches name none', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const path = writeConfig('debounce-route.json', {
       policies: [
         { name: 'chat', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'] }, behavior: { debounce: 100 } },
@@ -580,7 +586,7 @@ describe('debounce', () => {
       tags: ['chat:dm', 'chat:addressed'], metadata: { authorId: '42', channelId: '1548' } }));
     gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:general', content: 'chatter',
       metadata: { authorId: '7' } }));
-    await new Promise(r => setTimeout(r, 150));
+    t.mock.timers.tick(150);
     assert.strictEqual(inferenceRequests.length, 1);
     assert.strictEqual(inferenceRequests[0].routeChannelId, 'discord:dm:1548', 'the addressed event names the route');
     assert.strictEqual(inferenceRequests[0].routeServerId, 'discord', "and the route's server, since ids are unique only per server");
@@ -593,14 +599,15 @@ describe('debounce', () => {
     // Ambient-only batch: telemetry provenance, no route.
     gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'x',
       metadata: { authorId: '8' } }));
-    await new Promise(r => setTimeout(r, 150));
+    t.mock.timers.tick(150);
     assert.strictEqual(inferenceRequests.length, 2);
     assert.strictEqual(inferenceRequests[1].channelId, 'discord:g:room');
     assert.strictEqual(inferenceRequests[1].routeChannelId, undefined, 'ambient chatter never sets a route');
     assert.strictEqual(inferenceRequests[1].routeServerId, undefined, 'nor its server');
   });
 
-  it('the default resolver routes an addressed channel-incoming event; a push event needs the host resolver', async () => {
+  it('the default resolver routes an addressed channel-incoming event; a push event needs the host resolver', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const path = writeConfig('debounce-route-default.json', {
       policies: [
         { name: 'chat', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'] }, behavior: { debounce: 100 } },
@@ -610,16 +617,17 @@ describe('debounce', () => {
     const { gate, inferenceRequests } = makeGate(path);
     gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: '@agent hi',
       tags: ['chat:addressed'], metadata: { authorId: '1' } }));
-    await new Promise(r => setTimeout(r, 150));
+    t.mock.timers.tick(150);
     assert.strictEqual(inferenceRequests[0].routeChannelId, 'discord:g:room');
 
     gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'discord', channelId: '1548', content: 'dm',
       tags: ['chat:dm', 'chat:addressed'], metadata: { authorId: '42', channelId: '1548' } }));
-    await new Promise(r => setTimeout(r, 150));
+    t.mock.timers.tick(150);
     assert.strictEqual(inferenceRequests[1].routeChannelId, undefined, 'a raw id is never used as a route');
   });
 
-  it('the newest addressed event decides the route even when it has none (no guessing an older one)', async () => {
+  it('the newest addressed event decides the route even when it has none (no guessing an older one)', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const path = writeConfig('debounce-route-newest.json', {
       policies: [
         { name: 'chat', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'] }, behavior: { debounce: 100 } },
@@ -631,13 +639,14 @@ describe('debounce', () => {
       tags: ['chat:addressed'], metadata: { authorId: '1' } }));
     gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'discord', channelId: '1548', content: 'dm later',
       tags: ['chat:dm', 'chat:addressed'], metadata: { authorId: '42', channelId: '1548' } }));
-    await new Promise(r => setTimeout(r, 150));
+    t.mock.timers.tick(150);
     assert.strictEqual(inferenceRequests[0].counterparty, 'discord:user:42');
     assert.strictEqual(inferenceRequests[0].routeChannelId, undefined,
       'the DM is the newest addressed event; replying to the older mention would answer the wrong person');
   });
 
-  it('an addressed push that names only its registered channel (no raw id, no author) still routes', async () => {
+  it('an addressed push that names only its registered channel (no raw id, no author) still routes', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const path = writeConfig('debounce-route-only.json', {
       policies: [
         { name: 'chat', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'] }, behavior: { debounce: 100 } },
@@ -651,14 +660,15 @@ describe('debounce', () => {
       content: 'chatter', metadata: { authorId: '7' } }));
     gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'surface', content: 'dm',
       tags: ['chat:dm', 'chat:addressed'], metadata: { mcplChannelId: 'surface:dm:42' } }));
-    await new Promise(r => setTimeout(r, 150));
+    t.mock.timers.tick(150);
     assert.strictEqual(inferenceRequests.length, 1);
     assert.strictEqual(inferenceRequests[0].routeChannelId, 'surface:dm:42');
     assert.strictEqual(inferenceRequests[0].addressed, true);
     assert.strictEqual(inferenceRequests[0].counterparty, undefined, 'no author on the chosen event, none borrowed from the chatter');
   });
 
-  it('a newer AMBIENT route-only push does not hide an earlier event\'s channel and author', async () => {
+  it('a newer AMBIENT route-only push does not hide an earlier event\'s channel and author', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const path = writeConfig('debounce-route-only-ambient.json', {
       policies: [
         { name: 'chat', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'] }, behavior: { debounce: 100 } },
@@ -672,14 +682,15 @@ describe('debounce', () => {
       content: 'chatter', metadata: { authorId: '7' } }));
     gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'surface', content: 'status ping',
       metadata: { mcplChannelId: 'surface:room:feed' } }));
-    await new Promise(r => setTimeout(r, 150));
+    t.mock.timers.tick(150);
     assert.strictEqual(inferenceRequests.length, 1);
     assert.strictEqual(inferenceRequests[0].channelId, 'surface:room:general', 'telemetry keeps the attributable event');
     assert.strictEqual(inferenceRequests[0].counterparty, 'surface:user:7');
     assert.strictEqual(inferenceRequests[0].routeChannelId, undefined, 'ambient batches never route');
   });
 
-  it('a throwing route resolver never breaks gating', async () => {
+  it('a throwing route resolver never breaks gating', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const path = writeConfig('debounce-route-throw.json', {
       policies: [
         { name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
@@ -690,12 +701,13 @@ describe('debounce', () => {
     const decision = gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room',
       content: '@agent hi', tags: ['chat:addressed'] }));
     assert.strictEqual(decision.policyName, 'chat');
-    await new Promise(r => setTimeout(r, 150));
+    t.mock.timers.tick(150);
     assert.strictEqual(inferenceRequests.length, 1);
     assert.strictEqual(inferenceRequests[0].routeChannelId, undefined);
   });
 
-  it('a batched wake with no channel-bearing event carries no provenance', async () => {
+  it('a batched wake with no channel-bearing event carries no provenance', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const path = writeConfig('debounce-noprov.json', {
       policies: [
         { name: 'editor', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 100 } },
@@ -704,13 +716,14 @@ describe('debounce', () => {
     });
     const { gate, inferenceRequests } = makeGate(path);
     gate.evaluate(event({ content: 'edit' }));
-    await new Promise(r => setTimeout(r, 150));
+    t.mock.timers.tick(150);
     assert.strictEqual(inferenceRequests.length, 1);
     assert.strictEqual(inferenceRequests[0].channelId, undefined);
     assert.strictEqual(inferenceRequests[0].counterparty, undefined);
   });
 
-  it('quotes content for non-MCPL events (no context entry of their own)', async () => {
+  it('quotes content for non-MCPL events (no context entry of their own)', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const path = writeConfig('debounce-quote.json', {
       policies: [
         { name: 'editor', match: { scope: ['module:custom'] }, behavior: { debounce: 150 } },
@@ -720,7 +733,7 @@ describe('debounce', () => {
     const { gate, messages } = makeGate(path);
 
     gate.evaluate(event({ content: 'compile finished', eventType: 'module:custom' }));
-    await new Promise(r => setTimeout(r, 200));
+    t.mock.timers.tick(200);
 
     assert.strictEqual(messages.length, 1);
     const text = (messages[0].content as Array<{ text: string }>)[0].text;
@@ -728,7 +741,8 @@ describe('debounce', () => {
     assert.ok(text.includes('compile finished'), 'non-MCPL events carry their content');
   });
 
-  it('resets timer on new events', async () => {
+  it('resets timer on new events', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const path = writeConfig('debounce-reset.json', {
       policies: [
         { name: 'editor', match: {}, behavior: { debounce: 150 } },
@@ -738,14 +752,14 @@ describe('debounce', () => {
     const { gate, messages } = makeGate(path);
 
     gate.evaluate(event({ content: 'edit 1' }));
-    await new Promise(r => setTimeout(r, 80));
+    t.mock.timers.tick(80);
     // Timer hasn't fired yet, send another
     gate.evaluate(event({ content: 'edit 2' }));
-    await new Promise(r => setTimeout(r, 80));
+    t.mock.timers.tick(80);
     // Still within debounce window of second event
     assert.strictEqual(messages.length, 0);
 
-    await new Promise(r => setTimeout(r, 100));
+    t.mock.timers.tick(100);
     // Now it should have fired
     assert.strictEqual(messages.length, 1);
   });
@@ -795,7 +809,8 @@ describe('debounce bounds', () => {
 // ---------------------------------------------------------------------------
 
 describe('inference buffering', () => {
-  it('inference buffer is capped at MAX_INFERENCE_BUFFER', async () => {
+  it("a flood while the agent's turn runs holds a bounded backlog, dropping its oldest events", async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     const path = writeConfig('infer-cap.json', {
       policies: [
         { name: 'chat', match: {}, behavior: { debounce: 100 } },
@@ -805,33 +820,33 @@ describe('inference buffering', () => {
     const { gate, messages } = makeGate(path);
     gate.onInferenceStarted('agent');
 
-    // Fire many debounce batches — each with 20 events, 6 batches = 120 events
-    for (let batch = 0; batch < 6; batch++) {
-      for (let i = 0; i < 20; i++) {
-        gate.evaluate(event({ content: `batch${batch}-msg${i}` }));
+    const flood = (batches: number) => {
+      for (let batch = 0; batch < batches; batch++) {
+        for (let i = 0; i < 20; i++) {
+          gate.evaluate(event({ content: `batch${batch}-msg${i}` }));
+        }
+        t.mock.timers.tick(1_000);
       }
-      // Let debounce fire (into inference buffer since inferring)
-      await new Promise(r => setTimeout(r, 150));
-    }
-
-    // Buffer should be capped at 100 (oldest dropped)
-    const bufferLen = (gate as any).inferenceBuffer.length;
-    assert.ok(bufferLen <= 100, `Expected buffer <= 100, got ${bufferLen}`);
-    assert.ok(bufferLen > 0, 'Expected buffer to have events');
-
-    // First event should NOT be from batch 0 (those were dropped)
-    const firstEvent = (gate as any).inferenceBuffer[0];
-    assert.ok(!firstEvent.content.startsWith('batch0'), `Expected oldest events dropped, but first is ${firstEvent.content}`);
+    };
+    flood(6);
+    const afterSix = gate.inferenceDiagnostics().bufferedEvents;
+    assert.ok(afterSix > 0, 'Expected buffer to have events');
+    flood(6);
+    assert.strictEqual(gate.inferenceDiagnostics().bufferedEvents, afterSix, 'the backlog stops growing');
 
     // End inference → flush
     gate.onInferenceEnded('agent');
-    await new Promise(r => setTimeout(r, 10));
+    await new Promise((r) => setImmediate(r));
 
     assert.strictEqual(messages.length, 1);
+    const keptFromSecond = Math.floor((12 * 20 - afterSix) / 20);
+    const text = (messages[0]!.content as Array<{ text: string }>)[0]!.text;
+    assert.ok(text.includes(`(oldest ~${12 - keptFromSecond}s ago)`), `the oldest events are the ones dropped: ${text}`);
     gate.dispose();
   });
 
-  it('debounce during inference → buffer → flush on end', async () => {
+  it('debounce during inference → buffer → flush on end', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const path = writeConfig('infer-debounce.json', {
       policies: [
         { name: 'chat', match: {}, behavior: { debounce: 150 } },
@@ -847,7 +862,7 @@ describe('inference buffering', () => {
     gate.onInferenceStarted('agent');
 
     // Wait for debounce timer to fire
-    await new Promise(r => setTimeout(r, 200));
+    t.mock.timers.tick(200);
 
     // Should be buffered, not delivered (inference is active)
     assert.strictEqual(messages.length, 0);
@@ -856,7 +871,7 @@ describe('inference buffering', () => {
     gate.onInferenceEnded('agent');
 
     // queueMicrotask defers delivery
-    await new Promise(r => setTimeout(r, 10));
+    await new Promise((r) => setImmediate(r));
 
     assert.strictEqual(messages.length, 1);
   });
@@ -1021,7 +1036,6 @@ describe('trace events', () => {
     gate.evaluate(event()); // initial eval
 
     (gate as any).lastReloadCheck = 0;
-    await new Promise(r => setTimeout(r, 50));
     writeFileSync(path, JSON.stringify({ policies: [{ name: 'new', match: {}, behavior: 'skip' }], default: 'always' }));
 
     gate.evaluate(event());
@@ -1035,7 +1049,8 @@ describe('trace events', () => {
 // ---------------------------------------------------------------------------
 
 describe('dispose', () => {
-  it('clears debounce timers without delivering', () => {
+  it('clears debounce timers without delivering', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const path = writeConfig('dispose.json', {
       policies: [{ name: 'debounced', match: {}, behavior: { debounce: 10000 } }],
       default: 'skip',
@@ -1043,6 +1058,7 @@ describe('dispose', () => {
     const { gate, messages } = makeGate(path);
     gate.evaluate(event());
     gate.dispose();
+    t.mock.timers.tick(10_000);
 
     // No delivery should happen
     assert.strictEqual(messages.length, 0);
@@ -1153,7 +1169,8 @@ describe('defaultDecisions counters', () => {
 // ---------------------------------------------------------------------------
 
 describe('quiesce suppression', () => {
-  it('buffers debounce firings while quiesced and flushes on setQuiesced(false)', async () => {
+  it('buffers debounce firings while quiesced and flushes on setQuiesced(false)', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const path = writeConfig('quiesce-debounce.json', {
       policies: [
         { name: 'editor', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 120 } },
@@ -1167,19 +1184,20 @@ describe('quiesce suppression', () => {
     gate.evaluate(event({ content: 'edit 2' }));
 
     // Debounce fires while quiesced → buffered, no context write, no wake.
-    await new Promise(r => setTimeout(r, 250));
+    t.mock.timers.tick(250);
     assert.strictEqual(messages.length, 0, 'no gate message mid-surgery');
     assert.strictEqual(inferenceRequests.length, 0);
     assert.strictEqual(gate.inferenceDiagnostics().bufferedEvents, 2);
 
     gate.setQuiesced(false);
-    await new Promise(r => setTimeout(r, 20)); // flush is deferred a microtask
+    await new Promise((r) => setImmediate(r)); // flush is deferred a microtask
     assert.strictEqual(messages.length, 1, 'buffered events compose one delivery');
     assert.strictEqual(inferenceRequests.length, 1);
     assert.strictEqual(gate.inferenceDiagnostics().bufferedEvents, 0);
   });
 
-  it('a turn ending while quiesced does not flush the buffer', async () => {
+  it('a turn ending while quiesced does not flush the buffer', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const path = writeConfig('quiesce-turn-end.json', {
       policies: [
         { name: 'editor', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 120 } },
@@ -1191,9 +1209,9 @@ describe('quiesce suppression', () => {
     gate.setQuiesced(true);
     gate.onInferenceStarted('agent');
     gate.evaluate(event({ content: 'during drain' }));
-    await new Promise(r => setTimeout(r, 250));
+    t.mock.timers.tick(250);
     gate.onInferenceEnded('agent'); // drain completes mid-quiesce
-    await new Promise(r => setTimeout(r, 20));
+    await new Promise((r) => setImmediate(r));
     assert.strictEqual(messages.length, 0, 'buffer holds until resume, not turn end');
     assert.strictEqual(gate.inferenceDiagnostics().bufferedEvents, 1);
   });

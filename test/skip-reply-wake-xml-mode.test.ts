@@ -67,7 +67,7 @@ class XmlStream implements YieldingStream {
     this.events.push({
       type: 'tool-calls',
       calls: r.calls.map((c) => ({ id: c.id, name: c.name, input: c.input })),
-      context: { rawText: raw(r.calls), preamble: before, roundPreamble: before.slice(this.roundStart), depth: this.round, previousResults: [], accumulated: before + raw(r.calls) },
+      context: { rawText: raw(r.calls), preamble: before, roundPreamble: before.slice(this.roundStart), depth: this.round, previousResults: [], accumulated: before + raw(r.calls), supportsInjectedMessages: false },
     } as StreamEvent);
     this.acc = before + raw(r.calls);
     this.waiting = true;

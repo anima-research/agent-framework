@@ -158,21 +158,21 @@ test('concurrent close() calls share the teardown: none resolves while the child
   const first = connection.close().then(() => order.push(`first:${alive(pid!) ? 'alive' : 'gone'}`));
   const second = connection.close().then(() => order.push(`second:${alive(pid!) ? 'alive' : 'gone'}`));
   await Promise.all([first, second]);
-  assert.deepEqual(order, ['first:gone', 'second:gone']);
+  assert.deepEqual(order.sort(), ['first:gone', 'second:gone']);
 });
 
 test('a close that cannot reap fails, and so do concurrent ones; a later close re-checks and settles', async () => {
   const log = scratchLog();
-  const stuck = unreapableFrom(1);
+  const stuck = unreapableFrom(1, SHORT_GRACE_MS);
   const connection = await McplServerConnection.connect(config('ok', log), HOST_CAPS);
   connection.ready();
   const settled: string[] = [];
   const outcome = (name: string) => [() => settled.push(`${name}:ok`), (e: Error) => settled.push(`${name}:${e.message}`)] as const;
   const first = connection.close().then(...outcome('first'));
   const second = connection.close().then(...outcome('second'));
-  // The teardown sends SIGTERM, waits 2 s, sends SIGKILL and waits 2 s more
-  // before it gives up, so at 1 s it is still pending.
-  await new Promise((r) => setTimeout(r, 1000));
+  // The teardown sends SIGTERM, waits the grace, sends SIGKILL and waits the
+  // grace again before it gives up, so at half the grace it is still pending.
+  await new Promise((r) => setTimeout(r, SHORT_GRACE_MS / 2));
   assert.deepEqual(settled, [], 'neither resolves while the teardown is pending');
   await Promise.all([first, second]);
   assert.equal(settled.length, 2);
@@ -209,7 +209,7 @@ test("a handshake answered after its stdio pipe failed fails, holding a child th
   process.kill(stuck[0]!.pid, 'SIGUSR2');
   const error = await connecting;
   assert.ok(error instanceof McplUnreapedLaunchError, String(error));
-  assert.match(error.message, /^MCPL server "legacy" stdio pipe failed with write EPIPE during the handshake; its cleanup also failed: stdio child \d+ of MCP server "legacy" did not exit within \d+ms of SIGKILL; it could not be reaped$/);
+  assert.match(error.message, /^MCPL server "legacy": this host stopped using the server's stdio during the handshake \(write EPIPE\); its cleanup also failed: stdio child \d+ of MCP server "legacy" did not exit within \d+ms of SIGKILL; it could not be reaped$/);
   const owner = error.connection;
   assert.equal(owner.isConnected, false);
   assert.equal(owner.willReconnect, false);
@@ -232,7 +232,7 @@ test('a handshake fails when its answer is read in the same callback as a ping w
   const error = await connecting;
   assert.deepEqual(launch.sameCallback, [false, true], 'the ping and the answer were read in one callback');
   assert.ok(error instanceof Error && !(error instanceof McplUnreapedLaunchError), String(error));
-  assert.match(String(error), /^Error: MCPL server "legacy" stdio pipe failed with write EPIPE during the handshake$/);
+  assert.match(String(error), /^Error: MCPL server "legacy": this host stopped using the server's stdio during the handshake \(write EPIPE\)$/);
   assert.match(stderrTailOf(error) ?? '', /deaf-ping: stdin closed/, "the server's stderr goes with it, as with the handshake's other failures");
   assert.equal(alive(pid!), false, "gone once the connect failed: the handshake's cleanup reaped it");
 });
@@ -365,7 +365,7 @@ test('registry: an id stays held through its reap, and a second add is refused w
   })();
   await until(() => registry.getServer('legacy') !== null, 'registered');
   await until(() => starts(log).length === 1, 'launched');
-  await new Promise((r) => setTimeout(r, 100));
+  await until(() => existsSync(`${log}.sigterm`), 'the reap to begin');
   await assert.rejects(registry.addServer(config('ok', log), HOST_CAPS), /already registered/, 'held while its reap runs');
   await removing;
   assert.equal(registry.getServer('legacy'), null, 'freed once the exit is confirmed');
@@ -464,7 +464,7 @@ test("a write to a stdio child that has just exited is never thrown, and isn't r
   const closed: Array<{ reason?: string }> = [];
   transport.on('close', (info: { reason?: string }) => closed.push(info));
   child.emit('exit', 0, null);
-  assert.match(closed[0]?.reason ?? '', /its pipe failed with write EPIPE/);
+  assert.match(closed[0]?.reason ?? '', /this host had stopped using the server's stdio \(write EPIPE\)/);
 });
 
 test('close() during a WebSocket reconnect dial returns promptly, ending the dial', async () => {

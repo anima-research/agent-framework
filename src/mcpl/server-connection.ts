@@ -79,7 +79,8 @@ export interface McplConnectionCloseInfo {
   /** True when `reason` is the peer's own text, a WebSocket server's close
    *  reason, rather than the transport's or the host's words. */
   reasonFromPeer?: boolean;
-  /** True when the stdio transport ended the child after a pipe error. */
+  /** True when the stdio transport ended the child itself, after a pipe
+   *  error or a line on its stdout longer than the bound. */
   pipeFailed?: boolean;
   /** True when the host closed the link (`close()` / `reconnectAfterFailure()`),
    *  false when the transport dropped unexpectedly. */
@@ -1437,7 +1438,7 @@ export class McplServerConnection extends EventEmitter {
         transport.writeLine(JSON.stringify(initRequest));
       });
 
-      // The transport has found the child's stdin or stdout failed before the
+      // The transport has stopped using the child's stdio before the
       // handshake could hand it on, such as when this host's answer to a ping
       // the server sent met EPIPE. Nothing more is written to the child then,
       // so the connection couldn't serve. It's read here, once the answer has
@@ -1450,8 +1451,8 @@ export class McplServerConnection extends EventEmitter {
       // the launch if it can't reap the child. A failure of the write below
       // is reported only once the caller has wired the transport, so it
       // reaches the connection as a loss, like any later one.
-      const pipeFailure = transport.pipeFailure;
-      if (pipeFailure) throw failed(`MCPL server "${config.id}" stdio pipe failed with ${pipeFailure.message} during the handshake`);
+      const stopCause = transport.stdioStopCause;
+      if (stopCause) throw failed(`MCPL server "${config.id}": this host stopped using the server's stdio during the handshake (${stopCause.message})`);
 
       // Send `initialized` notification (no id)
       transport.writeLine(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }));
@@ -2183,12 +2184,8 @@ export class McplServerConnection extends EventEmitter {
         'not-sent',
       ));
     }
-    // Once the child's stdin or stdout has failed, the transport is ending
-    // it and writes nothing more to it, so a request is refused here as not
-    // sent rather than left to wait out its timeout. The method and the
-    // pipe's error are the operator's, so they go to the log.
-    const pipeFailure = this.transport?.pipeFailure;
-    if (pipeFailure) {
+    const stopCause = this.transport?.stdioStopCause;
+    if (stopCause) {
       return McplServerConnection.refused(
         new McplRequestError(
           `The request wasn't sent: this host can no longer write to the "${this.id}" server, so nothing ran. ` +
@@ -2197,7 +2194,7 @@ export class McplServerConnection extends EventEmitter {
               : "This host won't reconnect to it on its own. If you need it, ask whoever runs this host."),
           'not-sent',
         ),
-        `MCPL server "${this.id}": ${method} not sent, since its stdio pipe failed: ${logDetail(pipeFailure.message)}`,
+        `MCPL server "${this.id}": ${method} not sent, since this host stopped using the server's stdio (${logDetail(stopCause.message)})`,
       );
     }
 
@@ -2820,20 +2817,10 @@ export class McplServerConnection extends EventEmitter {
       }
     };
     transport.on('close', lost);
-    // A stdio child whose stdin or stdout failed, and that outlived SIGKILL
-    // too: the transport stays open, owning the child. The connection holds
-    // it as a launch it can't reap, as a reconnect does, which halts
-    // reconnecting, and is lost as on a close, with the permanent failure
-    // that raises the alert and takes its tools off the list. Its id stays
-    // held until close() confirms the exit. A close the host has begun
-    // reports the failure itself. During a handshake nothing listens yet: a
-    // handshake whose pipe has failed fails, when its answer comes (it's
-    // refused then), when the child's exit closes the transport, or at its
-    // timeout, and its own cleanup holds the launch.
     transport.on('unreaped', (failure: Error) => {
       if (this.closed || this.transport !== transport) return;
       this.holdUnreaped(transport, failure);
-      lost({ reason: `its stdio pipe failed with ${transport.pipeFailure?.message ?? 'an error'}, and its child outlived SIGKILL` });
+      lost({ reason: `this host stopped using the server's stdio (${transport.stdioStopCause?.message ?? 'an error'}), and the server's process outlived SIGKILL` });
       this.emit('reconnect-failed', { error: this.unreapedFailure(), attempt: Math.max(1, this.reconnectAttempts), permanent: true });
     });
   }

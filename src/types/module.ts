@@ -120,7 +120,10 @@ export interface Module {
 
   /**
    * Start the module.
-   * Called when the framework starts or when the module is added.
+   * Called when the module is added: create() adds the modules it is given,
+   * so for those it runs before create() returns. Its own removal and the
+   * framework's stop() wait for it to settle before the module's stop()
+   * runs, so it mustn't await either.
    */
   start(ctx: ModuleContext): Promise<void>;
 
@@ -132,6 +135,8 @@ export interface Module {
    * a host wires up after create() returns, such as a WorkspaceModule's
    * initStore(). A stop() that saves state can therefore run before that
    * wiring, and shouldn't then save over state it was handed and hasn't used.
+   * It isn't called before the module's start() has settled, so it can end
+   * what start() set up.
    */
   stop(): Promise<void>;
 
@@ -401,8 +406,7 @@ export interface ModuleContext {
    * and a tool round moves when it injects messages into a stream that
    * declares it carries them. So one that waited for its target's end (a
    * run's end, or a fork's last turn), one stored while it was idle and
-   * never sent, one stored at a tool round that ended the turn, and one
-   * injected into a stream that didn't declare it carries injections go to
+   * never sent, and one stored at a tool round that ended the turn go to
    * the primary. The framework's own
    * writes for a run or a fork are unchanged: they stay in its store,
    * unless they're notices the primary already takes in their place (a

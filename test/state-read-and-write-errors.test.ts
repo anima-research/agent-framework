@@ -454,9 +454,15 @@ describe("the conversation router's generation counters", () => {
       createMockResponse([{ type: 'tool_use', id: 'one', name: 'test--read', input: {} }], 'tool_use'),
       { aborted: true, reason: 'test-abort' },
     ];
+    const unscripted: number[] = [];
+    let calls = 0;
     (f.membrane as unknown as { stream: () => Promise<unknown> }).stream = async () => {
+      calls++;
       const response = responses.shift();
-      assert.ok(response, 'unexpected inference');
+      if (!response) {
+        unscripted.push(calls);
+        throw new Error('unexpected inference');
+      }
       return response;
     };
     try {
@@ -489,6 +495,7 @@ describe("the conversation router's generation counters", () => {
       assert.ok(f.framework.getAgent(forkAgentName('conversation', 'editor', 'chat', 1)));
       assert.ok(f.framework.getAgent(forkAgentName('conversation', 'editor', 'side', 1)));
       assert.deepEqual(store.getStateJson(ROUTER), { generations: { chat: 1, side: 1 } });
+      assert.deepEqual(unscripted, [], 'every inference the framework asked for was one the test scripted');
     } finally {
       write.open();
       await f.close();

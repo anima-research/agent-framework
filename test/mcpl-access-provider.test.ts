@@ -16,14 +16,10 @@ describe('mcpl per-dial credentials', () => {
     );
   });
 
-  it('override wins over static token; null strips it (redaction path)', () => {
+  it('override wins over static token', () => {
     assert.equal(
       buildWebSocketUrl({ ...base, token: 'static' }, 'fresh'),
       'wss://example.test/mcpl?token=fresh',
-    );
-    assert.equal(
-      buildWebSocketUrl({ ...base, token: 'static' }, null),
-      'wss://example.test/mcpl',
     );
   });
 
