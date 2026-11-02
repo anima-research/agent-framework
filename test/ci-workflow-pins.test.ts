@@ -15,7 +15,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -61,7 +61,7 @@ function testAsCi(then: string, callerWidth?: string) {
     else env.AF_TEST_CONCURRENCY = callerWidth;
     const run = spawnSync(process.execPath, [fileURLToPath(new URL('scripts/test-as-ci.mjs', ROOT))], { cwd: dir, env, encoding: 'utf8' });
     const [args, width] = existsSync(seen) ? readFileSync(seen, 'utf8').split('|') : [];
-    return { status: run.status, signal: run.signal, stdout: run.stdout, args, width };
+    return { status: run.status, signal: run.signal, stdout: run.stdout, stderr: run.stderr, args, width };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -84,6 +84,47 @@ test('scripts/test-as-ci.mjs fails when npm test fails', () => {
   const killed = testAsCi('kill -KILL $$');
   assert.equal(killed.args, 'test', `npm test ran before its signal: ${JSON.stringify(killed)}`);
   assert.equal(killed.signal, 'SIGKILL', `ends by the signal that killed npm: ${JSON.stringify(killed)}`);
+});
+
+test("npm test's output reaches the script's own stdout and stderr, so the step's log holds the suite's", () => {
+  const run = testAsCi('echo OUT-MARK; echo ERR-MARK >&2');
+  assert.equal(run.status, 0);
+  assert.match(run.stdout, /^OUT-MARK$/m);
+  assert.match(run.stderr, /^ERR-MARK$/m);
+});
+
+function testAsCiWithPath(setup: (bin: string, dir: string) => void, { binAlone = false } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'test-as-ci-'));
+  try {
+    const bin = join(dir, 'bin');
+    mkdirSync(bin);
+    setup(bin, dir);
+    const seen = join(dir, 'seen');
+    const env: NodeJS.ProcessEnv = { ...process.env, PATH: binAlone ? bin : `${bin}${delimiter}${process.env.PATH ?? ''}`, TEST_AS_CI_SEEN: seen };
+    delete env.AF_TEST_CONCURRENCY;
+    const run = spawnSync(process.execPath, [fileURLToPath(new URL('scripts/test-as-ci.mjs', ROOT))], { cwd: dir, env, encoding: 'utf8' });
+    return { status: run.status, stderr: run.stderr, seen: existsSync(seen) ? readFileSync(seen, 'utf8') : undefined };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('scripts/test-as-ci.mjs starts a JavaScript npm on PATH under --single-threaded', () => {
+  const run = testAsCiWithPath((bin, dir) => {
+    const cli = join(dir, 'npm-cli.js');
+    writeFileSync(cli, "#!/usr/bin/env node\nrequire('node:fs').writeFileSync(process.env.TEST_AS_CI_SEEN, JSON.stringify(process.execArgv));\n");
+    chmodSync(cli, 0o755);
+    symlinkSync(cli, join(bin, 'npm'));
+  });
+  assert.equal(run.status, 0, run.stderr);
+  assert.ok(run.seen, 'the npm on PATH ran');
+  assert.ok((JSON.parse(run.seen) as string[]).includes('--single-threaded'), `its Node's flags: ${run.seen}`);
+});
+
+test("scripts/test-as-ci.mjs fails, and says why, when npm can't be started", () => {
+  const run = testAsCiWithPath(() => {}, { binAlone: true });
+  assert.notEqual(run.status, 0);
+  assert.match(run.stderr, /ENOENT/);
 });
 
 /** The ERE the `changes` job matches the pull request's changed paths against for Bun's macOS legs. */
