@@ -164,7 +164,7 @@ export type TraceEvent =
       agentName: string;
       /** 'over_budget', or 'context_refusal' when no summary covers a span the compile would drop. */
       errorType: 'over_budget' | 'context_refusal';
-      /** The refusal's message, bounded (300 characters). */
+      /** The refusal's message, bounded as a trace event's `error` is (2,000 characters). */
       error: string;
       /** The refused compile's budget and size in tokens, when context-manager gave them. */
       budget?: number;

@@ -94,6 +94,7 @@ interface Backlog {
   pendingWorkError?: Error;
   tickGate?: Promise<void>;
   refusalName?: string;
+  refusalTail?: string;
   /** A dry compile resolves whether the context fits or not, as
    *  context-manager's resolves an over-budget plan (SelectOptions.dryRun). */
   dryRunResolves?: boolean;
@@ -106,8 +107,9 @@ interface Backlog {
 const fits = (b: Backlog): boolean => b.fit || b.ticks >= b.fitAt;
 const pending = (b: Backlog): boolean => b.alwaysPending || (!fits(b) && b.ticks < b.readyAt);
 let refusalName = 'OverBudgetError';
+let refusalTail = '';
 const overBudget = (actual = 100_201) => Object.assign(
-  new Error('Compile plan would exceed hard budget: head=41200 tail=8100 middle=62000 budget=48568'),
+  new Error('Compile plan would exceed hard budget: head=41200 tail=8100 middle=62000 budget=48568' + refusalTail),
   { name: refusalName, budget: 48_568, actual },
 );
 
@@ -123,6 +125,7 @@ async function withBacklog<T>(backlog: Partial<Backlog>, run: (b: Backlog) => Pr
     ...backlog,
   };
   refusalName = b.refusalName ?? 'OverBudgetError';
+  refusalTail = b.refusalTail ?? '';
   const proto = ContextManager.prototype as unknown as Patchable;
   const original = { compile: proto.compile, tick: proto.tick, isReady: proto.isReady, getPendingWork: proto.getPendingWork, previewContext: proto.previewContext };
   const passthrough = PassthroughStrategy.prototype as unknown as { getProgressSnapshot?: () => unknown };
@@ -209,6 +212,7 @@ async function withBacklog<T>(backlog: Partial<Backlog>, run: (b: Backlog) => Pr
     delete passthrough.getProgressSnapshot;
     delete priced.estimateTokens;
     refusalName = 'OverBudgetError';
+    refusalTail = '';
   }
 }
 
@@ -837,8 +841,8 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     }
   });
 
-  it('bounds context-manager\'s word in the line that logs a hold\'s start, and logs the line without it when it can\'t be read', async () => {
-    const long = `zz ${'pending work '.repeat(100)}`;
+  it('keeps context-manager\'s word whole in the line that logs a hold\'s start up to that line\'s own bound, and logs the line without it when it can\'t be read', async () => {
+    const long = `zz ${'pending work '.repeat(300)}`;
     const startLine = (lines: string[]) => lines.find((l) => l.startsWith('[budget-hold] agent=prime compile refused'));
     await withBacklog({ pendingDescription: long }, async (backlog) => {
       await errorLines(async (lines) => {
@@ -849,7 +853,8 @@ describe('a compile refused for budget holds its turn (#304)', () => {
           const line = startLine(lines)!;
           assert.match(line, /Held: this turn runs once a check finds its context fits its budget\. Compression: zz pending work/);
           const word = line.slice(line.indexOf(' Compression: ') + ' Compression: '.length);
-          assert.ok(long.length > 1_000 && word.length <= 300, `the description is cut to 300 characters (${word.length})`);
+          assert.ok(long.length > 2_000 && word.length <= 2_000 && word.length > 1_000, `the description is cut at the log's own bound (${word.length})`);
+          assert.match(word, /characters omitted/);
           backlog.fit = true;
           assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
         } finally {
@@ -865,6 +870,28 @@ describe('a compile refused for budget holds its turn (#304)', () => {
           assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000), 'the turn is held all the same');
           const line = startLine(lines)!;
           assert.ok(line.endsWith('Held: this turn runs once a check finds its context fits its budget.'), line);
+          backlog.fit = true;
+          assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
+        } finally {
+          await t.close();
+        }
+      });
+    });
+  });
+
+  it("keeps a refusal's whole reason, up to the log's own bound, in the hold's trace, its log line and a surgery's refusal", async () => {
+    const tail = ` (head=0, tail=377, ${'zz-diagnostic=1, '.repeat(60)}rawPins: zz-inputs)`;
+    await withBacklog({ refusalTail: tail }, async (backlog) => {
+      await errorLines(async (lines) => {
+        const t = await residentTurn({ maintenanceIntervalMs: 50 });
+        try {
+          t.send('Are you there?');
+          assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+          const whole = String(overBudget().message);
+          assert.ok(whole.length > 1_000 && whole.length < 2_000, `premise: a reason past 300 characters and within 2,000 (${whole.length})`);
+          assert.equal(t.of('inference:held')[0]!.error, whole, "the trace carries the refusal's whole reason");
+          assert.ok(lines.some((l) => l.startsWith('[budget-hold] agent=prime compile refused') && l.includes(whole)), 'and so does the start line');
+          await assert.rejects(t.framework.switchBranch('main'), (error: Error) => error.message.includes('rawPins: zz-inputs)'));
           backlog.fit = true;
           assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
         } finally {
@@ -2956,7 +2983,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
 });
 
 describe('the release check takes context-manager\'s verdict on the real strategy (#304)', () => {
-  async function realResident(adaptiveResolution: boolean, withStrategy?: (strategy: AutobiographicalStrategy) => void, modules: Module[] = []) {
+  async function realResident(adaptiveResolution: boolean, withStrategy?: (strategy: AutobiographicalStrategy) => void, modules: Module[] = [], given?: AutobiographicalStrategy) {
     const proto = ContextManager.prototype as unknown as {
       tick: () => Promise<void>; previewContext: (...args: unknown[]) => unknown; compile: (...args: unknown[]) => unknown;
     };
@@ -2977,7 +3004,7 @@ describe('the release check takes context-manager\'s verdict on the real strateg
     const tempDir = mkdtempSync(join(tmpdir(), 'budget-hold-real-'));
     const membrane = new SequentialStreamMembrane();
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Answered once it fit' }]));
-    const strategy = new AutobiographicalStrategy({ adaptiveResolution, targetChunkTokens: 300, recentWindowTokens: 400 });
+    const strategy = given ?? new AutobiographicalStrategy({ adaptiveResolution, targetChunkTokens: 300, recentWindowTokens: 400 });
     withStrategy?.(strategy);
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'store'),
@@ -2994,7 +3021,7 @@ describe('the release check takes context-manager\'s verdict on the real strateg
     const traces: TraceEvent[] = [];
     framework.onTrace((e) => traces.push(e));
     const cm = framework.getAgent('prime')!.getContextManager();
-    for (let i = 0; i < 16; i++) {
+    for (let i = 0; i < (given ? 0 : 16); i++) {
       cm.addMessage(i % 2 === 0 ? 'User' : 'prime', [{ type: 'text', text: `m${i} ` + 'lorem ipsum dolor sit amet '.repeat(i % 3 === 0 ? 500 : 60) }]);
     }
     const budget = (maxTokens: number) => ({ maxTokens, reserveForResponse: 1_000 });
@@ -3022,6 +3049,60 @@ describe('the release check takes context-manager\'s verdict on the real strateg
         rmSync(tempDir, { recursive: true, force: true });
       },
     };
+  }
+
+  async function pinnedResident(kind: 'pin' | 'document mark') {
+    class SeededStrategy extends AutobiographicalStrategy {
+      seedL1(content: string, sourceIds: string[]): void {
+        this.pushSummary({
+          id: `L1-${this.nextSummaryIdCounter()}`, level: 1, content, tokens: Math.ceil(content.length / 4), sourceLevel: 0,
+          sourceIds, sourceRange: { first: sourceIds[0]!, last: sourceIds[sourceIds.length - 1]! }, created: Date.now(),
+        } as never);
+      }
+    }
+    const strategy = new SeededStrategy({
+      headWindowTokens: 0, targetChunkTokens: 100, recentWindowTokens: 200, adaptiveResolution: true, autoTickOnNewMessage: false,
+    });
+    const t = await realResident(true, undefined, [], strategy);
+    const cm = t.framework.getAgent('prime')!.getContextManager();
+    const inputs: string[] = [];
+    for (let i = 0; i < 8; i++) inputs.push(cm.addMessage('User', [{ type: 'text', text: `Input ${i}. ` + 'word '.repeat(80) }]));
+    strategy.seedL1('The user gave eight inputs.', inputs);
+    for (let i = 0; i < 10; i++) cm.addMessage('prime', [{ type: 'text', text: `Round ${i}. ` + 'step '.repeat(30) }]);
+    const pinId = kind === 'pin' ? cm.pinRange(inputs[0]!, inputs[inputs.length - 1]!, { name: 'zz-inputs' }) : cm.markDocument(inputs[3]!, { name: 'zz-brief' });
+    const fits = (maxTokens: number, excludePins?: string[]) => (cm as unknown as {
+      previewContext: (b: object, o?: undefined, opts?: object) => { fits: boolean } | null;
+    }).previewContext({ maxTokens, reserveForResponse: 1_000 }, undefined, excludePins ? { excludePins } : undefined)?.fits === true;
+    const lowest = (excludePins?: string[]) => {
+      let lo = 1_000;
+      let hi = 400_000;
+      while (hi - lo > 1) {
+        const mid = Math.floor((lo + hi) / 2);
+        if (fits(mid, excludePins)) hi = mid; else lo = mid;
+      }
+      return hi;
+    };
+    return { t, cm, pinId, pinned: lowest(), free: lowest([pinId]) };
+  }
+
+  for (const kind of ['pin', 'document mark'] as const) {
+    it(`releases a held turn once the ${kind} its compile was refused for is removed, with nothing else changing`, async () => {
+      const { t, cm, pinId, pinned, free } = await pinnedResident(kind);
+      try {
+        assert.ok(free < pinned, `premise: the ${kind} keeps the inputs raw, and without it they fold (${free} < ${pinned})`);
+        t.setBudget(Math.floor((free + pinned) / 2));
+        t.framework.start();
+        t.wake();
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000), 'held with the inputs kept raw');
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        assert.deepEqual(t.of('inference:hold_ended'), [], 'still held over several maintenance passes');
+        assert.equal(cm.unpin(pinId), true);
+        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 3_000), `the turn runs once the ${kind} is removed`);
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
+      } finally {
+        await t.close();
+      }
+    });
   }
 
   function fitEdge(t: Awaited<ReturnType<typeof realResident>>): { lo: number; hi: number } {
