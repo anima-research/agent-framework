@@ -403,17 +403,24 @@ export interface FrameworkConfig {
   /**
    * A message quiet period: an idle agent's turn waits while message wakes
    * for it keep arriving, so a burst (a caption and its images, a reply split
-   * into several messages) starts one turn, not one per part. The scheduler
-   * holds the start until `quietMs` have passed since the agent's newest
-   * message wake, or `maxWaitMs` (default 30000) since its oldest held one,
-   * then starts one turn with everything queued, as it merges queued wakes
-   * today. A message wake is a channel message's or a server event's
-   * (`mcpl:channel-incoming`, `mcpl:push-event`) other than the heartbeat's.
-   * Each message's own decision stays what the gate gives it: who wakes a
-   * sleeping agent, where a reply goes, what tune-out and conversation
-   * routing see. A batch holding any other wake (a timer, an operator, a
-   * tool result, a continuation or a retry of the agent's turn) starts now.
-   * Off when omitted.
+   * into several messages) starts one turn, not one per part. A burst is one
+   * channel's message wakes (server and channel id), or a channel-less
+   * source's; each is held on its own clock, until `quietMs` have passed
+   * since its newest wake or `maxWaitMs` (default 30000) since its oldest,
+   * and then starts a turn with its wakes alone, the other bursts waiting
+   * their own turns. So chatter in one channel neither delays another
+   * channel's turn nor takes its reply: each turn speaks in its burst's
+   * channel, as on `main`. A message wake is a channel message's or a server
+   * event's (`mcpl:channel-incoming`, `mcpl:push-event`) other than the
+   * heartbeat's. Each message's own decision stays what the gate gives it:
+   * who wakes a sleeping agent, where a reply goes, what tune-out and
+   * conversation routing see. A batch holding any other wake (a timer, an
+   * operator, a tool result, a continuation or a retry of the agent's turn)
+   * starts whole, now. The hold is observable as `quiet-period:held` and
+   * `quiet-period:released` traces. Held wakes live only in the queue: as
+   * with any queued wake, `stop()` within the hold drops them, and the
+   * message, stored at ingress, waits in context for the next wake. Off
+   * when omitted.
    */
   messageQuietPeriod?: { quietMs: number; maxWaitMs?: number };
 
