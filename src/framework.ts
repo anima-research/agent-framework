@@ -21007,9 +21007,6 @@ export class AgentFramework {
     return this.channelRegistry!.routeSpeech(agent.name, text, locus);
   }
 
-  /** Whether a conversation's plain speech may take the process-global
-   *  fallback channel: every one but an ephemeral run's, whose plain speech
-   *  with no channel of its own is its caller's result. */
   private takesGlobalFallback(conversationId: string): boolean {
     return this.usedEphemeralAgentNames.get(conversationId) !== 'run';
   }

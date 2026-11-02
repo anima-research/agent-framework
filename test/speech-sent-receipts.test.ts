@@ -305,16 +305,28 @@ describe('plain speech a module says it showed', () => {
     assert.equal(receipt(f), '[delivered] plain speech → sent to the terminal \\[routing] says so · no channel posted it');
   });
 
-  for (const [what, answer] of [
-    ['a module that never answers costs it nothing', 'hang'],
-    ['a module that says it showed the speech puts no receipt in it', 'sent'],
+  it("a place cut at its cap is marked after the cut, so the cut can't leave a notice's opening unmarked", async () => {
+    const surface = new Surface();
+    surface.answer = { sentTo: `${'x'.repeat(192)}[routingX and more after it` };
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi there.' }]));
+    const f = await host([surface], membrane);
+    await turn(f);
+    assert.equal(receipt(f), `[delivered] plain speech → sent to ${'x'.repeat(192)}\\[routing… · no channel posted it`);
+  });
+
+  for (const [what, answer, proseRouting] of [
+    ['a module that never answers costs it nothing', 'hang', 'locus'],
+    ['a module that says it showed the speech puts no receipt in it', 'sent', 'locus'],
+    ['a module that never answers costs it nothing, under hybrid routing', 'hang', 'hybrid'],
+    ['a module that says it showed the speech puts no receipt in it, under hybrid routing', 'sent', 'hybrid'],
   ] as const) {
     it(`an ephemeral run with no channel asks no module, since its plain speech is its caller's result: ${what}`, async () => {
       const surface = new Surface();
       surface.answer = answer;
       const membrane = new MockMembrane();
       const f = await host([surface], membrane);
-      const created = await f.createEphemeralAgent({ name: 'run-1', model: 'test-model', systemPrompt: 'Do the task.', proseRouting: 'locus' });
+      const created = await f.createEphemeralAgent({ name: 'run-1', model: 'test-model', systemPrompt: 'Do the task.', proseRouting });
       created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
       const run = f.runEphemeralToCompletion(created.agent, created.contextManager);

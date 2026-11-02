@@ -601,7 +601,9 @@ export interface InferenceRequest {
    *  on its store's current branch, the wake starts no turn. */
   readsStoredMessage?: string;
   /** @internal The messages added by the module answers whose wakes this
-   *  request stands for, each as its stored id or a held write's handle. */
+   *  request stands for, and, for a request the framework queued to carry a
+   *  turn on, the messages that opened that turn, each as its stored id or a
+   *  held write's handle. */
   openingMessages?: string[];
   agentName: string;
   reason: string;

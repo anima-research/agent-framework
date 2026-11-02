@@ -766,9 +766,9 @@ export class ModuleRegistry {
       const { module, registration } = asked[i]!;
       if (this.moduleContexts.get(module.name) !== registration) return;
       const named = (answer as { sentTo?: unknown } | null | undefined)?.sentTo;
-      const flat = typeof named === 'string' ? markedTexts([oneLine(named).replace(/\s+/g, ' ').trim()])[0]! : '';
+      const flat = typeof named === 'string' ? oneLine(named).replace(/\s+/g, ' ').trim() : '';
       if (!flat) return;
-      places.push(flat.length > SPEECH_PLACE_MAX ? `${safeSlice(flat, 0, SPEECH_PLACE_MAX)}…` : flat);
+      places.push(markedTexts([flat.length > SPEECH_PLACE_MAX ? `${safeSlice(flat, 0, SPEECH_PLACE_MAX)}…` : flat])[0]!);
     });
     return places;
   }

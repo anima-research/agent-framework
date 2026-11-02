@@ -19,5 +19,7 @@
   none), `turnId`, and
   `openedBy`, the request that opened the turn, kept across a
   context-budget restart, with `messages`: the messages added by the module
-  answers whose wakes the turn took, as stored ids or held-write handles that
-  a module context's `getMessage` reads.
+  answers whose wakes the turn took, and, for a turn the framework queued to
+  carry another on (a `!` continuation, an autoContinue run, a bounce's
+  wake), the messages that opened that turn, as stored ids or held-write
+  handles that a module context's `getMessage` reads.
