@@ -1840,6 +1840,50 @@ describe('private wins, one way', () => {
       });
     }
 
+    it("a channel turn's script report deferred across an update's restart keeps only the next run's start out of every channel: a later nudge speaks as on main", async () => {
+      const storeDir = mkdtempSync(join(tmpdir(), 'channel-turn-restart-'));
+      try {
+        const first = await surfaceRig({ storeDir });
+        try {
+          await firstTurn(first, false);
+          assert.deepEqual(first.routed.map((r) => r.locus), [ROOM], 'control: the first run\'s turn is a channel turn');
+          const turnId = routingOf(first.framework).turnId as number;
+          await first.framework.quiesce({ reason: 'update' });
+          await (first.framework as unknown as {
+            scriptWake(agentName: string, scriptId: string, text: string, label: string, startTurnId: number): Promise<void>;
+          }).scriptWake('scout', 's1', '[script s1] the build finished', 's1-ended', turnId);
+          first.i.pendingRequests.length = 0;
+          assert.equal(first.framework.getHostModeStatus().deferredWrites, 1, 'control: the report is deferred, and kept');
+        } finally {
+          await first.close();
+        }
+        const next = await surfaceRig({ storeDir });
+        try {
+          if (next.framework.getHostModeStatus().quiesced) await next.framework.resume();
+          assert.ok(stored(next).includes('the build finished'), 'control: the next run stored the report');
+          const turn = async (ask: () => void, what: string) => {
+            const before = next.routed.length;
+            const streams = next.streams.length;
+            ask();
+            await next.until(() => next.streams.length > streams && idle(next), what);
+            await next.framework.runUntilIdle();
+            return next.routed.slice(before).map((r) => r.locus);
+          };
+          const channelTurn = () => turn(() => { next.i.pendingRequests.push(roomWake()); }, 'a channel turn to run');
+          const nudge = () => turn(() => { assert.ok(next.framework.nudgeAgent('scout', 'host-console').ok); }, 'the nudged turn to run');
+          assert.deepEqual(await channelTurn(), [], "control: the start that reads the earlier run's report speaks in no channel");
+          assert.deepEqual(await channelTurn(), [ROOM], 'control: a later channel turn speaks in its channel');
+          assert.deepEqual(await nudge(), [LOUNGE], 'a nudge after it speaks as on main, in the fallback channel');
+          assert.deepEqual(await channelTurn(), [ROOM], 'control: another channel turn');
+          assert.deepEqual(await nudge(), [LOUNGE], 'and so does the next nudge');
+        } finally {
+          await next.close();
+        }
+      } finally {
+        rmSync(storeDir, { recursive: true, force: true });
+      }
+    });
+
     it("a provider hold that holds a private wake beside an equal one wakes a turn that speaks in no channel", async () => {
       const rig = await surfaceRig();
       try {

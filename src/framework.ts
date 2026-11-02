@@ -419,6 +419,7 @@ const HOST_METADATA_KEYS = [
 ] as const;
 
 const CALLER_TURN_KEY = 'callerTurnId';
+const RESTORED_TURN = 0;
 
 function withoutPrivateWorkMarks<M extends object>(metadata: M | undefined): M | undefined {
   if (!metadata) return metadata;
@@ -1157,10 +1158,12 @@ type ReleasedWindow = {
 };
 
 /** Stamp a deferred write's durable id into the metadata it is stored with
- *  (boot recovery dedups replays by it). Idempotent for an already-stamped
- *  message. */
+ *  (boot recovery dedups replays by it), less a turn id restored across a
+ *  restart (RESTORED_TURN): the start that takes the write in is private, and
+ *  the stored row is not. Idempotent for an already-stamped message. */
 function withDeferredWriteId(metadata: MessageMetadata | undefined, id: string): MessageMetadata {
-  return { ...(metadata ?? {}), deferredWriteId: id } as MessageMetadata;
+  const { [CALLER_TURN_KEY]: turn, ...rest } = (metadata ?? {}) as Record<string, unknown>;
+  return { ...(turn === RESTORED_TURN ? rest : metadata ?? {}), deferredWriteId: id } as MessageMetadata;
 }
 
 /** A deferred entry as a log line names it: its id, participant and block
@@ -10000,7 +10003,7 @@ export class AgentFramework {
       ...m,
       seq: i + 1,
       ...(typeof (m.metadata as Record<string, unknown> | undefined)?.[CALLER_TURN_KEY] === 'number'
-        ? { metadata: { ...m.metadata, [CALLER_TURN_KEY]: 0 } as MessageMetadata }
+        ? { metadata: { ...m.metadata, [CALLER_TURN_KEY]: RESTORED_TURN } as MessageMetadata }
         : {}),
     }));
     this.deferredSeq = Math.max(this.deferredSeq, restored.length);
