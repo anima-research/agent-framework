@@ -293,6 +293,21 @@ export interface CoalescingReceiptRecord {
   batch: { latest: CoalescedOccurrence<unknown>; notices: DeferredNotice[]; dropped: number } | null;
 }
 
+export type CoalescingAudit = { subject: string; eventId: string } & (
+  | { kind: 'received'; retract: boolean; deferred: boolean }
+  | { kind: 'removed' }
+  | { kind: 'remove-failed' }
+  | { kind: 'revoked' }
+  | { kind: 'displaced'; batch?: true }
+  | { kind: 'render-cancelled'; reason?: 'suspend' }
+  | { kind: 'recovery-wake'; attempt: number; delayMs: number }
+  | { kind: 'rendered'; source: 'render' | 'fallback'; empty: boolean }
+  | { kind: 'render-failed'; serverId: string; field?: string; error: string }
+  | { kind: 'late-render'; discarded: true }
+  | { kind: 'persist-failed'; error: string }
+  | { kind: 'accepted-observer-failed'; error: string }
+);
+
 export interface CoalescerHost<E> {
   /** True iff the placement still exists and, as far as the host can tell,
    *  no model request has included it. */
@@ -326,7 +341,7 @@ export interface CoalescerHost<E> {
   /** Agents that read this occurrence's delivery target (may spawn a fork). */
   audience(occurrence: CoalescedOccurrence<E>): Promise<string[]>;
   render(occurrence: CoalescedOccurrence<E>, params: PushRenderParams): Promise<PushRenderResult>;
-  audit(record: Record<string, unknown>): void;
+  audit(record: CoalescingAudit): void;
   /** Persist (throttled by the host); the thunk builds the snapshot lazily. */
   save(snapshot: () => CoalescingSnapshot): void;
   /** Persist the snapshot NOW (a render is about to start: that boundary must

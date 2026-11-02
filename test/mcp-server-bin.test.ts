@@ -20,7 +20,6 @@ import { WebSocketServer } from 'ws';
 // The compiled test sits in dist/test/, beside dist/src/.
 const BIN = fileURLToPath(new URL('../src/api/mcp-server.js', import.meta.url));
 const CORE = fileURLToPath(new URL('../src/api/mcp-server-core.js', import.meta.url));
-const LINE_READER = fileURLToPath(new URL('../src/line-reader.js', import.meta.url));
 const ROOT_MODULE = fileURLToPath(new URL('../src/index.js', import.meta.url));
 // The repository root, from which mcp-wrapper.sh runs the built file.
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
@@ -112,16 +111,15 @@ test('importing the package, or running its server module under the command\'s n
   const entry = join(dir, 'entry.mjs');
   writeFileSync(entry, `const { McpServer } = await import(${rootUrl});\nif (typeof McpServer !== 'function') process.exit(2);\n`);
   // An application bundling the package carries the server's module, never
-  // the command: this copy, under the command's file name, with the module it
-  // imports at the path it imports it from, and inside the package so it
-  // resolves 'ws' as the module does, is that bundle run as the entry point.
-  // It used to start the server.
-  const bundleDir = join(dirname(CORE), '..', `bundle-${process.pid}`);
-  mkdirSync(join(bundleDir, 'api'), { recursive: true });
+  // the command: this copy, under the command's file name and as deep in
+  // dist/src/ as the original, so it resolves 'ws' and its own relative
+  // imports as the module does, is that bundle run as the entry point. It
+  // used to start the server.
+  const bundleDir = join(dirname(dirname(CORE)), `bundle-${process.pid}`);
+  mkdirSync(bundleDir);
   made.push(bundleDir);
-  const bundle = join(bundleDir, 'api', 'mcp-server.js');
+  const bundle = join(bundleDir, 'mcp-server.js');
   copyFileSync(CORE, bundle);
-  copyFileSync(LINE_READER, join(bundleDir, 'line-reader.js'));
   const cases: Array<[string, string[], string | undefined]> = [
     ['a host that imports the package root, from an entry script of its own', [entry], undefined],
     ['the package root imported under `node -e`', ['--input-type=module', '-e', `await import(${rootUrl});`], undefined],
