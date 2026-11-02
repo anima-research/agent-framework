@@ -1219,19 +1219,34 @@ test('framework: an ephemeral agent\'s recorded flag lives from its creation to 
   const N = 4;
   const membrane = new ScriptMembrane(Array.from({ length: N }, () => [final(text('done'))]), {});
   const h = await harness(membrane, { speculativeChannelChunks: true });
-  const optIn = () => (h.framework as unknown as { ephemeralSpeculativeOptIn: Map<string, boolean> }).ephemeralSpeculativeOptIn;
+  const optIn = () => (h.framework as unknown as { ephemeralSpeculativeOptIn: Map<string, { optIn: boolean }> }).ephemeralSpeculativeOptIn;
   try {
     h.framework.start();
     for (let i = 0; i < N; i++) {
       const created = await h.framework.createEphemeralAgent({
         name: `run-${i}`, model: 'test', systemPrompt: 'Do the task.', allowedTools: 'all', ...(i % 2 ? { speculativeChannelChunks: true } : {}),
       });
-      assert.equal(optIn().get(`run-${i}`), i % 2 === 1, 'recorded while it is a candidate');
+      assert.equal(optIn().get(`run-${i}`)?.optIn, i % 2 === 1, 'recorded while it is a candidate');
       created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
       await h.framework.runEphemeralToCompletion(created.agent, created.contextManager);
       assert.equal(optIn().has(`run-${i}`), false, 'deleted at its end');
     }
     assert.equal(optIn().size, 0, `${N} runs created and ended leave the map empty`);
+
+    // A candidate released by cleanup() before it runs.
+    const released = await h.framework.createEphemeralAgent({ name: 'released', model: 'test', systemPrompt: 's', speculativeChannelChunks: true });
+    assert.equal(optIn().has('released'), true);
+    released.cleanup();
+    assert.equal(optIn().has('released'), false, 'cleanup() removes it');
+
+    // A run whose startup is refused after it consumed its candidate.
+    const refused = await h.framework.createEphemeralAgent({ name: 'refused', model: 'test', systemPrompt: 's', speculativeChannelChunks: true });
+    const registry = (h.framework as unknown as { registry: { register: (...a: unknown[]) => unknown } }).registry;
+    const register = registry.register;
+    registry.register = () => { registry.register = register; throw new Error('zz spawner gone'); };
+    await assert.rejects(h.framework.runEphemeralToCompletion(refused.agent, refused.contextManager), /zz spawner gone/);
+    assert.equal(optIn().has('refused'), false, 'a startup refused after the candidate was consumed leaves nothing');
+    assert.equal(optIn().size, 0);
   } finally { await h.framework.stop(); }
 });
 

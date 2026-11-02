@@ -3844,11 +3844,16 @@ export class AgentFramework {
    */
   private speculativePins: Map<string, ChannelRef> = new Map();
   /**
-   * By name, the speculativeChannelChunks each ephemeral agent was built
-   * with, for one not registered yet (a candidate). Its end deletes it, with
-   * the other name-keyed state; a discarded candidate's goes too.
+   * By name, the speculativeChannelChunks of each ephemeral candidate (built,
+   * not yet run), with the candidate it belongs to. It lives as long as the
+   * candidate: its run consumes it (from there the agent map answers), and
+   * cleanup(), a discard, or the candidate being collected removes it.
    */
-  private ephemeralSpeculativeOptIn: Map<string, boolean> = new Map();
+  private ephemeralSpeculativeOptIn: Map<string, { agent: WeakRef<Agent>; optIn: boolean }> = new Map();
+  private ephemeralSpeculativeCollected = new FinalizationRegistry<string>((name) => {
+    const entry = this.ephemeralSpeculativeOptIn.get(name);
+    if (entry && entry.agent.deref() === undefined) this.ephemeralSpeculativeOptIn.delete(name);
+  });
   /** Publishes under way that end an open speculative stream: stop() waits for them before closing MCPL. */
   private speculativePublishes: Set<Promise<void>> = new Set();
   /**
@@ -11002,7 +11007,7 @@ export class AgentFramework {
       const agent = new Agent(config, contextManager, this.membrane);
       this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
-      this.ephemeralSpeculativeOptIn?.set(config.name, agent.speculativeChannelChunks);
+      this.recordSpeculativeCandidate(agent);
       this.ephemeralCandidates.set(agent, {
         contextManager,
         config,
@@ -11024,6 +11029,7 @@ export class AgentFramework {
       const cleanup = () => {
         this.releasedByCleanup.add(agent);
         this.releaseManager(agent);
+        this.forgetSpeculativeCandidate(agent);
       };
 
       return { agent, contextManager, cleanup };
@@ -11171,7 +11177,7 @@ export class AgentFramework {
 
   private discardEphemeralCandidate(agent: Agent, contextManager: ContextManager): void {
     this.ephemeralCandidates.delete(agent);
-    this.ephemeralSpeculativeOptIn?.delete(agent.name);
+    this.forgetSpeculativeCandidate(agent);
     this.ephemeralAgents.delete(agent);
     if (this.toolSurfaceOwners.has(agent.name) && !this.agents.has(agent.name)) this.toolSurfaceOwners.delete(agent.name);
     this.releaseManager(agent);
@@ -11343,7 +11349,7 @@ export class AgentFramework {
       agent = new Agent(fullConfig, contextManager, this.membrane);
       this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
-      this.ephemeralSpeculativeOptIn?.set(name, agent.speculativeChannelChunks);
+      this.recordSpeculativeCandidate(agent);
     } catch (error) {
       this.resumesPending.delete(name);
       this.closeManager(contextManager);
@@ -11359,6 +11365,7 @@ export class AgentFramework {
       if (this.resumesPending.get(name) === agent) this.resumesPending.delete(name);
       this.releasedByCleanup.add(agent);
       this.releaseManager(agent);
+      this.forgetSpeculativeCandidate(agent);
     };
     return { agent, contextManager, cleanup };
   }
@@ -12699,6 +12706,9 @@ export class AgentFramework {
     // Consume before any await/registration: the exact (Agent, ContextManager)
     // generation is one-shot even if startup later fails.
     this.ephemeralCandidates.delete(agent);
+    // From here the agent map answers for it (registered below, before any
+    // await), or its startup fails: either way its candidate entry is done.
+    this.forgetSpeculativeCandidate(agent);
     if (candidate.resume && this.resumesPending.get(agent.name) === agent) this.resumesPending.delete(agent.name);
     if (this.agents.has(agent.name) || this.ephemeralRuns.has(agent.name)) {
       throw new Error(`Ephemeral agent "${agent.name}" is already registered or running`);
@@ -12893,9 +12903,8 @@ export class AgentFramework {
       this.toolImageLedgers.delete(agent.name);
       if (this.agentConfigs.get(agent.name) === candidate.config) this.agentConfigs.delete(agent.name);
       this.toolSurfaceOwners.delete(agent.name);
-      // Read only while the agent isn't registered yet (showsSpeculativeServerId);
-      // nothing asks after its end: an ended run's name has no tools.
-      this.ephemeralSpeculativeOptIn?.delete(agent.name);
+      // Its run consumed its candidate's entry; one still there goes too.
+      this.forgetSpeculativeCandidate(agent);
       // Its scripts end with it: no turn of its is left for them to outlive.
       this.codeExecution?.scripts.agentGone(agent.name);
       // Spawn-and-dispose bookkeeping (main, d453165/fee96a7): without this,
@@ -22605,7 +22614,21 @@ export class AgentFramework {
   private showsSpeculativeServerId(agentName: string): boolean {
     const agent = this.agents.get(agentName);
     if (agent) return agent.speculativeChannelChunks === true;
-    return this.ephemeralSpeculativeOptIn?.get(agentName) === true;
+    const candidate = this.ephemeralSpeculativeOptIn?.get(agentName);
+    return candidate?.agent.deref() !== undefined && candidate.optIn;
+  }
+
+  /** An ephemeral candidate's speculativeChannelChunks, by its name, until its run or release (showsSpeculativeServerId). */
+  private recordSpeculativeCandidate(agent: Agent): void {
+    if (!this.ephemeralSpeculativeOptIn) return;
+    this.ephemeralSpeculativeOptIn.set(agent.name, { agent: new WeakRef(agent), optIn: agent.speculativeChannelChunks });
+    this.ephemeralSpeculativeCollected.register(agent, agent.name, agent);
+  }
+
+  /** Drops a candidate's entry, where it is still this agent's (a later candidate under the name keeps its own). */
+  private forgetSpeculativeCandidate(agent: Agent): void {
+    if (this.ephemeralSpeculativeOptIn?.get(agent.name)?.agent.deref() === agent) this.ephemeralSpeculativeOptIn.delete(agent.name);
+    this.ephemeralSpeculativeCollected?.unregister(agent);
   }
 
   /** Drops an agent's calls from speculativeCalls, where they still map to that stream set (any, when none is given). */
