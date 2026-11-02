@@ -12,17 +12,23 @@ type Is<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1
 type Takes<Raise extends (event: never) => void> = Is<Parameters<Raise>[0], TraceEventInput>;
 type Holds<Check extends true> = Check;
 
-function raisesOnlyListedTraces(raise: (event: TraceEventInput) => void): void {
-  // @ts-expect-error a trace whose name the union doesn't list
-  raise({ type: 'not:a-listed-trace' });
-  // @ts-expect-error a listed trace without its member's fields
-  raise({ type: 'tool:failed' });
-  // @ts-expect-error a field its member doesn't declare
-  raise({ type: 'mcpl:coalescing', kind: 'revoked', subject: 's', eventId: 'e', unlisted: true });
-  // @ts-expect-error a timestamp, which the framework's emitTrace stamps
-  raise({ type: 'module:added', moduleName: 'm', timestamp: 0 });
-}
-void raisesOnlyListedTraces;
+type RequiredKeys<Event> = Event extends unknown
+  ? { [Key in keyof Event]-?: {} extends Pick<Event, Key> ? never : Key }[keyof Event]
+  : never;
+type WithIndex<Event> = Event extends unknown ? (string extends keyof Event ? Event : never) : never;
+type WithTimestamp<Event> = Event extends unknown ? ('timestamp' extends keyof Event ? Event : never) : never;
+type FieldsNotRequired = {
+  [Name in TraceEvent['type']]: Is<
+    RequiredKeys<Extract<TraceEventInput, { type: Name }>>,
+    Exclude<RequiredKeys<Extract<TraceEvent, { type: Name }>>, 'timestamp'>
+  > extends true ? never : Name;
+}[TraceEvent['type']];
+
+type RefusesAnUnlistedName = Holds<Is<'not:a-listed-trace' extends TraceEventInput['type'] ? true : false, false>>;
+type RequiresEachMembersFields = Holds<Is<FieldsNotRequired, never>>;
+type RefusesAnUndeclaredField = Holds<Is<WithIndex<TraceEventInput>, never>>;
+type RefusesATimestamp = Holds<Is<WithTimestamp<TraceEventInput>, never>>;
+type ToolFailedErrorIsAString = Holds<Is<Extract<TraceEvent, { type: 'tool:failed' }>['error'], string>>;
 
 type FrameworkRaise = Holds<Takes<AgentFramework['emitTrace']>>;
 type GateHook = Holds<Takes<ConstructorParameters<typeof EventGate>[0]['emitTrace']>>;

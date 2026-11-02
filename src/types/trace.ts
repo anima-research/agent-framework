@@ -454,14 +454,18 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'mcpl:channels-changed';
       serverId: string;
+      /** The `id` of each descriptor in the notification's `added`, rejected ones included, as the server sent it: not validated, so a malformed descriptor's might not be a string. */
       added: string[];
+      /** The notification's `removed`, as the server sent it: not validated, so a channel the server names by a number arrives as that number. */
       removed: string[];
+      /** As `added`, for the notification's `updated`. */
       updated: string[];
     })
   | (TraceEventBase & {
       type: 'mcpl:channels-incoming';
       serverId: string;
       messageCount: number;
+      /** The distinct `channelId`s of the batch's messages, rejected ones included, as the server sent them: not validated, so a malformed message's might not be a string. */
       channelIds: string[];
     })
   | (TraceEventBase & {
