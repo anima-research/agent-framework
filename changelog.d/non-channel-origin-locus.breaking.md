@@ -16,16 +16,23 @@
   Before, the turn's plain speech went to the channel, with the private
   input in its context. An operator's `nudge` or `unstick`, or the API's
   `inference.request`, is private too while the agent's stored history
-  holds a private surface's message, even right after a channel turn: an
-  `unstick` asked in a room posts its outcome notice there, and the answer
-  reaches no channel. So does the answer to what a subagent or fork started,
-  or handed an operator's words, during a private turn sends back, a channel
-  turn that takes it in included.
+  (for an ordinary resident, the resident slot it shares with other
+  ordinary residents) holds a private surface's message, even right after a
+  channel turn: an `unstick` asked in a room posts its outcome notice there,
+  and the answer reaches no channel. A gate policy that holds
+  `api:inference-request` makes the request it lets through later no
+  retake, so the turn it wakes takes the wake's route. The answer to what a
+  subagent or fork started, or handed an operator's words, during a private
+  turn sends back by `deliverAgentResult` or agent mail is private too, a
+  channel turn that takes it in included.
   - **Who needs to act:** a host that counts on every addressed channel
     message getting a reply of its own, on an `unstick` or `nudge`
-    answering in its channel, or on a subagent's outcome being answered in a
-    channel, when its operators talk to the same agent through a private
-    surface.
+    answering in its channel (for ordinary residents, whose stored history
+    is the resident slot they share, whichever resident the operator
+    addressed), or on a subagent's outcome being answered in a channel,
+    when its operators talk to the same agent through a private surface. A
+    host with a private surface needs to keep its gate from holding
+    `api:inference-request`.
   - **Migration:** nothing to change in code. The resident answers such a
     message with an explicit send, as the notice says.
   - **Unchanged:** other than a retake, a start that holds no private input
