@@ -16,7 +16,9 @@ Upstream discussion: anima-research/agent-framework#892.
 
 ## Enabling it
 
-Both sides have to opt in. Other channels and other agents see no change.
+Both sides have to opt in. Other channels and other agents see no change, apart
+from one shared thing: `channel_publish`'s schema lists an optional `serverId`,
+whose description says to write it before `content` (every agent's schema).
 
 - **Agent:** `AgentConfig.speculativeChannelChunks: true` (default false).
   connectome-host's recipe takes it as `agent.speculativeChannelChunks`.
@@ -108,7 +110,8 @@ first chunk:
   whole text goes out as one chunk, just before the publish, to the channel
   its final arguments name. To stream as it writes, a call writes
   `channelId` and `serverId` before `content` (`channel_publish` takes
-  `serverId` though its schema doesn't list it).
+  `serverId`, which its schema lists as optional, with a description that
+  says to write it with `channelId` before `content`).
 - `channelId` not given: the channel the publish defaults to (host 0.19: the
   turn's channel, the one whose message woke it). That is known only once the
   call is finished, since a later argument could still name a channel, so the

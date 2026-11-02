@@ -571,6 +571,10 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
       type: 'object' as const,
       properties: {
         channelId: { type: 'string', description: "ID of the channel to publish to (defaults to where your plain speech goes this turn, as the tool's description says; required of a subagent)" },
+        serverId: {
+          type: 'string',
+          description: "Owning MCPL server of channelId; optional. A channel that streams speech as you write hears it only once channelId and serverId are both given, so write them before content.",
+        },
         content: { type: 'string', description: 'Text content to publish' },
         text: { type: 'string', description: 'Alias for content' },
       },
@@ -6390,10 +6394,11 @@ export class ChannelRegistry {
           ? serverGiven
             ? `Server "${input.serverId}" has no channel ${quotedValue(fallback!.channelId)}, the id of the channel this call would default to, so nothing was posted.`
             : `The channel this would default to, ${this.quotedShown(fallback!)}, isn't registered now, so nothing was posted.`
-          // This tool's schema has no serverId, so one given here is a host's
-          // ref (publishForAgent), or one an agent added unasked, and the
-          // refusal offers names its channelId takes instead. (A fork's guard
-          // refuses a home its server no longer registers before this runs.)
+          // A serverId here is a host's ref (publishForAgent) or the agent's
+          // own (the schema lists it, optional, for speculative chunks), and
+          // the refusal offers names its channelId takes instead. (A fork's
+          // guard refuses a home its server no longer registers before this
+          // runs.)
           : serverGiven
             ? `No channel "${input.channelId}" is on server "${input.serverId}", so nothing was posted. ${this.elsewhereText(input.channelId, false)}`
             : `No channel has the id "${input.channelId}", so nothing was posted. ${findIds}`,

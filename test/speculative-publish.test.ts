@@ -1078,3 +1078,13 @@ test('framework: each publish outcome ends the stream as it is known: delivered,
     } finally { await h.framework.stop(); }
   }
 });
+
+test('registry: channel_publish lists serverId as optional, and says to write it with channelId before content', () => {
+  const h = streamingRegistry();
+  const publish = h.registry.getChannelTools().find((t) => t.name === 'channel_publish')!;
+  const schema = publish.inputSchema as { properties: Record<string, { type: string; description?: string }>; required?: string[] };
+  assert.deepEqual(Object.keys(schema.properties), ['channelId', 'serverId', 'content', 'text']);
+  assert.equal(schema.properties.serverId!.type, 'string');
+  assert.match(schema.properties.serverId!.description ?? '', /before content/);
+  assert.deepEqual(schema.required, []);
+});
