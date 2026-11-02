@@ -46,7 +46,9 @@
     compression's progress or whether it still has compression pending, a
     message added, edited or removed (other than the arrival of a stored
     context injection, the hold's own note among them, or of a clock row), the
-    agent's runtime settings, or the budget its next compile plans at. A turn
+    agent's runtime settings, the budget its next compile plans at, or its
+    context manager's pins and document marks, since removing one can let
+    messages it kept raw fold to summaries they already have. A turn
     released and refused again is held again, as of the refusal that first
     held it, and isn't released again until one of those changes.
   - **When it ends without a fit:** once compression has nothing pending and

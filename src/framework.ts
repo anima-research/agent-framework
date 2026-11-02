@@ -6784,7 +6784,7 @@ export class AgentFramework {
     hold.checkpoint = checkpoint;
     hold.heldRequests = [own];
     hold.errorType = errorType;
-    hold.reason = boundFailureText(String(error.message), FAILURE_SUMMARY_MAX_CHARS);
+    hold.reason = boundFailureText(String(error.message));
     hold.budget = typeof figures.budget === 'number' ? figures.budget : undefined;
     hold.actual = typeof figures.actual === 'number' ? figures.actual : undefined;
     if (this.maintenanceIntervalMs <= 0) {
@@ -6837,7 +6837,7 @@ export class AgentFramework {
   private logBudgetHold(agent: Agent, hold: BudgetHold): void {
     const readiness = this.contextReadiness(agent.getContextManager());
     const compression = 'pending' in readiness && readiness.pending
-      ? ` Compression: ${boundFailureText(readiness.pending, FAILURE_SUMMARY_MAX_CHARS)}`
+      ? ` Compression: ${boundFailureText(readiness.pending)}`
       : '';
     console.error(`[budget-hold] agent=${agent.name} compile refused (${hold.errorType}): ${hold.reason} \u2014 Held: ` +
       `this turn runs once a check finds its context fits its budget.${compression}`);
@@ -6958,6 +6958,9 @@ export class AgentFramework {
         this.storeChangeCount(cm),
         agent.getRuntimeSettings(),
         agent.nextCompileBudget(),
+        cm.listPins()
+          .map((pin) => [pin.id, pin.firstMessageId, pin.lastMessageId, pin.kind, pin.level ?? null, pin.maxLevel ?? null])
+          .sort(([a], [b]) => (String(a) < String(b) ? -1 : String(a) > String(b) ? 1 : 0)),
       ]);
     } catch {
       return undefined;
