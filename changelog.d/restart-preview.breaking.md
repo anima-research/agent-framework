@@ -4,8 +4,8 @@
   preview fails other than by having no fold plan to preview: the stream
   goes on, each boundary that declines it emits
   an `inference:restart_declined` trace, and the next tool boundary over
-  the budget considers the restart again. On 0.30.0 a restart whose
-  compile the preview now says won't fit was taken too, and its compile
+  the budget considers the restart again. Before this release a restart
+  whose compile the preview now says won't fit was taken too, and its compile
   refused, ending the turn with an `over_budget` failure row, unless
   something it rested on changed after the cancel, such as a compression
   the stream had kept waiting landing before the compile.
@@ -30,14 +30,16 @@
     stream whose restart is declined: it can go on until the provider
     refuses a request at its own window, and the turn then ends with a
     `context_length` failure row. That ending raises the `context-refusal` ops alert and
-    kicks the compression drain, as 0.30.0's refused compile did. Set
+    kicks the compression drain, as a refused compile did before this
+    release. Set
     `physicalWindowTokens` to restart a stream before a request its window
     can't hold, with a `contextBudgetTokens` the window can hold. That
-    restart is taken whatever its compile would do, as on 0.30.0, so one
+    restart is taken whatever its compile would do, as before this release,
+    so one
     that can't fit refuses, and the turn ends with an `over_budget` failure
     row.
   - **A host whose `contextBudgetTokens` bounds what a request costs,**
-    rather than the provider's window: on 0.30.0 a stream past
+    rather than the provider's window: before this release a stream past
     `maxStreamTokens` always restarted into a compile held to that budget,
     and now a declined restart lets the stream's requests grow toward the
     provider's window. `physicalWindowTokens` bounds them instead: set below
@@ -52,8 +54,8 @@
     the stream is past `maxStreamTokens` too: its `inference:stream_restarted`
     trace gives the reason `physical_window`, with the projection as
     `inputTokens` and `physicalWindowTokens` as `budget`, and the stream's
-    inference-log entry the `stopReason` `physical_window`. 0.30.0 gave such
-    a restart `context_budget`, with the stream's count and
+    inference-log entry the `stopReason` `physical_window`. Before this
+    release such a restart had `context_budget`, with the stream's count and
     `maxStreamTokens`.
   - **With a turn's pin on the rows it opened with**
     (`agent-framework:turn-inputs`), the preview answers whether the
