@@ -16242,7 +16242,7 @@ export class AgentFramework {
     const agent = new Agent(agentConfig, contextManager, this.membrane);
     this.adoptToolResultGuard(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
-    this.joinSharedSlot(agent, contextManager); // reads the shared slot through its merged view
+    this.sharedSlotAgents.add(agent); // reads the shared slot through its merged view
     // An attention tenant of the resident it serves: reads the shared slot
     // through its merged view (held traffic included), never a broadcast
     // recipient, and outlives policy epochs.

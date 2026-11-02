@@ -655,6 +655,41 @@ test("a resumed job on the shared slot with toolResultGuard on replaces a held r
   });
 });
 
+test("the subconscious's edit to a row of its own doesn't reach a resident's remembered decline: the resident takes the decline's answer at its next boundary", async () => {
+  const membrane = new TurnMembrane([[...toolRounds(6, 4_000), answer('Done on the first stream.')], [answer(FINAL)]]);
+  const strategy = new ScriptedPreviewStrategy(() => ({ fits: false, clearedBy: ['compression'] }));
+  const module = new PagesModule();
+  const dir = mkdtempSync(join(tmpdir(), 'restart-preview-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: membrane.asMembrane(),
+    agents: [agentConfig({ maxStreamTokens: 10, contextBudgetTokens: 60_000, physicalWindowTokens: undefined, strategy })],
+    modules: [module],
+    syncIntervalMs: 0,
+    subconscious: { enabled: true, systemPrompt: 'Notice.' },
+  });
+  const traces: TraceEvent[] = [];
+  framework.onTrace((event) => traces.push(event));
+  try {
+    framework.start();
+    const subconscious = framework.getAgent('Subconscious')!.getContextManager();
+    const own = subconscious.addMessage('Subconscious', [{ type: 'text', text: 'A row of its own.' }]);
+    strategy.readiness = { ready: false, description: 'Compressing chunk 0' };
+    let calls = 0;
+    module.onCall = () => {
+      if (++calls === 5) subconscious.editMessage(own, [{ type: 'text', text: 'A row of its own, edited.' }]);
+    };
+    ask(framework);
+    await waitUntil('the turn to end', () => storedText(framework).includes('Done on the first stream.') || failureRows(framework).length > 0);
+    assert.equal(calls >= 5, true, "the subconscious's row was edited during the resident's 5th tool call");
+    assert.deepEqual(declined(traces).map((decline) => decline.previewed), [true, false, false], 'the 4th boundary declined on a preview, and the 5th and 6th took its answer');
+    assert.equal(strategy.previews, 1, 'one preview in all');
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a framework that stops during a tool call asks for no restart preview past maxStreamTokens', async () => {
   const membrane = new TurnMembrane([[...toolRounds(6, 4_000), answer('Done on the first stream.')], [answer(FINAL)]]);
   const strategy = new ScriptedPreviewStrategy(() => ({ fits: false, clearedBy: ['compression'] }));
