@@ -75,9 +75,11 @@
       its failure count kept, still paces its next call. The wait is
       recorded in the store, so a restart doesn't lift it, and a restart
       drops the held turn.
-    - **Work nothing bounds:** compression whose pending work isn't a call,
-      such as a quarantine clean-up under the compression-state lock that
-      never ends, keeps the turn held with no signal of its own. A chunk or a
+    - **Work nothing bounds:** a compression call that doesn't return, and
+      compression whose pending work isn't a call, such as a quarantine
+      clean-up under the compression-state lock that never ends, keep the
+      turn held with no signal of their own. Where the provider's client
+      times the call out, it fails, and is reported as above. A chunk or a
       merge blocked by a message held from compression waits too; this
       framework holds a message only as it stores it, which blocks no chunk
       or merge already made, so only a host's own later hold meets that.
