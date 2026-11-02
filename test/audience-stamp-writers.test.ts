@@ -323,6 +323,9 @@ const OWN_ROW_WRITERS: Record<string, { count: number; when: 'turn' | 'end' | 'u
   'framework.ts AgentFramework.deriveAgent': { count: 2, when: 'unregistered', what: "a derived agent's inheritance and framing" },
   'framework.ts AgentFramework.framePendingRound': { count: 2, when: 'unregistered', what: "a derived agent's framing of its parent's pending round" },
   'framework.ts AgentFramework.createConversationAgent': { count: 1, when: 'unregistered', what: "a conversation fork's seed" },
+  // A persisted reader's resumption (subconscious.persist): its framing,
+  // stored after resumeAgent and before its run registers it.
+  'framework.ts AgentFramework.persistedReaderLook': { count: 1, when: 'unregistered', what: "a resumed persisted reader's framing" },
   // main's [speech-not-posted] notice (0.28.0), stored past addMessage there,
   // read onto this branch as an own row: its frames hold the agent, but a
   // dropped start's agent may have been replaced, so it holds its row back.
