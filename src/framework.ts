@@ -2616,6 +2616,8 @@ interface BudgetHold {
   checkpoint: RecordedTurnCheckpoint | undefined;
   checkQueued?: boolean;
   drainKicked?: boolean;
+  outcome?: Exclude<BudgetHoldOutcome, 'stopped'>;
+  note?: string | null;
 }
 /** Longest delay one setTimeout can represent (2^31-1 ms, about 24.8 days);
  *  a longer timer fires almost at once, so longer waits re-arm in steps. */
@@ -6848,7 +6850,8 @@ export class AgentFramework {
     const pending = this.compressionPending(agent);
     const signature = this.budgetHoldSignature(agent, pending);
     if (signature !== undefined && signature === hold.lookedAt) return;
-    let verdict = this.budgetHoldPreview(agent);
+    const preview = this.budgetHoldPreview(agent);
+    let verdict = preview?.verdict;
     if (verdict === undefined) {
       if (hold.checking) return;
       const check = this.budgetHoldDryRun(agent);
@@ -6868,13 +6871,44 @@ export class AgentFramework {
       this.releaseBudgetHold(agentName, 'nothing_pending');
     } else {
       hold.lookedAt = signature;
-      this.releaseBudgetHold(agentName, verdict);
+      this.releaseBudgetHold(agentName, verdict,
+        verdict === 'fit' && preview?.plan ? this.budgetHoldNoteWhereItFits(agent, hold, preview.plan) : undefined);
     }
   }
 
-  private budgetHoldPreview(agent: Agent): 'fit' | 'refused' | 'check_failed' | undefined {
+  private budgetHoldNoteWhereItFits(
+    agent: Agent,
+    hold: BudgetHold,
+    plan: { finalTokens: number; budgetTokens: number },
+  ): string | null | undefined {
+    const note = this.budgetHoldNote(hold);
+    const cm = agent.getContextManager();
+    const strategy = cm.getStrategy() as unknown as { estimateTokens?: (content: ContentBlock[]) => number };
+    if (typeof strategy.estimateTokens !== 'function') return undefined;
+    let price: number;
+    try {
+      price = strategy.estimateTokens(asStoredRow({
+        namespace: BUDGET_HOLD_NOTE_NAMESPACE, position: 'afterUser', content: [{ type: 'text', text: note }],
+      }).content as ContentBlock[]);
+    } catch {
+      return undefined;
+    }
+    if (plan.budgetTokens - plan.finalTokens >= price) return note;
+    const budget = agent.nextCompileBudget();
+    const thinkingBinding = agent.thinkingBindingOption();
+    try {
+      const smaller = (cm as unknown as {
+        previewContext: (budget: TokenBudget, overrides?: undefined, opts?: { thinkingBinding?: ThinkingBinding }) => { fits?: unknown } | null;
+      }).previewContext({ ...budget, maxTokens: budget.maxTokens - price }, undefined, thinkingBinding ? { thinkingBinding } : undefined);
+      return smaller?.fits === true ? note : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private budgetHoldPreview(agent: Agent): { verdict: 'fit' | 'refused' | 'check_failed'; plan?: { finalTokens: number; budgetTokens: number } } | undefined {
     const cm = agent.getContextManager() as unknown as {
-      previewContext?: (budget: TokenBudget, overrides?: undefined, opts?: { thinkingBinding?: ThinkingBinding }) => { fits?: unknown } | null;
+      previewContext?: (budget: TokenBudget, overrides?: undefined, opts?: { thinkingBinding?: ThinkingBinding }) => { fits?: unknown; finalTokens?: unknown; budgetTokens?: unknown } | null;
     };
     if (typeof cm.previewContext !== 'function') return undefined;
     const thinkingBinding = agent.thinkingBindingOption();
@@ -6885,13 +6919,17 @@ export class AgentFramework {
     try {
       const preview = cm.previewContext(agent.nextCompileBudget(), undefined, thinkingBinding ? { thinkingBinding } : undefined);
       if (!preview) return undefined;
-      return preview.fits === true ? 'fit' : 'refused';
+      if (preview.fits !== true) return { verdict: 'refused' };
+      const { finalTokens, budgetTokens } = preview;
+      return typeof finalTokens === 'number' && typeof budgetTokens === 'number'
+        ? { verdict: 'fit', plan: { finalTokens, budgetTokens } }
+        : { verdict: 'fit' };
     } catch (error) {
       // The hierarchical strategy's preview has no fold plan for a context
       // that fits: context-manager 0.23.0 throws, 0.23.1 returns null. Its dry
       // compile refuses as its compile does.
       if (error instanceof Error && error.message.includes('requires adaptiveResolution')) return undefined;
-      return this.budgetHoldThrownVerdict(error);
+      return { verdict: this.budgetHoldThrownVerdict(error) };
     }
   }
 
@@ -6959,15 +6997,17 @@ export class AgentFramework {
     if (kicked === 'kicking') hold.drainKicked = true;
   }
 
-  private releaseBudgetHold(agentName: string, outcome: Exclude<BudgetHoldOutcome, 'stopped'>): void {
+  private releaseBudgetHold(agentName: string, outcome: Exclude<BudgetHoldOutcome, 'stopped'>, note?: string | null): void {
     const hold = this.budgetHolds?.get(agentName);
     if (hold?.state !== 'holding') return;
     this.clearBudgetHoldRecheck(hold);
     const waitedMs = Date.now() - hold.startedAt;
     const released = hold.heldRequests;
+    for (const request of released) this.pendingRequests.push(request);
     hold.state = outcome === 'nothing_pending' ? 'spent' : 'released';
+    hold.outcome = outcome;
+    hold.note = note;
     hold.heldRequests = [];
-    this.pendingRequests.push(...released);
     console.error(`[budget-hold] agent=${agentName} hold ended (${outcome}) after ${waitedMs}ms; ` +
       `${released.length} held request(s) queued for one fresh compile`);
     this.emitTrace({
@@ -7035,7 +7075,9 @@ export class AgentFramework {
     }
     if (hold?.state !== 'spent') return error;
     error.message = `${error.message} (the turn was first held ${describeWait(Date.now() - hold.startedAt)} ago; ` +
-      "compression had nothing left to do and it still didn't fit)";
+      (hold.outcome === 'fit'
+        ? "its context fit when the hold released it, and what its start then added didn't, with nothing left for compression to do)"
+        : "compression had nothing left to do and it still didn't fit)");
     return error;
   }
 
@@ -24705,7 +24747,9 @@ export class AgentFramework {
       }
 
       const heldTurn = this.budgetHolds?.get(agent.name);
-      const holdNote = heldTurn && heldTurn.state !== 'holding' ? this.budgetHoldNote(heldTurn) : undefined;
+      const holdNote = heldTurn && heldTurn.state !== 'holding'
+        ? (heldTurn.note === undefined ? this.budgetHoldNote(heldTurn) : heldTurn.note ?? undefined)
+        : undefined;
       if (holdNote !== undefined) {
         const noteInjection: ContextInjection = {
           namespace: BUDGET_HOLD_NOTE_NAMESPACE,

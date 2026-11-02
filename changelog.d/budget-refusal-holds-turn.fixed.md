@@ -53,15 +53,32 @@
     if that compile fits, and otherwise its refusal takes the error policy's
     path, as a refused compile did, its reason saying when it was first held.
     The hold has no time limit, since the turn can't run before its context
-    fits. Compression can stay pending without moving: with context-manager
-    0.24.1, when every compression call fails for a reason that says nothing
-    about the request, as in an outage of its model's provider or with bad
-    credentials, it waits between tries from 5 seconds doubling up to 10
-    minutes, tries again on later ticks for as long as that lasts, and decides
-    nothing; after a stated wait it can't hold as an instant, it makes no call
-    until a restart, a change of model or a release. The turn stays held
-    through that, and runs once a check finds its context fits.
-    `releaseProviderWait()` offers its release to the compression lane too.
+    fits. Compression can stay pending without moving, and the turn stays
+    held through that, and runs once a check finds its context fits:
+    - **Calls that keep failing:** with context-manager 0.24.1, when every
+      compression call fails for a reason that says nothing about the
+      request, as in an outage of its model's provider or with bad
+      credentials, it waits between tries from 5 seconds doubling up to 10
+      minutes and tries again on later ticks. Each failure raises
+      `context-maintenance-failed` under maintenance's rule for repeats, and
+      the hold ends by itself once a call succeeds and the context fits.
+    - **A wait with no end:** after a call whose provider states a wait that
+      can't be held as an instant, the framework records it as a wait until
+      released, which raises one `provider-wait` ops alert and holds the
+      agent's calls on that model, compression's included, and the lane
+      makes no call. `releaseProviderWait()` lifts that wait and the lane's
+      pause together. The wait is recorded in the store, so a restart doesn't
+      lift it, and a restart drops the held turn.
+    - **Work nothing bounds:** compression whose pending work isn't a call,
+      such as a quarantine clean-up under the compression-state lock that
+      never ends, keeps the turn held with no signal of its own. A chunk or a
+      merge blocked by a message held from compression waits too; this
+      framework holds a message only as it stores it, which blocks no chunk
+      or merge already made, so only a host's own later hold meets that.
+    - **Outside the framework's alerts:** a strategy that drains compression
+      on new messages by itself (`autoTickOnNewMessage`, which this framework
+      doesn't set) reports that drain's failures in context-manager's own
+      log only.
     The hold lives in memory: a restart drops it, and the agent's next wake
     compiles afresh.
   - **Undo:** a hold adds no undo step. When the refused start recorded a
