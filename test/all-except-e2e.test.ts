@@ -377,6 +377,7 @@ describe('tune-out, all-except scope', () => {
       const result = await f.framework.executeToolCall({ id: 'c1', name: 'channel_close', input: { channelId: 'work' }, callerAgentName: 'agent' } as never);
       assert.ok(result.success, result.error);
       assert.equal(internals(f).tuneOutCoordinator!.getAllExcept(), null, 'nothing left to speak into: the scope ended');
+      assert.equal((result.data as { note?: string }).note, 'The focus on it ended, and what the other channels held was delivered.', 'and the answer says so');
       assert.match(textOf(find(f, 'all channels except')), /antra: held/);
     } finally { await f.close(); }
   });
@@ -395,7 +396,7 @@ describe('tune-out, all-except scope', () => {
       const result = await f.framework.executeToolCall({ id: 'c1', name: 'channel_close', input: { channelId: 'work' }, callerAgentName: 'agent' } as never);
       assert.equal(result.success, false);
       assert.equal(internals(f).tuneOutCoordinator!.getAllExcept(), null, 'the scope ended');
-      assert.match(result.error ?? '', /The focus on it ended all the same/);
+      assert.match(result.error ?? '', /The focus on it ended, and what the other channels held was delivered/);
     } finally { await f.close(); }
   });
 

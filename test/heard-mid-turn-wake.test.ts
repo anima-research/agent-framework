@@ -1,9 +1,10 @@
 /**
  * A wake for a write the agent heard mid-turn (issue #264).
  *
- * A message that arrives while a turn is alive is deferred, and its wake
- * waits behind the busy agent. At the turn's next tool boundary the message
- * is stored and injected, so the live turn reads it (hear-while-acting). The
+ * A message that arrives while a turn is alive is stored at once and kept
+ * out of the agent's window (#291's presentation index), and its wake waits
+ * behind the busy agent. At the turn's next tool boundary the message enters
+ * the window and is injected, so the live turn reads it (hear-while-acting). The
  * wake then starts no turn of its own once nothing is left for the agent to
  * do: a request that carried the write was answered and, for a wake that
  * carries a channel, unless its message's server marked it ambient, the agent
@@ -27,17 +28,18 @@ import type {
   ToolDefinition,
   ToolResult,
 } from '../src/index.js';
-import { AgentFramework } from '../src/index.js';
+import { AgentFramework, workerSpec } from '../src/index.js';
 import type { GateConfig } from '../src/gate/types.js';
 import { destinationKey } from '../src/mcpl/channel-registry.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+import { bySequence, headOf, legacyMarkFrom, newestCovered, rowAt } from './helpers/read-mark-rows.js';
+import type { MarkCm, MarkedRow, ReadMark } from '../src/read-marks.js';
 import type { ContentBlock, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 
 const ROOM = 'chat:room';
 const GENERAL = 'chat:general';
 
 type Internals = {
-  deferredMessages: Array<{ id: string }>;
   pendingRequests: Array<Record<string, unknown>>;
   turnRouting: Map<string, unknown>;
   agents: Map<string, unknown>;
@@ -45,8 +47,13 @@ type Internals = {
   dispatchSleepToolCall(agentName: string, call: ToolCall): void;
   scriptWake(agentName: string, scriptId: string, text: string, label: string): Promise<void>;
   bounceProse(agent: unknown, text: string, reason: string, candidates: undefined, prefix: '>>', round: unknown): void;
-  readsWriteFor(placement: { agent?: string; deferredId?: string; messageId?: string } | undefined, agentName: string): { readsDeferredWrite?: string; readsStoredMessage?: string };
+  readsRowFor(placement: { agent?: string; messageId?: string; presented?: false } | undefined, agentName: string): { readsRow?: string };
   dispatchChannelToolCall(agentName: string, call: ToolCall): void;
+  reserveStoreForSurgery(verb: string, agentName: string): () => void;
+  surgeryHeldWrites: unknown[];
+  registry: { register(spec: ReturnType<typeof workerSpec>): unknown };
+  processNextEvent(): Promise<void>;
+  routingOf(agentName: string): unknown;
 };
 const internals = (f: AgentFramework) => f as unknown as Internals;
 
@@ -58,7 +65,8 @@ async function until(done: () => boolean, label: string, timeoutMs = 5000): Prom
 }
 
 /** Each tool holds its round open while `during` writes something, until
- *  that write is deferred, its wake waiting behind the busy agent. `wait`
+ *  that write is stored (out of the agent's window while its turn is alive),
+ *  its wake waiting behind the busy agent. `wait`
  *  then lets the turn go on; `stop` ends it at its boundary, with nothing
  *  more said. Events with text make module messages and ask for inference. */
 class HoldModule implements Module {
@@ -80,10 +88,10 @@ class HoldModule implements Module {
     const during = this.during;
     this.during = null;
     if (during) {
-      const fw = internals(this.framework!);
-      const queued = fw.deferredMessages.length;
+      const cm = this.framework!.getAgent('assistant')!.getContextManager();
+      const stored = cm.getMessageCount();
       await during();
-      await until(() => fw.deferredMessages.length > queued, 'the mid-turn write to be deferred');
+      await until(() => cm.getMessageCount() > stored, 'the mid-turn write to be stored');
     }
     if (call.name.endsWith('stop')) return { success: true, data: { stopped: true }, endTurn: true };
     return { success: true, data: { ok: true } };
@@ -389,14 +397,13 @@ describe('a wake for a write heard mid-turn', () => {
       await framework.runUntilIdle();
 
       assert.deepEqual(posted, [['hello', ROOM]]);
-      const agent = framework.getAgent('assistant') as unknown as {
-        getConsumedWatermark(): { branch: string; sequence: number };
-        publishedAfterReading(channelId: string, branch: string, sequence: number): boolean;
-      };
+      const agent = framework.getAgent('assistant')!;
       const read = agent.getConsumedWatermark();
+      const cm = agent.getContextManager();
       const room = destinationKey({ serverId: 'chat', channelId: ROOM });
-      assert.equal(agent.publishedAfterReading(room, read.branch, read.sequence), true, 'noted with what its request read');
-      assert.equal(agent.publishedAfterReading(room, read.branch, read.sequence + 1), false, 'and nothing stored after');
+      assert.equal(agent.publishedAfterReading(room, newestCovered(read, cm), cm), true, 'noted with what its request read');
+      const after = cm.getMessage(cm.addMessage('Antra', [text('stored after')]))!;
+      assert.equal(agent.publishedAfterReading(room, after, cm), false, 'and nothing stored after');
       await framework.stop();
     });
   }
@@ -636,43 +643,50 @@ describe('a wake for a write heard mid-turn', () => {
       const posted = stubChannelRegistry(framework, ROOM, { holdSpeech: () => landed, speech, speechAttempts: attempts });
       const fw = internals(framework);
       fw.turnRouting.set('assistant', { turnId: 1, wasIn: [], engaged: new Set(), ...routing });
-      const agent = framework.getAgent('assistant') as unknown as {
-        getConsumedWatermark(): { branch: string; sequence: number };
-        markContextConsumed(): void;
-        getContextManager(): { addMessage(participant: string, content: unknown[]): unknown };
-        publishedAfterReading(destination: string, branch: string, sequence: number): boolean;
-      };
-      agent.getContextManager().addMessage('Antra', [text('earlier words')]);
+      const agent = framework.getAgent('assistant')!;
+      const cm = agent.getContextManager();
+      // Each row the agent reads enters its window first (#291): a write past
+      // the framework does at the agent's next point.
+      const present = () => (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(agent);
+      const earlier = cm.getMessage(cm.addMessage('Antra', [text('earlier words')]))!;
+      present();
       agent.markContextConsumed();
       const atCall = agent.getConsumedWatermark();
 
       fw.dispatchSleepToolCall('assistant', { id: 's1', name: 'sleep', input: { seconds: 60 }, ...(turnId ? { callerTurnId: turnId } : {}) });
       const room = destinationKey({ serverId: 'chat', channelId: ROOM });
-      assert.equal(agent.publishedAfterReading(room, atCall.branch, atCall.sequence), false, 'nothing is noted before it lands');
+      assert.equal(agent.publishedAfterReading(room, earlier, cm), false, 'nothing is noted before it lands');
       // The agent reads more before the announcement lands.
-      agent.getContextManager().addMessage('Antra', [text('later words')]);
+      const laterRow = cm.getMessage(cm.addMessage('Antra', [text('later words')]))!;
+      present();
       agent.markContextConsumed();
       const later = agent.getConsumedWatermark();
-      assert.ok(later.sequence > atCall.sequence, 'the agent read more');
+      assert.ok(headOf(later) > headOf(atCall), 'the agent read more');
       land();
       await until(() => attempts.length > 0, 'the announcement to come to land');
       fw.eventGate!.clearSleep();
 
       assert.deepEqual(posted.map(([, channelId]) => channelId), speech === 'delivered' ? [ROOM] : []);
-      assert.equal(agent.publishedAfterReading(room, atCall.branch, atCall.sequence), noted);
-      assert.equal(agent.publishedAfterReading(room, later.branch, later.sequence), false, 'and not with what it read after the call');
+      assert.equal(agent.publishedAfterReading(room, earlier, cm), noted);
+      assert.equal(agent.publishedAfterReading(room, laterRow, cm), false, 'and not with what it read after the call');
       await framework.stop();
     });
   }
 
-  it("a write marks the wake of the agent it went to with the id it was deferred or stored under, and another agent's wake stays plain", async () => {
+  it("a write marks the wake of the agent it went to with the id it was stored under, and another agent's wake stays plain", async () => {
     const framework = await createFramework();
     const fw = internals(framework);
-    assert.deepEqual(fw.readsWriteFor({ agent: 'assistant', deferredId: 'd-1' }, 'assistant'), { readsDeferredWrite: 'd-1' });
-    assert.deepEqual(fw.readsWriteFor({ agent: 'assistant', deferredId: 'd-1' }, 'helper'), {}, "another agent's wake stays plain");
-    assert.deepEqual(fw.readsWriteFor({ agent: 'assistant', messageId: 'm-1' }, 'assistant'), { readsStoredMessage: 'm-1' },
-      'a wake can wait while a request reads a stored write, as behind a held continuation');
-    assert.deepEqual(fw.readsWriteFor({ agent: 'assistant', messageId: 'm-1' }, 'helper'), {}, "another agent's wake stays plain");
+    // Read onto #291: every write is stored at once, so main's two marks
+    // (readsDeferredWrite for a held write, readsStoredMessage for one stored
+    // as it arrived) are the one readsRow, by the stored id, whether or not
+    // the row was presented to the agent at its write.
+    assert.deepEqual(fw.readsRowFor({ agent: 'assistant', messageId: 'm-1', presented: false }, 'assistant'), { readsRow: 'm-1' });
+    assert.deepEqual(fw.readsRowFor({ agent: 'assistant', messageId: 'm-1', presented: false }, 'helper'), {}, "another agent's wake stays plain");
+    assert.deepEqual(fw.readsRowFor({ agent: 'assistant', messageId: 'm-1' }, 'assistant'), { readsRow: 'm-1' },
+      'a row presented to the agent at its write marks its wake too (#814): only a request that carried it drops the wake');
+    assert.deepEqual(fw.readsRowFor({ agent: 'assistant', messageId: 'm-1' }, 'helper'), {}, "another agent's wake stays plain");
+    assert.deepEqual(fw.readsRowFor({ agent: 'assistant' }, 'assistant'), {}, 'nor does a write a surgery holds, with no id yet');
+    assert.deepEqual(fw.readsRowFor(undefined, 'assistant'), {}, 'nor does a wake with no write');
     await framework.stop();
   });
 
@@ -690,6 +704,10 @@ describe('a wake for a write heard mid-turn', () => {
     ["a background script's wake", (framework) => internals(framework).scriptWake(
       'assistant', 'script-1', '[background-script script-1] finished: 42', 'wake',
     ), 'finished: 42'],
+    ["another agent's mail", (framework) => {
+      internals(framework).registry.register(workerSpec('job'));
+      return framework.sendAgentMessage('job', 'assistant', [text('the job says hello')]);
+    }, 'the job says hello'],
   ];
   for (const [what, write] of unchanneled) {
     it(`${what}, heard at the boundary, starts no turn of its own`, async () => {
@@ -729,7 +747,9 @@ describe('a wake for a write heard mid-turn', () => {
       const row = framework.getAgent('assistant')!.getContextManager().getAllMessages()
         .find((m) => JSON.stringify(m.content).includes(shown));
       assert.ok(row, `${what} was stored`);
-      assert.deepEqual(triggers.map((r) => r.readsStoredMessage), [row.id], "its wake's turn would start for the row it names");
+      // Read onto #291: main's readsStoredMessage is readsRow here, the one
+      // mark a wake takes for the stored row it is for.
+      assert.deepEqual(triggers.map((r) => r.readsRow), [row.id], "its wake's turn would start for the row it names");
       await framework.stop();
     });
   }
@@ -805,11 +825,8 @@ describe('a wake for a write heard mid-turn', () => {
     };
     const framework = await createFramework();
     const posted = stubChannelRegistry(framework, ROOM);
-    const agent = framework.getAgent('assistant') as unknown as {
-      getConsumedWatermark(): { branch: string; sequence: number };
-      publishedAfterReading(destination: string, branch: string, sequence: number): boolean;
-    };
-    let firstRead!: { branch: string; sequence: number };
+    const agent = framework.getAgent('assistant')!;
+    let firstRead!: ReadMark | null;
     module.during = () => {
       // During the first round's tool call: what the first request had read.
       firstRead = agent.getConsumedWatermark();
@@ -821,7 +838,7 @@ describe('a wake for a write heard mid-turn', () => {
 
     assert.ok(JSON.stringify(stream.injected).includes('also this'), 'the boundary handed the stream the message');
     assert.ok(posted.some(([t, channelId]) => t === 'heard you' && channelId === ROOM), `the turn spoke in room at its end: ${JSON.stringify(posted)}`);
-    assert.equal(agent.publishedAfterReading(destinationKey({ serverId: 'chat', channelId: ROOM }), firstRead.branch, firstRead.sequence), true,
+    assert.equal(agent.publishedAfterReading(destinationKey({ serverId: 'chat', channelId: ROOM }), newestCovered(firstRead, agent.getContextManager()), agent.getContextManager()), true,
       "the end's prose is noted as a publish made having read what the first request had");
     assert.equal(membrane.calls.length, 2, 'its wake started the turn');
     assert.deepEqual(drops, []);
@@ -859,23 +876,21 @@ describe('a wake for a write heard mid-turn', () => {
       if (event.type === 'tool-result' && event.callId) results.push(event.callId);
       push(event as never);
     };
-    const agent = framework.getAgent('assistant') as unknown as {
-      getConsumedWatermark(): { branch: string; sequence: number };
-      publishedAfterReading(destination: string, branch: string, sequence: number): boolean;
-    };
+    const agent = framework.getAgent('assistant')!;
+    // Its marks are asked of rows built from a sequence (rowAt): read by sequence.
+    const cm = bySequence(agent.getContextManager());
     const room = destinationKey({ serverId: 'chat', channelId: ROOM });
-    const branch = agent.getConsumedWatermark().branch;
 
     // The agent is in a turn, which the script's call isn't made in.
     fw.turnRouting.set('assistant', { turnId: 1, wasIn: [], engaged: new Set() });
     fw.dispatchChannelToolCall('assistant', { id: 'from-script', name: 'channel_publish', input: { channelId: ROOM, content: 'a script posts' } });
     await until(() => results.includes('from-script'), 'the script\'s publish to finish');
     assert.deepEqual(publishes, [[ROOM, 'delivered']], "the premise: the script's publish was delivered");
-    assert.equal(agent.publishedAfterReading(room, branch, 0), false, "a background script's publish isn't noted");
+    assert.equal(agent.publishedAfterReading(room, rowAt(0), cm), false, "a background script's publish isn't noted");
 
     fw.dispatchChannelToolCall('assistant', { id: 'from-turn', name: 'channel_publish', input: { channelId: ROOM, content: 'the agent posts' }, callerTurnId: 1 });
     await until(() => results.includes('from-turn'), "the turn's publish to finish");
-    assert.equal(agent.publishedAfterReading(room, branch, 0), true, "a turn's publish is noted");
+    assert.equal(agent.publishedAfterReading(room, rowAt(0), cm), true, "a turn's publish is noted");
     await framework.stop();
   });
 
@@ -891,13 +906,14 @@ describe('a wake for a write heard mid-turn', () => {
       turnRouting: Map<string, unknown>;
       scriptToolCall(agent: string, tool: string, argsJson: string, context: Record<string, unknown>): Promise<{ ok: boolean; json: string; held?: true }>;
     };
-    const agent = framework.getAgent('assistant') as unknown as {
-      getConsumedWatermark(): { branch: string; sequence: number };
-      publishedAfterReading(destination: string, branch: string, sequence: number): boolean;
-    };
+    const agent = framework.getAgent('assistant')!;
+    // Its marks are asked of rows built from a sequence (rowAt): read by sequence.
+    const cm: MarkCm = bySequence(agent.getContextManager());
     const room = destinationKey({ serverId: 'chat', channelId: ROOM });
-    const now = agent.getConsumedWatermark();
-    const atStart = { branch: now.branch, sequence: now.sequence - 1 };
+    const now = agent.getConsumedWatermark()!;
+    // What the agent had read when the script started: a mark just before now's.
+    const atStart = legacyMarkFrom(now, -1);
+    const read = (mark: ReadMark): MarkedRow => rowAt(headOf(mark));
     fw.turnRouting.set('assistant', { turnId: 1, wasIn: [], engaged: new Set() });
 
     const answer = fw.scriptToolCall('assistant', 'channel_publish', JSON.stringify({ channelId: ROOM, content: 'a script posts' }),
@@ -907,8 +923,8 @@ describe('a wake for a write heard mid-turn', () => {
     assert.equal(answered.held, undefined, `the call got its result: ${answered.json}`);
     assert.equal(JSON.parse(answered.json).isError, false, `the call succeeded: ${answered.json}`);
     assert.deepEqual(publishes, [[ROOM, 'delivered']], "the premise: the script's publish was delivered");
-    assert.equal(agent.publishedAfterReading(room, atStart.branch, atStart.sequence), true, 'credited with what the agent had read when the script started');
-    assert.equal(agent.publishedAfterReading(room, now.branch, now.sequence), false, 'not with what it has read since');
+    assert.equal(agent.publishedAfterReading(room, read(atStart), cm), true, 'credited with what the agent had read when the script started');
+    assert.equal(agent.publishedAfterReading(room, read(now), cm), false, 'not with what it has read since');
     await framework.stop();
   });
 
@@ -921,25 +937,26 @@ describe('a wake for a write heard mid-turn', () => {
       eventGate: { clearSleep(): void };
       scriptToolCall(agent: string, tool: string, argsJson: string, context: Record<string, unknown>): Promise<{ ok: boolean; json: string; held?: true }>;
     };
-    const agent = framework.getAgent('assistant') as unknown as {
-      getConsumedWatermark(): { branch: string; sequence: number };
-      publishedAfterReading(destination: string, branch: string, sequence: number): boolean;
-    };
+    const agent = framework.getAgent('assistant')!;
+    // Its marks are asked of rows built from a sequence (rowAt): read by sequence.
+    const cm: MarkCm = bySequence(agent.getContextManager());
     const room = destinationKey({ serverId: 'chat', channelId: ROOM });
-    const now = agent.getConsumedWatermark();
-    const atStart = { branch: now.branch, sequence: now.sequence - 1 };
+    const now = agent.getConsumedWatermark()!;
+    // What the agent had read when the script started: a mark just before now's.
+    const atStart = legacyMarkFrom(now, -1);
+    const read = (mark: ReadMark): MarkedRow => rowAt(headOf(mark));
     fw.turnRouting.set('assistant', { turnId: 1, wasIn: [], engaged: new Set(), locus: { serverId: 'chat', channelId: ROOM } });
 
     const answer = fw.scriptToolCall('assistant', 'sleep', JSON.stringify({ seconds: 60 }),
       { watch: { turnId: 1, endTurn: false }, startTurnId: 1, startReadThrough: atStart });
     const answered = await bridgeAnswer(framework, answer);
-    await until(() => agent.publishedAfterReading(room, atStart.branch, atStart.sequence), 'the announcement to be noted');
+    await until(() => agent.publishedAfterReading(room, read(atStart), cm), 'the announcement to be noted');
     fw.eventGate.clearSleep();
 
     assert.equal(answered.held, undefined, `the call got its result: ${answered.json}`);
     assert.equal(JSON.parse(answered.json).isError, false, `the call succeeded: ${answered.json}`);
     assert.equal(attempts.length, 1, 'the sleep was announced');
-    assert.equal(agent.publishedAfterReading(room, now.branch, now.sequence), false, 'not with what it has read since');
+    assert.equal(agent.publishedAfterReading(room, read(now), cm), false, 'not with what it has read since');
     await framework.stop();
   });
 
@@ -969,23 +986,24 @@ describe('a wake for a write heard mid-turn', () => {
         : prop === 'directsLifecycle' ? () => true
         : (target as Record<string, unknown>)[prop],
     });
-    const agent = framework.getAgent('assistant') as unknown as {
-      getConsumedWatermark(): { branch: string; sequence: number };
-      publishedAfterReading(destination: string, branch: string, sequence: number): boolean;
-    };
+    const agent = framework.getAgent('assistant')!;
+    // Its marks are asked of rows built from a sequence (rowAt): read by sequence.
+    const cm: MarkCm = bySequence(agent.getContextManager());
     const room = destinationKey({ serverId: 'chat', channelId: ROOM });
-    const now = agent.getConsumedWatermark();
-    const atStart = { branch: now.branch, sequence: now.sequence - 1 };
+    const now = agent.getConsumedWatermark()!;
+    // What the agent had read when the script started: a mark just before now's.
+    const atStart = legacyMarkFrom(now, -1);
+    const read = (mark: ReadMark): MarkedRow => rowAt(headOf(mark));
     fw.turnRouting.set('assistant', { turnId: 1, wasIn: [], engaged: new Set() });
 
     const answer = fw.scriptToolCall('assistant', 'chat--send_message', JSON.stringify({ channelId: ROOM, text: 'a script sends' }),
       { watch: { turnId: 1, endTurn: false }, startTurnId: 1, startReadThrough: atStart });
     const answered = await bridgeAnswer(framework, answer);
-    await until(() => agent.publishedAfterReading(room, atStart.branch, atStart.sequence), 'the send to be noted');
+    await until(() => agent.publishedAfterReading(room, read(atStart), cm), 'the send to be noted');
 
     assert.equal(answered.held, undefined, `the call got its result: ${answered.json}`);
     assert.equal(JSON.parse(answered.json).isError, false, `the call succeeded: ${answered.json}`);
-    assert.equal(agent.publishedAfterReading(room, now.branch, now.sequence), false, 'not with what it has read since');
+    assert.equal(agent.publishedAfterReading(room, read(now), cm), false, 'not with what it has read since');
     await framework.stop();
   });
 
@@ -1017,6 +1035,45 @@ describe('a wake for a write heard mid-turn', () => {
         'the turn heard it at its tool boundary');
       assert.equal(membrane.calls.length, 2, 'its wake started the turn');
       assert.deepEqual(drops, []);
+      await framework.stop();
+    });
+  }
+
+  // A write a surgery's hold keeps in memory has no id until the release
+  // stores it. It is traced once, then, with that id, as 'surgery-release',
+  // never at its arrival with an empty id (291-deferral-queue), on every
+  // path a write arrives by.
+  const arrivals: Array<[string, string, (framework: AgentFramework) => unknown]> = [
+    ...storedAsItArrives.filter(([what]) => !what.includes('self-wake')),
+    ['a prose bounce notice', 'no channel named #nowhere', (framework) => {
+      const fw = internals(framework);
+      fw.bounceProse(fw.agents.get('assistant'), 'hello there', 'no channel named #nowhere', undefined, '>>',
+        { routing: fw.routingOf('assistant'), notice: 'later' });
+    }],
+  ];
+  for (const [what, shown, write] of arrivals) {
+    it(`${what}, made while a surgery holds the store, is traced once, as the release stores it, with its stored id`, async () => {
+      const framework = await createFramework();
+      stubChannelRegistry(framework, ROOM);
+      (framework as unknown as { startAgentStream: () => Promise<unknown> }).startAgentStream = async () => undefined;
+      const added: Array<[string, string]> = [];
+      framework.onTrace((event) => {
+        if (event.type === 'message:added') added.push([event.source, event.messageId]);
+      });
+      const fw = internals(framework);
+      const release = fw.reserveStoreForSurgery('test', 'assistant');
+      try {
+        await write(framework);
+        for (let i = 0; i < 50 && fw.surgeryHeldWrites.length === 0; i++) await fw.processNextEvent();
+        assert.equal(fw.surgeryHeldWrites.length, 1, 'the hold kept it in memory');
+        assert.deepEqual(added, [], 'its arrival is not traced');
+      } finally {
+        release();
+      }
+      const rows = framework.getAgent('assistant')!.getContextManager().getAllMessages()
+        .filter((m) => JSON.stringify(m.content).includes(shown));
+      assert.equal(rows.length, 1, 'the release stored it once');
+      assert.deepEqual(added, [['surgery-release', rows[0]!.id]], 'traced once, with its stored id');
       await framework.stop();
     });
   }

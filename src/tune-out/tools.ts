@@ -29,10 +29,8 @@ export const SUBCONSCIOUS_TOOLS: ToolDefinition[] = [
   {
     name: 'deliver_summary',
     description:
-      'Deliver a summary into the resident\'s context, in your own voice, ' +
-      'addressed to them (second person). Use at cadence when the diverted ' +
-      'traffic merits it; staying silent is always allowed — an empty ' +
-      'period needs no report.',
+      'Deliver a summary into the resident\'s context: `text` arrives there ' +
+      'verbatim, under your own name.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -51,11 +49,11 @@ export const SUBCONSCIOUS_TOOLS: ToolDefinition[] = [
   {
     name: 'cancel_tuneout',
     description:
-      'End the tune-out on a channel now — use when something needs the ' +
-      'resident\'s full attention. The diverted backlog is delivered to ' +
-      'them (capped), and normal attention resumes. Add your own note in ' +
-      '`text`; it arrives alongside the backlog, in your voice. If you were ' +
-      'started to read one hold, you can end only that hold.',
+      'End the tune-out on a channel now. The diverted backlog is delivered ' +
+      'to the resident (capped), and the channel\'s traffic reaches them as ' +
+      'it did before the tune-out. A note in `text` arrives alongside the ' +
+      'backlog, verbatim, under your own name. If you were started to read ' +
+      'one hold, you can end only that hold.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -72,10 +70,10 @@ export const SUBCONSCIOUS_TOOLS: ToolDefinition[] = [
   {
     name: 'note_disposition',
     description:
-      'Record a standing disposition for yourself — a durable note that ' +
-      'shapes how you treat future traffic ("antra\'s pings always ' +
-      'escalate", "ignore release-bot"). Replaces any previous note under ' +
-      'the same key.',
+      'Record a standing disposition: a durable note, kept under `key` ' +
+      'across invocations and shown to the reader each time it runs (e.g. ' +
+      'key "<sender>", text "<a note on their messages>"). Replaces any ' +
+      'previous note under the same key.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -91,14 +89,13 @@ export const SUBCONSCIOUS_TOOLS: ToolDefinition[] = [
   {
     name: 'speak_in_channel',
     description:
-      'Post a message into a tuned-out channel, in your own words and ' +
-      'clearly as yourself (not as the resident); it goes out through the ' +
-      'resident\'s publish path, so the channel sees it under their account. ' +
-      'Use sparingly — e.g. to tell someone the resident is tuned out and ' +
-      'when to expect them. If you were started to read one hold, you can ' +
-      'post only into a channel that hold still holds, and a post made once ' +
-      'it has ended is refused; your report can say it instead. Disabled unless ' +
-      'the resident\'s configuration allows it.',
+      'Post `text` into a tuned-out channel, as written. It goes out through ' +
+      'the resident\'s publish path, so the channel sees it under the ' +
+      'resident\'s account; nothing in the post names you. If you were ' +
+      'started to read one hold, you can post only into a channel that hold ' +
+      'still holds, and a post made once it has ended is refused; your report ' +
+      'can say it instead. Disabled unless the resident\'s configuration ' +
+      'allows it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -109,6 +106,45 @@ export const SUBCONSCIOUS_TOOLS: ToolDefinition[] = [
     },
   },
 ];
+
+/**
+ * Who reads a tuned-out channel's traffic, as the text a resident reads
+ * says it: the persistent subconscious by the name it runs under, reader
+ * forks, or no reader (a silent hold, where `tuneOut.enabled` offers
+ * tune_out without one). A persistent reader's name is a value the host
+ * supplied, marked as such (suppliedValue).
+ */
+export type TuneOutReader =
+  | { readonly kind: 'persistent'; readonly name: string }
+  | { readonly kind: 'forks' }
+  | { readonly kind: 'none' };
+
+/**
+ * What a tuned-out channel's messages are, as the words after "its
+ * messages" in a refusal a resident reads (a channel tool's on a tuned-out
+ * channel): held from it and read by `reader`, by the name it runs under or
+ * as forks of the resident's context, or, with no reader, held with none to
+ * read them.
+ */
+export function tuneOutHeldWords(reader: TuneOutReader): string {
+  return reader.kind === 'persistent' ? `are held from you and read by ${reader.name}`
+    : reader.kind === 'forks' ? 'are held from you and read by forks of your context'
+      : 'are held from you, with no reader configured here to read them';
+}
+
+/**
+ * Whether a tuned-out channel's messages get to its reader, as the words
+ * after "its messages" in tune_out's answers about the channel's transport,
+ * in the sentence's `form`: they reach `reader`, by the name it runs under
+ * or as "the reader" (forks, as tuneOutTool says it), or, with no reader,
+ * they are received and held.
+ */
+export function tuneOutReachWords(reader: TuneOutReader, form: 'reach' | 'may not reach' | "don't reach"): string {
+  if (reader.kind === 'none') {
+    return form === 'reach' ? 'are received and held' : form === 'may not reach' ? 'may not be received' : "aren't received";
+  }
+  return `${form} ${reader.kind === 'persistent' ? reader.name : 'the reader'}`;
+}
 
 /**
  * Configuration for the subconscious (FrameworkConfig.subconscious). Two
@@ -156,12 +192,22 @@ interface SubconsciousConfigBase {
   thinkingBinding?: AgentConfig['thinkingBinding'];
 }
 
+/**
+ * The name a persistent reader runs under: its configuration's `name`, or,
+ * where the host gave none, `'Subconscious'` (PersistentReaderConfig.name).
+ * The one place the framework names a reader the host didn't: everything
+ * that needs the name of an unnamed reader asks this.
+ */
+export function persistentReaderName(config: { name?: string }): string {
+  return config.name ?? 'Subconscious';
+}
+
 export interface PersistentReaderConfig extends SubconsciousConfigBase {
   reader?: 'persistent';
   /**
    * Registry + participant name. Default 'Subconscious' — following the
    * Context Manager precedent: a title-case functional voice, not an
-   * agent-prefixed identifier.
+   * agent-prefixed identifier. persistentReaderName applies the default.
    */
   name?: string;
   /** Model id; defaults to the primary agent's (same-model side-process).
@@ -171,29 +217,53 @@ export interface PersistentReaderConfig extends SubconsciousConfigBase {
    *  `thinkingBinding` set its own. */
   model?: string;
   /**
-   * The voice/criteria mode block — recipe-side and co-authored with the
-   * resident (it is an aspect of their attention). Report-shaped, second
-   * person toward the resident. Canary before fleet use (issue #77).
+   * The persistent reader's system prompt (its AgentConfig.systemPrompt).
+   * Who writes it and what it says, a policy for the reader tools
+   * included, are the host's choice. Canary before fleet use (issue #77).
    */
   systemPrompt: string;
   /** WindowedPassthroughStrategy re-anchor fraction (default 0.5). */
   reAnchorFraction?: number;
+  /**
+   * How a resident's rounds go out in the subconscious's requests once its
+   * window follows the presentation index (#291, answer 13). Its own rounds go
+   * as stored either way.
+   *
+   * - `'transcript'` (the default): a line per tool call (the tool's name and
+   *   its input in brief) and per result (its outcome in brief), the text as
+   *   stored, and none of the resident's thinking (foreign-rounds.ts).
+   * - `'raw'`: as stored, as 0.30.0 sent them: the resident's thinking
+   *   blocks, its tool calls and their results, in the subconscious's
+   *   requests under the resident's name. A provider pairs tool blocks only
+   *   in the turns of the agent that made the call, so it may refuse them, or
+   *   the formatter may move them into the subconscious's own turns, where
+   *   they read as calls it made.
+   *
+   * A thinking block's signature binds the block to the prefix the resident
+   * was sent, so the block can't be sent as part of another agent's prefix;
+   * its text could be. Leaving the text out is the transcript's choice, not
+   * the provider's.
+   */
+  foreignRounds?: 'transcript' | 'raw';
 }
 
 export interface ForkReaderConfig extends SubconsciousConfigBase {
   reader: 'forks';
   /**
    * Whose weights run the fork. Required, never defaulted: a fork holds the
-   * resident's whole prefix, and which model reads it is the one fact the
-   * resident's consent names. The resident's own model is the copy; another
-   * model is allowed when stated here. `create` refuses the omission.
+   * resident's whole prefix, and which model reads it is recorded on each
+   * fork's `dendrite:agent-created` trace and is what a host's
+   * `dendrite.beforeDerive` can decide on. The resident's own model, or
+   * another model stated here. `create` refuses the omission.
    */
   model: string;
   /**
-   * The reader's voice block — report-shaped, second person toward the
-   * resident, co-authored with them. Delivered as the first message after
-   * the fork point, with the notice, the standing dispositions and the held
-   * traffic; never a system prompt.
+   * The reader's voice block: text the host supplies, handed to `framing`.
+   * The default framing (defaultReaderFraming) puts it in the one message a
+   * fork receives after the fork point, with the notice, the standing
+   * dispositions and the held traffic; it is never a system prompt. Who
+   * writes it and what it says, a policy for the reader tools included,
+   * are the host's choice.
    */
   voice: string;
   /**
@@ -232,13 +302,18 @@ export interface ReaderFramingContext {
   /** Standing dispositions recorded on the epoch, or null. */
   dispositions: string | null;
   /**
-   * The traffic held since the last look, oldest first; empty when nothing
-   * arrived. It includes the messages still queued behind the resident's
-   * turn (admitted, not yet stored), last: their ids are held handles and
-   * their sequences provisional, as a module's held rows are.
+   * The traffic held since the last look, oldest first, as stored; empty
+   * when nothing arrived. A held message is stored as it arrives, the
+   * resident's turn alive or not (#291), so the stored rows are all of it.
    */
   backlog: StoredMessage[];
-  /** How many of `backlog`'s last entries are still queued behind the resident's turn. Absent is none. */
+  /**
+   * Was how many of `backlog`'s last entries were still queued behind the
+   * resident's turn. Since #291 nothing is queued, so the framework never
+   * sets it.
+   *
+   * @deprecated Never set since #291; removed in a later release.
+   */
   queuedCount?: number;
 }
 
@@ -259,15 +334,11 @@ export function defaultReaderFraming(ctx: ReaderFramingContext): ContentBlock[] 
     return content;
   }
   const n = ctx.backlog.length;
-  const q = Math.min(Math.max(0, Math.floor(ctx.queuedCount ?? 0)), n);
   const lines: string[] = [`\n[Held in ${ctx.channelId} since your last look: ${n} message${n === 1 ? '' : 's'}]`];
   const flush = () => {
     if (lines.length > 0) content.push({ type: 'text', text: lines.splice(0).join('\n') });
   };
-  const which = q === n ? (q === 1 ? 'It' : 'They') : (q === 1 ? 'The last one' : `The last ${q}`);
-  const queuedNote = `[${which} arrived while ${ctx.resident}'s turn was running, so ${q === 1 ? 'it is' : 'they are'} still queued, not yet stored.]`;
-  for (const [i, message] of ctx.backlog.entries()) {
-    if (q > 0 && i === n - q) lines.push(queuedNote);
+  for (const message of ctx.backlog) {
     const author = (message.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? message.participant;
     const text = message.content
       .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')

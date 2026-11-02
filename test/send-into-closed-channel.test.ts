@@ -597,6 +597,8 @@ test('a reply_message into a channel decided open whose open failed opens it aga
 
 test('a send into a tuned-out channel leaves the tune-out in place, and its answer says so', async () => {
   const { registry, framework, opens, windowMessages, reply } = await harness();
+  // A persistent reader the host named Muse.
+  framework.subconsciousAgentName = 'Muse';
   // Tuned out: the transport stays open, and the decision is the tune-out.
   assert.equal((await registry.handleChannelToolCall('channel_open', { channelId }, origin)).success, true);
   registry.enterTuneOut('discord', channelId, {
@@ -604,7 +606,7 @@ test('a send into a tuned-out channel leaves the tune-out in place, and its answ
   }, 'agent-tool');
   const opensBefore = opens.length;
   const tunedOutNote = `[tuned out] #upkeep (${channelId}) stays tuned out: your words there don't end the tune-out, ` +
-    'so its traffic still goes to your subconscious until the tune-out ends. ' +
+    'so its traffic is still held from you, and read by Muse, until the tune-out ends. ' +
     `Call tune_out with channelId "${channelId}" and mode "cancel" for it to resume normal attention; cancelling ` +
     'delivers the diverted backlog. To stop this note, set closed_channel_note to false with agent_settings.';
 
@@ -625,6 +627,18 @@ test('a send into a tuned-out channel leaves the tune-out in place, and its answ
   framework.agents.set('sol', agentStub({ canUseTool: (tool: string) => tool !== 'tune_out' }));
   assert.ok((await reply()).data.endsWith('until the tune-out ends. To stop this note, set closed_channel_note to false with agent_settings.'));
   framework.agents.set('sol', agentStub());
+  // Reader forks: the note names them as forks of the agent's context.
+  framework.subconsciousAgentName = null;
+  framework.readerForks = true;
+  assert.ok((await reply()).data.includes('so its traffic is still held from you, and read by forks of your context, until the tune-out ends. '));
+  // No reader: the traffic is held for the agent, and nothing is said to read it.
+  framework.readerForks = false;
+  const silent = (await reply()).data;
+  assert.ok(silent.includes(
+    "your words there don't end the tune-out, so its traffic is still held until the tune-out ends, and delivered to you " +
+    'then; no reader is configured here to read it meanwhile. Call tune_out',
+  ), silent);
+  assert.ok(!/subconscious/i.test(silent), silent);
   // A conversation agent gets none.
   framework.registry.homes.set('sol', { serverId: 'discord', channelId });
   assert.ok(!(await reply()).data.includes('[tuned out]'));

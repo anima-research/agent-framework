@@ -5,13 +5,16 @@ import { isAbortedResponse } from '@animalabs/membrane';
 import { streamBounds, type InferenceBounds } from './inference-bounds.js';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
+import { storeOwnRow } from './dendrite/audience.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
 import { placeThinkingDrops, type CompiledForRequest, type PlacedDrop } from './thinking-drops.js';
 import { carriedBlock, type SentRow } from './sent-rows.js';
+import { foreignRowAsSent, transcribeForeignRounds } from './foreign-rounds.js';
 import { injectionsAsStored } from './text-as-stored.js';
 import { stableHash } from './stable-hash.js';
 import { hasRenderedContent, storedInjectionMarkOf } from './stored-injections.js';
-import { assertBooleanSetting, holdsSettings, kindOf } from './config-checks.js';
+import { covers, markAtOrAfter, readMarkOf, storeHeadOf, type MarkCm, type MarkedRow, type ReadMark } from './read-marks.js';
+import { assertBooleanSetting, assertOneOfSetting, holdsSettings, kindOf } from './config-checks.js';
 import {
   CONTINUE_ROW,
   continueTurn,
@@ -187,11 +190,13 @@ export function assertThinkingBinding(setting: string, value: AgentConfig['think
 
 /**
  * Refuse an agent config whose `promptCaching`, `toolResultGuard`,
- * `toolWrapperProseGuard`, `thinking.enabled`, `thinkingBinding.dropBlock`,
+ * `toolWrapperProseGuard`, `turnInputsPin`, `thinking.enabled`, `thinkingBinding.dropBlock`,
  * `thinkingBinding.binds` or `refusalHandling.autoRewind` holds anything but true or false
  * (assertBooleanSetting, where null counts as left out), or whose `thinking`, `thinkingBinding` or
  * `refusalHandling` is anything but an object, null or false (holdsSettings),
- * or whose `autoContinue` resolveAutoContinue refuses. The constructor runs it
+ * or whose `autoContinue` resolveAutoContinue refuses, or whose `observes`
+ * is anything but a list of names, or whose `foreignRounds` is neither of
+ * its modes (assertOneOfSetting). The constructor runs it
  * first, so the rule holds wherever an Agent is built. `create()` also runs it
  * for each of its agents before anything opens, and `createEphemeralAgent`
  * before it reserves the name, so a refusal there leaves nothing behind.
@@ -232,6 +237,26 @@ export function assertAgentSwitches(config: AgentConfig): void {
     config.toolWrapperProseGuard,
     'true keeps a response whose whole prose is a tool-call-shaped wrapper from running or entering the agent\'s history, ' +
       'and false or leaving it out doesn\'t',
+  );
+  assertBooleanSetting(
+    `${agent} turnInputsPin`,
+    config.turnInputsPin,
+    'true or leaving it out pins the rows that open a turn raw until it ends, and false places no pin',
+  );
+  const observes: unknown = config.observes;
+  if (observes !== undefined && observes !== null
+    && (!Array.isArray(observes) || !observes.every((name) => typeof name === 'string'))) {
+    throw new Error(
+      `${agent} observes must be a list of agent names, such as ["nova"], not ${Array.isArray(observes) ? 'a list holding something else' : kindOf(observes)}: ` +
+        'each names another configured agent whose own rows this agent\'s window takes',
+    );
+  }
+  assertOneOfSetting(
+    `${agent} foreignRounds`,
+    config.foreignRounds,
+    ['transcript', 'raw'],
+    '\'transcript\' or leaving it out sends the rounds of an agent it observes as a line per call and result, ' +
+      'without their thinking, and \'raw\' sends them as stored',
   );
   resolveAutoContinue(config);
 }
@@ -274,6 +299,18 @@ export function resolveAutoContinue(config: AgentConfig): { maxConsecutive: numb
   return { maxConsecutive: max };
 }
 
+/** A stored injection's copy a compile built to send rendered (Agent.renderedInjection). */
+interface RenderedInjectionCopy {
+  /** The row's id: the body the compile's provenance names. */
+  id: MessageId;
+  part: number;
+  parts: number;
+  /** Whether the compile held the part: every shard of it, however the strategy shaped it. */
+  held: boolean;
+  sequence: number;
+}
+
+/** A branch's key in Agent.unsentSince: its id and when it was created. */
 export function branchKey(branch: { readonly id: string; readonly created: number }): string {
   return `${branch.id}\u0000${branch.created}`;
 }
@@ -461,6 +498,7 @@ export class Agent {
     this.clock = resolveClockConfig(config.name, config.clock);
     this.cacheTtl = config.cacheTtl ?? '1h';
     this.promptCaching = config.promptCaching !== false;
+    this.pinsTurnInputs = config.turnInputsPin !== false;
     this.prefillUserMessage = config.prefillUserMessage;
     this.providerParams = config.providerParams;
     this.sameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
@@ -537,6 +575,42 @@ export class Agent {
   /** Whether a stored participant is this agent's own voice. */
   isOwnParticipant(participant: string): boolean {
     return this.ownParticipants.has(participant);
+  }
+
+  /**
+   * How another agent's rounds go out in this agent's requests (#291, answer
+   * 13): `'raw'`, as stored, or `'transcript'` (foreign-rounds.ts), a line
+   * per call and per result and no thinking, the same in every compile and
+   * in what a tool boundary injects. The framework sets it, once the
+   * agent's window follows the presentation index, for the persistent
+   * subconscious and for a resident that observes another
+   * (AgentConfig.observes), as their configurations' `foreignRounds` say
+   * (`'transcript'` by default); every other agent reads no other agent's
+   * rounds.
+   */
+  private foreignRounds: 'raw' | 'transcript' = 'raw';
+
+  /** Set how another agent's rounds go out in this agent's requests (see foreignRounds). */
+  setForeignRounds(mode: 'raw' | 'transcript'): void {
+    this.foreignRounds = mode;
+  }
+
+  /**
+   * A stored row as this agent's requests carry it, for a row a tool
+   * boundary injects: another participant's row as a transcript where this
+   * agent is sent other agents' rounds so (setForeignRounds), its own and
+   * every row otherwise as stored. An injected row holds no tool block (the
+   * boundary cuts at one), so what changes is its thinking.
+   */
+  injectedAsSent(participant: string, content: ContentBlock[]): ContentBlock[] {
+    if (this.foreignRounds !== 'transcript' || this.isOwnParticipant(participant)) return content;
+    return foreignRowAsSent(content);
+  }
+
+  /** A compile's messages with other agents' rounds as this agent is sent them (setForeignRounds). */
+  private foreignRoundsAsSent(messages: NormalizedMessage[]): NormalizedMessage[] {
+    if (this.foreignRounds !== 'transcript') return messages;
+    return transcribeForeignRounds(messages, (participant) => this.isOwnParticipant(participant));
   }
 
   /**
@@ -1131,45 +1205,60 @@ export class Agent {
   }
 
   /**
-   * RFC-006 consumed watermark, per branch: the newest stored message as of
-   * the latest of the agent's creation, a committing compile that returns,
-   * and a tool boundary that injected messages into a live stream declaring
-   * it carries them (`supportsInjectedMessages` true: membrane's native
-   * path, from membrane 0.6.0). A compile counts from when it takes its
-   * value, before it awaits, so one that began before a boundary's mark
-   * doesn't roll the mark back (applyCompileWatermark), and a dry run, such
-   * as previewActivation's, doesn't move it. Each move takes the store's
-   * head, a scalar, so it also covers stored messages the agent wasn't
-   * given, such as another slot's.
+   * RFC-006 consumed watermark, per branch: how far the agent had read as of
+   * the latest of its creation, a committing compile that returns, and a
+   * tool boundary that injected messages into a live stream declaring it
+   * carries them (`supportsInjectedMessages` true: membrane's native path,
+   * from membrane 0.6.0). A compile counts from when it takes its mark,
+   * before it awaits, so one that began before a boundary's mark doesn't
+   * roll the mark back (applyCompileWatermark), and a dry run, such as
+   * previewActivation's, doesn't move it.
+   *
+   * It is a ReadMark (read-marks.ts), read only through `covers`. Once the
+   * agent's context presents rows (#291's presentation index, in presented
+   * mode), it covers exactly the rows in the agent's window as of the mark:
+   * a row stored then and not yet presented to the agent isn't covered.
+   * While the context is in legacy mode, its window is the record, and the
+   * mark covers every row stored on the branch by then, as it always did:
+   * a prefix of the record, so it also covers stored messages the agent
+   * wasn't given, such as another slot's. Once the window is written down
+   * (an agent registered on a branch its window was never written down on
+   * holds such a mark until its first compile), a mark taken in legacy mode
+   * covers the rows its window held by the mark where they still stand, as
+   * a mark taken in presented mode then would: a row stored after it, taken
+   * out of the window since, or presented to the agent again, isn't.
    *
    * A message above it may still be replaced or withdrawn in place by its
    * sender, though it may already have been in one of the agent's requests.
    * A live stream carries each round's own content and results, which it
    * stores at its tool boundaries, into its next request.
    */
-  private consumedWatermark: { branch: string; sequence: number } | null = null;
+  private consumedWatermark: ReadMark | null = null;
   /** Counts marks (markContextConsumed's and applyCompileWatermark's), so a
    *  compile that finishes can tell whether one was made while it ran. */
   private watermarkMarks = 0;
   /**
-   * The newest stored message a compile or a tool boundary may have put in
-   * front of the agent, per branch. It moves where the consumed watermark
-   * does, and sooner: when a committing compile takes its value, before it
-   * awaits, and at every tool boundary that injects into its stream. A message above it may still
-   * have been shown, though: for one, a live stream carries each round's own
-   * content and results, stored at a boundary that injected nothing, into its
-   * next request. A compile that throws assembled nothing, and gives its move
-   * back where it can (unshowFailedCompile). A scalar counts a prefix, so a
-   * message stored below it without having been shown counts as shown, which
-   * errs toward a marker.
+   * How far a compile or a tool boundary may have put the agent's context in
+   * front of it, per branch. It moves where the consumed watermark does,
+   * and sooner: when a committing compile takes its mark, before it awaits,
+   * and at every tool boundary that injects into its stream. A message above
+   * it may still have been shown, though: for one, a live stream carries each
+   * round's own content and results, stored at a boundary that injected
+   * nothing, into its next request. A compile that throws assembled nothing,
+   * and gives its move back where it can (unshowFailedCompile). A mark taken
+   * in legacy mode, read while the window is the record, counts a prefix of
+   * the record, so a message stored below it without having been shown
+   * counts as shown, which errs toward a marker; one taken in presented
+   * mode, and one taken in legacy mode read once the window is written down,
+   * cover the window as it stood.
    */
-  private shownWatermark: { branch: string; sequence: number } | null = null;
+  private shownWatermark: ReadMark | null = null;
 
-  getConsumedWatermark(): { branch: string; sequence: number } | null {
+  getConsumedWatermark(): ReadMark | null {
     return this.consumedWatermark;
   }
 
-  getShownWatermark(): { branch: string; sequence: number } | null {
+  getShownWatermark(): ReadMark | null {
     return this.shownWatermark;
   }
 
@@ -1181,27 +1270,32 @@ export class Agent {
    * request runs, so a request that fails, ending its stream with an error,
    * leaves this as it was.
    */
-  private answeredWatermark: { branch: string; sequence: number } | null = null;
+  private answeredWatermark: ReadMark | null = null;
 
-  getAnsweredWatermark(): { branch: string; sequence: number } | null {
+  getAnsweredWatermark(): ReadMark | null {
     return this.answeredWatermark;
   }
 
   /** A request that carried `watermark` was answered. Requests are answered
    *  in the order they're sent, and the consumed watermark only advances
    *  within a branch, so the latest is the newest. */
-  markAnswered(watermark: { branch: string; sequence: number } | null): void {
+  markAnswered(watermark: ReadMark | null): void {
     if (watermark) this.answeredWatermark = watermark;
   }
 
+  /** Whether a turn this agent opens pins its inputs (AgentConfig.turnInputsPin, on by default). */
+  readonly pinsTurnInputs: boolean;
+
   /**
-   * Keep the stored rows from `first` through `last` raw for the turn now
-   * opening, with a raw pin under one name per agent. Any pin of that name
-   * already held is removed first, one a crash left included. Under a
-   * strategy without pins nothing is pinned. A committing compile that
-   * refuses as over budget while a pin of that name is held removes it and
-   * compiles once more, and `unpinTurnInputs` removes it. Returns the pin's
-   * id, or undefined when nothing was pinned.
+   * Keep the rows of the agent's window from `first` through `last` raw for
+   * the turn now opening, with a raw pin under one name per agent: a
+   * strategy reads a pin by its rows' positions in its message view, which
+   * is the window, in its order (#291; in legacy mode the record). Any pin
+   * of that name already held is removed first, one a crash left included.
+   * Under a strategy without pins nothing is pinned. A committing compile
+   * that refuses as over budget while a pin of that name is held removes it
+   * and compiles once more, and `unpinTurnInputs` removes it. Returns the
+   * pin's id, or undefined when nothing was pinned.
    *
    * @internal For the framework's turn starts; not a host API.
    */
@@ -1258,48 +1352,91 @@ export class Agent {
    * draft resend, or a send tool whose channel the framework records), on
    * the branch it was taken on. A wake that carries a channel, unless it's
    * marked ambient (InferenceRequest.ambient), keeps its turn unless the
-   * agent spoke there after reading the write the wake is for. It
+   * agent spoke there after reading the row the wake is for. It
    * lives as long as this Agent: an agent made again starts it empty, and
    * such a wake then stays.
    */
-  private publishedThrough = new Map<string, { branch: string; sequence: number }>();
+  private publishedThrough = new Map<string, ReadMark>();
 
   /** Note a publish into `destination` (its key), made having read through
    *  `readThrough`: the consumed watermark when its words were written, or
-   *  its call made. */
-  notePublished(destination: string, readThrough: { branch: string; sequence: number } | null): void {
+   *  its call made. A later mark on the same branch (markAtOrAfter: of two
+   *  at one head, the one whose window reached further) replaces an earlier
+   *  one; one on another branch replaces whatever was noted. */
+  notePublished(destination: string, readThrough: ReadMark | null): void {
     if (!readThrough) return;
     const noted = this.publishedThrough.get(destination);
-    if (noted && noted.branch === readThrough.branch && noted.sequence >= readThrough.sequence) return;
+    if (noted && markAtOrAfter(noted, readThrough) === true) return;
     this.publishedThrough.set(destination, readThrough);
   }
 
   /** Whether the agent published into `destination` (its key) having read
-   *  the row stored at `sequence` on `branch`. */
-  publishedAfterReading(destination: string, branch: string, sequence: number): boolean {
+   *  `row`, as `cm` (the agent's context, where the row's place in its
+   *  window is read) says: the mark noted for the destination covers it. A
+   *  mark that can't say (one on another branch) says no. */
+  publishedAfterReading(destination: string, row: MarkedRow, cm: MarkCm): boolean {
     const noted = this.publishedThrough.get(destination);
-    return !!noted && noted.branch === branch && noted.sequence >= sequence;
+    return !!noted && covers(noted, cm, row) === 'covered';
   }
 
-  /** Mark everything currently stored as consumed (the agent's creation, at
-   *  boot or later, and a tool boundary that injected messages into a live
-   *  stream declaring it carries them; see consumedWatermark). */
+  /**
+   * Every read mark this agent holds: its consumed, shown and answered
+   * watermarks and the mark noted for each destination it published into,
+   * each mark once (two of them are often the one mark). A redo on the
+   * window (AgentFramework.redo) reads which of them covered the rows it
+   * puts back, and gives those marks again (replaceReadMarks).
+   */
+  heldReadMarks(): ReadMark[] {
+    const held = new Set<ReadMark>();
+    for (const mark of [this.consumedWatermark, this.shownWatermark, this.answeredWatermark, ...this.publishedThrough.values()]) {
+      if (mark) held.add(mark);
+    }
+    return [...held];
+  }
+
+  /**
+   * Put each mark `replacements` maps in its place wherever this agent holds
+   * it (heldReadMarks), so a mark held as two of them stays one: a redo on
+   * the window (#291) puts rows back at new ordinals, past every mark that
+   * covered them before their undo, and gives each such mark again where it
+   * covers them now. It counts as a mark (watermarkMarks), so a compile that
+   * began before it doesn't put its own older mark back over it.
+   */
+  replaceReadMarks(replacements: ReadonlyMap<ReadMark, ReadMark>): void {
+    const swap = (mark: ReadMark | null): ReadMark | null => (mark && replacements.get(mark)) ?? mark;
+    const consumed = swap(this.consumedWatermark);
+    if (consumed !== this.consumedWatermark) {
+      this.consumedWatermark = consumed;
+      this.watermarkMarks++;
+    }
+    this.shownWatermark = swap(this.shownWatermark);
+    this.answeredWatermark = swap(this.answeredWatermark);
+    for (const [destination, mark] of this.publishedThrough) {
+      const next = replacements.get(mark);
+      if (next) this.publishedThrough.set(destination, next);
+    }
+  }
+
+  /** Mark everything in the agent's window (in legacy mode, everything
+   *  stored) as consumed: the agent's creation, at boot or later, and a tool
+   *  boundary that injected messages into a live stream declaring it carries
+   *  them; see consumedWatermark. */
   markContextConsumed(): void {
     // Tolerates partial context-manager doubles (tests build Agents over
     // stubs). Without a watermark, a reader that looks for one takes its own
     // side: the coalescer counts the message as read, and the framework's
-    // unreadNoticesForPrimary counts it as unread. A wake for a deferred
-    // write or a stored message reads the answered watermark instead
-    // (deferredWriteDone, storedMessageDone).
+    // releasedWindow counts it as unread. A wake for a row it reads
+    // (InferenceRequest.readsRow) reads the answered watermark instead
+    // (rowDone).
     this.consumedWatermark = this.pendingWatermark();
     this.watermarkMarks++;
     this.shownWatermark = this.consumedWatermark;
   }
 
-  /** Mark everything currently stored as possibly shown (a tool boundary
-   *  that injected messages into its stream). Without
-   *  a watermark the coalescer counts a message as shown, as it counts one
-   *  read without a consumed watermark. */
+  /** Mark everything in the agent's window (in legacy mode, everything
+   *  stored) as possibly shown (a tool boundary that injected messages into
+   *  its stream). Without a watermark the coalescer counts a message as
+   *  shown, as it counts one read without a consumed watermark. */
   markContextShown(): void {
     this.shownWatermark = this.pendingWatermark();
   }
@@ -1313,11 +1450,10 @@ export class Agent {
    *  the second then throws, it restores the first's failed claim. Messages
    *  up to that claim then count as shown, although no request held those
    *  above the watermark the first compile found, which errs toward a marker
-   *  until the next compile or boundary moves the watermark. */
-  private unshowFailedCompile(
-    watermark: { branch: string; sequence: number } | null,
-    before: { branch: string; sequence: number } | null,
-  ): void {
+   *  until the next compile or boundary moves the watermark. Each mark is a
+   *  fresh object (readMarkOf), so the compare by identity is this compile's
+   *  own claim. */
+  private unshowFailedCompile(watermark: ReadMark | null, before: ReadMark | null): void {
     if (watermark && this.shownWatermark === watermark) this.shownWatermark = before;
   }
 
@@ -1328,49 +1464,41 @@ export class Agent {
    * mark's branch, so a boundary's mark is never rolled back by a compile
    * that started before it (a committing compile, such as compileContext's,
    * run during a live turn; a dry run, such as previewActivation's, never
-   * reaches here).
+   * reaches here). Marks are ordered by markAtOrAfter: by the window's
+   * index length where both keep one, else by the store's head, each of
+   * which only grows on a branch.
    */
-  private applyCompileWatermark(watermark: { branch: string; sequence: number }, marksBefore: number): void {
+  private applyCompileWatermark(watermark: ReadMark, marksBefore: number): void {
     const current = this.consumedWatermark;
-    if (this.watermarkMarks !== marksBefore && current
-      && (current.branch !== watermark.branch || current.sequence >= watermark.sequence)) return;
+    if (this.watermarkMarks !== marksBefore && current && markAtOrAfter(current, watermark) !== false) return;
     this.consumedWatermark = watermark;
     this.watermarkMarks++;
   }
 
   /**
-   * The branch now (`branchKey`) and its head, as `pendingWatermark` reads it: a message stored on that branch later
-   * has a larger sequence. Sequences are numbered per branch, so one compares with another only on the same branch.
+   * The branch now (`branchKey`) and the store's head on it (storeHeadOf, the
+   * head a mark pendingWatermark takes keeps): a message stored on that
+   * branch later has a larger sequence. Sequences are numbered per branch, so
+   * one compares with another only on the same branch. A record sequence, not
+   * a place in the agent's window (#291).
    */
   branchHead(): { branch: string; sequence: number } | undefined {
-    const head = this.pendingWatermark();
+    const sequence = storeHeadOf(this.contextManager);
     const cm = this.contextManager as Partial<ContextManager>;
-    if (!head || typeof cm.currentBranchRef !== 'function') return undefined;
+    if (sequence === null || typeof cm.currentBranchRef !== 'function') return undefined;
     try {
-      return { branch: branchKey(cm.currentBranchRef()), sequence: head.sequence };
+      return { branch: branchKey(cm.currentBranchRef()), sequence };
     } catch {
       return undefined;
     }
   }
 
-  /** The watermark a successful compile will establish (taken before, applied after). */
-  private pendingWatermark(): { branch: string; sequence: number } | null {
-    const cm = this.contextManager as Partial<ContextManager>;
-    try {
-      if (typeof cm.currentBranch !== 'function' || typeof cm.getAllMessages !== 'function') return null;
-      // The chronicle head, not this slot's last message: a compile reads
-      // everything stored on the branch so far, including messages merged in
-      // from another slot (the subconscious reads the residents' shared slot).
-      const store = typeof cm.getStore === 'function' ? cm.getStore() as { currentSequence?: () => number } : undefined;
-      let sequence = typeof store?.currentSequence === 'function' ? store.currentSequence() : undefined;
-      if (sequence === undefined) {
-        const count = typeof cm.getMessageCount === 'function' ? cm.getMessageCount() : cm.getAllMessages().length;
-        sequence = count > 0 ? cm.getAllMessages().at(-1)?.sequence ?? 0 : 0;
-      }
-      return { branch: cm.currentBranch().name, sequence };
-    } catch {
-      return null;
-    }
+  /** The watermark a successful compile will establish (taken before, applied
+   *  after): where the agent's context stands now (readMarkOf), its window's
+   *  index length with the store's head once it presents rows. Null for a
+   *  context double that can't say. */
+  private pendingWatermark(): ReadMark | null {
+    return readMarkOf(this.contextManager);
   }
 
   /** A committing compile, as for a request that is sent: the context
@@ -1413,9 +1541,10 @@ export class Agent {
    */
   private renderedInjections?: {
     branch: { readonly id: string; readonly created: number };
-    /** Per namespace, per content hash: the parts any copy of that content
-     *  holds, how many it has, and its newest copy's sequence. */
-    byNamespace: Map<string, Map<string, { parts: number; held: Set<number>; sequence: number }>>;
+    /** Per namespace, per content hash: each copy of that content the
+     *  compile rendered, by its row's id, with the part it is, how many
+     *  parts the content has, whether the compile held it, and its sequence. */
+    byNamespace: Map<string, Map<string, RenderedInjectionCopy[]>>;
   };
 
   /**
@@ -1446,9 +1575,8 @@ export class Agent {
   /**
    * A host's hook, called with each committing compile's `thinkingStrip` (never a dry run's) and the key of the
    * branch it read (`branchKey`), as the compile returns, whether or not its request is then sent, since the
-   * context manager's binding record takes the strip either way. One that throws is logged. The framework sets it
-   * at the agent's first stream unless a host has set one, so a host's own observer stands in for the framework's,
-   * whose `[reasoning]` line for the agent then isn't told.
+   * context manager's binding record takes the strip either way. One that throws is logged. The framework sets none
+   * of its own, and tells the agent nothing of a strip.
    */
   onThinkingStrip?: (strip: ThinkingStrip, branch: string) => void;
 
@@ -1462,8 +1590,16 @@ export class Agent {
    * start and the next (a host's own committing compile, or the compression
    * an over-budget retry waits for) can summarize them all the same: the
    * next request then has the summary's word for them, and the start after
-   * it stores them again, as after any fold. The window is read back 64
-   * rows at a time from the newest, stopping at that point.
+   * it stores them again, as after any fold. The slot's record is read
+   * back 64 rows at a time from the newest, stopping at that point.
+   *
+   * It reads the record, by sequence, not the agent's window, and that
+   * holds once the context presents rows (#291): the rows it counts are
+   * this agent's own stored injections, its own rows, which enter its
+   * window as they are written, so one stored after the point is in no
+   * request yet whatever else has been stored or presented since. Another
+   * agent's rows, stored into a shared slot at once rather than queued, are
+   * passed over, whatever they are.
    */
   unsentInjection(namespace: string): { contentHash: string; whole: boolean } | undefined {
     let newest: { contentHash: string; parts: number; held: Set<number> } | undefined;
@@ -1484,6 +1620,9 @@ export class Agent {
           if (row.sequence <= since) break scan;
           const mark = storedInjectionMarkOf(row.metadata);
           if (mark?.agent !== this.name || mark.namespace !== namespace) continue;
+          // A copy an undo took out of the window (#291) is in no window
+          // now, so it isn't the copy the agent will read.
+          if (this.contextManager.windowMode?.() === 'presented' && this.contextManager.windowStatusOf(row.id) === 'undone') continue;
           // Read from the newest back, the first copy met is the newest
           // content; its other parts pool with it.
           newest ??= { contentHash: mark.contentHash, parts: mark.parts, held: new Set() };
@@ -1534,7 +1673,7 @@ export class Agent {
       this.renderedInjections = undefined;
       return;
     }
-    const byNamespace = new Map<string, Map<string, { parts: number; held: Set<number>; sequence: number }>>();
+    const byNamespace = new Map<string, Map<string, RenderedInjectionCopy[]>>();
     for (const [i, source] of provenance.messages.entries()) {
       // Only a message rendered as an injection's participant can be one, so
       // the store is read for those alone.
@@ -1548,14 +1687,11 @@ export class Agent {
         // would only add copies, every start. A part missing shards still
         // says which content is newest.
         const held = body.complete || (body.missing !== undefined && !body.missing.includes('shards'));
-        const contents = byNamespace.get(mark.namespace) ?? new Map();
+        const contents = byNamespace.get(mark.namespace) ?? new Map<string, RenderedInjectionCopy[]>();
         byNamespace.set(mark.namespace, contents);
-        // Copies of the same content in view pool what they hold: the agent
-        // has each part that one of them holds.
-        const known = contents.get(mark.contentHash) ?? { parts: mark.parts, held: new Set<number>(), sequence: body.sequence };
-        if (held) known.held.add(mark.part);
-        known.sequence = Math.max(known.sequence, body.sequence);
-        contents.set(mark.contentHash, known);
+        const copies = contents.get(mark.contentHash) ?? [];
+        copies.push({ id: body.messageId, part: mark.part, parts: mark.parts, held, sequence: body.sequence });
+        contents.set(mark.contentHash, copies);
       }
     }
     this.renderedInjections = { branch: provenance.branch, byNamespace };
@@ -1565,19 +1701,48 @@ export class Agent {
    * The newest content of `namespace` among this agent's stored injections
    * that the last compile built to send rendered, by its newest copy: its
    * content hash, and whether every part of that content was there in some
-   * copy, every shard, however the strategy shaped it. Undefined when none
-   * was, when this agent hasn't built a request since it started, or when
-   * the window's branch has changed since.
+   * copy, every shard, however the strategy shaped it. Copies of the same
+   * content pool what they hold: the agent has each part one of them holds.
+   * A copy the agent's next request won't hold is passed over: one an undo
+   * took out of its window since (#291: `'undone'`, which no presentation
+   * point presents again until a redo), and one no longer stored. Undefined
+   * when no copy is left, when this agent hasn't built a request since it
+   * started, or when the window's branch has changed since.
    */
   renderedInjection(namespace: string): { contentHash: string; whole: boolean } | undefined {
     const rendered = this.renderedInjections;
     const branch = this.contextManager.currentBranchRef();
     if (!rendered || rendered.branch.id !== branch.id || rendered.branch.created !== branch.created) return undefined;
-    let newest: [string, { parts: number; held: Set<number>; sequence: number }] | undefined;
-    for (const entry of rendered.byNamespace.get(namespace) ?? []) {
-      if (!newest || entry[1].sequence > newest[1].sequence) newest = entry;
+    let newest: { contentHash: string; parts: number; held: Set<number>; sequence: number } | undefined;
+    for (const [contentHash, copies] of rendered.byNamespace.get(namespace) ?? []) {
+      let pooled: { parts: number; held: Set<number>; sequence: number } | undefined;
+      for (const copy of copies) {
+        if (!this.renderedCopyStands(copy.id)) continue;
+        pooled ??= { parts: copy.parts, held: new Set(), sequence: copy.sequence };
+        if (copy.held) pooled.held.add(copy.part);
+        pooled.sequence = Math.max(pooled.sequence, copy.sequence);
+      }
+      if (pooled && (!newest || pooled.sequence > newest.sequence)) newest = { contentHash, ...pooled };
     }
-    return newest ? { contentHash: newest[0], whole: newest[1].held.size === newest[1].parts } : undefined;
+    return newest ? { contentHash: newest.contentHash, whole: newest.held.size === newest.parts } : undefined;
+  }
+
+  /**
+   * Whether a stored injection's copy the last compile rendered is still
+   * where the agent's next request reads it: stored, and not taken out of
+   * its window by an undo (#291). A copy out of the window otherwise
+   * (`'out'`, as a redo leaves one presented since its undo) is presented
+   * again at the agent's next point, its own rows' sweep, so it counts. A
+   * context that can't say (a double without windowStatusOf, a read that
+   * throws) counts it, as before the window was presented.
+   */
+  private renderedCopyStands(id: MessageId): boolean {
+    try {
+      const status = this.contextManager.windowStatusOf?.(id);
+      return status !== 'undone' && status !== 'absent';
+    } catch {
+      return true;
+    }
   }
 
   /**
@@ -1747,7 +1912,7 @@ export class Agent {
       const { systemInjections } = compiled;
       // The framework's own pricing stamp never goes out (thinking-token-stamp.ts);
       // the agent's own turns are then presented under its name (presentOwnTurns).
-      const messages = this.presentOwnTurns(withoutTokenEstimates(compiled.messages));
+      const messages = this.presentOwnTurns(this.foreignRoundsAsSent(withoutTokenEstimates(compiled.messages)));
       // Read once, after the first compile, since results may have become
       // ready while it ran; the refusal retry, assembled while the agent is
       // inferring, sends the same ones.
@@ -1989,6 +2154,8 @@ export class Agent {
     // compression path.)
     // The same pass a tool boundary applies to what it notes as sent
     // (sent-rows.ts), so the two can't drift.
+    // Another agent's rounds go out as this agent is sent them (setForeignRounds).
+    messages = this.foreignRoundsAsSent(messages);
     messages = messages
       .map((m) => ({ ...m, content: m.content.filter(carriedBlock) }))
       .filter((m) => m.content.length > 0);
@@ -2157,17 +2324,23 @@ export class Agent {
     return (await this.assembleActivationRequest(availableTools, injections, budget, compressionTools, options)).request;
   }
 
-  /** Stored rows that follow a request-only turn, memoized on the store's
-   * cached message array (ContextManager returns the same array until the
-   * store changes). */
+  /** Stored rows that follow a request-only turn, memoized on the window's
+   * cached row array (ContextManager returns the same array until the
+   * window changes): the rows a compile sends are the window's (#291), and
+   * a write another agent stores, which the window doesn't take, leaves the
+   * memo as it was. A context without a window reads the record, the same
+   * array as the window's for a single slot that is still the record. */
   private requestOnlyIndex: { source: readonly unknown[]; index: RequestOnlyRowIndex } | null = null;
 
   private indexRequestOnlyRows(): RequestOnlyRowIndex {
     const empty: RequestOnlyRowIndex = { ticks: new Map(), prompts: new Map() };
     const cm = this.contextManager as Partial<ContextManager>;
-    if (typeof cm.getAllMessages !== 'function') return empty;
+    const read = typeof cm.getPresentedMessages === 'function' ? () => cm.getPresentedMessages!()
+      : typeof cm.getAllMessages === 'function' ? () => cm.getAllMessages!()
+      : undefined;
+    if (!read) return empty;
     try {
-      const stored = cm.getAllMessages() as unknown as readonly StoredRowLike[];
+      const stored = read() as unknown as readonly StoredRowLike[];
       if (this.requestOnlyIndex?.source === stored) return this.requestOnlyIndex.index;
       const index = indexRequestOnlyRows(stored, this.ownParticipants);
       this.requestOnlyIndex = { source: stored, index };
@@ -2382,7 +2555,9 @@ export class Agent {
       );
       return undefined;
     }
-    return this.contextManager.addMessage(this.name, content, metadata);
+    // The agent's own round, stamped as its own (#291's audience stamp); its
+    // id is the stream's last reply for the thinking binding (noteStreamEnd).
+    return storeOwnRow(this, this.name, content, metadata);
   }
 
   /**
@@ -2492,6 +2667,27 @@ export class Agent {
     return this.contextManager;
   }
 
+  /** Where this agent tells of its own rows once they are stored (setOwnRowSink). */
+  private ownRowSink?: (ids: readonly MessageId[]) => void;
+
+  /**
+   * Install where this agent tells of its own rows once they are stored
+   * (its rounds and the rows the framework writes for it through
+   * storeOwnRow, and its tool results through its guard), or take it off
+   * with undefined. The presentation index (#291) installs one when it takes
+   * the agent on, and presents each row in the agent's window as it is
+   * told. With none, as for an agent nothing took on, nothing is told.
+   */
+  setOwnRowSink(sink: ((ids: readonly MessageId[]) => void) | undefined): void {
+    this.ownRowSink = sink;
+    this.toolResultGuard.setOwnRowSink(sink);
+  }
+
+  /** Tell the sink of own rows just stored (storeOwnRow calls it, once each add has returned). */
+  ownRowsStored(ids: readonly MessageId[]): void {
+    this.ownRowSink?.(ids);
+  }
+
   /**
    * Build the effective system prompt, appending any system-position
    * injections, their blocks joined by line breaks. The system prompt is
@@ -2583,8 +2779,8 @@ export class Agent {
     const content = guardedRefusal ? [] : response.content;
     const { toolCalls, speechContent } = this.extractToolCallsAndSpeech(content);
 
-    // Add assistant response to context
-    if (!guardedRefusal) this.contextManager.addMessage(this.name, content);
+    // Add assistant response to context, as the agent's own row
+    if (!guardedRefusal) storeOwnRow(this, this.name, content);
 
     return {
       toolCalls,

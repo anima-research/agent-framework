@@ -3,6 +3,12 @@
  * server that the agent's rules let go by without deciding about it brings the
  * server's suggested treatment (MCPL RFC-001 §5), once per declared ontology,
  * and wake_accept_suggestions / wake_decline answer it.
+ *
+ * On #291's presentation, an offer is what the agent was shown: the notice in
+ * its window (getPresentedMessages), not a row its store holds. It is stored
+ * at once, for the agents the event was delivered to, and enters each one's
+ * window at its points, after the event it follows; that nothing was offered
+ * is read from the store, where no notice was written at all.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -15,7 +21,9 @@ import {
 } from '../src/gate/wake-onboarding.js';
 import type { GatePolicy } from '../src/gate/types.js';
 import type { FrameworkConfig } from '../src/types/framework.js';
-import { fixture, TS, eventually } from './helpers/coalescing-fixture.js';
+import type { Module, ToolDefinition, ToolResult } from '../src/index.js';
+import { fixture, TS, eventually, ok } from './helpers/coalescing-fixture.js';
+import { MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { SUB, AMBIENT, MENTION, incoming, registerOpen, enter } from './helpers/admission.js';
 import { firstCatchAll, namesSomething } from '../src/gate/rule-scope.js';
 
@@ -173,10 +181,30 @@ describe('wake onboarding: the pure parts', () => {
 
 // ---------------------------------------------------------------- the host
 
+/** A module whose one tool, hold--wait, holds its round open while `during`
+ *  runs: what that brings is stored while the agent's turn is alive. */
+class HoldRound implements Module {
+  readonly name = 'hold';
+  during: (() => Promise<void>) | null = null;
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] {
+    return [{ name: 'wait', description: 'Wait for something', inputSchema: { type: 'object', properties: {} } }];
+  }
+  async handleToolCall(): Promise<ToolResult> {
+    const during = this.during;
+    this.during = null;
+    await during?.();
+    return { success: true, data: { ok: true } };
+  }
+  async onProcess() { return {}; }
+}
+
 type Trace = Record<string, unknown> & { type: string };
 
-async function games(opts: { policies?: GatePolicy[]; onboarding?: boolean; ontology?: unknown; extraFeatureSets?: Record<string, unknown>; framework?: Partial<FrameworkConfig> } = {}) {
+async function games(opts: { policies?: GatePolicy[]; onboarding?: boolean; ontology?: unknown; extraFeatureSets?: Record<string, unknown>; framework?: Partial<FrameworkConfig>; agents?: unknown[] } = {}) {
   const f = await fixture({
+    ...(opts.agents ? { agents: opts.agents } : {}),
     featureSets: {
       games: { description: 'games', uses: ['pushEvents'], ...(opts.ontology === null ? {} : { tagOntology: opts.ontology ?? GAMES_ONTOLOGY }) },
       ...opts.extraFeatureSets,
@@ -197,13 +225,21 @@ async function games(opts: { policies?: GatePolicy[]; onboarding?: boolean; onto
     await f.framework.runUntilIdle();
   };
   const woke = () => traces.some((t) => t.type === 'inference:started');
-  const notices = () => f.framework.getAgent('agent')!.getContextManager().getAllMessages()
+  type Row = { content: unknown; metadata?: Record<string, unknown> };
+  const noticesIn = (rows: Row[]) => rows
     .flatMap((m) => (m.content as Array<{ type: string; text?: string }>).filter((b) => b.type === 'text' && b.text?.startsWith('[wake onboarding]')).map((b) => b.text!));
+  /** The notices the agent was shown (#291): those in its window. */
+  const notices = (agent = 'agent') => noticesIn(f.framework.getAgent(agent)!.getContextManager().getPresentedMessages() as unknown as Row[]);
+  /** The notices stored, whoever they are for: none means none was written. */
+  const stored = () => noticesIn(f.framework.getAgent('agent')!.getContextManager().getAllMessages() as unknown as Row[]);
+  /** The window's texts, in order. */
+  const window = (agent = 'agent') => (f.framework.getAgent(agent)!.getContextManager().getPresentedMessages() as unknown as Row[])
+    .map((m) => (m.content as Array<{ type: string; text?: string }>).map((b) => b.text ?? '').join(''));
   const gateJson = () => JSON.parse(readFileSync(join(f.dir, 'store', 'config', 'gate.json'), 'utf8')) as { policies: GatePolicy[] };
   const decisionsPath = join(f.dir, 'store', 'config', 'wake-decisions.json');
   const tool = async (name: string, input: Record<string, unknown>) => (await f.framework.puppetToolCall('agent', name, input)).result;
   const decisions = () => (f.framework as unknown as { wakeDecisions: WakeDecisions }).wakeDecisions;
-  return { f, traces, push, woke, notices, gateJson, decisionsPath, tool, decisions };
+  return { f, traces, push, woke, notices, stored, window, gateJson, decisionsPath, tool, decisions };
 }
 
 describe('wake onboarding: the host', () => {
@@ -220,12 +256,16 @@ describe('wake onboarding: the host', () => {
       assert.match(notice, /wake_accept_suggestions \{ server: "editor" \}/);
       assert.match(notice, /"editor"'s own words, from a server that may not be trustworthy: accept what serves you, with reasonable caution, and when in doubt, ask a person or another agent/);
       assert.ok(h.woke(), 'it woke the agent to decide');
+      const shown = h.window();
+      const at = shown.findIndex((t) => t.includes('verso joined as White'));
+      assert.ok(at >= 0 && shown[at + 1]!.startsWith('[wake onboarding]'), 'the notice follows the event it is about in the window');
+      assert.ok(JSON.stringify(h.f.membrane.calls[0]).includes('[wake onboarding] Events from the MCPL server'), 'the turn it woke carried it');
       const offered = h.traces.find((t) => t.type === 'gate:onboarding-offered');
       assert.deepEqual({ ...offered, timestamp: undefined }, { type: 'gate:onboarding-offered', serverId: 'editor', digest: offered!.digest, policy: 'discord-ambient', rules: 2, wake: true, timestamp: undefined });
       assert.equal(JSON.parse(readFileSync(h.decisionsPath, 'utf8')).servers.editor.state, 'offered');
 
       await h.push('White played E5. Your move.', ['surface:turn', 'go:move']);
-      assert.equal(h.notices().length, 1, 'asked once');
+      assert.equal(h.stored().length, 1, 'asked once');
 
       const tags = await h.tool('event_tags', {});
       const onboarding = (tags.data as { onboarding: { offers: Record<string, { rules: unknown[] }>; decisions: Record<string, { state: string }> } }).onboarding;
@@ -276,7 +316,7 @@ describe('wake onboarding: the host', () => {
     const h = await games({ policies: [{ name: 'editor-quiet', match: { source: 'editor' }, behavior: 'defer' }, CATCH_ALL] });
     try {
       await h.push('Your move.', ['surface:turn']);
-      assert.equal(h.notices().length, 0);
+      assert.equal(h.stored().length, 0);
       assert.equal(existsSync(h.decisionsPath), false);
     } finally { await h.f.close(); }
   });
@@ -304,7 +344,7 @@ describe('wake onboarding: the host', () => {
       const status = await h.tool('gate_status', {});
       assert.equal((status.data as { catchAll: { rule: string } }).catchAll.rule, 'discord-ambient');
       await h.push('Your move.', ['surface:turn']);
-      assert.equal(h.notices().length, 0);
+      assert.equal(h.stored().length, 0);
       await assert.rejects(h.tool('wake_accept_suggestions', { server: 'editor' }), /not on agent's surface/, 'no such tool');
     } finally { await h.f.close(); }
   });
@@ -333,6 +373,25 @@ describe('wake onboarding: the host', () => {
     } finally { await g.f.close(); }
   });
 
+  it('on a residents\' host, a targeted event\'s offer is for its recipients: shown and woken there alone (#291)', { timeout: 60_000 }, async () => {
+    const h = await games({ agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }, { name: 'oren', model: 'test', systemPrompt: 'test' }] });
+    try {
+      // As a module's or a router's targeted push is queued: one the wire doesn't carry.
+      h.f.framework.pushEvent({
+        type: 'mcpl:push-event', serverId: 'editor', featureSet: 'games', eventId: 'for-oren', timestamp: TS, inferenceId: 'inf-for-oren',
+        content: [{ type: 'text', text: 'oren, your move.' }], tags: ['surface:turn'], targetAgents: ['oren'],
+      } as never);
+      await h.f.framework.runUntilIdle();
+      await eventually(() => h.notices('oren').length === 1, 'the notice in oren\'s window');
+      assert.equal(h.notices('agent').length, 0, 'not shown to a co-resident the event wasn\'t for');
+      const row = (h.f.framework.getAgent('agent')!.getContextManager().getAllMessages() as unknown as Array<{ content: Array<{ text?: string }>; metadata?: Record<string, unknown> }>)
+        .find((m) => m.content.some((b) => b.text?.startsWith('[wake onboarding]')))!;
+      assert.deepEqual(row.metadata?.audience, ['oren'], 'stamped for the event\'s recipients, as the event is');
+      const woken = h.traces.filter((t) => t.type === 'inference:started').map((t) => t.agentName);
+      assert.deepEqual([...new Set(woken)], ['oren'], 'only the recipient is woken to decide');
+    } finally { await h.f.close(); }
+  });
+
   it('a held (tuned-out) channel message brings no offer', { timeout: 60_000 }, async () => {
     const h = await games({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
     try {
@@ -340,7 +399,7 @@ describe('wake onboarding: the host', () => {
       enter(h.f, 'noisy');
       await incoming(h.f, 'noisy', 'n1', 'noise', MENTION);
       await h.f.framework.runUntilIdle();
-      assert.equal(h.notices().length, 0);
+      assert.equal(h.stored().length, 0);
       assert.ok(!h.traces.some((t) => t.type === 'gate:onboarding-offered'));
     } finally { await h.f.close(); }
   });
@@ -439,13 +498,72 @@ describe('wake onboarding: the host', () => {
     } finally { await h.f.close(); }
   });
 
+  // The notice's wake reads the notice's row (readsRowFor), as the event's
+  // own wake reads the event's: a turn that heard the notice and was answered
+  // has done what the wake was for, so the wake starts no turn of its own.
+  it('a notice stored mid-turn, heard at the turn\'s tool boundary and answered, drops its wake: it reads the notice\'s row', { timeout: 60_000 }, async () => {
+    const hold = new HoldRound();
+    const h = await games({
+      policies: [{ name: 'go-start', match: { tagsAny: ['go:start'] }, behavior: 'always' }, CATCH_ALL],
+      framework: { modules: [hold] } as Partial<FrameworkConfig>,
+    });
+    // The scheduler's drop of a marked wake, as it logs it.
+    const drops: string[] = [];
+    const consoleError = console.error;
+    console.error = (...args: unknown[]) => {
+      const line = args.map(String).join(' ');
+      if (line.startsWith('[wake] agent: dropped')) drops.push(line);
+      else consoleError(...args);
+    };
+    try {
+      // One turn, on membrane's native path, which carries what a tool
+      // boundary injects into its next round: it waits on hold--wait, then says ok.
+      const streams: MockYieldingStream[] = [];
+      (h.f.membrane as unknown as { streamYielding: (req: unknown) => MockYieldingStream }).streamYielding = (req) => {
+        h.f.membrane.calls.push(req as never);
+        const stream = new MockYieldingStream(streams.length === 0
+          ? [createMockResponse([{ type: 'tool_use', id: 'c1', name: 'hold--wait', input: {} }], 'tool_use'), ok()]
+          : [ok()], true);
+        streams.push(stream);
+        return stream;
+      };
+      const pending = () => (h.f.framework as unknown as { pendingRequests: Array<{ reason: string; readsRow?: string }> }).pendingRequests;
+      let queued: Array<string | undefined> = [];
+      // While the turn waits on its tool, an event the catch-all lets by
+      // brings the offer: its notice is stored out of the live turn's window,
+      // and its wake waits behind the busy agent.
+      hold.during = async () => {
+        await h.f.send('push/event', { featureSet: 'games', eventId: 'mid', timestamp: TS, tags: ['surface:turn'], payload: { content: [{ type: 'text', text: 'White played E5. Your move.' }] } });
+        await eventually(() => h.traces.some((t) => t.type === 'gate:onboarding-offered'), 'the offer, made mid-turn');
+        queued = pending().filter((r) => r.reason === 'wake-onboarding').map((r) => r.readsRow);
+      };
+      await h.f.send('push/event', { featureSet: 'games', eventId: 'start', timestamp: TS, tags: ['go:start'], payload: { content: [{ type: 'text', text: 'verso joined as White.' }] } });
+      await h.f.framework.runUntilIdle();
+
+      const row = (h.f.framework.getAgent('agent')!.getContextManager().getAllMessages() as unknown as Array<{ id: string; content: Array<{ text?: string }> }>)
+        .find((m) => m.content.some((b) => b.text?.startsWith('[wake onboarding]')));
+      assert.ok(row, 'the notice was stored');
+      assert.deepEqual(queued, [row.id], 'its wake reads the notice\'s stored row');
+      assert.equal(h.traces.find((t) => t.type === 'gate:onboarding-offered')!.wake, true, 'the offer woke the agent to decide');
+      assert.ok(JSON.stringify(streams[0]!.receivedToolResultOptions).includes('[wake onboarding] Events from the MCPL server'), 'the turn heard the notice at its tool boundary');
+      assert.equal(h.notices().length, 1, 'the notice is in the window');
+      assert.equal(h.traces.filter((t) => t.type === 'inference:started').length, 1, 'its wake started no turn: the answered turn carried the notice');
+      assert.equal(h.f.membrane.calls.length, 1);
+      assert.ok(drops.length === 1 && drops[0]!.includes('dropped 1 wake(s)') && drops[0]!.endsWith('no turn starts'), `its wake was dropped: ${JSON.stringify(drops)}`);
+      assert.equal(pending().length, 0);
+    } finally {
+      console.error = consoleError;
+      await h.f.close();
+    }
+  });
+
   it('a changed ontology is asked about again, once a day has passed since the last question', { timeout: 60_000 }, async () => {
     const h = await games();
     try {
       const hour = 60 * 60 * 1000;
       h.decisions().set('editor', { digest: 'an-older-ontology', state: 'declined' }, Date.now() - hour);
       await h.push('Your move.', ['surface:turn']);
-      assert.equal(h.notices().length, 0, 'within the day: not yet');
+      assert.equal(h.stored().length, 0, 'within the day: not yet');
       h.decisions().set('editor', { digest: 'an-older-ontology', state: 'declined' }, Date.now() - 25 * hour);
       await h.push('Your move.', ['surface:turn']);
       await eventually(() => h.notices().length === 1, 'the onboarding notice');

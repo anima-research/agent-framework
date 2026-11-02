@@ -1,11 +1,15 @@
 import type { JsStateRegistration, JsStore } from '@animalabs/chronicle';
 import type { ContentBlock } from '@animalabs/membrane';
 import type {
+  ContextManager,
   MessageId,
   MessageMetadata,
   MessageQuery,
   ContextInjection,
+  StoredMessage,
+  WindowStatus,
 } from '@animalabs/context-manager';
+import { WriteOutcomeUnknownError } from '@animalabs/context-manager';
 import type {
   Module,
   ModuleContext,
@@ -25,7 +29,6 @@ import type {
   ModuleContextInjection,
   MessageQueryResult,
 } from './types/index.js';
-import { heldWriteId } from './held-writes.js';
 import { boundedErrorMessage } from './error-message.js';
 import type { Agent } from './agent.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from './shutdown.js';
@@ -150,6 +153,13 @@ export class ModuleRegistry {
     message: string,
     data?: Record<string, unknown>,
   ) => void;
+  /** The window lookups ModuleContext.windowStatusOf, observes, viewKeeps
+   *  and agentNameOf give modules (#291), when the framework offers them.
+   *  Readonly-public, as notifyOpsFn is. */
+  readonly windowStatusOfFn?: (id: MessageId, opts?: { forAgent?: string }) => WindowStatus;
+  readonly observesFn?: (observer: string, observed: string) => boolean;
+  readonly viewKeepsFn?: (row: StoredMessage, opts?: { forAgent?: string }) => boolean;
+  readonly agentNameOfFn?: (contextManager: ContextManager) => string | undefined;
 
   constructor(
     store: JsStore,
@@ -170,6 +180,14 @@ export class ModuleRegistry {
       onTrace: (listener: TraceEventListener) => () => void;
       callTool: (call: ToolCall) => Promise<ToolResult>;
       notifyOps?: (kind: string, agentName: string, message: string, data?: Record<string, unknown>) => void;
+      /** Where a row stands with an agent's window (ModuleContext.windowStatusOf). */
+      windowStatusOf?: (id: MessageId, opts?: { forAgent?: string }) => WindowStatus;
+      /** Whether one agent observes another's own rows (ModuleContext.observes). */
+      observes?: (observer: string, observed: string) => boolean;
+      /** Whether an agent's view keeps a stored row (ModuleContext.viewKeeps). */
+      viewKeeps?: (row: StoredMessage, opts?: { forAgent?: string }) => boolean;
+      /** The live agent whose context a context manager is (ModuleContext.agentNameOf). */
+      agentNameOf?: (contextManager: ContextManager) => string | undefined;
     }
   ) {
     this.store = store;
@@ -184,6 +202,10 @@ export class ModuleRegistry {
     this.onTraceFn = options.onTrace;
     this.callToolFn = options.callTool;
     this.notifyOpsFn = options.notifyOps;
+    this.windowStatusOfFn = options.windowStatusOf;
+    this.observesFn = options.observes;
+    this.viewKeepsFn = options.viewKeeps;
+    this.agentNameOfFn = options.agentNameOf;
     this.dropRetiredPushFn = options.dropRetiredPush;
   }
 
@@ -748,6 +770,12 @@ class ModuleContextImpl implements ModuleContext {
   private pushEventFn: (event: ProcessEvent, moduleName?: string) => void;
   private onTraceFn: (listener: TraceEventListener) => () => void;
   private callToolFn: (call: ToolCall) => Promise<ToolResult>;
+  /** Offered only when the registry was given the framework's lookups, so
+   *  a module can tell a framework that has them from one that hasn't. */
+  readonly windowStatusOf?: (id: MessageId, opts?: { forAgent?: string }) => WindowStatus;
+  readonly observes?: (observer: string, observed: string) => boolean;
+  readonly viewKeeps?: (row: StoredMessage, opts?: { forAgent?: string }) => boolean;
+  readonly agentNameOf?: (contextManager: ContextManager) => string | undefined;
 
   // External ID mapping stored in module state
   private externalIdMap: Map<string, MessageId> = new Map();
@@ -794,6 +822,14 @@ class ModuleContextImpl implements ModuleContext {
     this.pushEventFn = pushEvent;
     this.onTraceFn = onTrace;
     this.callToolFn = callTool;
+    const windowStatusOf = registry.windowStatusOfFn;
+    if (windowStatusOf) this.windowStatusOf = (id, opts) => windowStatusOf(id, opts);
+    const observes = registry.observesFn;
+    if (observes) this.observes = (observer, observed) => observes(observer, observed);
+    const viewKeeps = registry.viewKeepsFn;
+    if (viewKeeps) this.viewKeeps = (row, opts) => viewKeeps(row, opts);
+    const agentNameOf = registry.agentNameOfFn;
+    if (agentNameOf) this.agentNameOf = (contextManager) => agentNameOf(contextManager);
 
     // Load external ID map from state if exists
     const state = this.getState<{ externalIdMap?: Record<string, string> }>();
@@ -951,15 +987,35 @@ class ModuleContextImpl implements ModuleContext {
       throw new Error(`A message for agent ${JSON.stringify(opts.forAgent)} can't carry metadata.external: `
         + "its external id would be looked up in the primary's window. Leave forAgent out, or the external id.");
     }
-    const id = this.addMessageFn(participant, content, metadata, opts);
+    let id: MessageId;
+    try {
+      id = this.addMessageFn(participant, content, metadata, opts);
+    } catch (error) {
+      // A write whose store threw where context-manager can't tell whether
+      // it landed (WriteOutcomeUnknownError, which the write is answered by)
+      // may be stored: its external id maps to '', as a write kept in memory
+      // does, so findMessageByExternalId looks it up in the store. A mapping
+      // that can't be persisted is logged, and the write's own error thrown.
+      if (metadata?.external && error instanceof WriteOutcomeUnknownError) {
+        this.externalIdMap.set(`${metadata.external.source}:${metadata.external.id}`, '');
+        try {
+          this.persistExternalIdMap();
+        } catch (persist) {
+          console.error(`[module:${this.moduleName}] the external id of a write that may be stored could not be persisted:`, persist);
+        }
+      }
+      throw error;
+    }
 
-    // Track external ID if provided. A write the framework holds keeps '',
-    // as it did before held writes had handles: the map is module state an
-    // earlier release reads back, and a handle is no id to it.
-    // findMessageByExternalId finds the held write by its external id.
+    // Track external ID if provided: the stored id the write was given
+    // (#291 stores every write at once), or '' for one kept in memory (a
+    // surgery's hold, or the wait for its agent's recovery), as earlier
+    // releases kept '' for a write they held.
+    // findMessageByExternalId finds such a write by its external id once it
+    // is stored.
     if (metadata?.external) {
       const key = `${metadata.external.source}:${metadata.external.id}`;
-      this.externalIdMap.set(key, heldWriteId(id) === undefined ? id : '');
+      this.externalIdMap.set(key, id);
       // Persist the mapping
       this.persistExternalIdMap();
     }
@@ -991,15 +1047,16 @@ class ModuleContextImpl implements ModuleContext {
     if (entry === undefined) return null;
     // A stored id answers while the store holds its row, and once the row is
     // gone the entry goes, as removeMessage drops it, except from a context
-    // whose module has stopped, which keeps its mapping as it was. The '' a held
-    // write keeps here (addMessage) names no row, so the message is looked up in
-    // the store by its external id, held rows included, and the first row found
-    // is taken, as context-manager's findByExternalId takes it: a held row
-    // answers by its handle and leaves the entry as it is, and a stored row's id
-    // becomes the entry. With nothing found, '' stays, as earlier releases kept
-    // it: in a module's start(), the writes the last process held don't show
-    // yet, since create() restores them after the modules start, and a write
-    // that shows later finds its entry.
+    // whose module has stopped, which keeps its mapping as it was. A '' here
+    // names no row: a write kept in memory (a surgery's hold, or the wait for
+    // its agent's recovery), or one an earlier release held, whose map it
+    // persisted with ''. So the message is looked up in the store by its
+    // external id, and the first row found is taken, as context-manager's
+    // findByExternalId takes it, and its id becomes the entry (but in a
+    // stopped module's context). With nothing found, '' stays: in a module's
+    // start(), a write an earlier release left queued isn't stored yet, since
+    // create() imports those after the modules start, and a write that shows
+    // later finds its entry.
     if (entry !== '') {
       if (this.getMessageFn(entry)) return entry;
       if (!this.retired) {
@@ -1009,7 +1066,6 @@ class ModuleContextImpl implements ModuleContext {
       return null;
     }
     const row = this.queryMessagesFn({ source, externalIds: [externalId] }).messages[0];
-    if (row?.held) return row.id;
     if (!row) return null;
     if (!this.retired) {
       this.externalIdMap.set(key, row.id);

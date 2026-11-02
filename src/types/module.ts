@@ -1,9 +1,11 @@
 import type { ContentBlock } from '@animalabs/membrane';
 import type {
+  ContextManager,
   MessageId,
   MessageMetadata,
   StoredMessage,
   ContextInjection,
+  WindowStatus,
 } from '@animalabs/context-manager';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from './events.js';
 import type { TraceEventListener } from './trace.js';
@@ -49,23 +51,28 @@ export interface MessageQuery {
 export type ModuleContextInjection = ContextInjection & { placedEachCompile?: true };
 
 /**
- * A message as a module context's reads answer it: a stored row, or a row
- * for a write the framework holds (`held`). Either is marked
+ * A message as a module context's reads answer it: a stored row, marked
+ * `held` when it isn't in the window of the agent the read is for, and
  * `heldFromResidents` when a tune-out holds it from the residents.
  */
 export type ModuleMessage = StoredMessage & {
   /**
-   * True while the framework holds the message's write, as it does while
-   * the write's agent has a turn alive or the host is quiesced, until a
-   * later boundary stores it. The row's `id` is then a handle, which
-   * getMessage, editMessage and removeMessage take as they take a stored
-   * id, and which names the stored row once the write lands. Its `sequence`
-   * and `timestamp` are provisional: the sequence comes after every stored
-   * row's, the timestamp is when the framework held the write (for a write
-   * an older release held, when its queue was read back), and both change
-   * when it lands. A held write whose earlier write may already be stored
-   * is looked up first, and answered as the stored row it is when the store
-   * holds it. Absent on a stored row.
+   * True on a row stored and not in the window of the agent the read is for
+   * (#291's presentation index): it arrived while that agent's turn was
+   * alive, or while the host was quiesced, and enters the window at the
+   * agent's next presentation point (a turn's start, a tool boundary that
+   * can carry it, a turn's end, or at once while no turn of it is alive);
+   * or it was taken out of the window as an undone turn's; or it is never
+   * presented to that agent, as a held message is to a resident. Set only
+   * once that agent's window is written down (presented mode); a held
+   * message an earlier release stored is in a resident's window written
+   * down from the record, so it reads without `held`, and
+   * `heldFromResidents` is what marks it. Its `id`,
+   * `sequence` and `timestamp` are the store's, as for any row: since #291
+   * every write is stored at once, so no row is a handle and nothing
+   * changes when it enters the window. Before #291 the same name marked a
+   * write the framework still held, under a `held:` handle; see the
+   * changelog. Absent on a row the window holds.
    */
   held?: true;
   /**
@@ -79,14 +86,14 @@ export type ModuleMessage = StoredMessage & {
    * marked, such as the
    * cancel's `<tuned-out-backlog>` row, with the text of the tune-out's newest
    * messages, up to `backlogCap` of them and as many as fit in one of the
-   * residents' messages, the stored ones first and then those still held;
-   * what the subconscious says of it, in its report or its note; and the
+   * residents' messages; what the subconscious says of it, in its report or
+   * its note; and the
    * result of a tool that reads history on request, such as a
    * channel's `fetch_history` or the history module's `extract`. A module
    * that builds on what the residents see, such as one choosing from the
    * recent conversation, leaves a marked row out, and one that matches
-   * what's stored, such as a sync's dedupe, keeps it. A held write (`held`)
-   * is marked too when it carries the stamp. Absent on every other row.
+   * what's stored, such as a sync's dedupe, keeps it. Absent on every other
+   * row.
    */
   heldFromResidents?: true;
 };
@@ -95,9 +102,8 @@ export type ModuleMessage = StoredMessage & {
  * Result of a message query.
  */
 export interface MessageQueryResult {
-  /** The matching stored rows, then, as the newest, the matching rows of
-   *  writes the framework holds (ModuleMessage.held): before the stored rows
-   *  in a reversed query */
+  /** The matching stored rows, in store order (newest first in a reversed
+   *  query), each marked as ModuleMessage says. */
   messages: ModuleMessage[];
   totalCount: number;
 }
@@ -281,9 +287,10 @@ export interface AgentSettingsExtension {
  *   nothing.
  *
  * Its reads (`getState`, `getLog`, `getLogLength`, `getMessage`,
- * `queryMessages`, `getAgents`, `getActiveTools`, `findMessageByExternalId`)
- * answer, and fail, as before; one that meets a held write may record that
- * the write has landed, as any reader's does. The framework calls none of the
+ * `queryMessages`, `getAgents`, `getActiveTools`, `findMessageByExternalId`,
+ * and the window lookups `windowStatusOf`, `observes`, `viewKeeps` and
+ * `agentNameOf` where the framework offers them) answer, and fail, as
+ * before. The framework calls none of the
  * module's `onProcess`, `onAgentSpeech` and `onToolBatchComplete` again; it
  * drops whole a response of its that hadn't been applied by then, with a line
  * naming what the response asked for if it asked for anything; and it leaves
@@ -381,20 +388,44 @@ export interface ModuleContext {
   getModule<T extends Module>(name: string): T | null;
 
   /**
-   * Add a message to the conversation, and answer its id. While the
-   * framework holds the write (the agent's turn is alive, or the host is
-   * quiesced), the id is a handle, `held:` and the write's id, which
-   * getMessage, editMessage and removeMessage take as they take a stored
-   * id, and which names the stored row once the write lands
-   * (ModuleMessage.held). The writes a process held, and keeps across a
-   * restart, show to the next process's modules once create() has restored
-   * them, which is after every module's start().
+   * Add a message to the conversation, and answer its stored id. The write
+   * is stored at once, whatever the agent's turn (#291): it enters the
+   * agent's window at the agent's next presentation point, or at once while
+   * no turn of it is alive, and until then reads mark it `held`
+   * (ModuleMessage.held). Only while the write is kept in memory is the id
+   * '': while an operator's surgery holds the store, stored at the
+   * surgery's end, and while the agent's context manager refuses its work
+   * after a failed re-initialization, stored when a switchBranch()
+   * re-initializes it (a restart loses it; if the agent ends first, it goes
+   * to the primary when it is a write the primary takes in its place).
+   * Until it lands, such a write can't be read, edited or removed through
+   * this context: it has no id, getMessage, editMessage and removeMessage
+   * take none for it, and queryMessages and findMessageByExternalId read
+   * the store, which doesn't hold it yet. Its release stores it as it was
+   * given here. A module that must change it keeps the change and applies
+   * it to the row once the row is stored, which the release traces
+   * synchronously as `message:added` with source `surgery-release` and the
+   * stored id, as the Discord module does for an edit or a delete of a
+   * message whose create was kept.
+   * Writes a release before #291 held and kept across a restart are
+   * stored once create() imports them, which is after every module's
+   * start().
+   * A write whose store throws after rows of it landed is answered by the
+   * first of them, as stored (context-manager's WriteLandedError names
+   * them). One whose store throws where the store can't be read to tell
+   * what of it landed throws context-manager's WriteOutcomeUnknownError,
+   * which names the rows it knows are stored (`landed`, presented as a
+   * stored write's rows are) and counts those it can't (`unknown`,
+   * `unnamed`): the write may be stored, in part or whole, or not at all,
+   * and isn't answered as stored. A read of the store tells, once the store
+   * reads: queryMessages, or findMessageByExternalId for a write that
+   * carried `metadata.external`. Any other error means none of it is stored.
    *
    * With `opts.forAgent`, it's added to the named agent's window instead: a
    * conversation fork's or a running sub-agent's own store, or, for an
-   * ordinary resident, the residents' shared slot. It's held while that
-   * agent's turn is alive, as a write for the primary is while the
-   * primary's is. A name that isn't a registered agent when the write is
+   * ordinary resident, the residents' shared slot. It enters that agent's
+   * window at that agent's points, as a write for the primary does at the
+   * primary's. A name that isn't a registered agent when the write is
    * made, or the empty name, throws, naming the registered ones, so a write
    * for a launcher that has gone is heard. For an ephemeral run (a
    * sub-agent's run) or a conversation fork, whose window nothing reads
@@ -413,12 +444,15 @@ export interface ModuleContext {
    * failed reply, or a channel notice its reader could act on). getMessage,
    * editMessage and removeMessage read the delivery agent's window (the
    * primary's, or the first agent's when none is primary): they don't take
-   * an id or handle for a row in a fork's or a sub-agent's window, and don't
+   * an id for a row in a fork's or a sub-agent's window, and don't
    * find it (read it with queryMessages and the same forAgent). The
    * residents' shared slot is the primary's window too, for a primary
    * that's an ordinary resident, so there they do.
    * `metadata.external` with a target throws: its id map is read in the
-   * primary's window.
+   * primary's window. The row is stamped (`metadata.audience`, #291) for
+   * the agent named, or, with no agent named, for the agents that take
+   * untargeted inbound in the slot it lands in: every resident on a
+   * residents' host.
    */
   addMessage(
     participant: string,
@@ -428,48 +462,53 @@ export interface ModuleContext {
   ): MessageId;
 
   /**
-   * Edit a message, by its id or a held write's handle. A held write is
-   * stored with the new content. One whose earlier write may already be
-   * stored, where the store can't be searched to tell, throws with nothing
-   * changed.
+   * Edit a stored message, by its id. An edit of a row an agent's window
+   * holds changes what that agent's next compile sends, as for any stored
+   * row. For one release it also takes the `held:` handle a release before
+   * #291 answered for a write it held, and edits the row that write landed
+   * as.
    */
   editMessage(id: MessageId, content: ContentBlock[]): void;
 
   /**
-   * Remove a message, by its id or a held write's handle. A held write is
-   * dropped, so the agent never reads it. One whose earlier write may
-   * already be stored, where the store can't be searched to tell, throws
-   * with nothing changed.
+   * Remove a stored message, by its id. For one release it also takes the
+   * `held:` handle a release before #291 answered for a write it held, and
+   * removes the row that write landed as.
    */
   removeMessage(id: MessageId): void;
 
   /**
    * Find the message for an external ID this context added a message under:
-   * the row it added, while the store holds it. For a write the framework
-   * held, whose id this context doesn't keep, the first row the store shows
-   * under that external ID, held rows included, a held row by its handle.
-   * Null when this context added none under it, when the row it added is
-   * gone, or when the store shows none for a held write, such as one the
-   * last process held, looked up in start().
+   * the row it added, while the store holds it. For a write whose id this
+   * context doesn't keep (one kept in memory, by an operator's surgery or
+   * for its agent's recovery, one whose store threw where context-manager
+   * couldn't tell whether it landed (WriteOutcomeUnknownError), or one a
+   * release before #291 held, whose map it kept as ''), the first row the
+   * store shows under that external ID. Null when this context added none under
+   * it, when the row it added is gone, or when the store shows none for
+   * such a write, as for one an earlier release left queued, looked up in
+   * start() before create() imports it.
    */
   findMessageByExternalId(source: string, externalId: string): MessageId | null;
 
   /**
-   * Get a message by its id or a held write's handle, marked
-   * `heldFromResidents` when a tune-out holds it from the residents
-   * (ModuleMessage).
+   * Get a stored message by its id, marked as ModuleMessage says: `held`
+   * when it isn't in the delivery agent's window, `heldFromResidents` when a
+   * tune-out holds it from the residents. For one release it also takes the
+   * `held:` handle a release before #291 answered, and gives the row that
+   * write landed as.
    */
   getMessage(id: MessageId): ModuleMessage | null;
 
   /**
    * Query messages by filter criteria.
    * Useful for finding messages from external sources, by participant, etc.
-   * The rows of writes the framework holds come after the stored rows, as
-   * the newest, or before them in a reversed query, marked `held`
-   * (ModuleMessage). Those the last process held show once create() has
-   * restored them, after every module's start() (addMessage). A message a
-   * tune-out holds from the residents is among the rows, marked
-   * `heldFromResidents` (ModuleMessage).
+   * The rows come in store order, each marked as ModuleMessage says: `held`
+   * when it isn't in the window of the agent the read is for (stored and not
+   * yet presented to it, or undone), and `heldFromResidents` when a tune-out
+   * holds it from the residents. Writes a release before #291 left queued
+   * show once create() has imported them, after every module's start()
+   * (addMessage).
    *
    * It reads the primary's window (the first registered agent's when none
    * is primary), or with `opts.forAgent`, the named agent's: a conversation
@@ -481,6 +520,66 @@ export interface ModuleContext {
    * empty window.
    */
   queryMessages(filter: MessageQuery, opts?: { forAgent?: string }): MessageQueryResult;
+
+  /**
+   * Where a stored row stands with an agent's window (#291), the rows its
+   * requests are given, before its view's filter (context-manager's
+   * `windowStatusOf`): `'in'` when the window holds it, which is every row
+   * its record holds while the window is still the record; `'undone'` when
+   * it was taken out as an undone turn's, or shed after a refusal; `'out'`
+   * when it is stored and not in the window (not presented to the agent
+   * yet, or taken back to arrived); `'absent'` when the agent's record
+   * doesn't hold it (removed, never stored on its branch, or in a slot it
+   * doesn't read). For the delivery agent (the primary's, or the first
+   * agent's when none is primary), or with `opts.forAgent`, the named
+   * agent, which must be registered, as for queryMessages: a name that
+   * isn't throws. A tool that reads the record for an agent, such as the
+   * history module's, says with it, and with viewKeeps, which of the rows it
+   * returns the agent isn't being shown.
+   *
+   * Optional: a framework from before the presentation index, or a host's
+   * own context, doesn't offer it. Call as `ctx.windowStatusOf?.(...)`.
+   */
+  windowStatusOf?(id: MessageId, opts?: { forAgent?: string }): WindowStatus;
+
+  /**
+   * Whether `observer` reads `observed`'s own rows through an observe edge
+   * (dendrite's relationships): one of its edges reads another slot
+   * `observed` owns, or names `observed` and reads the observer's own slot
+   * (a resident's `AgentConfig.observes`). Seeing another agent's rounds is
+   * a declared relationship (#291, decision 1): an observe edge, which a
+   * resident's configuration declares with `observes`, so a tool that reads
+   * the record for an agent leaves out another agent's own rows it isn't
+   * shown unless this is true.
+   * False for a name the registry doesn't know. Optional, as
+   * windowStatusOf is, and offered with it.
+   */
+  observes?(observer: string, observed: string): boolean;
+
+  /**
+   * Whether an agent's view keeps a stored row (#291): whether its requests
+   * carry the row while its window holds it. windowStatusOf answers before
+   * the view's filter, and a window written down from the record the
+   * residents share can hold rows the view never sends: another agent's
+   * stored context injection, and, for an agent whose view leaves held
+   * traffic out (a resident), a row a tune-out holds from the residents. A
+   * row the agent is shown is one windowStatusOf reads `'in'` and this
+   * keeps. It reads the view the agent's context was opened with
+   * (context-options.ts), for the delivery agent, or with `opts.forAgent`
+   * the named agent, which must be registered, as for windowStatusOf: a name
+   * that isn't throws. Optional, as windowStatusOf is, and offered with it.
+   */
+  viewKeeps?(row: StoredMessage, opts?: { forAgent?: string }): boolean;
+
+  /**
+   * The live agent whose context `contextManager` is (the one its
+   * `getContextManager()` returns), or undefined when it is no live
+   * agent's (#291). A module a host binds to an agent's context, as it binds
+   * the history module, reads that context's record and summaries; this
+   * says whose they are, so another agent's call can be told from that
+   * agent's own. Optional, as windowStatusOf is, and offered with it.
+   */
+  agentNameOf?(contextManager: ContextManager): string | undefined;
 
   /**
    * Get info about all agents.
@@ -649,19 +748,23 @@ export type AgentStatus = 'idle' | 'inferring' | 'streaming' | 'waiting_for_tool
  */
 export interface EventResponse {
   /**
-   * Messages to add to the conversation.
+   * Messages to add to the conversation. Each row says who it is for in
+   * `metadata.audience` (#291): the agents a `requestInference` list names
+   * that are registered (the agent the row is delivered to, when none of
+   * them is); for `true` or no request, as for any write that names no
+   * agent, the agents that take untargeted inbound in the slot it lands in
+   * (every resident on a residents' host). A message that carries a
+   * tune-out's hold is for nobody.
    */
   addMessages?: NewMessage[];
 
   /**
-   * Messages to edit, each by its id or a held write's handle
-   * (ModuleContext.editMessage).
+   * Messages to edit, each by its stored id (ModuleContext.editMessage).
    */
   editMessages?: MessageEdit[];
 
   /**
-   * Messages to remove, each by its id or a held write's handle
-   * (ModuleContext.removeMessage).
+   * Messages to remove, each by its stored id (ModuleContext.removeMessage).
    */
   removeMessages?: MessageId[];
 

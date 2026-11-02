@@ -14,12 +14,12 @@ import type { ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStrea
 import { AgentFramework } from '../src/index.js';
 import type { Module, ToolCall } from '../src/index.js';
 import { asNextRequestCarries, roundRows, sameData, type SentRow } from '../src/sent-rows.js';
-import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
+import { MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
+// The signed-round builders, shared with the window = wire tests (#291).
+import { cumulative, final, round, signed } from './helpers/wire-membrane.js';
 
 const UNSTORED = { unstored: true };
 const text = (t: string) => ({ type: 'text', text: t }) as ContentBlock;
-const signed = (signature: string, tokenEstimate?: number) =>
-  ({ type: 'thinking', thinking: '', signature, ...(tokenEstimate !== undefined ? { tokenEstimate } : {}) }) as ContentBlock;
 const toolUse = (id: string) => ({ type: 'tool_use', id, name: 'test--echo', input: {} }) as ContentBlock;
 const image = { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'iVBORw0KGgo=' } } as ContentBlock;
 const result = (toolUseId: string, content: string, isError?: boolean) =>
@@ -142,22 +142,6 @@ class Tools implements Module {
   }
   async handleToolCall(call: ToolCall) { return { success: true, data: { echoed: true }, ...(call.name.endsWith('end') ? { endTurn: true } : {}) }; }
 }
-const usage = { inputTokens: 100, outputTokens: 10, cacheCreationTokens: 0, cacheReadTokens: 0 };
-const round = (id: string, content: ContentBlock[], tool = 'echo'): NormalizedResponse =>
-  Object.assign(createMockResponse([...content, { type: 'tool_use', name: `test--${tool}`, id, input: {} }], 'tool_use'), { usage });
-const final = (content: ContentBlock[] = [signed('sig-3'), text('Done.')]): NormalizedResponse => {
-  const response = Object.assign(createMockResponse(content), { usage });
-  response.details!.usage = usage;
-  return response;
-};
-/** The stream's complete, as membrane gives it: every round's blocks, each round's results after its calls, then the
- *  last reply's (`last`, none for a stream that ends on its last results). */
-const cumulative = (first: ContentBlock[], last: ContentBlock[] = [signed('sig-3'), text('Done.')]): NormalizedResponse => {
-  const toolResult = (id: string) => ({ type: 'tool_result', toolUseId: id, content: '{"echoed":true}' }) as ContentBlock;
-  const response = final([...first, toolUse('c1'), toolResult('c1'), signed('sig-2'), text('Again.'), toolUse('c2'), toolResult('c2'), ...last]);
-  response.toolCalls = [];
-  return response;
-};
 const twoRounds = (first: ContentBlock[], last?: ContentBlock[]) =>
   [round('c1', first), round('c2', [signed('sig-2'), text('Again.')]), cumulative(first, last)];
 

@@ -118,8 +118,12 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
       payload: { content: text ? [{ type: 'text', text }] : [] },
     }),
     renderer: (fn: typeof renderer) => { renderer = fn; },
-    /** Serialized context of the primary agent. */
+    /** Serialized context of the primary agent: every row its store holds. */
     context: (agent = 'agent') => JSON.stringify(framework.getAgent(agent)!.getContextManager().getAllMessages()),
+    /** Serialized window of the primary agent (#291): the rows it was shown, in order. */
+    window: (agent = 'agent') => JSON.stringify(framework.getAgent(agent)!.getContextManager().getPresentedMessages()),
+    /** Present the agent what it is owed, as at its turn's end (#291): rows written past the framework enter its window. */
+    present: (agent = 'agent') => (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent(agent)),
     /** Serialized messages of the last model request (tool descriptions excluded). */
     lastRequest: () => JSON.stringify((membrane.calls.at(-1) as { messages?: unknown } | undefined)?.messages),
     turn: async () => { membrane.pushResponse(ok()); await framework.runUntilIdle(); },

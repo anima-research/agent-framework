@@ -3,6 +3,8 @@ import type { ProcessEvent } from './events.js';
 import type { ModuleProcessResponse } from './framework.js';
 import type { SessionUsage } from '../usage/types.js';
 import type { DraftReason } from '../prose-drafts.js';
+import type { MessageSlotRef } from '../dendrite/types.js';
+import type { PresentationOccasion } from '../presentation.js';
 
 /**
  * Base for all trace events.
@@ -380,6 +382,10 @@ export type TraceEvent =
     })
 
   // Message lifecycle
+  /** A message stored, with its stored id. A write kept in memory first (a
+   *  live surgery's hold, or the wait for its agent's context manager to be
+   *  re-initialized) is traced once, as a release stores it, with source
+   *  `surgery-release`; its arrival isn't traced. */
   | (TraceEventBase & {
       type: 'message:added';
       messageId: string;
@@ -512,9 +518,8 @@ export type TraceEvent =
        *  gate hands the line to the wake when its message is the newest at
        *  the fire, EventGate isNewestEntry, and the turn's start decides).
        *  `reason`: `newest`, on the delivery agent's start the message was
-       *  still the newest entry in the window; `held`, the host was quiesced
-       *  or another reader of the residents' shared slot had a turn alive,
-       *  so no line could be written then. */
+       *  still the newest entry in the window; `held`, the host was
+       *  quiesced, so no line could be written then. */
       type: 'gate:wake-line-omitted';
       reason: 'newest' | 'held';
       policyNames: string[];
@@ -560,21 +565,6 @@ export type TraceEvent =
       totals: SessionUsage;
       agentName: string;
       inferenceCount: number;
-    })
-
-  // Undo/redo lifecycle
-  | (TraceEventBase & {
-      type: 'undo:completed';
-      agentName: string;
-      turnIndex: number;
-      fromBranch: string;
-      toBranch: string;
-    })
-  | (TraceEventBase & {
-      type: 'redo:completed';
-      agentName: string;
-      fromBranch: string;
-      toBranch: string;
     })
 
   // Operator-initiated mutation (rollback/suppress/undo/hide/settings/quiesce…).
@@ -701,10 +691,6 @@ export type TraceEvent =
       toolUseId: string;
       isError: boolean;
       durationMs: number;
-      /** The pair was queued behind a turn that replaced the puppet's
-       *  reservation (provider-admission re-entry) instead of stored
-       *  directly; it lands at that turn's end flush. */
-      deferred?: boolean;
     })
 
   // MCPL server connection lifecycle (spawn / handshake / reconnect health).
@@ -933,10 +919,8 @@ export type TraceEvent =
       channelId: string;
       epochId: string;
       trigger: 'cadence' | 'wake' | 'cancel';
-      /** Held messages the fork was handed, stored and queued. */
+      /** Held messages the fork was handed. */
       held: number;
-      /** Of those, the ones still queued behind the resident's turn. */
-      queued: number;
     })
 
   /**
@@ -958,9 +942,30 @@ export type TraceEvent =
       returned: number;
     })
 
+  /**
+   * The persistent subconscious's window start was set by index ordinal
+   * (#291): `fixed`, a tune-out's start fixed once no row the subconscious
+   * is owed stored before the start was out of its window, and kept for its
+   * epochs; `clamped`, a kept start (`kept`) past its window's index length
+   * on the store's branch now (one a rollback made shorter), set at the
+   * length instead.
+   */
+  | (TraceEventBase & {
+      type: 'tune-out:subconscious-window';
+      agentName: string;
+      /** The tune-outs that start there. */
+      epochIds: string[];
+      how: 'fixed' | 'clamped';
+      /** The ordinal the window starts at now. */
+      ordinal: number;
+      /** For `clamped`, the ordinal kept for them. */
+      kept?: number;
+    })
+
   // Dendrite: agent registry and lifecycle.
-  // `agent-created` is the consent event: it names the kind of agent, what
-  // ends it, and what happens to it when its spawner ends.
+  // `agent-created` is the creation event: it names the kind of agent, what
+  // ends it, and what happens to it when its spawner ends, for whatever a
+  // host records or decides on them.
   | (TraceEventBase & {
       type: 'dendrite:agent-created';
       agentName: string;
@@ -1010,7 +1015,7 @@ export type TraceEvent =
       by?: string;
       reason?: string;
     })
-  /** The message entered the recipient's store (not merely queued for it). */
+  /** The message entered the recipient's store (not merely held for it). */
   | (TraceEventBase & {
       type: 'dendrite:mail-delivered';
       mailId: string;
@@ -1018,7 +1023,10 @@ export type TraceEvent =
       from: string;
       to: string;
     })
-  /** Queued for the recipient's next boundary; `mail-delivered` follows when it lands. */
+  /** Held in memory behind a live surgery (the operator's switch awaited),
+   *  or kept for a recipient whose context manager refuses its work after a
+   *  failed re-initialization; `mail-delivered` follows when a release
+   *  stores it. */
   | (TraceEventBase & {
       type: 'dendrite:mail-deferred';
       mailId: string;
@@ -1066,6 +1074,115 @@ export type TraceEvent =
       error: string;
     })
 
+  // The presentation index (#291, src/presentation.ts): which stored rows
+  // each agent's window holds, in the order its requests carried them.
+  | (TraceEventBase & {
+      /**
+       * Rows entered an agent's window (context-manager's presentRows), at
+       * one of its presentation points (`occasion`): `count` bodies, a
+       * sharded one counted once. At `rebase`, the store's branch moved to a
+       * branch with no window for the agent, and its window there was
+       * written down: `count` is the bodies it holds.
+       */
+      type: 'presentation:presented';
+      agentName: string;
+      occasion: PresentationOccasion;
+      count: number;
+      /** At a tool boundary: the first row that couldn't join the live
+       *  stream (a tool block, or a row named as the agent), where the rows
+       *  presented there stop. It and the rows after it wait for the turn's
+       *  end. */
+      cutAt?: string;
+      /** How many of them carry no audience stamp (stored by a host's
+       *  writer that doesn't stamp), presented to the slot's owners and
+       *  its observers. */
+      unstamped?: number;
+    })
+  | (TraceEventBase & {
+      /** An agent's own rows that were stored and not in its window, found
+       *  when the agent was taken on or at boot, were presented to it. */
+      type: 'presentation:repaired';
+      agentName: string;
+      count: number;
+    })
+  | (TraceEventBase & {
+      /**
+       * A row was stamped for agents of which none reads the slot it is
+       * stored in (`deliveredTo`'s), so no window presents it by its
+       * audience. It is stored as named, never widened: observers of the
+       * slot see it only as their edge shows it.
+       */
+      type: 'presentation:unreadable-audience';
+      messageId?: string;
+      audience: string[];
+      slot: MessageSlotRef;
+      deliveredTo: string;
+    })
+  | (TraceEventBase & {
+      /** A presentation failed; the rows it didn't present stay out of the
+       *  agent's window for its next presentation point. At `adopt`, the
+       *  agent's window couldn't be written down (another version's index
+       *  format, or a failed write), and the agent stays in legacy mode: its
+       *  window is the whole record, as before the index. At `rebase`, after
+       *  the store's branch moved, its window couldn't be written down on
+       *  the new branch, or its context's strategy couldn't follow the move
+       *  (`error` says which), and it stays in legacy mode until the next
+       *  move. */
+      type: 'presentation:failed';
+      agentName: string;
+      occasion: PresentationOccasion;
+      error: string;
+    })
+  | (TraceEventBase & {
+      /** At a tool boundary's hand-off, the newest rows of the agent's
+       *  window weren't the rows the stream was about to be given, in that
+       *  order. The stream's later rounds are noted as unvouched, so their
+       *  thinking is left out at the next compile rather than refused. */
+      type: 'presentation:hand-off-mismatch';
+      agentName: string;
+      expected: string[];
+      tail: string[];
+    })
+  | (TraceEventBase & {
+      /**
+       * Rows were taken out of an agent's window. Every reason but `shed`
+       * is a removal from the record made through another agent's context,
+       * which context-manager tombstones in that context's window only: the
+       * rows it removed leave this agent's window too, each at its own
+       * place, so no other row's place moves (`hide`, `suppress` on its
+       * fork, a coalescer's `coalescer`, a module's `module`, a suppression
+       * a start finished, `resume`, and a refusal rewind's shed from a
+       * window that is still the record, `rewind`), or that no live context
+       * heard, found at boot (`boot`). `shed` is a refusal rewind's or an
+       * inference failure's shed on a presented window: the rows leave the
+       * agent's own window as an undone turn's do, and stay in the record.
+       * `elsewhere` is a window written down from the shared record when the
+       * agent was taken on, or after a branch move: the rows it took in that
+       * carry an audience stamp and aren't the agent's (another agent's own
+       * rows, mail stamped for others, a held row) leave it, and stay in the
+       * record (decision 1).
+       */
+      type: 'presentation:retracted';
+      agentName: string;
+      messageIds: string[];
+      reason: PresentationRetractReason;
+    })
+  | (TraceEventBase & {
+      /** An undo or a redo on the presentation index, counted in bodies.
+       *  An undo's `retracted` is the bodies from the turn's checkpoint on
+       *  that left the agent's window, the turn's own and what arrived
+       *  after it, and it carries no `represented`. A redo's
+       *  `retracted` is the rows that entered the window after the undo, and
+       *  any of the undo's own still in it after an undo cut short, which
+       *  left so the redone rows come back after their prefix; its
+       *  `represented` is the undone rows presented again. No branch
+       *  moved. */
+      type: 'window:undone';
+      agentName: string;
+      retracted: number;
+      represented?: number;
+    })
+
   // Held prose drafts (src/prose-drafts.ts): plain speech kept privately
   // instead of sent; a resident's explicit resend; a deliberate dismissal.
   | (TraceEventBase & {
@@ -1089,6 +1206,9 @@ export type TraceEvent =
       agentName: string;
       draftIds: string[];
     });
+
+/** Why rows left an agent's window (`presentation:retracted`). */
+export type PresentationRetractReason = 'hide' | 'suppress' | 'coalescer' | 'module' | 'resume' | 'rewind' | 'shed' | 'boot' | 'elsewhere';
 
 /**
  * Listener for trace events.

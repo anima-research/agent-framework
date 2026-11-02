@@ -1623,7 +1623,6 @@ function hostCommandFramework(outbox: DiscordAwarenessOutbox | null, messages: A
   framework.lastVisiblePreview = async () => null;
   framework.activeTurnTokens = new Map();
   framework.nextTurnToken = 1;
-  framework.deferredMessages = [];
   framework.pendingAssistantBlocks = new Map();
   // A host/command and a store surgery are operations stop() waits for.
   framework.operatorOperations = new Set();
@@ -1637,6 +1636,10 @@ function hostCommandFramework(outbox: DiscordAwarenessOutbox | null, messages: A
   framework.ephemeralRuns = new Map();
   framework.operatorLog = new OperatorLog(undefined);
   framework.opsAlert = () => {};
+  // A branch move drops every redo entry, and rebases each agent the
+  // presentation index presents for: here, none.
+  framework.redoStacks = new Map();
+  framework.presentation = null;
   return { framework, removed, setBranch: (name: string) => { currentBranch = name; } };
 }
 

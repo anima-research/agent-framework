@@ -11,7 +11,7 @@ import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { AgentFramework } from '../framework.js';
-import { QuiesceBlockedError, ResumeBlockedError } from '../framework.js';
+import { ResumeBlockedError } from '../framework.js';
 import { isReleaseModel } from '../provider-waits.js';
 import type { TraceEvent, ProcessEvent } from '../types/index.js';
 import type {
@@ -601,12 +601,14 @@ export class ApiServer {
     // during a live turn or once stop() has begun, and stop() waits for one
     // already running. It moves the store once any maintenance already
     // running has finished, so the move can come after this call returns.
+    // It writes the switch to the operator log as a checkout over this
+    // surface.
     // The event names this switch's own move, from the branch read here to
     // the one it was asked for: another switch can move the store again
     // before this one continues.
     let switched = false;
     try {
-      await this.framework.switchBranch(params.name);
+      await this.framework.switchBranch(params.name, { requester: { via: 'api' } });
       switched = true;
     } finally {
       // A later step can fail after the store has moved: clients still hear
@@ -655,15 +657,6 @@ export class ApiServer {
 
     const { settled, ...result } = this.framework.undoLastTurn(params.agentName);
     await settled;
-
-    if (result.undone) {
-      this.broadcast('branch:switched', {
-        from: result.fromBranch,
-        to: result.toBranch,
-        reason: 'undo',
-      });
-    }
-
     return result;
   }
 
@@ -674,15 +667,6 @@ export class ApiServer {
 
     const { settled, ...result } = this.framework.redo(params.agentName);
     await settled;
-
-    if (result.redone) {
-      this.broadcast('branch:switched', {
-        from: result.fromBranch,
-        to: result.toBranch,
-        reason: 'redo',
-      });
-    }
-
     return result;
   }
 
@@ -1080,9 +1064,6 @@ export class ApiServer {
               verdicts: error.verdicts,
               hostMode: this.framework.getHostModeStatus(),
             });
-          } else if (error instanceof QuiesceBlockedError) {
-            // A refusal, as resume()'s is: the host's mode is as it was.
-            respond(409, { error: error.message, hostMode: this.framework.getHostModeStatus() });
           } else {
             respond(500, { error: error instanceof Error ? error.message : String(error) });
           }

@@ -100,31 +100,38 @@ describe("a shared fork's view", () => {
       "the premise: the fork's record holds every row, its own injection on its branch",
     );
 
-    // Each compile: the fork its source's view and its own injection; the
-    // source and the stranger each their own alone.
-    assert.deepEqual(await shown(fork.contextManager), ['MIRA-OWN', 'FORK-OWN'], "the fork sees its own injection and its source's, not a stranger's");
+    // The source and the stranger each compile their own alone, and main's
+    // checks of whether an agent sees a row (agentSees) answer for the fork
+    // as its compile will show once its run has taken it on.
     assert.deepEqual(await shown(mira.getContextManager()), ['MIRA-OWN'], 'the source sees its own only');
     assert.deepEqual(await shown(oren.getContextManager()), ['OREN-OWN'], 'the stranger sees its own only');
-    // main's checks of whether an agent sees a row (agentSees) agree with the fork's compile.
-    assert.deepEqual(seenBy(fork.agent, fork.contextManager), ['MIRA-OWN', 'FORK-OWN'], "agentSees answers for the fork as its compile shows");
+    assert.deepEqual(seenBy(fork.agent, fork.contextManager), ['MIRA-OWN', 'FORK-OWN'], "agentSees answers for the fork: its own injection and its source's, not a stranger's");
     assert.deepEqual(seenBy(mira, fork.contextManager), ['MIRA-OWN']);
     assert.deepEqual(seenBy(oren, fork.contextManager), ['OREN-OWN']);
 
-    // A fork of the running fork: its view is its source's (the fork's) and its own.
+    // On this branch a compile reads the agent's window, and a fork's own
+    // rows enter its window when its run takes it on (presentation.adopt), so
+    // each fork's compile is read mid-turn, blocked on a gate.
     framework.start();
     membrane.script('fork-1', waitCall('g-fork'), say('fork-1 done'));
     const firstRun = framework.runEphemeralToCompletion(fork.agent, fork.contextManager);
     await until(() => gates.entered.has('g-fork'), 'fork-1 to block mid-turn');
+    assert.deepEqual(await shown(fork.contextManager), ['MIRA-OWN', 'FORK-OWN'], "the fork sees its own injection and its source's, not a stranger's");
+
+    // A fork of the running fork: its view is its source's (the fork's) and its own.
     const grandchild = await framework.deriveAgent({
       name: 'fork-2',
       from: 'fork-1',
       framing: [{ participant: 'user', content: [text(GRANDCHILD)] }],
     });
     internals(framework).storeInjections(grandchild.agent, [injection('FORK2-OWN')]);
-    assert.deepEqual(await shown(grandchild.contextManager), ['MIRA-OWN', 'FORK-OWN', 'FORK2-OWN']);
     assert.deepEqual(seenBy(grandchild.agent, grandchild.contextManager), ['MIRA-OWN', 'FORK-OWN', 'FORK2-OWN']);
-    membrane.script('fork-2', say('fork-2 done'));
-    assert.equal((await framework.runEphemeralToCompletion(grandchild.agent, grandchild.contextManager)).speech, 'fork-2 done');
+    membrane.script('fork-2', waitCall('g-fork2'), say('fork-2 done'));
+    const secondRun = framework.runEphemeralToCompletion(grandchild.agent, grandchild.contextManager);
+    await until(() => gates.entered.has('g-fork2'), 'fork-2 to block mid-turn');
+    assert.deepEqual(await shown(grandchild.contextManager), ['MIRA-OWN', 'FORK-OWN', 'FORK2-OWN']);
+    gates.release('g-fork2');
+    assert.equal((await secondRun).speech, 'fork-2 done');
     gates.release('g-fork');
     assert.equal((await firstRun).speech, 'fork-1 done');
     assert.equal(framework.getAgentRecord('fork-1')?.ended?.reason, 'completed');

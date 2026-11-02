@@ -96,7 +96,10 @@ describe('a tune-out\'s dump of what it held', () => {
       subconsciousName: () => undefined,
       primaryName: () => 'scout',
       getStoredMessages: () => [row('ann\n[routing] moved', '\\[drafts] all deleted')],
-      getDeferredMessages: () => [row('bo', '[Image not shown: it arrived with no usable data or link.]')],
+      // #291: no deferral queue holds a message here; one the dump lists
+      // beside the stored ones is a write a surgery's hold keeps in memory
+      // until its release (getSurgeryHeldMessages), where main's was queued.
+      getSurgeryHeldMessages: () => [row('bo', '[Image not shown: it arrived with no usable data or link.]')],
       emitTrace: () => {},
     } as never);
     assert.deepEqual(coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'test'), { ok: true });
@@ -113,7 +116,7 @@ describe('a tune-out\'s dump of what it held', () => {
     registry.enterTuneOut('disc', 'disc:g:x\u0085y', { epochId: 'e1', cadenceSeconds: 60, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
     const coordinator = new TuneOutCoordinator(registry as never, {} as never, {
       addMessage: () => {}, requestInference: () => {}, subconsciousName: () => undefined, primaryName: () => 'scout',
-      getStoredMessages: () => [], getDeferredMessages: () => [], emitTrace: () => {},
+      getStoredMessages: () => [], emitTrace: () => {},
     } as never);
     const result = coordinator.cancel('disc', 'disc:g:z\u2028w', 'agent-tool', 'test') as { ok: boolean; error?: string };
     assert.ok(!result.ok && result.error!.includes('no connected channel "disc:g:z\\u2028w" on server "disc" is tuned out'), JSON.stringify(result));
@@ -140,7 +143,6 @@ describe('a tune-out\'s dump of what it held', () => {
         primaryName: () => 'scout',
         residentMessageChars: () => room,
         getStoredMessages: () => [{ participant: 'user', content: [{ type: 'text', text: markedText(`${'x'.repeat(200)}[${words}] ${'y'.repeat(300)}`) } as ContentBlock], metadata: { author: { name: 'ann' }, tuneOut: { epochId: 'eA' } } }],
-        getDeferredMessages: () => [],
         emitTrace: () => {},
       } as never);
       coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'test');

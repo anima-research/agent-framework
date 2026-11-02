@@ -275,7 +275,7 @@ function silentTick() {
   };
 }
 
-type Row = { participant: string; content: ContentBlock[]; metadata?: Record<string, any>; timestamp: Date };
+type Row = { id: string; participant: string; content: ContentBlock[]; metadata?: Record<string, any>; timestamp: Date };
 
 /** A membrane that answers a turn it has no response queued for with a
  *  plain reply, for a test where a second resident takes turns of its own. */
@@ -366,8 +366,10 @@ describe('clock rows in the framework', () => {
       const between = all.slice(first + 1, second).filter(isClock);
       assert.deepEqual(between.map(textOf), ['Clock: 11:20 UTC'], 'one clock for the gap: 10:50 to 11:20 coalesced');
       assert.ok(isClock(all[second - 1]!), 'it stands right before the event');
+      // A clock row is the agent's own row, stamped so (#291's audience stamp).
       assert.deepEqual(all[second - 1]!.metadata, {
         system: true, kind: 'clock', clock: { at: at('2026-10-21T11:20:00Z'), onBoundary: true, zone: 'UTC' },
+        audience: ['assistant'], ownRowOf: 'assistant',
       });
       assert.equal(all[second - 1]!.participant, 'user');
       assert.match(requestText(x.membrane.calls[1]!), /Clock: 11:20 UTC[\s\S]*second/, 'the turn\'s request holds it before the event');
@@ -685,7 +687,11 @@ describe('clock rows in the framework', () => {
     } finally { await x.framework.stop(); }
   });
 
-  it('writes no clock into the residents\' shared slot while another resident\'s turn is alive', async () => {
+  // Ported for #291: a clock row is its resident's own row, in no other
+  // resident's window, so another resident's live turn holds none back. This
+  // test once had the clock wait for the assistant's turn to end, since in
+  // the shared record it would have sat inside that turn.
+  it('writes a clock for one resident while another resident\'s turn is alive, in no window but its own', async () => {
     const x = await make(undefined, { agents: [{ name: 'other', clock: { intervalMinutes: 10 } }], membrane: new AnsweringMembrane() });
     const writeFor = (name: string, text: string) =>
       (x.framework as any).addMessage('user', [{ type: 'text', text }], {}, { forAgent: name });
@@ -702,9 +708,38 @@ describe('clock rows in the framework', () => {
       writeFor('other', 'for other, after');
       await x.framework.runUntilIdle();
       const all = rows(x.framework);
-      assert.ok(!isClock(all[indexOfText(all, 'for other, mid-turn') - 1]!),
-        'none while the assistant\'s turn is alive, though 11:10 had passed: it would sit inside that turn');
-      assert.equal(textOf(all[indexOfText(all, 'for other, after') - 1]!), 'Clock: 11:30 UTC', 'one once it has ended');
+      const clock = all[indexOfText(all, 'for other, mid-turn') - 1]!;
+      assert.equal(textOf(clock), 'Clock: 11:10 UTC', "one while the assistant's turn is alive, as 11:10 had passed");
+      assert.equal(x.framework.getAgent('assistant')!.getContextManager().ordinalOf(clock.id as never), undefined, "in no window of the assistant's");
+      assert.notEqual(x.framework.getAgent('other')!.getContextManager().ordinalOf(clock.id as never), undefined, "in other's");
+      assert.equal(textOf(all[indexOfText(all, 'for other, after') - 1]!), 'Clock: 11:30 UTC', 'and the next once it is due');
+    } finally { await x.framework.stop(); }
+  });
+
+  // #291, AF-5: a message a tune-out holds is stored at once, whatever the
+  // resident's turn, where it waited behind the turn. Stored during the
+  // turn, it takes no clock row: the clock is the resident's own row, and it
+  // would sit inside that turn. The turn's tool boundary takes the clock due.
+  it('writes no clock before a held message stored during a turn, though one is due', async () => {
+    const x = await make();
+    const heldWrite = (text: string) =>
+      (x.framework as any).addMessage('antra', [{ type: 'text', text }], { tuneOut: { epochId: 'e1' } });
+    try {
+      setClock('2026-10-21T10:41:10Z');
+      await wake(x, event('warm'), [{ type: 'text', text: 'ok' }]);
+      setClock('2026-10-21T11:05:10Z');
+      let storedAtOnce = false;
+      x.mod.during = () => {
+        setClock('2026-10-21T11:16:10Z');
+        heldWrite('held mid-turn');
+        storedAtOnce = rows(x.framework).some((r) => textOf(r) === 'held mid-turn');
+      };
+      await wake(x, event('go'), [ping], [{ type: 'text', text: 'done' }]);
+      assert.ok(storedAtOnce, 'stored while the tool ran, not deferred behind the turn');
+      const all = rows(x.framework);
+      const held = indexOfText(all, 'held mid-turn');
+      assert.ok(!isClock(all[held - 1]!), 'no clock before it, though 11:10 had passed: it would sit inside the turn');
+      assert.ok(all.slice(held + 1).some(isClock), "the turn's tool boundary takes the clock due, after it");
     } finally { await x.framework.stop(); }
   });
 
@@ -712,7 +747,10 @@ describe('clock rows in the framework', () => {
     const x = await make(undefined, { framework: { subconscious: { enabled: true, systemPrompt: 'notice' } } });
     try {
       assert.ok(x.framework.getAgent('assistant')!.clock, 'the resident has one');
-      assert.equal(x.framework.getAgent('Subconscious')!.clock, undefined, 'its merged view carries the resident\'s');
+      // Its view carries the resident's clocks: its merged view, and with the
+      // presentation index its window, which takes the resident's clock rows
+      // by its observe edge (#291).
+      assert.equal(x.framework.getAgent('Subconscious')!.clock, undefined, 'its view carries the resident\'s');
     } finally { await x.framework.stop(); }
   });
 

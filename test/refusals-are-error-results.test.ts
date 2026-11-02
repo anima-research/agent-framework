@@ -28,7 +28,7 @@ const FIXTURE = join(import.meta.dirname, 'fixtures/tune-out-mcpl-server.mjs');
 const CHANNEL = 'disc:guild:noisy';
 /** The api module's answer for a tool it doesn't have: it has none. */
 const API_UNKNOWN = 'There\'s no tool "api--lookup", so nothing ran. The api module has no tools of its own: every tool you can call is in your tool list.';
-const TUNED_OUT = `Channel "${CHANNEL}" is tuned out: its messages go to the subconscious, and channel_open doesn't change ` +
+const TUNED_OUT = `Channel "${CHANNEL}" is tuned out: its messages are held from you and read by Subconscious, and channel_open doesn't change ` +
   `that. Call tune_out with channelId "${CHANNEL}" and mode "cancel" for it to resume normal attention; cancelling ` +
   'delivers the diverted backlog.';
 
@@ -154,8 +154,7 @@ test("the subconscious's refusals reach it as error results", async (t) => {
     { id: 'speak', name: 'speak_in_channel', input: { channelId: CHANNEL, text: 'They are tuned out.' } },
   ]]);
   assert.deepEqual(round!.get('summary'), {
-    content: 'Nothing was delivered: deliver_summary needs the summary in "text". If there\'s nothing to report, '
-      + "don't call it: staying silent is allowed.",
+    content: 'Nothing was delivered: deliver_summary needs the summary in "text".',
     isError: true,
   });
   assert.deepEqual(round!.get('cancel'), {
@@ -170,8 +169,8 @@ test("the subconscious's refusals reach it as error results", async (t) => {
   });
   assert.deepEqual(round!.get('speak'), {
     content: "Nothing was posted: speak_in_channel is turned off for you in the resident's configuration, and calling "
-      + "it again won't change that. The resident can speak there: tell it what's needed with deliver_summary, or, if the "
-      + 'channel is tuned out and needs the resident now, end the tune-out with cancel_tuneout.',
+      + "it again won't change that. The resident can speak there. deliver_summary puts your text in the resident's "
+      + 'context, and cancel_tuneout ends the tune-out and delivers its backlog to the resident.',
     isError: true,
   });
 });

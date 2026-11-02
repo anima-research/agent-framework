@@ -15,8 +15,8 @@
  *    its creation time is the only monotonic signal). Both watermarks are
  *    kept in the module's state, which follows the store's branches, so each
  *    branch sends its own messages and summaries. A branch made at an earlier
- *    point, as an undo makes one, mints summary ids its parent already used,
- *    so a summary is keyed `sum:<id>@<created>`.
+ *    point, as a rollback makes one, mints summary ids its parent already
+ *    used, so a summary is keyed `sum:<id>@<created>`.
  *
  * What gets embedded per message: text blocks verbatim, plus the string
  * arguments of the agent's private-prose tools (think / journal / skip_reply
@@ -705,9 +705,10 @@ export class SemanticIndexer {
           if (budget <= 0) break;
           this.editedIds.delete(id);
           const m = this.cm.getMessage(id as never);
-          // Not on the current branch (e.g. /undo after the edit): drop it,
-          // never delete — /redo brings the message back and the time walk
-          // will not revisit it. Search-time branch checks hide it meanwhile.
+          // Not on the current branch (e.g. a rollback after the edit): drop
+          // it, never delete — a switch back to the branch that holds it
+          // brings the message back and the time walk will not revisit it.
+          // Search-time branch checks hide it meanwhile.
           if (!m) continue;
           edited.push(id); budget--;
           const item = messageToItem(m, this.cfg);

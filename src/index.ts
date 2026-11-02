@@ -8,6 +8,13 @@ export { Agent } from './agent.js';
 export { FLAT_MINIMUM_MS, type InferenceBoundsOptions } from './inference-bounds.js';
 export { storedInjectionMarkOf, type StoredInjectionMark } from './stored-injections.js';
 export type { StartStreamResult } from './agent.js';
+export type { PresentationOccasion } from './presentation.js';
+export { covers, coverTest, describeReadMark, markAtOrAfter, type Cover, type MarkCm, type MarkedRow, type ReadMark } from './read-marks.js';
+// How a resident's context and the subconscious's are opened (#291), for a host that opens one itself.
+export {
+  residentContextOptions, residentViewFilter, subconsciousContextOptions, subconsciousViewFilter,
+  type ContextManagerOpenOptions,
+} from './context-options.js';
 export { ProcessQueueImpl } from './queue.js';
 export { ModuleRegistry } from './module-registry.js';
 export { ShutdownTimeoutError, DEFAULT_SHUTDOWN_TIMEOUT_MS } from './shutdown.js';

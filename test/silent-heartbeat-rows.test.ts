@@ -21,6 +21,7 @@ import type { AgentConfig, Module, ModuleContext, ToolCall, ToolDefinition, Tool
 import { TOOL_RESULT_GUARD_NOTICE } from '../src/tool-result-guard.js';
 import { PassthroughStrategy } from '@animalabs/context-manager';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+import { withAudience } from '../src/dendrite/audience.js';
 import { MembraneError, NativeFormatter } from '@animalabs/membrane';
 import type { ContentBlock, NormalizedMessage, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 
@@ -28,7 +29,7 @@ class ToolModule implements Module {
   readonly name = 'tools';
   calls: ToolCall[] = [];
   /** A message someone sends while the next call runs: the agent's turn is
-   * alive, so it is deferred to the tool boundary. */
+   * alive, so it enters its window at the tool boundary. */
   arrive: string | null = null;
   /** The next call's result ends the turn. */
   endTurn = false;
@@ -647,14 +648,15 @@ describe('replies to a [Continue] turn', () => {
     const x = await make({ deliver: false });
     try {
       await wake(x, ordinaryEvent('hello'), signed('sig-1', 'first reply'));
-      // A render still queued (for another resident) keeps its wake to read
-      // it, which starts a turn with nothing new for this agent: [Continue].
+      // A render stored for another resident, never in this agent's window,
+      // keeps its wake to read it (#291: no request of this agent's carried
+      // it), which starts a turn with nothing new for this agent: [Continue].
       const internals = x.framework as any;
-      internals.deferredMessages.push({ id: 'render-x', seq: 1, participant: 'editor', forAgent: 'ghost', content: [{ type: 'text', text: 'elsewhere' }], heldAt: Date.now() });
+      const render = x.framework.getAgent('assistant')!.getContextManager()
+        .addMessage('editor', [{ type: 'text', text: 'elsewhere' }], withAudience(undefined, ['ghost']));
       x.membrane.pushResponse(createMockResponse(signed('sig-c', 'continued reply'), 'end_turn'));
-      internals.pendingRequests.push({ agentName: 'assistant', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsDeferredWrite: 'render-x' });
+      internals.pendingRequests.push({ agentName: 'assistant', reason: 'mcpl:push-event', source: 'editor', timestamp: Date.now(), readsRow: render });
       await x.framework.runUntilIdle();
-      internals.deferredMessages.splice(0);
       assert.equal(textOf(x.membrane.calls[1]!.messages.at(-1)!), '[Continue]');
       assert.equal(rowWith(x.framework, 'continued reply').metadata?.promptedBy?.text, '[Continue]', 'the reply carries the prompt it followed');
     } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
@@ -872,34 +874,55 @@ describe('replies to a [Continue] turn', () => {
     return { ...x, membrane, strategy, pending: () => internal.pendingRequests };
   }
 
-  it("a reply resumed after a provider cooldown follows the message that arrived during it, not [Continue], and the message's wake then starts no turn of its own", async () => {
-    // A message arrives during the cooldown, so the resumed compile ends on
-    // it, while the round, still in the window, renders [Continue] earlier.
+  it("a reply resumed after a provider cooldown is its [Continue] turn's next round, and a message that arrived during the cooldown follows it", async () => {
+    // A message arrives during the cooldown. The restart continues its
+    // logical turn, which takes no new input (#291's presentation index: the
+    // message is stored and enters the window at the turn's end), so the
+    // resumed compile ends on the round, which, still in the window, renders
+    // [Continue] earlier, and the resumed reply follows [Continue] with
+    // nothing new between. The message's wake doesn't go with the resumed
+    // turn, which never shows it the message: it starts a turn of its own
+    // after it, which reads it. (Before #291 the message was stored in the
+    // shared record during the cooldown, the resumed compile ended on it, the
+    // reply followed it, and main drops the message's wake as read.)
     const x = await heldRestartMeets({ deliver: false, event: ordinaryEvent('arrived during the cooldown'), resumed: [createMockResponse(signed('sig-r', 'resumed reply'))] });
     try {
-      assert.equal(x.membrane.calls.length, 4, 'first, the continued reply, its held restart, the resumed attempt');
-      assert.deepEqual(x.pending(), [], "the message's wake is gone");
+      assert.equal(x.membrane.calls.length, 5,
+        "first, the continued reply, its held restart, the resumed attempt, and the message's own turn");
+      assert.deepEqual(x.pending(), [], "the message's wake was spent on its own turn");
       const resumed = x.membrane.calls[3]!.messages;
-      assert.equal(textOf(resumed.at(-1)!), 'arrived during the cooldown');
+      assert.ok(resumed.at(-1)!.content.some((b) => b.type === 'tool_result'), 'the resumed compile ends on its round');
+      assert.ok(!resumed.some((m) => textOf(m) === 'arrived during the cooldown'), 'a restart takes no new input');
       assert.ok(resumed.some((m) => textOf(m) === '[Continue]'), 'the round renders its [Continue]');
-      assert.equal(rowWith(x.framework, 'resumed reply').metadata?.promptedBy, undefined);
+      assert.equal(rowWith(x.framework, 'resumed reply').metadata?.promptedBy?.text, '[Continue]', 'the reply is a round of the [Continue] turn');
+      const own = x.membrane.calls[4]!.messages;
+      assert.equal(textOf(own.at(-1)!), 'arrived during the cooldown', "the message's wake reads it, the newest of its window");
 
-      // Later, the window folds the round: no [Continue] is left to render.
+      // Later, the window folds the round: the reply is the turn's first
+      // surviving row, so [Continue] renders before it, and the message that
+      // arrived during the cooldown after it.
       x.strategy.omit = true;
       x.membrane.queues.splice(0);
       x.membrane.queues.push([createMockResponse(signed('sig-later', 'later reply'))]);
       await wake(x, ordinaryEvent('later'));
-      const later = x.membrane.calls[4]!.messages;
+      const later = x.membrane.calls[5]!.messages;
       const replyAt = later.findIndex((m) => textOf(m) === 'resumed reply');
-      assert.equal(textOf(later[replyAt - 1]!), 'arrived during the cooldown');
-      assert.ok(!later.some((m) => textOf(m) === '[Continue]'));
+      assert.equal(textOf(later[replyAt - 1]!), '[Continue]');
+      assert.equal(textOf(later[replyAt + 1]!), 'arrived during the cooldown', "which entered the window at the turn's end");
+      assert.equal(later.filter((m) => textOf(m) === '[Continue]').length, 1);
     } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
   });
 
-  it("a message that arrived while a restart was held keeps its wake when the resumed request that carried it fails", async () => {
+  // Read onto #291: a resumed turn presents no arrival, so the resumed
+  // request never carries the message that arrived while the restart was
+  // held (main's premise, where the record was every agent's window). Each
+  // case below keeps main's question, whether the message's wake starts a
+  // turn, and that wake now starts one wherever no request it answered
+  // carried the message: whatever the resumed turn did.
+  it("a message that arrived while a restart was held keeps its wake when the resumed request fails", async () => {
     const x = await heldRestartMeets({ deliver: false, event: ordinaryEvent('arrived during the cooldown'), resumed: unretriedFailure() });
     try {
-      assert.equal(textOf(x.membrane.calls[3]!.messages.at(-1)!), 'arrived during the cooldown', 'the resumed request carried the message');
+      assert.ok(!x.membrane.calls[3]!.messages.some((m) => textOf(m) === 'arrived during the cooldown'), 'the resumed request takes no new input');
       assert.equal(x.membrane.calls.length, 5, "the message's wake started its own turn: no answered request carried the message");
       assert.ok(x.membrane.calls[4]!.messages.some((m) => textOf(m) === 'arrived during the cooldown'), "the wake's turn reads it");
     } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
@@ -922,22 +945,23 @@ describe('replies to a [Continue] turn', () => {
   });
 
   for (const deliver of [true, false]) {
-    it(`a channel message that arrived while a restart was held ${deliver ? 'starts no turn once the resumed turn answered it in its channel' : 'keeps its wake when the resumed turn read it but said nothing there'}`, async () => {
+    it(`a channel message that arrived while a restart was held keeps its wake whether or not the resumed turn spoke in its channel (${deliver ? 'it did' : 'it said nothing there'})`, async () => {
       const event = { ...ordinaryEvent('arrived during the cooldown'), serverId: 'stub', origin: { mcplChannelId: 'world:commons' } };
       const x = await heldRestartMeets({ deliver, event, resumed: [createMockResponse(signed('sig-r', 'resumed reply'))] });
       try {
-        assert.equal(textOf(x.membrane.calls[3]!.messages.at(-1)!), 'arrived during the cooldown', 'the resumed request carried the message');
-        assert.equal(x.membrane.calls.length, deliver ? 4 : 5, deliver ? "the message's wake started no turn" : "the message's wake started its own turn");
+        assert.ok(!x.membrane.calls[3]!.messages.some((m) => textOf(m) === 'arrived during the cooldown'), 'the resumed request takes no new input');
+        assert.equal(x.membrane.calls.length, 5, "the message's wake started its own turn: no request it answered carried the message");
+        assert.ok(x.membrane.calls[4]!.messages.some((m) => textOf(m) === 'arrived during the cooldown'), "the wake's turn reads it");
       } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
     });
   }
 
-  it('an ambient channel message that arrived while a restart was held starts no turn once the resumed turn read it, though the turn said nothing there', async () => {
+  it('an ambient channel message that arrived while a restart was held keeps its wake, as the resumed turn never read it', async () => {
     const event = { ...ordinaryEvent('arrived during the cooldown'), serverId: 'stub', origin: { mcplChannelId: 'world:commons' }, tags: ['chat:ambient'] };
     const x = await heldRestartMeets({ deliver: false, event, resumed: [createMockResponse(signed('sig-r', 'resumed reply'))] });
     try {
-      assert.equal(textOf(x.membrane.calls[3]!.messages.at(-1)!), 'arrived during the cooldown', 'the resumed request carried the message');
-      assert.equal(x.membrane.calls.length, 4, "the message's wake started no turn: its server marked it ambient");
+      assert.ok(!x.membrane.calls[3]!.messages.some((m) => textOf(m) === 'arrived during the cooldown'), 'the resumed request takes no new input');
+      assert.equal(x.membrane.calls.length, 5, "the message's wake started its own turn: ambient or not, nothing read it");
     } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
   });
 

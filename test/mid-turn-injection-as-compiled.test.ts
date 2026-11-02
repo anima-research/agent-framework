@@ -5,7 +5,7 @@
  * cap and with the image limits applied across the batch. One the render
  * can't place among the newest, such as one before the recent window under
  * context-manager 0.23.0's memory strategy, goes in as stored, which is how
- * the next compile sends it.
+ * the next compile sends it. The same with the presentation index on.
  */
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
@@ -26,6 +26,7 @@ import type {
 import { AgentFramework } from '../src/index.js';
 import { AutobiographicalStrategy, WindowedPassthroughStrategy, type ContextInjection, type MessageId } from '@animalabs/context-manager';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { covers } from '../src/read-marks.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
 const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
@@ -92,6 +93,10 @@ class InterjectingModule implements Module {
   }
 }
 
+// With the presentation index (#291), the boundary presents what it injects
+// before it renders it, since a render places only what the agent's window
+// holds. (Each case ran twice before presentation was mandatory, without the
+// index too; AF-6 took that run away with the flag.)
 describe('a message injected at a tool boundary', () => {
   let tempDir: string;
   let membrane: MockMembrane;
@@ -186,7 +191,7 @@ describe('a message injected at a tool boundary', () => {
     assert.equal(seen.calls, 1, 'the batch is rendered in one call');
     assert.deepEqual(injected.map((m) => m.content), [[text('PLACEDBEFORE')], [text('HEARD')]]);
     const row = agent.getContextManager().getAllMessages().find((m) => JSON.stringify(m.content).includes('PLACEDBEFORE'))!;
-    assert.ok(agent.getConsumedWatermark()!.sequence >= row.sequence, 'the consumed mark covers it, as anything injected');
+    assert.equal(covers(agent.getConsumedWatermark(), agent.getContextManager(), row), 'covered', 'the consumed mark covers it, as anything injected');
   });
 
   it("each message goes in as its own render gives it, in its place in the batch", async () => {
@@ -310,6 +315,10 @@ describe('a message injected at a tool boundary', () => {
     } as never));
     const cm = framework.getAgent('assistant')!.getContextManager();
     for (let i = 0; i < 3; i++) cm.addMessage(i % 2 ? 'assistant' : 'user', [text(`hist${i} before the new topic`)]);
+    // Rows written into the context past the framework enter the window at
+    // the agent's next point: here, before the reset presents its transition
+    // after them, as the history before a new topic is.
+    (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(framework.getAgent('assistant'));
     await cm.resetHeadWindow('A new topic.');
     const seen = renderWith((ids) => ids.map(() => null));
     const injected = await turnWith([[text('AFTERRESET a short message')]]);

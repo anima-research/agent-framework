@@ -78,11 +78,17 @@ async function host(t: { after(fn: () => Promise<void>): void }, opts: { compres
   const text = (content: string): void => {
     framework.pushEvent({ type: 'external-message', source: 'test', content, metadata: {} });
   };
+  // #291: a registered agent compresses its window, and a row written to its
+  // store directly, past the framework, enters that window at the agent's
+  // next presentation point. The test runs that point (presentAtEnd, the
+  // agent at rest), as a turn's end or a write through the framework would.
   const compress = (): void => {
-    const cm = framework.getAgent('resident')!.getContextManager();
+    const agent = framework.getAgent('resident')!;
+    const cm = agent.getContextManager();
     for (let i = 0; i < 30; i++) {
       cm.addMessage(i % 2 === 0 ? 'user' : 'resident', [{ type: 'text', text: `message ${i}: ${'word '.repeat(30)}` }]);
     }
+    (framework as unknown as { presentAtEndOf(agent: unknown): void }).presentAtEndOf(agent);
   };
   const started = (): number => traces.filter((type) => type === 'inference:started').length;
   return { framework, provider, status, until, text, compress, started, logged };
