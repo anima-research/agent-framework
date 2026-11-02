@@ -457,7 +457,10 @@ export interface AgentConfig {
    * context injections, stay out. One way: `nova` observing `mira` shows
    * nova mira's rows, not mira nova's. `create()` refuses a name that is
    * this agent's own or no configured agent's. Read when a configured agent
-   * is created; a derived agent's spec carries its own edges.
+   * is created. A derived agent takes none from it: `deriveAgent` declares
+   * no observe edge, and a shared derivation's context reads its source's
+   * slot on a branch of its own, so an edge on a slot of the host's branch
+   * would merge nothing into it.
    */
   observes?: string[];
 

@@ -242,7 +242,8 @@ export interface ForkReaderConfig extends SubconsciousConfigBase {
   forkIdleTimeoutMs?: number;
   /**
    * How a reader fork is prompted: the content of the one message it
-   * receives after the fork point. Default `defaultReaderFraming`. The
+   * receives after the fork point (a resumed persisted reader, after its
+   * own last round). Default `defaultReaderFraming`. The
    * framework stores whatever this returns as a user message with
    * `metadata.kind = 'tune-out-reader-framing'`; the notice, voice,
    * dispositions and held traffic are in the context, and nothing else
@@ -260,12 +261,13 @@ export interface ForkReaderConfig extends SubconsciousConfigBase {
    *   `reader/<resident>/<epoch8>/g<k>` as `'look'` derives a fork, and each
    *   later look in that tune-out resumes it (`resumeAgent`): a new
    *   incarnation on the same branch, which continues from its own last
-   *   round. It is not derived again.
+   *   round, rather than a new fork.
    * - `'resident'`: the same, one identity across tune-outs,
    *   `reader/<resident>/g<k>`.
    *
    * The framework derives the identity again, under the next `g<k>`, when
-   * it has no ended record of it in scope, when the derivation's checkpoint
+   * it has no ended record of it in scope (with `'epoch'`, of that
+   * tune-out), when the derivation's checkpoint
    * is no longer on the host's branch, when (with `resync: 'window'`) its
    * last look was framed on another branch than the resident's window reads
    * now, or (with `'epoch'`) when the tune-out had ended before the look was
