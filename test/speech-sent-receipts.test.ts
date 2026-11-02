@@ -326,6 +326,10 @@ describe('plain speech a module says it showed', () => {
       surface.answer = answer;
       const membrane = new MockMembrane();
       const f = await host([surface], membrane);
+      const routed: string[] = [];
+      const registry = (f as unknown as { channelRegistry: { routeSpeech(...args: unknown[]): unknown } }).channelRegistry;
+      const routeSpeech = registry.routeSpeech.bind(registry);
+      registry.routeSpeech = (...args: unknown[]) => { routed.push(String(args[0])); return routeSpeech(...args); };
       const created = await f.createEphemeralAgent({ name: 'run-1', model: 'test-model', systemPrompt: 'Do the task.', proseRouting });
       created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
@@ -333,6 +337,7 @@ describe('plain speech a module says it showed', () => {
       f.start();
       const result = await run;
       assert.equal(result.speech, 'Done.');
+      await until(() => routed.includes('run-1'), "the run's speech reaching the registry, after any ask");
       assert.deepEqual(surface.asked, []);
       const runTexts = created.contextManager.getAllMessages().map((m) => textOf(m.content));
       assert.deepEqual(runTexts.filter((text) => text.startsWith('[delivered]')), []);
