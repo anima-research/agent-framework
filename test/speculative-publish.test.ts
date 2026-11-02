@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import type { ContentBlock, Membrane, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStreamOptions } from '@animalabs/membrane';
 import { AgentFramework, type AgentConfig, type Module, type ModuleContext, type ProcessEvent, type ProcessState } from '../src/index.js';
 import { MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
-import { PublishArgsReader, SpeculativePublishStreams, type SpeculativeStreamSink } from '../src/speculative-publish.js';
+import { PublishArgsReader, SpeculativePublishStreams, channelPublishWithServerId, type SpeculativeStreamSink } from '../src/speculative-publish.js';
 import { ChannelRegistry, type ChannelRef } from '../src/mcpl/channel-registry.js';
 import { ALL_CAPABILITY_PATHS, CapabilityGrant } from '../src/mcpl/capability-grant.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
@@ -1079,12 +1079,74 @@ test('framework: each publish outcome ends the stream as it is known: delivered,
   }
 });
 
-test('registry: channel_publish lists serverId as optional, and says to write it with channelId before content', () => {
+test("registry: channel_publish's own definition has no serverId; the speculative variant adds an optional one after channelId", () => {
   const h = streamingRegistry();
   const publish = h.registry.getChannelTools().find((t) => t.name === 'channel_publish')!;
   const schema = publish.inputSchema as { properties: Record<string, { type: string; description?: string }>; required?: string[] };
-  assert.deepEqual(Object.keys(schema.properties), ['channelId', 'serverId', 'content', 'text']);
-  assert.equal(schema.properties.serverId!.type, 'string');
-  assert.match(schema.properties.serverId!.description ?? '', /before content/);
-  assert.deepEqual(schema.required, []);
+  assert.deepEqual(Object.keys(schema.properties), ['channelId', 'content', 'text']);
+  const shown = channelPublishWithServerId(publish);
+  const shownSchema = shown.inputSchema as typeof schema;
+  assert.deepEqual(Object.keys(shownSchema.properties), ['channelId', 'serverId', 'content', 'text']);
+  assert.equal(shownSchema.properties.serverId!.type, 'string');
+  assert.match(shownSchema.properties.serverId!.description ?? '', /before content/);
+  assert.deepEqual(shownSchema.required, schema.required, 'serverId stays optional');
+  assert.equal(JSON.stringify({ ...shown, inputSchema: { ...shownSchema, properties: { ...shownSchema.properties, serverId: undefined } } }),
+    JSON.stringify(publish), 'nothing else changes');
+  assert.equal(JSON.stringify(h.registry.getChannelTools().find((t) => t.name === 'channel_publish')), JSON.stringify(publish), 'the registry keeps its own');
+});
+
+test("framework: only an agent whose tool surface opted in is shown serverId; others' channel_publish is the registry's, byte for byte, and a reader fork follows its resident", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'af-speculative-surface-')); dirs.push(dir);
+  const membrane = new ScriptMembrane([], {});
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
+    agents: [
+      { name: 'Glassy', model: 'test', systemPrompt: 'system', proseRouting: 'disabled', speculativeChannelChunks: true },
+      { name: 'Plain', model: 'test', systemPrompt: 'system', proseRouting: 'disabled' },
+    ],
+    modules: [new WakeModule()], syncIntervalMs: 0,
+  });
+  const h = streamingRegistry();
+  (framework as unknown as { channelRegistry: unknown }).channelRegistry = h.registry;
+  // As an inference reads them: with its snapshot, as a reader fork's does.
+  const toolsOf = (name: string) => (framework as unknown as {
+    getToolsForAgent(n: string, snapshot: { sameRoundThinkTextPolicy: string }): Array<{ name: string; inputSchema?: unknown }>;
+  }).getToolsForAgent(name, { sameRoundThinkTextPolicy: 'public' });
+  const publishOf = (name: string) => toolsOf(name).find((t) => t.name === 'channel_publish')!;
+  const registryPublish = h.registry.getChannelTools().find((t) => t.name === 'channel_publish')!;
+  try {
+    await framework.start();
+    assert.equal(JSON.stringify(publishOf('Plain')), JSON.stringify(registryPublish), "a non-opted agent's channel_publish is byte-equal to the registry's");
+    assert.equal(JSON.stringify(publishOf('Glassy')), JSON.stringify(channelPublishWithServerId(registryPublish)));
+    // Every other tool is the same for both.
+    const others = (name: string) => JSON.stringify(toolsOf(name).filter((t) => t.name !== 'channel_publish'));
+    assert.equal(others('Glassy'), others('Plain'));
+
+    await framework.deriveAgent({
+      name: 'glassy-reader', from: 'Glassy', mode: 'copy', kind: 'subconscious-fork',
+      framing: [{ participant: 'user', content: [{ type: 'text', text: 'Read and report.' }] }],
+    });
+    await framework.deriveAgent({
+      name: 'plain-reader', from: 'Plain', mode: 'copy', kind: 'subconscious-fork',
+      framing: [{ participant: 'user', content: [{ type: 'text', text: 'Read and report.' }] }],
+    });
+    assert.equal(JSON.stringify(publishOf('glassy-reader')), JSON.stringify(publishOf('Glassy')), "a reader fork shares its opted-in resident's definition");
+    assert.equal(JSON.stringify(publishOf('plain-reader')), JSON.stringify(registryPublish));
+  } finally { await framework.stop(); }
+});
+
+test('registry: a shared-name refusal names the channelId and serverId pairs for a caller shown serverId, and is unchanged for others', async () => {
+  const h = streamingRegistry();
+  await h.register('bosun', 'shared', SPECULATIVE);
+  await h.register('chat', 'shared', SPECULATIVE);
+  const plain = await h.registry.handleChannelToolCall('channel_publish', { channelId: 'shared', content: 'Hi.' }, { kind: 'agent', agentName: 'Plain' });
+  const opted = await h.registry.handleChannelToolCall('channel_publish', { channelId: 'shared', content: 'Hi.' },
+    { kind: 'agent', agentName: 'Glassy', showsServerId: true });
+  assert.equal(plain.isError, true);
+  assert.equal(plain.error,
+    'Channel "shared" is on more than one server ("bosun:shared", "chat:shared"), so nothing was posted. Call again with channelId set to one of them.',
+    "a non-opted caller's text is as on main");
+  assert.equal(opted.error, plain.error + ' To have a channel that streams speech hear it as you write, call again with '
+    + 'channelId "shared" with serverId "bosun" or channelId "shared" with serverId "chat", written before content.');
+  assert.equal(h.publishes.length, 0);
 });

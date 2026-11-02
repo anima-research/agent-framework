@@ -248,6 +248,30 @@ function isWhitespace(ch: string): boolean {
 
 const SIMPLE_ESCAPES: Record<string, string> = { '"': '"', '\\': '\\', '/': '/', b: '\b', f: '\f', n: '\n', r: '\r', t: '\t' };
 
+/**
+ * channel_publish as an agent with speculative chunks is shown it: with an
+ * optional `serverId` after `channelId`. A stream's text goes out as it is
+ * written only once both are read, so the description says to write them
+ * before content. Other agents' definition stays the registry's.
+ */
+export function channelPublishWithServerId<T extends { inputSchema?: unknown }>(tool: T): T {
+  const schema = tool.inputSchema as { properties?: Record<string, unknown> } | undefined;
+  if (!schema?.properties || 'serverId' in schema.properties) return tool;
+  const properties: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(schema.properties)) {
+    properties[key] = value;
+    if (key === 'channelId') properties.serverId = SPECULATIVE_SERVER_ID_PROPERTY;
+  }
+  if (!('serverId' in properties)) properties.serverId = SPECULATIVE_SERVER_ID_PROPERTY;
+  return { ...tool, inputSchema: { ...schema, properties } };
+}
+
+const SPECULATIVE_SERVER_ID_PROPERTY = {
+  type: 'string',
+  description: 'Owning MCPL server of channelId; optional. A channel that streams speech as you write hears it only '
+    + 'once channelId and serverId are both given, so write them before content.',
+} as const;
+
 /** Where a speculative stream's messages go: the channel registry's side. */
 export interface SpeculativeStreamSink {
   /**

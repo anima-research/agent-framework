@@ -16,9 +16,9 @@ Upstream discussion: anima-research/agent-framework#892.
 
 ## Enabling it
 
-Both sides have to opt in. Other channels and other agents see no change, apart
-from one shared thing: `channel_publish`'s schema lists an optional `serverId`,
-whose description says to write it before `content` (every agent's schema).
+Both sides have to opt in. Other channels and other agents see no change: an
+opted-in agent's `channel_publish` lists an optional `serverId` (below), and
+every other agent's `channel_publish` definition is unchanged, byte for byte.
 
 - **Agent:** `AgentConfig.speculativeChannelChunks: true` (default false).
   connectome-host's recipe takes it as `agent.speculativeChannelChunks`.
@@ -109,9 +109,11 @@ first chunk:
   so nothing goes out while the call is written. Once it is finished, its
   whole text goes out as one chunk, just before the publish, to the channel
   its final arguments name. To stream as it writes, a call writes
-  `channelId` and `serverId` before `content` (`channel_publish` takes
-  `serverId`, which its schema lists as optional, with a description that
-  says to write it with `channelId` before `content`).
+  `channelId` and `serverId` before `content`. An agent with the option is
+  shown `serverId` as an optional property of `channel_publish`, with a
+  description that says so, and so is a fork that shares its tool surface
+  (the surface owner's opt-in decides). A shared-name refusal to such an
+  agent also names each `channelId` and `serverId` pair.
 - `channelId` not given: the channel the publish defaults to (host 0.19: the
   turn's channel, the one whose message woke it). That is known only once the
   call is finished, since a later argument could still name a channel, so the
@@ -127,9 +129,11 @@ channel ever gets text that another channel's publish carries.
 ## Notes for servers
 
 - Chunks are speculative: speak them, but be ready for `cancelled`, and treat
-  `complete`'s content as the text that was published. This host completes a
-  stream only when that text is what the chunks carried; otherwise it cancels
-  the stream, and the publish that follows carries no `streamId`.
+  `complete`'s content as the text that was published. The full `complete`
+  carries the same text the chunks did: when the finished call's text differs
+  from what the chunks carried, the host cancels the stream, and the publish
+  that follows carries no `streamId`. When the publish's outcome is unknown,
+  the host sends neither a full nor a cancelled end.
 - The publish that follows a stream carries the same `streamId`. A server
   that handled that publish can settle the stream from the `streamId` and its
   own outcome of the publish, without waiting for the host's end

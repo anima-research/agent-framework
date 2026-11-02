@@ -893,7 +893,7 @@ const settingBoolean = (name: string, value: unknown): boolean => {
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
 import { asCalled, cutOffRefusal, markedInputRefusal, toolArgsProblems } from './tool-args.js';
-import { SpeculativePublishStreams } from './speculative-publish.js';
+import { SpeculativePublishStreams, channelPublishWithServerId } from './speculative-publish.js';
 import { cutOffRound, type CutOffCall } from './cut-off-round.js';
 import { EventGate, MCPL_GATE_EVENT_TYPES, checkToolInput, formatShadowWarning, shownValue, wakeLineText } from './gate/event-gate.js';
 import { ReplyJudge } from './gate/reply-judge.js';
@@ -8621,6 +8621,10 @@ export class AgentFramework {
       if ((tool.name === 'channel_open' || tool.name === 'channel_close') && !this.holdsChannelTrafficForTools(agentName)) {
         return { ...tool, description: NON_HOLDER_CHANNEL_DESCRIPTIONS[tool.name] };
       }
+      // Speculative chunks stream as written only with channelId and serverId
+      // both given: an agent whose surface owner opted in is shown the
+      // optional serverId; every other agent's definition is the registry's.
+      if (tool.name === 'channel_publish' && this.showsSpeculativeServerId(agentName)) return channelPublishWithServerId(tool);
       return tool;
     });
   }
@@ -22578,6 +22582,12 @@ export class AgentFramework {
     return channel ? { streamId: `spec_${callId}`, channel, live: false } : undefined;
   }
 
+  /** Whether an agent is shown channel_publish's optional serverId: its tool-surface owner has speculativeChannelChunks. */
+  private showsSpeculativeServerId(agentName: string): boolean {
+    const owner = this.toolSurfaceOwners.get(agentName) ?? agentName;
+    return this.agents.get(owner)?.speculativeChannelChunks === true;
+  }
+
   /** Drops an agent's calls from speculativeCalls, where they still map to that stream set (any, when none is given). */
   private forgetSpeculativeCalls(agentName: string, callIds: string[], streams?: SpeculativePublishStreams): void {
     for (const id of callIds) {
@@ -27465,7 +27475,9 @@ export class AgentFramework {
           : call.input;
         // A call whose text went out ahead of it publishes where it went or nowhere, by this path too.
         const pin = call.name === 'channel_publish' && origin.kind === 'agent' ? this.speculativePinOf(origin.agentName, call.id) : undefined;
-        const withTurn = origin.kind === 'agent' && turn ? { ...origin, inTurn: true } : origin;
+        const withTurn = origin.kind === 'agent'
+          ? { ...origin, ...(turn ? { inTurn: true } : {}), ...(call.name === 'channel_publish' && this.showsSpeculativeServerId(origin.agentName) ? { showsServerId: true } : {}) }
+          : origin;
         return this.channelRegistry!.handleChannelToolCall(call.name, input, pin && withTurn.kind === 'agent' ? { ...withTurn, speculativeStream: pin } : withTurn);
       }
 
@@ -36679,6 +36691,7 @@ export class AgentFramework {
     const publishing = this.channelRegistry!.handleChannelToolCall(call.name, channelInput, {
       kind: 'agent', agentName, own: callingTurn ? this.ownChannels(callingTurn) : [], ...(callingTurn ? { inTurn: true } : {}), ...(earlierWake ? { earlierWake } : {}),
       ...(speculativeStream ? { speculativeStream } : {}),
+      ...(call.name === 'channel_publish' && this.showsSpeculativeServerId(agentName) ? { showsServerId: true } : {}),
     }, published)
       .then((result) => {
         const destination = published.outcome?.status === 'delivered' ? published.outcome.destination : undefined;

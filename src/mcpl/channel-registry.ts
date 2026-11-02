@@ -571,10 +571,6 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
       type: 'object' as const,
       properties: {
         channelId: { type: 'string', description: "ID of the channel to publish to (defaults to where your plain speech goes this turn, as the tool's description says; required of a subagent)" },
-        serverId: {
-          type: 'string',
-          description: "Owning MCPL server of channelId; optional. A channel that streams speech as you write hears it only once channelId and serverId are both given, so write them before content.",
-        },
         content: { type: 'string', description: 'Text content to publish' },
         text: { type: 'string', description: 'Alias for content' },
       },
@@ -919,6 +915,18 @@ function withStop(text: string): string {
  * the resident to judge. The publish executor and channel_publish both read
  * a failed request this way.
  */
+/**
+ * For a caller shown channel_publish's serverId (speculative chunks): the
+ * channelId and serverId pairs that pick each of a shared name's channels,
+ * which a channel that streams speech hears as the text is written when they
+ * come before content.
+ */
+function speculativePairsText(entries: readonly ChannelEntry[]): string {
+  const pairs = entries.map((e) => `channelId ${JSON.stringify(e.descriptor.id)} with serverId ${JSON.stringify(e.serverId)}`);
+  const listed = pairs.length <= 1 ? pairs.join('') : `${pairs.slice(0, -1).join(', ')} or ${pairs[pairs.length - 1]}`;
+  return ` To have a channel that streams speech hear it as you write, call again with ${listed}, written before content.`;
+}
+
 function publishErrorOutcome(err: unknown, destination: PublishDestination, at: number): PublishOutcome {
   const message = requestErrorText(err);
   const notSent = err instanceof McplRequestError && err.outcome === 'not-sent';
@@ -1160,6 +1168,10 @@ export type ChannelToolOrigin =
      *  channel it went to. The publish goes to that channel or is refused,
      *  and carries the id while the stream is open (`live`). */
     speculativeStream?: { streamId: string; channel: ChannelRef; live?: boolean };
+    /** The caller is shown channel_publish's optional serverId (it has
+     *  speculative chunks), so a refusal of a shared name names the
+     *  channelId and serverId pairs, which stream as the text is written. */
+    showsServerId?: boolean;
   };
 
 /** The machine decision sources a module-origin channel_close may record.
@@ -6376,7 +6388,8 @@ export class ChannelRegistry {
         if (seen) seen.refusal = 'shared-id';
         return {
           success: false,
-          error: this.sharedNameRefusal(input.channelId, matches, { takesServerId: false, nothing: 'nothing was posted' }),
+          error: this.sharedNameRefusal(input.channelId, matches, { takesServerId: false, nothing: 'nothing was posted' })
+            + (origin?.kind === 'agent' && origin.showsServerId ? speculativePairsText(matches) : ''),
           isError: true,
         };
       }
@@ -6394,11 +6407,11 @@ export class ChannelRegistry {
           ? serverGiven
             ? `Server "${input.serverId}" has no channel ${quotedValue(fallback!.channelId)}, the id of the channel this call would default to, so nothing was posted.`
             : `The channel this would default to, ${this.quotedShown(fallback!)}, isn't registered now, so nothing was posted.`
-          // A serverId here is a host's ref (publishForAgent) or the agent's
-          // own (the schema lists it, optional, for speculative chunks), and
-          // the refusal offers names its channelId takes instead. (A fork's
-          // guard refuses a home its server no longer registers before this
-          // runs.)
+          // A serverId here is a host's ref (publishForAgent), or the
+          // agent's own: an agent with speculative chunks is shown one
+          // (getToolsForAgent), others add it unasked. The refusal offers
+          // names its channelId takes instead. (A fork's guard refuses a home
+          // its server no longer registers before this runs.)
           : serverGiven
             ? `No channel "${input.channelId}" is on server "${input.serverId}", so nothing was posted. ${this.elsewhereText(input.channelId, false)}`
             : `No channel has the id "${input.channelId}", so nothing was posted. ${findIds}`,
