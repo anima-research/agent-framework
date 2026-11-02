@@ -337,7 +337,7 @@ describe('plain speech a module says it showed', () => {
       f.start();
       const result = await run;
       assert.equal(result.speech, 'Done.');
-      await until(() => routed.includes('run-1'), "the run's speech reaching the registry, after any ask");
+      await until(() => routed.includes('run-1') || surface.asked.length > 0, "the run's speech reaching the registry, or a module being asked");
       assert.deepEqual(surface.asked, []);
       const runTexts = created.contextManager.getAllMessages().map((m) => textOf(m.content));
       assert.deepEqual(runTexts.filter((text) => text.startsWith('[delivered]')), []);
