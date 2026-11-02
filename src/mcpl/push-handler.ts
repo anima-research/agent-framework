@@ -22,6 +22,7 @@ import type { InboundSource } from './inbound-source.js';
 import { isSilentHeartbeatMarker, isVisiblyEmptyConversion } from './visible-content.js';
 import { logDetail, logValue } from './log-value.js';
 import { RefusalLines } from './refusal-lines.js';
+import type { TraceEventInput } from '../types/trace.js';
 
 // ============================================================================
 // McplPushEvent (the ProcessEvent shape pushed to the queue)
@@ -111,7 +112,7 @@ interface Responder {
 export class PushHandler {
   private featureSetManager: FeatureSetManager;
   private pushEventFn: (event: McplPushEvent) => void;
-  private emitTraceFn: (event: { type: string; [key: string]: unknown }) => void;
+  private emitTraceFn: (event: TraceEventInput) => void;
   private shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean;
   private dedup = new DedupSet(1000);
   /** Holds back repeats of the line for a channel-scoped push refused because
@@ -121,7 +122,7 @@ export class PushHandler {
   constructor(
     featureSetManager: FeatureSetManager,
     pushEventFn: (event: McplPushEvent) => void,
-    emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
+    emitTraceFn: (event: TraceEventInput) => void,
     shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean,
     private readonly handleCoalesced?: (serverId: string, params: PushEventParams, event: McplPushEvent) => Promise<PushEventResult>,
     /** An ordinary (uncoalesced) push was just admitted, before it is queued
