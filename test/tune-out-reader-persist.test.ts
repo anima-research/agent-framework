@@ -44,7 +44,12 @@ type Internals = {
   invokeReaderFork(invocation: Invocation): void;
   addMessage(participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, opts?: { forAgent?: string }): MessageId;
   pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number }>;
-  store: { listBranches(): Array<{ name: string }>; currentBranch(): { name: string } };
+  store: {
+    listBranches(): Array<{ name: string }>;
+    currentBranch(): { name: string };
+    currentSequence(): number;
+    createBranchAt(name: string, from: string, at: number): unknown;
+  };
 };
 
 const dirs: string[] = [];
@@ -349,5 +354,148 @@ describe('a persisted reader: re-synced by framing', () => {
     const { residentRows: _rows, resumed: _r, incarnation: _i, ...look } = ctx;
     assert.deepEqual(defaultReaderFraming(look), defaultReaderFraming({ ...look }), 'premise');
     assert.ok(!JSON.stringify(defaultReaderFraming(look)).includes("scout's context"), "without residentRows there's no block");
+  });
+});
+
+describe('a persisted reader: derived again, and when not', () => {
+  const rederived = (traces: TraceEvent[]) => traces.filter((e) => e.type === 'tune-out:reader-rederived')
+    .map((e) => { const r = e as unknown as { agentName: string; previous: string; reason: string }; return [r.previous, r.agentName, r.reason]; });
+
+  it("derives it again when its checkpoint is no longer on the host's branch", { timeout: 120_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-branch-'));
+    dirs.push(dir);
+    const t = await boot(dir, { persist: 'epoch' });
+    const epochId = t.enter();
+    const g = (k: number) => `reader/scout/${epochId.slice(0, 8)}/g${k}`;
+    const trunk = t.internals.store.currentBranch().name;
+    const first = t.hold(epochId, 'HELD-1');
+    const beforeLook = t.internals.store.currentSequence();
+    t.look(epochId, [first]);
+    await t.looked(g(1), 1);
+    t.internals.store.createBranchAt('side', trunk, beforeLook);
+    await t.framework.switchBranch('side');
+    t.look(epochId, [t.hold(epochId, 'HELD-2 on the side branch')]);
+    await t.looked(g(2), 1);
+    assert.deepEqual(rederived(t.traces), [[g(1), g(2), 'branch-moved']]);
+    assert.deepEqual(t.forkTraces().map((f) => [f.agentName, f.incarnation, f.resumed]), [[g(1), 1, false], [g(2), 1, false]]);
+    assert.equal(t.framework.getAgentRecord(g(2))!.inherit?.branch, 'side', "derived from the resident on the host's branch now");
+    assert.equal(t.framework.getAgentRecord(g(1))!.incarnation, 1, 'the earlier generation is not resumed');
+  });
+
+  it("with resync 'window', derives it again when its last look was framed on another branch; with 'none', resumes it", { timeout: 180_000 }, async () => {
+    for (const resync of ['window', 'none'] as const) {
+      const dir = mkdtempSync(join(tmpdir(), `reader-persist-mark-${resync}-`));
+      dirs.push(dir);
+      const t = await boot(dir, { persist: 'resident', resync });
+      const epochId = t.enter();
+      const trunk = t.internals.store.currentBranch().name;
+      t.look(epochId, [t.hold(epochId, 'HELD-1')]);
+      await t.looked('reader/scout/g1', 1);
+      // A branch made after the look: the checkpoint is on it, the mark's branch is not.
+      t.internals.store.createBranchAt('later', trunk, t.internals.store.currentSequence());
+      await t.framework.switchBranch('later');
+      t.look(epochId, [t.hold(epochId, 'HELD-2')]);
+      if (resync === 'window') {
+        await t.looked('reader/scout/g2', 1);
+        assert.deepEqual(rederived(t.traces), [['reader/scout/g1', 'reader/scout/g2', 'branch-moved']], resync);
+      } else {
+        await t.looked('reader/scout/g1', 2);
+        assert.deepEqual(rederived(t.traces), [], resync);
+        assert.equal(t.forkTraces()[1]!.resumed, true);
+      }
+      await t.framework.stop();
+      frameworks.splice(frameworks.indexOf(t.framework), 1);
+    }
+  });
+
+  it("with 'epoch', resumes it for the tune-out's own cancel look and derives it again for a look asked for after the tune-out ended", { timeout: 120_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-scope-'));
+    dirs.push(dir);
+    const t = await boot(dir, { persist: 'epoch' });
+    const epochId = t.enter();
+    const g = (k: number) => `reader/scout/${epochId.slice(0, 8)}/g${k}`;
+    const first = t.hold(epochId, 'HELD-1');
+    t.look(epochId, [first]);
+    await t.looked(g(1), 1);
+    const second = t.hold(epochId, 'HELD-2');
+    // The coordinator's own cancel: the tune-out's state is gone by the time
+    // it asks for its last look, which is still one of its looks.
+    assert.deepEqual(t.internals.tuneOutCoordinator.cancel('disc', CHANNEL, 'agent-tool', 'test cancel'), { ok: true });
+    await t.looked(g(1), 2);
+    const cancelLook = t.forkTraces()[1]!;
+    assert.deepEqual([cancelLook.agentName, cancelLook.trigger, cancelLook.resumed, cancelLook.held], [g(1), 'cancel', true, 1],
+      'resumed for the cancel, and handed HELD-2 alone: its branch holds HELD-1, which the coordinator, never told of it here, hands again');
+    // A reader that failed after the end has what it was handed go to one
+    // late look, which the coordinator marks as asked for after the end.
+    assert.equal(t.internals.tuneOutCoordinator.readerFailed({ serverId: 'disc', channelId: CHANNEL, epochId, backlog: [second] }), 1);
+    await t.looked(g(2), 1);
+    assert.deepEqual(rederived(t.traces), [[g(1), g(2), 'scope-ended']]);
+    assert.equal(t.forkTraces()[2]!.trigger, 'cancel');
+  });
+
+  it("with 'resident', resumes it for a look asked for after its tune-out ended", { timeout: 120_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-scope-resident-'));
+    dirs.push(dir);
+    const t = await boot(dir, { persist: 'resident' });
+    const epochId = t.enter();
+    t.look(epochId, [t.hold(epochId, 'HELD-1')]);
+    await t.looked('reader/scout/g1', 1);
+    t.look(epochId, [t.hold(epochId, 'HELD-2')], 'cancel', { epochEnded: true });
+    await t.looked('reader/scout/g1', 2);
+    assert.deepEqual(rederived(t.traces), []);
+  });
+
+  it('derives it again when its name has no ended record: a derivation whose run was refused', { timeout: 120_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-norecord-'));
+    dirs.push(dir);
+    const t = await boot(dir, { persist: 'epoch' });
+    const epochId = t.enter();
+    const g = (k: number) => `reader/scout/${epochId.slice(0, 8)}/g${k}`;
+    await t.framework.quiesce({ reason: 'test' });
+    t.look(epochId, [t.hold(epochId, 'HELD-1')]);
+    await waitFor('the refused look', () => t.traces.some((e) => e.type === 'tune-out:reader-fork-failed'));
+    assert.equal(t.framework.getAgentRecord(g(1)), null, 'premise: derived, its run refused, never registered');
+    await t.framework.resume();
+    t.look(epochId, [t.hold(epochId, 'HELD-2')]);
+    await t.looked(g(2), 1);
+    assert.deepEqual(rederived(t.traces), [[g(1), g(2), 'no-record']]);
+  });
+
+  it('asks beforeDerive at every derivation and every resumption, and a refused resumption is a failed look, never a derivation', { timeout: 120_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-refused-'));
+    dirs.push(dir);
+    const specs: Array<{ name: string; ownBranch?: string; metadata?: Record<string, unknown> }> = [];
+    let refuse = false;
+    const t = await boot(dir, { persist: 'epoch' }, {
+      dendrite: {
+        beforeDerive: (spec: { name: string; inherit?: { ownBranch?: string }; metadata?: Record<string, unknown> }) => {
+          if (!spec.name.startsWith('reader/')) return undefined;
+          specs.push({ name: spec.name, ...(spec.inherit?.ownBranch ? { ownBranch: spec.inherit.ownBranch } : {}), ...(spec.metadata ? { metadata: spec.metadata } : {}) });
+          return refuse ? { refuse: 'refused by the test' } : undefined;
+        },
+      },
+    } as never);
+    const epochId = t.enter();
+    const name = `reader/scout/${epochId.slice(0, 8)}/g1`;
+    t.look(epochId, [t.hold(epochId, 'HELD-1')]);
+    await t.looked(name, 1);
+    t.look(epochId, [t.hold(epochId, 'HELD-2')], 'wake');
+    await t.looked(name, 2);
+    refuse = true;
+    t.look(epochId, [t.hold(epochId, 'HELD-3')]);
+    await waitFor('the refused resumption', () => t.traces.some((e) => e.type === 'tune-out:reader-fork-failed'));
+    await t.framework.runUntilIdle();
+
+    assert.deepEqual(specs.map((s) => [s.name, s.ownBranch !== undefined, s.metadata?.trigger, s.metadata?.persist]),
+      [[name, false, 'cadence', 'epoch'], [name, true, 'wake', 'epoch'], [name, true, 'cadence', 'epoch']],
+      "the derivation's spec, then each resumption's, with that look's metadata");
+    const failed = t.traces.find((e) => e.type === 'tune-out:reader-fork-failed') as unknown as { agentName: string; error: string; returned: number };
+    assert.equal(failed.agentName, name);
+    assert.match(failed.error, /was not resumed: refused by the test/);
+    assert.equal(failed.returned, 1, 'its held row goes back to the next reader');
+    assert.deepEqual(rederived(t.traces), [], 'not derived again in its place');
+    assert.equal(t.forkTraces().length, 2);
+    assert.equal(t.framework.getAgentRecord(name)!.incarnation, 2, 'no incarnation began');
+    assert.ok(!t.framework.listAgents({ includeEnded: true }).some((r) => r.name !== name && r.kind === 'subconscious-fork'));
   });
 });

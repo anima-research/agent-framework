@@ -17700,9 +17700,13 @@ export class AgentFramework {
    */
   private invokePersistedReader(primary: string, cfg: ForkReaderConfig, persist: 'epoch' | 'resident', invocation: ReaderInvocation): void {
     const identity = persist === 'epoch' ? `reader/${primary}/${invocation.epochId.slice(0, 8)}` : `reader/${primary}`;
+    // Whether the scope had ended when the look was asked for: a look that
+    // waits behind another may run after its tune-out ended, and is still
+    // one of its looks. Only 'epoch' scopes end before the resident does.
+    const scopeEnded = persist === 'epoch' && invocation.epochEnded === true;
     const before = this.readerLooks.get(identity) ?? Promise.resolve();
     const look = before
-      .then(() => this.persistedReaderLook(primary, cfg, persist, identity, invocation))
+      .then(() => this.persistedReaderLook(primary, cfg, persist, identity, invocation, scopeEnded))
       .catch((error) => {
         console.error(`[tune-out] a look of reader ${identity} failed:`, error instanceof Error ? error.message : error);
       });
@@ -17714,12 +17718,29 @@ export class AgentFramework {
 
   /**
    * Where a persisted reader's look starts: the identity's current
-   * generation, resumed, when the registry has an ended record of it;
-   * otherwise a derivation under the first generation's name no agent has
-   * had in this process or in the registry. A derivation that follows an
-   * earlier generation says why (`reason`).
+   * generation, resumed, when the registry has an ended record of it in
+   * scope and nothing below says to derive it again; otherwise a derivation
+   * under the first generation's name no agent has had in this process or
+   * in the registry. Derived again (`reason`), the current generation having
+   * been used:
+   *
+   * - `'no-record'`: the registry has no ended record of its name, or (with
+   *   'epoch') one of another tune-out's;
+   * - `'scope-ended'`: (with 'epoch') the tune-out had ended when the look
+   *   was asked for (ReaderInvocation.epochEnded);
+   * - `'branch-moved'`: its derivation's checkpoint is no longer on the
+   *   host's branch (branchesPartAt), or, with resync 'window', its last look
+   *   was framed on another branch than the resident's window reads now,
+   *   whose window ordinals its mark can't be read against.
    */
-  private readerPlan(identity: string): { name: string; resume?: AgentRecord; previous?: string; reason?: ReaderRederivedReason } {
+  private readerPlan(
+    identity: string,
+    primary: string,
+    persist: 'epoch' | 'resident',
+    resync: 'window' | 'none',
+    invocation: ReaderInvocation,
+    scopeEnded: boolean,
+  ): { name: string; resume?: AgentRecord; previous?: string; reason?: ReaderRederivedReason } {
     const nameOf = (k: number): string => `${identity}/g${k}`;
     let k = this.readerGenerations.get(identity);
     if (k === undefined) {
@@ -17731,7 +17752,18 @@ export class AgentFramework {
     }
     const current = k > 0 ? nameOf(k) : undefined;
     const record = current !== undefined ? this.registry.inspect(current) : undefined;
-    if (current !== undefined && record?.ended) return { name: current, resume: record };
+    let reason: ReaderRederivedReason | undefined;
+    if (current !== undefined && record?.ended) {
+      const inherit = record.inherit;
+      const lastBranch = record.metadata?.residentBranch;
+      const windowBranch = this.residentMark(primary)?.branch;
+      if (persist === 'epoch' && record.metadata?.epochId !== invocation.epochId) reason = 'no-record';
+      else if (scopeEnded) reason = 'scope-ended';
+      else if (inherit?.branch !== undefined && inherit.atSequence !== undefined
+        && this.branchesPartAt(inherit.branch, this.store.currentBranch().name) < inherit.atSequence) reason = 'branch-moved';
+      else if (resync === 'window' && typeof lastBranch === 'string' && windowBranch !== undefined && lastBranch !== windowBranch) reason = 'branch-moved';
+      else return { name: current, resume: record };
+    }
     let next = Math.max(1, k);
     const taken = (name: string): boolean =>
       this.usedEphemeralAgentNames.has(name) || this.agents.has(name) || this.registry.inspect(name) !== undefined;
@@ -17741,7 +17773,7 @@ export class AgentFramework {
     // One whose derivation never got its name (a beforeDerive refusal)
     // is derived under the same name, as the first look was to be.
     const earlier = current !== undefined && (record !== undefined || this.usedEphemeralAgentNames.has(current));
-    return { name: nameOf(next), ...(earlier ? { previous: current, reason: 'no-record' as const } : {}) };
+    return { name: nameOf(next), ...(earlier ? { previous: current, reason: reason ?? 'no-record' } : {}) };
   }
 
   /**
@@ -17760,6 +17792,7 @@ export class AgentFramework {
     persist: 'epoch' | 'resident',
     identity: string,
     invocation: ReaderInvocation,
+    scopeEnded: boolean,
   ): Promise<void> {
     // The resident ended while this look waited: it ended the reader with it
     // (onParentEnd 'end'), and nothing resumes after.
@@ -17767,8 +17800,20 @@ export class AgentFramework {
     const parentConfig = this.agentConfigs.get(primary);
     if (!parent || !parentConfig) return;
     const resync = cfg.resync ?? 'window';
-    const plan = this.readerPlan(identity);
+    const plan = this.readerPlan(identity, primary, persist, resync, invocation, scopeEnded);
     const name = plan.name;
+    if (plan.reason && plan.previous) {
+      this.emitTrace({
+        type: 'tune-out:reader-rederived',
+        agentName: name,
+        previous: plan.previous,
+        reason: plan.reason,
+        serverId: invocation.serverId,
+        channelId: invocation.channelId,
+        epochId: invocation.epochId,
+        trigger: invocation.trigger,
+      });
+    }
     let framed = false;
     let handed = invocation.backlog;
     let candidate: { agent: Agent; contextManager: ContextManager; cleanup: () => void } | undefined;
