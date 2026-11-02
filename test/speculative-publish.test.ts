@@ -1095,7 +1095,7 @@ test("registry: channel_publish's own definition has no serverId; the speculativ
   assert.equal(JSON.stringify(h.registry.getChannelTools().find((t) => t.name === 'channel_publish')), JSON.stringify(publish), 'the registry keeps its own');
 });
 
-test("framework: only an agent whose tool surface opted in is shown serverId; others' channel_publish is the registry's, byte for byte, and a reader fork follows its resident", async () => {
+test("framework: an agent is shown serverId by the flag it runs under; others' channel_publish is the registry's, byte for byte; an inherited fork follows its parent, an override follows itself", async () => {
   const dir = mkdtempSync(join(tmpdir(), 'af-speculative-surface-')); dirs.push(dir);
   const membrane = new ScriptMembrane([], {});
   const framework = await AgentFramework.create({
@@ -1138,7 +1138,27 @@ test("framework: only an agent whose tool surface opted in is shown serverId; ot
     assert.equal(JSON.stringify(presented('Plain')), JSON.stringify(registryPublish));
     assert.equal(JSON.stringify(presented('Glassy')), JSON.stringify(channelPublishWithServerId(registryPublish)));
 
-    // A fork that outlives its resident (orphaned) keeps what it was shown.
+    // A derived agent that overrides the flag is shown what it runs under, though it shares its parent's tool surface.
+    const loud = await framework.deriveAgent({
+      name: 'plain-loud', from: 'Plain', mode: 'copy', kind: 'subconscious-fork', config: { speculativeChannelChunks: true },
+      framing: [{ participant: 'user', content: [{ type: 'text', text: 'Read and report.' }] }],
+    });
+    const quiet = await framework.deriveAgent({
+      name: 'glassy-quiet', from: 'Glassy', mode: 'copy', kind: 'subconscious-fork', config: { speculativeChannelChunks: false },
+      framing: [{ participant: 'user', content: [{ type: 'text', text: 'Read and report.' }] }],
+    });
+    const owners = (framework as unknown as { toolSurfaceOwners: Map<string, string> }).toolSurfaceOwners;
+    assert.equal(owners.get('plain-loud'), 'Plain', "premise: it shares its non-opted parent's tool surface");
+    assert.equal(owners.get('glassy-quiet'), 'Glassy', "premise: it shares its opted-in parent's tool surface");
+    // Its own flag is what its deltas and streams follow (Agent.speculativeChannelChunks), and what it is shown.
+    assert.equal(loud.agent.speculativeChannelChunks, true);
+    assert.equal(JSON.stringify(publishOf('plain-loud')), JSON.stringify(channelPublishWithServerId(registryPublish)));
+    assert.equal(JSON.stringify(presented('plain-loud')), JSON.stringify(channelPublishWithServerId(registryPublish)));
+    assert.equal(quiet.agent.speculativeChannelChunks, false);
+    assert.equal(JSON.stringify(publishOf('glassy-quiet')), JSON.stringify(registryPublish));
+    assert.equal(JSON.stringify(presented('glassy-quiet')), JSON.stringify(registryPublish));
+
+    // A fork that outlives its resident (orphaned) keeps what it runs under.
     (framework as unknown as { agents: Map<string, unknown> }).agents.delete('Glassy');
     assert.equal(JSON.stringify(publishOf('glassy-reader')), JSON.stringify(channelPublishWithServerId(registryPublish)));
   } finally { await framework.stop().catch(() => {}); }

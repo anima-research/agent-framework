@@ -3843,8 +3843,8 @@ export class AgentFramework {
    * call publishes there or nowhere (bounded: the oldest go first).
    */
   private speculativePins: Map<string, ChannelRef> = new Map();
-  /** Tool-surface owners last read with speculativeChannelChunks on (showsSpeculativeServerId), kept after they end. */
-  private speculativeSurfaceOwners: Set<string> = new Set();
+  /** By name, the speculativeChannelChunks each ephemeral agent was built with, for one not registered (yet, or any more). */
+  private ephemeralSpeculativeOptIn: Map<string, boolean> = new Map();
   /** Publishes under way that end an open speculative stream: stop() waits for them before closing MCPL. */
   private speculativePublishes: Set<Promise<void>> = new Set();
   /**
@@ -8624,8 +8624,8 @@ export class AgentFramework {
         return { ...tool, description: NON_HOLDER_CHANNEL_DESCRIPTIONS[tool.name] };
       }
       // Speculative chunks stream as written only with channelId and serverId
-      // both given: an agent whose surface owner opted in is shown the
-      // optional serverId; every other agent's definition is the registry's.
+      // both given: an agent running with speculativeChannelChunks is shown
+      // the optional serverId; every other agent's definition is the registry's.
       if (tool.name === 'channel_publish' && this.showsSpeculativeServerId(agentName)) return channelPublishWithServerId(tool);
       return tool;
     });
@@ -10998,6 +10998,7 @@ export class AgentFramework {
       const agent = new Agent(config, contextManager, this.membrane);
       this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
+      this.ephemeralSpeculativeOptIn?.set(config.name, agent.speculativeChannelChunks);
       this.ephemeralCandidates.set(agent, {
         contextManager,
         config,
@@ -11166,6 +11167,7 @@ export class AgentFramework {
 
   private discardEphemeralCandidate(agent: Agent, contextManager: ContextManager): void {
     this.ephemeralCandidates.delete(agent);
+    this.ephemeralSpeculativeOptIn?.delete(agent.name);
     this.ephemeralAgents.delete(agent);
     if (this.toolSurfaceOwners.has(agent.name) && !this.agents.has(agent.name)) this.toolSurfaceOwners.delete(agent.name);
     this.releaseManager(agent);
@@ -11337,6 +11339,7 @@ export class AgentFramework {
       agent = new Agent(fullConfig, contextManager, this.membrane);
       this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
+      this.ephemeralSpeculativeOptIn?.set(name, agent.speculativeChannelChunks);
     } catch (error) {
       this.resumesPending.delete(name);
       this.closeManager(contextManager);
@@ -22585,21 +22588,16 @@ export class AgentFramework {
   }
 
   /**
-   * Whether an agent is shown channel_publish's optional serverId: its
-   * tool-surface owner has speculativeChannelChunks. An owner's answer is
-   * kept once read, so a fork that outlives its owner (orphaned) shows what
-   * it was shown, and its refusals match it.
+   * Whether an agent is shown channel_publish's optional serverId: the
+   * speculativeChannelChunks it runs under itself, the flag its tool-input
+   * deltas and speculative streams follow. A derived agent inherits its
+   * parent's unless it overrides it, whatever tool surface it shares. A
+   * derived agent not yet running (still a candidate) is read too.
    */
   private showsSpeculativeServerId(agentName: string): boolean {
-    const owner = this.toolSurfaceOwners?.get(agentName) ?? agentName;
-    const agent = this.agents.get(owner);
-    if (agent) {
-      const shows = agent.speculativeChannelChunks === true;
-      if (shows) this.speculativeSurfaceOwners?.add(owner);
-      else this.speculativeSurfaceOwners?.delete(owner);
-      return shows;
-    }
-    return this.speculativeSurfaceOwners?.has(owner) === true;
+    const agent = this.agents.get(agentName);
+    if (agent) return agent.speculativeChannelChunks === true;
+    return this.ephemeralSpeculativeOptIn?.get(agentName) === true;
   }
 
   /** Drops an agent's calls from speculativeCalls, where they still map to that stream set (any, when none is given). */

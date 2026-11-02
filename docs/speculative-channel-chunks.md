@@ -111,8 +111,10 @@ first chunk:
   its final arguments name. To stream as it writes, a call writes
   `channelId` and `serverId` before `content`. An agent with the option is
   shown `serverId` as an optional property of `channel_publish`, with a
-  description that says so, and so is a fork that shares its tool surface
-  (the surface owner's opt-in decides). A shared-name refusal to such an
+  description that says so. What decides is the flag the agent runs under,
+  the one its tool-input deltas and streams follow: a derived agent inherits
+  its parent's unless it overrides it, whatever tool surface it shares. A
+  shared-name refusal to such an
   agent also names each `channelId` and `serverId` pair.
 - `channelId` not given: the channel the publish defaults to (host 0.19: the
   turn's channel, the one whose message woke it). That is known only once the

@@ -5,7 +5,8 @@
   channel's server as `channels/outgoing/chunk` deltas, before the publish;
   the publish carries the stream's `streamId`, and its known outcome ends the
   stream with `complete` (the full text) or `complete` with `cancelled: true`;
-  an unknown outcome sends neither. An agent with the option (and a fork
-  sharing its tool surface) is shown an optional `serverId` in
+  an unknown outcome sends neither. An agent running with the option (a
+  derived agent inherits it unless it overrides it) is shown an optional
+  `serverId` in
   `channel_publish`; other agents' definition is unchanged. Needs a
   membrane with `emitToolInputDeltas` (native tool mode, Anthropic).
