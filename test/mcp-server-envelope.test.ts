@@ -7,11 +7,11 @@
  * otherwise, and isn't dispatched; a message with an id and no method is a
  * response, and so is a JSON-RPC 2.0 error with no id, as MCP allows: this
  * server, sending no requests, logs one and never answers it; and a request
- * named 'initialized' gets -32601 like any unknown method. A JSON
- * value that isn't an object is an invalid request too, and so is an object
- * with neither a method nor an id, and a batch is refused as one. Lines go in as the server's stdin reader hands them
- * over, to a server that's never started, since starting connects it to its
- * WebSocket API first.
+ * named 'initialized' gets -32601 like any unknown method. A JSON value
+ * that isn't an object is an invalid request too, and so is an object with
+ * neither a method nor an id, and a batch is refused as one. Lines go in as
+ * the server's stdin reader hands them over, to a server that's never
+ * started, since starting connects it to its WebSocket API first.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';

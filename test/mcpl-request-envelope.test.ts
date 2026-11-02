@@ -7,16 +7,15 @@
  * JSON-RPC 2.0 error with no id, as MCP allows; a response is never
  * answered, and one whose id is neither a string nor a number, or that has
  * none, can't be matched, so it's ignored, and logged, its error redacted,
- * when it's a JSON-RPC 2.0 error, during the handshake too, except that such
- * an error with id null or none then answers initialize, and the connect
- * fails at once; any other object with
- * neither a method nor an id isn't JSON-RPC, so it's ignored, as a JSON
- * value that isn't an object is, a batch included. A message whose id isn't
- * a string, a number or null, or whose method isn't a string, with or
- * without an id, is answered once with -32600, carrying its id where that's
- * a string or a number and null otherwise, and isn't dispatched. Real
- * connection routing and response encoding, and stdio servers for the
- * handshake.
+ * when it's a JSON-RPC 2.0 error, during the handshake too, except that
+ * such an error with id null or none then answers initialize, and the
+ * connect fails at once; any other object with neither a method nor an id
+ * isn't JSON-RPC, so it's ignored, as a JSON value that isn't an object is,
+ * a batch included. A message whose id isn't a string, a number or null, or
+ * whose method isn't a string, with or without an id, is answered once with
+ * -32600, carrying its id where that's a string or a number and null
+ * otherwise, and isn't dispatched. Real connection routing and response
+ * encoding, and stdio servers for the handshake.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -232,7 +231,7 @@ test('a message without a method is a response, whatever its id, and is never an
   assert.deepEqual(replies(), []);
 });
 
-test("a response with id null or no id that isn't a JSON-RPC 2.0 error, such as a server's own log line, is ignored with no log, however many come (#534's review, R1-1)", (t) => {
+test("a response with id null that isn't a JSON-RPC 2.0 error, such as a server's own log line, is ignored with no log, however many come (#534's review, R1-1)", (t) => {
   const { send, replies, handled, logged } = wire(t);
   for (let i = 0; i < 50; i++) {
     send({ level: 'info', id: null, msg: `line ${i}` });
