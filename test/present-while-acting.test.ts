@@ -1506,7 +1506,6 @@ describe('present while acting', () => {
 
       const framework = await createFramework({ maxStreamTokens: 20, ...(physicalWindowTokens !== undefined ? { physicalWindowTokens } : {}) });
       stubChannelRegistry(framework);
-      module.toolDelayMs = 25;
       module.interjection = 'quick question for you';
       module.interjectionMetadata = addressed('discord:dm:antra');
       feedStart(framework, 2, [{ type: 'text', text: 'After the restart.' }] as ContentBlock[]);
@@ -1547,7 +1546,6 @@ describe('present while acting', () => {
       const routed = stubChannelRegistry(framework);
       const cm = framework.getAgent('assistant')!.getContextManager();
       cm.previewContext = (() => ({ fits: false, clearedBy: ['compression'], finalTokens: 9_000, budgetTokens: 8_000 })) as unknown as typeof cm.previewContext;
-      module.toolDelayMs = 25;
       module.interjection = 'quick question for you';
       module.interjectionMetadata = addressed('discord:dm:antra');
       const declines: string[] = [];
