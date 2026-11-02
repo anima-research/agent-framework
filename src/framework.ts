@@ -3843,7 +3843,11 @@ export class AgentFramework {
    * call publishes there or nowhere (bounded: the oldest go first).
    */
   private speculativePins: Map<string, ChannelRef> = new Map();
-  /** By name, the speculativeChannelChunks each ephemeral agent was built with, for one not registered (yet, or any more). */
+  /**
+   * By name, the speculativeChannelChunks each ephemeral agent was built
+   * with, for one not registered yet (a candidate). Its end deletes it, with
+   * the other name-keyed state; a discarded candidate's goes too.
+   */
   private ephemeralSpeculativeOptIn: Map<string, boolean> = new Map();
   /** Publishes under way that end an open speculative stream: stop() waits for them before closing MCPL. */
   private speculativePublishes: Set<Promise<void>> = new Set();
@@ -12889,6 +12893,9 @@ export class AgentFramework {
       this.toolImageLedgers.delete(agent.name);
       if (this.agentConfigs.get(agent.name) === candidate.config) this.agentConfigs.delete(agent.name);
       this.toolSurfaceOwners.delete(agent.name);
+      // Read only while the agent isn't registered yet (showsSpeculativeServerId);
+      // nothing asks after its end: an ended run's name has no tools.
+      this.ephemeralSpeculativeOptIn?.delete(agent.name);
       // Its scripts end with it: no turn of its is left for them to outlive.
       this.codeExecution?.scripts.agentGone(agent.name);
       // Spawn-and-dispose bookkeeping (main, d453165/fee96a7): without this,
@@ -18101,6 +18108,7 @@ export class AgentFramework {
     } else {
       // Nothing live under the name: only what the process keeps by name.
       this.closingConversationAgents.delete(agentName);
+      this.ephemeralSpeculativeOptIn?.delete(agentName);
       this.deadlineCuts.delete(agentName);
       this.freshCallsCut.delete(agentName);
       this.forgetFailureAccounting(agentName);

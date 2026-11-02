@@ -1214,3 +1214,59 @@ test("framework: dispatch marks a publish's caller as shown serverId by the flag
     } finally { await h.framework.stop(); }
   }
 });
+
+test('framework: an ephemeral agent\'s recorded flag lives from its creation to its end, so ended runs leave nothing behind', async () => {
+  const N = 4;
+  const membrane = new ScriptMembrane(Array.from({ length: N }, () => [final(text('done'))]), {});
+  const h = await harness(membrane, { speculativeChannelChunks: true });
+  const optIn = () => (h.framework as unknown as { ephemeralSpeculativeOptIn: Map<string, boolean> }).ephemeralSpeculativeOptIn;
+  try {
+    h.framework.start();
+    for (let i = 0; i < N; i++) {
+      const created = await h.framework.createEphemeralAgent({
+        name: `run-${i}`, model: 'test', systemPrompt: 'Do the task.', allowedTools: 'all', ...(i % 2 ? { speculativeChannelChunks: true } : {}),
+      });
+      assert.equal(optIn().get(`run-${i}`), i % 2 === 1, 'recorded while it is a candidate');
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+      await h.framework.runEphemeralToCompletion(created.agent, created.contextManager);
+      assert.equal(optIn().has(`run-${i}`), false, 'deleted at its end');
+    }
+    assert.equal(optIn().size, 0, `${N} runs created and ended leave the map empty`);
+  } finally { await h.framework.stop(); }
+});
+
+for (const parentOpted of [false, true]) {
+  test(`framework: a derived child that overrides its parent's flag (parent ${parentOpted ? 'opted in' : 'not'}) is marked shown serverId by its own flag on dispatch and executeToolCall`, async () => {
+    const childOpted = !parentOpted;
+    const membrane = new ScriptMembrane(
+      [[round(call('c1', 'channel_publish', { channelId: 'bosun:meeting:1', content: 'From the child.' })), final(text('done'))]],
+      { c1: ['{"channelId":"bosun:meeting:1","content":"From the child."}'] },
+    );
+    const h = await harness(membrane, parentOpted ? { speculativeChannelChunks: true } : {});
+    let forwarded = false;
+    // While the child runs, its publish is also sent through executeToolCall under its name.
+    h.framework.onTrace((e) => {
+      const event = e as unknown as { type: string; tool?: string };
+      if (event.type === 'tool:started' && event.tool === 'channel_publish' && !forwarded) {
+        forwarded = true;
+        void h.framework.executeToolCall({ id: 'c2', name: 'channel_publish', input: { channelId: 'bosun:meeting:1', content: 'Forwarded.' }, callerAgentName: 'child' });
+      }
+    });
+    try {
+      h.framework.start();
+      const child = await h.framework.deriveAgent({
+        name: 'child', from: 'Glassy', mode: 'copy', config: { speculativeChannelChunks: childOpted },
+        framing: [{ participant: 'user', content: [{ type: 'text', text: 'Post it.' }] }],
+      });
+      const owners = (h.framework as unknown as { toolSurfaceOwners: Map<string, string> }).toolSurfaceOwners;
+      assert.equal(owners.get('child'), 'Glassy', "premise: it shares its parent's tool surface");
+      assert.equal(child.agent.speculativeChannelChunks, childOpted);
+      await h.framework.runEphemeralToCompletion(child.agent, child.contextManager);
+      for (let i = 0; i < 100 && h.origins.length < 2; i++) await new Promise((r) => setTimeout(r, 5));
+      assert.deepEqual(h.origins.map((o) => [o.content, o.showsServerId]).sort(), [
+        ['Forwarded.', childOpted],
+        ['From the child.', childOpted],
+      ]);
+    } finally { await h.framework.stop(); }
+  });
+}
