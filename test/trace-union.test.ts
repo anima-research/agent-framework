@@ -15,17 +15,19 @@ type Holds<Check extends true> = Check;
 type RequiredKeys<Event> = Event extends unknown
   ? { [Key in keyof Event]-?: {} extends Pick<Event, Key> ? never : Key }[keyof Event]
   : never;
+type WithoutKey<Event, Dropped> = { [Key in keyof Event as Key extends Dropped | 'timestamp' ? never : Key]: Event[Key] };
 type WithIndex<Event> = Event extends unknown ? (string extends keyof Event ? Event : never) : never;
 type WithTimestamp<Event> = Event extends unknown ? ('timestamp' extends keyof Event ? Event : never) : never;
-type FieldsNotRequired = {
-  [Name in TraceEvent['type']]: Is<
-    RequiredKeys<Extract<TraceEventInput, { type: Name }>>,
-    Exclude<RequiredKeys<Extract<TraceEvent, { type: Name }>>, 'timestamp'>
-  > extends true ? never : Name;
-}[TraceEvent['type']];
+type FieldsNotRequired<Event> = Event extends { type: infer Name }
+  ? {
+      [Key in Exclude<RequiredKeys<Event>, 'type' | 'timestamp'>]: WithoutKey<Event, Key> extends TraceEventInput
+        ? [Name, Key]
+        : never;
+    }[Exclude<RequiredKeys<Event>, 'type' | 'timestamp'>]
+  : never;
 
 type RefusesAnUnlistedName = Holds<Is<'not:a-listed-trace' extends TraceEventInput['type'] ? true : false, false>>;
-type RequiresEachMembersFields = Holds<Is<FieldsNotRequired, never>>;
+type RequiresEachMembersFields = Holds<Is<FieldsNotRequired<TraceEvent>, never>>;
 type RefusesAnUndeclaredField = Holds<Is<WithIndex<TraceEventInput>, never>>;
 type RefusesATimestamp = Holds<Is<WithTimestamp<TraceEventInput>, never>>;
 type ToolFailedErrorIsAString = Holds<Is<Extract<TraceEvent, { type: 'tool:failed' }>['error'], string>>;
