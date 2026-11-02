@@ -1546,7 +1546,9 @@ export class McplServerConnection extends EventEmitter {
             return;
           }
           if (admission && envelope.kind === 'request' && ['channels/incoming', 'push/event', 'inference/request'].includes(envelope.method)) {
-            transport.writeLine(JSON.stringify({ jsonrpc: '2.0', id: envelope.id, error: { code: CAPABILITY_DISABLED, message: 'capability_denied' } }));
+            const event = McplServerConnection.METHOD_TO_EVENT[envelope.method]!;
+            const capability = McplServerConnection.EVENT_TO_REQUIRED_CAPABILITY[event];
+            transport.writeLine(JSON.stringify({ jsonrpc: '2.0', id: envelope.id, error: { code: CAPABILITY_DISABLED, message: 'capability_denied', data: { capability } } }));
             return;
           }
           if (envelope.kind !== 'response') return;

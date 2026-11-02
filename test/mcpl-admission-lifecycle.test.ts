@@ -434,7 +434,7 @@ test('required handshake drops null, refuses all data lanes, and buffers a same-
   const answers = await connection.sendToolsCall('answers', {}) as any;
   for (const method of ['channels/incoming', 'push/event', 'inference/request']) {
     assert.deepEqual(answers.find((r: any) => r.id === method)?.error,
-      { code: -32002, message: 'capability_denied' });
+      { code: -32002, message: 'capability_denied', data: { capability: ({ 'channels/incoming': 'channels.incoming', 'push/event': 'pushEvents', 'inference/request': 'inferenceRequest' } as Record<string, string>)[method] } });
   }
   assert.deepEqual(answers.find((r: any) => r.id === 'same-chunk')?.result, {});
   assert.equal(hooks, 0);

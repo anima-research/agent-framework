@@ -59,9 +59,15 @@ item per callback latency accumulates and is dropped/refused at the existing hol
 bounds. A bounded-concurrency ordered drain is a possible follow-up, at the
 maintainer's discretion; it is not implemented here.
 
-Without a backlog, independently sent live items still run admission concurrently:
-callback latency can reorder them. Items within a channel batch remain sequential.
-A pause during a running preflight still refuses that item.
+Without a backlog, independently sent live items still run admission concurrently.
+Non-coalesced items can complete in callback-latency order. Coalesced effects
+instead take a per-subject ordering ticket on arrival, before the callback, keyed
+by `coalescingSubjectKey(serverId, binding, scope, key)`. Channel deliveries and
+channel-scoped pushes share that queue: a later verdict waits for earlier tickets
+for the subject to retire, including refusals. Channel batches reserve all their
+tickets on arrival and still admit siblings sequentially. Unrelated subjects do
+not wait on one another's callbacks. A pause during a running preflight still
+refuses that item.
 Required connections never advertise `toolHints`, even if `toolHints: true` is
 configured. That explicit combination logs one diagnostic at connect (not on
 automatic transport retries); it is not a configuration error. Under RFC-014 §6.3 the peer must not send hints and should tailor
@@ -99,9 +105,11 @@ whose acknowledgement failed must still be persisted/committed before replay
 can succeed.
 
 Multi-item `channels/incoming` requests remain itemwise, sequential admissions,
-including coalesced items; they are not an atomic batch. Deferred `push/event`
-notices (`coalesce.deferred: true`) still refuse explicitly with
-`admission_unsupported` before the hook, dedup or acceptance. Their later
+including coalesced items; they are not an atomic batch. Required connections
+omit `eventCoalescing.deferred` from their initialize offer while retaining the
+other coalescing members, so producers can select their non-deferred fallback.
+As defence in depth, deferred `push/event` notices (`coalesce.deferred: true`)
+still refuse explicitly with `admission_unsupported` before the hook, dedup or acceptance. Their later
 `push/render` aggregates multiple occurrences, and this profile has no current-key
 re-admission for restored or prior-epoch batches. Unconfigured coalescing and its
 pending batches still survive reconnect/recovery unchanged. Drain pending
@@ -121,6 +129,8 @@ maintenance.
 Admitted work goes out with the round's results only on a stream that declares
 `supportsInjectedMessages: true`; otherwise it arrives at turn end.
 
+Channel-scoped pushes also require the `channels.incoming` grant and a declared
+channel before either receipt replay or the admission callback.
 Pushes run preflight after feature authorization, before deduplication,
 notices or queueing. Inference requests run admission after feature and loop checks, before model
 resolution; false `mayWake` is `admission_denied` and sends no chunks.
@@ -129,9 +139,10 @@ answers once with the existing stopped-request error while the transport is live
 Transport closure cancels it without a router answer. Both release the admission
 slot even if the callback ignores cancellation; late verdicts start no model call.
 While the initialize reader is installed, required data-lane requests receive
-JSON-RPC -32002 `capability_denied` (notifications are discarded); this is the
-handshake capability refusal, before an admission key exists. Malformed lines
-use the normal decoder. Once initialize settles, subsequent lines are buffered
+JSON-RPC -32002 `capability_denied` with `data: { capability }`, naming
+`channels.incoming`, `pushEvents` or `inferenceRequest` for the refused lane
+(notifications are discarded); this is the handshake capability refusal, before
+an admission key exists. Malformed lines use the normal decoder. Once initialize settles, subsequent lines are buffered
 for ordinary dispatch, including a ping in the same read chunk.
 
 Admission refusals after the handshake are itemwise channel results, push `{ accepted: false, reason }`

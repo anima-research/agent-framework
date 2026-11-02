@@ -143,14 +143,16 @@ for (const lane of lanes) {
     assert.equal(f.context(), before);
   });
 
-  test(`required ${lane}: receipt created during a concurrent callback beats its refusal`, async t => {
+  test(`required ${lane}: receipt created by another subject during a concurrent callback beats its refusal`, async t => {
     let calls = 0;
     let release!: (verdict: AdmissionVerdict) => void;
     const f = await fixture({ server: { inboundAdmission: config(() => {
       if (++calls === 1) return new Promise<AdmissionVerdict>(resolve => { release = resolve; });
       return allow;
     }) } }); t.after(f.close); await f.register();
-    const pending = send(f, lane, 'same-event', 'pending_must_not_store', { initial: true });
+    // Receipts are keyed by eventId across subjects. Same-subject effects
+    // now wait for the first callback; a different subject remains concurrent.
+    const pending = send(f, lane, 'same-event', 'pending_must_not_store', { initial: true, key: 'other-subject' });
     await eventually(() => !!release);
     const accepted = await send(f, lane, 'same-event', 'concurrent_admitted', { initial: true });
     assert.equal(accepted.accepted, true); assert(f.context().includes('concurrent_admitted'));

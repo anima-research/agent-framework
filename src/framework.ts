@@ -108,7 +108,7 @@ import { convertBlocks } from './mcpl/convert-block.js';
 import {
   PushCoalescer, CoalesceError, PUSH_COALESCING_SUPPORT, validateCoalesceMember, validateCoalescedContent,
   coalescingSubjectKey, type AssemblyResult, type CoalescedOccurrence, type CoalescingPlacement, type CoalescingSnapshot,
-  type CoalescingReceiptRecord,
+  type CoalescingReceiptRecord, type CoalescingScope,
 } from './mcpl/push-coalescer.js';
 import type { ChannelIncomingMessage, ChannelIncomingMessageResult, McplContentBlock, McpToolResultContent, PushEventResult } from './mcpl/types.js';
 import { isSilentHeartbeatMarker, isVisiblyEmptyContent, NON_STRING_TEXT_PLACEHOLDER } from './mcpl/visible-content.js';
@@ -4280,6 +4280,7 @@ export class AgentFramework {
   /** Both lanes are admitted in arrival order: a create, edit and delete of
    *  one subject must not overtake one another while routing awaits. */
   private coalescingAdmission: Promise<unknown> = Promise.resolve();
+  private readonly coalescingTickets = new Map<string, Promise<void>>();
   private coalescingSaveTimer: ReturnType<typeof setTimeout> | null = null;
   private coalescingSnapshotDirty: (() => CoalescingSnapshot) | null = null;
   private coalescingRecentReceipts: CoalescingReceiptRecord[] = [];
@@ -18951,6 +18952,22 @@ export class AgentFramework {
     }
   }
 
+  /** Reserve a subject's effect order before either lane awaits admission. */
+  private takeCoalescingTicket(serverId: string, scope: CoalescingScope, key: string) {
+    const subject = coalescingSubjectKey(serverId, this.coalescingBinding(serverId), scope, key);
+    const ready = this.coalescingTickets.get(subject) ?? Promise.resolve();
+    let retire!: () => void;
+    const retired = new Promise<void>(resolve => { retire = resolve; });
+    // Even an unused ticket retired early cannot release a later arrival
+    // before its predecessors (e.g. the rest of an aborted channel batch).
+    const tail = ready.then(() => retired);
+    this.coalescingTickets.set(subject, tail);
+    void tail.then(() => {
+      if (this.coalescingTickets.get(subject) === tail) this.coalescingTickets.delete(subject);
+    });
+    return { ready, retire };
+  }
+
   /** Serialize both lanes' admissions: create, edit and delete of one subject stay ordered. */
   private admitCoalesced<T>(work: () => Promise<T>): Promise<T> {
     const run = this.coalescingAdmission.then(work, work);
@@ -19051,6 +19068,9 @@ export class AgentFramework {
 
   private handleCoalescedPush(serverId: string, params: PushEventParams, event: McplPushEvent, check?: RequiredIngress['check']): Promise<PushEventResult> {
     return this.admitCoalesced(async () => {
+      // A required replay must pass current channel authorization too,
+      // including when it waited behind another coalesced effect.
+      if (check && params.coalesce?.channelId) this.assertChannelScopedPush(serverId, params.coalesce.channelId);
       const replay = check && this.replayCoalescedPush(serverId, params);
       if (replay) return replay;
       const reason = check?.();
@@ -32902,6 +32922,7 @@ export class AgentFramework {
         return source;
       },
       (serverId, params) => this.replayCoalescedPush(serverId, params),
+      (serverId, channelId) => this.assertChannelScopedPush(serverId, channelId),
     );
 
     // Server-initiated inference router (Step 6)
@@ -33844,12 +33865,15 @@ export class AgentFramework {
 
   /**
    * The host capabilities offered to one server: the host's own, plus
-   * RFC-014's `toolHints` unless its configuration turns them off
-   * (`toolHints: false`). With them off, the very object every server is
-   * offered.
+   * RFC-014's `toolHints` unless its configuration turns them off.
+   * Required admission also omits deferred coalescing, which it cannot admit.
    */
   private mcplHostCapabilitiesFor(config: McplServerConfig, hints = this.hintsFor(config)): McplHostCapabilities {
     const base = this.mcplHostCapabilities!;
+    if (config.inboundAdmission !== undefined && typeof base.eventCoalescing === 'object') {
+      const { deferred: _, ...eventCoalescing } = base.eventCoalescing;
+      return { ...base, eventCoalescing };
+    }
     return hints ? { ...base, toolHints: true } : base;
   }
 
@@ -35712,6 +35736,7 @@ export class AgentFramework {
           : undefined;
         const admission: RequiredIngress = {
           ...original,
+          orderCoalesced: (scope, key) => this.takeCoalescingTicket(connection.id, scope, key),
           check: () => this.queue?.isClosed ? 'admission_not_ready' :
             this.mcplServerRegistry?.getServer(connection.id) !== connection ? 'admission_stale' :
             original.check() ?? (registration && !registration() ? 'admission_stale' : undefined),
@@ -35904,6 +35929,7 @@ export class AgentFramework {
         const original = connection.admissionFor(params);
         const admission: RequiredIngress = {
           ...original,
+          orderCoalesced: (scope, key) => this.takeCoalescingTicket(connection.id, scope, key),
           check: () => this.queue?.isClosed ? 'admission_not_ready' :
             this.mcplServerRegistry?.getServer(connection.id) !== connection ? 'admission_stale' : original.check(),
         };

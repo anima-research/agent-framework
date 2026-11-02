@@ -1909,274 +1909,291 @@ export class ChannelRegistry {
       return false;
     };
 
-    for (const message of params.messages) {
-      if (!message || typeof message.channelId !== 'string' || !message.channelId
-        || typeof message.messageId !== 'string' || !message.messageId) {
-        // The same gate as admission below: with no coalescer wired, a
-        // message carrying `coalesce` is handled uncoalesced, and refused as
-        // any uncoalesced message without an identity is.
-        const coalescedItem = message?.coalesce !== undefined && !!this.handleCoalescedIncoming;
-        if (coalescedItem) {
-          this.traceCoalesceRejection(serverId, message, {
-            field: typeof message.channelId !== 'string' || !message.channelId ? 'channelId' : 'messageId',
-            message: 'a coalesced message needs a channelId and a messageId',
-          }, -32602);
-        }
-        results.push({
-          messageId: typeof message?.messageId === 'string' ? message.messageId : '',
-          accepted: false,
-          reason: coalescedItem ? 'coalesce_invalid' : 'invalid channel/message identity',
-        });
-        continue;
-      }
-      // §14.5 FIRST, before ANY semantic processing: admission against the
-      // actually-registered channel precedes tag expansion and content
-      // conversion — decoding an unregistered sender's payload (including
-      // inline base64) is allocation and parsing work done for a message
-      // that must be rejected (Sol, PR #79 re-review blocker 2).
-
-      // §14.5: channels/incoming is validated against the ACTUALLY
-      // REGISTERED channel. An unknown claimed channelId is rejected
-      // per-message with an itemized result — never minted by its first
-      // message (PR #79 review blocker 5: lazy-registration let a server
-      // self-attest a channel identity without ever passing
-      // channels/register authorization). A server whose channel genuinely
-      // exists registers it first; discord's DM case goes through
-      // ensureChannelRegistered on push/event, which creates a routable
-      // entry that isn't open, rather than an open self-attested one.
-      const incomingKey = destinationKey({ serverId, channelId: message.channelId });
-      if (!this.channels.has(incomingKey)) {
-        // Loud, coalesced or not, like every other refusal of a message, but
-        // at most once a minute per channel (RefusalLines): a server that
-        // never registered a busy channel would otherwise print a line for
-        // every message in it. Every refusal is traced.
-        const held = this.unknownChannelLines.admit(serverId, message.channelId);
-        if (held !== null) {
-          console.error(
-            `[channel-incoming-rejected] server=${serverId} channel=${logValue(message.channelId)} ` +
-            `messageId=${logValue(message.messageId)} reason=unknown-channel ` +
-            `(not registered, §14.5${held ? `; ${held} more since the last line` : ''})`,
-          );
-        }
-        this.emitTraceFn({
-          type: 'mcpl:channel-incoming-rejected',
-          serverId,
-          channelId: message.channelId,
-          messageId: message.messageId,
-          reason: 'unknown-channel',
-        });
-        results.push({
-          messageId: message.messageId,
-          accepted: false,
-          reason: `unknown channel "${message.channelId}" — register it first (§14.5)`,
-        });
-        continue;
-      }
-
-      let envelope: AdmittedEnvelope | undefined;
-      let checkAdmission: RequiredIngress['check'] | undefined;
-      if (admission) {
-        const refuse = (reason: import('./inbound-admission.js').RefusalCode) => {
-          this.admissionRefusals.report(this.emitTraceFn, serverId, 'channels/incoming', reason, message);
-          results.push({ messageId: message.messageId, accepted: false, reason });
-        };
-        const replay = () => {
-          const receipt = message.coalesce !== undefined ? this.replayCoalescedIncoming?.(serverId, message) : undefined;
-          return receipt?.then(result => {
-            const { firstView: _firstView, ...wire } = result as ChannelIncomingMessageResult & { firstView?: true };
-            results.push(wire);
-          }, error => { coalesceFailure(message, error); });
-        };
-        const receipt = replay();
-        if (receipt) {
-          await receipt;
-          if (requestError) break;
-          continue;
-        }
-        const before = admission.check();
-        if (before) { refuse(before); continue; }
-        const entry = this.channels.get(incomingKey)!;
-        const target = entry.descriptor;
-        checkAdmission = () => admission.check() ?? (this.channels.get(incomingKey) !== entry || entry.descriptor !== target ? 'admission_stale' : undefined);
-        const verdict = await admission.admit('channels/incoming', message);
-        const concurrentReceipt = replay();
-        if (concurrentReceipt) {
-          await concurrentReceipt;
-          if (requestError) break;
-          continue;
-        }
-        const reason = checkAdmission();
-        if (reason || !verdict.store) {
-          refuse(reason ?? (!verdict.store ? verdict.reason : 'admission_stale'));
-          continue;
-        }
-        envelope = Object.freeze({ connection: admission.key, mayWake: verdict.mayWake, ...(Object.hasOwn(verdict, 'replyIntent') ? { replyIntent: verdict.replyIntent } : {}) });
-      }
-
-      // ACCEPTED from here down: semantic processing only for admitted
-      // messages. §16.3 core-tag closure, then content conversion.
-      const coalesced = message.coalesce !== undefined && !!this.handleCoalescedIncoming;
-      // Only a coalescing retraction may be empty (pure withdrawal, RFC-006
-      // §6; the coalescer appends nothing for it). Any other message that
-      // shows the model nothing would wake it with no visible cause.
-      const emptyAllowed = coalesced && (message.coalesce as { retract?: unknown } | null)?.retract === true;
-      const rejectEmpty = () => {
-        console.error(`[channel-incoming-rejected] server=${serverId} channel=${logValue(message.channelId)} messageId=${logValue(message.messageId)} reason=empty-content`);
-        this.emitTraceFn({
-          type: 'mcpl:channel-incoming-rejected',
-          serverId,
-          channelId: message.channelId,
-          messageId: message.messageId,
-          reason: 'empty-content',
-        });
-        results.push({ messageId: message.messageId, accepted: false, reason: 'empty_content' });
-      };
-      if (coalesced) {
-        // RFC-006 §13: malformed content on a coalesced item is that item's
-        // failure, not the batch's — check the shape before converting.
-        try {
-          validateCoalescedContent(message.content, { allowEmpty: emptyAllowed });
-        } catch (error) {
-          if (error instanceof EmptyContentError) rejectEmpty();
-          else {
-            // Answered coalesce_invalid whatever the error's code: -32602.
-            this.traceCoalesceRejection(serverId, message, error as Error & { field?: string }, -32602);
-            results.push({ messageId: message.messageId, accepted: false, reason: 'coalesce_invalid' });
+    // Reserve the whole batch now, not when a preceding sibling finishes:
+    // later requests must not jump ahead of this batch's later subjects.
+    const tickets = admission?.orderCoalesced
+      ? params.messages.map(message => typeof message?.coalesce?.key === 'string'
+        ? admission.orderCoalesced!({ kind: 'channel', id: message.channelId }, message.coalesce.key)
+        : undefined)
+      : [];
+    try {
+      for (const [index, message] of params.messages.entries()) {
+        tickets[index - 1]?.retire();
+        const ticket = tickets[index];
+        if (!message || typeof message.channelId !== 'string' || !message.channelId
+          || typeof message.messageId !== 'string' || !message.messageId) {
+          // The same gate as admission below: with no coalescer wired, a
+          // message carrying `coalesce` is handled uncoalesced, and refused as
+          // any uncoalesced message without an identity is.
+          const coalescedItem = message?.coalesce !== undefined && !!this.handleCoalescedIncoming;
+          if (coalescedItem) {
+            this.traceCoalesceRejection(serverId, message, {
+              field: typeof message.channelId !== 'string' || !message.channelId ? 'channelId' : 'messageId',
+              message: 'a coalesced message needs a channelId and a messageId',
+            }, -32602);
           }
+          results.push({
+            messageId: typeof message?.messageId === 'string' ? message.messageId : '',
+            accepted: false,
+            reason: coalescedItem ? 'coalesce_invalid' : 'invalid channel/message identity',
+          });
           continue;
         }
-      }
-      if (message.tags) message.tags = expandCoreTags(message.tags);
-      const convertedContent: ContentBlock[] = convertBlocks(message.content, 'attachment on channel message', serverId);
-      if (!emptyAllowed && isVisiblyEmptyConversion(message.content, convertedContent)) {
-        rejectEmpty();
-        continue;
-      }
+        // §14.5 FIRST, before ANY semantic processing: admission against the
+        // actually-registered channel precedes tag expansion and content
+        // conversion — decoding an unregistered sender's payload (including
+        // inline base64) is allocation and parsing work done for a message
+        // that must be rejected (Sol, PR #79 re-review blocker 2).
 
-      // A server sending channels/incoming is evidence that the transport
-      // is open. This repairs transient status only; durable desired state
-      // still changes exclusively through lifecycle operations. Nothing else
-      // is decided here: whether this message is delivered, wakes anyone or
-      // counts as the latest inbound is the framework's admission decision,
-      // taken once the hold is known (see `noteDelivered`; issue #232 root
-      // cause A). A coalesced item is "accepted" only once the coalescer
-      // admits it, so for those this runs after the hook (below).
-      const incomingEntry = this.channels.get(incomingKey)!;
-      // `firstView` is the coalescer's mark that an edit was the agent's first
-      // view of its message; the registry no longer records the publish locus
-      // here (admission does, through noteDelivered, with the same marker rule).
-      const markAccepted = (_firstView = false) => {
-        // Where the host directs this server's lifecycle, traffic shows the
-        // transport open only for a channel still decided open or tuned out,
-        // and, but for one exception, only for a confirmed target: after a
-        // retarget, traffic for this id may still come from the old
-        // subscription, and a close receipt that landed first (or during the
-        // coalescer's await) stands. The exception is an entry made from a
-        // push that no update has given a target (untargetedPushEntries):
-        // there's no earlier target its traffic could come from, so for the
-        // receipt rule's own reason its traffic shows the transport open. It
-        // stops being one when a registration replaces it (registerEntry) or
-        // a channels/changed update gives it a target (handleChanged's
-        // retarget), and the receipt rule holds from then. Where the host
-        // doesn't direct the lifecycle, the server opens its own channels and
-        // its traffic is the only evidence the host gets, so it marks the
-        // channel open, as it always has. The entry is the one the message
-        // was accepted for: one a re-registration put in its place meanwhile
-        // waits for its own evidence. Traffic from a transport that has closed
-        // since its batch arrived (here after the coalescer's await, or behind
-        // a sibling's) is no evidence either: the close withdrew what that
-        // transport confirmed, and its connection's grant is empty until the
-        // next one's. Durable desired state still changes exclusively through
-        // lifecycle operations. A marker is evidence like any other message.
-        if ((this.transportCloses.get(serverId) ?? 0) !== closesAtArrival) return;
-        if (this.directsLifecycle(serverId)) {
-          if (this.unconfirmedChannelTargets.has(incomingEntry) && !this.untargetedPushEntries.has(incomingEntry)) return;
-          const desired = this.getDesiredState(serverId, message.channelId);
-          if (desired !== 'open' && desired !== 'tuned-out') return;
-        }
-        this.unconfirmedChannelTargets.delete(incomingEntry);
-        this.failedCloseTargets.delete(incomingEntry);
-        incomingEntry.open = true;
-      };
-      if (!coalesced) markAccepted();
-
-      // The server-level veto only; the wake gate runs at admission.
-      let triggerInference = envelope?.mayWake !== false;
-      if (triggerInference && this.shouldTriggerInference) {
-        // The text the agent's context gets, as the push lane's filter reads
-        // it: the converted text blocks, a placeholder or reference stub
-        // among them, NON_STRING_TEXT_PLACEHOLDER included.
-        const textContent = convertedContent
-          .filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text')
-          .map((b) => b.text)
-          .join('\n');
-        triggerInference = this.shouldTriggerInference(
-          textContent,
-          {
-            ...message.metadata,
-            eventType: 'mcpl:channel-incoming',
+        // §14.5: channels/incoming is validated against the ACTUALLY
+        // REGISTERED channel. An unknown claimed channelId is rejected
+        // per-message with an itemized result — never minted by its first
+        // message (PR #79 review blocker 5: lazy-registration let a server
+        // self-attest a channel identity without ever passing
+        // channels/register authorization). A server whose channel genuinely
+        // exists registers it first; discord's DM case goes through
+        // ensureChannelRegistered on push/event, which creates a routable
+        // entry that isn't open, rather than an open self-attested one.
+        const incomingKey = destinationKey({ serverId, channelId: message.channelId });
+        if (!this.channels.has(incomingKey)) {
+          // Loud, coalesced or not, like every other refusal of a message, but
+          // at most once a minute per channel (RefusalLines): a server that
+          // never registered a busy channel would otherwise print a line for
+          // every message in it. Every refusal is traced.
+          const held = this.unknownChannelLines.admit(serverId, message.channelId);
+          if (held !== null) {
+            console.error(
+              `[channel-incoming-rejected] server=${serverId} channel=${logValue(message.channelId)} ` +
+              `messageId=${logValue(message.messageId)} reason=unknown-channel ` +
+              `(not registered, §14.5${held ? `; ${held} more since the last line` : ''})`,
+            );
+          }
+          this.emitTraceFn({
+            type: 'mcpl:channel-incoming-rejected',
             serverId,
             channelId: message.channelId,
             messageId: message.messageId,
-            threadId: message.threadId,
-            author: message.author,
-            ...(message.tags ? { tags: message.tags } : {}),
-          },
-        );
-      }
-
-      // Build the incoming event
-      const event: McplChannelIncomingEvent = {
-        type: 'mcpl:channel-incoming',
-        serverId,
-        channelId: message.channelId,
-        messageId: message.messageId,
-        threadId: message.threadId,
-        author: message.author,
-        content: convertedContent,
-        timestamp: message.timestamp,
-        metadata: message.metadata,
-        ...(message.tags ? { tags: message.tags } : {}),
-        triggerInference,
-        acceptedAt: Date.now(),
-      };
-
-      if (envelope) attachAdmission(event, envelope);
-
-      if (coalesced) {
-        // RFC-006 §14.3: a coalesced message is admitted like any other and
-        // then handed, with the event the ordinary path would have queued, to
-        // the coalescer, which replaces, appends or withdraws. Malformed
-        // `coalesce` is a per-message failure; siblings are unaffected.
-        try {
-          const { firstView, ...result } = await this.handleCoalescedIncoming!(serverId, message, event, checkAdmission);
-          if (admission && !result.accepted) {
-            this.admissionRefusals.report(this.emitTraceFn, serverId, 'channels/incoming', result.reason as import('./inbound-admission.js').RefusalCode, message);
-          }
-          if (result.accepted) markAccepted(firstView === true);
-          results.push(result);
-        } catch (error) {
-          if (coalesceFailure(message, error)) break;
+            reason: 'unknown-channel',
+          });
+          results.push({
+            messageId: message.messageId,
+            accepted: false,
+            reason: `unknown channel "${message.channelId}" — register it first (§14.5)`,
+          });
+          continue;
         }
-        continue;
+
+        let envelope: AdmittedEnvelope | undefined;
+        let checkAdmission: RequiredIngress['check'] | undefined;
+        if (admission) {
+          const refuse = (reason: import('./inbound-admission.js').RefusalCode) => {
+            this.admissionRefusals.report(this.emitTraceFn, serverId, 'channels/incoming', reason, message);
+            results.push({ messageId: message.messageId, accepted: false, reason });
+          };
+          const replay = () => {
+            const receipt = message.coalesce !== undefined ? this.replayCoalescedIncoming?.(serverId, message) : undefined;
+            return receipt?.then(result => {
+              const { firstView: _firstView, ...wire } = result as ChannelIncomingMessageResult & { firstView?: true };
+              results.push(wire);
+            }, error => { coalesceFailure(message, error); });
+          };
+          const receipt = replay();
+          if (receipt) {
+            await ticket?.ready;
+            await receipt;
+            if (requestError) break;
+            continue;
+          }
+          const before = admission.check();
+          if (before) { await ticket?.ready; refuse(before); continue; }
+          const entry = this.channels.get(incomingKey)!;
+          const target = entry.descriptor;
+          checkAdmission = () => admission.check() ?? (this.channels.get(incomingKey) !== entry || entry.descriptor !== target ? 'admission_stale' : undefined);
+          const verdict = await admission.admit('channels/incoming', message);
+          await ticket?.ready;
+          const concurrentReceipt = replay();
+          if (concurrentReceipt) {
+            await concurrentReceipt;
+            if (requestError) break;
+            continue;
+          }
+          const reason = checkAdmission();
+          if (reason || !verdict.store) {
+            refuse(reason ?? (!verdict.store ? verdict.reason : 'admission_stale'));
+            continue;
+          }
+          envelope = Object.freeze({ connection: admission.key, mayWake: verdict.mayWake, ...(Object.hasOwn(verdict, 'replyIntent') ? { replyIntent: verdict.replyIntent } : {}) });
+        }
+
+        // ACCEPTED from here down: semantic processing only for admitted
+        // messages. §16.3 core-tag closure, then content conversion.
+        const coalesced = message.coalesce !== undefined && !!this.handleCoalescedIncoming;
+        // Only a coalescing retraction may be empty (pure withdrawal, RFC-006
+        // §6; the coalescer appends nothing for it). Any other message that
+        // shows the model nothing would wake it with no visible cause.
+        const emptyAllowed = coalesced && (message.coalesce as { retract?: unknown } | null)?.retract === true;
+        const rejectEmpty = () => {
+          console.error(`[channel-incoming-rejected] server=${serverId} channel=${logValue(message.channelId)} messageId=${logValue(message.messageId)} reason=empty-content`);
+          this.emitTraceFn({
+            type: 'mcpl:channel-incoming-rejected',
+            serverId,
+            channelId: message.channelId,
+            messageId: message.messageId,
+            reason: 'empty-content',
+          });
+          results.push({ messageId: message.messageId, accepted: false, reason: 'empty_content' });
+        };
+        if (coalesced) {
+          // RFC-006 §13: malformed content on a coalesced item is that item's
+          // failure, not the batch's — check the shape before converting.
+          try {
+            validateCoalescedContent(message.content, { allowEmpty: emptyAllowed });
+          } catch (error) {
+            if (error instanceof EmptyContentError) rejectEmpty();
+            else {
+              // Answered coalesce_invalid whatever the error's code: -32602.
+              this.traceCoalesceRejection(serverId, message, error as Error & { field?: string }, -32602);
+              results.push({ messageId: message.messageId, accepted: false, reason: 'coalesce_invalid' });
+            }
+            continue;
+          }
+        }
+        if (message.tags) message.tags = expandCoreTags(message.tags);
+        const convertedContent: ContentBlock[] = convertBlocks(message.content, 'attachment on channel message', serverId);
+        if (!emptyAllowed && isVisiblyEmptyConversion(message.content, convertedContent)) {
+          rejectEmpty();
+          continue;
+        }
+
+        // A server sending channels/incoming is evidence that the transport
+        // is open. This repairs transient status only; durable desired state
+        // still changes exclusively through lifecycle operations. Nothing else
+        // is decided here: whether this message is delivered, wakes anyone or
+        // counts as the latest inbound is the framework's admission decision,
+        // taken once the hold is known (see `noteDelivered`; issue #232 root
+        // cause A). A coalesced item is "accepted" only once the coalescer
+        // admits it, so for those this runs after the hook (below).
+        const incomingEntry = this.channels.get(incomingKey)!;
+        // `firstView` is the coalescer's mark that an edit was the agent's first
+        // view of its message; the registry no longer records the publish locus
+        // here (admission does, through noteDelivered, with the same marker rule).
+        const markAccepted = (_firstView = false) => {
+          // Where the host directs this server's lifecycle, traffic shows the
+          // transport open only for a channel still decided open or tuned out,
+          // and, but for one exception, only for a confirmed target: after a
+          // retarget, traffic for this id may still come from the old
+          // subscription, and a close receipt that landed first (or during the
+          // coalescer's await) stands. The exception is an entry made from a
+          // push that no update has given a target (untargetedPushEntries):
+          // there's no earlier target its traffic could come from, so for the
+          // receipt rule's own reason its traffic shows the transport open. It
+          // stops being one when a registration replaces it (registerEntry) or
+          // a channels/changed update gives it a target (handleChanged's
+          // retarget), and the receipt rule holds from then. Where the host
+          // doesn't direct the lifecycle, the server opens its own channels and
+          // its traffic is the only evidence the host gets, so it marks the
+          // channel open, as it always has. The entry is the one the message
+          // was accepted for: one a re-registration put in its place meanwhile
+          // waits for its own evidence. Traffic from a transport that has closed
+          // since its batch arrived (here after the coalescer's await, or behind
+          // a sibling's) is no evidence either: the close withdrew what that
+          // transport confirmed, and its connection's grant is empty until the
+          // next one's. Durable desired state still changes exclusively through
+          // lifecycle operations. A marker is evidence like any other message.
+          if ((this.transportCloses.get(serverId) ?? 0) !== closesAtArrival) return;
+          if (this.directsLifecycle(serverId)) {
+            if (this.unconfirmedChannelTargets.has(incomingEntry) && !this.untargetedPushEntries.has(incomingEntry)) return;
+            const desired = this.getDesiredState(serverId, message.channelId);
+            if (desired !== 'open' && desired !== 'tuned-out') return;
+          }
+          this.unconfirmedChannelTargets.delete(incomingEntry);
+          this.failedCloseTargets.delete(incomingEntry);
+          incomingEntry.open = true;
+        };
+        if (!coalesced) markAccepted();
+
+        // The server-level veto only; the wake gate runs at admission.
+        let triggerInference = envelope?.mayWake !== false;
+        if (triggerInference && this.shouldTriggerInference) {
+          // The text the agent's context gets, as the push lane's filter reads
+          // it: the converted text blocks, a placeholder or reference stub
+          // among them, NON_STRING_TEXT_PLACEHOLDER included.
+          const textContent = convertedContent
+            .filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text')
+            .map((b) => b.text)
+            .join('\n');
+          triggerInference = this.shouldTriggerInference(
+            textContent,
+            {
+              ...message.metadata,
+              eventType: 'mcpl:channel-incoming',
+              serverId,
+              channelId: message.channelId,
+              messageId: message.messageId,
+              threadId: message.threadId,
+              author: message.author,
+              ...(message.tags ? { tags: message.tags } : {}),
+            },
+          );
+        }
+
+        // Build the incoming event
+        const event: McplChannelIncomingEvent = {
+          type: 'mcpl:channel-incoming',
+          serverId,
+          channelId: message.channelId,
+          messageId: message.messageId,
+          threadId: message.threadId,
+          author: message.author,
+          content: convertedContent,
+          timestamp: message.timestamp,
+          metadata: message.metadata,
+          ...(message.tags ? { tags: message.tags } : {}),
+          triggerInference,
+          acceptedAt: Date.now(),
+        };
+
+        if (envelope) attachAdmission(event, envelope);
+
+        if (coalesced) {
+          // RFC-006 §14.3: a coalesced message is admitted like any other and
+          // then handed, with the event the ordinary path would have queued, to
+          // the coalescer, which replaces, appends or withdraws. Malformed
+          // `coalesce` is a per-message failure; siblings are unaffected.
+          try {
+            const { firstView, ...result } = await this.handleCoalescedIncoming!(serverId, message, event, checkAdmission);
+            if (admission && !result.accepted) {
+              this.admissionRefusals.report(this.emitTraceFn, serverId, 'channels/incoming', result.reason as import('./inbound-admission.js').RefusalCode, message);
+            }
+            if (result.accepted) markAccepted(firstView === true);
+            results.push(result);
+          } catch (error) {
+            if (coalesceFailure(message, error)) break;
+          }
+          continue;
+        }
+
+        // The source envelope is frozen here, at admission, before the message
+        // is queued or acknowledged: a rename or rebind while it waits in the
+        // queue cannot change where it says it came from.
+        const inboundSource = this.acceptInbound?.(event);
+        if (inboundSource) event.inboundSource = inboundSource;
+
+        // Push to the processing queue
+        // Cast through unknown because McplChannelIncomingEvent matches the
+        // CustomEvent `${string}:${string}` type pattern but lacks an index signature.
+        this.pushEventFn(event as unknown as ProcessEvent);
+
+        // Collect per-message result
+        results.push({
+          messageId: message.messageId,
+          accepted: true,
+        });
       }
-
-      // The source envelope is frozen here, at admission, before the message
-      // is queued or acknowledged: a rename or rebind while it waits in the
-      // queue cannot change where it says it came from.
-      const inboundSource = this.acceptInbound?.(event);
-      if (inboundSource) event.inboundSource = inboundSource;
-
-      // Push to the processing queue
-      // Cast through unknown because McplChannelIncomingEvent matches the
-      // CustomEvent `${string}:${string}` type pattern but lacks an index signature.
-      this.pushEventFn(event as unknown as ProcessEvent);
-
-      // Collect per-message result
-      results.push({
-        messageId: message.messageId,
-        accepted: true,
-      });
+    } finally {
+      // Includes the current item on throw, and unused siblings after a
+      // request-level acknowledgement failure. Retirement is idempotent.
+      for (const ticket of tickets) ticket?.retire();
     }
 
     if (requestError) responder!.respondError!(requestError.code, requestError.message, { field: requestError.field });
@@ -2459,7 +2476,7 @@ export class ChannelRegistry {
   captureRegistration(ref: ChannelRef): () => boolean {
     const entry = this.entryAt(ref);
     const descriptor = entry?.descriptor;
-    return () => this.entryAt(ref) === entry && entry?.descriptor === descriptor;
+    return () => !!entry && this.entryAt(ref) === entry && entry.descriptor === descriptor;
   }
 
   /** The registered label of `channelId` on exactly `serverId` (no

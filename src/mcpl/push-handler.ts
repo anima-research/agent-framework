@@ -133,6 +133,7 @@ export class PushHandler {
      *  (mcpl/inbound-source.ts). Coalesced work is stamped by its own path. */
     private readonly acceptInbound?: (event: McplPushEvent) => InboundSource | undefined,
     private readonly replayCoalesced?: (serverId: string, params: PushEventParams) => Promise<PushEventResult> | undefined,
+    private readonly assertChannelScopedPush?: (serverId: string, channelId: string) => void,
   ) {
     this.featureSetManager = featureSetManager;
     this.pushEventFn = pushEventFn;
@@ -155,60 +156,86 @@ export class PushHandler {
 
   /** Required-only preflight: the framework calls this before toolset notices. */
   async handleRequiredPushEvent(serverId: string, params: PushEventParams, responder: Responder | undefined, admission: RequiredIngress): Promise<void> {
+    const c = params.coalesce;
+    const ticket = typeof c?.key === 'string'
+      ? admission.orderCoalesced?.(c.channelId ? { kind: 'channel', id: c.channelId } : { kind: 'featureSet', id: params.featureSet }, c.key)
+      : undefined;
     try {
-      this.featureSetManager.validateInbound(serverId, params.featureSet);
-    } catch (err) {
-      if (err instanceof McplFeatureSetError && responder?.respondError) responder.respondError(err.code, err.message, { featureSet: err.featureSet });
-      else responder?.respond({ accepted: false, reason: 'Feature set validation failed' });
-      return;
+      try {
+        this.featureSetManager.validateInbound(serverId, params.featureSet);
+      } catch (err) {
+        if (err instanceof McplFeatureSetError && responder?.respondError) responder.respondError(err.code, err.message, { featureSet: err.featureSet });
+        else responder?.respond({ accepted: false, reason: 'Feature set validation failed' });
+        return;
+      }
+      const refuse = (reason: import('./inbound-admission.js').RefusalCode) => {
+        this.admissionRefusals.report(this.emitTraceFn, serverId, 'push/event', reason, params);
+        responder?.respond({ accepted: false, reason });
+      };
+      const replay = () => {
+        // A channel-scoped push needs channel authority before host callbacks
+        // or receipt replay, just as the unconfigured coalescer path does.
+        if (params.coalesce?.channelId) {
+          try {
+            this.assertChannelScopedPush?.(serverId, params.coalesce.channelId);
+          } catch (error) {
+            const err = error as Error & { code?: number; field?: string };
+            const code = err.code ?? -32603;
+            this.traceCoalesceRejection(serverId, params, err, code);
+            if (responder?.respondError) responder.respondError(code, err.message, { field: err.field });
+            else responder?.respond({ accepted: false, reason: err.message });
+            return Promise.resolve();
+          }
+        }
+        const receipt = params.coalesce !== undefined ? this.replayCoalesced?.(serverId, params) : undefined;
+        return receipt?.then(async result => {
+          await ticket?.ready;
+          this.emitTraceFn({ type: 'mcpl:push_event', serverId, eventId: params.eventId, featureSet: params.featureSet, coalesce: result.coalesce });
+          responder?.respond(result);
+        }, async error => {
+          await ticket?.ready;
+          const err = error as Error & { code?: number; field?: string };
+          const code = err.code ?? -32603;
+          this.traceCoalesceRejection(serverId, params, err, code);
+          if (responder?.respondError) responder.respondError(code, err.message, { field: err.field });
+          else responder?.respond({ accepted: false, reason: err.message });
+        });
+      };
+      const receipt = replay();
+      if (receipt) { await ticket?.ready; await receipt; return; }
+      // Deferred notices aggregate into a later push/render batch, which has
+      // no current-key re-admission across reconnect/recovery in this profile.
+      // Plain occurrences, including edits and withdrawals, stand on their
+      // own admission verdict and retain the RFC-006 replacement path.
+      if (params.coalesce?.deferred === true) {
+        await ticket?.ready;
+        refuse('admission_unsupported');
+        return;
+      }
+      const before = admission.check();
+      if (before) { await ticket?.ready; refuse(before); return; }
+      const verdict = await admission.admit('push/event', params);
+      await ticket?.ready;
+      // Another occurrence with this eventId may have been admitted while the
+      // callback ran. Its receipt wins even over a refusal or a stale verdict.
+      const concurrentReceipt = replay();
+      if (concurrentReceipt) { await concurrentReceipt; return; }
+      const check = () => {
+        let reason = admission.check();
+        try { this.featureSetManager.validateInbound(serverId, params.featureSet); } catch { reason ??= 'admission_stale'; }
+        return reason;
+      };
+      const reason = check();
+      if (reason || !verdict.store) {
+        refuse(reason ?? (!verdict.store ? verdict.reason : 'admission_stale'));
+        return;
+      }
+      const envelope = Object.freeze({ connection: admission.key, mayWake: verdict.mayWake, ...(Object.hasOwn(verdict, 'replyIntent') ? { replyIntent: verdict.replyIntent } : {}) });
+      // No await between the final check and the admitted continuation's first effect.
+      return await this.handlePushEvent(serverId, params, responder, envelope, check);
+    } finally {
+      ticket?.retire();
     }
-    const refuse = (reason: import('./inbound-admission.js').RefusalCode) => {
-      this.admissionRefusals.report(this.emitTraceFn, serverId, 'push/event', reason, params);
-      responder?.respond({ accepted: false, reason });
-    };
-    const replay = () => {
-      const receipt = params.coalesce !== undefined ? this.replayCoalesced?.(serverId, params) : undefined;
-      return receipt?.then(result => {
-        this.emitTraceFn({ type: 'mcpl:push_event', serverId, eventId: params.eventId, featureSet: params.featureSet, coalesce: result.coalesce });
-        responder?.respond(result);
-      }, error => {
-        const err = error as Error & { code?: number; field?: string };
-        const code = err.code ?? -32603;
-        this.traceCoalesceRejection(serverId, params, err, code);
-        if (responder?.respondError) responder.respondError(code, err.message, { field: err.field });
-        else responder?.respond({ accepted: false, reason: err.message });
-      });
-    };
-    const receipt = replay();
-    if (receipt) { await receipt; return; }
-    // Deferred notices aggregate into a later push/render batch, which has
-    // no current-key re-admission across reconnect/recovery in this profile.
-    // Plain occurrences, including edits and withdrawals, stand on their
-    // own admission verdict and retain the RFC-006 replacement path.
-    if (params.coalesce?.deferred === true) {
-      refuse('admission_unsupported');
-      return;
-    }
-    const before = admission.check();
-    if (before) { refuse(before); return; }
-    const verdict = await admission.admit('push/event', params);
-    // Another occurrence with this eventId may have been admitted while the
-    // callback ran. Its receipt wins even over a refusal or a stale verdict.
-    const concurrentReceipt = replay();
-    if (concurrentReceipt) { await concurrentReceipt; return; }
-    const check = () => {
-      let reason = admission.check();
-      try { this.featureSetManager.validateInbound(serverId, params.featureSet); } catch { reason ??= 'admission_stale'; }
-      return reason;
-    };
-    const reason = check();
-    if (reason || !verdict.store) {
-      refuse(reason ?? (!verdict.store ? verdict.reason : 'admission_stale'));
-      return;
-    }
-    const envelope = Object.freeze({ connection: admission.key, mayWake: verdict.mayWake, ...(Object.hasOwn(verdict, 'replyIntent') ? { replyIntent: verdict.replyIntent } : {}) });
-    // No await between the final check and the admitted continuation's first effect.
-    return this.handlePushEvent(serverId, params, responder, envelope, check);
   }
 
   async handlePushEvent(

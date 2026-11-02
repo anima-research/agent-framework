@@ -13,12 +13,17 @@
   item per callback latency accumulates and is dropped/refused at the existing hold
   bounds. A bounded-concurrency ordered drain is a possible follow-up at the
   maintainer's discretion, not implemented here.
-  Independently sent live items without a backlog may still finish in callback
-  latency order. Superseded-epoch items are refused. During initialize, data requests
+  Independently sent live non-coalesced items without a backlog may still finish
+  in callback-latency order. Plain coalesced creates, edits and withdrawals go
+  through admission with per-subject arrival ordering shared across both lanes.
+  Superseded-epoch items are refused. During initialize, data requests
   receive the existing capability error (-32002). Required connections do not
   advertise `toolHints` or carry RFC-014 toolset presence; an explicit
-  `toolHints: true` override logs once at connect. They refuse coalescing with `admission_unsupported` until
-  durable re-admission is supported; generic result taps remain intact.
+  `toolHints: true` override logs once at connect. Only deferred `push/event` /
+  `push/render` batches are refused with `admission_unsupported` until durable
+  re-admission is supported; `eventCoalescing.deferred` is not offered. Generic
+  result taps remain intact. Channel-scoped pushes require channel authorization
+  before admission or receipt replay; initialize refusals name the denied capability.
   `mayWake: false` caps downstream wakes, including module requests;
   `mayWake: true` does not override gate declines or prevent a module-driven wake.
   Admission refusals are traced with fixed codes and rate-limited diagnostics.

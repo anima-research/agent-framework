@@ -1,4 +1,5 @@
 /** Host-owned, opt-in admission. No wire metadata can create this authority. */
+import type { CoalescingScope } from './push-coalescer.js';
 import { RefusalLines } from './refusal-lines.js';
 import { logValue } from './log-value.js';
 import type { ChannelIncomingMessage, PushEventParams, McplInferenceRequestParams } from './types.js';
@@ -84,6 +85,8 @@ export function wakeForbidden(event: object): boolean {
 }
 export interface RequiredIngress {
   readonly key: ConnectionKey;
+  /** Reserve at arrival, before callbacks; both lanes share the subject queue. */
+  orderCoalesced?(scope: CoalescingScope, key: string): { ready: Promise<void>; retire(): void };
   check(): RefusalCode | undefined;
   admit(lane: AdmissionLane, item: unknown, signal?: AbortSignal): Promise<AdmissionVerdict>;
 }
