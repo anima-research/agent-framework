@@ -365,25 +365,32 @@ interface HeldItem {
   kept?: true;
 }
 
-/** The log line for a response whose id is neither a string nor a number,
- *  or that has none: the host's own request ids are numbers, so it can't be
- *  matched to one. A server sends an error with id null, or under MCP with
- *  no id, when it couldn't read a request (JSON-RPC 2.0 §5), so once
- *  connected it may be the answer to a request of ours, which gets nothing
- *  from it and ends as any unanswered request does, by its timeout where it
- *  has one. (During the handshake such an error answers initialize, when
- *  its jsonrpc is "2.0".) Its error member, if it has one, is the server's
- *  text, whatever JSON value it is, so it's printed redacted with `redact`,
- *  the server's redaction (logValueRedacted), as handleResponse prints a
- *  matched error's code and message. */
+/** Whether a response that can't be matched to a request of ours, its id
+ *  being neither a string nor a number or missing, is logged: only a
+ *  JSON-RPC 2.0 error is, since that's how a server says it couldn't read a
+ *  message of ours (JSON-RPC 2.0 §5). Anything else id-less, such as a
+ *  server's own JSON log line with `"id": null`, is ignored silently, as it
+ *  was before #475, so a server's log output can't fill the host's. */
+function isJsonRpcError(response: object): boolean {
+  return (response as { jsonrpc?: unknown }).jsonrpc === '2.0' && Object.hasOwn(response, 'error');
+}
+
+/** The log line for such an error. The host's own request ids are numbers,
+ *  so it can't be matched to one. Once connected it may be the answer to a
+ *  request of ours, which gets nothing from it and ends as any unanswered
+ *  request does, by its timeout where it has one. (During the handshake an
+ *  error with id null or no id answers initialize.) Its error member is the
+ *  server's text, whatever JSON value it is, so it's printed redacted with
+ *  `redact`, the server's redaction (logValueRedacted), as handleResponse
+ *  prints a matched error's code and message. */
 function unmatchedResponse(
   serverId: string,
   response: { id?: unknown; error?: unknown },
   redact: (text: string) => string,
 ): string {
   const which = Object.hasOwn(response, 'id') ? `whose id is ${jsonKind(response.id)}` : 'with no id';
-  return `[mcpl] ${serverId}: ignored a response ${which}, which can't be matched to a request of ours` +
-    (response.error !== undefined ? `; its error: ${logValueRedacted(response.error, redact)}` : '');
+  return `[mcpl] ${serverId}: ignored a response ${which}, which can't be matched to a request of ours; ` +
+    `its error: ${logValueRedacted(response.error, redact)}`;
 }
 
 /**
@@ -1365,9 +1372,9 @@ export class McplServerConnection extends EventEmitter {
           // `"jsonrpc": "2.0"` keeps a server's own JSON log line with an
           // error key and id null, or no id, from failing it; one with
           // initialize's id is taken for the answer, whatever its jsonrpc. Of
-          // the other responses, one whose id is neither a string nor a number,
-          // or that has none, is logged, as on a connected transport, and one
-          // with another string or number id is ignored.
+          // the other responses, a JSON-RPC 2.0 error whose id is neither a
+          // string nor a number is logged, as on a connected transport, and
+          // any other is ignored.
           const envelope = readEnvelope(msg as unknown as Record<string, unknown>);
           if (envelope.kind === 'request' && envelope.method === 'ping') {
             transport.writeLine(JSON.stringify({ jsonrpc: '2.0', id: envelope.id, result: {} }));
@@ -1377,7 +1384,7 @@ export class McplServerConnection extends EventEmitter {
           const namesNoRequest = msg.id === null || !Object.hasOwn(msg, 'id');
           const answersInitialize = msg.id === initId || (namesNoRequest && msg.jsonrpc === '2.0' && Boolean(msg.error));
           if (!answersInitialize) {
-            if (typeof msg.id !== 'string' && typeof msg.id !== 'number') {
+            if (typeof msg.id !== 'string' && typeof msg.id !== 'number' && isJsonRpcError(msg)) {
               console.error(unmatchedResponse(config.id, msg, (text) => redactServerText(text, config)));
             }
             return;
@@ -2652,9 +2659,11 @@ export class McplServerConnection extends EventEmitter {
     // A response whose id is neither a string nor a number, or that has
     // none, can't be matched to a request of ours, on this transport or an
     // earlier one. It isn't an orphan, which is a late answer to one, so
-    // it's logged and ignored.
+    // it's ignored, and logged when it's a JSON-RPC 2.0 error.
     if (typeof response.id !== 'string' && typeof response.id !== 'number') {
-      console.error(unmatchedResponse(this.id, response, (this.redactor ??= serverTextRedactor(this.config ?? {})).now()));
+      if (isJsonRpcError(response)) {
+        console.error(unmatchedResponse(this.id, response, (this.redactor ??= serverTextRedactor(this.config ?? {})).now()));
+      }
       return;
     }
     // One read after its transport's boundary answers a request the close

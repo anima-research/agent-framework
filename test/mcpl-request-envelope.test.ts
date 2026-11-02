@@ -6,9 +6,10 @@
  * and no method is a response, whatever the id's value, and so is a
  * JSON-RPC 2.0 error with no id, as MCP allows; a response is never
  * answered, and one whose id is neither a string nor a number, or that has
- * none, can't be matched, so it's logged, its error redacted, during the
- * handshake too, except that a JSON-RPC 2.0 error with id null or none then
- * answers initialize, and the connect fails at once; any other object with
+ * none, can't be matched, so it's ignored, and logged, its error redacted,
+ * when it's a JSON-RPC 2.0 error, during the handshake too, except that such
+ * an error with id null or none then answers initialize, and the connect
+ * fails at once; any other object with
  * neither a method nor an id isn't JSON-RPC, so it's ignored, as a JSON
  * value that isn't an object is, a batch included. A message whose id isn't
  * a string, a number or null, or whose method isn't a string, with or
@@ -210,8 +211,10 @@ test('a message without a method is a response, whatever its id, and is never an
   // and the form MCP allows for it, with no id (MCP 2025-11-25, Basic).
   send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
   send({ jsonrpc: '2.0', error: { code: -32700, message: 'Parse error' } });
-  // An id none of ours can have, with the state an orphan would carry.
+  // An id none of ours can have, with the state an orphan would carry, in a
+  // result, which isn't logged, and in an error, which is.
   send({ jsonrpc: '2.0', id: { x: 1 }, result: { state: {} } });
+  send({ jsonrpc: '2.0', id: { x: 1 }, error: 'boom' });
   assert.deepEqual(replies(), [], 'a response is never answered');
   assert.equal(handled.length, 0);
   assert.deepEqual(orphans, [], "neither is a late answer to a request of ours");
@@ -220,13 +223,25 @@ test('a message without a method is a response, whatever its id, and is never an
   assert.deepEqual(logged, [
     String.raw`[mcpl] srv: ignored a response whose id is null, which can't be matched to a request of ours; its error: "{\"code\":-32700,\"message\":\"Parse\u0020error\"}"`,
     String.raw`[mcpl] srv: ignored a response with no id, which can't be matched to a request of ours; its error: "{\"code\":-32700,\"message\":\"Parse\u0020error\"}"`,
-    "[mcpl] srv: ignored a response whose id is an object, which can't be matched to a request of ours",
+    "[mcpl] srv: ignored a response whose id is an object, which can't be matched to a request of ours; its error: boom",
   ]);
   // The control: a number id that matches no pending request, carrying state,
   // is still surfaced as an orphan.
   send({ jsonrpc: '2.0', id: 999, result: { state: {} } });
   assert.equal(orphans.length, 1);
   assert.deepEqual(replies(), []);
+});
+
+test("a response with id null or no id that isn't a JSON-RPC 2.0 error, such as a server's own log line, is ignored with no log, however many come (#534's review, R1-1)", (t) => {
+  const { send, replies, handled, logged } = wire(t);
+  for (let i = 0; i < 50; i++) {
+    send({ level: 'info', id: null, msg: `line ${i}` });
+    send({ level: 50, id: null, msg: 'request failed', error: { code: -32700, message: 'Parse error' } });
+    send({ jsonrpc: '2.0', id: null, result: {} });
+  }
+  assert.deepEqual(replies(), []);
+  assert.equal(handled.length, 0);
+  assert.deepEqual(logged, []);
 });
 
 test("an error that can't be matched is logged with a credential its server's configuration holds redacted", (t) => {
@@ -314,7 +329,7 @@ for (const [form, answer] of [
   });
 }
 
-test("during the handshake a response whose id isn't a string or a number, and that doesn't answer initialize, is logged, one with another number is ignored, and the handshake goes on", async (t) => {
+test("during the handshake a JSON-RPC 2.0 error whose id isn't a string or a number, and that doesn't answer initialize, is logged, any other such response and one with another number are ignored, and the handshake goes on", async (t) => {
   const logged: string[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
   // Answers initialize first with a number that isn't initialize's, then with
@@ -337,11 +352,10 @@ test("during the handshake a response whose id isn't a string or a number, and t
   );
   try {
     assert.equal(connection.capabilities?.pushEvents, true, 'the initialize answer that followed was taken');
-    // The numbered response that isn't initialize's is neither logged nor taken.
+    // The numbered response that isn't initialize's is neither logged nor
+    // taken, and so are the result with id null and the server's own log
+    // lines, which aren't JSON-RPC errors.
     assert.deepEqual(logged.filter((entry) => entry.startsWith('[mcpl] unmatched: ignored a response')), [
-      "[mcpl] unmatched: ignored a response whose id is null, which can't be matched to a request of ours",
-      String.raw`[mcpl] unmatched: ignored a response whose id is null, which can't be matched to a request of ours; its error: "{\"code\":-32700,\"message\":\"Parse\u0020error\"}"`,
-      String.raw`[mcpl] unmatched: ignored a response whose id is null, which can't be matched to a request of ours; its error: "db\u0020unavailable"`,
       "[mcpl] unmatched: ignored a response whose id is an object, which can't be matched to a request of ours; its error: boom",
     ]);
   } finally {
@@ -353,10 +367,10 @@ test("during the handshake an error that can't be matched is logged with a crede
   const logged: string[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
   const token = 'tok-0123456789abcdef';
-  // A log line of the server's own, with id null and an error, that doesn't
-  // say it's JSON-RPC, so it doesn't answer initialize; then the answer.
+  // An error with an id none of ours can have, which doesn't answer
+  // initialize; then the answer.
   const server = initializeAnswers(
-    JSON.stringify({ level: 'error', id: null, error: `bad token ${token}` }),
+    JSON.stringify({ jsonrpc: '2.0', id: { x: 1 }, error: `bad token ${token}` }),
     JSON.stringify({ jsonrpc: '2.0', id: 'INIT', result: { protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.5' } } } } }),
   );
   const connection = await McplServerConnection.connect(
@@ -365,7 +379,7 @@ test("during the handshake an error that can't be matched is logged with a crede
   );
   try {
     assert.deepEqual(logged.filter((entry) => entry.startsWith('[mcpl] unmatched: ignored a response')), [
-      String.raw`[mcpl] unmatched: ignored a response whose id is null, which can't be matched to a request of ours; its error: "bad\u0020token\u0020redacted"`,
+      String.raw`[mcpl] unmatched: ignored a response whose id is an object, which can't be matched to a request of ours; its error: "bad\u0020token\u0020redacted"`,
     ]);
   } finally {
     await connection.close();
