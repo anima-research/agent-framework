@@ -4,10 +4,11 @@
  * (`capabilities.streaming.speculative`), the call's `content` (or `text`)
  * argument goes to the channel's server as `channels/outgoing/chunk`
  * deltas, ahead of the publish, so a voice server can start speaking. The
- * publish stays authoritative: its success ends the stream with
- * `channels/outgoing/complete` carrying the full text, and anything else
- * (the call cut off, refused, failed, never run, or published elsewhere)
- * ends it with empty content and `cancelled: true`.
+ * publish stays authoritative: its known delivery ends the stream with
+ * `channels/outgoing/complete` carrying the full text, a publish known not to
+ * reach the channel (the call cut off, refused, known not sent, never run)
+ * ends it with empty content and `cancelled: true`, and an unknown outcome
+ * sends neither.
  *
  * This file holds the pure parts: an incremental reader of the call's
  * argument JSON as it streams (PublishArgsReader), and the streams of one
@@ -307,10 +308,12 @@ const sameChannel = (a: ChannelRef, b: ChannelRef) => a.serverId === b.serverId 
  * - called: the finished call arrived (onToolCalls).
  * - dispatched: its publish is under way (dispatch); `published` ends it.
  *
- * A stream ends exactly once: `complete` with the full text when the
- * publish was delivered to the channel the chunks went to, else `complete`
- * with empty content and `cancelled`. A call that sent no chunk ends with
- * nothing sent. The sink's sends never throw out of here.
+ * A stream gets at most one end: `complete` with the full text when the
+ * publish was delivered to the channel the chunks went to, `complete` with
+ * empty content and `cancelled` when it is known not to have been (refused,
+ * never run, known not sent), and none when the publish's outcome is unknown.
+ * A call that sent no chunk ends with nothing sent. The sink's sends never
+ * throw out of here.
  */
 export class SpeculativePublishStreams {
   private readonly streams = new Map<string, PublishStream>();
@@ -421,13 +424,21 @@ export class SpeculativePublishStreams {
   }
 
   /**
-   * The call's publish ended: delivered to `destination`, or not. The stream
-   * completes with the call's text when that is the channel it streamed to,
-   * else it is cancelled.
+   * The call's publish ended: delivered to `destination`, known not sent, or
+   * `unknown`. The stream completes with the call's text when it was
+   * delivered to the channel it streamed to, and is cancelled when it is
+   * known not to have reached it. When that is unknown, the host sends
+   * neither: the recipient settles the stream from the publish's streamId
+   * and its own outcome.
    */
-  published(callId: string, outcome: { delivered: boolean; destination?: ChannelRef }): void {
+  published(callId: string, outcome: { delivered: boolean; destination?: ChannelRef; unknown?: boolean }): void {
     const stream = this.streams.get(callId);
     if (!stream) return;
+    if (outcome.unknown) {
+      this.forget(stream);
+      stream.target = undefined;
+      return;
+    }
     const delivered = outcome.delivered && !!outcome.destination && !!stream.target
       && sameChannel(outcome.destination, stream.target);
     this.end(stream, delivered);

@@ -1299,9 +1299,10 @@ export interface ChannelsOutgoingSpeculativeChunkParams {
 
 /**
  * channels/outgoing/complete params ending a speculative stream (Host →
- * Server, Notification): its publish was delivered, with the full text, or
- * the stream is `cancelled` (the call was cut off, refused, failed, never
- * ran, or published elsewhere) with empty content.
+ * Server, Notification): its publish is known delivered, with the full text,
+ * or known not to reach the channel (the call was cut off, refused, known
+ * not sent, or never ran), `cancelled` with empty content. A stream whose
+ * publish has an unknown outcome gets neither; at most one is sent.
  */
 export interface ChannelsOutgoingSpeculativeCompleteParams {
   channelId: string;

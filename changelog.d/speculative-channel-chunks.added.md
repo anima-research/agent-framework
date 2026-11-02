@@ -3,6 +3,7 @@
   `channel_publish` call to a channel whose capabilities declare
   `streaming: { speculative: true }`, the call's text streams to that
   channel's server as `channels/outgoing/chunk` deltas, before the publish;
-  the publish carries the stream's `streamId`, and its outcome ends the stream
-  with `complete` (the full text) or `complete` with `cancelled: true`. Needs a
+  the publish carries the stream's `streamId`, and its known outcome ends the
+  stream with `complete` (the full text) or `complete` with `cancelled: true`;
+  an unknown outcome sends neither. Needs a
   membrane with `emitToolInputDeltas` (native tool mode, Anthropic).

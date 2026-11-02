@@ -36663,10 +36663,18 @@ export class AgentFramework {
     const speculativeStream = call.name === 'channel_publish'
       ? speculative?.dispatch(call.id) ?? this.speculativePinOf(agentName, call.id)
       : undefined;
-    const endSpeculative = (outcome: { delivered: boolean; destination?: ChannelRef }) => {
+    // The stream ends by what is known of the publish: delivered (a full
+    // complete), known not sent, refused before the send included (a cancel),
+    // or unknown (a deadline, a closed connection, an unclear receipt), where
+    // the host sends neither and the recipient settles the stream from the
+    // publish's streamId and its own outcome.
+    const endSpeculative = () => {
       if (!speculative) return;
       if (this.speculativeCalls?.get(speculativeKey) === speculative) this.speculativeCalls?.delete(speculativeKey);
-      speculative.published(call.id, outcome);
+      const outcome = published.outcome;
+      speculative.published(call.id, outcome?.status === 'delivered'
+        ? { delivered: true, destination: outcome.destination }
+        : outcome?.status === 'unknown' ? { delivered: false, unknown: true } : { delivered: false });
     };
     const publishing = this.channelRegistry!.handleChannelToolCall(call.name, channelInput, {
       kind: 'agent', agentName, own: callingTurn ? this.ownChannels(callingTurn) : [], ...(callingTurn ? { inTurn: true } : {}), ...(earlierWake ? { earlierWake } : {}),
@@ -36674,7 +36682,7 @@ export class AgentFramework {
     }, published)
       .then((result) => {
         const destination = published.outcome?.status === 'delivered' ? published.outcome.destination : undefined;
-        endSpeculative({ delivered: !!destination, ...(destination ? { destination } : {}) });
+        endSpeculative();
         if (publisher && destination) publisher.notePublished(destinationKey(destination), readThrough);
         const durationMs = Date.now() - startTime;
         this.emitTrace({
@@ -36752,7 +36760,7 @@ export class AgentFramework {
         });
       })
       .catch((error) => {
-        endSpeculative({ delivered: false });
+        endSpeculative();
         const err = error instanceof Error ? error : new Error(String(error));
         this.emitTrace({ type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id, error: err.message });
         this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);

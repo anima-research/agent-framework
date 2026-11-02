@@ -59,19 +59,22 @@ channels/outgoing/chunk
   and a surrogate pair is never split across chunks.
 - `conversationId` is the agent's name, as on §14.3 messages.
 
-The stream ends exactly once:
+The host sends at most one end notification per stream, by what it knows
+of the publish:
 
-- **Publish delivered** to the channel the chunks went to:
+- **Publish delivered** (known) to the channel the chunks went to:
   `channels/outgoing/complete { channelId, streamId, content: <full text>, speculative: true, conversationId }`.
   The publish itself carries the stream's id: `channels/publish` params get
   `streamId`, so the server can match the publish to the speech it already
   started and not speak it twice.
-- **Anything else**: `channels/outgoing/complete { channelId, streamId, content: "", speculative: true, cancelled: true, conversationId }`.
+- **Known not to reach it**: `channels/outgoing/complete { channelId, streamId, content: "", speculative: true, cancelled: true, conversationId }`.
   That is: the call was cut off (max tokens, a dropped call), the stream ended
   or was aborted before the call finished, a refusal retry discarded the
   attempt, the call was refused before its publish (a conversation fork's
-  guard, a hook), the publish failed or was not confirmed, the publish was
-  delivered to another channel than the stream's, the call's argument JSON
+  guard, a hook, a publish that would resolve to another channel), the
+  publish is known not to have been sent (the server answered
+  `delivered: false` naming no message, or the request never went out), the
+  call's argument JSON
   stopped parsing, the finished call posts other text than the chunks carried
   (a `text` before a `content`, a repeated key: the publish reads
   `content ?? text`), membrane marked the call (cut off or out of order), or
@@ -81,6 +84,13 @@ The stream ends exactly once:
   outcome: `stop()` waits for it before closing MCPL connections, bounded by
   the caller's shutdown bound when one is given, else by the publish
   request's own deadline.
+- **Outcome unknown**: no end notification. The publish went out (or may
+  have) but the host doesn't know whether it was delivered: its request
+  reached its deadline, the connection closed under it, `stop()`'s bound ran
+  out, or the answer was unclear (a `delivered: false` that names a message
+  id, a missing or malformed receipt). The connection may even stay open, stalled,
+  with neither the publish nor an end arriving. The recipient settles such a
+  stream itself (below).
 
 A call that sent no chunk (its channel didn't opt in, or it had no text) sends
 no `complete` either, and its publish carries no `streamId`.
@@ -117,12 +127,15 @@ channel ever gets text that another channel's publish carries.
   `complete`'s content as the text that was published. This host completes a
   stream only when that text is what the chunks carried; otherwise it cancels
   the stream, and the publish that follows carries no `streamId`.
-- The publish that follows a stream carries the same `streamId`, and it is
-  final for that stream: it holds the published text, whatever comes after.
-  The host sends `complete` once it has the publish's outcome; a host that
-  stops while a publish is under way may close the connection first, so a
-  server should not wait for that `complete` once it has the publish.
-- A stream still open when the connection closes was not published: drop it.
+- The publish that follows a stream carries the same `streamId`. A server
+  that handled that publish can settle the stream from the `streamId` and its
+  own outcome of the publish, without waiting for the host's end
+  notification, which may not come (see "Outcome unknown").
+- A stream the host never ends, with no publish carrying its `streamId`
+  either (a stalled connection, a close, a host that lost the outcome), is
+  the recipient's to settle: it owns its local policy for that unresolved
+  state, such as a timeout, or dropping the stream when the connection
+  closes.
 - A `channelId` or `serverId` that isn't a string stops the stream (the
   publish reads such a selector its own way), and the publish goes as usual.
 - A host without this option sends §14.3 chunks only, and those carry no

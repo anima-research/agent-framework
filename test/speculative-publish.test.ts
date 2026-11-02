@@ -448,10 +448,17 @@ test("registry: the reviewer's scenario: only A has the name while content is wr
     else streams.onInputDelta('t1', 'channel_publish', '"}');
     streams.onToolCalls([publishCall('t1', { channelId: 'shared', serverId: 'chat', content: 'For B only' })]);
     const spoken = streams.dispatch('t1');
+    const published: { outcome?: { status: string; destination?: ChannelRef } } = {};
     await h.registry.handleChannelToolCall('channel_publish', { channelId: 'shared', serverId: 'chat', content: 'For B only' },
-      { kind: 'agent', agentName: 'Glassy', ...(spoken ? { speculativeStream: spoken } : {}) });
+      { kind: 'agent', agentName: 'Glassy', ...(spoken ? { speculativeStream: spoken } : {}) }, published as never);
+    // As the framework ends it: by the publish's outcome.
+    assert.equal(published.outcome?.status, 'delivered', serverIdIn);
+    streams.published('t1', { delivered: true, destination: published.outcome!.destination! });
     assert.deepEqual(sent.filter((e) => e.serverId === 'bosun'), [], serverIdIn);
-    assert.deepEqual(sent.filter((e) => e.kind === 'chunk').map((e) => [e.serverId, e.content]), [['chat', 'For B only']], serverIdIn);
+    assert.deepEqual(sent.map((e) => [e.serverId, e.kind, e.content]), [
+      ['chat', 'chunk', 'For B only'],
+      ['chat', 'complete', 'For B only'],
+    ], serverIdIn);
     assert.equal(h.publishes.length, 1);
     assert.equal(h.publishes[0]!.streamId, 'spec_t1');
   }
@@ -600,6 +607,8 @@ async function harness(membrane: ScriptMembrane, config: Partial<AgentConfig> = 
   const log: Array<Record<string, unknown>> = [];
   const failing = new Set<string>();
   const throwing = new Set<string>();
+  /** A publish whose outcome is unknown (no answer before its deadline). */
+  const unclear = new Set<string>();
   /** For each publish: where the call's text went, which it may go to alone (the registry holds it there). */
   const pins: Array<{ content?: string; pinnedTo?: string }> = [];
   /** While set, a publish waits for it. */
@@ -620,6 +629,10 @@ async function harness(membrane: ScriptMembrane, config: Partial<AgentConfig> = 
       await gate.hold;
       if (throwing.has(input.content ?? '')) throw new Error('zz transport closed');
       const fails = failing.has(input.content ?? '');
+      if (unclear.has(input.content ?? '')) {
+        published.outcome = { status: 'unknown', destination: ref(input.channelId!), reason: 'zz no answer before the deadline (delivery uncertain)', at: Date.now() };
+        return { success: false, error: 'not confirmed', isError: true };
+      }
       published.outcome = fails
         ? { status: 'failed', destination: ref(input.channelId!), reason: 'the stub reported delivered: false', at: Date.now() }
         : { status: 'delivered', destination: ref(input.channelId!), at: Date.now() };
@@ -639,7 +652,7 @@ async function harness(membrane: ScriptMembrane, config: Partial<AgentConfig> = 
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} });
     await framework.runUntilIdle();
   };
-  return { framework, log, failing, throwing, gate, pins, run };
+  return { framework, log, failing, throwing, unclear, gate, pins, run };
 }
 
 test('framework: off by default; no tool-input deltas are asked for and nothing streams', async () => {
@@ -983,9 +996,13 @@ test("framework: stop()'s wait for such a publish ends at the caller's bound, wi
   try {
     void h.run().catch(() => {});
     for (let i = 0; i < 200 && !h.log.some((e) => e.kind === 'publish'); i++) await new Promise((r) => setTimeout(r, 5));
+    assert.ok(h.log.some((e) => e.kind === 'publish'), 'the publish reached its held point before stop()');
     const started = Date.now();
     await h.framework.stop(300);
-    assert.ok(Date.now() - started < 5000, 'stop() returned at its bound');
+    const took = Date.now() - started;
+    assert.ok(took >= 250, `stop() waited for the publish up to its bound (${took} ms)`);
+    assert.ok(took < 5000, `stop() returned at its bound (${took} ms)`);
+    assert.deepEqual(streamLog(h.log, 'spec_p1').filter(([kind]) => kind === 'complete'), [], 'no end while the outcome is unknown');
   } finally { release(); }
 });
 
@@ -1023,4 +1040,41 @@ test('framework: executeToolCall with a call whose text went out holds it to whe
     await h.framework.executeToolCall({ id: 'p1', name: 'channel_publish', input: { channelId: 'other', content: 'Once.' }, callerAgentName: 'Glassy' });
     assert.deepEqual(h.pins.map((p) => p.pinnedTo), ['bosun:meeting:1', 'bosun:meeting:1']);
   } finally { await h.framework.stop(); }
+});
+
+test('streams: a publish whose outcome is unknown ends its stream with neither a complete nor a cancel', () => {
+  const { sent, sink: s } = sink();
+  const streams = new SpeculativePublishStreams(s);
+  streams.onInputDelta('t1', 'channel_publish', '{"channelId":"voice","serverId":"bosun","content":"Maybe heard."}');
+  streams.onToolCalls([publishCall('t1', { channelId: 'voice', serverId: 'bosun', content: 'Maybe heard.' })]);
+  assert.equal(streams.dispatch('t1')?.live, true);
+  streams.published('t1', { delivered: false, unknown: true });
+  assert.deepEqual(sent.map((e) => e.kind), ['chunk']);
+  assert.equal(streams.size, 0, 'nothing is left open on the host');
+  streams.cancelPending();
+  assert.deepEqual(sent.map((e) => e.kind), ['chunk'], 'and nothing ends it later');
+});
+
+test('framework: each publish outcome ends the stream as it is known: delivered, known not sent, unknown', async () => {
+  for (const [outcome, expectEnd] of [
+    ['delivered', [['complete', 'Said.', false]]],
+    ['failed', [['complete', '', true]]],
+    ['unknown', []],
+  ] as const) {
+    const membrane = new ScriptMembrane(
+      [[round(call('p1', 'channel_publish', { channelId: 'bosun:meeting:1', serverId: 'bosun', content: 'Said.' })), final(text('done'))]],
+      { p1: ['{"channelId":"bosun:meeting:1","serverId":"bosun","content":"Said."}'] },
+    );
+    const h = await harness(membrane, { speculativeChannelChunks: true });
+    if (outcome === 'failed') h.failing.add('Said.');
+    if (outcome === 'unknown') h.unclear.add('Said.');
+    try {
+      await h.run();
+      assert.deepEqual(streamLog(h.log, 'spec_p1'), [
+        ['chunk', 'Said.', false],
+        ['publish', 'Said.', false],
+        ...expectEnd,
+      ], outcome);
+    } finally { await h.framework.stop(); }
+  }
 });
