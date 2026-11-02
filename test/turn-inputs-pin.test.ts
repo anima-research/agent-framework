@@ -3,8 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { JsStore } from '@animalabs/chronicle';
-import { AutobiographicalStrategy, ContextManager as ContextManagerClass, PassthroughStrategy } from '@animalabs/context-manager';
+import { AutobiographicalStrategy, PassthroughStrategy } from '@animalabs/context-manager';
 import type { ContextManager } from '@animalabs/context-manager';
 import { MembraneError } from '@animalabs/membrane';
 import type { ContentBlock, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
@@ -595,13 +594,7 @@ test("a pin starts at the first row the agent sees, past rows it never sees unde
 // branch of its own (deriveAgent). Its own turn's pin housekeeping clears and
 // sets pins of the turn's name; none of that may reach its parent's branch, or
 // the parent's opening request could fold mid-turn.
-const derives =
-  typeof (JsStore.prototype as unknown as { view?: unknown }).view === 'function' &&
-  typeof (ContextManagerClass.prototype as unknown as { derive?: unknown }).derive === 'function';
-
-test("a shared fork's opening and its end leave its parent's turn-inputs pin in place, and the parent's own end still releases it", {
-  skip: derives ? false : 'installed @animalabs/chronicle / context-manager lack branch-bound handles or ContextManager.derive',
-}, async () => {
+test("a shared fork's opening and its end leave its parent's turn-inputs pin in place, and the parent's own end still releases it", async () => {
   const dir = mkdtempSync(join(tmpdir(), 'turn-inputs-pin-'));
   const membrane = new RoutedMembrane();
   membrane.identify = (request) => (JSON.stringify(request.messages).includes('[FORK-FRAMING]') ? 'fork-1' : request.assistantParticipant ?? '');

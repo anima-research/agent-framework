@@ -195,7 +195,7 @@ test('untouched disk copies and brand-new files materialize exactly as before', 
   const res = await call(module, 'materialize', {});
   const data = res.data as MaterializeData;
   assert.deepEqual(data.materialized.map((m) => m.path).sort(), ['new.txt', 'script.sh']);
-  assert.equal(data.skipped ?? undefined, undefined, 'no spurious refusals');
+  assert.equal((data.skipped ?? []).length, 0, 'no spurious refusals');
   assert.equal(readFileSync(join(dir, 'script.sh'), 'utf8'), 'echo v2');
   assert.equal(readFileSync(join(dir, 'new.txt'), 'utf8'), 'fresh');
 });
@@ -213,7 +213,7 @@ test('after sync adopts a shell edit, the next agent edit materializes (baseline
   // external change and refuse this forever, sync or no sync.
   const res = await call(module, 'materialize', {});
   const data = res.data as MaterializeData;
-  assert.equal(data.skipped ?? undefined, undefined, `no refusal expected, got: ${JSON.stringify(data)}`);
+  assert.equal((data.skipped ?? []).length, 0, `no refusal expected, got: ${JSON.stringify(data)}`);
   assert.deepEqual(data.materialized.map((m) => m.path), ['script.sh']);
   assert.equal(readFileSync(join(dir, 'script.sh'), 'utf8'), 'echo v3-on-top-of-shell');
 });

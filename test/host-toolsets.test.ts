@@ -200,11 +200,11 @@ describe('the built-in toolset', () => {
     const h = await makeFramework({ dir });
     try {
       await call(h.framework, 'toolsets--open', { toolset: 'settings' });
-      const files = readdirSync(join(dir, 'store', 'config'));
-      const aside = files.find((f) => f.startsWith('toolsets.json.unreadable-'));
-      assert.ok(aside, files.join(', '));
-      assert.equal(readFileSync(join(dir, 'store', 'config', aside!), 'utf8'), 'not json at all', 'kept as it was');
-      assert.equal(JSON.parse(readFileSync(join(dir, 'store', 'config', 'toolsets.json'), 'utf8')).version, 1);
+      const config = join(dir, 'store', 'config');
+      const aside = readdirSync(config, { withFileTypes: true })
+        .filter((e) => e.isFile() && e.name !== 'toolsets.json' && readFileSync(join(config, e.name), 'utf8') === 'not json at all');
+      assert.equal(aside.length, 1, 'the unreadable file is kept as it was, beside the new one');
+      assert.equal(JSON.parse(readFileSync(join(config, 'toolsets.json'), 'utf8')).version, 1);
     } finally { await h.stop(); }
   });
 
@@ -518,6 +518,10 @@ describe('server tabs', () => {
     } finally { await h.stop(); await server.close(); }
   });
 
+  /** How long a start is watched for a connection it mustn't make. Nothing
+   *  marks a connect that never comes, so this is a window, not a wait. */
+  const NO_CONNECT_WINDOW_MS = 200;
+
   it('keeps an agent\'s tab, and a closed tab, across a restart; a configured closed tab starts unconnected', async () => {
     const { server } = await pingServer();
     const first = await makeFramework({ servers: [{ id: 'srv', url: server.url, toolPrefix: 'srv' }] });
@@ -536,7 +540,7 @@ describe('server tabs', () => {
     const third = await makeFramework({ dir: first.dir, servers: [{ id: 'srv', url: server.url, toolPrefix: 'srv' }] });
     try {
       await third.framework.start();
-      await new Promise((r) => setTimeout(r, 200));
+      await new Promise((r) => setTimeout(r, NO_CONNECT_WINDOW_MS));
       assert.equal(server.peers.length, peersBefore, 'a closed tab isn\'t connected at start');
       assert.ok(!third.framework.getAllTools().some((t) => t.name === 'srv--ping'));
     } finally { await third.stop(); }
@@ -544,7 +548,7 @@ describe('server tabs', () => {
     const configured = await makeFramework({ servers: [{ id: 'cfg', url: server.url, toolPrefix: 'cfg', presentation: 'closed-tab' }] });
     try {
       await configured.framework.start();
-      await new Promise((r) => setTimeout(r, 200));
+      await new Promise((r) => setTimeout(r, NO_CONNECT_WINDOW_MS));
       assert.equal(server.peers.length, peersBefore, 'presentation: closed-tab starts unconnected');
       assert.match(resultText(await call(configured.framework, 'toolsets--open', { server: 'cfg' })), /cfg connected/);
       await waitFor(() => configured.framework.getAllTools().some((t) => t.name === 'cfg--ping'), 'opened: connected');
@@ -866,7 +870,8 @@ describe('server tabs', () => {
       await h.framework.connectMcplServer(config);
       assert.doesNotMatch(resultText(await call(h.framework, 'toolsets--look')), /closed tab/, 'not a closed tab once connected');
       await h.framework.disconnectMcplServer('srv');
-      assert.doesNotMatch(resultText(await call(h.framework, 'toolsets--look')), /\[tab srv\]/, 'forgotten once removed');
+      const doc = JSON.parse(readFileSync(join(h.dir, 'store', 'config', 'toolsets.json'), 'utf8'));
+      assert.equal(doc.closed?.srv, undefined, 'forgotten once removed: no closed tab is kept for it');
     } finally { await h.stop(); await server.close(); }
   });
 

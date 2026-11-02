@@ -596,6 +596,10 @@ export interface FeatureSetDeclaration {
     coreTags?: string[];
     tags?: Record<string, unknown>;
     keyed?: Record<string, unknown>;
+    /** Ordered suggested rules (RFC-001 §5.1). Advisory: applied only on
+     *  acceptance (§5.2), which wake onboarding asks the agent for. */
+    suggestedTreatment?: unknown[];
+    /** @deprecated RFC-001 revision 1's name for suggestedTreatment; still read. */
     defaultTreatment?: unknown[];
     open?: boolean;
   };

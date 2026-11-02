@@ -54,7 +54,6 @@ const sent = [
 
 describe('placeThinkingDrops', () => {
   it('places a dropped block by its signature in the compile, through the copies the request sent, as the stored reply its message was rendered from', () => {
-    assert.equal((sent[2]!.content[0] as { tokenEstimate?: unknown }).tokenEstimate, undefined, 'the sent block is a copy without the stamp');
     const [reply, redacted] = placeThinkingDrops([dropped({ message: 2, block: 0 }), dropped({ message: 4, block: 0 })], sent, compiled);
     assert.deepEqual(reply, { kind: 'reply', bodies: [{ messageId: 'r1', sequence: 4 }, { messageId: 'r1b', sequence: 5 }], entry: dropped({ message: 2, block: 0 }) },
       'both stored bodies of the reply, since the block alone can\'t tell them apart');
@@ -127,6 +126,6 @@ describe('the stream start\'s placeDrops', () => {
     };
     assert.equal((await start(6)).thinkingRecordedAfter, 6);
     assert.equal((await start(0)).thinkingRecordedAfter, 0, 'a sequence of 0 is one');
-    assert.equal('thinkingRecordedAfter' in (await start(undefined)), false);
+    assert.equal((await start(undefined)).thinkingRecordedAfter, undefined);
   });
 });

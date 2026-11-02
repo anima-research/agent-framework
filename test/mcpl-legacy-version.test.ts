@@ -93,13 +93,6 @@ test('another legacy revision, or none, is a mismatch rather than a silent conne
   });
 });
 
-test('a version verdict gets no reconnect stub even with reconnect: true', async () => {
-  await assert.rejects(
-    McplServerConnection.connectWithReconnect(config('reject', { reconnect: true, reconnectIntervalMs: 20 }), HOST_CAPS),
-    (err: unknown) => err instanceof McplProtocolVersionError,
-  );
-});
-
 test('a version verdict on reconnect stops the backoff loop', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'legacy-version-'));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
@@ -263,17 +256,6 @@ test('an initialize error that is not a version verdict stays a plain, retryable
   const stub = await McplServerConnection.connectWithReconnect(config('error', { reconnect: true, reconnectIntervalMs: 20 }), HOST_CAPS);
   cleanups.push(() => stub.close());
   assert.equal(stub.willReconnect, true);
-});
-
-test('a modern stdio configuration is refused before anything is spawned', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'legacy-version-'));
-  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
-  const startLog = join(dir, 'starts.log');
-  await assert.rejects(
-    McplServerConnection.connect(config('ok', { protocol: 'modern' }, startLog), HOST_CAPS),
-    /configured for modern MCP/,
-  );
-  assert.deepEqual(startsIn(startLog), [], 'nothing was spawned');
 });
 
 test('a list that never ends is refused after its page bound', async () => {

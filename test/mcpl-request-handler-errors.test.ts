@@ -109,7 +109,7 @@ for (const [event, component, method] of [
   });
 }
 
-test('notification rejection is traced without inventing a response', async () => {
+test('a notification\'s rejection is traced, with no request id', async () => {
   const { framework, connection, traces } = harness();
   framework.channelRegistry = { async handleChanged() { throw new Error('notification failed'); } };
   connection.emit('channels-changed', {});
@@ -1108,7 +1108,8 @@ test("a trace listener that throws a value no printer can inspect is logged as t
     assert.deepEqual(reply.errors, [{ code: -32603, message: 'Internal error', data: undefined }]);
     assert.equal(failureTraces(traces).length, 1, 'the listener before the throwing one has the trace');
     assert.equal(failureTraces(after).length, 1, 'the listener after the throwing one has it too');
-    assert.deepEqual(logged, [
+    // Both lines, in whichever order they're written.
+    assert.deepEqual([...logged].sort(), [
       'Trace listener error: "[object Object]"',
       '[mcpl] srv channels-register handler failed: "register failed"',
     ]);

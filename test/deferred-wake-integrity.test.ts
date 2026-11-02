@@ -57,11 +57,14 @@ import type { ContentBlock, NormalizedRequest, NormalizedResponse } from '@anima
 class DmModule implements Module {
   readonly name = 'dm';
   framework: AgentFramework | null = null;
+  ctx: ModuleContext | null = null;
   /** Next `halt` call pushes this text as an external message (with
    *  requestInference) BEFORE returning its endTurn result. */
   interjection: string | null = null;
 
-  async start(_ctx: ModuleContext): Promise<void> {}
+  async start(ctx: ModuleContext): Promise<void> {
+    this.ctx = ctx;
+  }
   async stop(): Promise<void> {}
 
   getTools(): ToolDefinition[] {
@@ -79,16 +82,24 @@ class DmModule implements Module {
       if (this.interjection) {
         const text = this.interjection;
         this.interjection = null;
+        const processed = new Promise<void>((resolve) => {
+          const off = this.framework!.onTrace((t) => {
+            if (t.type === 'process:completed' && (t.processEvent as { content?: unknown }).content === text) {
+              off();
+              resolve();
+            }
+          });
+        });
         this.framework!.pushEvent({
           type: 'external-message',
           source: 'test',
           content: text,
           metadata: { channelId: 'dm-antra' },
         } as unknown as ProcessEvent);
-        // Let the run loop process the queued message while this tool round
-        // is still pending, so it lands in deferredMessages with its wake
-        // queued behind the busy agent.
-        await new Promise((r) => setTimeout(r, 30));
+        await Promise.race([
+          processed,
+          new Promise((_, reject) => setTimeout(() => reject(new Error('the run loop never processed the DM')), 10_000).unref()),
+        ]);
       }
       return { success: true, data: { halted: true }, endTurn: true };
     }
@@ -194,7 +205,6 @@ describe('deferred-message wake integrity', () => {
     pendingRequests: Array<Record<string, unknown>>;
     activeTurnTokens: Map<string, number>;
     activeStreams: Map<string, unknown>;
-    addMessage: (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>) => string;
   };
   const internals = (f: AgentFramework) => f as unknown as Internals;
 
@@ -251,9 +261,8 @@ describe('deferred-message wake integrity', () => {
     fw.activeTurnTokens.set('assistant', 999999);
     assert.equal(fw.activeStreams.size, 0, 'precondition: no live stream');
 
-    const id = fw.addMessage('Antra', [{ type: 'text', text: 'arrives mid-compile' }]);
-    assert.equal(id, '', 'message was deferred, not appended');
-    assert.equal(fw.deferredMessages.length, 1, 'message waits in the deferred queue');
+    const id = module.ctx!.addMessage('Antra', [{ type: 'text', text: 'arrives mid-compile' }]);
+    assert.ok(id.startsWith('held:'), `the write is held, not stored: ${id}`);
 
     fw.activeTurnTokens.delete('assistant');
     fw.deferredMessages.length = 0; // don't leak state into stop()

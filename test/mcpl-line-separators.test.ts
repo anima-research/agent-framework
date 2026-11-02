@@ -101,7 +101,8 @@ test('a stdio connection logs the first three lines it drops, in the handshake a
 test('once the host closes a stdio transport, a line its child writes after the close is not delivered', async () => {
   const transport = await StdioTransport.spawn({
     id: 'closing', command: process.execPath,
-    args: ['-e', String.raw`process.on('SIGTERM', () => process.stdout.write('{"after":"close"}\n')); process.stdout.write('{"ready":true}\n'); setInterval(() => {}, 1000);`],
+    // On the close's SIGTERM the child writes a line and exits once it's out.
+    args: ['-e', String.raw`process.on('SIGTERM', () => process.stdout.write('{"after":"close"}\n', () => process.exit(0))); process.stdout.write('{"ready":true}\n'); setInterval(() => {}, 1000);`],
   });
   const lines: string[] = [];
   const ready = new Promise<void>((resolve) => transport.on('line', (line: string) => { lines.push(line); resolve(); }));

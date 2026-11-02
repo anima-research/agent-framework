@@ -107,7 +107,7 @@ describe('duration expiry', () => {
       nameShown: (channel: { channelId: string }) => channel.channelId,
       quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
       listChannelsRaw: () => [],
-      getTuneOutState: () => null,
+      getTuneOutState: (_s: string, c: string) => (c === '#a' && !cancels.includes(c) ? { params: PARAMS, wakeCount: 0 } : null),
       enterTuneOut: () => {},
       cancelTuneOut: (_s: string, c: string) => {
         cancels.push(c);

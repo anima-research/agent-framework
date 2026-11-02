@@ -50,8 +50,8 @@ function harness(
 
   let state: { params: TuneOutParams; wakeCount: number } | null = stored ? { params: stored, wakeCount: 0 } : null;
   /** What each step throws on its next call, as a failed store write would. */
-  const throwsNext = new Map<'addMessage' | 'recordTuneOutWake' | 'cancelTuneOut', unknown>();
-  const throwIfSet = (step: 'addMessage' | 'recordTuneOutWake' | 'cancelTuneOut') => {
+  const throwsNext = new Map<'addMessage' | 'recordTuneOutWake' | 'cancelTuneOut' | 'requestInference', unknown>();
+  const throwIfSet = (step: 'addMessage' | 'recordTuneOutWake' | 'cancelTuneOut' | 'requestInference') => {
     if (!throwsNext.has(step)) return;
     const thrown = throwsNext.get(step);
     throwsNext.delete(step);
@@ -102,7 +102,7 @@ function harness(
       notices.push(content[0]?.text ?? '');
       return '';
     },
-    requestInference: (_agent: string, reason: string) => { inferences.push(reason); },
+    requestInference: (_agent: string, reason: string) => { throwIfSet('requestInference'); inferences.push(reason); },
     subconsciousName: () => 'Subconscious',
     primaryName: () => 'scout',
     getStoredMessages: () => [],
@@ -132,7 +132,7 @@ function harness(
   const active = () => state !== null;
   /** Make the step's next call throw `thrown`. */
   const failNext = (
-    step: 'addMessage' | 'recordTuneOutWake' | 'cancelTuneOut' = 'addMessage',
+    step: 'addMessage' | 'recordTuneOutWake' | 'cancelTuneOut' | 'requestInference' = 'addMessage',
     thrown: unknown = new Error('store write failed'),
   ) => { throwsNext.set(step, thrown); };
   const timerFailures = () => traces.filter((e) => e.type === 'tune-out:timer-failed');
@@ -589,9 +589,10 @@ it('a failed acknowledgement is written to stderr and traced, whatever it reject
 it('an end time whose cancel throws after the registry ended the tune-out stays in its timer, is reported, and tries no more', (t) => {
   const h = harness(t);
   assert.equal(h.coordinator.enter('disc', '#a', { durationSeconds: 120 }, 'agent-tool').ok, true);
-  h.failNext();
+  h.failNext('requestInference');
   assert.doesNotThrow(() => t.mock.timers.tick(120_000), "the cancel's error stays in the timer");
   assert.deepEqual(h.timerFailures(), [failure('expiry')]);
+  assert.equal(h.active(), false, 'the registry ended it before the wake threw');
   t.mock.timers.tick(10 * 60_000);
   assert.equal(h.cancelCalls(), 1, 'the registry ended it, so nothing tries again');
 });
@@ -613,13 +614,34 @@ it('an end time whose registry cancel throws is reported, and the cancel is trie
   assert.equal(h.cancelCalls(), 2, 'and nothing tries again after it ended');
 });
 
+it('a wake past the budget whose cancel throws, on a quiet tune-out with no end time, is reported, and the cancel is tried again a minute later', (t) => {
+  const h = harness(t);
+  assert.equal(h.coordinator.enter('disc', '#a', { maxWakes: 1 }, 'agent-tool').ok, true);
+  h.coordinator.onIncoming('disc', '#a', 'm1', ['chat:addressed']);
+  t.mock.timers.tick(2_000);
+  h.failNext('addMessage');
+  h.coordinator.onIncoming('disc', '#a', 'm2', ['chat:addressed']);
+  assert.doesNotThrow(() => t.mock.timers.tick(2_000), "the cancel's error stays in the timer");
+  assert.deepEqual(h.timerFailures(), [failure('wake')]);
+  assert.equal(h.active(), true, 'still tuned out after the failed cancel');
+  t.mock.timers.tick(60_000 - 1);
+  assert.deepEqual(h.cancels, [], 'not before the minute');
+  t.mock.timers.tick(1);
+  assert.deepEqual(h.cancels, ['tune-out-max-wakes'], 'ended a minute later, with no new message');
+  t.mock.timers.tick(10 * 60_000);
+  assert.equal(h.cancelCalls(), 1, 'and nothing tries again after it ended');
+});
+
 it('an end time that finds the tune-out already ended in the registry tries no more', (t) => {
   const h = harness(t);
   assert.equal(h.coordinator.enter('disc', '#a', { durationSeconds: 120 }, 'agent-tool').ok, true);
   h.endInRegistry();
+  const cancel = h.coordinator.cancel.bind(h.coordinator);
+  let attempts = 0;
+  h.coordinator.cancel = (...args: Parameters<typeof cancel>) => { attempts++; return cancel(...args); };
   t.mock.timers.tick(120_000);
   t.mock.timers.tick(10 * 60_000);
-  assert.equal(h.cancelCalls(), 1);
+  assert.equal(attempts, 1);
   assert.deepEqual(h.timerFailures(), []);
 });
 
