@@ -277,9 +277,7 @@ describe("under 'latest-inbound', the resident's turn after its own tune_out can
         modules: [new SurfaceModule()],
         speech: { locus: 'latest-inbound' },
       });
-      const publishes = () => existsSync(statusPath)
-        ? readFileSync(statusPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as { event: string }).filter((e) => e.event === 'publish').length
-        : 0;
+      const publishes = () => jsonLines<{ event: string }>(statusPath).filter((e) => e.event === 'publish').length;
       const idle = () => framework.getAgent('scout')!.state.status === 'idle';
       try {
         await framework.start();
@@ -297,7 +295,7 @@ describe("under 'latest-inbound', the resident's turn after its own tune_out can
         await framework.runUntilIdle();
         const text = JSON.stringify(framework.getAgent('scout')!.getContextManager().getAllMessages());
         assert.ok(text.includes('cancelled'), `control: the cancel went through: ${text.slice(-2000)}`);
-        assert.equal(publishes(), fromPrivate ? 1 : 3, `the cancelling turn's words and the next turn's: ${readFileSync(statusPath, 'utf8')}`);
+        assert.equal(publishes(), fromPrivate ? 1 : 3, `the cancelling turn's words and the next turn's: ${JSON.stringify(jsonLines(statusPath))}`);
       } finally {
         await framework.stop();
         rmSync(tempDir, { recursive: true, force: true });

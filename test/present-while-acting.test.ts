@@ -468,7 +468,6 @@ describe('present while acting', () => {
 
     const framework = await createFramework();
     const routed = stubChannelRegistry(framework);
-    module.toolDelayMs = 25;
     module.interjection = 'hey, quick question over here?';
     module.interjectionMetadata = { channelId: 'discord:dm:antra', tags: ['chat:addressed'] };
 
