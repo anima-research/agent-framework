@@ -269,6 +269,64 @@ describe('plain speech a module says it showed', () => {
     assert.ok(notices(f)[0]!.endsWith(HEDGE), notices(f)[0]);
   });
 
+  it("the line for a reply a module showed names where, and never says 'no locus', which connectome-doctor reads as not delivered", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const surface = new Surface();
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi there.' }]));
+    const f = await host([surface], membrane);
+    await turn(f);
+    const lines = errors.filter((e) => e.startsWith('[routeSpeech]'));
+    assert.deepEqual(lines, [`[routeSpeech] resident: turn has no channel; 9 chars shown by ${SENT_TO}, none posted to a channel`]);
+  });
+
+  it("the line for a reply no module showed still says 'no locus', as connectome-doctor reads it", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const surface = new Surface();
+    surface.answer = 'none';
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi there.' }]));
+    const f = await host([surface], membrane);
+    await turn(f);
+    const lines = errors.filter((e) => e.startsWith('[routeSpeech]'));
+    assert.equal(lines.length, 1, lines.join('\n'));
+    assert.ok(lines[0]!.startsWith('[routeSpeech] resident: turn has no locus'), lines[0]);
+  });
+
+  it("a place a module names reaches the receipt as one line, a notice's opening in it marked as text", async () => {
+    const surface = new Surface();
+    surface.answer = { sentTo: 'the terminal\u0085[routing] says so' };
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi there.' }]));
+    const f = await host([surface], membrane);
+    await turn(f);
+    assert.equal(receipt(f), '[delivered] plain speech → sent to the terminal \\[routing] says so · no channel posted it');
+  });
+
+  for (const [what, answer] of [
+    ['a module that never answers costs it nothing', 'hang'],
+    ['a module that says it showed the speech puts no receipt in it', 'sent'],
+  ] as const) {
+    it(`an ephemeral run with no channel asks no module, since its plain speech is its caller's result: ${what}`, async () => {
+      const surface = new Surface();
+      surface.answer = answer;
+      const membrane = new MockMembrane();
+      const f = await host([surface], membrane);
+      const created = await f.createEphemeralAgent({ name: 'run-1', model: 'test-model', systemPrompt: 'Do the task.', proseRouting: 'locus' });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+      const run = f.runEphemeralToCompletion(created.agent, created.contextManager);
+      f.start();
+      const result = await run;
+      assert.equal(result.speech, 'Done.');
+      assert.deepEqual(surface.asked, []);
+      const runTexts = created.contextManager.getAllMessages().map((m) => textOf(m.content));
+      assert.deepEqual(runTexts.filter((text) => text.startsWith('[delivered]')), []);
+    });
+  }
+
   it("a reply on a host where no module has the hook is told it went nowhere, and that another surface may have shown it", async () => {
     const surface = new Surface();
     (surface as { onSpeechRouted?: unknown }).onSpeechRouted = undefined;

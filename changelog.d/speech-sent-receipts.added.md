@@ -10,12 +10,14 @@
   since a turn's pieces route in order, a post after a piece with no channel
   waits behind that piece's answers, only while a module hasn't answered. The
   turn's `[delivered]` receipt waits up to the same bound for answers still
-  due. Private envelopes, explicit sends and a heartbeat's held prose are
-  never asked about.
+  due. Private envelopes, explicit sends, a heartbeat's held prose and an
+  ephemeral run's speech with no channel, which is its caller's result, are
+  never asked about. Answer from what the module already holds: the turn's
+  receipt, and the agent's next turn, wait for every answer up to the bound.
 - `SpeechRoutedContext`: `final` (the turn's final reply: its speech after
   its last tool call, a refused XML attempt or a call cut off unrun being
   none), `turnId`, and
   `openedBy`, the request that opened the turn, kept across a
-  context-budget restart, with `messages`: the messages of every wake the
-  turn took, as stored ids or held-write handles that a module context's
-  `getMessage` reads.
+  context-budget restart, with `messages`: the messages added by the module
+  answers whose wakes the turn took, as stored ids or held-write handles that
+  a module context's `getMessage` reads.

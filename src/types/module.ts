@@ -203,9 +203,13 @@ export interface Module {
    *
    * Asked only where the turn routes plain speech (prose routing by locus or
    * hybrid, on a host with a channel registry), in the order it routes the
-   * pieces, and never about private envelopes, explicit sends or a
-   * heartbeat's held prose. A module that throws, or hasn't answered within
-   * `SPEECH_RECEIPT_WAIT_MS`, names no place, as `{}` does.
+   * pieces, and never about private envelopes, explicit sends, a heartbeat's
+   * held prose or an ephemeral run's speech with no channel, which is its
+   * caller's result. A module that throws, or hasn't answered within
+   * `SPEECH_RECEIPT_WAIT_MS`, names no place, as `{}` does. The turn's
+   * receipt, and the agent's next turn, wait for every answer up to that
+   * bound, so answer from what the module already holds rather than after a
+   * round trip.
    */
   onSpeechRouted?(
     agentName: string,

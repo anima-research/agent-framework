@@ -33,6 +33,7 @@ import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown }
 import { logValue } from './mcpl/log-value.js';
 import { asCalled, markedInputRefusal, toolArgsProblems } from './tool-args.js';
 import { safeSlice } from './safe-slice.js';
+import { markedTexts, oneLine } from './supplied-text.js';
 
 /** How the registry queues a module's event: its push names the module. A
  * `ProcessQueue` serves too, ignoring the name. */
@@ -765,7 +766,7 @@ export class ModuleRegistry {
       const { module, registration } = asked[i]!;
       if (this.moduleContexts.get(module.name) !== registration) return;
       const named = (answer as { sentTo?: unknown } | null | undefined)?.sentTo;
-      const flat = typeof named === 'string' ? named.replace(/\s+/g, ' ').trim() : '';
+      const flat = typeof named === 'string' ? markedTexts([oneLine(named).replace(/\s+/g, ' ').trim()])[0]! : '';
       if (!flat) return;
       places.push(flat.length > SPEECH_PLACE_MAX ? `${safeSlice(flat, 0, SPEECH_PLACE_MAX)}…` : flat);
     });

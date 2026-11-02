@@ -20989,19 +20989,29 @@ export class AgentFramework {
       this.holdHeartbeatProse(agent, [text], round);
       return null;
     }
+    if (locus === null && !this.takesGlobalFallback(agent.name)) {
+      return this.channelRegistry!.routeSpeech(agent.name, text, locus);
+    }
     const asked = this.askSpeechRouted(agent, round, text);
     (round.routing.asking ??= []).push(asked);
     if (locus === null) {
       const places = await asked;
       if (places.length > 0) {
         if (!round.final) round.routing.liveSpeech = true;
-        console.error(`[routeSpeech] ${agent.name}: turn has no locus; ${text.length} chars sent to ${places.join(' · ')}, none posted to a channel`);
+        console.error(`[routeSpeech] ${agent.name}: turn has no channel; ${text.length} chars shown by ${places.join(' · ')}, none posted to a channel`);
         return null;
       }
       return this.channelRegistry!.routeSpeech(agent.name, text, locus);
     }
     round.routing.postTried = true;
     return this.channelRegistry!.routeSpeech(agent.name, text, locus);
+  }
+
+  /** Whether a conversation's plain speech may take the process-global
+   *  fallback channel: every one but an ephemeral run's, whose plain speech
+   *  with no channel of its own is its caller's result. */
+  private takesGlobalFallback(conversationId: string): boolean {
+    return this.usedEphemeralAgentNames.get(conversationId) !== 'run';
   }
 
   private async askSpeechRouted(agent: Agent, round: ProseRound, text: string): Promise<string[]> {
@@ -32172,7 +32182,7 @@ export class AgentFramework {
         // fallback: its prose is its caller's result, and the latest inbound
         // message's channel is nobody's choice for it (#551). By name, so a
         // speech dispatch that comes after the run's release still counts.
-        takesGlobalFallback: (conversationId) => this.usedEphemeralAgentNames.get(conversationId) !== 'run',
+        takesGlobalFallback: (conversationId) => this.takesGlobalFallback(conversationId),
         eventGatePresent: this.eventGate !== null,
         // A channel tool reads the connect and restart marks a tool call's
         // "connecting" text reads (mcplConnectInFlight, mcplServerAbsentText).
