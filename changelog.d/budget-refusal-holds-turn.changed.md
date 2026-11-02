@@ -50,13 +50,13 @@
   compression to make room." When the check that releases the turn finds its
   context fits, the note goes only where it fits too: where the plan's spare
   covers the note's price, by the strategy's own estimate (`estimateTokens`),
-  or where a preview at the budget less that price fits. Otherwise the turn
-  runs without this release's note, and its wait stays in
-  `inference:hold_ended`'s trace; a note an earlier release of the same hold
-  stored stays in the history. A strategy that gives no preview figures or no
-  estimate, or whose estimate throws, leaves the note stored as before. A
-  smaller budget stands in for the stored row, so the edge of the recent
-  window can differ from the compile's. A placed note doesn't make the picker
+  or where a preview at the budget less that price fits. Otherwise, and
+  where that preview fails, the turn runs without this release's note, and
+  its wait stays in `inference:hold_ended`'s trace; a note an earlier
+  release of the same hold stored stays in the history. A strategy that gives
+  no preview figures or no estimate, or whose estimate throws, leaves the
+  note stored as before. A smaller budget stands in for the stored row, so
+  the edge of the recent window can differ from the compile's. A placed note doesn't make the picker
   fold deeper, so while the window is held, where only a deeper fold had room
   for the note, the request goes past its budget by up to the note's price,
   out of the reply's reserve; a placed injection can't refuse the compile.
