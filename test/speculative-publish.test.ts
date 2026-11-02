@@ -611,6 +611,8 @@ async function harness(membrane: ScriptMembrane, config: Partial<AgentConfig> = 
   const unclear = new Set<string>();
   /** For each publish: where the call's text went, which it may go to alone (the registry holds it there). */
   const pins: Array<{ content?: string; pinnedTo?: string }> = [];
+  /** For each publish: whether dispatch marked the caller as shown serverId. */
+  const origins: Array<{ content?: string; showsServerId: boolean }> = [];
   /** While set, a publish waits for it. */
   const gate: { hold?: Promise<void> } = {};
   const ref = (channelId: string) => ({ serverId: 'bosun', channelId });
@@ -626,6 +628,7 @@ async function harness(membrane: ScriptMembrane, config: Partial<AgentConfig> = 
       if (name !== 'channel_publish') return { success: true, data: {} };
       log.push({ kind: 'publish', channelId: input.channelId, content: input.content, ...(origin.speculativeStream?.live !== false && origin.speculativeStream ? { streamId: origin.speculativeStream.streamId } : {}) });
       pins.push({ content: input.content, pinnedTo: (origin.speculativeStream as { channel?: ChannelRef } | undefined)?.channel?.channelId });
+      origins.push({ content: input.content, showsServerId: (origin as { showsServerId?: boolean }).showsServerId === true });
       await gate.hold;
       if (throwing.has(input.content ?? '')) throw new Error('zz transport closed');
       const fails = failing.has(input.content ?? '');
@@ -652,7 +655,7 @@ async function harness(membrane: ScriptMembrane, config: Partial<AgentConfig> = 
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} });
     await framework.runUntilIdle();
   };
-  return { framework, log, failing, throwing, unclear, gate, pins, run };
+  return { framework, log, failing, throwing, unclear, gate, pins, origins, run };
 }
 
 test('framework: off by default; no tool-input deltas are asked for and nothing streams', async () => {
@@ -1192,4 +1195,22 @@ test("registry: a refusal of a name two of the turn's own channels share names t
   assert.doesNotMatch(String(plain.error), /serverId/);
   assert.equal(opted.error, plain.error + ' To have a channel that streams speech hear it as you write, call again with '
     + 'channelId "room" with serverId "bosun" or channelId "room" with serverId "chat", written before content.');
+});
+
+test("framework: dispatch marks a publish's caller as shown serverId by the flag it runs under", async () => {
+  for (const opted of [true, false]) {
+    const membrane = new ScriptMembrane(
+      [[round(call('p1', 'channel_publish', { channelId: 'bosun:meeting:1', content: 'Marked?' })), final(text('done'))]],
+      { p1: ['{"channelId":"bosun:meeting:1","content":"Marked?"}'] },
+    );
+    const h = await harness(membrane, opted ? { speculativeChannelChunks: true } : {});
+    try {
+      await h.run();
+      await h.framework.executeToolCall({ id: 'p2', name: 'channel_publish', input: { channelId: 'bosun:meeting:1', content: 'Again?' }, callerAgentName: 'Glassy' });
+      assert.deepEqual(h.origins, [
+        { content: 'Marked?', showsServerId: opted },
+        { content: 'Again?', showsServerId: opted },
+      ], `opted: ${opted}`);
+    } finally { await h.framework.stop(); }
+  }
 });
