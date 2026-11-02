@@ -47,11 +47,7 @@ jobs:
         run: npm run build
 
       - name: Test
-        run: |
-          AF_TEST_CONCURRENCY=$(node -p "2 * require('node:os').cpus().length")
-          echo "cores: $(node -p "require('node:os').cpus().length") (Node's availableParallelism: $(node -p "require('node:os').availableParallelism()")); test files at once: $AF_TEST_CONCURRENCY"
-          export AF_TEST_CONCURRENCY
-          npm test
+        run: node scripts/test-as-ci.mjs
 
   # The tarball npm publish makes from this tree, installed alone into an
   # empty directory with its dependencies from npm (linked, so each package
