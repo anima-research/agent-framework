@@ -122,11 +122,13 @@ export function cancelWaitsNote(what: string, noteDropped = false): string {
 /**
  * The reason a reader's cancel_tuneout gives its cancel, which the resident
  * reads in the cancel's lifecycle line ("[Tune-out: #x cancelled — by Muse,
- * 2 wakes]"), the reader in its cancel notice, and the excepted channel in
- * an all-except hold's release line: who cancelled, by the name it runs
- * under (the persistent reader's, or a reader fork's own), marked as a value
- * the host supplied, or "the reader" where the call names none. It says who,
- * never why.
+ * 2 wakes]"), the reader in its cancel notice, and a host in the trace: who
+ * cancelled, by the name it runs under (the persistent reader's, or a reader
+ * fork's own), marked as a value the host supplied, or "the reader" where the
+ * call names none. It says who, never why. The line an all-except hold's
+ * release posts in the excepted channel says "by its reader" instead
+ * (cancelAllExcept): an agent's name there would show the channel an
+ * internal identity.
  */
 function cancelledBy(caller: string | undefined): string {
   return caller ? `by ${suppliedValue(caller)}` : 'by the reader';
@@ -1628,7 +1630,11 @@ export class TuneOutCoordinator {
     this.dropLooks(epochId);
     this.forgetWindowStart(epochId);
     this.hooks.emitTrace({ type: 'tune-out:cancelled', serverId: except.serverId, channelId: except.channelId, epochId, scope: 'all-except', reason, wakeCount: scope.wakeCount });
-    this.announce(except, epochId, 'released', `[${NOTICE_TAG.focus}: ${primary ?? 'the resident'} released — ${reason}.]`);
+    // The line the excepted channel sees names no agent but the resident:
+    // a reader's cancel is "by its reader" there, its name kept for the
+    // resident's line, the reader's notice and the trace above.
+    const channelReason = source === 'subconscious' ? 'by its reader' : reason;
+    this.announce(except, epochId, 'released', `[${NOTICE_TAG.focus}: ${primary ?? 'the resident'} released — ${channelReason}.]`);
     return { ok: true };
   }
 

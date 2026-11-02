@@ -15,8 +15,11 @@ type Held = { id?: string; participant: string; content: Array<{ type: string; t
 
 /** `stored`: the primary's stored messages; `kept`: the writes a surgery's
  *  hold keeps in memory; `writesHeld`: the framework's hook, which a
- *  surgery's hold makes true (left out, no write is taken to be held). */
-function harness(held: { stored?: Held[]; kept?: Held[]; writesHeld?: () => boolean } = {}) {
+ *  surgery's hold makes true (left out, no write is taken to be held).
+ *  `reader`: the persistent reader's name (default Subconscious), or null
+ *  for reader forks; `announced`: where the excepted channel's lines go,
+ *  with `tuneOut.announce` on (left out, nothing is announced). */
+function harness(held: { stored?: Held[]; kept?: Held[]; writesHeld?: () => boolean; reader?: string | null; announced?: string[] } = {}) {
   const stored = held.stored ?? [];
   const kept = held.kept ?? [];
   const state = new Map<string, unknown>();
@@ -56,7 +59,11 @@ function harness(held: { stored?: Held[]; kept?: Held[]; writesHeld?: () => bool
       if (fail.wake) throw new Error('the wake request failed');
       wakes.push(agentName);
     },
-    subconsciousName: () => 'Subconscious',
+    subconsciousName: () => (held.reader === undefined ? 'Subconscious' : held.reader),
+    ...(held.reader === null ? { invokeReader: () => {} } : {}),
+    ...(held.announced
+      ? { announce: async (_serverId: string, _channelId: string, text: string) => { held.announced!.push(text); return { success: true }; } }
+      : {}),
     primaryName: () => 'scout',
     getStoredMessages: () => stored,
     getSurgeryHeldMessages: () => kept,
@@ -416,5 +423,38 @@ describe('all-except scope on the coordinator', () => {
     assert.match(release.text, /messages=2/);
     assert.doesNotMatch(release.text, /held one|held two/, 'a cap below one shows no message');
     second.stop();
+  });
+  // The release line an all-except hold posts in the excepted channel names
+  // no agent but the resident: a reader's cancel is "by its reader" there,
+  // whatever the reader is called. Its name, a reader fork's structural one
+  // included, stays in what the resident reads (and the reader, and the
+  // trace). A cancel with another source says its reason there as before.
+  it("a reader's release of the hold says \"by its reader\" in the excepted channel, and its name only to the resident", async () => {
+    for (const { reader, caller } of [
+      { reader: 'Muse', caller: 'Muse' },
+      { reader: null, caller: 'reader/scout/1a2b3c4d/3' },
+    ]) {
+      const announced: string[] = [];
+      const h = harness({ reader, announced });
+      const c = h.make();
+      assert.ok(c.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool').ok);
+      const epochId = c.getAllExcept()!.params.epochId;
+      assert.deepEqual(
+        await c.handleSubconsciousTool('cancel_tuneout', { channelId: 'work', scope: 'all-except' }, [], caller, reader === null ? { epochId } : undefined),
+        { success: true, data: { cancelled: true, scope: 'all-except' } });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.deepEqual(announced.filter((t) => t.includes('released')), ['[Focus: scout released — by its reader.]'], String(reader));
+      const release = h.messages.find((m) => /released/.test(m.text))!.text;
+      assert.ok(release.startsWith(`[Tune-out: all channels except work released — by ${caller}, 0 wakes]`), release);
+      c.stop();
+    }
+    const announced: string[] = [];
+    const h = harness({ announced });
+    const c = h.make();
+    assert.ok(c.enterAllExcept({ serverId: 'disc', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool').ok);
+    assert.ok(c.cancelAllExcept('agent-tool', 'agent request').ok);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(announced.filter((t) => t.includes('released')), ['[Focus: scout released — agent request.]']);
+    c.stop();
   });
 });

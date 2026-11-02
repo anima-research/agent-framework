@@ -36,7 +36,9 @@
   configured here". A reader's `cancel_tuneout` gave its cancel the reason "subconscious judgment", which the
   resident read in "[Tune-out: … cancelled — subconscious judgment, N wakes]", the reader in its cancel notice, the
   excepted channel in an all-except hold's release line, and a host in the `tune-out:cancelled` trace; the reason is
-  now "by <name>", the reader's name or a reader fork's own (or "by the reader" where the call names none). The
+  now "by <name>", the reader's name or a reader fork's own (or "by the reader" where the call names none), except
+  in the line posted in the excepted channel, which says "[Focus: <resident> released — by its reader.]" so that no
+  agent's name, a reader fork's structural one included, reaches the channel. The
   channel registry takes the reader from the new `tuneOutReader` option, which the framework gives it; a registry
   made without one says no reader is configured.
 - **Hosts: `create()`'s refusal of reader forks with no `model` says what a reader fork is.** It said to give the
