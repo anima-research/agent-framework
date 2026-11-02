@@ -3843,6 +3843,8 @@ export class AgentFramework {
    * call publishes there or nowhere (bounded: the oldest go first).
    */
   private speculativePins: Map<string, ChannelRef> = new Map();
+  /** Tool-surface owners last read with speculativeChannelChunks on (showsSpeculativeServerId), kept after they end. */
+  private speculativeSurfaceOwners: Set<string> = new Set();
   /** Publishes under way that end an open speculative stream: stop() waits for them before closing MCPL. */
   private speculativePublishes: Set<Promise<void>> = new Set();
   /**
@@ -22582,10 +22584,22 @@ export class AgentFramework {
     return channel ? { streamId: `spec_${callId}`, channel, live: false } : undefined;
   }
 
-  /** Whether an agent is shown channel_publish's optional serverId: its tool-surface owner has speculativeChannelChunks. */
+  /**
+   * Whether an agent is shown channel_publish's optional serverId: its
+   * tool-surface owner has speculativeChannelChunks. An owner's answer is
+   * kept once read, so a fork that outlives its owner (orphaned) shows what
+   * it was shown, and its refusals match it.
+   */
   private showsSpeculativeServerId(agentName: string): boolean {
-    const owner = this.toolSurfaceOwners.get(agentName) ?? agentName;
-    return this.agents.get(owner)?.speculativeChannelChunks === true;
+    const owner = this.toolSurfaceOwners?.get(agentName) ?? agentName;
+    const agent = this.agents.get(owner);
+    if (agent) {
+      const shows = agent.speculativeChannelChunks === true;
+      if (shows) this.speculativeSurfaceOwners?.add(owner);
+      else this.speculativeSurfaceOwners?.delete(owner);
+      return shows;
+    }
+    return this.speculativeSurfaceOwners?.has(owner) === true;
   }
 
   /** Drops an agent's calls from speculativeCalls, where they still map to that stream set (any, when none is given). */
@@ -33405,6 +33419,11 @@ export class AgentFramework {
    * configured presentation.
    */
   presentedTools(agentName: string, tools: import('./types/index.js').ToolDefinition[], canUseMeta?: boolean): import('./types/index.js').ToolDefinition[] {
+    // channel_publish as getToolsForAgent shows it to this agent: with the
+    // optional serverId where its tool surface has speculative chunks.
+    if (this.showsSpeculativeServerId(agentName)) {
+      tools = tools.map((t) => (t.name === 'channel_publish' ? channelPublishWithServerId(t) : t));
+    }
     // A registered agent's own presentation first, as its requests have it
     // before the host's: the tools it hid left out, its descriptions applied.
     const snapshot = this.agents.has(agentName) ? this.inspectToolPresentation(agentName) : undefined;

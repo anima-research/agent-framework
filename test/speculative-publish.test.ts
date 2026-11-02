@@ -1132,7 +1132,16 @@ test("framework: only an agent whose tool surface opted in is shown serverId; ot
     });
     assert.equal(JSON.stringify(publishOf('glassy-reader')), JSON.stringify(publishOf('Glassy')), "a reader fork shares its opted-in resident's definition");
     assert.equal(JSON.stringify(publishOf('plain-reader')), JSON.stringify(registryPublish));
-  } finally { await framework.stop(); }
+
+    // The public presentation path shows the same.
+    const presented = (name: string) => framework.presentedTools(name, framework.getAllTools()).find((t) => t.name === 'channel_publish')!;
+    assert.equal(JSON.stringify(presented('Plain')), JSON.stringify(registryPublish));
+    assert.equal(JSON.stringify(presented('Glassy')), JSON.stringify(channelPublishWithServerId(registryPublish)));
+
+    // A fork that outlives its resident (orphaned) keeps what it was shown.
+    (framework as unknown as { agents: Map<string, unknown> }).agents.delete('Glassy');
+    assert.equal(JSON.stringify(publishOf('glassy-reader')), JSON.stringify(channelPublishWithServerId(registryPublish)));
+  } finally { await framework.stop().catch(() => {}); }
 });
 
 test('registry: a shared-name refusal names the channelId and serverId pairs for a caller shown serverId, and is unchanged for others', async () => {
@@ -1149,4 +1158,18 @@ test('registry: a shared-name refusal names the channelId and serverId pairs for
   assert.equal(opted.error, plain.error + ' To have a channel that streams speech hear it as you write, call again with '
     + 'channelId "shared" with serverId "bosun" or channelId "shared" with serverId "chat", written before content.');
   assert.equal(h.publishes.length, 0);
+});
+
+test("registry: a refusal of a name two of the turn's own channels share names the pairs for a caller shown serverId, and is unchanged for others", async () => {
+  const h = streamingRegistry();
+  await h.register('bosun', 'room', SPECULATIVE);
+  await h.register('chat', 'room', SPECULATIVE);
+  const own = [{ serverId: 'bosun', channelId: 'room' }, { serverId: 'chat', channelId: 'room' }];
+  const plain = await h.registry.handleChannelToolCall('channel_publish', { channelId: 'room', content: 'Hi.' }, { kind: 'agent', agentName: 'Plain', own });
+  const opted = await h.registry.handleChannelToolCall('channel_publish', { channelId: 'room', content: 'Hi.' },
+    { kind: 'agent', agentName: 'Glassy', own, showsServerId: true });
+  assert.equal(plain.isError, true);
+  assert.doesNotMatch(String(plain.error), /serverId/);
+  assert.equal(opted.error, plain.error + ' To have a channel that streams speech hear it as you write, call again with '
+    + 'channelId "room" with serverId "bosun" or channelId "room" with serverId "chat", written before content.');
 });

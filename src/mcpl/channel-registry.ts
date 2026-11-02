@@ -6373,7 +6373,13 @@ export class ChannelRegistry {
       entry = this.entryAt(serverGiven ? { serverId: input.serverId!, channelId: fallback!.channelId } : fallback!);
     } else if (own && 'neither' in own) {
       if (seen) seen.refusal = 'shared-id';
-      return { success: false, error: this.ownNeitherRefusal(input.channelId, own.neither, 'was posted', false), isError: true };
+      const registered = own.neither.map((c) => this.entryAt(c)).filter((e): e is ChannelEntry => !!e);
+      return {
+        success: false,
+        error: this.ownNeitherRefusal(input.channelId, own.neither, 'was posted', false)
+          + (origin?.kind === 'agent' && origin.showsServerId && registered.length > 0 ? speculativePairsText(registered) : ''),
+        isError: true,
+      };
     } else if (own) {
       entry = this.entryAt(own.channel);
       if (!entry) {
