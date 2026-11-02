@@ -17996,7 +17996,11 @@ export class AgentFramework {
       // being resumed until it is cleaned up, and the next look resumes it.
       candidate?.cleanup();
       const reported = this.tuneOutCoordinator?.readerReported(name) ?? false;
-      const returned = reported ? 0 : (this.tuneOutCoordinator?.readerFailed({ ...invocation, backlog: handed }) ?? 0);
+      // The rows it was handed go back, not those its branch held already.
+      // The invocation itself goes, since the coordinator knows its late
+      // look by the object (lateFork) and derives no other for one that fails.
+      invocation.backlog = handed;
+      const returned = reported ? 0 : (this.tuneOutCoordinator?.readerFailed(invocation) ?? 0);
       this.emitTrace({
         type: 'tune-out:reader-fork-failed',
         agentName: name,

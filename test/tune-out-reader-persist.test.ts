@@ -447,6 +447,28 @@ describe('a persisted reader: derived again, and when not', () => {
     assert.deepEqual(rederived(t.traces), []);
   });
 
+  it('asks for no second late look when the late look after the tune-out ended fails', { timeout: 120_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-late-'));
+    dirs.push(dir);
+    let refuse = false;
+    const t = await boot(dir, { persist: 'resident' }, {
+      dendrite: { beforeDerive: (spec: { name: string }) => (refuse && spec.name.startsWith('reader/') ? { refuse: 'refused by the test' } : undefined) },
+    } as never);
+    const epochId = t.enter();
+    const first = t.hold(epochId, 'HELD-1');
+    t.look(epochId, [first]);
+    await t.looked('reader/scout/g1', 1);
+    refuse = true;
+    assert.deepEqual(t.internals.tuneOutCoordinator.cancel('disc', CHANNEL, 'agent-tool', 'test cancel'), { ok: true });
+    // The cancel look's refusal came after the end, so one late look is
+    // asked for, and its own refusal must end there.
+    await waitFor("the cancel look's and the late look's refusals", () => t.traces.filter((e) => e.type === 'tune-out:reader-fork-failed').length >= 2);
+    await new Promise((r) => setTimeout(r, 500));
+    const failed = t.traces.filter((e) => e.type === 'tune-out:reader-fork-failed') as unknown as Array<{ returned: number; trigger: string }>;
+    assert.equal(failed.length, 2, 'the cancel look and one late look, and no third');
+    assert.equal(failed[1]!.returned, 0, "the late look's rows go nowhere: it was the last reader they had");
+  });
+
   it('derives it again when its name has no ended record: a derivation whose run was refused', { timeout: 120_000 }, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'reader-persist-norecord-'));
     dirs.push(dir);
