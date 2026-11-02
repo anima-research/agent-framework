@@ -891,7 +891,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
           assert.ok(whole.length > 1_000 && whole.length < 2_000, `premise: a reason past 300 characters and within 2,000 (${whole.length})`);
           assert.equal(t.of('inference:held')[0]!.error, whole, "the trace carries the refusal's whole reason");
           assert.ok(lines.some((l) => l.startsWith('[budget-hold] agent=prime compile refused') && l.includes(whole)), 'and so does the start line');
-          await assert.rejects(t.framework.switchBranch('main'), (error: Error) => error.message.includes('rawPins: zz-inputs)'));
+          await assert.rejects(t.framework.switchBranch('main'), (error: Error) => error.message.includes(whole));
           backlog.fit = true;
           assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
         } finally {
