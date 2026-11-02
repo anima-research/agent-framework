@@ -60,7 +60,6 @@ function stored(framework: AgentFramework): Array<{ text: string; metadata: Reco
 }
 const storedText = (framework: AgentFramework): string => stored(framework).map((m) => m.text).join('\n');
 const noteCount = (text: string): number => text.split('[budget-hold]').length - 1;
-/** The turn's own provider calls: a compression stand-in's calls go through the same membrane, with no messages. */
 const turnCalls = (membrane: MockMembrane): NormalizedRequest[] => (membrane.calls as NormalizedRequest[]).filter((c) => c.messages.length > 0);
 const toolBlocks = (framework: AgentFramework): number => {
   const msgs = (framework.getAgent('prime')?.getContextManager().queryMessages({}).messages ?? []) as unknown as Array<{ content?: Array<{ type: string }> }>;
@@ -102,10 +101,6 @@ interface Backlog {
   compileGate?: { nth: number; until: Promise<void> };
   bindings: { compile: unknown[]; dryRun: unknown[]; preview: unknown[] };
   thrown: Error[]; previewBudgets: unknown[];
-  /** Where set, a preview that fits gives its plan's figures, with this much
-   *  to spare at the agent's budget, and the strategy prices content at
-   *  `notePrice`, as the adaptive one does with its store's estimator. A
-   *  preview at a smaller budget fits only where the picker `foldsDeeper`. */
   spare?: number; foldsDeeper?: boolean | 'throws'; notePrice?: number | 'throws';
 }
 const fits = (b: Backlog): boolean => b.fit || b.ticks >= b.fitAt;
@@ -716,10 +711,11 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     { name: 'the spare is short, and no deeper fold fits it', spare: 5, foldsDeeper: false, notePrice: 47, looks: 2, noted: false },
     { name: 'the spare is short, and the look at the smaller budget fails', spare: 5, foldsDeeper: 'throws', notePrice: 47, looks: 2, noted: false },
     { name: "the strategy can't price the note", spare: 5, notePrice: 'throws', looks: 1, noted: true },
+    { name: 'the strategy has no estimate', spare: 5, looks: 1, noted: true },
   ] as const;
   for (const c of noteCases) {
     it(`decides the note at the check that finds the fit: ${c.name}`, async () => {
-      await withBacklog({ spare: c.spare, foldsDeeper: 'foldsDeeper' in c ? c.foldsDeeper : undefined, notePrice: c.notePrice }, async (backlog) => {
+      await withBacklog({ spare: c.spare, foldsDeeper: 'foldsDeeper' in c ? c.foldsDeeper : undefined, notePrice: 'notePrice' in c ? c.notePrice : undefined }, async (backlog) => {
         const t = await residentTurn({ maintenanceIntervalMs: 50 });
         try {
           t.send('Are you there?');
@@ -763,6 +759,29 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
+  it("ends a stopped held turn whose list is past the engine's spread limit, putting every wake back in the queue", async () => {
+    await withBacklog({}, async () => {
+      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        const hold = holdOf(t)!;
+        const now = Date.now();
+        for (let i = 0; i < 249_999; i++) hold.heldRequests.push({ agentName: 'prime', reason: 'zz-wake', timestamp: now + i } as unknown as HeldRequest);
+        let stopped = false;
+        assert.doesNotThrow(() => { stopped = t.framework.abortInference('prime'); });
+        assert.equal(stopped, true);
+        assert.equal(t.internal.pendingRequests.filter((r) => (r as { reason?: string }).reason === 'zz-wake').length, 249_999);
+        const kept = t.internal.pendingRequests.filter((r) => (r as { reason?: string }).reason !== 'zz-wake');
+        t.internal.pendingRequests.splice(0, t.internal.pendingRequests.length, ...kept);
+        assert.ok(await pollUntil(() => t.of('inference:aborted').length === 1, 3_000), 'the turn ends');
+        assert.equal(holdOf(t), undefined);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
   it("holds a turn whose compression an until-released provider wait stops, however long, alerted once by that wait, and runs it once release-provider-wait lets compression on", async (tc) => {
     tc.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.now() });
     const settle = async () => { for (let i = 0; i < 8; i++) await new Promise<void>((resolve) => setImmediate(resolve)); };
@@ -777,8 +796,6 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     try {
       await withCompressionCalls({ fitAt: 2, workUntil: 2 }, async (c) => {
         const t = await residentTurn({ maintenanceIntervalMs: 60_000 });
-        // As the autobiographical strategy's lane does: a stated wait it can't
-        // hold as an instant pauses it until released, and a release resumes it.
         strategy.releaseCompressionPause = () => { c.pauseAfter = Infinity; return true; };
         const complete = t.membrane.complete.bind(t.membrane);
         let compressionCalls = 0;
@@ -1359,7 +1376,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
-  it('reports each failure of a compression call while a turn is held, after a drive without one, and the hold ends by itself once compression lands', async () => {
+  it('reports a compression call\'s failure while a turn is held again after a drive without one, and the hold ends by itself once compression lands', async () => {
     await withCompressionCalls({ fitAt: 12, workUntil: 12, pauseAfter: 3 }, async (c) => {
       const t = await residentTurn({ maintenanceIntervalMs: 0, recheckMs: 50 });
       const failures = () => t.of('ops:alert').filter((e) => e.kind === 'context-maintenance-failed');
@@ -2148,7 +2165,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.ok(await pollUntil(() => t.of('inference:exhausted').length === 1, 5_000));
         assert.equal(t.of('inference:held').length, 1, 'not held again');
         assert.match(String(t.of('inference:exhausted')[0]!.error),
-          /the turn was first held \d+ s ago; its context fit when the hold released it, and what its start then added didn't, with nothing left for compression to do\)$/);
+          /the turn was first held \d+ s ago; its context fit at the check that released it, and the compile its start then ran didn't, with nothing left for compression to do\)$/);
       } finally {
         await t.close();
       }
@@ -2233,7 +2250,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         open();
         assert.ok(await pollUntil(() => t.of('inference:exhausted').length === 1, 5_000));
         assert.ok(String(t.of('inference:exhausted')[0]!.error).endsWith(
-          "(the turn was first held 30 min ago; its context fit when the hold released it, and what its start then added didn't, with nothing left for compression to do)"),
+          "(the turn was first held 30 min ago; its context fit at the check that released it, and the compile its start then ran didn't, with nothing left for compression to do)"),
           String(t.of('inference:exhausted')[0]!.error));
       } finally {
         open();
@@ -3007,7 +3024,6 @@ describe('the release check takes context-manager\'s verdict on the real strateg
     };
   }
 
-  /** The lowest budget whose preview fits the turn's context, and the highest that doesn't. */
   function fitEdge(t: Awaited<ReturnType<typeof realResident>>): { lo: number; hi: number } {
     let lo = 2_000;
     let hi = 400_000;
@@ -3068,7 +3084,7 @@ describe('the release check takes context-manager\'s verdict on the real strateg
   });
 
   for (const compression of ['still pending', 'finished'] as const) {
-    it(`where what a released start stores besides the note tips its compile over, ${compression === 'still pending' ? 'holds it again and later reads each note it stored' : 'fails it saying the context fit at the check and what the start added did not'}`, async () => {
+    it(`where what a released start stores besides the note tips its compile over, ${compression === 'still pending' ? 'holds it again and later reads each note it stored' : 'fails it saying the context fit at the check that released it and its compile did not'}`, async () => {
       let status = 0;
       const context = new InboxModuleForStatus(() => `zz status ${++status} ` + 'lorem ipsum dolor sit amet '.repeat(40));
       const t = await realResident(true, undefined, [context]);
@@ -3098,7 +3114,7 @@ describe('the release check takes context-manager\'s verdict on the real strateg
           assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
           assert.equal(t.membrane.calls.length, 0);
           const error = String(t.of('inference:exhausted')[0]!.error);
-          assert.match(error, /the turn was first held \d+ s ago; its context fit when the hold released it, and what its start then added didn't, with nothing left for compression to do\)$/);
+          assert.match(error, /the turn was first held \d+ s ago; its context fit at the check that released it, and the compile its start then ran didn't, with nothing left for compression to do\)$/);
           assert.doesNotMatch(error, /still didn't fit/);
         }
       } finally {

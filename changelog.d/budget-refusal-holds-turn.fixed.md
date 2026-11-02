@@ -11,9 +11,10 @@
   for a maintenance pass, and it drives it again after each pass (with the
   maintenance timer off, every 5 seconds) and when a call of that manager's
   lands while the turn is held, unless a drive of the hold's own or a drain it
-  joined is under way, whose end looks again; for a call that lands during
-  another drain, such as the OverBudget drain breaker's, the hold looks and
-  drives once that drain ends. A tick that starts no call, as while
+  joined is under way, whose end looks again; for a call that lands during a
+  drain it hasn't joined, such as the OverBudget drain breaker's, the hold
+  looks at once and, still short, joins that drain, whose end looks again.
+  A tick that starts no call, as while
   compression is paused after a failure, ends that drive. An ephemeral run, a
   turn in a framework that `start()` hasn't started (only `runUntilIdle()`
   runs its turns, so nothing would run a released one), and a refusal with
@@ -28,12 +29,12 @@
     for one that does, the dry compile decides. The hold looks after each tick
     it drives that starts a compression call, so a call that makes the context
     fit releases the turn at once, and looks again when each drive, or drain
-    it joined, ends, when a call of that manager's lands outside them (during
-    a drain it hasn't joined, once that drain ends), and after each
-    maintenance pass. After a compression call returns, its chunk's quarantine
-    clean-up can still run under the compression-state lock; a hold that
-    looked during that clean-up, with more compression still needed, is looked
-    at again at the next maintenance pass, at the hold's recheck with the
+    it joined, ends, when a call of that manager's lands outside them, and
+    after each maintenance pass. After a compression call returns, its
+    chunk's quarantine clean-up can still run under the compression-state
+    lock; a hold that looked during that clean-up, with more compression
+    still needed, is looked at again at the next maintenance pass, at the
+    hold's recheck with the
     maintenance timer off, or when another call of that manager's lands. With
     the maintenance timer on, once the hold's own drive has ended, the hold
     drives compression again at a pass's end or when a later call of that
@@ -59,16 +60,21 @@
       compression call fails for a reason that says nothing about the
       request, as in an outage of its model's provider or with bad
       credentials, it waits between tries from 5 seconds doubling up to 10
-      minutes and tries again on later ticks. Each failure raises
-      `context-maintenance-failed` under maintenance's rule for repeats, and
-      the hold ends by itself once a call succeeds and the context fits.
+      minutes and tries again on later ticks. A failure raises
+      `context-maintenance-failed` under maintenance's rule for repeats: the
+      same failure again is alerted only once the alert's cooldown has passed
+      or after a pass or drive without one. The hold ends by itself once a
+      call succeeds and the context fits.
     - **A wait with no end:** after a call whose provider states a wait that
       can't be held as an instant, the framework records it as a wait until
       released, which raises one `provider-wait` ops alert and holds the
       agent's calls on that model, compression's included, and the lane
-      makes no call. `releaseProviderWait()` lifts that wait and the lane's
-      pause together. The wait is recorded in the store, so a restart doesn't
-      lift it, and a restart drops the held turn.
+      makes no call. `releaseProviderWait()` lifts that wait and offers the
+      lane its release: context-manager's autobiographical lane then drops the
+      stated wait, and its own backoff, 5 seconds doubling to 10 minutes with
+      its failure count kept, still paces its next call. The wait is
+      recorded in the store, so a restart doesn't lift it, and a restart
+      drops the held turn.
     - **Work nothing bounds:** compression whose pending work isn't a call,
       such as a quarantine clean-up under the compression-state lock that
       never ends, keeps the turn held with no signal of its own. A chunk or a

@@ -7076,7 +7076,7 @@ export class AgentFramework {
     if (hold?.state !== 'spent') return error;
     error.message = `${error.message} (the turn was first held ${describeWait(Date.now() - hold.startedAt)} ago; ` +
       (hold.outcome === 'fit'
-        ? "its context fit when the hold released it, and what its start then added didn't, with nothing left for compression to do)"
+        ? "its context fit at the check that released it, and the compile its start then ran didn't, with nothing left for compression to do)"
         : "compression had nothing left to do and it still didn't fit)");
     return error;
   }
@@ -23971,7 +23971,7 @@ export class AgentFramework {
       ? this.takeBudgetHold(agentName) : undefined;
     if (budgetHold) {
       const wakes = take(budgetHold.requests);
-      if (putsBack) back.push(...wakes);
+      if (putsBack) for (const wake of wakes) back.push(wake);
     }
     for (const parked of [...this.parkedContinuations]) {
       if (!isContinuation(parked)) continue;
@@ -23987,7 +23987,7 @@ export class AgentFramework {
       requests.length = 0;
       requests.push(...left);
     }
-    this.pendingRequests.push(...back);
+    for (const request of back) this.pendingRequests.push(request);
     const reportHold = (): void => budgetHold?.report(putsBack ? 'put back in the queue' : 'dropped with it');
     if (!dropped || !drop) return reportHold();
     // A primary a provider hold left pending for what it released won't run
