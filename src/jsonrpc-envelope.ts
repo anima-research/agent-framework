@@ -11,18 +11,22 @@
  * read (MCP 2025-11-25, Basic, Error Responses), but only from a message
  * whose jsonrpc member is "2.0": a peer's own JSON log lines, which an MCPL
  * server's stdout can carry, can have an error key. Any other object with
- * neither a method nor an id isn't JSON-RPC. A message with a method is
- * a request when it has an id member, whatever its value, and a notification
- * when it has none (§4.1), so `"id": null` is a request. A request's method
- * must be a string and its id a string, a number or null (§4). A message
- * that breaks either isn't a Request object, and so isn't a notification
- * either, with or without an id: the endpoints answer it once with -32600,
- * carrying its id where that's a string or a number and null otherwise (§5,
- * and the spec's own example of an invalid Request object, which has no id),
- * and don't dispatch it. The MCPL handshake, which answers only pings,
- * ignores it, as it ignores every other request then. Apart from the error
- * with no id, the `jsonrpc` member isn't checked: a peer that leaves it out
- * is served, as before.
+ * neither a method nor an id isn't JSON-RPC: the MCP server answers it
+ * -32600 with id null, as it does a value that isn't an object, and the MCPL
+ * connection, whose server's stdout carries other output, ignores it. A
+ * message with a method is a request when it has an id member, whatever its
+ * value, and a notification when it has none (§4.1), so `"id": null` is a
+ * request. MCP says a request's id MUST NOT be null (2025-11-25, Basic); one
+ * is served anyway, as JSON-RPC allows, since its sender waits for the
+ * answer. A request's method must be a string and its id a string, a number
+ * or null (§4). A message that breaks either isn't a Request object, and so
+ * isn't a notification either, with or without an id: the endpoints answer
+ * it once with -32600, carrying its id where that's a string or a number and
+ * null otherwise (§5, and the spec's own example of an invalid Request
+ * object, which has no id), and don't dispatch it. The MCPL handshake, which
+ * answers only pings, ignores it, as it ignores every other request then.
+ * Apart from the error with no id, the `jsonrpc` member isn't checked: a
+ * peer that leaves it out is served, as before.
  */
 
 /** A JSON value's kind, as a log line or an error names what a peer sent

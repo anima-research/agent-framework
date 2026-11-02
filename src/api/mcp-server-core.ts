@@ -228,7 +228,9 @@ export class McpServer {
         // need no answer.
         return;
       case 'neither':
-        // Not JSON-RPC, and nothing to answer.
+        // Not a Request object, which needs a method, nor a response: an
+        // invalid request, as a value that isn't an object is.
+        this.sendError(null, -32600, 'Invalid Request: a message needs a method or an id');
         return;
     }
   }

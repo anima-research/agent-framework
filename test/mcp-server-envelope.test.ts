@@ -8,8 +8,8 @@
  * response, and so is a JSON-RPC 2.0 error with no id, as MCP allows: this
  * server, sending no requests, logs one and never answers it; and a request
  * named 'initialized' gets -32601 like any unknown method. A JSON
- * value that isn't an object is an invalid request too, and a batch is
- * refused as one. Lines go in as the server's stdin reader hands them
+ * value that isn't an object is an invalid request too, and so is an object
+ * with neither a method nor an id, and a batch is refused as one. Lines go in as the server's stdin reader hands them
  * over, to a server that's never started, since starting connects it to its
  * WebSocket API first.
  */
@@ -110,13 +110,21 @@ test("a JSON value that isn't an object is an invalid request, answered with id 
   assert.deepEqual(logged, []);
 });
 
-test('controls: a line that isn\'t JSON is a parse error; a notification, an object with neither a method nor an id, and an unknown method are handled as before', (t) => {
+test("an object with neither a method nor an id is an invalid request, answered -32600 with id null, as a value that isn't an object is (#534's review, R1-2)", (t) => {
+  const { send, replies, logged } = serve(t);
+  send({});
+  send({ jsonrpc: '2.0' });
+  // An error member alone, without saying it's JSON-RPC, is no response.
+  send({ error: { code: -32700, message: 'Parse error' } });
+  const invalid = { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid Request: a message needs a method or an id' } };
+  assert.deepEqual(replies, [invalid, invalid, invalid]);
+  assert.deepEqual(logged, []);
+});
+
+test('controls: a line that isn\'t JSON is a parse error; a notification and an unknown method are handled as before', (t) => {
   const { line, send, replies, logged } = serve(t);
   line('{"jsonrpc":');
   send({ jsonrpc: '2.0', method: 'notifications/initialized' });
-  send({});
-  // An error member alone, without saying it's JSON-RPC, is no response.
-  send({ error: { code: -32700, message: 'Parse error' } });
   send({ jsonrpc: '2.0', id: 4, method: 'no/such-method' });
   assert.deepEqual(replies, [
     { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } },

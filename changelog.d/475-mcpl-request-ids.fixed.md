@@ -6,4 +6,5 @@
   - **An invalid request now gets one `-32600` "Invalid Request",** saying what was wrong, and isn't handled. Before, a request whose `id` isn't a string, a number or null had that `id` echoed back in the answer, one whose `method` isn't a string got -32601 "Method not found", and one of those with no `id` got no answer.
   - **A message with an `id` and no `method` is a response,** and so is a JSON-RPC 2.0 error with no `id`. This server sends no requests, so it logs a response and never answers it. Before, one with an `id` was answered -32601, and an error with no `id` was ignored.
   - **A JSON value that isn't an object gets `-32600` with `id: null`,** and a batch's answer says this server doesn't accept batches. Before, a number, a string or `null` got -32700 "Parse error", and an array got no answer.
+  - **An object with neither a `method` nor an `id` gets `-32600` with `id: null` too,** where it was taken for a notification and got no answer.
   - **A request named `initialized` gets -32601 "Method not found"**, as any unknown method does, where it got no answer. MCP's acknowledgment is the `notifications/initialized` notification, which needs none.
