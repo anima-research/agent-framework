@@ -131,12 +131,14 @@ export interface FrameworkConfig {
      */
     announceOrphans?: boolean;
     /**
-     * With a `derivationNotice`, after this many derivations of one kind from
-     * one agent, the line it's given is a count line every so many instead of
-     * a line per fork, so a reader loop that forks a hundred times a session
-     * doesn't fill its source's context with stamps; every derivation still
-     * emits its `dendrite:agent-created` trace. Default 10; 0 never collapses.
-     * Without a `derivationNotice` the source is told nothing.
+     * With a `derivationNotice`, after this many incarnations of one kind
+     * from one agent, derivations and resumptions together, the line it's
+     * given is a count line every so many instead of a line per incarnation,
+     * so a reader loop that forks a hundred times a session, or resumes one
+     * reader at each look (`subconscious.persist`), doesn't fill its source's
+     * context with stamps; every incarnation still emits its
+     * `dendrite:agent-created` trace. Default 10; 0 never collapses. Without
+     * a `derivationNotice` the source is told nothing.
      */
     collapseDerivationNoticesAfter?: number;
     /**
@@ -151,8 +153,9 @@ export interface FrameworkConfig {
      */
     beforeDerive?: (spec: import('../dendrite/types.js').AgentSpec) => void | { refuse: string };
     /**
-     * What an agent is told when something is derived from it. Given the
-     * record, the agent it was derived from and the framework's own line,
+     * What an agent is told when something is derived from it, or resumed
+     * after it was. Given the record, the agent it was derived from and the
+     * framework's own line,
      * return the text to add (that line, or the host's own), or null to add
      * nothing. Absent, nothing is added: an agent isn't told of derivations
      * unless the host asks for it. The `dendrite:agent-created` trace is

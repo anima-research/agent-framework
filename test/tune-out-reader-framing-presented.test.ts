@@ -64,7 +64,10 @@ afterEach(async () => {
 });
 
 describe("a reader fork's framing is a presentation to the fork (#291, AF-5)", () => {
-  it('presents the held rows it hands into the fork, which holds them while it runs, and keeps them out of its compile', { timeout: 120_000 }, async () => {
+  // Run as it was written, and again with `persist: 'look'` stated, which
+  // is what leaving it out means (a persisted reader, tune-out-reader-persist).
+  for (const persist of [undefined, 'look'] as const) {
+  it(`presents the held rows it hands into the fork, which holds them while it runs, and keeps them out of its compile${persist ? ` (persist: '${persist}')` : ''}`, { timeout: 120_000 }, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'reader-framing-presented-'));
     dirs.push(dir);
     const commandPath = join(dir, 'commands.txt');
@@ -76,7 +79,7 @@ describe("a reader fork's framing is a presentation to the fork (#291, AF-5)", (
       storePath: join(dir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
       agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', proseRouting: 'disabled' }],
-      subconscious: { enabled: true, reader: 'forks', model: 'test-model', voice: 'Read for scout.' },
+      subconscious: { enabled: true, reader: 'forks', model: 'test-model', voice: 'Read for scout.', ...(persist ? { persist } : {}) },
       mcplServers: [{ id: 'disc', command: process.execPath, args: [FIXTURE], env: { STATUS_PATH: join(dir, 'status.jsonl'), COMMAND_PATH: commandPath } }],
       modules: [gates],
       syncIntervalMs: 0,
@@ -146,6 +149,7 @@ describe("a reader fork's framing is a presentation to the fork (#291, AF-5)", (
     await waitFor('the fork ended', () => !framework.getAgent(during!.fork));
     assert.equal(internals.presentation.presentedToAnyone(during!.held[0]!), false, 'a framed row is held only while the fork lives');
   });
+  }
 
   // J-AF28: the framing was noted at the fork's derivation, and its run's
   // refusal (here, a quiesced host's) came before its registration, so no

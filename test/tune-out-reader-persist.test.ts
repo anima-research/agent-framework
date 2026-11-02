@@ -13,11 +13,13 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { MessageId, StoredMessage } from '@animalabs/context-manager';
 import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
-import { AgentFramework, defaultReaderFraming } from '../src/index.js';
+import { AgentFramework, WorkspaceModule, defaultReaderFraming } from '../src/index.js';
 import type { FrameworkConfig, ReaderFramingContext, TraceEvent } from '../src/index.js';
 import type { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 import { WireMembrane, final } from './helpers/wire-membrane.js';
+import { GateModule, waitCall } from './helpers/dendrite.js';
+import { tuneOutTool } from '../src/framework.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/tune-out-mcpl-server.mjs');
 const CHANNEL = 'disc:guild:noisy';
@@ -497,5 +499,148 @@ describe('a persisted reader: derived again, and when not', () => {
     assert.equal(t.forkTraces().length, 2);
     assert.equal(t.framework.getAgentRecord(name)!.incarnation, 2, 'no incarnation began');
     assert.ok(!t.framework.listAgents({ includeEnded: true }).some((r) => r.name !== name && r.kind === 'subconscious-fork'));
+  });
+});
+
+describe('a persisted reader: what the resident and the reader are told', () => {
+  const lifecycle = (rows: StoredMessage[]) => rows.filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'agent-lifecycle');
+
+  it("tells the resident, with a derivationNotice, what a re-synced reader reads, and counts resumptions toward the collapse", { timeout: 180_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-notice-'));
+    dirs.push(dir);
+    const t = await boot(dir, { persist: 'resident' }, {
+      dendrite: { derivationNotice: (_record: unknown, _from: string, line: string) => line, collapseDerivationNoticesAfter: 2 },
+    } as never);
+    const epochId = t.enter();
+    for (let n = 1; n <= 4; n++) {
+      t.look(epochId, [t.hold(epochId, `HELD-${n}`)]);
+      await t.looked('reader/scout/g1', n);
+    }
+    const told = lifecycle(t.rows());
+    assert.deepEqual(told.map((m) => (m.metadata as { dendrite: { incarnation: number } }).dendrite.incarnation), [1, 2, 4],
+      'a line each for the first two, none for the third, a count line at the fourth');
+    assert.equal(textOf(told[0]!),
+      '[Agent lifecycle: reader/scout/g1 was derived from you as a subconscious-fork on your weights (test-model), reading your ' +
+      'context up to this point, and handed what entered your context after it at each later look; its result returns to you ' +
+      'as a message; it ends when its task does (idle 10 min), and ends with you.]');
+    assert.equal(textOf(told[1]!),
+      '[Agent lifecycle: reader/scout/g1 was resumed (incarnation 2) as a subconscious-fork on your weights (test-model), reading ' +
+      'your context up to the point it was derived, and handed what entered your context after it at each look; its result ' +
+      'returns to you as a message; it ends when its task does (idle 10 min), and ends with you.]');
+    assert.match(textOf(told[2]!), /^\[Agent lifecycle: 1 subconscious-fork has been derived from you, and resumed 3 times, since \d\d:\d\d UTC \(2 since the last note\); the latest, reader\/scout\/g1, is a subconscious-fork/);
+    assert.deepEqual((told[2]!.metadata as { dendrite: { collapsed: unknown } }).dendrite.collapsed, { count: 4, sinceLastNote: 2, resumed: 3 });
+  });
+
+  it("says in the tune_out tool what a persisted reader does at a later run, and nothing for a fork per look", () => {
+    const later = (reader: Parameters<typeof tuneOutTool>[0]) => tuneOutTool(reader).description;
+    const fork = 'A reader reads it instead: a fork of your context, run on a cadence and when a message there mentions you, ' +
+      'which can report to you in its own words and cancel the tune-out. ';
+    assert.ok(later({ kind: 'forks', persist: 'epoch', resync: 'window' }).includes(fork +
+      'Within one tune-out, later runs resume that fork, each handed what entered your context since the run before; ' +
+      'a new fork is made only when it can\'t be resumed. People who mention you'));
+    assert.ok(later({ kind: 'forks', persist: 'resident', resync: 'none' }).includes(fork +
+      'Later runs resume that fork, across tune-outs; a new fork is made only when it can\'t be resumed. People who mention you'));
+    assert.ok(later({ kind: 'forks' }).includes(fork + 'People who mention you'), 'a fork per look: as before');
+    for (const persist of ['epoch', 'resident'] as const) {
+      assert.ok(!/subconscious|judg/i.test(JSON.stringify(tuneOutTool({ kind: 'forks', persist, resync: 'window' }))));
+    }
+    const framework = Object.create(AgentFramework.prototype) as {
+      subconsciousAgentName: string | null; readerForks: boolean; subconsciousConfig: unknown; tuneOutToolDefinition(): ReturnType<typeof tuneOutTool>;
+    };
+    framework.subconsciousAgentName = null;
+    framework.readerForks = true;
+    framework.subconsciousConfig = { enabled: true, reader: 'forks', model: 'm', voice: 'v', persist: 'resident' };
+    assert.deepEqual(framework.tuneOutToolDefinition(), tuneOutTool({ kind: 'forks', persist: 'resident', resync: 'window' }));
+    framework.subconsciousConfig = { enabled: true, reader: 'forks', model: 'm', voice: 'v', persist: 'look' };
+    assert.deepEqual(framework.tuneOutToolDefinition(), tuneOutTool({ kind: 'forks' }));
+  });
+
+  it("lets the host word the result of the resident's open call a reader is derived beside (pendingRound)", { timeout: 180_000 }, async () => {
+    for (const persist of [undefined, 'epoch'] as const) {
+      const dir = mkdtempSync(join(tmpdir(), `reader-persist-round-${persist ?? 'unset'}-`));
+      dirs.push(dir);
+      const gates = new GateModule();
+      const seen: string[] = [];
+      const t = await boot(dir, {
+        ...(persist ? { persist } : {}),
+        pendingRound: (ctx: ReaderFramingContext) => { seen.push(ctx.fork); return { madeBy: { result: `[host: ${ctx.fork} reads for ${ctx.resident}]` } }; },
+      }, { modules: [gates] } as never);
+      const epochId = t.enter();
+      t.membrane.script('scout', waitCall('g1'), final([text('scout is done waiting')]));
+      t.internals.addMessage('antra', [text('wait for it')], { author: { id: 'u1', name: 'antra' } }, { forAgent: 'scout' });
+      t.internals.pendingRequests.push({ agentName: 'scout', reason: 'test', source: 'test', timestamp: Date.now() });
+      await waitFor('scout waits on its call', () => gates.entered.has('g1'));
+      t.look(epochId, [t.hold(epochId, 'HELD-1')]);
+      await waitFor("the reader's request", () => t.membrane.callsFor('reader').length === 1);
+      const fork = seen[0]!;
+      const round = (await t.framework.inspectAgentContext(fork)).getAllMessages()
+        .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'dendrite-pending-round');
+      const result = round.flatMap((m) => m.content).find((b) => b.type === 'tool_result') as { content: unknown } | undefined;
+      assert.equal(result?.content, `[host: ${fork} reads for scout]`, `${persist ?? 'persist unset'}: the host's words, not the framework's note`);
+      gates.release('g1');
+      await t.framework.runUntilIdle();
+      await t.framework.stop();
+      frameworks.splice(frameworks.indexOf(t.framework), 1);
+    }
+  });
+
+  it("shows a resumed reader the resident's tool presentation, as its derivation did", { timeout: 120_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-surface-'));
+    dirs.push(dir);
+    const board = mkdtempSync(join(tmpdir(), 'reader-persist-board-'));
+    dirs.push(board);
+    // scout's presentation hides a tool and rewords another, so a block
+    // built without it differs.
+    writeFileSync(join(board, 'tools.json'), JSON.stringify({ version: 1, tools: { journal: { visible: false }, think: { description: 'SCOUT-WORDED think' } } }));
+    const t = await boot(dir, { persist: 'resident' }, {
+      agents: [{
+        name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', proseRouting: 'disabled',
+        toolPresentation: { path: join(board, 'tools.json'), cataloguePath: 'board/tools.md' },
+      }],
+      modules: [new WorkspaceModule({ mounts: [{ name: 'board', path: board, mode: 'read-write', watch: 'never' }] })],
+    } as never);
+    await t.residentTurn('hello scout', 'scout hears you');
+    const epochId = t.enter();
+    t.look(epochId, [t.hold(epochId, 'HELD-1')]);
+    await t.looked('reader/scout/g1', 1);
+    t.look(epochId, [t.hold(epochId, 'HELD-2')]);
+    await t.looked('reader/scout/g1', 2);
+    const tools = (r: NormalizedRequest) => JSON.stringify(r.tools ?? []);
+    const resident = tools(t.membrane.callsFor('scout')[0]!);
+    assert.ok(!resident.includes('"journal"') && resident.includes('SCOUT-WORDED think'), "premise: scout's presentation shapes its block");
+    const [derived, resumed] = t.membrane.callsFor('reader');
+    assert.equal(tools(derived!), resident, 'premise: the derivation shows the resident\'s tool block');
+    assert.equal(tools(resumed!), resident, 'and so does the resumption');
+  });
+
+  it("with persist left out or 'look', keeps a fork's name, record, framing row and trace as they were", { timeout: 180_000 }, async () => {
+    for (const persist of [undefined, 'look'] as const) {
+      const dir = mkdtempSync(join(tmpdir(), `reader-persist-look-${persist ?? 'unset'}-`));
+      dirs.push(dir);
+      const contexts: ReaderFramingContext[] = [];
+      const t = await boot(dir, { ...(persist ? { persist } : {}), framing: (ctx: ReaderFramingContext) => { contexts.push(ctx); return defaultReaderFraming(ctx); } });
+      const epochId = t.enter();
+      t.look(epochId, [t.hold(epochId, 'HELD-1')]);
+      t.look(epochId, [t.hold(epochId, 'HELD-2')]);
+      const names = [1, 2].map((n) => `reader/scout/${epochId.slice(0, 8)}/${n}`);
+      for (const name of names) await t.looked(name, 1);
+      assert.deepEqual(t.forkTraces().map((f) => Object.keys(f).filter((k) => k !== 'timestamp').sort()),
+        [['agentName', 'channelId', 'epochId', 'held', 'serverId', 'trigger', 'type'], ['agentName', 'channelId', 'epochId', 'held', 'serverId', 'trigger', 'type']],
+        `${persist ?? 'unset'}: a fork per look, its trace without the persisted fields`);
+      assert.deepEqual(t.forkTraces().map((f) => f.agentName).sort(), names);
+      for (const name of names) {
+        const record = t.framework.getAgentRecord(name)!;
+        assert.deepEqual(Object.keys(record.metadata ?? {}).sort(), ['channelId', 'epochId', 'trigger']);
+        const framing = (await t.framework.inspectAgentContext(name)).getAllMessages()
+          .find((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'tune-out-reader-framing')!;
+        assert.deepEqual(Object.keys(framing.metadata as object).filter((k) => k !== 'ownRowOf' && k !== 'audience').sort(),
+          ['channelId', 'epochId', 'heldMessageIds', 'kind', 'system', 'trigger'], `${name}: no resident mark`);
+      }
+      assert.deepEqual(contexts.map((c) => Object.keys(c).sort()), [0, 1].map(() =>
+        ['backlog', 'channelId', 'dispositions', 'epochId', 'fork', 'notice', 'resident', 'trigger', 'voice']), 'a framing context without the new fields');
+      assert.equal(t.traces.some((e) => e.type === 'tune-out:reader-rederived'), false);
+      await t.framework.stop();
+      frameworks.splice(frameworks.indexOf(t.framework), 1);
+    }
   });
 });

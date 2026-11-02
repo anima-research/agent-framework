@@ -24,6 +24,7 @@ import {
   type SubconsciousConfig,
   type PersistentReaderConfig,
   type ForkReaderConfig,
+  type ReaderFramingContext,
   type ReaderRederivedReason,
 } from './tune-out/tools.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, alreadyTunedOutText, cancelWaitsNote, type ReaderInvocation } from './tune-out/coordinator.js';
@@ -2103,7 +2104,13 @@ function assertAgentNamesUnique(agents: readonly AgentConfig[]): void {
  */
 export type TuneOutReader =
   | { readonly kind: 'persistent'; readonly name: string }
-  | { readonly kind: 'forks' }
+  | {
+      readonly kind: 'forks';
+      /** `subconscious.persist`, when it persists the reader; left out for a fork per look. */
+      readonly persist?: 'epoch' | 'resident';
+      /** `subconscious.resync`, read with `persist`. */
+      readonly resync?: 'window' | 'none';
+    }
   | { readonly kind: 'none' };
 
 /**
@@ -2123,7 +2130,12 @@ export function tuneOutTool(reader: TuneOutReader): import('./types/index.js').T
       'mentions you, and can report to you in its own words and cancel the tune-out. '
     : reader.kind === 'forks'
       ? 'A reader reads it instead: a fork of your context, run on a cadence and when a message there mentions you, ' +
-        'which can report to you in its own words and cancel the tune-out. '
+        'which can report to you in its own words and cancel the tune-out. ' +
+        (reader.persist === undefined
+          ? ''
+          : `${reader.persist === 'epoch' ? 'Within one tune-out, later runs resume that fork' : 'Later runs resume that fork, across tune-outs'}` +
+            `${reader.resync === 'none' ? '' : ', each handed what entered your context since the run before'}` +
+            '; a new fork is made only when it can\'t be resumed. ')
       : 'No reader is configured here, so none reads it meanwhile: it is held for you, and delivered when you cancel ' +
         'the tune-out or durationSeconds runs out. ';
   return {
@@ -4696,8 +4708,8 @@ export class AgentFramework {
   private beforeDerive?: (spec: AgentSpec) => void | { refuse: string };
   /** What a source is told of a derivation (config.dendrite.derivationNotice); absent, nothing. */
   private derivationNoticeHook?: (record: AgentRecord, from: string, defaultText: string) => string | null;
-  /** Per source agent, per kind: how many derivations, since when, and at which count the last note went. */
-  private derivationTallies: Map<string, Map<string, { count: number; since: number }>> = new Map();
+  /** Per source agent, per kind: how many incarnations it was told of (derivations and resumptions), how many of them resumptions, and since when. */
+  private derivationTallies: Map<string, Map<string, { count: number; resumed: number; since: number }>> = new Map();
   private readonly sharedSlotAgents = new Set<Agent>();
   /** The batched-wake lines already written (placeWakeLines), and the agents
    *  each was written for, so every later start of a wake writes each at
@@ -12298,12 +12310,12 @@ export class AgentFramework {
       ...(record.relationships.resultTo ? { resultTo: record.relationships.resultTo } : {}),
       lifetime: record.lifetime,
     };
-    // With the host's hook: a resumption is rare and always passed to it. A
-    // first incarnation is tallied: past the threshold, a reader loop that
-    // forks a hundred times a session would fill its source's context with
-    // stamps, so the hook is given a count line every `threshold` forks
-    // instead, with the latest described; every derivation still emits its
-    // trace.
+    // With the host's hook, each incarnation from a source is tallied, a
+    // resumption as a derivation is: past the threshold, a reader loop that
+    // forks a hundred times a session, or resumes one reader at each look
+    // (subconscious.persist), would fill its source's context with stamps,
+    // so the hook is given a count line every `threshold` incarnations
+    // instead, with the latest described; every one still emits its trace.
     const threshold = this.collapseDerivationNoticesAfter;
     const tell = (defaultText: string, extra: Record<string, unknown> = {}) => {
       try {
@@ -12313,23 +12325,29 @@ export class AgentFramework {
         console.error(`[dendrite] ${record.name} was created, but ${from} could not be told:`, error);
       }
     };
-    if (record.incarnation > 1 || threshold <= 0) {
+    if (threshold <= 0) {
       tell(this.derivationNotice(record, from));
       return;
     }
     let byKind = this.derivationTallies.get(from);
     if (!byKind) this.derivationTallies.set(from, (byKind = new Map()));
     let tally = byKind.get(record.kind);
-    if (!tally) byKind.set(record.kind, (tally = { count: 0, since: Date.now() }));
+    if (!tally) byKind.set(record.kind, (tally = { count: 0, resumed: 0, since: Date.now() }));
     tally.count++;
+    if (record.incarnation > 1) tally.resumed++;
     if (tally.count <= threshold) {
       tell(this.derivationNotice(record, from));
     } else if ((tally.count - threshold) % threshold === 0) {
       const since = new Date(tally.since).toISOString().slice(11, 16) + ' UTC';
+      const derived = tally.count - tally.resumed;
+      const made = tally.resumed === 0
+        ? `${tally.count} ${record.kind}s have been derived from you since ${since}`
+        : `${derived} ${record.kind}${derived === 1 ? ' has' : 's have'} been derived from you, and resumed ` +
+          `${tally.resumed} time${tally.resumed === 1 ? '' : 's'}, since ${since}`;
       tell(
-        `[${NOTICE_TAG.agentLifecycle}: ${tally.count} ${record.kind}s have been derived from you since ${since} ` +
+        `[${NOTICE_TAG.agentLifecycle}: ${made} ` +
           `(${threshold} since the last note); the latest, ${record.name}, is ${this.derivationDescription(record, from)}.]`,
-        { collapsed: { count: tally.count, sinceLastNote: threshold } },
+        { collapsed: { count: tally.count, sinceLastNote: threshold, ...(tally.resumed > 0 ? { resumed: tally.resumed } : {}) } },
       );
     }
   }
@@ -12350,8 +12368,17 @@ export class AgentFramework {
       : record.model === sourceModel
         ? ` on your weights (${record.model})`
         : ` on ${record.model}`;
+    // A persisted reader (subconscious.persist, recorded in its metadata)
+    // reads the context it was derived with, and with resync 'window' is
+    // handed what entered the source's context after it at each look.
+    const persisted = record.metadata?.persist === 'epoch' || record.metadata?.persist === 'resident';
     const inherited = record.inherit?.mode === 'shared'
-      ? 'reading your context up to this point'
+      ? !persisted
+        ? 'reading your context up to this point'
+        : (record.incarnation > 1 ? 'reading your context up to the point it was derived' : 'reading your context up to this point') +
+          (record.metadata?.resync === 'window'
+            ? `, and handed what entered your context after it at each ${record.incarnation > 1 ? '' : 'later '}look`
+            : '')
       : 'with a copy of your context';
     const route = record.relationships.resultTo;
     const home = this.channelOfHome(record.homeChannel);
@@ -13391,7 +13418,13 @@ export class AgentFramework {
    */
   private tuneOutReader(): TuneOutReader {
     if (this.subconsciousAgentName) return { kind: 'persistent', name: suppliedValue(this.subconsciousAgentName) };
-    if (this.readerForks) return { kind: 'forks' };
+    if (this.readerForks) {
+      const cfg = this.subconsciousConfig;
+      const persist = cfg?.reader === 'forks' ? cfg.persist : undefined;
+      return persist === 'epoch' || persist === 'resident'
+        ? { kind: 'forks', persist, resync: (cfg as ForkReaderConfig).resync ?? 'window' }
+        : { kind: 'forks' };
+    }
     return { kind: 'none' };
   }
 
@@ -17574,7 +17607,7 @@ export class AgentFramework {
       let framed = false;
       try {
         const backlog = invocation.backlog;
-        const content = (cfg.framing ?? defaultReaderFraming)({
+        const context: ReaderFramingContext = {
           resident: primary,
           fork: name,
           voice: cfg.voice,
@@ -17584,11 +17617,14 @@ export class AgentFramework {
           notice: invocation.notice,
           dispositions: invocation.dispositions,
           backlog,
-        });
+        };
+        const content = (cfg.framing ?? defaultReaderFraming)(context);
+        const pendingRound = typeof cfg.pendingRound === 'function' ? cfg.pendingRound(context) : cfg.pendingRound;
         const fork = await this.deriveAgent({
           name,
           from: primary,
           kind: 'subconscious-fork',
+          ...(pendingRound !== undefined ? { pendingRound } : {}),
           ...(cfg.strategyFactory ? { strategy: cfg.strategyFactory() } : {}),
           // Whose weights, as the configuration states it; its report is a
           // tool call, so bare prose never routes anywhere.
@@ -17890,17 +17926,20 @@ export class AgentFramework {
         storeOwnRow(candidate.agent, 'user', content, framingRow(handed, mark));
       } else {
         incarnation = 1;
-        const content = (cfg.framing ?? defaultReaderFraming)({
+        const context: ReaderFramingContext = {
           ...base,
           backlog: handed,
           resumed: false,
           incarnation,
           ...(plan.reason ? { rederived: plan.reason } : {}),
-        });
+        };
+        const content = (cfg.framing ?? defaultReaderFraming)(context);
+        const pendingRound = typeof cfg.pendingRound === 'function' ? cfg.pendingRound(context) : cfg.pendingRound;
         candidate = await this.deriveAgent({
           name,
           from: primary,
           kind: 'subconscious-fork',
+          ...(pendingRound !== undefined ? { pendingRound } : {}),
           ...(cfg.strategyFactory ? { strategy: cfg.strategyFactory() } : {}),
           config: readerConfig,
           inheritRefusals: true,
