@@ -613,6 +613,48 @@ test("a resumed job that reads the shared slot feeds the slot's count: a residen
   });
 });
 
+test("a resumed job on the shared slot with toolResultGuard on replaces a held result's placeholder with the result: a resident's remembered decline is previewed again at its next boundary, and not at the one after", async () => {
+  const jobRound = createMockResponse([{ type: 'tool_use', id: 'job_1', name: 'pages--read', input: {} }] as ContentBlock[], 'tool_use');
+  const membrane = new TurnMembrane([[answer('Begun.')], [...toolRounds(6, 4_000), answer('Done on the first stream.')], [jobRound, answer('Job done.')], [answer(FINAL)]]);
+  const strategy = new ScriptedPreviewStrategy(() => ({ fits: false, clearedBy: ['compression'] }));
+  const module = new PagesModule();
+  const agent = agentConfig({ maxStreamTokens: 10, contextBudgetTokens: 60_000, physicalWindowTokens: undefined, strategy });
+  await withFramework(membrane, module, agent, async (framework, traces) => {
+    const { name: _name, ...job } = agentConfig({ name: 'job' });
+    const first = await framework.createEphemeralAgent(
+      { ...job, name: 'job', strategy: new PassthroughStrategy() },
+      { ...workerSpec('job'), readsSharedSlot: true },
+    );
+    first.contextManager.addMessage('User', [{ type: 'text', text: 'Begin.' }]);
+    await framework.runEphemeralToCompletion(first.agent, first.contextManager);
+    const resumed = await framework.resumeAgent('job', { ...job, strategy: new PassthroughStrategy(), toolResultGuard: true });
+    strategy.readiness = { ready: false, description: 'Compressing chunk 0' };
+    let residentCalls = 0;
+    let jobRunning = false;
+    let jobSpeech = '';
+    module.onCall = async () => {
+      if (jobRunning) return;
+      if (++residentCalls !== 5) return;
+      jobRunning = true;
+      try {
+        jobSpeech = (await framework.runEphemeralToCompletion(resumed.agent, resumed.contextManager)).speech;
+      } finally {
+        jobRunning = false;
+      }
+    };
+    try {
+      ask(framework);
+      await waitUntil('the turn to end', () => storedText(framework).includes('Done on the first stream.') || failureRows(framework).length > 0);
+      assert.ok(jobSpeech.includes('Job done.'), `the guarded job ran its round during the resident's 5th tool call: ${jobSpeech}`);
+      assert.deepEqual(declined(traces).map((decline) => decline.previewed), [true, true, false], "the 4th boundary declined on a preview, the 5th previewed again after the job's settlement, the 6th took the 5th's answer");
+      assert.equal(strategy.previews, 2, 'two previews in all');
+      assert.equal(restarted(traces).length, 0, 'and no restart');
+    } finally {
+      resumed.cleanup();
+    }
+  });
+});
+
 test('a framework that stops during a tool call asks for no restart preview past maxStreamTokens', async () => {
   const membrane = new TurnMembrane([[...toolRounds(6, 4_000), answer('Done on the first stream.')], [answer(FINAL)]]);
   const strategy = new ScriptedPreviewStrategy(() => ({ fits: false, clearedBy: ['compression'] }));

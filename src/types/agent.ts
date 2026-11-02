@@ -107,7 +107,13 @@ export interface AgentConfig {
    *  With `toolResultGuard` on, no remembered decline is taken: the guard
    *  holds each round's stored results from compression and edits them as
    *  it settles them, so what a preview rests on changes at every round,
-   *  and each boundary past this budget that would restart previews anew. A
+   *  and each boundary past this budget that would restart previews anew.
+   *  For a resident, a stored row edited or removed includes a row of the
+   *  residents' shared slot edited through another agent, such as that
+   *  agent's `toolResultGuard` replacing a held result's stored placeholder
+   *  with the result: the resident previews anew at its next boundary over
+   *  this budget, and not at the boundaries after it unless something it
+   *  rests on changes again. A
    *  decline whose preview names only compression as what would make room
    *  isn't cleared by a compression whose model call hasn't started: the
    *  stream keeps the agent's provider gate, and that call waits behind it

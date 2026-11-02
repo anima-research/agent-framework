@@ -25,7 +25,12 @@
     boundary past `maxStreamTokens` that would restart previews the compile
     anew.** The guard holds each round's stored results from compression and
     edits them as it settles them, so what a preview rests on changes at
-    every round.
+    every round. For a resident, a stored row edited or removed includes a
+    row of the residents' shared slot edited through another agent, such as
+    that agent's guard replacing a held result's stored placeholder with the
+    result: the resident previews anew at its next boundary past
+    `maxStreamTokens`, and not at the boundaries after it unless something
+    it rests on changes again.
   - **Migration:** with `physicalWindowTokens` unset, nothing else bounds a
     stream whose restart is declined: it can go on until the provider
     refuses a request at its own window, and the turn then ends with a
