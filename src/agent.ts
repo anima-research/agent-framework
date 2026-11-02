@@ -2154,16 +2154,7 @@ export class Agent {
     this.rowChanges = read;
   }
 
-  /**
-   * What a preview's answer rests on besides the rows a stream adds, as one string: the budget it's given, the
-   * compression holds, the live settings that change the select (`tailTokens`, `transitionPaceTokens`,
-   * `preparedWindowTokens`), the strategy's compression state (its counts of compressed chunks and summaries where it
-   * reports any of them, `getStats`, and otherwise its pending work, whose text a landing can leave reading the same),
-   * the pins and document marks other than `excludePins` (the ones the preview reads as absent), and how many times a
-   * stored row has been edited or removed. A restart declined for a reason a newer message can't clear is previewed
-   * again only once this has changed.
-   * @internal For the framework's restart decision; not a host API.
-   */
+  /** @internal For the framework's restart decision; not a host API. */
   restartPreviewKey(excludePins?: readonly string[]): string {
     const cm = this.contextManager;
     const hot = this.getHotContextSettings();
