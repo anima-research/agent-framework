@@ -179,9 +179,11 @@ export type TraceEvent =
       type: 'inference:hold_ended';
       agentName: string;
       /**
-       * 'fit': context-manager's preview of the turn's next compile says it
-       * fits (a dry compile does, for a strategy with no preview), and the
-       * held requests are queued for one fresh compile. 'check_failed': that
+       * 'fit': context-manager's preview, of the stored context at the turn's
+       * next compile budget, says it fits (a dry compile does, for a strategy
+       * with no preview), and the held requests are queued for one fresh
+       * compile. The preview doesn't see what that start adds before it
+       * compiles. 'check_failed': that
        * check failed for a reason other than the budget, and the requests are
        * queued for the turn's own compile to meet it. 'nothing_pending':
        * compression has nothing pending and the context still doesn't fit;
