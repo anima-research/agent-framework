@@ -567,7 +567,7 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'channel_publish',
-    description: "Publish a message to a channel. If channelId is omitted, publishes where your plain speech goes this turn: your conversation's channel if you are bound to one; otherwise the channel of the message that woke this turn, or one you opened during it; otherwise, while a focus holds, the channel it keeps; otherwise, on a turn your own skip_reply wake or the end of your sleep started, the channel this host names for such turns, if it names one. Where none of those names a channel, nothing is posted, unless this host is set to use the channel of the latest incoming message instead. A turn with no channel by design, such as a heartbeat's, has no default, so it names one. A subagent has no default, so it must name a channel.",
+    description: "Publish a message to a channel. If channelId is omitted, publishes where your plain speech goes this turn: your conversation's channel if you are bound to one; otherwise the channel of the message that woke this turn, or one you opened during it; otherwise, while a focus holds, the channel it keeps. Where none of those names a channel, nothing is posted, unless this host is set to use the channel of the latest incoming message instead. A turn with no channel of its own, such as a heartbeat's, has no default, so it names one. A subagent has no default, so it must name a channel.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1612,6 +1612,18 @@ export class ChannelRegistry {
     this.handleCoalescedIncoming = options?.handleCoalescedIncoming;
     this.acceptInbound = options?.acceptInbound;
     this.channelTools = CHANNEL_TOOL_DEFINITIONS.map((tool) => {
+      if (tool.name === 'channel_publish') {
+        if (options?.unpromptedChannel === undefined || options.eventGatePresent !== true) return tool;
+        return {
+          ...tool,
+          description: tool.description
+            .replace(
+              'otherwise, while a focus holds, the channel it keeps.',
+              'otherwise, while a focus holds, the channel it keeps; otherwise, on a turn your own skip_reply wake or the end of your sleep started, the channel this host names for such turns.',
+            )
+            .replace('A turn with no channel of its own, such as', 'A turn with no channel by design, such as'),
+        };
+      }
       if (tool.name !== 'skip_reply' || options?.eventGatePresent === true) return tool;
       const schema = tool.inputSchema as {
         type: 'object';

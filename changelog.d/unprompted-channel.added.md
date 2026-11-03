@@ -10,6 +10,6 @@
   prompted, from a channel, a module, a person at a console or another
   agent; not a heartbeat's or a reminder's; not a conversation fork's or an
   ephemeral run's; and not a start merged from a timer's wake and any other
-  cause. One value, for every agent on the framework. `channel_publish`'s
-  description, which every agent reads, now names that channel among its
-  defaults, whether or not the host sets it.
+  cause. One value, for every agent on the framework. On a framework with
+  the setting and an event gate, `channel_publish`'s description names that
+  channel among its defaults; on any other, the description is unchanged.
