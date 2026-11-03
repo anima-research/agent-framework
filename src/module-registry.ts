@@ -19,15 +19,18 @@ import type {
   SpeechContext,
   SpeechHandlerOptions,
   ProcessEvent,
+  ToolResultEvent,
   TraceEventListener,
   ModuleMessage,
+  ModuleContextInjection,
   MessageQueryResult,
 } from './types/index.js';
 import { heldWriteId } from './held-writes.js';
+import { boundedErrorMessage } from './error-message.js';
 import type { Agent } from './agent.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from './shutdown.js';
 import { logValue } from './mcpl/log-value.js';
-import { toolArgsProblems } from './tool-args.js';
+import { asCalled, markedInputRefusal, toolArgsProblems } from './tool-args.js';
 
 /** How the registry queues a module's event: its push names the module. A
  * `ProcessQueue` serves too, ignoring the name. */
@@ -36,6 +39,19 @@ export interface ModuleQueue {
 }
 
 const MODULE_STATE_PREFIX = 'modules/';
+
+export function droppedToolResultLine(event: ToolResultEvent, when: string): string {
+  const outcome = event.result.success && !event.result.isError
+    ? 'succeeded'
+    : `failed${event.result.error ? `: ${boundedErrorMessage(event.result.error)}` : ''}`;
+  return `[framework] ${event.agentName}: result of tool call ${event.callId} (${event.toolName ? `${event.toolName}, ` : ''}${event.moduleName}) arrived ${when} — dropped; the tool ${outcome}`;
+}
+
+export function retiredPushLine(event: ProcessEvent, moduleName: string): string {
+  return event.type === 'tool-result'
+    ? droppedToolResultLine(event, `after module ${moduleName} stopped`)
+    : `[framework] a '${event.type}' event from module ${moduleName} arrived after that module stopped — dropped`;
+}
 
 /**
  * True when a registerState failure means "this state id already exists" —
@@ -103,6 +119,7 @@ export class ModuleRegistry {
 
   private modules: Map<string, Module> = new Map();
   private stopping = new Map<Module, Promise<void>>();
+  private starting = new Map<Module, Promise<void>>();
   /** Module and namespace pairs already told that a system injection held a block that isn't text. */
   private notShownWarned = new Set<string>();
   private moduleContexts: Map<string, ModuleContextImpl> = new Map();
@@ -110,15 +127,20 @@ export class ModuleRegistry {
   private store: JsStore;
   private queue: ModuleQueue;
   private getAgents: () => Agent[];
-  private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
+  private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string }) => MessageId;
   private editMessageFn: (id: MessageId, content: ContentBlock[]) => void;
   private removeMessageFn: (id: MessageId) => void;
   private getMessageFn: (id: MessageId) => ModuleMessage | null;
-  private queryMessagesFn: (filter: MessageQuery) => MessageQueryResult;
+  private queryMessagesFn: (filter: MessageQuery, opts?: { forAgent?: string }) => MessageQueryResult;
 
   private pushEventFn: (event: ProcessEvent, moduleName?: string) => void;
   private onTraceFn: (listener: TraceEventListener) => () => void;
   private callToolFn: (call: ToolCall) => Promise<ToolResult>;
+  /**
+   * The constructor's `dropRetiredPush` option.
+   * @internal For the framework's drop lines; not a host API.
+   */
+  readonly dropRetiredPushFn?: (event: ProcessEvent, moduleName: string) => void;
   /** Framework ops-alert channel, surfaced to modules via
    *  ModuleContext.notifyOps. Readonly-public so ModuleContextImpl can
    *  delegate without another positional constructor parameter. */
@@ -134,13 +156,17 @@ export class ModuleRegistry {
     queue: ModuleQueue,
     options: {
       getAgents: () => Agent[];
-      addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
+      addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string }) => MessageId;
       editMessage: (id: MessageId, content: ContentBlock[]) => void;
       removeMessage: (id: MessageId) => void;
       getMessage: (id: MessageId) => ModuleMessage | null;
-      queryMessages: (filter: MessageQuery) => MessageQueryResult;
+      queryMessages: (filter: MessageQuery, opts?: { forAgent?: string }) => MessageQueryResult;
       /** Called with the pushing module's name. */
       pushEvent: (event: ProcessEvent, moduleName?: string) => void;
+      /** Logs a push a module made after its stop() completed, which is
+       *  dropped, not queued. Without it, the registry logs a line of its own.
+       *  @internal For the framework's drop lines; not a host API. */
+      dropRetiredPush?: (event: ProcessEvent, moduleName: string) => void;
       onTrace: (listener: TraceEventListener) => () => void;
       callTool: (call: ToolCall) => Promise<ToolResult>;
       notifyOps?: (kind: string, agentName: string, message: string, data?: Record<string, unknown>) => void;
@@ -158,6 +184,7 @@ export class ModuleRegistry {
     this.onTraceFn = options.onTrace;
     this.callToolFn = options.callTool;
     this.notifyOpsFn = options.notifyOps;
+    this.dropRetiredPushFn = options.dropRetiredPush;
   }
 
   /**
@@ -199,7 +226,21 @@ export class ModuleRegistry {
     this.moduleContexts.set(module.name, context);
 
     // Start the module
-    await module.start(context);
+    let release!: (start: Promise<void>) => void;
+    const settled = new Promise<void>((resolve) => { release = resolve; }).then(() => undefined, () => undefined);
+    this.starting.set(module, settled);
+    let started: Promise<void>;
+    try {
+      started = Promise.resolve(module.start(context));
+    } catch (error) {
+      started = Promise.reject(error);
+    }
+    release(started);
+    try {
+      await started;
+    } finally {
+      if (this.starting.get(module) === settled) this.starting.delete(module);
+    }
   }
 
   /**
@@ -229,8 +270,20 @@ export class ModuleRegistry {
   }
 
   /**
+   * The current registration of the module of this name: a value that
+   * changes each time a module of that name is added, the same module object
+   * included, and that stays the same until its stop() completes;
+   * `undefined` while none is registered.
+   * @internal For the framework's registration checks; not a host API.
+   */
+  registrationOf(moduleName: string): object | undefined {
+    return this.moduleContexts.get(moduleName);
+  }
+
+  /**
    * Set state for a module by name.
-   * Used by the framework to apply stateUpdate from EventResponse atomically.
+   * Used by the framework to apply stateUpdate from EventResponse after its
+   * message changes.
    */
   setModuleState(moduleName: string, state: unknown): void {
     const ctx = this.moduleContexts.get(moduleName);
@@ -280,8 +333,8 @@ export class ModuleRegistry {
   /**
    * All utilities from all modules, namespaced exactly like tools
    * (`module--name`). See Module.getUtilities — these are deliberately kept
-   * out of the model-facing tool list and surfaced through the framework's
-   * `utils` meta-tool; dispatch goes through the same handleToolCall.
+   * out of the model-facing tool list and presented in the host's built-in
+   * toolset; dispatch goes through the same handleToolCall.
    */
   getAllUtilities(): ToolDefinition[] {
     const utilities: ToolDefinition[] = [];
@@ -298,8 +351,8 @@ export class ModuleRegistry {
 
   /**
    * A module tool's call for a path that stores or sends its result: the
-   * model's dispatch, a script's inner call, the `utils` meta-tool for a
-   * model. The result is checked and read once, in its JSON form
+   * model's dispatch (a `toolsets--act` call of it included), a script's
+   * inner call. The result is checked and read once, in its JSON form
    * ({@link storableToolResult}).
    */
   async storableToolCall(call: ToolCall, options: { definition?: ToolDefinition } = {}): Promise<ToolResult> {
@@ -310,21 +363,27 @@ export class ModuleRegistry {
    * Handle a tool call by routing to the appropriate module: the module's own
    * result, unchecked, as it returned it, for a caller that uses the result
    * in process (`ModuleContext.callTool`, `executeToolCall`, or a host
-   * calling the registry). A module's throw is answered as an error result.
+   * calling the registry), less a refusal it claims (withoutRefusal). A
+   * module's throw is answered as an error result.
    * A call whose input isn't an object, or lacks a key the tool's schema
    * requires, is answered before the module runs, with an error result that
    * opens "Nothing was done:" and names what to send (toolArgsProblems).
-   * A caller that has already resolved the tool's definition, as the `utils`
-   * tool has a utility's, passes it as `definition`, and it's checked against
-   * that one.
+   * So is a call membrane marked `unparseableInput`, unless its text is JSON
+   * `null`, which reaches the module as a call with no arguments
+   * (markedInputRefusal).
+   * A caller that has already resolved the tool's definition passes it as
+   * `definition`, and it's checked against that one.
    */
-  async handleToolCall(call: ToolCall, options: { definition?: ToolDefinition } = {}): Promise<ToolResult> {
+  async handleToolCall(given: ToolCall, options: { definition?: ToolDefinition } = {}): Promise<ToolResult> {
+    const marked = markedInputRefusal(given);
+    if (marked !== undefined) return { success: false, error: marked, isError: true };
+    const call = asCalled(given);
     // Parse module--tool name
     const sepIndex = call.name.indexOf('--');
     if (sepIndex === -1) {
       return {
         success: false,
-        error: `Invalid tool name format: ${call.name}`,
+        error: `Invalid tool name format: ${call.name}, so nothing was done`,
         isError: true,
       };
     }
@@ -336,7 +395,7 @@ export class ModuleRegistry {
     if (!module) {
       return {
         success: false,
-        error: `Module not found: ${moduleName}`,
+        error: `Module not found: ${moduleName}, so nothing was done`,
         isError: true,
       };
     }
@@ -367,7 +426,9 @@ export class ModuleRegistry {
           isError: true,
         };
       }
-      return await module.handleToolCall(moduleCall);
+      // A refusal is the dispatcher's to say (RFC-007), so a module's result
+      // can't claim one on this route either.
+      return withoutRefusal(call, await module.handleToolCall(moduleCall));
     } catch (error) {
       return thrownResult(error);
     }
@@ -375,7 +436,9 @@ export class ModuleRegistry {
 
   /**
    * Stop all modules. A caller may bound its wait without cancelling cleanup.
-   * The default waits for each module's own shutdown contract.
+   * The default waits for each module's own shutdown contract. A module whose
+   * start() is still running is stopped once its start() has settled, within
+   * the same wait.
    */
   async stopAll(timeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS): Promise<void> {
     validateShutdownTimeout(timeoutMs);
@@ -387,11 +450,16 @@ export class ModuleRegistry {
   private stopModule(module: Module): Promise<void> {
     const existing = this.stopping.get(module);
     if (existing) return existing;
-    const attempt = Promise.resolve().then(() => module.stop()).then(() => {
+    const attempt = (this.starting.get(module) ?? Promise.resolve()).then(() => module.stop()).then(() => {
       if (this.modules.get(module.name) === module) {
+        const context = this.moduleContexts.get(module.name);
         this.modules.delete(module.name);
         this.moduleContexts.delete(module.name);
         this.speechHandlers = this.speechHandlers.filter(handler => handler.moduleName !== module.name);
+        this.batchHooksRunning.delete(module.name);
+        this.stopping.delete(module);
+        context?.retire();
+        return;
       }
       this.stopping.delete(module);
     }, error => {
@@ -436,8 +504,23 @@ export class ModuleRegistry {
 
   /**
    * Gather context injections from all modules before inference.
-   * Calls each module's gatherContext() in parallel with a per-module timeout.
-   * Fail-open: timed-out or erroring modules are skipped (with a stderr line).
+   * Calls each module's gatherContext() in parallel with a per-module timeout,
+   * and returns their injections in the modules' registration order, whatever
+   * order they finish in. Fail-open: timed-out or erroring modules are skipped
+   * (with a stderr line), whether the call throws, rejects, or answers with
+   * something that isn't an array of objects, or with a `system` entry whose
+   * content isn't an array of objects, every block of which the agent's
+   * buildSystemPrompt reads, and one that answers after its timeout adds
+   * nothing. Once every answer is in, the answers are merged, and an answer
+   * from a module whose registration has ended by then (its stop()
+   * completed, whether or not a module of its name has been added since) is
+   * left out, with a line if it held injections; a stop that completes after
+   * the merge doesn't change what this returned. An array returned without a
+   * promise is taken as the module's
+   * answer. An entry's other fields are the module's to get right. Each
+   * module's budget starts once its call returns, after its own synchronous
+   * work and every earlier module's; a later module's synchronous work still
+   * counts against it.
    *
    * The per-module budget is `module.contextTimeoutMs` when declared, else the
    * `timeoutMs` default (15s). Modules whose gatherContext does real work —
@@ -447,12 +530,17 @@ export class ModuleRegistry {
    * to MAX_CONTEXT_TIMEOUT_MS so no single module can hold every turn hostage.
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
    */
-  async gatherContext(agentName: string, timeoutMs = 15_000): Promise<ContextInjection[]> {
-    const injections: ContextInjection[] = [];
+  async gatherContext(agentName: string, timeoutMs = 15_000): Promise<ModuleContextInjection[]> {
+    // Each module's result in registration order, whatever order they finish
+    // in: a stored injection's content hash follows that order, and a module
+    // that answers after its timeout adds nothing (it's skipped, fail-open).
+    const results: ModuleContextInjection[][] = [];
     const promises: Promise<void>[] = [];
+    const asked: { slot: number; moduleName: string; registration: object | undefined }[] = [];
 
     for (const module of this.modules.values()) {
-      if (!module.gatherContext) continue;
+      const gather = module.gatherContext;
+      if (!gather) continue;
 
       // Clamp the per-module budget. A module declaring `contextTimeoutMs`
       // legitimately needs more than the shared default (e.g. a retrieval
@@ -464,14 +552,43 @@ export class ModuleRegistry {
         MAX_CONTEXT_TIMEOUT_MS,
       );
       let timer: ReturnType<typeof setTimeout> | undefined;
+      let timedOut = false;
+      const slot = results.length;
+      results.push([]);
+      asked.push({ slot, moduleName: module.name, registration: this.moduleContexts.get(module.name) });
+      // Called here, before its timer is set, so its budget starts after its
+      // synchronous work; a call that throws is skipped as a rejection is.
+      let call: Promise<ModuleContextInjection[]>;
+      try {
+        call = Promise.resolve(gather.call(module, agentName));
+      } catch (err) {
+        call = Promise.reject(err);
+      }
       const promise = Promise.race([
-        module.gatherContext(agentName).then(r => {
-          injections.push(...r);
-          this.noteBlocksNotShown(module.name, r);
+        call.then(r => {
+          if (timedOut) return;
+          // Checked before it's kept, so an answer that isn't an array of
+          // objects skips the module, as does a system entry whose content
+          // isn't an array of objects: buildSystemPrompt reads every block
+          // of it, and one it can't read would fail the turn. Each array is
+          // read through Array.from, which reads a hole as `undefined`, as
+          // context-manager's compile does when it spreads the content.
+          if (!Array.isArray(r) || Array.from(r).some((entry) => entry === null || typeof entry !== 'object')) {
+            throw new TypeError(`gatherContext answered with ${Array.isArray(r) ? 'an array holding an entry that is not an object' : r === null ? 'null' : typeof r}, not an array of objects`);
+          }
+          const unreadable = r.find((entry) => entry.position === 'system'
+            && !(Array.isArray(entry.content) && Array.from(entry.content).every((block) => block !== null && typeof block === 'object')));
+          if (unreadable) {
+            throw new TypeError(`gatherContext answered with a system injection in namespace ${logValue(unreadable.namespace)} whose content isn't an array of objects`);
+          }
+          results[slot] = [...r];
         }),
         new Promise<void>((_, rej) => {
           timer = setTimeout(
-            () => rej(new Error(`gatherContext timed out after ${budgetMs}ms`)),
+            () => {
+              timedOut = true;
+              rej(new Error(`gatherContext timed out after ${budgetMs}ms`));
+            },
             budgetMs,
           );
         }),
@@ -483,7 +600,20 @@ export class ModuleRegistry {
     }
 
     await Promise.all(promises);
-    return injections;
+    for (const { slot, moduleName, registration } of asked) {
+      if (this.moduleContexts.get(moduleName) === registration) {
+        this.noteBlocksNotShown(moduleName, results[slot]);
+        continue;
+      }
+      if (results[slot].length > 0) {
+        console.error(
+          `[framework] module ${moduleName} stopped before its gatherContext answer for ${agentName} was used, ` +
+          `so its ${results[slot].length} injection(s) were left out`,
+        );
+      }
+      results[slot] = [];
+    }
+    return results.flat();
   }
 
   /**
@@ -512,7 +642,8 @@ export class ModuleRegistry {
    * Tell modules an agent's tool batch completed (see
    * Module.onToolBatchComplete). Hooks run in parallel, each awaited up to
    * `timeoutMs`; a hook that throws or times out is logged and skipped, so a
-   * wedged module can't hold the round. Returns the modules that didn't
+   * wedged module can't hold the round. A module whose `stop()` completes
+   * before its hook is called isn't called. Returns the modules that didn't
    * finish, for the caller's trace.
    */
   async notifyToolBatchComplete(
@@ -530,10 +661,14 @@ export class ModuleRegistry {
         failures.push({ module: module.name, error: 'still running from an earlier batch' });
         continue;
       }
+      const registration = this.moduleContexts.get(module.name);
       // Called from a promise, so a hook that throws synchronously, before
       // returning its promise, is caught below like any other failure
       // instead of escaping the round (the result would never be provided).
-      const call = Promise.resolve().then(() => module.onToolBatchComplete!(agentName));
+      const call = Promise.resolve().then(() => {
+        if (this.moduleContexts.get(module.name) !== registration) return;
+        return module.onToolBatchComplete!(agentName);
+      });
       this.batchHooksRunning.set(module.name, call);
       const settled = (): void => {
         if (this.batchHooksRunning.get(module.name) === call) this.batchHooksRunning.delete(module.name);
@@ -570,10 +705,11 @@ export class ModuleRegistry {
     // Find handlers that match this agent
     const handlers = this.speechHandlers.filter(
       (h) => h.agents === '*' || h.agents.includes(agentName)
-    );
+    ).map((handler) => ({ handler, registration: this.moduleContexts.get(handler.moduleName) }));
 
     // Call each handler
-    for (const handler of handlers) {
+    for (const { handler, registration } of handlers) {
+      if (this.moduleContexts.get(handler.moduleName) !== registration) continue;
       const module = this.modules.get(handler.moduleName);
       if (module?.onAgentSpeech) {
         try {
@@ -604,17 +740,21 @@ class ModuleContextImpl implements ModuleContext {
   private registry: ModuleRegistry;
   readonly isRestart: boolean;
   private getAgentsFn: () => Agent[];
-  private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
+  private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string }) => MessageId;
   private editMessageFn: (id: MessageId, content: ContentBlock[]) => void;
   private removeMessageFn: (id: MessageId) => void;
   private getMessageFn: (id: MessageId) => ModuleMessage | null;
-  private queryMessagesFn: (filter: MessageQuery) => MessageQueryResult;
+  private queryMessagesFn: (filter: MessageQuery, opts?: { forAgent?: string }) => MessageQueryResult;
   private pushEventFn: (event: ProcessEvent, moduleName?: string) => void;
   private onTraceFn: (listener: TraceEventListener) => () => void;
   private callToolFn: (call: ToolCall) => Promise<ToolResult>;
 
   // External ID mapping stored in module state
   private externalIdMap: Map<string, MessageId> = new Map();
+
+  private retired = false;
+  private readonly saidRetired = new Set<string>();
+  private readonly traceSubscriptions = new Set<() => void>();
 
   constructor(
     moduleName: string,
@@ -624,11 +764,11 @@ class ModuleContextImpl implements ModuleContext {
     registry: ModuleRegistry,
     isRestart: boolean,
     getAgents: () => Agent[],
-    addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId,
+    addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string }) => MessageId,
     editMessage: (id: MessageId, content: ContentBlock[]) => void,
     removeMessage: (id: MessageId) => void,
     getMessage: (id: MessageId) => ModuleMessage | null,
-    queryMessages: (filter: MessageQuery) => MessageQueryResult,
+    queryMessages: (filter: MessageQuery, opts?: { forAgent?: string }) => MessageQueryResult,
     pushEvent: (event: ProcessEvent, moduleName?: string) => void,
     onTrace: (listener: TraceEventListener) => () => void,
     callTool: (call: ToolCall) => Promise<ToolResult>
@@ -637,7 +777,12 @@ class ModuleContextImpl implements ModuleContext {
     this.store = store;
     this.stateId = stateId;
     // The deprecated handle: a push names this module, as pushEvent() does.
-    this.queue = { push: (event) => queue.push(event, moduleName) };
+    this.queue = {
+      push: (event) => {
+        if (this.retired) this.dropPush(event);
+        else queue.push(event, moduleName);
+      },
+    };
     this.registry = registry;
     this.isRestart = isRestart;
     this.getAgentsFn = getAgents;
@@ -657,12 +802,38 @@ class ModuleContextImpl implements ModuleContext {
     }
   }
 
+  retire(): void {
+    this.retired = true;
+    const subscriptions = [...this.traceSubscriptions];
+    this.traceSubscriptions.clear();
+    for (const unsubscribe of subscriptions) {
+      try {
+        unsubscribe();
+      } catch (error) {
+        console.error(`[framework] module ${JSON.stringify(this.moduleName)} has stopped, and ending one of its trace subscriptions threw: ${boundedErrorMessage(error)}`);
+      }
+    }
+  }
+
+  private refused(method: string): boolean {
+    if (!this.retired) return false;
+    if (!this.saidRetired.has(method)) {
+      this.saidRetired.add(method);
+      console.error(
+        `[framework] module ${JSON.stringify(this.moduleName)} has stopped, so its ${method}() call had no effect; ` +
+        `later ${method}() calls from it aren't logged`,
+      );
+    }
+    return true;
+  }
+
   getState<T>(): T | null {
     const state = this.store.getStateJson(this.stateId);
     return state as T | null;
   }
 
   setState<T>(state: T): void {
+    if (this.refused('setState')) return;
     // Merge external ID map into state
     const fullState = {
       ...(state as object),
@@ -705,6 +876,7 @@ class ModuleContextImpl implements ModuleContext {
     name: string,
     opts?: { deltaSnapshotEvery?: number; fullSnapshotEvery?: number }
   ): void {
+    if (this.refused('registerLogState')) return;
     ensureStateRegistered(this.store, {
       id: this.logStateId(name),
       strategy: 'append_log',
@@ -715,10 +887,12 @@ class ModuleContextImpl implements ModuleContext {
   }
 
   appendToLog<T>(name: string, item: T): void {
+    if (this.refused('appendToLog')) return;
     this.store.appendToStateJson(this.registeredLogStateId(name), item);
   }
 
   editLogItem<T>(name: string, index: number, item: T): void {
+    if (this.refused('editLogItem')) return;
     this.store.editStateItem(this.registeredLogStateId(name), index, Buffer.from(JSON.stringify(item)));
   }
 
@@ -732,27 +906,52 @@ class ModuleContextImpl implements ModuleContext {
   }
 
   getModule<T extends Module>(name: string): T | null {
+    if (this.refused('getModule')) return null;
     return this.registry.getModule<T>(name);
   }
 
   onTrace(listener: TraceEventListener): () => void {
-    return this.onTraceFn(listener);
+    if (this.refused('onTrace')) return () => {};
+    const unsubscribe = this.onTraceFn((event) => {
+      if (!this.retired) listener(event);
+    });
+    this.traceSubscriptions.add(unsubscribe);
+    return () => {
+      if (this.traceSubscriptions.delete(unsubscribe)) unsubscribe();
+    };
   }
 
   callTool(call: ToolCall): Promise<ToolResult> {
+    if (this.refused('callTool')) {
+      return Promise.resolve({
+        success: false,
+        isError: true,
+        error: `module ${JSON.stringify(this.moduleName)} has stopped, so its call of ${call.name} wasn't made`,
+      });
+    }
     return this.callToolFn(call);
   }
 
   notifyOps(kind: string, agentName: string, message: string, data?: Record<string, unknown>): void {
+    if (this.refused('notifyOps')) return;
     this.registry.notifyOpsFn?.(kind, agentName, message, data);
   }
 
   addMessage(
     participant: string,
     content: ContentBlock[],
-    metadata?: MessageMetadata & { external?: ExternalIdRef }
+    metadata?: MessageMetadata & { external?: ExternalIdRef },
+    opts?: { forAgent?: string },
   ): MessageId {
-    const id = this.addMessageFn(participant, content, metadata);
+    if (this.refused('addMessage')) return '';
+    // The external id map is read in the primary's store
+    // (findMessageByExternalId), so a mapping into another window would
+    // answer wrong.
+    if (metadata?.external && opts?.forAgent !== undefined) {
+      throw new Error(`A message for agent ${JSON.stringify(opts.forAgent)} can't carry metadata.external: `
+        + "its external id would be looked up in the primary's window. Leave forAgent out, or the external id.");
+    }
+    const id = this.addMessageFn(participant, content, metadata, opts);
 
     // Track external ID if provided. A write the framework holds keeps '',
     // as it did before held writes had handles: the map is module state an
@@ -769,10 +968,12 @@ class ModuleContextImpl implements ModuleContext {
   }
 
   editMessage(id: MessageId, content: ContentBlock[]): void {
+    if (this.refused('editMessage')) return;
     this.editMessageFn(id, content);
   }
 
   removeMessage(id: MessageId): void {
+    if (this.refused('removeMessage')) return;
     this.removeMessageFn(id);
     // Clean up external ID mapping
     for (const [key, msgId] of this.externalIdMap) {
@@ -789,26 +990,31 @@ class ModuleContextImpl implements ModuleContext {
     const entry = this.externalIdMap.get(key);
     if (entry === undefined) return null;
     // A stored id answers while the store holds its row, and once the row is
-    // gone the entry goes, as removeMessage drops it. The '' a held write
-    // keeps here (addMessage) names no row, so the message is looked up in
-    // the store by its external id, held rows included, and the first row
-    // found is taken, as context-manager's findByExternalId takes it: a held
-    // row answers by its handle and leaves the entry as it is, and a stored
-    // row's id becomes the entry. With nothing found, '' stays, as earlier
-    // releases kept it: in a module's start(), the writes the last process
-    // held don't show yet, since create() restores them after the modules
-    // start, and a write that shows later finds its entry.
+    // gone the entry goes, as removeMessage drops it, except from a context
+    // whose module has stopped, which keeps its mapping as it was. The '' a held
+    // write keeps here (addMessage) names no row, so the message is looked up in
+    // the store by its external id, held rows included, and the first row found
+    // is taken, as context-manager's findByExternalId takes it: a held row
+    // answers by its handle and leaves the entry as it is, and a stored row's id
+    // becomes the entry. With nothing found, '' stays, as earlier releases kept
+    // it: in a module's start(), the writes the last process held don't show
+    // yet, since create() restores them after the modules start, and a write
+    // that shows later finds its entry.
     if (entry !== '') {
       if (this.getMessageFn(entry)) return entry;
-      this.externalIdMap.delete(key);
-      this.persistExternalIdMap();
+      if (!this.retired) {
+        this.externalIdMap.delete(key);
+        this.persistExternalIdMap();
+      }
       return null;
     }
     const row = this.queryMessagesFn({ source, externalIds: [externalId] }).messages[0];
     if (row?.held) return row.id;
     if (!row) return null;
-    this.externalIdMap.set(key, row.id);
-    this.persistExternalIdMap();
+    if (!this.retired) {
+      this.externalIdMap.set(key, row.id);
+      this.persistExternalIdMap();
+    }
     return row.id;
   }
 
@@ -816,8 +1022,8 @@ class ModuleContextImpl implements ModuleContext {
     return this.getMessageFn(id);
   }
 
-  queryMessages(filter: MessageQuery): MessageQueryResult {
-    return this.queryMessagesFn(filter);
+  queryMessages(filter: MessageQuery, opts?: { forAgent?: string }): MessageQueryResult {
+    return this.queryMessagesFn(filter, opts);
   }
 
   getAgents(): AgentInfo[] {
@@ -832,15 +1038,23 @@ class ModuleContextImpl implements ModuleContext {
     agents: '*' | string[],
     options?: SpeechHandlerOptions
   ): void {
+    if (this.refused('registerSpeechHandler')) return;
     this.registry.registerSpeechHandler(this.moduleName, agents, options);
   }
 
   unregisterSpeechHandler(): void {
+    if (this.refused('unregisterSpeechHandler')) return;
     this.registry.unregisterSpeechHandler(this.moduleName);
   }
 
   pushEvent(event: ProcessEvent): void {
-    this.pushEventFn(event, this.moduleName);
+    if (this.retired) this.dropPush(event);
+    else this.pushEventFn(event, this.moduleName);
+  }
+
+  private dropPush(event: ProcessEvent): void {
+    if (this.registry.dropRetiredPushFn) this.registry.dropRetiredPushFn(event, this.moduleName);
+    else console.error(retiredPushLine(event, this.moduleName));
   }
 
   private persistExternalIdMap(): void {
@@ -895,8 +1109,85 @@ class ProcessStateImpl implements ProcessState {
   }
 }
 
+/** The fields ToolResult declares, read by name, so a result class's getters count: endTurn first and the error next, so a failure keeps them. */
+const TOOL_RESULT_FIELDS = ['endTurn', 'error', 'success', 'isError', 'data', 'structured', 'keepWhenWithheld'] as const;
+
+/**
+ * A module's result for an in-process caller: the module's own object, unless
+ * it claims a refusal, which is the dispatcher's to say (RFC-007). Then it's a
+ * copy, less the claim: a plain object of every field ToolResult declares,
+ * read by name, so a result class's getters count, each read once, and every
+ * other own enumerable field, string or symbol, as a spread takes them, so
+ * non-enumerable own fields and inherited undeclared ones are left out. A
+ * result that can't be read, its claim included, is a failure saying so, as
+ * on the stored route (checkedToolResult),
+ * keeping the turn's end and the module's error if those could be read: the
+ * module's call completed, and the claim never reaches the caller.
+ */
+function withoutRefusal(call: ToolCall, result: ToolResult): ToolResult {
+  // Not an object: nothing to claim, and the caller gets it as it came.
+  if (!result || (typeof result !== 'object' && typeof result !== 'function')) return result;
+  const source = result as unknown as Record<PropertyKey, unknown>;
+  const copy: Record<PropertyKey, unknown> = {};
+  // Each field is read once: one whose getter threw isn't asked again.
+  const read = new Set<PropertyKey>();
+  // Defined, not assigned, so a field named __proto__ is a field.
+  const keep = (key: PropertyKey): void => {
+    read.add(key);
+    Object.defineProperty(copy, key, { value: source[key], enumerable: true, writable: true, configurable: true });
+  };
+  const once = (key: string): unknown => {
+    if (key in copy) return copy[key];
+    if (read.has(key)) return undefined;
+    return source[key];
+  };
+  // A failure keeps what could be read of the turn's end and the module's
+  // error, each read on its own, whatever else couldn't be.
+  const unreadable = (error: unknown): ToolResult => {
+    let endTurn: unknown;
+    let own: string | undefined;
+    try {
+      endTurn = once('endTurn');
+    } catch {
+      // Not readable: the failure doesn't end the turn.
+    }
+    try {
+      own = errorText(once('error'));
+    } catch {
+      // An error whose own text can't be read: the failure says only why.
+    }
+    return {
+      success: false,
+      isError: true,
+      error: `Tool '${call.name}' returned a result that couldn't be read (${thrownText(error).split('\n')[0] || 'no reason given'}). ` +
+        `The call itself completed${own ? `, with this error: ${own}` : '.'}`,
+      ...(endTurn ? { endTurn: true } : {}),
+    };
+  };
+  let claim: unknown;
+  try {
+    claim = source.refused;
+  } catch (error) {
+    return unreadable(error);
+  }
+  if (!claim) return result;
+  try {
+    const copied = new Set<PropertyKey>(['refused']);
+    for (const key of TOOL_RESULT_FIELDS) {
+      copied.add(key);
+      if (key in source) keep(key);
+    }
+    for (const key of Reflect.ownKeys(source)) {
+      if (!copied.has(key) && Object.prototype.propertyIsEnumerable.call(source, key)) keep(key);
+    }
+    return copy as unknown as ToolResult;
+  } catch (error) {
+    return unreadable(error);
+  }
+}
+
 /** A result's flags, which consumers read for their truth: booleans here. */
-const RESULT_FLAGS = ['success', 'isError', 'endTurn'] as const;
+const RESULT_FLAGS = ['success', 'isError', 'endTurn', 'dataIsContent'] as const;
 
 /**
  * A module's tool result as the framework can store, send and trace it. A
@@ -916,7 +1207,8 @@ const RESULT_FLAGS = ['success', 'isError', 'endTurn'] as const;
  * runs again. It's taken where the framework stores or sends a result
  * ({@link ModuleRegistry.storableToolCall}). A caller that uses the result
  * in process (`ModuleContext.callTool`, `executeToolCall`) gets the module's
- * own result, as the module returned it ({@link ModuleRegistry.handleToolCall}).
+ * own result, as the module returned it, less a refusal it claims
+ * ({@link ModuleRegistry.handleToolCall}).
  * The flags are booleans, read for their truth as consumers read them.
  * `error` is its text form, which is all a consumer reads of it, so an error
  * value JSON can't hold costs nothing. An error that says nothing (null,
@@ -966,12 +1258,15 @@ export function checkedToolResult(call: ToolCall, result: unknown): { result: To
     endTurn = Boolean(fields.endTurn);
     read('error');
     ownText = errorText(fields.error);
-    for (const key of ['success', 'isError', 'data']) read(key);
+    for (const key of ['success', 'isError', 'data', 'dataIsContent']) read(key);
     for (const key of Object.keys(candidate)) {
       if (key !== 'toJSON' && !(key in fields)) fields[key] = candidate[key];
     }
     // The error is kept as its text, which consumers read; its value isn't.
     delete fields.error;
+    // A refusal is the dispatcher's to say, before the call opens (RFC-007):
+    // a module answers after that, so its result can't claim one.
+    delete fields.refused;
     // The flags are kept as their truth, which is all consumers read of them,
     // before anything is serialized, so a flag's own value (a BigInt, a
     // function, an object with a toJSON) neither breaks nor runs anything.

@@ -51,13 +51,10 @@ function makeFakeClockGate(initialConfig: GateConfig, startTime = 1_000_000): Ha
   };
 }
 
-/** Force the next evaluate() to do a fresh file-mtime check. */
+/** Rewrite gate.json so the next evaluate() reloads it: the gate compares its text, whatever its mtime. */
 async function rewriteConfig(h: Harness, next: GateConfig): Promise<void> {
   // Bypass the 1s reload-check throttle (existing test pattern).
   (h.gate as unknown as { lastReloadCheck: number }).lastReloadCheck = 0;
-  // Wait long enough for the on-disk mtime to actually advance — fs
-  // resolution is millisecond-level on most platforms.
-  await new Promise((r) => setTimeout(r, 20));
   writeFileSync(h.configPath, JSON.stringify(next, null, 2));
 }
 
@@ -90,7 +87,7 @@ describe('validation: new behaviors', () => {
   // Validation errors during initialConfig seeding land in getStatus().errors
   // rather than throwing — this matches the existing pattern where a bad
   // gate.json edit doesn't crash the running gate, just reports the issue.
-  it('reports rate_limit with non-positive tokens', () => {
+  it('leaves out a rate_limit with non-positive tokens, which wakes on nothing, and says so', () => {
     const { gate } = makeFakeClockGate({
       policies: [{
         name: 'p',
@@ -99,26 +96,50 @@ describe('validation: new behaviors', () => {
       }],
     });
     const errors = gate.getStatus().errors;
+    assert.deepStrictEqual(gate.getStatus().policies, []);
     assert.ok(
-      errors.some(e => /tokens must be a positive number/.test(e)),
+      errors.some(e => /Rule "p" is left out: behavior\.rate_limit\.tokens is 0, where a positive number is needed\./.test(e)),
       `expected validation error, got: ${JSON.stringify(errors)}`,
     );
   });
 
-  it('reports rate_limit with non-positive refillIntervalMs', () => {
-    const { gate } = makeFakeClockGate({
-      policies: [{
-        name: 'p',
-        match: {},
-        behavior: { rate_limit: { tokens: 5, refillIntervalMs: -1 } },
-      }],
-    });
-    assert.ok(
-      gate.getStatus().errors.some(e => /refillIntervalMs must be a positive number/.test(e)),
-    );
+  it('reads a rate_limit with a refillIntervalMs under 0 as tokens that never refill, as it ran, and one of 0 as tokens that refill at once, and says so', () => {
+    for (const [refillIntervalMs, tokens, read, wakes] of [
+      [-1, 2, "so its tokens never refill, and once they're spent it wakes the agent on nothing it matches.", [true, true, false, false, false]],
+      // Earlier releases refilled a bucket with an interval of 0 once, and then never.
+      // One token is spent at each event, so the probe meets a spent bucket.
+      [0, 1, 'so its tokens refill at once, and it limits nothing it matches.', [true, true, true, true, true]],
+    ] as const) {
+      const h = makeFakeClockGate({
+        default: 'skip',
+        policies: [{
+          name: 'p',
+          match: {},
+          behavior: { rate_limit: { tokens, refillIntervalMs } },
+        }],
+      });
+      assert.deepStrictEqual(h.gate.getStatus().policies[0]!.behavior, { rate_limit: { tokens, refillIntervalMs } });
+      assert.ok(
+        h.gate.getStatus().errors.some(e => e.includes(
+          `Rule "p": behavior.rate_limit.refillIntervalMs is ${refillIntervalMs}, where a positive number of milliseconds is needed, ${read}`,
+        )),
+        JSON.stringify(h.gate.getStatus().errors),
+      );
+      // However long it waits, and with no wait at all for 0. The probe, which
+      // wake_add_rule's table reads, says the same at each step.
+      const woke: boolean[] = [];
+      const probed: boolean[] = [];
+      for (let i = 0; i < 5; i++) {
+        probed.push(h.gate.probe(event()).trigger);
+        woke.push(h.gate.evaluate(event()).trigger);
+        if (refillIntervalMs < 0) h.advance(60_000);
+      }
+      assert.deepStrictEqual(woke, wakes, `refillIntervalMs ${refillIntervalMs}`);
+      assert.deepStrictEqual(probed, woke, `refillIntervalMs ${refillIntervalMs}: the probe`);
+    }
   });
 
-  it('reports passive_sample with non-integer every', () => {
+  it('reads passive_sample with non-integer every as its next whole number, as it ran, and says so', () => {
     const { gate } = makeFakeClockGate({
       policies: [{
         name: 'p',
@@ -126,8 +147,9 @@ describe('validation: new behaviors', () => {
         behavior: { passive_sample: { every: 1.5 } as { every: number } },
       }],
     });
+    assert.deepStrictEqual(gate.getStatus().policies[0]!.behavior, { passive_sample: { every: 2 } });
     assert.ok(
-      gate.getStatus().errors.some(e => /every must be a positive integer/.test(e)),
+      gate.getStatus().errors.some(e => /passive_sample\.every is 1\.5, not a whole number, so it's read as 2\./.test(e)),
     );
   });
 
@@ -365,7 +387,8 @@ describe('passive_sample', () => {
       }],
       default: 'skip',
     });
-    // 3 messages in A → 3rd fires
+    // Two messages in A, then B's first: on one shared counter, B's would be
+    // the third and fire; on B's own, it doesn't.
     for (let i = 0; i < 2; i++) {
       assert.strictEqual(
         gate.evaluate(event({ channelId: 'A', metadata: { channelId: 'A' } })).trigger,
@@ -373,13 +396,14 @@ describe('passive_sample', () => {
       );
     }
     assert.strictEqual(
-      gate.evaluate(event({ channelId: 'A', metadata: { channelId: 'A' } })).trigger,
-      true,
-    );
-    // First message in B → must not fire (counter independent)
-    assert.strictEqual(
       gate.evaluate(event({ channelId: 'B', metadata: { channelId: 'B' } })).trigger,
       false,
+      'B counts on its own',
+    );
+    // A's third fires on A's counter.
+    assert.strictEqual(
+      gate.evaluate(event({ channelId: 'A', metadata: { channelId: 'A' } })).trigger,
+      true,
     );
   });
 
@@ -594,14 +618,15 @@ describe('hot reload — changed behavior clears stale state', () => {
       policies: [{
         name: 'rl',
         match: {},
-        behavior: { rate_limit: { tokens: 1, refillIntervalMs: 100_000, keyBy: 'channelId' } },
+        behavior: { rate_limit: { tokens: 1, refillIntervalMs: 100_000, keyBy: 'userId' } },
       }],
       default: 'skip',
     });
-    // Burn the only token under channel A
-    h.gate.evaluate(event({ metadata: { channelId: 'A', senderId: 'u' } }));
+    // Burn the only token under user K. (keyBy channelId would key by the
+    // channel the gate routes the event to, not the field's value.)
+    h.gate.evaluate(event({ metadata: { userId: 'K', senderId: 'x' } }));
     assert.strictEqual(
-      h.gate.evaluate(event({ metadata: { channelId: 'A', senderId: 'u' } })).trigger,
+      h.gate.evaluate(event({ metadata: { userId: 'K', senderId: 'x' } })).trigger,
       false,
     );
 
@@ -615,10 +640,11 @@ describe('hot reload — changed behavior clears stale state', () => {
       default: 'skip',
     });
 
-    // Sender u under the new scheme must get a fresh bucket — old
-    // channel-A bucket is gone, doesn't bleed into the new partition.
+    // Sender K under the new scheme must get a fresh bucket: the old
+    // user-K bucket, under the same key, is gone, and doesn't bleed into
+    // the new partition.
     assert.strictEqual(
-      h.gate.evaluate(event({ metadata: { channelId: 'A', senderId: 'u' } })).trigger,
+      h.gate.evaluate(event({ metadata: { userId: 'other', senderId: 'K' } })).trigger,
       true,
     );
   });
@@ -657,13 +683,13 @@ describe('hot reload — changed behavior clears stale state', () => {
       policies: [{
         name: 'ps',
         match: {},
-        behavior: { passive_sample: { every: 3, keyBy: 'channelId' } },
+        behavior: { passive_sample: { every: 3, keyBy: 'userId' } },
       }],
       default: 'skip',
     });
-    // Two messages in channel A — counter at 2.
+    // Two messages from user K — counter at 2.
     for (let i = 0; i < 2; i++) {
-      h.gate.evaluate(event({ metadata: { channelId: 'A' } }));
+      h.gate.evaluate(event({ metadata: { userId: 'K' } }));
     }
 
     await rewriteConfig(h, {
@@ -675,9 +701,10 @@ describe('hot reload — changed behavior clears stale state', () => {
       default: 'skip',
     });
 
-    // First post-reload event under sender X — fresh counter (1, not 3).
+    // First post-reload event under sender K, the old counter's key: a fresh
+    // counter (1, not 3), so it doesn't fire.
     assert.strictEqual(
-      h.gate.evaluate(event({ metadata: { senderId: 'X' } })).trigger,
+      h.gate.evaluate(event({ metadata: { senderId: 'K' } })).trigger,
       false,
     );
   });
@@ -729,7 +756,7 @@ describe('hot reload — changed behavior clears stale state', () => {
     const reload = h.traces.find(t => t.type === 'gate:config-reloaded');
     assert.ok(reload, 'should have emitted a reload trace');
     assert.deepStrictEqual(reload.stateClearedPolicies, ['a']);
-    assert.strictEqual(reload.removedPolicies, undefined);
+    assert.deepEqual((reload.removedPolicies as unknown[] | undefined) ?? [], [], 'no policy was removed');
   });
 
   it('trace event lists removed policies separately from state-cleared ones', async () => {

@@ -74,14 +74,17 @@ describe('the direct API sends the agent request settings', () => {
 
   it("carries every field the agent's settings give a request", async () => {
     const { agent, sent } = directAgent({
-      maxTokens: 1234, temperature: 0.3, thinking: { enabled: true, budgetTokens: 2048 },
+      maxTokens: 1234, temperature: 0.3, thinking: { enabled: true, budgetTokens: 2048 }, thinkingBinding: { dropBlock: true },
       promptCaching: false, cacheTtl: '5m', prefillUserMessage: 'scaffold', providerParams: { reasoning: { effort: 'low' } },
     });
     await agent.runInference([]);
     assert.equal(sent.length, 1);
     const { messages: _m, system: _s, tools: _t, ...settings } = sent[0];
     assert.deepEqual(settings, {
-      config: { model: 'test-model', maxTokens: 1234, temperature: 0.3, thinking: { enabled: true, budgetTokens: 2048 } },
+      config: {
+        model: 'test-model', maxTokens: 1234, temperature: 0.3,
+        thinking: { enabled: true, budgetTokens: 2048, blockBinding: { prefixMismatchBehavior: 'drop_block' } },
+      },
       promptCaching: false,
       cacheTtl: '5m',
       prefillUserMessage: 'scaffold',
@@ -94,7 +97,7 @@ describe('the direct API sends the agent request settings', () => {
   // too: an unset setting reaches both paths as the same resolved value.
   const parityCases: Array<[string, Partial<AgentConfig>]> = [
     ['every setting set', {
-      maxTokens: 1234, temperature: 0.3, thinking: { enabled: true, budgetTokens: 2048 },
+      maxTokens: 1234, temperature: 0.3, thinking: { enabled: true, budgetTokens: 2048 }, thinkingBinding: { dropBlock: true },
       promptCaching: false, cacheTtl: '5m', prefillUserMessage: 'scaffold', providerParams: { reasoning: { effort: 'low' } },
     }],
     ['no setting set', {}],

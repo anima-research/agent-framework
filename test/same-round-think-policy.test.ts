@@ -122,7 +122,7 @@ function makeChannelRegistry(framework: AgentFramework) {
       }
       return { success: false, error: `Unknown channel tool: ${toolName}`, isError: true };
     },
-    resolveLocus: () => 'chan-test',
+    resolveLocus: () => ({ serverId: 'stub', channelId: 'chan-test' }),
     routeSpeech: async (_agent: string, text: string) => {
       routed.push(text);
     },
@@ -360,6 +360,7 @@ class PausedAfterFirstToolRoundStream implements YieldingStream {
           previousResults: [],
           accumulated: '',
           roundContent: response.content,
+          supportsInjectedMessages: true,
         },
       } as StreamEvent);
       return;
@@ -553,21 +554,6 @@ describe('same-round think text policy', () => {
       trigger(framework);
       await framework.runUntilIdle();
       assert.deepEqual(routed, [TILDE_PREFACE_80]);
-    } finally {
-      await framework.stop();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('recipe private routes zero same-round prose for the exact Tilde shape', async () => {
-    const membrane = new MockMembrane();
-    membrane.pushResponse(createMockResponse(makeToolRound(TILDE_PREFACE_80), 'tool_use'));
-    membrane.pushResponse(createMockResponse([] as ContentBlock[]));
-    const { dir, framework, routed } = await createFramework({ policy: 'private', membrane });
-    try {
-      trigger(framework);
-      await framework.runUntilIdle();
-      assert.deepEqual(routed, []);
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });

@@ -81,8 +81,9 @@ function anyMatches(patterns: string[], path: string): boolean {
   return patterns.some((pattern) => patternMatchesPath(pattern, path));
 }
 
-/** Keys that are negotiation metadata, not grantable capabilities. */
-const UNMASKABLE_KEYS = new Set(['version', 'featureSets']);
+/** Keys that are negotiation metadata, or RFC-014 declarations (toolHints,
+ *  toolsets, surface), not grantable capabilities. */
+const UNMASKABLE_KEYS = new Set(['version', 'featureSets', 'toolHints', 'toolsets', 'surface']);
 
 /**
  * Interior object paths whose object value is itself the capability, with

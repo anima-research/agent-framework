@@ -78,8 +78,15 @@ test('framework preview, generated workspace read and both edit dispatch paths a
   } finally {agent.cancelStream();agent.membrane=membrane;}
 
 
-  assert.deepEqual(preview.tools,snapshot.advertised);
-  assert.ok((framework as any).getToolsForAgent('ada').some((t:any)=>t.name===target),'execution surface unchanged');
+  // The tool list is the advertised definitions less the host's built-in toolset.
+  const settingsToolset=['agent_settings','wake_add_rule','wake_remove_rule','gate_status','event_tags','set_tool_visibility','set_tool_description','heartbeat--heartbeat_status','heartbeat--heartbeat_trigger','workspace--status'];
+  const listed=(preview.tools??[]).map(t=>t.name);
+  assert.ok(!listed.includes(target),'a hidden tool leaves the tool list');
+  assert.deepEqual(listed.filter(n=>settingsToolset.includes(n)),[],"the built-in toolset's tools are not listed");
+  assert.deepEqual(snapshot.advertised.map(t=>t.name).filter(n=>!settingsToolset.includes(n)&&!listed.includes(n)),[],'every other advertised tool is listed');
+  assert.deepEqual(listed.filter(n=>!snapshot.advertised.some(t=>t.name===n)),[],'and nothing beyond the advertised tools');
+  const hiddenRun=await call(target,{pattern:'*'});
+  assert.equal(hiddenRun.success,true,`a hidden tool still runs: ${hiddenRun.error}`);
   assert.ok(!(await framework.previewActivation('other')).tools?.some(t=>t.name==='set_tool_visibility'));
   const read=await call('workspace--read',{path:'board/tools.md'});
   assert.equal(read.success,true);assert.match(JSON.stringify(read.data),/workspace--glob \(hidden\)/);
@@ -265,7 +272,7 @@ test('an edit refusal names every problem with its arguments, the call that work
    'Nothing was changed: "description" is 5, not a string or null. '
    +'set_tool_description takes {"name": a tool\'s exact name, "description": the new text, or null to restore the default}.');
   for (const name of ['workspace--read','set_tool_visibility','set_tool_description']) assert.equal(refusal('set_tool_visibility',{name,visible:false}),
-   `Nothing was changed: ${name} can't be hidden, since workspace--read, set_tool_visibility and set_tool_description are how you read the catalogue and undo these changes. Calling this again won't change that.`);
+   `Nothing was changed: ${name} can't be hidden, since workspace--read, set_tool_visibility, set_tool_description and the toolsets-- tools are how you read the catalogue, reach hidden tools and undo these changes. Calling this again won't change that.`);
   assert.equal(existsSync(path),false,'no refusal wrote the file');
   assert.equal(p.edit('set_tool_description',{name:'example',description:'\u{1F600}'.repeat(32768)},tools).success,true,'at the limit in characters, though twice it in UTF-16 units');
  } finally {rmSync(dir,{recursive:true,force:true});}
@@ -326,6 +333,51 @@ test('a presentation file the host can\'t use: edits refuse it and the catalogue
   assert.equal(lines.length,4);
   assert.match(lines[0],/^Diagnostic: Your tool presentation file can't be used \(it isn't valid JSON: .*\), so none of its settings apply: .* ask whoever runs this host to repair it\.$/);
   assert.deepEqual(lines.slice(1),['Diagnostic: first\\nsecond','Diagnostic: third\\nfourth','Diagnostic: fifth\\nsixth']);
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('a presentation file holding {} is the empty document, as a missing one is, and a 0-byte file, half a document or a value that isn\'t an object still refuses',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'presentation-empty-object-'));
+ try {
+  const path=join(dir,'tools.json'), p=new ToolPresentation({path,cataloguePath:'board/tools.md'});
+  const tools=presentationTargets('example','workspace--read');
+  for (const empty of ['{}','{ }\n']) {
+   writeFileSync(path,empty);
+   const snapshot=p.resolve(tools);
+   assert.deepEqual(snapshot.diagnostics,[],`${JSON.stringify(empty)} carries no settings, so nothing is said`);
+   assert.deepEqual(snapshot.advertised.map(t=>[t.name,t.description]),[['example','original'],['workspace--read','original']]);
+   assert.equal(p.edit('set_tool_visibility',{name:'example',visible:false},tools).success,true);
+   assert.deepEqual(JSON.parse(readFileSync(path,'utf8')),{version:1,tools:{example:{visible:false}}},'the edit writes the full form');
+  }
+  const refusedAs=(problem:string)=>`Nothing was changed: your tool presentation file can't be used (${problem}), and these tools won't write over it until it's repaired. Ask whoever runs this host to repair it.`;
+  for (const [content,problem] of [
+   ['{"tools":{}}','"version" must be 1, and it\'s missing'],
+   ['{"version":1}','"tools" must be an object of tool names, and it\'s missing'],
+   // Top-level values that aren't objects, for which Object.keys() gives no keys either (or, for null, throws).
+   ...['null','true','1'].map(value=>[value,`its top level is ${value}, not an object like {"version":1,"tools":{}}`]),
+  ]) {
+   writeFileSync(path,content);
+   assert.equal(p.edit('set_tool_visibility',{name:'example',visible:true},tools).error,refusedAs(problem),content);
+   assert.equal(readFileSync(path,'utf8'),content);
+   assert.equal(p.resolve(tools).diagnostics.length,1,content);
+  }
+  // 0 bytes is what a lost file looks like, since an edit's rename never leaves one.
+  writeFileSync(path,'');
+  assert.match(p.edit('set_tool_visibility',{name:'example',visible:true},tools).error!,
+   /^Nothing was changed: your tool presentation file can't be used \(it isn't valid JSON: .+\), and these tools won't write over it/);
+  assert.equal(readFileSync(path,'utf8'),'');
+  assert.equal(p.resolve(tools).diagnostics.length,1);
+
+  // A defaults file reads {} the same way, and still refuses half a document.
+  const web=join(dir,'web.json');
+  const q=new ToolPresentation({path:join(dir,'other.json'),cataloguePath:'board/tools.md',defaults:[{source:'MCPL server: web',path:web}]});
+  const webTools=presentationTargets('web--fetch'), sources=new Map([['web--fetch','MCPL server: web']]);
+  writeFileSync(web,'{}');
+  assert.deepEqual(q.resolve(webTools,sources).diagnostics,[]);
+  assert.equal(q.resolve(webTools,sources).available[0].description,'original');
+  writeFileSync(web,'{"version":1}');
+  assert.deepEqual(q.resolve(webTools,sources).diagnostics,['The description defaults for "MCPL server: web" can\'t be used ("tools" must be an object of tool names, and it\'s missing), '
+   +'so its tools show their installed descriptions, or yours where you set one. Ask whoever runs this host to fix that defaults file.']);
  } finally {rmSync(dir,{recursive:true,force:true});}
 });
 

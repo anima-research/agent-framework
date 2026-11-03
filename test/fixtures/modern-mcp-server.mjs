@@ -9,5 +9,8 @@ import { createServer } from './modern-tools.mjs';
 const [startLog, eventsFile] = process.argv.slice(2);
 if (startLog) appendFileSync(startLog, `start ${process.pid}\n`);
 process.stderr.write(`modern fixture ${process.pid} up\n`);
+const flood = Number(process.env.FIXTURE_STDERR_FLOOD ?? 0);
+for (let i = 1; i <= flood; i++) process.stderr.write(String(i).padStart(4, '0') + 'x'.repeat(96) + '\n');
+if (flood > 0) process.stderr.write('flood done\n');
 
 serveStdio(() => createServer({ eventsFile }), { legacy: 'reject' });

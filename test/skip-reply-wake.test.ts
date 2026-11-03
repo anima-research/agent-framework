@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   SKIP_REPLY_WAKE_NO_GATE_REFUSAL,
   readSkipReplyWake,
+  skipReplyNote,
   skipReplyWakeRefusal,
 } from '../src/mcpl/skip-reply-wake.js';
 
@@ -80,5 +81,32 @@ describe('skipReplyWakeRefusal: why a skip_reply call is refused, if it is', () 
   it('without an EventGate, any wake_in_seconds is refused: the host offers none', () => {
     assert.equal(skipReplyWakeRefusal({ kind: 'wake', seconds: 60 }, false), SKIP_REPLY_WAKE_NO_GATE_REFUSAL);
     assert.equal(skipReplyWakeRefusal({ kind: 'invalid', value: 'soon' }, false), SKIP_REPLY_WAKE_NO_GATE_REFUSAL);
+  });
+});
+
+describe('skipReplyNote: what a skip_reply\'s result tells the agent', () => {
+  const plain = 'Turn ended; nothing sent. Self-wake in ~900s unless something wakes you first.';
+
+  it('a skip with no wake says only that the turn ended, even beside a heartbeat', () => {
+    assert.equal(skipReplyNote(undefined), 'Turn ended; nothing sent.');
+    assert.equal(skipReplyNote(undefined, { inSeconds: 300, what: 'your heartbeat (a check-in prompt, every 60 min)' }), 'Turn ended; nothing sent.');
+  });
+
+  it('a self-wake with nothing known before it names the wake', () => {
+    assert.equal(skipReplyNote(900), plain);
+  });
+
+  it('a heartbeat due sooner is added, keeping the hedge: when it\'s due, and the time the self-wake would have left', () => {
+    assert.equal(
+      skipReplyNote(900, { inSeconds: 300, what: 'your heartbeat (a check-in prompt, every 60 min)' }),
+      `${plain} Your heartbeat (a check-in prompt, every 60 min) is due sooner, in ~300s; if it wakes you, the self-wake `
+        + 'is cancelled, so set it again for the ~600s left if you still want it.',
+    );
+    assert.equal(
+      skipReplyNote(600, { inSeconds: 45, what: 'your reminder "check the CI run"' }),
+      `Turn ended; nothing sent. Self-wake in ~600s unless something wakes you first. Your reminder "check the CI run" is due sooner, `
+        + 'in ~45s; if it wakes you, the self-wake is cancelled, so set it again for the ~555s left if you still want it.',
+    );
+    assert.match(skipReplyNote(900, { inSeconds: 900, what: 'your heartbeat' }), /for the ~1s left/, 'a wake rounded to the self-wake leaves at least a second');
   });
 });
