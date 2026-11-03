@@ -20538,7 +20538,11 @@ export class AgentFramework {
           .map((name) => this.agents.get(name))
           .filter((reader): reader is Agent => reader !== undefined)
       : [agent]).filter((reader) => this.agentSees(reader, message.metadata));
-    for (const holder of this.windowHolders(messageId)) if (!readers.includes(holder)) readers.push(holder);
+    // Holders that can't be read count it read, as any reader's doubt does:
+    // a window outside the slot's readers may hold the row and have read it.
+    const holders = this.windowHolders(messageId);
+    if (!holders) return false;
+    for (const holder of holders) if (!readers.includes(holder)) readers.push(holder);
     if (readers.length === 0) return true;
     const ts = message.timestamp instanceof Date ? message.timestamp.getTime() : Number(message.timestamp);
     for (const reader of readers) {
@@ -20563,9 +20567,11 @@ export class AgentFramework {
    * The live agents whose presented window holds a row (the presentation
    * index's holders, #291, leaving out a window that is still the whole
    * record): each one's own place for it, or a reader fork's framing.
-   * None on a framework built without the index, or when it can't be read.
+   * None on a framework built without the index. Undefined when it can't be
+   * read, which is logged: one window that can't be read fails the lookup
+   * for every window, so which hold the row isn't known.
    */
-  private windowHolders(messageId: MessageId): Agent[] {
+  private windowHolders(messageId: MessageId): Agent[] | undefined {
     if (!this.presentation) return [];
     try {
       return this.presentation.holders(messageId)
@@ -20574,7 +20580,7 @@ export class AgentFramework {
         .filter((holder): holder is Agent => holder !== undefined);
     } catch (err) {
       console.error(`[presentation] could not read which windows hold ${messageId}:`, err);
-      return [];
+      return undefined;
     }
   }
 

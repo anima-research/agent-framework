@@ -251,3 +251,34 @@ describe('the boot\'s worker-ended notice and the results it reads (AF #844 find
       'and writes w\'s end');
   });
 });
+
+describe('window reads whose failure a caller tells from an answer (AF #844 finding 51)', () => {
+  type WindowInternals = {
+    presentation: { holders(id: MessageId): unknown[] };
+    isUnreadStoredMessage(agent: Agent, id: MessageId): boolean;
+    windowHolders(id: MessageId): Agent[] | undefined;
+    addMessage(participant: string, content: ContentBlock[]): MessageId;
+  };
+
+  it('a row reads as read, not unread, while the windows holding it can\'t be read', async () => {
+    const h = await bootOne();
+    const internals = h.framework as unknown as WindowInternals;
+    internals.addMessage('user', [text('an unread arrival')]);
+    const row = h.rowOf('an unread arrival')!;
+    assert.equal(internals.isUnreadStoredMessage(h.agent, row.id), true, 'premise: no request has consumed it');
+    const holders = internals.presentation.holders;
+    internals.presentation.holders = () => { throw new Error('one window unreadable'); };
+    try {
+      const { value, logged } = await quietly(() => ({
+        holders: internals.windowHolders(row.id),
+        unread: internals.isUnreadStoredMessage(h.agent, row.id),
+      }));
+      assert.equal(value.holders, undefined, 'an unreadable lookup is not "held by none"');
+      assert.equal(value.unread, false, 'so the row counts as read: a holder outside its slot\'s readers may have read it');
+      assert.ok(logged.some((line) => line.includes(`could not read which windows hold ${row.id}`)), logged.join('\n'));
+    } finally {
+      internals.presentation.holders = holders;
+    }
+  });
+
+});
