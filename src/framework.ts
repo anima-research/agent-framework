@@ -16335,7 +16335,10 @@ export class AgentFramework {
      * stay in the window after the target: a branch cut can't separate
      * them from it. Not removed, so not counted in `messagesRemoved` and
      * not marked; suppressMessages, or the host's hide by Discord message
-     * id, takes them out. Set only on a presented window.
+     * id, takes them out: a suppression through the agent whose own slot
+     * holds each, this one, or for a row of a slot it observes (a
+     * persistent subconscious's residents' rows), that slot's owner. Set
+     * only on a presented window.
      */
     keptInWindowAfterTarget?: number;
   }> {
@@ -16724,7 +16727,8 @@ export class AgentFramework {
    * branch cut separates them from the target. Both are set only on a
    * presented window. A rollback that neither removes a row nor returns
    * one is refused as a no-op, saying why: rows presented with the target
-   * are named, with the removals that can take them out.
+   * are named, with the removals that can take them out, and through which
+   * agent a suppression does (suppressionThrough).
    */
   private planRollback(agentName: string, messageId: string): {
     cm: ContextManager;
@@ -16780,8 +16784,8 @@ export class AgentFramework {
           `Message ${messageId} was presented to ${agentName} in one write with the ${n} message${n === 1 ? '' : 's'} ` +
           `after it in its window (the first: ${named}), and a branch cut can't separate the rows one write presented, ` +
           `so a rollback to it would change nothing; to take ${n === 1 ? 'that message' : 'those messages'} out, ` +
-          `suppress ${n === 1 ? 'it' : 'them'} (suppressMessages), or hide ${n === 1 ? 'it' : 'them'} by Discord message id ` +
-          "(the host's hide command)");
+          `suppress ${n === 1 ? 'it' : 'them'} (${this.suppressionThrough(agentName, cm, kept)}), or hide ` +
+          `${n === 1 ? 'it' : 'them'} by Discord message id (the host's hide command)`);
       }
       throw new OperatorActionError('invalid', after > 0
         // Rows follow it in the record, but the cut keeps every one of them,
@@ -16798,6 +16802,61 @@ export class AgentFramework {
       discarded,
       ...(window ? { returnedToArrivals: window.returned.length, returnedIds: window.returned, keptInWindow: window.kept } : {}),
     };
+  }
+
+  /**
+   * Through which agent a suppression takes `rows` of `agentName`'s window
+   * out, for a refusal's advice: a suppression looks for its ids in the
+   * agent's own slot (planSuppression), so a row of a slot the agent
+   * observes, merged into its window, is suppressed through an owner of
+   * that slot whose own slot holds it (observedRowOwner). Plain
+   * `suppressMessages` when every row is in the agent's own slot.
+   */
+  private suppressionThrough(agentName: string, cm: ContextManager, rows: readonly StoredMessage[]): string {
+    let own = 0;
+    const merged = new Map<string | undefined, number>();
+    for (const row of rows) {
+      let inOwnSlot = true;
+      try { inOwnSlot = cm.getMessage(row.id as MessageId) !== null; } catch { /* read as its own: the plain advice */ }
+      if (inOwnSlot) { own++; continue; }
+      const owner = this.observedRowOwner(agentName, row.id as MessageId);
+      merged.set(owner, (merged.get(owner) ?? 0) + 1);
+    }
+    if (merged.size === 0) return 'suppressMessages';
+    const observed = `a slot ${agentName} observes`;
+    if (own === 0 && merged.size === 1) {
+      const [[owner, n]] = [...merged];
+      const pronoun = n === 1 ? 'it is' : 'they are';
+      return owner
+        ? `suppressMessages on ${owner}: ${pronoun} in ${owner}'s own slot, which ${agentName} observes`
+        : `suppressMessages on an agent whose own slot holds ${n === 1 ? 'it' : 'them'}: ${pronoun} in ${observed}`;
+    }
+    const parts = [
+      ...(own > 0 ? [`on ${agentName} for the ${own} in its own slot`] : []),
+      ...[...merged].map(([owner, n]) => owner
+        ? `on ${owner} for the ${n} in ${owner}'s own slot, which ${agentName} observes`
+        : `on an agent whose own slot holds the ${n} in ${observed}`),
+    ];
+    return `suppressMessages ${parts.slice(0, -1).join(', ')}${parts.length > 1 ? ' and ' : ''}${parts.at(-1)}`;
+  }
+
+  /**
+   * The live agent whose own slot holds `id`, a row of a slot `agentName`
+   * observes: an owner of one of the slots its observe edges read
+   * (readerFacts' observed slots), other than itself. Undefined when none
+   * is found or the registry can't be read.
+   */
+  private observedRowOwner(agentName: string, id: MessageId): string | undefined {
+    try {
+      for (const { owners } of readerFacts(this.registry, agentName).observed) {
+        for (const owner of owners) {
+          if (owner === agentName) continue;
+          const cm = this.agents.get(owner)?.getContextManager();
+          if (cm && !cm.isClosed() && cm.getMessage(id) !== null) return owner;
+        }
+      }
+    } catch { /* unknown: the advice says an owner */ }
+    return undefined;
   }
 
   /** Whether a slot `cm` merges beside its own holds the row, which its own slot doesn't. */

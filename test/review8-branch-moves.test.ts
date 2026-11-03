@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { AutobiographicalStrategy } from '@animalabs/context-manager';
 import type { ContextManager, MessageId, MessageMetadata, StoredMessage } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
-import { AgentFramework, OperatorActionError } from '../src/index.js';
+import { AgentFramework, OperatorActionError, asOwnRow } from '../src/index.js';
 import type { Agent, EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { GateModule, until } from './helpers/dendrite.js';
 import { WireMembrane, final } from './helpers/wire-membrane.js';
@@ -351,6 +351,51 @@ describe('a module that writes from start() on a host booting quiesced (AF #844 
   it('takes no clock row, and stays out of the window until resume, as a write the importer stores then does', async () => {
     assert.deepEqual(await bootWithStartWrite(false), { clocks: 1, status: 'in' }, 'premise: on a serving host it takes one, and enters the window');
     assert.deepEqual(await bootWithStartWrite(true), { clocks: 0, status: 'out' });
+  });
+});
+
+// 107: a rollback refused because rows one write presented with its target
+// follow it advised suppressMessages on the agent, but on a persistent
+// subconscious a row of the residents' slot merged into its window isn't in
+// its own slot, where a suppression looks: it answered "Not on the active
+// branch". The advice names the slot's owner to suppress through.
+describe("a no-op rollback's advice for a row of a slot the agent observes (AF #844 bot review 107)", () => {
+  it("names the resident whose own slot holds it, and a suppression through that resident takes it out", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-review8-2b-observed-'));
+    dirs.push(dir);
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store.chronicle'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [
+        { name: 'mira', model: 'test-model', systemPrompt: 'You are mira.' },
+        { name: 'oren', model: 'test-model', systemPrompt: 'You are oren.' },
+      ],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+      subconscious: { enabled: true, systemPrompt: 'You notice.' },
+    } as never);
+    frameworks.push(framework);
+    const SUB = 'Subconscious';
+    const scm = framework.getAgent(SUB)!.getContextManager();
+    assert.equal(scm.windowMode(), 'presented', 'premise');
+    framework.getAgent('mira')!.getContextManager().addMessage('someone', [text('an earlier residents\' row')], {});
+    // Its own row and a residents' row, presented to it in one write.
+    const own = scm.addMessage(SUB, [text('its own note')], asOwnRow(undefined, SUB));
+    const residents = framework.getAgent('mira')!.getContextManager().addMessage('someone', [text('a residents\' row')], {});
+    scm.presentRows([own, residents]);
+    assert.deepEqual(scm.getPresentedMessages().slice(-2).map((m) => m.id), [own, residents], 'premise: one write presented both');
+    await assert.rejects(framework.rollbackToMessage(SUB, { messageId: own }), (e: unknown) => {
+      assert.ok(e instanceof OperatorActionError && e.code === 'invalid', String(e));
+      assert.match(e.message, /was presented to Subconscious in one write with the 1 message after it in its window/);
+      assert.match(e.message, /suppress it \(suppressMessages on mira: it is in mira's own slot, which Subconscious observes\), or hide it by Discord message id/);
+      return true;
+    });
+    // As the advice says: not through the subconscious, through mira.
+    await assert.rejects(framework.suppressMessages(SUB, { messageIds: [residents] }), /Not on the active branch/);
+    const suppressed = await framework.suppressMessages('mira', { messageIds: [residents] });
+    assert.equal(suppressed.messagesRemoved, 1);
+    assert.equal(framework.getAgent(SUB)!.getContextManager().ordinalOf(residents), undefined, "it left the subconscious's window");
   });
 });
 

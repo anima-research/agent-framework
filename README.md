@@ -755,7 +755,8 @@ start, so the cut holds until the agent speaks again (`returnedToArrivals`,
 on the result and the preview). Rows that one write presented together with
 the target stay after it (`keptInWindowAfterTarget`), since no branch cut
 separates them from it: a rollback that only they follow is refused and
-names them, and `suppressMessages`, or the host's `hide` by Discord message
+names them, and `suppressMessages` (on the slot's owner, for a row of a slot
+the agent observes, which the refusal names), or the host's `hide` by Discord message
 id, takes them out. The preview's `neverPresented` counts the messages it
 removes that no agent's window holds. The host command's `/undo n` counts
 back over the rows of the agent's own slot in its window. A removal in place
