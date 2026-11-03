@@ -2915,12 +2915,17 @@ describe('a move while a maintenance tick is already running', () => {
         const setStrategy = cm.setStrategy.bind(cm);
         cm.setStrategy = (strategy: unknown) => { calls.push(name); return setStrategy(strategy); };
       }
+      const pass = (framework as unknown as { maintenancePass: Promise<void> | null }).maintenancePass;
+      assert.ok(pass, 'the tick runs in a maintenance pass');
       const undone = framework.undoLastTurn('a');
       assert.equal(undone.undone, true, 'the undo is done while the tick runs');
       assert.equal(undone.settled, undefined);
       gated.release!();
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      assert.deepEqual(calls, [], 'no manager re-initialized');
+      // A re-initialization a move schedules runs once the pass it waits
+      // for is over: the pass's end, not a delay, is where to look.
+      await pass;
+      await settled();
+      assert.deepEqual(calls, [], 'no manager re-initialized, once the pass is over');
     });
   });
 
