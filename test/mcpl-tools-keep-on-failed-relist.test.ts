@@ -488,6 +488,7 @@ test('a server whose re-list fails twice in a row keeps its tools both times', a
     await h.internals.refreshMcplTools();
     h.server('b').fails = true;
     await h.internals.refreshMcplTools();
+    assert.deepEqual(h.names(), ['mcpl--b--read', 'mcpl--b--write']);
     await h.internals.refreshMcplTools();
     assert.deepEqual(h.names(), ['mcpl--b--read', 'mcpl--b--write']);
   } finally {
