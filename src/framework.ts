@@ -28741,7 +28741,8 @@ export class AgentFramework {
     const roundCalls = context.watch ? this.scriptRoundCalls.get(context.watch) : undefined;
     let sent: RoundCall | undefined;
     if (roundCalls) {
-      const counted = this.roundCallOf(agentName, { name: toolName, input }, refusal !== undefined);
+      const counted = this.roundCallOf(agentName, { name: toolName, input }, refusal !== undefined,
+        context.startTurnId !== undefined && this.isPrivateTurn(context.startTurnId));
       if (counted.cause === 'send') {
         sent = counted;
         roundCalls.push(counted);

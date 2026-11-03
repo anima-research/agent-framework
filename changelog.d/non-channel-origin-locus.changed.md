@@ -117,8 +117,9 @@
   that doesn't resolve, or can't be delivered, isn't held as a draft either,
   words it adds to an `{{unsent}}` resend included: its notice says the words
   were kept private and how to publish, or, when the send threw, that they may
-  have gone out. Only a bare `{{unsent}}` resend keeps the draft it sent.
-  Where an earlier bounce is still held, either notice says that `{{unsent}}`
+  have gone out. The draft an `{{unsent}}` resend sent stays open, bare or
+  with words added, and only a bare resend's notice names it. Where an
+  earlier bounce is still held, either notice says that `{{unsent}}`
   names that draft, not these words. In every mode, words a send holds back
   are held as drafts, as in any turn. In locus and hybrid mode a send holds
   back speech going where it may have posted, or, when the framework can't
@@ -135,7 +136,8 @@
   to an agent that may call it. So must a script's whose starting turn is
   private, as that turn stands at the call, whichever turn watches the script
   then, a call it makes through `toolsets--act` included, and a host's
-  `executeToolCall` that carries a private turn's id (`callerTurnId`). Two
+  `executeToolCall`, or a module's `ctx.callTool`, that carries a private
+  turn's id (`callerTurnId`). Two
   kinds of turn id the framework can't place count as a private turn's,
   failing closed: one given out in this process before the framework was
   created, and one no newer than a private turn it has dropped from its

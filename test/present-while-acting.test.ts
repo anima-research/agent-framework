@@ -474,6 +474,8 @@ describe('present while acting', () => {
     framework.pushEvent({ type: 'external-message', source: 'tui', content: 'go', metadata: {} } as unknown as ProcessEvent);
     await framework.runUntilIdle();
 
+    const spoken = JSON.stringify(framework.getAgent('assistant')!.getContextManager().getAllMessages().map((m) => m.content));
+    assert.ok(spoken.includes('Still answering the operator.'), 'premise: the turn spoke after the injection');
     assert.deepEqual(routed, [], 'nothing is routed');
     const wired = membrane.lastStream!.receivedToolResultOptions
       .flatMap((o) => o?.injectedMessages ?? []).map((m) => JSON.stringify(m.content));

@@ -659,10 +659,11 @@ describe('private wins, one way', () => {
       caused.timestamp = now;
       rig.i.pendingRequests.push(caused as never, { agentName: 'scout', reason: 'timer', source: 'clock', timestamp: now + 1 });
       await rig.i.processInferenceRequests();
-      assert.equal(rig.i.pendingRequests.length, 1, 'premise: the quiesce kept one of the two');
+      assert.deepEqual(rig.i.pendingRequests.map((r) => r.timestamp), [now + 1], 'premise: the quiesce kept the newer of the two');
       await rig.framework.resume();
       await rig.until(() => rig.starts.length >= 1, 'the turn after resume');
       await rig.framework.runUntilIdle();
+      assert.ok(rig.texts().some((t) => t.startsWith('reply ')), `premise: the resumed turn spoke: ${JSON.stringify(rig.texts())}`);
       assert.deepEqual(rig.routed, [], 'nothing is routed');
     } finally {
       await rig.close();

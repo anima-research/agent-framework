@@ -98,7 +98,7 @@ describe('channel_publish without channelId', () => {
     } finally { await f.close(); }
   });
 
-  for (const [named, names] of [[false, false], [true, true]] as const) {
+  for (const [named, names] of [[true, false], [false, false], [true, true]] as const) {
     it(`a host's call carrying an open private turn's id${named ? '' : ', naming no agent,'} ${names ? 'and naming its channel posts there' : "meets the private turn's rule: refused, though a focus holds another channel"}`, async () => {
       const f = await fixture({ framework: { tuneOut: { enabled: true } } as never });
       try {
