@@ -38,21 +38,22 @@
   wake was queued. An operator's `nudge` or `unstick`, or an
   `inference.request` through the API server or its MCP tool
   (`agent_request_inference`), answers the agent's context as it stands, so it
-  is private exactly when, as it starts, the agent's stored history holds
-  private input: a private surface's message, or a script's wake message that
-  counts as private input. That holds however the context came to end where it
+  is private exactly when, as it starts, the agent's stored history holds a
+  private surface's message, or a result or mail from a private turn's work
+  (`dendrite.privateTurn`). That holds however the context came to end where it
   does, through the framework's `undo`, `redo` or operator surgery, a host's
   own move of its branch, or a restart. A gate policy that holds
   `api:inference-request` is the exception: the request it lets through
   later is no retake, and its turn takes the wake's route. A retake whose
-  history holds none speaks as before, so on a host with no private surface
-  it always does.
+  history holds none speaks as before.
   Otherwise it is private, even after a channel turn, and even where the
   context now shows that input only in a summary, and its delivery receipt
   says how to publish with a send. A script's wake message is private input,
   as a private surface's message is, when the script's start turn is private
   as the message is stored or injected: a turn that reads it is private, and a
-  tool boundary that injects it makes its turn private from there. An agent
+  tool boundary that injects it makes its turn private from there. A retake
+  doesn't count it, since the turn it names belongs to the run that stored
+  it: a retake counts that turn's own private input. An agent
   derived from, or spawned by, an agent whose turn is open and private
   (`deriveAgent`, or `createEphemeralAgent` with `inherit` or `spawnedBy`, a
   tune-out reader fork included) is that turn's work, and so is an
@@ -65,14 +66,14 @@
   framework's own routes (`deliverAgentResult`, or agent mail), a channel
   turn that takes it in at a boundary included, and names a channel to post
   there. An outcome a host writes itself, as a module's `addMessage` with a
-  wake of its own, carries no such mark, since a module's write can't, and
-  neither does a retry the host creates after the private turn has ended,
-  unless its spec carries the first attempt's `privateTurn`. A host that
-  derives or spawns an agent for its own reason while a private turn is
-  open gets a result its agent answers privately. A tune-out release that a
-  crash left deferred, restored at the next boot, opens its turn as before:
-  that turn reads the channel messages the hold kept, not an operator's
-  words.
+  wake of its own, carries no such mark, since a module's write can't
+  (#789), and neither does a retry the host creates after the private turn
+  has ended, unless its spec carries the first attempt's `privateTurn`. A
+  host that derives or spawns an agent for its own reason while a private
+  turn is open gets a result its agent answers privately. A tune-out release
+  that a crash left deferred, restored at the next boot, opens its turn as
+  before: that turn reads the channel messages the hold kept, not an
+  operator's words.
 
   In locus and hybrid mode, a private turn that holds a channel's message
   tells its resident which channels' messages it holds and that its plain
@@ -140,5 +141,4 @@
 - **A report from a script a turn started, deferred across a restart,** such
   as an update's, counts as private input in the next run, whichever turn it
   was, since that run can't know the turn: the start that reads it is
-  private, failing closed. It's stored without the turn, so later turns and
-  retakes don't count it.
+  private, failing closed. Later turns and retakes don't count it.

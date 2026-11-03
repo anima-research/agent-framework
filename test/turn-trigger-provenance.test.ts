@@ -1884,6 +1884,53 @@ describe('private wins, one way', () => {
       }
     });
 
+    const restarted = (next: Rig) => {
+      const turn = async (ask: () => void, what: string) => {
+        const before = next.routed.length;
+        const streams = next.streams.length;
+        ask();
+        await next.until(() => next.streams.length > streams && idle(next), what);
+        await next.framework.runUntilIdle();
+        return next.routed.slice(before).map((r) => r.locus);
+      };
+      return {
+        channelTurn: () => turn(() => { next.i.pendingRequests.push(roomWake()); }, 'a channel turn to run'),
+        nudge: () => turn(() => { assert.ok(next.framework.nudgeAgent('scout', 'host-console').ok); }, 'the nudged turn to run'),
+      };
+    };
+
+    it("a channel turn's script report the agent answered, in a store a second framework opens in the same process, leaves that framework's nudges as on main", async () => {
+      const storeDir = mkdtempSync(join(tmpdir(), 'answered-report-second-framework-'));
+      try {
+        const first = await surfaceRig({ storeDir });
+        try {
+          await firstTurn(first, false);
+          const turnId = routingOf(first.framework).turnId as number;
+          const starts = first.starts.length;
+          await (first.framework as unknown as {
+            scriptWake(agentName: string, scriptId: string, text: string, label: string, startTurnId: number): Promise<void>;
+          }).scriptWake('scout', 's0', '[script s0] lint passed', 's0-ended', turnId);
+          await first.until(() => first.starts.length > starts && idle(first), 'the turn that reads the report');
+          await first.framework.runUntilIdle();
+          assert.deepEqual(first.routed.map((r) => r.locus), [ROOM, LOUNGE], "control: the first framework's turns are channel turns, the report's in the fallback channel");
+        } finally {
+          await first.close();
+        }
+        const next = await surfaceRig({ storeDir });
+        try {
+          const { channelTurn, nudge } = restarted(next);
+          assert.deepEqual(await channelTurn(), [ROOM], 'control: a channel turn speaks in its channel');
+          assert.deepEqual(await nudge(), [LOUNGE], 'a nudge speaks as on main, in the fallback channel');
+          assert.deepEqual(await channelTurn(), [ROOM], 'control: another channel turn');
+          assert.deepEqual(await nudge(), [LOUNGE], 'and so does the next nudge');
+        } finally {
+          await next.close();
+        }
+      } finally {
+        rmSync(storeDir, { recursive: true, force: true });
+      }
+    });
+
     it("a provider hold that holds a private wake beside an equal one wakes a turn that speaks in no channel", async () => {
       const rig = await surfaceRig();
       try {

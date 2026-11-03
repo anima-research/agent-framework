@@ -420,7 +420,6 @@ const HOST_METADATA_KEYS = [
 ] as const;
 
 const CALLER_TURN_KEY = 'callerTurnId';
-const RESTORED_TURN = 0;
 
 function withoutPrivateWorkMarks<M extends object>(metadata: M | undefined): M | undefined {
   if (!metadata) return metadata;
@@ -1160,12 +1159,10 @@ type ReleasedWindow = {
 };
 
 /** Stamp a deferred write's durable id into the metadata it is stored with
- *  (boot recovery dedups replays by it), less a turn id restored across a
- *  restart (RESTORED_TURN): the start that takes the write in is private, and
- *  the stored row is not. Idempotent for an already-stamped message. */
+ *  (boot recovery dedups replays by it). Idempotent for an already-stamped
+ *  message. */
 function withDeferredWriteId(metadata: MessageMetadata | undefined, id: string): MessageMetadata {
-  const { [CALLER_TURN_KEY]: turn, ...rest } = (metadata ?? {}) as Record<string, unknown>;
-  return { ...(turn === RESTORED_TURN ? rest : metadata ?? {}), deferredWriteId: id } as MessageMetadata;
+  return { ...(metadata ?? {}), deferredWriteId: id } as MessageMetadata;
 }
 
 /** A deferred entry as a log line names it: its id, participant and block
@@ -1604,6 +1601,11 @@ function freshTurnRouting(): TurnRouting {
 }
 
 const TURN_INPUTS_SCAN = 64;
+
+function isMarkedPrivateInput(metadata: unknown): boolean {
+  if (readInboundSource(metadata)?.kind === 'surface') return true;
+  return (metadata as { dendrite?: { privateTurn?: unknown } } | undefined)?.dendrite?.privateTurn === true;
+}
 
 function turnInputs(
   cm: ContextManager, floor: number, agentName: string, sees: (metadata: unknown) => boolean,
@@ -10001,7 +10003,7 @@ export class AgentFramework {
       ...m,
       seq: i + 1,
       ...(typeof (m.metadata as Record<string, unknown> | undefined)?.[CALLER_TURN_KEY] === 'number'
-        ? { metadata: { ...m.metadata, [CALLER_TURN_KEY]: RESTORED_TURN } as MessageMetadata }
+        ? { metadata: { ...m.metadata, [CALLER_TURN_KEY]: 0 } as MessageMetadata }
         : {}),
     }));
     this.deferredSeq = Math.max(this.deferredSeq, restored.length);
@@ -15985,7 +15987,7 @@ export class AgentFramework {
   }
 
   private retakeIsPrivate(agent: Agent): boolean {
-    return agent.getContextManager().getAllMessages().some((m) => this.isPrivateInput(m.metadata));
+    return agent.getContextManager().getAllMessages().some((m) => isMarkedPrivateInput(m.metadata));
   }
 
   /**
@@ -30278,8 +30280,7 @@ export class AgentFramework {
   }
 
   private isPrivateInput(metadata: MessageMetadata | undefined): boolean {
-    if (readInboundSource(metadata)?.kind === 'surface') return true;
-    if ((metadata as { dendrite?: { privateTurn?: unknown } } | undefined)?.dendrite?.privateTurn === true) return true;
+    if (isMarkedPrivateInput(metadata)) return true;
     const turn = (metadata as Record<string, unknown> | undefined)?.[CALLER_TURN_KEY];
     return typeof turn === 'number' && this.isPrivateTurn(turn);
   }
