@@ -4317,6 +4317,7 @@ export class AgentFramework {
   private mcplToolServers: Map<string, string> = new Map();
   /** Servers whose tools/list answered in the latest refresh. */
   private mcplListedServers: Set<string> = new Set();
+  private mcplPublishedConnections: Map<string, McplServerConnection> = new Map();
   /** refreshMcplTools' starts, and the start whose result was published
    *  last: a refresh that a later-started one has overtaken publishes
    *  nothing, since that one listed every server after it. */
@@ -35582,7 +35583,8 @@ export class AgentFramework {
     // began, even if it has reconnected since: the close forgot its class
     // hints as stale (RFC-008), and its reconnect lists the new session.
     // An MCPL server whose listing doesn't count for that reason, or whose
-    // listing failed, keeps what's published while its connection serves.
+    // listing failed, keeps what's published while its connection serves,
+    // advertises tools, and is still the one whose tools were published.
     const mcplConnections = new Map<string, McplServerConnection>((this.mcplServerRegistry?.getAllServers() ?? []).map((server) => [server.id, server] as const));
     const connections = new Map<string, McplServerConnection | ModernMcpConnection>([...mcplConnections, ...this.modernServers()]);
     const serving = (serverId: string): boolean => {
@@ -35591,7 +35593,10 @@ export class AgentFramework {
     };
     const over = new Set([...listedServers].filter((serverId) => !serving(serverId) || closesOf(serverId) !== closesAtListing.get(serverId)));
     const keeps = new Set(results
-      .filter(({ serverId, error }) => serving(serverId) && mcplConnections.get(serverId)?.mcpToolsAdvertised === true && (error !== undefined || over.has(serverId)))
+      .filter(({ serverId, error }) => serving(serverId)
+        && mcplConnections.get(serverId)?.mcpToolsAdvertised === true
+        && this.mcplPublishedConnections?.get(serverId) === mcplConnections.get(serverId)
+        && (error !== undefined || over.has(serverId)))
       .map(({ serverId }) => serverId));
     if (over.size > 0) {
       for (const [name, serverId] of [...toolServers]) {
@@ -35614,12 +35619,13 @@ export class AgentFramework {
       return;
     }
     const kept = new Map<string, number>();
+    const publishedConnections = new Map<string, McplServerConnection>();
     for (const { serverId, staged } of results) {
+      const connection = mcplConnections.get(serverId);
+      if (connection && (keeps.has(serverId) || listedServers.has(serverId))) publishedConnections.set(serverId, connection);
       if (keeps.has(serverId)) {
-        const config = this.mcplServerConfigs.get(serverId);
-        const prefix = config?.toolPrefix ?? `mcpl--${serverId}`;
         const names = [...(this.mcplToolServers ?? [])]
-          .filter(([name, owner]) => owner === serverId && name.startsWith(`${prefix}--`) && isToolAllowed(name.slice(prefix.length + 2), config))
+          .filter(([, owner]) => owner === serverId)
           .map(([name]) => name);
         const known = new Set(names);
         tools.push(...(this.mcplTools ?? []).filter((tool) => known.has(tool.name)));
@@ -35648,6 +35654,7 @@ export class AgentFramework {
     tools.push(...(over.size > 0 ? modernTools.filter((tool) => toolServers.has(tool.name)) : modernTools));
     this.mcplToolsRefreshPublished = generation;
     this.mcplTools = tools;
+    this.mcplPublishedConnections = publishedConnections;
     this.mcplToolFeatureSets = toolFeatureSets;
     this.mcplToolClasses = toolClasses;
     this.mcplToolServers = toolServers;

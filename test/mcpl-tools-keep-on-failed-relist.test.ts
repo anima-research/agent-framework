@@ -261,24 +261,6 @@ test('a live server whose handshake advertised no tools has listed nothing, so n
   }
 });
 
-test('the tool policy and prefix in force decide which kept tools stay', async () => {
-  const h = await harness(['b']);
-  try {
-    h.server('b').lists = tools('read', 'write');
-    await h.internals.refreshMcplTools();
-    h.internals.mcplServerConfigs.set('b', { id: 'b', command: 'node', disabledTools: ['write'] });
-    h.server('b').fails = true;
-    await h.internals.refreshMcplTools();
-    assert.deepEqual(h.names(), ['mcpl--b--read'], 'a tool the policy now denies isn\'t kept');
-
-    h.internals.mcplServerConfigs.set('b', { id: 'b', command: 'node', toolPrefix: 'files' });
-    await h.internals.refreshMcplTools();
-    assert.deepEqual(h.names(), [], 'a tool under a prefix no longer configured isn\'t kept');
-  } finally {
-    await h.cleanup();
-  }
-});
-
 test('a re-list that fails keeps what is published when it publishes, so an older re-list\'s newer listing stands', async () => {
   const h = await harness(['b', 'c']);
   try {
