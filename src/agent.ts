@@ -2125,17 +2125,7 @@ export class Agent {
     return this.thinkingBinds ? { binds: true, dropBlock: this.thinkingDropBlock, participant: this.name } : undefined;
   }
 
-  /**
-   * Whether a compile of this agent now, at the budget and with the binding that compile is given, would fit,
-   * committing nothing (`ContextManager.previewContext`). Null where the strategy offers no preview, and on the
-   * hierarchical path of a strategy built from this context-manager copy. A select over the budget answers
-   * `fits: false`. It throws what `previewContext` throws: an `UncoveredDropError` from its dry select's coverage
-   * check, and from a hierarchical strategy built from another copy, whose select succeeded, that copy's refusal:
-   * a `NoFoldPlanToPreviewError` from a 0.23.1 copy, or a plain Error from a 0.23.0 copy, such as a host's own.
-   * `excludePins` lists pin ids the preview reads as absent (context-manager's `excludePins`): it answers what the
-   * compile would do were they unpinned, and unpins nothing.
-   * @internal For the framework's restart decision; not a host API.
-   */
+  /** @internal For the framework's restart decision; not a host API. */
   previewCompile(excludePins?: readonly string[]): ReturnType<ContextManager['previewContext']> {
     const thinkingBinding = this.thinkingBindingOption();
     const opts = {
