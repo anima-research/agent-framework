@@ -1,25 +1,35 @@
 /**
- * AF #844 bot review, finding 33: who a row is for, where the agents a
- * write names don't all read the slot it lands in.
+ * AF #844 bot review, findings 33 and 60: who a row is for, and whose own
+ * row it is, where the stamp alone doesn't say.
  *
- * A module's process response whose `requestInference` names agents is
+ * 33: a module's process response whose `requestInference` names agents is
  * stamped for those of them that read the slot the write lands in (the
  * delivery agent's: the residents' slot on a residents' host); one naming
  * only agents that don't read it (an isolated job, a fork) is stamped as a
  * write that names no agent is, for the residents. On main every resident
  * read such a row; stamped for the fork alone, it reached no window. The
  * batched-wake line the gate writes (`gate:debounce`) follows the same rule.
+ *
+ * 60: in a turn an earlier release recorded, a framework notice of the
+ * agent's own (a `prose-drafts` notice, an `[auto-continue]` row) was stored
+ * under `user` with no stamp. Its metadata names its owner (`draftOwner`,
+ * `agentName`), so an undo of that agent's turn takes it out as undone, and
+ * it doesn't return at the agent's next point, nor count as a notice in the
+ * agent's history.
  */
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { MessageId } from '@animalabs/context-manager';
+import { JsStore } from '@animalabs/chronicle';
+import { ContextManager as StoreWindow, PassthroughStrategy, type MessageId, type MessageMetadata } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import { AgentFramework, RESIDENTS_SLOT, audienceOf, sameSlot } from '../src/index.js';
-import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
+import type { Agent, EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
+import { residentContextOptions } from '../src/context-options.js';
 import { GateModule, RoutedMembrane, say, until, waitCall } from './helpers/dendrite.js';
+import { WireMembrane } from './helpers/wire-membrane.js';
 
 type Row = { id: MessageId; participant: string; content: ContentBlock[]; metadata?: Record<string, unknown> };
 const text = (t: string) => ({ type: 'text', text: t }) as ContentBlock;
@@ -122,5 +132,69 @@ describe('a write naming agents is for those of them that read the slot it lands
 
     gates.release('g-worker');
     await run;
+  });
+});
+
+describe("an earlier release's notices of an agent's own, under `user` and unstamped (AF #844 finding 60)", () => {
+  it("an undo of the turn takes them out as undone, no later point brings them back, and the history's drafts scan doesn't count them", async () => {
+    const dir = tempDir();
+    const storePath = join(dir, 'store.chronicle');
+    let before: number;
+    {
+      // An earlier release's store: two turns of mira's; in the second, her
+      // drafts notice and an [auto-continue] row, and a drafts notice
+      // another resident's turn wrote. Nothing is stamped.
+      const store = JsStore.openOrCreate({ path: storePath });
+      const cm = await StoreWindow.open({ store, ...residentContextOptions('mira'), strategy: new PassthroughStrategy() });
+      cm.addMessage('user', [text('first')]);
+      cm.addMessage('mira', [text('one')]);
+      cm.addMessage('user', [text('second')]);
+      before = store.currentSequence();
+      cm.addMessage('mira', [text('two')]);
+      cm.addMessage('user', [text('[drafts] mira: an open draft of yours')],
+        { system: true, kind: 'prose-drafts', draftOwner: 'mira', draftIds: ['d-1'] } as MessageMetadata);
+      cm.addMessage('user', [text('[auto-continue] mira')],
+        { system: true, kind: 'auto-continue', agentName: 'mira', continuation: 1, maxConsecutive: 3 } as MessageMetadata);
+      cm.addMessage('user', [text("[drafts] oren: an open draft of his")],
+        { system: true, kind: 'prose-drafts', draftOwner: 'oren', draftIds: ['d-9'] } as MessageMetadata);
+      cm.close();
+      store.close();
+    }
+    const framework = await AgentFramework.create({
+      storePath, membrane: new WireMembrane().asMembrane(),
+      agents: [{ name: 'mira', model: 'test-model', systemPrompt: 'You are mira.', allowedTools: 'all', proseRouting: 'disabled' }],
+      modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+    });
+    frameworks.push(framework);
+    const internals = framework as unknown as {
+      addMessage(participant: string, content: ContentBlock[], metadata?: MessageMetadata, opts?: { forAgent?: string }): MessageId;
+      saveTurnCheckpoints(agentName: string, checkpoints: unknown[]): void;
+      presentAtEndOf(agent: Agent | undefined): void;
+      draftsNamedInHistory(agent: Agent, ids: string[]): Map<string, string>;
+    };
+    const mira = framework.getAgent('mira')!;
+    const cm = mira.getContextManager();
+    const windowTexts = () => cm.getPresentedMessages().map((m) => textOf(m));
+    const ownNotice = '[drafts] mira: an open draft of yours';
+    const continued = '[auto-continue] mira';
+    const orensNotice = '[drafts] oren: an open draft of his';
+    assert.deepEqual(windowTexts(), ['first', 'one', 'second', 'two', ownNotice, continued, orensNotice], 'setup: written down at boot');
+    assert.deepEqual([...internals.draftsNamedInHistory(mira, ['d-1']).keys()], ['d-1'], 'setup: her notice names her draft');
+
+    // The earlier release's checkpoint for the second turn: no window length.
+    internals.saveTurnCheckpoints('mira', [{ agentName: 'mira', turnIndex: 1, sequenceBefore: before, branchName: framework.getStore().currentBranch().name, timestamp: Date.now() }]);
+    assert.deepEqual(framework.undoLastTurn('mira').window, { retracted: 4, represented: 0 });
+    const statusOf = (t: string) => cm.windowStatusOf(cm.getAllMessages().find((m) => textOf(m) === t)!.id);
+    assert.deepEqual([ownNotice, continued, orensNotice].map(statusOf), ['undone', 'undone', 'out'],
+      "her notices leave as undone; one naming another resident's draft leaves as arrived");
+    assert.equal(internals.draftsNamedInHistory(mira, ['d-1']).size, 0, 'the undone notice no longer counts as naming her draft');
+
+    // A write for mira while she is idle presents her at rest; so does the end of a turn.
+    internals.addMessage('alice', [text('hello again')], undefined, { forAgent: 'mira' });
+    internals.presentAtEndOf(mira);
+    assert.deepEqual(windowTexts(), ['first', 'one', 'second', orensNotice, 'hello again'], 'the undone turn stays out; the arrival comes back');
+    const redone = framework.redo('mira');
+    assert.equal(redone.window?.represented, 4, 'a redo puts back the rows the undo took out, hers and the arrival');
+    assert.deepEqual(windowTexts().slice(0, 7), ['first', 'one', 'second', 'two', ownNotice, continued, orensNotice], 'in their order');
   });
 });

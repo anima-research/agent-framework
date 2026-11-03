@@ -2603,15 +2603,18 @@ interface WindowBody {
   ordinal: number;
   sequence: number;
   /** Whether it is the agent's own row (ownWindowRow): its stamp's, or for a
-   *  row stored before the stamp, its voice's or its own calls' results. */
+   *  row stored before the stamp, its voice's, its own calls' results, or a
+   *  framework notice whose metadata names it as its owner. */
   own: boolean;
 }
 
 /**
  * Whether a row of `agent`'s window is its own (AgentFramework.windowBodiesFrom):
  * a stamped row by its stamp; an unstamped one, which an earlier release
- * stored, when it is stored under the agent's voice, or holds tool results
- * and every one answers a call in `ownCalls`. The tool calls of each own row
+ * stored, when it is stored under the agent's voice, holds tool results
+ * and every one answers a call in `ownCalls`, or is a framework notice of a
+ * kind this release writes as its owner's own row whose metadata names the
+ * agent as that owner (legacyNoticeOwner). The tool calls of each own row
  * are added to `ownCalls`, so pass the window's rows in order.
  */
 function ownWindowRow(row: StoredMessage, agent: Pick<Agent, 'name' | 'isOwnParticipant'>, ownCalls: Set<string>): boolean {
@@ -2620,9 +2623,38 @@ function ownWindowRow(row: StoredMessage, agent: Pick<Agent, 'name' | 'isOwnPart
   const own = stamp
     ? stamp.ownRowOf === agent.name
     : agent.isOwnParticipant(nameAsStored(row.participant))
+      || legacyNoticeOwner(row.metadata) === agent.name
       || (results.length > 0 && results.every((b) => ownCalls.has((b as { toolUseId?: string }).toolUseId ?? '')));
   if (own) for (const b of row.content) if (b.type === 'tool_use') ownCalls.add((b as { id: string }).id);
   return own;
+}
+
+/**
+ * The agent an unstamped framework notice (`system: true`) names as its
+ * owner, for a kind this release writes as its owner's own row
+ * (storeOwnRow): a drafts notice (`prose-drafts`) or a delivery receipt
+ * that names drafts, by `draftOwner`; an `[auto-continue]` row, by
+ * `agentName`; a stored context injection, by its mark's `agent`. An
+ * earlier release stored these with no stamp, a notice under `user`, in
+ * the slot its agent's context reads, which on a residents' host every
+ * resident reads. Undefined for any other row, and for one of these kinds
+ * whose metadata names no owner (a receipt that names no drafts), which an
+ * undo takes out as it does any other arrival.
+ */
+function legacyNoticeOwner(metadata: MessageMetadata | undefined): string | undefined {
+  const meta = metadata as Record<string, unknown> | undefined;
+  if (meta?.system !== true) return undefined;
+  switch (meta.kind) {
+    case 'prose-drafts':
+    case 'delivery-receipt':
+      return typeof meta.draftOwner === 'string' ? meta.draftOwner : undefined;
+    case 'auto-continue':
+      return typeof meta.agentName === 'string' ? meta.agentName : undefined;
+    case STORED_INJECTION_KIND:
+      return storedInjectionMarkOf(meta)?.agent;
+    default:
+      return undefined;
+  }
 }
 
 /** What an undo on the window (#291, decision 4) keeps for its redo. */
@@ -15495,9 +15527,11 @@ export class AgentFramework {
    * undo still takes) carries none, and the presentation index reads it as
    * an arrival, so an undo that took it out as arrived would see it come
    * back at the agent's next point: it is the agent's own when it is stored
-   * under the agent's voice (isOwnParticipant), or holds only results of
+   * under the agent's voice (isOwnParticipant), holds only results of
    * calls an own row of the window made, which such a release stored under
-   * `user`.
+   * `user`, or is a framework notice whose metadata names the agent as its
+   * owner (legacyNoticeOwner: a drafts notice, an `[auto-continue]` row, a
+   * stored injection), which such a release stored under `user` too.
    */
   private windowBodiesFrom(cm: ContextManager, from: number, agent: Agent): WindowBody[] {
     const bodies: WindowBody[] = [];
