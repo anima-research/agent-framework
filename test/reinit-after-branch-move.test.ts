@@ -1156,10 +1156,31 @@ describe('after a branch move, every agent on the store compiles without a resta
   });
 
   it("stop() waits for a branch switch's re-initialization before the store closes", async () => {
-    const switching = framework.switchBranch(framework.getStore().currentBranch().name);
+    // Held at a's re-initialization, which stop() must be seen waiting on, so
+    // a stop() that didn't wait would return first, or never be seen
+    // waiting, however long its own shutdown work.
+    const pass = gatedSwitch('a');
     let reinitEnded = false;
-    void switching.then(() => { reinitEnded = true; });
-    await framework.stop();
+    void pass.switched.then(() => { reinitEnded = true; });
+    await pass.reached;
+    const operations = (framework as unknown as { operatorOperations: Set<{ label: string; promise: Promise<void> }> }).operatorOperations;
+    const hold = [...operations].find((op) => op.label.startsWith('surgery:'));
+    assert.ok(hold, `the switch holds the store as an operation stop() waits for: ${JSON.stringify([...operations].map((op) => op.label))}`);
+    let waitedOn = false;
+    const then = hold.promise.then.bind(hold.promise) as (onFulfilled?: unknown, onRejected?: unknown) => Promise<unknown>;
+    Object.defineProperty(hold.promise, 'then', {
+      value: (onFulfilled?: unknown, onRejected?: unknown) => { waitedOn = true; return then(onFulfilled, onRejected); },
+    });
+    let stopped = false;
+    const stopping = framework.stop().then(() => { stopped = true; });
+    try {
+      await until(() => waitedOn || stopped, "stop() to wait on the switch's hold", 10_000);
+      assert.equal(stopped, false, 'stop() is still waiting while the re-initialization is held');
+      assert.equal(waitedOn, true, "stop() waits on the switch's hold");
+    } finally {
+      pass.open();
+    }
+    await stopping;
     assert.equal(reinitEnded, true, 'the re-initialization finished before stop() returned');
   });
 
