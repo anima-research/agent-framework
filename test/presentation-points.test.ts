@@ -50,6 +50,7 @@ type Internals = {
   readsRowFor(placement: Placement | undefined, agentName: string): { readsRow?: string };
   reserveStoreForSurgery(verb: string, agentName: string): () => void;
   storeInFork(target: Agent, content: ContentBlock[], metadata: MessageMetadata): MessageId;
+  createConversationAgent(name: string, home: { serverId: string; channelId: string }): Promise<Agent>;
   surgeryHeldWrites: unknown[];
   storeDueClock(agent: Agent, occasion: 'event' | 'turn-start' | 'tool-boundary'): { id: MessageId } | undefined;
   placeWakeLines(agent: Agent, lines: unknown[]): void;
@@ -73,7 +74,7 @@ afterEach(async () => {
   while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
 });
 
-async function boot(opts: { residents?: string[]; clock?: boolean | { intervalSeconds: number } } = {}) {
+async function boot(opts: { residents?: string[]; clock?: boolean | { intervalSeconds: number }; forks?: true } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'af-presentation-points-'));
   dirs.push(dir);
   const membrane = new WireMembrane();
@@ -90,6 +91,8 @@ async function boot(opts: { residents?: string[]; clock?: boolean | { intervalSe
       ...(i === 0 && opts.clock ? { clock: opts.clock === true ? { intervalMinutes: 1440 } : opts.clock } : {}),
     })),
     modules: [gates, surface],
+    // A conversation fork of the first resident, for the cases that make one.
+    ...(opts.forks ? { conversations: { templateAgent: residents[0] } } : {}),
     syncIntervalMs: 0,
     maintenanceIntervalMs: 0,
   } as never);
@@ -109,7 +112,9 @@ async function boot(opts: { residents?: string[]; clock?: boolean | { intervalSe
     return !row ? 'absent' : cm(name).ordinalOf(row.id) !== undefined ? 'in' : 'out';
   };
   const windowTexts = (name: string) => cm(name).getPresentedMessages().map((m) => textOf(m) || m.content.map((b) => b.type).join('+'));
-  return { framework, membrane, gates, surface, internals, traces, agent, cm, rowWith, inWindow, windowStatusOf, windowTexts };
+  /** A conversation fork of the first resident (boot with `forks`), in its own isolated store, registered as the spawn registers it. */
+  const fork = (name: string): Promise<Agent> => internals.createConversationAgent(name, { serverId: 'chat', channelId: 'room' });
+  return { framework, membrane, gates, surface, internals, traces, agent, cm, rowWith, inWindow, windowStatusOf, windowTexts, fork };
 }
 
 describe('presentation points (#291)', () => {
@@ -276,17 +281,20 @@ describe('presentation points (#291)', () => {
   });
 
   it("a channel message stored in a fork's store enters its window at once while it's idle, else at its turn's next point", async () => {
-    const h = await boot();
-    const mira = h.agent('mira');
-    h.internals.storeInFork(mira, [text('while idle')], {});
-    assert.equal(h.inWindow('mira', 'while idle'), true);
-    h.internals.activeTurnTokens.set('mira', 12);
-    h.internals.storeInFork(mira, [text('during a turn')], {});
-    assert.equal(h.windowStatusOf('mira', 'during a turn'), 'out');
-    assert.deepEqual(audienceOf(h.rowWith('mira', 'during a turn')!.metadata)?.audience, ['mira'], 'for the fork alone');
-    h.internals.activeTurnTokens.delete('mira');
-    h.internals.presentAtEndOf(mira);
-    assert.equal(h.inWindow('mira', 'during a turn'), true);
+    const h = await boot({ forks: true });
+    const fork = await h.fork('fork-room');
+    assert.equal(h.agent('fork-room'), fork, 'a registered fork');
+    h.internals.storeInFork(fork, [text('while idle')], {});
+    assert.equal(h.windowStatusOf('fork-room', 'while idle'), 'in');
+    h.internals.activeTurnTokens.set('fork-room', 12);
+    h.internals.storeInFork(fork, [text('during a turn')], {});
+    assert.equal(h.windowStatusOf('fork-room', 'during a turn'), 'out');
+    assert.deepEqual(audienceOf(h.rowWith('fork-room', 'during a turn')!.metadata)?.audience, ['fork-room'], 'for the fork alone');
+    assert.deepEqual([h.windowStatusOf('mira', 'while idle'), h.windowStatusOf('mira', 'during a turn')], ['absent', 'absent'],
+      "in the fork's store, not its template's");
+    h.internals.activeTurnTokens.delete('fork-room');
+    h.internals.presentAtEndOf(fork);
+    assert.equal(h.windowStatusOf('fork-room', 'during a turn'), 'in');
   });
 
   it("a turn's end is its logical turn's: a frame whose continuation is on its way presents nothing, and the turn's last end does", async () => {
@@ -584,26 +592,29 @@ describe('presentation points (#291)', () => {
   });
 
   it('a closure prompt written while the fork\'s turn is alive waits for that turn\'s end', async () => {
-    const h = await boot();
+    const h = await boot({ forks: true });
+    const fork = await h.fork('fork-room');
+    const real = h.internals.conversationRouter;
     const router = {
-      expired: () => [{ channelId: 'chat:room', serverId: 'chat', agentName: 'mira' }],
+      expired: () => [{ channelId: 'room', serverId: 'chat', agentName: 'fork-room' }],
       unbind: () => {},
       getBinding: () => undefined,
       closurePrompt: 'the conversation is closing',
     };
     h.internals.conversationRouter = router;
     h.internals.lastConversationSweep = 0;
-    h.internals.activeTurnTokens.set('mira', 31);
+    h.internals.activeTurnTokens.set('fork-room', 31);
     try {
       h.internals.sweepExpiredConversations();
-      assert.ok(h.rowWith('mira', 'the conversation is closing'), 'stored');
-      assert.equal(h.windowStatusOf('mira', 'the conversation is closing'), 'out', 'out of the live turn\'s window');
-      h.internals.activeTurnTokens.delete('mira');
-      h.internals.presentAtEndOf(h.agent('mira'));
-      assert.equal(h.inWindow('mira', 'the conversation is closing'), true, "presented at the turn's end, as its own row");
+      assert.ok(h.rowWith('fork-room', 'the conversation is closing'), "stored in the fork's store");
+      assert.equal(h.windowStatusOf('mira', 'the conversation is closing'), 'absent', "not its template's");
+      assert.equal(h.windowStatusOf('fork-room', 'the conversation is closing'), 'out', 'out of the live turn\'s window');
+      h.internals.activeTurnTokens.delete('fork-room');
+      h.internals.presentAtEndOf(fork);
+      assert.equal(h.windowStatusOf('fork-room', 'the conversation is closing'), 'in', "presented at the turn's end, as its own row");
     } finally {
-      h.internals.activeTurnTokens.delete('mira');
-      h.internals.conversationRouter = undefined;
+      h.internals.activeTurnTokens.delete('fork-room');
+      h.internals.conversationRouter = real;
       h.internals.closingConversationAgents.clear();
       h.internals.pendingRequests.length = 0;
     }
