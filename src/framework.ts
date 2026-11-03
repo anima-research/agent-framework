@@ -5151,8 +5151,8 @@ export class AgentFramework {
           addMessage: (participant, content, metadata, forAgent) =>
             framework.addMessage(participant, content, metadata as MessageMetadata,
               forAgent ? { forAgent } : undefined),
-          requestInference: (agentName, reason, source) => {
-            framework.pendingRequests.push({ agentName, reason, source, timestamp: Date.now() });
+          requestInference: (agentName, reason, source, mark) => {
+            framework.pendingRequests.push({ agentName, reason, source, timestamp: Date.now(), ...(mark?.channelBorne ? { channelBorne: true as const } : {}) });
           },
           subconsciousName: () => framework.subconsciousAgentName,
           ...(framework.readerForks
@@ -9941,7 +9941,7 @@ export class AgentFramework {
       if ((m.metadata as { kind?: unknown } | undefined)?.kind !== 'tune-out-cancel') continue;
       const target = m.forAgent ?? this.primaryAgentName;
       if (target) {
-        this.pendingRequests.push({ agentName: target, reason: 'tune-out released (restored)', source: 'tune-out', timestamp: Date.now() });
+        this.pendingRequests.push({ agentName: target, reason: 'tune-out released (restored)', source: 'tune-out', timestamp: Date.now(), channelBorne: true });
       }
     }
     // Rewrite the durable queue without the already-landed entries so a

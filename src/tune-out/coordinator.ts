@@ -254,7 +254,7 @@ export interface TuneOutFrameworkHooks {
     forAgent?: string,
   ) => string;
   /** Queue an inference request for an agent. */
-  requestInference: (agentName: string, reason: string, source: string) => void;
+  requestInference: (agentName: string, reason: string, source: string, mark?: { channelBorne?: true }) => void;
   /** The persistent subconscious's registry/participant name, or null. */
   subconsciousName: () => string | null;
   /**
@@ -842,7 +842,7 @@ export class TuneOutCoordinator {
     }
     const primary = this.hooks.primaryName();
     if (primary) {
-      this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out');
+      this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out', { channelBorne: true });
     }
     // The subconscious gets one cancel turn of its own: the issue's cancel
     // shape is dump + a report from the subconscious, and when the dump left
@@ -1200,7 +1200,7 @@ export class TuneOutCoordinator {
       this.hooks.deliverFromReader(noteAuthor, [{ type: 'text', text: note }], { kind: 'subconscious-note', epochId });
     }
     const primary = this.hooks.primaryName();
-    if (primary) this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out');
+    if (primary) this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out', { channelBorne: true });
     const notice = `[${NOTICE_TAG.tuneOutCancelled}: all channels except ${this.shown(except.serverId, except.channelId)} — ${reason}.]`;
     if (source !== 'subconscious' && subName) {
       this.hooks.addMessage('user', [{ type: 'text', text: notice }], { system: true, kind: 'tune-out-cancel-report', scope: 'all-except' }, subName);

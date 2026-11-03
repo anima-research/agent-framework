@@ -643,7 +643,8 @@ export interface InferenceRequest {
   /**
    * Framework-set: a channel message prompted this wake, though it names no
    * channel to speak in, as a gate batch of messages none of which addressed
-   * the agent (WakeProvenance.channelBorne). Such a turn never takes
+   * the agent (WakeProvenance.channelBorne), or a tune-out's release, whose
+   * turn reads the held messages. Such a turn never takes
    * `FrameworkConfig.unpromptedChannel`. True on a merged batch when any of
    * its causes is. Hosts don't set it.
    */

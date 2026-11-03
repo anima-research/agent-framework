@@ -9,6 +9,7 @@
   to a conversation fork's, a heartbeat's or an ephemeral run's turn. One
   value, for every agent on the framework. Without it, nothing changes.
 - `WakeProvenance.channelBorne` and `InferenceRequest.channelBorne`: set when
-  a gate batch held an event from a channel, addressed or not, and on a merged
-  batch when any of its causes is. A channel message prompted such a turn,
-  so it never takes `unpromptedChannel`.
+  a gate batch held an event from a channel, addressed or not, on a
+  tune-out's release wake, whose turn reads the held messages, and on a
+  merged batch when any of its causes is. Channel messages prompted such a
+  turn, so it never takes `unpromptedChannel`.

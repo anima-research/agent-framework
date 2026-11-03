@@ -11,7 +11,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, appendFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
 import { ChannelRegistry, destinationKey, type ChannelRef } from '../src/mcpl/channel-registry.js';
@@ -20,8 +20,11 @@ import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 import type { ChannelContext } from '../src/mcpl/types.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { jsonLines } from './helpers/json-lines.js';
-import { fixture } from './helpers/coalescing-fixture.js';
-import { SUB, internals, registerOpen, channellessTurnLocus } from './helpers/admission.js';
+import { fixture, eventually } from './helpers/coalescing-fixture.js';
+import { GateModule } from './helpers/dendrite.js';
+import {
+  SUB, internals, registerOpen, channellessTurnLocus, enter, incoming, settle, blockInTool, textOf, type Stored,
+} from './helpers/admission.js';
 import type { FrameworkConfig } from '../src/types/framework.js';
 
 const OPS = 'discord:g1:ops';
@@ -303,5 +306,77 @@ describe('unpromptedChannel and the tune-out holds', () => {
       await f.framework.runUntilIdle();
       assert.equal(await channellessTurnLocus(f), 'ops', 'the hold ended: the unprompted channel again');
     } finally { await f.close(); }
+  });
+
+  const releaseLoci = async (f: Awaited<ReturnType<typeof withUnprompted>>, cancel: () => void): Promise<Array<string | null>> => {
+    const loci: Array<string | null> = [];
+    const off = f.framework.onTrace((t) => {
+      if (t.type === 'inference:started' && (t as { agentName: string }).agentName === 'agent') {
+        loci.push((t as { channelId?: string }).channelId ?? null);
+      }
+    });
+    try {
+      cancel();
+      f.alwaysRespond();
+      await f.framework.runUntilIdle();
+    } finally { off(); }
+    return loci;
+  };
+
+  it("an all-except hold's release turn answers held channel messages, so it takes main's fallback, not the unprompted channel", async () => {
+    const f = await withUnprompted();
+    try {
+      await registerOpen(f, 'work', 'noisy', 'ops');
+      assert.ok(internals(f).tuneOutCoordinator!.enterAllExcept(
+        { serverId: 'editor', channelId: 'work' }, { durationSeconds: 120, backlogCap: 10 }, 'agent-tool',
+      ).ok);
+      await incoming(f, 'noisy', 'n1', 'noise one');
+      await settle(f);
+      const loci = await releaseLoci(f, () => assert.ok(internals(f).tuneOutCoordinator!.cancelAllExcept('agent-tool', 'test').ok));
+      assert.ok(loci.length >= 1, 'the release woke the resident');
+      assert.deepEqual(loci, loci.map(() => null), JSON.stringify(loci));
+    } finally { await f.close(); }
+  });
+
+  it("a channel's tune-out release turn: the same", async () => {
+    const f = await withUnprompted();
+    try {
+      await registerOpen(f, 'work', 'noisy', 'ops');
+      enter(f, 'noisy', { backlogCap: 10 });
+      await incoming(f, 'noisy', 'n1', 'noise one');
+      await settle(f);
+      const loci = await releaseLoci(f, () => assert.ok(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test').ok));
+      assert.ok(loci.length >= 1, 'the release woke the resident');
+      assert.deepEqual(loci, loci.map(() => null), JSON.stringify(loci));
+    } finally { await f.close(); }
+  });
+
+  it('a release restored at boot owes the resident a wake marked as a channel message\'s', async () => {
+    const gate = new GateModule();
+    const f = await fixture({ framework: { subconscious: SUB, modules: [gate] } as Partial<FrameworkConfig> });
+    let saved: string;
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enter(f, 'noisy', { backlogCap: 10 });
+      const { loop } = await blockInTool(f, gate);
+      await incoming(f, 'noisy', 'n1', 'held before the crash');
+      await eventually(() => internals(f).deferredMessages.some((m) => textOf(m as Stored).includes('held before the crash')), 'held message deferred');
+      assert.ok(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test').ok);
+      saved = readFileSync(join(f.dir, 'store', 'recovery', 'deferred-writes.json'), 'utf8');
+      f.alwaysRespond();
+      gate.release('g1');
+      await loop;
+    } finally { await f.close(); }
+
+    const dir = mkdtempSync(join(tmpdir(), 'unprompted-reboot-'));
+    const deferredWritesPath = join(dir, 'deferred-writes.json');
+    writeFileSync(deferredWritesPath, saved!);
+    const g = await fixture({ framework: { subconscious: SUB, deferredWritesPath } as Partial<FrameworkConfig>, dir });
+    try {
+      const pending = (g.framework as unknown as { pendingRequests: Array<{ agentName: string; reason: string; channelBorne?: true }> }).pendingRequests;
+      const release = pending.find((r) => r.agentName === 'agent' && /tune-out released/.test(r.reason));
+      assert.ok(release, 'the restored release owes the resident its wake');
+      assert.equal(release.channelBorne, true);
+    } finally { await g.close(); }
   });
 });
