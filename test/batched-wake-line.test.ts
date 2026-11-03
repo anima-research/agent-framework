@@ -685,9 +685,10 @@ describe('a handed line across readers, a quiesce and a hold', () => {
     .map((m) => m.content.map((x) => (x.type === 'text' ? x.text : '')).join(''));
   const wake = (lines: unknown[], timestamp = Date.now()) => ({ agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp, wakeLines: lines });
 
-  // Every resident gets every batched wake. Since #291 each resident's start
-  // decides the line by its own window and writes it as its own row, which
-  // enters no other window; a co-resident's reply is her own row too. This
+  // Every resident gets every batched wake for messages that name no agent.
+  // Since #291 each resident's start decides the line by its own window and
+  // writes it as its own row, which enters no other resident's window but an
+  // observer's; a co-resident's reply is her own row too. This
   // test once had only the delivery agent's start write the slot's one line,
   // after mira's reply; now the DM is newest in each window, so neither
   // writes it.
@@ -758,7 +759,8 @@ describe('a handed line across readers, a quiesce and a hold', () => {
   });
 
   // Since #291 a co-resident's live turn holds no line: the line is the
-  // starting resident's own row, in no window but its own. This test once
+  // starting resident's own row, in no other resident's window unless that
+  // resident observes it. This test once
   // traced a line placed while mira's turn was alive as held; now only a
   // quiesce holds one.
   it('the delivery agent\'s start while the host is quiesced: no line written, traced, left for a later start; a co-resident\'s live turn holds none', async () => {

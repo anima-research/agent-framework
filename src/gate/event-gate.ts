@@ -155,8 +155,8 @@ interface PendingEvent {
 /** Where the host put a message the gate wrote: the agent whose window it
  *  went to; its stored id, once stored (absent while a surgery's hold keeps
  *  the write in memory); and `presented: false` when it was stored and not
- *  presented to the agent, whose turn was alive (#291's presentation
- *  index). The host marks the wake that goes with it from these. */
+ *  presented to the agent: a turn of the agent's was alive, or its
+ *  presentation at rest failed (#291's presentation index). The host marks the wake that goes with it from these. */
 export interface WritePlacement {
   agent?: string;
   messageId?: string;
@@ -2191,7 +2191,9 @@ export class EventGate {
     forAgent?: string,
     /** Out-param: where the message landed, for the wake that goes with it. */
     placement?: WritePlacement,
-    /** The agents the row is for; absent: the host's default for the write. */
+    /** The agents the row is for; absent: the host's default for the write.
+     *  The host stamps those of them that read where it stores the row, and
+     *  its default when none does. */
     audience?: readonly string[],
   ) => unknown;
   private requestInferenceFn: (agentName: string, reason: string, source: string, provenance?: WakeProvenance, after?: WritePlacement) => void;
@@ -4449,8 +4451,9 @@ export class EventGate {
       // Compact in-window notice: without it the wake turn contains nothing
       // new, so the agent can't tell WHAT woke it (its own timer vs. a
       // heartbeat) or WHEN. One line, timestamped to the second. Added
-      // before the inference request so it rides the wake turn (addMessage's
-      // turn-alive guard defers it to that turn's start if needed).
+      // before the inference request so it rides the wake turn: it is stored
+      // at once, and while a turn of the agent's is alive it is kept out of
+      // the window until the agent's next presentation point.
       const nowIso = new Date(this.now()).toISOString().slice(0, 19) + 'Z';
       // Deliver the notice into the WAKING agent's window — a self-wake
       // armed by a non-primary agent (e.g. a subconscious cadence) must not

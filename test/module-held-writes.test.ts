@@ -6,7 +6,8 @@
  * Discord delete or edit before anyone is shown the message changes what the
  * agent is shown, and a history sync finds the row it already stored. These
  * run through the real ModuleContextImpl, keeping writes out of the window by
- * quiescing the host, which a live turn does too.
+ * quiescing the host, or, for edits and removals, with a live turn too, whose
+ * tool boundary presents what is left.
  *
  * Before #291 such a write waited in a deferred queue and the module was
  * answered a `held:` handle for it. For one release a handle a module kept
@@ -23,7 +24,7 @@ import { JsStore } from '@animalabs/chronicle';
 import type { MessageQuery } from '@animalabs/context-manager';
 import type { AgentConfig, EventResponse, Module, ModuleContext, ModuleMessage, ToolDefinition, ToolResult } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
-import { MockMembrane } from './helpers/mock-membrane.js';
+import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 class ProbeModule implements Module {
   readonly name = 'probe';
@@ -32,6 +33,9 @@ class ProbeModule implements Module {
   answer: EventResponse = {};
   /** Runs inside start(), with the context. */
   onStart?: (ctx: ModuleContext) => void;
+  /** What the `wait` tool waits for, and what it calls as it starts. */
+  hold: Promise<void> = Promise.resolve();
+  onWait: () => void = () => {};
   async start(ctx: ModuleContext): Promise<void> {
     this.ctx = ctx;
     this.onStart?.(ctx);
@@ -40,10 +44,13 @@ class ProbeModule implements Module {
     this.ctx = null;
   }
   getTools(): ToolDefinition[] {
-    return [];
+    return [{ name: 'wait', description: 'Wait for the test', inputSchema: { type: 'object', properties: {} } }];
   }
+  /** Keeps the agent's turn alive, its round's tool pending, until the test lets it go. */
   async handleToolCall(): Promise<ToolResult> {
-    return { success: false, error: 'no tools', isError: true };
+    this.onWait();
+    await this.hold;
+    return { success: true, data: { ok: true } };
   }
   async onProcess(event: { type: string; source?: string }): Promise<EventResponse> {
     if (event.type !== 'module-event' || event.source !== 'probe') return {};
@@ -61,6 +68,7 @@ interface Probe {
   framework: AgentFramework;
   ctx: ModuleContext;
   module: ProbeModule;
+  membrane: MockMembrane;
 }
 
 async function open(
@@ -70,14 +78,15 @@ async function open(
 ): Promise<Probe> {
   const module = new ProbeModule();
   module.onStart = onStart;
+  const membrane = new MockMembrane();
   const framework = await AgentFramework.create({
     storePath,
-    membrane: new MockMembrane().asMembrane(),
+    membrane: membrane.asMembrane(),
     agents: extra.agents ?? [{ name: 'assistant', model: 'test-model', systemPrompt: 'test' }],
     modules: [module],
     ...(extra.subconscious ? { subconscious: extra.subconscious } : {}),
   } as never);
-  return { framework, ctx: module.ctx!, module };
+  return { framework, ctx: module.ctx!, module, membrane };
 }
 
 async function withProbe(run: (probe: Probe & { storePath: string }) => Promise<void>, extra?: Parameters<typeof open>[1]): Promise<void> {
@@ -188,6 +197,54 @@ test('removing a write before the agent is shown it takes it out of the store, a
       rows.map(textOf).filter((t) => ['taken back', 'as first sent', 'as edited'].includes(t));
     assert.deepEqual(shown(cm.getAllMessages()), ['as edited'], 'the store');
     assert.deepEqual(shown(cm.getPresentedMessages()), ['as edited'], 'and the window');
+  });
+});
+
+// The quiesced tests above keep the writes out of the window by freezing
+// the host; this keeps them out with a live turn, whose tool boundary is the
+// next presentation point and hands the stream what it presents.
+test("a write removed and another edited during a live turn: its tool boundary hands the stream the edit alone, and the window holds it alone", async () => {
+  await withProbe(async ({ framework, ctx, module, membrane }) => {
+    framework.start();
+    let release: () => void = () => {};
+    let entered = false;
+    module.hold = new Promise<void>((resolve) => { release = resolve; });
+    module.onWait = () => { entered = true; };
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Waiting.' },
+      { type: 'tool_use', id: 'w1', name: 'probe--wait', input: {} },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    module.answer = { addMessages: [{ participant: 'user', content: text('go') }], requestInference: true };
+    ctx.pushEvent({ type: 'module-event', source: 'probe', eventType: 'go', payload: null });
+    try {
+      await waitFor("the agent's tool to start", () => entered);
+      const stream = membrane.lastStream!;
+      const gone = ctx.addMessage('user', text('LIVE taken back'));
+      const kept = ctx.addMessage('user', text('LIVE as first sent'));
+      assert.deepEqual([ctx.getMessage(gone)?.held, ctx.getMessage(kept)?.held], [true, true],
+        "both stored, held: out of the live turn's window");
+      ctx.removeMessage(gone);
+      ctx.editMessage(kept, text('LIVE as edited'));
+      assert.equal(ctx.getMessage(gone), null);
+      assert.deepEqual(ctx.queryMessages({}).messages.filter((m) => m.held).map((m) => [m.id, textOf(m)]), [[kept, 'LIVE as edited']]);
+
+      release();
+      await waitFor('the tool results handed to the stream', () => stream.receivedToolResultOptions.length > 0);
+      const injected = stream.receivedToolResultOptions.flatMap((options) =>
+        (options?.injectedMessages ?? []).map((message) => JSON.stringify(message.content)))
+        .filter((t) => t.includes('LIVE'));
+      assert.deepEqual(injected, [JSON.stringify(text('LIVE as edited'))], 'the boundary hands the live turn the edit, and nothing of the removed write');
+      await framework.runUntilIdle();
+      const cm = framework.getAgent('assistant')!.getContextManager();
+      const live = (rows: Array<{ content: ContentBlock[] }>) => rows
+        .map((m) => m.content.map((b) => (b.type === 'text' ? b.text : '')).join('')).filter((t) => t.startsWith('LIVE'));
+      assert.deepEqual(live(cm.getAllMessages()), ['LIVE as edited'], 'the store');
+      assert.deepEqual(live(cm.getPresentedMessages()), ['LIVE as edited'], 'and the window');
+      assert.equal(ctx.getMessage(kept)?.held, undefined, 'shown');
+    } finally {
+      release();
+    }
   });
 });
 

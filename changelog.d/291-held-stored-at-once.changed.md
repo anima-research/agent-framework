@@ -4,7 +4,8 @@
   and its reader has it while the resident is busy: the persistent subconscious's view at its next wake, and a
   reader fork's framing, which names it by its stored id (`heldMessageIds`). As any write, it is kept in memory only
   while a surgery holds the store, until its release, or while the context manager of the agent it is written for
-  refuses its work after a failed re-initialization, until a `switchBranch()` re-initializes it. Stored during its
+  refuses its work after a failed re-initialization, until a branch move (a `switchBranch()`, a rollback or a
+  suppression) re-initializes it. Stored during its
   target's turn, it takes no clock row. A module's context reads such a message as the stored row it is, always
   with `heldFromResidents`, and with `held` for a read
   for a resident once that resident's window is written down (presented, not the whole record) and doesn't hold it:

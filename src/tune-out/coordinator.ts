@@ -104,6 +104,19 @@ export interface SubconsciousWindowStart {
   /** The start as the subconscious's index ordinal, once fixed for one of `epochIds`. */
   ordinal?: number;
   epochIds: readonly string[];
+  /**
+   * At a resume: `ordinal` is the start in force before the restart (a
+   * cancelled tune-out's, earlier than the start kept for `epochIds`), set
+   * again and kept as the start in force only, never as theirs.
+   */
+  inForceOnly?: true;
+  /**
+   * At a resume that finds no start in force kept, `ordinal` being the one
+   * kept for `epochIds`: the anchor the subconscious's strategy persisted is
+   * kept where it is earlier (a cancelled tune-out's start that was set but
+   * never kept), as the start in force only.
+   */
+  keepEarlierAnchor?: true;
 }
 
 /**
@@ -274,7 +287,7 @@ export interface TuneOutCheck {
   peek?: string[];
 }
 
-/** How long after an end time's or a wake budget's cancel threw the cancel is tried again. */
+/** How long after an end time's or a wake budget's cancel threw, or a deferred cancel's run, the cancel is tried again. */
 const EXPIRY_RETRY_MS = 60_000;
 
 /** Ends a backlog line cut to fit in one of the residents' messages. */
@@ -501,6 +514,13 @@ export class TuneOutCoordinator {
     note?: string;
     noteAuthor?: string;
   }>();
+  /**
+   * The one retry of the deferred cancels whose run threw (a release that
+   * couldn't be made durable, a store operation that threw), armed by
+   * runDeferredCancels, unref'd, cleared at stop. A later release's
+   * runDeferredCancels runs them sooner.
+   */
+  private deferredRetry: ReturnType<typeof setTimeout> | undefined;
   /** Timer key for the scope's cadence and expiry. */
   private static readonly SCOPE_KEY = '\0all-except';
 
@@ -672,19 +692,34 @@ export class TuneOutCoordinator {
     const sequence = Math.min(...active.map((e) => e.sequence));
     const epochIds = active.filter((e) => e.sequence === sequence).map((e) => e.epochId);
     const kept = this.ordinalsKept();
-    const state: WindowStartsState = kept ? this.readWindowState() : { starts: {} };
-    let ordinal = epochIds.map((id) => state.starts[id]).find((o) => o !== undefined);
+    const read = kept ? this.readWindowState() : { starts: {} };
+    if (read === null) {
+      // Which starts are kept can't be told: set by sequence, the window
+      // could move off a start fixed for an active tune-out, and the fix
+      // would write over the record. It stays where it was, nothing written;
+      // the next enter or restart sets it.
+      console.error(`[tune-out] the subconscious's window start stays where it was: its kept starts can't be read; the next enter or restart sets it`);
+      return;
+    }
+    const state: WindowStartsState = read;
+    const own = epochIds.map((id) => state.starts[id]).find((o) => o !== undefined);
+    let ordinal = own;
     // At a resume, the start in force before the restart (a cancelled
     // tune-out's, say), and never past the oldest active one's own start
-    // where one is kept.
-    if (occasion === 'resume' && state.inForce !== undefined) {
-      ordinal = ordinal === undefined ? state.inForce : Math.min(ordinal, state.inForce);
-    }
-    // The start in force from now: this ordinal, or, while the start waits
-    // to be fixed, none until the fix reports it (subconsciousWindowFixed).
-    if (kept && state.inForce !== ordinal) {
+    // where one is kept. With none in force kept, the anchor (window-anchor)
+    // keeps the one its strategy persisted where that is earlier than the
+    // oldest active one's own start.
+    const inForceOnly = occasion === 'resume' && state.inForce !== undefined && (own === undefined || state.inForce < own);
+    if (inForceOnly) ordinal = state.inForce;
+    const keepEarlierAnchor = occasion === 'resume' && kept && state.inForce === undefined && own !== undefined;
+    // The start in force from now: an ordinal known is kept as in force once
+    // it is set (the anchor's fix reports it, subconsciousWindowFixed), not
+    // before, so a set that fails leaves the record with the start the
+    // strategy still has. While the start waits to be fixed, none is in
+    // force until the fix reports it.
+    if (kept && ordinal === undefined && state.inForce !== undefined) {
       const { inForce: _was, ...rest } = state;
-      this.writeWindowState(ordinal !== undefined ? { ...rest, inForce: ordinal } : rest);
+      this.writeWindowState(rest);
     }
     const others: SubconsciousWindowStart[] = [];
     if (kept) {
@@ -695,7 +730,13 @@ export class TuneOutCoordinator {
       }
       for (const [at, ids] of bySequence) others.push({ sequence: at, epochIds: ids });
     }
-    this.hooks.setSubconsciousAnchor({ sequence, ...(ordinal !== undefined ? { ordinal } : {}), epochIds }, others);
+    this.hooks.setSubconsciousAnchor({
+      sequence,
+      ...(ordinal !== undefined ? { ordinal } : {}),
+      epochIds,
+      ...(inForceOnly ? { inForceOnly: true as const } : {}),
+      ...(keepEarlierAnchor ? { keepEarlierAnchor: true as const } : {}),
+    }, others);
   }
 
   // ==========================================================================
@@ -720,20 +761,23 @@ export class TuneOutCoordinator {
    * Each tune-out's window start as an ordinal, by epoch id, as kept on the
    * store's branch now, and the start in force (`inForce`: the ordinal the
    * window start was last set to while a tune-out is active), which a
-   * restart sets again (anchorSubconscious). A state that can't be read, or
-   * isn't this format (`{ v: 1, starts, inForce? }`), reads as none kept,
-   * and is written over at the next fix, with a line saying so. A state an
-   * earlier version kept, with no `inForce`, reads as one with none in
-   * force, and a restart sets the oldest active tune-out's start, as that
-   * version did.
+   * restart sets again (anchorSubconscious). A state that isn't this format
+   * (`{ v: 1, starts, inForce? }`) reads as none kept, and is written over
+   * at the next fix, with a line saying so. A read that throws answers null:
+   * what is kept can't be told, so nothing is written over it (a fix isn't
+   * kept, and is tried again at the next presentation), and the window
+   * start isn't moved. A state an earlier version kept, with no `inForce`,
+   * reads as one with none in force, and a restart sets the oldest active
+   * tune-out's start, or the anchor the subconscious's strategy persisted
+   * where that is earlier (keepEarlierAnchor).
    */
-  private readWindowState(): WindowStartsState {
+  private readWindowState(): WindowStartsState | null {
     let raw: unknown;
     try {
       raw = this.channelRegistry.readCoordinatorState(this.windowStartsStateId);
     } catch (err) {
-      console.error(`[tune-out] the subconscious's window starts (${this.windowStartsStateId}) can't be read, so none is kept:`, err);
-      return { starts: {} };
+      console.error(`[tune-out] the subconscious's window starts (${this.windowStartsStateId}) can't be read, so nothing is written over them now:`, err);
+      return null;
     }
     if (raw == null) return { starts: {} };
     const state = raw as { v?: unknown; starts?: unknown; inForce?: unknown };
@@ -773,12 +817,14 @@ export class TuneOutCoordinator {
    * restart sets again (anchorSubconscious), when it is the start in force
    * (`inForce`; another active tune-out's start fixed beside it isn't).
    * Answers whether it is kept, so that the anchor tries again at its next
-   * presentation when it isn't.
+   * presentation when it isn't: not when the record can't be read, which
+   * is never written over then.
    */
   subconsciousWindowFixed(epochIds: readonly string[], ordinal: number, inForce = true): boolean {
     if (!this.ordinalsKept()) return true;
     const active = new Set(this.activeStarts().map((e) => e.epochId));
     const state = this.readWindowState();
+    if (state === null) return false;
     let changed = false;
     for (const epochId of epochIds) {
       if (!active.has(epochId) || state.starts[epochId] === ordinal) continue;
@@ -802,6 +848,8 @@ export class TuneOutCoordinator {
   private forgetWindowStart(epochId: string): void {
     if (!this.ordinalsKept()) return;
     const state = this.readWindowState();
+    // Unreadable: left as it is; a resume's prune takes the start out later.
+    if (state === null) return;
     const noneActive = this.activeStarts().length === 0;
     if (!(epochId in state.starts) && !(noneActive && state.inForce !== undefined)) return;
     delete state.starts[epochId];
@@ -813,6 +861,7 @@ export class TuneOutCoordinator {
   private pruneWindowStarts(): void {
     if (!this.ordinalsKept()) return;
     const state = this.readWindowState();
+    if (state === null) return;
     const active = new Set(this.activeStarts().map((e) => e.epochId));
     const stale = Object.keys(state.starts).filter((epochId) => !active.has(epochId));
     // With none active, no start is in force for the resume to set again.
@@ -1039,19 +1088,52 @@ export class TuneOutCoordinator {
    * this once a surgery's release has stored what its hold kept, or told of
    * what it couldn't store. One whose writes are
    * still held waits on; one whose hold has ended meanwhile ends nothing.
-   * Never throws.
+   * One that throws (its release couldn't be made durable, a store
+   * operation threw) stays waiting, with its note, the tune-out still in
+   * force: it runs again at the next call, or EXPIRY_RETRY_MS later, which
+   * one timer arms. Never throws.
    */
   runDeferredCancels(): void {
     if (this.deferredCancels.size === 0 || this.writesHeldNow()) return;
-    const runs = [...this.deferredCancels.values()];
+    if (this.deferredRetry !== undefined) {
+      clearTimeout(this.deferredRetry);
+      this.deferredRetry = undefined;
+    }
+    const runs = [...this.deferredCancels.entries()];
     this.deferredCancels.clear();
-    for (const { run, note, noteAuthor } of runs) {
+    let failed = false;
+    for (const [key, entry] of runs) {
       try {
-        run(note, noteAuthor);
+        entry.run(entry.note, entry.noteAuthor);
       } catch (err) {
-        console.error('[tune-out] a cancel asked for while writes were held in memory failed when it ran:', err);
+        failed = true;
+        // A run that waited again (deferCancel, its writes held once more)
+        // has its entry back already: its note is taken there when it has none.
+        const waiting = this.deferredCancels.get(key);
+        if (!waiting) {
+          this.deferredCancels.set(key, entry);
+        } else if (waiting.note === undefined && entry.note !== undefined) {
+          waiting.note = entry.note;
+          if (entry.noteAuthor !== undefined) waiting.noteAuthor = entry.noteAuthor;
+        }
+        console.error(`[tune-out] a cancel asked for while writes were held in memory failed when it ran, so it stays waiting, the tune-out in force, and is tried again in ${EXPIRY_RETRY_MS / 1000} s or at the next release:`, err);
       }
     }
+    if (failed) this.armDeferredRetry();
+  }
+
+  /** Arm the one retry of the deferred cancels, unless it is armed; it arms itself again while one still waits. */
+  private armDeferredRetry(): void {
+    if (this.deferredRetry !== undefined) return;
+    const timer = setTimeout(() => {
+      this.deferredRetry = undefined;
+      this.runDeferredCancels();
+      // Writes held again at the retry: the cancels wait on, for the next
+      // release or this retry.
+      if (this.deferredCancels.size > 0) this.armDeferredRetry();
+    }, EXPIRY_RETRY_MS);
+    timer.unref?.();
+    this.deferredRetry = timer;
   }
 
   /** Whether a reader (persistent subconscious or reader forks) attends holds. */
@@ -2499,6 +2581,8 @@ export class TuneOutCoordinator {
     // A cancel still waiting for held writes ends nothing: the tune-out stays
     // in force on disk, for the next boot.
     this.deferredCancels.clear();
+    if (this.deferredRetry !== undefined) clearTimeout(this.deferredRetry);
+    this.deferredRetry = undefined;
     for (const timer of this.cadenceTimers.values()) clearTimeout(timer);
     this.cadenceTimers.clear();
     for (const timer of this.expiryTimers.values()) clearTimeout(timer);

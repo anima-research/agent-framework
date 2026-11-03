@@ -1197,9 +1197,13 @@ export class HistoryModule implements Module {
       let kept = 0;
       let scanned = 0;
       let lastScanned: StoredMessage | undefined;
-      // Window position just past the last message put on the page, and that message.
+      // Window position just past the last message put on the page, that
+      // message, and the rows left out up to it: a page-full stop resumes
+      // there, so the rows the lookahead passed after it are the next page's
+      // to count.
       let afterPage = windowOffset;
       let lastOnPage: StoredMessage | undefined;
+      let leftOutAtPage = 0;
       let exhausted = false;
       let pageFull = false;
       outer: for (;;) {
@@ -1220,6 +1224,7 @@ export class HistoryModule implements Module {
             page.push(m);
             afterPage = windowOffset + scanned;
             lastOnPage = m;
+            leftOutAtPage = leftOut;
           }
           kept++;
           if (limit > 0 && page.length >= limit && kept > offset + limit) {
@@ -1245,20 +1250,22 @@ export class HistoryModule implements Module {
         }).messages;
         if (next.length === 0) exhausted = true;
       }
+      const counted = pageFull ? leftOutAtPage : leftOut;
       return {
         success: true,
         data: {
           // A resumed scan (windowOffset > 0) only saw the window from that
           // position on, so its count is named for that — never a total. A
           // page-full stop's lookahead match lies past the resume point and
-          // is left out, so counts add up across a chain of resumes.
+          // is left out, so counts add up across a chain of resumes, and so
+          // do the rows left out on the way to it, which the resume scans.
           ...(() => {
             const n = pageFull ? kept - 1 : kept;
             const base = windowOffset > 0 ? 'matchedSinceWindowOffset' : 'matchedCount';
             return { [exhausted ? base : `${base}AtLeast`]: n };
           })(),
           returned: page.length,
-          ...(leftOut > 0 ? { leftOut } : {}),
+          ...(counted > 0 ? { leftOut: counted } : {}),
           scanned,
           truncated: !exhausted,
           ...(shift !== 0 || missed.length > 0 || unverified
@@ -2657,15 +2664,16 @@ function mergeForeignIntoGap(
 /** The sentence extract's and search's descriptions gain with the window lookup (getTools). */
 const WINDOW_NOTE =
   ' A message that isn\'t in your context carries `window`: "undone" for one an undo or a refusal rewind took ' +
-  'out of it, "not-shown" for one you were never shown; another agent\'s own turns and notes are left out unless ' +
-  'you observe that agent, and how many were is `leftOut`.';
+  'out of it, "not-shown" for one you were never shown; another agent\'s own turns and notes that aren\'t in your ' +
+  'context are left out unless you observe that agent, and how many were is `leftOut`.';
 
 /** semantic_search's form of it. */
 const WINDOW_NOTE_SEMANTIC =
   ' A message hit that isn\'t in your context carries `window` ("undone" for one an undo or a refusal rewind took ' +
-  'out of it, "not-shown" for one you were never shown); another agent\'s own turns and notes are left out unless ' +
-  'you observe that agent, and so are summary hits when the summaries fold another agent\'s context (the one this ' +
-  'history is bound to) and you don\'t observe that agent, all counted in index.leftOut.';
+  'out of it, "not-shown" for one you were never shown); another agent\'s own turns and notes that aren\'t in your ' +
+  'context are left out unless you observe that agent, and so are summary hits when the summaries fold another ' +
+  'agent\'s context (the one this history is bound to) and you don\'t observe that agent, all counted in ' +
+  'index.leftOut.';
 
 /** overview's form of it: its entries are spans, and only a summary's text is the bound agent's. */
 const WINDOW_NOTE_OVERVIEW =

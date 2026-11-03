@@ -402,6 +402,21 @@ export type TraceEvent =
       messageId: string;
       source: string;
     })
+  /** A write kept in memory until a live surgery's release (source
+   *  `surgery-release`) whose store threw there: none of it was stored, or,
+   *  with `mayBeStored`, context-manager couldn't tell what of it landed (the
+   *  rows it names as stored are traced as `message:added`). `external` is
+   *  the address the write's metadata gave it, for the module that wrote it
+   *  (the Discord module ends its record of a create with no row). The
+   *  agent's writes lost at a release are told of once besides, by an ops
+   *  alert of kind `store-held-lost`. */
+  | (TraceEventBase & {
+      type: 'message:lost';
+      source: string;
+      agentName: string;
+      external?: { source: string; id: string };
+      mayBeStored?: true;
+    })
   /** A push/event refused at the MCPL boundary: visibly-empty content
    *  (`empty-content`, answered -32602, with no `field` or `detail`), or a
    *  coalesced occurrence the host refused. A refused occurrence's reason
@@ -1362,18 +1377,31 @@ export type TraceEvent =
     })
   | (TraceEventBase & {
       /** A presentation failed; the rows it didn't present stay out of the
-       *  agent's window for its next presentation point. At `adopt`, the
-       *  agent's window couldn't be written down (another version's index
-       *  format, or a failed write), and the agent stays in legacy mode: its
-       *  window is the whole record, as before the index. At `rebase`, after
-       *  the store's branch moved, its window couldn't be written down on
-       *  the new branch, or its context's strategy couldn't follow the move
-       *  (`error` says which), and it stays in legacy mode until the next
-       *  move. */
+       *  agent's window for its next presentation point. At a fresh turn's
+       *  start (`turn-start`, `assembly`), the start fails too. With
+       *  `legacy`, the agent was left in legacy mode, its window the whole
+       *  record as before the index, until a later move of the store's
+       *  branch writes its window down: at `adopt`, its window couldn't be
+       *  written down (another version's index format, or a failed write);
+       *  at `rebase`, after the store's branch moved, its window couldn't be
+       *  written down on the new branch, or its context's strategy couldn't
+       *  follow the move (`error` says which). The framework logs that and
+       *  raises an ops alert (`presentation-legacy`). Without it, at
+       *  `adopt` or `rebase`, presenting the agent's own rows failed, or
+       *  taking out the rows the write-down took in that aren't the
+       *  agent's did, which is tried again at its next turn start or point
+       *  at rest. */
       type: 'presentation:failed';
       agentName: string;
       occasion: PresentationOccasion;
       error: string;
+      /** The rows the presentation named that didn't enter the window,
+       *  each body by the id that names it, where they are known (a write
+       *  of the window that failed). Absent where a read failed before the
+       *  rows could be named. */
+      messageIds?: string[];
+      /** Set where the failure left the agent in legacy mode. */
+      legacy?: true;
     })
   | (TraceEventBase & {
       /** At a tool boundary's hand-off, the newest rows of the agent's
@@ -1388,10 +1416,10 @@ export type TraceEvent =
   | (TraceEventBase & {
       /**
        * Rows were taken out of an agent's window. Every reason but `shed`
-       * is a removal from the record made through another agent's context,
-       * which context-manager tombstones in that context's window only: the
-       * rows it removed leave this agent's window too, each at its own
-       * place, so no other row's place moves (`hide`, `suppress` on its
+       * and `elsewhere` is a removal from the record made through another
+       * agent's context, which context-manager tombstones in that context's
+       * window only: the rows it removed leave this agent's window too, each
+       * at its own place, so no other row's place moves (`hide`, `suppress` on its
        * fork, a coalescer's `coalescer`, a module's `module`, a suppression
        * a start finished, `resume`, and a refusal rewind's shed from a
        * window that is still the record, `rewind`), or that no live context

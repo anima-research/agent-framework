@@ -155,9 +155,10 @@ describe('read marks once windows are presented (#291)', () => {
   });
 
   // The coalescer removes only what no reader consumed: a row a presented
-  // window holds and no request of its agent's answered is taken back, as
-  // one never presented is (AF-6, once every window presents and rows enter
-  // an idle window at once). A row a reader fork was handed as framing stays.
+  // window holds and no request of its agent's carried (its consumed mark
+  // doesn't cover it) is taken back, as one never presented is (AF-6, once
+  // every window presents and rows enter an idle window at once). A row a
+  // reader fork was handed as framing stays.
   it("the coalescer takes back a row a presented window holds that no reader consumed, as one never presented, and keeps one a reader fork was handed as framing", async () => {
     const h = await boot({ subconscious: true });
     const subconscious = h.framework.getAgent('Subconscious')!;
@@ -224,7 +225,7 @@ describe('read marks once windows are presented (#291)', () => {
     const entry = { eventType: 'mcpl:push-event', serverId: 'discord', eventId: 'ev-1' };
     const event = { serverId: 'discord', eventId: 'ev-1' } as unknown as MessageMetadata;
 
-    it('an entry stays newest when an own row presented at its write follows it in the record, until it is presented after that row', async () => {
+    it('an entry stays newest when an own row presented at its write follows it in the record, and once it is presented after that row', async () => {
       const h = await boot();
       h.writeDown(h.mira, h.oren);
       const cm = h.mira.getContextManager();

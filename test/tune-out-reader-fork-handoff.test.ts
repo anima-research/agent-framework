@@ -5,12 +5,13 @@
  * that wake the reader. It is the reader-fork arm of #793's P1 (#291, AF-5).
  *
  * A held message is stored at once, whatever the resident's turn (#291,
- * AF-5): no resident is shown it, so it can't land inside one of their
- * turns, and a reader is handed it from the record while the resident is
- * still busy, the moment it is there for. (Until AF-5 the framework deferred
- * it behind the resident's turn, and the reader was handed it by its
- * deferred write's held handle; that is what this file pinned, and those
- * assertions are rewritten here for stored rows.)
+ * AF-5), unless a surgery's hold or a context manager refusing its work
+ * keeps it in memory: no resident is shown it, so it can't land inside one
+ * of their turns, and a reader is handed it from the record while the
+ * resident is still busy, the moment it is there for. (Until AF-5 the
+ * framework deferred it behind the resident's turn, and the reader was
+ * handed it by its deferred write's held handle; that is what this file
+ * pinned, and those assertions are rewritten here for stored rows.)
  *
  * Only the fork itself is stubbed (`deriveAgent`, `runEphemeralToCompletion`),
  * so this runs without the Dendrite builds of chronicle and context-manager.

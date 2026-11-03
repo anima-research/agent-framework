@@ -605,8 +605,9 @@ describe('a persisted reader: what the resident and the reader are told', () => 
 
   it("says in the tune_out tool what a persisted reader does at a later run, and nothing for a fork per look", () => {
     const later = (reader: Parameters<typeof tuneOutTool>[0]) => tuneOutTool(reader).description;
-    const fork = 'A reader reads it instead: a fork of your context, run on a cadence and when a message there mentions you, ' +
-      'which can report to you in its own words and cancel the tune-out. ';
+    const fork = 'A reader reads it instead: a fork of your context, run on a cadence and when a message there that your wake ' +
+      'rules let through mentions you or is from an author they privilege. It can report to you in its own words ' +
+      'and cancel the tune-out. ';
     assert.ok(later({ kind: 'forks', persist: 'epoch', resync: 'window' }).includes(fork +
       'Within one tune-out, later runs resume that fork, each handed an account of the messages your context took since the ' +
       'run before (not your stored context injections); a new fork is made when it can\'t be resumed, or for a run after the ' +

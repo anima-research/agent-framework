@@ -30,8 +30,9 @@ describe('the tune_out tool text', () => {
     const tool = tuneOutTool({ kind: 'persistent', name: 'Muse' });
     assert.equal(descriptionOf(tool),
       'Hold a channel for a while: its traffic stops entering your context and stops waking you. ' +
-      'Muse, the reader configured here, reads it instead. It runs on a cadence and when a message there mentions you, ' +
-      'and can report to you in its own words and cancel the tune-out. ' +
+      'Muse, the reader configured here, reads it instead. It runs on a cadence and when a message there that your ' +
+      'wake rules let through mentions you or is from an author they privilege, and can report to you in its own ' +
+      'words and cancel the tune-out. ' +
       'People who mention you get an automatic reaction so they know you saw nothing. ' +
       'Cancelling (mode "cancel") delivers the held backlog. ' +
       'The tune-out auto-cancels after maxWakes mention-bursts. ' +
@@ -68,7 +69,9 @@ describe('the tune_out tool text', () => {
 
   it('names reader forks as forks of the resident\'s context, and no variant says "subconscious" or "judging"', () => {
     const forks = descriptionOf(tuneOutTool({ kind: 'forks' }));
-    assert.ok(forks.includes('A reader reads it instead: a fork of your context, run on a cadence and when a message there mentions you, '), forks);
+    assert.ok(forks.includes('A reader reads it instead: a fork of your context, run on a cadence and when a message there that '
+      + 'your wake rules let through mentions you or is from an author they privilege. It can report to you in its own words '
+      + 'and cancel the tune-out. '), forks);
     for (const kind of ['forks', 'none'] as const) {
       const all = JSON.stringify(tuneOutTool({ kind }));
       assert.ok(!/subconscious|judg/i.test(all), `${kind}: ${all}`);
@@ -101,17 +104,20 @@ describe("the reader tools' text", () => {
 
   it('says what each tool does, and nothing of when to use it', () => {
     assert.equal(described('deliver_summary'),
-      'Deliver a summary into the resident\'s context: `text` arrives there verbatim, under your own name.');
+      'Deliver a summary into the resident\'s context: `text` arrives there verbatim (leading and trailing whitespace ' +
+      'trimmed), under your own name.');
     assert.equal(described('cancel_tuneout'),
       'End the tune-out on a channel now. The diverted backlog is delivered to the resident (capped), and the ' +
       'channel\'s traffic reaches them as it did before the tune-out. A note in `text` arrives alongside the backlog, ' +
-      'verbatim, under your own name. If you were started to read one hold, you can end only that hold.');
+      'verbatim (leading and trailing whitespace trimmed), under your own name. If you were started to read one hold, ' +
+      'you can end only that hold.');
     assert.equal(described('note_disposition'),
       'Record a standing disposition: a durable note, kept under `key` across invocations and shown to the reader ' +
       'each time it runs (e.g. key "<sender>", text "<a note on their messages>"). Replaces any previous note under ' +
       'the same key.');
     assert.equal(described('speak_in_channel'),
-      'Post `text` into a tuned-out channel, as written. It goes out through the resident\'s publish path, so the ' +
+      'Post `text` into a tuned-out channel, as written (leading and trailing whitespace trimmed). It goes out ' +
+      'through the resident\'s publish path, so the ' +
       'channel sees it under the resident\'s account; nothing in the post names you. If you were started to read one ' +
       'hold, you can post only into a channel that hold still holds, and a post made once it has ended is refused; ' +
       'your report can say it instead. Disabled unless the resident\'s configuration allows it.');

@@ -15,6 +15,7 @@ import { AgentFramework } from '../src/index.js';
 import { storeOwnRow } from '../src/dendrite/audience.js';
 import { foreignRowAsSent, transcribeForeignRounds } from '../src/foreign-rounds.js';
 import { WireMembrane } from './helpers/wire-membrane.js';
+import { ContextManager as StoreWindow } from '@animalabs/context-manager';
 
 const text = (t: string) => ({ type: 'text', text: t }) as ContentBlock;
 const thinking = (signature: string) => ({ type: 'thinking', thinking: 'mulling', signature }) as ContentBlock;
@@ -195,6 +196,53 @@ describe('subconscious.foreignRounds', () => {
           return true;
         },
       );
+    }
+  });
+});
+
+// AF #844 bot review, finding 12: the mode was set at registration only,
+// and only where the agent's window was presented then. A subconscious or
+// an observing resident whose write-down failed there stayed 'raw' after a
+// branch move wrote its window down, so another agent's thinking and calls
+// went out to it as stored.
+describe('foreign rounds after a branch move writes the window down', () => {
+  it("an agent whose write-down failed at registration is sent another agent's rounds as a transcript once a move presents its window", { timeout: 120_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sub-foreign-rounds-move-'));
+    const membrane = new WireMembrane();
+    const presentRows = StoreWindow.prototype.presentRows;
+    StoreWindow.prototype.presentRows = function (this: StoreWindow, ids: Parameters<typeof presentRows>[0], ...rest: unknown[]) {
+      if (ids.length === 0) throw new Error('the write-down is refused (test)');
+      return (presentRows as (...a: unknown[]) => ReturnType<typeof presentRows>).call(this, ids, ...rest);
+    } as typeof presentRows;
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      subconscious: { enabled: true, reader: 'persistent', systemPrompt: 'Read for scout.' },
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    } as never).finally(() => { StoreWindow.prototype.presentRows = presentRows; });
+    try {
+      await framework.start();
+      const scout = framework.getAgent('scout')!;
+      const sub = framework.getAgent('Subconscious')!;
+      assert.equal(sub.getContextManager().windowMode(), 'legacy', 'premise: its write-down failed at registration');
+      await framework.switchBranch(framework.getStore().currentBranch().name);
+      assert.equal(sub.getContextManager().windowMode(), 'presented', 'premise: the move wrote its window down');
+      storeOwnRow(scout, 'scout', [thinking('sig-scout'), text('Looking it up.'), call('c1', 'search', { q: 'build status' })]);
+      storeOwnRow(scout, 'user', [{ ...result('c1', 'green'), toolName: 'search' } as ContentBlock]);
+      (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({ agentName: 'Subconscious', reason: 'test', source: 'test', timestamp: Date.now() });
+      await framework.runUntilIdle();
+      const request = membrane.calls.at(-1)!;
+      assert.equal(request.assistantParticipant, 'Subconscious', "premise: the subconscious's request");
+      const round = request.messages.find((m) => m.participant === 'scout');
+      assert.ok(round, `the round is in its request: ${JSON.stringify(request.messages)}`);
+      assert.deepEqual(round.content, [text('Looking it up.'), text('[search called: {"q":"build status"}]')], 'a transcript');
+      assert.ok(!JSON.stringify(request.messages).includes('sig-scout'), 'no thinking goes out');
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

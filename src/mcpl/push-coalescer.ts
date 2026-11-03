@@ -72,8 +72,9 @@ export interface CoalescingPlacement {
    *  recovery), which counts as read and can't be removed. */
   messageId?: string;
   /** Set on a stored placement that wasn't presented to `agent` at its
-   *  write, because a turn of the agent's was alive (#291's presentation
-   *  index): the turn being assembled doesn't read it. */
+   *  write: a turn of the agent's was alive, or its presentation at rest
+   *  failed (#291's presentation index). No request of the agent's reads it
+   *  until it is presented. */
   presented?: false;
 }
 
@@ -799,8 +800,9 @@ export class PushCoalescer<E = unknown> {
   /**
    * Remove the occupant and the run it builds on, newest first, auditing each
    * as `kind`. Every member is unread: refreshOccupant has just run, under the
-   * lock. The host's removal may still refuse one, such as a held write the
-   * host can't tell isn't already stored. A member the host
+   * lock. The host's removal may still refuse one, such as a row a reader
+   * fork was handed as framing, or any while a surgery holds the store. A
+   * member the host
    * can't remove may be read, so the walk stops there, leaving it and the
    * renders it builds on, and the history becomes `unknown`.
    * Returns false then. It doesn't touch `state.occupant`, which still names
@@ -1263,9 +1265,26 @@ export class PushCoalescer<E = unknown> {
           // Saved now, not only once the assembly's other renders settle: a
           // newer batch's last snapshot, its acceptance's, has it rendering
           // as usual, and a restart before the next save would render it on
-          // top of the render the agent never got.
-          this.persist();
+          // top of the render the agent never got. Written at once and made
+          // durable, as the render-start boundary is (saveNow, then commit):
+          // the host's throttled save would leave that window open for its
+          // delay. Where either throws, the throttled save is asked for.
+          let written = false;
+          try {
+            if (this.host.saveNow) { this.host.saveNow(this.snapshot()); written = true; }
+          } catch (saveError) {
+            this.host.audit({ kind: 'persist-failed', subject, eventId: occurrence.eventId, error: String(saveError) });
+          }
+          if (!written) this.persist();
           this.scheduleRecovery(subject, state);
+          if (written) {
+            try {
+              await this.host.commit?.();
+            } catch (commitError) {
+              this.host.audit({ kind: 'persist-failed', subject, eventId: occurrence.eventId, error: String(commitError) });
+              this.persist();
+            }
+          }
           return;
         }
         if (placement?.presented === false) {

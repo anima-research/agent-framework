@@ -18,6 +18,8 @@ import { fileURLToPath } from 'node:url';
 import { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { StoredMessage } from '@animalabs/context-manager';
+import { ContextManager as StoreWindow, PassthroughStrategy } from '@animalabs/context-manager';
+import { residentContextOptions } from '../src/context-options.js';
 import { AgentFramework } from '../src/index.js';
 import { audienceOf } from '../src/dendrite/audience.js';
 import type { AgentConfig } from '../src/types/index.js';
@@ -56,8 +58,9 @@ async function host(agents: Array<Partial<AgentConfig> & { name: string }> = AGE
     } as Parameters<typeof AgentFramework.create>[0]);
     return framework;
   };
-  // A first boot makes the store and every agent's window, as the earlier
-  // release's process did.
+  // A first boot makes the store and every agent's window, which a release
+  // before #291 never wrote (it kept no window index); a store such a
+  // release left, with no index, is its own case below.
   await (await boot()).stop();
   return {
     dir,
@@ -114,6 +117,51 @@ describe('the deferred-write importer (#291, AF-6)', () => {
       } finally { await framework.stop(); }
     } finally { h.close(); }
   });
+
+  // The stores above were made by this release, every window written down
+  // already. A release before #291 kept no window index: its store's rows
+  // are in the agent's slot and nothing more, beside the queue it left.
+  for (const quiesced of [false, true]) {
+    it(`a ${quiesced ? 'quiesced' : 'serving'} boot of a store an earlier release left with no window index writes the window down and stores its queue into it${quiesced ? ' at resume' : ''}`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'deferred-import-legacy-'));
+      const storePath = join(dir, 'store');
+      try {
+        {
+          const store = JsStore.openOrCreate({ path: storePath });
+          const cm = await StoreWindow.open({ store, ...residentContextOptions('agent'), strategy: new PassthroughStrategy() });
+          for (const t of ['old-1', 'old-2']) cm.addMessage('someone', text(t), {});
+          assert.equal(cm.windowMode(), 'legacy', 'setup: the store predates the index');
+          cm.close();
+          store.close();
+        }
+        const recovery = join(storePath, 'recovery');
+        mkdirSync(recovery, { recursive: true });
+        writeFileSync(join(recovery, 'deferred-writes.json'), JSON.stringify({ version: 2, pending: [entry('q1', 1, 'queued-1')] }));
+        if (quiesced) writeFileSync(join(recovery, 'host-mode.json'), JSON.stringify({ version: 1, quiesced: true, reason: 'surgery', since: Date.now() }));
+        const framework = await AgentFramework.create({
+          storePath, membrane: new MockMembrane().asMembrane(), modules: [], syncIntervalMs: 0,
+          agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'You are agent.' }],
+        } as Parameters<typeof AgentFramework.create>[0]);
+        try {
+          const cm = framework.getAgent('agent')!.getContextManager();
+          assert.equal(cm.windowMode(), 'presented', 'written down at registration');
+          const queued = withText(framework, 'queued-1');
+          assert.deepEqual(queued.map(writeIdOf), ['q1'], 'stored once, under its queued id');
+          assert.deepEqual(JSON.parse(readFileSync(join(recovery, 'deferred-writes.json'), 'utf8')), { version: 1, pending: [] }, 'the record is cleared');
+          const olds = rowsOf(framework).filter((m) => /^old-\d$/.test(textOf(m)));
+          assert.deepEqual(olds.map((m) => cm.windowStatusOf(m.id)), ['in', 'in'], "the earlier release's rows are in the window");
+          assert.deepEqual(queued.map((m) => cm.windowStatusOf(m.id)), [quiesced ? 'out' : 'in'], quiesced ? 'the quiesce keeps the import out' : 'and the import, by the boot\'s pass');
+          if (quiesced) {
+            await framework.resume();
+            assert.deepEqual(queued.map((m) => cm.windowStatusOf(m.id)), ['in'], 'resume presents it');
+          }
+          const { messages } = await cm.compile();
+          assert.deepEqual(messages.map((m) => JSON.stringify(m.content)).filter((c) => /old-\d|queued-1/.test(c)).map((c) => /old-\d|queued-1/.exec(c)![0]),
+            ['old-1', 'old-2', 'queued-1'], 'the compile carries the earlier rows, then the import');
+        } finally { await framework.stop(); }
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+  }
 
   // host-quiesce.test.ts's case of a queue stranded beside a cleared
   // host-mode record, ported to this importer, was this case's twin; its
@@ -434,6 +482,51 @@ describe('the deferred-write importer (#291, AF-6)', () => {
     } finally { h.close(); }
   });
 
+  // AF #844 bot review finding 28: the boot's check of held mail releases
+  // it on a copy in the recipient's store only once the store has synced:
+  // after an import whose sync failed, the copy may be in memory only.
+  it("keeps imported mail held when the store doesn't sync before the boot would release it on the unsynced copy", async () => {
+    const h = await host();
+    const proto = JsStore.prototype as unknown as { sync(this: JsStore): void };
+    const sync = proto.sync;
+    const quiet = console.error;
+    try {
+      let framework = await h.boot();
+      let mailId: string;
+      try {
+        const registry = (framework as unknown as { registry: { holdMail(mail: Record<string, unknown>): { id: string } } }).registry;
+        mailId = registry.holdMail({ kind: 'message', from: { agent: 'helper', incarnation: 1 }, to: 'agent', content: text('unsynced mail') }).id;
+      } finally { await framework.stop(); }
+      h.writeQueue([entry('mail-2', 1, 'unsynced mail', {
+        participant: 'helper', forAgent: 'agent',
+        metadata: { kind: 'agent-message', dendrite: { mailId, kind: 'message', from: { agent: 'helper', incarnation: 1 }, to: 'agent' } },
+      })]);
+      // Every sync from the import on fails, through the boot's check of held mail.
+      proto.sync = function (this: JsStore) {
+        const stack = new Error().stack ?? '';
+        if (stack.includes('importPersistedDeferredWrites') || stack.includes('deliverHeldMail')) {
+          throw Object.assign(new Error('injected EIO syncing'), { code: 'EIO' });
+        }
+        return sync.call(this);
+      };
+      console.error = () => {};
+      try { framework = await h.boot(); } finally { proto.sync = sync; console.error = quiet; }
+      try {
+        assert.equal(withText(framework, 'unsynced mail').length, 1, 'the import stored it, in memory');
+        assert.deepEqual(framework.listHeldMail().map((m) => m.id), [mailId], 'the mail stays held: its copy never reached the disk');
+      } finally { await framework.stop(); }
+      framework = await h.boot();
+      try {
+        assert.equal(withText(framework, 'unsynced mail').length, 1, 'the next boot finds the copy and delivers no second one');
+        assert.deepEqual(framework.listHeldMail(), [], 'and releases it, synced');
+      } finally { await framework.stop(); }
+    } finally {
+      proto.sync = sync;
+      console.error = quiet;
+      h.close();
+    }
+  });
+
   it("owes a tune-out release's agent the wake its cancel requested", async () => {
     const h = await host();
     try {
@@ -504,6 +597,7 @@ describe('the deferred-write importer (#291, AF-6)', () => {
       };
       let framework: AgentFramework;
       try { framework = await h.boot(); } finally { proto.sync = sync; }
+      assert.equal(left, 0, "the injected failure fired, at the importer's sync");
       try {
         assert.equal(withText(framework, 'synced later').length, 1, 'stored in memory');
         assert.deepEqual(h.readQueue().pending.map((m) => m.id), ['s1'], 'the record is as it was');
@@ -515,6 +609,89 @@ describe('the deferred-write importer (#291, AF-6)', () => {
       } finally { await framework.stop(); }
     } finally {
       proto.sync = sync;
+      h.close();
+    }
+  });
+
+  // AF #844 bot review finding 25: an entry with no id is given one as it is
+  // read, and the record names it by that id before any of it is stored, so
+  // a boot that ends before the record is cleared, or whose sync fails,
+  // leaves a record the next boot finds the copy by.
+  it("names an id-less write by the id it is given before storing it, so a boot whose sync fails and the next store it once", async () => {
+    const h = await host();
+    const proto = JsStore.prototype as unknown as { sync(this: JsStore): void };
+    const sync = proto.sync;
+    const quiet = console.error;
+    try {
+      h.writeQueue([{ seq: 1, participant: 'user', content: text('no id given') }, entry('k1', 2, 'with an id')]);
+      let failSyncs = true;
+      proto.sync = function (this: JsStore) {
+        if (failSyncs && new Error().stack?.includes('importPersistedDeferredWrites')) {
+          failSyncs = false;
+          throw Object.assign(new Error('injected EIO syncing'), { code: 'EIO' });
+        }
+        return sync.call(this);
+      };
+      console.error = () => {};
+      let framework: AgentFramework;
+      try { framework = await h.boot(); } finally { proto.sync = sync; console.error = quiet; }
+      let given: unknown;
+      try {
+        const [row] = withText(framework, 'no id given');
+        assert.ok(row, 'stored in memory');
+        given = writeIdOf(row);
+        assert.deepEqual(h.readQueue().pending.map((m) => m.id), [given, 'k1'], 'the record names it by the id it was stored under');
+      } finally { await framework.stop(); }
+      framework = await h.boot();
+      try {
+        assert.equal(withText(framework, 'no id given').length, 1, 'skipped by that id, not stored twice');
+        assert.equal(withText(framework, 'with an id').length, 1);
+        assert.deepEqual(h.readQueue().pending, []);
+      } finally { await framework.stop(); }
+    } finally {
+      proto.sync = sync;
+      console.error = quiet;
+      h.close();
+    }
+  });
+
+  it("keeps an id-less write for the next boot, with what follows it for its agent, when the record can't be written with its id first", async () => {
+    const h = await host();
+    const proto = AgentFramework.prototype as unknown as { writeRecoveryFile(this: unknown, path: string, document: unknown): void };
+    const write = proto.writeRecoveryFile;
+    const lines: string[] = [];
+    const quiet = console.error;
+    try {
+      h.writeQueue([entry('k0', 1, 'before it'), { seq: 2, participant: 'user', content: text('no id given') }, entry('k2', 3, 'after it')]);
+      let refuse = true;
+      proto.writeRecoveryFile = function (this: unknown, path: string, document: unknown) {
+        if (refuse && path.endsWith('deferred-writes.json')) {
+          refuse = false;
+          throw Object.assign(new Error('injected EIO writing'), { code: 'EIO' });
+        }
+        write.call(this, path, document);
+      };
+      console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+      let framework: AgentFramework;
+      try { framework = await h.boot(); } finally { proto.writeRecoveryFile = write; console.error = quiet; }
+      try {
+        assert.equal(withText(framework, 'before it').length, 1, 'a write ahead of it is stored');
+        assert.deepEqual(withText(framework, 'no id given'), [], 'it is not stored under an id the record lacks');
+        assert.deepEqual(withText(framework, 'after it'), [], 'nor what follows it for its agent');
+        const left = h.readQueue().pending;
+        assert.deepEqual(left.map((m) => (m.content as Array<{ text: string }>)[0]!.text), ['no id given', 'after it'], 'both stay queued');
+        assert.match(String(left[0]!.id), /^[0-9a-f-]{36}$/, 'the one with no id under the id it was given');
+        assert.ok(lines.some((l) => l.includes('no id given') || l.includes('stay queued')), lines.join('\n'));
+      } finally { await framework.stop(); }
+      framework = await h.boot();
+      try {
+        assert.deepEqual(rowsOf(framework).filter((m) => ['before it', 'no id given', 'after it'].includes(textOf(m))).map(textOf),
+          ['before it', 'no id given', 'after it'], 'the next boot stores them once each, in order');
+        assert.deepEqual(h.readQueue().pending, []);
+      } finally { await framework.stop(); }
+    } finally {
+      proto.writeRecoveryFile = write;
+      console.error = quiet;
       h.close();
     }
   });

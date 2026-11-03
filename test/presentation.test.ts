@@ -896,3 +896,184 @@ describe('the presentation module when a store call fails', () => {
     assert.deepEqual(r.presentation.presentAtEnd(r.mira).map((m) => m.id), [arrival], "the arrival at the turn's end");
   });
 });
+
+describe('the presentation module at the point after one that failed', () => {
+  /** Run `body` with console.error and console.warn silenced, as the module logs each failure it traces. */
+  const quietly = <T>(body: () => T): T => {
+    const { error, warn } = console;
+    console.error = () => {};
+    console.warn = () => {};
+    try { return body(); } finally { console.error = error; console.warn = warn; }
+  };
+  /** Make `cm.presentRows` throw on its next call only. */
+  const failNextPresent = (cm: ContextManager): void => {
+    const real = cm.presentRows.bind(cm);
+    let fail = true;
+    cm.presentRows = (ids) => {
+      if (fail) { fail = false; throw new Error('a transient write failure'); }
+      return real(ids);
+    };
+  };
+
+  // AF #844 bot review finding 9.
+  it("an own row kept after a failed write stays kept when reading it back throws at the next write, and enters ahead of the rows after it", async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('mira');
+    failNextPresent(r.mira.cm);
+    const reply = quietly(() => storeOwnRow(r.mira, 'mira', text('A: a reply')));
+    assert.equal(r.mira.has(reply), false, 'setup: the reply missed its write');
+    const status = r.mira.cm.windowStatusOf.bind(r.mira.cm);
+    let failStatus = true;
+    r.mira.cm.windowStatusOf = (id) => {
+      if (failStatus) { failStatus = false; throw new Error('a transient read failure'); }
+      return status(id);
+    };
+    quietly(() => storeOwnRow(r.mira, 'user', text('B: its results')));
+    storeOwnRow(r.mira, 'mira', text('C: the next reply'));
+    r.alive.delete('mira');
+    r.presentation.presentAtEnd(r.mira);
+    assert.deepEqual(r.mira.window().slice(-3), ['A: a reply', 'B: its results', 'C: the next reply'], 'in the order they were stored');
+  });
+
+  // AF #844 bot review finding 54.
+  it("an own row whose presentation throws once it is stored still enters an idle observer's window at once", async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('mira');
+    const ordinal = r.mira.cm.ordinalOf.bind(r.mira.cm);
+    let fail = true;
+    r.mira.cm.ordinalOf = (id) => {
+      if (fail) { fail = false; throw new Error('a transient read failure'); }
+      return ordinal(id);
+    };
+    const reply = quietly(() => storeOwnRow(r.mira, 'mira', text("mira's reply")));
+    assert.deepEqual(ofType(r.traces, 'presentation:failed').map((t) => [t.agentName, t.occasion]), [['mira', 'write']], 'setup');
+    assert.equal(r.sub.has(reply), true, 'the idle subconscious takes it through its observe edge at once');
+  });
+
+  // AF #844 bot review finding 79.
+  it("a writer a failed rebase left in legacy mode still tells the idle readers of its slot of its own rows", async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('mira');
+    quietly(() => r.presentation.rebase(r.mira, new Error("its strategy couldn't follow the move")));
+    assert.equal(r.presentation.presenting(r.mira), false, 'setup: mira is left in legacy mode');
+    const reply = storeOwnRow(r.mira, 'mira', text('a reply in legacy mode'));
+    assert.equal(r.sub.has(reply), true, 'the idle subconscious takes it at once');
+  });
+
+  // AF #844 bot review finding 34.
+  it('a failed presentation names the rows that stay out of the window, in its trace and its log', async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('mira');
+    const ids = ['one', 'two'].map((t) => r.write(r.oren, 'someone', text(t), ['mira']));
+    r.alive.delete('mira');
+    failNextPresent(r.mira.cm);
+    const lines: string[] = [];
+    const { error } = console;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    try { r.presentation.presentAtEnd(r.mira); } finally { console.error = error; }
+    assert.deepEqual(ofType(r.traces, 'presentation:failed').map((t) => [t.occasion, (t as { messageIds?: string[] }).messageIds]), [['turn-end', ids]]);
+    assert.ok(lines.some((line) => line.includes('presenting 2 rows') && ids.every((id) => line.includes(id))), lines.join('\n'));
+    assert.deepEqual(ids.map((id) => r.mira.has(id)), [false, false], 'they wait');
+  });
+
+  // AF #844 bot review findings 5 and 13: a failed fresh start fails the start.
+  it("a fresh start whose presentation fails throws, and its arrival waits for the next point; the compile's backstop only traces", async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('mira');
+    const arrival = r.write(r.oren, 'someone', text('a question for mira'), ['mira']);
+    failNextPresent(r.mira.cm);
+    quietly(() => assert.throws(() => r.presentation.presentAtStart(r.mira, 'turn-start'),
+      (error: Error) => error.message.includes("mira's turn start could not present what it is owed") && error.message.includes('a transient write failure')));
+    assert.equal(r.mira.has(arrival), false, 'the arrival waits outside the window');
+    assert.deepEqual(ofType(r.traces, 'presentation:failed').map((t) => [t.occasion, (t as { messageIds?: string[] }).messageIds]), [['turn-start', [arrival]]]);
+    const own = storeOwnRow(r.mira, 'user', text('a notice held back'), undefined, undefined, false);
+    failNextPresent(r.mira.cm);
+    assert.deepEqual(quietly(() => r.presentation.presentAtStart(r.mira, 'compile')), [], "the backstop's failure doesn't throw");
+    assert.equal(r.mira.has(own), false);
+    assert.deepEqual(r.presentation.presentAtStart(r.mira, 'turn-start').map((m) => m.id), [arrival], 'the next start presents it');
+  });
+
+  // AF #844 bot review finding 20.
+  it("rows a write-down took in that aren't the agent's, whose retraction failed at adopt, leave its window at its next turn start", async () => {
+    const r = await rig();
+    r.presentation.adopt(r.mira);
+    const dm = r.write(r.mira, 'alice', text('a DM for mira alone'), ['mira']);
+    const reply = storeOwnRow(r.mira, 'mira', text("mira's private reply"));
+    const both = r.write(r.mira, 'someone', text('for both'), ['mira', 'oren']);
+    const retract = r.oren.cm.retractRows.bind(r.oren.cm);
+    let fail = true;
+    r.oren.cm.retractRows = (ids, options) => {
+      if (fail) { fail = false; throw new Error('a transient write failure'); }
+      return retract(ids, options);
+    };
+    quietly(() => r.presentation.adopt(r.oren));
+    assert.deepEqual([r.oren.has(dm), r.oren.has(reply)], [true, true], "setup: mira's rows are in oren's window");
+    assert.deepEqual(ofType(r.traces, 'presentation:failed').map((t) => [t.agentName, t.occasion]), [['oren', 'adopt']]);
+    r.presentation.presentAtStart(r.oren, 'turn-start');
+    assert.deepEqual([r.oren.has(dm), r.oren.has(reply), r.oren.has(both)], [false, false, true], 'taken out at its next start');
+    assert.deepEqual(ofType(r.traces, 'presentation:retracted').map((t) => [t.agentName, t.reason, t.messageIds]), [['oren', 'elsewhere', [dm, reply]]]);
+    r.presentation.presentAtEnd(r.oren);
+    assert.equal(ofType(r.traces, 'presentation:retracted').length, 1, 'and not again');
+  });
+
+  // AF #844 bot review finding 53.
+  it("framing whose presentation into a fork's window failed enters at the fork's next turn start", async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('mira');
+    const inherited = storeOwnRow(r.mira, 'mira', text("mira's reply"));
+    const later = r.write(r.oren, 'someone', text('a row the fork is handed'), ['mira']);
+    const kidCm = await r.mira.cm.derive({ branch: 'kid-branch', strategy: new PassthroughStrategy() });
+    closers.push(() => kidCm.close());
+    const kid = new TestAgent('kid', kidCm, ['kid', 'mira']);
+    r.live.set('kid', kid);
+    r.presentation.adopt(kid);
+    failNextPresent(kid.cm);
+    quietly(() => r.presentation.noteFramed(kid, [inherited, later]));
+    assert.equal(kid.has(later), false, 'setup: its presentation failed');
+    r.presentation.presentAtStart(kid, 'turn-start');
+    assert.equal(kid.has(later), true, "presented at the fork's next start");
+    assert.deepEqual(ofType(r.traces, 'presentation:presented').filter((t) => t.agentName === 'kid' && t.occasion === 'framing').map((t) => t.count), [1]);
+  });
+
+  // AF #844 bot review finding 55.
+  it("a scan of an agent's pending rows starts after the rows it found elsewhere before, and finds what is stored after them", async () => {
+    const r = await rig();
+    r.adoptAll();
+    const foreign = ['one', 'two', 'three'].map((t) => r.write(r.oren, 'someone', text(t), ['oren']));
+    const asked: Array<number | undefined> = [];
+    const list = r.mira.cm.getUnpresentedMessages.bind(r.mira.cm);
+    r.mira.cm.getUnpresentedMessages = (options) => { asked.push(options?.afterSequence); return list(options); };
+    assert.deepEqual(r.presentation.owedOf(r.mira), [], "oren's rows are nothing to mira");
+    assert.deepEqual(r.presentation.owedOf(r.mira), []);
+    assert.deepEqual(asked, [undefined, r.oren.cm.getMessage(foreign.at(-1)!)!.sequence], 'the second scan lists only the rows after those it weighed');
+    r.alive.add('mira');
+    const arrival = r.write(r.oren, 'someone', text('for mira'), ['mira']);
+    assert.deepEqual(r.presentation.owedOf(r.mira).map((m) => m.id), [arrival], 'a row stored after them is found');
+  });
+
+  // AF #844 bot review finding 62.
+  it("arrivals a rollback holds until the next start are held on its branch only", async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('mira');
+    const returned = r.write(r.oren, 'someone', text('returned'), ['mira']);
+    r.alive.delete('mira');
+    r.presentation.holdUntilStart(r.mira, [returned]);
+    assert.deepEqual(r.presentation.presentAtEnd(r.mira), [], 'setup: held at rest');
+    const main = r.store.currentBranch().name;
+    r.store.createBranchAt('other', main, r.store.currentSequence());
+    r.store.switchBranch('other');
+    for (const agent of r.live.values()) r.presentation.rebase(agent);
+    assert.deepEqual(r.presentation.presentAtEnd(r.mira).map((m) => m.id), [returned], 'on another branch it is an arrival as any');
+    r.store.switchBranch(main);
+    for (const agent of r.live.values()) r.presentation.rebase(agent);
+    assert.deepEqual(r.presentation.presentAtEnd(r.mira), [], 'back on its branch, still held');
+    assert.deepEqual(r.presentation.presentAtStart(r.mira, 'turn-start').map((m) => m.id), [returned], 'until the next start');
+  });
+});

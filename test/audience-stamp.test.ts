@@ -3,8 +3,10 @@
  * for (`metadata.audience`), and an agent's own rows name it as their owner
  * (`metadata.ownRowOf`), whichever path stored them: the framework's
  * addMessage, or a writer that stores into an agent's context directly.
- * "Own" goes by who stored the row, not by its participant. The stamp is
- * metadata only, so compiles are what they were.
+ * "Own" goes by who stored the row, not by its participant. Context-manager's
+ * compile doesn't read the stamp, so a window compiles as the same rows
+ * unstamped do; the presentation index does, so another resident's own rows
+ * no longer enter a resident's window.
  *
  * Also the registry's own-slot / observe split as the framework uses it: an
  * ended subconscious reopens on its own isolated slot (it read the shared
@@ -241,7 +243,7 @@ describe('the audience stamp (#291)', () => {
     }
   }
 
-  /** mira's compile against the same rows unstamped, in a store of their own: the stamp is metadata only. */
+  /** mira's compile against the same rows unstamped, in a store of their own: context-manager's compile doesn't read the stamp. */
   async function assertCompilesAsUnstamped(framework: AgentFramework): Promise<void> {
     const stamped = framework.getAgent('mira')!.getContextManager();
     assert.ok(stamped.getAllMessages().every((r) => audienceOf(r.metadata) !== undefined), 'every row is stamped');
@@ -267,7 +269,7 @@ describe('the audience stamp (#291)', () => {
     }
   }
 
-  it('compiles are byte for byte what they were: the stamp is metadata only', async () => {
+  it("a window compiles byte for byte as its rows unstamped do: context-manager's compile doesn't read the stamp", async () => {
     const framework = await boot();
     framework.start();
     membrane.script('mira', ping('call-1'), say('mira done'));

@@ -11,7 +11,9 @@
   dropped, logged. A tune-out's release among them wakes its agent, and mail among them is released as it is stored
   and wakes its recipient. The store is synced, and only then is the record cleared; where it doesn't sync, the
   record is left as it was and the next boot skips what landed. A write that can't be stored, or whose agent's store
-  can't be searched, keeps it and that agent's later writes in the record for the next boot. An unreadable record,
+  can't be searched, keeps it and that agent's later writes in the record for the next boot, which stores them after
+  the writes made for that agent later in this process (each stored as it was made), so they land after those in
+  its store and its window. An unreadable record,
   or one that holds anything but a queue, still fails `create()`. The imported rows enter each agent's window at the
   boot's pass, or at `resume()` on a quiesced host, apart from an agent's own rows.
 - A tune-out's release for the resident, and its notices for the subconscious, are stored at once and made durable

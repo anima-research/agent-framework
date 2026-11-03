@@ -5,11 +5,12 @@ import type { ContextManager, MessageId, StoredMessage } from '@animalabs/contex
  * write's agent's turn was alive: `held:` and the write's id in its deferred
  * queue, which the stored row carries as `metadata.deferredWriteId` once it
  * lands. This release stores every write at once and answers its stored id,
- * so no write gets a handle any more, but a module may have kept one across
- * the upgrade: for one release the context's getMessage, editMessage and
- * removeMessage still take it, and reach the row its write landed as
- * (AgentFramework.landedRow), which the importer stores at boot for a write
- * that release left queued.
+ * unless a surgery's hold or a context manager refusing its work keeps the
+ * write in memory, where it answers '', so no write gets a handle any more.
+ * A module may have kept one across the upgrade: for one release the
+ * context's getMessage, editMessage and removeMessage still take it, and
+ * reach the row its write landed as (AgentFramework.landedRow), which the
+ * importer stores at boot for a write that release left queued.
  */
 const HELD = 'held:';
 

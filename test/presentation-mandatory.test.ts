@@ -2,11 +2,12 @@
  * Presentation is mandatory (#291, AF-6): FrameworkConfig.presentationIndex
  * is gone, and every agent is taken on as it is registered, its window
  * written down and presented, whatever a host's configuration still says. A
- * turn's requests are its window, which with no other agent's turn
- * overlapping it is the record, and a write stamped only for agents that
- * can't read its slot is traced once. A context-manager that keeps no
- * window index is refused, and so is a store handle without chronicle's
- * batched identity append, with which context-manager writes a window.
+ * turn's requests are its window, which is the record when no other
+ * agent's turn overlaps it and every row in the slot is meant for it, and a
+ * write stamped only for agents that can't read its slot is traced once. A
+ * context-manager that keeps no window index is refused, and so is a store
+ * handle without chronicle's batched identity append, with which
+ * context-manager writes a window.
  */
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -83,7 +84,7 @@ describe('presentation is mandatory (#291)', () => {
         // mira's window holds every row of its turn, in the order its requests carried them.
         const cm = r.framework.getAgent('mira')!.getContextManager();
         assert.deepEqual(cm.getPresentedMessages().map((m) => m.id), cm.getAllMessages().map((m) => m.id),
-          "with no other turn in the slot, mira's window is the record");
+          "with no other turn in the slot and every row in it meant for her, mira's window is the record");
       } finally {
         await r.framework.stop();
       }

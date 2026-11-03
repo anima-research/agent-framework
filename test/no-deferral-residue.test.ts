@@ -1,8 +1,10 @@
 /**
  * The deferral queue is gone (#291, AF-6): a write is stored at once, and
- * enters each agent's window at that agent's presentation points. Only a
- * surgery's hold keeps a write out of the store, in memory, until its
- * release. A release before it left its queue on disk, which the importer
+ * enters each agent's window at that agent's presentation points. Two holds
+ * keep a write out of the store, in memory: a surgery's hold, until its
+ * release, and an agent's context manager that refuses its work after a
+ * failed re-initialization, until a branch move re-initializes it. A
+ * release before it left its queue on disk, which the importer
  * reads once at boot (src/deferred-import.ts and the framework's
  * importPersistedDeferredWrites), for one release.
  *
@@ -20,7 +22,7 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from '@babel/parser';
 
@@ -33,6 +35,10 @@ const GONE = [
   'flushDeferredWrites', 'ackDeferredWrites', 'handOffDeferredWrites', 'persistDeferredWrites',
   'writeDeferredWritesForQuiesce', 'restorePersistedDeferredWrites', 'fromQueue', 'deferredId',
   'DeferredWrite', 'DrainedWrite', 'storedCopiesOf', 'logDeferredWriteError', 'passOnFromReleasedWindow',
+  // Main's persistence of the queue: its writer, its durable copy and slot,
+  // its record, and its fell-behind and caught-up accounting.
+  'writeDeferredWrites', 'durableDeferredWrites', 'writeDeferredWritesSlot', 'deferredWritesRecord', 'DeferredWritesOutcome',
+  'deferredWritesBehind', 'deferredWritesFellBehind', 'deferredWritesCaughtUp', 'deferredWritesCapLogged',
   // The module API's handles onto queued writes, and the wakes that read them.
   'heldHandle', 'heldWritesFor', 'heldRows', 'settleUnknownLandings', 'deferredWriteDone', 'readsDeferredWrite',
   'readsDeferredFor', 'resolvePlacement', 'refuseUnsettled',
@@ -92,6 +98,12 @@ function memberName(node: unknown): string | undefined {
   return keyName(node.property);
 }
 
+/** What a callee, an assignment's target or a cast reads: a member's
+ *  property, or a name on its own (`f`, as `const { f } = a` makes one). */
+function readName(node: unknown): string | undefined {
+  return isNode(node) && node.type === 'Identifier' ? node.name as string : memberName(node);
+}
+
 /** How many parameters a function, or a function's type, takes; undefined for anything else. */
 function arity(node: unknown): number | undefined {
   if (!isNode(node)) return undefined;
@@ -129,9 +141,10 @@ function namesIn(sources: Array<{ name: string; text: string }>): Use[] {
         if (name !== undefined && RELEASED.has(name) && count !== undefined && count > 1) use(name, { extra: count - 1 });
       };
       switch (node.type) {
-        // A read with more than the agent: X.releasedWindow(agent, held).
+        // A read with more than the agent: X.releasedWindow(agent, held), or
+        // releasedWindow(agent, held) once destructured out of X.
         case 'CallExpression': case 'OptionalCallExpression':
-          released(memberName(node.callee), (node.arguments as unknown[]).length); break;
+          released(readName(node.callee), (node.arguments as unknown[]).length); break;
         // A method of the shape: releasedWindow(agent, held) { … } or `releasedWindow(agent, held): …` in a type.
         case 'ClassMethod': case 'ClassPrivateMethod': case 'TSDeclareMethod': case 'ObjectMethod': case 'TSMethodSignature':
           released(keyName(node.key), ((node.params ?? node.parameters) as unknown[]).length); break;
@@ -140,10 +153,10 @@ function namesIn(sources: Array<{ name: string; text: string }>): Use[] {
           released(keyName(node.key), arity(node.typeAnnotation ?? node.value)); break;
         // A stand-in put in its place: X.releasedWindow = (agent, held) => ….
         case 'AssignmentExpression':
-          released(memberName(node.left), arity(node.right)); break;
+          released(readName(node.left), arity(node.right)); break;
         // A read cast to the shape: (X.releasedWindow as (agent, held) => …).
         case 'TSAsExpression': case 'TSSatisfiesExpression': case 'TSTypeAssertion':
-          released(memberName(node.expression), arity(node.typeAnnotation)); break;
+          released(readName(node.expression), arity(node.typeAnnotation)); break;
       }
       for (const [field, value] of Object.entries(node)) {
         if (field === 'leadingComments' || field === 'trailingComments' || field === 'innerComments') continue;
@@ -164,14 +177,16 @@ const inImporter = (use: Use): boolean =>
   use.file === IMPORTER.file || use.scope === IMPORTER.scope || use.scope.startsWith(`${IMPORTER.scope}.`);
 const where = (use: Use): string => `${use.file}:${use.line} ${use.name}${use.extra ? ` (+${use.extra})` : ''} (in ${use.scope || 'the file'})`;
 
-/** Every source file under `root` whose name ends in one of `endings`, named by its path from there. */
+/** Every source file under `root` whose name ends in one of `endings`, named
+ *  by its path from there with `/` between its parts, as the lists name it,
+ *  whatever the platform's separator. */
 function sourcesUnder(root: string, endings: readonly string[]): Array<{ name: string; text: string }> {
   const sources: Array<{ name: string; text: string }> = [];
   const walk = (dir: string): void => {
     for (const name of readdirSync(dir)) {
       const full = join(dir, name);
       if (statSync(full).isDirectory()) walk(full);
-      else if (endings.some((ending) => name.endsWith(ending))) sources.push({ name: full.slice(root.length), text: readFileSync(full, 'utf8') });
+      else if (endings.some((ending) => name.endsWith(ending))) sources.push({ name: relative(root, full).split(sep).join('/'), text: readFileSync(full, 'utf8') });
     }
   };
   walk(root);
@@ -247,6 +262,9 @@ it("the scan finds the released window read, typed or stood in for with the queu
       "assert.ok(id && !id.startsWith('held:'));",
       "ctx.getMessage('held:w1'); ctx.getMessage(`held:${id}`);",
       "assert.equal(x, true, 'held: out of the live turn\\'s window');",
+      'const { releasedWindow } = state; releasedWindow(agent, new Set()); releasedWindow(agent);',
+      'let { releaseWindow } = owner; releaseWindow = (agent: unknown, held: unknown) => usual(agent, held);',
+      '(releasedWindow as (agent: unknown, held: Set<string>) => unknown)(agent, held);',
     ].join('\n'),
   }]);
   assert.deepEqual(uses.filter((u) => u.extra !== undefined).map((u) => `${u.line} ${u.name} +${u.extra}`), [
@@ -255,6 +273,10 @@ it("the scan finds the released window read, typed or stood in for with the queu
     '3 releasedWindow +1',
     '5 releasedWindow +1',
     '6 releasedWindow +1',
+    // Destructured: a read, a stand-in and a cast, by the name alone.
+    '11 releasedWindow +1',
+    '12 releaseWindow +1',
+    '13 releasedWindow +1',
   ], 'every read, typing and stand-in with more than the agent, and none with the agent alone');
   assert.deepEqual(uses.filter(handle).map((u) => `${u.line} ${u.name}`), ['8 held:', '9 held:w1', '9 held:'],
     "a handle and a check for one; the prose label isn't");

@@ -506,8 +506,9 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       { name: 'the long text, then an image', content: [...text(long), image] },
       { name: 'a short text, an image, then the long text', content: [...text('Intro. '), image, ...text(long)] },
     ];
-    // Every case is run, and those whose injection differs from the next
-    // compile are named together.
+    // Every case is run, and each one that isn't as it should be (not
+    // sharded, not one message injected and one in the next request, or an
+    // injection that differs from the next compile) is named, together.
     const differ: string[] = [];
     for (const [i, { name, content }] of cases.entries()) {
       membrane = new MockMembrane();
@@ -533,21 +534,26 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
         framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
         await framework.runUntilIdle();
         const landed = cm.getAllMessages().filter((m) => (m as { bodyGroupId?: string }).bodyGroupId);
-        assert.ok(landed.length > 1, `${name}: stored as ${landed.length} shards`);
+        if (landed.length <= 1) {
+          differ.push(`${name}: stored as ${landed.length} shard(s), not sharded`);
+          continue;
+        }
         const injected = ofLong(membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? []);
         // The next turn's request is compiled from the window.
         membrane.pushResponse(createMockResponse(text('Okay.')));
         framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
         await framework.runUntilIdle();
         const next = ofLong(membrane.calls.at(-1)!.messages);
-        assert.equal(injected.length, 1, `${name}: one message injected`);
-        assert.equal(next.length, 1, `${name}: one message in the next request`);
-        if (!isDeepStrictEqual(injected[0]!.content, next[0]!.content)) differ.push(name);
+        if (injected.length !== 1 || next.length !== 1) {
+          differ.push(`${name}: ${injected.length} message(s) injected, ${next.length} in the next request, where one of each is`);
+          continue;
+        }
+        if (!isDeepStrictEqual(injected[0]!.content, next[0]!.content)) differ.push(`${name}: the injection differs from the next compile`);
       } finally {
         await framework.stop();
       }
     }
-    assert.deepEqual(differ, [], 'the boundary carried what the next compile renders');
+    assert.deepEqual(differ, [], 'each sharded body stored whole, and the boundary carried what the next compile renders');
   });
 
   it('a turn waiting to retry when the framework stops gives up rather than compile again', { timeout: 60_000 }, async () => {
@@ -618,8 +624,14 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     await compiling;
     assert.deepEqual(agent.getConsumedWatermark(), marked, "the boundary's mark stands");
     (cm as unknown as { compile: typeof compile }).compile = compile;
+    // A row presented since, so the later compile has something past the
+    // boundary's mark to cover.
+    const since = internalsOf(framework).addMessage('Antra', text('presented since'));
+    assert.equal(cm.windowStatusOf(since as never), 'in', 'presented at once: no turn is alive');
     await agent.compileContext();
-    assert.equal(markAtOrAfter(agent.getConsumedWatermark()!, marked!), true, 'a later compile still advances it');
+    const after = agent.getConsumedWatermark()!;
+    assert.equal(markAtOrAfter(after, marked!), true, 'a later compile still advances it');
+    assert.equal(markAtOrAfter(marked!, after), false, "past the boundary's mark, over the row presented since");
     await framework.stop();
   });
 

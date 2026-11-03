@@ -300,8 +300,9 @@ describe('live operator surgery', () => {
   });
 
   it("the hold's release stores several agents' writes in the order they arrived", { timeout: 60_000 }, async () => {
-    // Residents share one message slot, so the order writes arrived in is the
-    // order every resident reads.
+    // Residents share one message slot, so the writes are stored in it in the
+    // order they arrived, whoever each is stamped for ('two' is builder's
+    // alone, out of scout's window).
     await framework.stop();
     framework = await AgentFramework.create({
       storePath,

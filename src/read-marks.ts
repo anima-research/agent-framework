@@ -96,10 +96,12 @@ function mark(branch: string, head: number, length: number | null): ReadMark {
 
 /**
  * A mark of where `cm` stands now: its branch, the store's head (the
- * chronicle head, not the slot's last row: a compile reads everything stored
- * on the branch, rows merged in from another slot included; a double without
- * a store gives its last row's sequence), and its index length when it is in
- * presented mode. Null for a double that can't say, or when reading throws.
+ * chronicle head, not the slot's last row: in legacy mode a compile reads
+ * everything stored on the branch, rows merged in from another slot
+ * included; a double without a store gives its last row's sequence), and
+ * its index length when it is in presented mode, where a compile reads the
+ * window and the mark covers by that length, not by the head. Null for a
+ * double that can't say, or when reading throws.
  */
 export function readMarkOf(cm: MarkCm): ReadMark | null {
   try {
@@ -115,9 +117,11 @@ export function readMarkOf(cm: MarkCm): ReadMark | null {
 
 /**
  * The store's head as `cm` reads it now, the head a mark readMarkOf takes
- * keeps: the chronicle head, not the slot's last message, since a compile
- * reads everything stored on the branch so far, rows merged in from another
- * slot included. A record sequence, on the branch `cm` is on: for a reader
+ * keeps: the chronicle head, not the slot's last message, since in legacy
+ * mode a compile reads everything stored on the branch so far, rows merged
+ * in from another slot included (in presented mode it reads the window,
+ * which a mark covers by its index length). A record sequence, on the
+ * branch `cm` is on: for a reader
  * that compares stored rows' sequences with it on that branch (Agent's
  * branchHead), not a cover of the window. Null for a context double that
  * can't say.

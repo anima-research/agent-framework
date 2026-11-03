@@ -30,6 +30,7 @@ function internals(framework: AgentFramework) {
     closingConversationAgents: Set<string>;
     activeStreams: Map<string, Promise<void>>;
     recordChannelAutoOpenNotice(agentName: string | undefined, serverId: string, channels: Array<{ channelId: string; label?: string }>, cause: 'subscription-policy' | 'opened-by-delivery' | 'opened-by-reply'): void;
+    recordReplyOpenFailedNotice(agentName: string | undefined, serverId: string, channel: { channelId: string; label?: string }, selectedForOpening?: 'server-bootstrap' | 'subscription-policy' | 'unrecorded'): void;
     addMessage(participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, opts?: { forAgent?: string }): string;
   };
 }
@@ -1183,6 +1184,64 @@ describe('notices about an agent\'s own action', () => {
         `[channel] ${fork.name} has ended, and no channel its notice said opened is decided open or tuned out now (#home (missing-channel)): no one is told`));
     });
 
+    // Ported from main's flush-time cases (c-9, c-22), which read a queue
+    // this branch no longer has: a fork's unread "Not open" notice is passed
+    // on at its release only while its channel is still decided open and its
+    // transport, on the notice's own server, isn't open.
+    /** A fork whose reply's channel failed to open, its notice unread. */
+    async function forkWithUnreadOpenFailure() {
+      const fork = await spawnFork();
+      const state = internals(framework);
+      decide('missing-channel', 'open', 'server-bootstrap');
+      state.recordReplyOpenFailedNotice(fork.name, 'srv', { channelId: 'missing-channel', label: '#home' }, 'server-bootstrap');
+      const stored = fork.getContextManager().getAllMessages()
+        .filter((m) => JSON.stringify(m.content).includes('Not open: #home'));
+      assert.equal(stored.length, 1, "the fork's notice is stored for it");
+      assert.equal((stored[0]!.metadata as { passOn?: { notice?: unknown } } | undefined)?.passOn?.notice, 'reply-open-failed',
+        'with the inputs a release passes on');
+      return { fork, state };
+    }
+    const openTransport = (state: ReturnType<typeof internals>, serverId: string) =>
+      (state.channelRegistry as unknown as { channels: Map<string, unknown> }).channels.set(
+        destinationKey({ serverId, channelId: 'missing-channel' }),
+        { serverId, descriptor: { id: 'missing-channel', type: serverId, label: '#home' }, open: true });
+
+    it("tells the primary nothing, logged, of a channel a fork's unread notice said was not open, once its transport has opened", async (t) => {
+      const errors: string[] = [];
+      t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+      const { fork, state } = await forkWithUnreadOpenFailure();
+      // Still decided open, and open since.
+      openTransport(state, 'srv');
+      assert.equal(state.channelRegistry.getDesiredState('srv', 'missing-channel'), 'open', 'still decided open');
+
+      reap(fork.name);
+
+      assert.equal(framework.getAgent(fork.name), null, 'released');
+      const told = framework.getAgent('primary')!.getContextManager().getAllMessages()
+        .filter((m) => JSON.stringify(m.content).includes('Not open: #home'));
+      assert.deepEqual(told.map((m) => m.content), [], 'the primary is told nothing');
+      assert.ok(errors.includes(
+        `[channel] ${fork.name} has ended, and #home (missing-channel), which its notice said was not open and selected for opening, is open now or no longer decided open: no one is told`),
+      errors.join('\n'));
+    });
+
+    it("tells the primary, by name, of a channel a fork's unread notice said was not open while another server's channel with its id is open", async () => {
+      const { fork, state } = await forkWithUnreadOpenFailure();
+      // The same id on another server, open; the notice's own isn't.
+      openTransport(state, 'other');
+
+      reap(fork.name);
+
+      assert.equal(framework.getAgent(fork.name), null, 'released');
+      const told = framework.getAgent('primary')!.getContextManager().getAllMessages()
+        .filter((m) => JSON.stringify(m.content).includes('Not open: #home'));
+      assert.equal(told.length, 1, 'the primary is told once');
+      assert.equal((told[0]!.content[0] as { text: string }).text,
+        `[channels] Not open: #home (srv:missing-channel). A reply from your fork in srv:missing-channel, named ${fork.name}, went out there, but opening the channel failed; that fork has ended. ` +
+        "It's selected for opening again, because its server lists it as open by default: the host tries again, and channel_close withdraws that.");
+      assert.equal((told[0]!.metadata as { speaker?: unknown } | undefined)?.speaker, fork.name);
+    });
+
     it("passes on no channel notice its reader couldn't act on: the primary was told then, once", async () => {
       const fork = await spawnFork();
       const state = internals(framework);
@@ -1482,9 +1541,9 @@ describe('notices about an agent\'s own action', () => {
           await framework.resume({ force: true });
         }
         assert.equal(framework.getAgent(fork.name), null, 'the fork is disposed when its closure turn ends');
-        // other-tool-cycle: a write waits only for its own target's tool
-        // cycle, so neither the fork's notice nor the primary's waits for the
-        // secondary's.
+        // other-tool-cycle: a write is stored at once, and only its
+        // presentation waits, for its own target's points, so neither the
+        // fork's notice nor the primary's waits on the secondary's tool cycle.
         // Open a fresh manager over the retained fork namespace, rather than
         // relying only on the disposed Agent's in-memory context manager.
         const archive = await ContextManager.open({

@@ -1046,8 +1046,9 @@ describe('Residents read one message slot', () => {
       [] as ContentBlock[],
     ], LEGACY);
     // While scout's tool runs, a message for shade is stored at once, an
-    // arrival for scout's turn. Then one for scout waits in its queue, and
-    // scout's boundary stores it after, re-pinning the turn there.
+    // arrival for scout's turn. Then one for scout is stored at once too and
+    // kept out of scout's window until its next presentation point, the
+    // boundary, which presents it after, re-pinning the turn there.
     pause.during = async () => {
       i.addMessage('Antra', [{ type: 'text', text: 'shade, a word' }],
         { channelId: 'discord:dm:xenia', serverId: 'discord', tags: ['chat:addressed'] }, { forAgent: 'shade' });

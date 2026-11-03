@@ -250,7 +250,8 @@ export interface FrameworkConfig {
    * write in memory instead, and a crash loses it: a live operator surgery
    * (a rollback, a suppression, a branch switch), until its release stores
    * it, and an agent's context manager refusing its work after a failed
-   * re-initialization, until a switchBranch() re-initializes it.
+   * re-initialization, until a branch move (switchBranch, a rollback or a
+   * suppression) re-initializes it.
    *
    * create() reads the record once and stores its writes. A write for an
    * agent no longer registered goes to the primary when it is a failed

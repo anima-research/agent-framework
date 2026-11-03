@@ -31,7 +31,8 @@ export const SUBCONSCIOUS_TOOLS: ToolDefinition[] = [
     name: 'deliver_summary',
     description:
       'Deliver a summary into the resident\'s context: `text` arrives there ' +
-      'verbatim, under your own name.',
+      'verbatim (leading and trailing whitespace trimmed), under your own ' +
+      'name.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -53,7 +54,8 @@ export const SUBCONSCIOUS_TOOLS: ToolDefinition[] = [
       'End the tune-out on a channel now. The diverted backlog is delivered ' +
       'to the resident (capped), and the channel\'s traffic reaches them as ' +
       'it did before the tune-out. A note in `text` arrives alongside the ' +
-      'backlog, verbatim, under your own name. If you were started to read ' +
+      'backlog, verbatim (leading and trailing whitespace trimmed), under ' +
+      'your own name. If you were started to read ' +
       'one hold, you can end only that hold.',
     inputSchema: {
       type: 'object',
@@ -90,7 +92,8 @@ export const SUBCONSCIOUS_TOOLS: ToolDefinition[] = [
   {
     name: 'speak_in_channel',
     description:
-      'Post `text` into a tuned-out channel, as written. It goes out through ' +
+      'Post `text` into a tuned-out channel, as written (leading and trailing ' +
+      'whitespace trimmed). It goes out through ' +
       'the resident\'s publish path, so the channel sees it under the ' +
       'resident\'s account; nothing in the post names you. If you were ' +
       'started to read one hold, you can post only into a channel that hold ' +

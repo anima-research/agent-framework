@@ -169,7 +169,8 @@ export interface ObserveEdge {
   fromSequence?: number;
   /**
    * Only messages from this one on, by message id, which names one row on
-   * every branch and in every agent's presentation order (#291).
+   * every branch and in every agent's presentation order (#291). Not read
+   * yet: an edge that sets it shows the rows one without it shows.
    */
   fromMessageId?: string;
   /** Whether held (policy-diverted) traffic in that slot is visible. */
@@ -392,7 +393,7 @@ export interface AgentRecord {
   /**
    * Whether the agent reads the residents' shared slot, as its own slot or
    * through an observe edge: derived from `ownSlot` and `relationships.observes`
-   * when the record is made.
+   * at each registration of the record (a restored one included), not once.
    *
    * @deprecated Use `ownSlot` and `relationships.observes`.
    */

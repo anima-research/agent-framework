@@ -251,7 +251,7 @@ describe('HistoryModule semantic_search', () => {
   });
 
   it('another branch\'s summary under the same id is dropped as off-branch, and this branch\'s is found by its own words and dated by its own start', async () => {
-    // A branch made from an earlier point, as an undo makes one, can mint a
+    // A branch made from an earlier point, as a rollback makes one, can mint a
     // summary id another branch already used. Each summary's key carries its
     // creation time, so the index holds both, and a hit is this branch's only
     // when its time is this branch's summary's.

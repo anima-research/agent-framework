@@ -8,8 +8,10 @@
   its window the whole record, as before, until a branch move writes its window down on the new branch.
   - **Undo and redo are on the agent's window** (decision 4): `undoLastTurn` takes the turn's rows out of the
     agent's window, its own as undone and others' back to arrived, and `redo` puts them back. In a turn an earlier
-    release recorded, whose rows carry no audience stamp, a row stored under the agent's name, or one holding only
-    results of its own calls, is its own. Neither writes the
+    release recorded, whose rows carry no audience stamp, a row stored under the agent's name, one holding only
+    results of its own calls, or a framework notice whose metadata names it as its owner (a drafts notice or a
+    delivery receipt by `draftOwner`, an `[auto-continue]` row by `agentName`, a stored context injection by its
+    mark's `agent`), is its own. Neither writes the
     record or moves a branch, so neither reverts the workspace or `_config` mounts, MCPL checkpoints or the
     inference log any more: `rollbackToMessage` is the record-level revert. Neither marks the Discord messages it
     takes out of the window as removed, as no turn undo has since 0.24.0 made awareness marks one-shot; a host that
@@ -24,6 +26,14 @@
     the result carries no `settled`. So neither takes 0.28.0's `agent-busy` refusals while another agent sharing
     the store is busy or a conversation agent is being created, a coalesced update or retraction made meanwhile
     isn't held back, and neither judges a conversation agent for disposal, as a move does.
+  - **A resident is shown another resident's rows only through `observes`** (decision 1): its window takes its own
+    rows, the rows meant for it (their audience stamp, the 291-audience-stamp entry) and the own rows of each agent
+    it observes (`AgentConfig.observes`, none by default, the 291-resident-observes entry). In 0.32.0 a resident's
+    view was the whole shared slot but held traffic and the other residents' stored context injections, so it was
+    shown each co-resident's rounds, replies, tool results and notes, and the mail and messages meant for them. Rows
+    stored before the upgrade carry no stamp and stay in the window its write-down takes from the record; a row
+    stored since that is another resident's own enters a resident's window only through `observes`, and one meant
+    only for another resident (its mail, a message addressed to it) enters none of the others'.
   - **Context-manager's MANIFEST:** the first window write-down that holds rows, or any presentation of more than
     one row, moves the store's MANIFEST to version 2, which chronicle 0.5.0 and earlier refuse, and so does a release
     whose chronicle range resolves one, such as agent-framework 0.30.0 or context-manager 0.24.0 (context-manager's
@@ -32,4 +42,7 @@
 
   **Migration:** drop `presentationIndex` from the configuration. A host that listened for `undo:completed`,
   `redo:completed`, or `branch:switched` with reason `undo`/`redo`, to refresh a view listens for `window:undone`.
-  A host that relied on undo reverting a mount or the inference log uses `rollbackToMessage`.
+  A host that relied on undo reverting a mount or the inference log uses `rollbackToMessage`. A host whose
+  residents read each other's rounds sets `observes` on each resident, naming the others: an edge is one way, so
+  two residents that share their rounds each name the other. Mail and messages meant for a co-resident stay out of
+  a resident's window either way.

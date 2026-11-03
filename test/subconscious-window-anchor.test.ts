@@ -13,8 +13,9 @@
  *     rows, sets the start back to the older tune-out's ordinal exactly. (c)
  *     The start is the same after a restart, over the same window. (d)
  *     While the window is the record (an earlier release's, or one whose
- *     write-down failed, which pins it so for the process) the start is set
- *     by sequence, as before. (e) A kept ordinal past a shorter window is
+ *     write-down failed, which pins it so until a branch move writes it
+ *     down: rebase) the start is set by sequence, as before. (e) A kept
+ *     ordinal past a shorter window is
  *     clamped and traced. (f) A tune-out active at the upgrade gets its
  *     ordinal right after the window is written down, in record order. (g)
  *     A cancel forgets the tune-out's start. (h) A cancel of the oldest
@@ -23,8 +24,9 @@
  *     (its `inForce`) rather than setting the other's.
  *
  * Since #291 every framework presents, so the tests stand in for an earlier
- * release's process by one whose write-down fails (boot's `legacy`), which keeps
- * each window the record for that process, as that release kept it.
+ * release's process by one whose write-down fails (boot's `legacy`), which
+ * keeps each window the record, as that release kept it, until a branch
+ * move writes it down (rebase).
  */
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -524,12 +526,14 @@ describe('SubconsciousWindowAnchor', () => {
     return { anchor, calls, fixed, traces, state };
   }
 
-  it('(e) clamps a kept ordinal past the window to its length, and traces it', () => {
+  it('(e) clamps a kept ordinal past the window to its length, keeps the clamped one, and traces it', () => {
     const h = host({ length: 4 });
     h.anchor.set({ sequence: 50, ordinal: 9, epochIds: ['t1'] });
     assert.deepEqual(h.calls, ['setAnchorOrdinal(4)']);
     assert.deepEqual(h.traces, [{ type: 'tune-out:subconscious-window', agentName: SUB, epochIds: ['t1'], how: 'clamped', ordinal: 4, kept: 9 }]);
-    assert.deepEqual(h.fixed, [], 'the kept ordinal stays kept');
+    // AF #844 review 8, finding 67: the kept 9 stayed kept, so a restart on
+    // a longer window set 9, past rows the window held from 4 on.
+    assert.deepEqual(h.fixed, [{ epochIds: ['t1'], ordinal: 4 }], 'the clamped ordinal is kept as the start');
   });
 
   it('sets by sequence in legacy mode, and fixes a start only once nothing owed is older', () => {
