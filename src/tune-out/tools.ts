@@ -1,7 +1,7 @@
 import type { ContentBlock } from '@animalabs/membrane';
 import { ANONYMOUS_PARTICIPANT, authorLine } from '../author-presentation.js';
 import type { StoredMessage } from '@animalabs/context-manager';
-import { foreignRowAsSent } from '../foreign-rounds.js';
+import { NOTHING_SAID, foreignRowAsSent } from '../foreign-rounds.js';
 /**
  * The subconscious's tool surface (issue #77).
  *
@@ -464,7 +464,10 @@ export function defaultReaderFraming(ctx: ReaderFramingContext): ContentBlock[] 
  * the tool's name and its input or outcome in brief, no thinking), and its
  * non-text blocks as they are. A row's author is its participant, or for a
  * row under the anonymous participant, the author its metadata names; one
- * that names none, a tool result's or a notice's, goes with no author.
+ * that names none, a tool result's or a notice's, goes with no author. Each
+ * row counted has its line: a row with media and no text has `author: `
+ * before its media (with no author to name, its media alone), and a row
+ * with nothing to send reads `[no text]`.
  */
 function residentRowLines(resident: string, rows: readonly StoredMessage[]): ContentBlock[] {
   if (rows.length === 0) return [{ type: 'text', text: `\n[Nothing has entered ${resident}'s context since your last look.]` }];
@@ -486,8 +489,10 @@ function residentRowLines(resident: string, rows: readonly StoredMessage[]): Con
       .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
       .map((b) => b.text)
       .join('\n');
-    if (text.length > 0) lines.push(author !== undefined ? authorLine(author, text) : text);
     const media = sent.filter((b) => b.type !== 'text');
+    const said = text.length > 0 || media.length > 0 ? text : NOTHING_SAID;
+    if (author !== undefined) lines.push(authorLine(author, said));
+    else if (said.length > 0) lines.push(said);
     if (media.length > 0) {
       flush();
       content.push(...media);

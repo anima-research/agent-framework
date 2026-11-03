@@ -90,7 +90,7 @@ function transcriptLine(name: string, words: readonly [string, string], body: re
 }
 
 /** Where a row with nothing left to send stands, so the transcript keeps a row for each stored one. */
-const NOTHING_SAID = `[${NOTICE_TAG.noText}]`;
+export const NOTHING_SAID = `[${NOTICE_TAG.noText}]`;
 
 /**
  * One stored row of another agent's as the watcher is sent it: thinking
