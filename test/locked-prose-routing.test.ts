@@ -33,6 +33,8 @@ class RobotModule implements Module {
   interjection: { text: string; metadata: Record<string, unknown> } | null = null;
   /** Runs inside the next `move` call, while the turn waits on it. */
   during: (() => Promise<void>) | null = null;
+  /** Every call this module ran, by tool name. */
+  ran: string[] = [];
 
   async start(_ctx: ModuleContext): Promise<void> {}
   async stop(): Promise<void> {}
@@ -46,6 +48,7 @@ class RobotModule implements Module {
   }
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
+    this.ran.push(call.name);
     const during = this.during;
     this.during = null;
     if (during) await during();
@@ -418,7 +421,14 @@ describe('locked prose routing', () => {
       { type: 'text', text: 'Something private.' },
       { type: 'tool_use', id: 'pl1', name: 'prose_locus', input: { to: '#ops' } },
     ] as ContentBlock[], 'tool_use'));
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Now for ops.' }] as ContentBlock[]));
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'pl2', name: 'prose_locus', input: {} },
+    ] as ContentBlock[], 'tool_use'));
+    // On the XML path the turn's final response carries every round's words.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Something private.' },
+      { type: 'text', text: 'Now for ops.' },
+    ] as ContentBlock[]));
     const framework = await createFramework({ proseLock: 'drafts' });
     const { routed } = stubChannelRegistry(framework);
 
@@ -431,10 +441,16 @@ describe('locked prose routing', () => {
         && t.includes('routed when it ends, all of it together, so it is held as drafts instead')),
       'the move says what happens to this turn',
     );
+    assert.ok(
+      toolResultTexts().some((t) => t.includes('Your plain speech is held as drafts for the rest of this turn')
+        && t.includes('From your next turn it goes to discord:g:ops.')),
+      'a query later in the turn says the same',
+    );
     const receipt = windowTexts(framework).find((t) => t.startsWith('[delivered]'));
     assert.match(receipt ?? '', /^\[delivered\] nothing — \d+ plain-speech segment\(s\) held as drafts? d-/);
     const listed = JSON.stringify(await framework.executeToolCall({ id: 'l', name: 'drafts', input: { action: 'list' }, callerAgentName: 'assistant' } as ToolCall));
     for (const id of draftIds(receipt!)) assert.ok(listed.includes(id), `${id} is open`);
+    assert.ok(listed.includes('Something private.'), 'the words written before the move are held');
     assert.ok(listed.includes('Now for ops.'), 'the words written after the move are held');
 
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Next turn, in ops.' }] as ContentBlock[]));
@@ -518,8 +534,10 @@ describe('locked prose routing', () => {
       };
       internals.channelRegistry.isChannelOpen = () => false;
       // The stored lock says #ops, but the open turn still speaks in #main
-      // (a move from outside the turn leaves it where it was).
-      await framework.executeToolCall({ id: 'h', name: 'prose_locus', input: { to: '#ops' }, callerAgentName: 'assistant' } as ToolCall);
+      // (a move from outside the turn leaves it where it was). Stored
+      // directly: an agent without prose_locus can't call it.
+      (framework as unknown as { writeProseLock(name: string, lock: unknown): void })
+        .writeProseLock('assistant', { serverId: 'stub', channelId: 'discord:g:ops' });
       internals.openLogical.set('assistant', { turnId: 1, locked: true, locus: { serverId: 'stub', channelId: 'discord:g:main' }, wasIn: [], engaged: new Set() });
       const invitation = internals.buildClosedChannelInvitation({
         serverId: 'stub', channelId: 'discord:g:ops', messageId: 'm1', authorName: 'Ann', tags: ['chat:addressed'],
@@ -613,6 +631,7 @@ describe('locked prose routing', () => {
     trigger(framework);
     await framework.runUntilIdle();
 
+    assert.deepEqual(module.ran, ['send_message'], 'the send ran');
     assert.deepEqual(routed, [], 'neither the narration nor the postscript is posted beside the send');
     await framework.stop();
   });
@@ -708,6 +727,67 @@ describe('locked prose routing', () => {
     assert.equal(make({ activeChannelResolver: () => null, channellessTurn: () => true }).incomingFor('agent'), undefined);
     // Without the option, a null channel still means no message to answer, as before.
     assert.equal(make({ activeChannelResolver: () => null }).incomingFor('agent'), undefined);
+  });
+
+  it('a turn whose lock moved while its words waited for its end holds its speech on every path', async () => {
+    const framework = await createFramework({ proseLock: '#main' });
+    const { routed } = stubChannelRegistry(framework);
+    const internals = framework as unknown as {
+      routeLocusSpeech(agent: unknown, round: unknown, text: string, locus: unknown): Promise<unknown>;
+    };
+    const routing = { turnId: 1, locked: true, heldForMove: true, locus: { serverId: 'stub', channelId: 'discord:g:ops' }, wasIn: [], engaged: new Set(), deliveries: [], drafts: [] as unknown[], suppressed: 0, keptPrivate: 0 };
+    const outcome = await internals.routeLocusSpeech(framework.getAgent('assistant'), { routing, notice: 'later' }, 'A later stream, live.', routing.locus);
+    assert.equal(outcome, null);
+    assert.deepEqual(routed, [], 'not posted at the new lock');
+    assert.equal(routing.drafts.length, 1, 'held as a draft');
+    await framework.stop();
+  });
+
+  it("a turn with no channel of its own answers no message, a locked one's lock included", async () => {
+    const framework = await createFramework({ proseLock: '#main' });
+    const internals = framework as unknown as { turnRouting: Map<string, unknown>; channellessTurn(name: string): boolean };
+    const main = { serverId: 'stub', channelId: 'discord:g:main' };
+    const cases: Array<[Record<string, unknown>, boolean, string]> = [
+      [{ heartbeat: true, locked: true, locus: main }, true, "a locked heartbeat's lock is no message it answers"],
+      [{ heartbeat: true }, true, 'a heartbeat with no locus'],
+      [{ heartbeat: true, locus: main }, false, 'a heartbeat a re-pin or channel_open gave a channel'],
+      [{ locked: true, triggerChannel: main }, false, 'a locked turn woken from a channel, drafts or not'],
+      [{ noChannel: true, locked: true }, true, 'a wake for a channel that names none'],
+    ];
+    for (const [routing, expected, why] of cases) {
+      internals.turnRouting.set('assistant', routing);
+      assert.equal(internals.channellessTurn('assistant'), expected, why);
+    }
+    internals.turnRouting.delete('assistant');
+    await framework.stop();
+  });
+
+  it('a malformed prose-lock record is never overwritten, so every agent stays held as drafts', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'pl1', name: 'prose_locus', input: { to: '#ops' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Held.' }] as ContentBlock[]));
+    const framework = await createFramework({ proseLock: '#main' });
+    const { routed } = stubChannelRegistry(framework);
+    const store = (framework as unknown as { store: { getStateJson(id: string): unknown; setStateJson(id: string, v: unknown): void } }).store;
+    store.setStateJson('framework/state', { ...((store.getStateJson('framework/state') ?? {}) as object), proseLocks: ['damaged'] });
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.ok(toolResultTexts().some((t) => t.includes("The change wasn't recorded") && t.includes("aren't a record")));
+    assert.deepEqual((store.getStateJson('framework/state') as { proseLocks: unknown }).proseLocks, ['damaged'], 'left for the operator');
+    assert.deepEqual(routed, [], 'still held as drafts');
+    await framework.stop();
+  });
+
+  it('a prose_locus the agent is refused at dispatch is named nowhere', async () => {
+    const framework = await createFramework({ proseLock: '#main', denyToolsAtDispatch: ['prose_locus', 'drafts'] });
+    stubChannelRegistry(framework);
+    const internals = framework as unknown as { proseLocusMoves(name: string): string; proseLockShown(lock: unknown, name: string): string };
+    assert.equal(internals.proseLocusMoves('assistant'), '');
+    assert.equal(internals.proseLockShown(null, 'assistant'), 'is held as drafts, posted nowhere');
+    await framework.stop();
   });
 
   it('prose_locus is offered only to a locked agent, and refuses any other', async () => {
