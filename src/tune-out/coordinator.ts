@@ -267,7 +267,7 @@ export interface TuneOutCheck {
   peek?: string[];
 }
 
-/** How long after an end time's or a wake budget's cancel threw the cancel is tried again. */
+/** How long after an end time's or a wake budget's cancel threw, or a deferred cancel's run, the cancel is tried again. */
 const EXPIRY_RETRY_MS = 60_000;
 
 /** Ends a backlog line cut to fit in one of the residents' messages. */
@@ -494,6 +494,13 @@ export class TuneOutCoordinator {
     note?: string;
     noteAuthor?: string;
   }>();
+  /**
+   * The one retry of the deferred cancels whose run threw (a release that
+   * couldn't be made durable, a store operation that threw), armed by
+   * runDeferredCancels, unref'd, cleared at stop. A later release's
+   * runDeferredCancels runs them sooner.
+   */
+  private deferredRetry: ReturnType<typeof setTimeout> | undefined;
   /** Timer key for the scope's cadence and expiry. */
   private static readonly SCOPE_KEY = '\0all-except';
 
@@ -1032,19 +1039,52 @@ export class TuneOutCoordinator {
    * this once a surgery's release has stored what its hold kept, or told of
    * what it couldn't store. One whose writes are
    * still held waits on; one whose hold has ended meanwhile ends nothing.
-   * Never throws.
+   * One that throws (its release couldn't be made durable, a store
+   * operation threw) stays waiting, with its note, the tune-out still in
+   * force: it runs again at the next call, or EXPIRY_RETRY_MS later, which
+   * one timer arms. Never throws.
    */
   runDeferredCancels(): void {
     if (this.deferredCancels.size === 0 || this.writesHeldNow()) return;
-    const runs = [...this.deferredCancels.values()];
+    if (this.deferredRetry !== undefined) {
+      clearTimeout(this.deferredRetry);
+      this.deferredRetry = undefined;
+    }
+    const runs = [...this.deferredCancels.entries()];
     this.deferredCancels.clear();
-    for (const { run, note, noteAuthor } of runs) {
+    let failed = false;
+    for (const [key, entry] of runs) {
       try {
-        run(note, noteAuthor);
+        entry.run(entry.note, entry.noteAuthor);
       } catch (err) {
-        console.error('[tune-out] a cancel asked for while writes were held in memory failed when it ran:', err);
+        failed = true;
+        // A run that waited again (deferCancel, its writes held once more)
+        // has its entry back already: its note is taken there when it has none.
+        const waiting = this.deferredCancels.get(key);
+        if (!waiting) {
+          this.deferredCancels.set(key, entry);
+        } else if (waiting.note === undefined && entry.note !== undefined) {
+          waiting.note = entry.note;
+          if (entry.noteAuthor !== undefined) waiting.noteAuthor = entry.noteAuthor;
+        }
+        console.error(`[tune-out] a cancel asked for while writes were held in memory failed when it ran, so it stays waiting, the tune-out in force, and is tried again in ${EXPIRY_RETRY_MS / 1000} s or at the next release:`, err);
       }
     }
+    if (failed) this.armDeferredRetry();
+  }
+
+  /** Arm the one retry of the deferred cancels, unless it is armed; it arms itself again while one still waits. */
+  private armDeferredRetry(): void {
+    if (this.deferredRetry !== undefined) return;
+    const timer = setTimeout(() => {
+      this.deferredRetry = undefined;
+      this.runDeferredCancels();
+      // Writes held again at the retry: the cancels wait on, for the next
+      // release or this retry.
+      if (this.deferredCancels.size > 0) this.armDeferredRetry();
+    }, EXPIRY_RETRY_MS);
+    timer.unref?.();
+    this.deferredRetry = timer;
   }
 
   /** Whether a reader (persistent subconscious or reader forks) attends holds. */
@@ -2491,6 +2531,8 @@ export class TuneOutCoordinator {
     // A cancel still waiting for held writes ends nothing: the tune-out stays
     // in force on disk, for the next boot.
     this.deferredCancels.clear();
+    if (this.deferredRetry !== undefined) clearTimeout(this.deferredRetry);
+    this.deferredRetry = undefined;
     for (const timer of this.cadenceTimers.values()) clearTimeout(timer);
     this.cadenceTimers.clear();
     for (const timer of this.expiryTimers.values()) clearTimeout(timer);
