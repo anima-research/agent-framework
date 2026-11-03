@@ -409,12 +409,15 @@ describe('a stream that completes while its tools run', () => {
     }
   });
   for (const [label, stop, reason] of [
-    ["a caller's stop", (framework: AgentFramework) => { assert.equal(framework.abortInference('prime', 'test'), true); }, 'test'],
+    ["a caller's stop", (framework: AgentFramework) => { assert.equal(framework.abortInference('prime', 'test'), true); return undefined; }, 'test'],
     ["an operator's abandon", async (framework: AgentFramework) => {
       const quiesced = framework.quiesce({ abandon: true, timeoutMs: 1_000 });
       const marks = (framework as unknown as { frameworkCancelledStreams: Map<string, string> }).frameworkCancelledStreams;
       await waitFor('the abandon to cancel the stream', () => [...marks.values()].includes('quiesce_abandoned'));
-      return quiesced;
+      // Wrapped, so the async function's promise does not adopt it: the
+      // quiesce returns only once the spill is released, so awaiting it here
+      // would wait out the abandon's grace before run.finish() released it.
+      return { settled: quiesced };
     }, 'quiesce_abandoned'],
   ] as const) {
     it(`drops the round and its results when ${label} lands while its results are built`, async () => {
@@ -425,9 +428,9 @@ describe('a stream that completes while its tools run', () => {
       const warn = console.warn;
       console.warn = () => {};
       try {
-        const settled = await stop(framework);
+        const stopped = await stop(framework);
         await run.finish();
-        await within('the quiesce to return', Promise.resolve(settled));
+        await within('the quiesce to return', Promise.resolve(stopped?.settled));
         const all = blocks();
         for (const block of ['text:Fetching both.', 'tool_use:call_fetch', 'tool_use:call_slow', 'tool_result:call_fetch', 'tool_result:call_slow']) {
           assert.ok(!all.includes(block), `${block} is not stored`);
