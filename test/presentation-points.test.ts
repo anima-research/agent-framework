@@ -101,8 +101,15 @@ async function boot(opts: { residents?: string[]; clock?: boolean | { intervalSe
   const cm = (name: string): ContextManager => agent(name).getContextManager();
   const rowWith = (name: string, t: string): StoredMessage | undefined => cm(name).getAllMessages().find((m) => textOf(m) === t);
   const inWindow = (name: string, t: string) => { const row = rowWith(name, t); return !!row && cm(name).ordinalOf(row.id) !== undefined; };
+  /** Where a row stands for `name`: in its window, stored and out of it, or
+   *  not in its store at all, which a check that a write is kept out of the
+   *  window must tell from the second. */
+  const windowStatusOf = (name: string, t: string): 'in' | 'out' | 'absent' => {
+    const row = rowWith(name, t);
+    return !row ? 'absent' : cm(name).ordinalOf(row.id) !== undefined ? 'in' : 'out';
+  };
   const windowTexts = (name: string) => cm(name).getPresentedMessages().map((m) => textOf(m) || m.content.map((b) => b.type).join('+'));
-  return { framework, membrane, gates, surface, internals, traces, agent, cm, rowWith, inWindow, windowTexts };
+  return { framework, membrane, gates, surface, internals, traces, agent, cm, rowWith, inWindow, windowStatusOf, windowTexts };
 }
 
 describe('presentation points (#291)', () => {
@@ -119,7 +126,7 @@ describe('presentation points (#291)', () => {
     const named = h.internals.addMessage('mira', [text('named as mira')], undefined, { forAgent: 'mira' });
     assert.ok(heard && named, 'both stored at once, though her turn is alive');
     assert.ok(h.cm('mira').getMessage(heard) && h.cm('mira').getMessage(named), 'in the record');
-    assert.deepEqual([h.inWindow('mira', 'heard at the boundary'), h.inWindow('mira', 'named as mira')], [false, false], 'out of her window');
+    assert.deepEqual([h.windowStatusOf('mira', 'heard at the boundary'), h.windowStatusOf('mira', 'named as mira')], ['out', 'out'], 'out of her window');
     assert.deepEqual(placement, { agent: 'mira', messageId: heard, presented: false }, 'placed as stored and not presented to her');
     assert.deepEqual(h.internals.readsRowFor(placement, 'mira'), { readsRow: heard }, 'so a wake for it reads it');
     assert.equal(clocks(), clocksBefore, 'a write stored during a turn takes no clock: it would sit inside the turn');
@@ -228,7 +235,7 @@ describe('presentation points (#291)', () => {
     // notices until HOST-1): unstamped, so it's for the slot's owners, and
     // no write through the framework presents it at once.
     h.cm('mira').addMessage('user', [text('a host wrote this')]);
-    assert.equal(h.inWindow('mira', 'a host wrote this'), false);
+    assert.equal(h.windowStatusOf('mira', 'a host wrote this'), 'out');
     h.membrane.script('mira', final([text('read it')]));
     h.framework.start();
     h.internals.pendingRequests.push({ agentName: 'mira', reason: 'test', source: 'test', timestamp: Date.now() });
@@ -275,7 +282,7 @@ describe('presentation points (#291)', () => {
     assert.equal(h.inWindow('mira', 'while idle'), true);
     h.internals.activeTurnTokens.set('mira', 12);
     h.internals.storeInFork(mira, [text('during a turn')], {});
-    assert.equal(h.inWindow('mira', 'during a turn'), false);
+    assert.equal(h.windowStatusOf('mira', 'during a turn'), 'out');
     assert.deepEqual(audienceOf(h.rowWith('mira', 'during a turn')!.metadata)?.audience, ['mira'], 'for the fork alone');
     h.internals.activeTurnTokens.delete('mira');
     h.internals.presentAtEndOf(mira);
@@ -289,9 +296,9 @@ describe('presentation points (#291)', () => {
     h.internals.pendingRequests.push(continuation);
     try {
       h.internals.addMessage('user', [text('arrived between frames')], undefined, { forAgent: 'mira' });
-      assert.equal(h.inWindow('mira', 'arrived between frames'), false, 'not presented at rest: the turn is alive');
+      assert.equal(h.windowStatusOf('mira', 'arrived between frames'), 'out', 'stored, and not presented at rest: the turn is alive');
       h.internals.presentAtEndOf(h.agent('mira'));
-      assert.equal(h.inWindow('mira', 'arrived between frames'), false, "the old frame's end presents nothing");
+      assert.equal(h.windowStatusOf('mira', 'arrived between frames'), 'out', "the old frame's end presents nothing");
     } finally {
       h.internals.pendingRequests.length = 0;
     }
@@ -311,7 +318,7 @@ describe('presentation points (#291)', () => {
       await until(() => h.gates.entered.has('p'), 'the puppet call waiting');
       const arrived = h.internals.addMessage('user', [text('hey, you there?')], undefined, { forAgent: 'mira' });
       assert.ok(arrived && h.cm('mira').getMessage(arrived), 'stored at once, and answered by its stored id');
-      assert.equal(h.inWindow('mira', 'hey, you there?'), false, 'stored, and out of the window while the puppet holds the agent');
+      assert.equal(h.windowStatusOf('mira', 'hey, you there?'), 'out', 'stored, and out of the window while the puppet holds the agent');
       h.gates.release('p');
       await puppet;
       assert.deepEqual(h.windowTexts('mira').slice(-3), ['tool_use', 'tool_result', 'hey, you there?'], 'the pair first and adjacent; the message after');
@@ -353,8 +360,8 @@ describe('presentation points (#291)', () => {
     const landed = h.cm('mira').getAllMessages().slice(before);
     assert.deepEqual(landed.map((m) => textOf(m)), ['one', 'two', 'three'], 'in the order they arrived');
     assert.ok(landed.every((m) => !(m.metadata && 'deferredWriteId' in m.metadata)), 'never queued, so no durable queue id');
-    assert.deepEqual(['one', 'two', 'three'].map((t) => h.inWindow('mira', t)), [true, false, true], "in mira's window: what's for her");
-    assert.deepEqual(['one', 'two', 'three'].map((t) => h.inWindow('oren', t)), [true, true, false], "in oren's: what's for him");
+    assert.deepEqual(['one', 'two', 'three'].map((t) => h.windowStatusOf('mira', t)), ['in', 'out', 'in'], "in mira's window: what's for her");
+    assert.deepEqual(['one', 'two', 'three'].map((t) => h.windowStatusOf('oren', t)), ['in', 'in', 'out'], "in oren's: what's for him");
   });
 
   // B5: frozen() reads the quiesce alone. A surgery's hold freezes every
@@ -373,11 +380,11 @@ describe('presentation points (#291)', () => {
       // stores at once.
       h.cm('mira').addMessage('user', [text('stored under the hold')]);
       h.internals.presentAtEndOf(h.agent('mira'));
-      assert.equal(h.inWindow('mira', 'stored under the hold'), false, "a point at rest presents nothing: the hold's token keeps her turn-alive");
+      assert.equal(h.windowStatusOf('mira', 'stored under the hold'), 'out', "a point at rest presents nothing: the hold's token keeps her turn-alive");
       h.internals.pendingRequests.push({ agentName: 'mira', reason: 'test-wake', source: 'test', timestamp: Date.now() });
       await h.internals.processInferenceRequests();
       assert.deepEqual(h.membrane.callsFor('mira'), [], 'no turn starts under the hold');
-      assert.equal(h.inWindow('mira', 'stored under the hold'), false, 'still out of her window');
+      assert.equal(h.windowStatusOf('mira', 'stored under the hold'), 'out', 'still out of her window');
     } finally {
       release();
     }
@@ -400,7 +407,7 @@ describe('presentation points (#291)', () => {
     await quiesced;
     const injected = h.membrane.streams[0]!.stream.receivedToolResultOptions.flatMap((o) => o?.injectedMessages ?? []);
     assert.deepEqual(injected, [], "the draining turn's boundary injects nothing while quiesced");
-    assert.deepEqual([h.inWindow('mira', 'arrived mid-turn'), h.inWindow('mira', 'arrived while quiesced')], [false, false], 'stored, not presented');
+    assert.deepEqual([h.windowStatusOf('mira', 'arrived mid-turn'), h.windowStatusOf('mira', 'arrived while quiesced')], ['out', 'out'], 'stored, not presented');
     assert.ok(h.rowWith('mira', 'arrived while quiesced'), 'in the record');
     assert.ok(h.inWindow('mira', 'done'), "the draining turn's own rows are presented");
     await h.framework.resume();
@@ -473,7 +480,7 @@ describe('presentation points (#291)', () => {
     await until(() => h.inWindow('mira', 'two'), 'the second turn');
     await h.framework.runUntilIdle();
     assert.equal(h.inWindow('mira', 'from someone'), true, 'premise: her turn heard it');
-    assert.equal(h.inWindow('mira', 'for oren'), false, "premise: oren's row stays out of her window");
+    assert.equal(h.windowStatusOf('mira', 'for oren'), 'out', "premise: oren's row stays out of her window");
 
     assert.equal(h.framework.undoLastTurn('mira').undone, true);
     assert.equal(h.cm('mira').windowStatusOf(h.rowWith('mira', 'from someone')!.id), 'out', 'given back as arrived and not presented');
@@ -590,7 +597,7 @@ describe('presentation points (#291)', () => {
     try {
       h.internals.sweepExpiredConversations();
       assert.ok(h.rowWith('mira', 'the conversation is closing'), 'stored');
-      assert.equal(h.inWindow('mira', 'the conversation is closing'), false, 'out of the live turn\'s window');
+      assert.equal(h.windowStatusOf('mira', 'the conversation is closing'), 'out', 'out of the live turn\'s window');
       h.internals.activeTurnTokens.delete('mira');
       h.internals.presentAtEndOf(h.agent('mira'));
       assert.equal(h.inWindow('mira', 'the conversation is closing'), true, "presented at the turn's end, as its own row");
