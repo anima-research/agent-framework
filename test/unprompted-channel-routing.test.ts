@@ -1,24 +1,24 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync, writeFileSync, appendFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
+import type { EventResponse, ProcessEvent, ProcessState } from '../src/index.js';
 import { ChannelRegistry, destinationKey, type ChannelRef } from '../src/mcpl/channel-registry.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 import type { ChannelContext } from '../src/mcpl/types.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { jsonLines } from './helpers/json-lines.js';
-import { fixture, eventually } from './helpers/coalescing-fixture.js';
+import { fixture } from './helpers/coalescing-fixture.js';
 import { GateModule } from './helpers/dendrite.js';
-import {
-  SUB, internals, registerOpen, channellessTurnLocus, enter, incoming, settle, blockInTool, textOf, type Stored,
-} from './helpers/admission.js';
+import { SUB, internals, registerOpen, enter, incoming, settle, textOf, find } from './helpers/admission.js';
 import type { FrameworkConfig } from '../src/types/framework.js';
 
 const OPS = 'discord:g1:ops';
 const BUSY = 'discord:g1:busy';
+const FEED = 'discord:g1:feed';
 const TRIGGER = 'discord:g1:trigger';
 const FORK_HOME = 'discord:g1:fork-home';
 const ref = (channelId: string): ChannelRef => ({ serverId: 'discord', channelId });
@@ -42,13 +42,12 @@ function makeRegistry(opts: {
   for (const id of [OPS, BUSY, TRIGGER, FORK_HOME]) {
     raw.channels.set(destinationKey(ref(id)), { serverId: 'discord', descriptor: { id, type: 'discord', label: id }, open: true });
   }
-  // The global most-recent-inbound locus: some unrelated channel was busy.
   raw.defaultPublishChannel = ref(BUSY);
   return registry;
 }
 
-describe('unpromptedChannel: speech locus for no-trigger turns', () => {
-  it('a no-trigger turn resolves to the configured unprompted channel, not the last-active one', () => {
+describe('unpromptedChannel in the registry', () => {
+  it('a turn with no channel of its own resolves to the configured channel, not the last-active one', () => {
     const registry = makeRegistry({ unpromptedChannel: OPS, activeChannelResolver: () => undefined });
     assert.deepEqual(registry.resolveLocus('agent'), ref(OPS));
   });
@@ -73,7 +72,23 @@ describe('unpromptedChannel: speech locus for no-trigger turns', () => {
   });
 });
 
-describe('unpromptedChannel: a no-trigger turn is told, and published to, the unprompted channel', () => {
+class InputModule extends GateModule {
+  override async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
+    const e = event as unknown as { type: string; content?: string };
+    if (e.type === 'external-message') {
+      return { addMessages: [{ participant: 'user', content: [{ type: 'text', text: String(e.content) }] }], requestInference: true };
+    }
+    if (e.type === 'test:chat') {
+      return {
+        addMessages: [{ participant: 'user', content: [{ type: 'text', text: String(e.content) }], metadata: { serverId: 'discord', channelId: BUSY } as never }],
+        requestInference: true,
+      };
+    }
+    return {};
+  }
+}
+
+describe('unpromptedChannel on a real MCPL server', () => {
   const FIXTURE = join(import.meta.dirname, 'fixtures/speech-route-mcpl-server.mjs');
   let tempDir: string;
   let statusPath: string;
@@ -82,7 +97,7 @@ describe('unpromptedChannel: a no-trigger turn is told, and published to, the un
   let framework: AgentFramework | undefined;
 
   beforeEach(() => {
-    tempDir = mkdtempSync(join(tmpdir(), 'unprompted-channel-delivery-'));
+    tempDir = mkdtempSync(join(tmpdir(), 'unprompted-channel-'));
     statusPath = join(tempDir, 'status.jsonl');
     commandPath = join(tempDir, 'commands.jsonl');
     writeFileSync(commandPath, '');
@@ -104,10 +119,9 @@ describe('unpromptedChannel: a no-trigger turn is told, and published to, the un
   };
 
   /**
-   * A trunk agent on a real MCPL server with OPS and BUSY registered and
-   * open. Channel messages are stored without waking it, and the previous
-   * locus rule (latest inbound) is the fallback, so activity in BUSY is what
-   * a turn with no channel of its own would otherwise follow.
+   * A trunk agent on a real MCPL server with OPS, BUSY and an inbound-only
+   * FEED registered and open, and a gate whose rules wake only on the test
+   * module's input, so channel messages are stored without a turn.
    */
   async function setup(
     unpromptedChannel?: string,
@@ -120,107 +134,178 @@ describe('unpromptedChannel: a no-trigger turn is told, and published to, the un
         name: 'scout', model: 'test-model', systemPrompt: 'You are scout.',
         ...(opts.proseRouting ? { proseRouting: opts.proseRouting } : {}),
       }],
-      modules: [],
-      speech: { locus: opts.speech ?? 'latest-inbound' },
-      gate: { config: { policies: [], default: 'skip' } },
+      modules: [new InputModule()],
+      speech: { locus: opts.speech ?? 'delivery' },
+      gate: { config: { policies: [{ name: 'module-input', match: { scope: ['external-message', 'test:chat'] }, behavior: 'always' }], default: 'skip' } },
       mcplServers: [{
         id: 'discord',
         command: process.execPath,
         args: [FIXTURE],
         env: {
           STATUS_PATH: statusPath, COMMAND_PATH: commandPath,
-          CHANNELS: JSON.stringify([{ id: OPS, label: '#ops' }, { id: BUSY, label: '#busy' }]),
+          CHANNELS: JSON.stringify([
+            { id: OPS, label: '#ops' }, { id: BUSY, label: '#busy' }, { id: FEED, label: '#feed', direction: 'inbound' },
+          ]),
         },
       }],
       ...(unpromptedChannel ? { unpromptedChannel } : {}),
     });
     await framework.start();
     const fw = framework;
-    const internals = fw as unknown as {
+    const internal = fw as unknown as {
       channelRegistry: ChannelRegistry;
       pendingRequests: Array<Record<string, unknown>>;
+      eventGate: {
+        armSelfWake(agentName: string, seconds: number, source?: string): unknown;
+        setSleep(seconds: number, note?: string, agentName?: string): unknown;
+        requestInferenceFn(agentName: string, reason: string, source: string, provenance?: Record<string, unknown>): void;
+      };
     };
-    await until(() => internals.channelRegistry.listChannelsRaw().length >= 2, 'registration');
-    const registry = internals.channelRegistry;
+    await until(() => internal.channelRegistry.listChannelsRaw().length >= 3, 'registration');
 
-    const context = (): ChannelContext | undefined => registry.buildChannelContext('scout', 'discord');
-
+    const context = (): ChannelContext | undefined => internal.channelRegistry.buildChannelContext('scout', 'discord');
     const published = (): string[] => jsonLines<{ event: string; channelId?: string }>(statusPath)
       .filter((e) => e.event === 'publish').map((e) => e.channelId!);
+    const texts = (): string[] => fw.getAgent('scout')!.getContextManager().getAllMessages()
+      .flatMap((m) => m.content)
+      .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+      .map((b) => b.text);
+    const routingNotices = (): string[] => texts().filter((t) => t.startsWith('[routing]'));
 
-    async function wake(request: Record<string, unknown>, responses: Array<ReturnType<typeof createMockResponse>>) {
+    async function started(responses: Array<ReturnType<typeof createMockResponse>>, begin: () => void): Promise<number> {
       for (const r of responses) membrane.pushResponse(r);
       const before = membrane.calls.length;
-      internals.pendingRequests.push({ agentName: 'scout', timestamp: Date.now(), ...request });
+      begin();
       await until(() => membrane.calls.length > before, 'turn start');
       await fw.runUntilIdle();
+      return before;
     }
+    const skipReplyWake = (responses: Array<ReturnType<typeof createMockResponse>>) =>
+      started(responses, () => internal.eventGate.armSelfWake('scout', 1, 'skip_reply'));
+    const sleepEnd = (responses: Array<ReturnType<typeof createMockResponse>>) =>
+      started(responses, () => internal.eventGate.setSleep(0.05, undefined, 'scout'));
+    const wake = (request: Record<string, unknown>, responses: Array<ReturnType<typeof createMockResponse>>) =>
+      started(responses, () => internal.pendingRequests.push({ agentName: 'scout', timestamp: Date.now(), ...request }));
+    const gateWakes = (calls: Array<[string, string, Record<string, unknown>?]>, responses: Array<ReturnType<typeof createMockResponse>>) =>
+      started(responses, () => { for (const [reason, source, provenance] of calls) internal.eventGate.requestInferenceFn('scout', reason, source, provenance); });
+    const moduleEvent = (event: Record<string, unknown>, responses: Array<ReturnType<typeof createMockResponse>>) =>
+      started(responses, () => fw.pushEvent(event as unknown as ProcessEvent));
 
-    /** Run one turn that no channel message caused, which says `text`. */
-    async function channelless(text: string) {
-      await wake({ reason: 'test', source: 'framework' }, [createMockResponse([{ type: 'text', text }])]);
-    }
-
-    /** Some other channel had activity: the global most-recent-inbound locus. */
     async function busyElsewhere() {
-      const delivered = () => fw.getAgent('scout')!.getContextManager().getAllMessages()
-        .some((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text.includes('busy chatter')));
       appendFileSync(commandPath, JSON.stringify({ op: 'incoming', channelId: BUSY, messageId: 'busy-1', mode: 'ambient', text: 'busy chatter' }) + '\n');
-      await until(delivered, 'the busy channel message delivered');
+      await until(() => texts().some((t) => t.includes('busy chatter')), 'the busy channel message delivered');
     }
 
-    function routingNotices(): string[] {
-      return fw.getAgent('scout')!.getContextManager().getAllMessages()
-        .flatMap((m) => m.content)
-        .filter((b): b is { type: 'text'; text: string } => b.type === 'text' && b.text.startsWith('[routing]'))
-        .map((b) => b.text);
-    }
-
-    return { framework: fw, published, context, wake, channelless, busyElsewhere, routingNotices };
+    return { framework: fw, published, context, texts, routingNotices, skipReplyWake, sleepEnd, wake, gateWakes, moduleEvent, busyElsewhere };
   }
 
+  const say = (text: string) => createMockResponse([{ type: 'text', text }]);
   const publishCall = (content: string) => createMockResponse(
     [{ type: 'tool_use', id: 'p1', name: 'channel_publish', input: { content } } as never],
     'tool_use',
   );
   const done = () => createMockResponse([]);
 
-  describe('which turns take it', () => {
-    it('a self-scheduled wake speaks in the unprompted channel, under the default speech.locus too', async () => {
-      const t = await setup(OPS, { speech: 'delivery' });
-      await t.wake({ reason: 'self-scheduled wake (skip_reply, 60s)', source: 'self-wake' }, [createMockResponse([{ type: 'text', text: 'back' }])]);
+  describe('the turns that take it: the agent\'s own timers', () => {
+    it('a skip_reply wake speaks in the unprompted channel, under the default speech.locus too', async () => {
+      const t = await setup(OPS);
+      await t.skipReplyWake([say('back')]);
       assert.deepEqual(t.published(), [OPS]);
+      assert.ok(t.routingNotices().some((n) => n.includes(OPS)), JSON.stringify(t.routingNotices()));
+    });
+
+    it("a sleep's end: the same", async () => {
+      const t = await setup(OPS);
+      await t.sleepEnd([say('awake')]);
+      assert.deepEqual(t.published(), [OPS]);
+    });
+
+    it('with activity in another channel, under latest-inbound, it speaks in the unprompted channel, not the busy one', async () => {
+      const t = await setup(OPS, { speech: 'latest-inbound' });
+      await t.busyElsewhere();
+      await t.skipReplyWake([say('check-in')]);
+      assert.deepEqual(t.published(), [OPS]);
+      assert.equal(t.context()?.defaultOutgoing?.channelId, OPS, 'the server is told its speech lands there');
+      assert.ok(!t.routingNotices().some((n) => n.includes(BUSY)), JSON.stringify(t.routingNotices()));
+    });
+
+    it('control: without unpromptedChannel the same turn follows the busy channel', async () => {
+      const t = await setup(undefined, { speech: 'latest-inbound' });
+      await t.busyElsewhere();
+      await t.skipReplyWake([say('check-in')]);
+      assert.deepEqual(t.published(), [BUSY]);
+      assert.equal(t.context()?.defaultOutgoing?.channelId, BUSY);
     });
 
     it('channel_publish naming no channel goes there too, in explicit prose routing, and servers are told the same channel', async () => {
-      const t = await setup(OPS, { speech: 'delivery', proseRouting: 'explicit' });
-      await t.wake({ reason: 'test', source: 'framework' }, [publishCall('a note'), done()]);
+      const t = await setup(OPS, { proseRouting: 'explicit' });
+      await t.skipReplyWake([publishCall('a note'), done()]);
       assert.deepEqual(t.published(), [OPS]);
       assert.equal(t.context()?.defaultOutgoing?.channelId, OPS);
     });
+  });
 
-    it("a heartbeat's turn doesn't take it: its plain speech is held as a draft", async () => {
-      const t = await setup(OPS, { speech: 'delivery' });
-      await t.wake({ reason: 'heartbeat', source: 'heartbeat' }, [createMockResponse([{ type: 'text', text: 'still here' }])]);
+  describe("the turns that don't: they keep what they do without it", () => {
+    it("a start merged from a timer's wake and an ambient batch's", async () => {
+      const t = await setup(OPS);
+      const before = await t.gateWakes([
+        ['self-scheduled wake (skip_reply, 1s)', 'self-wake'],
+        ['gate:debounce', 'gate', { counterparty: 'discord:user:U-other', at: Date.now() }],
+      ], [say('joining in')]);
+      assert.equal(membrane.calls.length - before, 1, 'premise: both wakes made one start');
+      assert.deepEqual(t.published(), []);
+      assert.ok(t.texts().includes('joining in'), 'the turn spoke');
+    });
+
+    it('a person typing at a console or TUI (a module\'s external-message)', async () => {
+      const t = await setup(OPS);
+      await t.moduleEvent({ type: 'external-message', source: 'tui', content: 'are you there?' }, [say('my answer')]);
+      assert.deepEqual(t.published(), []);
+      assert.ok(t.texts().includes('my answer'), 'the turn spoke');
+    });
+
+    it("a module's message that names a channel", async () => {
+      const t = await setup(OPS);
+      await t.moduleEvent({ type: 'test:chat', source: 'mod', content: 'are you there?', metadata: { channelId: BUSY } }, [say('my answer')]);
+      assert.deepEqual(t.published(), []);
+      assert.ok(t.texts().includes('my answer'), 'the turn spoke');
+    });
+
+    for (const [what, request] of [
+      ["another agent's mail", { reason: 'agent-message:peer', source: 'dendrite' }],
+      ['a retry after a refused turn is rewound', { reason: 'refusal-rewind-retry', source: 'framework' }],
+    ] as const) {
+      it(`${what}: under latest-inbound, it follows the busy channel`, async () => {
+        const t = await setup(OPS, { speech: 'latest-inbound' });
+        await t.busyElsewhere();
+        await t.wake(request, [say('my answer')]);
+        assert.deepEqual(t.published(), [BUSY]);
+      });
+    }
+
+    it("a heartbeat's turn: its plain speech is held as a draft", async () => {
+      const t = await setup(OPS);
+      await t.wake({ reason: 'heartbeat', source: 'heartbeat' }, [say('still here')]);
       assert.deepEqual(t.published(), []);
       assert.ok(t.routingNotices().some((n) => n.includes('came from your heartbeat')), JSON.stringify(t.routingNotices()));
     });
 
-    it("a silent heartbeat tick doesn't take it: its channel_publish naming no channel posts nothing", async () => {
-      const t = await setup(OPS, { speech: 'delivery' });
+    it("a silent heartbeat tick: its channel_publish naming no channel posts nothing", async () => {
+      const t = await setup(OPS);
       await t.wake({ reason: 'heartbeat', source: 'heartbeat', suppressProse: true }, [publishCall('a note'), done()]);
       assert.deepEqual(t.published(), []);
     });
 
-    it("an ephemeral run doesn't take it: its prose is its caller's result", async () => {
-      const t = await setup(OPS, { speech: 'delivery' });
+    it("an ephemeral run: its prose is its caller's result", async () => {
+      const t = await setup(OPS);
       const created = await t.framework.createEphemeralAgent({ name: 'sub', model: 'test-model', systemPrompt: 'Do the task.', proseRouting: 'locus' });
       created.contextManager.addMessage('user', [{ type: 'text', text: 'Find it and report back.' }]);
-      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'the result' }]));
+      membrane.pushResponse(say('the result'));
       const run = t.framework.runEphemeralToCompletion(created.agent, created.contextManager);
       await t.framework.runUntilIdle();
-      await run;
+      const result = await run;
       await t.framework.runUntilIdle();
+      assert.equal(result.speech.trim(), 'the result');
       assert.deepEqual(t.published(), []);
     });
   });
@@ -241,68 +326,93 @@ describe('unpromptedChannel: a no-trigger turn is told, and published to, the un
       });
     }
 
-    it('one that names no registered channel: such a turn takes what it would without it, and the host logs that once', async () => {
-      const logged: string[] = [];
-      const error = console.error;
-      console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
-      try {
-        const t = await setup('discord:g1:nowhere', { speech: 'delivery' });
-        await t.channelless('first');
-        await t.channelless('second');
-        assert.deepEqual(t.published(), []);
-        assert.ok(!t.routingNotices().some((n) => n.includes('nowhere')), JSON.stringify(t.routingNotices()));
-        assert.deepEqual(logged.filter((l) => l.includes('unpromptedChannel')), [
-          '[routing] unpromptedChannel discord:g1:nowhere names no registered channel, so a turn no channel message prompted '
-            + 'takes the fallback it takes without the setting until the setting names one. Logged once.',
-        ]);
-      } finally {
-        console.error = error;
-      }
+    it('create() reads null as not set', async () => {
+      framework = await AgentFramework.create({
+        storePath: join(tempDir, 'null.chronicle'),
+        membrane: membrane.asMembrane(),
+        agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+        modules: [],
+        unpromptedChannel: null as never,
+      });
     });
-  });
 
-  it('with activity in another channel, a turn no channel caused speaks in the unprompted channel, not the busy channel', async () => {
-    const t = await setup(OPS);
-    await t.busyElsewhere();
-    await t.channelless('check-in');
-    assert.deepEqual(t.published(), [OPS], 'published to the unprompted channel only');
-    assert.equal(t.context()?.defaultOutgoing?.channelId, OPS, 'the server is told its speech lands there');
-    assert.ok(t.routingNotices().some((n) => n.includes(OPS)), 'the routing notice names it');
-    assert.ok(!t.routingNotices().some((n) => n.includes(BUSY)), 'and never the busy channel');
-  });
-
-  it('with no prior inbound message at all, such a turn still speaks in the unprompted channel', async () => {
-    const t = await setup(OPS);
-    await t.channelless('first words');
-    assert.deepEqual(t.published(), [OPS]);
-    assert.equal(t.context()?.defaultOutgoing?.channelId, OPS);
-  });
-
-  it('control: without unpromptedChannel the same turn follows the busy channel', async () => {
-    const t = await setup();
-    await t.busyElsewhere();
-    await t.channelless('check-in');
-    assert.deepEqual(t.published(), [BUSY]);
-    assert.equal(t.context()?.defaultOutgoing?.channelId, BUSY);
+    for (const [what, value, why] of [
+      ['names no registered channel', 'discord:g1:nowhere', 'names no registered channel'],
+      ['names a channel its server declared inbound-only', FEED, 'names a channel its server declared inbound-only'],
+    ] as const) {
+      it(`one that ${what}: a timer's turn takes what it would without it, and the host logs that once`, async () => {
+        const logged: string[] = [];
+        const error = console.error;
+        console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+        try {
+          const t = await setup(value, { speech: 'latest-inbound' });
+          await t.busyElsewhere();
+          await t.skipReplyWake([say('first')]);
+          await t.sleepEnd([say('second')]);
+          assert.deepEqual(t.published(), [BUSY, BUSY]);
+          assert.deepEqual(logged.filter((l) => l.includes('unpromptedChannel')), [
+            `[routing] unpromptedChannel ${value} ${why}, so a turn the agent's own timer starts `
+              + 'takes the fallback it takes without the setting until the setting names a channel it can speak in. Logged once.',
+          ]);
+        } finally {
+          console.error = error;
+        }
+      });
+    }
   });
 });
 
 describe('unpromptedChannel and the tune-out holds', () => {
-  const withUnprompted = () => fixture({ framework: { subconscious: SUB, unpromptedChannel: 'ops' } as Partial<FrameworkConfig> });
+  const withUnprompted = (agents?: unknown[]) => fixture({
+    framework: { subconscious: SUB, unpromptedChannel: 'ops', gate: { config: { policies: [], default: 'skip' } } } as Partial<FrameworkConfig>,
+    ...(agents ? { agents } : {}),
+  });
+  type Fixture = Awaited<ReturnType<typeof withUnprompted>>;
+  const gateOf = (f: Fixture) => (f.framework as unknown as { eventGate: { setSleep(seconds: number, note?: string, agentName?: string): unknown } }).eventGate;
 
-  it("what servers are told follows the same order: an explicit-mode turn's channel context names the excepted channel while the hold is open", async () => {
-    const f = await fixture({
-      framework: { subconscious: SUB, unpromptedChannel: 'ops' } as Partial<FrameworkConfig>,
-      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', proseRouting: 'explicit' }],
+  /** The locus of the turn the end of a short sleep starts. */
+  async function sleepEndLocus(f: Fixture): Promise<string | null> {
+    let locus: string | null | undefined;
+    const off = f.framework.onTrace((t) => {
+      if (t.type === 'inference:started' && (t as { agentName: string }).agentName === 'agent') {
+        locus = (t as { channelId?: string }).channelId ?? null;
+      }
     });
+    try {
+      gateOf(f).setSleep(0.05, undefined, 'agent');
+      const deadline = Date.now() + 15_000;
+      while (locus === undefined && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+      await f.framework.runUntilIdle();
+    } finally { off(); }
+    assert.notEqual(locus, undefined, "the sleep's end started a turn");
+    return locus ?? null;
+  }
+
+  const enterAllExcept = (f: Fixture, except: string) => assert.ok(internals(f).tuneOutCoordinator!.enterAllExcept(
+    { serverId: 'editor', channelId: except }, { durationSeconds: 120, backlogCap: 10 }, 'agent-tool',
+  ).ok);
+
+  it("an all-except hold's channel outranks it: a timer's turn speaks in the excepted channel while the hold is open, and in the unprompted channel before and after", async () => {
+    const f = await withUnprompted();
+    try {
+      f.alwaysRespond();
+      await registerOpen(f, 'work', 'noisy', 'ops');
+      assert.equal(await sleepEndLocus(f), 'ops', 'no hold: the unprompted channel');
+      enterAllExcept(f, 'work');
+      assert.equal(await sleepEndLocus(f), 'work', 'the hold: the channel the agent kept');
+      assert.ok(internals(f).tuneOutCoordinator!.cancelAllExcept('agent-tool', 'test').ok);
+      await f.framework.runUntilIdle();
+      assert.equal(await sleepEndLocus(f), 'ops', 'the hold ended: the unprompted channel again');
+    } finally { await f.close(); }
+  });
+
+  it("what servers are told follows the same order: an explicit-mode timer turn's channel context names the excepted channel while the hold is open", async () => {
+    const f = await withUnprompted([{ name: 'agent', model: 'test', systemPrompt: 'test', proseRouting: 'explicit' }]);
     f.membrane.responses.length = 0;
     (f.membrane as unknown as { responseIndex: number }).responseIndex = 0;
     const told = async (): Promise<string | undefined> => {
       f.membrane.pushResponse(createMockResponse([]));
-      (f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
-        agentName: 'agent', reason: 'test', source: 'test', timestamp: Date.now(),
-      });
-      await f.framework.runUntilIdle();
+      await sleepEndLocus(f);
       const registry = internals(f).channelRegistry as unknown as {
         buildChannelContext(agentName: string, serverId: string): { defaultOutgoing?: { channelId: string } } | undefined;
       };
@@ -311,31 +421,12 @@ describe('unpromptedChannel and the tune-out holds', () => {
     try {
       await registerOpen(f, 'work', 'noisy', 'ops');
       assert.equal(await told(), 'ops', 'no hold: the unprompted channel');
-      assert.ok(internals(f).tuneOutCoordinator!.enterAllExcept(
-        { serverId: 'editor', channelId: 'work' }, { durationSeconds: 120, backlogCap: 10 }, 'agent-tool',
-      ).ok);
+      enterAllExcept(f, 'work');
       assert.equal(await told(), 'work', 'the hold: the channel the agent kept');
     } finally { await f.close(); }
   });
 
-  it("an all-except hold's channel outranks it: a turn no channel prompted speaks in the excepted channel while the hold is open, and in the unprompted channel before and after", async () => {
-    const f = await withUnprompted();
-    try {
-      await registerOpen(f, 'work', 'noisy', 'ops');
-      assert.equal(await channellessTurnLocus(f), 'ops', 'no hold: the unprompted channel');
-      const entered = internals(f).tuneOutCoordinator!.enterAllExcept(
-        { serverId: 'editor', channelId: 'work' }, { durationSeconds: 120, backlogCap: 10 }, 'agent-tool',
-      );
-      assert.ok(entered.ok);
-      assert.equal(await channellessTurnLocus(f), 'work', 'the hold: the channel the agent kept');
-      assert.ok(internals(f).tuneOutCoordinator!.cancelAllExcept('agent-tool', 'test').ok);
-      f.alwaysRespond();
-      await f.framework.runUntilIdle();
-      assert.equal(await channellessTurnLocus(f), 'ops', 'the hold ended: the unprompted channel again');
-    } finally { await f.close(); }
-  });
-
-  const releaseLoci = async (f: Awaited<ReturnType<typeof withUnprompted>>, cancel: () => void): Promise<Array<string | null>> => {
+  const releaseLoci = async (f: Fixture, cancel: () => void): Promise<Array<string | null>> => {
     const loci: Array<string | null> = [];
     const off = f.framework.onTrace((t) => {
       if (t.type === 'inference:started' && (t as { agentName: string }).agentName === 'agent') {
@@ -350,16 +441,15 @@ describe('unpromptedChannel and the tune-out holds', () => {
     return loci;
   };
 
-  it("an all-except hold's release turn answers held channel messages, so it takes main's fallback, not the unprompted channel", async () => {
+  it("an all-except hold's release turn answers the held messages, so it takes main's fallback, not the unprompted channel", async () => {
     const f = await withUnprompted();
     try {
       await registerOpen(f, 'work', 'noisy', 'ops');
-      assert.ok(internals(f).tuneOutCoordinator!.enterAllExcept(
-        { serverId: 'editor', channelId: 'work' }, { durationSeconds: 120, backlogCap: 10 }, 'agent-tool',
-      ).ok);
+      enterAllExcept(f, 'work');
       await incoming(f, 'noisy', 'n1', 'noise one');
       await settle(f);
       const loci = await releaseLoci(f, () => assert.ok(internals(f).tuneOutCoordinator!.cancelAllExcept('agent-tool', 'test').ok));
+      assert.match(textOf(find(f, '<tuned-out-backlog')), /noise one/, 'the release carried the held message');
       assert.ok(loci.length >= 1, 'the release woke the resident');
       assert.deepEqual(loci, loci.map(() => null), JSON.stringify(loci));
     } finally { await f.close(); }
@@ -373,37 +463,9 @@ describe('unpromptedChannel and the tune-out holds', () => {
       await incoming(f, 'noisy', 'n1', 'noise one');
       await settle(f);
       const loci = await releaseLoci(f, () => assert.ok(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test').ok));
+      assert.match(textOf(find(f, '<tuned-out-backlog')), /noise one/, 'the release carried the held message');
       assert.ok(loci.length >= 1, 'the release woke the resident');
       assert.deepEqual(loci, loci.map(() => null), JSON.stringify(loci));
     } finally { await f.close(); }
-  });
-
-  it('a release restored at boot owes the resident a wake marked as a channel message\'s', async () => {
-    const gate = new GateModule();
-    const f = await fixture({ framework: { subconscious: SUB, modules: [gate] } as Partial<FrameworkConfig> });
-    let saved: string;
-    try {
-      await registerOpen(f, 'work', 'noisy');
-      enter(f, 'noisy', { backlogCap: 10 });
-      const { loop } = await blockInTool(f, gate);
-      await incoming(f, 'noisy', 'n1', 'held before the crash');
-      await eventually(() => internals(f).deferredMessages.some((m) => textOf(m as Stored).includes('held before the crash')), 'held message deferred');
-      assert.ok(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test').ok);
-      saved = readFileSync(join(f.dir, 'store', 'recovery', 'deferred-writes.json'), 'utf8');
-      f.alwaysRespond();
-      gate.release('g1');
-      await loop;
-    } finally { await f.close(); }
-
-    const dir = mkdtempSync(join(tmpdir(), 'unprompted-reboot-'));
-    const deferredWritesPath = join(dir, 'deferred-writes.json');
-    writeFileSync(deferredWritesPath, saved!);
-    const g = await fixture({ framework: { subconscious: SUB, deferredWritesPath } as Partial<FrameworkConfig>, dir });
-    try {
-      const pending = (g.framework as unknown as { pendingRequests: Array<{ agentName: string; reason: string; channelBorne?: true }> }).pendingRequests;
-      const release = pending.find((r) => r.agentName === 'agent' && /tune-out released/.test(r.reason));
-      assert.ok(release, 'the restored release owes the resident its wake');
-      assert.equal(release.channelBorne, true);
-    } finally { await g.close(); }
   });
 });

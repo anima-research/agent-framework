@@ -1251,16 +1251,21 @@ const TURN_RETRY: unique symbol = Symbol('turn-retry');
  */
 const MERGED_BATCH: unique symbol = Symbol('merged-batch');
 const REARMED: unique symbol = Symbol('rearmed');
+const UNPROMPTED: unique symbol = Symbol('unprompted');
 const TURN_CARRY: unique symbol = Symbol('turn-carry');
 interface TurnCarry {
   silence: TurnSilence | null;
   sends: SendsReached | null;
   read: number;
 }
-type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [TURN_CARRY]?: TurnCarry; [REARMED]?: true };
+type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [UNPROMPTED]?: true };
 
 function isRearmed(request: InferenceRequest | undefined): boolean {
   return request !== undefined && (request as MarkedRequest)[REARMED] === true;
+}
+
+function isUnprompted(request: InferenceRequest | undefined): boolean {
+  return request !== undefined && (request as MarkedRequest)[UNPROMPTED] === true;
 }
 
 interface StatedWaitRun { since: number; holds: number; alerted: boolean; model: string; reason: string; heldUntil: number }
@@ -1415,7 +1420,7 @@ interface TurnRouting {
    * wake, so a heartbeat can't start a loop of turns.
    */
   heartbeat?: true;
-  channelBorne?: true;
+  unprompted?: true;
   /**
    * Locus and hybrid mode: where the turn's unpinned plain prose lands.
    * Frozen when the turn opens (home channel for a fork, else the trigger
@@ -4867,7 +4872,7 @@ export class AgentFramework {
         addMessage: (p, c, m, forAgent, placement) => framework.addMessage(p, c, m as MessageMetadata,
           forAgent || placement ? { ...(forAgent ? { forAgent } : {}), ...(placement ? { placement } : {}) } : undefined),
         requestInference: (agentName, reason, source, provenance, after) => {
-          framework.pendingRequests.push({
+          const request: MarkedRequest = {
             agentName, reason, source, timestamp: Date.now(),
             ...framework.readsWriteFor(after, agentName),
             // gate-requested wakes carry where/who (EventGate wakeProvenance)
@@ -4875,7 +4880,6 @@ export class AgentFramework {
             ...(provenance?.channelId ? { wakeChannelId: provenance.channelId } : {}),
             ...(provenance?.counterparty ? { counterparty: provenance.counterparty } : {}),
             ...(provenance?.at ? { wakeAt: provenance.at } : {}),
-            ...(provenance?.channelBorne ? { channelBorne: true as const } : {}),
             // The batch's line, when the gate left it to the turn's start
             // (beginAgentTurn decides it: placeWakeLines).
             ...(provenance?.line ? { wakeLines: [provenance.line] } : {}),
@@ -4900,7 +4904,9 @@ export class AgentFramework {
                 ? { channelId: route.channelId, channelServerId: route.serverId, addressed: true }
                 : {};
             })(),
-          });
+          };
+          if (source === 'self-wake' || source === 'sleep') request[UNPROMPTED] = true;
+          framework.pendingRequests.push(request);
         },
         getAgentNames: () => framework.registry.gateRecipients(),
         isHeld: (serverId, channelId) =>
@@ -5156,8 +5162,8 @@ export class AgentFramework {
           addMessage: (participant, content, metadata, forAgent) =>
             framework.addMessage(participant, content, metadata as MessageMetadata,
               forAgent ? { forAgent } : undefined),
-          requestInference: (agentName, reason, source, mark) => {
-            framework.pendingRequests.push({ agentName, reason, source, timestamp: Date.now(), ...(mark?.channelBorne ? { channelBorne: true as const } : {}) });
+          requestInference: (agentName, reason, source) => {
+            framework.pendingRequests.push({ agentName, reason, source, timestamp: Date.now() });
           },
           subconsciousName: () => framework.subconsciousAgentName,
           ...(framework.readerForks
@@ -9946,7 +9952,7 @@ export class AgentFramework {
       if ((m.metadata as { kind?: unknown } | undefined)?.kind !== 'tune-out-cancel') continue;
       const target = m.forAgent ?? this.primaryAgentName;
       if (target) {
-        this.pendingRequests.push({ agentName: target, reason: 'tune-out released (restored)', source: 'tune-out', timestamp: Date.now(), channelBorne: true });
+        this.pendingRequests.push({ agentName: target, reason: 'tune-out released (restored)', source: 'tune-out', timestamp: Date.now() });
       }
     }
     // Rewrite the durable queue without the already-landed entries so a
@@ -19711,7 +19717,6 @@ export class AgentFramework {
           // line stays to be decided when the host resumes.
           const lines = prev ? mergeWakeLines([prev, request]) : undefined;
           if (lines) kept.wakeLines = lines;
-          if (prev?.channelBorne || request.channelBorne) kept.channelBorne = true;
           newestByKey.set(key, kept);
         }
         this.pendingRequests.push(...newestByKey.values());
@@ -20000,7 +20005,6 @@ export class AgentFramework {
         // A heartbeat's turn when any cause is a heartbeat's wake and none
         // names a channel, whatever the batch's order (isHeartbeatWake).
         heartbeatTurn: !channelReq && requests.some((r) => isHeartbeatWake(r)),
-        channelBorne: requests.some((r) => r.channelBorne === true) || undefined,
         // The channel and its server from the one request, so the turn's
         // channel is that message's, never one server's id with another's.
         channelId: channelReq?.channelId,
@@ -20029,6 +20033,8 @@ export class AgentFramework {
       else delete start[TURN_CARRY];
       if (requests.every(isRearmed)) start[REARMED] = true;
       else delete start[REARMED];
+      if (requests.every(isUnprompted)) start[UNPROMPTED] = true;
+      else delete start[UNPROMPTED];
       // A start merged from more than one request, any of them not the
       // turn's, records the batch it was merged from (MERGED_BATCH): until
       // it takes its token it stands for them all.
@@ -24101,8 +24107,8 @@ export class AgentFramework {
       // speech is held as a draft (TurnRouting.heartbeat).
       if (isHeartbeatWake(trigger)) routing.heartbeat = true;
       else delete routing.heartbeat;
-      if (trigger?.channelBorne) routing.channelBorne = true;
-      else delete routing.channelBorne;
+      if (isUnprompted(trigger)) routing.unprompted = true;
+      else delete routing.unprompted;
       // Resolve the turn's outbound locus now: the home channel for forks,
       // else the trigger channel, else the global default, which an
       // ephemeral run never takes (takesGlobalFallback), with the configured
@@ -32246,11 +32252,8 @@ export class AgentFramework {
         // message's channel is nobody's choice for it (#551). By name, so a
         // speech dispatch that comes after the run's release still counts.
         takesGlobalFallback: (conversationId) => this.usedEphemeralAgentNames.get(conversationId) !== 'run',
-        takesUnpromptedChannel: (conversationId) => {
-          if (this.usedEphemeralAgentNames.get(conversationId) === 'run') return false;
-          const routing = this.turnRouting.get(conversationId);
-          return !(routing?.channelBorne || routing?.heartbeat || routing?.silent);
-        },
+        takesUnpromptedChannel: (conversationId) =>
+          this.usedEphemeralAgentNames.get(conversationId) !== 'run' && this.turnRouting.get(conversationId)?.unprompted === true,
         eventGatePresent: this.eventGate !== null,
         unpromptedChannel: this.mcplUnpromptedChannel ?? undefined,
         // A channel tool reads the connect and restart marks a tool call's

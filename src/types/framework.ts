@@ -202,7 +202,10 @@ export interface FrameworkConfig {
    *   inbound message is a global fallback locus for turns without one, and
    *   an addressed message injected mid-turn re-pins the turn's locus.
    *
-   * Held traffic never moves the locus under either rule.
+   * Held traffic never moves the locus under either rule. Under either, a
+   * turn the agent's own timer starts takes `unpromptedChannel` where it's
+   * set, after an all-except hold's channel and before both rules' own
+   * fallbacks.
    */
   speech?: {
     locus?: 'delivery' | 'latest-inbound';
@@ -483,23 +486,24 @@ export interface FrameworkConfig {
   inferenceRouting?: InferenceRoutingPolicy;
 
   /**
-   * The channel for a turn no channel message prompted, while the turn has no
-   * channel of its own: a self-scheduled wake's or a sleep's end, say. Plain
+   * The channel for a turn the agent's own timer starts, which no message
+   * prompted: the wake `skip_reply` schedules, or the end of a `sleep`. Plain
    * speech in locus or hybrid prose routing goes there, and so does
    * `channel_publish` naming no channel in any prose routing mode, which
    * servers are told as the turn's default outgoing channel. An all-except
    * hold's channel still comes first while one is open, and without the
-   * setting such a turn follows `speech.locus`. It never applies to a turn a
-   * channel message prompted, addressed or not, nor to a conversation fork's
-   * turn, a heartbeat's, silent or not (its plain speech is held as drafts, a
-   * silent tick's suppressed), or an ephemeral run's (its prose is its
-   * caller's result). One value, for every agent on the framework. A
-   * registered channel's id, e.g.
+   * setting such a turn follows `speech.locus`. No other turn takes it: not
+   * one a message prompted, from a channel, a module, a person at a console
+   * or another agent; not a heartbeat's or a reminder's (its plain speech is
+   * held as drafts); not a conversation fork's or an ephemeral run's; and not
+   * a start merged from a timer's wake and any other cause. One value, for
+   * every agent on the framework. A registered channel's id, e.g.
    * `discord:{guildId}:{channelId}`, or, to pick one server's where two
    * register that id, `{serverId}:{channelId}`. `create()` refuses a value
-   * that isn't a string or is blank. One that names no registered channel,
-   * or several, when a turn would take it is logged once, and the turn takes
-   * what it would without the setting.
+   * that is neither a string nor null, or is blank; null reads as not set. A
+   * value that names no registered channel, several, or one its server
+   * declared inbound-only, when a turn would take it, is logged once, and the
+   * turn takes what it would without the setting.
    */
   unpromptedChannel?: string;
 

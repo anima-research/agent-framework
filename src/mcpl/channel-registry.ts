@@ -567,7 +567,7 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'channel_publish',
-    description: "Publish a message to a channel. If channelId is omitted, publishes where your plain speech goes this turn: your conversation's channel if you are bound to one; otherwise the channel of the message that woke this turn, or one you opened during it; otherwise, while a focus holds, the channel it keeps; otherwise, on a turn no channel message prompted, the channel this host names for such turns, if it names one. Where none of those names a channel, nothing is posted, unless this host is set to use the channel of the latest incoming message instead. A turn with no channel by design, such as a heartbeat's, has no default, so it names one. A subagent has no default, so it must name a channel.",
+    description: "Publish a message to a channel. If channelId is omitted, publishes where your plain speech goes this turn: your conversation's channel if you are bound to one; otherwise the channel of the message that woke this turn, or one you opened during it; otherwise, while a focus holds, the channel it keeps; otherwise, on a turn your own skip_reply wake or the end of your sleep started, the channel this host names for such turns, if it names one. Where none of those names a channel, nothing is posted, unless this host is set to use the channel of the latest incoming message instead. A turn with no channel by design, such as a heartbeat's, has no default, so it names one. A subagent has no default, so it must name a channel.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1103,15 +1103,15 @@ interface ChannelRegistryOptions {
   /**
    * FrameworkConfig.unpromptedChannel: where a turn that takes it
    * (takesUnpromptedChannel) and has no home and no channel of its own is
-   * placed, ahead of the process-global fallback. A name, as entriesNamed
-   * reads one.
+   * placed, within the process-global fallback, after an all-except hold's
+   * channel (sharedFallback). A name, as entriesNamed reads one.
    */
   unpromptedChannel?: string;
   /**
    * Whether the conversation's current turn takes `unpromptedChannel` where it
-   * has no channel of its own: false for a turn a channel message prompted
-   * (InferenceRequest.channelBorne), a heartbeat's and an ephemeral run's.
-   * Absent, every turn does.
+   * has no channel of its own: the framework answers true only for a turn
+   * the agent's own timer started, as FrameworkConfig.unpromptedChannel
+   * says. Absent, every turn does.
    */
   takesUnpromptedChannel?: (conversationId: string) => boolean;
   /**
@@ -2580,11 +2580,11 @@ export class ChannelRegistry {
     // An ephemeral run takes no global fallback (takesGlobalFallback): not the
     // all-except hold's channel, not the latest inbound message's channel as
     // its outgoing one, nor that message as the one it is replying to.
-    const fallback = agentName !== undefined
+    const fallback = (): ChannelRef | null => agentName !== undefined
       ? this.globalFallbackFor(agentName, () => this.configuredUnprompted(agentName))
       : this.sharedFallback();
     // A turn that deliberately has no channel (null) takes no fallback.
-    const outgoing = home ?? (active !== undefined ? active : fallback);
+    const outgoing = home ?? (active !== undefined ? active : fallback());
 
     const context: ChannelContext = {};
 
@@ -5801,15 +5801,17 @@ export class ChannelRegistry {
     if (!this.unpromptedChannel) return null;
     if (conversationId !== undefined && this.takesUnpromptedChannel?.(conversationId) === false) return null;
     const named = this.entriesNamed(this.unpromptedChannel);
-    if (named.length === 1) return refOf(named[0]!);
+    if (named.length === 1 && !isInboundOnly(named[0]!)) return refOf(named[0]!);
     if (!this.unpromptedChannelWarned) {
       this.unpromptedChannelWarned = true;
       const why = named.length === 0
         ? 'names no registered channel'
-        : `names ${named.length} registered channels (name one with its server, as "serverId:channelId")`;
+        : named.length === 1
+          ? 'names a channel its server declared inbound-only'
+          : `names ${named.length} registered channels (name one with its server, as "serverId:channelId")`;
       console.error(
-        `[routing] unpromptedChannel ${logValue(this.unpromptedChannel)} ${why}, so a turn no channel message prompted `
-          + 'takes the fallback it takes without the setting until the setting names one. Logged once.',
+        `[routing] unpromptedChannel ${logValue(this.unpromptedChannel)} ${why}, so a turn the agent's own timer starts `
+          + 'takes the fallback it takes without the setting until the setting names a channel it can speak in. Logged once.',
       );
     }
     return null;

@@ -641,15 +641,6 @@ export interface InferenceRequest {
    */
   heartbeatTurn?: boolean;
   /**
-   * Framework-set: a channel message prompted this wake, though it names no
-   * channel to speak in, as a gate batch of messages none of which addressed
-   * the agent (WakeProvenance.channelBorne), or a tune-out's release, whose
-   * turn reads the held messages. Such a turn never takes
-   * `FrameworkConfig.unpromptedChannel`. True on a merged batch when any of
-   * its causes is. Hosts don't set it.
-   */
-  channelBorne?: true;
-  /**
    * True when the triggering message explicitly addressed the agent (mention,
    * reply-to-bot, DM — `chat:addressed` in MCPL RFC-001 terms). When a wake
    * batch spans several channels, an addressed channel outranks ambient

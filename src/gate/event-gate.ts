@@ -192,10 +192,6 @@ export interface WakeProvenance {
   /** Timestamp (ms) of the chosen event, so a consumer coalescing several
    *  requests can order by event recency, not by flush order. */
   at?: number;
-  /** True when any event in the batch came from a channel (it names one, its
-   *  own or a resolved route), addressed or not, so a channel message
-   *  prompted the wake even where it names no speech locus. */
-  channelBorne?: true;
   /** The batch's `[Gate: …]` line, when the gate handed it to the wake rather
    *  than wrote it: a WakeLine, the parts its text is rendered from when it's
    *  written (wakeLineText), decided by a fresh start of the wake's turn as
@@ -313,9 +309,8 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     if (!newest || e.timestamp >= newest.timestamp) newest = e;
     if (e.addressed && (!newestAddressed || e.timestamp >= newestAddressed.timestamp)) newestAddressed = e;
   }
-  const channelBorne = events.some((e) => !!(e.channelId || e.routeChannelId));
   const pick = newestAddressed ?? newest;
-  if (!pick) return channelBorne ? { channelBorne: true } : undefined;
+  if (!pick) return undefined;
   // push-event channel ids are the adapter's raw ids (a Discord snowflake):
   // not a composite channel id, so not reported as one
   const channelId = pick.channelId && pick.eventType !== 'mcpl:push-event' ? pick.channelId : undefined;
@@ -328,7 +323,6 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
       ? { routeChannelId: pick.routeChannelId, ...(pick.serverId ? { routeServerId: pick.serverId } : {}) }
       : {}),
     at: pick.timestamp,
-    ...(channelBorne ? { channelBorne: true } : {}),
   };
 }
 

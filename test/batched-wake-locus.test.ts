@@ -257,6 +257,12 @@ for (const locus of ['delivery', 'latest-inbound'] as const) {
     const settled = async (): Promise<void> => {
       await waitFor(() => rig.membrane().calls.length >= 1, 'the batch woke the agent');
       await rig.framework().runUntilIdle();
+      const texts = (): string[] => rig.framework().getAgent('scout')!.getContextManager().getAllMessages()
+        .flatMap((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text));
+      await waitFor(
+        () => publishes().length > 0 || texts().some((t) => t.startsWith('[send-undeliverable]')),
+        'the reply was routed: published, or found no channel',
+      );
     };
 
     it('chatter in one channel: the reply goes where it would without the setting, not to the unprompted channel', async () => {
