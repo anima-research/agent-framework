@@ -139,21 +139,29 @@ describe('judge rules: reading', () => {
 });
 
 describe('judge rules: verdicts', () => {
-  it("a reply hands the wake the write of each event the host says isn't answered yet, and keeps the wake for the rest", async () => {
-    const judge = scriptedJudge();
-    const answered = new Set(['row-1']);
-    const { gate, wakes } = makeGate(writeConfig('reply-split.json', JUDGED), {
-      judge: judge.fn, isNewestEntry: () => false, isAnswered: (after) => answered.has(after.messageId!),
+  for (const [answeredRows, handed] of [[[], true], [['row-1'], false]] as const) {
+    it(`a reply with ${answeredRows.length ? 'an event the host says is already answered keeps the wake for it, so the batch\'s line is written at delivery and none handed' : 'no event the host says is answered hands the wake each event\'s write'}`, async () => {
+      const judge = scriptedJudge();
+      const answered = new Set<string>(answeredRows);
+      const { gate, wakes, messages } = makeGate(writeConfig(`reply-split-${answeredRows.length}.json`, JUDGED), {
+        judge: judge.fn, isNewestEntry: () => false, isAnswered: (after) => answered.has(after.messageId!),
+      });
+      gate.evaluate(chat('already answered'), { agent: 'agent', messageId: 'row-1' });
+      gate.evaluate(chat('still open'), { agent: 'agent', messageId: 'row-2' });
+      await until(() => judge.waiting() === 1, 'the judge is asked');
+      judge.answer({ reply: true, reason: 'a direct question', inputTokens: 1 });
+      await until(() => wakes.length === 1, 'the wake');
+      if (handed) {
+        const lines = wakes[0]!.lines as Array<{ after?: WritePlacement }>;
+        assert.deepStrictEqual(lines.map((line) => line.after), [{ agent: 'agent', messageId: 'row-1' }, { agent: 'agent', messageId: 'row-2' }]);
+        assert.strictEqual(messages.length, 0);
+      } else {
+        assert.strictEqual(wakes[0]!.lines, undefined, 'no lines handed: the wake has nothing to drop it by');
+        assert.strictEqual(messages.length, 1, 'the line written at delivery');
+      }
+      gate.dispose();
     });
-    gate.evaluate(chat('already answered'), { agent: 'agent', messageId: 'row-1' });
-    gate.evaluate(chat('still open'), { agent: 'agent', messageId: 'row-2' });
-    await until(() => judge.waiting() === 1, 'the judge is asked');
-    judge.answer({ reply: true, reason: 'a direct question', inputTokens: 1 });
-    await until(() => wakes.length === 1, 'the wake');
-    const lines = wakes[0]!.lines as Array<{ after?: WritePlacement }>;
-    assert.deepStrictEqual(lines.map((line) => line.after), [undefined, { agent: 'agent', messageId: 'row-2' }]);
-    gate.dispose();
-  });
+  }
 
   for (const [doubt, isAnswered] of [
     ['no isAnswered', undefined],

@@ -2269,10 +2269,11 @@ export class EventGate {
     /** Whether an MCPL event's own context entry is still the newest entry in
      *  the window a batched wake's line would be written to, with nothing
      *  waiting to be written there. A batched wake for that one message, or
-     *  one with an event `evaluate` was given a write for (`after`,
+     *  one whose every event `evaluate` was given a write for (`after`,
      *  naming the agent it went to by the time the batch fires), doesn't
      *  write its line when it fires: it hands the line to the wake
-     *  (WakeProvenance.lines), for a turn's start to decide (WakeLine). Absent: every batched wake writes its line, as before. */
+     *  (WakeProvenance.lines), for a turn's start to decide (WakeLine).
+     *  Absent: every batched wake writes its line, as before. */
     isNewestEntry?: (entry: GateEntryRef) => boolean;
     /** Whether the agent an event's write went to (`after`, as `evaluate`
      *  was given it) has answered a request that carried it, its answer's
@@ -3899,12 +3900,13 @@ export class EventGate {
     // nothing the message right above doesn't. But the turn compiles later,
     // and what lands in between puts the message above other entries, so the
     // gate hands the line to the wake (WakeProvenance.lines) and a turn's start
-    // decides it (WakeLine). So does a batch with an event whose write names
-    // the agent it went to, which the agent may have answered by then; a
-    // write the host never filled in can't be answered, and doesn't count.
+    // decides it (WakeLine). So does a batch whose every event has a write
+    // naming the agent it went to, each of which the agent may have answered
+    // by then. A batch with an event given no write, or one the host never
+    // filled in, can't be judged answered whole, so its line is written now.
     const only = events.length === 1 && events[0].inContext ? events[0] : undefined;
     const handed = this.isNewestEntryFn !== undefined
-      && (events.some((e) => !!e.after?.agent) || (only !== undefined && this.newestEntry(only)));
+      && (events.every((e) => !!e.after?.agent) || (only !== undefined && this.newestEntry(only)));
     if (!handed) {
       this.addMessageFn('user', [{ type: 'text', text: wakeLineText(lines, Date.now()) }], {
         source: 'gate:debounce',

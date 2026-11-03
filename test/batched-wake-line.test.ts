@@ -399,6 +399,47 @@ describe('isNewestContextEntry', () => {
     assert.equal(linesIn('LINE-E2'), 1, 'the second written: the wake has two causes');
   });
 
+  // A line with a write (`after`) and a reply owed (`replyTo`): no turn runs
+  // here, so the agent hasn't answered it.
+  const writtenLineFor = async (text: string, shown: string) => {
+    const row = await waitForRow(text);
+    return { ...lineFor(row.metadata ?? {}, shown), after: { agent: 'scout', messageId: row.id }, replyTo: { serverId: 'discord', channelId: 'discord:dm:1' } };
+  };
+  const waitForRow = async (text: string) => {
+    await stored(text);
+    return internals().agents.get('scout')!.getContextManager().getAllMessages()
+      .find((m) => m.content.some((b) => b.type === 'text' && (b.text ?? '').includes(text)))! as unknown as { id: string; metadata?: Record<string, unknown> };
+  };
+
+  it('a line with a write left out as newest isn\'t written by the next wake\'s start, whose own newest line is left out too', async () => {
+    const omitted: string[] = [];
+    framework.onTrace((event) => { if (event.type === 'gate:wake-line-omitted') omitted.push((event as unknown as { reason: string }).reason); });
+    command(`dm ev-${++n} 134 1548000000000000001 first DM`);
+    (framework as unknown as Placing).placeWakeLines(scout(), [await writtenLineFor('first DM', '[Gate: LINE-S1E]')]);
+    command(`dm ev-${++n} 134 1548000000000000001 second DM`);
+    (framework as unknown as Placing).placeWakeLines(scout(), [await writtenLineFor('second DM', '[Gate: LINE-S1M]')]);
+    assert.equal(linesIn('LINE-S1'), 0, 'no line for either');
+    assert.deepEqual(omitted, ['newest', 'newest']);
+  });
+
+  it('a line with a write left out as newest isn\'t written by a later start of another wake', async () => {
+    command(`dm ev-${++n} 134 1548000000000000001 a DM`);
+    (framework as unknown as Placing).placeWakeLines(scout(), [await writtenLineFor('a DM', '[Gate: LINE-S2]')]);
+    internals().addMessage('someone', [{ type: 'text', text: 'later, elsewhere' }], { serverId: 'discord', channelId: 'discord:g1:general', messageId: `m-later-${n}` });
+    (framework as unknown as Placing).placeWakeLines(scout(), []);
+    assert.equal(linesIn('LINE-S2'), 0);
+  });
+
+  it('a line with a write left out as newest is written by a later start of its own wake once something newer has come', async () => {
+    command(`dm ev-${++n} 134 1548000000000000001 a DM`);
+    const line = await writtenLineFor('a DM', '[Gate: LINE-SAME]');
+    (framework as unknown as Placing).placeWakeLines(scout(), [line]);
+    assert.equal(linesIn('LINE-SAME'), 0, 'premise: left out as newest');
+    internals().addMessage('someone', [{ type: 'text', text: 'during the hold' }], { serverId: 'discord', channelId: 'discord:g1:general', messageId: `m-hold-${n}` });
+    (framework as unknown as Placing).placeWakeLines(scout(), [line]);
+    assert.equal(linesIn('LINE-SAME'), 1);
+  });
+
   it('a handed line written later counts its message\'s age to when it is written', async () => {
     command(`dm ev-${++n} 134 1548000000000000001 a DM`);
     const md = await stored('a DM');

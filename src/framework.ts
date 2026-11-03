@@ -4212,6 +4212,10 @@ export class AgentFramework {
   /** The batched-wake lines already written, so a wake's line that another
    *  start wrote isn't owed again by a later start of that wake. */
   private readonly placedWakeLines = new WeakSet<WakeLine>();
+  /** The batched-wake lines a start left out as newest: as a line with no
+   *  write is, they're decided again only by the delivery agent's later starts
+   *  of their own wake (placeWakeLines). */
+  private readonly newestWakeLines = new WeakSet<WakeLine>();
   /** Rounds of tool calls, by their results array, that a save_recent_image
    *  in the round counted by their share of the bound: such a round is
    *  stored by its share whether or not it fits (buildStoredToolResultContent). */
@@ -29830,10 +29834,11 @@ export class AgentFramework {
    * with a write (`after`) is owed to the slot (owedWakeLines): the first
    * start of any agent that reads it after the batch fires writes it,
    * whichever reader it is, so every reader's request after it holds it. A
-   * line with none, handed for its newest message, is written by the delivery
-   * agent's start of its own wake only, as it can't be judged answered and
-   * another reader's start could follow that agent's answer. Called by a fresh start
-   * that doesn't resume a logical turn, after the turn's own inputs (a due
+   * line with none, handed for its newest message, is decided by the delivery
+   * agent's starts of its own wake only, as it can't be judged answered and
+   * another reader's start could follow that agent's answer; so is a line any
+   * start left out as newest. Called by a fresh start that doesn't resume a
+   * logical turn, after the turn's own inputs (a due
    * clock row, the deferred-write and assembly flushes) and before its
    * checkpoint, so a line lands after whatever arrived since the gate's
    * decision, before the notices the turn's start writes itself (the locus
@@ -29855,22 +29860,24 @@ export class AgentFramework {
    *   (overlapping turns in the slot, #286).
    *
    * The start's own wake's lines with a write join those owed. A line left
-   * out, or whose write fails, is decided again later: one with a write by
-   * the next fresh start of a reader, one without by the delivery agent's
-   * next start of its wake. One left out is traced (newest, held). Each line
-   * is written once (placedWakeLines).
+   * out for a held slot, or whose write fails, is decided again by the next
+   * fresh start of a reader if it has a write; one left out as newest, or one
+   * with no write, by the delivery agent's later starts of its own wake (a
+   * provider hold's release, a requeue). One left out is traced (newest,
+   * held). Each line is written once (placedWakeLines).
    */
   private placeWakeLines(agent: Agent, lines: readonly WakeLine[] = []): void {
     const slot = this.deliveryAgent();
     if (!slot || !this.residentHoldsTraffic(agent.name)) return;
-    for (const line of lines) if (line.after?.agent && !this.placedWakeLines.has(line)) this.owedWakeLines.add(line);
+    const kept = (line: WakeLine) => !line.after?.agent || this.newestWakeLines.has(line);
+    for (const line of lines) if (!kept(line) && !this.placedWakeLines.has(line)) this.owedWakeLines.add(line);
     for (const line of this.owedWakeLines) {
       if (this.wakeLineDone(slot, line)) this.owedWakeLines.delete(line);
     }
-    // A line with no write, handed for its newest message, can't be judged
-    // answered, so only the delivery agent's starts of its own wake decide it:
-    // another reader's start could follow that agent's answer.
-    const own = agent === slot ? lines.filter((line) => !line.after?.agent && !this.placedWakeLines.has(line)) : [];
+    // Another reader's start could come after the agent's turn for these.
+    const own = agent === slot
+      ? lines.filter((line) => kept(line) && !this.placedWakeLines.has(line) && !this.wakeLineDone(slot, line))
+      : [];
     const open = [...this.owedWakeLines, ...own];
     if (open.length === 0) return;
     const held = this.slotHeldFrom(agent);
@@ -29881,6 +29888,10 @@ export class AgentFramework {
     if (leftOut) {
       const reason = held ? 'held' : 'newest';
       for (const line of open) {
+        if (!held) {
+          this.newestWakeLines.add(line);
+          this.owedWakeLines.delete(line);
+        }
         this.emitTrace({
           type: 'gate:wake-line-omitted',
           reason,

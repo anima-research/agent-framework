@@ -1,20 +1,21 @@
-- A batched wake's `[Gate: …]` line is written at the first fresh start after
-  the batch fires of any agent that reads the window it names, whatever woke
-  that agent, not when the batch fires, whenever the batch has an event the
-  agent it was written for may have answered by then, and it names only the
-  events not yet answered then. A batch answered by then leaves no line, and
-  residents who share the window of the agent that answered it still wake
-  for it and find none, where a line was written when the batch fired
-  before. The lines owed to one start are written as one
-  `[Gate: N events matched]` line, in the order their batches fired, each
-  channel's messages counted together, where each batch's was written on its
-  own. A start writes none while the host is quiesced or another reader of
-  the window has a turn alive, and none for a single event that is still the
-  newest entry there; they stay owed for the next start. Owed lines are held
-  in memory, so a restart between a batch's firing and that start loses
-  them. A batch with no such event keeps the rule it had: its line is
-  written when it fires, or, for one message still the newest entry then,
-  decided by the delivery agent's start.
+- A batched wake's `[Gate: …]` line, for a batch whose every event the host
+  wrote to a window (`after`), is written at the first fresh start after the
+  batch fires of any agent that reads that window, whatever woke that agent,
+  not when the batch fires, and it names only the events not yet answered
+  then. A batch answered by then leaves no line, and residents who share the
+  window of the agent that answered it still wake for it and find none,
+  where a line was written when the batch fired before. The lines owed to one
+  start are written as one `[Gate: N events matched]` line, in the order their
+  batches fired, each channel's messages counted together, where each batch's
+  was written on its own. A start that finds the host quiesced or another
+  reader of the window with a turn alive writes none, and the next start of
+  any reader writes them. A line left out because its one event is still the
+  newest entry there is decided again only by the delivery agent's later
+  starts of its wake, as a newest message's line is. Owed lines are held in
+  memory, so a restart between a batch's firing and that start loses them.
+  Any other batch's line is written when it fires, and a single message
+  still the newest entry then is handed to the delivery agent's start, as
+  before.
 - A batch partly answered by its turn's start keeps the route the whole
   batch chose: its turn speaks in the channel of its newest addressed event
   even when that event is answered and the line names only the others.

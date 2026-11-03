@@ -320,6 +320,51 @@ describe('debounced writes already read and answered', () => {
     } finally { await f.close(); }
   });
 
+  it("a batch with an event the host gave no write is written when it fires, naming every event, though the woken start finds the slot held", async () => {
+    const module = new class extends ReminderModule {
+      override async onProcess(event: ProcessEvent, state: ProcessState): Promise<EventResponse> {
+        if (event.type !== 'test:double') return super.onProcess(event, state);
+        return {
+          addMessages: ['double one', 'double two'].map((text) => ({ participant: 'user', content: [{ type: 'text' as const, text }] })),
+          requestInference: true,
+        };
+      }
+    }();
+    const f = await fixture({ framework: {
+      modules: [module],
+      subconscious: { enabled: true, systemPrompt: 'notice' },
+      errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
+      gate: { config: { policies: [{ name: 'batch', match: { scope: ['clock:reminder', 'test:double'] }, behavior: { debounce: 60_000 } }], default: 'always' } },
+    } });
+    const starts: string[] = [];
+    f.framework.onTrace((event) => { if (event.type === 'inference:started') starts.push(event.agentName); });
+    let held: HeldStream | undefined;
+    (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
+      f.membrane.calls.push(request);
+      if (!held) return (held = new HeldStream([say('noted')], true));
+      return new MockYieldingStream([say('fresh turn')], true);
+    };
+    const lines = () => f.framework.getAgent('agent')!.getContextManager().getAllMessages().filter((row) => row.metadata?.source === 'gate:debounce');
+    try {
+      await send(f, 'module', 'with a write');
+      f.framework.pushEvent({ type: 'test:double', source: 'test', content: 'no write' } as unknown as ProcessEvent);
+      await f.framework.runUntilIdle();
+      fire(f);
+      assert.equal(lines().length, 1, 'written when it fired');
+      assert.match(JSON.stringify(lines()[0]!.content), /2 events matched/, 'naming every event');
+      const internals = f.framework as unknown as { pendingRequests: Array<{ agentName: string }> };
+      internals.pendingRequests.unshift({ agentName: 'Subconscious', reason: 'test', source: 'test', timestamp: Date.now() } as never);
+      const idle = f.framework.runUntilIdle();
+      await eventually(() => held?.entered === true, "the subconscious's turn is alive");
+      await eventually(() => starts.length === 2, "the resident's woken turn starts while the subconscious's is alive");
+      held!.release();
+      await idle;
+      assert.deepEqual(starts.slice(0, 2), ['Subconscious', 'agent']);
+      assert.match(JSON.stringify(f.membrane.calls[1]), /2 events matched/, "the woken turn's request carries it");
+      assert.equal(lines().length, 1, 'once');
+    } finally { await f.close(); }
+  });
+
   it('two batches owed to one start are written as one line, in the order they fired', async () => {
     const module = new class extends ReminderModule {
       override async onProcess(event: ProcessEvent, state: ProcessState): Promise<EventResponse> {
