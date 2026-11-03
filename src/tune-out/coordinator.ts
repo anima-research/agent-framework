@@ -685,7 +685,16 @@ export class TuneOutCoordinator {
     const sequence = Math.min(...active.map((e) => e.sequence));
     const epochIds = active.filter((e) => e.sequence === sequence).map((e) => e.epochId);
     const kept = this.ordinalsKept();
-    const state: WindowStartsState = kept ? this.readWindowState() : { starts: {} };
+    const read = kept ? this.readWindowState() : { starts: {} };
+    if (read === null) {
+      // Which starts are kept can't be told: set by sequence, the window
+      // could move off a start fixed for an active tune-out, and the fix
+      // would write over the record. It stays where it was, nothing written;
+      // the next enter or restart sets it.
+      console.error(`[tune-out] the subconscious's window start stays where it was: its kept starts can't be read; the next enter or restart sets it`);
+      return;
+    }
+    const state: WindowStartsState = read;
     const own = epochIds.map((id) => state.starts[id]).find((o) => o !== undefined);
     let ordinal = own;
     // At a resume, the start in force before the restart (a cancelled
@@ -745,21 +754,23 @@ export class TuneOutCoordinator {
    * Each tune-out's window start as an ordinal, by epoch id, as kept on the
    * store's branch now, and the start in force (`inForce`: the ordinal the
    * window start was last set to while a tune-out is active), which a
-   * restart sets again (anchorSubconscious). A state that can't be read, or
-   * isn't this format (`{ v: 1, starts, inForce? }`), reads as none kept,
-   * and is written over at the next fix, with a line saying so. A state an
-   * earlier version kept, with no `inForce`, reads as one with none in
-   * force, and a restart sets the oldest active tune-out's start, or the
-   * anchor the subconscious's strategy persisted where that is earlier
-   * (keepEarlierAnchor).
+   * restart sets again (anchorSubconscious). A state that isn't this format
+   * (`{ v: 1, starts, inForce? }`) reads as none kept, and is written over
+   * at the next fix, with a line saying so. A read that throws answers null:
+   * what is kept can't be told, so nothing is written over it (a fix isn't
+   * kept, and is tried again at the next presentation), and the window
+   * start isn't moved. A state an earlier version kept, with no `inForce`,
+   * reads as one with none in force, and a restart sets the oldest active
+   * tune-out's start, or the anchor the subconscious's strategy persisted
+   * where that is earlier (keepEarlierAnchor).
    */
-  private readWindowState(): WindowStartsState {
+  private readWindowState(): WindowStartsState | null {
     let raw: unknown;
     try {
       raw = this.channelRegistry.readCoordinatorState(this.windowStartsStateId);
     } catch (err) {
-      console.error(`[tune-out] the subconscious's window starts (${this.windowStartsStateId}) can't be read, so none is kept:`, err);
-      return { starts: {} };
+      console.error(`[tune-out] the subconscious's window starts (${this.windowStartsStateId}) can't be read, so nothing is written over them now:`, err);
+      return null;
     }
     if (raw == null) return { starts: {} };
     const state = raw as { v?: unknown; starts?: unknown; inForce?: unknown };
@@ -799,12 +810,14 @@ export class TuneOutCoordinator {
    * restart sets again (anchorSubconscious), when it is the start in force
    * (`inForce`; another active tune-out's start fixed beside it isn't).
    * Answers whether it is kept, so that the anchor tries again at its next
-   * presentation when it isn't.
+   * presentation when it isn't: not when the record can't be read, which
+   * is never written over then.
    */
   subconsciousWindowFixed(epochIds: readonly string[], ordinal: number, inForce = true): boolean {
     if (!this.ordinalsKept()) return true;
     const active = new Set(this.activeStarts().map((e) => e.epochId));
     const state = this.readWindowState();
+    if (state === null) return false;
     let changed = false;
     for (const epochId of epochIds) {
       if (!active.has(epochId) || state.starts[epochId] === ordinal) continue;
@@ -828,6 +841,8 @@ export class TuneOutCoordinator {
   private forgetWindowStart(epochId: string): void {
     if (!this.ordinalsKept()) return;
     const state = this.readWindowState();
+    // Unreadable: left as it is; a resume's prune takes the start out later.
+    if (state === null) return;
     const noneActive = this.activeStarts().length === 0;
     if (!(epochId in state.starts) && !(noneActive && state.inForce !== undefined)) return;
     delete state.starts[epochId];
@@ -839,6 +854,7 @@ export class TuneOutCoordinator {
   private pruneWindowStarts(): void {
     if (!this.ordinalsKept()) return;
     const state = this.readWindowState();
+    if (state === null) return;
     const active = new Set(this.activeStarts().map((e) => e.epochId));
     const stale = Object.keys(state.starts).filter((epochId) => !active.has(epochId));
     // With none active, no start is in force for the resume to set again.

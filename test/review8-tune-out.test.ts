@@ -10,6 +10,7 @@
  * 67: a kept start clamped to a shorter window is kept clamped.
  * 68: a restart with no start in force kept keeps the strategy's persisted
  *     anchor where it is earlier than the oldest active start.
+ * 69: a window-starts record that can't be read is never written over.
  */
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
@@ -247,4 +248,27 @@ test("68: a restart that finds a cancelled tune-out's start in force sets it, wi
   h.internals.anchorSubconscious('resume');
   assert.deepEqual(h.calls, ['setAnchorOrdinal(3)']);
   assert.deepEqual(h.kept(), { v: 1, starts: { Y: 7 }, inForce: 3 }, "Y's own start stays 7, for the next enter");
+});
+
+test('69: a window-starts record that cannot be read is never written over, and its fix is kept once it can be read', () => {
+  const h = anchored({ active: [{ epochId: 'X', sequence: 30 }, { epochId: 'Y', sequence: 70 }], state: { starts: { X: 3 }, inForce: 3 }, length: 12 });
+  const errors = mock.method(console, 'error', () => {});
+  try {
+    h.control.readFails = 1;
+    assert.equal(h.coordinator.subconsciousWindowFixed(['Y'], 8, false), false, 'not kept');
+    assert.deepEqual(h.writes, [], 'and nothing written over the record');
+    assert.equal(h.coordinator.subconsciousWindowFixed(['Y'], 8, false), true);
+    assert.deepEqual(h.kept(), { v: 1, starts: { X: 3, Y: 8 }, inForce: 3 }, "X's start is kept beside Y's");
+
+    // An anchor whose read fails leaves the window where it was, nothing written.
+    const writes = h.writes.length;
+    h.control.readFails = 1;
+    h.internals.anchorSubconscious('enter');
+    assert.deepEqual(h.calls, [], 'the window start is not moved');
+    h.control.readFails = 2;
+    h.internals.forgetWindowStart('X');
+    h.internals.pruneWindowStarts();
+    assert.equal(h.writes.length, writes, 'nor is anything written by a forget or a prune');
+    assert.deepEqual(h.kept(), { v: 1, starts: { X: 3, Y: 8 }, inForce: 3 });
+  } finally { errors.mock.restore(); }
 });
