@@ -35437,11 +35437,10 @@ export class AgentFramework {
 
     const tools: import('./types/index.js').ToolDefinition[] = [];
     const toolFeatureSets = new Map<string, string>();
-    const previousTools = this.mcplTools;
-    const previousFeatureSets = this.mcplToolFeatureSets;
     const toolClasses = new Map<string, ToolClass[]>();
     const toolServers = new Map<string, string>();
     const listedServers = new Set<string>();
+    const keptServers = new Set<string>();
     const closesOf = (serverId: string): number => this.mcplServerCloses?.get(serverId) ?? 0;
     // Each server's close count as its listing began.
     const closesAtListing = new Map<string, number>();
@@ -35452,9 +35451,15 @@ export class AgentFramework {
       const config = this.mcplServerConfigs.get(server.id);
       const prefix = config?.toolPrefix ?? `mcpl--${server.id}`;
       closesAtListing.set(server.id, closesOf(server.id));
+      const stage = () => ({
+        tools: [] as import('./types/index.js').ToolDefinition[],
+        featureSets: new Map<string, string>(),
+        classes: new Map<string, ToolClass[]>(),
+        servers: new Map<string, string>(),
+      });
+      let staged = stage();
       try {
         const result = await server.sendToolsList();
-        listedServers.add(server.id);
         const listed = new Set<string>();
         const repeated: string[] = [];
         // RFC-014 §8.1: a toolHints server's dynamic tools are announced in
@@ -35471,7 +35476,7 @@ export class AgentFramework {
         // doesn't (a listing that breaks off publishes what it read). The
         // rest stay pending for a refresh that does.
         const presence = this.toolsetHub?.get(server.id);
-        if (presence?.presence.active) movesListed.set(server.id, { controller: presence, prefix, moves: presence.presence.moves() });
+        const moves = presence?.presence.active ? { controller: presence, prefix, moves: presence.presence.moves() } : undefined;
         const dynamic = (name: string): boolean => !!presence?.presence.active && presence.presence.presenceOf(name) === 'dynamic';
         for (const tool of result.tools) {
           if (!isToolAllowed(tool.name, config)) continue;
@@ -35482,7 +35487,7 @@ export class AgentFramework {
             continue;
           }
           listed.add(namespacedName);
-          toolServers.set(namespacedName, server.id);
+          staged.servers.set(namespacedName, server.id);
           const attributedTool = tool as typeof tool & {
             featureSet?: unknown;
             _meta?: { featureSet?: unknown; [key: string]: unknown };
@@ -35490,7 +35495,7 @@ export class AgentFramework {
           // RFC-008: the server's class hint for this tool. Never shown to
           // the model (the definition below is unchanged by it).
           const declaredClasses = parseDeclaredClasses(attributedTool._meta, namespacedName);
-          if (declaredClasses) toolClasses.set(namespacedName, declaredClasses);
+          if (declaredClasses) staged.classes.set(namespacedName, declaredClasses);
           const featureSet = typeof attributedTool.featureSet === 'string'
             ? attributedTool.featureSet
             : typeof attributedTool._meta?.featureSet === 'string'
@@ -35499,42 +35504,47 @@ export class AgentFramework {
           // MCP tool schemas are generic JSON Schema; cast to membrane's ToolDefinition format
           const schema = tool.inputSchema as import('./types/index.js').ToolDefinition['inputSchema'];
           if (offered) {
-            tools.push({
+            staged.tools.push({
               name: namespacedName,
               description: tool.description ?? '',
               inputSchema: schema,
             });
           }
           if (featureSet !== undefined) {
-            toolFeatureSets.set(namespacedName, featureSet);
+            staged.featureSets.set(namespacedName, featureSet);
           }
         }
+        listedServers.add(server.id);
+        if (moves) movesListed.set(server.id, moves);
         if (repeated.length > 0) repeats.push({ serverId: server.id, tools: repeated });
       } catch (error) {
-        // A server that can't answer right now (mid-reconnect, hung, briefly
-        // down) keeps the tools it had: dropping them would change the tool
-        // list, which is the top of every request, forcing a full prompt-cache
-        // rewrite now and another when they come back, and hiding the tools
-        // unannounced in between. A call to a down server fails on its own.
-        // A server that never listed tools (none known) contributes nothing.
-        const kept = previousTools.filter((t) => t.name.startsWith(`${prefix}--`));
-        for (const tool of kept) {
-          tools.push(tool);
-          const fs = previousFeatureSets.get(tool.name);
-          if (fs !== undefined) toolFeatureSets.set(tool.name, fs);
-        }
-        if (kept.length > 0) {
-          console.error(
-            `[mcpl-tools] server "${server.id}" did not answer tools/list ` +
-              `(${error instanceof Error ? error.message : String(error)}); keeping its ${kept.length} known tool(s)`,
-          );
-        }
+        staged = stage();
         // A live server whose handshake advertised no MCP `tools` has, in
         // effect, listed nothing; count it as listed so tool-pattern checks do
         // not wait on it forever. (A server that advertised tools but failed
         // to list them stays unknown.)
-        if (server.isConnected && !server.mcpToolsAdvertised) listedServers.add(server.id);
+        if (server.isConnected && !server.mcpToolsAdvertised) {
+          listedServers.add(server.id);
+        } else if (AgentFramework.mcpConnectionServes(server)) {
+          const kept = [...(this.mcplToolServers ?? [])].filter(([name, owner]) => owner === server.id
+            && name.startsWith(`${prefix}--`) && isToolAllowed(name.slice(prefix.length + 2), config));
+          const keptNames = new Set(kept.map(([name]) => name));
+          staged.tools.push(...(this.mcplTools ?? []).filter((tool) => keptNames.has(tool.name)));
+          for (const [name] of kept) {
+            staged.servers.set(name, server.id);
+            const featureSet = this.mcplToolFeatureSets?.get(name);
+            if (featureSet !== undefined) staged.featureSets.set(name, featureSet);
+          }
+          if (kept.length > 0) {
+            keptServers.add(server.id);
+            console.error(`[mcpl] server "${server.id}": tools/list failed (${redactServerText(error instanceof Error ? error.message : String(error), config ?? {})}); keeping its ${kept.length} known tool(s)`);
+          }
+        }
       }
+      tools.push(...staged.tools);
+      for (const [name, featureSet] of staged.featureSets) toolFeatureSets.set(name, featureSet);
+      for (const [name, classes] of staged.classes) toolClasses.set(name, classes);
+      for (const [name, serverId] of staged.servers) toolServers.set(name, serverId);
     }
 
     // Modern servers: the same namespacing, tool policy and RFC-008 class
@@ -35592,7 +35602,10 @@ export class AgentFramework {
       const connection = connections.get(serverId);
       return !!connection && AgentFramework.mcpConnectionServes(connection);
     };
-    const over = new Set([...listedServers].filter((serverId) => !serving(serverId) || closesOf(serverId) !== closesAtListing.get(serverId)));
+    const over = new Set([
+      ...[...listedServers].filter((serverId) => !serving(serverId) || closesOf(serverId) !== closesAtListing.get(serverId)),
+      ...[...keptServers].filter((serverId) => !serving(serverId)),
+    ]);
     if (over.size > 0) {
       for (const [name, serverId] of [...toolServers]) {
         if (!over.has(serverId)) continue;
