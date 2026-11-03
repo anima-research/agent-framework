@@ -350,7 +350,8 @@ interface LiveCreate {
   /** converting: the live path fetches its attachments; queued: its event
    *  waits in the queue; writing: onProcess answered it, and each Discord
    *  event after it looks for the message's row, and ends the entry once it
-   *  shows. */
+   *  shows, or a release that couldn't store its write ends it with no row
+   *  (`message:lost`, endLostCreate). */
   phase: 'converting' | 'queued' | 'writing';
   /** A delete for the message came before its create was handled, so no row
    *  comes, and the entry waits for that delete to be handled. */
@@ -454,6 +455,10 @@ export class DiscordModule implements Module {
     this.unsubscribeTrace = ctx.onTrace((event: TraceEvent) => {
       if (event.type === 'message:added' && event.source === 'surgery-release') {
         this.applyUnapplied();
+        return;
+      }
+      if (event.type === 'message:lost' && event.external?.source === 'discord') {
+        this.endLostCreate(event.external.id);
         return;
       }
       if (!this.config.autoTyping) return;
@@ -1499,6 +1504,26 @@ export class DiscordModule implements Module {
     return {
       removeMessages: oncePerBody(rows),
     };
+  }
+
+  /**
+   * A write the release of a surgery's hold couldn't store (`message:lost`):
+   * an answered create of the message (`writing`) with no row then ends,
+   * with the edits or delete kept for it (LiveCreate.unapplied), since no
+   * row comes for them to reach. Its delete, a history sync and a live
+   * create of the message are no longer passed over. One whose row the
+   * store shows (a write whose outcome is unknown that landed) waits, as
+   * any answered create, for the next Discord event to find it.
+   */
+  private endLostCreate(discordMessageId: string): void {
+    if (this.creating.get(discordMessageId)?.phase !== 'writing') return;
+    try {
+      if (this.storedRow(discordMessageId)) return;
+    } catch (error) {
+      console.error(`Discord: whether message ${discordMessageId}'s lost create left a row couldn't be read, so its record waits for the next event to find its row:`, error);
+      return;
+    }
+    this.creating.delete(discordMessageId);
   }
 
   private applyUnapplied(): void {

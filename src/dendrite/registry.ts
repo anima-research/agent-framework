@@ -169,9 +169,24 @@ function readsResidentsSlot(
  * A restored record with its own slot: one written before `ownSlot` existed
  * gets the slot its `readsSharedSlot`, observe edges, inheritance and
  * namespace meant (resolveOwnSlot). Its `readsSharedSlot` is kept as written.
+ *
+ * Its observe edges are read as that code read them too: an edge with no
+ * `slot` read the residents' shared slot, whatever agent it named, so one
+ * naming an agent is restored without the name, an edge on the shared slot
+ * (which names neither), rather than one on that agent's own slot, which is
+ * what such an edge reads since own slots. A host that wants the agent's
+ * slot read declares the edge again (`{ agent }` in a spec now reads it).
  */
 function withOwnSlot(record: AgentRecord): AgentRecord {
   if (record.ownSlot !== undefined) return record;
+  const observes = record.relationships?.observes;
+  if (Array.isArray(observes)) {
+    record.relationships.observes = observes.map((edge) => {
+      if (edge.slot !== undefined || edge.agent === undefined) return edge;
+      const { agent: _named, ...onShared } = edge;
+      return onShared;
+    });
+  }
   const ownSlot = resolveOwnSlot({
     readsSharedSlot: record.readsSharedSlot,
     observes: record.relationships?.observes,
@@ -274,7 +289,8 @@ export class AgentRegistry {
       ...(spec.presentAs ? { presentAs: spec.presentAs } : {}),
       ...(spec.homeChannel ? { homeChannel: { serverId: spec.homeChannel.serverId, channelId: spec.homeChannel.channelId } } : {}),
       ...(ownSlot ? { ownSlot } : {}),
-      // Kept for readers of the record from before the split: derived from it.
+      // Kept for readers of the record from before the split: derived from
+      // it, and again as agents register (refreshReadsSharedSlot).
       readsSharedSlot: readsResidentsSlot(ownSlot, observes, (name) => this.recordedSlotOf(name)),
       ...(spec.namespace ? { namespace: spec.namespace } : {}),
       ...(spec.metadata ? { metadata: clone(spec.metadata) } : {}),
@@ -295,8 +311,19 @@ export class AgentRegistry {
       };
     }
     this.live.set(spec.name, record);
+    // The deprecated flag of each live record, the new one's included, as
+    // the slots it names read now: an edge on an agent declared with it
+    // (declaredWith) reads that agent's slot only once it is registered.
+    this.refreshReadsSharedSlot();
     this.persist();
     return record;
+  }
+
+  /** Each live record's deprecated `readsSharedSlot`, derived again from its own slot and edges (readsResidentsSlot). */
+  private refreshReadsSharedSlot(): void {
+    for (const record of this.live.values()) {
+      record.readsSharedSlot = readsResidentsSlot(record.ownSlot, record.relationships.observes, (name) => this.recordedSlotOf(name));
+    }
   }
 
   private validate(spec: AgentSpec, resume = false, declaredWith: readonly AgentName[] = []): void {

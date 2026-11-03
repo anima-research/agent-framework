@@ -402,6 +402,21 @@ export type TraceEvent =
       messageId: string;
       source: string;
     })
+  /** A write kept in memory until a live surgery's release (source
+   *  `surgery-release`) whose store threw there: none of it was stored, or,
+   *  with `mayBeStored`, context-manager couldn't tell what of it landed (the
+   *  rows it names as stored are traced as `message:added`). `external` is
+   *  the address the write's metadata gave it, for the module that wrote it
+   *  (the Discord module ends its record of a create with no row). The
+   *  agent's writes lost at a release are told of once besides, by an ops
+   *  alert of kind `store-held-lost`. */
+  | (TraceEventBase & {
+      type: 'message:lost';
+      source: string;
+      agentName: string;
+      external?: { source: string; id: string };
+      mayBeStored?: true;
+    })
   /** A push/event refused at the MCPL boundary: visibly-empty content
    *  (`empty-content`, answered -32602, with no `field` or `detail`), or a
    *  coalesced occurrence the host refused. A refused occurrence's reason

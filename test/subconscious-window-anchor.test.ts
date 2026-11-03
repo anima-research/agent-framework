@@ -526,12 +526,14 @@ describe('SubconsciousWindowAnchor', () => {
     return { anchor, calls, fixed, traces, state };
   }
 
-  it('(e) clamps a kept ordinal past the window to its length, and traces it', () => {
+  it('(e) clamps a kept ordinal past the window to its length, keeps the clamped one, and traces it', () => {
     const h = host({ length: 4 });
     h.anchor.set({ sequence: 50, ordinal: 9, epochIds: ['t1'] });
     assert.deepEqual(h.calls, ['setAnchorOrdinal(4)']);
     assert.deepEqual(h.traces, [{ type: 'tune-out:subconscious-window', agentName: SUB, epochIds: ['t1'], how: 'clamped', ordinal: 4, kept: 9 }]);
-    assert.deepEqual(h.fixed, [], 'the kept ordinal stays kept');
+    // AF #844 review 8, finding 67: the kept 9 stayed kept, so a restart on
+    // a longer window set 9, past rows the window held from 4 on.
+    assert.deepEqual(h.fixed, [{ epochIds: ['t1'], ordinal: 4 }], 'the clamped ordinal is kept as the start');
   });
 
   it('sets by sequence in legacy mode, and fixes a start only once nothing owed is older', () => {

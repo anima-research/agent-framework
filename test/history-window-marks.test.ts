@@ -120,6 +120,22 @@ describe("the history tools' window marks (#291, AF-7)", () => {
     assert.equal(byAuthor.leftOut, 1);
   });
 
+  it("an author-filtered extract's leftOut adds up across its resumes: a row left out past the page's last is counted on the page that resumes there (AF #844 review 8, finding 72)", async () => {
+    const h = await boot();
+    const { both, undone, orens, miras, out } = h.ids;
+    // limit 2: both and undone fill the page; oren's round, left out for
+    // mira, comes before miras, the lookahead match that proves more.
+    const first = await h.call('extract', { excludeAuthor: 'nobody-zz', limit: 2 }, 'mira');
+    assert.deepEqual(marks(first.messages).map(([id]) => id), [both, undone]);
+    const resume = first.resume as Record<string, unknown>;
+    assert.ok(resume, 'premise: the page is full, with more');
+    assert.equal('leftOut' in first, false, "oren's round lies past the page's last row, where the resume starts, so it isn't counted here");
+    const second = await h.call('extract', { excludeAuthor: 'nobody-zz', limit: 2, ...resume }, 'mira');
+    assert.deepEqual(marks(second.messages).map(([id]) => id), [miras, out]);
+    assert.equal(second.leftOut, 1, 'it is counted once, on the page that scans it');
+    void orens;
+  });
+
   it("another agent's own row that the caller's window holds is shown, unmarked, as its context is", async () => {
     const h = await boot();
     // As a window written down from a record with oren's earlier rounds in

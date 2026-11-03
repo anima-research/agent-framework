@@ -25,7 +25,11 @@ export interface OfflineRecoveryBranchOptions {
    * write that presented the anchor, so rows stored after the anchor and
    * before that write stay on the branch: those the window took after the
    * anchor enter it again at the agent's next presentation point, after the
-   * anchor. Only rows stored after the cut are removed and counted.
+   * anchor. Only rows stored after the cut are removed and counted. A
+   * suppression may name any row the branch keeps, one the cut keeps after
+   * the anchor too. A recovery on that window that would change nothing (no
+   * row removed, none an arrival again, no suppression) is refused, as the
+   * live rollback refuses it.
    */
   messageId?: string;
   /** Exact internal ContextManager message ID that remains as the anchor (the cut as for `messageId`). */
@@ -213,12 +217,19 @@ export async function createOfflineRecoveryBranch(
 
     validateAnchorBoundary(contextManager, targetIndex, total, target);
 
+    // The rows the branch keeps are the record's first `total -
+    // removedCount`: a suppression may name any of them, those stored after
+    // the anchor and kept by a presented window's cut too (in the record
+    // before a presentation, the last kept row is the anchor).
     const suppression = buildSuppressionPlan(
       contextManager,
-      targetIndex,
+      total - removedCount - 1,
       options.suppressMessageIds ?? [],
       options.suppressRanges ?? [],
     );
+    if (presented && removedCount === 0 && suppression.intervals.length === 0) {
+      refuseIneffectiveCut(contextManager, target, options.agentName);
+    }
     validateRemovalIntegrity(
       contextManager,
       total,
@@ -501,6 +512,58 @@ function firstIndexAfterCut(
   return total;
 }
 
+/**
+ * Refuses a recovery on a presented window that would change nothing, as
+ * the live rollback refuses one: the cut at the write that presented the
+ * anchor removes no row, and no row the window took after that write
+ * (stored at or before the cut) becomes an arrival again. Read from the
+ * window's newest row back to the anchor or the first row presented before
+ * the cut, as the live rollback reads it (every row's cut grows in window
+ * order). The rows that write presented after the anchor name the way to
+ * take them out: a suppression in the same recovery.
+ */
+function refuseIneffectiveCut(
+  contextManager: ContextManager,
+  target: StoredWindowMessage,
+  agentName: string,
+): void {
+  const cut = contextManager.branchSequenceOf(target.id);
+  const window = contextManager.getPresentedMessages();
+  const kept: StoredWindowMessage[] = [];
+  for (let i = window.length - 1; i >= 0; i--) {
+    const row = window[i]!;
+    if (row.id === target.id) break;
+    const at = contextManager.branchSequenceOf(row.id);
+    if (at < cut) break;
+    if (at === cut) kept.unshift(row as StoredWindowMessage);
+    else if (row.sequence <= cut) return;
+  }
+  const anchorDiscordId = discordIdOf(target);
+  const anchor = `${String(target.id)}${anchorDiscordId ? ` (Discord message ${anchorDiscordId})` : ''}`;
+  if (kept.length > 0) {
+    const n = kept.length;
+    const first = kept[0]!;
+    const firstDiscordId = discordIdOf(first);
+    const named = `${String(first.id)}${firstDiscordId ? `, Discord message ${firstDiscordId}` : ''}`;
+    throw new Error(
+      `Recovery anchor ${anchor} was presented to ${agentName} in one write with the ${n} message${n === 1 ? '' : 's'} ` +
+      `after it in its window (the first: ${named}), and a branch cut can't separate the rows one write presented, ` +
+      `so a recovery anchored there would remove nothing; to take ${n === 1 ? 'that message' : 'those messages'} out, ` +
+      `suppress ${n === 1 ? 'it' : 'them'} in the same recovery (--suppress / suppressMessageIds, or a --suppress-range)`,
+    );
+  }
+  throw new Error(
+    `Recovery anchor ${anchor} is already the tail of ${agentName}'s window: every message stored after it was ` +
+    'stored before the write that presented it, where the branch is cut, and none entered the window after it, so ' +
+    'a recovery anchored there would change nothing',
+  );
+}
+
+function discordIdOf(message: { metadata?: Record<string, unknown> }): string | undefined {
+  const id = message.metadata?.messageId;
+  return id === undefined || id === null || id === '' ? undefined : String(id);
+}
+
 function validateAnchorBoundary(
   contextManager: ContextManager,
   targetIndex: number,
@@ -574,7 +637,7 @@ function validateRemovalIntegrity(
 
 function buildSuppressionPlan(
   contextManager: ContextManager,
-  targetIndex: number,
+  lastKeptIndex: number,
   rawMessageIds: string[],
   rawRanges: Array<{ fromMessageId: string; toMessageId: string }>,
 ): { intervals: SuppressionInterval[]; carriers: DiscordMessageMetadataCarrier[]; messageCount: number } {
@@ -590,10 +653,10 @@ function buildSuppressionPlan(
   if (wanted.size === 0) return { intervals: [], carriers: [], messageCount: 0 };
 
   const locations = new Map<string, MessageLocation>();
-  for (let offset = 0; offset <= targetIndex; offset += RECOVERY_SCAN_WINDOW) {
+  for (let offset = 0; offset <= lastKeptIndex; offset += RECOVERY_SCAN_WINDOW) {
     const messages = contextManager.getMessageWindow(
       offset,
-      Math.min(RECOVERY_SCAN_WINDOW, targetIndex - offset + 1),
+      Math.min(RECOVERY_SCAN_WINDOW, lastKeptIndex - offset + 1),
       { resolveBlobs: false },
     ).messages;
     for (let i = 0; i < messages.length; i++) {
