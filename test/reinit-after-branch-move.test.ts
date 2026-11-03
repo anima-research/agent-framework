@@ -1090,8 +1090,10 @@ describe('after a branch move, every agent on the store compiles without a resta
 
   it('a hold let go before its threshold says nothing after it', async () => {
     shortenHoldAlert(1_000);
+    const before = longHoldAlerts().length;
     await framework.switchBranch(framework.getStore().currentBranch().name);
     const atRelease = longHoldAlerts().length;
+    assert.equal(atRelease, before, 'nothing while it was held: it was let go before its threshold');
     await new Promise((resolve) => setTimeout(resolve, 1_500));
     assert.equal(longHoldAlerts().length, atRelease, 'its timer went with the hold');
   });
