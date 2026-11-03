@@ -852,6 +852,31 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
+  it("keeps a held turn's changedAt at the change while a slow dry compile looks at it", async () => {
+    await withBacklog({ previewless: true, stalled: true, dryRunMs: 300 }, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      const changedAt = () => (t.framework.healthSnapshot() as { agents: Array<{ name: string; budgetHold: { changedAt: number } | null }> })
+        .agents.find((a) => a.name === 'prime')!.budgetHold!.changedAt;
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.dryRuns >= 1 && backlog.dryRunsRunning === 0, 5_000));
+        const changed = Date.now();
+        backlog.progress = 1;
+        assert.ok(await pollUntil(() => backlog.dryRunsRunning === 1, 2_000), 'a look starts its dry compile');
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        const seen = changedAt();
+        assert.ok(seen >= changed && seen - changed < 120, `stamped at the change, within a pass (${seen - changed} ms after it)`);
+        assert.ok(await pollUntil(() => backlog.dryRunsRunning === 0, 2_000));
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        assert.equal(changedAt(), seen, 'and not again by the passes while the look ran, nor after it');
+        backlog.fit = true;
+        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000));
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
   it("bounds the pending description in healthSnapshot() as the hold's start line bounds it", async () => {
     await withBacklog({ stalled: true, pendingDescription: `zz ${'pending work '.repeat(300)}` }, async (backlog) => {
       const t = await residentTurn({ maintenanceIntervalMs: 50 });

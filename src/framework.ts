@@ -2613,6 +2613,7 @@ interface BudgetHold {
   checking: Promise<{ verdict: 'fit' | 'refused' | 'check_failed'; note?: string | null }> | undefined;
   managerCalls: number;
   lookedAt?: string;
+  seen?: string;
   changedAt: number;
   checkpoint: RecordedTurnCheckpoint | undefined;
   checkQueued?: boolean;
@@ -6852,7 +6853,10 @@ export class AgentFramework {
     const pending = this.compressionPending(agent);
     const signature = this.budgetHoldSignature(agent, pending);
     if (signature !== undefined && signature === hold.lookedAt) return;
-    if (signature !== undefined && hold.lookedAt !== undefined) hold.changedAt = Date.now();
+    if (signature !== undefined && signature !== hold.seen) {
+      if (hold.seen !== undefined) hold.changedAt = Date.now();
+      hold.seen = signature;
+    }
     const preview = this.budgetHoldPreview(agent);
     let verdict = preview?.verdict;
     let note: string | null = null;
