@@ -6281,8 +6281,13 @@ export class ChannelRegistry {
             ? 'Nothing was posted: name the channel with channelId. A subagent has no default channel, since its plain '
               + 'speech is returned to whoever called it, so channel_publish sends only to a channel it names.'
             : caller !== undefined && inTurn && this.activeChannelResolver?.(caller) === null
-              ? `Nothing was posted: name the channel with channelId. This turn has no channel of its own, so its plain speech `
-                + `goes to none and channel_publish sends only to a channel it names. ${findIds}`
+              ? (this.channellessTurn && !this.channellessTurn(caller)
+                // The turn came from a channel, but its speech goes to none
+                // (a locked turn held as drafts).
+                ? `Nothing was posted: name the channel with channelId. Your plain speech goes to no channel now, so `
+                  + `channel_publish sends only to a channel it names. ${findIds}`
+                : `Nothing was posted: name the channel with channelId. This turn has no channel of its own, so its plain speech `
+                  + `goes to none and channel_publish sends only to a channel it names. ${findIds}`)
               : `Nothing was posted: channel_publish needs a \`channelId\`, and there's no channel to default to yet. ${findIds}`,
         isError: true,
       };

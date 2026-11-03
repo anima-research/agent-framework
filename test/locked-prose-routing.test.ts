@@ -92,6 +92,7 @@ function stubChannelRegistry(framework: AgentFramework) {
     },
     resolveProseTarget: (spec: string, opts?: { forSpeech?: boolean; own?: Array<{ channelId: string }> }) => {
       state.targets.push({ spec, forSpeech: opts?.forSpeech, own: (opts?.own ?? []).map((c) => c.channelId) });
+      if (spec === '#dup') return { error: '"#dup" names more than one channel', candidates: ['#dup (one)', '#dup (two)'] };
       return CHANNELS[spec]
         ? { serverId: 'stub', channelId: CHANNELS[spec], label: spec }
         : { error: `no channel matches "${spec}"` };
@@ -283,8 +284,10 @@ describe('locked prose routing', () => {
       { text: 'Now in ops.', locus: 'discord:g:ops' },
       { text: 'Next turn, still ops.', locus: 'discord:g:ops' },
     ]);
-    // The result told the agent, so the next turn doesn't announce it again.
-    assert.ok(!windowTexts(framework).some((t) => t.startsWith('[routing]')), 'no announcement after an in-turn move');
+    // The next turn confirms where its speech lands, once: a rewind of the
+    // exchange can't leave the agent untold.
+    assert.deepEqual(windowTexts(framework).filter((t) => t.startsWith('[routing]')),
+      ['[routing] Your plain speech now lands in discord:g:ops. Other channels need an explicit send tool.']);
     await framework.stop();
 
     // The choice outlives the process, and outranks the recipe's proseLock.
@@ -417,6 +420,7 @@ describe('locked prose routing', () => {
   it('on a stream routed only at its end, a move holds the whole stream as drafts, posting nothing to either destination', async () => {
     const streamYielding = membrane.streamYielding.bind(membrane);
     membrane.streamYielding = (request, options) => withoutRoundContent(streamYielding(request, options));
+    membrane.supportsInjectedMessages = false; // as membrane's XML path declares
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'Something private.' },
       { type: 'tool_use', id: 'pl1', name: 'prose_locus', input: { to: '#ops' } },
@@ -443,7 +447,7 @@ describe('locked prose routing', () => {
     );
     assert.ok(
       toolResultTexts().some((t) => t.includes('Your plain speech is held as drafts for the rest of this turn')
-        && t.includes('From your next turn it goes to discord:g:ops.')),
+        && t.includes('and from your next turn it goes to discord:g:ops.')),
       'a query later in the turn says the same',
     );
     const receipt = windowTexts(framework).find((t) => t.startsWith('[delivered]'));
@@ -787,6 +791,78 @@ describe('locked prose routing', () => {
     const internals = framework as unknown as { proseLocusMoves(name: string): string; proseLockShown(lock: unknown, name: string): string };
     assert.equal(internals.proseLocusMoves('assistant'), '');
     assert.equal(internals.proseLockShown(null, 'assistant'), 'is held as drafts, posted nowhere');
+    await framework.stop();
+  });
+
+  it('an ambiguous target is refused with its candidates', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'pl1', name: 'prose_locus', input: { to: '#dup' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Still main.' }] as ContentBlock[]));
+    const framework = await createFramework({ proseLock: '#main' });
+    const { routed } = stubChannelRegistry(framework);
+    trigger(framework);
+    await framework.runUntilIdle();
+    assert.ok(toolResultTexts().some((t) => t.includes('It could mean: #dup (one), #dup (two).') && t.includes('still goes to discord:g:main')));
+    assert.deepEqual(routed, [{ text: 'Still main.', locus: 'discord:g:main' }]);
+    await framework.stop();
+  });
+
+  it("a locked agent's ephemeral run publishes none of its narration", async () => {
+    const framework = await createFramework({ proseLock: '#main' });
+    const { routed } = stubChannelRegistry(framework);
+    try {
+      const created = await framework.createEphemeralAgent({
+        name: 'run-1', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all', proseRouting: 'locked', proseLock: '#main',
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'Checking page 2.' },
+        { type: 'tool_use', id: 'r1', name: 'robot--move', input: { dir: 'north' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Found it.' }] as ContentBlock[]));
+      const run = framework.runEphemeralToCompletion(created.agent, created.contextManager);
+      framework.start();
+      const outcome = await run;
+      assert.deepEqual(routed, [], 'neither the narration nor the result was posted');
+      assert.match(outcome.speech, /Found it\./, 'the run still answers its caller');
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('a sleep in a locked turn announces where its speech goes now, and nowhere while it is held', async () => {
+    const framework = await createFramework({ proseLock: '#main' });
+    const internals = framework as unknown as {
+      eventGate: unknown; channelRegistry: unknown;
+      openLogical: Map<string, unknown>; turnRouting: Map<string, unknown>; activeTurnTriggers: Map<string, unknown>;
+      dispatchSleepToolCall(name: string, call: ToolCall, deliver?: (r: ToolResult) => void): void;
+    };
+    const announced: unknown[] = [];
+    const { eventGate, channelRegistry } = internals;
+    internals.eventGate = { setSleep: () => ({ until: Date.now() + 60_000 }) };
+    internals.channelRegistry = {
+      routeSpeech: async (_agent: string, _text: string, to: unknown) => { announced.push(to); return { delivered: true, serverId: 'stub', channelId: 'x' }; },
+    };
+    const ops = { serverId: 'stub', channelId: 'discord:g:ops' };
+    const settle = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+    for (const [turn, expected] of [
+      [{ turnId: 7, locked: true, locus: ops, wasIn: [], engaged: new Set() }, [ops]],
+      [{ turnId: 8, locked: true, locus: ops, heldForMove: true, wasIn: [], engaged: new Set() }, []],
+      [{ turnId: 9, locked: true, wasIn: [], engaged: new Set() }, []],
+    ] as const) {
+      announced.length = 0;
+      internals.openLogical.set('assistant', turn);
+      internals.turnRouting.set('assistant', turn);
+      internals.activeTurnTriggers.set('assistant', {});
+      internals.dispatchSleepToolCall('assistant', { id: `s-${turn.turnId}`, name: 'sleep', input: { seconds: 60 }, callerTurnId: turn.turnId } as ToolCall, () => {});
+      await settle();
+      assert.deepEqual(announced, expected, `turn ${turn.turnId}`);
+    }
+    internals.openLogical.delete('assistant');
+    internals.turnRouting.delete('assistant');
+    internals.activeTurnTriggers.delete('assistant');
+    Object.assign(internals, { eventGate, channelRegistry });
     await framework.stop();
   });
 

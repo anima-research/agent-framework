@@ -40,7 +40,8 @@ Offered only to a locked agent (and only where its `allowedTools` permit it).
 
 A move is recorded in `framework/state` (`proseLocks`) before it applies, so a
 failed write moves nothing. It applies to the calling turn's later rounds and
-to every later turn, across restarts. What the resident wrote in the same
+to every later turn, across restarts once the store has synced (the move syncs
+it; a sync that fails is logged, and the write stays in the store's log). What the resident wrote in the same
 round as the call goes where speech went before it: a round's routing is
 decided from the locus that round had.
 
@@ -100,13 +101,14 @@ same reason.
 
 - Entering locked mode appends one short `[prose-routing]` notice, once,
   naming where plain speech goes and that `prose_locus` moves it.
-- A `prose_locus` move made in the resident's turn is answered in its own
-  tool result, and nothing else announces it.
-- When the lock changes some other way, the next turn starts with the usual
-  `[routing]` announce-on-change notice. That happens after a move made from
-  outside the turn, unless that turn is the agent's first in locked mode,
-  whose primer names the lock instead, or when a recipe `proseLock` channel
-  registers after turns that held speech as drafts.
+- A `prose_locus` move is answered in its own tool result, and the next turn
+  starts with the usual `[routing]` announce-on-change notice of where its
+  speech lands. So a rewind or a branch move that takes the exchange out of
+  the window still leaves the resident told.
+- The same notice follows a move made from outside the turn, unless the next
+  turn is the agent's first in locked mode, whose primer names the lock
+  instead, and a recipe `proseLock` channel that registers after turns that
+  held speech as drafts.
 - Notices name `prose_locus`, and the `drafts` tool, only where the
   resident's `allowedTools` let it call them.
 - A turn whose plain speech was delivered or held ends with its `[delivered]`
