@@ -33,6 +33,8 @@ export function ruleDecides(policy: GatePolicy): boolean {
  */
 export function firstCatchAll(policies: readonly GatePolicy[], opts: { lettingBy?: boolean } = {}): string | null {
   for (const p of policies) {
+    // A suppress rule decides no wake: what it lets by goes on to the rules after it.
+    if (p.suppress) continue;
     if (ruleDecides(p)) continue;
     if (opts.lettingBy && p.behavior !== 'defer' && p.behavior !== 'skip') continue;
     const scope = p.match?.scope;
