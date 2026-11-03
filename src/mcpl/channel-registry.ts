@@ -916,6 +916,18 @@ function withStop(text: string): string {
  * the resident to judge. The publish executor and channel_publish both read
  * a failed request this way.
  */
+/**
+ * For a caller shown channel_publish's serverId (speculative chunks): the
+ * channelId and serverId pairs that pick each of a shared name's channels,
+ * which a channel that streams speech hears as the text is written when they
+ * come before content.
+ */
+function speculativePairsText(entries: readonly ChannelEntry[]): string {
+  const pairs = entries.map((e) => `channelId ${JSON.stringify(e.descriptor.id)} with serverId ${JSON.stringify(e.serverId)}`);
+  const listed = pairs.length <= 1 ? pairs.join('') : `${pairs.slice(0, -1).join(', ')} or ${pairs[pairs.length - 1]}`;
+  return ` To have a channel that streams speech hear it as you write, call again with ${listed}, written before content.`;
+}
+
 function publishErrorOutcome(err: unknown, destination: PublishDestination, at: number): PublishOutcome {
   const message = requestErrorText(err);
   const notSent = err instanceof McplRequestError && err.outcome === 'not-sent';
@@ -1152,6 +1164,15 @@ export type ChannelToolOrigin =
      *  a channel_publish naming no channel arrives with that turn's default
      *  already applied, so it takes no other. */
     inTurn?: boolean;
+    /** A channel_publish whose text went out ahead of it in a speculative
+     *  stream (docs/speculative-channel-chunks.md): that stream's id and the
+     *  channel it went to. The publish goes to that channel or is refused,
+     *  and carries the id while the stream is open (`live`). */
+    speculativeStream?: { streamId: string; channel: ChannelRef; live?: boolean };
+    /** The caller is shown channel_publish's optional serverId (it has
+     *  speculative chunks), so a refusal of a shared name names the
+     *  channelId and serverId pairs, which stream as the text is written. */
+    showsServerId?: boolean;
   };
 
 /** The machine decision sources a module-origin channel_close may record.
@@ -5751,6 +5772,67 @@ export class ChannelRegistry {
   }
 
   /**
+   * Speculative chunks (docs/speculative-channel-chunks.md): the channel a
+   * `channel_publish` naming this channel goes to, when a speculative stream
+   * may go there: the name picks one registered channel (its id or its
+   * server-qualified name, or the exact pair with a serverId), not
+   * inbound-only, whose descriptor's capabilities have
+   * `streaming.speculative: true`, and whose server's grant has
+   * `channels.streaming` (§5.4) and `channels.publish`. Null otherwise: such a call streams nothing.
+   * `own`: the calling turn's own channels, as the publish reads the name.
+   */
+  speculativeTarget(named: { channelId: string; serverId?: string }, own?: readonly ChannelRef[]): ChannelRef | null {
+    // As the publish resolves the name (handleToolPublish): without a
+    // serverId, a name the calling turn's own channels answer to by id means
+    // that channel, even where its server no longer registers it.
+    const ownNamed = named.serverId ? undefined : this.ownChannelNamed(named.channelId, own);
+    if (ownNamed && 'neither' in ownNamed) return null;
+    const exact = named.serverId ? { serverId: named.serverId, channelId: named.channelId } : ownNamed?.channel;
+    const matches = exact
+      ? [this.entryAt(exact)].filter((e): e is ChannelEntry => !!e)
+      : this.entriesNamed(named.channelId);
+    if (matches.length !== 1) return null;
+    const entry = matches[0]!;
+    if (isInboundOnly(entry) || entry.descriptor.capabilities?.streaming?.speculative !== true) return null;
+    return this.speculativeServerAt(refOf(entry)) ? refOf(entry) : null;
+  }
+
+  /** A speculative stream's chunk, to the channel's server while it may stream there. Never throws. */
+  sendSpeculativeChunk(to: ChannelRef, conversationId: string, streamId: string, seq: number, content: string): void {
+    const server = this.speculativeServerAt(to);
+    if (!server) return;
+    try {
+      server.sendChannelsOutgoingSpeculativeChunk({ channelId: to.channelId, streamId, seq, content, speculative: true, conversationId });
+    } catch { /* observer surface — never disturb the turn */ }
+  }
+
+  /**
+   * A speculative stream's end: the publish's full text, or empty content and
+   * `cancelled`. It goes to the channel's server while that server is
+   * connected, whatever the channel's state now, so a stream that started
+   * always ends. Never throws.
+   */
+  sendSpeculativeComplete(to: ChannelRef, conversationId: string, streamId: string, content: string, cancelled: boolean): void {
+    const server = this.serverRegistry.getServer(to.serverId);
+    if (!server) return;
+    try {
+      server.sendChannelsOutgoingSpeculativeComplete({
+        channelId: to.channelId, streamId, content, speculative: true, ...(cancelled ? { cancelled: true as const } : {}), conversationId,
+      });
+    } catch { /* observer surface — never disturb the turn */ }
+  }
+
+  private speculativeServerAt(to: ChannelRef): McplServerConnection | null {
+    const entry = this.entryAt(to);
+    if (!entry || entry.descriptor.capabilities?.streaming?.speculative !== true) return null;
+    const server = this.serverRegistry.getServer(to.serverId);
+    // The publish needs channels.publish (handleToolPublish): text it would
+    // refuse there doesn't stream there either.
+    const grant = server ? CapabilityGrant.of(server) : undefined;
+    return server && grant!.has('channels.streaming') && grant!.has('channels.publish') ? server : null;
+  }
+
+  /**
    * A destination's server, for a stream message: while that server
    * registers that channel, and its grant has `channels.streaming` (§5.4:
    * the grant gates streaming, not the raw advertisement). A stream doesn't
@@ -6297,7 +6379,13 @@ export class ChannelRegistry {
       entry = this.entryAt(serverGiven ? { serverId: input.serverId!, channelId: fallback!.channelId } : fallback!);
     } else if (own && 'neither' in own) {
       if (seen) seen.refusal = 'shared-id';
-      return { success: false, error: this.ownNeitherRefusal(input.channelId, own.neither, 'was posted', false), isError: true };
+      const registered = own.neither.map((c) => this.entryAt(c)).filter((e): e is ChannelEntry => !!e);
+      return {
+        success: false,
+        error: this.ownNeitherRefusal(input.channelId, own.neither, 'was posted', false)
+          + (origin?.kind === 'agent' && origin.showsServerId && registered.length > 0 ? speculativePairsText(registered) : ''),
+        isError: true,
+      };
     } else if (own) {
       entry = this.entryAt(own.channel);
       if (!entry) {
@@ -6312,7 +6400,8 @@ export class ChannelRegistry {
         if (seen) seen.refusal = 'shared-id';
         return {
           success: false,
-          error: this.sharedNameRefusal(input.channelId, matches, { takesServerId: false, nothing: 'nothing was posted' }),
+          error: this.sharedNameRefusal(input.channelId, matches, { takesServerId: false, nothing: 'nothing was posted' })
+            + (origin?.kind === 'agent' && origin.showsServerId ? speculativePairsText(matches) : ''),
           isError: true,
         };
       }
@@ -6330,10 +6419,11 @@ export class ChannelRegistry {
           ? serverGiven
             ? `Server "${input.serverId}" has no channel ${quotedValue(fallback!.channelId)}, the id of the channel this call would default to, so nothing was posted.`
             : `The channel this would default to, ${this.quotedShown(fallback!)}, isn't registered now, so nothing was posted.`
-          // This tool's schema has no serverId, so one given here is a host's
-          // ref (publishForAgent), or one an agent added unasked, and the
-          // refusal offers names its channelId takes instead. (A fork's guard
-          // refuses a home its server no longer registers before this runs.)
+          // A serverId here is a host's ref (publishForAgent), or the
+          // agent's own: an agent with speculative chunks is shown one
+          // (getToolsForAgent), others add it unasked. The refusal offers
+          // names its channelId takes instead. (A fork's guard refuses a home
+          // its server no longer registers before this runs.)
           : serverGiven
             ? `No channel "${input.channelId}" is on server "${input.serverId}", so nothing was posted. ${this.elsewhereText(input.channelId, false)}`
             : `No channel has the id "${input.channelId}", so nothing was posted. ${findIds}`,
@@ -6367,10 +6457,24 @@ export class ChannelRegistry {
       }
       return { success: false, error: `Nothing was posted to channel ${quoted}: ${this.sendRefusal(entry.serverId)}.`, isError: true };
     }
+    // A message whose text already went out ahead of it (a speculative
+    // stream) goes where its text went or nowhere: no other recipient gets
+    // it after one already has its words.
+    const spoken = origin?.kind === 'agent' ? origin.speculativeStream : undefined;
+    if (spoken && !sameChannel(spoken.channel, refOf(entry))) {
+      return {
+        success: false,
+        error: `Nothing was posted to channel ${quoted}: this message's text already went to channel `
+          + `${this.quotedShown(spoken.channel)} as it was written, and a message goes only where its text went. `
+          + 'Call channel_publish again to post it.',
+        isError: true,
+      };
+    }
     const publishParams: ChannelsPublishParams = {
       conversationId: '', // Framework will fill this when wired
       channelId,
       content: [{ type: 'text', text: messageText }],
+      ...(spoken && spoken.live !== false ? { streamId: spoken.streamId } : {}),
     };
     const destination: PublishDestination = {
       serverId: entry.serverId,

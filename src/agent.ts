@@ -312,6 +312,8 @@ export class Agent {
   readonly toolResultGuard: ToolResultGuard;
   /** Prose delivery mode (see AgentConfig.proseRouting). Default 'locus'. */
   readonly proseRouting: 'locus' | 'explicit' | 'hybrid' | 'disabled';
+  /** AgentConfig.speculativeChannelChunks. Default false. */
+  readonly speculativeChannelChunks: boolean;
   /** Exact whole-response known-tool wrapper containment (default off). */
   readonly toolWrapperProseGuard: boolean;
   /** Continuation after a turn the model ends itself (see
@@ -456,6 +458,7 @@ export class Agent {
     this.refusalHandling = config.refusalHandling;
     this.toolResultGuard = new ToolResultGuard(config.name, contextManager, config.toolResultGuard === true);
     this.proseRouting = config.proseRouting ?? 'locus';
+    this.speculativeChannelChunks = config.speculativeChannelChunks === true;
     this.toolWrapperProseGuard = config.toolWrapperProseGuard === true;
     this.autoContinue = resolveAutoContinue(config);
     this.clock = resolveClockConfig(config.name, config.clock);
@@ -2265,7 +2268,12 @@ export class Agent {
     }
 
     const agent = this;
+    // Speculative channel chunks read a channel_publish call's arguments as
+    // they stream (membrane's emitToolInputDeltas; a membrane without the
+    // option ignores it, and nothing streams).
+    const toolInputDeltas: { emitToolInputDeltas?: boolean } = this.speculativeChannelChunks ? { emitToolInputDeltas: true } : {};
     const stream = this.membrane.streamYielding(request, {
+      ...toolInputDeltas,
       emitTokens: true,
       emitBlocks: false,
       emitUsage: true,

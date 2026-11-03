@@ -68,6 +68,8 @@ export type {
   ChannelsCloseResult,
   ChannelsOutgoingChunkParams,
   ChannelsOutgoingCompleteParams,
+  ChannelsOutgoingSpeculativeChunkParams,
+  ChannelsOutgoingSpeculativeCompleteParams,
   ChannelsPublishParams,
   ChannelsPublishResult,
   ChannelIncomingMessage,

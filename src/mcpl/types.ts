@@ -1117,6 +1117,16 @@ export interface ChannelCapabilities {
     kind?: string;
     supportsValue?: boolean;
   };
+  /**
+   * Outgoing streaming this channel takes beyond §14.3's. `speculative`: the
+   * host may stream the text of a `channel_publish` call to this channel
+   * while the model is still writing it, before the publish
+   * (ChannelsOutgoingSpeculativeChunkParams), when the agent has
+   * speculativeChannelChunks on. docs/speculative-channel-chunks.md.
+   */
+  streaming?: {
+    speculative?: boolean;
+  };
 }
 
 export interface ChannelHistoryRequest {
@@ -1270,6 +1280,42 @@ export interface ChannelsOutgoingCompleteParams {
 }
 
 /**
+ * channels/outgoing/chunk params of a speculative stream (Host → Server,
+ * Notification), to a channel whose capabilities have
+ * `streaming.speculative`: a delta of the text of a `channel_publish` call
+ * the model is still writing, sent before the publish and before anything
+ * says the call will run. docs/speculative-channel-chunks.md.
+ */
+export interface ChannelsOutgoingSpeculativeChunkParams {
+  channelId: string;
+  /** The stream's id: the same on its chunks, its complete and its publish. */
+  streamId: string;
+  /** 0, 1, 2… in the order sent. */
+  seq: number;
+  /** The new text since the previous chunk. */
+  content: string;
+  speculative: true;
+  /** The agent whose call this is. */
+  conversationId: string;
+}
+
+/**
+ * channels/outgoing/complete params ending a speculative stream (Host →
+ * Server, Notification): its publish is known delivered, with the full text,
+ * or known not to reach the channel (the call was cut off, refused, known
+ * not sent, or never ran), `cancelled` with empty content. A stream whose
+ * publish has an unknown outcome gets neither; at most one is sent.
+ */
+export interface ChannelsOutgoingSpeculativeCompleteParams {
+  channelId: string;
+  streamId: string;
+  content: string;
+  speculative: true;
+  cancelled?: true;
+  conversationId: string;
+}
+
+/**
  * channels/publish params (Host → Server, Notification or Request).
  * Asks connector server to deliver content to a channel.
  * Spec Section 14.3.
@@ -1279,6 +1325,10 @@ export interface ChannelsPublishParams {
   channelId: string;
   stream?: boolean;
   content: McplContentBlock[];
+  /** The speculative stream this publish's text went out in, ahead of it
+   *  (ChannelsOutgoingSpeculativeChunkParams), so the server can match the
+   *  two. Only on a publish that had one. */
+  streamId?: string;
 }
 
 /**
