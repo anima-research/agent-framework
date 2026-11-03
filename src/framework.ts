@@ -35441,7 +35441,7 @@ export class AgentFramework {
     const toolClasses = new Map<string, ToolClass[]>();
     const toolServers = new Map<string, string>();
     const listedServers = new Set<string>();
-    const results: Array<{ serverId: string; staged: { tools: import('./types/index.js').ToolDefinition[]; featureSets: Map<string, string>; classes: Map<string, ToolClass[]>; servers: Map<string, string> }; error?: string }> = [];
+    const results: Array<{ serverId: string; connection: McplServerConnection; staged: { tools: import('./types/index.js').ToolDefinition[]; featureSets: Map<string, string>; classes: Map<string, ToolClass[]>; servers: Map<string, string> }; error?: string }> = [];
     const modernTools: import('./types/index.js').ToolDefinition[] = [];
     const closesOf = (serverId: string): number => this.mcplServerCloses?.get(serverId) ?? 0;
     // Each server's close count as its listing began.
@@ -35526,13 +35526,13 @@ export class AgentFramework {
         // to list them stays unknown.)
         if (!server.mcpToolsAdvertised) {
           if (server.isConnected) listedServers.add(server.id);
-          results.push({ serverId: server.id, staged: stage() });
+          results.push({ serverId: server.id, connection: server, staged: stage() });
         } else {
-          results.push({ serverId: server.id, staged: stage(), error: redactServerText(error instanceof Error ? error.message : String(error), config ?? {}) });
+          results.push({ serverId: server.id, connection: server, staged: stage(), error: redactServerText(error instanceof Error ? error.message : String(error), config ?? {}) });
         }
         continue;
       }
-      results.push({ serverId: server.id, staged });
+      results.push({ serverId: server.id, connection: server, staged });
     }
 
     // Modern servers: the same namespacing, tool policy and RFC-008 class
@@ -35620,9 +35620,9 @@ export class AgentFramework {
     }
     const kept = new Map<string, number>();
     const publishedConnections = new Map<string, McplServerConnection>();
-    for (const { serverId, staged } of results) {
-      const connection = mcplConnections.get(serverId);
-      if (connection && (keeps.has(serverId) || listedServers.has(serverId))) publishedConnections.set(serverId, connection);
+    for (const { serverId, connection, staged } of results) {
+      const publisher = keeps.has(serverId) ? this.mcplPublishedConnections?.get(serverId) : listedServers.has(serverId) ? connection : undefined;
+      if (publisher) publishedConnections.set(serverId, publisher);
       if (keeps.has(serverId)) {
         const names = [...(this.mcplToolServers ?? [])]
           .filter(([, owner]) => owner === serverId)
