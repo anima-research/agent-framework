@@ -8,12 +8,14 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { AutobiographicalStrategy } from '@animalabs/context-manager';
 import type { ContextManager, MessageId, MessageMetadata, StoredMessage } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import { AgentFramework, OperatorActionError } from '../src/index.js';
 import type { Agent, EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { GateModule, until } from './helpers/dendrite.js';
 import { WireMembrane, final } from './helpers/wire-membrane.js';
+import { MockMembrane } from './helpers/mock-membrane.js';
 import { fixture } from './helpers/coalescing-fixture.js';
 import type { FrameworkConfig } from '../src/types/framework.js';
 import { SUB, internals as admissionInternals, textOf as storedText, find, registerOpen, enter } from './helpers/admission.js';
@@ -240,3 +242,66 @@ describe("a surgery's release, while it replays the writes its hold kept (AF #84
   });
 });
 
+
+// 61: a rollback through an agent whose switch failed, and whose restore
+// selected the source but couldn't initialize its manager, leaves that
+// manager refusing its work. Following the move skipped it as the agent the
+// move was made through and counted it as recovered: its window was rebased
+// and read as presented though its strategy refuses, and writes kept for it
+// would have gone to the release as recovered.
+describe('a branch move made through an agent whose manager its restore left refusing its work (AF #844 bot review 61)', () => {
+  it("doesn't count that manager recovered: its window stays in legacy mode, traced with the cause, until a move re-initializes it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-review8-2b-fenced-'));
+    dirs.push(dir);
+    const autobiographical = () => new AutobiographicalStrategy({
+      adaptiveResolution: true, foldingStrategy: 'kv-stable', recentWindowTokens: 30_000, kvStableReachTokens: 8_000,
+    });
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [
+        { name: 'a', model: 'test-model', systemPrompt: 'You are a.', strategy: autobiographical() },
+        { name: 'b', model: 'test-model', systemPrompt: 'You are b.', strategy: autobiographical() },
+      ],
+      modules: [],
+    });
+    frameworks.push(framework);
+    const traces: TraceEvent[] = [];
+    framework.onTrace((event) => { traces.push(event); });
+    const cmA = () => framework.getAgent('a')!.getContextManager();
+    const firstId = String(cmA().addMessage('user', [text('hello a')]));
+    cmA().addMessage('user', [text('second a')]);
+    const presents = () => (framework as unknown as { presents(agent: Agent): boolean }).presents(framework.getAgent('a')!);
+    assert.equal(presents(), true, 'premise');
+    const logged: string[] = [];
+    const quiet = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
+      // The rollback's switch fails, and its restore selects main but can't
+      // initialize a's manager.
+      const target = cmA() as unknown as { initializeStrategy: (...args: unknown[]) => Promise<void> };
+      const initializeStrategy = target.initializeStrategy;
+      target.initializeStrategy = async () => { throw new Error('injected strategy init failure'); };
+      const before = traces.length;
+      try {
+        await assert.rejects(framework.rollbackToMessage('a', { messageId: firstId, branchName: 'failed-twice' }),
+          (e: unknown) => e instanceof OperatorActionError && /RESTORE TO main selected it/.test(e.message));
+      } finally {
+        target.initializeStrategy = initializeStrategy;
+      }
+      assert.equal(framework.getStore().currentBranch().name, 'main', 'premise: the restore selected main');
+      assert.equal(presents(), false, 'its window is not read as presented');
+      const failed = traces.slice(before).filter((t) => t.type === 'presentation:failed' && t.agentName === 'a');
+      assert.deepEqual(failed.map((t) => (t as { occasion: string }).occasion), ['rebase']);
+      assert.match((failed[0] as { error: string }).error, /injected strategy init failure/, 'naming the cause');
+      assert.equal(traces.slice(before).filter((t) => t.type === 'ops:alert' && t.kind === 'context-reinit-failed' && t.agentName === 'a').length, 1,
+        'reported once, by the restore');
+      // A switch that re-initializes the manager presents its window again.
+      await framework.switchBranch(framework.getStore().currentBranch().name);
+    } finally {
+      console.error = quiet;
+    }
+    assert.equal(presents(), true);
+    await framework.getAgent('a')!.getContextManager().compile({ maxTokens: 100_000, reserveForResponse: 1_000 }, undefined, { dryRun: true });
+  });
+});

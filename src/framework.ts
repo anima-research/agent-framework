@@ -4597,7 +4597,13 @@ export class AgentFramework {
    * passes on the ones the primary takes in its place (passHeldWritesOn).
    */
   private readonly heldForRecovery = new Map<string, SurgeryHeldWrite[]>();
-  private readonly managersRefusingWork = new WeakSet<ContextManager>();
+  /**
+   * The context managers that refuse their work until a re-initialization
+   * succeeds, each with what failed: a move's re-initialization of it
+   * (reinitializeManagers), or a failed surgery's restore that selected the
+   * branch and couldn't initialize it (restoreSourceBranch).
+   */
+  private readonly managersRefusingWork = new WeakMap<ContextManager, string>();
   /**
    * The agents whose foreignRounds the framework sets (applyForeignRounds),
    * each with the mode its configuration names: a resident that observes
@@ -15082,8 +15088,10 @@ export class AgentFramework {
    * surgery's restore): every live agent's context follows the move. Its
    * context manager is re-initialized for the branch the store is on
    * (reinitializeManagers, #353), every one but `except`'s, the agent the
-   * move was made through, whose own switchBranch or fork initialized it
-   * (a manager that didn't make the move keeps its strategy at the old
+   * move was made through, whose own switchBranch or fork initialized it,
+   * or whose failed surgery's restore left it refusing its work, which
+   * counts here as a failed re-initialization, reported by the restore and
+   * not returned (a manager that didn't make the move keeps its strategy at the old
    * branch generation otherwise, and an AutobiographicalStrategy refuses
    * every compile until a re-initialization). Then the presentation index
    * rebases each agent on the new branch (#291): a window the branch has
@@ -15114,11 +15122,19 @@ export class AgentFramework {
       this.subconsciousAnchor?.branchMoved();
       this.redoStacks.clear();
       failures = await this.reinitializeManagers(except);
+      // The agent the move was made through initialized its own manager,
+      // or failed to: a failed surgery's restore that left it refusing its
+      // work (restoreSourceBranch) reported it, and it counts here as a
+      // manager whose re-initialization failed, so its kept writes stay
+      // kept and its window in legacy mode.
+      const fenced = except === undefined ? undefined : this.agents.get(except)?.getContextManager();
+      const refusal = fenced ? this.managersRefusingWork?.get(fenced) : undefined;
+      const unrecovered: ManagerReinitFailure[] = refusal === undefined ? failures : [...failures, { agentName: except!, error: refusal }];
       // A manager that refused its work, and doesn't now, has the writes
       // kept for it meanwhile stored at the move's release, first.
-      this.recoverHeldWrites(failures);
+      this.recoverHeldWrites(unrecovered);
       for (const agent of this.agents.values()) {
-        const failed = failures.find((f) => f.agentName === agent.name);
+        const failed = unrecovered.find((f) => f.agentName === agent.name);
         this.presentation?.rebase(agent, failed && 'error' in failed ? failed.error : undefined);
         // The rebase can present a window a write-down left in legacy mode,
         // or leave one in it.
@@ -15790,7 +15806,7 @@ export class AgentFramework {
         await cm.setStrategy(cm.getStrategy());
         this.managersRefusingWork?.delete(cm);
       } catch (error) {
-        if (cm) this.managersRefusingWork?.add(cm);
+        if (cm) this.managersRefusingWork?.set(cm, failureDescription(error));
         if (this.agents.get(agentName) === agent) {
           failures.push({ agentName, error: failureDescription(error) });
         }
@@ -16229,7 +16245,7 @@ export class AgentFramework {
       const detail = restoreError instanceof Error ? restoreError.message : String(restoreError);
       const now = this.store.currentBranch().name;
       const selected = now === sourceBranch;
-      if (selected || !managerCurrent) this.managersRefusingWork?.add(cm);
+      if (selected || !managerCurrent) this.managersRefusingWork?.set(cm, detail);
       const status = selected
         ? `RESTORE TO ${sourceBranch} selected it, but re-initializing the agent's context manager for it FAILED (${detail}); ` +
           'the agent refuses its work until switchBranch() to the current branch re-initializes it'
@@ -16377,6 +16393,9 @@ export class AgentFramework {
           branchName = cm.branchAt(tailMessageId as MessageId, targetBranch);
           await cm.switchBranch(branchName);
           moved = true;
+          // Its own switch initialized its manager: one that refused its
+          // work doesn't now.
+          this.managersRefusingWork?.delete(cm);
           // The store moved under every other agent: their contexts follow it
           // now (followBranchMove), so the agent's window is presented on the
           // new branch before the rows the cut returned are held below.
@@ -16573,6 +16592,9 @@ export class AgentFramework {
         try {
           createdBranch = await cm.fork(targetBranch);
           moved = true;
+          // Its own fork initialized its manager: one that refused its work
+          // doesn't now.
+          this.managersRefusingWork?.delete(cm);
           // The fork moved the store under every other agent: their contexts
           // follow it now (followBranchMove), before any removal reaches
           // their windows. A strategy still at the old branch generation
