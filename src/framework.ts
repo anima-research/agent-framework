@@ -17933,6 +17933,8 @@ export class AgentFramework {
       const readerConfig = { model: cfg.model, proseRouting: 'disabled' as const, ...readerModelFields(cfg) };
       let incarnation: number;
       let residentRows: StoredMessage[] | undefined;
+      // With resync 'window', why a resumed look's resident rows couldn't be read.
+      let unavailable: ReaderFramingContext['residentRowsUnavailable'];
       if (plan.resume) {
         // The configuration deriveAgent gives a reader, built again: it is
         // not stored with the agent.
@@ -17965,8 +17967,13 @@ export class AgentFramework {
         // run that takes the reader on.
         handed = backlog.filter((m) => !before.held.has(m.id));
         taken = before.taken;
-        if (resync === 'window' && mark && before.through !== undefined) {
-          residentRows = this.residentRowsSince(primary, name, before.through);
+        // Read from the resident's window index, from the mark the last
+        // framing on its branch recorded: with no index (its window isn't
+        // presented) or no such mark, the framing says they couldn't be read.
+        if (resync === 'window') {
+          if (!mark) unavailable = 'not-presented';
+          else if (before.through === undefined) unavailable = 'no-mark';
+          else residentRows = this.residentRowsSince(primary, name, before.through);
         }
         const content = (cfg.framing ?? defaultReaderFraming)({
           ...base,
@@ -17974,6 +17981,7 @@ export class AgentFramework {
           resumed: true,
           incarnation,
           ...(residentRows ? { residentRows } : {}),
+          ...(unavailable ? { residentRowsUnavailable: unavailable } : {}),
         });
         storeOwnRow(candidate.agent, 'user', content, framingRow(handed, incarnation, mark));
       } else {
@@ -18022,7 +18030,9 @@ export class AgentFramework {
         held: handed.length,
         incarnation,
         resumed: plan.resume !== undefined,
-        resynced: residentRows?.length ?? 0,
+        // Left out where the rows couldn't be read: none were handed, and
+        // none were known to have entered.
+        ...(unavailable ? {} : { resynced: residentRows?.length ?? 0 }),
       });
       const outcome = await this.runEphemeralToCompletion(candidate.agent, candidate.contextManager);
       const prose = outcome.speech.trim();

@@ -405,10 +405,19 @@ export interface ReaderFramingContext {
    * was shown, the mail it was sent). Left out are the reader's own mail and
    * rows under its name, the resident's stored context injections, and held
    * traffic, which the resident's window doesn't take and which comes as
-   * `backlog`. Left out on any other look, and when the resident's window
-   * isn't presented.
+   * `backlog`. Left out on any other look, and when they can't be read
+   * (residentRowsUnavailable).
    */
   residentRows?: StoredMessage[];
+  /**
+   * With `persist` `'epoch'` or `'resident'` and `resync: 'window'`, on a
+   * resumed look whose rows can't be read, why: `'not-presented'`, the
+   * resident's window isn't presented, so there is no index to read it
+   * from; `'no-mark'`, no framing row on the reader's branch records where
+   * the resident's window stood on the branch it reads now. `residentRows`
+   * is left out then.
+   */
+  residentRowsUnavailable?: 'not-presented' | 'no-mark';
 }
 
 /** Why a persisted reader was derived again rather than resumed (ForkReaderConfig.persist). */
@@ -419,7 +428,8 @@ export type ReaderRederivedReason = 'no-record' | 'branch-moved' | 'scope-ended'
  * trigger; the notice; the voice block; standing dispositions if any; with
  * `residentRows` (a resumed persisted reader's), the rows the resident's
  * context took since the last look, under a count line, each as a line
- * (residentRowLines); then the held traffic as `author: text` lines with
+ * (residentRowLines), or with `residentRowsUnavailable`, a line saying they
+ * could not be read; then the held traffic as `author: text` lines with
  * non-text blocks (images, documents) preserved in order as the source
  * supplied them.
  */
@@ -430,6 +440,9 @@ export function defaultReaderFraming(ctx: ReaderFramingContext): ContentBlock[] 
     (ctx.dispositions ? `\n\n[Standing dispositions]\n${ctx.dispositions}` : '');
   const content: ContentBlock[] = [{ type: 'text', text: header }];
   if (ctx.residentRows !== undefined) content.push(...residentRowLines(ctx.resident, ctx.residentRows));
+  else if (ctx.residentRowsUnavailable !== undefined) {
+    content.push({ type: 'text', text: `\n[What entered ${ctx.resident}'s context since your last look could not be read; none of it is shown here.]` });
+  }
   if (ctx.backlog.length === 0) {
     content.push({ type: 'text', text: '\n[Nothing new has been held since your last look.]' });
     return content;

@@ -884,6 +884,39 @@ describe('a persisted reader: a look that fails, and what goes back', () => {
 describe('a persisted reader: the resync, bounded and unreadable', () => {
 
 
+  it("with resync 'window', tells a resumed reader when what entered the resident's context can't be read", { timeout: 180_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-unread-'));
+    dirs.push(dir);
+    const contexts: ReaderFramingContext[] = [];
+    const t = await boot(dir, { persist: 'resident', framing: (ctx: ReaderFramingContext) => { contexts.push(ctx); return defaultReaderFraming(ctx); } });
+    const fw = t.framework as unknown as { residentMark(primary: string): unknown };
+    const mark = fw.residentMark.bind(fw);
+    const epochId = t.enter();
+    const name = 'reader/scout/g1';
+    try {
+      // Derived while the resident's window gives no mark: its framing records none.
+      fw.residentMark = () => undefined;
+      t.look(epochId, [t.hold(epochId, 'HELD-1')]);
+      await t.looked(name, 1);
+      // Its window gives one now, and no framing on its branch says where it stood.
+      fw.residentMark = mark;
+      t.look(epochId, [t.hold(epochId, 'HELD-2')]);
+      await t.looked(name, 2);
+      // And none at this look.
+      fw.residentMark = () => undefined;
+      t.look(epochId, [t.hold(epochId, 'HELD-3')]);
+      await t.looked(name, 3);
+    } finally {
+      fw.residentMark = mark;
+    }
+    assert.deepEqual(contexts.map((c) => [c.residentRows, c.residentRowsUnavailable]),
+      [[undefined, undefined], [undefined, 'no-mark'], [undefined, 'not-presented']]);
+    assert.deepEqual(t.forkTraces().map((f) => f.resynced), [0, undefined, undefined], 'resynced is left out where the rows could not be read');
+    for (const n of [1, 2]) {
+      const sent = JSON.stringify(t.membrane.callsFor('reader')[n]!.messages.at(-1));
+      assert.ok(sent.includes("[What entered scout's context since your last look could not be read; none of it is shown here.]"), sent);
+    }
+  });
 
 });
 
