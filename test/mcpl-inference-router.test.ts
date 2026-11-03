@@ -115,7 +115,7 @@ interface Answer {
 /** Ask the router for one inference, played by `script` on a real Membrane. */
 async function ask(
   script: Script,
-  opts: { stream: boolean; mode: Mode; policy?: InferenceRoutingPolicy; noChunkSender?: boolean },
+  opts: { stream: boolean; mode: Mode; policy?: InferenceRoutingPolicy; noChunkSender?: boolean; requestId?: string | number | null },
 ): Promise<Answer> {
   const membrane = new Membrane(new ScriptedAdapter(script), {
     formatter: opts.mode === 'xml' ? new AnthropicXmlFormatter({ toolMode: 'xml' }) : new NativeFormatter(),
@@ -126,17 +126,19 @@ async function ask(
     answer.stream = streamYielding(request);
     return answer.stream;
   };
-  return askWith(membrane, opts.stream, answer, opts.policy, opts.noChunkSender);
+  return askWith(membrane, opts.stream, answer, opts.policy, opts.noChunkSender, opts.requestId);
 }
 
 /** Ask a router built on `membrane`, routing by `policy` (none given: a policy
- *  whose default is `default`), for one inference. */
+ *  whose default is `default`), for one inference, as the request `requestId`
+ *  (7 unless given). */
 async function askWith(
   membrane: Membrane,
   stream: boolean,
   answer: Answer = { chunks: [], sent: [], traces: [] },
   policy?: InferenceRoutingPolicy,
   noChunkSender = false,
+  requestId: string | number | null = 7,
 ): Promise<Answer> {
   const router = new InferenceRouter(
     membrane,
@@ -151,7 +153,7 @@ async function askWith(
     stream,
     messages: [{ role: 'user', content: 'Summarize these memories.' }],
   }, {
-    requestId: 7,
+    requestId,
     respond: (result) => {
       answer.result = result;
       answer.sent.push(`result:${result.content}`);
@@ -384,6 +386,18 @@ for (const mode of ['native', 'xml'] as const) {
     });
   });
 }
+
+describe('MCPL inference router: a request whose id is null (#475)', () => {
+  it('answers a streamed request whole, with no chunks, since a chunk names its request by id', async () => {
+    const answer = await ask({ chunks: ['Hello ', 'world'], stopReason: 'end_turn' }, { stream: true, mode: 'native', requestId: null });
+
+    assert.strictEqual(answer.error, undefined);
+    assert.strictEqual(answer.stream, undefined, 'no stream was opened');
+    assert.deepStrictEqual(answer.chunks, []);
+    assert.deepStrictEqual(answer.sent, ['result:Hello world']);
+    assert.deepStrictEqual(answer.traces.at(-1), completeTrace(false));
+  });
+});
 
 // A native tool call arrives as a typed tool_use block. membrane's yielding
 // stream lists it in toolCalls only when the stop is tool_use, so a streamed
