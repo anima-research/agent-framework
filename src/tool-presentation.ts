@@ -339,8 +339,9 @@ export class ToolPresentation {
       let held = false;
       try { held = Object.hasOwn(parsePresentation(this.read()).tools, name); } catch { held = false; }
       throw new PresentationRefusal(`Nothing was changed: you have no tool named ${quoted(name)} right now, shown or hidden.${near.length ? ` Did you mean ${quotedList(near, 'or', JSON.stringify)}?` : ''}`
-        + ` Copy the exact name from your tool catalogue's index, workspace--read {"path":${JSON.stringify(this.config.cataloguePath)},"limit":140}, reading on with "offset" if the index runs past that.`
-        + (held ? ' Your file keeps a setting under this name, but you have no tool by that name right now. The setting stays, and you can change it if you have a tool by that name.' : ''));
+        + (held
+          ? ' Your file keeps a setting under this name, but you have no tool by that name right now. The setting stays, and you can change it if you have a tool by that name.'
+          : ` Copy the exact name from your tool catalogue's index, workspace--read {"path":${JSON.stringify(this.config.cataloguePath)},"limit":140}, reading on with "offset" if the index runs past that.`));
     }
     if (field === 'description' && typeof args.description === 'string' && characters(args.description) > MAX_DESCRIPTION_CHARS)
       throw new PresentationRefusal(`Nothing was changed: the description is ${count(characters(args.description))} characters, over the ${count(MAX_DESCRIPTION_CHARS)} allowed. Shorten it and call set_tool_description again.`);
