@@ -3275,7 +3275,7 @@ const RECOVERY = 're-initializes it and stores the writes kept in memory for it 
 
 export function refusedWorkAlert(move: ReinitMove, cause: string): ReinitAlertText {
   const opening = `The ${move} moved the store's branch, and this agent's context manager failed to re-initialize. ` +
-    `It refuses its work until switchBranch() to the current branch ${RECOVERY}`;
+    `It refuses its work until a branch move, such as switchBranch() to the current branch, ${RECOVERY}`;
   return { opening, message: `${opening} Its re-initialization failed: ${cause}.` };
 }
 
@@ -3288,7 +3288,7 @@ export function restoreAlert(restore: {
   const { move, source, now, selected, managerCurrent, cause } = restore;
   if (selected) {
     const opening = `The ${move} failed and the store was put back, but this agent's context manager failed to re-initialize. ` +
-      `It refuses its work until switchBranch() to the current branch ${RECOVERY}`;
+      `It refuses its work until a branch move, such as switchBranch() to the current branch, ${RECOVERY}`;
     return { opening, message: `${opening} The store is on ${source}. Its re-initialization failed: ${cause}.` };
   }
   const where = ` The store is on ${now}, and the restore to ${source} failed: ${cause}.`;
@@ -3299,7 +3299,7 @@ export function restoreAlert(restore: {
     return { opening, message: `${opening}${where}` };
   }
   const opening = `The ${move} failed and the store couldn't be put back, so this agent's context manager refuses its work ` +
-    `until switchBranch() to the branch it should run on ${RECOVERY}`;
+    `until a branch move, such as switchBranch() to the branch it should run on, ${RECOVERY}`;
   return { opening, message: `${opening}${where}` };
 }
 
@@ -15875,7 +15875,8 @@ export class AgentFramework {
     this.heldForRecovery.set(agentName, [write]);
     console.error(
       `[surgery] agent=${agentName}: its context manager refuses its work, so this write for it, and each one after it, ` +
-      'waits in memory until switchBranch() re-initializes it and stores them (a restart loses them)' +
+      'waits in memory until a branch move (switchBranch, rollback or suppression) re-initializes it and stores them ' +
+      '(a restart loses them, except mail, which stays held in the registry)' +
       (refusal === undefined ? '' : `: ${errorMessage(refusal)}`),
     );
   }
@@ -15896,7 +15897,7 @@ export class AgentFramework {
    * no queue persists (#291), told of once per agent they are for, by a log
    * line and an ops alert of kind `store-held-lost` naming how many and of
    * what kinds. Those kept for an agent whose context manager refuses its
-   * work (heldForRecovery) are lost: no switchBranch() follows a stop. Those
+   * work (heldForRecovery) are lost: no branch move follows a stop. Those
    * a surgery's hold still keeps (surgeryHeldWrites, a hold whose operation
    * outlived stop()'s wait for it) are stored only if it releases before the
    * process exits. Mail among them stays held in the registry, and the next
@@ -15921,7 +15922,7 @@ export class AgentFramework {
       const { kinds, mail, told } = heldWritesTold(writes);
       const parts = [
         ...(recovery.length > 0
-          ? [`${recovery.length} kept while its context manager refuses its work, which are lost: no switchBranch() re-initializes it after a stop`]
+          ? [`${recovery.length} kept while its context manager refuses its work, which are lost: no branch move re-initializes it after a stop`]
           : []),
         ...(hold.length > 0
           ? [`${hold.length} a ${verb}'s hold still keeps, its operation having outlived stop()'s wait, which are stored only if it releases before the process exits`]
@@ -16257,12 +16258,12 @@ export class AgentFramework {
       if (selected || !managerCurrent) this.managersRefusingWork?.set(cm, detail);
       const status = selected
         ? `RESTORE TO ${sourceBranch} selected it, but re-initializing the agent's context manager for it FAILED (${detail}); ` +
-          'the agent refuses its work until switchBranch() to the current branch re-initializes it'
+          'the agent refuses its work until a branch move, such as switchBranch() to the current branch, re-initializes it'
         : managerCurrent
           ? `RESTORE TO ${sourceBranch} ALSO FAILED (${detail}); the store is still on ${now}, where the agent's ` +
             'context manager is current, so the agent serves from that branch until switchBranch() moves it'
           : `RESTORE TO ${sourceBranch} ALSO FAILED (${detail}); the store is still on ${now}, ` +
-            `and the agent refuses its work until switchBranch() to ${sourceBranch} re-initializes it`;
+            `and the agent refuses its work until a branch move, such as switchBranch() to ${sourceBranch}, re-initializes it`;
       console.error(`[operator] agent=${agentName} ${status}`);
       try {
         const named = move === 'suppression' ? { move, managerCurrent } : { move };
