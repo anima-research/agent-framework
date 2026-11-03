@@ -1469,7 +1469,7 @@ test('a tune-out on record when a start without servers connects one later ends 
   assert.deepEqual(unleased.data, { refusal: 'explicit-open', channelId: CHANNEL, serverId: 'disc' });
 });
 
-test('a tune-out whose ending fails at a start with no subconscious stays recorded, and the log says so', async (t) => {
+test('a tune-out whose release fails at a start with no subconscious stays recorded for the next start, and the log says so', async (t) => {
   const store = await tunedOutStore(t, 0);
   const cancel = ChannelRegistry.prototype.cancelTuneOut;
   ChannelRegistry.prototype.cancelTuneOut = () => { throw new Error('the store refused the write'); };
@@ -1480,10 +1480,9 @@ test('a tune-out whose ending fails at a start with no subconscious stays record
     ChannelRegistry.prototype.cancelTuneOut = cancel;
   }
   const registry = (second as unknown as RestartInternals).channelRegistry;
-  assert.equal(registry.getDesiredState('disc', CHANNEL), 'tuned-out');
-  assert.ok(store.logged.includes(`[tune-out] "${CHANNEL}" on the "disc" server is tuned out, and nothing on this host ` +
-    'watches or cancels tune-outs, but ending this one failed, so it stays recorded until a start that can end it: the ' +
-    'store refused the write.'), store.logged.join('\n'));
+  assert.equal(registry.getDesiredState('disc', CHANNEL), 'tuned-out', 'still recorded: the next start releases it');
+  assert.ok(store.logged.some((l) => l.includes('could not be released (no reader is configured), so it stays on record')
+    && l.includes('the store refused the write')), store.logged.join('\n'));
 });
 
 test('a decline of a tuned-out channel whose transport isn\'t open is refused, and the backlog survives to the cancel', async (t) => {

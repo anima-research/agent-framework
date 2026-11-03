@@ -1918,7 +1918,7 @@ function assertFrameworkSwitches(config: FrameworkConfig): void {
     throw new Error(
       'tuneOut.enabled was removed in agent-framework 0.33.0: residents are offered tune_out only with a reader ' +
         '(subconscious), since a hold nothing summarizes hands the resident an undated backlog all at once. ' +
-        'Remove tuneOut.enabled, or configure a subconscious.',
+        'Remove tuneOut.enabled; to keep tune-out, configure a subconscious as well.',
     );
   }
   if (holdsSettings('subconscious', config.subconscious, '{ enabled: true }')) {
@@ -36339,14 +36339,12 @@ export class AgentFramework {
    */
   private releaseTuneOutsWithoutReader(): void {
     if (!this.channelRegistry || this.tuneOutCoordinator) return;
-    try {
-      // Nothing is posted in an excepted channel: this runs while the host
-      // starts, before anything is live.
-      this.makeTuneOutCoordinator({ announce: false }).releaseAll('start', 'no reader is configured');
-    } catch (err) {
-      console.error('[tune-out] the holds on record could not be released with no reader configured:', err);
-    }
-    this.endTuneOutsWithoutCoordinator();
+    // Nothing is posted in an excepted channel: this is the host's own
+    // housekeeping, at a start or when the channel subsystem comes up after
+    // one. A hold whose release fails stays on record (releaseAll logs it),
+    // so the next start releases it, backlog and all, rather than ending it
+    // with none.
+    this.makeTuneOutCoordinator({ announce: false }).releaseAll('start', 'no reader is configured');
   }
 
   /**
@@ -36362,9 +36360,9 @@ export class AgentFramework {
    * reads it). A log line names the channel and says how many of the
    * messages it diverted are held here, stored or still queued to be
    * written, which nothing will now deliver as its backlog. Where no reader
-   * is configured, releaseTuneOutsWithoutReader ends them first, backlog
-   * delivered; what reaches this is a hold whose release failed, or the
-   * late-connect path of a host that has a reader.
+   * is configured, releaseTuneOutsWithoutReader ends them instead, backlog
+   * delivered; this is only the late-connect path of a host that has a
+   * reader.
    */
   private endTuneOutsWithoutCoordinator(): void {
     const registry = this.channelRegistry;

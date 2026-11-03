@@ -92,14 +92,17 @@ test('an all-except hold on record at a start with no reader ends there, its bac
   await eventually(() => residentRows(f).some((m) => m.metadata?.tuneOut && JSON.stringify(m.content).includes('document_diff')), 'the batch held');
 
   await f.framework.stop();
-  const postedBefore = f.published.length;
   options.framework = {}; // announce on, as by default
   await f.create();
+  const announced: string[] = [];
+  // Any attempt counts: at a start the channel isn't registered yet, so a
+  // post tried then is traced as tune-out:announce-failed, not announced.
+  f.framework.onTrace((e) => { if (e.type.startsWith('tune-out:announce')) announced.push(e.type); }, { replay: true });
   const scoped = releases(f).filter((m) => m.metadata?.scope === 'all-except');
   assert.equal(scoped.length, 1, 'the all-except hold was released');
   assert.match(JSON.stringify(scoped[0]!.content), /document_diff/);
   assert.equal(internals(f).channelRegistry.readCoordinatorState('tune-out/agent/all-except') ?? null, null, 'its record is cleared');
-  assert.equal(f.published.length, postedBefore, 'nothing is posted in the excepted channel while the host starts');
+  assert.deepEqual(announced, [], 'no release is announced in the excepted channel while the host starts');
 });
 
 test('when the persistent reader is stopped, its holds end with it and each backlog goes to the resident', async (t) => {
@@ -115,4 +118,27 @@ test('when the persistent reader is stopped, its holds end with it and each back
   assert.equal(releases(f).length, 1);
   assert.match(JSON.stringify(releases(f)[0]!.content), /its reader ended/);
   assert.match(JSON.stringify(releases(f)[0]!.content), /document_diff/);
+  // With the reader gone, no new hold, for one channel or all-except.
+  const again = coordinator.enter('editor', 'chat', {}, 'agent-tool');
+  assert.equal(again.ok, false);
+  assert.match((again as { error: string }).error, /no subconscious resident to watch a channel/);
+  const focus = coordinator.enterAllExcept({ serverId: 'editor', channelId: 'chat' }, { durationSeconds: 600 }, 'agent-tool');
+  assert.equal(focus.ok, false);
+});
+
+test('when the persistent reader is stopped during an all-except hold, the hold ends with it and its backlog goes to the resident', async (t) => {
+  const f = await fixture({ framework: { subconscious: READER, tuneOut: { announce: false } } as Partial<FrameworkConfig> });
+  t.after(f.close);
+  await f.register('chat');
+  await f.register('other');
+  const coordinator = internals(f).tuneOutCoordinator!;
+  assert.ok(coordinator.enterAllExcept({ serverId: 'editor', channelId: 'other' }, { durationSeconds: 3600 }, 'agent-tool').ok);
+  await f.send('push/event', f.params('e1', 'notice_fallback', { channelId: 'chat', key: 'doc1', deferred: true }));
+  await eventually(() => residentRows(f).some((m) => m.metadata?.tuneOut && JSON.stringify(m.content).includes('document_diff')), 'the batch held');
+  f.framework.stopAgent(internals(f).subconsciousAgentName!);
+  assert.equal(coordinator.getAllExcept(), null, 'the all-except hold ended');
+  const scoped = releases(f).filter((m) => m.metadata?.scope === 'all-except');
+  assert.equal(scoped.length, 1);
+  assert.match(JSON.stringify(scoped[0]!.content), /its reader ended/);
+  assert.match(JSON.stringify(scoped[0]!.content), /document_diff/);
 });

@@ -960,21 +960,27 @@ export class TuneOutCoordinator {
   releaseAll(source: string, reason: string): void {
     // What the registry has on record, registered or not: at a start the
     // channels aren't registered yet, so listActive() would find none.
-    for (const { serverId, channelId, source: recorded } of this.channelRegistry.tuneOutsOnRecord()) {
+    let onRecord: ReturnType<ChannelRegistry['tuneOutsOnRecord']> = [];
+    try {
+      onRecord = this.channelRegistry.tuneOutsOnRecord();
+    } catch (err) {
+      console.error(`[tune-out] the tune-outs on record could not be read to release them (${reason}), so they stay on record:`, err);
+    }
+    for (const { serverId, channelId, source: recorded } of onRecord) {
       try {
         const r = this.cancel(serverId, channelId, recorded, reason);
-        if (!r.ok) console.error(`[tune-out] ${this.shown(serverId, channelId)} could not be ended with no reader configured, so it stays on record: ${r.error}`);
+        if (!r.ok) console.error(`[tune-out] ${this.shown(serverId, channelId)} could not be released (${reason}), so it stays on record: ${r.error}`);
       } catch (err) {
-        console.error(`[tune-out] ${this.shown(serverId, channelId)} could not be ended with no reader configured, so it stays on record:`, err);
+        console.error(`[tune-out] ${this.shown(serverId, channelId)} could not be released (${reason}), so it stays on record:`, err);
       }
     }
-    if (this.getAllExcept()) {
-      try {
+    try {
+      if (this.getAllExcept()) {
         const r = this.cancelAllExcept(source, reason);
-        if (!r.ok) console.error(`[tune-out] the all-except hold could not be ended with no reader configured, so it stays on record: ${r.error}`);
-      } catch (err) {
-        console.error('[tune-out] the all-except hold could not be ended with no reader configured, so it stays on record:', err);
+        if (!r.ok) console.error(`[tune-out] the all-except hold could not be released (${reason}), so it stays on record: ${r.error}`);
       }
+    } catch (err) {
+      console.error(`[tune-out] the all-except hold could not be released (${reason}), so it stays on record:`, err);
     }
   }
 
@@ -2136,8 +2142,9 @@ export class TuneOutCoordinator {
 
   /**
    * The reader ended, not the framework: its turns stop (cadence and
-   * coalescing wakes), and every hold keeps its end time, which releases it
-   * to the resident with no reader.
+   * coalescing wakes). The framework then releases every hold with
+   * releaseAll ("its reader ended"); a hold whose release fails keeps its end
+   * time, which releases it to the resident with no reader.
    */
   stopReader(): void {
     for (const timer of this.cadenceTimers.values()) clearTimeout(timer);

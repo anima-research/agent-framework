@@ -172,7 +172,8 @@ export interface FrameworkConfig {
    * Tune-out settings. Residents are offered `tune_out` only with a reader
    * (`subconscious`): a hold nothing summarizes would hand the resident an
    * undated backlog all at once when it ends. `enabled`, which offered one
-   * without a reader, was removed in 0.33.0 and is refused.
+   * without a reader, was removed in 0.33.0: `enabled: true` is refused at
+   * `create` (`false` is still accepted, from JavaScript, and does nothing).
    */
   tuneOut?: {
     /**
