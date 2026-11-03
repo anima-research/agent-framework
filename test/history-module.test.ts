@@ -77,6 +77,25 @@ function buildStub(messages: StoredMessage[], opts: StubOptions = {}): { cm: Con
       const limit = args.limit ?? filtered.length;
       return { messages: filtered.slice(offset, offset + limit), matchedCount };
     },
+    // Time-only native query (search's candidate window and extract's
+    // aroundId use it for timestamp-ordered edges). Real contract:
+    // timestamp-ordered, `reverse` supported, matchedCount = PAGE size.
+    queryMessagesByTime(args: { fromMs?: number; toMs?: number; limit?: number; offset?: number; reverse?: boolean }): IndexedMessageQueryResult {
+      calls.push({ method: 'queryMessagesByTime', args });
+      if (opts.throwUnsupported) return unsupported();
+      let filtered = messages
+        .filter((m) => {
+          const ts = m.timestamp.getTime();
+          if (args.fromMs !== undefined && ts < args.fromMs) return false;
+          if (args.toMs !== undefined && ts > args.toMs) return false;
+          return true;
+        })
+        .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+      if (args.reverse) filtered = filtered.reverse();
+      const offset = args.offset ?? 0;
+      const page = filtered.slice(offset, args.limit === undefined ? undefined : offset + args.limit);
+      return { messages: page, matchedCount: page.length };
+    },
     getChannelMessageCounts(): ChannelCount[] {
       calls.push({ method: 'getChannelMessageCounts', args: undefined });
       if (opts.throwUnsupported) return unsupported();
@@ -181,7 +200,7 @@ describe('HistoryModule', () => {
       const result = await h.handleToolCall(call('stats', { from: 'not-a-date' }));
       assert.equal(result.success, false);
       assert.equal(result.isError, true);
-      assert.match(result.error ?? '', /Invalid ISO 8601 date/);
+      assert.match(result.error ?? '', /isn't an ISO 8601 date/);
     });
 
     it('surfaces the capability-absent error as a clean tool error, not a crash', async () => {
@@ -232,13 +251,17 @@ describe('HistoryModule', () => {
     });
 
     it('caps limit at the hard maximum before it reaches context-manager', async () => {
-      const { cm, calls } = buildStub(FIXTURE);
+      // More messages than the hard cap of 200, which the tool's schema states.
+      const many = Array.from({ length: 250 }, (_, i) => msg(`n${i}`, 1000 + i, 'User', [textBlock(`line ${i}`)], 'c1'));
+      const { cm } = buildStub(many);
       const h = new HistoryModule();
       h.bind(cm);
 
-      await h.handleToolCall(call('extract', { limit: 999999 }));
-      const queryCall = calls.find((c) => c.method === 'queryMessagesByTimeAndChannel');
-      assert.equal((queryCall?.args as { limit?: number }).limit, 200);
+      const result = await h.handleToolCall(call('extract', { limit: 999999 }));
+      const data = result.data as { returned: number; hasMore: boolean; messages: unknown[] };
+      assert.equal(data.messages.length, 200, 'a page holds at most the hard cap');
+      assert.equal(data.returned, 200);
+      assert.equal(data.hasMore, true, 'and says there are more');
     });
 
     it('clamps an out-of-u32-range offset to the native ceiling instead of passing it through to wrap (reviewer repro)', async () => {
@@ -345,7 +368,9 @@ describe('HistoryModule', () => {
       h.bind(cm);
 
       const start = Date.now();
-      const result = await h.handleToolCall(call('search', { query: '(a+)+$', regex: true, maxScan: 1 }));
+      // A long one, so the refusal's quote of it is cut at 80 UTF-16 units, as every quote of a call's value is.
+      const pattern = `(a+)+$|${'q'.repeat(100)}`;
+      const result = await h.handleToolCall(call('search', { query: pattern, regex: true, maxScan: 1 }));
       const elapsed = Date.now() - start;
 
       // Returns well within a bounded time (module deadline is 2s; generous
@@ -357,7 +382,13 @@ describe('HistoryModule', () => {
       // indistinguishable from "no matches found", which is a lie.
       assert.equal(result.success, false);
       assert.equal(result.isError, true);
-      assert.match(result.error ?? '', /timed out/i);
+      // The whole refusal, as the agent reads it.
+      assert.equal(
+        result.error,
+        `The search stopped, and returned nothing: matching the regular expression "(a+)+$|${'q'.repeat(72)}… against up to 1 `
+          + 'message took longer than 2000 ms, as a pattern that backtracks heavily can. Try a simpler pattern, '
+          + 'set "regex" to false to search for the text as written, or lower "maxScan".',
+      );
     });
 
     it('a normal regex against the same kind of input still matches correctly (worker path is not just failing everything)', async () => {
@@ -379,7 +410,7 @@ describe('HistoryModule', () => {
       const result = await h.handleToolCall(call('search', { query: '(unclosed', regex: true }));
       assert.equal(result.success, false);
       assert.equal(result.isError, true);
-      assert.match(result.error ?? '', /Invalid regex/);
+      assert.match(result.error ?? '', /isn't a valid regular expression/);
     });
 
     it('reports truncated:true up front when the candidate window exceeds maxScan', async () => {
@@ -438,6 +469,8 @@ describe('HistoryModule', () => {
         const h = new HistoryModule();
         h.bind(cm);
         const result = await h.handleToolCall(call('extract', { limit: value }));
+        // The refusal quotes the value as given: Infinity and NaN as themselves, not as JSON's null.
+        assert.ok(result.error?.includes(`"limit" is ${value},`), result.error);
         assert.equal(result.success, false);
         assert.equal(result.isError, true);
         assert.equal(calls.length, 0, 'must reject before ever calling context-manager');
@@ -448,6 +481,7 @@ describe('HistoryModule', () => {
         const h = new HistoryModule();
         h.bind(cm);
         const result = await h.handleToolCall(call('extract', { offset: value }));
+        assert.ok(result.error?.includes(`"offset" is ${value},`), result.error);
         assert.equal(result.success, false);
         assert.equal(result.isError, true);
         assert.equal(calls.length, 0);
@@ -458,6 +492,7 @@ describe('HistoryModule', () => {
         const h = new HistoryModule();
         h.bind(cm);
         const result = await h.handleToolCall(call('search', { query: 'm', limit: value }));
+        assert.ok(result.error?.includes(`"limit" is ${value},`), result.error);
         assert.equal(result.success, false);
         assert.equal(result.isError, true);
         assert.equal(calls.length, 0);
@@ -468,6 +503,7 @@ describe('HistoryModule', () => {
         const h = new HistoryModule();
         h.bind(cm);
         const result = await h.handleToolCall(call('search', { query: 'm', maxScan: value }));
+        assert.ok(result.error?.includes(`"maxScan" is ${value},`), result.error);
         assert.equal(result.success, false);
         assert.equal(result.isError, true);
         assert.equal(calls.length, 0);
@@ -594,7 +630,7 @@ describe('HistoryModule', () => {
       const result = await h.handleToolCall(call('extract', { channelId: '#c1-labl' })); // typo
       assert.equal(result.success, false);
       assert.equal(result.isError, true);
-      assert.match(result.error ?? '', /No channel history found/i);
+      assert.match(result.error ?? '', /no channel history matches/i);
       assert.match(result.error ?? '', /#c1-label/); // the suggestion made it into the error
     });
 
@@ -655,7 +691,7 @@ describe('HistoryModule', () => {
           assert.equal(result.isError, true);
           assert.match(
             result.error ?? '',
-            /No channel history found/i,
+            /no channel history matches/i,
             `${toolName}(${mention}) should surface the clean resolution error`,
           );
         }
@@ -676,12 +712,13 @@ describe('HistoryModule', () => {
     });
   });
 
-  it('rejects tool calls before bind()', async () => {
+  it('rejects tool calls before bind()', async (t) => {
+    t.mock.method(console, 'error', () => {});
     const h = new HistoryModule();
     const result = await h.handleToolCall(call('stats', {}));
     assert.equal(result.success, false);
     assert.equal(result.isError, true);
-    assert.match(result.error ?? '', /not bound/);
+    assert.match(result.error ?? '', /hasn't finished setting up the history module/);
   });
 
   it('rejects an unknown tool name', async () => {
@@ -691,6 +728,7 @@ describe('HistoryModule', () => {
     const result = await h.handleToolCall(call('bogus', {}));
     assert.equal(result.success, false);
     assert.equal(result.isError, true);
-    assert.match(result.error ?? '', /Unknown tool/);
+    assert.match(result.error ?? '', /There's no tool "history--bogus"/);
+    assert.equal(result.refused, undefined);
   });
 });

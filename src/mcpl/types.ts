@@ -22,7 +22,8 @@
 export interface JsonRpcRequest {
   jsonrpc: '2.0';
   method: string;
-  id?: string | number;
+  /** A request's id; null is allowed, though JSON-RPC 2.0 discourages it. */
+  id?: string | number | null;
   params?: Record<string, unknown>;
 }
 
@@ -31,7 +32,8 @@ export interface JsonRpcRequest {
  */
 export interface JsonRpcResponse {
   jsonrpc: '2.0';
-  id: string | number;
+  /** The request's id, or null when the request's own couldn't be read. */
+  id: string | number | null;
   result?: unknown;
   error?: JsonRpcError;
 }
@@ -96,6 +98,9 @@ export interface McplAudioContent {
   disposition?: 'never' | 'ref';
 }
 
+/** MCPL's reference block (RFC-005 §3). A `resource` block with no `uri` of
+ *  its own may be MCP's embedded resource instead, its contents under
+ *  `resource`, which classifyBlock tells apart and shows as its contents. */
 export interface McplResourceContent {
   type: 'resource';
   /** Resource URI (e.g., "memory://facts/12345") */
@@ -145,6 +150,10 @@ export interface McplCapabilities {
   /** Server consumes inference/lifecycle notifications (§10.5). */
   inferenceLifecycle?: boolean;
 
+  /** RFC-007 tool lifecycle: observe (metadata) and inputs (requested
+   *  argument fields). `true` = both leaves. */
+  toolLifecycle?: boolean | { observe?: boolean; inputs?: boolean };
+
   /** Server supports model/info requests */
   modelInfo?: boolean;
 
@@ -161,6 +170,15 @@ export interface McplCapabilities {
  */
 export interface McplHostCapabilities {
   version: string;
+  /** RFC-006 support, independent of capability grants. */
+  eventCoalescing?: boolean | {
+    pushEvents?: boolean;
+    channelsIncoming?: boolean;
+    deferred?: boolean;
+    channelScopedPush?: boolean;
+    /** Retry-window guarantee in ms (integer ≥ 3,600,000; default 3,600,000). */
+    retryWindowMs?: number;
+  };
   pushEvents?: boolean;
   contextHooks?: {
     beforeInference?: boolean | {
@@ -170,9 +188,16 @@ export interface McplHostCapabilities {
   };
   inferenceRequest?: boolean | { streaming?: boolean };
   inferenceLifecycle?: boolean;
+
+  /** RFC-007 tool lifecycle: observe (metadata) and inputs (requested
+   *  argument fields). `true` = both leaves. */
+  toolLifecycle?: boolean | { observe?: boolean; inputs?: boolean };
   modelInfo?: boolean;
   featureSets?: boolean;
   channels?: boolean | McplChannelCapabilities;
+  /** RFC-014 §6.3: this host presents tool hints. Sent to every server
+   *  with hints (McplServerConfig.toolHints: on unless false). */
+  toolHints?: boolean;
 }
 
 /** Channel capability leaves (§14.1). `observe` was the pre-0.5 name for
@@ -194,48 +219,123 @@ export interface McplChannelCapabilities {
 /**
  * Configuration for connecting to a single MCPL server.
  * Provided in FrameworkConfig.mcplServers[].
+ *
+ * Treat a submitted configuration and its nested values as immutable for as
+ * long as the server uses them. Apply changed settings with
+ * `restartMcplServer(id, newConfig)`; use `accessProvider` for a network
+ * server's rotating credentials (a stdio server's changed `env` goes through
+ * a restart with the new configuration).
  */
 export interface McplServerConfig {
   /** Unique server identifier */
   id: string;
 
   /**
-   * Command to spawn the server process (stdio transport). Mutually exclusive
-   * with `url`. Required for the stdio transport; omit it (and set `url`) for
-   * the WebSocket transport.
+   * Command to spawn the server process (stdio transport). Required for the
+   * stdio transport; omit it (and set `url`) for a network server, over
+   * WebSocket or HTTP. A configuration with both needs `transport` to say
+   * which one is used, and is refused without it.
    */
   command?: string;
 
   /** Arguments for the command */
   args?: string[];
 
-  /** Environment variables for the child process */
+  /**
+   * Environment variables for the child process. Stdio children do NOT inherit
+   * the host environment wholesale: they get a small allowlist (PATH, HOME,
+   * LANG, LC_*, TMPDIR, TLS CA bundles, and HTTP(S) proxy settings — see
+   * CHILD_ENV_ALLOWLIST) plus exactly these. Proxy URLs can contain credentials.
+   * This limits accidental inheritance; it does not isolate a hostile child.
+   */
   env?: Record<string, string>;
 
   /**
-   * WebSocket URL for the network transport (`ws://` or `wss://`). Mutually
-   * exclusive with `command`. When set (or `transport: 'websocket'`), the host
-   * dials this endpoint instead of spawning a process — newline-delimited
-   * JSON-RPC MCPL runs over the socket identically to stdio.
+   * Escape hatch: pass the host's entire environment (including secrets) to
+   * the stdio child, as older versions did. Only for servers that genuinely
+   * need it. Default false. Only `true` turns it on, and null counts as not
+   * set. For a stdio server, `create()`, `connectMcplServer` and
+   * `restartMcplServer` refuse any other value, such as a quoted "false". A
+   * WebSocket server never reads it.
+   */
+  inheritEnv?: boolean;
+
+  /**
+   * URL for a network server, used instead of `command`. A configuration
+   * with both needs `transport` to say which one is used, and is refused
+   * without it. Its scheme decides the protocol family:
+   * - `ws://` or `wss://` is a legacy MCPL server over MCPL's WebSocket
+   *   binding. The host dials it and runs the same newline-delimited JSON-RPC
+   *   as over stdio.
+   * - `http://` or `https://` is a modern MCP (2026-07-28) server over
+   *   Streamable HTTP.
    */
   url?: string;
 
   /**
-   * Transport selector. Defaults to `'websocket'` when a bare `url` is given
-   * (no `command`), `'stdio'` otherwise. Set explicitly to disambiguate.
+   * Transport selector. When it is absent, a `command` means stdio and a
+   * `url` means the transport its scheme names; with both, it is required.
+   * When it is set, it decides which of the two is used and must agree with
+   * it: `'stdio'` needs a `command`, `'websocket'` a ws(s):// url and
+   * `'http'` an http(s):// url.
    */
-  transport?: 'stdio' | 'websocket';
+  transport?: 'stdio' | 'websocket' | 'http';
 
   /**
-   * Bearer token for WebSocket auth. Appended to `url` as a `token` query
-   * parameter (`?token=…`) on connect. Ignored by the stdio transport.
+   * Protocol family for a stdio (`command`) server. Defaults to `'legacy'`,
+   * which is MCP 2024-11-05 + MCPL and today's behavior. `'modern'` speaks
+   * MCP 2026-07-28 through the SDK-backed modern engine. A network server's
+   * family comes from its url's scheme, so setting this on one is a
+   * configuration error. There is no probing between families.
+   */
+  protocol?: 'legacy' | 'modern';
+
+  /**
+   * Bearer token for a network server. Where it travels depends on the
+   * transport: on a ws(s):// url it is appended as a `token` query parameter
+   * (`?token=…`) on connect, unless `tokenTransport` is `'header'`; to an
+   * http(s):// server it is sent as an `Authorization: Bearer` header and
+   * never put in the url. A legacy stdio server ignores it, and a modern
+   * stdio server refuses it.
    */
   token?: string;
 
   /**
+   * How a ws(s):// server's credential, `token` or what `accessProvider`
+   * returns for the dial, is sent on the WebSocket upgrade. `'query'`, the
+   * default: as a `token` query parameter (`?token=…`). `'header'`: as an
+   * `Authorization: Bearer …` header, with no query parameter, so the
+   * credential stays out of the url and of the access logs that record it.
+   * A header carries a credential as configured only if it is printable
+   * ASCII (U+0020 to U+007E) with no space at either end, so header mode
+   * refuses any other: a static `token` when the server is added, an access
+   * provider's at the dial. Set only on a WebSocket server; an http(s)://
+   * server always sends the header, and a stdio server sends no credential.
+   * `null` counts as not set.
+   */
+  tokenTransport?: 'query' | 'header';
+
+  /**
+   * Require a provider credential on every WebSocket dial, including reconnect.
+   * Only true enables this; false, null and omission preserve optional credentials.
+   * Requires tokenTransport 'header', no static token (even empty), and no URL
+   * token parameter, userinfo or fragment. HTTP, stdio and modern servers cannot
+   * use this option. Cleartext ws:// is allowed only to localhost or a literal
+   * loopback address.
+   * Missing, throwing, empty or non-sendable providers fail without connecting;
+   * printable ASCII credentials with no space at either end have no length floor.
+   * Redirects are never followed. Refused upgrades need a finite numeric status:
+   * 401/403 yield credential-rejected; missing status yields engine-unsupported.
+   * Provider failures yield provider-failed; other dial failures yield
+   * connection-failed. Diagnostic redaction is unchanged.
+   */
+  credentialRequired?: boolean;
+
+  /**
    * Lazily resolves the connection credential at EVERY dial — first connect
    * and each background reconnect — overriding `token` when it returns a
-   * value (null/throw falls back to `token`). Host-attached plumbing, never
+   * value (null/throw falls back to `token`, except under `credentialRequired`,
+   * where they fail the dial). Host-attached plumbing, never
    * serialized: the point is that credentials stay out of the agent's
    * context entirely (the agent asks for access by name; the host fetches
    * something fresh each redial, which also makes short-lived credentials
@@ -248,14 +348,22 @@ export interface McplServerConfig {
    * unstick). DEFAULT FALSE: no §6.2 capability path exists for it, and the
    * grant cannot confer it — only this config, decided by the operator, can
    * (PR #79 review blocker 9). The one legitimate fleet user is
-   * discord-mcpl's slash-command relay.
+   * discord-mcpl's slash-command relay. Only `true` turns it on, and null
+   * counts as not set. `create()`, `connectMcplServer` and
+   * `restartMcplServer` refuse any other value, such as a quoted "true".
    */
   allowHostCommands?: boolean;
 
-  /** Feature sets to enable on connect */
+  /**
+   * Feature sets to enable on connect (`.`-segment wildcards). Omitted:
+   * every declared set is a candidate. `[]`: none. Either way a set is
+   * enabled only if its declared `uses` are recognized capabilities the
+   * grant covers (§6.4) — a set declaring no `uses` stays disabled even when
+   * listed here (logged, and traced as `mcpl:feature-set-disabled`).
+   */
   enabledFeatureSets?: string[];
 
-  /** Feature sets to explicitly disable on connect */
+  /** Feature sets to explicitly disable on connect (wins over enabledFeatureSets). */
   disabledFeatureSets?: string[];
 
   /**
@@ -295,7 +403,9 @@ export interface McplServerConfig {
    *
    * `disabledCapabilities` takes precedence on conflict. `version` and
    * `featureSets` are not maskable here — feature sets have their own
-   * enable/disable knobs above.
+   * enable/disable knobs above — and neither are RFC-014's `toolHints`,
+   * `toolsets` and `surface`, which a server's own `toolHints` config turns
+   * off.
    */
   enabledCapabilities?: string[];
 
@@ -315,6 +425,9 @@ export interface McplServerConfig {
    * When true, connect() resolves immediately (with null capabilities) if the
    * server is unavailable, and retries in the background.
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
+   * Only `true` turns it on, and null counts as not set. `create()`,
+   * `connectMcplServer` and `restartMcplServer` refuse any other value, such
+   * as a quoted "false".
    */
   reconnect?: boolean;
 
@@ -338,7 +451,23 @@ export interface McplServerConfig {
    * accepts a request and never responds would otherwise freeze the awaiting
    * agent turn forever; with the timeout the pending request rejects with a
    * descriptive error, which the framework surfaces as a normal isError
-   * tool_result. Set 0 to disable. Default: 60000 (60 seconds).
+   * tool_result. Request timeouts are the only bound for a stdio server that
+   * stops reading its stdin without closing it: the host's writes are
+   * buffered, no error is raised, and the connection stays up. Under Bun they
+   * are also the only bound for one that closes its stdin, since Bun emits no
+   * 'error' event for the writes to it. requestTimeoutMs is the timeout of
+   * every request that names none; the handshake's initialize has its own.
+   * Set 0 to disable, except for channels/publish, channels/open and
+   * channels/close, which keep the 60 s default: a publish's outcome is
+   * reported to the resident and recorded for its draft, so it must end, and
+   * a delivery waits for a channel's queued opens and closes.
+   * Default: 60000 (60 seconds). A value above 2^31−1 is refused: Node runs a
+   * longer timer after about 1 ms, so every request would time out at once.
+   *
+   * For a modern server it is one deadline per tool call, across every leg
+   * of the call, and must be an integer from 1 to 2^31−1. It can't be
+   * disabled: the SDK reads 0 as "time out now". At the deadline
+   * cancellation is requested and the outcome is unknown.
    */
   requestTimeoutMs?: number;
 
@@ -358,13 +487,20 @@ export interface McplServerConfig {
 
   /**
    * Tool name prefix for this server's tools.
-   * Tools are exposed as `{toolPrefix}:{toolName}`.
+   * Tools are exposed as `{toolPrefix}--{toolName}`.
    *
-   * Default: `mcpl:{id}` (e.g., `mcpl:zk:lobby_start_game`).
+   * Default: `mcpl--{id}` (e.g., `mcpl--zk--lobby_start_game`).
    * Set to the server ID for cleaner names (e.g., `toolPrefix: 'zk'`
-   * gives `zk:lobby_start_game`).
+   * gives `zk--lobby_start_game`).
    *
-   * Must not collide with any module name or another server's prefix.
+   * Tool-name patterns elsewhere (`toolClassOverrides` keys,
+   * `toolLifecycle.*.tools`) match these full names; `enabledTools` /
+   * `disabledTools` use the bare server-side names.
+   *
+   * Must not equal any module name or another server's prefix, nor meet
+   * another server's prefix: two prefixes meet when one is the other
+   * followed by `-`, or begins with the other followed by `--`, as `foo-`
+   * and `foo--bar` each meet `foo` (prefixesMeet, #265).
    */
   toolPrefix?: string;
 
@@ -378,6 +514,48 @@ export interface McplServerConfig {
    *  cumulative per-server byte budget (reference-fetcher.ts defaults apply
    *  when absent). */
   autofetch?: { maxBytes?: number; maxTotalBytes?: number };
+
+  /**
+   * RFC-007 tool lifecycle policy for this server: narrowing for the
+   * `toolLifecycle.observe` and `toolLifecycle.inputs` grants, and the
+   * `input` size bound. Both paths are DENIED BY DEFAULT; stating a key here
+   * (or naming the path in enabledCapabilities) is the explicit grant.
+   * `inputs` without a `tools` or `classes` term delivers no arguments, and
+   * `comms` or unclassed tools never carry arguments whatever it says.
+   * See src/mcpl/tool-lifecycle.ts.
+   */
+  toolLifecycle?: import('./tool-lifecycle.js').ToolLifecycleConfig;
+
+  /**
+   * MCPL RFC-014 (tool presence, toolsets and surfaces). On unless set to
+   * `false`: the host advertises `experimental.mcpl.toolHints` and honours
+   * hints (through the `toolsets` meta-tools) only from a server that
+   * advertised `toolHints` too. Such a server's static tools stay in the tool
+   * list as before, and its dynamic tools (toolset tools, `mcpl/presence:
+   * "dynamic"`) leave it: they are announced in the conversation as they
+   * become visible and invisible, and called through `toolsets--act`, opened
+   * with `toolsets--open`, inspected with `toolsets--look` and closed with
+   * `toolsets--close`. A server that doesn't advertise `toolHints` lists every
+   * tool as before. `false` advertises nothing and treats every tool as
+   * static. Omitted and null are on unless a module given to `create()`
+   * holds the name `toolsets` (or a restart is moving a server to that
+   * prefix, which is refused); `true` with such a module is refused.
+   */
+  toolHints?: boolean;
+
+  /**
+   * How this server is presented to agents at first (the host's own
+   * toolsets, src/host-presentation.ts): `'full'` (the default) puts its
+   * tools in the tool list, as before; `'tab'` keeps it connected, its events
+   * still arriving, with none of its tools in the tool list until an agent
+   * opens its tab (`toolsets--open {server}`) and calls them through
+   * `toolsets--act`; `'closed-tab'` leaves it disconnected until an agent
+   * opens it. Each agent can switch it later (`toolsets--close {server}`,
+   * with `disconnect: true` for a closed tab; `toolsets--open {server,
+   * full: true}` back into the tool list), and that choice is kept across
+   * restarts beside the store, over this default.
+   */
+  presentation?: 'full' | 'tab' | 'closed-tab';
 }
 
 // ============================================================================
@@ -420,6 +598,10 @@ export interface FeatureSetDeclaration {
     coreTags?: string[];
     tags?: Record<string, unknown>;
     keyed?: Record<string, unknown>;
+    /** Ordered suggested rules (RFC-001 §5.1). Advisory: applied only on
+     *  acceptance (§5.2), which wake onboarding asks the agent for. */
+    suggestedTreatment?: unknown[];
+    /** @deprecated RFC-001 revision 1's name for suggestedTreatment; still read. */
     defaultTreatment?: unknown[];
     open?: boolean;
   };
@@ -623,6 +805,21 @@ export interface StateRollbackResult {
  * Spec Section 9.1.
  */
 export interface PushEventParams {
+  /** RFC-006 event coalescing (mcpl PR #5, revision 7). */
+  coalesce?: {
+    /** Subject key, 1..256 UTF-8 bytes, opaque to the host. */
+    key: string;
+    /** push/event only: address a registered channel's subject namespace. */
+    channelId?: string;
+    /** push/event only: deferred mode — the host calls push/render at assembly. */
+    deferred?: boolean;
+    /** The subject ceased to exist; `payload.content` is the deletion notice. */
+    retract?: boolean;
+    /** No earlier occurrence of this subject was ever sent (§3.3). */
+    initial?: boolean;
+    /** deferred only; ≤ 4 KiB serialized; server-private, echoed by push/render. */
+    data?: unknown;
+  };
   /** Declaring feature set */
   featureSet: string;
 
@@ -650,6 +847,10 @@ export interface PushEventParams {
  * Spec Section 9.3.
  */
 export interface PushEventResult {
+  coalesce?: {
+    outcome: 'first' | 'replaced' | 'appended' | 'retracted' | 'noted' | 'consumed';
+    priorEventId?: string;
+  };
   /** Whether the event was accepted */
   accepted: boolean;
 
@@ -990,7 +1191,15 @@ export interface ChannelsListResult {
  * Spec Section 14.3.
  */
 export interface ChannelsOpenParams {
-  /** Exact registered id. Preferred over type/address matching. */
+  /**
+   * The exact registered id to open. Without it, a server matches by `type`
+   * and `address`, as before. A server that doesn't know the id should
+   * refuse rather than open another channel: the host fails an open whose
+   * answer names a different channel id, by its `channel.id` or a history
+   * item's `channelId`, compared exactly, as the server's traffic is. When
+   * that other channel is registered and decided closed, the host closes it
+   * again.
+   */
   channelId?: string;
   type: string;
   address?: Record<string, unknown>;
@@ -1086,6 +1295,8 @@ export interface ChannelsPublishResult {
  * Spec Section 14.3.
  */
 export interface ChannelIncomingMessage {
+  eventId?: string;
+  coalesce?: Omit<NonNullable<PushEventParams['coalesce']>, 'channelId' | 'deferred'>;
   /** Channel this message came from */
   channelId: string;
 
@@ -1133,6 +1344,7 @@ export interface ChannelsIncomingResult {
 
 /** Result for a single incoming message. */
 export interface ChannelIncomingMessageResult {
+  coalesce?: PushEventResult['coalesce'];
   messageId: string;
   accepted: boolean;
   conversationId?: string;
@@ -1149,7 +1361,8 @@ export interface ChannelIncomingMessageResult {
  * Non-normative; host-defined. See Spec Section 11.5.
  */
 export interface InferenceRoutingPolicy {
-  /** Default model for all inference requests */
+  /** Model for a request no override, byFeature or wildcards entry names a
+   *  model for. Left empty, such a request is refused with -32603. */
   default: string;
 
   /** Model override per feature set name */
@@ -1189,6 +1402,13 @@ export const McplMethod = {
   // Inference lifecycle (Host → Server, Notification) — §10.5, replaces
   // context/afterInference. Metadata only; BEST-EFFORT delivery.
   InferenceLifecycle: 'inference/lifecycle',
+
+  // Tool lifecycle (RFC-007). tools/lifecycle is Host → Server,
+  // Notification, metadata plus (under its own grant) requested argument
+  // fields — never results. tools/observe is Server → Host, Request: the
+  // server's filter over what it is sent (interest, never authority).
+  ToolsLifecycle: 'tools/lifecycle',
+  ToolsObserve: 'tools/observe',
 
   // Server manifest changes (§17). manifestChanged is S→H Notification —
   // an opaque revision plus changed domains, NO payload, deliberately
@@ -1235,6 +1455,8 @@ export interface McpToolDefinition {
   name: string;
   description?: string;
   inputSchema: Record<string, unknown>;
+  /** Server metadata for the tool (e.g. RFC-008 `mcpl/class` hints). */
+  _meta?: Record<string, unknown>;
 }
 
 /**

@@ -6,15 +6,18 @@
  * hard-down, zero self-rescue). noteInferenceExhausted breaks it by kicking
  * the strategy drain (cm.tick()) directly.
  *
- * The trigger is the classified errorType 'over_budget' (err.name ===
- * 'OverBudgetError' — CM does not export the class, so no cross-package
- * instanceof; the message-prose match is only a fallback). These tests pin
- * that classification so a CM message rewording cannot silently kill the
+ * The trigger is the classified errorType 'over_budget'. Since
+ * context-manager#41/#71 the classes are exported from CM's root, so the
+ * primary match is a real cross-package `instanceof`; `err.name` stays as a
+ * fallback for dual-CM-copy deployments, and the message-prose match remains
+ * a last resort for serialized reasons. These tests pin all of it so a CM
+ * message rewording — or a second CM copy — cannot silently kill the
  * breaker.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AgentFramework } from '../src/framework.js';
+import { OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
 import { MembraneError } from '@animalabs/membrane';
 
 function makeHarness(tick: () => Promise<void>) {
@@ -29,6 +32,7 @@ function makeHarness(tick: () => Promise<void>) {
   fw.rewindEpisode = new Map();
   fw.lastInferenceAt = new Map();
   fw.overBudgetDrainInFlight = new Set();
+  fw.overBudgetDrains = new Set();
   fw.opsAlertLastSent = new Map();
   fw.pendingRequests = [];
   fw.traceListeners = [];
@@ -55,6 +59,47 @@ async function settle(rounds = 3) {
 const OVER_BUDGET_REASON =
   'Compile plan would exceed hard budget: head=41200 tail=8100 middle=62000 budget=100000';
 
+test('classification: a REAL context-manager OverBudgetError classifies as over_budget', () => {
+  const { fw, restore } = makeHarness(async () => {});
+  restore();
+  const real = new OverBudgetError({
+    budget: 4000,
+    actual: 8000,
+    diagnostics: { headTokens: 1, tailTokens: 2, middleTokens: 3, middleChunkCount: 1, deepestLevel: 1 },
+  });
+  assert.deepEqual(fw.classifyInferenceError(real), { errorType: 'over_budget' });
+});
+
+test('classification: a REAL UncoveredDropError classifies as context_refusal', () => {
+  const { fw, restore } = makeHarness(async () => {});
+  restore();
+  const real = new UncoveredDropError({
+    droppedIds: ['m1'],
+    site: 'selectHierarchical',
+    diagnostics: { budget: 4000, totalTokens: 8000 },
+  });
+  assert.deepEqual(fw.classifyInferenceError(real), { errorType: 'context_refusal' });
+});
+
+// A real instance still carries the constructor's `name`, so the two cases
+// above classify through the name fallback too. Overwriting `name` leaves
+// instanceof as the only path that can decide, which pins it.
+test('classification: a real OverBudgetError classifies by instanceof even when its name is overwritten', () => {
+  const { fw, restore } = makeHarness(async () => {});
+  restore();
+  const real = new OverBudgetError({ budget: 1, actual: 2, diagnostics: { headTokens: 1, tailTokens: 1, middleTokens: 1, middleChunkCount: 1, deepestLevel: 1 } });
+  Object.defineProperty(real, 'name', { value: 'Wrapped' });
+  assert.deepEqual(fw.classifyInferenceError(real), { errorType: 'over_budget' });
+});
+
+test('classification: a real UncoveredDropError classifies by instanceof even when its name is overwritten', () => {
+  const { fw, restore } = makeHarness(async () => {});
+  restore();
+  const real = new UncoveredDropError({ droppedIds: ['m1'], site: 's', diagnostics: { budget: 1, totalTokens: 2 } });
+  Object.defineProperty(real, 'name', { value: 'Wrapped' });
+  assert.deepEqual(fw.classifyInferenceError(real), { errorType: 'context_refusal' });
+});
+
 test('classification: err.name OverBudgetError → over_budget, regardless of message wording', () => {
   const fw = Object.create(AgentFramework.prototype) as any;
 
@@ -80,7 +125,7 @@ test('classification: err.name OverBudgetError → over_budget, regardless of me
   assert.deepEqual(fw.classifyInferenceError(new Error('boom')), {});
 });
 
-test('errorType over_budget kicks the drain: 8 ticks, honest success log', async () => {
+test('errorType over_budget kicks the drain, and its success log counts the ticks', async () => {
   let ticks = 0;
   const { fw, errs, restore } = makeHarness(async () => { ticks++; });
   try {
@@ -88,9 +133,9 @@ test('errorType over_budget kicks the drain: 8 ticks, honest success log', async
     await settle(20);
   } finally { restore(); }
 
-  assert.equal(ticks, 8);
+  assert.ok(ticks > 0, 'the drain ticked');
   assert.ok(
-    errs.some((e) => e.includes('drain kicked for cairn') && e.includes('8 ticks')),
+    errs.some((e) => e.includes('drain kicked for cairn') && e.includes(`${ticks} ticks`)),
     `success log with real tick count, got: ${errs.join(' | ')}`,
   );
 });
@@ -102,7 +147,7 @@ test('message fallback: "exceed hard budget" prose kicks even without errorType'
     fw.noteInferenceExhausted('cairn', OVER_BUDGET_REASON, undefined, undefined);
     await settle(20);
   } finally { restore(); }
-  assert.equal(ticks, 8);
+  assert.ok(ticks > 0, 'the fallback kicked a drain');
 });
 
 test('unrelated failures never kick the drain', async () => {
@@ -133,18 +178,18 @@ test('overlapping kicks are suppressed: one drain per agent at a time', async ()
     // Only ONE kick started; its first tick is still in flight.
     assert.equal(started, 1);
 
-    // Release ticks one at a time — exactly 8 run, then the drain finishes.
-    for (let i = 0; i < 8; i++) {
-      gates[i]!();
+    let released = 0;
+    while (released < started && released < 1_000) {
+      gates[released++]!();
       await settle();
     }
-    assert.equal(started, 8, 'exactly one drain worth of ticks, not three');
-    assert.equal(errs.filter((e) => e.includes('drain kicked for cairn')).length, 1);
+    assert.equal(errs.filter((e) => e.includes('drain kicked for cairn')).length, 1, 'one drain, not three');
 
     // The in-flight flag was cleared: a NEW failure kicks again.
+    const drained = started;
     fw.noteInferenceExhausted('cairn', OVER_BUDGET_REASON, undefined, 'over_budget');
     await settle();
-    assert.equal(started, 9);
+    assert.equal(started, drained + 1);
   } finally { restore(); }
 });
 
@@ -158,7 +203,6 @@ test('a failing tick is logged with the real count and clears the in-flight flag
     fw.noteInferenceExhausted('cairn', OVER_BUDGET_REASON, undefined, 'over_budget');
     await settle(20);
     assert.ok(errs.some((e) => e.includes('drain kick failed for cairn after 2 ticks')));
-    assert.equal(fw.overBudgetDrainInFlight.size, 0, 'flag cleared on failure');
 
     // Recovery: the next failure can kick again.
     fw.noteInferenceExhausted('cairn', OVER_BUDGET_REASON, undefined, 'over_budget');

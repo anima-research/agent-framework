@@ -85,7 +85,15 @@ function handleEvent(data: { event: string; data: unknown }) {
   if (data.event === 'inference:started') {
     const { agentName } = data.data as { agentName: string };
     agentsStore.updateAgentStatus(agentName, 'inferring');
-  } else if (data.event === 'inference:completed' || data.event === 'inference:failed') {
+  } else if (
+    // The events that end a turn (onTrace's contract). A turn dropped
+    // before it sends anything ends with inference:aborted alone.
+    data.event === 'inference:completed' ||
+    data.event === 'inference:turn_ended' ||
+    data.event === 'inference:aborted' ||
+    data.event === 'inference:failed' ||
+    data.event === 'inference:exhausted'
+  ) {
     const { agentName } = data.data as { agentName: string };
     agentsStore.updateAgentStatus(agentName, 'idle');
   }

@@ -16,7 +16,10 @@
  *     it (turn-start flush runs before the locus announcement and compile).
  *  2. addMessage defers on turn-alive (activeTurnTokens), not merely
  *     stream-alive — the compile window between dequeue and stream
- *     registration is closed to cross-turn writers.
+ *     registration is closed to cross-turn writers: what they write is
+ *     deferred, and what is deferred before the turn's checkpoint lands as
+ *     the turn's input through its own flushes (flushForStart), unless the
+ *     host is quiesced by then, when it waits for resume().
  *  3. endTurn edge: a message stored at an endTurn tool boundary (collected
  *     for injection but never delivered — the stream is cancelled) is seen by
  *     the follow-up turn its own wake starts, positioned AFTER the turn that
@@ -54,11 +57,14 @@ import type { ContentBlock, NormalizedRequest, NormalizedResponse } from '@anima
 class DmModule implements Module {
   readonly name = 'dm';
   framework: AgentFramework | null = null;
+  ctx: ModuleContext | null = null;
   /** Next `halt` call pushes this text as an external message (with
    *  requestInference) BEFORE returning its endTurn result. */
   interjection: string | null = null;
 
-  async start(_ctx: ModuleContext): Promise<void> {}
+  async start(ctx: ModuleContext): Promise<void> {
+    this.ctx = ctx;
+  }
   async stop(): Promise<void> {}
 
   getTools(): ToolDefinition[] {
@@ -76,16 +82,24 @@ class DmModule implements Module {
       if (this.interjection) {
         const text = this.interjection;
         this.interjection = null;
+        const processed = new Promise<void>((resolve) => {
+          const off = this.framework!.onTrace((t) => {
+            if (t.type === 'process:completed' && (t.processEvent as { content?: unknown }).content === text) {
+              off();
+              resolve();
+            }
+          });
+        });
         this.framework!.pushEvent({
           type: 'external-message',
           source: 'test',
           content: text,
           metadata: { channelId: 'dm-antra' },
         } as unknown as ProcessEvent);
-        // Let the run loop process the queued message while this tool round
-        // is still pending, so it lands in deferredMessages with its wake
-        // queued behind the busy agent.
-        await new Promise((r) => setTimeout(r, 30));
+        await Promise.race([
+          processed,
+          new Promise((_, reject) => setTimeout(() => reject(new Error('the run loop never processed the DM')), 10_000).unref()),
+        ]);
       }
       return { success: true, data: { halted: true }, endTurn: true };
     }
@@ -115,9 +129,9 @@ class DmModule implements Module {
 function stubChannelRegistry(framework: AgentFramework) {
   const routed: Array<{ text: string; locus: string | null }> = [];
   const explicit: Record<string, unknown> = {
-    resolveLocus: () => 'dm-antra',
-    routeSpeech: async (_agent: string, text: string, locus?: string | null) => {
-      routed.push({ text, locus: locus ?? null });
+    resolveLocus: () => ({ serverId: 'stub', channelId: 'dm-antra' }),
+    routeSpeech: async (_agent: string, text: string, locus?: { serverId: string; channelId: string } | null) => {
+      routed.push({ text, locus: locus?.channelId ?? null });
     },
     getDefaultPublishChannel: () => null,
     isChannelOpen: () => true,
@@ -191,7 +205,6 @@ describe('deferred-message wake integrity', () => {
     pendingRequests: Array<Record<string, unknown>>;
     activeTurnTokens: Map<string, number>;
     activeStreams: Map<string, unknown>;
-    addMessage: (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>) => string;
   };
   const internals = (f: AgentFramework) => f as unknown as Internals;
 
@@ -248,9 +261,8 @@ describe('deferred-message wake integrity', () => {
     fw.activeTurnTokens.set('assistant', 999999);
     assert.equal(fw.activeStreams.size, 0, 'precondition: no live stream');
 
-    const id = fw.addMessage('Antra', [{ type: 'text', text: 'arrives mid-compile' }]);
-    assert.equal(id, '', 'message was deferred, not appended');
-    assert.equal(fw.deferredMessages.length, 1, 'message waits in the deferred queue');
+    const id = module.ctx!.addMessage('Antra', [{ type: 'text', text: 'arrives mid-compile' }]);
+    assert.ok(id.startsWith('held:'), `the write is held, not stored: ${id}`);
 
     fw.activeTurnTokens.delete('assistant');
     fw.deferredMessages.length = 0; // don't leak state into stop()

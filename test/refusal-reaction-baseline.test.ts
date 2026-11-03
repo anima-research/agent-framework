@@ -1,9 +1,11 @@
 /**
  * The exported REFUSAL_REACTION_BASELINE must be exactly the set of markers
  * reactToRefusal can emit — every category's emoji plus the unknown-category
- * fallback, nothing more, nothing less. Host composition serializes this
- * export into DISCORD_SUPPRESSED_REACTIONS_BASELINE; if the emitted set and
- * the export could drift, a framework annotation could re-enter a resident's
+ * fallback, nothing more, nothing less. It is the refusal set only: the
+ * protective default the framework injects into DISCORD_SUPPRESSED_REACTIONS_BASELINE
+ * is framework.getPlacedReactionBaseline(), which adds the awareness markers
+ * (test/placed-reaction-baseline.test.ts). If the emitted refusal set and the
+ * export could drift, a framework annotation could re-enter a resident's
  * context as a reaction event (the 8/3 Mythos self-amplifying refusal loop).
  * The implementation shares one constant; these tests pin the contract so a
  * refactor that splits them fails here first.
@@ -20,18 +22,17 @@ import {
 /** Drive the private reactToRefusal against a Discord locus, capturing the
  *  emoji it stamps. */
 async function emittedFor(category: string): Promise<string> {
-  const calls: Array<{ tool: string; args: { emoji: string } }> = [];
+  const calls: Array<{ server: string; tool: string; args: { emoji: string } }> = [];
   const fakeThis = {
     channelRegistry: {
-      buildChannelContext: () => ({
-        incoming: { channelId: 'discord:g1:c1', messageId: 'm1' },
-      }),
-      getChannelServerId: () => 'srv1',
+      incomingFor: () => ({ channel: { serverId: 'srv1', channelId: 'discord:g1:c1' }, messageId: 'm1' }),
     },
     mcplServerRegistry: {
-      getServer: () => ({
+      // Each server's connection records under its own id, so the call shows
+      // which one reacted: the incoming message's own server.
+      getServer: (serverId: string) => ({
         sendToolsCall: (tool: string, args: { emoji: string }) => {
-          calls.push({ tool, args });
+          calls.push({ server: serverId, tool, args });
           return Promise.resolve({});
         },
       }),
@@ -45,6 +46,7 @@ async function emittedFor(category: string): Promise<string> {
   await react.call(fakeThis, 'tester', category);
   assert.equal(calls.length, 1, `exactly one reaction for category "${category}"`);
   assert.equal(calls[0].tool, 'add_reaction');
+  assert.equal(calls[0].server, 'srv1', "the reaction goes through the incoming message's own server");
   return calls[0].args.emoji;
 }
 
@@ -73,6 +75,12 @@ describe('refusal-reaction baseline export', () => {
     // Exactness both ways: the framework can emit everything the baseline
     // names — no stale entries suppressing markers nothing stamps anymore.
     assert.deepEqual(emitted, new Set(REFUSAL_REACTION_BASELINE));
+  });
+
+  it('a category named like an inherited property takes the fallback', async () => {
+    for (const category of ['constructor', 'toString', '__proto__']) {
+      assert.equal(await emittedFor(category), REFUSAL_REACTION_FALLBACK, category);
+    }
   });
 
   it('serialized baseline survives the Discord adapter env round-trip (comma-join)', () => {

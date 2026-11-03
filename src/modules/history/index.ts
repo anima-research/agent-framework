@@ -49,6 +49,9 @@ import type { ToolDefinition, ToolCall, ToolResult, ProcessEvent } from '../../t
 import type { EventResponse, ProcessState } from '../../types/module.js';
 import type { SearchWorkerMessage, SearchWorkerMatch } from './search-regex-worker.js';
 import type { ChannelRegistry } from '../../mcpl/channel-registry.js';
+import { EmbedServiceError, SemanticIndexClient, SemanticIndexer, messageIndexText, parseSummaryKey, summaryIndexText, type SearchResponse, type SemanticIndexConfig, type SyncReport, type PendingChanges, type SyncCursors } from './semantic.js';
+import { unknownToolMessage } from '../unknown-tool.js';
+import { safeSlice } from '../../safe-slice.js';
 
 // ============================================================================
 // Tool input shapes
@@ -60,6 +63,9 @@ interface StatsInput {
   channelId?: string;
 }
 
+/** One author spec or several — see `matchesAuthorFilter`. */
+type AuthorSpec = string | string[];
+
 interface ExtractInput {
   from?: string;
   to?: string;
@@ -67,15 +73,37 @@ interface ExtractInput {
   limit?: number;
   offset?: number;
   format?: 'text' | 'raw';
+  author?: AuthorSpec;
+  excludeAuthor?: AuthorSpec;
+  maxScan?: number;
+  /** Resume point of an author-filtered scan (from a previous `resume`). */
+  windowOffset?: number;
+  /** Id of the message just before `windowOffset` (from a previous `resume`). */
+  afterId?: string | null;
+  /** Time-ordered (no channelId) resume only: the store's highest sequence when the previous call ran. */
+  seqMark?: number;
+  aroundId?: string;
+  before?: number;
+  after?: number;
+  allChannels?: boolean;
 }
 
 interface SearchInput {
   query: string;
   regex?: boolean;
   caseSensitive?: boolean;
+  wholeWord?: boolean;
   from?: string;
   to?: string;
   channelId?: string;
+  author?: AuthorSpec;
+  excludeAuthor?: AuthorSpec;
+  order?: 'oldest' | 'newest';
+  /** Continuation only (from a previous `resume`): messages at exactly the
+   *  resume bound's millisecond whose sequence lies in [lo, hi] were already
+   *  scanned. A range, not a count, so a message added or removed at that
+   *  millisecond between calls can't shift what gets skipped. */
+  skipSequences?: [number, number];
   limit?: number;
   maxScan?: number;
 }
@@ -86,6 +114,22 @@ interface OverviewInput {
   channelId?: string;
   level?: number;
   limit?: number;
+}
+
+interface SemanticSearchInput {
+  query: string;
+  limit?: number;
+  from?: string;
+  to?: string;
+  channelId?: string;
+  kinds?: 'messages' | 'summaries' | 'both';
+  level?: number;
+  minScore?: number;
+}
+
+export interface HistoryModuleOptions {
+  /** Enable `semantic_search` against a shared embed-service (see ./semantic.ts). Absent = tool not offered. */
+  semantic?: SemanticIndexConfig;
 }
 
 // ============================================================================
@@ -109,6 +153,47 @@ const EXTRACT_MAX_LIMIT = 200;
  */
 const NATIVE_OFFSET_MAX = 0xffffffff; // 4294967295
 
+/**
+ * `extract` with an author filter can't lean on a native index (chronicle
+ * indexes time and channel, not author), so it pages through the time/channel
+ * window and filters in-process. Bounded like `search`'s maxScan, with the
+ * same explicit truncated/scannedThrough signal when the window is larger.
+ */
+const EXTRACT_FILTER_DEFAULT_MAX_SCAN = 10000;
+const EXTRACT_FILTER_MAX_MAX_SCAN = 50000;
+/** How far (in window positions) a filtered-extract resume looks for its
+ *  `afterId` when the window moved since the previous call. */
+const RELOCATE_RADIUS = 1000;
+/** Most appends a no-channel resume walks back through to check for
+ *  messages added behind its cursor; past it the check is reported as
+ *  unverified rather than failing. */
+const APPENDED_SCAN_CAP = 200_000;
+/** Native page size for the in-process filtered scans above. */
+const FILTER_SCAN_PAGE = 1000;
+
+/** `extract({aroundId})` window sizes, per side. */
+const AROUND_DEFAULT = 10;
+const AROUND_MAX = 100;
+/** Upper bound on messages sharing the anchor's millisecond that
+ *  `extract({aroundId})` will fetch to order them by sequence — real stores
+ *  see a handful; past this the call fails loudly rather than guessing. */
+const AROUND_TIE_CAP = 5000;
+
+function tieCapError(anchorId: string, ms: number, channelId: string | undefined): Error {
+  const at = new Date(ms).toISOString();
+  // The channel is the agent's to send back, so it's quoted whole: a cut one
+  // couldn't be sent. It's one the store holds, with all those messages in it.
+  const inChannel = channelId !== undefined ? ` and "channelId" set to ${JSON.stringify(channelId)}` : '';
+  return new Error(
+    `Nothing was read: more than ${AROUND_TIE_CAP} messages share the timestamp of message ${shown(anchorId)}, ${at}, too ` +
+      `many for aroundId to put in order. To read them, call history--extract with "from" and "to" both set to ${at}` +
+      `${inChannel}; it pages through them with "offset" and "limit".`,
+  );
+}
+
+/** Largest valid Date value (ms) — an open newest edge. */
+const MAX_DATE_MS = 8.64e15;
+
 const SEARCH_DEFAULT_LIMIT = 20;
 const SEARCH_MAX_LIMIT = 100;
 const SEARCH_DEFAULT_MAX_SCAN = 5000;
@@ -125,6 +210,20 @@ const SEARCH_MAX_MAX_SCAN = 50000;
  */
 const OVERVIEW_DEFAULT_LIMIT = 50;
 const OVERVIEW_MAX_LIMIT = 200;
+
+const SEMANTIC_DEFAULT_LIMIT = 10;
+const SEMANTIC_MAX_LIMIT = 50;
+/** Largest k sent to the embed-service when over-fetching past dropped hits (its own cap is 200). */
+const SEMANTIC_MAX_FETCH = 200;
+/**
+ * Local snippet: the leading SEMANTIC_SNIPPET_CHARS of the current text, one
+ * fewer where the last would split a surrogate pair, since the snippet reaches
+ * the agent's context.
+ */
+function snippetOf(text: string): string {
+  return text.length <= SEMANTIC_SNIPPET_CHARS ? text : `${safeSlice(text, 0, SEMANTIC_SNIPPET_CHARS)}…`;
+}
+const SEMANTIC_SNIPPET_CHARS = 400;
 
 /**
  * A `<@id>`/`<@!id>` Discord-style mention — same shape `ChannelRegistry`
@@ -157,12 +256,37 @@ const SEARCH_REGEX_TIMEOUT_MS = 2000;
  *  directory this module's own compiled output lives in. */
 const SEARCH_WORKER_PATH = join(dirname(fileURLToPath(import.meta.url)), 'search-regex-worker.js');
 
+// Declared as an array (tool-schema dialects vary on anyOf); a bare string is
+// also accepted at runtime — see toAuthorSet.
+const AUTHOR_SPEC_JSON_SCHEMA = { type: 'array', items: { type: 'string' } };
+const AUTHOR_SCHEMA = {
+  ...AUTHOR_SPEC_JSON_SCHEMA,
+  description:
+    'Only messages written by one of these authors (an array of names or ids). Matches, case-insensitively and exactly, ' +
+    'the author\'s display name or user id (a leading "@" or a <@id> mention is accepted), or the ' +
+    'stored participant for messages without author metadata — e.g. your own turns, under your name.',
+};
+const EXCLUDE_AUTHOR_SCHEMA = {
+  ...AUTHOR_SPEC_JSON_SCHEMA,
+  description: 'Drop messages written by any of these authors (an array of names or ids). Same matching as `author`.',
+};
+
 export class HistoryModule implements Module {
   readonly name = 'history';
 
   private ctx: ModuleContext | null = null;
   private cm: ContextManager | null = null;
   private channelRegistry: ChannelRegistry | null = null;
+  private readonly semanticCfg: SemanticIndexConfig | null;
+  private semanticClient: SemanticIndexClient | null = null;
+  private indexer: SemanticIndexer | null = null;
+  private syncTimer: ReturnType<typeof setInterval> | null = null;
+  private firstSyncTimer: ReturnType<typeof setTimeout> | null = null;
+
+  constructor(options: HistoryModuleOptions = {}) {
+    this.semanticCfg = options.semantic ?? null;
+    if (this.semanticCfg) this.semanticClient = new SemanticIndexClient(this.semanticCfg);
+  }
 
   /**
    * Wire the context-manager instance, and optionally the host's
@@ -180,6 +304,15 @@ export class HistoryModule implements Module {
   bind(contextManager: ContextManager, channelRegistry?: ChannelRegistry): void {
     this.cm = contextManager;
     this.channelRegistry = channelRegistry ?? null;
+    if (this.semanticCfg && this.semanticClient) {
+      this.indexer?.dispose();
+      this.indexer = new SemanticIndexer(contextManager, this.semanticClient, this.semanticCfg, (m) => console.warn(m));
+      // start() may already have run (framework start before host bind):
+      // wire persistence now, or pending changes are neither restored nor saved.
+      if (this.ctx) this.wireIndexer(this.ctx);
+      else this.indexer.attach();
+      this.startSyncTimer();
+    }
   }
 
   /**
@@ -214,16 +347,20 @@ export class HistoryModule implements Module {
    * you're trying to deliver a message, nonsense advice from a read-only
    * history tool. This module always uses its own read-only-appropriate
    * wording instead, regardless of which branch of the live resolver
-   * produced the miss.
+   * produced the miss. Its refusals open with "Nothing was read", which
+   * holds because every tool that resolves a channel here only reads (see
+   * the note above the helpers).
    */
   private resolveChannel(input: string | undefined): string | undefined {
     if (!input || !this.channelRegistry) return input;
     const resolved = this.channelRegistry.resolveProseTargetDurable(input);
     if (!('error' in resolved)) return resolved.channelId;
     if (input.startsWith('#') || input.startsWith('@') || DM_MENTION_RE.test(input)) {
-      const suggestions = resolved.candidates?.length ? ` Did you mean: ${resolved.candidates.join(', ')}?` : '';
+      const suggestions = resolved.candidates?.length ? ` Did you mean ${quotedList(resolved.candidates, 'or')}?` : '';
       throw new Error(
-        `No channel history found for "${input}" — it may never have been seen by this resident, or predates this feature.${suggestions}`,
+        `Nothing was read: no channel history matches ${shown(input)}. This host may never have seen a channel by that ` +
+          `name, or saw it before it kept channel names.${suggestions} Each message history--search returns carries ` +
+          'its "channelId", so searching for something said in that channel shows its id; pass that id as "channelId".',
       );
     }
     return input;
@@ -258,12 +395,280 @@ export class HistoryModule implements Module {
     return cm.queryMessagesByTime({ fromMs: ms, toMs: ms }).messages;
   }
 
+  /** Messages at exactly `ms` (in `channelId` when given). Bounded by
+   *  AROUND_TIE_CAP: past it a same-millisecond group is too large to step
+   *  through by sequence, and the caller should narrow instead. */
+  private countAtMs(ms: number, channelId: string | undefined): number {
+    const cm = this.cm as ContextManager;
+    const n =
+      channelId !== undefined
+        ? cm.queryMessagesByTimeAndChannel({ fromMs: ms, toMs: ms, channelId, limit: 0 }).matchedCount
+        : cm.queryMessagesByTime({ fromMs: ms, toMs: ms, limit: AROUND_TIE_CAP + 1 }).messages.length;
+    if (n > AROUND_TIE_CAP) {
+      // The count is by channel alone, so an author filter can't bring it down.
+      const at = new Date(ms).toISOString();
+      throw new Error(
+        `Nothing was searched: more than ${AROUND_TIE_CAP} messages share the instant ${at}, too many for a ` +
+          `continuation to step past. To read them, call history--extract with "from" and "to" both set to ${at}` +
+          (channelId !== undefined
+            ? ' and the same "channelId"; it pages through them with "offset" and "limit".'
+            : '; it pages through them with "offset" and "limit". Searching one channel, with "channelId", may also ' +
+              'bring them under the limit.'),
+      );
+    }
+    return n;
+  }
+
+  /** Highest sequence in the store right now (the last append), or -1 when empty. */
+  private storeSeqMark(): number {
+    const cm = this.cm as ContextManager;
+    const count = cm.getMessageCount();
+    if (count === 0) return -1;
+    return cm.getMessageWindow(count - 1, 1).messages[0]?.sequence ?? -1;
+  }
+
+  /**
+   * Of the messages appended since `seqMark` (the store's append tail above
+   * it, walked back in pages), the ones `relevant` keeps. Unrelated appends
+   * cost a look but never count. `complete` is false when the walk stopped
+   * at APPENDED_SCAN_CAP before reaching seqMark — the result is then a
+   * lower bound, not a verification.
+   */
+  private appendedSince(
+    seqMark: number,
+    relevant: (m: StoredMessage) => boolean,
+  ): { messages: StoredMessage[]; complete: boolean } {
+    const cm = this.cm as ContextManager;
+    const out: StoredMessage[] = [];
+    let looked = 0;
+    let end = cm.getMessageCount();
+    while (end > 0) {
+      const start = Math.max(0, end - 1000);
+      const w = cm.getMessageWindow(start, end - start).messages;
+      for (let i = w.length - 1; i >= 0; i--) {
+        if (w[i]!.sequence <= seqMark) return { messages: out, complete: true };
+        if (relevant(w[i]!)) out.push(w[i]!);
+        if (++looked >= APPENDED_SCAN_CAP) return { messages: out, complete: false };
+      }
+      end = start;
+    }
+    return { messages: out, complete: true };
+  }
+
+  /**
+   * Validate a filtered-extract resume position against the window as it is
+   * NOW. `afterId` names the message the previous call saw at position
+   * `windowOffset - 1`. If it is still there, resume as asked. If the window
+   * moved (a removal or an insertion before that point since the previous
+   * call), look for it within RELOCATE_RADIUS positions either side and
+   * resume just past it, reporting the shift. If it can't be found — it was
+   * itself removed, or the window moved further than that — fail loudly:
+   * guessing is how a message gets silently skipped.
+   */
+  private relocateWindowOffset(
+    windowOffset: number,
+    afterId: string | null | undefined,
+    q: { fromMs?: number; toMs?: number; channelId?: string },
+  ): { windowOffset: number; shift: number } {
+    if (windowOffset === 0) {
+      if (afterId != null) {
+        throw new Error(
+          'Nothing was read: "afterId" goes with a "windowOffset" above 0, both copied from a truncated response\'s ' +
+            '"resume". For a first page, leave afterId out; to continue, copy the fields of that "resume" into the call.',
+        );
+      }
+      return { windowOffset, shift: 0 };
+    }
+    if (afterId == null) {
+      throw new Error(
+        'Nothing was read: "windowOffset" needs the "afterId" from the same "resume", or a message added or removed ' +
+          'since the previous call would be skipped unseen. Copy the fields of the previous response\'s "resume" into ' +
+          'the call.',
+      );
+    }
+    const cm = this.cm as ContextManager;
+    const at = cm.queryMessagesByTimeAndChannel({ ...q, limit: 1, offset: windowOffset - 1 }).messages[0];
+    if (at && String(at.id) === afterId) return { windowOffset, shift: 0 };
+    const lo = Math.max(0, windowOffset - 1 - RELOCATE_RADIUS);
+    const around = cm.queryMessagesByTimeAndChannel({ ...q, limit: 2 * RELOCATE_RADIUS + 1, offset: lo }).messages;
+    const i = around.findIndex((m) => String(m.id) === afterId);
+    if (i === -1) {
+      throw new Error(
+        `Nothing was read: the window changed since the previous call. Message ${shown(afterId)}, where that scan stopped, ` +
+          `is no longer within ${RELOCATE_RADIUS} positions of windowOffset ${windowOffset}; it may have been deleted. ` +
+          'Restart the scan without "windowOffset" and "afterId", over the same range or one narrowed with "from" and "to".',
+      );
+    }
+    const relocated = lo + i + 1;
+    return { windowOffset: relocated, shift: relocated - windowOffset };
+  }
+
+  /**
+   * The `n` messages of a time/channel range nearest one of its edges, in
+   * TIMESTAMP order walking away from that edge (newest-first for
+   * side:"newest", oldest-first for side:"oldest"), plus whether the range
+   * holds more than `n`.
+   *
+   * Why not just `queryMessagesByTimeAndChannel` + offset: (a) a time-only
+   * query's `matchedCount` is the returned PAGE size, not a total (see
+   * context-manager MessageStore.queryByTime), so it can't locate a tail;
+   * (b) channel-scoped results come back in APPEND (ordinal) order, and
+   * Discord catch-up appends old-timestamped messages late — an ordinal
+   * tail is not the timestamp tail.
+   *
+   * No channel: chronicle's timestamp index answers directly (`reverse`
+   * for the newest edge). With a channel: channel queries report an exact
+   * matchedCount, so grow a time window out from the edge (×4 per step)
+   * until it holds ≥ n channel messages or covers the whole range. If that
+   * window holds more than `fetchCap` (a density jump across one step, or a
+   * burst), bisect its far bound between the last step that held < n and
+   * this one — counts are exact, so it lands on a window of [n, fetchCap].
+   * Only when a single millisecond holds the overflow does bisection bottom
+   * out; then the window is everything strictly nearer the edge plus that
+   * millisecond's nearest messages by sequence, which within one millisecond
+   * IS the (timestamp, sequence) order — still exact. The newest side is
+   * left open when `toMs` is (clock-skewed future stamps stay visible).
+   */
+  private edgeWindow(opts: {
+    fromMs?: number;
+    toMs?: number;
+    channelId?: string;
+    n: number;
+    side: 'newest' | 'oldest';
+  }): { messages: StoredMessage[]; more: boolean; total?: number } {
+    const cm = this.cm as ContextManager;
+    const { fromMs, toMs, channelId, n, side } = opts;
+    const newest = side === 'newest';
+    const cmp = (a: StoredMessage, b: StoredMessage) =>
+      a.timestamp.getTime() - b.timestamp.getTime() || a.sequence - b.sequence;
+    const dirSort = (ms: StoredMessage[]) => ms.sort(newest ? (a, b) => cmp(b, a) : cmp);
+
+    if (channelId === undefined) {
+      const r = cm.queryMessagesByTime({ fromMs, toMs, limit: n + 1, reverse: newest });
+      return { messages: r.messages.slice(0, n), more: r.messages.length > n };
+    }
+
+    const count = (f?: number, t?: number) =>
+      cm.queryMessagesByTimeAndChannel({ fromMs: f, toMs: t, channelId, limit: 0 }).matchedCount;
+    const fetch = (f: number | undefined, t: number | undefined, limit: number, offset = 0) =>
+      limit <= 0 ? [] : cm.queryMessagesByTimeAndChannel({ fromMs: f, toMs: t, channelId, limit, offset }).messages;
+    const total = count(fromMs, toMs);
+    if (n === 0) return { messages: [], more: total > 0, total };
+    if (total <= n) return { messages: dirSort(fetch(fromMs, toMs, total)), more: false, total };
+
+    // The window is parameterised by its FAR bound `e`: [e, toMs] for the
+    // newest side, [fromMs, e] for the oldest; its count is monotone in e.
+    const win = (e: number): [number | undefined, number | undefined] => (newest ? [e, toMs] : [fromMs, e]);
+    const cnt = (e: number) => count(...win(e));
+    const lo = fromMs ?? this.earliestMessageMs(toMs) ?? 0;
+    const hi = toMs ?? Date.now(); // growth anchor only — never a bound
+    // `outside`: a far bound whose window holds < n (initially empty).
+    // `inside`: one whose window holds ≥ n (initially the whole range).
+    let outside: number | null = null;
+    let inside = newest ? lo : (toMs ?? MAX_DATE_MS);
+    let inCount = total;
+    for (let width = 10 * 60_000; ; width *= 4) {
+      const e = newest ? hi - width : lo + width;
+      if (newest ? e <= lo : e >= hi) break; // covered: keep the whole range
+      const c = cnt(e);
+      if (c >= n) {
+        inside = e;
+        inCount = c;
+        break;
+      }
+      outside = e;
+    }
+    const fetchCap = Math.max(4 * n, n + 1000);
+    if (inCount <= fetchCap) {
+      return { messages: dirSort(fetch(...win(inside), inCount)).slice(0, n), more: true, total };
+    }
+    // Overshoot: bisect the far bound. The empty side starts one past the
+    // range's near end (newest: past toMs / any date; oldest: before lo).
+    const emptyOut = newest ? (toMs ?? MAX_DATE_MS) + 1 : lo - 1;
+    let out = outside ?? emptyOut;
+    while (Math.abs(inside - out) > 1) {
+      const mid = Math.floor((inside + out) / 2);
+      const c = cnt(mid);
+      if (c < n) {
+        out = mid;
+      } else {
+        inside = mid;
+        inCount = c;
+        if (c <= fetchCap) {
+          return { messages: dirSort(fetch(...win(mid), c)).slice(0, n), more: true, total };
+        }
+      }
+    }
+    // Millisecond `inside` alone carries the overflow. Everything nearer the
+    // edge (the `out` window, < n messages) plus the nearest-by-sequence
+    // messages of that millisecond (channel pages are append = sequence
+    // ordered, which is the tie order within one millisecond).
+    const near = out === emptyOut ? [] : fetch(...win(out), cnt(out));
+    const need = n - near.length;
+    const ties = count(inside, inside);
+    const edgeMs = fetch(inside, inside, need, newest ? Math.max(0, ties - need) : 0);
+    return { messages: dirSort([...near, ...edgeMs]).slice(0, n), more: true, total };
+  }
+
   async start(ctx: ModuleContext): Promise<void> {
     this.ctx = ctx;
+    this.wireIndexer(ctx);
+    this.startSyncTimer();
+  }
+
+  /** Pending edits/removals survive a restart through module state. Called from whichever of start()/bind() runs second. */
+  private wireIndexer(ctx: ModuleContext): void {
+    if (!this.indexer) return;
+    this.indexer.restorePending(ctx.getState<{ semanticPending?: PendingChanges }>()?.semanticPending);
+    this.indexer.onPendingChange = (p) => {
+      const prev = this.ctx?.getState<Record<string, unknown>>() ?? {};
+      this.ctx?.setState({ ...prev, semanticPending: p });
+    };
+    // Module state follows the store's branches, so each branch keeps its
+    // own sync cursors, and a branch made at an earlier point inherits them
+    // as they were there.
+    this.indexer.cursorStore = {
+      read: () => this.ctx?.getState<{ semanticCursors?: SyncCursors }>()?.semanticCursors ?? null,
+      write: (cursors) => {
+        const prev = this.ctx?.getState<Record<string, unknown>>() ?? {};
+        this.ctx?.setState({ ...prev, semanticCursors: cursors });
+      },
+    };
+    this.indexer.attach();
   }
 
   async stop(): Promise<void> {
     this.ctx = null;
+    if (this.syncTimer) { clearInterval(this.syncTimer); this.syncTimer = null; }
+    if (this.firstSyncTimer) { clearTimeout(this.firstSyncTimer); this.firstSyncTimer = null; }
+    // Unwired from the state it can no longer reach, the indexer goes on
+    // from the cursors it last wrote for each branch, kept in memory.
+    if (this.indexer) { this.indexer.onPendingChange = null; this.indexer.cursorStore = null; }
+    this.indexer?.dispose();
+  }
+
+  /**
+   * Background sync into the semantic index: every `syncIntervalMs` (default
+   * 60 s) write at most `maxSyncPerTick` items to the index, counted as its
+   * doc says. Idempotent to call — starts
+   * once we have both a context-manager (bind) and a config; `unref`'d so it
+   * never keeps a shutting-down process alive. A first tick runs after 5 s so
+   * a fresh store starts backfilling immediately rather than a minute later.
+   */
+  private startSyncTimer(): void {
+    if (this.syncTimer || !this.indexer || !this.semanticCfg) return;
+    const interval = this.semanticCfg.syncIntervalMs ?? 60_000;
+    if (interval <= 0) return;
+    const perTick = this.semanticCfg.maxSyncPerTick ?? 1024;
+    const tick = (): void => { void this.indexer?.catchUp(perTick); };
+    this.firstSyncTimer = setTimeout(() => { this.firstSyncTimer = null; tick(); }, 5_000);
+    this.firstSyncTimer.unref?.();
+    this.syncTimer = setInterval(tick, interval); this.syncTimer.unref?.();
+  }
+
+  /** Exposed for hosts/tests: one sync pass now. */
+  syncSemanticIndex(maxItems = 1024): Promise<SyncReport> | null {
+    return this.indexer ? this.indexer.catchUp(maxItems) : null;
   }
 
   getTools(): ToolDefinition[] {
@@ -291,15 +696,33 @@ export class HistoryModule implements Module {
           'Fetch raw, uncompressed messages for a time range and/or channel, paginated oldest-first. ' +
           'Use after `stats` to pull the actual content. format:"text" flattens each message to a short ' +
           'readable string (tool_use/tool_result/thinking/images rendered as bracketed labels); ' +
-          'format:"raw" returns the content blocks unmodified.',
+          'format:"raw" returns the content blocks unmodified. ' +
+          'Two extra modes: (1) aroundId — pass a message id (e.g. from `search`) to get the conversation ' +
+          'around it: `before` messages before it, the message itself (anchor:true), and `after` messages ' +
+          'after it, in the anchor\'s own channel unless channelId/allChannels says otherwise; from/to/offset/limit ' +
+          'do not apply in this mode (at most before+after+1 messages). (2) author/excludeAuthor — keep only (or drop) messages by these ' +
+          'authors; this is filtered in-process over at most maxScan messages of the window, so a response ' +
+          'may report truncated:true with a `resume` object ({windowOffset, offset, afterId}) — repeat the call with ' +
+          'those fields added to continue exactly where it stopped. If messages were added or removed in the window ' +
+          'meanwhile, the resume re-anchors on afterId and says so (windowChanged), or fails loudly when it can\'t.',
         inputSchema: {
           type: 'object' as const,
           properties: {
             from: { type: 'string', description: 'ISO 8601 inclusive lower bound. Omit for open-ended.' },
             to: { type: 'string', description: 'ISO 8601 inclusive upper bound. Omit for open-ended.' },
             channelId: { type: 'string', description: 'Restrict to one channel. Accepts a channel label (e.g. "#general") or the raw internal channel id.' },
+            author: AUTHOR_SCHEMA,
+            excludeAuthor: EXCLUDE_AUTHOR_SCHEMA,
+            aroundId: { type: 'string', description: 'Message id to center on (as returned by search/extract; a "msg:<id>" hit id works too). Returns the surrounding conversation instead of a range.' },
+            before: { type: 'number', description: `With aroundId: messages to include before the anchor (default ${AROUND_DEFAULT}, cap ${AROUND_MAX}).` },
+            after: { type: 'number', description: `With aroundId: messages to include after the anchor (default ${AROUND_DEFAULT}, cap ${AROUND_MAX}).` },
+            allChannels: { type: 'boolean', description: 'With aroundId: interleave every channel around the anchor\'s time instead of staying in its channel (default false).' },
             limit: { type: 'number', description: `Max messages to return (default ${EXTRACT_DEFAULT_LIMIT}, hard cap ${EXTRACT_MAX_LIMIT}). Must be a non-negative integer.` },
             offset: { type: 'number', description: `Number of matching messages to skip (default 0, capped to ${NATIVE_OFFSET_MAX}). Must be a non-negative integer.` },
+            maxScan: { type: 'number', description: `With author/excludeAuthor: max window messages to examine (default ${EXTRACT_FILTER_DEFAULT_MAX_SCAN}, hard cap ${EXTRACT_FILTER_MAX_MAX_SCAN}).` },
+            windowOffset: { type: 'number', description: 'With author/excludeAuthor: resume a truncated scan at this position of the window — copy it from the previous response\'s `resume`.' },
+            seqMark: { type: 'number', description: 'With windowOffset and no channelId: copy it from `resume`. Lets a resume find messages added behind it since the previous call.' },
+            afterId: { type: 'string', description: 'With windowOffset: id of the last message the previous call scanned — copy it from `resume`. Lets a resume notice messages added or removed since, instead of silently skipping one.' },
             format: { type: 'string', enum: ['text', 'raw'], description: 'Content rendering (default "text").' },
           },
         },
@@ -311,7 +734,14 @@ export class HistoryModule implements Module {
           'range/channel window. Narrows candidates via the same query as `extract` before matching, up ' +
           'to maxScan candidates — if the narrowed window is larger than maxScan, the response reports ' +
           'truncated:true up front rather than silently missing later matches; narrow the filter or raise ' +
-          'maxScan and retry. regex:true matching runs under a wall-clock deadline and is cleanly failed ' +
+          'maxScan and retry. When the scan stops early (truncated, or `limit` matches reached) the response ' +
+          'carries a `resume` object ({from|to, skipSequences}): repeat the call with its fields to continue ' +
+          '(scannedThrough is the same instant, for reading). ' +
+          'order:"newest" scans the most recent maxScan messages of the window first — usually what you want ' +
+          'for "when did this last come up". author/excludeAuthor narrow by who wrote the message; ' +
+          'wholeWord:true stops "mission" from matching inside "uncommissioned". Each match carries an `id` ' +
+          'you can hand to extract({aroundId}) to read the conversation around it. ' +
+          'regex:true matching runs under a wall-clock deadline and is cleanly failed ' +
           `(not silently empty) if a pattern is too slow — avoid nested-quantifier patterns like (a+)+.`,
         inputSchema: {
           type: 'object' as const,
@@ -319,11 +749,20 @@ export class HistoryModule implements Module {
             query: { type: 'string', description: 'Substring (or regex source, when regex:true) to search for.' },
             regex: { type: 'boolean', description: 'Treat query as a regular expression (default false).' },
             caseSensitive: { type: 'boolean', description: 'Case-sensitive match (default false).' },
+            wholeWord: { type: 'boolean', description: 'Substring mode only: match whole words, not inside longer words (default false). In regex mode use \\b yourself.' },
             from: { type: 'string', description: 'ISO 8601 inclusive lower bound. Omit for open-ended.' },
             to: { type: 'string', description: 'ISO 8601 inclusive upper bound. Omit for open-ended.' },
             channelId: { type: 'string', description: 'Restrict to one channel. Accepts a channel label (e.g. "#general") or the raw internal channel id.' },
+            author: AUTHOR_SCHEMA,
+            excludeAuthor: EXCLUDE_AUTHOR_SCHEMA,
+            order: { type: 'string', enum: ['oldest', 'newest'], description: 'Scan and return oldest-first (default) or newest-first.' },
             limit: { type: 'number', description: `Max matches to return (default ${SEARCH_DEFAULT_LIMIT}, hard cap ${SEARCH_MAX_LIMIT}). Must be a non-negative integer.` },
-            maxScan: { type: 'number', description: `Max candidate messages to scan (default ${SEARCH_DEFAULT_MAX_SCAN}, hard cap ${SEARCH_MAX_MAX_SCAN}). Must be a non-negative integer.` },
+            maxScan: { type: 'number', description: `Max candidate messages to scan (default ${SEARCH_DEFAULT_MAX_SCAN}, hard cap ${SEARCH_MAX_MAX_SCAN}). Must be a whole number, 1 or more.` },
+            skipSequences: {
+              type: 'array',
+              items: { type: 'number' },
+              description: 'Continuation only: copy it from the previous response\'s `resume` together with its from/to. Marks the messages at exactly that instant that were already scanned.',
+            },
           },
           required: ['query'],
         },
@@ -373,13 +812,58 @@ export class HistoryModule implements Module {
           },
         },
       },
+      ...(this.semanticCfg ? [this.semanticSearchTool()] : []),
     ];
+  }
+
+  private semanticSearchTool(): ToolDefinition {
+    return {
+      name: 'semantic_search',
+      description:
+        'Search your own history by MEANING, not exact words: an embedding index over your raw messages ' +
+        '(text plus your own think/journal/skip_reply notes) and every compression summary. Use it when you ' +
+        'remember roughly what something was about but not the words — "the night the fluid sim was read ' +
+        'back to me as art" — then narrow with `from`/`to`/`channelId` and drill into the exact span with ' +
+        '`extract` or `overview` (for a message hit, `extract({ aroundId: messageId })` opens the conversation ' +
+        'around it — use the raw `messageId` field, not the `msg:` id). Results are ranked by cosine similarity (score ~0.6+ is a strong match, ' +
+        '~0.3 is thematic, below ~0.2 is noise); each hit carries its id (`msg:<id>` or `sum:<id>`), ' +
+        'timestamp, channel, kind/level and a snippet. The index catches up with recent messages before ' +
+        'searching (bounded, so a huge backlog is reported as `index.behind` rather than blocking; if a ' +
+        'background sync is already running, the search waits for that run to finish instead). ' +
+        'Purely a read: nothing is written to your history. Hits are checked against your current branch ' +
+        'before they come back: a message you undid or a summary from a branch you left is dropped and ' +
+        'counted in index.droppedOffBranch; a message edited down to nothing searchable is dropped and ' +
+        'counted in index.droppedStale. When that leaves fewer than `limit` hits and the index may hold more, it ' +
+        'searches again, deeper, down to its first 200 hits; if a search after the first fails, the hits found so ' +
+        'far come back, with why in index.searchAgainError. Message snippets ' +
+        'always show the current text of the message.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          query: { type: 'string', description: 'What you are looking for, in natural language. A sentence works better than keywords.' },
+          limit: { type: 'number', description: `Max hits (default ${SEMANTIC_DEFAULT_LIMIT}, cap ${SEMANTIC_MAX_LIMIT}).` },
+          from: { type: 'string', description: 'ISO 8601 inclusive lower bound on the message timestamp / summary span start. Omit for open-ended.' },
+          to: { type: 'string', description: 'ISO 8601 inclusive upper bound. Omit for open-ended.' },
+          channelId: { type: 'string', description: 'Only raw messages from this channel (label like "#general" or the raw internal id). Summaries are not per-channel and are excluded when this is set; combining it with kinds="summaries" or level is an error.' },
+          kinds: { type: 'string', enum: ['messages', 'summaries', 'both'], description: 'What to search: raw messages, compression summaries, or both (default).' },
+          level: { type: 'number', description: 'Only summaries of this exact level (implies kinds=summaries).' },
+          minScore: { type: 'number', description: 'Drop hits below this cosine score (0..1). Default none.' },
+        },
+        required: ['query'],
+      },
+    };
   }
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
     try {
       if (!this.cm) {
-        throw new Error('HistoryModule not bound — host must call bind(contextManager) before tool dispatch.');
+        // The host's mistake, named for whoever runs it; the agent reads what
+        // it can do about it, which is nothing.
+        console.error('[history] a tool was called before the host bound the module: call bind(contextManager) before tool dispatch');
+        throw new Error(
+          "The history tools aren't available: this host hasn't finished setting up the history module, so nothing " +
+            "was read. Calling them again won't change that; ask whoever runs this host.",
+        );
       }
       switch (call.name) {
         case 'stats':
@@ -390,8 +874,10 @@ export class HistoryModule implements Module {
           return await this.handleSearch((call.input ?? {}) as SearchInput);
         case 'overview':
           return this.handleOverview((call.input ?? {}) as OverviewInput);
+        case 'semantic_search':
+          return await this.handleSemanticSearch((call.input ?? {}) as SemanticSearchInput);
         default:
-          return { success: false, isError: true, error: `Unknown tool: ${call.name}` };
+          return { success: false, isError: true, error: unknownToolMessage(this.name, call.name, this.getTools()) };
       }
     } catch (error) {
       // Catches our own validation errors (bad ISO date, invalid regex,
@@ -459,28 +945,347 @@ export class HistoryModule implements Module {
   // ==========================================================================
 
   private handleExtract(input: ExtractInput): ToolResult {
+    if (input.aroundId !== undefined) return this.handleExtractAround(input);
+    const aroundOnly = (['before', 'after', 'allChannels'] as const).filter((k) => input[k] !== undefined);
+    if (aroundOnly.length > 0) {
+      const one = aroundOnly.length === 1;
+      throw new Error(
+        `Nothing was read: ${quotedList(aroundOnly, 'and')} ${one ? 'goes' : 'go'} with "aroundId", which reads the ` +
+          `conversation around one message. Pass aroundId too, or leave ${one ? 'it' : 'them'} out to read a range ` +
+          'with "from", "to" and "channelId".',
+      );
+    }
     const channelId = this.resolveChannel(input.channelId);
     const fromMs = parseIsoDate(input.from, 'from');
     const toMs = parseIsoDate(input.to, 'to');
-    const limit = clampCount(input.limit, EXTRACT_DEFAULT_LIMIT, EXTRACT_MAX_LIMIT, 'limit');
-    const offset = clampCount(input.offset, 0, NATIVE_OFFSET_MAX, 'offset');
+    const limit = clampCount(input.limit, EXTRACT_DEFAULT_LIMIT, EXTRACT_MAX_LIMIT, 'limit', 'read');
+    const offset = clampCount(input.offset, 0, NATIVE_OFFSET_MAX, 'offset', 'read');
     const format = input.format ?? 'text';
+    const authorFilter = buildAuthorFilter(input.author, input.excludeAuthor);
 
     const cm = this.cm as ContextManager;
+    const resumeOnly = (['windowOffset', 'afterId', 'seqMark'] as const).filter((k) => input[k] !== undefined);
+    if (!authorFilter && resumeOnly.length > 0) {
+      const one = resumeOnly.length === 1;
+      throw new Error(
+        `Nothing was read: ${quotedList(resumeOnly, 'and')} ${one ? 'resumes' : 'resume'} an author-filtered ` +
+          `extract, so ${one ? 'it goes' : 'they go'} with the "author" or "excludeAuthor" of the call that returned ` +
+          `${one ? 'it' : 'them'}: repeat that call with the fields of its "resume". To page through a range without an ` +
+          'author filter, use "offset".',
+      );
+    }
+
+    if (authorFilter) {
+      // No native author index: page through the time/channel window and
+      // filter here. offset/limit apply to the FILTERED sequence. Stop as
+      // soon as the requested page is full; otherwise scan to maxScan. Only
+      // an exhausted window yields an exact matchedCount — anything else is
+      // reported as truncated with a resume point, never as a total.
+      //
+      // Resume is by WINDOW POSITION (`windowOffset`), never by timestamp: a
+      // channel-scoped window pages in append order, and Discord catch-up
+      // appends old-timestamped messages late, so "continue from the last
+      // timestamp seen" would skip them.
+      // An author-filtered extract has to examine at least 1 message.
+      const maxScan = clampCount(
+        input.maxScan, EXTRACT_FILTER_DEFAULT_MAX_SCAN, EXTRACT_FILTER_MAX_MAX_SCAN, 'maxScan', 'read', 1,
+      );
+      const requestedOffset = clampCount(input.windowOffset, 0, NATIVE_OFFSET_MAX, 'windowOffset', 'read');
+      // A position is only meaningful against the window it was taken in:
+      // a removal before it (every discord:delete, host hide, /undo) shifts
+      // later positions left, and a message inserted before it (a
+      // time-ordered window with backfill) shifts them right. Either would
+      // silently skip or repeat a message. afterId pins the position to the
+      // message that was there; relocate it if the window moved.
+      const { windowOffset, shift } = this.relocateWindowOffset(
+        requestedOffset,
+        input.afterId,
+        { fromMs, toMs, channelId },
+      );
+      // A time-ordered window (no channelId) can also take an older-stamped
+      // insertion BEFORE the cursor; paired with a removal there, positions
+      // balance out (shift 0) and afterId alone can't see it. Appends carry
+      // the highest sequences, so everything appended since the previous
+      // call is the store's append tail above its seqMark: check those
+      // directly. (A channel window pages in append order, so an append
+      // always lands after the cursor and is simply scanned.)
+      const seqMarkNow = channelId === undefined ? this.storeSeqMark() : undefined;
+      let missed: StoredMessage[] = [];
+      let unverified = false;
+      if (channelId === undefined && windowOffset > 0) {
+        if (typeof input.seqMark !== 'number') {
+          throw new Error(
+            'Nothing was read: "windowOffset" without "channelId" needs the "seqMark" from the same "resume". Copy the ' +
+              'fields of the previous response\'s "resume" into the call.',
+          );
+        }
+        const cursor = cm.queryMessagesByTimeAndChannel({ fromMs, toMs, limit: 1, offset: windowOffset - 1 }).messages[0];
+        if (cursor) {
+          const ct = cursor.timestamp.getTime();
+          const r = this.appendedSince(input.seqMark, (m) => {
+            const ts = m.timestamp.getTime();
+            if ((fromMs !== undefined && ts < fromMs) || (toMs !== undefined && ts > toMs)) return false;
+            return ts < ct || (ts === ct && m.sequence < cursor.sequence);
+          });
+          missed = r.messages;
+          unverified = !r.complete;
+        }
+      }
+      const page: StoredMessage[] = [];
+      let kept = 0;
+      let scanned = 0;
+      let lastScanned: StoredMessage | undefined;
+      // Window position just past the last message put on the page, and that message.
+      let afterPage = windowOffset;
+      let lastOnPage: StoredMessage | undefined;
+      let exhausted = false;
+      let pageFull = false;
+      outer: for (;;) {
+        const want = Math.min(FILTER_SCAN_PAGE, maxScan - scanned);
+        if (want <= 0) break;
+        const chunk = cm.queryMessagesByTimeAndChannel({
+          fromMs,
+          toMs,
+          channelId,
+          limit: want,
+          offset: Math.min(windowOffset + scanned, NATIVE_OFFSET_MAX),
+        }).messages;
+        for (const m of chunk) {
+          scanned++;
+          lastScanned = m;
+          if (!authorFilter(m)) continue;
+          if (kept >= offset && page.length < limit) {
+            page.push(m);
+            afterPage = windowOffset + scanned;
+            lastOnPage = m;
+          }
+          kept++;
+          if (limit > 0 && page.length >= limit && kept > offset + limit) {
+            // One filtered match beyond the page proves there is more;
+            // no need to keep scanning.
+            pageFull = true;
+            break outer;
+          }
+        }
+        if (chunk.length < want) {
+          exhausted = true;
+          break;
+        }
+      }
+      if (!exhausted && !pageFull && scanned >= maxScan) {
+        // Probe one past maxScan: a window of exactly maxScan is complete.
+        const next = cm.queryMessagesByTimeAndChannel({
+          fromMs,
+          toMs,
+          channelId,
+          limit: 1,
+          offset: Math.min(windowOffset + scanned, NATIVE_OFFSET_MAX),
+        }).messages;
+        if (next.length === 0) exhausted = true;
+      }
+      return {
+        success: true,
+        data: {
+          // A resumed scan (windowOffset > 0) only saw the window from that
+          // position on, so its count is named for that — never a total. A
+          // page-full stop's lookahead match lies past the resume point and
+          // is left out, so counts add up across a chain of resumes.
+          ...(() => {
+            const n = pageFull ? kept - 1 : kept;
+            const base = windowOffset > 0 ? 'matchedSinceWindowOffset' : 'matchedCount';
+            return { [exhausted ? base : `${base}AtLeast`]: n };
+          })(),
+          returned: page.length,
+          scanned,
+          truncated: !exhausted,
+          ...(shift !== 0 || missed.length > 0 || unverified
+            ? {
+                windowChanged: {
+                  shift,
+                  ...(unverified
+                    ? {
+                        unverified: true,
+                        unverifiedNote:
+                          `More than ${APPENDED_SCAN_CAP} messages were appended since the previous call; only the newest ` +
+                          'were checked, so messages may have been added behind the resume point unseen. Restart without ' +
+                          'windowOffset, or narrow with from/to/channelId, if that matters.',
+                      }
+                    : {}),
+                  ...(channelId === undefined
+                    ? {
+                        addedBefore: missed.length,
+                        // the ones this filter would have kept — fetch them with extract({aroundId})
+                        missedIds: missed.filter(authorFilter).map((m) => String(m.id)),
+                      }
+                    : {}),
+                  note:
+                    missed.length > 0 || shift > 0
+                      ? `${missed.length || shift} message(s) were added to the window before the resume point since the previous call; this scan chain did not see them` +
+                        (channelId === undefined ? ' (matching ones listed in missedIds).' : '.')
+                      : shift < 0
+                        ? `${-shift} message(s) before the resume point were removed since the previous call; the resume was re-anchored, nothing skipped.`
+                        : 'No change found behind the resume point, but the check was incomplete (see unverifiedNote).',
+                },
+              }
+            : {}),
+          ...(!exhausted
+            ? (() => {
+                // pageFull: resume just past the last returned message, no
+                // skip. maxScan: resume past everything scanned, still owing
+                // whatever part of `offset` was not yet consumed.
+                // afterId = the message at position windowOffset-1 (see
+                // relocateWindowOffset). When nothing was scanned (no
+                // chunk came back), carry the incoming anchor forward.
+                const mark = seqMarkNow !== undefined ? { seqMark: seqMarkNow } : {};
+                const resume = pageFull
+                  ? { windowOffset: afterPage, offset: 0, afterId: idOrNull(lastOnPage) ?? input.afterId ?? null, ...mark }
+                  : {
+                      windowOffset: windowOffset + scanned,
+                      offset: Math.max(0, offset - kept),
+                      afterId: idOrNull(lastScanned) ?? input.afterId ?? null,
+                      ...mark,
+                    };
+                return {
+                  resume,
+                  hint:
+                    (pageFull
+                      ? 'More matching messages exist. '
+                      : `Stopped after scanning ${scanned} messages of the window without reaching its end` +
+                        (page.length === 0 ? ', so returning none is not a negative result for the window. ' : '. ')) +
+                    `Continue by repeating this call with the same from/to/channelId/author plus ` +
+                    `the fields of \`resume\` (windowOffset:${resume.windowOffset}, offset:${resume.offset}, afterId).`,
+                };
+              })()
+            : {}),
+          messages: page.map((msg) => projectMessage(msg, format)),
+        },
+      };
+    }
+
+    // One extra row answers "is there another page" in every case. The
+    // native matchedCount is a true total only for channel-scoped queries;
+    // for time-only/unfiltered ones it is just the page size (see
+    // edgeWindow), so it is reported only where it means what it says.
     const result = cm.queryMessagesByTimeAndChannel({
       fromMs,
       toMs,
       channelId,
-      limit,
+      limit: limit + 1,
       offset,
     });
+    const page = result.messages.slice(0, limit);
 
     return {
       success: true,
       data: {
-        matchedCount: result.matchedCount,
-        returned: result.messages.length,
-        messages: result.messages.map((msg) => projectMessage(msg, format)),
+        ...(channelId !== undefined ? { matchedCount: result.matchedCount } : {}),
+        returned: page.length,
+        hasMore: result.messages.length > limit,
+        messages: page.map((msg) => projectMessage(msg, format)),
+      },
+    };
+  }
+
+  /**
+   * `extract({aroundId})` — the conversation around one message, like
+   * Discord's fetch_around. Neighbours are by (timestamp, sequence): first
+   * the anchor's own millisecond in sequence order, then, for whatever a
+   * side still needs, the nearest messages strictly before/after it (both
+   * via edgeWindow, which is exact by timestamp).
+   */
+  private handleExtractAround(input: ExtractInput): ToolResult {
+    const windowFields = (['from', 'to', 'offset', 'windowOffset', 'limit'] as const).filter((k) => input[k] !== undefined);
+    if (windowFields.length > 0) {
+      throw new Error(
+        `Nothing was read: "aroundId" picks its own window, so it doesn't take ${quotedList(windowFields, 'or')}. Size ` +
+          'the window with "before" and "after", or leave out "aroundId" to read a range.',
+      );
+    }
+    if (input.author !== undefined || input.excludeAuthor !== undefined) {
+      throw new Error(
+        'Nothing was read: "aroundId" reads the whole conversation around one message, so author filters don\'t ' +
+          'apply to it. To find someone\'s messages, use history--search or history--extract with "author".',
+      );
+    }
+    if (input.allChannels && input.channelId !== undefined) {
+      throw new Error(
+        'Nothing was read: "channelId" and "allChannels" can\'t go together. Leave out "channelId" to read around the ' +
+          'message in every channel, or leave out both to read around it in its own channel.',
+      );
+    }
+    const before = clampCount(input.before, AROUND_DEFAULT, AROUND_MAX, 'before', 'read');
+    const after = clampCount(input.after, AROUND_DEFAULT, AROUND_MAX, 'after', 'read');
+    const format = input.format ?? 'text';
+    const cm = this.cm as ContextManager;
+
+    // semantic_search (#173) hands out `msg:<id>` / `sum:<id>`; accept the
+    // message form as-is, and say plainly what a summary id is.
+    const rawId = String(input.aroundId);
+    if (/^sum:/.test(rawId)) {
+      throw new Error(
+        `Nothing was read: ${shown(rawId)} is a compression summary, not a message. history--overview reads ` +
+          'summaries; "aroundId" takes a message, such as ' +
+          (this.semanticCfg
+            ? 'the "messageId" of a history--semantic_search hit.'
+            : 'the "id" of a history--search or history--extract result.'),
+      );
+    }
+    const anchor = cm.getMessage(rawId.replace(/^msg:/, ''));
+    if (!anchor) {
+      throw new Error(
+        `Nothing was read: no message in your history has the id ${shown(input.aroundId)}. Pass the "id" ` +
+          'of a history--search or history--extract result' +
+          (this.semanticCfg ? ', or the "messageId" of a history--semantic_search hit.' : '.'),
+      );
+    }
+    const anchorId = String(anchor.id);
+    const anchorChannel = getChannelId(anchor);
+    const channelId = input.allChannels ? undefined : (this.resolveChannel(input.channelId) ?? anchorChannel);
+    const t = anchor.timestamp.getTime();
+
+    // The anchor's own millisecond first, whole and in sequence order —
+    // that is the (timestamp, sequence) order the neighbours are defined
+    // by, and it may hold many messages (a backfill burst). Then only if a
+    // side still needs more, the nearest messages strictly before / after
+    // that millisecond (edgeWindow is exact by timestamp).
+    let ties: StoredMessage[];
+    if (channelId !== undefined) {
+      const n = cm.queryMessagesByTimeAndChannel({ fromMs: t, toMs: t, channelId, limit: 0 }).matchedCount;
+      if (n > AROUND_TIE_CAP) throw tieCapError(anchorId, t, channelId);
+      ties = cm.queryMessagesByTimeAndChannel({ fromMs: t, toMs: t, channelId, limit: n }).messages;
+    } else {
+      ties = cm.queryMessagesByTime({ fromMs: t, toMs: t, limit: AROUND_TIE_CAP + 1 }).messages;
+      if (ties.length > AROUND_TIE_CAP) throw tieCapError(anchorId, t, undefined);
+    }
+    ties = [...ties].sort((x, y) => x.sequence - y.sequence);
+    const idx = ties.findIndex((m) => String(m.id) === anchorId);
+    if (idx === -1) {
+      // The anchor is in the store and every message of its millisecond in
+      // `channelId` was fetched, so only an explicit channelId excludes it.
+      throw new Error(
+        `Nothing was read: message ${shown(anchorId)} isn't in channel ${shown(input.channelId)}` +
+          (anchorChannel ? ` (it's in ${shown(anchorChannel)}).` : '.') +
+          ' Leave out "channelId" to read around it in its own channel.',
+      );
+    }
+    const tiesBefore = ties.slice(Math.max(0, idx - before), idx);
+    const tiesAfter = ties.slice(idx + 1, idx + 1 + after);
+    const needBefore = before - tiesBefore.length;
+    const needAfter = after - tiesAfter.length;
+    const earlier =
+      needBefore > 0 ? this.edgeWindow({ toMs: t - 1, channelId, n: needBefore, side: 'newest' }).messages.reverse() : [];
+    const later = needAfter > 0 ? this.edgeWindow({ fromMs: t + 1, channelId, n: needAfter, side: 'oldest' }).messages : [];
+    const window = [...earlier, ...tiesBefore, ties[idx]!, ...tiesAfter, ...later];
+    return {
+      success: true,
+      data: {
+        anchorId,
+        channelId: channelId ?? null,
+        returned: window.length,
+        messages: window.map((m) => ({
+          ...projectMessage(m, format),
+          ...(String(m.id) === anchorId ? { anchor: true } : {}),
+        })),
       },
     };
   }
@@ -490,16 +1295,37 @@ export class HistoryModule implements Module {
   // ==========================================================================
 
   private async handleSearch(input: SearchInput): Promise<ToolResult> {
-    if (!input.query) {
-      throw new Error('search requires a non-empty "query".');
+    // A finite number is searched as its text, as a regular expression made
+    // from it reads it; any other value that isn't text is refused.
+    const given: unknown = input.query;
+    const query = typeof given === 'number' && Number.isFinite(given) ? String(given) : given;
+    if (typeof query !== 'string' || query === '') {
+      throw new Error(
+        'Nothing was searched: "query" must be the text to look for; ' +
+          `${given === undefined ? 'this call gave none' : `it's ${shown(given)}`}.`,
+      );
     }
     const channelId = this.resolveChannel(input.channelId);
     const fromMs = parseIsoDate(input.from, 'from');
     const toMs = parseIsoDate(input.to, 'to');
-    const limit = clampCount(input.limit, SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT, 'limit');
-    const maxScan = clampCount(input.maxScan, SEARCH_DEFAULT_MAX_SCAN, SEARCH_MAX_MAX_SCAN, 'maxScan');
+    const limit = clampCount(input.limit, SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT, 'limit', 'searched');
+    // A search has to scan at least 1 message.
+    const maxScan = clampCount(input.maxScan, SEARCH_DEFAULT_MAX_SCAN, SEARCH_MAX_MAX_SCAN, 'maxScan', 'searched', 1);
     const caseSensitive = input.caseSensitive ?? false;
     const flags = caseSensitive ? '' : 'i';
+    const order = input.order ?? 'oldest';
+    if (order !== 'oldest' && order !== 'newest') {
+      throw new Error(
+        `Nothing was searched: "order" must be "oldest" or "newest", or left out for "oldest"; it's ${shown(input.order)}.`,
+      );
+    }
+    if (input.wholeWord && input.regex) {
+      throw new Error(
+        'Nothing was searched: "wholeWord" applies to a search for text, not a regular expression. In a regular ' +
+          'expression, write \\b around the pattern instead, or set "regex" to false.',
+      );
+    }
+    const authorFilter = buildAuthorFilter(input.author, input.excludeAuthor);
 
     // Validate regex SYNTAX up front — an invalid pattern is a clean tool
     // error, not a crash mid-scan. This does NOT bound match TIME (a
@@ -508,27 +1334,119 @@ export class HistoryModule implements Module {
     // than here.
     if (input.regex) {
       try {
-        new RegExp(input.query, flags);
+        new RegExp(query, flags);
       } catch (error) {
-        throw new Error(`Invalid regex "${input.query}": ${error instanceof Error ? error.message : String(error)}`);
+        // V8's message restates the pattern; the reason alone follows it.
+        const reason = (error instanceof Error ? error.message : String(error))
+          .replace(/^Invalid regular expression: \/.*\/[a-z]*: /s, '');
+        throw new Error(
+          `Nothing was searched: "query" ${shown(query)} isn't a valid regular expression (${reason}). ` +
+            'Fix the pattern, or set "regex" to false to search for the text as written.',
+        );
       }
     }
-    const needle = caseSensitive ? input.query : input.query.toLowerCase();
+    const needle = caseSensitive ? query : query.toLowerCase();
 
     const cm = this.cm as ContextManager;
-    // Fetch one more than maxScan so an oversized candidate window is
-    // detected up front (before any matching is attempted), rather than
+    // The candidate window is the oldest (order:"oldest") or newest
+    // (order:"newest", via edgeWindow — see there for why not an offset
+    // tail) maxScan messages of the time/channel range. Oversize is
+    // detected up front rather than
     // silently scanning maxScan candidates and returning as if that were the
     // whole window. See the tool description's `truncated` contract.
-    const probe = cm.queryMessagesByTimeAndChannel({
-      fromMs,
-      toMs,
-      channelId,
-      limit: maxScan + 1,
-      offset: 0,
-    });
-    const truncated = probe.messages.length > maxScan;
-    const candidates = truncated ? probe.messages.slice(0, maxScan) : probe.messages;
+    //
+    // Continuation: `skipSequences` names what the previous call already
+    // scanned at exactly the resume bound's millisecond (the bound is
+    // inclusive). Identified by sequence range rather than a count, so a
+    // message removed at that millisecond, or appended there (a new
+    // message always gets the highest sequence), between calls neither
+    // shifts the skip onto an unscanned message nor hides the new one.
+    const skipRange = parseSkipSequences(input.skipSequences);
+    const edgeMs = order === 'oldest' ? fromMs : toMs;
+    if (skipRange && edgeMs === undefined) {
+      throw new Error(
+        `Nothing was searched: "skipSequences" goes with the "${order === 'oldest' ? 'from' : 'to'}" from the same ` +
+          '"resume". Copy the fields of the previous response\'s "resume" into the call, or leave "skipSequences" ' +
+          'out for a new search.',
+      );
+    }
+    const isSkipped = (m: StoredMessage) =>
+      !!skipRange && m.timestamp.getTime() === edgeMs && m.sequence >= skipRange[0] && m.sequence <= skipRange[1];
+    let windowMessages: StoredMessage[];
+    let truncated: boolean;
+    let unscanned: number | undefined;
+    {
+      // Over-fetch by the number of messages at the edge millisecond (the
+      // only ones that can be skipped), then drop the skipped ones.
+      const edgeTies = skipRange ? this.countAtMs(edgeMs!, channelId) : 0;
+      const w = this.edgeWindow({ fromMs, toMs, channelId, n: maxScan + edgeTies, side: order });
+      const pool = skipRange ? w.messages.filter((m) => !isSkipped(m)) : w.messages;
+      truncated = w.more || pool.length > maxScan;
+      windowMessages = pool.slice(0, maxScan);
+      if (w.total !== undefined) unscanned = w.total - (w.messages.length - pool.length) - windowMessages.length;
+    }
+    const candidatePoolSize = windowMessages.length;
+    const candidates = authorFilter ? windowMessages.filter(authorFilter) : windowMessages;
+    const poolInfo = {
+      candidatePoolSize,
+      ...(authorFilter ? { afterAuthorFilter: candidates.length } : {}),
+      order,
+    };
+    // Where the scan stopped, when it stopped before the end of the window
+    // the caller asked about: either `limit` matches came first (the rest of
+    // the pool was never looked at) or the pool itself was truncated. The
+    // timestamp is the continuation point — from: (oldest) / to: (newest).
+    // Boundary is inclusive, so a message at exactly that instant may repeat.
+    const resumeInfo = (scanned: number, matched: number): Record<string, unknown> => {
+      const stoppedEarly = scanned < candidates.length;
+      if (!stoppedEarly && !truncated) return {};
+      // Stopped at limit: the last candidate actually looked at. Scanned the
+      // whole (truncated) pool: the pool's own far edge — which may lie past
+      // the last author-filtered candidate.
+      const last = stoppedEarly ? candidates[scanned - 1] : windowMessages[windowMessages.length - 1];
+      if (!last) return {};
+      const at = last.timestamp.toISOString();
+      const bound = order === 'oldest' ? 'from' : 'to';
+      // The continuation bound is inclusive, so the next window starts with
+      // every message at exactly `at`. Hand back the sequence range already
+      // scanned there: this call's messages at `at` up to the stop, plus —
+      // when `at` is still the incoming bound — the range the previous
+      // call had already covered. Within one millisecond the pool is in
+      // sequence order, so every message at `at` whose sequence lies in the
+      // union was scanned; anything appended later sorts outside it.
+      const atMs = last.timestamp.getTime();
+      const stop = windowMessages.indexOf(last);
+      let lo = Infinity;
+      let hi = -Infinity;
+      for (let i = 0; i <= stop; i++) {
+        const m = windowMessages[i]!;
+        if (m.timestamp.getTime() !== atMs) continue;
+        lo = Math.min(lo, m.sequence);
+        hi = Math.max(hi, m.sequence);
+      }
+      if (skipRange && atMs === edgeMs) {
+        lo = Math.min(lo, skipRange[0]);
+        hi = Math.max(hi, skipRange[1]);
+      }
+      const resume = { [bound]: at, skipSequences: [lo, hi] as [number, number] };
+      return {
+        scannedThrough: at,
+        resume,
+        hint:
+          (stoppedEarly
+            ? 'Stopped at limit; more candidates remain. '
+            : matched === 0
+              ? `No match among the ${order} ${candidatePoolSize} ${candidatePoolSize === 1 ? 'message' : 'messages'} ` +
+                'scanned (maxScan); ' +
+                (unscanned === undefined
+                  ? 'the rest of this range was not searched'
+                  : `${unscanned} more in this range ${unscanned === 1 ? 'was' : 'were'} not searched`) +
+                ', so this is not a negative result for the range. '
+              : `Only the ${order} ${candidatePoolSize} messages of this range were scanned (maxScan). `) +
+          `Continue by repeating the call with the fields of \`resume\` (${bound}:"${at}" and skipSequences), ` +
+          `or raise limit/maxScan, or narrow with ${[channelId === undefined ? 'channelId' : null, stoppedEarly && input.author === undefined ? 'author' : null, 'dates'].filter((w) => w !== null).join('/')}.`,
+      };
+    };
 
     if (input.regex) {
       // Regex matching against caller-supplied patterns is ReDoS-shaped: a
@@ -540,8 +1458,8 @@ export class HistoryModule implements Module {
       // through a worker thread instead, which can be forcibly terminated
       // on a deadline. See search-regex-worker.ts's header for the full
       // rationale.
-      const { matches, scanned } = await this.searchWithRegexWorker(candidates, input.query, flags, limit);
-      return { success: true, data: { scanned, candidatePoolSize: candidates.length, truncated, matches } };
+      const { matches, scanned } = await this.searchWithRegexWorker(candidates, query, flags, limit);
+      return { success: true, data: { scanned, ...poolInfo, truncated, ...resumeInfo(scanned, matches.length), matches } };
     }
 
     // Plain substring search (String.prototype.indexOf) is inherently
@@ -559,12 +1477,13 @@ export class HistoryModule implements Module {
       if (matches.length >= limit) break;
       scanned++;
       const text = flattenContent(msg.content);
-      const hit = matchSubstring(text, needle, caseSensitive);
+      const hit = matchSubstring(text, needle, caseSensitive, input.wholeWord ?? false);
       if (!hit) continue;
       matches.push({
         id: String(msg.id),
         timestamp: msg.timestamp.toISOString(),
         participant: msg.participant,
+        author: authorName(msg),
         channelId: getChannelId(msg) ?? null,
         snippet: snippetAround(text, hit.index, hit.length),
       });
@@ -572,7 +1491,7 @@ export class HistoryModule implements Module {
 
     return {
       success: true,
-      data: { scanned, candidatePoolSize: candidates.length, truncated, matches },
+      data: { scanned, ...poolInfo, truncated, ...resumeInfo(scanned, matches.length), matches },
     };
   }
 
@@ -605,22 +1524,32 @@ export class HistoryModule implements Module {
           const timer = setTimeout(() => {
             reject(
               new Error(
-                `search timed out after ${SEARCH_REGEX_TIMEOUT_MS}ms while matching regex "${pattern}" against ` +
-                  `up to ${texts.length} candidate(s) — the pattern may be catastrophically slow (exponential ` +
-                  'backtracking) against this data; try a simpler pattern, a literal substring search ' +
-                  '(regex:false), or a smaller maxScan.',
+                `The search stopped, and returned nothing: matching the regular expression ${shown(pattern)} ` +
+                  `against up to ${texts.length} ${texts.length === 1 ? 'message' : 'messages'} took longer than ` +
+                  `${SEARCH_REGEX_TIMEOUT_MS} ms, as a ` +
+                  'pattern that backtracks heavily can. Try a simpler pattern, set "regex" to false to search for the ' +
+                  'text as written, or lower "maxScan".',
               ),
             );
           }, SEARCH_REGEX_TIMEOUT_MS);
           timer.unref?.();
           worker.once('message', (msg: SearchWorkerMessage) => {
             clearTimeout(timer);
-            if (msg.type === 'error') reject(new Error(msg.error));
-            else resolve({ matches: msg.matches, scanned: msg.scanned });
+            if (msg.type === 'error') {
+              reject(new Error(
+                `The search stopped, and returned nothing: matching the regular expression ${shown(pattern)} ` +
+                  `failed (${msg.error}). Try a simpler pattern, or set "regex" to false to search for the text as written.`,
+              ));
+            } else {
+              resolve({ matches: msg.matches, scanned: msg.scanned });
+            }
           });
           worker.once('error', (err) => {
             clearTimeout(timer);
-            reject(err);
+            reject(new Error(
+              `The search stopped, and returned nothing: the worker matching the regular expression ${shown(pattern)} ` +
+                `failed (${err.message}). Set "regex" to false to search for the text as written.`,
+            ));
           });
         },
       );
@@ -632,6 +1561,7 @@ export class HistoryModule implements Module {
           id: String(msg.id),
           timestamp: msg.timestamp.toISOString(),
           participant: msg.participant,
+          author: authorName(msg),
           channelId: getChannelId(msg) ?? null,
           snippet: snippetAround(text, matchIndex, matchLength),
         };
@@ -649,12 +1579,285 @@ export class HistoryModule implements Module {
   // overview
   // ==========================================================================
 
+  private async handleSemanticSearch(input: SemanticSearchInput): Promise<ToolResult> {
+    if (!this.semanticCfg || !this.semanticClient) {
+      throw new Error(
+        "Nothing was searched: this host has no semantic index set up, so history--semantic_search isn't available " +
+          "here, and calling it again won't change that. history--search finds messages by their words.",
+      );
+    }
+    if (typeof input.query !== 'string' || !input.query.trim()) {
+      throw new Error(
+        'Nothing was searched: "query" must be a sentence describing what you\'re looking for; ' +
+          `${input.query === undefined ? 'this call gave none' : `it's ${shown(input.query)}`}.`,
+      );
+    }
+    // A search has to return at least 1 hit.
+    const limit = clampCount(input.limit, SEMANTIC_DEFAULT_LIMIT, SEMANTIC_MAX_LIMIT, 'limit', 'searched', 1);
+    const fromMs = parseIsoDate(input.from, 'from');
+    const toMs = parseIsoDate(input.to, 'to');
+    assertOrderedRange(fromMs, toMs, input.from, input.to);
+    const channelId = this.resolveChannel(input.channelId);
+    // Summaries carry no channel, so a channel filter on a summaries-only
+    // search can only ever match nothing. Say so instead of returning [].
+    const wantsSummariesOnly = input.level !== undefined || input.kinds === 'summaries';
+    if (channelId && wantsSummariesOnly) {
+      const picks = [
+        ...(input.kinds === 'summaries' ? ['"kinds": "summaries"'] : []),
+        ...(input.level !== undefined ? ['"level"'] : []),
+      ];
+      const fields = [...(input.kinds === 'summaries' ? ['kinds'] : []), ...(input.level !== undefined ? ['level'] : [])];
+      throw new Error(
+        `Nothing was searched: summaries aren't kept by channel, so "channelId" can't go with ${picks.join(' or ')}. ` +
+          `Leave out "channelId" to search summaries, or leave out ${quotedList(fields, 'and')} to search that ` +
+          'channel\'s messages.',
+      );
+    }
+    if (input.level !== undefined && input.kinds === 'messages') {
+      throw new Error(
+        'Nothing was searched: "level" picks summaries, and "kinds" is "messages", so the two can\'t go together. ' +
+          'Leave out "kinds" to search summaries of that level, or leave out "level" to search messages.',
+      );
+    }
+    let kinds: string[] | undefined;
+    if (wantsSummariesOnly) kinds = ['summary'];
+    else if (input.kinds === 'messages' || channelId) kinds = ['message'];
+    if (input.level !== undefined && (!Number.isInteger(input.level) || input.level < 0)) {
+      throw new Error(`Nothing was searched: "level" must be a whole number, 0 or more, such as 1; it's ${shown(input.level)}.`);
+    }
+    if (input.minScore !== undefined && (typeof input.minScore !== 'number' || input.minScore < -1 || input.minScore > 1)) {
+      throw new Error(
+        `Nothing was searched: "minScore" must be a number from -1 to 1, or left out; it's ${shown(input.minScore)}.`,
+      );
+    }
+
+    // A catch-up bounded in what it writes, so the newest messages are
+    // searchable without waiting on a backlog. It can re-send many items the
+    // index holds unchanged, as on a branch's first pass (maxSyncPerTick's
+    // doc), which costs a request per batch and no embedding.
+    let sync: SyncReport | null = null;
+    if (this.indexer) {
+      try { sync = await this.indexer.catchUp(this.semanticCfg.maxSyncBeforeSearch ?? 256); } catch { /* reported via indexer.lastError */ }
+    }
+
+    // A message's or summary's snippet is built here, from the local text.
+    // `snippet` still bounds what a service that keeps text sends with each
+    // hit, since what it sends without one isn't specified here.
+    const runSearch = (k: number) => this.semanticClient!.search({
+      query: input.query, k,
+      ts_from: fromMs === undefined ? undefined : fromMs / 1000,
+      ts_to: toMs === undefined ? undefined : toMs / 1000,
+      channel: channelId, kinds, level: input.level, min_score: input.minScore, snippet: SEMANTIC_SNIPPET_CHARS,
+    });
+    // The client says what went wrong with the service; what that means for
+    // this call, and what the agent can do, is said here. The service's own
+    // source isn't in this repository, so a 404's advice holds whether it
+    // means this store's index doesn't exist yet or a route the service lacks.
+    const failure = (e: unknown): { reason: string; advice: string; mayPass: boolean } => {
+      const status = e instanceof EmbedServiceError ? e.status : null;
+      const reason = e instanceof Error ? e.message : String(e);
+      const later = {
+        reason, mayPass: true,
+        advice: 'You can try again later; if it keeps happening, ask whoever runs this host',
+      };
+      if (status === 404) {
+        return {
+          reason, mayPass: true,
+          advice: "If this store's index doesn't exist yet, the first messages indexed create it, and a later call " +
+            'can work; if it keeps happening, ask whoever runs this host',
+        };
+      }
+      if (status === 408 || status === 429 || (status !== null && status >= 500)) return later;
+      // An answer without what a search reads: a page shown while the service
+      // restarts clears, and an address that points at something else doesn't.
+      if (status !== null && status >= 200 && status < 300) {
+        return {
+          reason, mayPass: true,
+          advice: 'If the service was restarting, a later call can work; if its address points at something else, ' +
+            "none will until whoever runs this host fixes the semantic index's settings",
+        };
+      }
+      if (status !== null) {
+        return {
+          reason, mayPass: false,
+          advice: "Calling it again the same way won't change that; if it keeps happening, ask whoever runs this host",
+        };
+      }
+      // No answer: the service down or slow, or the connection dropped, which
+      // clears, or its address or certificate wrong, which doesn't.
+      return {
+        reason, mayPass: true,
+        advice: 'If the service is down or slow, or the connection dropped, a later call can work; if its address ' +
+          "or certificate is wrong, none will until whoever runs this host fixes the semantic index's settings",
+      };
+    };
+    // The remote index is append-only and knows nothing about branches: a
+    // message removed from the agent's reach by /undo, /checkout, /restore or
+    // /newtopic keeps its id (a new message gets a fresh one) and stays
+    // indexed. Check every hit against the CURRENT branch before it goes back
+    // to the model — getMessage/getSummary rebuild on branch switch, so an
+    // undone message, or a summary this branch doesn't hold, answers null.
+    // A branch made from an earlier point, as an undo makes one, can mint a
+    // summary id another branch already used, so a summary's key carries its
+    // creation time too, and a hit whose time isn't this branch's summary's
+    // is another branch's. k is small, so this is at most `limit` local
+    // lookups.
+    // A message hit whose current text has nothing left to index (edited
+    // blank, delete not yet applied) is dropped too, so its stale snippet is
+    // never served. Dropped hits are replaced by over-fetching: when the
+    // top k held droppable entries, re-query with a larger k (service cap
+    // 200) so lower-ranked on-branch matches still fill `limit`.
+    const cm = this.cm as ContextManager;
+    const includePrivate = this.semanticCfg.includePrivateTools ?? true;
+    // A message hit's snippet is rebuilt from the CURRENT local text, never
+    // the remote copy: an edit not yet synced (or one the index never got)
+    // must not leak a passage the edit removed. Only the ranking can be stale.
+    // A summary hit's snippet is rebuilt from the local summary too, so a
+    // service that keeps only vectors and ids (no text) still yields one.
+    const currentText = new Map<string, string>();
+    const keep = (h: { id: string }): 'ok' | 'offBranch' | 'stale' | 'superseded' => {
+      const msgId = /^msg:(.+)$/.exec(h.id)?.[1];
+      const sum = parseSummaryKey(h.id);
+      if (msgId !== undefined) {
+        const m = cm.getMessage(msgId);
+        if (!m) return 'offBranch';
+        const text = safeSlice(messageIndexText(m, includePrivate), 0, this.semanticCfg!.maxChars ?? 32_000);
+        if (!text) return 'stale';
+        currentText.set(h.id, text);
+        return 'ok';
+      }
+      if (sum !== null) {
+        // An item from before keys carried the creation time is never a hit.
+        // One whose id names no summary on this branch is another branch's,
+        // and is counted as such. One whose id this branch has can hold this
+        // branch's summary or another's under the same id, and isn't counted.
+        // Until this branch's passes send the summary under its own key, as
+        // the search's catch-up does within its budget after any queued
+        // edits, a search can miss it.
+        const s = cm.getSummary(sum.id);
+        if (!s) return 'offBranch';
+        if (sum.createdMs === null) return 'superseded';
+        if (s.created !== sum.createdMs) return 'offBranch';
+        const text = summaryIndexText(s, this.semanticCfg!);
+        // An empty text here is mostly defensive: context-manager drops a
+        // summary that's empty after trimming when it loads, and refuses to
+        // store one. Short of that, only a maxChars that cuts the text to
+        // nothing gives one. The hit is dropped rather than show the index's
+        // text.
+        if (!text) return 'stale';
+        currentText.set(h.id, text);
+        return 'ok';
+      }
+      return 'ok';
+    };
+    let k = limit;
+    let res: SearchResponse;
+    try {
+      res = await runSearch(k);
+    } catch (e) {
+      const { reason, advice } = failure(e);
+      throw new Error(`Nothing was searched: ${reason}. ${advice}. history--search finds messages by their words meanwhile.`);
+    }
+    let droppedOffBranch = 0;
+    let droppedStale = 0;
+    // Why searching again for more hits failed, when it did. The search
+    // before it answered, so its hits on this branch are returned.
+    let searchAgainError: string | null = null;
+    let onBranch: typeof res.hits = [];
+    // The last answer's hits on this branch, checked as they are now.
+    const check = (): void => {
+      droppedOffBranch = 0; droppedStale = 0;
+      onBranch = res.hits.filter((h) => {
+        const v = keep(h);
+        if (v === 'offBranch') droppedOffBranch++;
+        else if (v === 'stale') droppedStale++;
+        return v === 'ok';
+      });
+    };
+    for (;;) {
+      check();
+      if (onBranch.length >= limit || res.hits.length < k || k >= SEMANTIC_MAX_FETCH) break;
+      k = Math.min(SEMANTIC_MAX_FETCH, k * 4);
+      try {
+        res = await runSearch(k);
+      } catch (e) {
+        const { reason, mayPass } = failure(e);
+        searchAgainError = `searching again for more hits failed: ${reason}. ` +
+          (mayPass ? 'Calling again may bring more.' : "Calling again the same way won't change that.");
+        // A message may have been edited, deleted or taken off this branch
+        // while that search waited, so the hits are checked again.
+        check();
+        break;
+      }
+    }
+    onBranch = onBranch.slice(0, limit);
+    // A ts that makes no date reads as no timestamp, as a null one does, and a
+    // meta that isn't an object as no participant or author. The hit is still
+    // returned, but the index holds data written wrong, so the host is told.
+    // The index writes ts as a number of seconds, and text holding one reads
+    // as main read it; nothing else makes a date, and reading it can't throw.
+    const unread: string[] = [];
+    const hits = onBranch.map((h) => {
+      const ts: unknown = h.ts;
+      const seconds = typeof ts === 'number' ? ts : typeof ts === 'string' && ts.trim() !== '' ? Number(ts) : NaN;
+      const at = new Date(seconds * 1000);
+      const timestamp = Number.isNaN(at.getTime()) ? null : at.toISOString();
+      const meta = typeof h.meta === 'object' && h.meta !== null && !Array.isArray(h.meta)
+        ? h.meta as { participant?: unknown; author?: unknown }
+        : null;
+      // A summary is shown as `sum:<id>`, as it was before its key carried its creation time.
+      const sum = parseSummaryKey(h.id);
+      const id = sum ? `sum:${sum.id}` : h.id;
+      const missing = [...(h.ts !== null && timestamp === null ? ['ts'] : []), ...(meta === null ? ['meta'] : [])];
+      if (missing.length > 0) unread.push(`${shown(id)} (${missing.join(' and ')})`);
+      return {
+        id,
+        /** Raw message id for a `msg:` hit (null for summaries) — pass it to extract({ aroundId }). */
+        messageId: h.id.startsWith('msg:') ? h.id.slice(4) : null,
+        kind: h.kind,
+        level: h.level,
+        score: h.score,
+        timestamp,
+        channelId: h.channel,
+        participant: meta?.participant ?? null,
+        author: meta?.author ?? null,
+        snippet: currentText.has(h.id) ? snippetOf(currentText.get(h.id)!) : (h.text ?? ''),
+        chars: currentText.has(h.id) ? currentText.get(h.id)!.length : h.chars,
+      };
+    });
+    if (unread.length > 0) {
+      this.indexer?.warn(`a search returned hits whose ts or meta couldn't be read, without them: ${unread.join(', ')}`);
+    }
+    return {
+      success: true,
+      data: {
+        hits,
+        index: {
+          indexed: res.count_indexed,
+          // The pass may have read another branch: one the search joined
+          // that started before a switch, or one the search left while it
+          // waited.
+          behind: this.indexer === null ? null : sync && this.indexer.passedOn(sync) === this.indexer.branchId() ? sync.more : true,
+          syncedThisCall: sync ? sync.pushed : 0,
+          lastError: this.indexer?.lastError ?? null,
+          /** Hits the index returned for messages/summaries not on the current branch (undone, checked out past). */
+          droppedOffBranch,
+          /** Hits for messages whose current text has nothing indexable (edited blank; the index keeps such a message until its delete goes through, and on a service without /delete it never does). */
+          droppedStale,
+          /** When too few hits were on this branch and searching again for more failed: why, and whether calling again can help. */
+          searchAgainError,
+        },
+        timingMs: res.timing_ms,
+      },
+    };
+  }
+
   private handleOverview(input: OverviewInput): ToolResult {
     const channelId = this.resolveChannel(input.channelId);
     const fromMs = parseIsoDate(input.from, 'from');
     const toMs = parseIsoDate(input.to, 'to');
     assertOrderedRange(fromMs, toMs, input.from, input.to);
-    const limit = clampCount(input.limit, OVERVIEW_DEFAULT_LIMIT, OVERVIEW_MAX_LIMIT, 'limit');
+    const limit = clampCount(input.limit, OVERVIEW_DEFAULT_LIMIT, OVERVIEW_MAX_LIMIT, 'limit', 'read');
     const cm = this.cm as ContextManager;
 
     let entries: TimeRangeSummaryEntry[];
@@ -1024,6 +2227,12 @@ export class HistoryModule implements Module {
 // Helpers
 // ============================================================================
 
+// The checks here (and resolveChannel) are shared by several tools. Their
+// refusals open with "Nothing was read", or for clampCount with the outcome
+// its caller names, and "Nothing was read" holds because every history tool
+// only reads. A tool that changes something should give its refusals an
+// opener of its own rather than reach these.
+
 /** Parse an ISO 8601 date string to Unix ms. Throws a clear error (not a
  *  crash) on an unparseable string; returns undefined for an omitted field
  *  (open-ended bound). */
@@ -1031,7 +2240,10 @@ function parseIsoDate(value: string | undefined, field: string): number | undefi
   if (value === undefined) return undefined;
   const ms = Date.parse(value);
   if (Number.isNaN(ms)) {
-    throw new Error(`Invalid ISO 8601 date for "${field}": ${JSON.stringify(value)}`);
+    throw new Error(
+      `Nothing was read: "${field}" is ${shown(value)}, which isn't an ISO 8601 date. Write it like 2026-03-01 or ` +
+        '2026-03-01T09:00:00Z.',
+    );
   }
   return ms;
 }
@@ -1045,7 +2257,10 @@ function parseIsoDate(value: string | undefined, field: string): number | undefi
  */
 function assertOrderedRange(fromMs: number | undefined, toMs: number | undefined, fromRaw: string | undefined, toRaw: string | undefined): void {
   if (fromMs !== undefined && toMs !== undefined && fromMs > toMs) {
-    throw new Error(`"from" (${fromRaw}) must not be after "to" (${toRaw}).`);
+    throw new Error(
+      `Nothing was read: "from" (${shown(fromRaw)}) is after "to" (${shown(toRaw)}), so the range holds nothing. Swap them, ` +
+        'or correct the one that\'s wrong.',
+    );
   }
 }
 
@@ -1057,22 +2272,52 @@ function assertOrderedRange(fromMs: number | undefined, toMs: number | undefined
  * "hard cap" and reach a native chronicle call expecting an unsigned
  * pagination argument (observed: `extract({limit:-1})` returning every
  * message in the store instead of being capped). Rejects (rather than
- * silently clamping) anything that isn't a finite non-negative integer, so
- * a caller mistake is surfaced as a clean tool error instead of silently
- * doing something other than what was asked.
+ * silently clamping) anything that isn't a whole number of at least `min`,
+ * so a caller mistake is surfaced as a clean tool error instead of silently
+ * doing something other than what was asked. The refusal opens with what
+ * didn't happen for the calling tool (`outcome`), and gives the range and
+ * the default.
  */
-function clampCount(value: number | undefined, def: number, max: number, field: string): number {
+function clampCount(
+  value: number | undefined, def: number, max: number, field: string, outcome: 'read' | 'searched', min = 0,
+): number {
   if (value === undefined) return def;
-  if (typeof value !== 'number' || !Number.isFinite(value)) {
-    throw new Error(`"${field}" must be a finite number, got ${JSON.stringify(value)}.`);
-  }
-  if (!Number.isInteger(value)) {
-    throw new Error(`"${field}" must be an integer, got ${value}.`);
-  }
-  if (value < 0) {
-    throw new Error(`"${field}" must be >= 0, got ${value}.`);
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < min) {
+    throw new Error(
+      `Nothing was ${outcome}: "${field}" is ${shown(value)}, which isn't a whole number from ${min} to ${max}. `
+        + `Pass one, or leave it out for ${def}.`,
+    );
   }
   return Math.min(value, max);
+}
+
+/**
+ * A value a message names, the call's or the store's, as the message quotes
+ * it: its JSON, or what String() gives where JSON can't give the value itself,
+ * cut to 80 UTF-16 units, or one fewer where the 80th would split a surrogate
+ * pair: the message stays in the agent's context, and half a pair isn't
+ * well-formed text. Inside a list or an object, JSON writes Infinity and NaN
+ * as null, and so does the quote. A value the message gives the agent to send
+ * is quoted whole instead, since a cut one couldn't be sent.
+ */
+function shown(value: unknown): string {
+  let text: string | undefined;
+  // A value JSON can't give, such as a cycle, or Infinity or NaN as the whole
+  // value, which JSON.stringify gives as null, is shown as String() shows it.
+  if (typeof value !== 'number' || Number.isFinite(value)) {
+    try { text = JSON.stringify(value); } catch { /* String() below */ }
+  }
+  text ??= String(value);
+  return text.length <= 80 ? text : `${safeSlice(text, 0, 80)}…`;
+}
+
+/**
+ * Names in prose, each quoted whole: "a"; "a" and "b"; "a", "b" and "c" (or
+ * "or"). They're the tools' own field names, or names the agent can send.
+ */
+function quotedList(names: readonly string[], joiner: 'and' | 'or'): string {
+  const quoted = names.map((name) => JSON.stringify(name));
+  return quoted.length <= 1 ? quoted.join('') : `${quoted.slice(0, -1).join(', ')} ${joiner} ${quoted[quoted.length - 1]}`;
 }
 
 /** channelId lives at metadata.external.channelId — same path context-manager's
@@ -1200,6 +2445,7 @@ function projectMessage(msg: StoredMessage, format: 'text' | 'raw'): Record<stri
     id: String(msg.id),
     timestamp: msg.timestamp.toISOString(),
     participant: msg.participant,
+    author: authorName(msg),
     channelId: getChannelId(msg) ?? null,
     content: format === 'raw' ? msg.content : flattenContent(msg.content),
   };
@@ -1252,26 +2498,199 @@ interface SearchMatch {
   id: string;
   timestamp: string;
   participant: string;
+  /** Display name from metadata.author (null when absent — e.g. the agent's own turns; see participant). */
+  author: string | null;
   channelId: string | null;
   snippet: string;
 }
 
-function matchSubstring(text: string, needle: string, caseSensitive: boolean): MatchHit | null {
+/** Letters, combining marks (NFD accents, Indic vowel signs), digits, underscore. */
+const WORD_CHAR_RE = /[\p{L}\p{M}\p{N}_]/u;
+
+function isWordChar(ch: string | undefined): boolean {
+  return ch !== undefined && WORD_CHAR_RE.test(ch);
+}
+
+/** The whole code point starting at `i` (astral letters are two UTF-16 units). */
+function codePointAt(s: string, i: number): string | undefined {
+  const cp = s.codePointAt(i);
+  return cp === undefined ? undefined : String.fromCodePoint(cp);
+}
+
+/** The whole code point ending just before `i`. */
+function codePointBefore(s: string, i: number): string | undefined {
+  if (i <= 0) return undefined;
+  const lo = s.charCodeAt(i - 1);
+  if (lo >= 0xdc00 && lo <= 0xdfff && i >= 2) {
+    const hi = s.charCodeAt(i - 2);
+    if (hi >= 0xd800 && hi <= 0xdbff) return s.slice(i - 2, i);
+  }
+  return s[i - 1];
+}
+
+/**
+ * First occurrence of `needle` in `text`, as the units of `text` it covers.
+ * Without `caseSensitive`, `needle` is lower case already, and is found in
+ * `text.toLowerCase()`. With `wholeWord`, an occurrence
+ * only counts when it isn't glued to a letter/digit/underscore on either
+ * side (Unicode-aware, so Cyrillic words work too) — "mission" no longer
+ * hits inside "uncommissioned". Word-ness is checked only on the sides
+ * where the needle itself starts/ends with a word character, so a needle
+ * like "#general" or "v2." still matches the way a person would expect.
+ */
+function matchSubstring(text: string, needle: string, caseSensitive: boolean, wholeWord = false): MatchHit | null {
   const haystack = caseSensitive ? text : text.toLowerCase();
-  const index = haystack.indexOf(needle);
-  if (index === -1) return null;
-  return { index, length: needle.length };
+  const hit = firstOccurrence(haystack, needle, wholeWord);
+  // Lowering can lengthen a character, as it does `İ` (one unit to two). Then
+  // the lowered text's units aren't the text's, and the snippet cuts the text.
+  return hit !== null && haystack.length !== text.length ? inTextUnits(text, hit) : hit;
+}
+
+function firstOccurrence(haystack: string, needle: string, wholeWord: boolean): MatchHit | null {
+  if (!wholeWord) {
+    const index = haystack.indexOf(needle);
+    return index === -1 ? null : { index, length: needle.length };
+  }
+  const checkLeft = isWordChar(codePointAt(needle, 0));
+  const checkRight = isWordChar(codePointBefore(needle, needle.length));
+  for (let from = 0; ; ) {
+    const index = haystack.indexOf(needle, from);
+    if (index === -1) return null;
+    const end = index + needle.length;
+    if ((!checkLeft || !isWordChar(codePointBefore(haystack, index))) && (!checkRight || !isWordChar(codePointAt(haystack, end)))) {
+      return { index, length: needle.length };
+    }
+    from = index + 1;
+  }
+}
+
+/**
+ * The units of `text` that a hit in `text.toLowerCase()` covers. Each code
+ * point of `text` takes as many units there as its own lower case has, so a
+ * hit that starts or ends inside a character's lower case takes in the whole
+ * character.
+ */
+function inTextUnits(text: string, hit: MatchHit): MatchHit {
+  const end = hit.index + hit.length;
+  let start = -1;
+  let lowered = 0;
+  let at = 0;
+  while (at < text.length && lowered < end) {
+    const cp = text.codePointAt(at)!;
+    lowered += String.fromCodePoint(cp).toLowerCase().length;
+    if (start === -1 && lowered > hit.index) start = at;
+    at += cp > 0xffff ? 2 : 1;
+  }
+  return { index: start, length: at - start };
+}
+
+// ============================================================================
+// author filtering
+// ============================================================================
+
+/** metadata.author as MCPL channel ingestion and DiscordModule write it
+ *  ({id, name}), and ApiModule ({name}, or the author object an api:message
+ *  event carries). Their participant is "user", or the sender's name marked
+ *  with its source unless it's the generic "user", so the plain author
+ *  name is read here. */
+function authorOf(msg: StoredMessage): { id?: string; name?: string } | undefined {
+  const a = (msg.metadata as { author?: unknown } | undefined)?.author;
+  if (!a || typeof a !== 'object') return undefined;
+  const { id, name } = a as { id?: unknown; name?: unknown };
+  return {
+    ...(typeof id === 'string' || typeof id === 'number' ? { id: String(id) } : {}),
+    ...(typeof name === 'string' ? { name } : {}),
+  };
+}
+
+function parseSkipSequences(v: unknown): [number, number] | null {
+  if (v === undefined || v === null) return null;
+  if (
+    !Array.isArray(v) ||
+    v.length !== 2 ||
+    !v.every((x) => typeof x === 'number' && Number.isInteger(x) && x >= 0) ||
+    v[0] > v[1]
+  ) {
+    throw new Error(
+      'Nothing was searched: "skipSequences" must be two whole numbers, 0 or more, the first no larger than the ' +
+        `second, as a search's "resume" gives it; it's ${shown(v)}. Copy it from "resume" with its "from" or "to", ` +
+        'or leave it out for a new search.',
+    );
+  }
+  return [v[0], v[1]];
+}
+
+function idOrNull(msg: StoredMessage | undefined): string | null {
+  return msg ? String(msg.id) : null;
+}
+
+function authorName(msg: StoredMessage): string | null {
+  return authorOf(msg)?.name ?? null;
+}
+
+/** Normalize one author spec: trim, case-fold, strip a leading "@", unwrap a
+ *  <@id>/<@!id> mention to its id. */
+function normalizeAuthorSpec(spec: string): string {
+  const s = spec.trim();
+  const mention = /^<@!?([^\s<>@]+)>$/.exec(s);
+  if (mention) return mention[1]!.toLowerCase();
+  return s.replace(/^@/, '').toLowerCase();
+}
+
+function toAuthorSet(spec: AuthorSpec | undefined, field: string): Set<string> | null {
+  if (spec === undefined) return null;
+  const list = Array.isArray(spec) ? spec : [spec];
+  const odd = list.findIndex((s) => typeof s !== 'string');
+  if (odd !== -1) {
+    throw new Error(
+      `Nothing was read: "${field}" must list names or ids as text, such as ["alice", "1234"], and ` +
+        `${shown(list[odd])} isn't text.`,
+    );
+  }
+  const set = new Set(list.map(normalizeAuthorSpec).filter((s) => s.length > 0));
+  if (set.size === 0) {
+    throw new Error(
+      `Nothing was read: "${field}" names no one: ${list.length > 0 ? 'its entries are blank' : 'the list is empty'}. ` +
+        `List at least one name or id, such as ["alice"], or leave "${field}" out.`,
+    );
+  }
+  return set;
+}
+
+/**
+ * Predicate for `author`/`excludeAuthor`, or null when neither is given.
+ * A message's identities are its metadata.author name and id when it has
+ * one, and otherwise its stored participant, which is what identifies the
+ * agent's own turns (and anything else ingested without author metadata). Exact match after
+ * normalization, never substring: "ann" must not pull in "joanne".
+ */
+function buildAuthorFilter(include: AuthorSpec | undefined, exclude: AuthorSpec | undefined): ((m: StoredMessage) => boolean) | null {
+  const inc = toAuthorSet(include, 'author');
+  const exc = toAuthorSet(exclude, 'excludeAuthor');
+  if (!inc && !exc) return null;
+  return (m) => {
+    const a = authorOf(m);
+    // participant only for messages WITHOUT author metadata (the agent's own
+    // turns): every MCPL-ingested message has participant "user", which
+    // would otherwise make author:"user" match everyone.
+    const keys = (a ? [a.name?.toLowerCase(), a.id?.toLowerCase()] : [m.participant?.toLowerCase()]).filter(
+      (k): k is string => !!k,
+    );
+    if (inc && !keys.some((k) => inc.has(k))) return false;
+    if (exc && keys.some((k) => exc.has(k))) return false;
+    return true;
+  };
 }
 
 /** ~SNIPPET_CONTEXT_CHARS of surrounding context on each side of a match, or
  *  the first ~SNIPPET_FALLBACK_CHARS of content when no meaningful match
  *  position is given (kept simple on purpose — this is a readability aid,
- *  not a highlighting engine). */
+ *  not a highlighting engine). Neither end splits a surrogate pair. */
 function snippetAround(text: string, index: number, length: number): string {
-  if (index < 0) return text.slice(0, SNIPPET_FALLBACK_CHARS);
+  if (index < 0) return safeSlice(text, 0, SNIPPET_FALLBACK_CHARS);
   const start = Math.max(0, index - SNIPPET_CONTEXT_CHARS);
   const end = Math.min(text.length, index + length + SNIPPET_CONTEXT_CHARS);
   const prefix = start > 0 ? '…' : '';
   const suffix = end < text.length ? '…' : '';
-  return prefix + text.slice(start, end) + suffix;
+  return prefix + safeSlice(text, start, end) + suffix;
 }

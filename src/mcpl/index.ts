@@ -88,6 +88,11 @@ export type {
 } from './types.js';
 
 export { McplMethod } from './types.js';
+// RFC-014 tool presence and toolsets (host side).
+export { ToolsetHub, ToolsetController, TOOLSETS_MODULE, META_TOOL_NAMES } from './toolset-host.js';
+export { ToolsetsModule, TOOLSETS_REMINDER_NAMESPACE } from './toolsets-module.js';
+export { ToolPresence } from './tool-presence.js';
+export type { ChangeSet, MetaToolNames, ToolsetDecl } from './tool-presence.js';
 
 // Error codes and factories
 export {
@@ -106,7 +111,22 @@ export {
 } from './errors.js';
 
 // Server connection and registry
-export { McplServerConnection } from './server-connection.js';
+export { McplServerConnection, McplRequestError, McplProtocolVersionError, McplUnreapedLaunchError } from './server-connection.js';
+export type { McplConnectionCloseInfo } from './server-connection.js';
+export type { TransportCloseInfo } from './transport.js';
+export { ModernMcpConnection } from './modern-connection.js';
+export type { ModernToolCallResult } from './modern-connection.js';
+export {
+  LEGACY_MCP_PROTOCOL_VERSION,
+  MODERN_MCP_PROTOCOL_VERSION,
+  MAX_TIMER_MS,
+  mcplPolicyGrants,
+  resolveServerBinding,
+  serverConfigProblems,
+  serverConfigWarnings,
+  checkServerConfig,
+} from './protocol-family.js';
+export type { McpProtocolFamily, McpTransportKind, ServerBinding } from './protocol-family.js';
 export { McplServerRegistry, type McplCapabilityQuery } from './server-registry.js';
 
 // Feature set management (permission layer)
@@ -118,6 +138,35 @@ export { ScopeManager, type ElevationHandler } from './scope-manager.js';
 // Hook orchestration (beforeInference/afterInference fan-out)
 export { HookOrchestrator } from './hook-orchestrator.js';
 
+export {
+  ToolLifecycleEmitter,
+  parseToolObserveParams,
+  selectFields,
+  boundInput,
+  openingFor,
+  DEFAULT_MAX_INPUT_BYTES,
+  TOOL_OBSERVE_LIMITS,
+  type ToolPhase,
+  type ToolLifecycleParams,
+  type ToolObserveRule,
+  type ToolObserveMatch,
+  type ToolLifecycleConfig,
+  type ToolLifecycleNarrowing,
+} from './tool-lifecycle.js';
+export {
+  TOOL_CLASSES,
+  TOOL_CLASS_META_KEY,
+  DEFAULT_INPUT_CLASSES,
+  BUILTIN_TOOL_CLASSES,
+  parseDeclaredClasses,
+  resolveToolClass,
+  isToolClass,
+  type ToolClass,
+  type ToolClassSource,
+  type EffectiveToolClass,
+} from './tool-classes.js';
+export { globMatch } from './tool-glob.js';
+
 // Push events (Section 9)
 export { PushHandler } from './push-handler.js';
 export type { McplPushEvent } from './push-handler.js';
@@ -127,9 +176,22 @@ export { InferenceRouter } from './inference-router.js';
 
 // Channel registry (channel lifecycle, incoming messages, synthesized tools)
 export { ChannelRegistry } from './channel-registry.js';
+export type { ChannelRef, PublishRefusalReason } from './channel-registry.js';
+
+// Inbound source envelope: where each accepted item came from, stamped once;
+// and the digest of a delivered or stored body
+export { INBOUND_SOURCE_KEY, readInboundSource, conversationKey, sourceBodyDigest } from './inbound-source.js';
+export type {
+  InboundSource,
+  InboundChannelSource,
+  InboundUnscopedSource,
+  InboundSurfaceSource,
+} from './inbound-source.js';
 
 // Per-channel conversation routing (fork-per-channel agents)
+/** @deprecated Per-channel conversation routing is deprecated and will be removed (anima-research/agent-framework#235). */
 export { ConversationRouter, DEFAULT_CLOSURE_PROMPT } from './conversation-router.js';
+/** @deprecated Per-channel conversation routing is deprecated and will be removed (anima-research/agent-framework#235). */
 export type {
   ConversationRouterConfig,
   ConversationBinding,
