@@ -789,8 +789,12 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   }
 
-  it('tells an agent addressed from another channel while its turn was held that the turn waited for compression', async () => {
-    await withBacklog({}, async (backlog) => {
+  for (const c of [
+    { ending: 'its context fits', backlog: {}, fits: true },
+    { ending: 'compression has nothing left to do', backlog: { readyAt: 20 }, fits: false },
+  ] as const) {
+  it(`tells an agent addressed from another channel while its turn was held that the turn waited for compression, when the hold ends as ${c.ending}`, async () => {
+    await withBacklog(c.backlog, async (backlog) => {
       const t = await residentTurn({ maintenanceIntervalMs: 50 });
       // A channel registry with every channel open and named, as the speech
       // routing tests stub it, so an addressed message becomes an arrival.
@@ -813,8 +817,13 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
         t.send('hey, over here?', { channelId: 'discord:dm:antra', tags: ['chat:addressed'] });
         await new Promise((resolve) => setTimeout(resolve, 100));
-        backlog.fit = true;
-        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000), 'the turn runs');
+        if (c.fits) {
+          backlog.fit = true;
+          assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000), 'the turn runs');
+        } else {
+          assert.ok(await pollUntil(() => t.of('inference:exhausted').length === 1, 5_000), 'the turn is exhausted');
+          assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['nothing_pending']);
+        }
         const notices = stored(t.framework).filter((m) => m.metadata.kind === 'routing-notice').map((m) => m.text);
         const notice = notices.find((text) => text.includes('addressed you from discord:dm:antra'));
         assert.ok(notice, `the released start announces the arrival: ${JSON.stringify(notices)}`);
@@ -825,6 +834,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
       }
     });
   });
+  }
 
   it("gives a held turn's pending work and its last change in healthSnapshot()", async () => {
     await withBacklog({ stalled: true, pendingDescription: 'zz 3 chunks pending' }, async (backlog) => {

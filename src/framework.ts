@@ -24670,7 +24670,7 @@ export class AgentFramework {
             ? 'at your budget restart'
             : isTurnContinuation(trigger?.reason ?? '')
               ? 'before this re-inference on your tool results'
-              : this.budgetHolds?.get(agent.name)?.state === 'released'
+              : (this.budgetHolds?.get(agent.name)?.state ?? 'holding') !== 'holding'
                 ? 'while your turn waited for compression'
                 : 'while your turn waited on a provider hold';
         this.noticeAddressedArrivals(agent, routing, arrivals, when);
