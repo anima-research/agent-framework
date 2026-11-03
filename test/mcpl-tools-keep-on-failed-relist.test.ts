@@ -145,27 +145,58 @@ test('a listing that answers but breaks off keeps the known tools whole, with no
   }
 });
 
-test('a kept tool keeps its feature set and its server, so a later filter keeps it and a call reaches it', async () => {
-  const h = await harness(['b', 'c']);
+test('a kept tool keeps its feature set and its server, beside another server lost while a later one lists, and a call reaches it', async () => {
+  const h = await harness(['b', 'c', 'd']);
   try {
     h.server('b').lists = [{ name: 'read', featureSet: 'files' }, { name: 'write' }];
     h.server('c').lists = tools('ping');
+    h.server('d').lists = tools('pong');
     await h.internals.refreshMcplTools();
 
-    // b's list fails while its connection stays up; c closes as its listing
-    // is awaited, so its listing doesn't count and the published list is
-    // filtered to the tools a server is known for.
     h.server('b').fails = true;
-    h.server('c').beforeAnswer = () => h.internals.noteMcplServerClosed('c');
+    h.server('d').beforeAnswer = () => {
+      h.internals.noteMcplServerClosed('c');
+      Object.assign(h.server('c'), { isConnected: false, willReconnect: false });
+    };
     await h.internals.refreshMcplTools();
-    assert.deepEqual(h.names(), ['mcpl--b--read', 'mcpl--b--write']);
+    assert.deepEqual(h.names(), ['mcpl--b--read', 'mcpl--b--write', 'mcpl--d--pong']);
     assert.equal(h.internals.mcplToolFeatureSets.get('mcpl--b--read'), 'files');
     assert.equal(h.internals.mcplToolServers.get('mcpl--b--read'), 'b');
     assert.equal(h.internals.mcplToolServers.get('mcpl--b--write'), 'b');
+    assert.equal(h.internals.mcplToolServers.has('mcpl--c--ping'), false);
 
     const result = await h.fw.executeToolCall({ id: 'call-1', name: 'mcpl--b--read', input: {}, callerAgentName: 'assistant' });
     assert.equal(result.success, true, result.error);
     assert.deepEqual(h.reached, ['b:read']);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('a server that answers, then closes while a later server lists, keeps what is published while it reconnects, and none of the closed session\'s listing', async () => {
+  const h = await harness(['b', 'c']);
+  try {
+    h.server('b').lists = tools('read');
+    h.server('c').lists = tools('ping');
+    await h.internals.refreshMcplTools();
+
+    h.server('b').lists = tools('read', 'write');
+    h.server('c').beforeAnswer = () => {
+      h.internals.noteMcplServerClosed('b');
+      Object.assign(h.server('b'), { isConnected: false, willReconnect: true });
+    };
+    await h.internals.refreshMcplTools();
+    assert.deepEqual(h.names(), ['mcpl--b--read', 'mcpl--c--ping'], 'its published tools, in their place');
+    assert.equal(h.internals.mcplToolServers.get('mcpl--b--read'), 'b');
+    assert.equal((h.internals as unknown as { mcplListedServers: Set<string> }).mcplListedServers.has('b'), false, 'its listing doesn\'t count');
+
+    Object.assign(h.server('b'), { isConnected: true });
+    h.server('c').beforeAnswer = () => {
+      h.internals.noteMcplServerClosed('b');
+      Object.assign(h.server('b'), { isConnected: false, willReconnect: false });
+    };
+    await h.internals.refreshMcplTools();
+    assert.deepEqual(h.names(), ['mcpl--c--ping'], 'lost for good the same way, it keeps nothing');
   } finally {
     await h.cleanup();
   }
@@ -349,6 +380,36 @@ test('a server whose handshake advertised no tools keeps nothing while it reconn
     await h.internals.refreshMcplTools();
     assert.deepEqual(h.names(), [], 'none of its tools are kept');
     assert.deepEqual(logged.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes('tools/list failed')), []);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('a kept tool of a server that hasn\'t closed keeps the class it declared', async () => {
+  const h = await harness(['b']);
+  try {
+    h.server('b').lists = [{ name: 'read', classes: ['comms'] }];
+    await h.internals.refreshMcplTools();
+    h.server('b').fails = true;
+    await h.internals.refreshMcplTools();
+    assert.deepEqual(h.fw.listToolClasses().find((tool) => tool.tool === 'mcpl--b--read'), { tool: 'mcpl--b--read', class: ['comms'], source: 'server', serverId: 'b' });
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('kept tools of servers on either side of a listed one stay in their places', async () => {
+  const h = await harness(['a', 'b', 'c']);
+  try {
+    h.server('a').lists = tools('read', 'write');
+    h.server('b').lists = tools('ping');
+    h.server('c').lists = tools('list', 'get');
+    await h.internals.refreshMcplTools();
+    const before = h.names();
+    h.server('a').fails = true;
+    h.server('c').fails = true;
+    await h.internals.refreshMcplTools();
+    assert.deepEqual(h.names(), before);
   } finally {
     await h.cleanup();
   }
