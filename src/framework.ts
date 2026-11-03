@@ -35473,8 +35473,8 @@ export class AgentFramework {
         // reach the tool list here (§4.2). The agent is told where each tool
         // went once this refresh publishes a list that shows it there: a move
         // to static once the list offers the tool, a move to dynamic once it
-        // doesn't (a listing that breaks off publishes what it read). The
-        // rest stay pending for a refresh that does.
+        // doesn't. The rest stay pending for a refresh that does, as do all
+        // of a listing that breaks off, which publishes none of what it read.
         const presence = this.toolsetHub?.get(server.id);
         const moves = presence?.presence.active ? { controller: presence, prefix, moves: presence.presence.moves() } : undefined;
         const dynamic = (name: string): boolean => !!presence?.presence.active && presence.presence.presenceOf(name) === 'dynamic';
