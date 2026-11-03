@@ -349,11 +349,14 @@ describe('Turn trigger provenance', () => {
     assert.equal(handed.at(-1)?.counterparty, 'discord:user:bob');
     await framework.stop();
   });
-  for (const mark of ['private turn', 'retake', 'own', 'none'] as const) {
+  for (const mark of ['private turn', 'retake', 'own', 'shared', 'withdrawn', 'kept plain', 'none'] as const) {
     it(`a held merged start ${{
-      'private turn': "that takes in an equal request continuing a private turn starts private once the hold's release judges its batch again, each member carrying the turn",
-      retake: "that takes in an equal retake starts private once the hold's release judges its batch again, over a history that holds a private surface's message",
-      own: "whose member continues a private turn gives that turn to no other member when the hold's release judges its batch again",
+      'private turn': "that takes in an equal request continuing a private turn gives each of its requests that turn at the dedup, and starts private once the hold's release judges its batch again",
+      retake: "that takes in an equal retake gives each of its requests the retake at the dedup, and starts private over a history that holds a private surface's message",
+      own: "whose request continues a private turn gives that turn to no other request when the hold's release judges its batch again",
+      shared: "that takes in an equal request continuing the private turn one of its requests continues gives that turn to the other request too",
+      withdrawn: "whose request continuing a private turn is withdrawn as a coalesced wake starts its other request in its channel, with none of the withdrawn one's turn",
+      'kept plain': "taken in by an equal plain request the hold kept gives each of its requests the kept request's private turn, and starts private",
       none: 'with no mark starts in its channel once the hold releases it, over a history that holds a private surface\'s message, as on main',
     }[mark]}`, async () => {
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi bob' }]));
@@ -364,6 +367,8 @@ describe('Turn trigger provenance', () => {
         notePrivateTurn(turnId: number): void;
         requestForTurn(agentName: string, reason: string, source: string, callerTurnId?: number): void;
         retakeRequest(agentName: string, reason: string): InferenceRequest;
+        holdRequest(held: InferenceRequest[], request: InferenceRequest): void;
+        cancelCoalescedWakes(subject: string): void;
         turnRouting: Map<string, { nonChannelOrigin?: boolean }>;
       };
       const handed: Array<InferenceRequest | undefined> = [];
@@ -387,7 +392,8 @@ describe('Turn trigger provenance', () => {
       let fail!: (error: Error) => void;
       const auxiliary = i.withAuxiliaryAdmission('scout', () => new Promise<void>((_, reject) => { fail = reject; }), 'test-model').catch(() => {});
       const timer: Record<PropertyKey, unknown> = { agentName: 'scout', reason: 'timer', source: 'clock', timestamp: t - 3_000 };
-      if (mark === 'own') timer[callerTurns] = [privateTurn];
+      if (mark === 'own' || mark === 'shared' || mark === 'withdrawn') timer[callerTurns] = [privateTurn];
+      if (mark === 'withdrawn') timer.coalescingSubject = 'zz-subject';
       const room: Record<PropertyKey, unknown> = { agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: t - 1_000,
         channelId: 'discord:g:bob-room', counterparty: 'discord:user:bob', addressed: true };
       i.pendingRequests.push(timer as unknown as InferenceRequest, room as unknown as InferenceRequest);
@@ -400,39 +406,51 @@ describe('Turn trigger provenance', () => {
         assert.ok(performance.now() < deadline, 'the merged wake held by the wait');
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
-      const held = i.providerAccelerationCooldowns.get('scout')!.heldRequests[0]!;
+      const hold = i.providerAccelerationCooldowns.get('scout')!;
+      const held = hold.heldRequests[0]!;
       const batchKey = Object.getOwnPropertySymbols(held).find((key) => key.description === 'merged-batch');
       assert.ok(batchKey, 'premise: the hold keeps a merged start');
       const batch = (held as unknown as Record<symbol, unknown[]>)[batchKey!]!;
       assert.ok(batch.length === 2 && batch.includes(timer) && batch.includes(room), 'premise: its batch is the two requests pushed');
-      if (mark === 'private turn' || mark === 'retake') {
+      if (mark === 'private turn' || mark === 'retake' || mark === 'shared') {
         const duplicate: Record<PropertyKey, unknown> = Object.fromEntries(Object.entries(held));
-        if (mark === 'private turn') duplicate[callerTurns] = [privateTurn];
-        else duplicate[retake] = true;
+        if (mark === 'retake') duplicate[retake] = true;
+        else duplicate[callerTurns] = [privateTurn];
         i.pendingRequests.push(duplicate as unknown as InferenceRequest);
         await i.processInferenceRequests();
-        assert.equal(i.providerAccelerationCooldowns.get('scout')?.heldRequests.length, 1, 'premise: the hold kept one request for both');
+        assert.equal(hold.heldRequests.length, 1, 'premise: the hold kept one request for both');
+        if (mark === 'retake') assert.deepEqual([timer[retake], room[retake]], [true, true], 'at the dedup, each request takes the retake');
+        else assert.deepEqual([timer[callerTurns], room[callerTurns]], [[privateTurn], [privateTurn]], 'at the dedup, each request takes the turn');
+      }
+      if (mark === 'withdrawn') {
+        i.cancelCoalescedWakes('zz-subject');
+        assert.deepEqual((held as unknown as Record<symbol, unknown[]>)[batchKey!], [room], 'premise: the withdrawn request left the batch');
+      }
+      if (mark === 'kept plain') {
+        const plain: Record<PropertyKey, unknown> = Object.fromEntries(Object.entries(held));
+        plain[callerTurns] = [privateTurn];
+        hold.heldRequests.splice(0, 1, plain as unknown as InferenceRequest);
+        i.holdRequest(hold.heldRequests, held);
+        assert.deepEqual(hold.heldRequests, [plain], 'premise: the hold kept the plain request for both');
+        assert.deepEqual([timer[callerTurns], room[callerTurns]], [[privateTurn], [privateTurn]], "each request of the start's batch takes the kept request's turn");
       }
       framework.releaseProviderWait('scout');
       await i.processInferenceRequests();
       await framework.runUntilIdle();
       const start = handed.at(-1);
       const routing = i.turnRouting.get('scout');
-      if (mark === 'none') {
-        assert.notEqual(routing?.nonChannelOrigin, true, `control: the start isn't private: ${JSON.stringify(start)}`);
-        assert.equal(start?.channelId, 'discord:g:bob-room', 'control: it starts in its channel');
+      if (mark === 'none' || mark === 'withdrawn') {
+        assert.notEqual(routing?.nonChannelOrigin, true, `the start isn't private: ${JSON.stringify(start)}`);
+        assert.equal(start?.channelId, 'discord:g:bob-room', 'it starts in its channel');
       } else {
         assert.equal(routing?.nonChannelOrigin, true, `the start is private: ${JSON.stringify(start)}`);
         if (mark !== 'retake') assert.equal(start?.channelId, undefined, 'and names no channel');
       }
-      if (mark === 'private turn') {
-        assert.deepEqual([timer[callerTurns], room[callerTurns]], [[privateTurn], [privateTurn]], 'the duplicate matched the start as a whole, so each member carries its turn');
-      }
-      if (mark === 'retake') assert.deepEqual([timer[retake], room[retake]], [true, true], 'each member carries the retake');
       if (mark === 'own') {
-        assert.deepEqual(timer[callerTurns], [privateTurn], 'the member keeps its own turn');
-        assert.equal(room[callerTurns], undefined, 'and the other member takes none of it');
+        assert.deepEqual(timer[callerTurns], [privateTurn], 'the request keeps its own turn');
+        assert.equal(room[callerTurns], undefined, 'and the other request takes none of it');
       }
+      if (mark === 'withdrawn') assert.equal(room[callerTurns], undefined, "the other request takes none of the withdrawn one's turn");
       await framework.stop();
     });
   }
@@ -982,7 +1000,7 @@ describe('private wins, one way', () => {
         assert.ok(stored(rig).includes('"p1"'), 'control: the call was made');
         if (typeof channelId === 'number') {
           assert.ok(stored(rig).includes(NO_DEFAULT_CHANNEL), `it is refused as private: ${stored(rig).slice(-3000)}`);
-          assert.ok(stored(rig).includes("a channel's id as a string"), 'and told the id must be a string');
+          assert.ok(stored(rig).includes("a channel's id as a non-empty string. Nothing was posted."), 'and told the id must be a non-empty string, and that nothing was posted');
           assert.deepEqual(published, [], 'nothing reached a channel');
         } else {
           assert.ok(!stored(rig).includes(NO_DEFAULT_CHANNEL), 'a channel named by id is not refused');
@@ -2988,7 +3006,7 @@ describe("an agent derived or spawned while its parent's turn is open", () => {
   }
 
   for (const privateTurn of [true, false]) for (const how of ['spawning', 'deriving'] as const) {
-    it(`a worker a ${privateTurn ? 'private' : "room's"} turn spawned, ${how} one of its own in a turn of its own, gives it a result its grandparent answers ${privateTurn ? 'in no channel' : "where a channel-less turn's speech goes"}`, async () => {
+    it(`a worker a ${privateTurn ? 'private' : "room's"} turn spawned, ${how === 'spawning' ? 'spawning one of its own in a turn of its own, gives it a result its grandparent answers' : 'with a child derived from it for its parent while its own turn runs, gives that child a result the parent answers'} ${privateTurn ? 'in no channel' : "where a channel-less turn's speech goes"}`, async () => {
       let framework: AgentFramework | undefined;
       let spawned: Promise<{ agent: unknown; contextManager: unknown }> | undefined;
       let releaseHold = (): void => {};
@@ -3024,7 +3042,7 @@ describe("an agent derived or spawned while its parent's turn is open", () => {
         const { name: _name, ...spec } = workerSpec('finder', { spawnedBy: 'helper', resultTo: { to: 'scout', as: 'message' } });
         const finder = how === 'spawning'
           ? await rig.framework.createEphemeralAgent({ name: 'finder', model: 'test-model', systemPrompt: 'finder' } as never, spec)
-          : await rig.framework.deriveAgent({ name: 'finder', from: 'helper', mode: 'copy', resultTo: { to: 'scout', as: 'message' } });
+          : await rig.framework.deriveAgent({ name: 'finder', from: 'helper', spawnedBy: 'scout', mode: 'copy', resultTo: { to: 'scout', as: 'message' } });
         rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'the code is 4417' }]));
         const run = rig.framework.runEphemeralToCompletion(finder.agent as never, finder.contextManager as never);
         let ran = false;

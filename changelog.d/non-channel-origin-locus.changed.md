@@ -10,9 +10,9 @@
   Private wins, one way. A start whose batch holds a private surface's wake is
   private, whatever else the batch holds: directly, through one gate debounce
   window, after a quiesce or a provider hold. A provider hold that keeps one
-  request for two equal ones keeps the marks of the one it drops, and where
-  the one it keeps is a merged start, each request of its batch takes those
-  marks when the hold releases it. So is a start that is the first
+  request for two equal ones keeps the marks of both, and when one of them is
+  a merged start and the other isn't, each request of the start's batch takes
+  the other's marks. So is a start that is the first
   to read a private surface's message stored before it, though the message's
   own wake may still wait in a gate window, or the message woke nothing, and
   for an ordinary resident whose view keeps the message, whichever resident
@@ -86,7 +86,8 @@
   there. An outcome a host writes itself, as a module's `addMessage` with a
   wake of its own, carries no such mark, since a module's write can't
   (#789), and neither does a retry the host creates after the private turn
-  has ended, unless its spec carries the first attempt's `privateTurn`. A
+  has ended, unless its spec carries the first attempt's `privateTurn` or
+  names as its parent or spawner an agent that is that turn's work. A
   host that derives or spawns an agent for its own reason while a private
   turn is open gets a result its agent answers privately. A tune-out release
   that a crash left deferred, restored at the next boot, opens its turn as

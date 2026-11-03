@@ -4736,8 +4736,15 @@ describe('a heartbeat turn that takes in private input keeps its plain speech pr
     async start() {}, async stop() {},
     getTools: () => [{ name: 'move', description: 'Move', inputSchema: { type: 'object', properties: {} } }],
     async handleToolCall() {
-      speaks()?.pushEvent({ type: 'external-message', source: 'tui', content: 'for your eyes only', metadata: {} } as never);
-      await new Promise((r) => setTimeout(r, 30));
+      const framework = speaks();
+      if (framework) {
+        framework.pushEvent({ type: 'external-message', source: 'tui', content: 'for your eyes only', metadata: {} } as never);
+        const deferred = () => (framework as unknown as { deferredMessages: Array<{ content: unknown }> }).deferredMessages;
+        const deadline = Date.now() + 10_000;
+        while (!deferred().some((m) => JSON.stringify(m.content).includes('for your eyes only')) && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 5));
+        }
+      }
       return { success: true, data: 'moved' };
     },
     async onProcess() { return {}; },

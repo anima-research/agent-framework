@@ -98,8 +98,8 @@ describe('channel_publish without channelId', () => {
     } finally { await f.close(); }
   });
 
-  for (const named of [true, false]) {
-    it(`a host's call carrying an open private turn's id${named ? '' : ', naming no agent,'} meets the private turn's rule: refused, though a focus holds another channel`, async () => {
+  for (const [named, names] of [[true, false], [false, false], [true, true]] as const) {
+    it(`a host's call carrying an open private turn's id${named ? '' : ', naming no agent,'} ${names ? 'and naming its channel posts there' : "meets the private turn's rule: refused, though a focus holds another channel"}`, async () => {
       const f = await fixture({ framework: { tuneOut: { enabled: true } } as never });
       try {
         await registerOpen(f, 'work');
@@ -118,7 +118,7 @@ describe('channel_publish without channelId', () => {
           m.responseIndex = m.responses.length;
           open ??= fw.openLogical.get('agent');
           host ??= f.framework.executeToolCall({
-            id: 'h1', name: 'channel_publish', input: { content: 'zz-host' }, callerTurnId: open?.turnId, ...(named ? { callerAgentName: 'agent' } : {}),
+            id: 'h1', name: 'channel_publish', input: { content: 'zz-host', ...(names ? { channelId: 'work' } : {}) }, callerTurnId: open?.turnId, ...(named ? { callerAgentName: 'agent' } : {}),
           } as never) as never;
           const stream = new HeldStream(host.then(() => undefined), remaining as never);
           m.lastStream = stream;
@@ -130,9 +130,15 @@ describe('channel_publish without channelId', () => {
         await f.framework.runUntilIdle();
         assert.ok(open?.turnId !== undefined && open.nonChannelOrigin === true, 'premise: the call carried an open private turn');
         const result = await host!;
-        assert.equal(result.success, false, 'refused');
-        assert.match(result.error ?? '', /This private turn has no default channel/);
-        assert.equal(publishOf(f, 'zz-host'), undefined, 'nothing was posted');
+        if (names) {
+          assert.ok(result.success, result.error);
+          await eventually(() => !!publishOf(f, 'zz-host'), 'the call posted');
+          assert.equal(publishOf(f, 'zz-host')!.channelId, 'work', 'where it names');
+        } else {
+          assert.equal(result.success, false, 'refused');
+          assert.match(result.error ?? '', /This private turn has no default channel/);
+          assert.equal(publishOf(f, 'zz-host'), undefined, 'nothing was posted');
+        }
       } finally { await f.close(); }
     });
   }

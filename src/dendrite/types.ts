@@ -254,10 +254,11 @@ export interface AgentSpec {
   /**
    * Set by the framework at creation, and kept by a resumed record: the
    * agent is a private turn's work. It was derived from, or spawned by, an agent whose turn was open
-   * and private (an operator's private input in it), or, as an ephemeral
-   * run, it was handed mail from such work. A host may set it too, as on a
-   * retry of an attempt whose record has it, since a retry created once the
-   * private turn has ended isn't marked otherwise. What it sends, and the
+   * and private (an operator's private input in it), or an agent that is
+   * such a turn's work, or, as an ephemeral run, it was handed mail from such
+   * work. A host may set it too, as on a retry of an attempt whose record has
+   * it, since a retry created once the private turn has ended, by a parent
+   * or spawner that isn't that turn's work, isn't marked otherwise. What it sends, and the
    * notice that a restart interrupted it, make the turn that reads them
    * private.
    */

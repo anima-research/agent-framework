@@ -2452,7 +2452,7 @@ describe('a round whose run or wait call watches a script that can change its ro
       h.framework.pushEvent(surface());
       await h.framework.runUntilIdle();
       assert.ok(scriptNote(h).includes(REFUSED), scriptNote(h));
-      assert.ok(scriptNote(h).includes("a channel's id as a string"), scriptNote(h));
+      assert.ok(scriptNote(h).includes("a channel's id as a non-empty string"), scriptNote(h));
       assert.ok(!h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
     } finally {
       await h.done();

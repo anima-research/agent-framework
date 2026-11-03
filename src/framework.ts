@@ -6606,8 +6606,13 @@ export class AgentFramework {
     if (isTurnRetry(request)) (same as MarkedRequest)[TURN_RETRY] = true;
     // A merged start's batch (MERGED_BATCH) stays recorded on the request
     // kept in its place, which then stands for it, as the start did.
+    const keptBatch = mergedBatch(same);
     const batch = mergedBatch(request);
-    if (batch) (same as MarkedRequest)[MERGED_BATCH] = [...new Set([...(mergedBatch(same) ?? []), ...batch])];
+    if (batch) (same as MarkedRequest)[MERGED_BATCH] = [...new Set([...(keptBatch ?? []), ...batch])];
+    for (const member of mergedBatch(same) ?? []) {
+      if (!batch) carryTurnMarks(member, request);
+      else if (!keptBatch) carryTurnMarks(member, same);
+    }
     carryWakes(same, [request]);
   }
   private consultProviderHold(error: Error, agentName: string): { holdMs: number; reason: string } | undefined {
@@ -19790,23 +19795,12 @@ export class AgentFramework {
       // A start that came back before it took its
       // token stands for the batch it was merged from (MERGED_BATCH),
       // including one a hold released just now. The batch takes its place,
-      // each request as it was, with the marks a hold's dedup carried onto
-      // the start beyond its requests' own, judged one by one from here: a wait holds
+      // each request as it was, judged one by one from here: a wait holds
       // them apart, a quiesce parks the wakes while the turn's request
       // passes, and the read check and the policy decide on them all; the
       // merge below records the batch anew.
       if (requests.some((r) => mergedBatch(r) !== undefined)) {
-        requests = requests.flatMap((r) => {
-          const batch = mergedBatch(r);
-          if (!batch) return [r];
-          const own = new Set(batch.flatMap(callerTurnsOf));
-          const added = {
-            ...continuesTurns(...callerTurnsOf(r).filter((turn) => !own.has(turn))),
-            ...((r as MarkedRequest)[RETAKE] && !batch.some((member) => (member as MarkedRequest)[RETAKE]) ? { [RETAKE]: true as const } : {}),
-          } as InferenceRequest;
-          for (const member of batch) carryTurnMarks(member, added);
-          return batch;
-        });
+        requests = requests.flatMap((r) => mergedBatch(r) ?? [r]);
       }
 
       // A provider's stated wait on this agent's primary model, including one
@@ -36706,7 +36700,7 @@ export class AgentFramework {
   }
 
   private scriptPrivatePublishRefusal(agentName: string): string {
-    return "this script's turn is private and has no default channel, so channel_publish requires an explicit channelId, a channel's id as a string"
+    return "this script's turn is private and has no default channel, so channel_publish requires an explicit channelId, a channel's id as a non-empty string"
       + `${this.mayCallTool(agentName, 'channel_list') ? '; channel_list shows the channel ids' : ''}; nothing was posted`;
   }
 
@@ -36718,7 +36712,7 @@ export class AgentFramework {
     if (call.name !== 'channel_publish' || !privateTurn) return undefined;
     if (namesChannel(call.input)) return undefined;
     if (call.id !== undefined && this.scriptCallStarts.has(call.id)) return this.scriptPrivatePublishRefusal(agentName);
-    return "This private turn has no default channel; channel_publish requires an explicit channelId, a channel's id as a string."
+    return "This private turn has no default channel; channel_publish requires an explicit channelId, a channel's id as a non-empty string. Nothing was posted."
       + (this.mayCallTool(agentName, 'channel_list') ? ' channel_list shows the channel ids.' : '');
   }
 
