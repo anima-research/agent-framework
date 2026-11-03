@@ -17803,9 +17803,11 @@ export class AgentFramework {
    * resumes it (resumeAgent): a new incarnation on the branch it left, with
    * the configuration a derivation gives it and this look's epoch, channel
    * and trigger as its metadata. Either way it is handed this look's
-   * framing as one stored row and runs once. A resumption that fails, a
-   * beforeDerive refusal included, is a failed look: its held rows go back
-   * (readerFailed). Never throws.
+   * framing as one stored row and runs once. A look that fails, in its
+   * planning (readerPlan), its derivation or resumption (a beforeDerive
+   * refusal included) or its run, is a failed look: its held rows go back
+   * (readerFailed), and it is traced (`tune-out:reader-fork-failed`). Never
+   * throws.
    */
   private async persistedReaderLook(
     primary: string,
@@ -17821,24 +17823,27 @@ export class AgentFramework {
     const parentConfig = this.agentConfigs.get(primary);
     if (!parent || !parentConfig) return;
     const resync = cfg.resync ?? 'window';
-    const plan = this.readerPlan(identity, primary, persist, resync, invocation, scopeEnded);
-    const name = plan.name;
-    if (plan.reason && plan.previous) {
-      this.emitTrace({
-        type: 'tune-out:reader-rederived',
-        agentName: name,
-        previous: plan.previous,
-        reason: plan.reason,
-        serverId: invocation.serverId,
-        channelId: invocation.channelId,
-        epochId: invocation.epochId,
-        trigger: invocation.trigger,
-      });
-    }
+    // The look's name: its generation's once it is planned, the identity's
+    // for a failure before (a registry or branch read that throws).
+    let name = identity;
     let framed = false;
     let handed = invocation.backlog;
     let candidate: { agent: Agent; contextManager: ContextManager; cleanup: () => void } | undefined;
     try {
+      const plan = this.readerPlan(identity, primary, persist, resync, invocation, scopeEnded);
+      name = plan.name;
+      if (plan.reason && plan.previous) {
+        this.emitTrace({
+          type: 'tune-out:reader-rederived',
+          agentName: name,
+          previous: plan.previous,
+          reason: plan.reason,
+          serverId: invocation.serverId,
+          channelId: invocation.channelId,
+          epochId: invocation.epochId,
+          trigger: invocation.trigger,
+        });
+      }
       const base = {
         resident: primary,
         fork: name,

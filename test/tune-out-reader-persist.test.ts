@@ -11,14 +11,15 @@ import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { WindowedPassthroughStrategy } from '@animalabs/context-manager';
 import type { MessageId, StoredMessage } from '@animalabs/context-manager';
 import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
 import { AgentFramework, WorkspaceModule, defaultReaderFraming } from '../src/index.js';
-import type { FrameworkConfig, ReaderFramingContext, TraceEvent } from '../src/index.js';
+import type { AgentConfig, FrameworkConfig, ReaderFramingContext, TraceEvent } from '../src/index.js';
 import type { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
-import { MockMembrane } from './helpers/mock-membrane.js';
+import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { WireMembrane, final } from './helpers/wire-membrane.js';
-import { GateModule, waitCall } from './helpers/dendrite.js';
+import { GateModule, RoutedMembrane, waitCall } from './helpers/dendrite.js';
 import { tuneOutTool } from '../src/framework.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/tune-out-mcpl-server.mjs');
@@ -665,4 +666,66 @@ describe('a persisted reader: what the resident and the reader are told', () => 
       frameworks.splice(frameworks.indexOf(t.framework), 1);
     }
   });
+});
+
+describe('a persisted reader: a look that fails, and what goes back', () => {
+  const failed = (traces: TraceEvent[]) => traces.filter((e) => e.type === 'tune-out:reader-fork-failed') as unknown as Array<{
+    agentName: string; error: string; returned: number; reported: boolean;
+  }>;
+  const framingRows = async (framework: AgentFramework, name: string) => (await framework.inspectAgentContext(name)).getAllMessages()
+    .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'tune-out-reader-framing');
+
+
+
+  it('is a failed look, its rows given back, when planning it throws', { timeout: 120_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-plan-throws-'));
+    dirs.push(dir);
+    const t = await boot(dir, { persist: 'resident' });
+    const epochId = t.enter();
+    const registry = (t.framework as unknown as { registry: { inspect(name: string): unknown } }).registry;
+    const inspect = registry.inspect.bind(registry);
+    registry.inspect = (name: string) => {
+      if (name.startsWith('reader/')) throw new Error('store read failed (test)');
+      return inspect(name);
+    };
+    try {
+      t.look(epochId, [t.hold(epochId, 'HELD-1')]);
+      await waitFor('the failed look', () => failed(t.traces).length > 0, 10_000);
+    } finally {
+      registry.inspect = inspect;
+    }
+    const [f] = failed(t.traces);
+    assert.deepEqual([f!.agentName, f!.returned], ['reader/scout', 1]);
+    assert.match(f!.error, /store read failed \(test\)/);
+  });
+
+
+
+
+});
+
+describe('a persisted reader: the resync, bounded and unreadable', () => {
+
+
+
+});
+
+describe('resumeAgent and the derivation notice', () => {
+  const create = async (dendrite: Record<string, unknown> = {}) => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-dendrite-'));
+    dirs.push(dir);
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 's.chronicle'),
+      membrane: new RoutedMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      modules: [],
+      syncIntervalMs: 0,
+      ...(Object.keys(dendrite).length > 0 ? { dendrite } : {}),
+    } as never);
+    frameworks.push(framework);
+    await framework.start();
+    return framework;
+  };
+
+
 });
