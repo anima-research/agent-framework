@@ -504,6 +504,7 @@ describe('the deferred-write importer (#291, AF-6)', () => {
       };
       let framework: AgentFramework;
       try { framework = await h.boot(); } finally { proto.sync = sync; }
+      assert.equal(left, 0, "the injected failure fired, at the importer's sync");
       try {
         assert.equal(withText(framework, 'synced later').length, 1, 'stored in memory');
         assert.deepEqual(h.readQueue().pending.map((m) => m.id), ['s1'], 'the record is as it was');
