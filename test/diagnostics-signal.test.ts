@@ -78,7 +78,7 @@ test('a SIGUSR2 dumps each framework while it runs, and says when none is runnin
   assert.deepEqual(agentsOf(both), [['first-agent'], ['second-agent']]);
   // connectome-doctor reads gate and activeStreams from a framework's line.
   for (const dumped of parsed(both)) {
-    assert.deepEqual(Object.keys(dumped), ['at', 'gate', 'activeStreams', 'pendingRequests', 'agents']);
+    assert.deepEqual(Object.keys(dumped).sort(), ['activeStreams', 'agents', 'at', 'gate', 'pendingRequests']);
   }
   await first.stop();
   assert.deepEqual(agentsOf(dump(t)), [['second-agent']]);

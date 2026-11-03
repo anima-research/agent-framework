@@ -355,8 +355,8 @@ describe('Dendrite lifecycle', () => {
     );
   });
 
-  it('a derivation tells the agent it was made from — name, kind, weights, inheritance, route, lifetime — and not the fork (#270)', async () => {
-    const framework = await boot();
+  it('with a derivationNotice that passes the line on, a derivation tells the agent it was made from — name, kind, weights, inheritance, route, lifetime — and not the fork (#270)', async () => {
+    const framework = await boot({ dendrite: { derivationNotice: (_record, _from, line) => line } });
     framework.start();
     const fork = await startBlocked(
       framework,
@@ -395,7 +395,7 @@ describe('Dendrite lifecycle', () => {
   });
 
   it('above a threshold, derivation notices collapse to a count line every threshold forks (Linn, #270)', async () => {
-    const framework = await boot({ dendrite: { collapseDerivationNoticesAfter: 3 } });
+    const framework = await boot({ dendrite: { collapseDerivationNoticesAfter: 3, derivationNotice: (_record, _from, line) => line } });
     framework.start();
     for (let n = 1; n <= 7; n++) {
       const name = `reader-${n}`;

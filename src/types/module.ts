@@ -51,7 +51,8 @@ export type ModuleContextInjection = ContextInjection & { placedEachCompile?: tr
 /**
  * A message as a module context's reads answer it: a stored row, or a row
  * for a write the framework holds (`held`). Either is marked
- * `heldFromResidents` when a tune-out holds it from the residents.
+ * `heldFromResidents` when a tune-out or a suppress rule holds it from the
+ * residents.
  */
 export type ModuleMessage = StoredMessage & {
   /**
@@ -406,8 +407,7 @@ export interface ModuleContext {
    * and a tool round moves when it injects messages into a stream that
    * declares it carries them. So one that waited for its target's end (a
    * run's end, or a fork's last turn), one stored while it was idle and
-   * never sent, one stored at a tool round that ended the turn, and one
-   * injected into a stream that didn't declare it carries injections go to
+   * never sent, and one stored at a tool round that ended the turn go to
    * the primary. The framework's own
    * writes for a run or a fork are unchanged: they stay in its store,
    * unless they're notices the primary already takes in their place (a
@@ -457,8 +457,8 @@ export interface ModuleContext {
 
   /**
    * Get a message by its id or a held write's handle, marked
-   * `heldFromResidents` when a tune-out holds it from the residents
-   * (ModuleMessage).
+   * `heldFromResidents` when a tune-out or a suppress rule holds it from the
+   * residents (ModuleMessage).
    */
   getMessage(id: MessageId): ModuleMessage | null;
 
@@ -469,8 +469,8 @@ export interface ModuleContext {
    * the newest, or before them in a reversed query, marked `held`
    * (ModuleMessage). Those the last process held show once create() has
    * restored them, after every module's start() (addMessage). A message a
-   * tune-out holds from the residents is among the rows, marked
-   * `heldFromResidents` (ModuleMessage).
+   * tune-out or a suppress rule holds from the residents is among the rows,
+   * marked `heldFromResidents` (ModuleMessage).
    *
    * It reads the primary's window (the first registered agent's when none
    * is primary), or with `opts.forAgent`, the named agent's: a conversation

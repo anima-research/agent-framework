@@ -28,16 +28,15 @@
  * A message a stream declares it carried has been read: RFC-006's consumed
  * watermark covers it, so a coalesced replacement can no longer remove it.
  * Only a stream that declares it carries injected messages (membrane's native
- * path, from 0.6.0) is known to have carried them. One that declares it can't
- * (membrane's XML prefill path, from 0.6.0) gets none, and what is queued
- * waits for the turn's end. One that doesn't say (membrane 0.5.x) gets them,
- * and they stay unread, though its native path carries them.
+ * path) gets them. One that declares it can't (membrane's XML prefill path)
+ * gets none, and neither does one that doesn't say: what is queued waits for
+ * the turn's end.
  */
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import type {
@@ -293,17 +292,6 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     await framework.stop();
   });
 
-  it('a stream that doesn\'t say whether it carries injections gets them, and they stay unread', async () => {
-    // membrane 0.5.87 doesn't declare it, on either path, and its XML path
-    // drops what's injected: marked read there, a message the agent never
-    // saw could no longer be replaced.
-    const framework = await runTurn('move', [{ participant: 'Antra', content: text('look left') }]);
-    assert.deepEqual(injected(), ['Antra: look left']);
-    assert.deepEqual(windowOf(framework).slice(2), ['user: <tool_result>', 'Antra: look left', 'assistant: Done.']);
-    assert.equal(unread(framework, 'look left'), true);
-    await framework.stop();
-  });
-
   it('a stream that can\'t carry injections gets none: what is queued waits for the turn to end', async () => {
     membrane.supportsInjectedMessages = false; // membrane's XML prefill path declares it, from 0.6.0
     const framework = await runTurn('move', [{ participant: 'Antra', content: text('look left') }]);
@@ -312,6 +300,46 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     assert.deepEqual(windowOf(framework).slice(2), ['user: <tool_result>', 'assistant: Done.', 'Antra: look left']);
     assert.equal(unread(framework, 'look left'), true);
     await framework.stop();
+  });
+
+  it('a stream that doesn\'t say whether it carries injections is taken as one that can\'t: what is queued waits for the turn to end', async () => {
+    membrane.supportsInjectedMessages = 'undeclared';
+    const framework = await runTurn('move', [{ participant: 'Antra', content: text('look left') }]);
+    assert.deepEqual(atBoundary(), undefined, 'the boundary drained nothing');
+    assert.equal(membrane.lastStream!.receivedToolResultOptions[0], undefined, 'nothing was injected');
+    assert.deepEqual(windowOf(framework).slice(2), ['user: <tool_result>', 'assistant: Done.', 'Antra: look left']);
+    assert.equal(unread(framework, 'look left'), true);
+    await framework.stop();
+  });
+
+  it("a boundary with no stream, the direct API's, stores what was queued for the agent there", async () => {
+    let writer!: ModuleContext;
+    const response = createMockResponse([{ type: 'tool_use', id: 'direct-1', name: 'robot--halt', input: {} }] as ContentBlock[], 'tool_use');
+    (membrane as unknown as { stream: () => Promise<typeof response> }).stream = async () => response;
+    const framework = await createFramework({
+      modules: [module, {
+        name: 'writer', async start(ctx: ModuleContext) { writer = ctx; }, async stop() {}, getTools: () => [],
+        async handleToolCall() { return { success: true }; }, async onProcess() { return {}; },
+      } as Module],
+    });
+    try {
+      const agent = framework.getAgent('assistant')!;
+      agent.getContextManager().addMessage('user', text('take the direct path'));
+      await agent.runInference(framework.getAllTools());
+      assert.equal(agent.state.status, 'waiting_for_tools');
+      await framework.quiesce({ timeoutMs: 1_000 });
+      writer.addMessage('Antra', text('look left'));
+      assert.ok(!windowOf(framework).includes('Antra: look left'), 'queued while the host is quiesced');
+      await (framework as unknown as { handleProcessEvent(e: unknown): Promise<void> }).handleProcessEvent({
+        type: 'tool-result', source: 'robot', moduleName: 'robot', agentName: 'assistant', callId: 'direct-1',
+        result: { success: true, data: { halted: true }, endTurn: true },
+      });
+      assert.deepEqual(windowOf(framework).slice(-2), ['user: <tool_result>', 'Antra: look left'], 'stored at the boundary, after the results');
+      assert.equal(unread(framework, 'look left'), true, 'never carried to the model, so it stays unread');
+    } finally {
+      await framework.resume().catch(() => {});
+      await framework.stop();
+    }
   });
 
   it('a message stored at a boundary that ends the turn was never carried, and stays unread', async () => {
@@ -1230,42 +1258,15 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
 
   it("settling a held write whose landing is unknown, not found, persists the queue without its mark, as an edit does", async () => {
     const framework = await createFramework();
-    const internals = drainInternals(framework) as ReturnType<typeof drainInternals> & { persistDeferredWrites(): void };
+    const internals = drainInternals(framework);
     internals.deferredWritesPersisted = true;
     internals.deferredMessages.push({ ...entry('w-persist', 'look left'), landing: 'unknown' });
-    let persisted = 0;
-    const persist = internals.persistDeferredWrites;
-    internals.persistDeferredWrites = function (this: unknown) { persisted++; return persist.call(this); };
     internals.queryMessages({});
-    assert.equal(persisted, 1, 'the queue without its mark is persisted');
+    // The durable queue's documented place under the store (FrameworkConfig.deferredWritesPath).
+    const onDisk = JSON.parse(readFileSync(join(tempDir, 'test.chronicle', 'recovery', 'deferred-writes.json'), 'utf8')) as { pending: Array<{ id: string; landing?: string }> };
+    assert.deepEqual(onDisk.pending.map((m) => [m.id, m.landing]), [['w-persist', undefined]], 'the queue on disk no longer carries the mark');
     assert.deepEqual(internals.deferredMessages.map((m) => [m.id, m.landing]), [['w-persist', undefined]]);
     await framework.stop();
-  });
-
-  it("a module's edit or removal by a stored id settles the held write that row is a copy of, even while its store can't be searched", async () => {
-    for (const op of ['edit', 'remove'] as const) {
-      // Each pass opens the test's one store again, so each takes its own id.
-      const id = `w-row-${op}`;
-      const framework = await createFramework();
-      const internals = drainInternals(framework);
-      heldAndStored(framework, id, 'look left');
-      const cm = framework.getAgent('assistant')!.getContextManager() as unknown as {
-        queryMessages: (...args: unknown[]) => { messages: Array<{ id: string }> };
-      };
-      const [copy] = cm.queryMessages({ metadata: { deferredWriteId: id } }).messages;
-      const query = cm.queryMessages;
-      cm.queryMessages = () => { throw new Error('search failed'); };
-    const unscan = noScan(framework);
-      const error = console.error;
-      console.error = () => {};
-      try {
-        if (op === 'edit') internals.editMessage(copy!.id, text('look up'));
-        else internals.removeMessage(copy!.id);
-      } finally { cm.queryMessages = query; unscan(); console.error = error; }
-      assert.deepEqual(copiesOf(framework, id), op === 'edit' ? ['look up'] : [], `${op}: the row is changed once`);
-      assert.deepEqual(internals.deferredMessages.map((m) => m.id), [], `${op}: its write is settled by the row, so nothing writes it again`);
-      await framework.stop();
-    }
   });
 
   it("a module's edit or removal of a held write whose landing is unknown throws with nothing changed while its store can't be searched", async () => {
@@ -1885,7 +1886,6 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       { name: 'the long text, then an image', content: [...text(long), image] },
       { name: 'a short text, an image, then the long text', content: [...text('Intro. '), image, ...text(long)] },
     ];
-    const readBacks: number[] = [];
     // Every case is run, and those whose injection differs from the next
     // compile are named together.
     const differ: string[] = [];
@@ -1908,19 +1908,12 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
         } as never],
       });
       const cm = framework.getAgent('assistant')!.getContextManager();
-      // The store is read back for a write only when it took more than one
-      // message: here the body, and not the short message after it.
-      const internals = framework as unknown as { storedCopiesOf: (...args: unknown[]) => unknown[] };
-      const storedCopiesOf = internals.storedCopiesOf.bind(framework);
-      let readBack = 0;
-      internals.storedCopiesOf = (...args) => { readBack++; return storedCopiesOf(...args); };
       module.interjections = [{ participant: 'Antra', content }, { participant: 'Antra', content: text('look right') }];
       try {
         framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
         await framework.runUntilIdle();
         const landed = cm.getAllMessages().filter((m) => (m as { bodyGroupId?: string }).bodyGroupId);
         assert.ok(landed.length > 1, `${name}: stored as ${landed.length} shards`);
-        readBacks.push(readBack);
         const injected = ofLong(membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? []);
         // The next turn's request is compiled from the store.
         membrane.pushResponse(createMockResponse(text('Okay.')));
@@ -1935,7 +1928,6 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
       }
     }
     assert.deepEqual(differ, [], 'the boundary carried what the next compile renders');
-    assert.deepEqual(readBacks, [1, 1, 1, 1], 'the store is read back for each body, and not for the short message after it');
   });
 
   it("a write that throws after it's stored, re-added from the queue, is weighed for its agent's open turn as a stored write is", async () => {

@@ -15,12 +15,17 @@
  * test opens the gate. Where a fork's turn runs (a mention, or a batch's
  * wake), the fixture's membrane answers it.
  */
-import { describe, it } from 'node:test';
+import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { TraceEvent } from '../src/index.js';
 import { createMockResponse } from './helpers/mock-membrane.js';
 import { fixture } from './helpers/coalescing-fixture.js';
 import { forkAgentName } from '../src/mcpl/conversation-router.js';
+
+const unscripted: string[] = [];
+afterEach(() => {
+  assert.deepEqual(unscripted.splice(0), [], 'every inference the framework asked for was one the test scripted');
+});
 
 /** The fixture's channel `chat` is on its server `editor`. */
 const FORK = forkAgentName('conversation', 'editor', 'chat', 1);
@@ -76,9 +81,14 @@ async function heldTemplate(options: { server?: Record<string, unknown>; convers
     createMockResponse([{ type: 'tool_use', id: 'one', name: 'test--read', input: {} }], 'tool_use'),
     { aborted: true, reason: 'test-abort' },
   ];
+  let calls = 0;
   (f.membrane as unknown as { stream: () => Promise<unknown> }).stream = async () => {
+    calls++;
     const response = responses.shift();
-    assert.ok(response, 'unexpected inference');
+    if (!response) {
+      unscripted.push(`call ${calls}`);
+      throw new Error('unexpected inference');
+    }
     return response;
   };
   const template = f.framework.getAgent('agent')!;

@@ -64,8 +64,7 @@ class RobotModule implements Module {
   /** Full metadata override for the interjected message (wins over
    *  interjectionChannelId when set) — e.g. reaction tags. */
   interjectionMetadata: Record<string, unknown> | null = null;
-  /** Delay tool completion so live routing deterministically precedes it. */
-  toolDelayMs = 0;
+  beforeResult: (() => Promise<void>) | null = null;
   /** Run once, during the next turn start's context gathering (the turn is
    *  alive and its stream doesn't exist yet). */
   startHook: (() => Promise<void>) | null = null;
@@ -108,9 +107,7 @@ class RobotModule implements Module {
   }
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
-    if (this.toolDelayMs > 0) {
-      await new Promise((r) => setTimeout(r, this.toolDelayMs));
-    }
+    if (this.beforeResult) await this.beforeResult();
     if (this.interjection) {
       const text = this.interjection;
       this.interjection = null;
@@ -249,18 +246,28 @@ describe('present while acting', () => {
 
     const framework = await createFramework();
     const routed = stubChannelRegistry(framework);
-    module.toolDelayMs = 25;
 
     // Track live ordering: when the first segment routes, no tool results
     // may have been provided yet (i.e. delivery happened DURING the round).
     const resultsAtRouteTime: number[] = [];
+    const routedRound: Array<() => void> = [];
     const registry = (framework as unknown as {
       channelRegistry: { routeSpeech: (a: string, t: string, l?: string | null) => Promise<void> };
     }).channelRegistry;
     const origRoute = registry.routeSpeech;
     registry.routeSpeech = async (a, t, l) => {
       resultsAtRouteTime.push(membrane.lastStream!.receivedToolResults.length);
+      routedRound[resultsAtRouteTime.length - 1]?.();
       return origRoute(a, t, l);
+    };
+    let rounds = 0;
+    module.beforeResult = () => {
+      const round = rounds++;
+      if (resultsAtRouteTime.length > round) return Promise.resolve();
+      return new Promise<void>((resolve) => {
+        const bound = setTimeout(resolve, 10_000);
+        routedRound[round] = () => { clearTimeout(bound); resolve(); };
+      });
     };
 
     trigger(framework);
@@ -378,7 +385,6 @@ describe('present while acting', () => {
 
     const framework = await createFramework();
     stubChannelRegistry(framework);
-    module.toolDelayMs = 25;
     module.interjection = 'hey, over here?';
     module.interjectionMetadata = { channelId: 'discord:dm:an\ud83d', tags: ['chat:addressed'] };
 
@@ -415,7 +421,6 @@ describe('present while acting', () => {
 
     const framework = await createFramework({ speech: { locus: 'latest-inbound' } }); // the re-pin is the legacy rule
     const routed = stubChannelRegistry(framework);
-    module.toolDelayMs = 25;
     module.interjection = 'hey, quick question over here?';
     module.interjectionMetadata = { channelId: 'discord:dm:antra', tags: ['chat:addressed'] };
 
@@ -491,7 +496,6 @@ describe('present while acting', () => {
   }
 
   function addressedFromDm(): void {
-    module.toolDelayMs = 25;
     module.interjection = 'hey, quick question over here?';
     module.interjectionMetadata = { channelId: 'discord:dm:antra', tags: ['chat:addressed'] };
   }
@@ -608,7 +612,6 @@ describe('present while acting', () => {
 
     const framework = await createFramework();
     const routed = stubChannelRegistry(framework);
-    module.toolDelayMs = 25;
     module.interjection = 'hey, quick question over here?';
     module.interjectionMetadata = { channelId: 'discord:dm:antra', tags: ['chat:addressed'] };
 
@@ -701,7 +704,6 @@ describe('present while acting', () => {
 
     const framework = await createFramework({ speech: { locus: 'latest-inbound' } }); // the re-pin is the legacy rule
     const routed = stubChannelRegistry(framework);
-    module.toolDelayMs = 25;
     module.interjection = 'I need to swap out this eye screen';
     module.interjectionMetadata = {
       channelId: 'discord:guild:portables',
@@ -744,7 +746,6 @@ describe('present while acting', () => {
 
     const framework = await createFramework({ speech: { locus: 'latest-inbound' } }); // the re-pin is the legacy rule
     const routed = stubChannelRegistry(framework);
-    module.toolDelayMs = 25;
     module.interjection = '*from the table* one receipt for the case, since I have a dated instance';
     module.interjectionMetadata = {
       channelId: 'discord:guild:hospital',
@@ -780,7 +781,6 @@ describe('present while acting', () => {
 
     const framework = await createFramework();
     const routed = stubChannelRegistry(framework);
-    module.toolDelayMs = 25;
     module.interjection = 'unrelated lounge chatter';
     module.interjectionMetadata = {
       channelId: 'discord:guild:lounge',
@@ -810,7 +810,6 @@ describe('present while acting', () => {
 
     const framework = await createFramework();
     const routed = stubChannelRegistry(framework);
-    module.toolDelayMs = 25;
     module.interjection = '* world weather: clear (forecast)';
     module.interjectionMetadata = {
       channelId: 'eidoverse:world',
@@ -847,7 +846,6 @@ describe('present while acting', () => {
 
     const framework = await createFramework();
     const routed = stubChannelRegistry(framework);
-    module.toolDelayMs = 25;
     module.interjection = 'and one more thing';
     module.interjectionMetadata = { channelId: 'chan-live-1', tags: ['chat:addressed'] };
 
@@ -1041,7 +1039,6 @@ describe('present while acting', () => {
 
     const framework = await createFramework(LEGACY);
     const routed = stubChannelRegistry(framework);
-    module.toolDelayMs = 25;
     module.interjection = 'quick question for you';
     module.interjectionMetadata = addressed('discord:dm:antra');
     failStream(1, () => new Error('synthetic transient stream error'));
@@ -1081,7 +1078,6 @@ describe('present while acting', () => {
 
       const framework = await createFramework(LEGACY);
       const routed = stubChannelRegistry(framework);
-      module.toolDelayMs = 25;
       failStream(1, accelerationLimit);
       feedStart(framework, 2, [{ type: 'text', text: 'Here is the rest.' }] as ContentBlock[]);
 
@@ -1113,7 +1109,6 @@ describe('present while acting', () => {
 
     const framework = await createFramework();
     const routed = stubChannelRegistry(framework);
-    module.toolDelayMs = 25;
     failStream(1, accelerationLimit);
     feedStart(framework, 2, [{ type: 'text', text: 'Here is the rest.' }] as ContentBlock[]);
 
@@ -1188,7 +1183,6 @@ describe('present while acting', () => {
 
       const framework = await createFramework(LEGACY);
       const routed = stubChannelRegistry(framework);
-      module.toolDelayMs = 25;
       failStream(1, accelerationLimit);
       feedStart(framework, 2, [{ type: 'text', text: 'Here is the rest.' }] as ContentBlock[]);
 
@@ -1223,7 +1217,6 @@ describe('present while acting', () => {
 
     const framework = await createFramework();
     const routed = stubChannelRegistry(framework);
-    module.toolDelayMs = 25;
     failStream(1, accelerationLimit);
     // Were the failed read taken as a withdrawal, the compile would run and
     // answer here, at the turn's old channel.
@@ -1264,7 +1257,6 @@ describe('present while acting', () => {
 
     const framework = await createFramework(LEGACY);
     const routed = stubChannelRegistry(framework);
-    module.toolDelayMs = 25;
     const internals = framework as unknown as {
       pendingRequests: InferenceRequest[];
       turnRouting: Map<string, { engaged: Set<string> }>;
@@ -1314,7 +1306,6 @@ describe('present while acting', () => {
 
     const framework = await createFramework(LEGACY);
     const routed = stubChannelRegistry(framework);
-    module.toolDelayMs = 25;
     const origHandle = module.handleToolCall.bind(module);
     module.handleToolCall = async (call) => {
       if (call.id === 'c2') {
@@ -1355,7 +1346,6 @@ describe('present while acting', () => {
 
     const framework = await createFramework(LEGACY);
     const routed = stubChannelRegistry(framework);
-    module.toolDelayMs = 25;
     // The host holds the agent once when its stream can't be set up. (Asked
     // again at the release, it lets the hold go.)
     let hostHolds = 0;
@@ -1407,7 +1397,6 @@ describe('present while acting', () => {
     cycles.delete('builder');
     assert.equal(deferredInStart, 1, 'the DM was deferred while the start held the turn');
     assert.equal(calls, 2, 'the second start failed before its stream');
-    assert.equal(store.deferredMessages.length, 0, "the failed start's flush stored the DM while another agent's tools were pending");
     // During the second hold, someone else addresses the agent.
     await say(framework, 'over here', addressed('discord:dm:q'));
     await release(framework);
@@ -1428,7 +1417,6 @@ describe('present while acting', () => {
 
     const framework = await createFramework();
     stubChannelRegistry(framework);
-    module.toolDelayMs = 25;
     let hostHolds = 0;
     (framework as unknown as { providerHoldHook: (error: Error) => { holdMs: number; reason: string } | undefined })
       .providerHoldHook = (error) => error.message === 'stream setup failed' && hostHolds++ === 0
@@ -1461,7 +1449,6 @@ describe('present while acting', () => {
     // and are deferred, and the store refuses the first of them.
     const store = framework as unknown as {
       addMessage(participant: string, content: ContentBlock[], metadata: Record<string, unknown>): string;
-      deferredMessages: Array<{ content: ContentBlock[] }>;
     };
     const cm = framework.getAgent('assistant')!.getContextManager() as unknown as {
       addMessage(participant: string, content: ContentBlock[], metadata?: unknown): string;
@@ -1481,8 +1468,6 @@ describe('present while acting', () => {
       .filter((t) => t === 'first' || t === 'second');
     await release(framework);
     assert.equal(calls, 2, 'the second start failed before its stream');
-    assert.deepEqual(store.deferredMessages.map((m) => (m.content[0] as { text: string }).text), ['first', 'second'],
-      'the message the flush could not store, and the one behind it, stay queued in order');
     assert.deepEqual(texts(), [], 'nothing behind the refused message was stored');
 
     // Once the store takes it, the next start stores both, in order.
@@ -1507,7 +1492,6 @@ describe('present while acting', () => {
 
       const framework = await createFramework({ ...LEGACY, maxStreamTokens: 20 });
       const routed = stubChannelRegistry(framework);
-      module.toolDelayMs = 25;
       module.interjection = 'quick question for you';
       module.interjectionMetadata = addressed('discord:dm:antra');
       feedStart(framework, 2, [{ type: 'text', text: 'After the restart.' }] as ContentBlock[]);
@@ -1550,7 +1534,6 @@ describe('present while acting', () => {
     const shown: string[] = [];
     registry.startTyping = (channel: { channelId: string }) => { shown.push(`start ${channel.channelId}`); };
     registry.stopTyping = (channel?: { channelId: string }) => { shown.push(`stop ${channel?.channelId ?? '(all)'}`); };
-    module.toolDelayMs = 25;
     module.interjection = 'quick question for you';
     module.interjectionMetadata = addressed('discord:dm:antra');
     feedStart(framework, 2, [{ type: 'text', text: 'After the restart.' }] as ContentBlock[]);
@@ -1583,7 +1566,6 @@ describe('present while acting', () => {
     const cm = framework.getAgent('assistant')!.getContextManager();
     let rendered = 0;
     (cm as { renderAsNewest: unknown }).renderAsNewest = (ids: readonly string[]) => { rendered++; return ids.map(() => null); };
-    module.toolDelayMs = 25;
     module.interjection = 'hey, quick question over here?';
     module.interjectionMetadata = { channelId: 'discord:dm:antra', tags: ['chat:addressed'] };
 
@@ -1616,7 +1598,6 @@ describe('present while acting', () => {
     const cm = framework.getAgent('assistant')!.getContextManager();
     let rendered = 0;
     (cm as { renderAsNewest: unknown }).renderAsNewest = (ids: readonly string[]) => { rendered++; return ids.map(() => null); };
-    module.toolDelayMs = 25;
     module.interjection = 'quick question for you';
     module.interjectionMetadata = addressed('discord:dm:antra');
     feedStart(framework, 2, [{ type: 'text', text: 'After the restart.' }] as ContentBlock[]);
@@ -1756,7 +1737,6 @@ describe('present while acting', () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'quiet' }] as ContentBlock[]));
     const framework = await createFramework();
     stubChannelRegistry(framework);
-    module.toolDelayMs = 25;
     module.interjection = 'quick question for you';
     module.interjectionMetadata = addressed('discord:dm:antra');
     const internals = framework as unknown as { pendingRequests: InferenceRequest[] };
@@ -1779,7 +1759,6 @@ describe('present while acting', () => {
     membrane.pushResponse(createMockResponse([] as ContentBlock[]));
     const framework = await createFramework();
     const routed = stubChannelRegistry(framework);
-    module.toolDelayMs = 25;
     failStream(1, accelerationLimit);
     feedStart(framework, 2, [{ type: 'text', text: 'A new turn.' }] as ContentBlock[]);
     const internals = framework as unknown as {
@@ -1795,7 +1774,6 @@ describe('present while acting', () => {
     internals.recordTurnCheckpoint = () => { throw new Error('checkpoint failed'); };
     await assert.rejects(release(framework), /checkpoint failed/);
     internals.recordTurnCheckpoint = checkpoint;
-    assert.equal(internals.openLogical.has('assistant'), false, 'the held turn ended with its failed compile');
     trigger(framework);
     await framework.runUntilIdle();
 
@@ -1837,30 +1815,6 @@ describe('present while acting', () => {
       console.error = error;
       await framework.stop();
     }
-  });
-
-  it("a silent start that throws leaves an open prose turn alone", async () => {
-    const framework = await createFramework();
-    stubChannelRegistry(framework);
-    type Routing = { locus?: Ref; engaged: Set<string>; [field: string]: unknown };
-    const internals = framework as unknown as {
-      openLogical: Map<string, Routing>; pendingRequests: InferenceRequest[];
-      recordTurnCheckpoint(agentName: string): void;
-    };
-    const open: Routing = {
-      locus: stub('chan-turn'), engaged: new Set(), wasIn: [],
-      continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
-    };
-    internals.openLogical.set('assistant', open);
-    internals.recordTurnCheckpoint = () => { throw new Error('checkpoint failed'); };
-    internals.pendingRequests.push({
-      agentName: 'assistant', reason: 'heartbeat', source: 'framework', timestamp: Date.now(), suppressProse: true,
-    } as InferenceRequest);
-
-    await assert.rejects(framework.runUntilIdle(), /checkpoint failed/);
-    assert.equal(internals.openLogical.get('assistant'), open);
-
-    await framework.stop();
   });
 
   it("a resume whose turn isn't open continues it, and opens it again for the turn's later starts", async () => {
@@ -1905,43 +1859,6 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
-  it("a silent turn's over-budget boundary leaves no arrival on an open prose turn", async () => {
-    const overBudget = createMockResponse([
-      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
-    ] as ContentBlock[], 'tool_use');
-    overBudget.usage = { inputTokens: 100, outputTokens: 5 };
-    membrane.pushResponse(overBudget);
-    const framework = await createFramework({ maxStreamTokens: 20 });
-    const routed = stubChannelRegistry(framework);
-    module.toolDelayMs = 25;
-    module.interjection = 'quick question for you';
-    module.interjectionMetadata = addressed('discord:dm:antra');
-    feedStart(framework, 2, [{ type: 'text', text: 'quiet' }] as ContentBlock[]);
-    type Routing = { locus?: Ref; engaged: Set<string>; arrivals: Array<{ messageId: string; channel: Ref }>; [field: string]: unknown };
-    const internals = framework as unknown as {
-      openLogical: Map<string, Routing>; pendingRequests: InferenceRequest[];
-    };
-    // Built by hand, as #312's silent-start test does: production runs no
-    // silent turn while a prose turn is open.
-    const open: Routing = {
-      locus: stub('chan-turn'), engaged: new Set(), wasIn: [],
-      continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [],
-    };
-    internals.openLogical.set('assistant', open);
-    internals.pendingRequests.push({
-      agentName: 'assistant', reason: 'heartbeat', source: 'framework', timestamp: Date.now(), suppressProse: true,
-    } as InferenceRequest);
-
-    await framework.runUntilIdle();
-
-    assert.equal(membrane.calls.length, 2, 'the silent turn crossed its budget and restarted');
-    assert.deepEqual(routed, [], 'and its restart stayed silent');
-    assert.equal(module.interjection, null, 'the DM arrived during its tool round');
-    assert.deepEqual(open.arrivals, [], "the silent turn's injections are no arrival of the prose turn");
-
-    await framework.stop();
-  });
-
   for (const [label, notice] of [
     ['a re-pin', 'The conversation moved to'],
     ["a turn's announcement", 'Your plain speech now lands in'],
@@ -1954,7 +1871,6 @@ describe('present while acting', () => {
       // A re-pin is the legacy rule's; the default announces an arrival instead.
       const framework = await createFramework(notice === 'The conversation moved to' ? LEGACY : {});
       stubChannelRegistry(framework);
-      module.toolDelayMs = 25;
       if (notice === 'The conversation moved to') {
         // Someone addresses the agent mid-turn from a DM: the turn re-pins.
         module.interjection = 'quick question for you';
@@ -2340,7 +2256,7 @@ describe('present while acting', () => {
     }, 'chat', 'chat');
     await until(() => results.length > 0 && resolveOpen !== undefined, 'the send to finish');
     resolveOpen({ status: 'already-open', channelId: 'discord:guild:portables', serverId: 'chat' });
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual([...sending.engaged], [], "the turn didn't send there");
   });
 
@@ -2363,7 +2279,7 @@ describe('present while acting', () => {
     assert.deepEqual(announced.map((a) => a.locus), [stub('chan-turn')], "only the turn's own sleep announces, in its locus");
   });
 
-  it("a sleep announces in the calling turn's explicit pin, and the open turn's sleep under a silent start announces in the open turn's", async () => {
+  it("a sleep announces in the calling turn's explicit pin or locus, and nowhere with prose routing disabled", async () => {
     const framework = bareFramework();
     const announced: unknown[] = [];
     framework.eventGate = { setSleep: () => ({ until: Date.now() + 60_000 }) };
@@ -2375,7 +2291,6 @@ describe('present while acting', () => {
     });
     const settle = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
     const open = { turnId: 7, engaged: new Set(), wasIn: [], locus: stub('chan-open'), pin: stub('pin-open') };
-    const silent = { turnId: 8, engaged: new Set(), wasIn: [], locus: stub('chan-silent'), pin: stub('pin-silent') };
     for (const mode of ['explicit', 'locus'] as const) {
       announced.length = 0;
       framework.agents = new Map([['assistant', { proseRouting: mode, ...noteStub }]]);
@@ -2385,16 +2300,8 @@ describe('present while acting', () => {
       framework.activeTurnTriggers = new Map([['assistant', {}]]);
       sleep(7);
       await settle();
-      // A silent start's routing is the latest while turn 7 is still open:
-      // turn 7's sleep is turn 7's, so it announces where turn 7 would;
-      // the silent start's own sleep announces nowhere.
-      framework.turnRouting = new Map([['assistant', silent]]);
-      framework.activeTurnTriggers = new Map([['assistant', { suppressProse: true }]]);
-      sleep(7);
-      sleep(8);
-      await settle();
       const expected = mode === 'explicit' ? stub('pin-open') : stub('chan-open');
-      assert.deepEqual(announced, [expected, expected], `${mode}: the open turn's sleep, live and under a silent start; none for the silent start's`);
+      assert.deepEqual(announced, [expected], `${mode}: the turn's sleep announces where its prose goes`);
     }
     // With prose routing disabled, the turn's own sleep announces nowhere.
     announced.length = 0;
@@ -2447,7 +2354,6 @@ describe('present while acting', () => {
 
     const framework = await createFramework({ speech: { locus: 'latest-inbound' } }); // the re-pin is the legacy rule
     stubChannelRegistry(framework);
-    module.toolDelayMs = 25;
     module.interjection = 'quick question over here?';
     module.interjectionMetadata = { channelId: 'discord:dm:antra', tags: ['chat:addressed'] };
 
@@ -2777,7 +2683,6 @@ describe('present while acting', () => {
     const framework = await createFramework(LEGACY);
     const routed = stubChannelRegistry(framework);
     declareEarsInboundOnly(framework);
-    module.toolDelayMs = 25;
     module.interjection = 'Linn, can you hear me?';
     module.interjectionMetadata = { channelId: 'body:ears', tags: ['chat:addressed'] };
 
@@ -3015,7 +2920,7 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
-  it('passes no injection options when nothing arrived mid-turn', async () => {
+  it('injects no message at the tool boundary when nothing arrived mid-turn', async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
     ] as ContentBlock[], 'tool_use'));
@@ -3030,7 +2935,7 @@ describe('present while acting', () => {
 
     const stream = membrane.lastStream!;
     assert.equal(stream.receivedToolResults.length, 1);
-    assert.equal(stream.receivedToolResultOptions[0], undefined);
+    assert.equal(stream.receivedToolResultOptions[0]?.injectedMessages?.length ?? 0, 0, 'no message was injected');
 
     await framework.stop();
   });

@@ -13,18 +13,10 @@ import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, type ContextInjection } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import { AgentFramework, systemChangeMetadata, taskForkSpec, type Agent } from '../src/index.js';
 import { GateModule, RoutedMembrane, say, until, waitCall } from './helpers/dendrite.js';
-
-const supported =
-  typeof (JsStore.prototype as unknown as { view?: unknown }).view === 'function' &&
-  typeof (ContextManager.prototype as unknown as { derive?: unknown }).derive === 'function';
-const skip = supported
-  ? false
-  : 'installed @animalabs/chronicle / context-manager lack branch-bound handles or ContextManager.derive';
 
 type Internals = {
   storeInjections(agent: Agent, injections: ContextInjection[] | undefined): ContextInjection[] | undefined;
@@ -88,7 +80,7 @@ describe("a shared fork's view", () => {
   /** agentSees takes an agent; an inspected context has none, so this stands in for it. */
   const readerOf = (cm: ContextManager): Agent => ({ getContextManager: () => cm }) as unknown as Agent;
 
-  it('sees its source\'s view and its own stored injections: in its compile, in agentSees, and reopened after it ends', { skip }, async () => {
+  it('sees its source\'s view and its own stored injections: in its compile, in agentSees, and reopened after it ends', async () => {
     const mira = framework.getAgent('mira')!;
     const oren = framework.getAgent('oren')!;
     mira.getContextManager().addMessage('user', [text('Please look into the open issues.')]);
@@ -147,7 +139,7 @@ describe("a shared fork's view", () => {
     assert.deepEqual(seenBy(readerOf(leftBelow), leftBelow), ['MIRA-OWN', 'FORK-OWN', 'FORK2-OWN']);
   });
 
-  it("keeps its source's system changes and its own and leaves out another resident's, and reopened after it ends still leaves out another resident's", { skip }, async () => {
+  it("keeps its source's system changes and its own and leaves out another resident's, and reopened after it ends still leaves out another resident's", async () => {
     const change = (name: string) => [{ type: 'system_change', defineTools: [{ name, description: name, inputSchema: { type: 'object', properties: {} } }] }] as never;
     const changeTools = async (cm: ContextManager): Promise<string[]> =>
       (await cm.compile(undefined, undefined, { dryRun: true })).messages.flatMap((m) =>
@@ -202,7 +194,7 @@ describe("a shared fork of an isolated-slot reader's view", () => {
   const compiled = async (cm: ContextManager): Promise<string[]> =>
     (await cm.compile(undefined, undefined, { dryRun: true })).messages.map(textOf);
 
-  it("a fork of the subconscious, reopened after it ends, shows what its live compile showed", { skip }, async () => {
+  it("a fork of the subconscious, reopened after it ends, shows what its live compile showed", async () => {
     const mira = framework.getAgent('mira')!;
     const sub = framework.getAgent('Subconscious')!;
     mira.getContextManager().addMessage('user', [text('MIRA-SAID')]);
@@ -256,7 +248,7 @@ describe("a shared child of a resident with former names", () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  it("keeps, reopened after it ends, a change its source counts as its own under a former name, as it did live", { skip }, async () => {
+  it("keeps, reopened after it ends, a change its source counts as its own under a former name, as it did live", async () => {
     const changeTools = async (cm: ContextManager): Promise<string[]> =>
       (await cm.compile(undefined, undefined, { dryRun: true })).messages.flatMap((m) =>
         (m.content as Array<{ type: string; defineTools?: Array<{ name: string }> }>)
@@ -279,7 +271,7 @@ describe("a shared child of a resident with former names", () => {
     assert.deepEqual([record.selfParticipants, record.presentAs], [['mira-old'], 'mira-shown'], "the resident's record states its mapping");
   });
 
-  it("gives a resumed child the view of the mapping it resumes with", { skip }, async () => {
+  it("gives a resumed child the view of the mapping it resumes with", async () => {
     const changeTools = async (cm: ContextManager): Promise<string[]> =>
       (await cm.compile(undefined, undefined, { dryRun: true })).messages.flatMap((m) =>
         (m.content as Array<{ type: string; defineTools?: Array<{ name: string }> }>)
@@ -301,7 +293,7 @@ describe("a shared child of a resident with former names", () => {
     resumed.cleanup();
   });
 
-  it("gives a child resumed with no mapping of its own the view of its record's", { skip }, async () => {
+  it("gives a child resumed with no mapping of its own the view of its record's", async () => {
     const changeTools = async (cm: ContextManager): Promise<string[]> =>
       (await cm.compile(undefined, undefined, { dryRun: true })).messages.flatMap((m) =>
         (m.content as Array<{ type: string; defineTools?: Array<{ name: string }> }>)
@@ -352,7 +344,7 @@ describe("a resumed 'head' job", () => {
   const job = { model: 'test-model', systemPrompt: 'Do the task.', contextBudgetTokens: 20000 };
 
   for (const [how, shared] of [['in a namespace of its own', false], ["continuing a resident's context", true]] as const) {
-    it(`sends its request beside a host's change rows that alone exceed its budget, ${how}`, { skip }, async () => {
+    it(`sends its request beside a host's change rows that alone exceed its budget, ${how}`, async () => {
       framework.getAgent('mira')!.getContextManager().addMessage('user', [text('Please look into the open issues.')]);
       const { name: _name, ...spec } = taskForkSpec('job', { parent: 'mira', inherit: { mode: 'shared' } });
       const first = await framework.createEphemeralAgent({ name: 'job', ...job } as never, shared ? spec : undefined);

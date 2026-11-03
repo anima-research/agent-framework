@@ -7,7 +7,7 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { rig, skip } from './helpers/reader-fork-rig.js';
+import { rig } from './helpers/reader-fork-rig.js';
 import { createMockResponse } from './helpers/mock-membrane.js';
 import type { Module, ModuleContext, ToolCall, ToolResult, ToolDefinition } from '../src/types/index.js';
 
@@ -54,7 +54,7 @@ class LateModule implements Module {
 
 const use = (id: string, name: string) => ({ type: 'tool_use', id, name, input: {} });
 
-describe('reader forks and tools out of the tool list', { skip }, () => {
+describe('reader forks and tools out of the tool list', () => {
   const stub = new StubModule();
   const late = new LateModule();
   const r = rig('host-toolsets', false, { modules: [stub] });
