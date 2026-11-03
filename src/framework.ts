@@ -35440,7 +35440,9 @@ export class AgentFramework {
     const toolClasses = new Map<string, ToolClass[]>();
     const toolServers = new Map<string, string>();
     const listedServers = new Set<string>();
-    const keptServers = new Set<string>();
+    // A server whose listing failed, where its kept tools go in the list,
+    // and its error, redacted, for the line that says what was published.
+    const failed: Array<{ serverId: string; at: number; error: string; advertised: boolean }> = [];
     const closesOf = (serverId: string): number => this.mcplServerCloses?.get(serverId) ?? 0;
     // Each server's close count as its listing began.
     const closesAtListing = new Map<string, number>();
@@ -35525,20 +35527,13 @@ export class AgentFramework {
         // to list them stays unknown.)
         if (server.isConnected && !server.mcpToolsAdvertised) {
           listedServers.add(server.id);
-        } else if (AgentFramework.mcpConnectionServes(server)) {
-          const kept = [...(this.mcplToolServers ?? [])].filter(([name, owner]) => owner === server.id
-            && name.startsWith(`${prefix}--`) && isToolAllowed(name.slice(prefix.length + 2), config));
-          const keptNames = new Set(kept.map(([name]) => name));
-          staged.tools.push(...(this.mcplTools ?? []).filter((tool) => keptNames.has(tool.name)));
-          for (const [name] of kept) {
-            staged.servers.set(name, server.id);
-            const featureSet = this.mcplToolFeatureSets?.get(name);
-            if (featureSet !== undefined) staged.featureSets.set(name, featureSet);
-          }
-          if (kept.length > 0) {
-            keptServers.add(server.id);
-            console.error(`[mcpl] server "${server.id}": tools/list failed (${redactServerText(error instanceof Error ? error.message : String(error), config ?? {})}); keeping its ${kept.length} known tool(s)`);
-          }
+        } else {
+          failed.push({
+            serverId: server.id,
+            at: tools.length,
+            error: redactServerText(error instanceof Error ? error.message : String(error), config ?? {}),
+            advertised: server.mcpToolsAdvertised,
+          });
         }
       }
       tools.push(...staged.tools);
@@ -35604,7 +35599,7 @@ export class AgentFramework {
     };
     const over = new Set([
       ...[...listedServers].filter((serverId) => !serving(serverId) || closesOf(serverId) !== closesAtListing.get(serverId)),
-      ...[...keptServers].filter((serverId) => !serving(serverId)),
+      ...failed.map(({ serverId }) => serverId).filter((serverId) => !serving(serverId)),
     ]);
     if (over.size > 0) {
       for (const [name, serverId] of [...toolServers]) {
@@ -35625,6 +35620,30 @@ export class AgentFramework {
       const unlisted = [...listedServers].find((id) => !this.mcplListedServers.has(id));
       if (unlisted !== undefined) this.handleToolsListChanged(unlisted);
       return;
+    }
+    const kept = new Map<string, number>();
+    for (const { serverId, at } of [...failed].reverse()) {
+      if (over.has(serverId)) continue;
+      const config = this.mcplServerConfigs.get(serverId);
+      const prefix = config?.toolPrefix ?? `mcpl--${serverId}`;
+      const names = [...(this.mcplToolServers ?? [])]
+        .filter(([name, owner]) => owner === serverId && name.startsWith(`${prefix}--`) && isToolAllowed(name.slice(prefix.length + 2), config))
+        .map(([name]) => name);
+      const known = new Set(names);
+      tools.splice(at, 0, ...(this.mcplTools ?? []).filter((tool) => known.has(tool.name)));
+      for (const name of names) {
+        toolServers.set(name, serverId);
+        const featureSet = this.mcplToolFeatureSets?.get(name);
+        if (featureSet !== undefined) toolFeatureSets.set(name, featureSet);
+      }
+      kept.set(serverId, names.length);
+    }
+    if (!this.stopHasBegun()) {
+      for (const { serverId, error, advertised } of failed) {
+        if (!advertised) continue;
+        const count = kept.get(serverId) ?? 0;
+        console.error(`[mcpl] server "${serverId}": tools/list failed (${error}); ${count > 0 ? `keeping its ${count} known tool(s)` : 'none of its tools are offered'}`);
+      }
     }
     this.mcplToolsRefreshPublished = generation;
     this.mcplTools = over.size > 0 ? tools.filter((tool) => toolServers.has(tool.name)) : tools;
