@@ -6,6 +6,9 @@
  *     (the framework traces the lost write, `message:lost`), so a later
  *     delete, a history sync and a live create of the message are no longer
  *     passed over for the lifetime of the module.
+ * 73: a registry record written before own slots, whose observe edge names
+ *     an agent and no slot, reads the residents' shared slot, as it did, and
+ *     its own slot is its namespace's.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -16,6 +19,9 @@ import type { ContentBlock } from '@animalabs/membrane';
 import { AgentFramework } from '../src/index.js';
 import type { TraceEvent } from '../src/index.js';
 import { DiscordModule } from '../src/modules/discord/index.js';
+import { AgentRegistry, RESIDENTS_SLOT } from '../src/dendrite/registry.js';
+import { residentSpec, workerSpec } from '../src/dendrite/presets.js';
+import type { AgentRecord, RegistrySnapshot } from '../src/dendrite/types.js';
 import type { DiscordClientInterface, DiscordMessageData, HistoryMessage } from '../src/modules/discord/types.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
@@ -140,4 +146,30 @@ test('71: a Discord create lost at a surgery release ends its record, so the mes
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+const roles = { defaultDelivery: false, receivesUntargeted: false, receivesGateWakes: false, ownsProviderScheduling: false };
+
+test("73: a record from before own slots, whose edge names an agent and no slot, is restored reading the residents' shared slot, as it did", () => {
+  let snapshot: RegistrySnapshot | null = null;
+  const first = new AgentRegistry({ persist: (s) => { snapshot = JSON.parse(JSON.stringify(s)); } });
+  first.register(residentSpec('mira', { primary: true }));
+  first.register(workerSpec('worker-1', { spawnedBy: 'mira' }));
+  first.register({ name: 'o', kind: 'watcher', roles, lifetime: { kind: 'persistent' }, observes: [{ agent: 'worker-1' }], namespace: 'watch/o', ownSlot: { namespace: 'watch/o' } });
+  // As the code before the split wrote it: no ownSlot on any record, and the
+  // watcher's readsSharedSlot set, its edge with no slot reading the shared slot.
+  const legacy = snapshot! as RegistrySnapshot;
+  for (const record of legacy.records) delete (record as Partial<AgentRecord>).ownSlot;
+  legacy.records.find((r) => r.name === 'o')!.readsSharedSlot = true;
+
+  // The record awaiting re-declaration, as restored.
+  const awaiting = new AgentRegistry();
+  awaiting.restore(legacy, []);
+  const record = (awaiting as unknown as { awaiting: Map<string, AgentRecord> }).awaiting.get('o')!;
+  assert.deepEqual(record.ownSlot, { namespace: 'watch/o' }, "its own slot is its namespace's, not the shared slot");
+  assert.deepEqual(record.relationships.observes, [{}], 'its edge reads the shared slot, the agent it named left off');
+  assert.deepEqual(awaiting.observedSlotOf(record.relationships.observes[0]!), RESIDENTS_SLOT);
+  assert.equal(record.readsSharedSlot, true, 'the old flag is kept as written');
+  // An edge declared now with the same shape reads the named agent's slot.
+  assert.deepEqual(awaiting.observedSlotOf({ agent: 'worker-1' }), { namespace: 'subagent/worker-1' });
 });

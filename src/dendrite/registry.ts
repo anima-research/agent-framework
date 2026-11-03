@@ -169,9 +169,24 @@ function readsResidentsSlot(
  * A restored record with its own slot: one written before `ownSlot` existed
  * gets the slot its `readsSharedSlot`, observe edges, inheritance and
  * namespace meant (resolveOwnSlot). Its `readsSharedSlot` is kept as written.
+ *
+ * Its observe edges are read as that code read them too: an edge with no
+ * `slot` read the residents' shared slot, whatever agent it named, so one
+ * naming an agent is restored without the name, an edge on the shared slot
+ * (which names neither), rather than one on that agent's own slot, which is
+ * what such an edge reads since own slots. A host that wants the agent's
+ * slot read declares the edge again (`{ agent }` in a spec now reads it).
  */
 function withOwnSlot(record: AgentRecord): AgentRecord {
   if (record.ownSlot !== undefined) return record;
+  const observes = record.relationships?.observes;
+  if (Array.isArray(observes)) {
+    record.relationships.observes = observes.map((edge) => {
+      if (edge.slot !== undefined || edge.agent === undefined) return edge;
+      const { agent: _named, ...onShared } = edge;
+      return onShared;
+    });
+  }
   const ownSlot = resolveOwnSlot({
     readsSharedSlot: record.readsSharedSlot,
     observes: record.relationships?.observes,
