@@ -1213,32 +1213,17 @@ function announcedDomainsOf(announce: unknown): string[] {
 
 const HIERARCHICAL_PREVIEW_REFUSAL = 'previewContext requires adaptiveResolution; the hierarchical path has no fold plan to preview';
 
-/**
- * Whether a restart's preview threw context-manager's refusal from a hierarchical strategy whose dry select
- * succeeded, which has no fold plan to report: the compile fits. `ContextManager.previewContext` returns null for
- * its own copy's `NoFoldPlanToPreviewError`, matched with `instanceof`, so the refusal reaches here from a strategy
- * built from another copy: a 0.23.1 copy's `NoFoldPlanToPreviewError`, or 0.23.0's plain Error. Its name and
- * message survive that boundary, as `classifyInferenceError` matches its errors by name.
- */
 function isNoFoldPlanRefusal(error: unknown): boolean {
   return error instanceof Error && (error.name === 'NoFoldPlanToPreviewError' || error.message === HIERARCHICAL_PREVIEW_REFUSAL);
 }
 
-/**
- * A maxStreamTokens restart declined at a tool boundary, since its preview said the restart's compile wouldn't fit
- * (`wont_fit`), threw an `UncoveredDropError` (`uncovered_drop`), or failed (`preview_error`), with what the
- * preview reported.
- */
 interface RestartDecline {
   reason: 'wont_fit' | 'uncovered_drop' | 'preview_error';
   finalTokens?: number;
   budgetTokens?: number;
   clearedBy?: readonly string[];
-  /** The stream it was declined on (`Agent.streamId`). */
   streamId: number;
-  /** What the preview rested on (`Agent.restartPreviewKey`), for a `wont_fit` decline a newer message can't clear. */
   key?: string;
-  /** How a `preview_error` decline's preview failed. */
   failure?: string;
 }
 
@@ -4098,7 +4083,6 @@ export class AgentFramework {
    *  auxiliary call, in no queue meanwhile. A drop takes one out and gives
    *  its admission back; the park, woken, then finds it gone. */
   private parkedContinuations: Set<InferenceRequest> = new Set();
-  /** Each agent's latest maxStreamTokens restart decline (declineBudgetRestart), for the stream it names. */
   private restartDeclines = new WeakMap<Agent, RestartDecline>();
   /** Each turn whose settle has ended it (settleAgent, endDroppedTurn), for
    *  its agent's scripts: its start's teardown can still hold the agent's
@@ -16892,15 +16876,9 @@ export class AgentFramework {
             : 0;
           const overPhysical = projectedRealTokens > (agent.physicalWindowTokens ?? Infinity);
 
-          // The maxStreamTokens restart is declined where context-manager's preview says its compile won't fit
-          // (declineBudgetRestart), and the stream goes on. The preview isn't asked at a boundary that ends the turn,
-          // or while the framework stops (the turn then ends with its stream), or where the window projection
-          // restarts the stream, which it does whatever the compile would do: that restart is the window's.
           const declined = overStreamBudget && !shouldEndTurn && !this.providerAdmissionClosed && !overPhysical
             ? this.declineBudgetRestart(agent) : undefined;
           const overBudget = overStreamBudget && !overPhysical && declined === undefined;
-          // Past maxStreamTokens and restarting, whichever check forced it: the boundary leaves the turn's
-          // routing to the restart.
           const budgetRestart = overStreamBudget && (overPhysical || declined === undefined);
           if (declined) {
             const { decline, previewed } = declined;
@@ -32022,13 +32000,6 @@ export class AgentFramework {
     // failure (a provider's 400, say) already says what it is, and its
     // message is the provider's text, which can quote anything, including
     // these phrases from the agent's own context.
-    //
-    // A stream whose maxStreamTokens restart was declined can go on until the
-    // provider refuses a request as too long, where no window projection
-    // bounds it. That `context_length` ends the turn as a refused restart
-    // compile would, so it alerts and drains as a refusal does. It's the
-    // declining stream's own refusal: a retry is a new stream,
-    // whose compile refuses for itself if it can't fit.
     const decline = errorType === 'context_length' && agent ? this.restartDeclines?.get(agent) : undefined;
     const afterDecline = decline !== undefined && decline.streamId === agent?.streamId;
     const overBudget =
