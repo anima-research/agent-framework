@@ -25,6 +25,7 @@ import type {
 import { AgentFramework, PassthroughStrategy } from '../src/index.js';
 import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../src/tool-result-history.js';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
+import { TOOL_RESULT_NOTICE_ROOM } from '../src/tool-image-ledger.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 
 /**
@@ -343,7 +344,7 @@ describe('tool-result spill completion (issue #89)', () => {
             id: `page-${pages}`, name: 'workspace--read', input, callerAgentName: 'prime',
           });
           assert.strictEqual(result.success, true, result.error);
-          const page = result.data as { content: string; offsetChars: number; nextOffsetChars: number | null };
+          const page = result.structured as { content: string; offsetChars: number; nextOffsetChars: number | null };
           assert.strictEqual(page.offsetChars, recovered.length);
           assert.ok(page.content.length > 0);
           // Exercise the actual stored/live spill policy on each read result.
@@ -357,7 +358,11 @@ describe('tool-result spill completion (issue #89)', () => {
           const outcome = storage.spilled.get(`page-${pages}`)!;
           assert.strictEqual(outcome.filePath, null, 'read-back must not spill again');
           assert.ok(outcome.text.length <= cap);
-          assert.strictEqual(JSON.parse(outcome.text).content, page.content);
+          // And it uses its room: the advised page is sized to the cap, up to
+          // the 2,000 characters a page is advised at the most.
+          if (page.nextOffsetChars !== null) assert.ok(outcome.text.length > Math.min(cap / 2, 2_000), `a page of ${outcome.text.length} at a cap of ${cap}`);
+          assert.strictEqual(outcome.text, (result.data as Array<{ text: string }>)[0]!.text, 'the page is stored as its text');
+          assert.ok(outcome.text.endsWith(`\n--- content ---\n${page.content}`), 'which ends with its content');
           recovered += page.content;
           pages++;
           if (page.nextOffsetChars === null) break;
@@ -394,7 +399,7 @@ describe('tool-result spill completion (issue #89)', () => {
         id: 'tail', name: 'read', input: { path: ref[1], offsetChars: expected.length - 100, limitChars: 100 },
       });
       assert.strictEqual(lastPage.success, true);
-      assert.deepStrictEqual((lastPage.data as { content: string }).content, expected.toString().slice(-100));
+      assert.deepStrictEqual((lastPage.structured as { content: string }).content, expected.toString().slice(-100));
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });
@@ -426,6 +431,132 @@ describe('tool-result spill completion (issue #89)', () => {
     }
   });
 
+  it('spills a plain string result as its text: lines intact, greppable, not one JSON-quoted line', async () => {
+    // A module tool that answers with a line-per-item listing returns a
+    // string. It used to be JSON-quoted on the way to history, so its spill
+    // file held one escaped line that could only be paged by character.
+    const body = Array.from({ length: 3000 }, (_, i) => `[review] org/repo#${i} "title ${i}"\tsize ${'t'.repeat(10)}`).join('\n');
+    const h = await startSpillTurn({
+      prefix: 'spill-string-',
+      result: { success: true, data: body },
+      withWorkspace: true,
+    });
+    try {
+      const stored = await waitForStoredToolResult(h.framework);
+      assert.ok(stored, 'tool result should be stored');
+      assert.ok(stored.content.startsWith('[review] org/repo#0 "title 0"\t'), 'inline head is the text itself, unquoted');
+
+      const refMatch = stored.content.match(/workspace file (files\/tool-results\/\S+\.txt)/);
+      assert.ok(refMatch, 'reference should name the spill file');
+      const file = await h.workspace!.readBinary(refMatch[1]);
+      assert.ok('data' in file, 'spill file should be readable');
+      const saved = (file as { data: Buffer }).data.toString('utf8');
+      assert.strictEqual(saved, body, 'the spill file holds the string verbatim');
+      assert.strictEqual(saved.split('\n').length, 3000, 'one line per item');
+
+      // grep finds one item, on its own line.
+      const grep = await h.workspace!.handleToolCall({
+        id: 'grep', name: 'grep', input: { pattern: 'repo#2999 ', path: refMatch[1] },
+      });
+      assert.strictEqual(grep.success, true, grep.error);
+      const matches = (grep.structured as { results: Array<{ matches: Array<{ line: number; text: string }> }> })
+        .results.flatMap((r) => r.matches);
+      assert.deepStrictEqual(matches.map((m) => [m.line, m.text]), [[3000, body.split('\n')[2999]]]);
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a plain string result reaches history and the live wire as its text, byte-identical', async () => {
+    const body = 'As of 10:00. 2 open.\n[review] org/repo#1 "Fix it"\n[merge] org/repo#2 done';
+    const h = await startSpillTurn({
+      prefix: 'string-wire-',
+      result: { success: true, data: body },
+      withWorkspace: false,
+    });
+    try {
+      const stored = await waitForStoredToolResult(h.framework);
+      assert.ok(stored, 'tool result should be stored');
+      assert.strictEqual(stored.content, body, 'history holds the string, not its JSON encoding');
+      const wire = h.membrane.lastStream?.receivedToolResults[0] as
+        Array<{ content: unknown }> | undefined;
+      assert.ok(wire && wire.length === 1, 'one wire tool result expected');
+      assert.strictEqual(wire[0].content, body, 'the wire carries the same text');
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a result stored JSON-quoted, as strings were before they went as their text, is sent as stored after a restart', async () => {
+    // History keeps each result's text as it was stored, so a string result
+    // stored in its old quoted form reaches the next request byte for byte,
+    // and a cached prompt's prefix doesn't move. This doesn't depend on how a
+    // string is rendered now: the store is seeded with the old form directly.
+    const quoted = JSON.stringify('As of 10:00. 2 open.\n[review] org/repo#1 "Fix it"');
+    const { tempDir, storePath } = tempStorePath('string-stored-');
+    try {
+      const seed = await AgentFramework.create({
+        storePath,
+        membrane: new MockMembrane().asMembrane(),
+        agents: [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all' }],
+        modules: [],
+        syncIntervalMs: 0,
+      });
+      try {
+        const cm = seed.getAgent('prime')!.getContextManager();
+        cm.addMessage('prime', [{ type: 'tool_use', id: 'call_old', name: 'canned--fetch', input: {} }]);
+        cm.addMessage('user', [{ type: 'tool_result', toolUseId: 'call_old', content: quoted }]);
+      } finally {
+        await seed.stop();
+      }
+      const h = await startSpillTurn({
+        prefix: 'unused-',
+        result: { success: true, data: 'new' },
+        withWorkspace: false,
+        tempDir,
+        storePath,
+      });
+      try {
+        const deadline = Date.now() + 20_000;
+        while (h.membrane.calls.length === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+        const request = h.membrane.calls[0];
+        assert.ok(request, 'the boot makes a request');
+        const sent = request.messages
+          .flatMap((m) => (Array.isArray(m.content) ? m.content : []) as Array<{ type: string; toolUseId?: string; content?: unknown }>)
+          .filter((b) => b.type === 'tool_result' && b.toolUseId === 'call_old')
+          .map((b) => b.content);
+        assert.deepStrictEqual(sent, [quoted], 'the stored result goes as it was stored');
+      } finally {
+        await h.framework.stop();
+      }
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('an empty string result is stored and sent as a result with no data is: as no text', async () => {
+    // JSON quoted an empty string as '""'. Kept as it is, it is the text a
+    // result with no data already gave, so nothing downstream meets a new shape.
+    const seen: Array<{ stored: string; wire: unknown }> = [];
+    for (const result of [{ success: true, data: '' }, { success: true }] as ToolResult[]) {
+      const h = await startSpillTurn({ prefix: 'empty-string-', result, withWorkspace: false });
+      try {
+        const stored = await waitForStoredToolResult(h.framework);
+        assert.ok(stored, 'tool result should be stored');
+        const wire = h.membrane.lastStream?.receivedToolResults[0] as Array<{ content: unknown }> | undefined;
+        assert.ok(wire && wire.length === 1, 'one wire tool result expected');
+        seen.push({ stored: stored.content, wire: wire[0].content });
+      } finally {
+        await h.framework.stop();
+        rmSync(h.tempDir, { recursive: true, force: true });
+      }
+    }
+    assert.deepStrictEqual(seen[0], seen[1], 'an empty string goes as no data does');
+    assert.deepStrictEqual(seen[0], { stored: '', wire: '' });
+  });
+
   it('falls back to EXPLICIT plain truncation with no writable workspace', async () => {
     const h = await startSpillTurn({
       prefix: 'spill-nows-',
@@ -436,7 +567,7 @@ describe('tool-result spill completion (issue #89)', () => {
       const stored = await waitForStoredToolResult(h.framework);
       assert.ok(stored, 'tool result should be stored');
       assert.ok(stored.content.length < CAPPED, 'inline copy must be capped');
-      assert.match(stored.content, /no writable workspace, full content not retained/);
+      assert.match(stored.content, /no writable workspace mount without an include, full content not retained/);
       assert.doesNotMatch(stored.content, /workspace file/);
     } finally {
       await h.framework.stop();
@@ -526,6 +657,31 @@ describe('tool-result spill completion (issue #89)', () => {
     }
   });
 
+  it('cuts a failed spill\'s reason at 200 units without halving a surrogate pair', async () => {
+    // 199 units, then an emoji whose two units straddle the 200-unit cut.
+    const reason = `${'r'.repeat(199)}😀 and the rest of the reason`;
+    const proto = WorkspaceModule.prototype as unknown as { writeBinary: (...args: unknown[]) => Promise<unknown> };
+    const writeBinary = proto.writeBinary;
+    proto.writeBinary = async () => ({ success: false, error: reason });
+    let h: SpillHarness | undefined;
+    try {
+      h = await startSpillTurn({
+        prefix: 'spill-pair-',
+        result: { success: true, data: { blob: 'w'.repeat(60_000) } },
+        withWorkspace: true,
+      });
+      const stored = await waitForStoredToolResult(h.framework);
+      assert.ok(stored, 'tool result should be stored');
+      assert.ok(stored.content.includes(`FAILED (${'r'.repeat(199)})`), `the cut leaves the emoji out whole: ${stored.content.slice(-400)}`);
+    } finally {
+      proto.writeBinary = writeBinary;
+      if (h) {
+        await h.framework.stop();
+        rmSync(h.tempDir, { recursive: true, force: true });
+      }
+    }
+  });
+
   it('clamps the default down to the strategy bound and reports it', async () => {
     // maxMessageTokens=1000 → strategy bound 4000 < default 24000. This branch
     // decides the cap for every resident on a bounded strategy — pin it.
@@ -538,7 +694,10 @@ describe('tool-result spill completion (issue #89)', () => {
     try {
       const stored = await waitForStoredToolResult(h.framework);
       assert.ok(stored, 'tool result should be stored');
-      assert.match(stored.content, /showing 4000 of \d+ chars/);
+      // The cap is the strategy's bound, so the head moves back to leave the
+      // notice its room: the stored copy, notice included, fits the bound.
+      assert.ok(stored.content.length <= 4000, `the stored copy is ${stored.content.length} characters`);
+      assert.match(stored.content, new RegExp(`showing ${4000 - TOOL_RESULT_NOTICE_ROOM} of \\d+ chars`));
       const prov = capProvenance(h.framework);
       assert.strictEqual(prov.tool_result_inline_max_chars_effective, 4000);
       assert.strictEqual(prov.tool_result_inline_max_chars_source, 'default');
@@ -616,7 +775,10 @@ describe('tool-result spill completion (issue #89)', () => {
       // The clamp is enforced on the wire, not just reported.
       const stored = await waitForStoredToolResult(h.framework);
       assert.ok(stored, 'tool result should be stored');
-      assert.match(stored.content, /showing 4000 of \d+ chars/);
+      // The cap is the strategy's bound, so the head moves back to leave the
+      // notice its room: the stored copy, notice included, fits the bound.
+      assert.ok(stored.content.length <= 4000, `the stored copy is ${stored.content.length} characters`);
+      assert.match(stored.content, new RegExp(`showing ${4000 - TOOL_RESULT_NOTICE_ROOM} of \\d+ chars`));
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });

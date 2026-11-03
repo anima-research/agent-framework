@@ -7,8 +7,10 @@ import { MembraneError } from '@animalabs/membrane';
 import type { DetailedUsage, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import { AgentFramework } from '../src/index.js';
 import { HealthModule } from '../src/modules/health/index.js';
+import { EPHEMERAL_USAGE_NAME } from '../src/usage/usage-tracker.js';
 import type { EventResponse, Module, ProcessEvent, ToolCall, TraceEvent } from '../src/index.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
+import { bindAsConversationFork } from './helpers/dendrite.js';
 
 class TurnTools implements Module {
   readonly name = 'test';
@@ -151,8 +153,9 @@ describe('tool-ended turn usage accounting', () => {
         const snapshot = f.framework.getSessionUsage();
         assert.equal(snapshot.inferenceCount, 1);
         assert.deepEqual(snapshot.totals, expectedTotals(totalUsage));
+        // An ephemeral run counts in the one shared entry; the traces name it.
         assert.deepEqual(snapshot.byAgent, [{
-          agentName: 'worker', usage: expectedTotals(totalUsage), inferenceCount: 1,
+          agentName: EPHEMERAL_USAGE_NAME, usage: expectedTotals(totalUsage), inferenceCount: 1, ephemeral: true,
         }]);
       } finally {
         await f.framework.stop();
@@ -209,7 +212,7 @@ describe('tool-ended turn usage accounting', () => {
     }
   });
 
-  it('attributes successive streams separately and persists their totals through store reopen', async () => {
+  it('attributes successive streams separately in the traces and the log, and persists their totals through store reopen', async () => {
     const f = await fixture();
     let stopped = false;
     try {
@@ -219,10 +222,18 @@ describe('tool-ended turn usage accounting', () => {
       await run(f.framework, 'bob');
       const snapshot = f.framework.getSessionUsage();
       assert.equal(snapshot.inferenceCount, 2);
-      assert.deepEqual(snapshot.byAgent, [
-        { agentName: 'alice', usage: expectedTotals(firstUsage), inferenceCount: 1 },
-        { agentName: 'bob', usage: expectedTotals(totalUsage), inferenceCount: 1 },
-      ]);
+      // Both ephemeral runs count in the one shared entry; the traces and the
+      // inference log attribute each stream to its own agent.
+      const shared = snapshot.byAgent.map(({ usage: { estimatedCost, ...tokens }, ...entry }) => ({ ...entry, tokens, currency: estimatedCost?.currency }));
+      assert.deepEqual(shared, [{
+        agentName: EPHEMERAL_USAGE_NAME,
+        tokens: { inputTokens: 350, outputTokens: 75, cacheCreationTokens: 75, cacheReadTokens: 130 },
+        currency: 'USD',
+        inferenceCount: 2,
+        ephemeral: true,
+      }]);
+      // The two streams' costs, 0.03 and 0.08.
+      assert.ok(Math.abs(snapshot.byAgent[0].usage.estimatedCost!.total - 0.11) < 1e-10);
       assert.deepEqual(f.traces.filter((e) => e.type === 'usage:updated').map((e) => e.agentName), ['alice', 'bob']);
       const logs = f.framework.queryInferenceLogs();
       assert.equal(logs.total, 2);
@@ -306,7 +317,9 @@ class SequentialStreamMembrane extends MockMembrane {
 }
 
 /** A stream that finishes one tool round with `usage`, then ends as `ending`
- *  says: with that event, by throwing it, or, for 'close', by just closing. */
+ *  says: with that event, by throwing it, or, for 'close', by just closing.
+ *  A cancel ends it as `cancelledAs` says: with an `aborted` event, as
+ *  membrane reports one, with an `error` event, or by just closing. */
 class RoundThenEnd implements YieldingStream {
   isWaitingForTools = false;
   pendingToolCallIds: string[] = [];
@@ -314,7 +327,11 @@ class RoundThenEnd implements YieldingStream {
   isCancelled = false;
   private resumed = false;
   private resume: (() => void) | null = null;
-  constructor(private readonly usage: DetailedUsage, private readonly ending: StreamEvent | Error | 'close') {}
+  constructor(
+    private readonly usage: DetailedUsage,
+    private readonly ending: StreamEvent | Error | 'close',
+    private readonly cancelledAs: 'aborted' | 'error' | 'close' = 'aborted',
+  ) {}
   provideToolResults(): void {
     this.isWaitingForTools = false;
     this.resumed = true;
@@ -333,11 +350,12 @@ class RoundThenEnd implements YieldingStream {
     yield {
       type: 'tool-calls',
       calls: [{ id: call.id, name: call.name, input: {} }],
-      context: { rawText: '', preamble: '', depth: 0, previousResults: [], accumulated: '', roundContent: [call] },
+      context: { rawText: '', preamble: '', depth: 0, previousResults: [], accumulated: '', roundContent: [call], supportsInjectedMessages: true },
     } as StreamEvent;
     if (!this.resumed) await new Promise<void>((r) => { this.resume = r; });
     if (this.isCancelled) {
-      yield { type: 'aborted', reason: 'user' } as StreamEvent;
+      if (this.cancelledAs === 'aborted') yield { type: 'aborted', reason: 'user' } as StreamEvent;
+      if (this.cancelledAs === 'error') yield { type: 'error', error: new Error('stream cancelled') } as StreamEvent;
       return;
     }
     if (this.ending === 'close') return;
@@ -447,7 +465,7 @@ describe('a stream counts its usage once, however it ends', () => {
 
   for (const [name, ending] of [
     ['a stream error', { type: 'error', error: new MembraneError({ type: 'auth', retryable: false, message: 'key revoked', rawError: { status: 401 } }) } as StreamEvent],
-    ['an abort', { type: 'aborted', reason: 'timeout' } as StreamEvent],
+    ['an abort', { type: 'aborted', reason: 'error' } as StreamEvent],
     ['a thrown stream', new Error('socket hang up')],
   ] as const) {
     it(`${name} after a finished round counts that round once and logs it with the failure`, async () => {
@@ -484,6 +502,67 @@ describe('a stream counts its usage once, however it ends', () => {
         assert.equal(logs.length, 1);
         assert.equal(logs[0].success, false);
         assert.deepEqual(logs[0].tokenUsage, expectedTokens(firstUsage), 'the failure entry carries the finished round');
+      } finally {
+        await framework.stop();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+/** Its first stream holds a tool round over the budget and the turn's end; a later stream, a restart's, the end alone. */
+class ToolRoundThenFinal extends MockMembrane {
+  override streamYielding(request: NormalizedRequest): YieldingStream {
+    this.calls.push(request);
+    const stream = new MockYieldingStream(this.calls.length === 1
+      ? [toolResponse('echo', 'echo-1', firstUsage), finalResponse('Recovered.', secondUsage)]
+      : [finalResponse('Recovered.', secondUsage)]);
+    this.lastStream = stream;
+    return stream;
+  }
+}
+
+describe('an agent whose model binds its thinking, with its window size set, takes no new stream mid-turn for budget alone', () => {
+  // A budget restart compiles afresh mid-turn, and what that compile changes ahead of the turn's own earlier rounds
+  // takes their reasoning out of the request. The window projection still guards.
+  const huge = 1_000_000;
+  for (const [label, limits, restarts] of [
+    ['binds, with a window size: the stream goes on', { thinkingBinding: { binds: true }, physicalWindowTokens: huge }, []],
+    ['binds, with no window size: the budget restart, as before', { thinkingBinding: { binds: true } }, ['context_budget']],
+    ['a window size, without binds: the budget restart, as before', { physicalWindowTokens: huge }, ['context_budget']],
+    // A window size that isn't a finite number reads as none: a config read from JSON can hold null.
+    ['binds, with a null window size: the budget restart, as before', { thinkingBinding: { binds: true }, physicalWindowTokens: null as unknown as number }, ['context_budget']],
+    ['binds, with an infinite window size: the budget restart, as before', { thinkingBinding: { binds: true }, physicalWindowTokens: Infinity }, ['context_budget']],
+    // One a config holds as a string reads as its number, as the projection's comparison always read it.
+    ['binds, with a window size given as a string: the stream goes on', { thinkingBinding: { binds: true }, physicalWindowTokens: String(huge) as unknown as number }, []],
+    // The first call's projection passes the window: its prompt (170, cache included), its output (20) and the
+    // reserve for the next response (100) make 290, past 250, where without the prompt they'd make 120.
+    ['binds, with a window the stream outgrows: the window restart', { thinkingBinding: { binds: true }, maxTokens: 100, physicalWindowTokens: 250 }, ['physical_window']],
+  ] as const) {
+    it(label, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'af-binds-budget-'));
+      const membrane = new ToolRoundThenFinal();
+      const framework = await AgentFramework.create({
+        storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(), agents: [],
+        modules: [new TurnTools()], syncIntervalMs: 0,
+      });
+      const traces: TraceEvent[] = [];
+      framework.onTrace((event) => traces.push(event));
+      framework.start();
+      const tornDown = streamsDriven(framework);
+      try {
+        const { agent, contextManager } = await framework.createEphemeralAgent({
+          name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
+          proseRouting: 'disabled', maxStreamTokens: 50, ...limits,
+        });
+        contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+        await framework.runEphemeralToCompletion(agent, contextManager);
+        await tornDown();
+        const restarted = traces.filter((e) => e.type === 'inference:stream_restarted');
+        assert.ok(firstUsage.inputTokens! > 50, 'the first call is over the budget');
+        assert.deepEqual(restarted.map((e) => (e as { reason?: string }).reason), restarts);
+        assert.equal(membrane.calls.length, restarts.length > 0 ? 2 : 1, restarts.length > 0 ? 'the restart opened a second stream' : 'one stream, its tool round included');
+        assert.equal(traces.filter((e) => e.type === 'inference:completed').length, 1, 'the turn completed');
       } finally {
         await framework.stop();
         rmSync(dir, { recursive: true, force: true });
@@ -618,7 +697,7 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
       assert.ok(await pollUntil(() => r.traces.some((e) => e.type === 'usage:updated')), 'the finished round was counted');
       const logs = r.framework.queryInferenceLogs({ agentName: 'resident' }).entries.map((e) => e.entry);
       assert.equal(logs.length, 1);
-      assert.match(String(logs[0].error), /^Provider acceleration cooldown: /);
+      assert.match(String(logs[0].error), /^This request would exceed your organization's maximum usage increase rate/);
       assert.deepEqual(logs[0].tokenUsage, expectedTokens(firstUsage));
       assert.deepEqual(r.framework.getSessionUsage().totals, expectedTotals(firstUsage));
       assert.equal(r.traces.filter((e) => e.type === 'usage:updated').length, 1);
@@ -639,12 +718,11 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
     // cooldown. Its turns aren't an external message's default target, so
     // the turn is started directly.
     const internal = r.framework as unknown as {
-      conversationAgentHomes: Map<string, string>;
       startAgentStream(agent: unknown, trigger: unknown): Promise<void>;
     };
     r.framework.start();
     try {
-      internal.conversationAgentHomes.set('resident', 'world:zz');
+      bindAsConversationFork(r.framework, 'resident', { serverId: 'stub', channelId: 'world:zz' });
       r.framework.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text: 'first' }]);
       await internal.startAgentStream(r.framework.getAgent('resident'),
         { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
@@ -652,7 +730,7 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
         && r.framework.queryInferenceLogs({ agentName: 'resident' }).total > 0), 'the finished round was counted and logged');
       const logs = r.framework.queryInferenceLogs({ agentName: 'resident' }).entries.map((e) => e.entry);
       assert.equal(logs.length, 1, 'the wait writes the stream\'s one entry');
-      assert.match(String(logs[0].error), /^Provider wait: /);
+      assert.equal(String(logs[0].error), 'zz rate limit reached for requests');
       assert.deepEqual(logs[0].tokenUsage, expectedTokens(firstUsage), 'and it carries the finished round');
       assert.deepEqual(r.framework.getSessionUsage().totals, expectedTotals(firstUsage));
       assert.equal(r.traces.filter((e) => e.type === 'usage:updated').length, 1);
@@ -780,47 +858,99 @@ class HeldTools implements Module {
   }
 }
 
-describe('a stream that ends without writing its own entry is logged once, in finally', () => {
-  async function residentWith(stream: YieldingStream, tools: Module) {
-    const dir = mkdtempSync(join(tmpdir(), 'af-end-turn-usage-'));
-    const membrane = new MockMembrane();
-    let made = false;
-    membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
-      membrane.calls.push(request);
-      if (made) return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'done' }])]);
-      made = true;
-      return stream;
-    };
-    const framework = await AgentFramework.create({
-      storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
-      agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system', allowedTools: 'all' }],
-      modules: [new InputModule(), tools], syncIntervalMs: 0, maintenanceIntervalMs: 0,
-    });
-    const traces: TraceEvent[] = [];
-    framework.onTrace((event) => traces.push(event));
-    framework.start();
-    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
-    return { dir, membrane, framework, traces };
-  }
+type WrittenEntry = { agentName?: string; success?: boolean; error?: string; tokenUsage?: unknown };
 
-  function loggedOnce(framework: AgentFramework, traces: TraceEvent[], error: RegExp) {
-    assert.equal(traces.filter((e) => e.type === 'usage:updated').length, 1, 'counted once');
-    assert.deepEqual(framework.getSessionUsage().totals, expectedTotals(firstUsage));
-    const logs = framework.queryInferenceLogs({ agentName: 'resident' }).entries.map((e) => e.entry);
-    assert.equal(logs.length, 1, 'one entry');
-    assert.equal(logs[0].success, false);
-    assert.match(String(logs[0].error), error);
-    assert.deepEqual(logs[0].tokenUsage, expectedTokens(firstUsage), 'the entry carries what was counted');
-  }
+/** A resident whose first stream is `stream`, with `tools` and any `limits`
+ *  of its own, started on one message. `written` holds every inference-log
+ *  entry as it's written, which outlasts stop() closing the store the log
+ *  query reads. */
+async function residentWith(stream: YieldingStream, tools: Module, limits: { maxStreamTokens?: number } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'af-end-turn-usage-'));
+  const membrane = new MockMembrane();
+  let made = false;
+  membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
+    membrane.calls.push(request);
+    if (made) return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'done' }])]);
+    made = true;
+    return stream;
+  };
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
+    agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system', allowedTools: 'all', ...limits }],
+    modules: [new InputModule(), tools], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+  });
+  const traces: TraceEvent[] = [];
+  framework.onTrace((event) => traces.push(event));
+  const written: WrittenEntry[] = [];
+  const internal = framework as unknown as { logInference: (entry: WrittenEntry) => void };
+  const write = internal.logInference.bind(framework);
+  internal.logInference = (entry) => {
+    written.push(entry);
+    write(entry);
+  };
+  framework.start();
+  framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+  return { dir, membrane, framework, traces, written };
+}
 
-  it('a turn abandoned by an operator quiesce after a finished round', async () => {
+function loggedOnce(framework: AgentFramework, traces: TraceEvent[], error: RegExp) {
+  assert.equal(traces.filter((e) => e.type === 'usage:updated').length, 1, 'counted once');
+  assert.deepEqual(framework.getSessionUsage().totals, expectedTotals(firstUsage));
+  const logs = framework.queryInferenceLogs({ agentName: 'resident' }).entries.map((e) => e.entry);
+  assert.equal(logs.length, 1, 'one entry');
+  assert.equal(logs[0].success, false);
+  assert.match(String(logs[0].error), error);
+  assert.deepEqual(logs[0].tokenUsage, expectedTokens(firstUsage), 'the entry carries what was counted');
+}
+
+/** Whether the stream's turn has ended: the host mode lists an agent among
+ *  its active turns from the turn's dequeue to its settled teardown, which
+ *  comes after the stream's accounting. */
+function tornDown(framework: AgentFramework): boolean {
+  return !framework.getHostModeStatus().activeTurnAgents.includes('resident');
+}
+
+describe("a stop's own entry carries the rounds its stream finished, once", () => {
+  it("a caller's stop after a finished round", async () => {
+    const tools = new HeldTools();
+    const r = await residentWith(new RoundThenEnd(firstUsage, unseenCompletion()), tools);
+    try {
+      assert.ok(await pollUntil(() => tools.calledWith.length === 1), 'the round finished and its tool is running');
+      assert.ok(r.framework.abortInference('resident'), 'the stream was cancelled');
+      assert.ok(await pollUntil(() => tornDown(r.framework)), 'its teardown ran');
+      loggedOnce(r.framework, r.traces, /^Stream cancelled \(user\)$/);
+    } finally {
+      tools.release();
+      await r.framework.stop();
+      rmSync(r.dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a shutdown after a finished round', async () => {
+    const tools = new HeldTools();
+    const r = await residentWith(new RoundThenEnd(firstUsage, unseenCompletion()), tools);
+    try {
+      assert.ok(await pollUntil(() => tools.calledWith.length === 1), 'the round finished and its tool is running');
+      const stopping = r.framework.stop();
+      tools.release();
+      await stopping;
+      assert.equal(r.traces.filter((e) => e.type === 'usage:updated').length, 1, 'counted once');
+      const entries = r.written.filter((entry) => entry.agentName === 'resident');
+      assert.deepEqual(entries.map((entry) => entry.error), ['Stream aborted: shutdown'], "one entry, the shutdown's own");
+      assert.deepEqual(entries[0].tokenUsage, expectedTokens(firstUsage), 'it carries the round the stream finished');
+    } finally {
+      rmSync(r.dir, { recursive: true, force: true });
+    }
+  });
+
+  it('an operator quiesce after a finished round', async () => {
     const tools = new HeldTools();
     const r = await residentWith(new RoundThenEnd(firstUsage, unseenCompletion()), tools);
     try {
       assert.ok(await pollUntil(() => tools.calledWith.length === 1), 'the round finished and its tool is running');
       await r.framework.quiesce({ timeoutMs: 50, abandon: true });
-      assert.ok(await pollUntil(() => r.framework.queryInferenceLogs({ agentName: 'resident' }).total > 0), 'logged');
-      loggedOnce(r.framework, r.traces, /^Turn abandoned by operator quiesce$/);
+      assert.ok(await pollUntil(() => tornDown(r.framework)), 'its teardown ran');
+      loggedOnce(r.framework, r.traces, /^Stream aborted: quiesce_abandoned$/);
     } finally {
       // Let the held tool finish while the framework's queue is still open.
       tools.release();
@@ -831,6 +961,139 @@ describe('a stream that ends without writing its own entry is logged once, in fi
     }
   });
 
+  it('an operator quiesce before the first round returns: its entry has nothing to carry', async () => {
+    const stream = new FirstRoundHeld();
+    const r = await residentWith(stream, new TurnTools());
+    try {
+      assert.ok(await pollUntil(() => stream.started), 'the stream is running');
+      await r.framework.quiesce({ timeoutMs: 50, abandon: true });
+      assert.ok(await pollUntil(() => stream.isCancelled), 'the abandon cancelled it');
+      assert.ok(await pollUntil(() => tornDown(r.framework)), 'its teardown ran');
+      const logs = r.framework.queryInferenceLogs({ agentName: 'resident' }).entries.map((e) => e.entry);
+      assert.deepEqual(logs.map((entry) => entry.error), ['Stream aborted: quiesce_abandoned'], "one entry, the abandon's own");
+      assert.equal(logs[0].tokenUsage, undefined, 'it carries no usage');
+      assert.equal(r.traces.filter((e) => e.type === 'usage:updated').length, 0, 'nothing counted');
+      assert.equal(r.framework.getSessionUsage().inferenceCount, 0);
+    } finally {
+      await r.framework.stop();
+      rmSync(r.dir, { recursive: true, force: true });
+    }
+  });
+
+  // The stop terminals are reached from the `aborted` case, the `error` case
+  // and the block after the stream loop, each with the stream's logStream.
+  const stops = [
+    { stop: "a caller's stop", error: 'Stream cancelled (user)' },
+    { stop: 'a shutdown', error: 'Stream aborted: shutdown' },
+    { stop: 'an operator quiesce', error: 'Stream aborted: quiesce_abandoned' },
+  ] as const;
+  for (const cancelledAs of ['error', 'close'] as const) {
+    for (const { stop, error } of stops) {
+      it(`${stop} after a finished round, its stream reporting the cancel ${cancelledAs === 'error' ? 'as an error' : 'by just closing'}`, async () => {
+        const tools = new HeldTools();
+        const r = await residentWith(new RoundThenEnd(firstUsage, unseenCompletion(), cancelledAs), tools);
+        try {
+          assert.ok(await pollUntil(() => tools.calledWith.length === 1), 'the round finished and its tool is running');
+          if (stop === 'a shutdown') {
+            const stopping = r.framework.stop();
+            tools.release();
+            await stopping;
+          } else {
+            if (stop === "a caller's stop") assert.ok(r.framework.abortInference('resident'), 'the stream was cancelled');
+            else await r.framework.quiesce({ timeoutMs: 50, abandon: true });
+            assert.ok(await pollUntil(() => tornDown(r.framework)), 'its teardown ran');
+          }
+          const entries = r.written.filter((entry) => entry.agentName === 'resident');
+          assert.deepEqual(entries.map((entry) => entry.error), [error], "one entry, the stop's own");
+          assert.deepEqual(entries[0].tokenUsage, expectedTokens(firstUsage), 'it carries the round the stream finished');
+          assert.equal(r.traces.filter((e) => e.type === 'usage:updated').length, 1, 'counted once');
+          assert.equal(r.traces.filter((e) => e.type === 'inference:exhausted').length, 0, 'and not as a failure');
+        } finally {
+          tools.release();
+          if (stop !== 'a shutdown') {
+            await pollUntil(() => r.traces.some((e) =>
+              (e.type === 'tool:completed' || e.type === 'tool:failed') && (e as { callId?: string }).callId === 'echo-1'));
+            await r.framework.stop();
+          }
+          rmSync(r.dir, { recursive: true, force: true });
+        }
+      });
+    }
+  }
+
+  // settleDeliberateCancel() writes after its trace, settleFrameworkCancel()
+  // before it.
+  for (const { stop, error } of stops) {
+    it(`${stop} after a finished round whose own entry's write throws stays a stop, and says so`, async () => {
+      const tools = new HeldTools();
+      const r = await residentWith(new RoundThenEnd(firstUsage, unseenCompletion()), tools);
+      const internal = r.framework as unknown as { logInference: (entry: WrittenEntry) => void };
+      const write = internal.logInference;
+      internal.logInference = (entry) => {
+        if (entry.error === error) throw new Error('zz store refused the write');
+        write(entry);
+      };
+      const lines: string[] = [];
+      const original = console.error;
+      console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+      try {
+        assert.ok(await pollUntil(() => tools.calledWith.length === 1), 'the round finished and its tool is running');
+        if (stop === 'a shutdown') {
+          const stopping = r.framework.stop();
+          tools.release();
+          await stopping;
+        } else {
+          if (stop === "a caller's stop") assert.ok(r.framework.abortInference('resident'), 'the stream was cancelled');
+          else await r.framework.quiesce({ timeoutMs: 50, abandon: true });
+          assert.ok(await pollUntil(() => tornDown(r.framework)), 'its teardown ran');
+        }
+        assert.equal(r.traces.filter((e) => e.type === 'inference:aborted').length, 1, 'one aborted trace');
+        assert.deepEqual(r.traces.filter((e) => e.type === 'inference:failed' || e.type === 'inference:exhausted').map((e) => e.type), [],
+          'and no failure');
+        assert.equal(lines.filter((line) =>
+          line.startsWith("[usage] agent=resident could not record a stopped stream's inference-log entry: ")).length, 1,
+          'the failed write is said, once');
+        assert.equal(r.traces.filter((e) => e.type === 'usage:updated').length, 1, 'the round is counted');
+        assert.deepEqual(r.written.filter((entry) => entry.agentName === 'resident').map((entry) => entry.error), [],
+          'and no other entry carries it');
+      } finally {
+        console.error = original;
+        tools.release();
+        if (stop !== 'a shutdown') {
+          await pollUntil(() => r.traces.some((e) =>
+            (e.type === 'tool:completed' || e.type === 'tool:failed') && (e as { callId?: string }).callId === 'echo-1'));
+          await r.framework.stop();
+        }
+        rmSync(r.dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+describe("a budget restart's own cancel isn't a caller's stop, however its stream reports it", () => {
+  // The restart marks its stream and then calls cancelStream() at the tool
+  // boundary, which leaves a reasonless caller record there too. The record
+  // decides only when the framework marked nothing.
+  for (const cancelledAs of ['error', 'close'] as const) {
+    it(`its stream reporting the cancel ${cancelledAs === 'error' ? 'as an error' : 'by just closing'}`, async () => {
+      const r = await residentWith(new RoundThenEnd(firstUsage, unseenCompletion(), cancelledAs), new TurnTools(), { maxStreamTokens: 50 });
+      try {
+        assert.ok(await pollUntil(() => r.traces.some((e) => e.type === 'inference:stream_restarted')), 'the boundary restarted the turn');
+        assert.ok(await pollUntil(() => r.membrane.calls.length >= 2), 'the restart opened its next stream');
+        assert.ok(await pollUntil(() => tornDown(r.framework)), 'and the turn ended');
+        assert.deepEqual(r.traces.filter((e) => e.type === 'inference:aborted'), [], 'no stop was traced');
+        const texts = r.framework.getAgent('resident')!.getContextManager().queryMessages({}).messages
+          .flatMap((m) => m.content.filter((b): b is { type: 'text'; text: string } => b.type === 'text').map((b) => b.text));
+        assert.ok(!texts.some((text) => text.startsWith('[turn-interrupted]')), 'and no stop marker was written');
+      } finally {
+        await r.framework.stop();
+        rmSync(r.dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+describe('a stream that ends without writing its own entry is logged once, in finally', () => {
   it('a failure after a completion is logged without carrying the usage again', async () => {
     const r = await resident([() => new MockYieldingStream([finalResponse('Done.', totalUsage)])]);
     // Something after the completion's entry throws: the stream's catch
@@ -896,29 +1159,8 @@ describe('a stream that ends without writing its own entry is logged once, in fi
     }
   });
 
-  it('a turn abandoned by an operator quiesce before its first round returns has nothing to carry, and writes no entry', async () => {
-    const stream = new FirstRoundHeld();
-    const r = await residentWith(stream, new TurnTools());
-    const internal = r.framework as unknown as { activeTurnTokens: Map<string, unknown>; activeStreams: Map<string, unknown> };
-    try {
-      assert.ok(await pollUntil(() => stream.started), 'the stream is running');
-      await r.framework.quiesce({ timeoutMs: 50, abandon: true });
-      assert.ok(await pollUntil(() => stream.isCancelled), 'the abandon cancelled it');
-      // The stream and its turn are released at the end of finally, after its accounting.
-      assert.ok(await pollUntil(() => !internal.activeTurnTokens.has('resident') && !internal.activeStreams.has('resident')),
-        'its teardown ran');
-      assert.equal(r.framework.queryInferenceLogs({ agentName: 'resident' }).total, 0, 'no entry');
-      assert.equal(r.traces.filter((e) => e.type === 'usage:updated').length, 0, 'nothing counted');
-      assert.equal(r.framework.getSessionUsage().inferenceCount, 0);
-    } finally {
-      await r.framework.stop();
-      rmSync(r.dir, { recursive: true, force: true });
-    }
-  });
-
   it("a write that fails while finally logs the stream doesn't skip the teardown after it", async () => {
-    const tools = new HeldTools();
-    const r = await residentWith(new RoundThenEnd(firstUsage, unseenCompletion()), tools);
+    const r = await residentWith(new RoundThenEnd(firstUsage, 'close'), new TurnTools());
     const internal = r.framework as unknown as {
       logInference: (entry: { error?: string }) => void;
       activeTurnTokens: Map<string, unknown>;
@@ -926,24 +1168,19 @@ describe('a stream that ends without writing its own entry is logged once, in fi
     };
     const write = internal.logInference.bind(r.framework);
     internal.logInference = (entry) => {
-      if (entry.error === 'Turn abandoned by operator quiesce') throw new Error('zz store refused the write');
+      if (entry.error === 'Stream ended without a final response') throw new Error('zz store refused the write');
       write(entry);
     };
     const lines: string[] = [];
     const original = console.error;
     console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
     try {
-      assert.ok(await pollUntil(() => tools.calledWith.length === 1), 'the round finished and its tool is running');
-      await r.framework.quiesce({ timeoutMs: 50, abandon: true });
       assert.ok(await pollUntil(() => lines.some((line) => line.startsWith('[usage] agent=resident could not record'))),
         'the failed write is said');
       assert.ok(await pollUntil(() => !internal.activeTurnTokens.has('resident') && !internal.activeStreams.has('resident')),
         'and the stream and its turn are still released');
     } finally {
       console.error = original;
-      tools.release();
-      await pollUntil(() => r.traces.some((e) =>
-        (e.type === 'tool:completed' || e.type === 'tool:failed') && (e as { callId?: string }).callId === 'echo-1'));
       await r.framework.stop();
       rmSync(r.dir, { recursive: true, force: true });
     }

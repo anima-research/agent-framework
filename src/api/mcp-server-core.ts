@@ -12,8 +12,10 @@
  */
 
 import WebSocket from 'ws';
-import { createInterface } from 'node:readline';
+import { escapeLineSeparators, readLines } from '../line-reader.js';
 import type { ApiRequest, ApiResponse, ApiEvent } from './types.js';
+import { jsonKind, readEnvelope } from '../jsonrpc-envelope.js';
+import { logValue } from '../mcpl/log-value.js';
 
 // ============================================================================
 // MCP Protocol Types
@@ -21,7 +23,8 @@ import type { ApiRequest, ApiResponse, ApiEvent } from './types.js';
 
 interface JsonRpcRequest {
   jsonrpc: '2.0';
-  id: string | number;
+  /** null is allowed, though JSON-RPC 2.0 discourages it. */
+  id: string | number | null;
   method: string;
   params?: unknown;
 }
@@ -86,20 +89,16 @@ export class McpServer {
     // Connect to WebSocket API
     await this.connectWs();
 
-    // Set up stdio interface
-    const rl = createInterface({
-      input: process.stdin,
-      output: process.stdout,
-      terminal: false,
-    });
-
-    rl.on('line', (line) => {
-      this.handleInput(line);
-    });
-
-    rl.on('close', () => {
-      this.close();
-      process.exit(0);
+    readLines(process.stdin, {
+      line: (line) => this.handleInput(line),
+      end: () => {
+        this.close();
+        process.exit(0);
+      },
+      tooLong: (maxChars) => {
+        this.close();
+        process.stderr.write(`MCP server stopped: a line on stdin was longer than ${maxChars.toLocaleString('en-US')} UTF-16 code units\n`, () => process.exit(1));
+      },
     });
 
     // Handle SIGINT gracefully
@@ -188,20 +187,58 @@ export class McpServer {
   }
 
   private handleInput(line: string): void {
+    let message: unknown;
     try {
-      const message = JSON.parse(line);
-      
-      // Check if this is a notification (no id) or a request (has id)
-      if (!('id' in message) || message.id === undefined) {
-        // This is a notification - handle silently without response
-        // Common notifications: notifications/initialized, notifications/cancelled
-        return;
-      }
-      
-      // This is a request - process and respond
-      this.handleRequest(message as JsonRpcRequest);
+      message = JSON.parse(line);
     } catch {
       this.sendError(null, -32700, 'Parse error');
+      return;
+    }
+    // A request is an object (JSON-RPC 2.0 §4), so any other JSON value is an
+    // invalid request, answered with id null (§5). An array is JSON-RPC's
+    // batch, which this server doesn't take.
+    if (Array.isArray(message)) {
+      this.sendError(null, -32600, "Invalid Request: this server doesn't accept batches, so send each message on a line of its own");
+      return;
+    }
+    if (message === null || typeof message !== 'object') {
+      this.sendError(null, -32600, `Invalid Request: a message must be an object, not ${jsonKind(message)}`);
+      return;
+    }
+
+    // The envelope is read once, here (src/jsonrpc-envelope.ts says how).
+    const envelope = readEnvelope(message as Record<string, unknown>);
+    switch (envelope.kind) {
+      case 'request':
+        void this.handleRequest(message as JsonRpcRequest);
+        return;
+      case 'invalid':
+        this.sendError(envelope.id, envelope.error.code, envelope.error.message);
+        return;
+      case 'response': {
+        // This server sends its client no requests, so a response can't be
+        // matched to one, and it's never answered. A client that couldn't
+        // read a line this server sent, whatever it was, may answer it with
+        // id null, or under MCP with no id. The error member, if it has one,
+        // is printed through logValue, which escapes and bounds the client's
+        // text, and so is the id when it's a string or a number; any other
+        // id is named by its kind.
+        const { id, error } = message as { id?: unknown; error?: unknown };
+        const which = !Object.hasOwn(message as object, 'id') ? 'with no id'
+          : `whose id is ${typeof id === 'string' || typeof id === 'number' ? logValue(id) : jsonKind(id)}`;
+        console.error(`[agent-framework-mcp] ignored a response ${which}, since this server sends no requests` +
+          (error !== undefined ? `; its error: ${logValue(error)}` : ''));
+        return;
+      }
+      case 'notification':
+        // notifications/initialized, notifications/cancelled and the like
+        // need no answer.
+        return;
+      case 'neither':
+        // Not a Request object, which needs a method, nor a response: an
+        // invalid request, as a value that isn't an object is.
+        this.sendError(null, -32600, 'Invalid Request: a message needs a method or an id');
+        return;
     }
   }
 
@@ -219,10 +256,6 @@ export class McpServer {
               version: '0.1.0',
             },
           });
-          break;
-
-        case 'initialized':
-          // Client acknowledgment, no response needed
           break;
 
         case 'tools/list':
@@ -536,7 +569,7 @@ export class McpServer {
             },
             errorsOnly: {
               type: 'boolean',
-              description: 'Only show failed inferences',
+              description: "Only show inferences that didn't succeed: failed or stopped",
             },
             limit: {
               type: 'number',
@@ -639,7 +672,7 @@ export class McpServer {
     });
   }
 
-  private sendResult(id: string | number, result: unknown): void {
+  private sendResult(id: string | number | null, result: unknown): void {
     const response: JsonRpcResponse = {
       jsonrpc: '2.0',
       id,
@@ -667,7 +700,7 @@ export class McpServer {
   }
 
   private send(message: JsonRpcResponse | JsonRpcNotification): void {
-    process.stdout.write(JSON.stringify(message) + '\n');
+    process.stdout.write(escapeLineSeparators(JSON.stringify(message)) + '\n');
   }
 
   close(): void {

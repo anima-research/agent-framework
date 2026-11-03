@@ -39,6 +39,7 @@ import type {
 import { AgentFramework } from '../src/index.js';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
+import { UNREACHED_WATCHDOG, silenceRun } from './helpers/run-watchdog.js';
 
 function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve!: (value: T) => void;
@@ -499,6 +500,22 @@ describe('a stop at a tool boundary', () => {
     }
   });
 
+  it('abortInference at a tool boundary traces one inference:aborted, carrying its reason', async () => {
+    const b = await holdAtToolBoundary();
+    try {
+      assert.equal(b.framework.getAgent('prime')!.state.status, 'ready', 'the turn is held at its tool boundary');
+      assert.equal(b.framework.abortInference('prime', 'stopped at the boundary'), true, 'abortInference reports the abort');
+      await b.release();
+      await waitFor('the turn to end', b.turnEnded);
+      const aborted = b.traces.filter((t) => t.type === 'inference:aborted' && (t as { agentName?: string }).agentName === 'prime');
+      assert.deepEqual(aborted.map((t) => (t as { reason?: string }).reason), ['stopped at the boundary'],
+        "the stream's terminal traces the stop once, and abortInference adds none of its own");
+      await b.stop();
+    } finally {
+      await b.cleanup();
+    }
+  });
+
   it("a quiesce's abandon at a boundary over budget doesn't restart the turn in the maintenance window", async () => {
     // Membrane itself over a scripted provider that reports 10 input tokens,
     // over this agent's budget of 5, so the boundary's next step would be a
@@ -621,12 +638,14 @@ describe('a stop at a tool boundary', () => {
         allowedTools: 'all',
       });
       contextManager.addMessage('user', [{ type: 'text', text: 'fetch it' }]);
-      // Its idle watchdog disposes the run while the round's write is held.
-      const run = framework.runEphemeralToCompletion(agent, contextManager, { idleTimeoutMs: 300, idlePollMs: 50 });
+      // Once the round's write is held, the test makes the run look idle, and
+      // its idle watchdog disposes the run.
+      const run = framework.runEphemeralToCompletion(agent, contextManager, UNREACHED_WATCHDOG);
       const ended = run.then(() => null, (error: unknown) => error);
       framework.start();
       await within("the round's spill write to start", spills.entered);
       assert.equal(agent.state.status, 'ready', "the round's result is in and its boundary is storing it");
+      silenceRun(framework, 'worker');
 
       const error = await within('the run to be disposed', ended);
       assert.match(String(error), /stalled/, 'the watchdog ended the run');

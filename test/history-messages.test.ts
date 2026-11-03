@@ -96,15 +96,18 @@ async function service(t: TestContext, status: number, msg: string): Promise<str
  * upsert, delete or search) and how many of that kind came before it. A
  * string body goes as it is, as a web page; anything else, as JSON.
  */
-async function routed(t: TestContext, reply: (kind: string, n: number) => [number, unknown]): Promise<string> {
+async function routed(t: TestContext, reply: (kind: string, n: number, sent: unknown) => [number, unknown]): Promise<string> {
   const seen = new Map<string, number>();
   const server = createServer((req, res) => {
-    req.resume();
+    let raw = '';
+    req.on('data', (c: Buffer) => { raw += c.toString(); });
     req.on('end', () => {
       const kind = (req.url ?? '').slice((req.url ?? '').lastIndexOf('/') + 1);
       const n = seen.get(kind) ?? 0;
       seen.set(kind, n + 1);
-      const [status, body] = reply(kind, n);
+      let sent: unknown = null;
+      try { sent = raw ? JSON.parse(raw) : null; } catch { /* not JSON */ }
+      const [status, body] = reply(kind, n, sent);
       res.writeHead(status, { 'content-type': typeof body === 'string' ? 'text/html' : 'application/json' });
       res.end(typeof body === 'string' ? body : JSON.stringify(body));
     });
@@ -652,8 +655,8 @@ test('a semantic search the index service fails says nothing was searched, and w
   }
   // No answer within the timeout.
   assert.equal(
-    await search(await listen(t, createServer(() => {})), 300),
-    `Nothing was searched: the semantic index service didn't answer the search request within 300 ms. ${noAnswer}`,
+    await search(await listen(t, createServer(() => {})), 20),
+    `Nothing was searched: the semantic index service didn't answer the search request within 20 ms. ${noAnswer}`,
   );
   // Nothing listening: the port of a server that has closed.
   const gone = createServer(() => {});
@@ -775,9 +778,10 @@ test("a hit whose ts or meta can't be read is returned without it, and the host 
   ]);
 });
 
-test("a background sync whose upsert is answered with a web page, or JSON that isn't an object, keeps the client's sentence as lastError", async (t) => {
+test("a background sync whose upsert is answered with a web page, JSON that isn't an object, or an object without both counts keeps the client's sentence as lastError", async (t) => {
   const hit = { id: 'msg:m1', score: 0.9, ts: T / 1000, channel: 'c1', kind: 'message', level: null, meta: {}, text: 'hello', chars: 5 };
-  for (const body of [PAGE, [], null]) {
+  // A pass's budget spends the counts, so an answer without them isn't taken as one.
+  for (const body of [PAGE, [], null, {}, { inserted: 1, unchanged: 0 }, { inserted: '1', updated: 0 }, { inserted: 1, updated: null }]) {
     const url = await routed(t, (kind) => {
       if (kind === 'search') return [200, { namespace: 'test/ns', hits: [hit], count_indexed: 1, timing_ms: { embed: 1, search: 1 } }];
       if (kind === 'stats') return [404, { error: { message: 'no such index' } }];
@@ -786,7 +790,7 @@ test("a background sync whose upsert is answered with a web page, or JSON that i
     const found = await answer<{ index: Record<string, unknown> }>(withIndex(t, url), 'semantic_search', { query: 'x', limit: 1 });
     assert.equal(
       found.index.lastError,
-      'the semantic index service answered the upsert request without a JSON object (HTTP 200)',
+      'the semantic index service answered the upsert request without counts of the items inserted and updated (HTTP 200)',
       JSON.stringify(body),
     );
   }
@@ -860,7 +864,9 @@ test('a sync pass names each failure it met in lastError once: the stats answer 
   // A failed delete and a failed edit's upsert in one pass are each named, in the order met.
   const both = await routed(t, (kind, n) => {
     if (kind === 'search') return [200, { namespace: 'test/ns', hits: [hit], count_indexed: 1, timing_ms: { embed: 1, search: 1 } }];
-    if (kind === 'stats') return [404, { error: { message: 'no such index' } }];
+    // An index that's made, so the removal goes to /delete: a pass whose
+    // stats answer 404 has no index to remove from, and makes no call.
+    if (kind === 'stats') return [200, { namespace: 'test/ns', by_kind: {} }];
     if (kind === 'delete') return [500, { error: { message: 'delete failed' } }];
     // The edit's upsert comes first, before the walk's.
     return n === 0 ? [503, { error: { message: 'overloaded' } }] : [200, { inserted: 1, updated: 0, unchanged: 0, count: 1 }];
@@ -898,13 +904,15 @@ test('a background sync without stats fails on that answer when its budget cuts 
     },
   } as unknown as ContextManager;
   const hit = { id: 'msg:m1', score: 0.9, ts: T / 1000, channel: 'c1', kind: 'message', level: null, meta: {}, text: 'hello', chars: 5 };
-  const url = await routed(t, (kind) => {
+  const url = await routed(t, (kind, _n, sent) => {
     if (kind === 'search') return [200, { namespace: 'test/ns', hits: [hit], count_indexed: 1, timing_ms: { embed: 1, search: 1 } }];
     if (kind === 'stats') return [200, PAGE];
-    return [200, { inserted: 1, updated: 0, unchanged: 0, count: 1 }];
+    // Every message is new to this index, so each upsert inserts all it carries.
+    const items = (sent as { items?: unknown[] } | null)?.items?.length ?? 0;
+    return [200, { inserted: items, updated: 0, unchanged: 0, count: items }];
   });
   const warned = t.mock.method(console, 'warn', () => {});
-  // Batches of 100, so the 256 the pass walks end in a batch of 56, sent before the pass fails.
+  // Batches of 100, so the 256 the pass writes end in a batch of 56, sent before the pass fails.
   const h = new HistoryModule({ semantic: { url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0, syncBatch: 100 } });
   h.bind(many);
   t.after(() => h.stop());
@@ -1021,13 +1029,10 @@ test("the index client's failure carries the service's status, and a namespace t
     'the semantic index service answered the stats request with an error (HTTP 500: {"error":{"message":{"code":7}}})',
   );
 
-  // The timeout as the client used it: whole seconds, or else milliseconds.
   const silent = await listen(t, createServer(() => {}));
-  for (const [ms, within] of [[1000, '1 s'], [1100, '1100 ms']] as const) {
-    const late = await failed(client(silent, ms).stats());
-    assert.equal(late.message, `the semantic index service didn't answer the stats request within ${within}`);
-    assert.equal(late.status, null);
-  }
+  const late = await failed(client(silent, 20).stats());
+  assert.equal(late.message, "the semantic index service didn't answer the stats request within 20 ms");
+  assert.equal(late.status, null);
 });
 
 test('an answer cut off after its status counts as no answer, and says it was cut off', async (t) => {
@@ -1101,4 +1106,14 @@ test("the index's background sync names the index in the lines it logs", async (
     ),
     JSON.stringify(lines),
   );
+});
+
+test("the semantic index leaves out a stored context injection: a source's context, not something that happened", () => {
+  const row = (metadata: Record<string, unknown>): StoredMessage => ({
+    id: 'm1', sequence: 1, timestamp: new Date(0), participant: 'system_context:lessons',
+    content: [{ type: 'text', text: 'LESSON: check the logs first.' }], metadata,
+  } as unknown as StoredMessage);
+  assert.equal(semantic.messageToItem(row({ system: true, kind: 'context-injection',
+    contextInjection: { agent: 'prime', namespace: 'lessons', contentHash: 'h', part: 0, parts: 1 } }), {}), null);
+  assert.ok(semantic.messageToItem(row({}), {}), 'the premise: the same row unmarked is indexed');
 });

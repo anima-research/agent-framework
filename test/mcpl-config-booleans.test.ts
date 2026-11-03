@@ -17,6 +17,7 @@ import { assertServerConfigBooleans } from '../src/mcpl/transport.js';
 import type { McplHostCapabilities, McplServerConfig } from '../src/mcpl/types.js';
 
 const WHAT_TRUE_DOES = {
+  credentialRequired: 'true requires a provider credential on every WebSocket dial without fallback; false or leaving it out keeps legacy behavior',
   inheritEnv: "true passes the server the host's whole environment, and false or leaving it out passes only the allowlisted and LC_* host variables",
   reconnect: "true retries in the background when the server can't be reached or its connection drops, and false or leaving it out doesn't",
   allowHostCommands: "true lets the server run the host's admin commands, such as undo, hide, unstick and quiesce, and false or leaving it out refuses them",
@@ -62,11 +63,15 @@ test('any other value is refused, naming the server, the setting and the kind of
   }
 });
 
-test('inheritEnv is checked only for a stdio server, since a WebSocket server never reads it', () => {
+test('inheritEnv is checked only for a stdio server, since a network server never reads it', () => {
   // A url alone or transport: 'websocket' dials, as openTransport chooses.
   check({ ...WEBSOCKET, inheritEnv: 'false' });
   check({ id: 'remote', url: 'ws://127.0.0.1:1', command: 'unused', transport: 'websocket', inheritEnv: 'no' });
-  // A url beside a command, with no transport, spawns the command.
+  // So does an http(s) url, over the modern engine.
+  check({ id: 'web', url: 'https://127.0.0.1:1/mcp', inheritEnv: 'false' });
+  // A url beside a command, with no transport, names no transport to use, so
+  // its family check refuses it; its booleans are still checked as a stdio
+  // server's.
   assert.throws(() => check({ id: 'both', url: 'ws://127.0.0.1:1', command: 'discord-mcpl', inheritEnv: 'false' }),
     /MCPL server "both" inheritEnv must be true or false, unquoted, not a string: /);
   // The other two apply to both transports.

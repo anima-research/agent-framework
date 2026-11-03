@@ -124,8 +124,9 @@ describe('default operator branch names', () => {
     await framework.switchBranch('main');
     await assert.rejects(
       framework.rollbackToMessage('scout', { messageId: ids[1], branchName: 'chosen' }),
-      (error: unknown) => error instanceof OperatorActionError && error.code === 'failed'
-        && /Branch already exists: chosen/.test(error.message),
+      // Refused before anything is prepared, as a known collision is.
+      (error: unknown) => error instanceof OperatorActionError && error.code === 'invalid'
+        && /^Rollback branch chosen already exists$/.test(error.message),
     );
     assert.deepEqual(branchNames(), ['chosen', 'main']);
   });

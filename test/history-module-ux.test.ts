@@ -373,3 +373,85 @@ describe('HistoryModule UX: real-store ordering (catch-up backfill)', () => {
     assert.equal(c.hasMore, true);
   });
 });
+
+describe('HistoryModule UX: a case-insensitive match\'s snippet', () => {
+  // `İ` (U+0130) is the one character whose lower case is longer (two UTF-16
+  // units: `i` and a combining dot), so each one before a match moves the
+  // match's index in the lowered text one unit past its index in the text.
+  it('stays on its match when İ comes before it', async () => {
+    const text = `${'İ'.repeat(100)} the needle is here`;
+    const { mod } = stub([mk({ id: 'i1', ms: min(1), text })]);
+    const d = data(await call(mod, 'search', { query: 'needle' }));
+    assert.equal(d.matches.length, 1);
+    assert.equal(d.matches[0].snippet, `…${text.slice(105 - 80)}`);
+  });
+
+  it('stays on its match when the search is case-sensitive, which lowers nothing', async () => {
+    const text = `${'İ'.repeat(100)} the Needle is here`;
+    const { mod } = stub([mk({ id: 'i5', ms: min(1), text })]);
+    const d = data(await call(mod, 'search', { query: 'Needle', caseSensitive: true }));
+    assert.equal(d.matches.length, 1);
+    assert.equal(d.matches[0].snippet, `…${text.slice(105 - 80)}`);
+  });
+
+  it('stays on its match with wholeWord', async () => {
+    const text = `${'İ'.repeat(100)} the needle is here`;
+    const { mod } = stub([mk({ id: 'i2', ms: min(1), text })]);
+    const d = data(await call(mod, 'search', { query: 'needle', wholeWord: true }));
+    assert.equal(d.matches.length, 1);
+    assert.equal(d.matches[0].snippet, `…${text.slice(105 - 80)}`);
+  });
+
+  it('spans the match in the text when the query holds an İ', async () => {
+    const text = `${'x'.repeat(200)} İstanbul ${'y'.repeat(200)}`;
+    const { mod } = stub([mk({ id: 'i3', ms: min(1), text })]);
+    const d = data(await call(mod, 'search', { query: 'İstanbul' }));
+    assert.equal(d.matches.length, 1);
+    assert.equal(d.matches[0].snippet, `…${'x'.repeat(79)} İstanbul ${'y'.repeat(79)}…`);
+  });
+
+  // `İ` lowers to `i` and then U+0307, a combining dot, so a match can start
+  // or end inside its lower case. The snippet then takes in the whole `İ`.
+  it('takes in the whole İ when the match starts inside its lower case', async () => {
+    const text = `${'a'.repeat(100)}İ${'b'.repeat(100)}`;
+    const { mod } = stub([mk({ id: 'i4', ms: min(1), text })]);
+    const d = data(await call(mod, 'search', { query: '\u0307' }));
+    assert.equal(d.matches.length, 1);
+    assert.equal(d.matches[0].snippet, `…${'a'.repeat(80)}İ${'b'.repeat(80)}…`);
+  });
+
+  it('takes in the whole İ when the match starts before it and ends inside its lower case, after earlier İs', async () => {
+    const text = `${'İ'.repeat(5)}${'a'.repeat(100)}İ${'b'.repeat(100)}`;
+    const { mod } = stub([mk({ id: 'i6', ms: min(1), text })]);
+    const d = data(await call(mod, 'search', { query: 'ai' }));
+    assert.equal(d.matches.length, 1);
+    assert.equal(d.matches[0].snippet, `…${'a'.repeat(81)}İ${'b'.repeat(80)}…`);
+  });
+
+  it('takes in both İs when the match starts inside one and ends inside the next', async () => {
+    const text = `${'a'.repeat(100)}İİ${'b'.repeat(100)}`;
+    const { mod } = stub([mk({ id: 'i7', ms: min(1), text })]);
+    const d = data(await call(mod, 'search', { query: '\u0307i' }));
+    assert.equal(d.matches.length, 1);
+    assert.equal(d.matches[0].snippet, `…${'a'.repeat(80)}İİ${'b'.repeat(80)}…`);
+  });
+
+  it('stays on its match with characters outside the BMP before it', async () => {
+    // Each emoji is two UTF-16 units, and lowers to itself.
+    const text = `${'😀'.repeat(50)}${'x'.repeat(100)}İ the needle is here`;
+    const { mod } = stub([mk({ id: 'i8', ms: min(1), text })]);
+    const d = data(await call(mod, 'search', { query: 'needle' }));
+    assert.equal(d.matches.length, 1);
+    assert.equal(d.matches[0].snippet, `…${'x'.repeat(74)}İ the needle is here`);
+  });
+
+  it('passes over a message with an İ that holds no match', async () => {
+    const { mod } = stub([
+      mk({ id: 'i9', ms: min(1), text: 'İstanbul trip' }),
+      mk({ id: 'i10', ms: min(2), text: 'the needle is here' }),
+    ]);
+    const d = data(await call(mod, 'search', { query: 'needle' }));
+    assert.equal(d.matches.length, 1);
+    assert.equal(d.matches[0].snippet, 'the needle is here');
+  });
+});

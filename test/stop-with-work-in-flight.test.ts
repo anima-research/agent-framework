@@ -14,8 +14,21 @@
  *   - a server's push, incoming message or other request the host can't
  *     take any more is answered with a JSON-RPC error (-32000, "the host is
  *     stopping"), never "accepted", and never thrown out of the
- *     connection's listener; a handler's own fault is answered -32603.
- * Any other event pushed to a stopped framework still throws to its caller.
+ *     connection's listener; a handler's own fault is answered -32603,
+ *     "Internal error", or -32000 with the stop wording alone once the host
+ *     is stopping, and its own text goes only to the host's log.
+ * Any other event pushed to a stopped framework through pushEvent() still
+ * throws to its caller; a module's other events are logged and dropped.
+ * A turn waiting to retry is work in flight too: stop() cancels the retry,
+ * and leaves no agent inferring at the event gate (#334). The turn ends with
+ * inference:aborted, saying no retry follows its inference:failed, whether
+ * its stream failed to start or failed once started.
+ * Work that outlasts stop()'s budget fails the stop, with teardown gone on
+ * and the store left open (#373): a stream whose cancel can't reach it,
+ * whose agent's deferred writes wait for its own end, and an event loop in a
+ * module's onProcess, which finishes that iteration once the call returns
+ * and exits. Two such waits fail it together, and a later stop() waits for
+ * what an earlier one left running.
  * Each test waits on the event it needs (a log line, an answer), not on a
  * fixed delay, and then one more turn, so a late rejection would be seen.
  */
@@ -28,8 +41,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from '@babel/parser';
-import type { ContentBlock } from '@animalabs/membrane';
+import type { ContentBlock, StreamEvent } from '@animalabs/membrane';
 import type {
+  ErrorAction,
   Module,
   ModuleContext,
   ProcessEvent,
@@ -39,8 +53,8 @@ import type {
   ToolDefinition,
   ToolResult,
 } from '../src/index.js';
-import { AgentFramework } from '../src/index.js';
-import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { AgentFramework, ShutdownTimeoutError } from '../src/index.js';
+import { HeldStream, MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 
 /** Resolve once `cond` holds, polling each turn; fail, naming `what`, after `ms`. */
 async function until(cond: () => boolean, what: string, ms = 5000): Promise<void> {
@@ -257,7 +271,9 @@ describe('stop() with work still in flight', () => {
     }
     framework.start();
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
-    await module.started;
+    let started = false;
+    void module.started.then(() => { started = true; });
+    await until(() => started, 'the slow tool to start');
     return { framework, module, failed };
   }
 
@@ -337,7 +353,7 @@ describe('stop() with work still in flight', () => {
     assert.match(line, /the tool failed: .*the dispatch was lost/, line);
   });
 
-  it('any other event pushed to a stopped framework still throws to its caller', async () => {
+  it('any other event pushed to a stopped framework through pushEvent() still throws to its caller', async () => {
     const { framework, module } = await frameworkWithRunningTool();
     await framework.stop();
     assert.throws(
@@ -347,6 +363,438 @@ describe('stop() with work still in flight', () => {
     module.finish('success');
     await droppedLine();
     assert.deepEqual(rejections, []);
+  });
+
+  /** A resident whose retry waits longer than the test, so only stop() ends
+   *  the wait, which cancels the retry; `stream` is its one stream. */
+  async function frameworkWaitingToRetry(stream: () => MockYieldingStream): Promise<{
+    framework: AgentFramework; membrane: MockMembrane; inDelay: Promise<void>; turnEvents: Array<{ type: string; reason?: string }>;
+  }> {
+    let waiting!: () => void;
+    const inDelay = new Promise<void>((resolve) => { waiting = resolve; });
+    const membrane = new MockMembrane();
+    membrane.streamYielding = (request) => {
+      membrane.calls.push(request);
+      return stream();
+    };
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'store'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'test' }],
+      modules: [new SlowModule()],
+      gate: { config: { policies: [], default: 'always' } },
+      errorPolicy: {
+        maxRetries: 1,
+        onInferenceError: (_error: Error, _agent: string, attempt: number): ErrorAction => {
+          waiting();
+          return attempt < 1 ? { retry: true, delayMs: 60_000 } : { retry: false };
+        },
+      },
+    });
+    // What a listener that brackets the turn sees, such as a typing loop.
+    const turnEvents: Array<{ type: string; reason?: string }> = [];
+    framework.onTrace((event) => {
+      const traced = event as { type: string; agentName?: string; reason?: string };
+      if (traced.agentName === 'assistant' && /^inference:(started|completed|failed|aborted|exhausted)$/.test(traced.type)) {
+        turnEvents.push({ type: traced.type, ...(traced.reason !== undefined ? { reason: traced.reason } : {}) });
+      }
+    });
+    framework.start();
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+    return { framework, membrane, inDelay, turnEvents };
+  }
+
+  /** The turn's record on /healthz, which ends when the turn does. */
+  function lastInference(framework: AgentFramework): { startedAt?: number; endedAt?: number } | null | undefined {
+    const snapshot = framework.healthSnapshot() as {
+      agents: Array<{ name: string; lastInference: { startedAt?: number; endedAt?: number } | null }>;
+    };
+    return snapshot.agents.find((agent) => agent.name === 'assistant')?.lastInference;
+  }
+
+  const RETRY_CANCELLED = 'a retry waiting while the framework was stopping is dropped before it sends anything';
+
+  /** A stream that fails once it has started, so driveStream waits to retry. */
+  function failingOnceStarted(): MockYieldingStream {
+    const stream = new MockYieldingStream([]);
+    (stream as unknown as { events: unknown[] }).events.push({ type: 'error', error: new Error('overloaded') });
+    return stream;
+  }
+
+  it('a turn whose retry stop() cancels leaves no agent inferring at the event gate, and ends saying why', { timeout: 60_000 }, async () => {
+    // The stream can't start. While an agent is inferring at the gate, the
+    // gate buffers every batch it debounces instead of delivering it, and
+    // wakes no agent for it.
+    const { framework, membrane, inDelay, turnEvents } = await frameworkWaitingToRetry(() => {
+      throw new Error('the stream could not start');
+    });
+    const inferring = () => (framework.healthSnapshot().gate as { inferring: string[] }).inferring;
+    await inDelay;
+    assert.deepEqual(inferring(), ['assistant'], 'the turn is open at the gate while its retry waits');
+    await framework.stop();
+    assert.deepEqual(inferring(), [], 'stop() leaves no agent inferring');
+    assert.equal(membrane.calls.length, 1, 'the retry was cancelled, not sent');
+    // The attempt's inference:failed is usually followed by its retry: the
+    // turn ends with an event saying none follows, and its record ends.
+    assert.deepEqual(turnEvents, [
+      { type: 'inference:started' }, { type: 'inference:failed' }, { type: 'inference:aborted', reason: RETRY_CANCELLED },
+    ]);
+    const last = lastInference(framework);
+    assert.ok(last?.endedAt !== undefined && last.endedAt >= (last.startedAt ?? Infinity), JSON.stringify(last));
+    assert.deepEqual(rejections, []);
+  });
+
+  it('a turn whose stream failed once started, and whose retry stop() cancels, ends saying why', { timeout: 60_000 }, async () => {
+    // The same cancelled retry, waited for by the stream's own frame.
+    const { framework, membrane, inDelay, turnEvents } = await frameworkWaitingToRetry(failingOnceStarted);
+    await inDelay;
+    await framework.stop();
+    assert.equal(membrane.calls.length, 1, 'the retry was cancelled, not sent');
+    assert.deepEqual(turnEvents, [
+      { type: 'inference:started' }, { type: 'inference:failed' }, { type: 'inference:aborted', reason: RETRY_CANCELLED },
+    ]);
+    const last = lastInference(framework);
+    assert.ok(last?.endedAt !== undefined && last.endedAt >= (last.startedAt ?? Infinity), JSON.stringify(last));
+    assert.deepEqual(rejections, []);
+  });
+
+  it("a stream's cancelled retry says nothing when another turn of its agent's name holds the turn", { timeout: 60_000 }, async () => {
+    // The events carry only the name, so this frame's end would end that
+    // newer turn's bracket instead, as abortDroppedTurn's drops avoid too.
+    const { framework, inDelay, turnEvents } = await frameworkWaitingToRetry(failingOnceStarted);
+    await inDelay;
+    (framework as unknown as { activeTurnTokens: Map<string, number> }).activeTurnTokens.set('assistant', -1);
+    await framework.stop();
+    assert.deepEqual(turnEvents, [{ type: 'inference:started' }, { type: 'inference:failed' }]);
+    assert.deepEqual(rejections, []);
+  });
+
+  describe("stop()'s budget, with work that outlasts it", () => {
+    /** What `promise` has come to after `ms`: its rejection, 'resolved', or
+     *  'still pending', so a stop() that doesn't come back fails the test
+     *  rather than hanging it. */
+    async function settledWithin(promise: Promise<unknown>, ms: number): Promise<unknown> {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const late = new Promise<string>((resolve) => { timer = setTimeout(() => resolve('still pending'), ms); });
+      try {
+        return await Promise.race([promise.then(() => 'resolved', (error: unknown) => error), late]);
+      } finally { clearTimeout(timer); }
+    }
+
+    /**
+     * A resident whose stream, once started, yields nothing until the test
+     * releases it, cancel included (HeldStream), and a module whose onProcess
+     * waits on any text that starts with "hang" until the test lets it go.
+     * Any other text is added for the resident and asks for its inference.
+     */
+    async function frameworkWithHeldWork() {
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      let streaming!: () => void;
+      const residentStreaming = new Promise<void>((resolve) => { streaming = resolve; });
+      const membrane = new MockMembrane();
+      membrane.streamYielding = (request) => {
+        membrane.calls.push(request);
+        streaming();
+        return new HeldStream(released, [createMockResponse([{ type: 'text', text: 'resident done' }] as ContentBlock[])]);
+      };
+      const entered: string[] = [];
+      const hung = new Map<string, () => void>();
+      const order: string[] = [];
+      const events: Module = {
+        name: 'events',
+        async start() {},
+        async stop() { order.push('modules stopped'); },
+        getTools: () => [],
+        async handleToolCall() { return { success: true }; },
+        async onProcess(event) {
+          if (event.type !== 'external-message') return {};
+          const text = String((event as { content?: unknown }).content);
+          if (text.startsWith('hang')) {
+            entered.push(text);
+            await new Promise<void>((resolve) => { hung.set(text, resolve); });
+            return {};
+          }
+          return { addMessages: [{ participant: 'User', content: [{ type: 'text', text }] }], requestInference: true };
+        },
+      };
+      const framework = await AgentFramework.create({
+        storePath: join(tempDir, 'store'),
+        membrane: membrane.asMembrane(),
+        agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'test' }],
+        modules: [events],
+        syncIntervalMs: 0,
+      });
+      const push = (content: string) =>
+        framework.pushEvent({ type: 'external-message', source: 'test', content, metadata: {} } as unknown as ProcessEvent);
+      const letGo = (text: string) => { hung.get(text)?.(); };
+      const internals = framework as unknown as { deferredMessages: Array<{ forAgent?: string }>; loopPromise: Promise<void> | null };
+      const storedTexts = (): string[] => framework.getAgent('assistant')!.getContextManager().getAllMessages()
+        .flatMap((m) => m.content.map((b) => (b.type === 'text' ? (b as { text: string }).text : `<${b.type}>`)));
+      return { framework, release, residentStreaming, entered, letGo, order, push, internals, storedTexts };
+    }
+
+    for (const record of ['current', 'behind'] as const) {
+      it(`a stream that outlasts the budget says a persisted queue whose record is ${record} ${record === 'current' ? 'keeps' : 'can lose'} its agent's queued writes`, { timeout: 30_000 }, async () => {
+        const { framework, release, residentStreaming, push, internals } = await frameworkWithHeldWork();
+        const fw = framework as unknown as { deferredWritesPersisted: boolean; writeDeferredWrites: () => unknown };
+        try {
+          framework.start();
+          push('go');
+          await residentStreaming;
+          fw.deferredWritesPersisted = true;
+          if (record === 'behind') fw.writeDeferredWrites = () => { throw new Error('injected record write failure'); };
+          push('a note for later');
+          await until(() => internals.deferredMessages.length === 1, 'the note to be deferred behind the stream');
+          const outcome = await settledWithin(framework.stop(100), 5_000);
+          assert.ok(outcome instanceof ShutdownTimeoutError, String(outcome));
+          const line = logged.find((l) => l.includes('1 deferred write(s) for assistant stay queued')) ?? '';
+          assert.ok(line.includes('its stream is still running'), logged.join('\n'));
+          if (record === 'current') {
+            assert.ok(line.includes('the persisted queue keeps them for boot') && !/can lose|record is behind/.test(line), line);
+          } else {
+            assert.ok(["the persisted queue's record is behind", 'since its last write failed or met the cap', 'a restart can lose them']
+              .every((fact) => line.includes(fact)) && !line.includes('keeps them for boot'), line);
+          }
+        } finally {
+          release();
+          await framework.stop().catch(() => {});
+        }
+      });
+    }
+
+    it("a stream that outlasts the budget fails the stop, keeps the store open, and keeps its agent's deferred write queued until its own end stores it", { timeout: 30_000 }, async () => {
+      // The deferral's rule holds through the timeout: no entry lands ahead of
+      // a stream that may still write.
+      const { framework, release, residentStreaming, order, push, internals, storedTexts } = await frameworkWithHeldWork();
+      try {
+        framework.start();
+        push('go');
+        await residentStreaming;
+        push('a note for later');
+        await until(() => internals.deferredMessages.length === 1, 'the note to be deferred behind the stream');
+        const outcome = await settledWithin(framework.stop(100), 5_000);
+        assert.ok(outcome instanceof ShutdownTimeoutError && outcome.message.includes('stream:assistant'), String(outcome));
+        assert.ok(order.includes('modules stopped'), 'teardown went on');
+        assert.equal(framework.getStore().isClosed(), false, 'the stream may still write');
+        assert.ok(!storedTexts().includes('a note for later'), 'nothing landed ahead of the stream');
+        const kept = logged.filter((line) => line.startsWith('[deferral] stop:'));
+        assert.equal(kept.length, 1, logged.join('\n'));
+        for (const part of ['assistant', 'queued', 'may still write', 'memory-only', 'exits']) {
+          assert.ok(kept[0]!.includes(part), `${JSON.stringify(part)} in: ${kept[0]}`);
+        }
+        release();
+        await until(() => storedTexts().includes('a note for later'), "the stream's own end to store the note");
+        await framework.stop();
+        assert.equal(framework.getStore().isClosed(), true, 'a later stop() closes the store');
+        assert.deepEqual(rejections, []);
+      } finally {
+        release();
+        await framework.stop().catch(() => {});
+      }
+    });
+
+    it("a write deferred behind the entry a retry that failed to compile left is stored by stop(), with a budget or without", { timeout: 30_000 }, async () => {
+      // A resident stream fails and its error policy retries, but the retry's
+      // compile throws after taking the agent's stream id. The old frame no
+      // longer owns the activeStreams entry, so its finally leaves it, and no
+      // new handle replaces it: the entry outlives its stream. No stream that
+      // stop() waited on is still running, so the final flush stores a write
+      // deferred behind that entry, as on main.
+      class FailingStream extends MockYieldingStream {
+        constructor(private readonly released: Promise<void>) {
+          super([createMockResponse([{ type: 'text', text: 'unused' }] as ContentBlock[])]);
+        }
+        override async *[Symbol.asyncIterator](): AsyncGenerator<StreamEvent> {
+          await this.released;
+          yield { type: 'error', error: new Error('the provider failed') } as unknown as StreamEvent;
+        }
+      }
+      const agents = [{ name: 'assistant', model: 'test-model', systemPrompt: 'test' }];
+      const textsIn = (framework: AgentFramework): string[] => framework.getAgent('assistant')!.getContextManager().getAllMessages()
+        .flatMap((m) => m.content.map((b) => (b.type === 'text' ? (b as { text: string }).text : `<${b.type}>`)));
+      for (const budget of [undefined, 100]) {
+        let release!: () => void;
+        const released = new Promise<void>((resolve) => { release = resolve; });
+        const membrane = new MockMembrane();
+        membrane.streamYielding = (request) => {
+          membrane.calls.push(request);
+          return new FailingStream(released);
+        };
+        const events: Module = {
+          name: 'events',
+          async start() {},
+          async stop() {},
+          getTools: () => [],
+          async handleToolCall() { return { success: true }; },
+          async onProcess(event) {
+            if (event.type !== 'external-message') return {};
+            return { addMessages: [{ participant: 'User', content: [{ type: 'text', text: 'go' }] }], requestInference: true };
+          },
+        };
+        const attempts: number[] = [];
+        const storePath = join(tempDir, `store-${budget ?? 'unbounded'}`);
+        const framework = await AgentFramework.create({
+          storePath,
+          membrane: membrane.asMembrane(),
+          agents,
+          modules: [events],
+          syncIntervalMs: 0,
+          errorPolicy: {
+            maxRetries: 1,
+            onInferenceError: (_error: Error, _agent: string, attempt: number): ErrorAction => {
+              attempts.push(attempt);
+              return attempt < 1 ? { retry: true, delayMs: 0 } : { retry: false };
+            },
+          },
+        });
+        const internals = framework as unknown as {
+          activeStreams: Map<string, Promise<void>>;
+          deferredMessages: unknown[];
+          addMessage(participant: string, content: ContentBlock[]): string;
+        };
+        try {
+          framework.start();
+          framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+          await until(() => internals.activeStreams.has('assistant'), 'the first stream');
+          const handle = internals.activeStreams.get('assistant')!;
+          // The stream path compiles through the agent's own assembler
+          // (buildActivationRequest is only its wrapper for previews).
+          (framework.getAgent('assistant') as unknown as { assembleActivationRequest: () => never }).assembleActivationRequest = () => {
+            throw new Error('the compile failed');
+          };
+          release();
+          await handle;
+          await until(() => attempts.length === 2, 'the retry to fail');
+          assert.equal(internals.activeStreams.get('assistant'), handle, 'the old frame left its entry');
+          internals.addMessage('Antra', [{ type: 'text', text: 'late note' }] as ContentBlock[]);
+          assert.ok(!textsIn(framework).includes('late note'), 'deferred behind it');
+          await framework.stop(budget);
+          assert.ok(!logged.some((line) => line.startsWith('[deferral] stop:')), logged.join('\n'));
+        } finally {
+          release();
+          await framework.stop().catch(() => {});
+        }
+        const reopened = await AgentFramework.create({ storePath, membrane: new MockMembrane().asMembrane(), agents, modules: [], syncIntervalMs: 0 });
+        try {
+          assert.ok(textsIn(reopened).includes('late note'), `budget ${budget}: the store has the write:\n${textsIn(reopened).join('\n')}`);
+        } finally {
+          await reopened.stop();
+        }
+      }
+      assert.deepEqual(rejections, []);
+    });
+
+    it("a stream handle that rejects settles stop()'s wait on it, as on main, with a budget or without", { timeout: 30_000 }, async () => {
+      // A driver that crashed rather than ended: stop() waited on the
+      // streams with Promise.allSettled, so a rejection never failed it.
+      for (const budget of [undefined, 100]) {
+        const { framework } = await frameworkWithHeldWork();
+        const streams = (framework as unknown as { activeStreams: Map<string, Promise<void>> }).activeStreams;
+        const crashed = Promise.reject(new Error('the driver crashed'));
+        crashed.catch(() => {});
+        streams.set('assistant', crashed);
+        try {
+          framework.start();
+          await framework.stop(budget);
+          assert.equal(framework.getStore().isClosed(), true, `budget ${budget}: the stop finished`);
+        } finally {
+          streams.delete('assistant');
+          await framework.stop().catch(() => {});
+        }
+      }
+      assert.deepEqual(rejections, []);
+    });
+
+    it("an event loop still in a module's onProcess when the budget runs out fails the stop, and teardown goes on", { timeout: 30_000 }, async () => {
+      const { framework, entered, letGo, order, push } = await frameworkWithHeldWork();
+      try {
+        framework.start();
+        push('hang');
+        await until(() => entered.includes('hang'), 'the loop to enter the call');
+        const outcome = await settledWithin(framework.stop(100), 5_000);
+        assert.ok(outcome instanceof ShutdownTimeoutError
+          && outcome.message === 'Shutdown timed out after 100 ms; pending: event loop', String(outcome));
+        assert.ok(order.includes('modules stopped'), 'teardown went on, the module whose call is still running included');
+        assert.equal(framework.getStore().isClosed(), false);
+        letGo('hang');
+        await framework.stop();
+        assert.equal(framework.getStore().isClosed(), true, 'once the call returns, the loop ends and a later stop() closes the store');
+        assert.deepEqual(rejections, []);
+      } finally {
+        letGo('hang');
+        await framework.stop().catch(() => {});
+      }
+    });
+
+    it('a stream and the event loop that both outlast the budget each fail the stop, together as an AggregateError', { timeout: 30_000 }, async () => {
+      const { framework, release, residentStreaming, entered, letGo, push } = await frameworkWithHeldWork();
+      try {
+        framework.start();
+        push('go');
+        await residentStreaming;
+        push('hang');
+        await until(() => entered.includes('hang'), 'the loop to enter the call');
+        const outcome = await settledWithin(framework.stop(100), 5_000);
+        assert.ok(outcome instanceof AggregateError && !(outcome instanceof ShutdownTimeoutError), String(outcome));
+        assert.deepEqual(outcome.errors.map((error: unknown) => error instanceof ShutdownTimeoutError ? error.pending : String(error)),
+          [['stream:assistant'], ['event loop']]);
+        assert.equal(outcome.message,
+          'Framework shutdown failed: Shutdown timed out after 100 ms; pending: stream:assistant; Shutdown timed out after 100 ms; pending: event loop');
+        assert.equal(framework.getStore().isClosed(), false);
+        release();
+        letGo('hang');
+        await framework.stop();
+        assert.equal(framework.getStore().isClosed(), true);
+        assert.deepEqual(rejections, []);
+      } finally {
+        release();
+        letGo('hang');
+        await framework.stop().catch(() => {});
+      }
+    });
+
+    it("a stop() after a timed-out one waits for the loop that one left running, and keeps the store open until it has settled", { timeout: 30_000 }, async () => {
+      const { framework, entered, letGo, push } = await frameworkWithHeldWork();
+      try {
+        framework.start();
+        push('hang');
+        await until(() => entered.includes('hang'), 'the loop to enter the call');
+        const first = await settledWithin(framework.stop(100), 5_000);
+        assert.ok(first instanceof ShutdownTimeoutError && first.pending.includes('event loop'), String(first));
+        const second = await settledWithin(framework.stop(100), 5_000);
+        assert.ok(second instanceof ShutdownTimeoutError
+          && second.message === 'Shutdown timed out after 100 ms; pending: event loop', String(second));
+        assert.equal(framework.getStore().isClosed(), false, "the loop's call is still running");
+        letGo('hang');
+        await framework.stop();
+        assert.equal(framework.getStore().isClosed(), true, 'a stop() closes the store once the loop has settled');
+        assert.deepEqual(rejections, []);
+      } finally {
+        letGo('hang');
+        await framework.stop().catch(() => {});
+      }
+    });
+
+    it("a loop whose stop() came back while it was in a call exits once that call returns", { timeout: 30_000 }, async () => {
+      const { framework, entered, letGo, push, internals } = await frameworkWithHeldWork();
+      try {
+        framework.start();
+        push('hang');
+        await until(() => entered.includes('hang'), 'the loop to enter the call');
+        const outcome = await settledWithin(framework.stop(100), 5_000);
+        assert.ok(outcome instanceof ShutdownTimeoutError && outcome.pending.includes('event loop'), String(outcome));
+        const loop = internals.loopPromise!;
+        assert.equal(await settledWithin(loop, 100), 'still pending', 'the loop is still in its call');
+        letGo('hang');
+        assert.equal(await settledWithin(loop, 5_000), 'resolved', 'the loop exits once its call returns');
+        await framework.stop();
+        assert.deepEqual(rejections, []);
+      } finally {
+        letGo('hang');
+        await framework.stop().catch(() => {});
+      }
+    });
   });
 
   describe("tune-out's subconscious tools", () => {
@@ -394,6 +842,35 @@ describe('stop() with work still in flight', () => {
         const result = (pushed[0] as unknown as { result: ToolResult }).result;
         assert.deepEqual(result, { success: false, error: 'the summary failed', isError: true });
         assert.deepEqual(rejections, []);
+      } finally {
+        await framework.stop();
+      }
+    });
+
+    it('a rejection over 500 characters is cut there, counting code points, without halving a surrogate pair', async () => {
+      const { framework, settle, pushed } = await withTuneOut();
+      try {
+        // 499 characters, then an emoji whose two UTF-16 units straddle unit
+        // 500. Counted in code points, the emoji is the 500th character.
+        const message = `${'x'.repeat(499)}😀 and more`;
+        settle().reject(new Error(message));
+        await until(() => pushed.length > 0, 'the failed result');
+        const result = (pushed[0] as unknown as { result: ToolResult }).result;
+        assert.equal(result.error, `${'x'.repeat(499)}😀… (509 characters)`, 'the cut keeps the emoji whole, and the count is of code points');
+      } finally {
+        await framework.stop();
+      }
+    });
+
+    it('a rejection of 500 characters or fewer comes back whole, though it is longer than 500 UTF-16 units', async () => {
+      const { framework, settle, pushed } = await withTuneOut();
+      try {
+        // 300 emoji: 600 UTF-16 units, 300 characters.
+        const message = '😀'.repeat(300);
+        settle().reject(new Error(message));
+        await until(() => pushed.length > 0, 'the failed result');
+        const result = (pushed[0] as unknown as { result: ToolResult }).result;
+        assert.equal(result.error, message, 'within 500 characters, nothing is cut and no note is added');
       } finally {
         await framework.stop();
       }
@@ -490,7 +967,7 @@ describe('stop() with work still in flight', () => {
         modules: [],
       });
       const connection = Object.assign(new EventEmitter(), { id: 'srv' });
-      (framework as unknown as { wireMcplEvents(c: unknown): void }).wireMcplEvents(connection);
+      (framework as unknown as { wireMcplEvents(c: unknown, config: unknown): void }).wireMcplEvents(connection, { id: 'srv', url: 'wss://h/mcp?token=wireToken0123456789' });
       return { framework, connection };
     }
 
@@ -505,7 +982,7 @@ describe('stop() with work still in flight', () => {
       };
       fw.pushHandler = { handlePushEvent: handler };
       fw.channelRegistry = { handleIncoming: handler, handleRegister: handler, handleChanged: handler, stopAll: () => {} };
-      fw.inferenceRouter = { handleInferenceRequest: handler };
+      fw.inferenceRouter = { handleInferenceRequest: handler, stopAll: () => [] };
       fw.handleHostCommand = handler;
     }
 
@@ -520,23 +997,28 @@ describe('stop() with work still in flight', () => {
     ] as const;
 
     /**
-     * A server's responder, recording each answer.
-     * - throws: respondError records its answer, then throws (the connection is going).
+     * A server's responder, recording each answer it sends, and in `tried`
+     * each error answer asked of it.
+     * - throws: respondError throws, sending nothing (the connection is going).
      * - serializes: respond serializes the result before it records it, as the
-     *   connection's sendResponse does, so a result JSON can't hold throws.
+     *   connection's sendResponse does, so a result JSON can't hold throws,
+     *   with nothing sent.
      */
     function responder(opts: { throws?: boolean; serializes?: boolean } = {}) {
       const answers: Array<{ result?: unknown; error?: { code: number; message: string } }> = [];
+      const tried: Array<{ code: number; message: string }> = [];
       return {
         id: 7,
         answers,
+        tried,
         respond: (result: unknown) => {
           if (opts.serializes) JSON.stringify(result);
           answers.push({ result });
         },
         respondError: (code: number, message: string) => {
-          answers.push({ error: { code, message } });
+          tried.push({ code, message });
           if (opts.throws) throw new Error('the connection is gone');
+          answers.push({ error: { code, message } });
         },
       };
     }
@@ -575,35 +1057,7 @@ describe('stop() with work still in flight', () => {
       assert.deepEqual(rejections, []);
     });
 
-    for (const [event, method, params] of [
-      ['push-event', 'push/event', { featureSet: 'chat', eventId: 'e2', payload: { content: [{ type: 'text', text: 'waiting' }] } }],
-      ['channels-incoming', 'channels/incoming', { messages: [{ channelId: 'c', messageId: 'm2', content: [] }] }],
-      ['inference-request', 'inference/request', { messages: [] }],
-      ['host-command', 'host/command', { command: 'undo' }],
-    ] as const) {
-      it(`a ${method} held at the awareness barrier while the host stops is refused once the barrier lifts`, async () => {
-        const { framework, connection } = await wiredFramework();
-        let lift!: () => void;
-        (framework as unknown as { discordAwarenessBarrier: unknown }).discordAwarenessBarrier = {
-          promise: new Promise<void>((r) => { lift = r; }),
-        };
-        let handled = 0;
-        standIns(framework, async () => { handled++; return {}; });
-
-        const r = responder();
-        connection.emit(event, params, r);
-        await framework.stop();
-        lift();
-        await answered(r);
-
-        assert.equal(handled, 0);
-        assert.deepEqual(r.answers, [stopping]);
-        assert.ok(logged.some((line) => line.includes(`${method} from srv refused: the host is stopping`)), logged.join('\n'));
-        assert.deepEqual(rejections, []);
-      });
-    }
-
-    it('a handler running when the host stops, and then failing, is answered -32000 with its own message', async () => {
+    it('a handler running when the host stops, and then failing, is answered -32000 with the stop wording alone', async () => {
       const { framework, connection } = await wiredFramework();
       let release!: () => void;
       const gate = new Promise<void>((r) => { release = r; });
@@ -617,13 +1071,12 @@ describe('stop() with work still in flight', () => {
       release();
       await answered(push);
 
-      const reason = 'the host stopped while handling this request (Queue is closed)';
-      assert.deepEqual(push.answers, [{ error: { code: -32000, message: reason } }]);
-      assert.ok(logged.some((line) => line.includes(`push/event from srv failed: ${reason} (part of it may already have been admitted)`)), logged.join('\n'));
+      assert.deepEqual(push.answers, [{ error: { code: -32000, message: 'the host stopped while handling this request' } }]);
+      assert.ok(logged.some((line) => line.includes('[mcpl] srv push-event handler failed: "Queue is closed"')), logged.join('\n'));
       assert.deepEqual(rejections, []);
     });
 
-    it('a handler that throws is answered -32603 with its error, not rejected into the listener; a notification is only logged', async () => {
+    it('a handler that throws is answered -32603 "Internal error", not rejected into the listener, and its error is logged; a notification is only logged', async () => {
       const { framework, connection } = await wiredFramework();
       try {
         (framework as unknown as { pushHandler: unknown }).pushHandler = {
@@ -636,8 +1089,9 @@ describe('stop() with work still in flight', () => {
         await answered(push);
         await until(() => logged.some((line) => line.includes('the handler broke on e4')), "the notification's log line");
 
-        assert.deepEqual(push.answers, [{ error: { code: -32603, message: 'the handler broke on e3' } }]);
-        assert.ok(logged.some((line) => line.includes('push/event from srv failed: the handler broke on e4 (part of it may already have been admitted)')), logged.join('\n'));
+        assert.deepEqual(push.answers, [{ error: { code: -32603, message: 'Internal error' } }]);
+        assert.ok(logged.some((line) => line.includes('[mcpl] srv push-event handler failed: "the handler broke on e3"')), logged.join('\n'));
+        assert.ok(logged.some((line) => line.includes('[mcpl] srv push-event handler failed: "the handler broke on e4"')), logged.join('\n'));
         assert.deepEqual(rejections, []);
       } finally {
         await framework.stop();
@@ -680,13 +1134,9 @@ describe('stop() with work still in flight', () => {
         connection.emit('channels-incoming', { messages: [{ channelId: 'c', messageId: 'm', content: [] }] }, incoming);
         await answered(e5, e7, e8, e12, e13, e14, incoming);
 
-        assert.deepEqual(e5.answers, [{ error: { code: -32603, message: 'the handler failed' } }]);
-        assert.deepEqual(e7.answers, [{ error: { code: -32603, message: 'the handler failed: a plain string' } }]);
-        assert.deepEqual(e8.answers, [{ error: { code: -32603, message: 'the handler failed: (a value that could not be read)' } }]);
-        assert.deepEqual(e12.answers, [{ error: { code: -32603, message: 'the handler failed: (a value that could not be read)' } }]);
-        assert.deepEqual(e13.answers, [{ error: { code: -32603, message: '42' } }]);
-        assert.deepEqual(e14.answers, [{ error: { code: -32603, message: '(a value that could not be read)' } }]);
-        assert.deepEqual(incoming.answers, [{ error: { code: -32603, message: 'the handler failed' } }]);
+        for (const r of [e5, e7, e8, e12, e13, e14, incoming]) {
+          assert.deepEqual(r.answers, [{ error: { code: -32603, message: 'Internal error' } }]);
+        }
         assert.ok(!logged.some((line) => line.includes('refused')), 'a live host refuses nothing');
         assert.deepEqual(rejections, []);
       } finally {
@@ -694,7 +1144,7 @@ describe('stop() with work still in flight', () => {
       }
     });
 
-    it('a long error is answered and logged bounded', async () => {
+    it("a long error is answered with the standard message, and logged bounded", async () => {
       const { framework, connection } = await wiredFramework();
       try {
         (framework as unknown as { pushHandler: unknown }).pushHandler = {
@@ -703,9 +1153,36 @@ describe('stop() with work still in flight', () => {
         const push = responder();
         connection.emit('push-event', { featureSet: 'chat', eventId: 'e9', payload: { content: [{ type: 'text', text: 'x' }] } }, push);
         await answered(push);
-        const message = push.answers[0]!.error!.message;
-        assert.ok(message.length < 600, `answered ${message.length} characters`);
-        assert.match(message, /… \(5000 characters\)$/);
+        assert.deepEqual(push.answers, [{ error: { code: -32603, message: 'Internal error' } }]);
+        const line = logged.find((l) => l.includes('push-event handler failed')) ?? '';
+        assert.ok(line.length < 600, `logged ${line.length} characters`);
+        assert.ok(line.endsWith('…(5000)'), line.slice(-40));
+      } finally {
+        await framework.stop();
+      }
+    });
+
+    it("a handler's error quoting the server's configured credential is recorded and answered without it, also across the cut", async () => {
+      const { framework, connection } = await wiredFramework();
+      try {
+        // The credential starts just before the 500-character cut, so a cut
+        // made before redacting would keep its first characters.
+        // Once whole, and once with the credential across the 500-character
+        // cut, where a cut made before redacting keeps its first nine.
+        const errors = ['refused wireToken0123456789', `${'x'.repeat(490)} wireToken0123456789 and more`];
+        for (const [i, error] of errors.entries()) {
+          (framework as unknown as { pushHandler: unknown }).pushHandler = {
+            handlePushEvent: async () => { throw new Error(error); },
+          };
+          const push = responder();
+          connection.emit('push-event', { featureSet: 'chat', eventId: `e-cred-${i}`, payload: { content: [{ type: 'text', text: 'x' }] } }, push);
+          await answered(push);
+          const message = push.answers[0]!.error!.message;
+          await until(() => logged.filter((line) => line.includes('srv push-event handler failed')).length > i, 'the log line');
+          for (const text of [message, ...logged]) {
+            assert.ok(!text.includes('wireToken'), text.slice(-120));
+          }
+        }
       } finally {
         await framework.stop();
       }
@@ -723,10 +1200,10 @@ describe('stop() with work still in flight', () => {
         const push = responder();
         connection.emit('push-event', { featureSet: 'chat', eventId: 'e10', payload: { content: [{ type: 'text', text: 'x' }] } }, push);
         await answered(push);
-        await until(() => logged.some((line) => line.includes('failed after it was answered')), 'the log line');
+        await until(() => logged.some((line) => line.includes('the trace emit broke')), 'the log line');
 
         assert.deepEqual(push.answers, [{ result: { accepted: true } }]);
-        assert.ok(logged.some((line) => line.includes('push/event from srv failed after it was answered: the trace emit broke')), logged.join('\n'));
+        assert.ok(logged.some((line) => line.includes('[mcpl] srv push-event handler failed: "the trace emit broke"')), logged.join('\n'));
         assert.deepEqual(rejections, []);
       } finally {
         await framework.stop();
@@ -743,8 +1220,8 @@ describe('stop() with work still in flight', () => {
         connection.emit('push-event', { featureSet: 'chat', eventId: 'e21', payload: { content: [{ type: 'text', text: 'x' }] } }, push);
         await answered(push);
 
-        assert.deepEqual(push.answers, [{ error: { code: -32603, message: 'Do not know how to serialize a BigInt' } }]);
-        assert.ok(!logged.some((line) => line.includes('failed after it was answered')), logged.join('\n'));
+        assert.deepEqual(push.answers, [{ error: { code: -32603, message: 'Internal error' } }]);
+        assert.ok(!logged.some((line) => line.includes('a second answer was refused')), logged.join('\n'));
         assert.deepEqual(rejections, []);
       } finally {
         await framework.stop();
@@ -761,23 +1238,21 @@ describe('stop() with work still in flight', () => {
         const push = responder();
         connection.emit('push-event', { featureSet: 'chat', eventId: 'e22', payload: { content: [{ type: 'text', text: 'x' }] } }, push);
         await answered(push);
-        await until(() => logged.some((line) => line.includes('a second answer (respond) was refused')), 'the refused second answer');
+        await until(() => logged.some((line) => line.includes('a second answer was refused')), 'the refused second answer');
         await turn();
 
-        assert.deepEqual(push.answers, [{ error: { code: -32603, message: 'the handler broke first' } }]);
-        assert.ok(logged.some((line) => line.includes('push/event from srv: a second answer (respond) was refused; the request was already answered')), logged.join('\n'));
+        assert.deepEqual(push.answers, [{ error: { code: -32603, message: 'Internal error' } }]);
+        assert.ok(logged.some((line) => line.includes('[mcpl] srv push-event: a second answer was refused; the request was already answered')), logged.join('\n'));
         assert.deepEqual(rejections, []);
       } finally {
         await framework.stop();
       }
     });
 
-    it('a responder without respondError reaches the handler without one', async () => {
+    it('a responder with respond alone gets the handler\'s answer', async () => {
       const { framework, connection } = await wiredFramework();
       try {
-        let seen: string | undefined;
-        standIns(framework, async (_s: string, _p: unknown, r: { respond(x: unknown): void; respondError?: unknown }) => {
-          seen = typeof r.respondError;
+        standIns(framework, async (_s: string, _p: unknown, r: { respond(x: unknown): void }) => {
           r.respond({ results: [] });
         });
         const answers: unknown[] = [];
@@ -787,7 +1262,6 @@ describe('stop() with work still in flight', () => {
         await until(() => answers.length > 0, 'the answer');
         await turn();
 
-        assert.equal(seen, 'undefined', "a handler checking for respondError takes its fallback");
         assert.deepEqual(answers, [{ results: [] }]);
         assert.deepEqual(rejections, []);
       } finally {
@@ -795,7 +1269,7 @@ describe('stop() with work still in flight', () => {
       }
     });
 
-    it("every request listener answers its handler's throw -32603 with its error, never rejecting into the listener", async () => {
+    it("every request listener answers its handler's throw -32603 \"Internal error\" and logs the error, never rejecting into the listener", async () => {
       const { framework, connection } = await wiredFramework();
       try {
         standIns(framework, async () => { throw new Error('the handler broke'); });
@@ -806,9 +1280,9 @@ describe('stop() with work still in flight', () => {
         });
         await answered(...answers);
 
-        for (const [i, [, method]] of requests.entries()) {
-          assert.deepEqual(answers[i]!.answers, [{ error: { code: -32603, message: 'the handler broke' } }], method);
-          assert.ok(logged.some((line) => line.includes(`${method} from srv failed: the handler broke`)), `${method}:\n${logged.join('\n')}`);
+        for (const [i, [event, method]] of requests.entries()) {
+          assert.deepEqual(answers[i]!.answers, [{ error: { code: -32603, message: 'Internal error' } }], method);
+          assert.ok(logged.some((line) => line.includes(`[mcpl] srv ${event} handler failed: "the handler broke"`)), `${method}:\n${logged.join('\n')}`);
         }
         assert.deepEqual(rejections, []);
       } finally {
@@ -818,18 +1292,25 @@ describe('stop() with work still in flight', () => {
 
     it('an inference request during a render is refused -32600, and a throwing responder there is not rejected into the listener', async () => {
       const { framework, connection } = await wiredFramework();
+      const fw = framework as unknown as { pushCoalescer: unknown };
+      const coalescer = fw.pushCoalescer;
       try {
-        const fw = framework as unknown as { pushCoalescer: unknown };
-        const coalescer = fw.pushCoalescer;
         fw.pushCoalescer = { isRendering: () => true, suspend: () => {}, flush: () => {} };
         const inference = responder({ throws: true });
         connection.emit('inference-request', { messages: [] }, inference);
-        await answered(inference);
+        // A write that throws sent nothing, so the request is answered once
+        // more, as any handler's unanswered failure is; that throws too.
+        await until(() => inference.tried.length >= 2, 'the internal-error answer after the refusal failed');
+        await turn();
 
-        assert.deepEqual(inference.answers, [{ error: { code: -32600, message: 'Cannot request inference while push/render is in progress' } }]);
+        assert.deepEqual(inference.tried, [
+          { code: -32600, message: 'Cannot request inference while push/render is in progress' },
+          { code: -32603, message: 'Internal error' },
+        ]);
+        assert.deepEqual(inference.answers, []);
         assert.deepEqual(rejections, []);
-        fw.pushCoalescer = coalescer;
       } finally {
+        fw.pushCoalescer = coalescer;
         await framework.stop();
       }
     });
@@ -839,9 +1320,13 @@ describe('stop() with work still in flight', () => {
       await framework.stop();
       const push = responder({ throws: true });
       connection.emit('push-event', { featureSet: 'chat', eventId: 'e11', payload: { content: [{ type: 'text', text: 'x' }] } }, push);
-      await answered(push);
+      // The refusal's write threw, sending nothing, so the request is answered
+      // once more with the stop wording a failed handler gets; that throws too.
+      await until(() => push.tried.length >= 2, 'the stop answer after the refusal failed');
+      await turn();
 
-      assert.deepEqual(push.answers, [stopping]);
+      assert.deepEqual(push.tried, [stopping.error, { code: -32000, message: 'the host stopped while handling this request' }]);
+      assert.deepEqual(push.answers, []);
       assert.ok(logged.some((line) => line.includes('push/event from srv refused: the host is stopping')), logged.join('\n'));
       assert.deepEqual(rejections, []);
     });

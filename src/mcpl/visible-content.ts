@@ -14,21 +14,62 @@
  * a stored message.
  */
 
+import { classifyBlock, NON_STRING_TEXT_PLACEHOLDER } from './references.js';
+
 /**
  * True when `content` holds nothing the model would see: no non-text block,
  * and no text block whose text has a non-whitespace character. Mirrors the
  * request sanitizer, which drops text that is not a string or trims to ''.
- * Accepts MCPL wire blocks and converted membrane blocks alike.
+ * Accepts MCPL wire blocks and converted membrane blocks alike. A wire
+ * block is judged as the block the converter makes of it where that's text:
+ * MCP's embedded resource shows as the block its contents make
+ * (classifyBlock's `embedded`), so one whose contents are blank text holds
+ * nothing to see.
  */
 export function isVisiblyEmptyContent(content: readonly unknown[] | null | undefined): boolean {
   if (!Array.isArray(content)) return true;
   for (const block of content) {
     if (!block || typeof block !== 'object') continue;
     const b = block as { type?: unknown; text?: unknown };
+    const shown = b.type === 'resource' ? embeddedText(b) : undefined;
+    if (shown !== undefined) {
+      if (shown.trim() !== '') return false;
+      continue;
+    }
     if (b.type !== 'text') return false;
     if (typeof b.text === 'string' && b.text.trim() !== '') return false;
   }
   return true;
+}
+
+/** The text an embedded resource's contents make, or undefined for any other
+ *  block, an embedded resource shown as anything but text among them. */
+function embeddedText(block: unknown): string | undefined {
+  const c = classifyBlock(block);
+  return c.kind === 'embedded' && c.contents.kind === 'block' && c.contents.block.type === 'text' ? c.contents.block.text : undefined;
+}
+
+// What the converter shows for a text block whose text isn't a string,
+// beside the converters' other markers in references.ts.
+export { NON_STRING_TEXT_PLACEHOLDER };
+
+/** A wire text block whose text isn't a string, which the converter shows as
+ *  NON_STRING_TEXT_PLACEHOLDER. */
+function isNonStringTextBlock(block: unknown): boolean {
+  if (!block || typeof block !== 'object') return false;
+  const b = block as { type?: unknown; text?: unknown };
+  return b.type === 'text' && typeof b.text !== 'string';
+}
+
+/**
+ * isVisiblyEmptyContent for content as a converter showed it, `wire` being
+ * the content as it arrived, block for block: a block shown as
+ * NON_STRING_TEXT_PLACEHOLDER counts as the nothing it held. So content that
+ * is only such blocks (or blank text) is still empty, and anything else is
+ * judged as the converted blocks show it, placeholders included.
+ */
+export function isVisiblyEmptyConversion(wire: readonly unknown[], converted: readonly unknown[]): boolean {
+  return isVisiblyEmptyContent(converted.filter((_, i) => !isNonStringTextBlock(wire[i])));
 }
 
 /** The server id and feature set the marker must carry. */

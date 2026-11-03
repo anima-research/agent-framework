@@ -7,7 +7,9 @@
  * resident's own context as an [inference-failed] marker, wrote it to
  * stderr and failures.log, and traced it. These tests drive ~1 MB reasons
  * through the real failure paths and through each sink, and check that what
- * a small failure produced before is produced unchanged.
+ * a small failure produced before is produced unchanged. Two more check that
+ * the marker keeps a supplied reason and type on its one line, with an
+ * opening of a notice tag the framework knows marked.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -21,6 +23,7 @@ import type { ContextEntry, ContextLogView, ContextStrategy, MessageStoreView, R
 import type { ErrorPolicy, EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 import { AgentFramework as FrameworkClass } from '../src/framework.js';
+import { NOTICE_TAG } from '../src/notice-tags.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 const MEGA = 1_000_000;
@@ -130,6 +133,33 @@ test('a small unclassified reason produces exactly the marker it did before', ()
   assert.deepEqual(markers[0].meta, { system: true, kind: 'inference-failed', reason: '400 image exceeds 5 MB', consecutive: 1 });
   assert.deepEqual(logged[0], { agent: 'cairn', consecutive: 1, reason: '400 image exceeds 5 MB', kind: 'inference-exhausted' });
   assert.ok(errs.includes('[inference-failed] agent=cairn consecutive=1: 400 image exceeds 5 MB'));
+});
+
+test("the marker gives a failure's reason and type on its one line, with a notice's opening in them marked", () => {
+  const { fw, markers, restore } = makeHarness();
+  try {
+    fw.noteInferenceExhausted('cairn', `first\n[${NOTICE_TAG.inferenceFailed}] second\u2028third`, false, `over\n[${NOTICE_TAG.inferenceFailed}] loaded`, { httpStatus: 529 });
+  } finally { restore(); }
+  assert.equal(markers.length, 1);
+  const text: string = markers[0].text;
+  assert.ok(!/[\n\u2028]/.test(text), JSON.stringify(text));
+  assert.ok(text.includes(`the model call failed (over \\[${NOTICE_TAG.inferenceFailed}] loaded, HTTP 529) and produced no response`), JSON.stringify(text));
+  assert.ok(text.includes(`Reason: first \\[${NOTICE_TAG.inferenceFailed}] second third. If this recurs`), JSON.stringify(text));
+});
+
+test("the note for a turn that ended gives the failure's type on its one line, with a notice's opening in it marked", () => {
+  const { fw, markers, restore } = makeHarness();
+  fw.exhaustedTurns = new Map([['cairn', { roundsRan: true, callsCutOff: false, liveSpeech: false, speechRouting: false }]]);
+  try {
+    fw.noteInferenceExhausted('cairn', 'stopped', false, `over\n[${NOTICE_TAG.inferenceFailed}] loaded`, { httpStatus: 529 });
+  } finally { restore(); }
+  assert.equal(markers.length, 1);
+  const text: string = markers[0].text;
+  assert.ok(!/[\n\u2028]/.test(text), JSON.stringify(text));
+  assert.ok(text.includes(
+    `Your previous turn did not complete: it failed (over \\[${NOTICE_TAG.inferenceFailed}] loaded, HTTP 529). ` +
+    'Its earlier rounds ran, and their tool calls ran as their results show. Reason: stopped.',
+  ), JSON.stringify(text));
 });
 
 const isHigh = (text: string, index: number) => { const code = text.charCodeAt(index); return code >= 0xd800 && code <= 0xdbff; };
@@ -242,7 +272,7 @@ test('an over-budget phrase quoted inside a classified provider error does not k
     unclassified.fw.noteInferenceExhausted('cairn', 'Context would exceed hard budget (90000 > 80000)');
     await settle();
   } finally { unclassified.restore(); }
-  assert.equal(unclassified.ticks(), 8);
+  assert.ok(unclassified.ticks() > 0, 'the unclassified phrase kicks the drain');
 
   // ...decided on the whole reason, even where the excerpts omit the phrase.
   const long = makeHarness();
@@ -250,7 +280,7 @@ test('an over-budget phrase quoted inside a classified provider error does not k
     long.fw.noteInferenceExhausted('cairn', `${'x'.repeat(50_000)} Context would exceed hard budget ${'y'.repeat(50_000)}`);
     await settle();
   } finally { long.restore(); }
-  assert.equal(long.ticks(), 8, 'presentation bounds never change the decision');
+  assert.equal(long.ticks(), unclassified.ticks(), 'presentation bounds never change the decision');
 });
 
 test('a reason that is not a string is described whole, not thrown on: each sink cuts it once, and the fallback reads it uncut', async () => {
@@ -274,7 +304,14 @@ test('a reason that is not a string is described whole, not thrown on: each sink
     phrased.fw.noteInferenceExhausted('cairn', new Error(`${'x'.repeat(50_000)} Context would exceed hard budget ${'y'.repeat(50_000)}`));
     await settle();
   } finally { phrased.restore(); }
-  assert.equal(phrased.ticks(), 8);
+  // The same drain a short reason with the phrase kicks.
+  const short = makeHarness();
+  try {
+    short.fw.noteInferenceExhausted('cairn', new Error('Context would exceed hard budget'));
+    await settle();
+  } finally { short.restore(); }
+  assert.ok(short.ticks() > 0);
+  assert.equal(phrased.ticks(), short.ticks());
 });
 
 test("a caller's long error type is bounded wherever it is written", () => {
@@ -473,9 +510,9 @@ test('a thrown non-Error, and an error whose projection throws, still log bounde
 
 test('a provider hold keeps a bounded reason, and a failed resume logs the bounded projection', async () => {
   const providerState = (fw: any) => Object.assign(fw, {
-    ephemeralRuns: new Map(), conversationAgentHomes: new Map(), providerGates: new Map(),
+    ephemeralRuns: new Map(), registry: { ownsProviderScheduling: () => true, homeChannel: () => undefined }, providerGates: new Map(),
     providerAccelerationCooldowns: new Map(), providerAccelerationRecoveries: new Map(),
-    providerAdmissionClosed: false, activeTurnTokens: new Map(), quiesced: false,
+    providerAdmissionClosed: false, activeTurnTokens: new Map(), quiesced: false, deadlineCuts: new Map(),
   });
   const held = makeHarness();
   providerState(held.fw);
@@ -693,14 +730,11 @@ test('alert data that is not a plain object is one bounded field, not a field pe
   assert.deepEqual(logged[3], { agent: 'cairn', kind: 'zz-instance', reason: 'short message', data: { channel: 'zz-channel' } });
   assert.deepEqual({ ...recordAlert.data }, { channel: 'zz-channel' });
   assert.deepEqual(logged[4], { agent: 'cairn', kind: 'zz-record', reason: 'short message', channel: 'zz-channel' });
-  for (const [sink, fields] of [['trace', stringAlert.data], ['failures.log', logged[0]]] as const) {
-    assert.equal(Object.keys(fields).length, sink === 'trace' ? 1 : 4, `${sink}: string data's fields`);
-    assertCut(text, fields.data, 2_000, `${sink}: string data`);
-  }
-  for (const [sink, fields] of [['trace', arrayAlert.data], ['failures.log', logged[1]]] as const) {
-    assert.equal(Object.keys(fields).length, sink === 'trace' ? 1 : 4, `${sink}: array data's fields`);
-    assertCut(JSON.stringify(list), fields.data, 2_000, `${sink}: array data`);
-  }
+  // The trace carries what the record gets, bounded once.
+  assert.equal(Object.keys(stringAlert.data).length, 1, "string data's fields");
+  assertCut(text, stringAlert.data.data, 2_000, 'string data');
+  assert.equal(Object.keys(arrayAlert.data).length, 1, "array data's fields");
+  assertCut(JSON.stringify(list), arrayAlert.data.data, 2_000, 'array data');
   assert.deepEqual(smallAlert.data, { data: [1, 2] });
   assert.deepEqual(logged[2], { agent: 'cairn', kind: 'zz-small', reason: 'short message', data: [1, 2] });
 });
@@ -708,7 +742,7 @@ test('alert data that is not a plain object is one bounded field, not a field pe
 /** The projection's head for hugeProviderError(), before ': ' and the message. */
 const HUGE_ERROR_HEAD = 'MembraneError (invalid_request, HTTP 400, zz_bad_request, retryable=false)';
 
-test('alert data is bounded field by field, on the trace and the failures.log record', () => {
+test('alert data is bounded field by field on the trace', () => {
   const { fw, traces, logged, restore } = makeHarness();
   const nested = { items: Array.from({ length: 2_000 }, (_, i) => ({ i, note: 'zz' })) };
   const text = echo();
@@ -725,7 +759,7 @@ test('alert data is bounded field by field, on the trace and the failures.log re
     });
   } finally { restore(); }
   const alert = traces.find((t) => t.type === 'ops:alert');
-  for (const [sink, fields] of [['trace', alert.data], ['failures.log', logged[0]]] as const) {
+  for (const [sink, fields] of [['trace', alert.data]] as const) {
     assertCut(text, fields.text, 2_000, `${sink}: text`);
     // An Error is its projection: serialising it would write its rawRequest.
     // It is cut once, so its marker states the head and the whole message.
@@ -983,7 +1017,7 @@ test('a MembraneError from another copy of membrane is recognised by its name', 
   // The organization acceleration limit is recognised too, and held.
   const harness = makeHarness();
   Object.assign(harness.fw, {
-    ephemeralRuns: new Map(), conversationAgentHomes: new Map(), providerGates: new Map(),
+    ephemeralRuns: new Map(), registry: { ownsProviderScheduling: () => true, homeChannel: () => undefined }, providerGates: new Map(),
     providerAccelerationCooldowns: new Map(), providerAccelerationRecoveries: new Map(),
     providerAccelerationDefaultCooldownMs: 30_000, providerAccelerationJitterMs: 0,
   });

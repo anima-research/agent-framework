@@ -5,6 +5,8 @@
  * into conversation messages and inference requests.
  */
 
+import { unknownToolMessage } from '../unknown-tool.js';
+import { outsideSenderName } from '../sender-name.js';
 import type {
   Module,
   ModuleContext,
@@ -38,9 +40,9 @@ export class ApiModule implements Module {
     // Nothing to clean up
   }
 
-  async handleToolCall(_call: ToolCall): Promise<ToolResult> {
+  async handleToolCall(call: ToolCall): Promise<ToolResult> {
     // API module has no tools
-    return { success: false, error: 'Unknown tool', isError: true };
+    return { success: false, error: unknownToolMessage(this.name, call.name, this.getTools()), isError: true };
   }
 
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
@@ -61,12 +63,13 @@ export class ApiModule implements Module {
   }
 
   private handleMessage(event: ApiMessageEvent): EventResponse {
+    const carried = event.metadata?.author;
     const response: EventResponse = {
       addMessages: [
         {
-          participant: event.participant,
+          participant: outsideSenderName(event.participant, 'API'),
           content: [{ type: 'text', text: event.content }],
-          metadata: event.metadata,
+          metadata: { ...event.metadata, author: typeof carried === 'object' && carried !== null ? carried : { name: event.participant } },
         },
       ],
     };

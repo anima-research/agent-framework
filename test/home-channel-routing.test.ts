@@ -11,220 +11,190 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
-import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, destinationKey, type ChannelRef } from '../src/mcpl/channel-registry.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
-import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import type { ChannelContext } from '../src/mcpl/types.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { jsonLines } from './helpers/json-lines.js';
 
 const HOME = 'discord:g1:home';
 const BUSY = 'discord:g1:busy';
 const TRIGGER = 'discord:g1:trigger';
 const FORK_HOME = 'discord:g1:fork-home';
+const ref = (channelId: string): ChannelRef => ({ serverId: 'discord', channelId });
 
 function makeRegistry(opts: {
   homeChannel?: string;
-  homeChannelResolver?: (agentName: string) => string | undefined;
-  activeChannelResolver?: (agentName: string) => string | undefined;
+  homeChannelResolver?: (agentName: string) => ChannelRef | undefined;
+  activeChannelResolver?: (agentName: string) => ChannelRef | null | undefined;
 }) {
   const registry = new ChannelRegistry(
     { getServer: () => undefined } as unknown as McplServerRegistry,
     {} as FeatureSetManager,
     () => {},
     () => {},
-    opts,
+    { ...opts, latestInboundLocus: true },
   );
+  const raw = registry as unknown as {
+    channels: Map<string, { serverId: string; descriptor: { id: string; type: string; label: string }; open: boolean }>;
+    defaultPublishChannel: ChannelRef | null;
+  };
+  for (const id of [HOME, BUSY, TRIGGER, FORK_HOME]) {
+    raw.channels.set(destinationKey(ref(id)), { serverId: 'discord', descriptor: { id, type: 'discord', label: id }, open: true });
+  }
   // The global most-recent-inbound locus: some unrelated channel was busy.
-  (registry as unknown as { defaultPublishChannel: string | null }).defaultPublishChannel = BUSY;
+  raw.defaultPublishChannel = ref(BUSY);
   return registry;
 }
 
 describe('homeChannel: speech locus for no-trigger turns', () => {
   it('a no-trigger turn resolves to the configured home channel, not the last-active one', () => {
     const registry = makeRegistry({ homeChannel: HOME, activeChannelResolver: () => undefined });
-    assert.equal(registry.resolveLocus('agent'), HOME);
+    assert.deepEqual(registry.resolveLocus('agent'), ref(HOME));
   });
 
   it('without homeChannel the global most-recent-inbound fallback is unchanged', () => {
     const registry = makeRegistry({ activeChannelResolver: () => undefined });
-    assert.equal(registry.resolveLocus('agent'), BUSY);
+    assert.deepEqual(registry.resolveLocus('agent'), ref(BUSY));
   });
 
   it('a triggering channel still wins over the home channel', () => {
-    const registry = makeRegistry({ homeChannel: HOME, activeChannelResolver: () => TRIGGER });
-    assert.equal(registry.resolveLocus('agent'), TRIGGER);
+    const registry = makeRegistry({ homeChannel: HOME, activeChannelResolver: () => ref(TRIGGER) });
+    assert.deepEqual(registry.resolveLocus('agent'), ref(TRIGGER));
   });
 
   it("a conversation fork's home still wins over everything", () => {
     const registry = makeRegistry({
       homeChannel: HOME,
-      homeChannelResolver: () => FORK_HOME,
-      activeChannelResolver: () => TRIGGER,
+      homeChannelResolver: () => ref(FORK_HOME),
+      activeChannelResolver: () => ref(TRIGGER),
     });
-    assert.equal(registry.resolveLocus('agent'), FORK_HOME);
-  });
-});
-
-describe('FrameworkConfig.homeChannel reaches the ChannelRegistry', () => {
-  let tempDir: string;
-
-  beforeEach(() => {
-    tempDir = mkdtempSync(join(tmpdir(), 'home-channel-test-'));
-  });
-
-  afterEach(() => {
-    rmSync(tempDir, { recursive: true, force: true });
-  });
-
-  it('a heartbeat-style turn (no trigger) on a trunk agent resolves to homeChannel', async () => {
-    const framework = await AgentFramework.create({
-      storePath: join(tempDir, 'test.chronicle'),
-      membrane: new MockMembrane().asMembrane(),
-      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
-      modules: [],
-      homeChannel: HOME,
-    });
-    const internals = framework as unknown as {
-      initializeMcpl(servers: unknown[], routing?: unknown): Promise<void>;
-      channelRegistry: ChannelRegistry | null;
-    };
-    await internals.initializeMcpl([]);
-    const registry = internals.channelRegistry!;
-    (registry as unknown as { defaultPublishChannel: string | null }).defaultPublishChannel = BUSY;
-    assert.equal(registry.resolveLocus('scout'), HOME);
-    await framework.stop();
+    assert.deepEqual(registry.resolveLocus('agent'), ref(FORK_HOME));
   });
 });
 
 describe('homeChannel: a no-trigger turn is told, and published to, the home channel', () => {
+  const FIXTURE = join(import.meta.dirname, 'fixtures/speech-route-mcpl-server.mjs');
   let tempDir: string;
+  let statusPath: string;
+  let commandPath: string;
   let membrane: MockMembrane;
+  let framework: AgentFramework | undefined;
 
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), 'home-channel-delivery-'));
+    statusPath = join(tempDir, 'status.jsonl');
+    commandPath = join(tempDir, 'commands.jsonl');
+    writeFileSync(commandPath, '');
     membrane = new MockMembrane();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await framework?.stop();
+    framework = undefined;
     rmSync(tempDir, { recursive: true, force: true });
   });
 
+  const until = async (cond: () => boolean, what: string): Promise<void> => {
+    const deadline = Date.now() + 15_000;
+    while (!cond()) {
+      if (Date.now() > deadline) throw new Error(`timed out: ${what}`);
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  };
+
   /**
-   * A trunk agent on the real ChannelRegistry, with HOME and BUSY registered
-   * and open on a publish-capable mock server. Records every channels/publish
-   * and every channel context the turn is given (what the agent is told).
+   * A trunk agent on a real MCPL server with HOME and BUSY registered and
+   * open. Channel messages are stored without waking it, and the previous
+   * locus rule (latest inbound) is the fallback, so activity in BUSY is what
+   * a turn with no channel of its own would otherwise follow.
    */
   async function setup(homeChannel?: string) {
-    const framework = await AgentFramework.create({
+    framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
       agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
       modules: [],
+      speech: { locus: 'latest-inbound' },
+      gate: { config: { policies: [], default: 'skip' } },
+      mcplServers: [{
+        id: 'discord',
+        command: process.execPath,
+        args: [FIXTURE],
+        env: {
+          STATUS_PATH: statusPath, COMMAND_PATH: commandPath,
+          CHANNELS: JSON.stringify([{ id: HOME, label: '#home' }, { id: BUSY, label: '#busy' }]),
+        },
+      }],
       ...(homeChannel ? { homeChannel } : {}),
     });
-    const internals = framework as unknown as {
-      initializeMcpl(servers: unknown[], routing?: unknown): Promise<void>;
-      channelRegistry: ChannelRegistry | null;
+    await framework.start();
+    const fw = framework;
+    const internals = fw as unknown as {
+      channelRegistry: ChannelRegistry;
       pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number }>;
     };
-    await internals.initializeMcpl([]);
-    const registry = internals.channelRegistry!;
+    await until(() => internals.channelRegistry.listChannelsRaw().length >= 2, 'registration');
+    const registry = internals.channelRegistry;
 
-    const published: string[] = [];
-    const server = {
-      grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
-      sendChannelsPublish: async (params: { channelId?: string }) => {
-        published.push(params.channelId ?? '');
-        return { delivered: true, messageId: `out-${published.length}` };
-      },
-    };
-    const raw = registry as unknown as {
-      serverRegistry: McplServerRegistry;
-      channels: Map<string, { serverId: string; descriptor: { id: string; type: string; label: string }; open: boolean }>;
-      defaultPublishChannel: string | null;
-      defaultPublishMessageId: string | null;
-    };
-    raw.serverRegistry = { getServer: () => server } as unknown as McplServerRegistry;
-    for (const id of [HOME, BUSY]) {
-      raw.channels.set(`discord:${id}`, { serverId: 'discord', descriptor: { id, type: 'discord', label: id }, open: true });
-    }
+    const context = (): ChannelContext | undefined => registry.buildChannelContext('scout', 'discord');
 
-    const told: Array<ChannelContext | undefined> = [];
-    const build = registry.buildChannelContext.bind(registry);
-    registry.buildChannelContext = (agentName?: string) => {
-      const ctx = build(agentName);
-      if (agentName === 'scout') told.push(ctx);
-      return ctx;
-    };
+    const published = (): string[] => jsonLines<{ event: string; channelId?: string }>(statusPath)
+      .filter((e) => e.event === 'publish').map((e) => e.channelId!);
 
-    /** Run one heartbeat-style turn (no triggering channel) that says `text`. */
-    async function heartbeat(text: string) {
+    /** Run one turn that no channel message caused, which says `text`. */
+    async function channelless(text: string) {
       membrane.pushResponse(createMockResponse([{ type: 'text', text }]));
-      internals.pendingRequests.push({ agentName: 'scout', reason: 'heartbeat', source: 'framework', timestamp: Date.now() });
-      await framework.runUntilIdle();
+      const before = membrane.calls.length;
+      internals.pendingRequests.push({ agentName: 'scout', reason: 'test', source: 'framework', timestamp: Date.now() });
+      await until(() => membrane.calls.length > before, 'turn start');
+      await fw.runUntilIdle();
     }
 
     /** Some other channel had activity: the global most-recent-inbound locus. */
-    function busyElsewhere() {
-      raw.defaultPublishChannel = BUSY;
-      raw.defaultPublishMessageId = 'busy-1';
+    async function busyElsewhere() {
+      const delivered = () => fw.getAgent('scout')!.getContextManager().getAllMessages()
+        .some((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text.includes('busy chatter')));
+      appendFileSync(commandPath, JSON.stringify({ op: 'incoming', channelId: BUSY, messageId: 'busy-1', mode: 'ambient', text: 'busy chatter' }) + '\n');
+      await until(delivered, 'the busy channel message delivered');
     }
 
     function routingNotices(): string[] {
-      return framework.getAgent('scout')!.getContextManager().queryMessages({}).messages
+      return fw.getAgent('scout')!.getContextManager().getAllMessages()
         .flatMap((m) => m.content)
         .filter((b): b is { type: 'text'; text: string } => b.type === 'text' && b.text.startsWith('[routing]'))
         .map((b) => b.text);
     }
 
-    return { framework, published, told, heartbeat, busyElsewhere, routingNotices };
+    return { published, context, channelless, busyElsewhere, routingNotices };
   }
 
-  it('with activity in another channel, the heartbeat speaks in HOME, not the busy channel', async () => {
+  it('with activity in another channel, a turn no channel caused speaks in HOME, not the busy channel', async () => {
     const t = await setup(HOME);
-    try {
-      t.busyElsewhere();
-      await t.heartbeat('heartbeat check-in');
-      assert.deepEqual(t.published, [HOME], 'published to the home channel only');
-      assert.ok(t.told.length > 0, 'the turn was given a channel context');
-      for (const ctx of t.told) {
-        assert.equal(ctx?.defaultOutgoing?.channelId, HOME, 'the agent is told its speech lands in HOME');
-      }
-      assert.ok(t.routingNotices().some((n) => n.includes(HOME)), 'the routing notice names HOME');
-      assert.ok(!t.routingNotices().some((n) => n.includes(BUSY)), 'and never the busy channel');
-    } finally {
-      await t.framework.stop();
-    }
+    await t.busyElsewhere();
+    await t.channelless('check-in');
+    assert.deepEqual(t.published(), [HOME], 'published to the home channel only');
+    assert.equal(t.context()?.defaultOutgoing?.channelId, HOME, 'the server is told its speech lands in HOME');
+    assert.ok(t.routingNotices().some((n) => n.includes(HOME)), 'the routing notice names HOME');
+    assert.ok(!t.routingNotices().some((n) => n.includes(BUSY)), 'and never the busy channel');
   });
 
-  it('with no prior inbound message at all, the heartbeat still speaks in HOME', async () => {
+  it('with no prior inbound message at all, such a turn still speaks in HOME', async () => {
     const t = await setup(HOME);
-    try {
-      await t.heartbeat('first words');
-      assert.deepEqual(t.published, [HOME]);
-      for (const ctx of t.told) {
-        assert.equal(ctx?.defaultOutgoing?.channelId, HOME);
-      }
-    } finally {
-      await t.framework.stop();
-    }
+    await t.channelless('first words');
+    assert.deepEqual(t.published(), [HOME]);
+    assert.equal(t.context()?.defaultOutgoing?.channelId, HOME);
   });
 
-  it('control: without homeChannel the same heartbeat follows the busy channel', async () => {
+  it('control: without homeChannel the same turn follows the busy channel', async () => {
     const t = await setup();
-    try {
-      t.busyElsewhere();
-      await t.heartbeat('heartbeat check-in');
-      assert.deepEqual(t.published, [BUSY]);
-      for (const ctx of t.told) {
-        assert.equal(ctx?.defaultOutgoing?.channelId, BUSY);
-      }
-    } finally {
-      await t.framework.stop();
-    }
+    await t.busyElsewhere();
+    await t.channelless('check-in');
+    assert.deepEqual(t.published(), [BUSY]);
+    assert.equal(t.context()?.defaultOutgoing?.channelId, BUSY);
   });
 });

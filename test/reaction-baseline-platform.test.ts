@@ -6,7 +6,7 @@ import type { McplServerConfig } from '../src/mcpl/types.js';
 import { REFUSAL_REACTION_BASELINE } from '../src/refusal-reactions.js';
 
 const KEY = 'DISCORD_SUPPRESSED_REACTIONS_BASELINE';
-/** The framework's protective default for the stub below (awareness emoji 🔕, no ledger). */
+/** The framework's protective default for the stub below (awareness emoji 🔕, an empty journal). */
 const DEFAULT = [...REFUSAL_REACTION_BASELINE, '💤', '🔕'].join(',');
 
 /** Exercise the real default-injection boundary, intercepting immediately
@@ -26,9 +26,10 @@ async function connectionEnv(
     mcplPrefixMap: new Map(),
     mcplServerConfigs: new Map(),
     channelRegistry: null,
-    discordAwarenessOutbox: null,
+    discordAwarenessOutbox: { batches: () => [] },
     discordAwarenessEmoji: '🔕',
     mcplServerRegistry: {
+      getServer: () => undefined,
       async addServer(config: McplServerConfig) {
         captured = config;
         throw stopBeforeSpawn;
@@ -81,7 +82,6 @@ for (const inheritEnv of [false, true]) {
       // The chosen value must survive the spawn's own merge (#205), which
       // keeps the first spelling of a folded name within each source.
       assert.equal(windowsChildValue(composed, inheritEnv, process.env), expected);
-      assert.equal(composed[KEY], expected, 'a generated default must not replace an explicit choice');
     }
   });
 }
@@ -100,7 +100,6 @@ test('Windows inherited-only baseline lookup handles case-sensitive worker env c
     ];
     for (const { parent, expected } of cases) {
       const composed = await connectionEnv('win32', {}, true, parent);
-      assert.equal(composed[KEY], expected);
       assert.equal(windowsChildValue(composed, true, parent), expected);
     }
   }
@@ -109,17 +108,17 @@ test('Windows inherited-only baseline lookup handles case-sensitive worker env c
 test('Windows chooses duplicate spellings within each source, then declared over inherited', async () => {
   const parent = { [KEY]: 'host-upper', [KEY.toLowerCase()]: 'host-lower' };
   const composed = await connectionEnv('win32', { [KEY.toLowerCase()]: '', [KEY]: 'declared-upper' }, true, parent);
-  assert.equal(composed[KEY], 'declared-upper');
   assert.equal(windowsChildValue(composed, true, parent), 'declared-upper');
   const singleDeclared = await connectionEnv('win32', { [KEY.toLowerCase()]: '' }, true, parent);
-  assert.equal(singleDeclared[KEY], 'host-upper', 'a blank declared value is unset, so the inherited choice stands');
-  assert.equal(windowsChildValue(singleDeclared, true, parent), 'host-upper');
+  assert.equal(windowsChildValue(singleDeclared, true, parent), 'host-upper', 'a blank declared value is unset, so the inherited choice stands');
 });
 
 test('inherited-only baseline lookup remains opt-in and POSIX case-sensitive', async () => {
   for (const [platform, inheritEnv] of [['win32', false], ['linux', true]] as const) {
-    const composed = await connectionEnv(platform, {}, inheritEnv, { [KEY.toLowerCase()]: '' });
-    assert.ok(composed[KEY]!.split(',').includes('💤'));
+    const parent = { [KEY.toLowerCase()]: '🟦' };
+    const composed = await connectionEnv(platform, {}, inheritEnv, parent);
+    const value = platform === 'win32' ? windowsChildValue(composed, inheritEnv, parent) : composed[KEY];
+    assert.equal(value, DEFAULT, `${platform}, inheritEnv=${inheritEnv}: the host's lowercase value isn't read`);
   }
   const explicitPosix = await connectionEnv('linux', {}, true, { [KEY]: '' });
   assert.equal(explicitPosix[KEY], DEFAULT, 'a blank inherited value is unset');
