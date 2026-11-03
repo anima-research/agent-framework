@@ -19447,8 +19447,8 @@ export class AgentFramework {
   }
 
   /**
-   * Explicit mode's typing channel for one start of a turn, which has no
-   * locus, read once as the start opens (driveStream then shows what the
+   * The typing channel for one start of a turn that has no locus, an
+   * explicit or a disabled mode turn's, read once as the start opens (driveStream then shows what the
    * start showed, TurnRouting.typing): where that start's wake came from,
    * its trigger's channel with its server (channelNamed), so a start batched
    * with a new wake shows typing where that wake came from. Not the turn's
@@ -19462,9 +19462,12 @@ export class AgentFramework {
    * (TurnRouting.noChannel), a wake named without its server isn't read: a
    * retry's trigger names it again, and reading it then could take a
    * channel the turn never had. A wake that gives its server, as every one
-   * the framework makes for a channel does, names that pair.
+   * the framework makes for a channel does, names that pair. A silent wake's
+   * start (InferenceRequest.suppressProse), which runs as disabled mode in
+   * every mode, shows none, though its wake names a channel.
    */
-  private explicitTypingChannel(routing: TurnRouting, trigger: InferenceRequest | undefined): ChannelRef | null {
+  private noLocusTypingChannel(routing: TurnRouting, trigger: InferenceRequest | undefined): ChannelRef | null {
+    if (trigger?.suppressProse) return null;
     // A server is read as channelNamed reads one: an empty one as none given.
     const own = trigger?.channelId && !(routing.noChannel && !trigger.channelServerId)
       ? this.channelNamed(trigger.channelId, trigger.channelServerId)
@@ -24187,11 +24190,11 @@ export class AgentFramework {
     // Same channel choice as driveStream's own startTyping (which stays, is
     // idempotent per channel, and owns the 7s refresh); the catch below stops
     // it on the no-driveStream failure paths (e.g. a compile refusal).
-    // Explicit mode's is where this start's wake came from
-    // (explicitTypingChannel).
+    // Explicit and disabled mode's is where this start's wake came from
+    // (noLocusTypingChannel).
     const earlyTypingChannel =
-      turnProseRouting === 'explicit'
-        ? this.explicitTypingChannel(routing, trigger)
+      turnProseRouting === 'explicit' || turnProseRouting === 'disabled'
+        ? this.noLocusTypingChannel(routing, trigger)
         : turnLocus ?? null;
     if (earlyTypingChannel) this.showTurnTyping(routing, earlyTypingChannel);
 
@@ -24935,20 +24938,19 @@ export class AgentFramework {
     //     can move it between rounds, and followTurnLocus (below) moves the
     //     indicator with it at the next round's first content, or at its
     //     retry after a refusal.
-    //   - explicit mode: there is no locus — indicate on the TRIGGER channel,
-    //     where this start's wake came from, as the start's opening showed
-    //     it (explicitTypingChannel), not read again after its hooks and
-    //     compile. This doesn't violate never-guess: it says "attending to
-    //     what you sent here", which is true regardless of where the reply
-    //     goes. A start whose wake names no channel keeps what the turn
-    //     shows; a heartbeat explicit turn shows none, and a turn with no
-    //     channel doesn't read a wake that gives no server.
+    //   - explicit and disabled mode: there is no locus — indicate on the
+    //     TRIGGER channel, where this start's wake came from, as the start's
+    //     opening showed it (noLocusTypingChannel), not read again after its
+    //     hooks and compile. This doesn't violate never-guess: it says
+    //     "attending to what you sent here", which is true regardless of
+    //     where the reply goes, or whether one goes at all. A start whose
+    //     wake names no channel keeps what the turn shows; a heartbeat's turn
+    //     and a silent wake's show none, and a turn with no channel doesn't
+    //     read a wake that gives no server.
     let typingChannel =
-      turnProseRouting === 'disabled'
-        ? null
-        : turnProseRouting === 'explicit'
-          ? streamRouting.typing ?? null
-          : resolveTurnLocus();
+      turnProseRouting === 'explicit' || turnProseRouting === 'disabled'
+        ? streamRouting.typing ?? null
+        : resolveTurnLocus();
     if (typingChannel) this.showTurnTyping(streamRouting, typingChannel);
     // Locus and hybrid mode: move the indicator to the turn's locus when it
     // has moved since the indicator last showed. Once a turn has a locus it
