@@ -96,6 +96,12 @@ function memberName(node: unknown): string | undefined {
   return keyName(node.property);
 }
 
+/** What a callee, an assignment's target or a cast reads: a member's
+ *  property, or a name on its own (`f`, as `const { f } = a` makes one). */
+function readName(node: unknown): string | undefined {
+  return isNode(node) && node.type === 'Identifier' ? node.name as string : memberName(node);
+}
+
 /** How many parameters a function, or a function's type, takes; undefined for anything else. */
 function arity(node: unknown): number | undefined {
   if (!isNode(node)) return undefined;
@@ -133,9 +139,10 @@ function namesIn(sources: Array<{ name: string; text: string }>): Use[] {
         if (name !== undefined && RELEASED.has(name) && count !== undefined && count > 1) use(name, { extra: count - 1 });
       };
       switch (node.type) {
-        // A read with more than the agent: X.releasedWindow(agent, held).
+        // A read with more than the agent: X.releasedWindow(agent, held), or
+        // releasedWindow(agent, held) once destructured out of X.
         case 'CallExpression': case 'OptionalCallExpression':
-          released(memberName(node.callee), (node.arguments as unknown[]).length); break;
+          released(readName(node.callee), (node.arguments as unknown[]).length); break;
         // A method of the shape: releasedWindow(agent, held) { … } or `releasedWindow(agent, held): …` in a type.
         case 'ClassMethod': case 'ClassPrivateMethod': case 'TSDeclareMethod': case 'ObjectMethod': case 'TSMethodSignature':
           released(keyName(node.key), ((node.params ?? node.parameters) as unknown[]).length); break;
@@ -144,10 +151,10 @@ function namesIn(sources: Array<{ name: string; text: string }>): Use[] {
           released(keyName(node.key), arity(node.typeAnnotation ?? node.value)); break;
         // A stand-in put in its place: X.releasedWindow = (agent, held) => ….
         case 'AssignmentExpression':
-          released(memberName(node.left), arity(node.right)); break;
+          released(readName(node.left), arity(node.right)); break;
         // A read cast to the shape: (X.releasedWindow as (agent, held) => …).
         case 'TSAsExpression': case 'TSSatisfiesExpression': case 'TSTypeAssertion':
-          released(memberName(node.expression), arity(node.typeAnnotation)); break;
+          released(readName(node.expression), arity(node.typeAnnotation)); break;
       }
       for (const [field, value] of Object.entries(node)) {
         if (field === 'leadingComments' || field === 'trailingComments' || field === 'innerComments') continue;
@@ -251,6 +258,9 @@ it("the scan finds the released window read, typed or stood in for with the queu
       "assert.ok(id && !id.startsWith('held:'));",
       "ctx.getMessage('held:w1'); ctx.getMessage(`held:${id}`);",
       "assert.equal(x, true, 'held: out of the live turn\\'s window');",
+      'const { releasedWindow } = state; releasedWindow(agent, new Set()); releasedWindow(agent);',
+      'let { releaseWindow } = owner; releaseWindow = (agent: unknown, held: unknown) => usual(agent, held);',
+      '(releasedWindow as (agent: unknown, held: Set<string>) => unknown)(agent, held);',
     ].join('\n'),
   }]);
   assert.deepEqual(uses.filter((u) => u.extra !== undefined).map((u) => `${u.line} ${u.name} +${u.extra}`), [
@@ -259,6 +269,10 @@ it("the scan finds the released window read, typed or stood in for with the queu
     '3 releasedWindow +1',
     '5 releasedWindow +1',
     '6 releasedWindow +1',
+    // Destructured: a read, a stand-in and a cast, by the name alone.
+    '11 releasedWindow +1',
+    '12 releaseWindow +1',
+    '13 releasedWindow +1',
   ], 'every read, typing and stand-in with more than the agent, and none with the agent alone');
   assert.deepEqual(uses.filter(handle).map((u) => `${u.line} ${u.name}`), ['8 held:', '9 held:w1', '9 held:'],
     "a handle and a check for one; the prose label isn't");
