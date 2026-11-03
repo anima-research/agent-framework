@@ -35455,12 +35455,13 @@ export class AgentFramework {
       const config = this.mcplServerConfigs.get(server.id);
       const prefix = config?.toolPrefix ?? `mcpl--${server.id}`;
       closesAtListing.set(server.id, closesOf(server.id));
-      const staged = {
+      const stage = () => ({
         tools: [] as import('./types/index.js').ToolDefinition[],
         featureSets: new Map<string, string>(),
         classes: new Map<string, ToolClass[]>(),
         servers: new Map<string, string>(),
-      };
+      });
+      const staged = stage();
       try {
         const result = await server.sendToolsList();
         const listed = new Set<string>();
@@ -35527,10 +35528,11 @@ export class AgentFramework {
         // to list them stays unknown.)
         if (!server.mcpToolsAdvertised) {
           if (server.isConnected) listedServers.add(server.id);
+          results.push({ serverId: server.id, staged: stage() });
         } else {
-          results.push({ serverId: server.id, staged, error: redactServerText(error instanceof Error ? error.message : String(error), config ?? {}) });
-          continue;
+          results.push({ serverId: server.id, staged: stage(), error: redactServerText(error instanceof Error ? error.message : String(error), config ?? {}) });
         }
+        continue;
       }
       results.push({ serverId: server.id, staged });
     }
