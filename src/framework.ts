@@ -49,6 +49,7 @@ import type {
   ErrorAction,
   FrameworkState,
   TraceEvent,
+  TraceEventInput,
   TraceEventListener,
   InferenceLogEntry,
   InferenceLogQuery,
@@ -1072,7 +1073,8 @@ class McpConfigurationRefusal extends Error {
 
 /** The reply helpers an MCPL connection hands an inbound request's handler. */
 type InboundResponder = {
-  id: string | number;
+  /** The request's id: null for a request that the server sent with id null. */
+  id: string | number | null;
   respond: (result: unknown) => void;
   respondError: (code: number, message: string, data?: unknown) => void;
 };
@@ -4859,7 +4861,7 @@ export class AgentFramework {
         } : {}),
         ...(judge && judgeOptions?.timeoutMs !== undefined ? { judgeTimeoutMs: judgeOptions.timeoutMs } : {}),
         ...(judge && judgeOptions?.onError !== undefined ? { judgeOnError: judgeOptions.onError } : {}),
-        emitTrace: (e) => framework.emitTrace(e as { type: TraceEvent['type']; [key: string]: unknown }),
+        emitTrace: (e) => framework.emitTrace(e),
         addMessage: (p, c, m, forAgent, placement) => framework.addMessage(p, c, m as MessageMetadata,
           forAgent || placement ? { ...(forAgent ? { forAgent } : {}), ...(placement ? { placement } : {}) } : undefined),
         requestInference: (agentName, reason, source, provenance, after) => {
@@ -6228,11 +6230,7 @@ export class AgentFramework {
     }
     this.emitTrace({ type: 'tool:started', module: 'heartbeat', tool: call.name, callId: call.id, input: call.input });
     const result = this.runHeartbeatTool(call);
-    this.emitTrace({
-      type: result.isError ? 'tool:failed' : 'tool:completed',
-      module: 'heartbeat', tool: call.name, callId: call.id, durationMs: 0,
-      ...(result.isError ? { error: result.error } : {}),
-    });
+    this.traceToolOutcome('heartbeat', call.name, call.id, result, 0);
     this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'heartbeat', result });
   }
 
@@ -19390,8 +19388,8 @@ export class AgentFramework {
   }
 
   /**
-   * Explicit mode's typing channel for one start of a turn, which has no
-   * locus, read once as the start opens (driveStream then shows what the
+   * The typing channel for one start of a turn that has no locus, an
+   * explicit or a disabled mode turn's, read once as the start opens (driveStream then shows what the
    * start showed, TurnRouting.typing): where that start's wake came from,
    * its trigger's channel with its server (channelNamed), so a start batched
    * with a new wake shows typing where that wake came from. Not the turn's
@@ -19405,9 +19403,12 @@ export class AgentFramework {
    * (TurnRouting.noChannel), a wake named without its server isn't read: a
    * retry's trigger names it again, and reading it then could take a
    * channel the turn never had. A wake that gives its server, as every one
-   * the framework makes for a channel does, names that pair.
+   * the framework makes for a channel does, names that pair. A silent wake's
+   * start (InferenceRequest.suppressProse), which runs as disabled mode in
+   * every mode, shows none, though its wake names a channel.
    */
-  private explicitTypingChannel(routing: TurnRouting, trigger: InferenceRequest | undefined): ChannelRef | null {
+  private noLocusTypingChannel(routing: TurnRouting, trigger: InferenceRequest | undefined): ChannelRef | null {
+    if (trigger?.suppressProse) return null;
     // A server is read as channelNamed reads one: an empty one as none given.
     const own = trigger?.channelId && !(routing.noChannel && !trigger.channelServerId)
       ? this.channelNamed(trigger.channelId, trigger.channelServerId)
@@ -24130,11 +24131,11 @@ export class AgentFramework {
     // Same channel choice as driveStream's own startTyping (which stays, is
     // idempotent per channel, and owns the 7s refresh); the catch below stops
     // it on the no-driveStream failure paths (e.g. a compile refusal).
-    // Explicit mode's is where this start's wake came from
-    // (explicitTypingChannel).
+    // Explicit and disabled mode's is where this start's wake came from
+    // (noLocusTypingChannel).
     const earlyTypingChannel =
-      turnProseRouting === 'explicit'
-        ? this.explicitTypingChannel(routing, trigger)
+      turnProseRouting === 'explicit' || turnProseRouting === 'disabled'
+        ? this.noLocusTypingChannel(routing, trigger)
         : turnLocus ?? null;
     if (earlyTypingChannel) this.showTurnTyping(routing, earlyTypingChannel);
 
@@ -24878,20 +24879,19 @@ export class AgentFramework {
     //     can move it between rounds, and followTurnLocus (below) moves the
     //     indicator with it at the next round's first content, or at its
     //     retry after a refusal.
-    //   - explicit mode: there is no locus — indicate on the TRIGGER channel,
-    //     where this start's wake came from, as the start's opening showed
-    //     it (explicitTypingChannel), not read again after its hooks and
-    //     compile. This doesn't violate never-guess: it says "attending to
-    //     what you sent here", which is true regardless of where the reply
-    //     goes. A start whose wake names no channel keeps what the turn
-    //     shows; a heartbeat explicit turn shows none, and a turn with no
-    //     channel doesn't read a wake that gives no server.
+    //   - explicit and disabled mode: there is no locus — indicate on the
+    //     TRIGGER channel, where this start's wake came from, as the start's
+    //     opening showed it (noLocusTypingChannel), not read again after its
+    //     hooks and compile. This doesn't violate never-guess: it says
+    //     "attending to what you sent here", which is true regardless of
+    //     where the reply goes, or whether one goes at all. A start whose
+    //     wake names no channel keeps what the turn shows; a heartbeat's turn
+    //     and a silent wake's show none, and a turn with no channel doesn't
+    //     read a wake that gives no server.
     let typingChannel =
-      turnProseRouting === 'disabled'
-        ? null
-        : turnProseRouting === 'explicit'
-          ? streamRouting.typing ?? null
-          : resolveTurnLocus();
+      turnProseRouting === 'explicit' || turnProseRouting === 'disabled'
+        ? streamRouting.typing ?? null
+        : resolveTurnLocus();
     if (typingChannel) this.showTurnTyping(streamRouting, typingChannel);
     // Locus and hybrid mode: move the indicator to the turn's locus when it
     // has moved since the indicator last showed. Once a turn has a locus it
@@ -24903,6 +24903,8 @@ export class AgentFramework {
       this.showTurnTyping(streamRouting, locus);
       typingChannel = locus;
     };
+    const tracedChannelId = (): string | undefined =>
+      (turnProseRouting === 'disabled' ? undefined : typingChannel?.channelId);
 
     // §10.5 inference/lifecycle: `started` now, exactly one terminal in the
     // finally below (the one block every exit path shares). Which terminal
@@ -25069,8 +25071,9 @@ export class AgentFramework {
               blockIndex: event.meta.blockIndex,
               // The channel the typing indicator above shows, the conversation
               // the turn is attending: lets trace consumers tag every chunk
-              // with it, without re-deriving routing.
-              channelId: typingChannel?.channelId,
+              // with it, without re-deriving routing. None in disabled mode,
+              // whose text is never sent to a channel.
+              channelId: tracedChannelId(),
             };
             if (agent.toolResultGuard.hasSubmittedPending || agent.toolResultGuard.recovering) {
               guardHeld.push(trace);
@@ -25101,7 +25104,7 @@ export class AgentFramework {
               content: '',
               blockType: 'text',
               blockIndex: 0,
-              channelId: typingChannel?.channelId,
+              channelId: tracedChannelId(),
             });
             break;
           }
@@ -25114,7 +25117,7 @@ export class AgentFramework {
               phase,
               blockType: block.type,
               blockIndex: index,
-              channelId: typingChannel?.channelId,
+              channelId: tracedChannelId(),
             });
             break;
           }
@@ -31292,7 +31295,7 @@ export class AgentFramework {
     };
   }
 
-  private emitTrace(event: { type: TraceEvent['type']; [key: string]: unknown }): void {
+  private emitTrace(event: TraceEventInput): void {
     // Centralized inference-health observability. Every terminal failure path
     // funnels through an `inference:exhausted` trace and every successful model
     // response through `inference:completed`, so intercepting here is the one
@@ -32038,12 +32041,12 @@ export class AgentFramework {
     const coalescing = this.restorePushCoalescer();
     const checkpoints = new CheckpointManager(
       this.store,
-      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      (event) => this.emitTrace(event),
     );
     for (const config of serverConfigs) checkpoints.loadHostStates(config.id);
     this.mcplServerRegistry = new McplServerRegistry();
     this.featureSetManager = new FeatureSetManager(
-      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      (event) => this.emitTrace(event),
     );
     this.hookOrchestrator = new HookOrchestrator(this.mcplServerRegistry, this.featureSetManager);
     this.toolLifecycleEmitter = new ToolLifecycleEmitter({
@@ -32070,7 +32073,7 @@ export class AgentFramework {
     this.pushHandler = new PushHandler(
       this.featureSetManager,
       (event) => this.pushEvent(event as unknown as ProcessEvent),
-      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      (event) => this.emitTrace(event),
       triggerFilter,
       (serverId, params, event) => this.handleCoalescedPush(serverId, params, event),
       // An ordinary push: freeze its envelope and observe the acceptance at
@@ -32088,7 +32091,7 @@ export class AgentFramework {
       this.hookOrchestrator,
       this.featureSetManager,
       inferenceRouting ?? null,
-      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      (event) => this.emitTrace(event),
       () => this.inferenceBounds,
     );
 
@@ -32100,7 +32103,7 @@ export class AgentFramework {
       this.mcplServerRegistry,
       this.featureSetManager,
       (event) => this.pushEvent(event),
-      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      (event) => this.emitTrace(event),
       {
         store: this.store,
         handleCoalescedIncoming: (serverId, message, event) =>
@@ -34897,7 +34900,7 @@ export class AgentFramework {
     onRequest('inference-request', async (
       params: McplInferenceRequestParams,
       responder?: {
-        id: string | number;
+        id: string | number | null;
         respond: (result: unknown) => void;
         respondError: (code: number, message: string) => void;
         sendChunk?: (chunk: InferenceChunkParams) => void;
@@ -35359,14 +35362,11 @@ export class AgentFramework {
     });
   }
 
-  /** An MCP tool call's trace: a result the server marked an error (or one
-   *  the reading takes as one, such as malformed content) is tool:failed, as
-   *  on the other tool paths; anything else is tool:completed. */
-  private traceMcpToolOutcome(serverId: string, tool: string, callId: string, result: ToolResult, durationMs: number): void {
+  private traceToolOutcome(module: string, tool: string, callId: string, result: ToolResult, durationMs: number): void {
     if (result.isError) {
-      this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool, callId, durationMs, error: result.error ?? 'tool returned an error' });
+      this.emitTrace({ type: 'tool:failed', module, tool, callId, durationMs, error: result.error ?? 'tool returned an error' });
     } else {
-      this.emitTrace({ type: 'tool:completed', module: `mcpl:${serverId}`, tool, callId, durationMs });
+      this.emitTrace({ type: 'tool:completed', module, tool, callId, durationMs });
     }
   }
 
@@ -35927,7 +35927,7 @@ export class AgentFramework {
       modern.callTool(toolName, args)
         .then((result) => reading(result, false))
         .then((result) => {
-          this.traceMcpToolOutcome(serverId, toolName, call.id, result, Date.now() - startTime);
+          this.traceToolOutcome(`mcpl:${serverId}`, toolName, call.id, result, Date.now() - startTime);
           this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: `mcpl:${serverId}`, result });
         })
         .catch(failDispatch);
@@ -36036,7 +36036,7 @@ export class AgentFramework {
       .then(({ result, toolResult: answer }) => {
         let toolResult = answer;
         const durationMs = Date.now() - startTime;
-        this.traceMcpToolOutcome(serverId, toolName, call.id, toolResult, durationMs);
+        this.traceToolOutcome(`mcpl:${serverId}`, toolName, call.id, toolResult, durationMs);
 
         // Record checkpoint from stateful tool response (Step 8).
         // Explicit response attribution is authoritative. Otherwise use the
@@ -36324,7 +36324,7 @@ export class AgentFramework {
               },
             }
           : {}),
-        emitTrace: (e) => this.emitTrace(e as never),
+        emitTrace: (e) => this.emitTrace(e),
       },
     );
   }
@@ -36519,11 +36519,7 @@ export class AgentFramework {
         const destination = published.outcome?.status === 'delivered' ? published.outcome.destination : undefined;
         if (publisher && destination) publisher.notePublished(destinationKey(destination), readThrough);
         const durationMs = Date.now() - startTime;
-        this.emitTrace({
-          type: result.isError ? 'tool:failed' : 'tool:completed',
-          module: 'channels', tool: call.name, callId: call.id, durationMs,
-          ...(result.isError ? { error: result.error } : {}),
-        });
+        this.traceToolOutcome('channels', call.name, call.id, result, durationMs);
         // A successful channel_open plants the agent's feet in the opened
         // channel. The agent's own deliberate open is the strongest "my next
         // words go here" signal in the system — stronger than any injection —
@@ -36749,11 +36745,7 @@ export class AgentFramework {
       // Where notes follow an error that doesn't end in a stop, it gets one, so each reads as a sentence of its own.
       const said = given.error && !/[.!?]$/.test(given.error) ? `${given.error}.` : given.error;
       const result = given.isError && ignored.length > 0 ? { ...given, error: [said, ...ignored].join(' ') } : given;
-      this.emitTrace({
-        type: result.isError ? 'tool:failed' : 'tool:completed',
-        module: 'gate', tool: call.name, callId: call.id, durationMs: 0,
-        ...(result.isError ? { error: result.error } : {}),
-      });
+      this.traceToolOutcome('gate', call.name, call.id, result, 0);
       deliver(result);
     };
 
@@ -37581,12 +37573,7 @@ export class AgentFramework {
       } catch (error) {
         result = { success: false, isError: true, error: `fetch_reference couldn't answer: ${thrownText(error)}` };
       }
-      this.emitTrace({
-        type: result.isError ? 'tool:failed' : 'tool:completed',
-        module: 'workspace', tool: call.name, callId: call.id,
-        durationMs: Date.now() - startTime,
-        ...(result.isError ? { error: result.error } : {}),
-      });
+      this.traceToolOutcome('workspace', call.name, call.id, result, Date.now() - startTime);
       deliver({ ...result, isError: result.isError ?? false });
     })();
   }
@@ -37594,14 +37581,7 @@ export class AgentFramework {
   private dispatchReadImageToolCall(agentName: string, call: ToolCall, deliver = this.pushToolResult(agentName, call, 'workspace')): void {
     this.emitTrace({ type: 'tool:started', module: 'workspace', tool: call.name, callId: call.id, input: call.input });
     const finish = (result: ToolResult): void => {
-      this.emitTrace({
-        type: result.isError ? 'tool:failed' : 'tool:completed',
-        module: 'workspace',
-        tool: call.name,
-        callId: call.id,
-        durationMs: 0,
-        ...(result.isError ? { error: result.error } : {}),
-      });
+      this.traceToolOutcome('workspace', call.name, call.id, result, 0);
       deliver(result);
     };
     void (async (): Promise<void> => {
@@ -37738,14 +37718,7 @@ export class AgentFramework {
   private dispatchSaveImageToolCall(agentName: string, call: ToolCall, deliver = this.pushToolResult(agentName, call, 'workspace')): void {
     this.emitTrace({ type: 'tool:started', module: 'workspace', tool: call.name, callId: call.id, input: call.input });
     const finish = (result: ToolResult): void => {
-      this.emitTrace({
-        type: result.isError ? 'tool:failed' : 'tool:completed',
-        module: 'workspace',
-        tool: call.name,
-        callId: call.id,
-        durationMs: 0,
-        ...(result.isError ? { error: result.error } : {}),
-      });
+      this.traceToolOutcome('workspace', call.name, call.id, result, 0);
       deliver(result);
     };
     type Candidate =
@@ -38371,14 +38344,7 @@ export class AgentFramework {
         isError: true,
       };
     }
-    this.emitTrace({
-      type: result.isError ? 'tool:failed' : 'tool:completed',
-      module: 'agent',
-      tool: call.name,
-      callId: call.id,
-      durationMs: 0,
-      ...(result.isError ? { error: result.error } : {}),
-    });
+    this.traceToolOutcome('agent', call.name, call.id, result, 0);
     deliver(result);
   }
 
