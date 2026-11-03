@@ -224,7 +224,7 @@ describe('read marks once windows are presented (#291)', () => {
     const entry = { eventType: 'mcpl:push-event', serverId: 'discord', eventId: 'ev-1' };
     const event = { serverId: 'discord', eventId: 'ev-1' } as unknown as MessageMetadata;
 
-    it('an entry stays newest when an own row presented at its write follows it in the record, until it is presented after that row', async () => {
+    it('an entry stays newest when an own row presented at its write follows it in the record, and once it is presented after that row', async () => {
       const h = await boot();
       h.writeDown(h.mira, h.oren);
       const cm = h.mira.getContextManager();
