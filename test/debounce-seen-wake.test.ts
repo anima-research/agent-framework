@@ -1,4 +1,3 @@
-/** Debounce keeps only wakes whose writes still need an answered request and, where a reply is owed, a publication after it (#814). */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { EventResponse, ProcessEvent, ProcessState } from '../src/index.js';
@@ -40,7 +39,6 @@ class BeforeCompletionStream extends MockYieldingStream {
   }
 }
 
-/** A stream that waits for release() before it answers, keeping its turn alive. */
 class HeldStream extends MockYieldingStream {
   entered = false;
   release: () => void = () => {};
@@ -66,8 +64,6 @@ class RateLimitedAtComplete extends MockYieldingStream {
 
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 type GateState = Pick<EventGate, 'inferenceDiagnostics' | 'onInferenceStarted' | 'onInferenceEnded'> & { debounceTimers: Map<string, { timer: ReturnType<typeof setTimeout>; events: unknown[] }>; fireDebounce(name: string): void };
-// Access the timer only to fire the long-delay cases deterministically. The
-// reproduction below uses the actual 200 ms timer, including its held path.
 function gateOf(f: Fixture) {
   return (f.framework as unknown as { eventGate: GateState }).eventGate;
 }
@@ -124,7 +120,6 @@ function deferred(f: Fixture, body: string) {
   return (f.framework as unknown as { deferredMessages: unknown[] }).deferredMessages.some((m) => JSON.stringify(m).includes(body));
 }
 function heard(stream: MockYieldingStream) { return JSON.stringify(stream.receivedToolResultOptions); }
-/** The wakes the gate requests from here on, each with the lines it hands on. */
 function recordWakes(f: Fixture): Array<{ agentName: string; lines?: number }> {
   const gate = gateOf(f) as unknown as { requestInferenceFn: (agentName: string, ...rest: unknown[]) => void };
   const wakes: Array<{ agentName: string; lines?: number }> = [];
@@ -500,7 +495,7 @@ describe('debounced writes already read and answered', () => {
         await wait;
         if (outcome === 'publishes') return original(...args);
         if (outcome === 'throws') throw new Error('publication failed');
-        return null; // a refusal (including a connection closed during stop)
+        return null;
       };
       try {
         const { loop } = await start();

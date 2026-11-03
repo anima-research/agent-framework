@@ -20,7 +20,8 @@
   or `api:message`; any other module response keeps the wake. A judge rule's
   batch is judged so too where no judge decided it (none wired, or one that
   failed, timed out or made no call, with `onError: "wake"`), and on a reply
-  verdict, except for an event the agent had already answered when the judge
-  answered: the judge answered after it, so its reply stands, and such a
-  batch's line is written when the judge answers, naming every event. A deferred
+  verdict, except for an event the agent had already answered a request
+  carrying when the judge answered, its publication there or not: the judge
+  answered after it, so its reply stands, and such a batch's line is written
+  when the judge answers, naming every event. A deferred
   render's batched wake is unchanged.

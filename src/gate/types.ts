@@ -445,14 +445,18 @@ export interface GateEntryRef {
  *  holds a line whose write went to the delivery agent as owed to its window,
  *  and the first fresh start after the batch fires of any agent that reads
  *  that window decides it; any other line is decided by the delivery agent's
- *  starts of its own wake (the framework's placeWakeLines). A start drops each line whose event
- *  the agent it was written for has read and answered, judged as the wake's
- *  drop is (InferenceRequest.readsWakeLines), leaves out a single line whose
- *  event is still the newest entry, and writes the others as one message,
- *  none while the host is quiesced or another reader of the residents'
- *  shared slot has a turn alive. A line not written is decided again by the
- *  next such start. Its text is rendered when it's written (wakeLineText),
- *  so its ages are true then.
+ *  starts of its own wake (the framework's placeWakeLines). A start drops
+ *  each line whose event the agent it was written for has read and answered,
+ *  judged as the wake's drop is (InferenceRequest.readsWakeLines), leaves out
+ *  a single line whose event, a channel message or a push, is still the
+ *  newest entry, unless a line of its own wake already written is still
+ *  unanswered, and writes the others as one message, none while the host is
+ *  quiesced or another reader of the residents' shared slot has a turn
+ *  alive. A line left out for a held slot stays owed to the next start of a
+ *  reader if it was owed; any other line not written, one left out as newest
+ *  among them, is decided again by the delivery agent's later starts of its
+ *  own wake. Its text is rendered when it's written (wakeLineText), so its
+ *  ages are true then.
  *
  *  Every request for one batch's wakes carries the same objects: the
  *  framework writes each line once by its identity. A host that hands the

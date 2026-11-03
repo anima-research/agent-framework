@@ -162,8 +162,6 @@ export interface WritePlacement {
   messageId?: string;
 }
 
-/** Whether a placement names a write the agent could have answered: the
- *  agent and the id its message waits or is stored under. */
 export function isWrite(after: WritePlacement | undefined): after is WritePlacement & { agent: string } {
   return !!after?.agent && !!(after.deferredId || after.messageId);
 }
@@ -3906,10 +3904,8 @@ export class EventGate {
     // nothing the message right above doesn't. But the turn compiles later,
     // and what lands in between puts the message above other entries, so the
     // gate hands the line to the wake (WakeProvenance.lines) and a turn's start
-    // decides it (WakeLine). So does a batch whose every event has a write
-    // (isWrite), each of which the agent may have answered by then. A batch
-    // with an event given no write, or one the host never filled in, can't be
-    // judged answered whole, so its line is written now.
+    // decides it (WakeLine), as it does for a batch whose every event has a
+    // write (isWrite).
     const only = events.length === 1 && events[0].inContext ? events[0] : undefined;
     const handed = this.isNewestEntryFn !== undefined
       && (events.every((e) => isWrite(e.after)) || (only !== undefined && this.newestEntry(only)));

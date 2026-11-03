@@ -399,8 +399,6 @@ describe('isNewestContextEntry', () => {
     assert.equal(linesIn('LINE-E2'), 1, 'the second written: the wake has two causes');
   });
 
-  // A line with a write (`after`) and a reply owed (`replyTo`): no turn runs
-  // here, so the agent hasn't answered it.
   const writtenLineFor = async (text: string, shown: string) => {
     const row = await waitForRow(text);
     return { ...lineFor(row.metadata ?? {}, shown), after: { agent: 'scout', messageId: row.id }, replyTo: { serverId: 'discord', channelId: 'discord:dm:1' } };
@@ -423,8 +421,12 @@ describe('isNewestContextEntry', () => {
   });
 
   it('a line with a write left out as newest isn\'t written by a later start of another wake', async () => {
+    const omitted: string[] = [];
+    framework.onTrace((event) => { if (event.type === 'gate:wake-line-omitted') omitted.push((event as unknown as { reason: string }).reason); });
     command(`dm ev-${++n} 134 1548000000000000001 a DM`);
     (framework as unknown as Placing).placeWakeLines(scout(), [await writtenLineFor('a DM', '[Gate: LINE-S2]')]);
+    assert.deepEqual(omitted, ['newest'], 'premise: left out as newest');
+    assert.equal(linesIn('LINE-S2'), 0, 'premise: no line');
     internals().addMessage('someone', [{ type: 'text', text: 'later, elsewhere' }], { serverId: 'discord', channelId: 'discord:g1:general', messageId: `m-later-${n}` });
     (framework as unknown as Placing).placeWakeLines(scout(), []);
     assert.equal(linesIn('LINE-S2'), 0);
@@ -729,10 +731,9 @@ describe('a handed line across readers, a flush, a quiesce and a hold', () => {
     .map((m) => m.content.map((x) => (x.type === 'text' ? x.text : '')).join(''));
   const wake = (lines: unknown[], timestamp = Date.now()) => ({ agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp, wakeLines: lines });
 
-  // Every resident gets every batched wake. A line handed for its newest
-  // message, with no write, is placed only by the delivery agent's start, so
-  // it lands once, before that agent's own answer; a line with a write, by
-  // the first reader's start.
+  // Every resident gets every batched wake. A line with no write is placed
+  // only by the delivery agent's start, so it lands once, before that agent's
+  // own answer.
   it('one wake for two residents, the co-resident first: she writes no line, and the delivery agent\'s start writes it once, after her reply and before its own answer', async () => {
     const b = await bare(['scout', 'mira']);
     try {
