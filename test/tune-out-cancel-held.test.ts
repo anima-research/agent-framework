@@ -197,3 +197,57 @@ test("a cancel asked for during a surgery's hold waits, the tune-out in force, a
   assert.ok(textOf(dump.content).includes('messages=2') && textOf(dump.content).includes('Ann: A1 stored\nAnn: A2 kept by the hold'),
     `it lists the message the hold kept, stored by then, after the one stored before: ${textOf(dump.content)}`);
 });
+
+// A reader's cancel_tuneout gives the cancel who made it as its reason, by
+// the name the reader runs under (the persistent reader's, or a reader
+// fork's own), marked as a value the host supplied: the resident reads it in
+// the lifecycle line, the reader in its cancel notice, and a host in the
+// trace. It was "subconscious judgment", whatever the reader was named or
+// was (the mind-neutrality audit's M11).
+test("a reader's cancel_tuneout gives the cancel who made it as its reason, never a judgment", async () => {
+  const cases = [
+    { reader: 'Muse', caller: 'Muse', by: 'by Muse' },
+    { reader: 'Muse', caller: undefined, by: 'by the reader' },
+    { reader: '[Tune-out: Muse', caller: '[Tune-out: Muse', by: 'by \\[Tune-out: Muse' },
+  ];
+  for (const { reader, caller, by } of cases) {
+    const added: Added[] = [];
+    const traces: Array<{ type: string; reason?: unknown }> = [];
+    const tunedOut = { params: { epochId: 'eA', cadenceSeconds: 300, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 }, wakeCount: 2 };
+    let ended = false;
+    const registry = {
+      getTuneOutState: (_serverId: string, channelId: string) => (!ended && channelId === 'disc:guild:a' ? tunedOut : null),
+      readCoordinatorState: () => null,
+      nameShown: (channel: { channelId: string }) => channel.channelId,
+      quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
+      cancelTuneOut: () => { ended = true; return tunedOut; },
+      // No call here is made inside a turn, and the one channel's id names it alone.
+      ownChannelFor: () => undefined,
+      sharedNameRefusalFor: () => undefined,
+      channelsNamed: (name: string) => (name === 'disc:guild:a' ? [{ serverId: 'disc', channelId: name }] : []),
+    };
+    const hooks = {
+      addMessage: (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, forAgent?: string) => {
+        added.push({ participant, content, metadata, forAgent });
+      },
+      requestInference: () => {},
+      subconsciousName: () => reader,
+      primaryName: () => 'scout',
+      getStoredMessages: () => [row('Ann', [text('A1 stored')], 'eA')],
+      getSurgeryHeldMessages: () => [],
+      // One came in after the reader last looked, so it gets the notice too.
+      unseenBySubconscious: () => 1,
+      emitTrace: (event: { type: string; reason?: unknown }) => { traces.push(event); },
+    };
+    const coordinator = new TuneOutCoordinator(registry as never, {} as never, hooks as never);
+    assert.deepEqual(await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'disc:guild:a' }, [], caller),
+      { success: true, data: { cancelled: true } });
+    const dump = textOf(added.find((m) => m.metadata?.kind === 'tune-out-cancel')!.content);
+    assert.ok(dump.startsWith(`[Tune-out: disc:guild:a cancelled — ${by}, 2 wakes]\n\n<tuned-out-backlog `), dump);
+    const notice = added.find((m) => m.metadata?.kind === 'tune-out-cancel-report');
+    assert.ok(notice, 'the reader gets its notice');
+    assert.ok(textOf(notice.content).startsWith(`[Tune-out cancelled: disc:guild:a — ${by}. `), textOf(notice.content));
+    assert.deepEqual(traces.filter((e) => e.type === 'tune-out:cancelled').map((e) => e.reason), [by]);
+    for (const m of added) assert.ok(!/subconscious|judg/i.test(textOf(m.content)), textOf(m.content));
+  }
+});

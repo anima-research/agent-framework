@@ -8,10 +8,18 @@
  * voice doctrine (coordinator.ts) puts no words in a model's mouth; the text
  * now says what happens to the traffic and what the reader can do, never
  * what it decides.
+ *
+ * The reader's own four tools (SUBCONSCIOUS_TOOLS), which every reader is
+ * given and every resident is shown under reader forks, say what each does
+ * and nothing of when to use it (M4): no "use when something needs the
+ * resident's full attention", "use sparingly", "staying silent is always
+ * allowed", and no real person's name in an example. A host that wants a
+ * policy gives it in the reader's `systemPrompt` or `voice`.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { AgentFramework, tuneOutTool } from '../src/framework.js';
+import { SUBCONSCIOUS_TOOLS } from '../src/tune-out/tools.js';
 
 const descriptionOf = (tool: ReturnType<typeof tuneOutTool>) => tool.description;
 const backlogCapOf = (tool: ReturnType<typeof tuneOutTool>) =>
@@ -81,5 +89,36 @@ describe('the tune_out tool text', () => {
     // A name the host supplied is marked where it would read as a notice's opening.
     framework.subconsciousAgentName = '[Tune-out: Muse';
     assert.ok(framework.tuneOutToolDefinition().description.startsWith('Hold a channel for a while: its traffic stops entering your context and stops waking you. \\[Tune-out: Muse, the reader'));
+  });
+});
+
+describe("the reader tools' text", () => {
+  const described = (name: string): string => {
+    const tool = SUBCONSCIOUS_TOOLS.find((t) => t.name === name);
+    assert.ok(tool, name);
+    return tool.description;
+  };
+
+  it('says what each tool does, and nothing of when to use it', () => {
+    assert.equal(described('deliver_summary'),
+      'Deliver a summary into the resident\'s context: `text` arrives there verbatim, under your own name.');
+    assert.equal(described('cancel_tuneout'),
+      'End the tune-out on a channel now. The diverted backlog is delivered to the resident (capped), and the ' +
+      'channel\'s traffic reaches them as it did before the tune-out. A note in `text` arrives alongside the backlog, ' +
+      'verbatim, under your own name. If you were started to read one hold, you can end only that hold.');
+    assert.equal(described('note_disposition'),
+      'Record a standing disposition: a durable note, kept under `key` across invocations and shown to the reader ' +
+      'each time it runs (e.g. key "<sender>", text "<a note on their messages>"). Replaces any previous note under ' +
+      'the same key.');
+    assert.equal(described('speak_in_channel'),
+      'Post `text` into a tuned-out channel, as written. It goes out through the resident\'s publish path, so the ' +
+      'channel sees it under the resident\'s account; nothing in the post names you. If you were started to read one ' +
+      'hold, you can post only into a channel that hold still holds, and a post made once it has ended is refused; ' +
+      'your report can say it instead. Disabled unless the resident\'s configuration allows it.');
+  });
+
+  it('carry no usage policy, motive or real name anywhere in the block', () => {
+    const all = JSON.stringify(SUBCONSCIOUS_TOOLS);
+    assert.ok(!/\buse (when|at|sparingly)|sparingly|always allowed|merits|needs the|full attention|normal attention|antra|release-bot|second person|subconscious/i.test(all), all);
   });
 });

@@ -21,11 +21,13 @@ import {
   SUBCONSCIOUS_TOOL_NAMES,
   defaultReaderFraming,
   persistentReaderName,
+  tuneOutReachWords,
   type SubconsciousConfig,
   type PersistentReaderConfig,
   type ForkReaderConfig,
   type ReaderFramingContext,
   type ReaderRederivedReason,
+  type TuneOutReader,
 } from './tune-out/tools.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, alreadyTunedOutText, cancelWaitsNote, type ReaderInvocation } from './tune-out/coordinator.js';
 import { SubconsciousWindowAnchor } from './tune-out/window-anchor.js';
@@ -57,6 +59,7 @@ import type {
   FrameworkState,
   PresentationRetractReason,
   TraceEvent,
+  TraceEventInput,
   TraceEventListener,
   InferenceLogEntry,
   InferenceLogQuery,
@@ -1060,7 +1063,8 @@ class McpConfigurationRefusal extends Error {
 
 /** The reply helpers an MCPL connection hands an inbound request's handler. */
 type InboundResponder = {
-  id: string | number;
+  /** The request's id: null for a request that the server sent with id null. */
+  id: string | number | null;
   respond: (result: unknown) => void;
   respondError: (code: number, message: string, data?: unknown) => void;
 };
@@ -2095,23 +2099,7 @@ function assertAgentNamesUnique(agents: readonly AgentConfig[]): void {
   );
 }
 
-/**
- * Who reads a tuned-out channel's traffic, as the text a resident reads
- * says it: the persistent subconscious by the name it runs under, reader
- * forks, or no reader (a silent hold, where `tuneOut.enabled` offers
- * tune_out without one). A persistent reader's name is a value the host
- * supplied, marked as such (suppliedValue).
- */
-export type TuneOutReader =
-  | { readonly kind: 'persistent'; readonly name: string }
-  | {
-      readonly kind: 'forks';
-      /** `subconscious.persist`, when it persists the reader; left out for a fork per look. */
-      readonly persist?: 'epoch' | 'resident';
-      /** `subconscious.resync`, read with `persist`. */
-      readonly resync?: 'window' | 'none';
-    }
-  | { readonly kind: 'none' };
+export type { TuneOutReader };
 
 /**
  * The `tune_out` tool for a host with `reader`. The text says what happens
@@ -5432,7 +5420,7 @@ export class AgentFramework {
         } : {}),
         ...(judge && judgeOptions?.timeoutMs !== undefined ? { judgeTimeoutMs: judgeOptions.timeoutMs } : {}),
         ...(judge && judgeOptions?.onError !== undefined ? { judgeOnError: judgeOptions.onError } : {}),
-        emitTrace: (e) => framework.emitTrace(e as { type: TraceEvent['type']; [key: string]: unknown }),
+        emitTrace: (e) => framework.emitTrace(e),
         addMessage: (p, c, m, forAgent, placement, audience) => framework.addMessage(p, c, m as MessageMetadata,
           forAgent || placement || audience
             ? { ...(forAgent ? { forAgent } : {}), ...(placement ? { placement } : {}), ...(audience ? { audience } : {}) }
@@ -5820,7 +5808,7 @@ export class AgentFramework {
                 },
               }
             : {}),
-          emitTrace: (e) => framework.emitTrace(e as never),
+          emitTrace: (e) => framework.emitTrace(e),
         },
       );
       framework.tuneOutCoordinator.resumeActiveEpochs();
@@ -6786,11 +6774,7 @@ export class AgentFramework {
     }
     this.emitTrace({ type: 'tool:started', module: 'heartbeat', tool: call.name, callId: call.id, input: call.input });
     const result = this.runHeartbeatTool(call);
-    this.emitTrace({
-      type: result.isError ? 'tool:failed' : 'tool:completed',
-      module: 'heartbeat', tool: call.name, callId: call.id, durationMs: 0,
-      ...(result.isError ? { error: result.error } : {}),
-    });
+    this.traceToolOutcome('heartbeat', call.name, call.id, result, 0);
     this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'heartbeat', result });
   }
 
@@ -13412,7 +13396,8 @@ export class AgentFramework {
 
   /**
    * The reader of a tuned-out channel's traffic, as the text a resident
-   * reads describes it (tuneOutTool, tunedOutSendNote): the persistent
+   * reads describes it (tuneOutTool, tunedOutSendNote, tune_out's answers
+   * and the channel registry's refusals of a tuned-out channel): the persistent
    * subconscious by the name it runs under, which the host gives it, reader
    * forks as forks of the resident's context, or none.
    */
@@ -17553,9 +17538,9 @@ export class AgentFramework {
     // channel, 10-09).
     if (typeof cfg.model !== 'string' || cfg.model.length === 0) {
       throw new Error(
-        `subconscious.reader "forks": a reader fork holds the whole prefix of "${primaryName}", so \`model\` ` +
-          `must say whose weights run it — "${primaryConfig.model}" for a copy of the resident, or another model ` +
-          'by name. It is not defaulted',
+        `subconscious.reader "forks": a reader fork of "${primaryName}" holds its whole prefix, so \`model\` must ` +
+          `say whose weights run it — "${primaryConfig.model}", the model "${primaryName}" runs, or another model by ` +
+          'name. It is not defaulted',
       );
     }
     if (typeof cfg.voice !== 'string' || cfg.voice.length === 0) {
@@ -33081,7 +33066,7 @@ export class AgentFramework {
     };
   }
 
-  private emitTrace(event: { type: TraceEvent['type']; [key: string]: unknown }): void {
+  private emitTrace(event: TraceEventInput): void {
     // Centralized inference-health observability. Every terminal failure path
     // funnels through an `inference:exhausted` trace and every successful model
     // response through `inference:completed`, so intercepting here is the one
@@ -33845,12 +33830,12 @@ export class AgentFramework {
     const coalescing = this.restorePushCoalescer();
     const checkpoints = new CheckpointManager(
       this.store,
-      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      (event) => this.emitTrace(event),
     );
     for (const config of serverConfigs) checkpoints.loadHostStates(config.id);
     this.mcplServerRegistry = new McplServerRegistry();
     this.featureSetManager = new FeatureSetManager(
-      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      (event) => this.emitTrace(event),
     );
     this.hookOrchestrator = new HookOrchestrator(this.mcplServerRegistry, this.featureSetManager);
     this.toolLifecycleEmitter = new ToolLifecycleEmitter({
@@ -33877,7 +33862,7 @@ export class AgentFramework {
     this.pushHandler = new PushHandler(
       this.featureSetManager,
       (event) => this.pushEvent(event as unknown as ProcessEvent),
-      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      (event) => this.emitTrace(event),
       triggerFilter,
       (serverId, params, event) => this.handleCoalescedPush(serverId, params, event),
       // An ordinary push: freeze its envelope and observe the acceptance at
@@ -33895,7 +33880,7 @@ export class AgentFramework {
       this.hookOrchestrator,
       this.featureSetManager,
       inferenceRouting ?? null,
-      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      (event) => this.emitTrace(event),
       () => this.inferenceBounds,
     );
 
@@ -33907,7 +33892,7 @@ export class AgentFramework {
       this.mcplServerRegistry,
       this.featureSetManager,
       (event) => this.pushEvent(event),
-      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      (event) => this.emitTrace(event),
       {
         store: this.store,
         handleCoalescedIncoming: (serverId, message, event) =>
@@ -33948,6 +33933,9 @@ export class AgentFramework {
             : 'The focus on it ended, and what the other channels held was delivered.';
         },
         focusChannelResolver: () => this.tuneOutCoordinator?.focusChannel() ?? null,
+        // Who reads a tuned-out channel's traffic, for the registry's texts
+        // that say where its messages go (tuneOutHeldWords, tuneOutReachWords).
+        tuneOutReader: () => this.tuneOutReader(),
         // Route a conversation fork's plain-text speech to its HOME channel, not
         // the process-global most-recent-inbound locus (item 3). The trunk agent
         // has no home entry, so this returns undefined and routeSpeech falls back
@@ -36715,7 +36703,7 @@ export class AgentFramework {
     onRequest('inference-request', async (
       params: McplInferenceRequestParams,
       responder?: {
-        id: string | number;
+        id: string | number | null;
         respond: (result: unknown) => void;
         respondError: (code: number, message: string) => void;
         sendChunk?: (chunk: InferenceChunkParams) => void;
@@ -37177,14 +37165,11 @@ export class AgentFramework {
     });
   }
 
-  /** An MCP tool call's trace: a result the server marked an error (or one
-   *  the reading takes as one, such as malformed content) is tool:failed, as
-   *  on the other tool paths; anything else is tool:completed. */
-  private traceMcpToolOutcome(serverId: string, tool: string, callId: string, result: ToolResult, durationMs: number): void {
+  private traceToolOutcome(module: string, tool: string, callId: string, result: ToolResult, durationMs: number): void {
     if (result.isError) {
-      this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool, callId, durationMs, error: result.error ?? 'tool returned an error' });
+      this.emitTrace({ type: 'tool:failed', module, tool, callId, durationMs, error: result.error ?? 'tool returned an error' });
     } else {
-      this.emitTrace({ type: 'tool:completed', module: `mcpl:${serverId}`, tool, callId, durationMs });
+      this.emitTrace({ type: 'tool:completed', module, tool, callId, durationMs });
     }
   }
 
@@ -37745,7 +37730,7 @@ export class AgentFramework {
       modern.callTool(toolName, args)
         .then((result) => reading(result, false))
         .then((result) => {
-          this.traceMcpToolOutcome(serverId, toolName, call.id, result, Date.now() - startTime);
+          this.traceToolOutcome(`mcpl:${serverId}`, toolName, call.id, result, Date.now() - startTime);
           this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: `mcpl:${serverId}`, result });
         })
         .catch(failDispatch);
@@ -37854,7 +37839,7 @@ export class AgentFramework {
       .then(({ result, toolResult: answer }) => {
         let toolResult = answer;
         const durationMs = Date.now() - startTime;
-        this.traceMcpToolOutcome(serverId, toolName, call.id, toolResult, durationMs);
+        this.traceToolOutcome(`mcpl:${serverId}`, toolName, call.id, toolResult, durationMs);
 
         // Record checkpoint from stateful tool response (Step 8).
         // Explicit response attribution is authoritative. Otherwise use the
@@ -38239,11 +38224,7 @@ export class AgentFramework {
         const destination = published.outcome?.status === 'delivered' ? published.outcome.destination : undefined;
         if (publisher && destination) publisher.notePublished(destinationKey(destination), readThrough);
         const durationMs = Date.now() - startTime;
-        this.emitTrace({
-          type: result.isError ? 'tool:failed' : 'tool:completed',
-          module: 'channels', tool: call.name, callId: call.id, durationMs,
-          ...(result.isError ? { error: result.error } : {}),
-        });
+        this.traceToolOutcome('channels', call.name, call.id, result, durationMs);
         // A successful channel_open plants the agent's feet in the opened
         // channel. The agent's own deliberate open is the strongest "my next
         // words go here" signal in the system — stronger than any injection —
@@ -38469,11 +38450,7 @@ export class AgentFramework {
       // Where notes follow an error that doesn't end in a stop, it gets one, so each reads as a sentence of its own.
       const said = given.error && !/[.!?]$/.test(given.error) ? `${given.error}.` : given.error;
       const result = given.isError && ignored.length > 0 ? { ...given, error: [said, ...ignored].join(' ') } : given;
-      this.emitTrace({
-        type: result.isError ? 'tool:failed' : 'tool:completed',
-        module: 'gate', tool: call.name, callId: call.id, durationMs: 0,
-        ...(result.isError ? { error: result.error } : {}),
-      });
+      this.traceToolOutcome('gate', call.name, call.id, result, 0);
       deliver(result);
     };
 
@@ -38778,8 +38755,8 @@ export class AgentFramework {
     }
     // An open that throws is answered too, never left unhandled.
     const openThrew = (err: unknown): string =>
-      'The tune-out is recorded, but its messages may not reach the subconscious, since opening its channel ' +
-      `failed: ${thrownText(err)}`;
+      `The tune-out is recorded, but its messages ${tuneOutReachWords(this.tuneOutReader(), 'may not reach')}, since ` +
+      `opening its channel failed: ${thrownText(err)}`;
     const serverId = typeof input.serverId === 'string' && input.serverId ? input.serverId : undefined;
     const allExcept = input.scope === 'all-except';
 
@@ -38863,7 +38840,7 @@ export class AgentFramework {
           maxWakes: r.params.maxWakes,
           note: coordinator.hasReader()
             ? `${speech} Reader wakes pause, not cancel, when the budget is spent.`
-            : `No subconscious is configured: this is a silent hold. ${speech} The backlog is delivered per channel when you cancel or the duration ends.`,
+            : `No reader is configured here: this is a silent hold. ${speech} The backlog is delivered per channel when you cancel or the duration ends.`,
         },
       };
     }
@@ -38890,7 +38867,7 @@ export class AgentFramework {
         const error = now?.params.epochId === tuneOut.params.epochId
           // A name in a sentence is quoted as tune_out takes it back (main's #852).
           ? alreadyTunedOutText(channelRegistry.quotedShown(resolved), now.params,
-            openError ?? 'Its transport is open now, so its messages reach the subconscious.')
+            openError ?? `Its transport is open now, so its messages ${tuneOutReachWords(this.tuneOutReader(), 'reach')}.`)
           : TUNE_OUT_REPLACED;
         return { success: false, error, isError: true };
       }
@@ -38913,7 +38890,7 @@ export class AgentFramework {
         ...(openError ? { openError } : {}),
         ...(coordinator.hasReader()
           ? {}
-          : { note: 'No subconscious is configured: this is a silent hold. Nothing summarizes or wakes you; the backlog is delivered when you cancel.' }),
+          : { note: 'No reader is configured here: this is a silent hold. Nothing summarizes or wakes you; the backlog is delivered when you cancel.' }),
       },
     };
   }
@@ -39323,12 +39300,7 @@ export class AgentFramework {
       } catch (error) {
         result = { success: false, isError: true, error: `fetch_reference couldn't answer: ${thrownText(error)}` };
       }
-      this.emitTrace({
-        type: result.isError ? 'tool:failed' : 'tool:completed',
-        module: 'workspace', tool: call.name, callId: call.id,
-        durationMs: Date.now() - startTime,
-        ...(result.isError ? { error: result.error } : {}),
-      });
+      this.traceToolOutcome('workspace', call.name, call.id, result, Date.now() - startTime);
       deliver({ ...result, isError: result.isError ?? false });
     })();
   }
@@ -39336,14 +39308,7 @@ export class AgentFramework {
   private dispatchReadImageToolCall(agentName: string, call: ToolCall, deliver = this.pushToolResult(agentName, call, 'workspace')): void {
     this.emitTrace({ type: 'tool:started', module: 'workspace', tool: call.name, callId: call.id, input: call.input });
     const finish = (result: ToolResult): void => {
-      this.emitTrace({
-        type: result.isError ? 'tool:failed' : 'tool:completed',
-        module: 'workspace',
-        tool: call.name,
-        callId: call.id,
-        durationMs: 0,
-        ...(result.isError ? { error: result.error } : {}),
-      });
+      this.traceToolOutcome('workspace', call.name, call.id, result, 0);
       deliver(result);
     };
     void (async (): Promise<void> => {
@@ -39480,14 +39445,7 @@ export class AgentFramework {
   private dispatchSaveImageToolCall(agentName: string, call: ToolCall, deliver = this.pushToolResult(agentName, call, 'workspace')): void {
     this.emitTrace({ type: 'tool:started', module: 'workspace', tool: call.name, callId: call.id, input: call.input });
     const finish = (result: ToolResult): void => {
-      this.emitTrace({
-        type: result.isError ? 'tool:failed' : 'tool:completed',
-        module: 'workspace',
-        tool: call.name,
-        callId: call.id,
-        durationMs: 0,
-        ...(result.isError ? { error: result.error } : {}),
-      });
+      this.traceToolOutcome('workspace', call.name, call.id, result, 0);
       deliver(result);
     };
     type Candidate =
@@ -40125,14 +40083,7 @@ export class AgentFramework {
         isError: true,
       };
     }
-    this.emitTrace({
-      type: result.isError ? 'tool:failed' : 'tool:completed',
-      module: 'agent',
-      tool: call.name,
-      callId: call.id,
-      durationMs: 0,
-      ...(result.isError ? { error: result.error } : {}),
-    });
+    this.traceToolOutcome('agent', call.name, call.id, result, 0);
     deliver(result);
   }
 

@@ -36,7 +36,7 @@
  */
 import type { ContextManager, StoredMessage } from '@animalabs/context-manager';
 import type { SubconsciousWindowStart } from './coordinator.js';
-import type { TraceEvent } from '../types/trace.js';
+import type { TraceEventInput } from '../types/trace.js';
 
 /** The windowed strategy's anchor setters and read, as the anchor uses them. */
 export interface AnchoredStrategy {
@@ -62,7 +62,7 @@ export interface SubconsciousWindowAnchorHost {
    * `inForce`; false when it couldn't be kept.
    */
   fixed(epochIds: readonly string[], ordinal: number, inForce: boolean): boolean;
-  emitTrace(event: Omit<Extract<TraceEvent, { type: 'tune-out:subconscious-window' }>, 'timestamp' | 'traceId'>): void;
+  emitTrace(event: Extract<TraceEventInput, { type: 'tune-out:subconscious-window' }>): void;
 }
 
 /** The subconscious's window start, set by sequence in legacy mode and by a fixed ordinal once its window is presented. */
