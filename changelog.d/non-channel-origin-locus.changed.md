@@ -12,6 +12,11 @@
   window, after a quiesce or a provider hold. So is a start that is the first
   to read a private surface's message stored before it, though the message's
   own wake may still wait in a gate window, or the message woke nothing. So is
+  a resident's first start in a framework made on its store, as after a
+  restart, when the resident hasn't answered since a private surface's
+  message, a result or mail from a private turn's work, or a report from a
+  script a turn started, whichever turn it was: what the earlier run had
+  noted went with it. So is
   the turn of its own that a wake starts after waiting on a private turn,
   because that turn's continuation (a budget restart or a held retry) starts
   alone, or a quiesce parked the wake while the turn ran. A turn that takes in
@@ -141,4 +146,6 @@
 - **A report from a script a turn started, deferred across a restart,** such
   as an update's, counts as private input in the next run, whichever turn it
   was, since that run can't know the turn: the start that reads it is
-  private, failing closed. Later turns and retakes don't count it.
+  private, failing closed, as is the first start after a restart when such a
+  report stored before it is unanswered. Later turns and retakes don't count
+  it.

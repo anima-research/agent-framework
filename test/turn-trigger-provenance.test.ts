@@ -1899,6 +1899,67 @@ describe('private wins, one way', () => {
       };
     };
 
+    it("a private surface's message stored before a restart, which woke nothing and no start read, keeps the next run's first start out of every channel", async () => {
+      const storeDir = mkdtempSync(join(tmpdir(), 'unread-private-restart-'));
+      try {
+        const first = await surfaceRig({ storeDir, quietSources: ['console'] });
+        try {
+          await firstTurn(first, false);
+          assert.deepEqual(first.routed.map((r) => r.locus), [ROOM], "control: the first run's turn is a channel turn");
+          const starts = first.starts.length;
+          first.framework.pushEvent({ type: 'external-message', source: 'console', content: 'for your eyes only', metadata: {} } as never);
+          await first.until(() => stored(first).includes('for your eyes only'), 'the private message stored');
+          await first.framework.runUntilIdle();
+          assert.equal(first.starts.length, starts, 'control: no start read it in the first run');
+        } finally {
+          await first.close();
+        }
+        const next = await surfaceRig({ storeDir, quietSources: ['console'] });
+        try {
+          const { channelTurn } = restarted(next);
+          assert.deepEqual(await channelTurn(), [], 'the start that reads it speaks in no channel');
+          assert.deepEqual(await channelTurn(), [ROOM], 'control: a later channel turn speaks in its channel');
+        } finally {
+          await next.close();
+        }
+      } finally {
+        rmSync(storeDir, { recursive: true, force: true });
+      }
+    });
+
+    it("a channel turn's script report stored before a restart, which no start read, keeps only the next run's first start out of every channel: a later nudge speaks as on main", async () => {
+      const storeDir = mkdtempSync(join(tmpdir(), 'unread-report-restart-'));
+      try {
+        const first = await surfaceRig({ storeDir });
+        try {
+          await firstTurn(first, false);
+          assert.deepEqual(first.routed.map((r) => r.locus), [ROOM], "control: the first run's turn is a channel turn");
+          const turnId = routingOf(first.framework).turnId as number;
+          const starts = first.starts.length;
+          await (first.framework as unknown as {
+            scriptWake(agentName: string, scriptId: string, text: string, label: string, startTurnId: number): Promise<void>;
+          }).scriptWake('scout', 's1', '[script s1] the build finished', 's1-ended', turnId);
+          first.i.pendingRequests.length = 0;
+          assert.ok(stored(first).includes('the build finished'), 'control: the report is stored');
+          await first.framework.runUntilIdle();
+          assert.equal(first.starts.length, starts, 'control: no start read it in the first run');
+        } finally {
+          await first.close();
+        }
+        const next = await surfaceRig({ storeDir });
+        try {
+          const { channelTurn, nudge } = restarted(next);
+          assert.deepEqual(await channelTurn(), [], "the start that reads the earlier run's report speaks in no channel");
+          assert.deepEqual(await channelTurn(), [ROOM], 'control: a later channel turn speaks in its channel');
+          assert.deepEqual(await nudge(), [LOUNGE], 'a nudge after it speaks as on main, in the fallback channel');
+        } finally {
+          await next.close();
+        }
+      } finally {
+        rmSync(storeDir, { recursive: true, force: true });
+      }
+    });
+
     it("a channel turn's script report the agent answered, in a store a second framework opens in the same process, leaves that framework's nudges as on main", async () => {
       const storeDir = mkdtempSync(join(tmpdir(), 'answered-report-second-framework-'));
       try {

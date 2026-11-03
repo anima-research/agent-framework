@@ -1607,6 +1607,20 @@ function isMarkedPrivateInput(metadata: unknown): boolean {
   return (metadata as { dendrite?: { privateTurn?: unknown } } | undefined)?.dendrite?.privateTurn === true;
 }
 
+function holdsUnansweredPrivateInput(cm: ContextManager, agentName: string, sees: (metadata: unknown) => boolean): boolean {
+  for (let end = cm.getMessageCount(); end > 0; end -= TURN_INPUTS_SCAN) {
+    const { messages } = cm.getMessageWindow(Math.max(0, end - TURN_INPUTS_SCAN), Math.min(TURN_INPUTS_SCAN, end), { resolveBlobs: false });
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+      if (!sees(message.metadata)) continue;
+      if (message.participant === agentName) return false;
+      if (isMarkedPrivateInput(message.metadata)) return true;
+      if (typeof (message.metadata as Record<string, unknown> | undefined)?.[CALLER_TURN_KEY] === 'number') return true;
+    }
+  }
+  return false;
+}
+
 function turnInputs(
   cm: ContextManager, floor: number, agentName: string, sees: (metadata: unknown) => boolean,
 ): { first: MessageId; last: MessageId } | undefined {
@@ -16153,6 +16167,7 @@ export class AgentFramework {
     const agent = new Agent(config, contextManager, this.membrane);
     this.adoptToolResultGuard(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
+    if (holdsUnansweredPrivateInput(contextManager, config.name, sees)) this.privateInputStored.add(config.name);
     this.sharedSlotAgents.add(agent);
     // The first resident declared owns default delivery.
     this.announceAgentCreated(
