@@ -26,13 +26,19 @@
  * having been before the tune-out. The coordinator keeps the ordinal
  * (subconsciousWindowFixed), and from then on the start is set by it,
  * clamped to the window's length on a branch whose window is shorter (a
- * rollback), never converted again. Two starts wait longer: one set while
+ * rollback), the clamped ordinal then kept as the start, never converted
+ * again. A kept ordinal is kept as the start in force once it is set, not
+ * before, and one whose setting or keeping fails is tried again at the next
+ * presentation, as a fix is. Two starts wait longer: one set while
  * the window is the record (a branch move whose re-initialization of the
  * subconscious failed) is set by sequence and fixed at the next enter or
  * restart once the window presents; and one whose setting or keeping
  * failed before a branch move is fixed again at the next enter or restart.
  * A restart that finds a start in force kept sets that one, and the oldest
- * active tune-out's start, if it isn't kept, waits for the next enter.
+ * active tune-out's start, if it isn't kept, waits for the next enter; one
+ * that finds none kept, the oldest's start being kept, sets the anchor the
+ * strategy persisted where that is earlier (a cancelled tune-out's start
+ * that was set but never kept), as the start in force.
  */
 import type { ContextManager, StoredMessage } from '@animalabs/context-manager';
 import type { SubconsciousWindowStart } from './coordinator.js';
@@ -71,9 +77,18 @@ export class SubconsciousWindowAnchor {
    * The starts whose ordinal isn't set and kept yet, the one in force
    * (`inForce`) first if it is among them: some row older than a start is
    * still out of the window, or setting or keeping the ordinal it was fixed
-   * at (`ordinal`) failed, which the next presentation tries again.
+   * at (`ordinal`) failed, which the next presentation tries again. A start
+   * set by an ordinal already known (`known`) waits only for its setting and
+   * keeping: kept for `keep` (none for a start in force only) and as the
+   * start in force, traced when clamped (`clampedFrom`, the ordinal kept
+   * before).
    */
-  private pending: Array<{ start: SubconsciousWindowStart; ordinal?: number; inForce: boolean }> = [];
+  private pending: Array<{
+    start: SubconsciousWindowStart;
+    ordinal?: number;
+    inForce: boolean;
+    known?: { keep: readonly string[]; clampedFrom?: number };
+  }> = [];
 
   constructor(private readonly host: SubconsciousWindowAnchorHost) {}
 
@@ -81,13 +96,17 @@ export class SubconsciousWindowAnchor {
    * Set the window start (the coordinator's setSubconsciousAnchor). In
    * legacy mode by its sequence, as before the index. In presented mode by
    * its ordinal when one was fixed, clamped to the window's index length
-   * and traced when past it; else by its sequence for now, converted as the
-   * strategy converts one, and the ordinal is fixed (see the module doc) as
-   * soon as no row the subconscious is owed stored before the start is out
-   * of its window, now or at a later presentation (presented). The starts
-   * of `others`, the other active tune-outs' whose ordinal isn't kept yet,
-   * are fixed the same way, without moving the window to them. Never
-   * throws: a set that fails is logged, and the anchor stays where it was.
+   * and traced when past it, the clamped ordinal kept as the start; the
+   * strategy's persisted anchor where it is earlier, at a resume that asks
+   * for it (keepEarlierAnchor); else by its sequence for now, converted as
+   * the strategy converts one, and the ordinal is fixed (see the module
+   * doc) as soon as no row the subconscious is owed stored before the start
+   * is out of its window, now or at a later presentation (presented). An
+   * ordinal set is kept as the start in force once it is set, and tried
+   * again at the next presentation until both succeed. The starts of
+   * `others`, the other active tune-outs' whose ordinal isn't kept yet, are
+   * fixed the same way, without moving the window to them. Never throws: a
+   * set that fails is logged, and the anchor stays where it was.
    */
   set(start: SubconsciousWindowStart, others: readonly SubconsciousWindowStart[] = []): void {
     try {
@@ -100,20 +119,28 @@ export class SubconsciousWindowAnchor {
       }
       const was = this.pending;
       const carried = (wanted: SubconsciousWindowStart, inForce: boolean) => ({
-        ...(was.find((p) => sameStart(p.start, wanted)) ?? { start: wanted }),
+        ...(was.find((p) => !p.known && sameStart(p.start, wanted)) ?? { start: wanted }),
         inForce,
       });
       this.pending = others.map((other) => carried(other, false));
-      if (start.ordinal !== undefined) {
-        const length = this.host.cm()?.indexLength() ?? 0;
-        const ordinal = Math.min(start.ordinal, length);
-        strategy.setAnchorOrdinal(ordinal);
-        if (ordinal !== start.ordinal) {
-          this.host.emitTrace({
-            type: 'tune-out:subconscious-window', agentName: this.host.agentName,
-            epochIds: [...start.epochIds], how: 'clamped', ordinal, kept: start.ordinal,
-          });
+      let known = start.ordinal;
+      let inForceOnly = start.inForceOnly === true;
+      if (known !== undefined && start.keepEarlierAnchor) {
+        const persisted = persistedOrdinal(strategy);
+        if (persisted !== undefined && persisted < known) {
+          known = persisted;
+          inForceOnly = true;
         }
+      }
+      if (known !== undefined) {
+        const length = this.host.cm()?.indexLength() ?? 0;
+        const ordinal = Math.min(known, length);
+        this.pending.unshift({
+          start,
+          ordinal,
+          inForce: true,
+          known: { keep: inForceOnly ? [] : start.epochIds, ...(ordinal !== known ? { clampedFrom: known } : {}) },
+        });
       } else {
         this.pending.unshift(carried(start, true));
         strategy.setAnchor(start.sequence);
@@ -141,16 +168,20 @@ export class SubconsciousWindowAnchor {
   /**
    * Fix each pending start's ordinal, once no row owed and stored before it
    * is out of the window, then set it (the start in force) and keep it;
-   * until both succeed a start stays pending at that ordinal.
+   * until both succeed a start stays pending at that ordinal. A start set by
+   * an ordinal known is set and kept the same way, and traced only when
+   * clamped.
    */
   private tryFix(): void {
     if (this.pending.length === 0 || !this.host.presents()) return;
     const cm = this.host.cm();
     const strategy = this.host.strategy();
     if (!cm || !strategy) return;
-    const owed = this.host.owed();
+    // Read once, and only for a start still to be fixed.
+    let owed: readonly Pick<StoredMessage, 'sequence'>[] | undefined;
     for (const entry of [...this.pending]) {
       if (entry.ordinal === undefined) {
+        owed ??= this.host.owed();
         if (owed.some((row) => row.sequence < entry.start.sequence)) continue;
         // Just past the last row in the window stored before the start.
         let ordinal = 0;
@@ -163,13 +194,30 @@ export class SubconsciousWindowAnchor {
       }
       const ordinal = entry.ordinal;
       if (entry.inForce) strategy.setAnchorOrdinal(ordinal);
-      if (!this.host.fixed(entry.start.epochIds, ordinal, entry.inForce)) continue;
+      if (!this.host.fixed(entry.known ? entry.known.keep : entry.start.epochIds, ordinal, entry.inForce)) continue;
       this.pending = this.pending.filter((p) => p !== entry);
-      this.host.emitTrace({
-        type: 'tune-out:subconscious-window', agentName: this.host.agentName,
-        epochIds: [...entry.start.epochIds], how: 'fixed', ordinal,
-      });
+      if (!entry.known) {
+        this.host.emitTrace({
+          type: 'tune-out:subconscious-window', agentName: this.host.agentName,
+          epochIds: [...entry.start.epochIds], how: 'fixed', ordinal,
+        });
+      } else if (entry.known.clampedFrom !== undefined) {
+        this.host.emitTrace({
+          type: 'tune-out:subconscious-window', agentName: this.host.agentName,
+          epochIds: [...entry.start.epochIds], how: 'clamped', ordinal, kept: entry.known.clampedFrom,
+        });
+      }
     }
+  }
+}
+
+/** The anchor the strategy persisted, as an ordinal, or undefined when it can't say. */
+function persistedOrdinal(strategy: AnchoredStrategy): number | undefined {
+  try {
+    return strategy.getAnchorOrdinal();
+  } catch (error) {
+    console.error(`[tune-out] the subconscious's persisted window start couldn't be read, so the start kept is set:`, error);
+    return undefined;
   }
 }
 

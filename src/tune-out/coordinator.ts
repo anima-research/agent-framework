@@ -97,6 +97,19 @@ export interface SubconsciousWindowStart {
   /** The start as the subconscious's index ordinal, once fixed for one of `epochIds`. */
   ordinal?: number;
   epochIds: readonly string[];
+  /**
+   * At a resume: `ordinal` is the start in force before the restart (a
+   * cancelled tune-out's, earlier than the start kept for `epochIds`), set
+   * again and kept as the start in force only, never as theirs.
+   */
+  inForceOnly?: true;
+  /**
+   * At a resume that finds no start in force kept, `ordinal` being the one
+   * kept for `epochIds`: the anchor the subconscious's strategy persisted is
+   * kept where it is earlier (a cancelled tune-out's start that was set but
+   * never kept), as the start in force only.
+   */
+  keepEarlierAnchor?: true;
 }
 
 /**
@@ -673,18 +686,24 @@ export class TuneOutCoordinator {
     const epochIds = active.filter((e) => e.sequence === sequence).map((e) => e.epochId);
     const kept = this.ordinalsKept();
     const state: WindowStartsState = kept ? this.readWindowState() : { starts: {} };
-    let ordinal = epochIds.map((id) => state.starts[id]).find((o) => o !== undefined);
+    const own = epochIds.map((id) => state.starts[id]).find((o) => o !== undefined);
+    let ordinal = own;
     // At a resume, the start in force before the restart (a cancelled
     // tune-out's, say), and never past the oldest active one's own start
-    // where one is kept.
-    if (occasion === 'resume' && state.inForce !== undefined) {
-      ordinal = ordinal === undefined ? state.inForce : Math.min(ordinal, state.inForce);
-    }
-    // The start in force from now: this ordinal, or, while the start waits
-    // to be fixed, none until the fix reports it (subconsciousWindowFixed).
-    if (kept && state.inForce !== ordinal) {
+    // where one is kept. With none in force kept, the anchor (window-anchor)
+    // keeps the one its strategy persisted where that is earlier than the
+    // oldest active one's own start.
+    const inForceOnly = occasion === 'resume' && state.inForce !== undefined && (own === undefined || state.inForce < own);
+    if (inForceOnly) ordinal = state.inForce;
+    const keepEarlierAnchor = occasion === 'resume' && kept && state.inForce === undefined && own !== undefined;
+    // The start in force from now: an ordinal known is kept as in force once
+    // it is set (the anchor's fix reports it, subconsciousWindowFixed), not
+    // before, so a set that fails leaves the record with the start the
+    // strategy still has. While the start waits to be fixed, none is in
+    // force until the fix reports it.
+    if (kept && ordinal === undefined && state.inForce !== undefined) {
       const { inForce: _was, ...rest } = state;
-      this.writeWindowState(ordinal !== undefined ? { ...rest, inForce: ordinal } : rest);
+      this.writeWindowState(rest);
     }
     const others: SubconsciousWindowStart[] = [];
     if (kept) {
@@ -695,7 +714,13 @@ export class TuneOutCoordinator {
       }
       for (const [at, ids] of bySequence) others.push({ sequence: at, epochIds: ids });
     }
-    this.hooks.setSubconsciousAnchor({ sequence, ...(ordinal !== undefined ? { ordinal } : {}), epochIds }, others);
+    this.hooks.setSubconsciousAnchor({
+      sequence,
+      ...(ordinal !== undefined ? { ordinal } : {}),
+      epochIds,
+      ...(inForceOnly ? { inForceOnly: true as const } : {}),
+      ...(keepEarlierAnchor ? { keepEarlierAnchor: true as const } : {}),
+    }, others);
   }
 
   // ==========================================================================
@@ -724,8 +749,9 @@ export class TuneOutCoordinator {
    * isn't this format (`{ v: 1, starts, inForce? }`), reads as none kept,
    * and is written over at the next fix, with a line saying so. A state an
    * earlier version kept, with no `inForce`, reads as one with none in
-   * force, and a restart sets the oldest active tune-out's start, as that
-   * version did.
+   * force, and a restart sets the oldest active tune-out's start, or the
+   * anchor the subconscious's strategy persisted where that is earlier
+   * (keepEarlierAnchor).
    */
   private readWindowState(): WindowStartsState {
     let raw: unknown;
