@@ -17,16 +17,18 @@
   the resident's full attention … and normal attention resumes"; `speak_in_channel`, "in your own words and clearly
   as yourself (not as the resident) … Use sparingly — e.g. to tell someone the resident is tuned out and when to
   expect them"; and `note_disposition`'s examples named a real person ("antra's pings always escalate", "ignore
-  release-bot"). Each now says what the tool does: a summary or a cancel's note arrives verbatim under the reader's
-  own name, a cancel delivers the backlog and the channel's traffic reaches the resident as before, a disposition is
-  kept under its key and shown to the reader each time it runs (its example a placeholder), and a post goes out
-  under the resident's account with nothing in it naming the reader. `deliver_summary`'s refusal of an empty `text`
+  release-bot"). Each now says what the tool does: a summary or a cancel's note arrives verbatim (leading and
+  trailing whitespace trimmed) under the reader's own name, a cancel delivers the backlog and the channel's traffic
+  reaches the resident as before, a disposition is kept under its key and shown to the reader each time it runs
+  (its example a placeholder), and a post goes out as written, trimmed the same way, under the resident's account
+  with nothing in it naming the reader. `deliver_summary`'s refusal of an empty `text`
   no longer adds "staying silent is allowed", and `speak_in_channel`'s refusal where channel speech is off no longer
   says "tell it what's needed with deliver_summary, or, if the channel is tuned out and needs the resident now, end
   the tune-out": it says what each does (deliver_summary puts the reader's text in the resident's context;
   cancel_tuneout ends the tune-out and delivers its backlog). A host that wants a policy for its reader gives it in the reader's
   `systemPrompt` (persistent) or `voice` / `framing` (forks). The four tools are in every reader's tool block, and
-  under reader forks in every resident's, so the first request after the upgrade misses the prompt cache there too.
+  under reader forks in every resident's, unless the resident's `allowedTools` leaves them out (then its reader
+  forks aren't shown them either), so the first request after the upgrade misses the prompt cache there too.
 - **Residents and readers: the rest of the text about a tuned-out channel names the reader this host configures, or
   says there is none, and a reader's cancel says who made it.** A channel tool's refusal of a tuned-out channel
   (`channel_open`, `channel_close`, `channel_decline`, a decline a tune-out replaced) said "its messages go to the

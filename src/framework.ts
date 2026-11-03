@@ -2089,10 +2089,12 @@ export function tuneOutTool(reader: TuneOutReader): import('./types/index.js').T
   const who = reader.kind === 'persistent' ? reader.name : 'the reader';
   const reads = reader.kind === 'persistent'
     ? `${reader.name}, the reader configured here, reads it instead. It runs on a cadence and when a message there ` +
-      'mentions you, and can report to you in its own words and cancel the tune-out. '
+      'that your wake rules let through mentions you or is from an author they privilege, and can report to you in ' +
+      'its own words and cancel the tune-out. '
     : reader.kind === 'forks'
-      ? 'A reader reads it instead: a fork of your context, run on a cadence and when a message there mentions you, ' +
-        'which can report to you in its own words and cancel the tune-out. '
+      ? 'A reader reads it instead: a fork of your context, run on a cadence and when a message there that your wake ' +
+        'rules let through mentions you or is from an author they privilege. It can report to you in its own words ' +
+        'and cancel the tune-out. '
       : 'No reader is configured here, so none reads it meanwhile: it is held for you, and delivered when you cancel ' +
         'the tune-out or durationSeconds runs out. ';
   return {
