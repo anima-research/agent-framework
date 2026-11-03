@@ -318,6 +318,11 @@ export type CoalescingAudit = { subject: string; eventId: string } & (
   | { kind: 'recovery-wake'; attempt: number; delayMs: number }
   | { kind: 'rendered'; source: 'render' | 'fallback'; empty: boolean }
   | { kind: 'render-failed'; serverId: string; field?: string; error: string }
+  /** The render's delivery threw, and its batch went to the recovery wake.
+   *  `mayBeStored`: the host couldn't tell whether a row landed
+   *  (CoalescerHost.mayHaveStored), so the recovery's delivery reads the
+   *  store before it stores the fallback. */
+  | { kind: 'deliver-failed'; error: string; mayBeStored?: true }
   | { kind: 'late-render'; discarded: true }
   | { kind: 'persist-failed'; error: string }
   | { kind: 'accepted-observer-failed'; error: string }

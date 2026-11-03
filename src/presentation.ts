@@ -65,7 +65,7 @@ import type { AgentName, AgentRecord, MessageSlotRef, ObserveEdge } from './dend
 import type { WindowOrdinal } from './read-marks.js';
 import { isAnotherAgentsInjection } from './stored-injections.js';
 import { nameAsStored } from './text-as-stored.js';
-import type { PresentationRetractReason, TraceEvent } from './types/trace.js';
+import type { PresentationRetractReason, TraceEventInput } from './types/trace.js';
 
 export { heldFromResidents } from './dendrite/audience.js';
 
@@ -377,9 +377,8 @@ export interface PresentedAgent {
   setOwnRowSink?(sink: ((ids: readonly MessageId[]) => void) | undefined): void;
 }
 
-type WithoutTimestamp<T> = T extends unknown ? Omit<T, 'timestamp' | 'traceId'> : never;
 /** The traces the module emits, as a host passes them on. */
-export type PresentationTrace = WithoutTimestamp<Extract<TraceEvent, { type: `presentation:${string}` }>>;
+export type PresentationTrace = Extract<TraceEventInput, { type: `presentation:${string}` }>;
 
 /** What the module reads of its host (the framework). */
 export interface PresentationHost {
