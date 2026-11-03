@@ -18,6 +18,8 @@ import { fileURLToPath } from 'node:url';
 import { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { StoredMessage } from '@animalabs/context-manager';
+import { ContextManager as StoreWindow, PassthroughStrategy } from '@animalabs/context-manager';
+import { residentContextOptions } from '../src/context-options.js';
 import { AgentFramework } from '../src/index.js';
 import { audienceOf } from '../src/dendrite/audience.js';
 import type { AgentConfig } from '../src/types/index.js';
@@ -56,8 +58,9 @@ async function host(agents: Array<Partial<AgentConfig> & { name: string }> = AGE
     } as Parameters<typeof AgentFramework.create>[0]);
     return framework;
   };
-  // A first boot makes the store and every agent's window, as the earlier
-  // release's process did.
+  // A first boot makes the store and every agent's window, which a release
+  // before #291 never wrote (it kept no window index); a store such a
+  // release left, with no index, is its own case below.
   await (await boot()).stop();
   return {
     dir,
@@ -114,6 +117,51 @@ describe('the deferred-write importer (#291, AF-6)', () => {
       } finally { await framework.stop(); }
     } finally { h.close(); }
   });
+
+  // The stores above were made by this release, every window written down
+  // already. A release before #291 kept no window index: its store's rows
+  // are in the agent's slot and nothing more, beside the queue it left.
+  for (const quiesced of [false, true]) {
+    it(`a ${quiesced ? 'quiesced' : 'serving'} boot of a store an earlier release left with no window index writes the window down and stores its queue into it${quiesced ? ' at resume' : ''}`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'deferred-import-legacy-'));
+      const storePath = join(dir, 'store');
+      try {
+        {
+          const store = JsStore.openOrCreate({ path: storePath });
+          const cm = await StoreWindow.open({ store, ...residentContextOptions('agent'), strategy: new PassthroughStrategy() });
+          for (const t of ['old-1', 'old-2']) cm.addMessage('someone', text(t), {});
+          assert.equal(cm.windowMode(), 'legacy', 'setup: the store predates the index');
+          cm.close();
+          store.close();
+        }
+        const recovery = join(storePath, 'recovery');
+        mkdirSync(recovery, { recursive: true });
+        writeFileSync(join(recovery, 'deferred-writes.json'), JSON.stringify({ version: 2, pending: [entry('q1', 1, 'queued-1')] }));
+        if (quiesced) writeFileSync(join(recovery, 'host-mode.json'), JSON.stringify({ version: 1, quiesced: true, reason: 'surgery', since: Date.now() }));
+        const framework = await AgentFramework.create({
+          storePath, membrane: new MockMembrane().asMembrane(), modules: [], syncIntervalMs: 0,
+          agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'You are agent.' }],
+        } as Parameters<typeof AgentFramework.create>[0]);
+        try {
+          const cm = framework.getAgent('agent')!.getContextManager();
+          assert.equal(cm.windowMode(), 'presented', 'written down at registration');
+          const queued = withText(framework, 'queued-1');
+          assert.deepEqual(queued.map(writeIdOf), ['q1'], 'stored once, under its queued id');
+          assert.deepEqual(JSON.parse(readFileSync(join(recovery, 'deferred-writes.json'), 'utf8')), { version: 1, pending: [] }, 'the record is cleared');
+          const olds = rowsOf(framework).filter((m) => /^old-\d$/.test(textOf(m)));
+          assert.deepEqual(olds.map((m) => cm.windowStatusOf(m.id)), ['in', 'in'], "the earlier release's rows are in the window");
+          assert.deepEqual(queued.map((m) => cm.windowStatusOf(m.id)), [quiesced ? 'out' : 'in'], quiesced ? 'the quiesce keeps the import out' : 'and the import, by the boot\'s pass');
+          if (quiesced) {
+            await framework.resume();
+            assert.deepEqual(queued.map((m) => cm.windowStatusOf(m.id)), ['in'], 'resume presents it');
+          }
+          const { messages } = await cm.compile();
+          assert.deepEqual(messages.map((m) => JSON.stringify(m.content)).filter((c) => /old-\d|queued-1/.test(c)).map((c) => /old-\d|queued-1/.exec(c)![0]),
+            ['old-1', 'old-2', 'queued-1'], 'the compile carries the earlier rows, then the import');
+        } finally { await framework.stop(); }
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+  }
 
   // host-quiesce.test.ts's case of a queue stranded beside a cleared
   // host-mode record, ported to this importer, was this case's twin; its
