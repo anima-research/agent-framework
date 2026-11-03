@@ -1887,7 +1887,10 @@ function heldWritesTold(writes: readonly SurgeryHeldWrite[]): { kinds: Record<st
   }
   const mail = writes.filter((write) => typeof (write.metadata as { dendrite?: { mailId?: unknown } } | undefined)?.dendrite?.mailId === 'string').length;
   const told = 'Kinds: ' + Object.entries(kinds).map(([kind, count]) => `${count} ${kind}`).join(', ') + '.' +
-    (mail > 0 ? ` The mail among them (${mail}) stays held in the registry, and the next boot delivers it.` : '');
+    (mail > 0
+      ? ` The mail among them (${mail}) stays held in the registry, and the next boot delivers it to its recipient, or, ` +
+        'where that recipient is gone by then, keeps it held there, marked recipient-gone.'
+      : '');
   return { kinds, mail, told };
 }
 
@@ -3264,9 +3267,11 @@ export type ReinitMove = (typeof REINIT_MOVES)[number];
 // #291: no queue keeps a write for a manager that refuses its work. Each
 // write for its agent waits in memory instead (heldForRecovery), its writer
 // answered as a held write's is, until a branch move re-initializes the manager
-// and its release stores them in arrival order; a restart loses them, and an
-// agent that ends first passes on the ones the primary takes in its place.
-const RECOVERY = 're-initializes it and stores the writes kept in memory for it meanwhile; a restart loses them.';
+// and its release stores them in arrival order; a restart loses them, but for
+// mail, which stays held in the registry for the next boot, and an agent that
+// ends first passes on the ones the primary takes in its place.
+const RECOVERY = 're-initializes it and stores the writes kept in memory for it meanwhile; a restart loses them, ' +
+  'except mail, which stays held in the registry.';
 
 export function refusedWorkAlert(move: ReinitMove, cause: string): ReinitAlertText {
   const opening = `The ${move} moved the store's branch, and this agent's context manager failed to re-initialize. ` +

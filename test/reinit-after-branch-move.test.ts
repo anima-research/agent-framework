@@ -647,7 +647,8 @@ describe('after a branch move, every agent on the store compiles without a resta
     assert.equal(lines.length, 1, `one line, for b: ${lines.join('\n')}`);
     says(lines[0]!, '[stop] agent=b: 3 writes for b kept in memory are not stored by this stop',
       '3 kept while its context manager refuses its work, which are lost', 'Kinds: 2 message, 1 agent-message.',
-      'The mail among them (1) stays held in the registry, and the next boot delivers it.');
+      'The mail among them (1) stays held in the registry, and the next boot delivers it to its recipient, or, where that ' +
+        'recipient is gone by then, keeps it held there, marked recipient-gone.');
     const lost = traces.filter((t): t is Extract<TraceEvent, { type: 'ops:alert' }> => t.type === 'ops:alert' && t.kind === 'store-held-lost');
     assert.deepEqual(lost.map((alert) => [alert.agentName, alert.data]), [
       ['b', { count: 3, keptForRecovery: 3, heldBySurgery: 0, kinds: { message: 2, 'agent-message': 1 }, mail: 1 }],
@@ -2909,7 +2910,8 @@ describe("a re-initialization alert's opening", () => {
     // #291: no queue keeps a write. A refusing manager's writes wait in
     // memory until a branch move re-initializes it and stores them, and a hold
     // keeps its writes in memory until its release.
-    const remedy = 're-initializes it and stores the writes kept in memory for it meanwhile; a restart loses them.';
+    const remedy = 're-initializes it and stores the writes kept in memory for it meanwhile; a restart loses them, ' +
+      'except mail, which stays held in the registry.';
     for (const [queued, says] of [[0, '0 writes'], [1, '1 write'], [2, '2 writes']] as const) {
       const { opening } = longHoldAlert({ move: 'branch switch', agentName: 'a', heldSeconds: 61, queued, waitingForMaintenance: false });
       assert.ok(opening.includes(` wait in memory (${says} now). `), opening);
