@@ -17875,6 +17875,8 @@ export class AgentFramework {
     let candidate: { agent: Agent; contextManager: ContextManager; cleanup: () => void } | undefined;
     try {
       const plan = this.readerPlan(identity, primary, persist, resync, invocation, scopeEnded);
+      // The host's branch the plan was made on (its checkpoint and mark checks).
+      const plannedOn = this.store.currentBranch().name;
       name = plan.name;
       if (plan.reason && plan.previous) {
         this.emitTrace({
@@ -17943,6 +17945,14 @@ export class AgentFramework {
           }, true),
           { metadata },
         );
+        // The reopen waits for the store: a branch switch meanwhile leaves
+        // the plan's checks, and the metadata's branch, of another branch.
+        // The look fails (the catch cleans the candidate up), and the next
+        // plans on the branch it runs on.
+        const now = this.store.currentBranch().name;
+        if (now !== plannedOn) {
+          throw new Error(`the host's branch moved from ${plannedOn} to ${now} while ${name} was being resumed`);
+        }
         incarnation = plan.resume.incarnation + 1;
         // From here to the stored row nothing waits, so the rows read and
         // the mark recorded are of one instant of the resident's window.

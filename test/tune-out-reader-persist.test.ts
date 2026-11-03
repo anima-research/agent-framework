@@ -822,6 +822,36 @@ describe('a persisted reader: a look that fails, and what goes back', () => {
     assert.deepEqual([f?.agentName, f?.returned, f?.error], ['reader/gone', 1, 'the resident ended before the look ran']);
   });
 
+  it("fails a resumed look when the host's branch moved while the reader was reopened; the next look plans again", { timeout: 120_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-moved-'));
+    dirs.push(dir);
+    const t = await boot(dir, { persist: 'resident' });
+    const epochId = t.enter();
+    const g = (k: number) => `reader/scout/g${k}`;
+    const trunk = t.internals.store.currentBranch().name;
+    t.look(epochId, [t.hold(epochId, 'HELD-1')]);
+    await t.looked(g(1), 1);
+    t.internals.store.createBranchAt('later', trunk, t.internals.store.currentSequence());
+    const fw = t.framework as unknown as { reopenAgentContext: (...args: unknown[]) => Promise<unknown> };
+    const reopen = fw.reopenAgentContext.bind(fw);
+    let moves = 0;
+    fw.reopenAgentContext = async (...args: unknown[]) => {
+      if (moves++ === 0) await t.framework.switchBranch('later');
+      return reopen(...args);
+    };
+    t.look(epochId, [t.hold(epochId, 'HELD-2')]);
+    await waitFor('the failed look', () => failed(t.traces).length > 0);
+    await t.framework.runUntilIdle();
+    const [f] = failed(t.traces);
+    assert.deepEqual([f!.agentName, f!.returned], [g(1), 1]);
+    assert.match(f!.error, new RegExp(`branch moved from ${trunk} to later`));
+    assert.equal(t.framework.getAgentRecord(g(1))!.incarnation, 1, 'no incarnation began');
+    assert.equal(t.forkTraces().length, 1);
+    t.look(epochId, [t.hold(epochId, 'HELD-3')]);
+    await t.looked(g(2), 1);
+    assert.deepEqual(t.traces.filter((e) => e.type === 'tune-out:reader-rederived').map((e) => (e as unknown as { reason: string }).reason), ['branch-moved'],
+      "planned on the branch it runs on: its last look was framed on the other");
+  });
 
   it("counts held rows as handed only from a framing its window holds: an undone framing's are handed again", { timeout: 120_000 }, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'reader-persist-undone-'));
