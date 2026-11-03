@@ -596,13 +596,11 @@ export type TraceEvent =
       outputTokens?: number;
     })
   | (TraceEventBase & {
-      /** A batched wake's turn started without its `[Gate: …]` line (the
-       *  gate hands the line to the wake when its message is the newest at
-       *  the fire, EventGate isNewestEntry, and the turn's start decides).
-       *  `reason`: `newest`, on the delivery agent's start the message was
-       *  still the newest entry in the window; `held`, the host was quiesced
-       *  or another reader of the residents' shared slot had a turn alive,
-       *  so no line could be written then. */
+      /** A start that would write a batched wake's handed `[Gate: …]` line
+       *  (EventGate isNewestEntry, WakeLine) left it out, for a later start to
+       *  decide again. `reason`: `newest`, its one line's message was still the
+       *  newest entry in the window; `held`, the host was quiesced or another
+       *  reader of the residents' shared slot had a turn alive. */
       type: 'gate:wake-line-omitted';
       reason: 'newest' | 'held';
       policyNames: string[];

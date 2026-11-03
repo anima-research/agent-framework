@@ -1447,9 +1447,22 @@ describe('a batched wake writes its line only when it says something', () => {
   });
 
   it('a host that doesn\'t place handed lines (no isNewestEntry) gets the line written now, a write given or not', () => {
-    const { gate, messages, inferenceRequests } = makeGate(config('written-no-host.json'));
-    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'hi',
-      metadata: { messageId: 'm1' } }), { agent: 'agent', messageId: 'row-1' });
+    for (const write of [{ agent: 'agent', messageId: 'row-1' }, undefined]) {
+      const { gate, messages, inferenceRequests } = makeGate(config(`written-no-host-${write ? 'write' : 'none'}.json`));
+      gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'hi',
+        metadata: { messageId: 'm1' } }), write);
+      fire(gate, 'chat');
+      assert.strictEqual(messages.length, 1);
+      assert.strictEqual(inferenceRequests[0].lines, undefined);
+    }
+  });
+
+  it('a write the host never filled in counts as none: the batch\'s line is written when it fires', () => {
+    const { gate, messages, inferenceRequests } = makeGate(config('unfilled-write.json'), { isNewestEntry: () => false });
+    for (const [content, messageId] of [['a', 'm1'], ['b', 'm2']]) {
+      gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content,
+        metadata: { messageId } }), { agent: '' });
+    }
     fire(gate, 'chat');
     assert.strictEqual(messages.length, 1);
     assert.strictEqual(inferenceRequests[0].lines, undefined);

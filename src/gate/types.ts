@@ -441,22 +441,23 @@ export interface GateEntryRef {
  *  handed to the wake rather than wrote (WakeProvenance.lines): its batch
  *  had an event with a write the agent may already have read and answered
  *  (`after`), or was one event whose entry was still the newest in the
- *  window when the batch fired (EventGate's `isNewestEntry`). A fresh start
- *  of the wake's turn decides its lines (the framework's placeWakeLines):
- *  the delivery agent's own start leaves out each line whose event it has
- *  read and answered, judged as the wake's drop is
- *  (InferenceRequest.readsWakeLines), and the line of a remaining event that
- *  is the only one and still the newest entry, and writes the others as one
- *  message; a co-resident's start places none; and none is written while
- *  the host is quiesced or another reader of the residents' shared slot has
- *  a turn alive. A line not written stays for a later fresh start of the
- *  same wake. Its text is rendered when it's written (wakeLineText), so its
- *  ages are true then.
+ *  window when the batch fired (EventGate's `isNewestEntry`). The framework
+ *  holds a line with a write as owed to the window it names, and the first
+ *  fresh start after the batch fires of any agent that reads it decides it;
+ *  a line with none is decided by the delivery agent's starts of its own
+ *  wake (the framework's placeWakeLines). A start drops each line whose event
+ *  the agent it was written for has read and answered, judged as the wake's
+ *  drop is (InferenceRequest.readsWakeLines), leaves out a single line whose
+ *  event is still the newest entry, and writes the others as one message,
+ *  none while the host is quiesced or another reader of the residents'
+ *  shared slot has a turn alive. A line not written is decided again by the
+ *  next such start. Its text is rendered when it's written (wakeLineText),
+ *  so its ages are true then.
  *
- *  Every request for one wake carries the same object: the framework writes
- *  each line once by its identity, across the wake's retries and holds. A
- *  host that hands the gate's requests on itself passes the line on as it
- *  is, not a copy per agent. */
+ *  Every request for one batch's wakes carries the same objects: the
+ *  framework writes each line once by its identity. A host that hands the
+ *  gate's requests on itself passes the lines on as they are, not a copy per
+ *  agent. */
 export interface WakeLine {
   /** The event's own entry. */
   entry: GateEntryRef;

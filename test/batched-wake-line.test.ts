@@ -688,8 +688,10 @@ describe('a handed line across readers, a flush, a quiesce and a hold', () => {
     .map((m) => m.content.map((x) => (x.type === 'text' ? x.text : '')).join(''));
   const wake = (lines: unknown[], timestamp = Date.now()) => ({ agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp, wakeLines: lines });
 
-  // Every resident gets every batched wake. Only the delivery agent's start
-  // places the line, so it lands once, before that agent's own answer.
+  // Every resident gets every batched wake. A line handed for its newest
+  // message, with no write, is placed only by the delivery agent's start, so
+  // it lands once, before that agent's own answer; a line with a write, by
+  // the first reader's start.
   it('one wake for two residents, the co-resident first: she writes no line, and the delivery agent\'s start writes it once, after her reply and before its own answer', async () => {
     const b = await bare(['scout', 'mira']);
     try {
@@ -710,6 +712,29 @@ describe('a handed line across readers, a flush, a quiesce and a hold', () => {
       const scout = all.findIndex((t) => t.includes('scout answers'));
       assert.equal(all.filter((t) => t.includes('LINE-MIRA-FIRST')).length, 1, 'written once');
       assert.ok(mira >= 0 && at > mira && scout > at, `after mira's reply, before scout's answer (mira ${mira}, line ${at}, scout ${scout})`);
+    } finally { await done(b); }
+  });
+
+  it('a line with a write, the co-resident first: her start writes it once, before her answer, and the delivery agent\'s start writes none', async () => {
+    const b = await bare(['scout', 'mira']);
+    try {
+      const messageId = b.internals.addMessage('antra', [{ type: 'text', text: 'are you there?' }], { serverId: 'discord', eventId: 'ev-1', channelId: 'discord:dm:1' });
+      storeChatter(b);
+      const line = { ...dmLine('ev-1', 'LINE-MIRA-WRITES'), after: { agent: 'scout', messageId } };
+      b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'mira answers' }]));
+      b.internals.pendingRequests.push({ ...wake([line]), agentName: 'mira' });
+      await b.framework.runUntilIdle();
+      assert.equal(b.membrane.calls.length, 1, 'premise: mira\'s turn ran');
+      assert.match(JSON.stringify(b.membrane.calls[0]), /LINE-MIRA-WRITES/, 'mira\'s request carries it');
+      b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'scout answers' }]));
+      b.internals.pendingRequests.push(wake([line]));
+      await b.framework.runUntilIdle();
+      assert.equal(b.membrane.calls.length, 2, 'premise: scout\'s turn ran');
+      const all = texts(b);
+      const at = all.findIndex((t) => t.includes('LINE-MIRA-WRITES'));
+      const mira = all.findIndex((t) => t.includes('mira answers'));
+      assert.equal(all.filter((t) => t.includes('LINE-MIRA-WRITES')).length, 1, 'written once');
+      assert.ok(at >= 0 && mira > at, `before mira's answer (line ${at}, mira ${mira})`);
     } finally { await done(b); }
   });
 

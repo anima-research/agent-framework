@@ -198,8 +198,8 @@ export interface WakeProvenance {
   at?: number;
   /** The batch's `[Gate: …]` line, when the gate handed it to the wake rather
    *  than wrote it: a WakeLine for each of the batch's events, the parts its
-   *  text is rendered from when it's written (wakeLineText), decided by a
-   *  fresh start of the wake's turn as WakeLine says. Unlike the fields
+   *  text is rendered from when it's written (wakeLineText), decided at a
+   *  turn's start as WakeLine says. Unlike the fields
    *  above, this is content for the agent's window, not telemetry: it
    *  carries the channel's name as the agent is shown it, and a quoted
    *  event's text. */
@@ -2269,10 +2269,10 @@ export class EventGate {
     /** Whether an MCPL event's own context entry is still the newest entry in
      *  the window a batched wake's line would be written to, with nothing
      *  waiting to be written there. A batched wake for that one message, or
-     *  one with an event `evaluate` was given a write for (`after`),
-     *  doesn't write its line when it fires: it hands the line to the wake
-     *  (WakeProvenance.lines), for a fresh start of the wake's turn to decide
-     *  (WakeLine). Absent: every batched wake writes its line, as before. */
+     *  one with an event `evaluate` was given a write for (`after`,
+     *  naming the agent it went to by the time the batch fires), doesn't
+     *  write its line when it fires: it hands the line to the wake
+     *  (WakeProvenance.lines), for a turn's start to decide (WakeLine). Absent: every batched wake writes its line, as before. */
     isNewestEntry?: (entry: GateEntryRef) => boolean;
     /** Whether the agent an event's write went to (`after`, as `evaluate`
      *  was given it) has answered a request that carried it, its answer's
@@ -3898,11 +3898,13 @@ export class EventGate {
     // still the newest thing in the window it would be written to, it says
     // nothing the message right above doesn't. But the turn compiles later,
     // and what lands in between puts the message above other entries, so the
-    // gate hands the line to the wake (WakeProvenance.lines) and a fresh start
-    // of the wake's turn decides it (WakeLine).
+    // gate hands the line to the wake (WakeProvenance.lines) and a turn's start
+    // decides it (WakeLine). So does a batch with an event whose write names
+    // the agent it went to, which the agent may have answered by then; a
+    // write the host never filled in can't be answered, and doesn't count.
     const only = events.length === 1 && events[0].inContext ? events[0] : undefined;
     const handed = this.isNewestEntryFn !== undefined
-      && (events.some((e) => e.after !== undefined) || (only !== undefined && this.newestEntry(only)));
+      && (events.some((e) => !!e.after?.agent) || (only !== undefined && this.newestEntry(only)));
     if (!handed) {
       this.addMessageFn('user', [{ type: 'text', text: wakeLineText(lines, Date.now()) }], {
         source: 'gate:debounce',

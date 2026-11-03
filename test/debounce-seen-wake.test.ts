@@ -40,6 +40,17 @@ class BeforeCompletionStream extends MockYieldingStream {
   }
 }
 
+/** A stream that waits for release() before it answers, keeping its turn alive. */
+class HeldStream extends MockYieldingStream {
+  entered = false;
+  release: () => void = () => {};
+  override async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    this.entered = true;
+    await new Promise<void>((resolve) => { this.release = resolve; });
+    yield* { [Symbol.asyncIterator]: () => super[Symbol.asyncIterator]() };
+  }
+}
+
 class RateLimitedAtComplete extends MockYieldingStream {
   constructor(replies: ConstructorParameters<typeof MockYieldingStream>[0], private readonly error: Error) { super(replies, true); }
   override async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
@@ -113,12 +124,25 @@ function deferred(f: Fixture, body: string) {
   return (f.framework as unknown as { deferredMessages: unknown[] }).deferredMessages.some((m) => JSON.stringify(m).includes(body));
 }
 function heard(stream: MockYieldingStream) { return JSON.stringify(stream.receivedToolResultOptions); }
+/** The wakes the gate requests from here on, each with the lines it hands on. */
+function recordWakes(f: Fixture): Array<{ agentName: string; lines?: number }> {
+  const gate = gateOf(f) as unknown as { requestInferenceFn: (agentName: string, ...rest: unknown[]) => void };
+  const wakes: Array<{ agentName: string; lines?: number }> = [];
+  const original = gate.requestInferenceFn;
+  gate.requestInferenceFn = (agentName, ...rest) => {
+    const provenance = rest[2] as { lines?: unknown[] } | undefined;
+    wakes.push({ agentName, ...(provenance?.lines ? { lines: provenance.lines.length } : {}) });
+    original(agentName, ...rest);
+  };
+  return wakes;
+}
 
 describe('debounced writes already read and answered', () => {
   for (const lane of ['module', 'channel', 'push', 'heartbeat', 'reminder'] as const) {
     for (const held of [false, true]) {
       it(`${lane}: ${held ? 'a 200 ms batch held for inference' : 'a batch fired after the turn'} starts no second call`, async () => {
         const { f, module, streams, start } = await setup(held ? 200 : 60_000);
+        const wakes = recordWakes(f);
         try {
           const { loop } = await start();
           await send(f, lane);
@@ -131,6 +155,7 @@ describe('debounced writes already read and answered', () => {
             fire(f);
           }
           await eventually(() => gateOf(f).debounceTimers.size === 0, 'debounce fired');
+          assert.deepEqual(wakes, [{ agentName: 'agent', lines: 1 }], 'the batch requested its wake, handing on its line');
           await f.framework.runUntilIdle();
           assert.ok(heard(streams[0]!).includes('new event'), 'the tool boundary carried the event');
           if (lane === 'channel') assert.ok(f.published.some((p) => p.channelId === 'work'), 'the answer reached the channel');
@@ -259,6 +284,103 @@ describe('debounced writes already read and answered', () => {
     } finally { await f.close(); }
   });
 
+
+  it("a reader of the slot the batch didn't wake writes the batch's line at its own start, before the woken turn's", async () => {
+    const f = await fixture({ framework: {
+      modules: [new ReminderModule()],
+      subconscious: { enabled: true, systemPrompt: 'notice' },
+      errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
+      gate: { config: { policies: [{ name: 'batch', match: { scope: ['clock:reminder'] }, behavior: { debounce: 60_000 } }], default: 'always' } },
+    } });
+    const starts: string[] = [];
+    f.framework.onTrace((event) => { if (event.type === 'inference:started') starts.push(event.agentName); });
+    let held: HeldStream | undefined;
+    (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
+      f.membrane.calls.push(request);
+      if (!held) return (held = new HeldStream([say('noted')], true));
+      return new MockYieldingStream([say('fresh turn')], true);
+    };
+    try {
+      await send(f, 'module', 'first unread');
+      await send(f, 'module', 'second unread', 'second');
+      await f.framework.runUntilIdle();
+      fire(f);
+      const internals = f.framework as unknown as { pendingRequests: Array<{ agentName: string }> };
+      assert.deepEqual(internals.pendingRequests.map((r) => r.agentName), ['agent'], 'premise: the batch wakes the resident, not the subconscious');
+      internals.pendingRequests.unshift({ agentName: 'Subconscious', reason: 'test', source: 'test', timestamp: Date.now() } as never);
+      const idle = f.framework.runUntilIdle();
+      await eventually(() => held?.entered === true, "the subconscious's turn is alive");
+      await eventually(() => starts.length === 2, "the resident's woken turn starts while the subconscious's is alive");
+      held!.release();
+      await idle;
+      assert.deepEqual(starts.slice(0, 2), ['Subconscious', 'agent']);
+      for (const i of [0, 1]) assert.match(JSON.stringify(f.membrane.calls[i]), /2 events matched/, `request ${i} carries the batch's line`);
+      const lines = f.framework.getAgent('agent')!.getContextManager().getAllMessages().filter((row) => row.metadata?.source === 'gate:debounce');
+      assert.equal(lines.length, 1, 'one line in the slot');
+    } finally { await f.close(); }
+  });
+
+  it('two batches owed to one start are written as one line, in the order they fired', async () => {
+    const module = new class extends ReminderModule {
+      override async onProcess(event: ProcessEvent, state: ProcessState): Promise<EventResponse> {
+        if (event.type !== 'test:second') return super.onProcess(event, state);
+        return {
+          addMessages: [{ participant: 'user', content: [{ type: 'text', text: String((event as unknown as { content: string }).content) }] }],
+          requestInference: true,
+        };
+      }
+    }();
+    const f = await fixture({ framework: {
+      modules: [module],
+      errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
+      gate: { config: { policies: [
+        { name: 'reminders', match: { scope: ['clock:reminder'] }, behavior: { debounce: 60_000 } },
+        { name: 'seconds', match: { scope: ['test:second'] }, behavior: { debounce: 60_000 } },
+      ], default: 'always' } },
+    } });
+    (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
+      f.membrane.calls.push(request);
+      return new MockYieldingStream([say('noted')], true);
+    };
+    try {
+      f.framework.pushEvent({ type: 'clock:reminder', source: 'clock', content: 'fired second' } as unknown as ProcessEvent);
+      f.framework.pushEvent({ type: 'test:second', source: 'test', content: 'fired first' } as unknown as ProcessEvent);
+      await f.framework.runUntilIdle();
+      const gate = gateOf(f);
+      assert.equal(gate.debounceTimers.size, 2, 'premise: two batches pending');
+      for (const rule of ['seconds', 'reminders']) {
+        const name = [...gate.debounceTimers.keys()].find((key) => key.includes(rule))!;
+        clearTimeout(gate.debounceTimers.get(name)!.timer);
+        gate.fireDebounce(name);
+      }
+      await f.framework.runUntilIdle();
+      assert.equal(f.membrane.calls.length, 1, 'one start');
+      const lines = f.framework.getAgent('agent')!.getContextManager().getAllMessages().filter((row) => row.metadata?.source === 'gate:debounce');
+      assert.equal(lines.length, 1);
+      assert.match(JSON.stringify(lines[0]!.content), /2 events matched\]\\n\\n- \[seconds\] \(test:second\): fired first\\n- \[reminders\] \(clock:reminder\): fired second/);
+    } finally { await f.close(); }
+  });
+
+  it('an owed line whose event was answered before any start leaves the set unwritten at the next start', async () => {
+    const { f, module, start } = await setup(200);
+    const owed = () => (f.framework as unknown as { owedWakeLines: Set<unknown> }).owedWakeLines.size;
+    try {
+      const { loop } = await start();
+      await send(f, 'module');
+      await eventually(() => deferred(f, 'new event'), 'event deferred');
+      await eventually(() => gateOf(f).inferenceDiagnostics().bufferedEvents === 1, 'batch held');
+      module.release('first');
+      await loop;
+      await f.framework.runUntilIdle();
+      assert.equal(f.membrane.calls.length, 1, 'premise: the answered batch started no turn');
+      assert.equal(owed(), 1, 'premise: no start has decided its line');
+      (f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({ agentName: 'agent', reason: 'test', source: 'test', timestamp: Date.now() });
+      await f.framework.runUntilIdle();
+      assert.equal(f.membrane.calls.length, 2, 'premise: a later start');
+      assert.equal(owed(), 0, 'that start found it answered');
+      assert.ok(!f.context().includes('[Gate:'), 'and wrote no line');
+    } finally { await f.close(); }
+  });
 
   for (const kind of ['addressed', 'ambient', 'system'] as const) {
     it(`a channel event read without replying there ${kind === 'addressed' ? 'keeps its addressed wake' : kind === 'ambient' ? 'drops its ambient wake' : 'drops a chat:system notice\'s wake'}`, async () => {
@@ -484,9 +606,11 @@ async function judged(wired: boolean, opts: { tool?: boolean } = {}) {
 describe('judge rules and the answered-batch drop', () => {
   it('with no judge wired, a judge rule\'s batch the agent answered starts no turn, as a debounce of its quiet period', async () => {
     const { f, answeredMidTurn } = await judged(false, { tool: true });
+    const wakes = recordWakes(f);
     try {
       await answeredMidTurn();
       fire(f);
+      assert.deepEqual(wakes, [{ agentName: 'agent', lines: 1 }], 'the batch requested its wake, handing on its line');
       await f.framework.runUntilIdle();
       assert.equal(f.membrane.calls.length, 1, 'no redundant model call');
       assert.ok(!f.context().includes('[Gate:'), 'no gate line for the answered event');
@@ -499,6 +623,7 @@ describe('judge rules and the answered-batch drop', () => {
   ] as const) {
     it(`a judge that ${how}, with onError "wake", delivers a batch the agent answered as a debounce: no turn`, async () => {
       const { f, asked, verdicts, answeredMidTurn } = await judged(true, { tool: true });
+      const wakes = recordWakes(f);
       try {
         await answeredMidTurn();
         fire(f);
@@ -506,6 +631,7 @@ describe('judge rules and the answered-batch drop', () => {
         asked.shift()!.reject(error);
         await eventually(() => (gateOf(f) as unknown as { judging: Map<string, unknown> }).judging.size === 0, "the judge's outcome is settled");
         assert.deepEqual(verdicts, traced);
+        assert.deepEqual(wakes, [{ agentName: 'agent', lines: 1 }], 'the batch requested its wake, handing on its line');
         await f.framework.runUntilIdle();
         assert.equal(f.membrane.calls.length, 1, 'no redundant model call');
       } finally { await f.close(); }

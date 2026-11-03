@@ -4203,8 +4203,14 @@ export class AgentFramework {
   /** Per source agent, per kind: how many derivations, since when, and at which count the last note went. */
   private derivationTallies: Map<string, Map<string, { count: number; since: number }>> = new Map();
   private readonly sharedSlotAgents = new Set<Agent>();
-  /** The batched-wake lines already written (placeWakeLines), so every agent a
-   *  wake was for, and every later start of it, writes each at most once. */
+  /** The batched-wake lines with a write (WakeLine.after) handed to wakes and
+   *  not yet written, in the order their batches fired: the first fresh start
+   *  of a reader of the residents' shared slot writes them there
+   *  (placeWakeLines). Held in memory only, so a restart before that start
+   *  loses them. */
+  private readonly owedWakeLines = new Set<WakeLine>();
+  /** The batched-wake lines already written, so a wake's line that another
+   *  start wrote isn't owed again by a later start of that wake. */
   private readonly placedWakeLines = new WeakSet<WakeLine>();
   /** Rounds of tool calls, by their results array, that a save_recent_image
    *  in the round counted by their share of the bound: such a round is
@@ -4865,6 +4871,9 @@ export class AgentFramework {
         addMessage: (p, c, m, forAgent, placement) => framework.addMessage(p, c, m as MessageMetadata,
           forAgent || placement ? { ...(forAgent ? { forAgent } : {}), ...(placement ? { placement } : {}) } : undefined),
         requestInference: (agentName, reason, source, provenance, after) => {
+          // A line with a write is owed to the slot once, however many agents
+          // the batch wakes (placeWakeLines).
+          for (const line of provenance?.lines ?? []) if (line.after?.agent) framework.owedWakeLines.add(line);
           framework.pendingRequests.push({
             agentName, reason, source, timestamp: Date.now(),
             ...framework.readsWriteFor(after, agentName),
@@ -4910,8 +4919,8 @@ export class AgentFramework {
         // back, with its server where another server shares its id.
         channelShown: (channel) => framework.channelRegistry?.nameShown(channel) ?? suppliedValue(channel.channelId),
         // A batched wake for one message still newest in the window hands its
-        // `[Gate: …]` line to the wake, for a fresh start of the wake's turn
-        // to decide (placeWakeLines).
+        // `[Gate: …]` line to the wake, for the first start after it in the
+        // window to decide (placeWakeLines).
         isNewestEntry: (entry) => framework.isNewestContextEntry(entry),
         isAnswered: (after) => {
           const agent = after.agent !== undefined ? framework.agents.get(after.agent) : undefined;
@@ -13068,7 +13077,7 @@ export class AgentFramework {
             type: 'number',
             description:
               'Shorthand for { debounce: ms }: wake once after ms of quiet (100–300000), unless by the ' +
-              'time it would start your turn you\'ve read and answered every event in the batch.',
+              'time it would start your turn you\'ve read and answered every event in the batch written for you.',
           },
           rateLimit: {
             type: 'object',
@@ -23924,19 +23933,17 @@ export class AgentFramework {
     // vector 25). Not once the host is quiesced, when it waits for resume().
     if (assembled && !this.quiesced && this.deferredMessages.length > 0) this.flushForStart(agent, 'assembly');
 
-    // The batched-wake lines the gate left to this start (WakeLine), decided
-    // now that the turn's inputs are in and before its checkpoint: on the
-    // delivery agent's own start (a co-resident's places none,
-    // placeWakeLines), from here to the compile an arrival into its window is
-    // deferred past this request. Not on a start that resumes a logical turn,
-    // as the flushes above: it takes in no new input. Each line is written at
-    // most once (placeWakeLines); one left out is decided again by a later
-    // fresh start of the same wake (a provider hold's release, a requeue),
-    // whose window may have taken arrivals while the turn was held. Fresh
-    // starts only, as the flushes: a retry re-sends the same turn, and what
-    // follows the message by then is mostly the first attempt's own notices or
-    // rounds, so a line would land after them, mid-turn.
-    if (trigger?.wakeLines && attempt === 0 && !resumesTurn) this.placeWakeLines(agent, trigger.wakeLines);
+    // The batched-wake lines the slot is owed and this start's own (WakeLine),
+    // decided now that the turn's inputs are in and before its checkpoint, on
+    // the start of any reader of the slot (placeWakeLines); from here to the
+    // compile an arrival into its window is deferred past this request. Not
+    // on a start that resumes a logical turn, as the flushes above: it takes
+    // in no new input. One left out is decided again by a later start. Fresh
+    // starts only, as the flushes: a retry re-sends the same
+    // turn, and what follows the message by then is mostly the first
+    // attempt's own notices or rounds, so a line would land after them,
+    // mid-turn.
+    if (attempt === 0 && !resumesTurn) this.placeWakeLines(agent, trigger?.wakeLines);
 
     // An autoContinue continuation's `[continue]` row, written here: the
     // turn has passed every gate that could still stop it (a stopping
@@ -29818,51 +29825,59 @@ export class AgentFramework {
   }
 
   /**
-   * Write the batched-wake lines the gate left to this turn's start (WakeLine)
-   * into the window they name, the delivery agent's (the residents' shared
-   * slot where it is one), on that agent's own start only. Called by a fresh
-   * start that doesn't resume a logical turn, after the turn's own inputs (a
-   * due clock row, the deferred-write and assembly flushes) and before its
+   * Write batched-wake lines (WakeLine) into the window they name, the
+   * delivery agent's (the residents' shared slot where it is one). A line
+   * with a write (`after`) is owed to the slot (owedWakeLines): the first
+   * start of any agent that reads it after the batch fires writes it,
+   * whichever reader it is, so every reader's request after it holds it. A
+   * line with none, handed for its newest message, is written by the delivery
+   * agent's start of its own wake only, as it can't be judged answered and
+   * another reader's start could follow that agent's answer. Called by a fresh start
+   * that doesn't resume a logical turn, after the turn's own inputs (a due
+   * clock row, the deferred-write and assembly flushes) and before its
    * checkpoint, so a line lands after whatever arrived since the gate's
    * decision, before the notices the turn's start writes itself (the locus
    * notice among them), and before the agent's answer to the wake.
    *
-   * - A line whose event the delivery agent has read and answered is left
-   *   out (wakeLineDone, as the wake's drop judges it).
-   * - A wake's one line left whose event is still the newest entry is left out:
-   *   no message follows the wake's, so it is the wake's whole cause, and the
+   * - A line whose event the delivery agent has read and answered is no
+   *   longer owed (wakeLineDone, as the wake's drop judges it): a line in the
+   *   shared slot would re-present it to its answered owner.
+   * - One line left whose event is still the newest entry is left out, where
+   *   no written line of the start's own wake is still unanswered: no
+   *   message follows the wake's, so it is the wake's whole cause, and the
    *   start's token defers an arrival into the window past its request. (The
    *   start's own notices, written after this, aren't messages a reply could
    *   be meant for.)
-   * - A co-resident's start places nothing. Every resident gets every
-   *   batched wake, so a co-resident writing the line would put it under the
-   *   message, the line #727 left out, or after the delivery agent's answer,
-   *   a wake line for a message already answered. Its request shows what the
-   *   slot holds, as on `main`: a reply after the message is in the message's
-   *   own channel, but a message from another channel that lands between the
-   *   gate's decision and its compile follows the message with no line.
    * - None is written while the host is quiesced or another reader of the
    *   slot has a turn alive (slotHeldFrom, as for a clock row): written, a
    *   line would land inside that turn, and deferred, it would wait for the
    *   delivery agent's next boundary, never reaching this request
-   *   (overlapping turns in the slot, #286). They stay undecided, and are
-   *   written only if another fresh start of the wake comes (a provider
-   *   hold's release, a requeue): this start's request goes without them.
+   *   (overlapping turns in the slot, #286).
    *
-   * A line left out as the newest entry or for a held slot is traced. Each
-   * line is written once (placedWakeLines), across the wake's retries and
-   * holds, whichever copy of its trigger a start carries: every request for
-   * the wake carries the same line. A line left out, or whose write fails,
-   * stays undecided for a later fresh start.
+   * The start's own wake's lines with a write join those owed. A line left
+   * out, or whose write fails, is decided again later: one with a write by
+   * the next fresh start of a reader, one without by the delivery agent's
+   * next start of its wake. One left out is traced (newest, held). Each line
+   * is written once (placedWakeLines).
    */
-  private placeWakeLines(agent: Agent, lines: readonly WakeLine[]): void {
+  private placeWakeLines(agent: Agent, lines: readonly WakeLine[] = []): void {
     const slot = this.deliveryAgent();
-    if (!slot || agent !== slot) return;
-    const owed = lines.filter((line) => !this.wakeLineDone(slot, line));
-    const open = owed.filter((line) => !this.placedWakeLines.has(line));
+    if (!slot || !this.residentHoldsTraffic(agent.name)) return;
+    for (const line of lines) if (line.after?.agent && !this.placedWakeLines.has(line)) this.owedWakeLines.add(line);
+    for (const line of this.owedWakeLines) {
+      if (this.wakeLineDone(slot, line)) this.owedWakeLines.delete(line);
+    }
+    // A line with no write, handed for its newest message, can't be judged
+    // answered, so only the delivery agent's starts of its own wake decide it:
+    // another reader's start could follow that agent's answer.
+    const own = agent === slot ? lines.filter((line) => !line.after?.agent && !this.placedWakeLines.has(line)) : [];
+    const open = [...this.owedWakeLines, ...own];
+    if (open.length === 0) return;
     const held = this.slotHeldFrom(agent);
-    const leftOut = held
-      || (owed.length === 1 && open.length === 1 && this.isNewestIn(slot, open[0].entry));
+    // A line of this start's wake already written, still unanswered, is
+    // another cause of the wake, so the newest message isn't its whole cause.
+    const writtenCause = lines.some((line) => this.placedWakeLines.has(line) && !this.wakeLineDone(slot, line));
+    const leftOut = held || (open.length === 1 && !writtenCause && this.isNewestIn(slot, open[0].entry));
     if (leftOut) {
       const reason = held ? 'held' : 'newest';
       for (const line of open) {
@@ -29876,11 +29891,10 @@ export class AgentFramework {
       }
       return;
     }
-    if (open.length === 0) return;
     const metadata = { source: 'gate:debounce', policies: [...new Set(open.flatMap((line) => line.policyNames))] } as MessageMetadata;
     // A line is the wake's context, not its cause, so a write that fails
-    // doesn't fail the start: the line stays undecided, for a later fresh
-    // start of the wake. One whose write threw after its row landed counts
+    // doesn't fail the start: the line is decided again by a later start.
+    // One whose write threw after its row landed counts
     // as written, read back as the clock row's is.
     const before = this.storedCountOf(slot);
     let id: MessageId;
@@ -29897,7 +29911,10 @@ export class AgentFramework {
       id = landed[0]!.id;
     }
     this.emitTrace({ type: 'message:added', messageId: id, source: 'gate:wake-line' });
-    for (const line of open) this.placedWakeLines.add(line);
+    for (const line of open) {
+      this.placedWakeLines.add(line);
+      this.owedWakeLines.delete(line);
+    }
   }
 
   /** Whether `entry`'s own stored entry is the newest in `agent`'s window,

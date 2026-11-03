@@ -193,6 +193,9 @@ describe('Conversation routing', () => {
           clearTimeout(state.timer);
           gate.fireDebounce(name);
         }
+        const queued = (framework as unknown as { pendingRequests: Array<{ agentName: string; readsWakeLines?: boolean; wakeLines?: unknown[] }> }).pendingRequests
+          .filter((r) => r.agentName === fork);
+        assert.deepEqual(queued.map((r) => [r.readsWakeLines, r.wakeLines?.length]), [[true, 1]], "premise: the batch queued the fork's wake, with its line");
         await framework.runUntilIdle();
         assert.ok(!turns.slice(1).includes(fork), "the fork's batched wake was dropped");
       } finally {
