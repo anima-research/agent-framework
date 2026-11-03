@@ -796,6 +796,34 @@ describe('a handed line across readers, a flush, a quiesce and a hold', () => {
       assert.equal(texts(b).filter((t) => t.includes('LINE-SCOUT-FIRST')).length, 0, 'no wake line after an answered DM');
     } finally { await done(b); }
   });
+  it("a line whose write went to another agent's window isn't owed to the slot: a later resident start writes none", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'wake-line-fork-write-'));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'test.chronicle'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      gate: { onboarding: false, config: { policies: [], default: 'skip' } },
+      modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+    } as never);
+    try {
+      const internals = framework as unknown as Bare['internals'] & {
+        eventGate: { requestInferenceFn(agentName: string, reason: string, source: string, provenance?: unknown): void };
+      };
+      internals.addMessage('antra', [{ type: 'text', text: 'for a fork' }], { serverId: 'discord', eventId: 'ev-1', channelId: 'discord:dm:1' });
+      internals.addMessage('someone', [{ type: 'text', text: 'unrelated chatter' }], { serverId: 'discord', channelId: 'discord:g1:general', messageId: 'm-chatter' });
+      const line = { ...dmLine('ev-1', 'LINE-FORKS'), after: { agent: 'conversation-fork', messageId: 'row-fork' } };
+      internals.eventGate.requestInferenceFn('conversation-fork', 'gate:debounce', 'gate', { lines: [line] });
+      internals.pendingRequests.length = 0;
+      internals.placeWakeLines(framework.getAgent('scout'), []);
+      const written = framework.getAgent('scout')!.getContextManager().getAllMessages()
+        .filter((m) => m.content.some((b) => b.type === 'text' && (b.text ?? '').includes('LINE-FORKS')));
+      assert.equal(written.length, 0);
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('one wake for two agents: each request carries the gate\'s own line object, which "written once" rests on', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'wake-line-identity-'));
     const framework = await AgentFramework.create({

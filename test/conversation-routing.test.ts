@@ -196,6 +196,11 @@ describe('Conversation routing', () => {
         const queued = (framework as unknown as { pendingRequests: Array<{ agentName: string; readsWakeLines?: boolean; wakeLines?: unknown[] }> }).pendingRequests
           .filter((r) => r.agentName === fork);
         assert.deepEqual(queued.map((r) => [r.readsWakeLines, r.wakeLines?.length]), [[true, 1]], "premise: the batch queued the fork's wake, with its line");
+        const stored = framework.getAgent(fork)!.getContextManager().getAllMessages()
+          .find((m) => m.content.some((b) => b.type === 'text' && ((b as { text?: string }).text ?? '').includes('just chatting')));
+        const after = (queued[0]!.wakeLines![0] as { after?: { agent?: string; messageId?: string; deferredId?: string } }).after;
+        assert.equal(after?.agent, fork, "the line's write names the fork");
+        assert.equal(after?.messageId, stored?.id, "and the fork's own stored message");
         await framework.runUntilIdle();
         assert.ok(!turns.slice(1).includes(fork), "the fork's batched wake was dropped");
       } finally {

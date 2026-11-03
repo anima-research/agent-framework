@@ -439,13 +439,13 @@ export interface GateEntryRef {
 
 /** One event's part of a batched wake's `[Gate: …]` line, which the gate
  *  handed to the wake rather than wrote (WakeProvenance.lines): every event
- *  of its batch had a write the agent may already have read and answered
- *  (`after`), or it was one event whose entry was still the newest in the
+ *  of its batch had a write (`after`, an agent and an id) the agent may
+ *  already have read and answered, or it was one event whose entry was still the newest in the
  *  window when the batch fired (EventGate's `isNewestEntry`). The framework
- *  holds a line with a write as owed to the window it names, and the first
- *  fresh start after the batch fires of any agent that reads it decides it;
- *  a line with none is decided by the delivery agent's starts of its own
- *  wake (the framework's placeWakeLines). A start drops each line whose event
+ *  holds a line whose write went to the delivery agent as owed to its window,
+ *  and the first fresh start after the batch fires of any agent that reads
+ *  that window decides it; any other line is decided by the delivery agent's
+ *  starts of its own wake (the framework's placeWakeLines). A start drops each line whose event
  *  the agent it was written for has read and answered, judged as the wake's
  *  drop is (InferenceRequest.readsWakeLines), leaves out a single line whose
  *  event is still the newest entry, and writes the others as one message,

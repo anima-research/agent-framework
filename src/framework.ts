@@ -895,7 +895,7 @@ import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
 import { asCalled, cutOffRefusal, markedInputRefusal, toolArgsProblems } from './tool-args.js';
 import { cutOffRound, type CutOffCall } from './cut-off-round.js';
-import { EventGate, MCPL_GATE_EVENT_TYPES, checkToolInput, formatShadowWarning, shownValue, wakeLineText, type WritePlacement } from './gate/event-gate.js';
+import { EventGate, MCPL_GATE_EVENT_TYPES, checkToolInput, formatShadowWarning, isWrite, shownValue, wakeLineText, type WritePlacement } from './gate/event-gate.js';
 import { ReplyJudge } from './gate/reply-judge.js';
 import {
   WakeDecisions, carriesAttention, isSuggestedRuleOf, isUndecided, offerFor, placementFor, rulesToWrite,
@@ -4875,9 +4875,9 @@ export class AgentFramework {
         addMessage: (p, c, m, forAgent, placement) => framework.addMessage(p, c, m as MessageMetadata,
           forAgent || placement ? { ...(forAgent ? { forAgent } : {}), ...(placement ? { placement } : {}) } : undefined),
         requestInference: (agentName, reason, source, provenance, after) => {
-          // A line with a write is owed to the slot once, however many agents
-          // the batch wakes (placeWakeLines).
-          for (const line of provenance?.lines ?? []) if (line.after?.agent) framework.owedWakeLines.add(line);
+          // A line with a write into the slot is owed to it once, however many
+          // agents the batch wakes (placeWakeLines).
+          for (const line of provenance?.lines ?? []) if (framework.owedToSlot(line)) framework.owedWakeLines.add(line);
           framework.pendingRequests.push({
             agentName, reason, source, timestamp: Date.now(),
             ...framework.readsWriteFor(after, agentName),
@@ -13081,7 +13081,7 @@ export class AgentFramework {
             type: 'number',
             description:
               'Shorthand for { debounce: ms }: wake once after ms of quiet (100–300000), unless by the ' +
-              'time it would start your turn you\'ve read and answered every event in the batch written for you.',
+              'time it would start your turn every event in the batch was written for you and you\'ve read and answered it.',
           },
           rateLimit: {
             type: 'object',
@@ -29828,17 +29828,26 @@ export class AgentFramework {
     return this.isNewestIn(agent, entry);
   }
 
+  /** Whether a handed line is owed to the residents' shared slot: its write
+   *  went to the slot's own agent, the one whose answer wakeLineDone judges.
+   *  Any other line, a fork's among them, is decided by the delivery agent's
+   *  starts of its wake. */
+  private owedToSlot(line: WakeLine): boolean {
+    return isWrite(line.after) && line.after.agent === this.deliveryAgent()?.name;
+  }
+
   /**
    * Write batched-wake lines (WakeLine) into the window they name, the
    * delivery agent's (the residents' shared slot where it is one). A line
-   * with a write (`after`) is owed to the slot (owedWakeLines): the first
-   * start of any agent that reads it after the batch fires writes it,
-   * whichever reader it is, so every reader's request after it holds it. A
-   * line with none, handed for its newest message, is decided by the delivery
-   * agent's starts of its own wake only, as it can't be judged answered and
-   * another reader's start could follow that agent's answer; so is a line any
-   * start left out as newest. Called by a fresh start that doesn't resume a
-   * logical turn, after the turn's own inputs (a due
+   * whose write went to the slot's own agent (owedToSlot) is owed to the slot
+   * (owedWakeLines): the first start of any agent that reads it after the
+   * batch fires writes it, whichever reader it is, so every reader's request
+   * after it holds it. Any other line, one with no write handed for its
+   * newest message or one written to another agent's window, is decided by
+   * the delivery agent's starts of its own wake only, as the slot's owner
+   * can't judge it answered and another reader's start could follow that
+   * agent's answer; so is a line any start left out as newest. Called by a
+   * fresh start that doesn't resume a logical turn, after the turn's own inputs (a due
    * clock row, the deferred-write and assembly flushes) and before its
    * checkpoint, so a line lands after whatever arrived since the gate's
    * decision, before the notices the turn's start writes itself (the locus
@@ -29859,17 +29868,17 @@ export class AgentFramework {
    *   delivery agent's next boundary, never reaching this request
    *   (overlapping turns in the slot, #286).
    *
-   * The start's own wake's lines with a write join those owed. A line left
-   * out for a held slot, or whose write fails, is decided again by the next
-   * fresh start of a reader if it has a write; one left out as newest, or one
-   * with no write, by the delivery agent's later starts of its own wake (a
-   * provider hold's release, a requeue). One left out is traced (newest,
+   * The start's own wake's lines owed to the slot join those owed. A line
+   * left out for a held slot, or whose write fails, is decided again by the
+   * next fresh start of a reader if it's owed to the slot; any other, and one
+   * left out as newest, by the delivery agent's later starts of its own wake
+   * (a provider hold's release, a requeue). One left out is traced (newest,
    * held). Each line is written once (placedWakeLines).
    */
   private placeWakeLines(agent: Agent, lines: readonly WakeLine[] = []): void {
     const slot = this.deliveryAgent();
     if (!slot || !this.residentHoldsTraffic(agent.name)) return;
-    const kept = (line: WakeLine) => !line.after?.agent || this.newestWakeLines.has(line);
+    const kept = (line: WakeLine) => !this.owedToSlot(line) || this.newestWakeLines.has(line);
     for (const line of lines) if (!kept(line) && !this.placedWakeLines.has(line)) this.owedWakeLines.add(line);
     for (const line of this.owedWakeLines) {
       if (this.wakeLineDone(slot, line)) this.owedWakeLines.delete(line);

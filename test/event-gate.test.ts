@@ -1471,6 +1471,16 @@ describe('a batched wake writes its line only when it says something', () => {
     assert.strictEqual(inferenceRequests[0].lines, undefined);
   });
 
+  it('a write naming its agent but no id counts as none, for the line and for what the judge is told', () => {
+    const { gate, messages, inferenceRequests } = makeGate(config('agent-only-write.json'), { isNewestEntry: () => false });
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'a',
+      metadata: { messageId: 'm1' } }), { agent: 'agent' });
+    assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => w.certain), [true], 'a wake no answer can drop is certain');
+    fire(gate, 'chat');
+    assert.strictEqual(messages.length, 1);
+    assert.strictEqual(inferenceRequests[0].lines, undefined);
+  });
+
   it('a write the host never filled in counts as none: the batch\'s line is written when it fires', () => {
     const { gate, messages, inferenceRequests } = makeGate(config('unfilled-write.json'), { isNewestEntry: () => false });
     for (const [content, messageId] of [['a', 'm1'], ['b', 'm2']]) {

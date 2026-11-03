@@ -162,6 +162,12 @@ export interface WritePlacement {
   messageId?: string;
 }
 
+/** Whether a placement names a write the agent could have answered: the
+ *  agent and the id its message waits or is stored under. */
+export function isWrite(after: WritePlacement | undefined): after is WritePlacement & { agent: string } {
+  return !!after?.agent && !!(after.deferredId || after.messageId);
+}
+
 /**
  * Where a gate-requested wake came from, handed to the framework alongside the
  * reason so the turn's InferenceRequest can carry it (host telemetry stamps
@@ -3901,12 +3907,12 @@ export class EventGate {
     // and what lands in between puts the message above other entries, so the
     // gate hands the line to the wake (WakeProvenance.lines) and a turn's start
     // decides it (WakeLine). So does a batch whose every event has a write
-    // naming the agent it went to, each of which the agent may have answered
-    // by then. A batch with an event given no write, or one the host never
-    // filled in, can't be judged answered whole, so its line is written now.
+    // (isWrite), each of which the agent may have answered by then. A batch
+    // with an event given no write, or one the host never filled in, can't be
+    // judged answered whole, so its line is written now.
     const only = events.length === 1 && events[0].inContext ? events[0] : undefined;
     const handed = this.isNewestEntryFn !== undefined
-      && (events.every((e) => !!e.after?.agent) || (only !== undefined && this.newestEntry(only)));
+      && (events.every((e) => isWrite(e.after)) || (only !== undefined && this.newestEntry(only)));
     if (!handed) {
       this.addMessageFn('user', [{ type: 'text', text: wakeLineText(lines, Date.now()) }], {
         source: 'gate:debounce',
@@ -4076,7 +4082,7 @@ export class EventGate {
       const batch = `${n} ${n === 1 ? 'event' : 'events'}`;
       wakes.push(state.judge
         ? { at: state.dueAt, certain: false, what: `rule ${quotedValue(name)}'s batch of ${batch} goes to the judge` }
-        : { at: state.dueAt, certain: this.isNewestEntryFn === undefined || !state.events.every((e) => agentNames.every((agent) => e.after?.agent === agent)), what: `rule ${quotedValue(name)}'s debounced batch of ${batch}` });
+        : { at: state.dueAt, certain: this.isNewestEntryFn === undefined || !state.events.every((e) => agentNames.every((agent) => isWrite(e.after) && e.after.agent === agent)), what: `rule ${quotedValue(name)}'s debounced batch of ${batch}` });
     }
     return wakes.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
   }
