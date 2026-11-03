@@ -6317,6 +6317,12 @@ export class AgentFramework {
     // once a stop() is admitted, so no new lifecycle begins beside it.)
     for (const [name, run] of this.ephemeralRuns) run.settle.reject(ephemeralRunStopped(name));
     for (const agent of this.agents.values()) step(() => { agent.unpinTurnInputs(); });
+    // A persisted reader's looks (invokePersistedReader) run one after another
+    // outside the event loop: the one whose run was just ended settles, and
+    // each queued behind it starts nothing once admission is closed
+    // (persistedReaderLook). Waited for so none touches the store after it
+    // is torn down.
+    await waitFor([...this.readerLooks].map(([identity, promise]) => ({ label: `reader looks:${identity}`, promise })));
 
     // Admission closed when stop() began. What admitted operations start now,
     // such as a surgery's config materialization, joins the set, so wait until
@@ -17817,6 +17823,12 @@ export class AgentFramework {
     invocation: ReaderInvocation,
     scopeEnded: boolean,
   ): Promise<void> {
+    // stop() has begun while this look waited: its run would be refused, so
+    // nothing is planned, derived or resumed for it, and no framing is
+    // stored. Its rows aren't given back: the coordinator has stopped, and
+    // after a restart, where it has no cursor, an epoch's first look is
+    // handed all the epoch holds (stop() waits for the looks: stopOwned).
+    if (this.providerAdmissionClosed) return;
     // The resident ended while this look waited: it ended the reader with it
     // (onParentEnd 'end'), and nothing resumes after. No reader read the
     // look's held rows, which go back as a failed look's do, and the look is

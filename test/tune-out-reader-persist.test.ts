@@ -676,6 +676,43 @@ describe('a persisted reader: a look that fails, and what goes back', () => {
     .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'tune-out-reader-framing');
 
 
+  it('runs no look queued behind a running one once stop() has begun; after the restart the reader is resumed', { timeout: 180_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-stop-queued-'));
+    dirs.push(dir);
+    const first = await boot(dir, { persist: 'resident' });
+    const epochId = first.enter();
+    const g = (k: number) => `reader/scout/g${k}`;
+    first.look(epochId, [first.hold(epochId, 'HELD-1')]);
+    await first.looked(g(1), 1);
+    let release!: () => void;
+    first.membrane.hold('reader', new Promise<void>((r) => { release = r; }));
+    first.look(epochId, [first.hold(epochId, 'HELD-2 running')]);
+    await waitFor('the second look is running', () => first.membrane.callsFor('reader').length === 2);
+    first.look(epochId, [first.hold(epochId, 'HELD-3 queued')]);
+    const seen = first.traces.length;
+    const stopping = first.framework.stop(10_000);
+    setTimeout(() => release(), 300);
+    frameworks.splice(frameworks.indexOf(first.framework), 1);
+    await stopping;
+    await new Promise((r) => setTimeout(r, 300));
+    const after = first.traces.slice(seen)
+      .filter((e) => e.type.startsWith('tune-out:reader'))
+      .map((e) => [e.type, (e as unknown as { agentName: string }).agentName]);
+    // The running look's own end may be traced (its prose, or its failure); the queued look derives,
+    // resumes and fails nothing.
+    assert.ok(!after.some(([type, agent]) => agent !== g(1) || type === 'tune-out:reader-fork' || type === 'tune-out:reader-rederived'),
+      JSON.stringify(after));
+
+    const second = await boot(dir, { persist: 'resident' });
+    assert.deepEqual(second.internals.store.listBranches().map((b) => b.name).filter((b) => b.startsWith('dendrite/reader/')), [`dendrite/${g(1)}`],
+      'no generation was derived for the queued look');
+    // After a restart the coordinator's cursor is gone: the epoch's held rows are handed again.
+    const all = second.rows().filter((m) => (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId);
+    second.look(epochId, all);
+    await second.looked(g(1), 3);
+    assert.deepEqual(second.forkTraces().map((f) => [f.agentName, f.incarnation, f.resumed]), [[g(1), 3, true]]);
+    assert.ok(JSON.stringify(second.membrane.callsFor('reader')[0]!.messages).includes('HELD-3 queued'));
+  });
 
   it('is a failed look, its rows given back, when planning it throws', { timeout: 120_000 }, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'reader-persist-plan-throws-'));
