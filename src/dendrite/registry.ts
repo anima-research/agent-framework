@@ -289,7 +289,8 @@ export class AgentRegistry {
       ...(spec.presentAs ? { presentAs: spec.presentAs } : {}),
       ...(spec.homeChannel ? { homeChannel: { serverId: spec.homeChannel.serverId, channelId: spec.homeChannel.channelId } } : {}),
       ...(ownSlot ? { ownSlot } : {}),
-      // Kept for readers of the record from before the split: derived from it.
+      // Kept for readers of the record from before the split: derived from
+      // it, and again as agents register (refreshReadsSharedSlot).
       readsSharedSlot: readsResidentsSlot(ownSlot, observes, (name) => this.recordedSlotOf(name)),
       ...(spec.namespace ? { namespace: spec.namespace } : {}),
       ...(spec.metadata ? { metadata: clone(spec.metadata) } : {}),
@@ -310,8 +311,19 @@ export class AgentRegistry {
       };
     }
     this.live.set(spec.name, record);
+    // The deprecated flag of each live record, the new one's included, as
+    // the slots it names read now: an edge on an agent declared with it
+    // (declaredWith) reads that agent's slot only once it is registered.
+    this.refreshReadsSharedSlot();
     this.persist();
     return record;
+  }
+
+  /** Each live record's deprecated `readsSharedSlot`, derived again from its own slot and edges (readsResidentsSlot). */
+  private refreshReadsSharedSlot(): void {
+    for (const record of this.live.values()) {
+      record.readsSharedSlot = readsResidentsSlot(record.ownSlot, record.relationships.observes, (name) => this.recordedSlotOf(name));
+    }
   }
 
   private validate(spec: AgentSpec, resume = false, declaredWith: readonly AgentName[] = []): void {

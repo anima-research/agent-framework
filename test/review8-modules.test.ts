@@ -9,6 +9,9 @@
  * 73: a registry record written before own slots, whose observe edge names
  *     an agent and no slot, reads the residents' shared slot, as it did, and
  *     its own slot is its namespace's.
+ * 74: the deprecated readsSharedSlot of a watcher registered before the
+ *     resident it observes (declaredWith) follows that resident's
+ *     registration.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -172,4 +175,15 @@ test("73: a record from before own slots, whose edge names an agent and no slot,
   assert.equal(record.readsSharedSlot, true, 'the old flag is kept as written');
   // An edge declared now with the same shape reads the named agent's slot.
   assert.deepEqual(awaiting.observedSlotOf({ agent: 'worker-1' }), { namespace: 'subagent/worker-1' });
+});
+
+test('74: the deprecated readsSharedSlot of a watcher registered before the resident it observes follows that registration', () => {
+  const r = new AgentRegistry();
+  r.register({ name: 'w', kind: 'watcher', roles, lifetime: { kind: 'persistent' }, observes: [{ agent: 'mira' }], namespace: 'watch/w', ownSlot: { namespace: 'watch/w' } }, { declaredWith: ['mira'] });
+  assert.equal(r.readsSharedSlot('w'), false, 'premise: mira has no record yet');
+  r.register(residentSpec('mira', { primary: true }));
+  assert.deepEqual(r.readersOf(RESIDENTS_SLOT), ['w', 'mira']);
+  assert.deepEqual(r.sharedSlotReaders(), ['w', 'mira'], 'the deprecated query agrees with readersOf');
+  assert.equal(r.readsSharedSlot('w'), true);
+  assert.equal(r.get('w')!.readsSharedSlot, true, 'and so does the record a host reads');
 });
