@@ -3242,10 +3242,11 @@ export class EventGate {
 
   /** `after`: where the host put the event's own message, which it may fill
    *  in after this call, before the batch fires. For a host that places
-   *  handed lines (`isNewestEntry`) and passes them on as the request's
-   *  `wakeLines` with `readsWakeLines`, a debounced batch's wake for an agent
-   *  that has read and answered it is then dropped (WakeLine.after); absent,
-   *  the event keeps its batch's wake. */
+   *  handed lines (`isNewestEntry`), a debounced batch whose every event has
+   *  a write hands its lines to the wake with those writes (WakeLine.after),
+   *  for the host's scheduler to drop the wake once the agent has read and
+   *  answered them, as AgentFramework's does for a request with
+   *  `readsWakeLines`; absent, the event keeps its batch's wake. */
   evaluate(info: GateEventInfo, after?: WritePlacement): GateDecision {
     this.reloadIfChanged();
 
@@ -4189,7 +4190,7 @@ export class EventGate {
   }
 
   private answeredWhenJudged(e: PendingEvent): boolean {
-    if (!e.after) return false;
+    if (!isWrite(e.after)) return false;
     if (!this.isAnsweredFn) return true;
     try {
       return this.isAnsweredFn(e.after) !== false;

@@ -820,17 +820,24 @@ describe('a handed line across readers, a flush, a quiesce and a hold', () => {
     const framework = await AgentFramework.create({
       storePath: join(dir, 'test.chronicle'),
       membrane: new MockMembrane().asMembrane(),
-      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      agents: [
+        { name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' },
+        { name: 'conversation-fork', model: 'test-model', systemPrompt: 'You are a fork.' },
+      ],
       gate: { onboarding: false, config: { policies: [], default: 'skip' } },
       modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0,
     } as never);
     try {
       const internals = framework as unknown as Bare['internals'] & {
         eventGate: { requestInferenceFn(agentName: string, reason: string, source: string, provenance?: unknown): void };
+        wakeLineDone(agent: unknown, line: unknown): boolean;
       };
       internals.addMessage('antra', [{ type: 'text', text: 'for a fork' }], { serverId: 'discord', eventId: 'ev-1', channelId: 'discord:dm:1' });
       internals.addMessage('someone', [{ type: 'text', text: 'unrelated chatter' }], { serverId: 'discord', channelId: 'discord:g1:general', messageId: 'm-chatter' });
-      const line = { ...dmLine('ev-1', 'LINE-FORKS'), after: { agent: 'conversation-fork', messageId: 'row-fork' } };
+      const fork = framework.getAgent('conversation-fork')!;
+      const forkRow = fork.getContextManager().addMessage('antra', [{ type: 'text', text: 'for a fork' }]) as unknown as string;
+      const line = { ...dmLine('ev-1', 'LINE-FORKS'), after: { agent: 'conversation-fork', messageId: forkRow } };
+      assert.equal(internals.wakeLineDone(fork, line), false, "premise: the fork hasn't answered its write");
       internals.eventGate.requestInferenceFn('conversation-fork', 'gate:debounce', 'gate', { lines: [line] });
       internals.pendingRequests.length = 0;
       internals.placeWakeLines(framework.getAgent('scout'), []);

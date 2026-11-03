@@ -163,6 +163,23 @@ describe('judge rules: verdicts', () => {
     });
   }
 
+  it('a reply asks isAnswered only about events with a write, never an unfilled placement', async () => {
+    const judge = scriptedJudge();
+    const asked: WritePlacement[] = [];
+    const { gate, wakes, messages } = makeGate(writeConfig('reply-asked-writes.json', JUDGED), {
+      judge: judge.fn, isNewestEntry: () => false, isAnswered: (after) => { asked.push(after); return false; },
+    });
+    gate.evaluate(chat('never placed'), { agent: '' });
+    gate.evaluate(chat('placed'), { agent: 'agent', messageId: 'row-2' });
+    await until(() => judge.waiting() === 1, 'the judge is asked');
+    judge.answer({ reply: true, reason: 'a direct question', inputTokens: 1 });
+    await until(() => wakes.length === 1, 'the wake');
+    assert.deepStrictEqual(asked, [{ agent: 'agent', messageId: 'row-2' }]);
+    assert.strictEqual(wakes[0]!.lines, undefined, 'the unplaced event has no write, so nothing is handed');
+    assert.strictEqual(messages.length, 1);
+    gate.dispose();
+  });
+
   it("a reply asks isAnswered when the judge answers: an event answered while the judge read keeps the wake", async () => {
     const judge = scriptedJudge();
     const answered = new Set<string>();

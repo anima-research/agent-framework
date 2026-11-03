@@ -3591,8 +3591,8 @@ const JUDGE_PARAMETER: ToolParameter = {
     'Ask the reply judge first: batch matching events like debounceMs, then a small, cheap model reads your ' +
     'context (its newest part) with your instructions and decides whether to wake you now. When it says wait, ' +
     'you aren\'t woken (the events stay in your context, as for "defer"); the next batch is judged afresh. ' +
-    'If the judge fails or times out you are woken, unless your host set it to stay quiet then or you\'ve ' +
-    'already read and answered every event in the batch. ' +
+    'If the judge fails or times out you are woken, unless your host set it to stay quiet then or every ' +
+    'event in the batch was written for you and you\'ve already read and answered it. ' +
     'Its verdicts and reasons are in gate_status.',
   properties: {
     debounceMs: { type: 'number', description: 'Quiet period (ms) before the batch is judged (100–300000).' },
