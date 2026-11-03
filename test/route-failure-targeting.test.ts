@@ -1482,9 +1482,9 @@ describe('notices about an agent\'s own action', () => {
           await framework.resume({ force: true });
         }
         assert.equal(framework.getAgent(fork.name), null, 'the fork is disposed when its closure turn ends');
-        // other-tool-cycle: a write waits only for its own target's tool
-        // cycle, so neither the fork's notice nor the primary's waits for the
-        // secondary's.
+        // other-tool-cycle: a write is stored at once, and only its
+        // presentation waits, for its own target's points, so neither the
+        // fork's notice nor the primary's waits on the secondary's tool cycle.
         // Open a fresh manager over the retained fork namespace, rather than
         // relying only on the disposed Agent's in-memory context manager.
         const archive = await ContextManager.open({

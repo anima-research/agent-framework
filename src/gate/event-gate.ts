@@ -4449,8 +4449,9 @@ export class EventGate {
       // Compact in-window notice: without it the wake turn contains nothing
       // new, so the agent can't tell WHAT woke it (its own timer vs. a
       // heartbeat) or WHEN. One line, timestamped to the second. Added
-      // before the inference request so it rides the wake turn (addMessage's
-      // turn-alive guard defers it to that turn's start if needed).
+      // before the inference request so it rides the wake turn: it is stored
+      // at once, and while a turn of the agent's is alive it is kept out of
+      // the window until the agent's next presentation point.
       const nowIso = new Date(this.now()).toISOString().slice(0, 19) + 'Z';
       // Deliver the notice into the WAKING agent's window — a self-wake
       // armed by a non-primary agent (e.g. a subconscious cadence) must not

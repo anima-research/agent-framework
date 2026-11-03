@@ -252,7 +252,8 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
       const plainHandle = ctx.addMessage('user', [{ type: 'text', text: 'T2-PLAIN a module write while the turn is alive' }]);
 
       // The stored held row is marked as any stored held row is; the module's
-      // own write is held behind the turn, with no mark.
+      // own write is stored already and kept out of the live turn's window,
+      // marked held, with no heldFromResidents.
       const rows = ctx.queryMessages({}).messages;
       const heldRow = rowWith(rows, 'T2-HELD')!;
       assert.ok(heldRow.metadata?.tuneOut, 'the stored message carries the stamp');
@@ -265,9 +266,9 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
       assert.equal('heldFromResidents' in plain, false, 'a write without the stamp has no such mark');
       assert.equal('heldFromResidents' in ctx.getMessage(plainHandle)!, false, 'nor by its id');
 
-      // At the tool boundary the module's write is stored and handed to the
-      // live turn; the tuned-out one, stored already, isn't, as its compiled
-      // view leaves it out.
+      // At the tool boundary the module's write, stored already, is
+      // presented and handed to the live turn; the tuned-out one isn't, as
+      // its compiled view leaves it out.
       release();
       await waitFor('the tool results handed to the stream', () => stream.receivedToolResultOptions.length > 0);
       const injected = stream.receivedToolResultOptions.flatMap((options) =>
@@ -364,8 +365,10 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
   // turn is stored, so the subconscious's view has the one the cap leaves
   // out of the dump, and its report notice is followed by no held row of
   // its own. Until AF-5 the message was queued behind the turn and handed
-  // to the report as a row of its own (that path, for a message a quiesce
-  // or a surgery queues, is tune-out-cancel-held's).
+  // to the report as a row of its own. That path is gone for a quiesce and
+  // a surgery too: a quiesce stores the message at once, and a surgery's
+  // release stores it before a cancel asked for meanwhile runs, so no held
+  // row follows the notice (tune-out-cancel-held asserts none does).
   it("leaves the older held message, which the cap leaves out of the dump, to the subconscious's view, which holds it stored", async () => {
     const { framework, ctx, module, membrane, internals, emit, close } = await open(1);
     let release: () => void = () => {};

@@ -1,8 +1,10 @@
 /**
  * The deferral queue is gone (#291, AF-6): a write is stored at once, and
- * enters each agent's window at that agent's presentation points. Only a
- * surgery's hold keeps a write out of the store, in memory, until its
- * release. A release before it left its queue on disk, which the importer
+ * enters each agent's window at that agent's presentation points. Two holds
+ * keep a write out of the store, in memory: a surgery's hold, until its
+ * release, and an agent's context manager that refuses its work after a
+ * failed re-initialization, until a branch move re-initializes it. A
+ * release before it left its queue on disk, which the importer
  * reads once at boot (src/deferred-import.ts and the framework's
  * importPersistedDeferredWrites), for one release.
  *

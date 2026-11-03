@@ -2447,8 +2447,8 @@ export interface HostModeStatus {
    * Context writes kept in memory, to be stored later: those a live
    * operator surgery's hold keeps until its release, and those kept for an
    * agent whose context manager refuses its work after a failed
-   * re-initialization, until a switchBranch() re-initializes it; 0
-   * otherwise. Before #291 it counted the writes held in the deferred queue,
+   * re-initialization, until a branch move (switchBranch, a rollback or a
+   * suppression) re-initializes it; 0 otherwise. Before #291 it counted the writes held in the deferred queue,
    * which this release no longer keeps: a write made while quiesced is
    * stored at once, and no agent is shown another's until resume.
    *
@@ -9300,10 +9300,11 @@ export class AgentFramework {
    * a turn token, which spans dequeue → settled teardown, a continuation of
    * the turn on its way to its start, or the turn's retry, which a provider
    * hold keeps or which waits to start: turnHolders). Idempotent. While
-   * quiesced a write is stored at once, as always, and the presentation
-   * index presents no agent another's row until resume (#291): every
-   * window is frozen but for each agent's own rows, a draining turn's tool
-   * boundaries included.
+   * quiesced a write is stored at once, as always, unless a surgery's hold
+   * or a context manager refusing its work keeps it in memory, and the
+   * presentation index presents no agent another's row until resume
+   * (#291): every window is frozen but for each agent's own rows, a
+   * draining turn's tool boundaries included.
    *
    * On drain timeout the host STAYS quiesced (`drained: false` in the
    * result); with `abandon: true` the undrained streams are cancelled via a
@@ -24851,13 +24852,13 @@ export class AgentFramework {
     const target = this.noticeTargetFor(name, 'prose-bounce');
     if (target) {
       try {
-        // Through framework.addMessage, NOT the context manager directly: while
-        // the turn is still streaming this defers the notice to the next tool
-        // boundary, where it is BOTH stored in order and injected into the live
+        // Through framework.addMessage, NOT the context manager directly: it
+        // stamps the notice for the bouncing agent (noticeTargetFor), stores it
+        // at once and keeps it out of the window until the agent's next
+        // presentation point. While the turn is still streaming that is its
+        // next tool boundary, which presents it and injects it into the live
         // stream (hear-while-acting) — the model sees the error and can correct
-        // the prefix within the same turn. A direct append here would land the
-        // notice before the turn's assistant blocks (cache bust, invisible
-        // until the next compile). Addressed to the bouncing agent (noticeTargetFor).
+        // the prefix within the same turn — or else the turn's end.
         const id = this.addMessage(
           'user',
           [{ type: 'text', text: notice }],
@@ -28762,8 +28763,10 @@ export class AgentFramework {
    * - Refused unless the agent is idle with no turn alive: puppeting
    *   mid-turn would corrupt the turn state machine and the live stream's
    *   wire ordering. For its own duration the puppet HOLDS the turn-alive
-   *   marker (wakes requeue, cross-turn writers defer), so a wake landing
-   *   during the tool's execution cannot start a turn underneath the pair.
+   *   marker (wakes requeue, and a write meanwhile is stored at once and
+   *   kept out of the window until the agent's next presentation point, the
+   *   puppet's end), so a wake landing during the tool's execution cannot
+   *   start a turn underneath the pair.
    * - Refused for tools outside the agent's own surface (the tools it may
    *   call, availableToolsForPresentation), and for skip_reply, by name or
    *   through a toolsets--act that reaches it, which ends the turn it's
@@ -28850,8 +28853,9 @@ export class AgentFramework {
     // straight through the context manager into a turn that never saw it,
     // the exact wire-order corruption this method exists to avoid. Holding
     // a turn token is the same invariant the scheduler respects (turn-alive
-    // requeues wakes) and the addMessage guard reads (cross-turn writers
-    // defer), so for the duration this behaves like a turn with no stream.
+    // requeues wakes) and addMessage reads (a write meanwhile is stored at
+    // once and kept out of the window until the agent's next presentation
+    // point), so for the duration this behaves like a turn with no stream.
     // Token-matched release in finally, same leak-proofing as
     // startAgentStream: a token nobody clears wedges the agent.
     const turnToken = this.nextTurnToken++;
@@ -28876,10 +28880,12 @@ export class AgentFramework {
 
       // Store the pair through the same shapes the ordinary path uses. Build
       // the result blocks BEFORE storing the tool_use: the spill path awaits.
-      // A message arriving during either await is deferred by the turn
-      // token (as during a real tool call) and lands AFTER the pair, never
-      // between tool_use and its tool_result. The two addMessage calls
-      // below are synchronous and adjacent — nothing can interleave.
+      // A message arriving during either await is stored at once and kept
+      // out of the window until the agent's next presentation point (as
+      // during a real tool call): the puppet's end presents it AFTER the
+      // pair, never between tool_use and its tool_result. The two
+      // addMessage calls below are synchronous and adjacent — nothing can
+      // interleave.
       const { bound } = this.resolveToolResultInlineCap(agent);
       const { blocks } = await this.buildStoredToolResultContent(
         agentName,
@@ -31354,12 +31360,14 @@ export class AgentFramework {
     }
     // A write is stored at once (#291): each reader's window takes it at
     // that reader's points (presentation.afterStore below), so a write
-    // stored while a turn of its agent's is alive stays out of that turn.
-    // Only a surgery's hold keeps a write out of the store while the
-    // operator's switch is awaited: it is held in memory, as given, and its
-    // release replays it through here (releaseSurgeryHeldWrites). It goes in
-    // no window and no store before then, so its placement names only its
-    // agent.
+    // stored while a turn of its agent's is alive stays out of that turn's
+    // window until one of its tool boundaries hears it or the turn ends.
+    // Two holds keep a write out of the store. A surgery's, while the
+    // operator's switch is awaited: the write is held in memory, as given,
+    // and its release replays it through here (releaseSurgeryHeldWrites). It
+    // goes in no window and no store before then, so its placement names
+    // only its agent. The other is a context manager refusing its work
+    // (below).
     const kept = (): SurgeryHeldWrite => {
       const { placement: _placement, ...rest } = opts ?? {};
       return {

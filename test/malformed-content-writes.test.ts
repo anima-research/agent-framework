@@ -8,7 +8,8 @@
  * isn't text at its call. Before, a deferred write was refused only at a
  * later flush, where the writer never heard of it, and a held write's edit
  * could replace valid content with content the drain then dropped; since
- * #291 every write is stored at once.
+ * #291 every write is stored at once, unless a surgery's hold or a context
+ * manager refusing its work keeps it in memory.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';

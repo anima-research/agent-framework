@@ -1,6 +1,8 @@
 - What changes for a host now that each agent's context follows its own window (#291):
-  - A quiesce freezes every window but for each agent's own rows: a write is stored at once and presented at
-    resume, and a turn draining through the quiesce hears nothing at its tool boundaries.
+  - A quiesce freezes every window but for each agent's own rows: a write is stored at once, taking no clock row,
+    and presented at resume, and a turn draining through the quiesce hears nothing at its tool boundaries. The
+    clock row due by then is written at the agent's next turn start, after the write; before, resume stored the
+    queued write through the path that writes a due clock row, so the clock row came first.
   - While a surgery holds the store (a rollback, a suppression, a branch switch), writes are held in memory and
     replayed in arrival order at its release, where each idle reader is presented them.
   - A row stored for an agent is in its context's record at once: a host that reads `getAllMessages()` sees rows
