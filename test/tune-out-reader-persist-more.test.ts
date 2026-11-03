@@ -3,6 +3,7 @@
  * are in tune-out-reader-persist.test.ts, whose boot() this file copies.
  *
  * - a look a stop cut off, resumed after the restart;
+ * - the resident's rows between two looks, on either side of a restart;
  */
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -11,8 +12,8 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { MessageId, StoredMessage } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
-import { AgentFramework } from '../src/index.js';
-import type { FrameworkConfig, TraceEvent } from '../src/index.js';
+import { AgentFramework, defaultReaderFraming } from '../src/index.js';
+import type { FrameworkConfig, ReaderFramingContext, TraceEvent } from '../src/index.js';
 import type { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
 import { WireMembrane, final } from './helpers/wire-membrane.js';
 
@@ -177,5 +178,41 @@ describe('a persisted reader: across a restart', () => {
     assert.equal(occurrences(body, 'HELD-1 before the stop'), 1, "the cut-off look's row is in the request once: its own framing's");
     const last = JSON.stringify(request.messages.at(-1));
     assert.ok(last.includes('HELD-2 after the restart') && !last.includes('HELD-1'), last);
+  });
+
+  it("hands the look after a restart the resident's rows since the look before it, from either side of the restart", { timeout: 180_000 }, async () => {
+    const dir = newDir('reader-persist-more-resync-');
+    const first = await boot(dir, { persist: 'epoch' });
+    await first.residentTurn('EARLY-1 hello scout', 'EARLY-2 scout hears you');
+    const epochId = first.enter();
+    const name = `reader/scout/${epochId.slice(0, 8)}/g1`;
+    first.membrane.script('reader', final([text('READER-REPORT-1 one held message.')]));
+    first.membrane.script('scout', final([text('MID-0 noted the report')]));
+    first.look(epochId, [first.hold(epochId, 'HELD-1')]);
+    await first.looked(name, 1);
+    await waitFor("scout's turn on the report", () => first.rows().some((m) => textOf(m) === 'MID-0 noted the report'));
+    await first.residentTurn('MID-1 before the restart', 'MID-2 scout, before the restart');
+    await first.stopped();
+
+    const contexts: ReaderFramingContext[] = [];
+    const second = await boot(dir, { persist: 'epoch', framing: (ctx: ReaderFramingContext) => { contexts.push(ctx); return defaultReaderFraming(ctx); } });
+    await second.framework.runUntilIdle();
+    await second.residentTurn('MID-3 after the restart', 'MID-4 scout, after the restart');
+    second.membrane.script('reader', final([text('READER-REPORT-2')]));
+    second.look(epochId, [second.hold(epochId, 'HELD-2')]);
+    await second.looked(name, 2);
+
+    assert.equal(contexts.length, 1);
+    assert.equal(contexts[0]!.resumed, true, 'premise: resumed, not derived');
+    const handed = contexts[0]!.residentRows ?? [];
+    const texts = handed.map((m) => textOf(m));
+    assert.deepEqual(texts.filter((h) => h.startsWith('MID-')), [
+      'MID-0 noted the report', 'MID-1 before the restart', 'MID-2 scout, before the restart',
+      'MID-3 after the restart', 'MID-4 scout, after the restart',
+    ], "the resident's rows since the first look, in window order: those before the restart and those after it");
+    assert.ok(!texts.some((h) => h.includes('EARLY') || h.includes('HELD-')), 'none from before the first look, and no held row');
+    assert.equal(second.forkTraces()[0]!.resynced, handed.length, 'the trace counts what it was handed');
+    const sent = JSON.stringify(second.membrane.callsFor('reader')[0]!.messages.at(-1));
+    assert.ok(sent.includes(`[In scout's context since your last look: ${handed.length} messages]`), sent);
   });
 });
