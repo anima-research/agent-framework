@@ -269,6 +269,19 @@ test('the catalogue opens on what the resident hid, each with its source and the
  } finally {rmSync(dir,{recursive:true,force:true});}
 });
 
+test('a hidden tool with no override and no configured default shows its installed description in the hidden section',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'catalogue-hidden-installed-'));
+ try {
+  const path=join(dir,'tools.json'), p=new ToolPresentation({path,cataloguePath:'board/tools.md'});
+  const tools=[{name:'web--put',description:'Put a page, as installed',inputSchema:{type:'object' as const}},...presentationTargets('workspace--read')];
+  writeFileSync(path,JSON.stringify({version:1,tools:{'web--put':{visible:false}}}));
+  const lines=renderCatalogue(p.resolve(tools,new Map([['web--put','MCPL server: web'],['workspace--read','Module: workspace']]))).split('\n');
+  const hiddenAt=lines.indexOf('## Hidden (1)');
+  assert.ok(hiddenAt>0,lines.join('\n'));
+  assert.deepEqual(lines.slice(hiddenAt,hiddenAt+6),['## Hidden (1)','','### web--put (MCPL server: web)','','> Put a page, as installed','']);
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
 test('an edit naming a name the file holds but the resident has no tool for says its setting stays, and only for that exact name',()=>{
  const dir=mkdtempSync(join(tmpdir(),'presentation-away-'));
  try {
@@ -280,11 +293,18 @@ test('an edit naming a name the file holds but the resident has no tool for says
   const r=p.edit('set_tool_visibility',{name:held,visible:true},tools);
   assert.equal(r.success,false);
   assert.ok(r.error!.endsWith(` ${keeps}`),r.error);
+  assert.ok(!r.error!.includes('Copy the exact name'),'a name with no tool now is in no index to copy from');
   assert.equal(JSON.parse(readFileSync(path,'utf8')).tools[held].visible,false,'its setting stays');
+  const rd=p.edit('set_tool_description',{name:held,description:'new words'},tools);
+  assert.equal(rd.success,false);
+  assert.ok(rd.error!.endsWith(` ${keeps}`),rd.error);
+  assert.ok(!rd.error!.includes('Copy the exact name'),rd.error);
+  assert.deepEqual(JSON.parse(readFileSync(path,'utf8')).tools[held],{visible:false},'a description edit changes nothing either');
   const typo=held.slice(0,-2)+'x_';
   assert.equal(typo.length,held.length);
   const r2=p.edit('set_tool_visibility',{name:typo,visible:true},tools);
   assert.equal(r2.success,false);
+  assert.ok(r2.error!.startsWith('Nothing was changed: you have no tool named '),r2.error);
   assert.ok(!r2.error!.includes(keeps),'a name that differs past the cut gets no such sentence');
   writeFileSync(path,'not json');
   const r3=p.edit('set_tool_visibility',{name:held,visible:true},tools);
@@ -292,6 +312,7 @@ test('an edit naming a name the file holds but the resident has no tool for says
   assert.ok(!r3.error!.includes(keeps),'a file that can\'t be parsed holds no setting');
   writeFileSync(path,JSON.stringify({version:1,tools:{[held]:{visible:false}}}));
   const r4=p.edit('set_tool_visibility',{name:'toString',visible:true},tools);
+  assert.ok(r4.error!.startsWith('Nothing was changed: you have no tool named '),r4.error);
   assert.ok(!r4.error!.includes(keeps),'a name the file holds only through its prototype is no setting');
  } finally {rmSync(dir,{recursive:true,force:true});}
 });
