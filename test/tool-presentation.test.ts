@@ -243,11 +243,12 @@ test('the catalogue opens on what the resident hid, each with its source and the
   const p=new ToolPresentation({path,cataloguePath:'board/tools.md',defaults:[{source:'MCPL server: web',path:web}]});
   const tools=presentationTargets('web--fetch','web--post','mail--send','workspace--read');
   const sources=new Map([['web--fetch','MCPL server: web'],['web--post','MCPL server: web'],['mail--send','MCPL server: mail'],['workspace--read','Module: workspace']]);
-  writeFileSync(path,JSON.stringify({version:1,tools:{'web--fetch':{visible:false},'mail--send':{visible:false,description:'my words\nsecond line'},'web--post':{visible:true},'gone--tool':{visible:false}}}));
+  writeFileSync(path,JSON.stringify({version:1,tools:{'web--fetch':{visible:false},'mail--send':{visible:false,description:'my words\nsecond line'},'web--post':{visible:true},'gone--tool':{visible:false},'gone--other':{visible:false}}}));
   const lines=renderCatalogue(p.resolve(tools,sources)).split('\n');
   const hiddenAt=lines.indexOf('## Hidden (2)'), indexAt=lines.indexOf('## Index by source');
   const diagnosticAt=lines.indexOf('Diagnostic: Not currently available: "gone--tool"');
-  assert.ok(diagnosticAt>0 && diagnosticAt<hiddenAt && hiddenAt<indexAt,'the diagnostics, then what was hidden, then the index');
+  const secondAt=lines.indexOf('Diagnostic: Not currently available: "gone--other"');
+  assert.ok(diagnosticAt>0 && secondAt>diagnosticAt && secondAt<hiddenAt && hiddenAt<indexAt,'every diagnostic, then what was hidden, then the index');
   assert.deepEqual(lines.slice(hiddenAt,indexAt),['## Hidden (2)','',
    '### web--fetch (MCPL server: web)','','> Fetch, as the host words it','',
    '### mail--send (MCPL server: mail)','','> my words','> second line','']);
@@ -445,6 +446,21 @@ test('a presentation file the host can\'t use: edits refuse it and the catalogue
   assert.match(lines[0],/^Diagnostic: Your tool presentation file can't be used \(it isn't valid JSON: .*\), so none of its settings apply: .* ask whoever runs this host to repair it\.$/);
   assert.deepEqual(lines.slice(1),['Diagnostic: first\\nsecond','Diagnostic: third\\nfourth','Diagnostic: fifth\\nsixth']);
  } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('an entry holding no setting is named nowhere once its tool is gone, as the editing tools\' refusal has it',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'presentation-emptied-entry-'));
+ try {
+  const path=join(dir,'tools.json'), p=new ToolPresentation({path,cataloguePath:'board/tools.md'});
+  const tools=presentationTargets('example','workspace--read'), without=presentationTargets('workspace--read');
+  assert.equal(p.edit('set_tool_description',{name:'example',description:'mine'},tools).success,true);
+  assert.equal(p.edit('set_tool_description',{name:'example',description:null},tools).success,true);
+  assert.deepEqual(p.resolve(without).diagnostics,[],'restoring its only description left the entry holding nothing');
+  writeFileSync(path,JSON.stringify({version:1,tools:{gone:{},left:{visible:false}}}));
+  assert.deepEqual(p.resolve(without).diagnostics,['Not currently available: "left"'],'a {} written by hand is named nowhere either');
+ } finally {
+  rmSync(dir,{recursive:true,force:true});
+ }
 });
 
 test('a presentation file holding {} is the empty document, as a missing one is, and a 0-byte file, half a document or a value that isn\'t an object still refuses',()=>{
