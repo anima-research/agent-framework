@@ -201,7 +201,8 @@ test('a server that no longer serves keeps nothing: lost for good, or lost while
   }
 });
 
-test('a live server whose handshake advertised no tools has listed nothing, so none of its old tools are kept', async () => {
+test('a live server whose handshake advertised no tools has listed nothing, so none of its old tools are kept', async (t) => {
+  const logged = t.mock.method(console, 'error', () => {});
   const h = await harness(['b']);
   try {
     h.server('b').lists = tools('read');
@@ -209,6 +210,10 @@ test('a live server whose handshake advertised no tools has listed nothing, so n
     Object.assign(h.server('b'), { fails: true, isConnected: true, mcpToolsAdvertised: false });
     await h.internals.refreshMcplTools();
     assert.deepEqual(h.names(), []);
+    h.server('b').isConnected = false;
+    await h.internals.refreshMcplTools();
+    assert.deepEqual(logged.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes('tools/list failed')), [],
+      'a failed listing of a server that advertised no tools, connected or reconnecting, logs nothing');
   } finally {
     await h.cleanup();
   }

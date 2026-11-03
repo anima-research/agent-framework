@@ -998,6 +998,9 @@ test('a tools/list page holding an entry that isn\'t a tool changes nothing the 
     // The re-list's answer was sent before look's request, on an ordered transport.
     assert.match(await look(t.fw), /peek\(\)/, 'peek is still known and visible');
     assert.ok(!notices(t.fw).some((x) => x.includes('now unavailable: peek')), 'nothing was told gone');
+    const connection = (t.fw.framework as unknown as { mcplServerRegistry: { getServer(id: string): { sendToolsList(): Promise<unknown> } } })
+      .mcplServerRegistry.getServer('arc');
+    await assert.rejects(connection.sendToolsList(), /malformed tools\/list page 1: entry 5 isn't an object with a string name/, 'a host asking itself gets the refusal, not the page');
   } finally { await t.done(); }
 });
 
