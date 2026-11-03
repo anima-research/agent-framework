@@ -896,3 +896,43 @@ describe('the presentation module when a store call fails', () => {
     assert.deepEqual(r.presentation.presentAtEnd(r.mira).map((m) => m.id), [arrival], "the arrival at the turn's end");
   });
 });
+
+describe('the presentation module at the point after one that failed', () => {
+  /** Run `body` with console.error and console.warn silenced, as the module logs each failure it traces. */
+  const quietly = <T>(body: () => T): T => {
+    const { error, warn } = console;
+    console.error = () => {};
+    console.warn = () => {};
+    try { return body(); } finally { console.error = error; console.warn = warn; }
+  };
+  /** Make `cm.presentRows` throw on its next call only. */
+  const failNextPresent = (cm: ContextManager): void => {
+    const real = cm.presentRows.bind(cm);
+    let fail = true;
+    cm.presentRows = (ids) => {
+      if (fail) { fail = false; throw new Error('a transient write failure'); }
+      return real(ids);
+    };
+  };
+
+  // AF #844 bot review finding 9.
+  it("an own row kept after a failed write stays kept when reading it back throws at the next write, and enters ahead of the rows after it", async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('mira');
+    failNextPresent(r.mira.cm);
+    const reply = quietly(() => storeOwnRow(r.mira, 'mira', text('A: a reply')));
+    assert.equal(r.mira.has(reply), false, 'setup: the reply missed its write');
+    const status = r.mira.cm.windowStatusOf.bind(r.mira.cm);
+    let failStatus = true;
+    r.mira.cm.windowStatusOf = (id) => {
+      if (failStatus) { failStatus = false; throw new Error('a transient read failure'); }
+      return status(id);
+    };
+    quietly(() => storeOwnRow(r.mira, 'user', text('B: its results')));
+    storeOwnRow(r.mira, 'mira', text('C: the next reply'));
+    r.alive.delete('mira');
+    r.presentation.presentAtEnd(r.mira);
+    assert.deepEqual(r.mira.window().slice(-3), ['A: a reply', 'B: its results', 'C: the next reply'], 'in the order they were stored');
+  });
+});

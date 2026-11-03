@@ -728,10 +728,14 @@ export class AgentPresentation {
    * sweep. Never throws.
    */
   presentOwn(agent: PresentedAgent, ids: ReadonlyArray<MessageId | undefined>): void {
-    let tried: readonly MessageId[] = unique(ids);
+    const cm = agent.getContextManager();
+    // Every row this call tries, the ones an earlier failed write kept
+    // among them, from before the first read: a read that throws keeps them
+    // all (keepFailedOwn), so none of them is put behind the rows written
+    // after it.
+    let tried: readonly MessageId[] = unique([...(this.failedOwn.get(cm) ?? []), ...ids]);
     try {
       if (!this.presenting(agent)) return;
-      const cm = agent.getContextManager();
       tried = unique([...this.failedOwnOf(agent), ...ids]).filter((id) => cm.ordinalOf(id) === undefined);
       this.present(agent, tried, 'write');
       this.keepFailedOwn(agent, tried);
