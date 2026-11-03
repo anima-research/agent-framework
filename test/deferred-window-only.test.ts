@@ -618,8 +618,14 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     await compiling;
     assert.deepEqual(agent.getConsumedWatermark(), marked, "the boundary's mark stands");
     (cm as unknown as { compile: typeof compile }).compile = compile;
+    // A row presented since, so the later compile has something past the
+    // boundary's mark to cover.
+    const since = internalsOf(framework).addMessage('Antra', text('presented since'));
+    assert.equal(cm.windowStatusOf(since as never), 'in', 'presented at once: no turn is alive');
     await agent.compileContext();
-    assert.equal(markAtOrAfter(agent.getConsumedWatermark()!, marked!), true, 'a later compile still advances it');
+    const after = agent.getConsumedWatermark()!;
+    assert.equal(markAtOrAfter(after, marked!), true, 'a later compile still advances it');
+    assert.equal(markAtOrAfter(marked!, after), false, "past the boundary's mark, over the row presented since");
     await framework.stop();
   });
 
