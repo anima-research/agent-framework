@@ -22,6 +22,7 @@ type Internals = {
 
 const a: ChannelRef = { serverId: 'a', channelId: 'general' };
 const b: ChannelRef = { serverId: 'b', channelId: 'general' };
+const lounge: ChannelRef = { serverId: 'b', channelId: 'lounge' };
 
 async function residentWith(t: TestContext, opts: { gate?: boolean; beforeInference?: () => void } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'af-disabled-typing-'));
@@ -56,11 +57,17 @@ async function residentWith(t: TestContext, opts: { gate?: boolean; beforeInfere
   for (const ref of [a, b]) {
     map.set(destinationKey(ref), { serverId: ref.serverId, descriptor: { id: 'general', type: 'chat', label: '#general' }, open: true });
   }
+  map.set(destinationKey(lounge), { serverId: 'b', descriptor: { id: 'lounge', type: 'chat', label: '#lounge' }, open: true });
   let started = 0;
-  framework.onTrace((e) => { if ((e as { type: string }).type === 'inference:started') started++; });
+  const streamed: Array<{ type: string; channelId?: string }> = [];
+  framework.onTrace((e) => {
+    const event = e as { type: string; channelId?: string };
+    if (event.type === 'inference:started') started++;
+    if (event.type === 'inference:tokens' || event.type === 'inference:content_block') streamed.push({ type: event.type, channelId: event.channelId });
+  });
   const turn = () => membrane.pushResponse(createMockResponse([{ type: 'text', text: 'noted' }]));
   const run = async () => { await framework.runUntilIdle(); };
-  return { framework, i, typing, started: () => started, turn, run };
+  return { framework, i, typing, streamed, started: () => started, turn, run };
 }
 
 const starts = (typing: string[]) => typing.filter((c) => c.includes(' start '));
@@ -92,7 +99,7 @@ test("a disabled turn the gate woke for an addressed message shows typing in tha
 test('a disabled turn woken by a gate batch of ambient messages alone shows no typing, as an explicit turn shows none', async (t) => {
   const r = await residentWith(t, { gate: true });
   r.turn();
-  r.i.eventGate.requestInferenceFn('scout', 'gate:debounce', 'gate', { channelId: 'general', counterparty: 'U1', at: Date.now() });
+  r.i.eventGate.requestInferenceFn('scout', 'gate:debounce', 'gate', { channelId: 'lounge', counterparty: 'U1', at: Date.now() });
   await r.run();
   assert.equal(r.started(), 1, 'control: the turn ran');
   assert.deepEqual(starts(r.typing), [], r.typing.join(', '));
@@ -103,11 +110,11 @@ test('a disabled conversation fork shows typing on its home channel, and not whe
   t.after(bindAsConversationFork(r.framework, 'scout', a));
   r.turn();
   r.i.eventGate.requestInferenceFn('scout', 'gate:debounce', 'gate', {
-    channelId: 'general', routeChannelId: 'general', routeServerId: 'b', counterparty: 'U1', at: Date.now(),
+    channelId: 'lounge', routeChannelId: 'lounge', routeServerId: 'b', counterparty: 'U1', at: Date.now(),
   });
   await r.run();
   assert.equal(r.started(), 1, "control: the turn ran");
-  assert.ok(!starts(r.typing).includes('b start general'), `no typing in b's general, which isn't its home: ${r.typing.join(', ')}`);
+  assert.deepEqual(starts(r.typing), [], `no typing in b's lounge, which isn't its home: ${r.typing.join(', ')}`);
 
   r.typing.length = 0;
   r.turn();
@@ -161,4 +168,18 @@ test("a disabled turn shows its typing again when its stream starts, where somet
   const stopped = r.typing.indexOf('a stop general');
   assert.ok(stopped > 0 && r.typing.indexOf('a start general') < stopped, `control: typing showed, then was stopped: ${r.typing.join(', ')}`);
   assert.ok(r.typing.slice(stopped + 1).includes('a start general'), `and showed again in the same channel: ${r.typing.join(', ')}`);
+});
+
+test("a disabled turn's stream traces name no channel, though the turn shows typing in one", async (t) => {
+  const r = await residentWith(t);
+  r.turn();
+  r.i.pendingRequests.push({
+    agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'a', timestamp: Date.now(),
+    channelId: 'general', channelServerId: 'a', addressed: true,
+  });
+  await r.run();
+  assert.deepEqual([...new Set(starts(r.typing))], ['a start general'], `control: typing showed: ${r.typing.join(', ')}`);
+  assert.ok(r.streamed.some((e) => e.type === 'inference:tokens'), 'control: the stream was traced');
+  assert.ok(r.streamed.some((e) => e.type === 'inference:content_block'), 'control: its blocks were traced');
+  assert.deepEqual(r.streamed.filter((e) => e.channelId !== undefined), [], 'no stream trace names a channel');
 });

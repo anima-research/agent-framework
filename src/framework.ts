@@ -24962,6 +24962,8 @@ export class AgentFramework {
       this.showTurnTyping(streamRouting, locus);
       typingChannel = locus;
     };
+    const tracedChannelId = (): string | undefined =>
+      (turnProseRouting === 'disabled' ? undefined : typingChannel?.channelId);
 
     // §10.5 inference/lifecycle: `started` now, exactly one terminal in the
     // finally below (the one block every exit path shares). Which terminal
@@ -25128,8 +25130,9 @@ export class AgentFramework {
               blockIndex: event.meta.blockIndex,
               // The channel the typing indicator above shows, the conversation
               // the turn is attending: lets trace consumers tag every chunk
-              // with it, without re-deriving routing.
-              channelId: typingChannel?.channelId,
+              // with it, without re-deriving routing. None in disabled mode,
+              // whose text is never sent to a channel.
+              channelId: tracedChannelId(),
             };
             if (agent.toolResultGuard.hasSubmittedPending || agent.toolResultGuard.recovering) {
               guardHeld.push(trace);
@@ -25160,7 +25163,7 @@ export class AgentFramework {
               content: '',
               blockType: 'text',
               blockIndex: 0,
-              channelId: typingChannel?.channelId,
+              channelId: tracedChannelId(),
             });
             break;
           }
@@ -25173,7 +25176,7 @@ export class AgentFramework {
               phase,
               blockType: block.type,
               blockIndex: index,
-              channelId: typingChannel?.channelId,
+              channelId: tracedChannelId(),
             });
             break;
           }
