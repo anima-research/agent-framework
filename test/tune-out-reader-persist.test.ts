@@ -1031,5 +1031,20 @@ describe('resumeAgent and the derivation notice', () => {
     return framework;
   };
 
+  it("leaves a later incarnation's tool presentation as it is when an earlier one's cleanup runs", { timeout: 60_000 }, async () => {
+    const framework = await create();
+    const owners = (framework as unknown as { toolSurfaceOwners: Map<string, string> }).toolSurfaceOwners;
+    const derived = await framework.deriveAgent({ name: 'f', from: 'scout', framing: [{ participant: 'user', content: [text('go')] }] });
+    await framework.runEphemeralToCompletion(derived.agent, derived.contextManager);
+    const { name: _name, ...config } = (framework as unknown as { agentConfigs: Map<string, AgentConfig> }).agentConfigs.get('scout')!;
+    const second = await framework.resumeAgent('f', config);
+    await framework.runEphemeralToCompletion(second.agent, second.contextManager);
+    const third = await framework.resumeAgent('f', config);
+    assert.equal(owners.get('f'), 'scout', "premise: the third incarnation shows scout's presentation");
+    second.cleanup();
+    assert.equal(owners.get('f'), 'scout', "the second incarnation's cleanup leaves the third's");
+    third.cleanup();
+    assert.equal(owners.get('f'), undefined, 'its own cleanup takes it out');
+  });
 
 });

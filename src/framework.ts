@@ -11619,7 +11619,9 @@ export class AgentFramework {
     // A shared derivation on its source's tools shows the source's tool
     // presentation, as deriveAgent set it up (toolSurfaceOwners): its tool
     // block is the front of the prefix it shares. The run's end clears it,
-    // as it does a derivation's; a cleanup before the run does here.
+    // as it does a derivation's; a cleanup before the run does here, while
+    // this candidate is still the one being resumed: a later incarnation's
+    // entry is the same name and owner, and its own to clear.
     const source = record.inherit?.mode === 'shared' ? record.inherit.from : undefined;
     const sourceConfig = source !== undefined && this.agents.has(source) ? this.agentConfigs.get(source) : undefined;
     const surfaceOwner = source !== undefined && sourceConfig && sameAllowedTools(fullConfig.allowedTools, sourceConfig.allowedTools)
@@ -11627,8 +11629,9 @@ export class AgentFramework {
       : undefined;
     if (surfaceOwner !== undefined) this.toolSurfaceOwners.set(name, surfaceOwner);
     const cleanup = () => {
-      if (this.resumesPending.get(name) === agent) this.resumesPending.delete(name);
-      if (surfaceOwner !== undefined && !this.agents.has(name) && this.toolSurfaceOwners.get(name) === surfaceOwner) {
+      const pending = this.resumesPending.get(name) === agent;
+      if (pending) this.resumesPending.delete(name);
+      if (pending && surfaceOwner !== undefined && !this.agents.has(name) && this.toolSurfaceOwners.get(name) === surfaceOwner) {
         this.toolSurfaceOwners.delete(name);
       }
       this.releasedByCleanup.add(agent);
