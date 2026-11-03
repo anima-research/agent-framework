@@ -16891,15 +16891,36 @@ export class AgentFramework {
       : this.planSuppression(agentName, [...new Set((target as { suppress: string[] }).suppress.map(String))]).targeted;
     // On a presented window (#291): which of the rows no live window holds,
     // and, for a rollback, which rows the cut keeps that leave the window
-    // and which it keeps in it, after the target.
+    // and which it keeps in it, after the target. A row no window is read
+    // to hold, where a window's lookup failed, isn't known to be in none:
+    // it is left out of the count, and logged.
     const presented = this.presents(this.agents.get(agentName));
-    const windowFacts = presented
-      ? {
-          neverPresented: messages.filter((m) => this.holderNames(m.id as MessageId, m.metadata).length === 0).length,
-          ...(plan?.returnedToArrivals !== undefined ? { returnedToArrivals: plan.returnedToArrivals } : {}),
-          ...(plan?.keptInWindow !== undefined ? { keptInWindowAfterTarget: plan.keptInWindow.length } : {}),
-        }
-      : {};
+    let windowFacts = {};
+    if (presented) {
+      let neverPresented = 0;
+      let unknown = 0;
+      const unreadable = new Map<string, string>();
+      for (const m of messages) {
+        const holders = this.holderNames(m.id as MessageId, m.metadata);
+        if (holders.names.length > 0) continue;
+        if (holders.unreadable.length === 0) { neverPresented++; continue; }
+        unknown++;
+        for (const { agent, error } of holders.unreadable) if (!unreadable.has(agent)) unreadable.set(agent, error);
+      }
+      if (unknown > 0) {
+        console.error(
+          `[operator] preview for ${agentName}: ${unknown === 1 ? '1 message' : `${unknown} messages`} it removes ` +
+            `${unknown === 1 ? 'is' : 'are'} in no window read, and ${[...unreadable.keys()].join(', ')}'s window couldn't ` +
+            `be read for ${unknown === 1 ? 'it' : 'them'}, so neverPresented leaves ${unknown === 1 ? 'it' : 'them'} out: ` +
+            [...unreadable].map(([agent, error]) => `${agent}: ${error}`).join('; '),
+        );
+      }
+      windowFacts = {
+        neverPresented,
+        ...(plan?.returnedToArrivals !== undefined ? { returnedToArrivals: plan.returnedToArrivals } : {}),
+        ...(plan?.keptInWindow !== undefined ? { keptInWindowAfterTarget: plan.keptInWindow.length } : {}),
+      };
+    }
     const scopeView = (scope: DiscordAwarenessScope): SurgeryMarksPreview['scopes'][DiscordAwarenessScope] => {
       const { refs } = selectDiscordAwarenessRefs(messages, { scope });
       const channels = new Map<string, number>();
@@ -16922,24 +16943,28 @@ export class AgentFramework {
   /**
    * The live agents whose window holds a row now (#291): each whose context
    * reads it `'in'` (windowStatusOf), every agent whose window is still the
-   * record and whose record holds it among them. A row a tune-out holds from
-   * residents is held by no agent whose window leaves such rows out: a
-   * write-down took them in, and its view never shows them.
+   * record and whose record holds it among them (`names`). A row a tune-out
+   * holds from residents is held by no agent whose window leaves such rows
+   * out: a write-down took them in, and its view never shows them. An agent
+   * whose lookup throws is in `unreadable`, with the error: whether its
+   * window holds the row isn't known.
    */
-  private holderNames(id: MessageId, metadata?: unknown): string[] {
+  private holderNames(id: MessageId, metadata?: unknown): { names: string[]; unreadable: Array<{ agent: string; error: string }> } {
     const held = heldFromResidents(metadata as Record<string, unknown> | undefined);
     const names: string[] = [];
+    const unreadable: Array<{ agent: string; error: string }> = [];
     for (const agent of this.agents.values()) {
       const cm = agent.getContextManager();
       try {
         if (cm.isClosed() || cm.windowStatusOf(id) !== 'in') continue;
-      } catch {
+      } catch (error) {
+        unreadable.push({ agent: agent.name, error: thrownText(error) });
         continue;
       }
       if (held && readerFacts(this.registry, agent.name).hidesHeld) continue;
       names.push(agent.name);
     }
-    return names;
+    return { names, unreadable };
   }
 
   /** The awareness ledger's batches and retract requests, for operator surfaces. */

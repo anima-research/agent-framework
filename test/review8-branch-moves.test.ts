@@ -354,3 +354,32 @@ describe('a module that writes from start() on a host booting quiesced (AF #844 
   });
 });
 
+// 50: the preview's holder lookup skipped an agent whose windowStatusOf
+// threw, so a removed row that agent's window holds counted as never
+// presented.
+describe("a surgery preview whose window lookup fails (AF #844 bot review 50)", () => {
+  it("doesn't count a row as never presented where a window couldn't be read for it, and logs it", async () => {
+    const h = await boot();
+    await h.turn('first', 'one');
+    await h.turn('second', 'two');
+    const target = h.rowWith('one').id;
+    assert.equal(h.framework.previewSurgeryMarks('mira', { rollbackTo: target }).neverPresented, 0, 'premise: both rows it removes are in her window');
+    const cm = h.cm as unknown as { windowStatusOf: (id: MessageId) => unknown };
+    const real = cm.windowStatusOf;
+    cm.windowStatusOf = () => { throw new Error('the index read failed'); };
+    const logged: string[] = [];
+    const quiet = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    let preview: ReturnType<AgentFramework['previewSurgeryMarks']>;
+    try {
+      preview = h.framework.previewSurgeryMarks('mira', { rollbackTo: target });
+    } finally {
+      cm.windowStatusOf = real;
+      console.error = quiet;
+    }
+    assert.equal(preview.messagesRemoved, 2);
+    assert.equal(preview.neverPresented, 0);
+    assert.ok(logged.some((line) => line.includes("[operator] preview for mira: 2 messages it removes are in no window read, and mira's window couldn't be read for them, so neverPresented leaves them out: mira: ")
+      && line.includes('the index read failed')), logged.join('\n'));
+  });
+});
