@@ -9,7 +9,10 @@
 
   Private wins, one way. A start whose batch holds a private surface's wake is
   private, whatever else the batch holds: directly, through one gate debounce
-  window, after a quiesce or a provider hold. So is a start that is the first
+  window, after a quiesce or a provider hold. A provider hold that keeps one
+  request for two equal ones keeps the marks of the one it drops, and where
+  the one it keeps is a merged start, each request of its batch takes those
+  marks when the hold releases it. So is a start that is the first
   to read a private surface's message stored before it, though the message's
   own wake may still wait in a gate window, or the message woke nothing, and
   for an ordinary resident whose view keeps the message, whichever resident

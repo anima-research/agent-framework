@@ -19790,7 +19790,8 @@ export class AgentFramework {
       // A start that came back before it took its
       // token stands for the batch it was merged from (MERGED_BATCH),
       // including one a hold released just now. The batch takes its place,
-      // each request as it was, judged one by one from here: a wait holds
+      // each request as it was, with the marks a hold's dedup carried onto
+      // the start beyond its requests' own, judged one by one from here: a wait holds
       // them apart, a quiesce parks the wakes while the turn's request
       // passes, and the read check and the policy decide on them all; the
       // merge below records the batch anew.
@@ -19798,7 +19799,12 @@ export class AgentFramework {
         requests = requests.flatMap((r) => {
           const batch = mergedBatch(r);
           if (!batch) return [r];
-          for (const member of batch) carryTurnMarks(member, r);
+          const own = new Set(batch.flatMap(callerTurnsOf));
+          const added = {
+            ...continuesTurns(...callerTurnsOf(r).filter((turn) => !own.has(turn))),
+            ...((r as MarkedRequest)[RETAKE] && !batch.some((member) => (member as MarkedRequest)[RETAKE]) ? { [RETAKE]: true as const } : {}),
+          } as InferenceRequest;
+          for (const member of batch) carryTurnMarks(member, added);
           return batch;
         });
       }
@@ -27655,8 +27661,8 @@ export class AgentFramework {
       // inferred from which method was used: only the ModuleRegistry closure
       // carries module provenance (see handleToolClose).
       case 'channel': {
-        const refusal = call.callerAgentName && call.callerTurnId !== undefined
-          ? this.privatePublishRefusal(call.callerAgentName, call, this.isPrivateTurn(call.callerTurnId))
+        const refusal = call.callerTurnId !== undefined
+          ? this.privatePublishRefusal(call.callerAgentName ?? '__ephemeral__', call, this.isPrivateTurn(call.callerTurnId))
           : undefined;
         if (refusal !== undefined) return failed({ success: false, error: refusal, isError: true });
         const turn = call.name === 'channel_publish' && call.callerAgentName ? this.callingTurnOf(call.callerAgentName, call) : undefined;
@@ -36700,7 +36706,7 @@ export class AgentFramework {
   }
 
   private scriptPrivatePublishRefusal(agentName: string): string {
-    return "this script's turn is private and has no default channel, so channel_publish requires an explicit channelId"
+    return "this script's turn is private and has no default channel, so channel_publish requires an explicit channelId, a channel's id as a string"
       + `${this.mayCallTool(agentName, 'channel_list') ? '; channel_list shows the channel ids' : ''}; nothing was posted`;
   }
 
@@ -36712,7 +36718,7 @@ export class AgentFramework {
     if (call.name !== 'channel_publish' || !privateTurn) return undefined;
     if (namesChannel(call.input)) return undefined;
     if (call.id !== undefined && this.scriptCallStarts.has(call.id)) return this.scriptPrivatePublishRefusal(agentName);
-    return 'This private turn has no default channel; channel_publish requires an explicit channelId.'
+    return "This private turn has no default channel; channel_publish requires an explicit channelId, a channel's id as a string."
       + (this.mayCallTool(agentName, 'channel_list') ? ' channel_list shows the channel ids.' : '');
   }
 
@@ -37485,8 +37491,8 @@ export class AgentFramework {
       const except = "except on a turn that has no channel, such as a heartbeat's, or one that holds private input";
       const speech = home
         ? open?.nonChannelOrigin
-          ? `This turn holds private input, so its plain speech stays private; from your next turn it stays in ${this.channelShown(home)}, your conversation's channel.`
-          : `Your plain speech stays in ${this.channelShown(home)}, your conversation's channel.`
+          ? `This turn holds private input, so its plain speech stays private; from your next turn it stays in ${this.channelShown(home)}, your conversation's channel, except on a turn that holds private input.`
+          : `Your plain speech stays in ${this.channelShown(home)}, your conversation's channel, except on a turn that holds private input.`
         : open?.nonChannelOrigin
           ? `This turn holds private input, so its plain speech stays private; from your next turn it lands in the excepted channel while this holds, ${except}.`
           : open?.locus && !sameChannel(open.locus, resolved)

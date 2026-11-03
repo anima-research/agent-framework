@@ -649,9 +649,10 @@ describe('a private turn and the focus', () => {
       await f.framework.runUntilIdle();
       assert.equal(internals(f).tuneOutCoordinator!.getAllExcept()?.params.except.channelId, 'work', 'control: the focus holds');
       const results = stored(f).map((m) => JSON.stringify(m.content));
-      assert.ok(results.some((text) => text.includes('This turn holds private input, so its plain speech stays private;')),
-        `the focus result says this turn's speech stays private: ${results.slice(-4).join('\n')}`);
+      assert.ok(results.some((text) => text.includes("This turn holds private input, so its plain speech stays private; from your next turn it stays in home, your conversation's channel, except on a turn that holds private input.")),
+        `the focus result says this turn's speech stays private, and where the fork's later speech goes: ${results.slice(-4).join('\n')}`);
       assert.ok(!results.some((text) => text.includes('Your plain speech stays in')), "it doesn't say this turn's speech stays in the fork's home");
+      assert.ok(has(f, 'zz-the code is 4417'), 'premise: the private turn spoke');
       assert.deepEqual(sent(f, 'zz-the code is 4417'), [], 'the private words reached no channel');
     } finally { await f.close(); }
   });

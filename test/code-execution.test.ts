@@ -2452,6 +2452,7 @@ describe('a round whose run or wait call watches a script that can change its ro
       h.framework.pushEvent(surface());
       await h.framework.runUntilIdle();
       assert.ok(scriptNote(h).includes(REFUSED), scriptNote(h));
+      assert.ok(scriptNote(h).includes("a channel's id as a string"), scriptNote(h));
       assert.ok(!h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
     } finally {
       await h.done();
@@ -2490,6 +2491,39 @@ describe('a round whose run or wait call watches a script that can change its ro
       }
     });
   }
+
+  it("a script a private turn started, left running past that turn into a channel turn, is refused a channel_publish through toolsets--act that names no channel", async () => {
+    const mount = mkdtempSync(join(tmpdir(), 'ce-act-late-'));
+    const workspace = new WorkspaceModule({ mounts: [{ name: 'work', path: mount, mode: 'read-write', watch: 'never' }] });
+    const acting = '{ tool: "channel_publish", args: { content: "from the watcher" } }';
+    const h = await scriptRound('locus', [
+      createMockResponse([scriptCall({
+        code: `await tools["test--slow"]({}); let note; try { await tools["toolsets--act"](${acting}); note = "posted"; } catch (e) { note = String(e && e.message); } await tools["test--echo"]({ note });`,
+        yield_time_ms: 100,
+      })] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'watching' }] as ContentBlock[]),
+    ], { toolPresentation: { path: join(mount, 'tools.json'), cataloguePath: 'work/tools.md' } }, { channelPublish: true, modules: [workspace], serveWakes: true });
+    try {
+      for (const [name, input] of [['set_tool_visibility', { name: 'channel_publish', visible: false }], ['toolsets--open', { toolset: 'settings' }]] as const) {
+        const result = await h.framework.executeToolCall({ id: `setup-${name}`, name, input, callerAgentName: 'assistant' } as never);
+        assert.ok(result.success, `premise: ${name}: ${result.error}`);
+      }
+      h.framework.pushEvent(surface());
+      await h.framework.runUntilIdle();
+      assert.equal(h.framework.getHostModeStatus().backgroundScripts, 1, 'control: the script was left running');
+      h.framework.pushEvent(surface('world:test'));
+      await h.framework.runUntilIdle();
+      const routing = (h.framework as unknown as { turnRouting: Map<string, { nonChannelOrigin?: boolean }> }).turnRouting.get('assistant');
+      assert.notEqual(routing?.nonChannelOrigin, true, "premise: the agent's latest turn is a channel's");
+      h.module.releaseSlow();
+      await driven(h, () => h.log.some((e) => e.startsWith('note:')));
+      assert.ok(scriptNote(h).includes('has no default channel'), scriptNote(h));
+      assert.ok(!h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
+    } finally {
+      await h.done();
+      rmSync(mount, { recursive: true, force: true });
+    }
+  });
 
   it("a script's channel_publish that names its channel goes there, in a private turn too", async () => {
     const h = await scriptRound('locus', [
