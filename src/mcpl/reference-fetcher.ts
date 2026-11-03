@@ -246,7 +246,7 @@ export class ReferenceFetcher {
 
   private withholds(record: ReferenceRecord): boolean {
     if (this.withhold === undefined) return false;
-    return record.payloadNever === true || referenceRegistry.findByUri(record.testimony.uri)?.payloadNever === true;
+    return record.payloadNever === true || referenceRegistry.markedAs(record.testimony.uri) !== undefined;
   }
 
   /** The server a check (dialServer or dialCheck) chose, with its credential

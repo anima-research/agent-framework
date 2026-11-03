@@ -1140,9 +1140,10 @@ test("inline data's expiry claims nothing for a link to its uri, which the host 
 
 test("a never nested where only the script's view reads it withholds a link whose uri shows as the same text", { timeout: 30_000 }, async () => {
   await withPeers(async ({ answer, script, modelCall }) => {
-    // Off the server's origin, so the line, which reads the top-level blocks
-    // alone, shows the link's uri; the view reads the nested never, found by
-    // the text the link shows.
+    // Off the server's origin. The result's nested never marks its uri's
+    // record, and the link's uri shows as the same text, so the link's record
+    // is marked too, as it's made: the model's line, which reads the top-level
+    // blocks alone, shows the never stub, as the view does.
     const uri = 'https://elsewhere.example.invalid/view-cut/report.csv';
     const content = () => [
       { type: 'text', text: 'sealed', attachment: { type: 'resource', uri, name: 'report.csv', disposition: 'never' } },
@@ -1150,14 +1151,13 @@ test("a never nested where only the script's view reads it withholds a link whos
     ];
     answer({ content: content(), structuredContent: {} });
     const line = nonErrorResultText(await modelCall('attach'));
-    assert.ok(line.includes('view-cut/report.csv'), line);
+    assert.ok(!line.includes('view-cut') && line.includes('a server asked that its content never reach you or your tools'), line);
     answer({ content: content(), structuredContent: {} });
     const out = await script('mcpl--files--attach');
     assert.ok(!out.includes('view-cut'), out);
     const link = (JSON.parse(out) as { content: Array<Record<string, unknown>> }).content[1]!;
-    // The server's never names another uri, which shows as the same text, so
-    // no mark is on the link's record: it gives out no id to fetch by.
-    assert.deepEqual(link, RESULT_NEVER('report.csv'), out);
+    // A marked record's object keeps its id, and a fetch by it is refused.
+    assert.deepEqual([typeof link.refId, link.savedTo, link.unfetchable], ['string', null, 'a server asked that its content never reach you or your tools'], out);
   });
 });
 

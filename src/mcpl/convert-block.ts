@@ -20,6 +20,7 @@ import {
   referenceRegistry,
   referenceStubOrNull,
   unknownBlockText,
+  uriWithheld,
   type ResultClaims,
 } from './references.js';
 import { NON_STRING_TEXT_PLACEHOLDER } from './visible-content.js';
@@ -67,7 +68,7 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
         } as ContentBlock;
       }
       if (isFilledString(block.uri)) {
-        if (referenceRegistry.findByUri(block.uri)?.payloadNever || claims.get(block.uri)?.never) return stub();
+        if (uriWithheld(block.uri, claims)) return stub();
         return {
           type: 'image',
           source: { type: 'url', url: block.uri },

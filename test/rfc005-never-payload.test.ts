@@ -178,6 +178,88 @@ describe('the payload mark', () => {
     });
   });
 
+  it('withholds a later spelling of a marked uri that shows as the same text: a reference, a link, an image sent by uri alone and an embedded resource', async () => {
+    await quietly(() => {
+      const kinds = {
+        resource: (uri: string) => ({ type: 'resource', uri }),
+        link: (uri: string) => ({ type: 'resource_link', uri, name: 'padded.png' }),
+        image: (uri: string) => ({ type: 'image', uri }),
+      };
+      for (const [kind, block] of Object.entries(kinds)) {
+        const uri = uniq(`padded-${kind}.png`);
+        referenceRegistry.register(testimonyOf({ type: 'resource', uri, disposition: 'never' }), 'zz-never-dialed');
+        for (const padded of [` ${uri}`, `${uri}\n`, `\u200e${uri}`, `${uri.slice(0, 12)}\u0007${uri.slice(12)}`]) {
+          const label = `${kind}, ${JSON.stringify(padded)}`;
+          const [shown] = convertBlocks([block(padded)] as McplContentBlock[], 'attachment on push event', 'zz-never-dialed') as Array<{ type: string; text?: string }>;
+          const record = referenceRegistry.findByUri(padded);
+          assert.equal(record?.payloadNever, true, `${label}: its record is born marked`);
+          assert.ok(shown?.type === 'text' && shown.text!.includes(NEVER_TEXT) && !shown.text!.includes('zz-never.example'), `${label}: ${JSON.stringify(shown)}`);
+        }
+      }
+      const uri = uniq('padded-embedded.txt');
+      referenceRegistry.register(testimonyOf({ type: 'resource', uri, disposition: 'never' }), 'zz-never-dialed');
+      for (const padded of [` ${uri}`, `${uri}\n`, `\u200e${uri}`]) {
+        const embedded = { type: 'resource', resource: { uri: padded, text: 'secret contents', mimeType: 'text/plain' } };
+        assert.deepEqual(convertBlock(embedded as unknown as McplContentBlock, 'attachment on push event', 'zz-other'), { type: 'text', text: references.EMBEDDED_RESOURCE_NEVER_TEXT }, `embedded, ${JSON.stringify(padded)}`);
+      }
+    });
+  });
+
+  it('marks the record of the uri a padded inline `never` shows, so a later delivery of that uri is withheld', async () => {
+    await quietly(() => {
+      const uri = uniq('inline-padded.png');
+      const record = referenceRegistry.register(testimonyOf({ type: 'resource', uri }), 'zz-never-dialed');
+      convertBlocks([inlineNever(` ${uri}\n`)] as McplContentBlock[], 'attachment on push event', 'zz-never-dialed');
+      assert.equal(record.payloadNever, true, 'the padded `never` marks the record of the uri it shows');
+      const [later] = convertBlocks([{ type: 'resource', uri }] as McplContentBlock[], 'attachment on push event', 'zz-never-dialed');
+      assert.deepEqual(later, { type: 'text', text: `[${record.refId}] attachment on push event — ${NEVER_TEXT}` });
+    });
+  });
+
+  it("marks a padded inline `never`'s own spelling's record too, so a later delivery so spelled is withheld", async () => {
+    await quietly(() => {
+      const padded = ` ${uniq('inline-own.png')}`;
+      const own = referenceRegistry.register(testimonyOf({ type: 'resource', uri: padded }), 'zz-never-dialed');
+      convertBlocks([inlineNever(padded)] as McplContentBlock[], 'attachment on push event', 'zz-never-dialed');
+      assert.equal(own.payloadNever, true, "the padded `never` marks its own spelling's record");
+      const [later] = convertBlocks([{ type: 'resource', uri: padded }] as McplContentBlock[], 'attachment on push event', 'zz-never-dialed');
+      assert.deepEqual(later, { type: 'text', text: `[${own.refId}] attachment on push event — ${NEVER_TEXT}` });
+    });
+  });
+
+  it('marks the record a reference makes beside a padded inline `never` spelled as it is, in one message', async () => {
+    await quietly(() => {
+      const padded = `${uniq('inline-same.png')}\n`;
+      convertBlocks([inlineNever(padded), { type: 'resource', uri: padded }] as McplContentBlock[], 'attachment on push event', 'zz-never-dialed');
+      assert.equal(referenceRegistry.findByUri(padded)?.payloadNever, true);
+    });
+  });
+
+  it("marks the record a well-formed reference makes beside a padded inline `never` for the text it shows, in one message", async () => {
+    await quietly(() => {
+      const uri = uniq('inline-clean.png');
+      convertBlocks([inlineNever(` ${uri}`), { type: 'resource', uri }] as McplContentBlock[], 'attachment on push event', 'zz-never-dialed');
+      const record = referenceRegistry.findByUri(uri)!;
+      assert.equal(record.payloadNever, true);
+      const [later] = convertBlocks([{ type: 'resource', uri }] as McplContentBlock[], 'attachment on push event', 'zz-never-dialed');
+      assert.deepEqual(later, { type: 'text', text: `[${record.refId}] attachment on push event — ${NEVER_TEXT}` });
+      const f = new ReferenceFetcher(() => BINDING, async () => null, { remove: async () => {} });
+      assert.deepEqual(f.refusal(record), NEVER_REFUSAL);
+    });
+  });
+
+  it('marks a record made before the mark when it is delivered again, where its uri shows as the marked uri does', async () => {
+    await quietly(() => {
+      const uri = uniq('earlier.png');
+      const padded = ` ${uri}`;
+      const earlier = referenceRegistry.register(testimonyOf({ type: 'resource', uri: padded }), 'zz-never-dialed');
+      referenceRegistry.register(testimonyOf({ type: 'resource', uri, disposition: 'never' }), 'zz-never-dialed');
+      assert.equal(earlier.payloadNever, undefined, "premise: the mark is on the uri's own record alone");
+      const [again] = convertBlocks([{ type: 'resource', uri: padded }] as McplContentBlock[], 'attachment on push event', 'zz-never-dialed');
+      assert.deepEqual([earlier.payloadNever, again], [true, { type: 'text', text: `[${earlier.refId}] attachment on push event — ${NEVER_TEXT}` }]);
+    });
+  });
+
   it("withholds an embedded resource's contents, text or blob, where its uri is `never`, beside a `never` for it in either order, by its own `never`, or by a server's earlier mark: on the lanes, in history and to a script", async () => {
     const NOTICE = '[Resource not shown: its content is marked never to reach you or your tools.]';
     const notice = { type: 'text', text: NOTICE };
@@ -402,6 +484,15 @@ describe('a fetcher built to withhold', () => {
     { remove: async (path) => { opts.removed?.push(path); } },
   );
 
+  it('refuses a fetch of any spelling of a marked uri that shows as the same text, one registered before the mark included', async () => {
+    const f = fetcher();
+    const uri = `${ORIGIN}/ok?${randomUUID()}`;
+    const before = (await quietly(() => referenceRegistry.register(testimonyOf({ type: 'resource', uri: ` ${uri}` }), 'srv'))).value;
+    await quietly(() => referenceRegistry.register(testimonyOf({ type: 'resource', uri, disposition: 'never' }), 'srv'));
+    const after = (await quietly(() => referenceRegistry.register(testimonyOf({ type: 'resource', uri: `${uri}\n` }), 'srv'))).value;
+    assert.deepEqual([f.refusal(before), f.refusal(after), after.payloadNever], [NEVER_REFUSAL, NEVER_REFUSAL, true]);
+  });
+
   it('refuses a marked payload before anything else: no request, nothing saved, a saved copy neither served nor offered', async () => {
     const reg = new ReferenceRegistry();
     const saved: string[] = [];
@@ -443,6 +534,8 @@ describe('a fetcher built to withhold', () => {
     await within('the request reaching the server', arrived);
     const response = held.shift()!;
     try {
+      const charged = () => (f as unknown as { totals: Map<string, number> }).totals.get('srv') ?? 0;
+      await within('the first part read', (async () => { while (charged() < 16) await new Promise((resolve) => setTimeout(resolve, 5)); })());
       reg.register(testimonyOf({ type: 'resource', uri, disposition: 'never' }), 'srv');
       response.more();
       assert.deepEqual(await within('the marked download', running), NEVER_FAILURE);
@@ -453,7 +546,7 @@ describe('a fetcher built to withhold', () => {
     }
   });
 
-  it("saves nothing for a payload a `never` marks after its last part, and answers each caller's wait with the mark, whatever the flight's own ending", async () => {
+  it("saves nothing for a payload a `never` marks after its last part, and answers a joined caller's wait and a new call with the mark while the flight runs", async () => {
     const reg = new ReferenceRegistry();
     const saved: string[] = [];
     const removed: string[] = [];
@@ -764,7 +857,7 @@ describe("the framework's fetcher", () => {
     getReferenceFetcher(): ReferenceFetcher;
   };
   const failure = (path: string, why: string) =>
-    `couldn't delete ${path} from the workspace, a copy whose payload a server marked never (RFC-005), so the agent's tools can still open it there: ${why}`;
+    `couldn't delete ${path} from the workspace, a copy whose payload a server marked never (RFC-005), so the agent's tools may still open it there: ${why}`;
 
   it('removes a copy a `never` marks during its own save, as a workspace delete removes a file, each failure to the log, with where the copy is', async () => {
     const fw = Object.create(AgentFramework.prototype) as Fw;

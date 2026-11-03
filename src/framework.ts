@@ -7971,7 +7971,7 @@ export class AgentFramework {
         {
           remove: async (path) => {
             const failed = (why: string) => console.error(
-              `[refs] couldn't delete ${path} from the workspace, a copy whose payload a server marked never (RFC-005), so the agent's tools can still open it there: ${why}`);
+              `[refs] couldn't delete ${path} from the workspace, a copy whose payload a server marked never (RFC-005), so the agent's tools may still open it there: ${why}`);
             const workspace = this.getWorkspaceModule();
             if (!workspace) {
               failed('this host has no workspace');
