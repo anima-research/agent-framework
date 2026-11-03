@@ -50,6 +50,7 @@ import { McplRequestError, type McplServerConnection } from './server-connection
 import { readSkipReplyWake, skipReplyNote, type SkipReplyEarlierWake } from './skip-reply-wake.js';
 import { isProseTargetToken } from './prose-grammar.js';
 import { tuneOutHeldWords, tuneOutReachWords, type TuneOutReader } from '../tune-out/tools.js';
+import type { TraceEventInput } from '../types/trace.js';
 
 // ============================================================================
 // Typing indicator interval (Discord typing lasts ~10s, so 7s keeps it alive)
@@ -201,7 +202,7 @@ function substitutedChannel(
  */
 const CHANNEL_LABEL_HISTORY_LOG_ID = 'mcpl/channel-label-history';
 
-type DesiredChannelState = 'open' | 'closed' | 'tuned-out';
+export type DesiredChannelState = 'open' | 'closed' | 'tuned-out';
 
 /**
  * Parameters of an active tune-out (issue #77), carried on the
@@ -1186,7 +1187,7 @@ export class ChannelRegistry {
   private serverRegistry: McplServerRegistry;
   private featureSetManager: FeatureSetManager;
   private pushEventFn: (event: ProcessEvent) => void;
-  private emitTraceFn: (event: { type: string; [key: string]: unknown }) => void;
+  private emitTraceFn: (event: TraceEventInput) => void;
   private sendTypingFn?: (
     serverId: string,
     channelId: string,
@@ -1591,7 +1592,7 @@ export class ChannelRegistry {
     serverRegistry: McplServerRegistry,
     featureSetManager: FeatureSetManager,
     pushEventFn: (event: ProcessEvent) => void,
-    emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
+    emitTraceFn: (event: TraceEventInput) => void,
     options?: ChannelRegistryOptions & {
       sendTypingFn?: (
         serverId: string,
