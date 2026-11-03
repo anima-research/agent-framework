@@ -1137,7 +1137,7 @@ export type TraceEvent =
       incarnation?: number;
       /** Whether this look resumed the reader rather than deriving it. */
       resumed?: boolean;
-      /** How many of the resident's window's rows since the reader's last look it was handed (ReaderFramingContext.residentRows); 0 when none were. */
+      /** How many of the resident's window's rows since the reader's last look it was handed (ReaderFramingContext.residentRows); 0 when none were, and left out when they couldn't be read (ReaderFramingContext.residentRowsUnavailable). */
       resynced?: number;
     })
 
@@ -1172,6 +1172,7 @@ export type TraceEvent =
    */
   | (TraceEventBase & {
       type: 'tune-out:reader-fork-failed';
+      /** The fork's name; for a persisted reader that failed before a generation was planned (the resident ended, or planning threw), its identity (`reader/<resident>…`). */
       agentName: string;
       serverId: string;
       channelId: string;

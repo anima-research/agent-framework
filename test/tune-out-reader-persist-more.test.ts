@@ -258,7 +258,7 @@ describe('a persisted reader: refused resumptions', () => {
   // after its framing was stored gives its held rows back, a second refusal
   // included, and the look that then runs holds each of them once.
   it('gives a held row back at each refused resumption, and the look that runs holds it once', {
-    timeout: 180_000, skip: 'awaits fix/review5-1 (#967 finding 2)',
+    timeout: 180_000,
   }, async () => {
     const dir = newDir('reader-persist-more-refused-');
     const t = await boot(dir, { persist: 'epoch' });
