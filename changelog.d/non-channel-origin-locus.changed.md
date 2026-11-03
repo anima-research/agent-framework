@@ -12,7 +12,8 @@
   window, after a quiesce or a provider hold. A provider hold that keeps one
   request for two equal ones keeps the marks of both, and when one of them is
   a merged start and the other isn't, each request of the start's batch takes
-  the other's marks. So is a start that is the first
+  the other's marks, a private wake's included. So is a start that is the
+  first
   to read a private surface's message stored before it, though the message's
   own wake may still wait in a gate window, or the message woke nothing, and
   for an ordinary resident whose view keeps the message, whichever resident

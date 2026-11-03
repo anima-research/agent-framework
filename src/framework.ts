@@ -6609,9 +6609,12 @@ export class AgentFramework {
     const keptBatch = mergedBatch(same);
     const batch = mergedBatch(request);
     if (batch) (same as MarkedRequest)[MERGED_BATCH] = [...new Set([...(keptBatch ?? []), ...batch])];
-    for (const member of mergedBatch(same) ?? []) {
-      if (!batch) carryTurnMarks(member, request);
-      else if (!keptBatch) carryTurnMarks(member, same);
+    const plain = !batch ? request : !keptBatch ? same : undefined;
+    if (plain) {
+      for (const member of mergedBatch(same) ?? []) {
+        carryTurnMarks(member, plain);
+        if (plain.nonChannelOrigin === true) member.nonChannelOrigin = true;
+      }
     }
     carryWakes(same, [request]);
   }
@@ -23403,9 +23406,10 @@ export class AgentFramework {
 
   /**
    * A routing envelope that could not be delivered: outside a private turn,
-   * its words are held as a draft (the `{{unsent}}` source); in one, they're
-   * kept private with no draft, unless the envelope is a bare `{{unsent}}`
-   * resend. Either way the resident is told, privately.
+   * its words are held as a draft (the `{{unsent}}` source), unless its send
+   * threw with no draft behind it; in one, they're kept private with no
+   * draft, unless the envelope is a bare `{{unsent}}` resend. Either way the
+   * resident is told, privately.
    * `{{unsent}}` in it follows the re-bounce rule (unsentWords).
    */
   private bounceProse(

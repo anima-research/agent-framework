@@ -349,14 +349,16 @@ describe('Turn trigger provenance', () => {
     assert.equal(handed.at(-1)?.counterparty, 'discord:user:bob');
     await framework.stop();
   });
-  for (const mark of ['private turn', 'retake', 'own', 'shared', 'withdrawn', 'kept plain', 'none'] as const) {
+  for (const mark of ['private turn', 'retake', 'own', 'shared', 'withdrawn', 'kept plain', 'private wake', 'kept private wake', 'none'] as const) {
     it(`a held merged start ${{
       'private turn': "that takes in an equal request continuing a private turn gives each of its requests that turn at the dedup, and starts private once the hold's release judges its batch again",
       retake: "that takes in an equal retake gives each of its requests the retake at the dedup, and starts private over a history that holds a private surface's message",
-      own: "whose request continues a private turn gives that turn to no other request when the hold's release judges its batch again",
+      own: "whose request continues a private turn gives that turn to no other request, through a dedup or the hold's release",
       shared: "that takes in an equal request continuing the private turn one of its requests continues gives that turn to the other request too",
       withdrawn: "whose request continuing a private turn is withdrawn as a coalesced wake starts its other request in its channel, with none of the withdrawn one's turn",
       'kept plain': "taken in by an equal plain request the hold kept gives each of its requests the kept request's private turn, and starts private",
+      'private wake': "that takes in an equal private wake makes each of its requests a private wake, so withdrawing the request that made it private still starts it private",
+      'kept private wake': "taken in by an equal private wake the hold kept makes each of its requests a private wake, so withdrawing the request that made it private still starts it private",
       none: 'with no mark starts in its channel once the hold releases it, over a history that holds a private surface\'s message, as on main',
     }[mark]}`, async () => {
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi bob' }]));
@@ -392,8 +394,9 @@ describe('Turn trigger provenance', () => {
       let fail!: (error: Error) => void;
       const auxiliary = i.withAuxiliaryAdmission('scout', () => new Promise<void>((_, reject) => { fail = reject; }), 'test-model').catch(() => {});
       const timer: Record<PropertyKey, unknown> = { agentName: 'scout', reason: 'timer', source: 'clock', timestamp: t - 3_000 };
-      if (mark === 'own' || mark === 'shared' || mark === 'withdrawn') timer[callerTurns] = [privateTurn];
-      if (mark === 'withdrawn') timer.coalescingSubject = 'zz-subject';
+      const withdraws = mark === 'withdrawn' || mark === 'private wake' || mark === 'kept private wake';
+      if (mark === 'own' || mark === 'shared' || withdraws) timer[callerTurns] = [privateTurn];
+      if (withdraws) timer.coalescingSubject = 'zz-subject';
       const room: Record<PropertyKey, unknown> = { agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: t - 1_000,
         channelId: 'discord:g:bob-room', counterparty: 'discord:user:bob', addressed: true };
       i.pendingRequests.push(timer as unknown as InferenceRequest, room as unknown as InferenceRequest);
@@ -412,19 +415,31 @@ describe('Turn trigger provenance', () => {
       assert.ok(batchKey, 'premise: the hold keeps a merged start');
       const batch = (held as unknown as Record<symbol, unknown[]>)[batchKey!]!;
       assert.ok(batch.length === 2 && batch.includes(timer) && batch.includes(room), 'premise: its batch is the two requests pushed');
-      if (mark === 'private turn' || mark === 'retake' || mark === 'shared') {
+      if (mark === 'private turn' || mark === 'retake' || mark === 'shared' || mark === 'own' || mark === 'private wake') {
         const duplicate: Record<PropertyKey, unknown> = Object.fromEntries(Object.entries(held));
         if (mark === 'retake') duplicate[retake] = true;
-        else duplicate[callerTurns] = [privateTurn];
+        else if (mark !== 'own' && mark !== 'private wake') duplicate[callerTurns] = [privateTurn];
+        if (mark === 'private wake') assert.equal(duplicate.nonChannelOrigin, true, 'premise: the equal request is a private wake, as the private start is');
         i.pendingRequests.push(duplicate as unknown as InferenceRequest);
         await i.processInferenceRequests();
         assert.equal(hold.heldRequests.length, 1, 'premise: the hold kept one request for both');
         if (mark === 'retake') assert.deepEqual([timer[retake], room[retake]], [true, true], 'at the dedup, each request takes the retake');
+        else if (mark === 'own') assert.equal(room[callerTurns], undefined, "the dedup gives no request another request's own turn");
+        else if (mark === 'private wake') assert.deepEqual([timer.nonChannelOrigin, room.nonChannelOrigin], [true, true], 'at the dedup, each request becomes a private wake');
         else assert.deepEqual([timer[callerTurns], room[callerTurns]], [[privateTurn], [privateTurn]], 'at the dedup, each request takes the turn');
       }
-      if (mark === 'withdrawn') {
+      if (mark === 'kept private wake') {
+        const plain: Record<PropertyKey, unknown> = Object.fromEntries(Object.entries(held));
+        assert.equal(plain.nonChannelOrigin, true, 'premise: the kept request is a private wake, as the private start is');
+        hold.heldRequests.splice(0, 1, plain as unknown as InferenceRequest);
+        i.holdRequest(hold.heldRequests, held);
+        assert.deepEqual(hold.heldRequests, [plain], 'premise: the hold kept the private wake for both');
+        assert.deepEqual([timer.nonChannelOrigin, room.nonChannelOrigin], [true, true], "each request of the start's batch becomes a private wake");
+      }
+      if (withdraws) {
         i.cancelCoalescedWakes('zz-subject');
-        assert.deepEqual((held as unknown as Record<symbol, unknown[]>)[batchKey!], [room], 'premise: the withdrawn request left the batch');
+        const kept = hold.heldRequests[0] as unknown as Record<symbol, unknown[]>;
+        assert.deepEqual(kept[batchKey!], [room], 'premise: the withdrawn request left the batch');
       }
       if (mark === 'kept plain') {
         const plain: Record<PropertyKey, unknown> = Object.fromEntries(Object.entries(held));

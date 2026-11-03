@@ -38,12 +38,15 @@
     marked `SpeechContext.nonChannelOrigin`. A bridge that sends a channel's
     messages as `external-message` events with no `metadata.channelId` now
     has them read as a private surface's, so their turns are private and
-    reply in no channel.
+    reply in no channel. A host whose `executeToolCall` of `channel_publish`
+    carries a private turn's id (`callerTurnId`) and names no channel now
+    gets a failed result.
   - **Migration:** a speech handler that publishes posts nothing when
-    `SpeechContext.nonChannelOrigin` is set, and a bridge names each
-    message's channel in `metadata.channelId`. Otherwise nothing changes in
-    code: the resident answers such a message with an explicit send, as the
-    notice says.
+    `SpeechContext.nonChannelOrigin` is set, a bridge names each message's
+    channel in `metadata.channelId`, and a host's `executeToolCall` of
+    `channel_publish` that carries a private turn's id names its channel.
+    Otherwise nothing changes in code: the resident answers such a message
+    with an explicit send, as the notice says.
   - **Upgrade:** work in flight across the upgrade carries no private mark.
     A subagent's record or held mail, or a script's report deferred, under a
     release before this one reads as ordinary, since this release marks only

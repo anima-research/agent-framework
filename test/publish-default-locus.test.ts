@@ -1,7 +1,7 @@
 /**
  * `channel_publish` without a channelId goes where the turn's plain speech
  * would: the frozen turn locus (the waking delivery, or a channel opened
- * this turn). First live run, 2026-10-12: under `speech.locus: 'delivery'`
+ * this turn). A private turn's is refused. First live run, 2026-10-12: under `speech.locus: 'delivery'`
  * the registry's own default is null, and the tool failed on the very turn
  * a delivery on that channel woke the agent.
  */

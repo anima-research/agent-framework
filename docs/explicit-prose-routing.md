@@ -157,9 +157,9 @@ undelivered text produces a bounce notice carrying the exact resend syntax —
 the model learns by doing, and the knowledge accretes into its own history.
 A first undelivered line doesn't bounce in two places. In a private turn it
 is kept private, and its notice says how to publish. In a round of any other
-turn that calls `drafts` (above), the line is held with no notice, and the
-agent is told of it by a later `drafts` listing and a later turn's catch-up
-notice, so a line written there teaches no syntax.
+turn that calls `drafts` (above), outside XML tool mode, the line is held with
+no notice, and the agent is told of it by a later `drafts` listing and a later
+turn's catch-up notice, so a line written there teaches no syntax.
 When the agent's `allowedTools` permits `prose_help`, the full reference is
 available on demand through that tool. Its result is model-requested content. The system prompt is never touched: those
 bytes belong to the recipe, and the deepest KV prefix must not vary with

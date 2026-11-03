@@ -4731,24 +4731,28 @@ describe('a heartbeat turn that takes in private input keeps its plain speech pr
     },
   }) as unknown as Module;
   /** A tool during whose call the operator speaks on that surface, when `speaks` says so. */
-  const robot = (speaks: () => AgentFramework | undefined): Module => ({
-    name: 'robot',
-    async start() {}, async stop() {},
-    getTools: () => [{ name: 'move', description: 'Move', inputSchema: { type: 'object', properties: {} } }],
-    async handleToolCall() {
-      const framework = speaks();
-      if (framework) {
-        framework.pushEvent({ type: 'external-message', source: 'tui', content: 'for your eyes only', metadata: {} } as never);
-        const deferred = () => (framework as unknown as { deferredMessages: Array<{ content: unknown }> }).deferredMessages;
-        const deadline = Date.now() + 10_000;
-        while (!deferred().some((m) => JSON.stringify(m.content).includes('for your eyes only')) && Date.now() < deadline) {
-          await new Promise((r) => setTimeout(r, 5));
+  const robot = (speaks: () => AgentFramework | undefined): Module & { queued?: boolean } => {
+    const tool = {
+      name: 'robot',
+      queued: undefined as boolean | undefined,
+      async start() {}, async stop() {},
+      getTools: () => [{ name: 'move', description: 'Move', inputSchema: { type: 'object', properties: {} } }],
+      async handleToolCall() {
+        const framework = speaks();
+        if (framework) {
+          framework.pushEvent({ type: 'external-message', source: 'tui', content: 'for your eyes only', metadata: {} } as never);
+          const deferred = () => (framework as unknown as { deferredMessages: Array<{ content: unknown }> }).deferredMessages;
+          const deadline = Date.now() + 10_000;
+          const queued = () => deferred().some((m) => JSON.stringify(m.content).includes('for your eyes only'));
+          while (!queued() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+          tool.queued = queued();
         }
-      }
-      return { success: true, data: 'moved' };
-    },
-    async onProcess() { return {}; },
-  }) as unknown as Module;
+        return { success: true, data: 'moved' };
+      },
+      async onProcess() { return {}; },
+    };
+    return tool as unknown as Module & { queued?: boolean };
+  };
   const heldNotice = (h: Awaited<ReturnType<typeof harness>>) => h.texts().filter((t) => t.startsWith('[routing] This turn came from your heartbeat'));
 
   for (const proseRouting of ['locus', 'hybrid', 'explicit'] as const) {
@@ -4796,13 +4800,15 @@ describe('a heartbeat turn that takes in private input keeps its plain speech pr
         ? "that an operator's message makes private at a tool boundary keeps the words after it private, with no draft"
         : 'with no private input holds its words before and after a tool call as drafts, as on main'}`, async () => {
         let framework: AgentFramework | undefined;
-        const h = await harness({ agents: [{ name: 'scout', proseRouting }], modules: [surface(), robot(() => (operator ? framework : undefined))] });
+        const tool = robot(() => (operator ? framework : undefined));
+        const h = await harness({ agents: [{ name: 'scout', proseRouting }], modules: [surface(), tool] });
         framework = h.framework;
         try {
           await h.turn([
             createMockResponse([text('Before the operator spoke.'), call('m1', 'robot--move', {})], 'tool_use'),
             createMockResponse([text('After the operator spoke.')]),
           ], 'scout', 'heartbeat');
+          if (operator) assert.equal(tool.queued, true, "premise: the operator's message was queued before the tool call returned");
           assert.ok(h.texts().includes('After the operator spoke.'), "control: the turn spoke after the tool call");
           assert.deepEqual(h.publishes(), []);
           const held = h.drafts().map((d) => d.text);
