@@ -3159,9 +3159,12 @@ test("a render whose store write is refused leaves a batch opened while it rende
 });
 
 test("a render whose store write is refused while a newer batch is open saves that batch's fallback mark at once, so a restart before the assembly's other renders settle delivers it as its fallback", async () => {
-  // The host writes each save as it is asked for, so `saved` is what a
-  // restart finds.
-  let saved: CoalescingSnapshot | undefined;
+  // The host saves as the framework's does: save() is throttled, written
+  // only once its timer fires (flush), and saveNow() writes at once, so
+  // `onDisk` is what a restart finds.
+  let onDisk: CoalescingSnapshot | undefined;
+  let dirty: (() => CoalescingSnapshot) | undefined;
+  const flush = () => { if (dirty) { onDisk = structuredClone(dirty()); dirty = undefined; } };
   const latch = () => { let open!: () => void; const opened = new Promise<void>((resolve) => { open = resolve; }); return { open, opened }; };
   const documentStarted = latch(), documentGo = latch(), outlineGo = latch();
   const kinds: string[] = [];
@@ -3185,7 +3188,8 @@ test("a render whose store write is refused while a newer batch is open saves th
       return { content: [{ type: 'text', text: `render_${occ.eventId}` }] };
     },
     audit: (record) => { kinds.push(String(record.kind)); },
-    save: (snapshot) => { saved = structuredClone(snapshot()); },
+    save: (snapshot) => { dirty = snapshot; },
+    saveNow: (snapshot) => { dirty = undefined; onDisk = structuredClone(snapshot); },
   };
   const occurrence = (key: string, eventId: string, initial = false): CoalescedOccurrence<null> => ({
     serverId: 'editor', binding: 'binding', scope: { kind: 'featureSet', id: 'doc' }, key, eventId, timestamp: TS,
@@ -3199,21 +3203,22 @@ test("a render whose store write is refused while a newer batch is open saves th
   const assembling = coalescer.assemble('agent').then(() => { assembled = true; });
   await documentStarted.opened;
   await coalescer.accept(occurrence('document', 'n2'));
+  flush(); // the newer batch's acceptance snapshot reaches the disk: its timer fired
   documentGo.open();
   for (let i = 0; !kinds.includes('deliver-failed'); i++) {
     assert(i < 1000, "the document's render was delivered");
     await new Promise((resolve) => setImmediate(resolve));
   }
   assert.ok(!assembled, "premise: the outline's render is still out, so the assembly hasn't settled");
-  // The process stops here.
-  const onDisk = structuredClone(saved!);
+  // The process stops here, before a throttled save's timer fires.
+  const atStop = structuredClone(onDisk!);
   outlineGo.open();
   await assembling;
   refuse = false;
   rendered.length = 0;
   delivered.length = 0;
   const restored = new PushCoalescer<null>(host, { recoveryBackoffMs: 60_000 });
-  restored.restore(onDisk);
+  restored.restore(atStop);
   await restored.assemble('agent');
   assert.ok(!rendered.includes('n2'), `the server isn't asked to render the newer batch on top of the render the agent never got: ${rendered.join(', ')}`);
   assert.ok(delivered.includes('n2: fallback_n2'), `it is delivered as its fallback: ${delivered.join(' | ')}`);

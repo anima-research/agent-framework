@@ -9869,6 +9869,11 @@ export class AgentFramework {
    *   boot's pass after the import asks its recipient's wake
    *   (wakeForUnpresentedMail), as the delivery did.
    *
+   * - A write with no id is given one as it is read (readPersistedDeferredWrites),
+   *   and the record is written with it before anything is stored, so the
+   *   next boot finds a copy that landed by it. Where that write fails,
+   *   such a write cuts its agent.
+   *
    * What is stored is presented to no window here: the pass after the
    * import presents each agent its own rows and what it is owed at rest, and
    * a quiesced host's other rows wait for resume. Once every write is stored
@@ -9918,6 +9923,30 @@ export class AgentFramework {
         { cause: error },
       );
     }
+    // An entry with no id was given one as it was read, and a read gives it
+    // a new one each time: the record names it by this one before any of it
+    // is stored, so a boot that ends before the record is cleared, or whose
+    // sync below fails, leaves a record the next boot finds its copy by.
+    // Where that write fails, such an entry stays queued, with what follows
+    // it for its agent, as a write that can't be stored: stored under an id
+    // the record lacks, it would be stored again under another.
+    let unrecorded: ReadonlySet<string> = new Set();
+    if (queue.given.size > 0) {
+      try {
+        this.recordImportQueue(file, queue.entries);
+      } catch (error) {
+        unrecorded = queue.given;
+        const where = file ?? DEFERRED_WRITES_ID;
+        console.error(
+          `[host-mode] the deferred-write record ${where} could not be written with the ids given to its writes that had ` +
+            `none, so each of those writes, and what follows it for its agent, stays queued for the next boot:`,
+          error,
+        );
+        this.opsAlert('deferred-import', 'framework',
+          `the deferred-write record ${where} could not be written with the ids given to its writes that had none: ${thrownText(error)}`,
+          { data: { record: where } });
+      }
+    }
     const primary = this.primaryAgentName;
     // Agents whose writes stop here: what is left for them stays queued.
     const cut = new Set<string>();
@@ -9950,6 +9979,15 @@ export class AgentFramework {
         continue;
       }
       if (cut.has(target.name)) {
+        keep(entry);
+        continue;
+      }
+      if (unrecorded.has(entry.id)) {
+        console.error(
+          `[host-mode] a context write an earlier version queued with no id isn't named in its record by the id it was ` +
+            `given, so it and what follows it for ${target.name} stay queued for the next boot: ${describeDeferredWrite(entry)}`,
+        );
+        cut.add(target.name);
         keep(entry);
         continue;
       }
@@ -10145,12 +10183,7 @@ export class AgentFramework {
    */
   private writeImportedRecord(file: string | undefined, kept: PersistedDeferredWrite[]): void {
     try {
-      if (file) {
-        this.writeRecoveryFile(file, kept.length > 0 ? { version: 2, pending: kept } : { version: 1, pending: [] });
-      } else {
-        this.store.setStateJson(DEFERRED_WRITES_ID, kept.length > 0 ? { version: 2, pending: kept } : []);
-        this.store.sync();
-      }
+      this.recordImportQueue(file, kept);
     } catch (error) {
       const record = file ?? DEFERRED_WRITES_ID;
       const reason = thrownText(error);
@@ -10158,6 +10191,20 @@ export class AgentFramework {
       this.opsAlert('deferred-import', 'framework',
         `the deferred-write record ${record} could not be cleared after its import: ${reason}`,
         { data: { record } });
+    }
+  }
+
+  /**
+   * Write the deferred-write record the importer reads: empty, or holding
+   * `entries`, in their order. The file where it was read from the file,
+   * else the store's slot, synced. Throws what the write threw.
+   */
+  private recordImportQueue(file: string | undefined, entries: PersistedDeferredWrite[]): void {
+    if (file) {
+      this.writeRecoveryFile(file, entries.length > 0 ? { version: 2, pending: entries } : { version: 1, pending: [] });
+    } else {
+      this.store.setStateJson(DEFERRED_WRITES_ID, entries.length > 0 ? { version: 2, pending: entries } : []);
+      this.store.sync();
     }
   }
 
@@ -12700,6 +12747,9 @@ export class AgentFramework {
     for (const outcome of this.registry.reconcile().unconfigured) this.settleEndedAgent(outcome);
 
     const byRecipient = new Map<string, AgentRecord[]>();
+    // Those whose recipient's store couldn't be read for their result: left
+    // out of this boot's notice and settling, so the next boot asks again.
+    const unread: AgentRecord[] = [];
     for (const record of interrupted) {
       this.emitTrace({
         type: 'dendrite:agent-ended',
@@ -12714,7 +12764,9 @@ export class AgentFramework {
       // A result it had already handed over needs no apology: one still
       // held, delivered below, or one its recipient's store holds already.
       if (this.registry.listMail({ from: record.name }).some((mail) => mail.kind === 'result')) continue;
-      if (this.resultStoredFor(record, route.to)) continue;
+      const stored = this.resultStoredFor(record, route.to);
+      if (stored === undefined) unread.push(record);
+      if (stored !== false) continue;
       byRecipient.set(route.to, [...(byRecipient.get(route.to) ?? []), record]);
     }
     for (const [recipient, all] of byRecipient) {
@@ -12764,7 +12816,7 @@ export class AgentFramework {
     if (interrupted.length > 0) {
       try {
         this.store.sync();
-        this.registry.settleInterrupted();
+        this.registry.settleInterrupted(unread);
       } catch (error) {
         console.error('[dendrite] the restart notices could not be synced; the interrupted records stay in the registry, and the next boot tells their recipients again unless the notice is found:', error);
       }
@@ -12788,12 +12840,24 @@ export class AgentFramework {
    * mail then; a second delivery here would put it in the window twice
    * under one mail id. A copy for another recipient is not that write, as a
    * stored one isn't.
+   *
+   * A copy found is released only once the store has synced, as
+   * releaseLandedMail releases: the copy may be in memory only (an import
+   * whose sync failed), and the release is written to the registry's own
+   * recovery file at once. A sync that fails leaves the mail held and
+   * undelivered, for the next boot's check.
    */
   private deliverHeldMail(mail: HeldMail, wake = true): void {
     const recipient = this.agents.get(mail.to);
     if (recipient) {
       const already = recipient.getContextManager().queryMessages({ metadata: { 'dendrite.mailId': mail.id } });
       if (already.messages.some((message) => isMailCopyFor(message.metadata, mail))) {
+        try {
+          this.store.sync();
+        } catch (error) {
+          console.error(`[dendrite] mail ${mail.id} is in ${mail.to}'s store but the store did not sync, so it stays held until the next boot settles it:`, error);
+          return;
+        }
         this.registry.releaseMail(mail.id);
         return;
       }
@@ -12812,23 +12876,38 @@ export class AgentFramework {
    * does (#291). It counts as handed over even while it is out of the
    * recipient's window, the turn it arrived in cut off by the restart: the
    * boot asked that recipient's wake for it again (wakeForUnpresentedMail),
-   * and its pass presented it. False where the store can't be read, which
-   * is logged: the recipient is told the agent ended without a result, as
-   * with none.
+   * and its pass presented it.
+   *
+   * A result counts only where it was produced (dendrite.producedAt, which
+   * every delivered result carries) at or after the record was created: a
+   * single-use name whose counter aged out of the registry starts again at
+   * incarnation 1, so an earlier agent of that name and incarnation may have
+   * delivered one to the same recipient.
+   *
+   * Undefined where the store can't be read, which is logged: whether the
+   * result was handed over is unknown, so the boot leaves the record out of
+   * its notice and of its settling (settleInterrupted), and the next boot
+   * asks again.
    */
-  private resultStoredFor(record: AgentRecord, recipient: string): boolean {
+  private resultStoredFor(record: AgentRecord, recipient: string): boolean | undefined {
     try {
       const cm = this.agents.get(recipient)?.getContextManager();
       if (!cm) return false;
       return cm.queryMessages({
         metadata: { 'dendrite.kind': 'result', 'dendrite.from.agent': record.name, 'dendrite.from.incarnation': record.incarnation },
       }).messages.some((m) => {
-        const to = (m.metadata as { dendrite?: { to?: unknown } } | undefined)?.dendrite?.to;
-        return to === undefined || to === recipient;
+        const dendrite = (m.metadata as { dendrite?: { to?: unknown; producedAt?: unknown } } | undefined)?.dendrite;
+        const producedAt = dendrite?.producedAt;
+        return (dendrite?.to === undefined || dendrite.to === recipient)
+          && typeof producedAt === 'number' && producedAt >= record.createdAt;
       });
     } catch (error) {
-      console.error(`[dendrite] could not read ${recipient}'s store for a result ${record.name} delivered before the restart:`, error);
-      return false;
+      console.error(
+        `[dendrite] could not read ${recipient}'s store for a result ${record.name} delivered before the restart; ` +
+          `${recipient} isn't told ${record.name} ended without a result, and the next boot asks again:`,
+        error,
+      );
+      return undefined;
     }
   }
 
@@ -20467,7 +20546,11 @@ export class AgentFramework {
           .map((name) => this.agents.get(name))
           .filter((reader): reader is Agent => reader !== undefined)
       : [agent]).filter((reader) => this.agentSees(reader, message.metadata));
-    for (const holder of this.windowHolders(messageId)) if (!readers.includes(holder)) readers.push(holder);
+    // Holders that can't be read count it read, as any reader's doubt does:
+    // a window outside the slot's readers may hold the row and have read it.
+    const holders = this.windowHolders(messageId);
+    if (!holders) return false;
+    for (const holder of holders) if (!readers.includes(holder)) readers.push(holder);
     if (readers.length === 0) return true;
     const ts = message.timestamp instanceof Date ? message.timestamp.getTime() : Number(message.timestamp);
     for (const reader of readers) {
@@ -20492,9 +20575,11 @@ export class AgentFramework {
    * The live agents whose presented window holds a row (the presentation
    * index's holders, #291, leaving out a window that is still the whole
    * record): each one's own place for it, or a reader fork's framing.
-   * None on a framework built without the index, or when it can't be read.
+   * None on a framework built without the index. Undefined when it can't be
+   * read, which is logged: one window that can't be read fails the lookup
+   * for every window, so which hold the row isn't known.
    */
-  private windowHolders(messageId: MessageId): Agent[] {
+  private windowHolders(messageId: MessageId): Agent[] | undefined {
     if (!this.presentation) return [];
     try {
       return this.presentation.holders(messageId)
@@ -20503,7 +20588,7 @@ export class AgentFramework {
         .filter((holder): holder is Agent => holder !== undefined);
     } catch (err) {
       console.error(`[presentation] could not read which windows hold ${messageId}:`, err);
-      return [];
+      return undefined;
     }
   }
 
@@ -32858,13 +32943,21 @@ export class AgentFramework {
    * manager merges: getMessage reads the manager's own slot alone, and the
    * subconscious hears the residents' rows at its tool boundary from the slot
    * it watches (#291). Null in legacy mode, where nothing is heard from
-   * another slot, and for a row the window doesn't hold.
+   * another slot, and for a row the window doesn't hold; null too where the
+   * window can't be read, which is logged naming `agentName` and the row,
+   * so a note that then records the row as not stored can be told from one
+   * whose row is absent.
    */
-  private windowRowOf(cm: ContextManager, id: MessageId): StoredMessage | null {
+  private windowRowOf(cm: ContextManager, id: MessageId, agentName: string): StoredMessage | null {
     try {
       if (cm.windowMode() !== 'presented') return null;
       return cm.getPresentedMessages().find((m) => m.id === id) ?? null;
-    } catch {
+    } catch (error) {
+      console.error(
+        `[thinking-binding] ${agentName}: could not read its window for the injected row ${id}, so this stream's note ` +
+          'records that row as not stored:',
+        error,
+      );
       return null;
     }
   }
@@ -32884,7 +32977,7 @@ export class AgentFramework {
       const rendered = cm.renderAsNewest(ids);
       const carried = new Map<MessageId, { participant: string; content: ContentBlock[] } | null>();
       ids.forEach((id, i) => {
-        const stored = cm.getMessage(id) ?? (injected.has(id) ? this.windowRowOf(cm, id) : null);
+        const stored = cm.getMessage(id) ?? (injected.has(id) ? this.windowRowOf(cm, id, agent.name) : null);
         const content = rendered ? rendered[i]! : stored?.content ?? null;
         // An injected row as the boundary sent it (Agent.injectedAsSent).
         const sent = content && stored && injected.has(id) ? agent.injectedAsSent(stored.participant, content) : content;

@@ -1264,9 +1264,26 @@ export class PushCoalescer<E = unknown> {
           // Saved now, not only once the assembly's other renders settle: a
           // newer batch's last snapshot, its acceptance's, has it rendering
           // as usual, and a restart before the next save would render it on
-          // top of the render the agent never got.
-          this.persist();
+          // top of the render the agent never got. Written at once and made
+          // durable, as the render-start boundary is (saveNow, then commit):
+          // the host's throttled save would leave that window open for its
+          // delay. Where either throws, the throttled save is asked for.
+          let written = false;
+          try {
+            if (this.host.saveNow) { this.host.saveNow(this.snapshot()); written = true; }
+          } catch (saveError) {
+            this.host.audit({ kind: 'persist-failed', subject, eventId: occurrence.eventId, error: String(saveError) });
+          }
+          if (!written) this.persist();
           this.scheduleRecovery(subject, state);
+          if (written) {
+            try {
+              await this.host.commit?.();
+            } catch (commitError) {
+              this.host.audit({ kind: 'persist-failed', subject, eventId: occurrence.eventId, error: String(commitError) });
+              this.persist();
+            }
+          }
           return;
         }
         if (placement?.presented === false) {

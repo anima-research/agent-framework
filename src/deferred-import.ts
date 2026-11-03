@@ -54,11 +54,17 @@ export interface PersistedQueue {
    */
   scanFrom: Map<string, number>;
   /**
-   * Whether reading it dropped or renumbered anything (a malformed entry, a
-   * repeated id, a missing or invalid seq), so a record cleared or written
-   * again doesn't name those again.
+   * Whether reading it dropped, renumbered or named anything (a malformed
+   * entry, a repeated id, a missing or invalid seq, an entry given an id),
+   * so a record cleared or written again doesn't name those again.
    */
   changed: boolean;
+  /**
+   * The ids this read gave entries that had none. A read gives each a new
+   * one, so until the record holds it, a copy stored under it is one no
+   * later read finds by its id.
+   */
+  given: ReadonlySet<string>;
 }
 
 /** Where a queue's record is: the recovery file, or the store's slot. */
@@ -116,9 +122,11 @@ export function deferredWritesRefusal(record: DeferredWritesRecord, problem: str
  *   name. A release wrote `forAgent` only as a non-empty name, so another
  *   value is damage or a hand edit, and the agent it meant can't be known.
  * - One entry per id: an id that comes again is dropped with a line, the
- *   first entry with it kept. An entry with no id is given one, with a line:
- *   a copy of it that landed carries the id it lost, so the boot dedup can't
- *   find it, and it may be stored again.
+ *   first entry with it kept. An entry with no id is given one, with a line
+ *   (`given`, and the queue reads as `changed`): a copy of it that landed
+ *   carries the id it lost, so the boot dedup can't find it, and it may be
+ *   stored again. Each read gives it a new id, so the importer writes the
+ *   record with the ids given before it stores any of them.
  * - `heldAt` is kept where it is a time a Date can hold.
  * - Arrival order: entries whose seq is a positive whole number up to
  *   Number.MAX_SAFE_INTEGER by seq, then, in record order, those without one
@@ -130,7 +138,7 @@ export function readPersistedDeferredWrites(
   record: DeferredWritesRecord,
   log: (line: string) => void,
 ): PersistedQueue {
-  const empty: PersistedQueue = { entries: [], scanFrom: new Map(), changed: false };
+  const empty: PersistedQueue = { entries: [], scanFrom: new Map(), changed: false, given: new Set() };
   if (!record.file && (raw === null || raw === undefined)) return empty;
   const doc = (Array.isArray(raw) ? { pending: raw } : raw !== null && typeof raw === 'object' ? raw : undefined) as
     { pending?: unknown; scanFrom?: unknown } | undefined;
@@ -167,12 +175,16 @@ export function readPersistedDeferredWrites(
     log(`[host-mode] a recovered deferred context write is malformed and was dropped: ${field('id')} (${field('participant')})`);
   }
   const seen = new Set<string>();
+  const given = new Set<string>();
   const kept: Array<Omit<PersistedDeferredWrite, 'seq'> & { seq?: unknown }> = [];
   let duplicates = 0;
   for (const m of data.filter(wellFormed)) {
     const hasId = typeof m.id === 'string' && m.id !== '';
     const id = hasId ? (m.id as string) : randomUUID();
-    if (!hasId) log(`[host-mode] a recovered deferred context write (${m.participant}) has no id; it is given ${id}`);
+    if (!hasId) {
+      given.add(id);
+      log(`[host-mode] a recovered deferred context write (${m.participant}) has no id; it is given ${id}`);
+    }
     if (seen.has(id)) {
       duplicates++;
       log(`[host-mode] a recovered deferred context write repeats id ${id} (${m.participant}) and was dropped; the first entry with that id is kept`);
@@ -206,7 +218,8 @@ export function readPersistedDeferredWrites(
   return {
     entries: ordered.map((m, i) => ({ ...m, seq: i + 1 })),
     scanFrom,
-    changed: malformed.length > 0 || duplicates > 0 || unnumbered.length > 0,
+    changed: malformed.length > 0 || duplicates > 0 || unnumbered.length > 0 || given.size > 0,
+    given,
   };
 }
 

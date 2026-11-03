@@ -482,6 +482,51 @@ describe('the deferred-write importer (#291, AF-6)', () => {
     } finally { h.close(); }
   });
 
+  // AF #844 bot review finding 28: the boot's check of held mail releases
+  // it on a copy in the recipient's store only once the store has synced:
+  // after an import whose sync failed, the copy may be in memory only.
+  it("keeps imported mail held when the store doesn't sync before the boot would release it on the unsynced copy", async () => {
+    const h = await host();
+    const proto = JsStore.prototype as unknown as { sync(this: JsStore): void };
+    const sync = proto.sync;
+    const quiet = console.error;
+    try {
+      let framework = await h.boot();
+      let mailId: string;
+      try {
+        const registry = (framework as unknown as { registry: { holdMail(mail: Record<string, unknown>): { id: string } } }).registry;
+        mailId = registry.holdMail({ kind: 'message', from: { agent: 'helper', incarnation: 1 }, to: 'agent', content: text('unsynced mail') }).id;
+      } finally { await framework.stop(); }
+      h.writeQueue([entry('mail-2', 1, 'unsynced mail', {
+        participant: 'helper', forAgent: 'agent',
+        metadata: { kind: 'agent-message', dendrite: { mailId, kind: 'message', from: { agent: 'helper', incarnation: 1 }, to: 'agent' } },
+      })]);
+      // Every sync from the import on fails, through the boot's check of held mail.
+      proto.sync = function (this: JsStore) {
+        const stack = new Error().stack ?? '';
+        if (stack.includes('importPersistedDeferredWrites') || stack.includes('deliverHeldMail')) {
+          throw Object.assign(new Error('injected EIO syncing'), { code: 'EIO' });
+        }
+        return sync.call(this);
+      };
+      console.error = () => {};
+      try { framework = await h.boot(); } finally { proto.sync = sync; console.error = quiet; }
+      try {
+        assert.equal(withText(framework, 'unsynced mail').length, 1, 'the import stored it, in memory');
+        assert.deepEqual(framework.listHeldMail().map((m) => m.id), [mailId], 'the mail stays held: its copy never reached the disk');
+      } finally { await framework.stop(); }
+      framework = await h.boot();
+      try {
+        assert.equal(withText(framework, 'unsynced mail').length, 1, 'the next boot finds the copy and delivers no second one');
+        assert.deepEqual(framework.listHeldMail(), [], 'and releases it, synced');
+      } finally { await framework.stop(); }
+    } finally {
+      proto.sync = sync;
+      console.error = quiet;
+      h.close();
+    }
+  });
+
   it("owes a tune-out release's agent the wake its cancel requested", async () => {
     const h = await host();
     try {
@@ -564,6 +609,89 @@ describe('the deferred-write importer (#291, AF-6)', () => {
       } finally { await framework.stop(); }
     } finally {
       proto.sync = sync;
+      h.close();
+    }
+  });
+
+  // AF #844 bot review finding 25: an entry with no id is given one as it is
+  // read, and the record names it by that id before any of it is stored, so
+  // a boot that ends before the record is cleared, or whose sync fails,
+  // leaves a record the next boot finds the copy by.
+  it("names an id-less write by the id it is given before storing it, so a boot whose sync fails and the next store it once", async () => {
+    const h = await host();
+    const proto = JsStore.prototype as unknown as { sync(this: JsStore): void };
+    const sync = proto.sync;
+    const quiet = console.error;
+    try {
+      h.writeQueue([{ seq: 1, participant: 'user', content: text('no id given') }, entry('k1', 2, 'with an id')]);
+      let failSyncs = true;
+      proto.sync = function (this: JsStore) {
+        if (failSyncs && new Error().stack?.includes('importPersistedDeferredWrites')) {
+          failSyncs = false;
+          throw Object.assign(new Error('injected EIO syncing'), { code: 'EIO' });
+        }
+        return sync.call(this);
+      };
+      console.error = () => {};
+      let framework: AgentFramework;
+      try { framework = await h.boot(); } finally { proto.sync = sync; console.error = quiet; }
+      let given: unknown;
+      try {
+        const [row] = withText(framework, 'no id given');
+        assert.ok(row, 'stored in memory');
+        given = writeIdOf(row);
+        assert.deepEqual(h.readQueue().pending.map((m) => m.id), [given, 'k1'], 'the record names it by the id it was stored under');
+      } finally { await framework.stop(); }
+      framework = await h.boot();
+      try {
+        assert.equal(withText(framework, 'no id given').length, 1, 'skipped by that id, not stored twice');
+        assert.equal(withText(framework, 'with an id').length, 1);
+        assert.deepEqual(h.readQueue().pending, []);
+      } finally { await framework.stop(); }
+    } finally {
+      proto.sync = sync;
+      console.error = quiet;
+      h.close();
+    }
+  });
+
+  it("keeps an id-less write for the next boot, with what follows it for its agent, when the record can't be written with its id first", async () => {
+    const h = await host();
+    const proto = AgentFramework.prototype as unknown as { writeRecoveryFile(this: unknown, path: string, document: unknown): void };
+    const write = proto.writeRecoveryFile;
+    const lines: string[] = [];
+    const quiet = console.error;
+    try {
+      h.writeQueue([entry('k0', 1, 'before it'), { seq: 2, participant: 'user', content: text('no id given') }, entry('k2', 3, 'after it')]);
+      let refuse = true;
+      proto.writeRecoveryFile = function (this: unknown, path: string, document: unknown) {
+        if (refuse && path.endsWith('deferred-writes.json')) {
+          refuse = false;
+          throw Object.assign(new Error('injected EIO writing'), { code: 'EIO' });
+        }
+        write.call(this, path, document);
+      };
+      console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+      let framework: AgentFramework;
+      try { framework = await h.boot(); } finally { proto.writeRecoveryFile = write; console.error = quiet; }
+      try {
+        assert.equal(withText(framework, 'before it').length, 1, 'a write ahead of it is stored');
+        assert.deepEqual(withText(framework, 'no id given'), [], 'it is not stored under an id the record lacks');
+        assert.deepEqual(withText(framework, 'after it'), [], 'nor what follows it for its agent');
+        const left = h.readQueue().pending;
+        assert.deepEqual(left.map((m) => (m.content as Array<{ text: string }>)[0]!.text), ['no id given', 'after it'], 'both stay queued');
+        assert.match(String(left[0]!.id), /^[0-9a-f-]{36}$/, 'the one with no id under the id it was given');
+        assert.ok(lines.some((l) => l.includes('no id given') || l.includes('stay queued')), lines.join('\n'));
+      } finally { await framework.stop(); }
+      framework = await h.boot();
+      try {
+        assert.deepEqual(rowsOf(framework).filter((m) => ['before it', 'no id given', 'after it'].includes(textOf(m))).map(textOf),
+          ['before it', 'no id given', 'after it'], 'the next boot stores them once each, in order');
+        assert.deepEqual(h.readQueue().pending, []);
+      } finally { await framework.stop(); }
+    } finally {
+      proto.writeRecoveryFile = write;
+      console.error = quiet;
       h.close();
     }
   });
