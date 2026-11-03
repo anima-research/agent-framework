@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Membrane, NormalizedRequest } from '@animalabs/membrane';
 import {
-  SuppressionReview, parseReviewAnswer, reviewNoticeText, reviewSettings, spread,
+  SuppressionReview, eventTextCap, parseReviewAnswer, reviewNoticeText, reviewSettings, spread, EVENT_TEXT_BUDGET,
   DEFAULT_REVIEW_INTERVAL_MS, MIN_REVIEW_INTERVAL_MS, type ReviewRuleInfo, type SuppressionReviewDeps,
 } from '../src/gate/suppression-review.js';
 import type { SuppressedEventRecord } from '../src/gate/suppression-stats.js';
@@ -86,6 +86,12 @@ describe('the review\'s settings and helpers', () => {
     assert.deepEqual(spread([1, 2], 5), [1, 2]);
   });
 
+  it('shares the text budget: short events whole, a long one what they leave', () => {
+    assert.equal(eventTextCap([10, 20, 30], 100), Number.POSITIVE_INFINITY, 'all fit, nothing is cut');
+    assert.equal(eventTextCap([10, 20, 1000], 100), 70, 'the long one takes what the short ones leave');
+    assert.equal(eventTextCap([500, 500], 100), 50, 'long ones share evenly');
+  });
+
   it('reads the reviewer\'s JSON, with prose around it, keeping only numbers it was shown', () => {
     assert.deepEqual(parseReviewAnswer('Sure.\n{"fits": false, "flagged": [3, 3, 9, 0, "2"], "note": "a direct question"}\n', 5),
       { flagged: [3], note: 'a direct question' });
@@ -133,9 +139,11 @@ describe('a review', () => {
   it('with notify "flagged", tells the agent only of a flag; wakeOnFlag false tells without waking', async () => {
     const quiet = harness({ records: [rec('hide-ears', 1, 'chatter')], options: { notify: 'flagged' } });
     await quiet.run();
+    assert.equal(quiet.requests.length, 1, 'the review ran');
     assert.equal(quiet.delivered.length, 0);
     const noWake = harness({ statePath: null, records: [rec('hide-ears', 1, 'hey agent?')], options: { wakeOnFlag: false }, answers: ['{"fits": false, "flagged": [1]}'] });
-    await noWake.run();
+    const flagged = await noWake.run();
+    assert.equal(flagged?.flagged, 1);
     assert.equal(noWake.delivered[0].wake, false);
   });
 
@@ -159,9 +167,9 @@ describe('a review', () => {
     });
     const summary = await h.run();
     assert.deepEqual(summary?.rules.map((r) => [r.rule, r.verdict]), [['a', 'error'], ['b', 'error']]);
-    assert.match(h.delivered[0].text, /"a" \(aa\) hid 1\. The reviewer couldn't answer this time; they'll be reviewed again next time\./);
+    assert.match(h.delivered[0].text, /"a" \(aa\) hid 1\. The reviewer couldn't answer this time; they'll be reviewed again next time, as far back as a week\./);
     assert.match(h.delivered[0].text, /"b" \(bb\) hid 1\. The reviewer couldn't answer this time/);
-    assert.match(String(summary?.rules[0].note), /overloaded/, 'the cause is kept for the log and the trace');
+    assert.match(String(summary?.rules[0].note), /overloaded/, 'the cause is kept for the log');
     assert.equal(h.delivered[0].wake, false, 'an error is no flag');
   });
 
@@ -259,5 +267,14 @@ describe('a review', () => {
     await h.run();
     assert.match(h.delivered[0].text, /suppression_stats shows what a rule hid/);
     assert.ok(!h.delivered[0].text.includes('dump_suppressed'));
+  });
+
+  it('reads what matters late in a long event, within the budget', async () => {
+    const long = `${'filler '.repeat(500)}the fire alarm is going off`;
+    const h = harness({ statePath: null, records: [rec('hide-ears', 1, 'short'), rec('hide-ears', 2, long)] });
+    await h.run();
+    const listing = (h.requests[0].messages[0].content[0] as { text: string }).text;
+    assert.ok(long.length < EVENT_TEXT_BUDGET);
+    assert.match(listing, /the fire alarm is going off/);
   });
 });

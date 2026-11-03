@@ -246,7 +246,7 @@ export interface SuppressionReviewOptions {
   model?: string;
   /** When the agent is told: after every review in which a rule hid something (`"always"`, the default), or only when an event was flagged (`"flagged"`). */
   notify?: 'always' | 'flagged';
-  /** Whether a flagged event wakes the agent. Default true. */
+  /** Whether a flagged event wakes the agent, which is a full turn of its own model, so a false flag costs that turn. Default true. */
   wakeOnFlag?: boolean;
   /** The most events of one rule the reviewer reads in one review, spread across the period. Default 60. */
   maxEventsPerRule?: number;

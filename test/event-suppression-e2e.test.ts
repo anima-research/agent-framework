@@ -51,15 +51,30 @@ class NotesModule implements Module {
   }
 }
 
-/** A module that only asks for a wake on `notes:new`, as a second module answering the same event might. */
-class WakeOnNotes implements Module {
-  readonly name = 'wake-on-notes';
+/** A host module that writes a row of its own for a server's push event. */
+class EchoPushes implements Module {
+  readonly name = 'echo-pushes';
   async start(_ctx: ModuleContext): Promise<void> {}
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] { return []; }
   async handleToolCall(_call: ToolCall): Promise<ToolResult> { return { success: false, error: 'none', isError: true }; }
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
-    return (event as { type: string }).type === 'notes:new' ? { requestInference: true } : {};
+    return (event as { type: string }).type === 'mcpl:push-event' ? { addMessages: [{ participant: 'user', content: [{ type: 'text', text: 'echoed by a module' }] }] } : {};
+  }
+}
+
+/** A module that only asks for a wake on `notes:new`, as a second module answering the same event might. */
+class WakeOnNotes implements Module {
+  readonly name = 'wake-on-notes';
+  handled = 0;
+  async start(_ctx: ModuleContext): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] { return []; }
+  async handleToolCall(_call: ToolCall): Promise<ToolResult> { return { success: false, error: 'none', isError: true }; }
+  async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
+    if ((event as { type: string }).type !== 'notes:new') return {};
+    this.handled++;
+    return { requestInference: true };
   }
 }
 
@@ -157,16 +172,55 @@ describe('event suppression', () => {
 
   it('a second module that only asks for a wake on a suppressed event wakes nobody, whichever answers first', async () => {
     const rule = { name: 'hide-notes', match: { scope: ['notes:new'] }, behavior: 'defer', suppress: S('every note') };
-    for (const modules of [[new WakeOnNotes(), new NotesModule()], [new NotesModule(), new WakeOnNotes()]]) {
+    for (const first of [true, false]) {
+      const waker = new WakeOnNotes();
+      const modules = first ? [waker, new NotesModule()] : [new NotesModule(), waker];
       const f = await fixture({ framework: { ...GATE([rule]), modules } });
       try {
         f.framework.pushEvent({ type: 'notes:new', source: 'notes', content: 'a hidden note' } as unknown as ProcessEvent);
         await settle(f);
+        assert.equal(waker.handled, 1, 'the wake-only module answered');
         assert.ok(suppressedOf(find(f, 'a hidden note')));
         const stats = (await tool(f, 'suppression_stats', {})).data as { rules: Array<{ bySource: Record<string, number> }> };
         assert.deepEqual(stats.rules[0].bySource, { notes: 1 }, 'a module\'s row is counted under its source');
       } finally { await f.close(); }
     }
+  });
+
+  it('API input is never suppressed, and a suppress rule doesn\'t defer its wake; nor a tagged addressed module event', async () => {
+    const f = await fixture({ framework: { ...GATE([
+      { name: 'hide-api', match: { scope: ['api:message'] }, behavior: 'defer', suppress: S('api chatter') },
+      { name: 'hide-notes', match: { scope: ['notes:new'] }, behavior: 'defer', suppress: S('every note') },
+    ]), modules: [new NotesModule()] } });
+    try {
+      const gate = (f.framework as unknown as { eventGate: { evaluate(i: unknown): { trigger: boolean } } }).eventGate;
+      assert.equal(gate.evaluate({ content: 'hi', eventType: 'api:message', serverId: 'api', channelId: '', suppressionAsked: true }).trigger, true);
+      f.framework.pushEvent({ type: 'notes:new', source: 'notes', content: 'a note for you', tags: ['chat:addressed'] } as unknown as ProcessEvent);
+      await f.turn();
+      assert.equal(suppressedOf(find(f, 'a note for you')), undefined, 'an addressed module event isn\'t suppressed');
+      assert.equal(await inView(f, 'a note for you'), true);
+    } finally { await f.close(); }
+  });
+
+  it('a module reading a suppressed row is told it\'s held from the residents', async () => {
+    const { asModuleRow } = await import('../src/held-writes.js');
+    assert.equal(asModuleRow({ metadata: { suppressed: { rule: 'r', eventType: 'x' } } }).heldFromResidents, true);
+    assert.equal(asModuleRow({ metadata: {} }).heldFromResidents, undefined);
+  });
+
+  it('a response that only wakes an agent it names isn\'t decided: the named wake stands', async () => {
+    class NamedWake extends WakeOnNotes {
+      override async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
+        return (event as { type: string }).type === 'notes:new' ? { requestInference: ['agent'] } : {};
+      }
+    }
+    const f = await fixture({ framework: { ...GATE([{ name: 'hide-notes', match: { scope: ['notes:new'] }, behavior: 'defer', suppress: S('every note') }]), modules: [new NamedWake()] } });
+    try {
+      const before = f.membrane.calls.length;
+      f.framework.pushEvent({ type: 'notes:new', source: 'notes' } as unknown as ProcessEvent);
+      await f.turn();
+      assert.ok(f.membrane.calls.length > before, 'the agent it named was woken');
+    } finally { await f.close(); }
   });
 
   it('a server\'s [toolsets] notice is suppressed as its "mcpl:tool-changes" event', async () => {
@@ -387,6 +441,41 @@ describe('event suppression', () => {
       assert.ok(suppressedOf(find(f, 'document_diff')), 'its latest occurrence was hidden, so the batch is, and nothing woke for it');
       const gate = (f.framework as unknown as { eventGate: { suppressScriptState(name: string): unknown } }).eventGate;
       assert.deepEqual(gate.suppressScriptState('second'), { n: 2 }, 'each occurrence asked once');
+    } finally { await f.close(); }
+  });
+
+  it('a batch holding an addressed occurrence is shown, whatever comes after it', async () => {
+    const f = await fixture({ framework: GATE([{ name: 'hide-doc', match: { source: 'editor', scope: ['mcpl:push-event'] }, behavior: 'defer', suppress: S('document notices') }]) });
+    try {
+      f.alwaysRespond();
+      await f.send('push/event', { ...f.params('1', 'fallback', { deferred: true }), tags: ['chat:mention', 'chat:addressed'] });
+      await f.send('push/event', f.params('2', 'fallback', { deferred: true }));
+      await f.framework.runUntilIdle();
+      assert.ok(f.context().includes('document_diff'), 'stored at the turn the batch\'s wake started');
+      assert.equal(suppressedOf(find(f, 'document_diff')), undefined);
+      assert.equal(await inView(f, 'document_diff'), true);
+    } finally { await f.close(); }
+  });
+
+  it('a plain occurrence that displaces a deferred batch the rule let by is asked on its own text', async () => {
+    const f = await fixture({ framework: GATE([{ name: 'hide-pings', match: { scope: ['mcpl:push-event'], filter: { type: 'text', pattern: 'ping' } }, behavior: 'defer', suppress: S('pings') }]) });
+    try {
+      f.alwaysRespond();
+      await f.send('push/event', f.params('1', 'hello one', { deferred: true }));
+      await f.send('push/event', f.params('2', 'ping two'));
+      await f.framework.runUntilIdle();
+      assert.deepEqual(suppressedOf(find(f, 'ping two')), { rule: 'hide-pings', eventType: 'mcpl:push-event', source: 'editor' });
+      assert.equal(await inView(f, 'ping two'), false);
+    } finally { await f.close(); }
+  });
+
+  it('a module\'s row answering a suppressed server event is stamped with the server as its source', async () => {
+    const f = await fixture({ framework: { ...GATE([{ name: 'hide-pings', match: { scope: ['mcpl:push-event'], filter: { type: 'text', pattern: 'ping' } }, behavior: 'defer', suppress: S('pings') }]), modules: [new EchoPushes()] } });
+    try {
+      await ping(f, 'p1', 'ping 1');
+      await settle(f);
+      assert.deepEqual(suppressedOf(find(f, 'echoed by a module')), { rule: 'hide-pings', eventType: 'mcpl:push-event', source: 'editor' });
+      assert.equal(await inView(f, 'echoed by a module'), false);
     } finally { await f.close(); }
   });
 });

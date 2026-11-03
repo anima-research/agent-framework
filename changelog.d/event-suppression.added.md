@@ -41,11 +41,16 @@
   `AgentFramework.reviewSuppression()` runs one now. New traces:
   `gate:suppressed`, `gate:suppression-review`; `admission:decided` gains
   `suppressed`.
-- **Hosts rolling back:** a release without suppression doesn't read the
-  stamp, so after a rollback every suppressed row renders again where it was
-  stored, and the residents' next compile carries them (a prompt-cache miss
-  from the first, and memory folded from them); suppress rules keep their
-  `defer`, so nothing wakes for them. The changed `wake_add_rule` definition
-  and the two new tools change the tool definitions once, in the built-in
-  settings toolset, or in the tool list on a host without host presentation.
-  The review's calls count toward the agent's usage, as the reply judge's do.
+- **Hosts rolling back past this release:** run its `agent-framework-recover
+  --store <path> --agent <name> --remove-suppressed` first, with the host
+  stopped. A release without suppression doesn't read the stamp, and where
+  compression formed a summary around a hidden row, it refuses the store at
+  open (`StoreTopologyError`). The command makes and activates a branch without
+  the hidden rows; the source branch keeps them. Suppress rules load as `defer`
+  in every release back to 0.22, so nothing wakes for their events; 0.22 to
+  0.26 drop `suppress` from gate.json at their first rule edit.
+- The changed `wake_add_rule` definition and the two new tools change the tool
+  definitions once, in the built-in settings toolset, or in the tool list on a
+  host without host presentation, where it's one prompt-cache miss. The review's calls count toward the agent's
+  usage, as the reply judge's do, and a wake on a flag is a full turn of the
+  agent's own model.

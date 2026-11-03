@@ -17,10 +17,12 @@
  * failure is counted and named in gate_status. A timeout stops the worker; a
  * fresh one loads every script again, one at a time, so a script whose own
  * loading hangs is set aside without the others. A script that times out
- * MAX_CONSECUTIVE_TIMEOUTS times in a row, probes included, stops being run
- * until its script changes, so a looping script doesn't cost every event its
- * timeout. A worker that fails to start or answer is tried again with a
- * later event.
+ * MAX_TIMEOUTS_IN_WINDOW times in its last TIMEOUT_WINDOW runs, probes
+ * included, stops being run until its script changes: each timeout blocks the
+ * caller's thread for the timeout and a worker's restart, so neither a script
+ * that always hangs nor one that hangs now and then goes on costing that. A
+ * worker that fails to start or answer is tried again with a later event,
+ * each try later than the last, since a try can block for LOAD_TIMEOUT_MS.
  *
  * The worker starts with the first rule that has a script, so a gate with
  * none runs no thread.
@@ -40,10 +42,12 @@ const SAB_SIZE = 8 + 2 * MAX_SUPPRESS_STATE_BYTES + 16_384;
 export const DEFAULT_SUPPRESS_SCRIPT_TIMEOUT_MS = 50;
 /** How long compiling one script may take, the worker's start included (ms). */
 const LOAD_TIMEOUT_MS = 3_000;
-/** Timeouts in a row after which a script isn't run again until its script changes. */
-export const MAX_CONSECUTIVE_TIMEOUTS = 3;
-/** How long after the worker failed to start or answer a later event tries loading the scripts again (ms). */
+/** Timeouts within a script's last TIMEOUT_WINDOW runs after which it isn't run again until its script changes. */
+export const MAX_TIMEOUTS_IN_WINDOW = 3;
+export const TIMEOUT_WINDOW = 20;
+/** How long after the worker failed to start or answer a later event first tries loading the scripts again (ms); doubled each failed try, up to the most. */
 const WORKER_RETRY_MS = 5_000;
+const WORKER_RETRY_MAX_MS = 5 * 60_000;
 /** How soon after a state changes it's written to disk (ms), and how long a failed write waits to be tried again. */
 const SAVE_DELAY_MS = 2_000;
 const SAVE_RETRY_MS = 30_000;
@@ -87,7 +91,8 @@ interface RuleScript {
   hidden: number;
   errors: number;
   timeouts: number;
-  timeoutsInARow: number;
+  /** Whether each of its last TIMEOUT_WINDOW runs timed out. */
+  recentRuns: boolean[];
   lastError: string | null;
 }
 
@@ -126,15 +131,20 @@ export class SuppressScripts {
   private disposed = false;
   /** Whether the first sync, with every rule in force, has run: saved states it didn't take are then retired. */
   private synced = false;
-  /** When loading last failed for want of a worker (not a script's own error), so a later event tries again. */
-  private workerFailedAt: number | null = null;
+  /** When a later event may try loading again, after loading failed for want of a worker (not a script's own error). */
+  private workerRetryAt: number | null = null;
+  private workerRetryDelay = WORKER_RETRY_MS;
 
   constructor(private readonly opts: { statePath?: string; timeoutMs?: number } = {}) {
     if (opts.statePath && existsSync(opts.statePath)) {
       try {
         this.saved = readSaved(JSON.parse(readFileSync(opts.statePath, 'utf-8')), opts.statePath);
       } catch (error) {
-        console.error(`[gate] suppress-rule states in ${opts.statePath} can't be read, so every rule's state starts afresh:`, error);
+        // Moved aside, so the next save doesn't write over a file a later release wrote.
+        const aside = `${opts.statePath}.unreadable`;
+        let moved = '';
+        try { renameSync(opts.statePath, aside); moved = ` It's kept as ${aside}.`; } catch { /* the save may yet fail too; the log says what was read */ }
+        console.error(`[gate] suppress-rule states in ${opts.statePath} can't be read, so every rule's state starts afresh.${moved}`, error);
       }
     }
   }
@@ -161,7 +171,7 @@ export class SuppressScripts {
       this.saved.delete(name);
       this.rules.set(name, {
         script, hash, state: saved && saved.script === hash ? saved.state : {}, loaded: false, disabled: null,
-        runs: 0, hidden: 0, errors: 0, timeouts: 0, timeoutsInARow: 0, lastError: null,
+        runs: 0, hidden: 0, errors: 0, timeouts: 0, recentRuns: [], lastError: null,
       });
       changed = true;
     }
@@ -194,6 +204,8 @@ export class SuppressScripts {
       this.load(); // the worker was stopped: the rules' scripts go to a fresh one
       return `compiling it took over ${LOAD_TIMEOUT_MS / 1000} s`;
     }
+    // A gate with no scripts runs no thread, this check's included.
+    if (this.rules.size === 0) this.stopWorker();
     return typeof answer.error === 'string' ? answer.error : null;
   }
 
@@ -207,8 +219,8 @@ export class SuppressScripts {
     const rule = this.rules.get(name);
     if (!rule) return undefined;
     if (rule.disabled) return { error: rule.disabled };
-    // A load that failed for want of a worker is tried again, at most every few seconds.
-    if (!rule.loaded && this.workerFailedAt !== null && Date.now() - this.workerFailedAt > WORKER_RETRY_MS) this.load();
+    // A load that failed for want of a worker is tried again, later each time.
+    if (!rule.loaded && this.workerRetryAt !== null && Date.now() >= this.workerRetryAt) this.load();
     if (!rule.loaded) return { error: rule.lastError ?? 'the script is not loaded' };
     const answer = this.call({ type: 'eval', name, event, state: rule.state }, this.timeoutMs);
     if ('timeout' in answer) {
@@ -217,18 +229,17 @@ export class SuppressScripts {
       const error = `it took over ${this.timeoutMs} ms, so it was stopped`;
       if (commit) rule.runs++;
       rule.timeouts++;
-      rule.timeoutsInARow++;
       rule.lastError = error;
-      if (rule.timeoutsInARow >= MAX_CONSECUTIVE_TIMEOUTS) {
-        rule.disabled = `it took over ${this.timeoutMs} ms ${rule.timeoutsInARow} times in a row, so it isn't run again until its script changes`;
+      if (this.noteRun(rule, true) >= MAX_TIMEOUTS_IN_WINDOW) {
+        rule.disabled = `it took over ${this.timeoutMs} ms ${MAX_TIMEOUTS_IN_WINDOW} times in its last ${TIMEOUT_WINDOW} runs, so it isn't run again until its script changes`;
         rule.lastError = rule.disabled;
       }
       this.load();
       return { error };
     }
+    this.noteRun(rule, false);
     if (!commit) return typeof answer.error === 'string' ? { error: answer.error } : { hide: answer.hide === true };
     rule.runs++;
-    rule.timeoutsInARow = 0;
     if (typeof answer.error === 'string') {
       rule.errors++;
       rule.lastError = answer.error;
@@ -242,6 +253,13 @@ export class SuppressScripts {
     const hide = answer.hide === true;
     if (hide) rule.hidden++;
     return { hide };
+  }
+
+  /** One run in the rule's recent runs: how many of them timed out. */
+  private noteRun(rule: RuleScript, timedOut: boolean): number {
+    rule.recentRuns.push(timedOut);
+    if (rule.recentRuns.length > TIMEOUT_WINDOW) rule.recentRuns.shift();
+    return rule.recentRuns.filter(Boolean).length;
   }
 
   status(name: string): SuppressScriptStatus | undefined {
@@ -282,15 +300,18 @@ export class SuppressScripts {
    * fresh worker that follows.
    */
   private load(): void {
+    if (this.rules.size === 0) return;
     for (let attempt = 0; attempt <= this.rules.size; attempt++) {
       const reset = this.call({ type: 'reset' }, LOAD_TIMEOUT_MS);
       if ('timeout' in reset || typeof reset.error === 'string') {
         const why = 'timeout' in reset ? `the script worker didn't answer within ${LOAD_TIMEOUT_MS / 1000} s` : reset.error as string;
         for (const rule of this.rules.values()) { rule.loaded = false; rule.lastError = rule.disabled ?? `${why}; it's tried again with a later event`; }
-        this.workerFailedAt = Date.now();
+        this.workerRetryAt = Date.now() + this.workerRetryDelay;
+        this.workerRetryDelay = Math.min(WORKER_RETRY_MAX_MS, this.workerRetryDelay * 2);
         return;
       }
-      this.workerFailedAt = null;
+      this.workerRetryAt = null;
+      this.workerRetryDelay = WORKER_RETRY_MS;
       let restarted = false;
       for (const [name, rule] of this.rules) {
         if (rule.disabled) { rule.loaded = false; continue; }
@@ -343,6 +364,14 @@ export class SuppressScripts {
       const sab = new SharedArrayBuffer(SAB_SIZE);
       const worker = new Worker(WORKER_PATH, { workerData: { sab, maxStateBytes: MAX_SUPPRESS_STATE_BYTES } });
       worker.on('error', (e) => { console.error('[gate] the suppress-script worker failed:', e); });
+      // A worker that dies on its own (a script's stray asynchronous throw) is
+      // no one's timeout: the next run loads the scripts on a fresh one.
+      worker.once('exit', () => {
+        if (this.channel?.worker !== worker) return;
+        this.channel = undefined;
+        for (const rule of this.rules.values()) rule.loaded = false;
+        this.workerRetryAt = 0;
+      });
       worker.unref();
       this.channel = { worker, ctrl: new Int32Array(sab, 0, 2), data: new Uint8Array(sab, 8) };
       return this.channel;

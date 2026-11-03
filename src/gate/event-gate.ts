@@ -933,7 +933,7 @@ function readRule(raw: unknown, unnamed: string, file = 'gate.json', named: (pat
   const match = readMatch(r, obj.match);
   const resets = readResets(r, obj.resets);
   const passthrough = readPassthrough(r, obj.passthrough, kind);
-  const suppress = readSuppress(r, obj.suppress, obj.behavior, match);
+  const suppress = readSuppress(r, obj.suppress, obj.behavior, match, obj.match);
   const reading: RuleReading = {
     where: r.where, problems: r.problems, notes: r.notes, quiet: kind === 'skip' || kind === 'defer' || r.noTokens === true,
   };
@@ -1411,20 +1411,22 @@ const SUPPRESS_EXAMPLE = '{"description": "the eye going on and off"}';
  * "always" and would wake the agent on every event the rule was meant to
  * hide.
  */
-function readSuppress(r: Reader, value: unknown, behavior: unknown, match: GatePolicyMatch): SuppressConfig | undefined {
+function readSuppress(r: Reader, value: unknown, behavior: unknown, match: GatePolicyMatch, rawMatch: unknown): SuppressConfig | undefined {
   if (value === undefined || value === false) return undefined;
   const without = "so the rule doesn't suppress, and its behavior decides its events as for any other rule";
   if (!isPlainObject(value)) {
     r.problems.push({ text: `suppress is ${shownValue(value)}, where an object such as ${SUPPRESS_EXAMPLE} is needed`, read: without });
     return undefined;
   }
+  const before = r.problems.length;
   // A script given as null or "" is a script that's missing, not one left
   // out: read as left out, the rule would hide every event its match takes.
-  if (Object.hasOwn(value, 'script') && (value.script === null || value.script === '')) {
+  const { script: _givenScript, ...rest } = value;
+  const emptyScript = Object.hasOwn(value, 'script') && (value.script === null || value.script === '');
+  if (emptyScript) {
     r.problems.push({ text: `suppress.script is ${shownValue(value.script)}, where the source of a function such as "(event, state) => false" is needed`, read: without });
   }
-  const before = r.problems.length;
-  const given = withoutEmpty(`${r.where}: suppress`, value, r.notes);
+  const given = withoutEmpty(`${r.where}: suppress`, emptyScript ? rest : value, r.notes);
   const reported = r.problems.length;
   readFieldNames(r, 'suppress', given, SUPPRESS_FIELDS);
   // A field it doesn't read can't be left aside here, as elsewhere in a
@@ -1476,10 +1478,18 @@ function readSuppress(r: Reader, value: unknown, behavior: unknown, match: GateP
       read: without,
     });
   }
+  // A match field the gate doesn't read would, left aside, hide more than was
+  // written: the condition it was meant to add is gone.
+  if (isPlainObject(rawMatch)) {
+    const unreadMatch = Object.keys(rawMatch).filter((key) => !MATCH_FIELDS.includes(key));
+    if (unreadMatch.length > 0) {
+      r.problems.push({ text: `suppress is given, and match has ${quotedList(unreadMatch)}, which the gate doesn't read, so the rule would hide more than was written`, read: without });
+    }
+  }
   if (!suppressMatchNarrows(match)) {
     r.problems.push({
       text: 'suppress is given, and the rule\'s match names nothing it hides: a suppress rule needs a match that names '
-        + 'a scope, a source, a channel, tags, a mount or path, metadata or a filter (not a pattern of wildcards alone), '
+        + 'a scope, a source, a channel, tags, a mount or path, metadata or a filter (not a pattern of wildcards alone, or tagsNone alone), '
         + 'so it can\'t hide everything',
       read: without,
     });
@@ -3659,7 +3669,8 @@ export class EventGate {
    * The suppress rule that takes this event, or null when none does.
    * Side-effect-free, like probe: no counter moves, no batch forms, nothing
    * is traced, and a rule's script runs on a copy of its state, which is
-   * then dropped. The probe table and other dry runs ask this; the
+   * then dropped. (A closure a script builds for itself is its own, and a
+   * dry run's timeout counts toward setting a script aside, as it costs the same.) The probe table and other dry runs ask this; the
    * framework asks decideSuppression instead, once per event.
    *
    * It reads the rules as evaluate does, first match deciding: a rule ahead
@@ -3682,7 +3693,8 @@ export class EventGate {
 
   /**
    * suppressionFor, for an event that is arriving now: each script asked
-   * keeps the state it leaves, whatever later rules do with the event. Ask
+   * keeps the state it leaves, whatever later rules do with the event, and a
+   * suppressed event counts in the passthrough rules ahead of its rule. Ask
    * once per event.
    */
   decideSuppression(info: GateEventInfo): string | null {
@@ -3695,6 +3707,7 @@ export class EventGate {
     if (info.serverId === 'heartbeat') return null;
     const addressed = Array.isArray(info.tags) && info.tags.includes('chat:addressed');
     let event: SuppressScriptEvent | undefined;
+    const observers: GatePolicy[] = [];
     for (const compiled of this.compiledPolicies) {
       if (!this.compiledMatches(compiled, info)) continue;
       const suppress = compiled.policy.suppress;
@@ -3706,9 +3719,14 @@ export class EventGate {
           // A script that failed shows the event: it goes on to the rules after.
           if (!ran || !('hide' in ran) || !ran.hide) continue;
         }
+        // A suppressed event never reaches evaluate, so the passthrough rules
+        // ahead of this one count it here, as evaluate would have: none of
+        // them fires for it, and each fires on its schedule. A dry run counts
+        // nothing.
+        if (commit) for (const observer of observers) this.computeDecision(observer, info);
         return compiled.policy.name;
       }
-      if (compiled.policy.passthrough && !this.wouldTrigger(compiled.policy, info)) continue;
+      if (compiled.policy.passthrough && !this.wouldTrigger(compiled.policy, info)) { observers.push(compiled.policy); continue; }
       return null;
     }
     return null;

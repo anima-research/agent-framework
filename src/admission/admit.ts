@@ -79,9 +79,10 @@ export interface AdmissionPolicy {
     probe(env: InboundEnvelope): boolean;
   };
   /**
-   * The suppress rule that takes this event, or null. Side-effect-free (the
-   * gate's suppressionFor); null where the event would land in a view that
-   * doesn't hide suppressed rows. Left out, nothing is suppressed.
+   * The suppress rule that takes this event, or null; null where the event
+   * would land in a view that doesn't hide suppressed rows. Asked once per
+   * event, since it commits (a rule's script keeps the state it leaves, the
+   * gate's decideSuppression). Left out, nothing is suppressed.
    */
   suppressionFor?(env: InboundEnvelope): string | null;
 }

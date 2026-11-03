@@ -545,11 +545,20 @@ are registered for every agent, MCPL or none, unless a module holds the name.
   see the event (the suppress rule's own `matchCount` counts what it took). Because the view reads only the stamp, editing or removing the
   rule changes only what arrives afterwards; the rows already hidden stay
   hidden, which keeps each row's visibility fixed, as context-manager's
-  `viewFilter` requires. **Rollback:** a release without suppression doesn't
-  read the stamp, so after a rollback every suppressed row renders again,
-  where it was stored, and the residents' next compile carries them (a
-  prompt-cache miss from the first one, and memory folded from them).
-  Suppress rules keep their `defer` there, so nothing wakes for them.
+  `viewFilter` requires. **Rollback needs a step.** A release without
+  suppression doesn't read the stamp. Where compression formed a summary around
+  a hidden row, that summary is non-contiguous under such a release's view, and
+  context-manager refuses the store at open (`StoreTopologyError`), unless the
+  strategy sets `topologyPolicy` or a kv-unified gap flag. Before rolling back,
+  with the host stopped, run this release's `agent-framework-recover --store
+  <path> --agent <name> --remove-suppressed`: it makes and activates a branch
+  without the hidden rows, which such a release opens, and the source branch
+  keeps them. Skipped where no summary spans one, the rows render again where
+  they were stored (a prompt-cache miss from the first). Suppress rules load as
+  `defer` in every release back to 0.22, so nothing wakes for their events.
+  Releases 0.22 to 0.26 rewrite gate.json without `suppress` at their first
+  rule edit, so rolling back that far and forward again leaves rules that defer
+  and no longer suppress.
   - **The rule.** It needs `behavior: "defer"` (or the legacy `"skip"`) written out, so an earlier
     release that doesn't know `suppress` defers those events instead of
     waking on them, a match that narrows it, and a `description` of what it's
@@ -580,16 +589,18 @@ are registered for every agent, MCPL or none, unless a module holds the name.
     state it can't keep lets the event on to the rules after it, as one that
     says show does, keeps its state as it was, and is named in `gate_status`
     (`suppress.scriptStatus`). A timeout restarts the worker, which loads every
-    script again one at a time; a script that times out three times in a row,
-    probes included, isn't run again until its script changes, and a worker
-    that fails to start is tried again with a later event. wake_add_rule compiles a
+    script again one at a time; a script that times out three times in its
+    last twenty runs, probes included, isn't run again until its script
+    changes, and a worker that fails to start is tried again with a later
+    event, later each time. wake_add_rule compiles a
     script on the worker before it saves the rule. `suppressionFor` runs a
     script on a copy of its state, for the probe table; the arrival paths call
     `decideSuppression`, once per event, which keeps the state the script
     leaves. The worker starts with the first rule that has a script.
   - **Covered:** MCPL channel messages and push events (admission; a deferred
     coalesced push is decided once, at its wake, and a suppressed batch is
-    stored at once), a module's events (every message its responses add, and
+    stored at once; a batch's row follows its latest occurrence, as its wake
+    does, unless the batch holds an addressed occurrence, when it's shown), a module's events (every message its responses add, and
     every wake they ask for, the event decided once whichever module answers
     first), and a server's `[toolsets]` notices, gated as its
     `mcpl:tool-changes` events.
@@ -612,22 +623,26 @@ are registered for every agent, MCPL or none, unless a module holds the name.
   - **Review.** Every `gate.suppressionReview.intervalMs` (two hours by
     default), for each rule that hid events since the last review, a small
     model (`model`, Claude Haiku 5.5 by default, on the reply judge's
-    membrane) reads the rule's description, its match, its script (cut to
-    3,000 characters) and a sample of the events it hid: at most
-    `maxEventsPerRule` (60) spread across the period, each cut to 400
-    characters. It flags any that don't fit the description or that the agent
-    would plausibly need to see. The agent gets a `[suppression review]`
+    membrane) reads the rule's description, its match and script while it's in
+    force (the script cut to 3,000 characters), and a sample of the events it hid: at most
+    `maxEventsPerRule` (60) spread across the period, sharing 24,000 characters
+    of text, so a short event is read whole and a long one takes what the
+    others leave. These bounds are chosen, not measured: they keep one rule's
+    request to roughly 8,000 input tokens. It flags any that don't fit the
+    description or that the agent would plausibly need to see. The agent gets a `[suppression review]`
     notice naming each rule, what it hid and what was flagged, with the first
     five flagged events of each rule shown, each cut short. A rule the
     reviewer couldn't answer about is reviewed again next time, from where its
-    events begin (at most a week back). A flag wakes the agent (`wakeOnFlag`, default true). With
+    events begin (at most a week back; older events aren't reviewed again). A flag wakes the agent (`wakeOnFlag`, default true). With
     `notify: "flagged"` the agent is told only of a flag; with the default,
     `"always"`, after every review in which something was hidden. The notice
     is the framework's own and never suppressed. Progress, retries and each
     rule's last description (noted as the rule hides a row) are kept in
     `suppression-review.json` beside gate.json, written as the review starts,
     so a restart resumes and a removed rule's events are still judged. Its
-    calls count toward the agent's usage, as the reply judge's do.
+    calls count toward the agent's usage, as the reply judge's do, and a wake
+    on a flag is a full turn of the agent's own model, so a false flag costs
+    that turn.
     `gate.suppressionReview: false` turns it off; `AgentFramework.reviewSuppression()`
     runs one now. The `gate:suppression-review` trace records each review.
 

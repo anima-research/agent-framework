@@ -98,6 +98,13 @@ export interface CoalescedOccurrence<E = unknown> {
   identity?: { messageId?: string; author?: { id: string; name: string }; threadId?: string };
   /** The event the ordinary path would have queued — the host delivers it. */
   event: E;
+  /**
+   * The suppress rule that took this occurrence, or null when none did, once
+   * the host has decided (its wake, or its row, whichever came first). Decided
+   * once for the occurrence, since a rule's script answers once per event:
+   * its row and any later wake read this. Snapshots carry it.
+   */
+  suppressionDecision?: string | null;
   /** Set by the coalescer: deliver into this agent only (§3.2 audience may
    *  narrow, never widen — a replacement or notice follows the prior delivery). */
   deliverTo?: string;

@@ -13082,7 +13082,7 @@ export class AgentFramework {
         'e.g. `{ name: "watch-cairn", match: { source: "discord", channel: "discord:*:12345", tagsAny: ["chat:ambient"] }, debounceMs: 60000 }` ' +
         '(the channel must be subscribed for ambient events to arrive — see channel mode).\n' +
         '• Keep a noisy stream out of your context with `suppress`, e.g. ' +
-        '`{ name: "hide-eye-flaps", match: { source: "body", scope: ["mcpl:tool-changes"] }, suppress: { description: "the eye going on and off" } }`, ' +
+        '`{ name: "hide-tool-flaps", match: { source: "body", scope: ["mcpl:tool-changes"] }, suppress: { description: "the body\'s tools coming and going" } }`, ' +
         'and give it a `script` for logic of your own, such as showing one in ten minutes: ' +
         '`(event, state) => { if (event.at - (state.shown ?? 0) < 600000) return true; state.shown = event.at; return false; }`. ' +
         'suppression_stats shows what each suppress rule has hidden, and dump_suppressed, where you have a workspace, writes it to a file.',
@@ -13305,7 +13305,7 @@ export class AgentFramework {
     name: 'suppression_stats',
     description:
       'Show what your suppress rules (wake_add_rule with suppress) have kept out of your context. For each rule: ' +
-      'how many events it hid, how much text they held, when the first and last arrived, which servers and event types ' +
+      'how many events it hid, how much text they held, when the first and last were stored, which servers and event types ' +
       'they came from, and the newest few with a short preview. It reads the stored events themselves, so it counts ' +
       'every one since the rule was added, across restarts, on the branch your memory is on. A rule you removed still ' +
       'shows what it hid, with inForce: false.',
@@ -13314,7 +13314,7 @@ export class AgentFramework {
       properties: {
         rule: { type: 'string', description: 'Only this rule.' },
         recent: { type: 'number', description: `How many of each rule's newest hidden events to show, with a preview (0 to ${MAX_RECENT}; default 3).` },
-        since: { type: 'string', description: 'Only events that arrived at or after this time (ISO 8601, e.g. "2026-11-02T00:00:00Z").' },
+        since: { type: 'string', description: 'Only events stored at or after this time (ISO 8601, e.g. "2026-11-02T00:00:00Z").' },
       },
     },
   };
@@ -13323,7 +13323,7 @@ export class AgentFramework {
   private static readonly DUMP_SUPPRESSED_TOOL: import('./types/index.js').ToolDefinition = {
     name: 'dump_suppressed',
     description:
-      'Write the events your suppress rules hid to a file in your workspace, whole, to read them or keep them: ' +
+      'Write the events your suppress rules hid to a file in your workspace, their text in full and any other block named, to read them or keep them: ' +
       'one rule\'s or every rule\'s, over the time you choose. As a transcript ("text", the default) or one JSON ' +
       'object a line ("jsonl"). Without path, it goes to suppressed/<rule or all>-<time> in your first writable ' +
       `mount. A file holds at most ${Math.round(DUMP_MAX_BYTES / 1024 / 1024)} MB: past that, the newest events ` +
@@ -13333,8 +13333,8 @@ export class AgentFramework {
       properties: {
         path: { type: 'string', description: 'Where to write it, mount-prefixed (e.g. "notes/hidden-events.txt"). An existing file is replaced.' },
         rule: { type: 'string', description: 'Only this rule\'s events.' },
-        since: { type: 'string', description: 'Only events that arrived at or after this time (ISO 8601).' },
-        until: { type: 'string', description: 'Only events that arrived before this time (ISO 8601).' },
+        since: { type: 'string', description: 'Only events stored at or after this time (ISO 8601).' },
+        until: { type: 'string', description: 'Only events stored before this time (ISO 8601).' },
         format: { type: 'string', enum: ['text', 'jsonl'], description: '"text" (default) or "jsonl".' },
       },
     },
@@ -17387,18 +17387,35 @@ export class AgentFramework {
     // never is, nor a tool's call or result. An MCPL event was decided at
     // admission, where its own row was written, and its modules' responses
     // read that decision.
-    const suppressible = ((response.addMessages?.length ?? 0) > 0 || !!response.requestInference) && !surface && !localInput
+    // A response that only wakes agents it names has nothing to hide, and that
+    // wake is an ask of its own (a subagent's, an API call's): it isn't decided.
+    const suppressible = ((response.addMessages?.length ?? 0) > 0 || response.requestInference === true) && !surface && !localInput
       && event.type !== 'tool-call' && event.type !== 'tool-result';
     let suppressedRule: string | null = null;
     if (suppressible) {
       const decided = this.eventSuppression.get(event);
       if (decided !== undefined) suppressedRule = decided;
       else if (!event.type.startsWith('mcpl:')) {
-        suppressedRule = this.suppressionFor({ ...extractGateFields(event), eventType: event.type, serverId: source, channelId: namesChannel ? String(eventChannel) : '' });
+        // The event's tags too, which the addressed exemption reads. (The wake
+        // gate below isn't given them: its rules have never matched a module
+        // event's tags, and that isn't changed here.)
+        const eventTags = (event as { tags?: unknown }).tags;
+        suppressedRule = this.suppressionFor({
+          ...extractGateFields(event), eventType: event.type, serverId: source, channelId: namesChannel ? String(eventChannel) : '',
+          ...(Array.isArray(eventTags) ? { tags: eventTags.filter((t): t is string => typeof t === 'string') } : {}),
+        });
         this.eventSuppression.set(event, suppressedRule);
       }
     }
-    const suppressionAsked = suppressible && !event.type.startsWith('mcpl:') && !!this.eventGate && this.viewHidesSuppressed(this.deliveryAgent());
+    // What the gate is told when it's asked about the wake: suppression has
+    // had its say wherever a view could hide the row, so a suppress rule
+    // decides no wake here, for an event it let by or for one it never takes
+    // (console and API input, a wake that names its agent). Where no view could
+    // hide it, the rule defers, as its behavior says.
+    const suppressionAsked = !!this.eventGate && this.viewHidesSuppressed(this.deliveryAgent());
+    // Where a suppressed row came from: an MCPL event names its server, not a source.
+    const eventServer = (event as { serverId?: unknown }).serverId;
+    const stampSource = typeof eventServer === 'string' && eventServer !== '' ? eventServer : source;
     let added: { agent?: string; deferredId?: string; messageId?: string } | undefined;
     if (response.addMessages) {
       for (const [i, msg] of response.addMessages.entries()) {
@@ -17411,12 +17428,12 @@ export class AgentFramework {
         if (surface) metadata = { ...metadata, [INBOUND_SOURCE_KEY]: surface };
         const placement: { agent?: string; deferredId?: string; messageId?: string } = {};
         const id = this.addMessage(msg.participant, localInput ? markNoticeOpenings(msg.content) : msg.content, metadata, {
-          placement, ...(suppressedRule !== null ? { suppressedBy: { rule: suppressedRule, eventType: event.type, source } } : {}),
+          placement, ...(suppressedRule !== null ? { suppressedBy: { rule: suppressedRule, eventType: event.type, source: stampSource } } : {}),
         });
         if (response.addMessages.length === 1 && !surface && !namesChannel && metadata?.channelId === undefined) added = placement;
         this.emitTrace({ type: 'message:added', messageId: id, source: event.type });
         if (suppressedRule !== null) {
-          this.noteSuppressedWrite(suppressedRule, { eventType: event.type, serverId: source, channelId: namesChannel ? String(eventChannel) : '' });
+          this.noteSuppressedWrite(suppressedRule, { eventType: event.type, serverId: stampSource, channelId: namesChannel ? String(eventChannel) : '' });
         }
       }
     }
@@ -17488,57 +17505,13 @@ export class AgentFramework {
   /** Each event's suppression, decided once: by its MCPL lane at admission, or by the first module response that adds messages or asks for a wake (applyProcessResponse). */
   private readonly eventSuppression = new WeakMap<object, string | null>();
   /**
-   * Coalesced pushes (RFC-006): each occurrence is decided once, at its wake
-   * (queueCoalescedWakes), and its batch's row reads the decision of the
-   * batch's latest decided occurrence when it's written: a batch's wake is
-   * its latest occurrence's (a new one cancels the earlier ones' wakes), so
-   * its row follows the same decision, and is never shown with no wake for
-   * it, nor hidden from a turn woken for it. `coalescedOccurrences` keeps each occurrence's own decision, by
-   * `${serverId}\u0000${eventId}`, so a later wake for it (one to read a row
-   * queued behind a turn, one after a hold) reads it instead of asking a
-   * rule's script again. Both are bounded; an entry lost to the bound, or to a
-   * restart, is decided again.
+   * The coalesced subjects whose pending batch holds an occurrence addressed
+   * to the agent. A batch's row follows its latest occurrence's decision, and
+   * an addressed event is never suppressed, so a later occurrence in such a
+   * batch isn't asked: the batch is shown. Cleared when a row is written for
+   * the subject, which consumes the batch.
    */
-  private readonly coalescedBatches = new Map<string, string | null>();
-  private readonly coalescedOccurrences = new Map<string, string | null>();
-
-  private static boundedSet(map: Map<string, string | null>, key: string, value: string | null): void {
-    map.delete(key);
-    map.set(key, value);
-    if (map.size > 10_000) map.delete(map.keys().next().value!);
-  }
-
-  /** An occurrence's decision at its wake, kept for it and as its batch's latest. */
-  private rememberCoalescedSuppression(subject: string, serverId: string, eventId: string | undefined, rule: string | null): void {
-    if (eventId) AgentFramework.boundedSet(this.coalescedOccurrences, `${serverId}\u0000${eventId}`, rule);
-    AgentFramework.boundedSet(this.coalescedBatches, subject, rule);
-  }
-
-  /** An occurrence's decision made earlier, for a later wake of the same occurrence; none when it was never decided. */
-  private coalescedOccurrenceDecision(serverId: string, eventId: string | undefined): { decided?: string | null } {
-    const key = eventId ? `${serverId}\u0000${eventId}` : undefined;
-    return key !== undefined && this.coalescedOccurrences.has(key) ? { decided: this.coalescedOccurrences.get(key)! } : {};
-  }
-
-  /**
-   * The decision a coalesced batch's row is written under (admitInbound's
-   * `decided`): its latest decided occurrence's, taken, since the row
-   * consumes the batch; else the occurrence's own; none when nothing was
-   * decided for it.
-   */
-  private coalescedDecision(subject: string, serverId: string, eventId: string | undefined): { decided?: string | null } {
-    if (this.coalescedBatches.has(subject)) {
-      const decided = this.coalescedBatches.get(subject)!;
-      this.coalescedBatches.delete(subject);
-      return { decided };
-    }
-    return this.coalescedOccurrenceDecision(serverId, eventId);
-  }
-
-  /** The decision a coalesced row was written under, kept for its occurrence's later wakes. */
-  private noteCoalescedRow(serverId: string, eventId: string | undefined, rule: string | null): void {
-    if (eventId) AgentFramework.boundedSet(this.coalescedOccurrences, `${serverId}\u0000${eventId}`, rule);
-  }
+  private readonly coalescedAddressed = new Set<string>();
 
   /** The servers and keys whose drop withoutHostKeys has logged, each as
    *  `${serverId}\u0000${key}`. */
@@ -17605,6 +17578,8 @@ export class AgentFramework {
     targetAgents?: string[];
     /** RFC-006: set when the coalescer delivers; rides the wake it queues. */
     coalescingSubject?: string;
+    /** The occurrence's suppression, when its wake decided it (CoalescedOccurrence.suppressionDecision). */
+    suppressionDecision?: string | null;
     eventId?: string;
     assemblingFor?: string;
     deliverTo?: string;
@@ -17711,10 +17686,10 @@ export class AgentFramework {
         author: event.author,
         ...(event.tags ? { tags: event.tags } : {}),
       },
-    }, { suppressible: !this.conversationRouter, ...(event.coalescingSubject ? this.coalescedDecision(event.coalescingSubject, event.serverId, event.eventId) : {}) });
+    }, { suppressible: !this.conversationRouter, ...(event.suppressionDecision !== undefined ? { decided: event.suppressionDecision } : {}) });
     // Modules answering this event read the same decision (applyProcessResponse).
     this.eventSuppression.set(event, decision.suppressed?.rule ?? null);
-    if (event.coalescingSubject) this.noteCoalescedRow(event.serverId, event.eventId, decision.suppressed?.rule ?? null);
+    if (event.coalescingSubject) this.coalescedAddressed.delete(event.coalescingSubject);
     metadata.triggered = decision.wake;
     if (decision.held) {
       // The admission record rides the message; the hold's own bookkeeping
@@ -19153,6 +19128,13 @@ export class AgentFramework {
     const coalescingSubject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
     const narrowing = occ.deliverTo ? { deliverTo: occ.deliverTo } : {};
     const firstViewMark = occ.firstView ? { firstView: true } : {};
+    // The occurrence's suppression, when its wake decided it; its row reads
+    // that, and a row that decides keeps its answer for the occurrence's later wakes.
+    const decided = occ.suppressionDecision !== undefined ? { suppressionDecision: occ.suppressionDecision } : {};
+    const keepDecision = (event: object): void => {
+      const rule = this.eventSuppression.get(event);
+      if (rule !== undefined) occ.suppressionDecision = rule;
+    };
     // The envelope frozen at acceptance travels unchanged; this delivery only
     // adds the fact that it carries the rendered body.
     const frozenSource = (source: InboundSource | undefined): { inboundSource?: InboundSource } =>
@@ -19160,8 +19142,9 @@ export class AgentFramework {
         ? { inboundSource: materialized && source.kind !== 'surface' ? { ...source, materialized: true } : source }
         : {};
     if (occ.event.lane === 'channel') {
-      const event = { ...occ.event.event, coalescingSubject, ...narrowing, ...firstViewMark, ...(assemblingFor ? { assemblingFor } : {}) };
+      const event = { ...occ.event.event, coalescingSubject, ...narrowing, ...firstViewMark, ...decided, ...(assemblingFor ? { assemblingFor } : {}) };
       const placement = await this.handleMcplChannelIncoming(event);
+      keepDecision(event);
       await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
       return placement;
     }
@@ -19191,10 +19174,12 @@ export class AgentFramework {
         eventId: occ.eventId,
         ...narrowing,
         ...firstViewMark,
+        ...decided,
         ...(assemblingFor ? { assemblingFor } : {}),
         ...frozenSource(push.inboundSource),
       };
       const placement = await this.handleMcplChannelIncoming(event);
+      keepDecision(event);
       await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
       return placement;
     }
@@ -19209,9 +19194,11 @@ export class AgentFramework {
       ...(assemblingFor ? { assemblingFor, triggerInference: false } : {}),
       ...(occ.deliverTo ? { targetAgents: [occ.deliverTo] } : {}),
       ...firstViewMark,
+      ...decided,
       ...frozenSource(occ.event.event.inboundSource),
     };
     const placement = this.handleMcplPushEvent(event);
+    keepDecision(event);
     await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
     return placement;
   }
@@ -19238,11 +19225,17 @@ export class AgentFramework {
     // A deferred batch is admitted when it asks for its wake: the hold and
     // the gate decide now; its materialized delivery at assembly is vetoed
     // (`triggerInference: false`) and so is not shown to the gate again.
-    // Decided once per occurrence: a later wake for it reads that decision.
-    const remembered = this.coalescedOccurrenceDecision(occ.serverId, occ.eventId);
     // A channel-scoped push under conversation routing may go to a fork's own
     // store, which has no view filter, as the channel lane says; it isn't asked.
     const suppressible = !(occ.scope.kind === 'channel' && this.conversationRouter);
+    // Decided once per occurrence: a later wake for it reads that decision. A
+    // batch holding an addressed occurrence is shown, whatever comes after it
+    // (coalescedAddressed), and its row follows its latest occurrence's decision.
+    if (isAddressedMessage(occ.tags)) this.coalescedAddressed.add(subject);
+    const pinned = this.coalescedAddressed.has(subject);
+    const remembered = occ.suppressionDecision !== undefined
+      ? { decided: occ.suppressionDecision }
+      : pinned ? { decided: null } : {};
     const decision = this.admitInbound({
       lane: 'push',
       serverId: occ.serverId,
@@ -19266,11 +19259,10 @@ export class AgentFramework {
         ...(occ.tags ? { tags: occ.tags } : {}),
       },
     }, { suppressible, ...remembered });
-    // Its batch's row, written later, reads this decision (coalescedDecision),
-    // since a rule's script answers once per event.
-    if (suppressible && remembered.decided === undefined) {
-      this.rememberCoalescedSuppression(subject, occ.serverId, occ.eventId, decision.suppressed?.rule ?? null);
-    }
+    // Its batch's row, written later, reads this decision, since a rule's
+    // script answers once per event. (A copy of the occurrence, as a wake to
+    // read a row has, was decided before it was copied.)
+    if (suppressible) occ.suppressionDecision = decision.suppressed?.rule ?? null;
     // A suppressed batch wakes nobody, so no turn's assembly would store it;
     // it's stored now, stamped, and consumed, as a held batch is.
     if (decision.suppressed && !plain && this.pushCoalescer) {
@@ -19599,10 +19591,10 @@ export class AgentFramework {
         eventType: 'mcpl:push-event',
         ...(event.tags ? { tags: event.tags } : {}),
       },
-    }, event.coalescingSubject ? this.coalescedDecision(event.coalescingSubject, event.serverId, event.eventId) : {});
+    }, event.suppressionDecision !== undefined ? { decided: event.suppressionDecision } : {});
     // Modules answering this event read the same decision (applyProcessResponse).
     this.eventSuppression.set(event, decision.suppressed?.rule ?? null);
-    if (event.coalescingSubject) this.noteCoalescedRow(event.serverId, event.eventId, decision.suppressed?.rule ?? null);
+    if (event.coalescingSubject) this.coalescedAddressed.delete(event.coalescingSubject);
     metadata.triggered = decision.wake;
     if (decision.held && triggerChannel) {
       metadata.tuneOut = { epochId: decision.held.epochId };
@@ -38997,9 +38989,10 @@ export class AgentFramework {
       const counted = new Map<string, number>();
       for (const r of records.slice(dump.omitted)) counted.set(r.rule, (counted.get(r.rule) ?? 0) + 1);
       const byRule = Object.fromEntries(counted);
-      // Written on the branch the rows were read from, or not at all.
-      const branch = reader?.getContextManager().currentBranch().name;
-      const result = await workspace.writeBinary(path, Buffer.from(dump.content, 'utf8'), 'text/plain', { agentName, ...(branch ? { branch } : {}) });
+      // Written on the branch the store is on now, or not at all, which is the
+      // branch the workspace checks (a derived agent's rows may be on its own).
+      const branch = this.store.currentBranch().name;
+      const result = await workspace.writeBinary(path, Buffer.from(dump.content, 'utf8'), 'text/plain', { agentName, branch });
       const storeOnly = !result.success && (result.data as { inChronicle?: boolean } | undefined)?.inChronicle === true;
       if (!result.success && !storeOnly) {
         refuse(`writing ${path} failed: ${result.error ?? 'the workspace gave no reason'}. Nothing was written.`);
@@ -39009,7 +39002,7 @@ export class AgentFramework {
         success: true,
         data: {
           path,
-          ...(storeOnly ? { diskNote: `${path} is in the workspace, where its tools read it, but its copy on disk failed: ${result.error ?? 'no reason given'}.` } : {}),
+          ...(storeOnly ? { diskNote: `${path} is in the workspace, where its tools read it, but the rest of its write failed: ${result.error ?? 'no reason given'}.` } : {}),
           written: dump.written,
           ...(dump.omitted > 0 ? { omitted: dump.omitted, note: `The ${dump.omitted} oldest events didn't fit in ${Math.round(DUMP_MAX_BYTES / 1024 / 1024)} MB; give since, until or rule for the rest.` } : {}),
           bytes: Buffer.byteLength(dump.content),

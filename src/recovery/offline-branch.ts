@@ -1,3 +1,4 @@
+import { suppressionRecordOf } from '../gate/suppression-stats.js';
 import { JsStore } from '@animalabs/chronicle';
 import type { SurgeryMarkerReceipt } from '../operator-log.js';
 import { ContextManager, continuesBody, type BodyShard } from '@animalabs/context-manager';
@@ -25,6 +26,14 @@ export interface OfflineRecoveryBranchOptions {
   contextId?: string;
   /** Backward-compatible alternative: remove the newest N context entries. */
   messages?: number;
+  /**
+   * Remove every row a suppress rule hid (`metadata.suppressed`) on the new
+   * branch, which needs no anchor: the branch then starts from the newest row.
+   * For rolling back to a release that doesn't read the stamp, where a row
+   * hidden between messages a summary covers makes that summary non-contiguous,
+   * and the store is refused at open. The source branch keeps them.
+   */
+  removeSuppressed?: boolean;
   /** Exact Discord messages to suppress on the new branch. */
   suppressMessageIds?: string[];
   /** Inclusive context-order ranges between Discord message endpoints. */
@@ -88,7 +97,7 @@ export async function createOfflineRecoveryBranch(
   const anchorCount = Number(!!options.messageId)
     + Number(!!options.contextId)
     + Number(options.messages !== undefined);
-  if (anchorCount !== 1) {
+  if (anchorCount !== 1 && !(anchorCount === 0 && options.removeSuppressed === true)) {
     throw new Error('Specify exactly one of messageId, contextId, or messages');
   }
   const count = options.messages === undefined ? undefined : Math.floor(options.messages);
@@ -148,17 +157,19 @@ export async function createOfflineRecoveryBranch(
     } else {
       // Count mode remains for compatibility. Read only the target plus suffix,
       // avoiding full-history materialization and attachment blob inflation.
-      const window = contextManager.getMessageWindow(total - count! - 1, count! + 1, {
+      // With no anchor (removeSuppressed alone), the target is the newest row.
+      const dropping = count ?? 0;
+      const window = contextManager.getMessageWindow(total - dropping - 1, dropping + 1, {
         resolveBlobs: false,
       }).messages;
       const countTarget = window[0];
       const discarded = window.slice(1);
-      if (!countTarget || discarded.length !== count) {
+      if (!countTarget || discarded.length !== dropping) {
         throw new Error('Could not read the requested recovery window from Chronicle');
       }
       target = countTarget;
-      targetIndex = total - count! - 1;
-      removedCount = count!;
+      targetIndex = total - dropping - 1;
+      removedCount = dropping;
       carriers = discarded.map(addressingOnly);
     }
 
@@ -169,6 +180,7 @@ export async function createOfflineRecoveryBranch(
       targetIndex,
       options.suppressMessageIds ?? [],
       options.suppressRanges ?? [],
+      options.removeSuppressed === true,
     );
     validateRemovalIntegrity(
       contextManager,
@@ -504,6 +516,7 @@ function buildSuppressionPlan(
   targetIndex: number,
   rawMessageIds: string[],
   rawRanges: Array<{ fromMessageId: string; toMessageId: string }>,
+  removeSuppressed = false,
 ): { intervals: SuppressionInterval[]; carriers: DiscordMessageMetadataCarrier[]; messageCount: number } {
   const messageIds = rawMessageIds.map(normalizeDiscordMessageId);
   const ranges = rawRanges.map((range) => ({
@@ -514,7 +527,8 @@ function buildSuppressionPlan(
     ...messageIds,
     ...ranges.flatMap((range) => [range.fromMessageId, range.toMessageId]),
   ]);
-  if (wanted.size === 0) return { intervals: [], carriers: [], messageCount: 0 };
+  if (wanted.size === 0 && !removeSuppressed) return { intervals: [], carriers: [], messageCount: 0 };
+  const stamped: SuppressionInterval[] = [];
 
   const locations = new Map<string, MessageLocation>();
   for (let offset = 0; offset <= targetIndex; offset += RECOVERY_SCAN_WINDOW) {
@@ -524,6 +538,9 @@ function buildSuppressionPlan(
       { resolveBlobs: false },
     ).messages;
     for (let i = 0; i < messages.length; i++) {
+      if (removeSuppressed && suppressionRecordOf(messages[i].metadata as Record<string, unknown> | undefined)) {
+        stamped.push({ start: offset + i, end: offset + i, fromId: messages[i].id, toId: messages[i].id });
+      }
       const externalId = String(messages[i].metadata?.messageId ?? '');
       if (!wanted.has(externalId)) continue;
       const index = offset + i;
@@ -565,7 +582,7 @@ function buildSuppressionPlan(
     }
   }
 
-  const intervals: SuppressionInterval[] = [];
+  const intervals: SuppressionInterval[] = [...stamped];
   for (const id of messageIds) {
     const location = locations.get(id)!;
     intervals.push(...location.runs.map((run) => ({ ...run })));

@@ -19,8 +19,8 @@
  * events still to be reviewed begin, so the next review takes them again; and
  * each rule's description as last seen (the framework tells the review when a
  * rule hides a row), so the events a rule hid before it was removed are still
- * judged against it. The review reads a sample of each rule's events, each
- * cut short, not every event whole.
+ * judged against it. The review reads a sample of each rule's events, sharing
+ * a fixed budget of text among them (EVENT_TEXT_BUDGET), not every event whole.
  * The reviewer reads; it never decides what's suppressed and never edits a
  * rule. The notice is the framework's own and is never suppressed.
  */
@@ -42,8 +42,15 @@ const MAX_REVIEW_EVENTS = 200;
 const DEFAULT_REVIEW_TIMEOUT_MS = 60_000;
 /** How long after a start the first review may run, at the soonest: the host settles first. */
 const FIRST_REVIEW_DELAY_MS = 60_000;
-/** Characters of each event's text the reviewer reads. */
-const EVENT_TEXT_CHARS = 400;
+/**
+ * Characters of event text the reviewer reads for one rule, shared among its
+ * sample: a short event takes what it needs and a long one the rest
+ * (eventTextCap), so what makes a long message matter past its start is
+ * read. Chosen, not measured: with the default sample it keeps one rule's
+ * request to roughly 8,000 input tokens, which a review every two hours can
+ * afford.
+ */
+export const EVENT_TEXT_BUDGET = 24_000;
 /** Characters of a rule's script the reviewer reads. */
 const SCRIPT_CHARS = 3_000;
 /** Characters of a flagged event's text the notice shows. */
@@ -136,7 +143,11 @@ function readState(path: string): ReviewState | null {
     for (const [name, ms] of entriesOf(raw.retryFrom)) if (typeof ms === 'number' && Number.isFinite(ms)) retryFrom.set(name, ms);
     return { version: 1, reviewedThrough: raw.reviewedThrough, retryFrom, descriptions };
   } catch (error) {
-    console.error(`[gate] the suppression review's progress in ${path} can't be read, so it reviews from now on:`, error);
+    // Moved aside, so the review's first save doesn't write over a file a later release wrote.
+    const aside = `${path}.unreadable`;
+    let moved = '';
+    try { renameSync(path, aside); moved = ` It's kept as ${aside}.`; } catch { /* the log says what was read */ }
+    console.error(`[gate] the suppression review's progress in ${path} can't be read, so it reviews from now on.${moved}`, error);
     return null;
   }
 }
@@ -184,6 +195,22 @@ const REVIEW_SYSTEM = [
   '{"fits": <true when you flag nothing>, "flagged": [<the numbers of the flagged events>], "note": "<one short sentence>"}',
 ].join('\n');
 
+/**
+ * The most characters any event may take so that the sample fits `budget`:
+ * every event shorter than it is read whole, and the budget they leave is
+ * shared among the rest.
+ */
+export function eventTextCap(lengths: readonly number[], budget: number): number {
+  const sorted = [...lengths].sort((a, b) => a - b);
+  let left = budget;
+  for (let i = 0; i < sorted.length; i++) {
+    const share = Math.floor(left / (sorted.length - i));
+    if (sorted[i]! > share) return share;
+    left -= sorted[i]!;
+  }
+  return Number.POSITIVE_INFINITY;
+}
+
 /** The reviewer's request for one rule's events. */
 export function reviewRequest(
   rule: { name: string; description: string; match?: unknown; script?: string },
@@ -195,8 +222,10 @@ export function reviewRequest(
   const script = rule.script !== undefined
     ? `Of the events it matches, it hides those this script of the agent's returns true for (state is the rule's own memory between events):\n${cut(rule.script, SCRIPT_CHARS)}\n`
     : '';
+  const texts = events.map((e) => oneLine(e.text));
+  const cap = eventTextCap(texts.map((t) => [...t].length), EVENT_TEXT_BUDGET);
   const listing = events.map((e, i) =>
-    `#${i + 1} [${e.at}] ${e.eventType}${e.source ? ` · ${e.source}` : ''}${e.channel ? ` · ${e.channel}` : ''}${e.author ? ` · ${e.author}` : ''}: ${cut(oneLine(e.text), EVENT_TEXT_CHARS)}`,
+    `#${i + 1} [${e.at}] ${e.eventType}${e.source ? ` · ${e.source}` : ''}${e.channel ? ` · ${e.channel}` : ''}${e.author ? ` · ${e.author}` : ''}: ${cut(texts[i]!, cap)}`,
   ).join('\n');
   const text = [
     `The agent's rule ${JSON.stringify(rule.name)} hides events from its context. The agent described it as:`,
@@ -263,7 +292,7 @@ export function reviewNoticeText(summary: SuppressionReviewSummary, opts: { dump
     if (r.verdict === 'fits') said = `The reviewer ${read} and found they fit.`;
     else if (r.verdict === 'flagged') said = `The reviewer ${read} and flagged ${r.flagged.length}${r.note ? `: ${r.note}` : '.'}`;
     else if (r.verdict === 'unjudged') said = 'There was no description to judge them against.';
-    else said = "The reviewer couldn't answer this time; they'll be reviewed again next time.";
+    else said = "The reviewer couldn't answer this time; they'll be reviewed again next time, as far back as a week.";
     lines.push(`- ${named} hid ${r.suppressed}. ${said}`);
     // The flagged events, each cut short: the first few, and how many more.
     for (const e of r.flagged.slice(0, NOTICE_FLAGGED_SHOWN)) {

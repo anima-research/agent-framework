@@ -2150,7 +2150,7 @@ test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its
   // Each of the description's examples, made as the call it shows, is saved as it reads.
   const examples = [...description.matchAll(/`(\{ name: "[^`]+\})`/g)]
     .map((m) => new Function(`return (${m[1]});`)() as Record<string, unknown>);
-  assert.deepEqual(examples.map((e) => e.name), ['watch-notes', 'watch-cairn', 'hide-eye-flaps', 'ambient-judged']);
+  assert.deepEqual(examples.map((e) => e.name), ['watch-notes', 'watch-cairn', 'hide-tool-flaps', 'ambient-judged']);
   for (const example of examples) {
     const result = await call(example);
     assert.equal(result.isError, false, result.content);
@@ -2160,7 +2160,7 @@ test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its
     { name: 'watch-notes', match: { scope: ['workspace:modified'], mount: 'project', pathGlob: 'notes/*.md' }, behavior: 'always' },
     { name: 'watch-cairn', match: { source: 'discord', channel: 'discord:*:12345', tagsAny: ['chat:ambient'] }, behavior: { debounce: 60000 } },
     // A suppress rule given no behavior is saved with "defer" written out.
-    { name: 'hide-eye-flaps', match: { source: 'body', scope: ['mcpl:tool-changes'] }, behavior: 'defer', suppress: { description: 'the eye going on and off' } },
+    { name: 'hide-tool-flaps', match: { source: 'body', scope: ['mcpl:tool-changes'] }, behavior: 'defer', suppress: { description: "the body's tools coming and going" } },
     {
       name: 'ambient-judged',
       match: { tagsAny: ['chat:ambient'] },
