@@ -23028,6 +23028,15 @@ export class AgentFramework {
           console.error(`[surgery] a write held while the store was held couldn't be stored at its release, so it is lost:`, error);
         }
         const agentName = target?.name ?? write.direct?.agentName ?? write.opts?.forAgent ?? 'the primary';
+        // Traced at once, by the address the write gave it, for the module
+        // that wrote it: its record of the write ends here (the Discord
+        // module's of a create with no row).
+        const external = write.metadata?.external as { source?: unknown; id?: unknown } | undefined;
+        this.emitTrace({
+          type: 'message:lost', source: 'surgery-release', agentName,
+          ...(typeof external?.source === 'string' && typeof external.id === 'string' ? { external: { source: external.source, id: external.id } } : {}),
+          ...(unknown ? { mayBeStored: true as const } : {}),
+        });
         const entry = lost.get(agentName) ?? { writes: [], unknown: [], reason: thrownText(error) };
         entry.writes.push(write);
         if (unknown) entry.unknown.push(unknown);
