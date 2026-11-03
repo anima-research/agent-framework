@@ -109,7 +109,8 @@ describe("a cancel that waits for the held writes says so to its caller", () => 
       assert.equal(result.success, false);
       assert.ok(coordinator.getAllExcept(), 'premise: the hold is still in force');
       assert.doesNotMatch(result.error ?? '', /ended all the same|was delivered/, result.error);
-      assert.match(result.error ?? '', /The focus on it ends once an operator's change to the store is over, or a context that refuses writes is re-initialized by the host/, result.error);
+      assert.match(result.error ?? '', /The close cancels the all-except hold that excepts it\. Not cancelled yet: /, result.error);
+      saysWhatItWaitsFor(result.error ?? '');
       assert.doesNotMatch(result.error ?? '', /Nothing you can do/, result.error);
       again();
       assert.equal(coordinator.getAllExcept(), null, 'ended at the release');
@@ -135,8 +136,9 @@ describe("a cancel that waits for the held writes says so to its caller", () => 
       const data = (result.data ?? {}) as { status?: string; note?: string };
       assert.equal(data.status, already ? 'already closed' : 'closed');
       assert.ok(coordinator.getAllExcept(), 'premise: the hold is still in force');
-      assert.match(data.note ?? '', /The focus on it ends once an operator's change to the store is over, or a context that refuses writes is re-initialized by the host/,
-        `the answer says the focus waits, not only that the channel is closed: ${JSON.stringify(data)}`);
+      assert.match(data.note ?? '', /^The close cancels the all-except hold that excepts it\. Not cancelled yet: /,
+        `the answer says the hold's end waits, not only that the channel is closed: ${JSON.stringify(data)}`);
+      saysWhatItWaitsFor(data.note ?? '');
       assert.doesNotMatch(data.note ?? '', /ended|was delivered/, data.note);
       again();
       assert.equal(coordinator.getAllExcept(), null, 'ended at the release');
