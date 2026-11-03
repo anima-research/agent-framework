@@ -2495,6 +2495,38 @@ describe('a round whose run or wait call watches a script that can change its ro
     }
   });
 
+  it("a script a channel turn started, left running past that turn, publishes a channel_publish that names no channel while a private turn's wait watches it, judged by its start turn", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([scriptCall({
+        code: 'await tools["test--slow"]({}); let note; try { await tools.channel_publish({ content: "from the script" }); note = "posted"; } catch (e) { note = String(e && e.message); } await tools["test--echo"]({ note });' + HOLDS,
+        yield_time_ms: 100,
+      })] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'watching' }] as ContentBlock[]),
+    ], {}, { channelPublish: true, serveWakes: true });
+    try {
+      h.framework.pushEvent(surface('world:test'));
+      await h.framework.runUntilIdle();
+      assert.equal(h.framework.getHostModeStatus().backgroundScripts, 1, 'control: the script was left running');
+      h.membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'checking' },
+        scriptCall({ action: 'wait', script_id: 's1-test' }, 'ce2'),
+      ] as ContentBlock[], 'tool_use'));
+      h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]));
+      let watcherPrivate: boolean | undefined;
+      stepWatches(h.framework, [{ onWatch: () => {
+        watcherPrivate = (h.framework as unknown as { turnRouting: Map<string, { nonChannelOrigin?: boolean }> }).turnRouting.get('assistant')?.nonChannelOrigin === true;
+        h.module.releaseSlow();
+      } }]);
+      h.framework.pushEvent(surface());
+      await h.framework.runUntilIdle();
+      assert.equal(watcherPrivate, true, 'premise: the turn whose wait watches the script is private');
+      assert.equal(scriptNote(h), 'note:posted');
+      assert.ok(h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
+    } finally {
+      await h.done();
+    }
+  });
+
   it("a script's channel_publish that names its channel goes there, in a private turn too", async () => {
     const h = await scriptRound('locus', [
       createMockResponse([scriptCall({ code: publishing('{ channelId: "world:test", content: "from the script" }'), yield_time_ms: 30_000 })] as ContentBlock[], 'tool_use'),

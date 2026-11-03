@@ -349,11 +349,14 @@ describe('Turn trigger provenance', () => {
     assert.equal(handed.at(-1)?.counterparty, 'discord:user:bob');
     await framework.stop();
   });
-  for (const mark of ['retake', 'own', 'kept plain', 'kept private wake', 'none'] as const) {
+  for (const mark of ['private turn', 'retake', 'own', 'withdrawn', 'kept plain', 'private wake', 'kept private wake', 'none'] as const) {
     it(`a held merged start ${{
+      'private turn': "that takes in an equal request continuing a private turn gives each of its requests that turn at the dedup, and starts private once the hold's release judges its batch again",
       retake: "that takes in an equal retake gives each of its requests the retake at the dedup, and starts private over a history that holds a private surface's message",
       own: "whose request continues a private turn gives that turn to no other request, through a dedup or the hold's release",
+      withdrawn: "whose request continuing a private turn is withdrawn as a coalesced wake starts its other request in its channel, with none of the withdrawn one's turn",
       'kept plain': "taken in by an equal plain request the hold kept gives each of its requests the kept request's private turn, and starts private",
+      'private wake': "that takes in an equal private wake makes each of its requests a private wake, so withdrawing the request that made it private still starts it private",
       'kept private wake': "taken in by an equal private wake the hold kept makes each of its requests a private wake, so withdrawing the request that made it private still starts it private",
       none: "that takes in an equal request with no mark makes no request private, and starts in its channel once the hold releases it, over a history that holds a private surface's message, as on main",
     }[mark]}`, async () => {
@@ -390,7 +393,7 @@ describe('Turn trigger provenance', () => {
       let fail!: (error: Error) => void;
       const auxiliary = i.withAuxiliaryAdmission('scout', () => new Promise<void>((_, reject) => { fail = reject; }), 'test-model').catch(() => {});
       const timer: Record<PropertyKey, unknown> = { agentName: 'scout', reason: 'timer', source: 'clock', timestamp: t - 3_000 };
-      const withdraws = mark === 'kept private wake';
+      const withdraws = mark === 'withdrawn' || mark === 'private wake' || mark === 'kept private wake';
       if (mark === 'own' || withdraws) timer[callerTurns] = [privateTurn];
       if (withdraws) timer.coalescingSubject = 'zz-subject';
       const room: Record<PropertyKey, unknown> = { agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: t - 1_000,
@@ -411,13 +414,17 @@ describe('Turn trigger provenance', () => {
       assert.ok(batchKey, 'premise: the hold keeps a merged start');
       const batch = (held as unknown as Record<symbol, unknown[]>)[batchKey!]!;
       assert.ok(batch.length === 2 && batch.includes(timer) && batch.includes(room), 'premise: its batch is the two requests pushed');
-      if (mark === 'retake' || mark === 'own' || mark === 'none') {
+      if (mark === 'private turn' || mark === 'retake' || mark === 'own' || mark === 'private wake' || mark === 'none') {
         const duplicate: Record<PropertyKey, unknown> = Object.fromEntries(Object.entries(held));
         if (mark === 'retake') duplicate[retake] = true;
+        if (mark === 'private turn') duplicate[callerTurns] = [privateTurn];
+        if (mark === 'private wake') assert.equal(duplicate.nonChannelOrigin, true, 'premise: the equal request is a private wake, as the private start is');
         i.pendingRequests.push(duplicate as unknown as InferenceRequest);
         await i.processInferenceRequests();
         assert.equal(hold.heldRequests.length, 1, 'premise: the hold kept one request for both');
         if (mark === 'retake') assert.deepEqual([timer[retake], room[retake]], [true, true], 'at the dedup, each request takes the retake');
+        else if (mark === 'private turn') assert.deepEqual([timer[callerTurns], room[callerTurns]], [[privateTurn], [privateTurn]], 'at the dedup, each request takes the turn');
+        else if (mark === 'private wake') assert.deepEqual([timer.nonChannelOrigin, room.nonChannelOrigin], [true, true], 'at the dedup, each request becomes a private wake');
         else if (mark === 'own') assert.equal(room[callerTurns], undefined, "the dedup gives no request another request's own turn");
         else assert.deepEqual([timer.nonChannelOrigin, room.nonChannelOrigin], [undefined, undefined], 'the dedup makes no request a private wake');
       }
@@ -449,7 +456,7 @@ describe('Turn trigger provenance', () => {
       await framework.runUntilIdle();
       const start = handed.at(-1);
       const routing = i.turnRouting.get('scout');
-      if (mark === 'none') {
+      if (mark === 'none' || mark === 'withdrawn') {
         assert.notEqual(routing?.nonChannelOrigin, true, `the start isn't private: ${JSON.stringify(start)}`);
         assert.equal(start?.channelId, 'discord:g:bob-room', 'it starts in its channel');
       } else {
@@ -460,6 +467,7 @@ describe('Turn trigger provenance', () => {
         assert.deepEqual(timer[callerTurns], [privateTurn], 'the request keeps its own turn');
         assert.equal(room[callerTurns], undefined, 'and the other request takes none of it');
       }
+      if (mark === 'withdrawn') assert.equal(room[callerTurns], undefined, "the other request takes none of the withdrawn one's turn");
       await framework.stop();
     });
   }
@@ -2304,6 +2312,37 @@ describe('private wins, one way', () => {
         }
       } finally {
         rmSync(storeDir, { recursive: true, force: true });
+      }
+    });
+
+    it("a provider hold that takes in a request continuing a private turn, equal to a plain one it holds, keeps that turn on the one it keeps, and its turn speaks in no channel", async () => {
+      const rig = await surfaceRig();
+      try {
+        const internalsOf = rig.framework as unknown as {
+          providerAccelerationCooldowns: Map<string, Record<string, unknown>>;
+          releaseProviderAccelerationCooldown(agentName: string): void;
+          notePrivateTurn(turnId: number): void;
+          requestForTurn(agentName: string, reason: string, source: string, callerTurnId?: number): void;
+        };
+        const now = Date.now();
+        internalsOf.notePrivateTurn(9_999);
+        internalsOf.providerAccelerationCooldowns.set('scout', {
+          startedAt: now, until: now + 60_000, timer: setTimeout(() => {}, 60_000), heldRequests: [], reason: 'a test hold', failures: 1,
+        });
+        internalsOf.requestForTurn('scout', 'timer', 'clock', 9_999);
+        const caused = rig.i.pendingRequests.pop()! as { timestamp: number };
+        caused.timestamp = now;
+        rig.i.pendingRequests.push({ agentName: 'scout', reason: 'timer', source: 'clock', timestamp: now }, caused as never);
+        await rig.i.processInferenceRequests();
+        assert.equal((internalsOf.providerAccelerationCooldowns.get('scout')!.heldRequests as unknown[]).length, 1, 'premise: the hold kept one request for both');
+        internalsOf.providerAccelerationCooldowns.get('scout')!.until = Date.now();
+        internalsOf.releaseProviderAccelerationCooldown('scout');
+        await rig.until(() => rig.starts.length >= 1 && idle(rig), 'the released turn');
+        await rig.framework.runUntilIdle();
+        assert.ok(rig.texts().some((t) => t.startsWith('reply ')), `premise: the released turn spoke: ${JSON.stringify(rig.texts())}`);
+        assert.deepEqual(rig.routed, []);
+      } finally {
+        await rig.close();
       }
     });
 

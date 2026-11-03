@@ -68,5 +68,6 @@
     after a private one, its message arriving while the private turn was
     open included, unless its wake waited beside that turn's own
     continuation (a budget restart or a held retry that started alone, or
-    one that passed a quiesce in the same pass). What's private is the turn,
+    one that passed a quiesce in the same pass), or names as its cause one of
+    the two kinds of turn id the framework can't place. What's private is the turn,
     not the operator's words: that later turn's context still holds them.

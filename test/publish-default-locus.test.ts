@@ -98,9 +98,14 @@ describe('channel_publish without channelId', () => {
     } finally { await f.close(); }
   });
 
-  for (const [named, names] of [[true, false], [false, false], [true, true]] as const) {
-    it(`a host's call carrying an open private turn's id${named ? '' : ', naming no agent,'} ${names ? 'and naming its channel posts there' : "meets the private turn's rule: refused, though a focus holds another channel"}`, async () => {
-      const f = await fixture({ framework: { tuneOut: { enabled: true } } as never });
+  for (const [named, names, via] of [[true, false, 'host'], [false, false, 'host'], [true, true, 'host'], [false, false, 'module']] as const) {
+    it(`a ${via === 'host' ? "host's call" : "module's ctx.callTool"} carrying an open private turn's id${named ? '' : ', naming no agent,'} ${names ? 'and naming its channel posts there' : "meets the private turn's rule: refused, though a focus holds another channel"}`, async () => {
+      let context: { callTool(call: unknown): Promise<{ success: boolean; error?: string }> } | undefined;
+      const caller = {
+        name: 'caller', getTools: () => [], async handleToolCall() { return { success: false, error: 'none' }; },
+        async start(ctx: unknown) { context = ctx as typeof context; }, async stop() {}, async onProcess() { return {}; },
+      };
+      const f = await fixture({ framework: { tuneOut: { enabled: true }, ...(via === 'module' ? { modules: [caller] } : {}) } as never });
       try {
         await registerOpen(f, 'work');
         const coordinator = (f.framework as unknown as { tuneOutCoordinator: { enterAllExcept(ref: unknown, opts: unknown, source: string): { ok: boolean } } }).tuneOutCoordinator;
@@ -117,9 +122,10 @@ describe('channel_publish without channelId', () => {
           const remaining = m.responses.slice(m.responseIndex);
           m.responseIndex = m.responses.length;
           open ??= fw.openLogical.get('agent');
-          host ??= f.framework.executeToolCall({
+          const call = {
             id: 'h1', name: 'channel_publish', input: { content: 'zz-host', ...(names ? { channelId: 'work' } : {}) }, callerTurnId: open?.turnId, ...(named ? { callerAgentName: 'agent' } : {}),
-          } as never) as never;
+          };
+          host ??= (via === 'module' ? context!.callTool(call) : f.framework.executeToolCall(call as never)) as never;
           const stream = new HeldStream(host.then(() => undefined), remaining as never);
           m.lastStream = stream;
           return stream;

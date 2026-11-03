@@ -95,8 +95,7 @@ In a private turn such a bounce holds no draft, words it adds to an
 `{{unsent}}` resend included: its notice says the words were kept private and
 how to publish, or, when the send threw, that they may have gone out. The
 draft an `{{unsent}}` resend sent stays open after its failed send, bare or
-with words added: held, or unconfirmed when the send threw. Only a bare
-resend's notice names it.
+with words added: held, or unconfirmed when the send threw.
 Only the framework's own `drafts` tool makes such a round, not a module's or
 server's tool of that bare name. An envelope beside a script whose code
 mentions `drafts` waits for the script. In XML tool mode, where a turn's prose

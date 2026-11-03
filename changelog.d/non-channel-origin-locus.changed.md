@@ -118,9 +118,8 @@
   words it adds to an `{{unsent}}` resend included: its notice says the words
   were kept private and how to publish, or, when the send threw, that they may
   have gone out. The draft an `{{unsent}}` resend sent stays open, bare or
-  with words added, and only a bare resend's notice names it. Where an
-  earlier bounce is still held, either notice says that `{{unsent}}`
-  names that draft, not these words. In every mode, words a send holds back
+  with words added. Where an earlier bounce is still held, the kept-private
+  notice says that `{{unsent}}` names that draft, not these words. In every mode, words a send holds back
   are held as drafts, as in any turn. In locus and hybrid mode a send holds
   back speech going where it may have posted, or, when the framework can't
   read where it posted, speech going anywhere. A private turn's unprefixed
@@ -139,8 +138,9 @@
   `executeToolCall`, or a module's `ctx.callTool`, that carries a private
   turn's id (`callerTurnId`). Two
   kinds of turn id the framework can't place count as a private turn's,
-  failing closed: one given out in this process before the framework was
-  created, and one no newer than a private turn it has dropped from its
+  failing closed, here and wherever the framework asks whether a turn id is
+  a private turn's, a wake's caller turn included: one given out in this process before the framework
+  was created, and one no newer than a private turn it has dropped from its
   record of the latest 4,096.
   `channel_publish`'s description says so, so the tool list of every agent
   offered `channel_publish` changes once. The model's call is refused before
