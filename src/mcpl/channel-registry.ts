@@ -1112,6 +1112,12 @@ interface ChannelRegistryOptions {
    */
   unpromptedChannel?: string;
   /**
+   * Whether the conversation's current turn takes `unpromptedChannel` where it
+   * has no channel of its own: false for a turn a channel message prompted
+   * (InferenceRequest.channelBorne). Absent, every turn does.
+   */
+  takesUnpromptedChannel?: (conversationId: string) => boolean;
+  /**
    * Whether a conversation takes the process-global fallback, the channel of
    * the most recent delivered inbound message: as where its plain speech lands
    * when it has no home and no channel of its own this turn, as its channel
@@ -1212,6 +1218,7 @@ export class ChannelRegistry {
   private takesGlobalFallback?: (conversationId: string) => boolean;
   private serverConnecting?: (serverId: string) => boolean;
   private unpromptedChannel?: string;
+  private takesUnpromptedChannel?: (conversationId: string) => boolean;
   private store?: JsStore;
 
   /**
@@ -1638,6 +1645,7 @@ export class ChannelRegistry {
     this.activeChannelResolver = options?.activeChannelResolver;
     this.takesGlobalFallback = options?.takesGlobalFallback;
     this.unpromptedChannel = options?.unpromptedChannel;
+    this.takesUnpromptedChannel = options?.takesUnpromptedChannel;
     this.serverConnecting = options?.serverConnecting;
     this.store = options?.store;
     this.initializeLifecycleStore();
@@ -2572,7 +2580,7 @@ export class ChannelRegistry {
     // An ephemeral run takes no global fallback (takesGlobalFallback): not the
     // all-except hold's channel, not the latest inbound message's channel as
     // its outgoing one, nor that message as the one it is replying to.
-    const fallback = this.configuredUnprompted() ?? (agentName !== undefined ? this.globalFallbackFor(agentName) : this.sharedFallback());
+    const fallback = this.configuredUnprompted(agentName) ?? (agentName !== undefined ? this.globalFallbackFor(agentName) : this.sharedFallback());
     // A turn that deliberately has no channel (null) takes no fallback.
     const outgoing = home ?? (active !== undefined ? active : fallback);
 
@@ -5781,11 +5789,12 @@ export class ChannelRegistry {
     if (home) return home;
     // A turn that deliberately has no channel (null) takes no fallback.
     const active = this.activeChannelResolver?.(conversationId);
-    return active !== undefined ? active : this.configuredUnprompted() ?? this.globalFallbackFor(conversationId);
+    return active !== undefined ? active : this.configuredUnprompted(conversationId) ?? this.globalFallbackFor(conversationId);
   }
 
-  private configuredUnprompted(): ChannelRef | null {
+  private configuredUnprompted(conversationId: string | undefined): ChannelRef | null {
     if (!this.unpromptedChannel) return null;
+    if (conversationId !== undefined && this.takesUnpromptedChannel?.(conversationId) === false) return null;
     const named = this.entriesNamed(this.unpromptedChannel);
     return named.length === 1 ? refOf(named[0]!) : null;
   }

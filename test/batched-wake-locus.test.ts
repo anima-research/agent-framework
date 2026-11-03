@@ -42,7 +42,7 @@ async function waitFor(cond: () => boolean, what: string, timeoutMs = 15_000): P
   throw new Error(`timed out waiting for: ${what}`);
 }
 
-function batchedWakeRig(speech?: { locus: 'delivery' | 'latest-inbound' }) {
+function batchedWakeRig(speech?: { locus: 'delivery' | 'latest-inbound' }, unpromptedChannel?: string) {
   let tempDir: string;
   let statusPath: string;
   let commandPath: string;
@@ -61,6 +61,7 @@ function batchedWakeRig(speech?: { locus: 'delivery' | 'latest-inbound' }) {
       membrane: membrane.asMembrane(),
       agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
       ...(speech ? { speech } : {}),
+      ...(unpromptedChannel ? { unpromptedChannel } : {}),
       gate: {
         config: {
           policies: [{
@@ -246,6 +247,37 @@ describe("batched wake routing under speech.locus 'latest-inbound'", () => {
     assert.deepEqual(publishes(), [GENERAL]);
   });
 });
+
+for (const locus of ['delivery', 'latest-inbound'] as const) {
+  describe(`an ambient-only batch with unpromptedChannel set, under speech.locus '${locus}'`, () => {
+    const rig = batchedWakeRig({ locus }, ROOM);
+    const { incoming, sent, publishes, holdBatches } = rig;
+    const expected = locus === 'latest-inbound' ? [GENERAL] : [];
+
+    const settled = async (): Promise<void> => {
+      await waitFor(() => rig.membrane().calls.length >= 1, 'the batch woke the agent');
+      await rig.framework().runUntilIdle();
+    };
+
+    it('chatter in one channel: the reply goes where it would without the setting, not to the unprompted channel', async () => {
+      rig.membrane().pushResponse(createMockResponse([{ type: 'text', text: 'joining in' }]));
+      incoming(GENERAL, 'ambient', 'anyone know how to fix this?');
+      await settled();
+      assert.deepEqual(publishes(), expected);
+    });
+
+    it('chatter in two channels, in one batch: the same', async () => {
+      const held = holdBatches();
+      rig.membrane().pushResponse(createMockResponse([{ type: 'text', text: 'joining in' }]));
+      incoming(ROOM, 'ambient', 'first');
+      await waitFor(() => sent('incoming-sent') === 1, 'first sent');
+      await waitFor(() => held() >= 1, "the first message's batch held past its window");
+      incoming(GENERAL, 'ambient', 'second');
+      await settled();
+      assert.deepEqual(publishes(), expected);
+    });
+  });
+}
 
 describe('batched wake routing with conversation forks', () => {
   let tempDir: string;
