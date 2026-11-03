@@ -35440,9 +35440,6 @@ export class AgentFramework {
     const toolClasses = new Map<string, ToolClass[]>();
     const toolServers = new Map<string, string>();
     const listedServers = new Set<string>();
-    // Each MCPL server's listing, held whole until the refresh publishes, in
-    // the registry's order; a failed one carries its error, redacted, for
-    // the line that says what was published.
     const results: Array<{ serverId: string; staged: { tools: import('./types/index.js').ToolDefinition[]; featureSets: Map<string, string>; classes: Map<string, ToolClass[]>; servers: Map<string, string> }; error?: string }> = [];
     const modernTools: import('./types/index.js').ToolDefinition[] = [];
     const closesOf = (serverId: string): number => this.mcplServerCloses?.get(serverId) ?? 0;
@@ -35586,17 +35583,15 @@ export class AgentFramework {
     // hints as stale (RFC-008), and its reconnect lists the new session.
     // An MCPL server whose listing doesn't count for that reason, or whose
     // listing failed, keeps what's published while its connection serves.
-    const connections = new Map<string, McplServerConnection | ModernMcpConnection>([
-      ...(this.mcplServerRegistry?.getAllServers() ?? []).map((server) => [server.id, server] as const),
-      ...this.modernServers(),
-    ]);
+    const mcplConnections = new Map<string, McplServerConnection>((this.mcplServerRegistry?.getAllServers() ?? []).map((server) => [server.id, server] as const));
+    const connections = new Map<string, McplServerConnection | ModernMcpConnection>([...mcplConnections, ...this.modernServers()]);
     const serving = (serverId: string): boolean => {
       const connection = connections.get(serverId);
       return !!connection && AgentFramework.mcpConnectionServes(connection);
     };
     const over = new Set([...listedServers].filter((serverId) => !serving(serverId) || closesOf(serverId) !== closesAtListing.get(serverId)));
     const keeps = new Set(results
-      .filter(({ serverId, error }) => serving(serverId) && (error !== undefined || over.has(serverId)))
+      .filter(({ serverId, error }) => serving(serverId) && mcplConnections.get(serverId)?.mcpToolsAdvertised === true && (error !== undefined || over.has(serverId)))
       .map(({ serverId }) => serverId));
     if (over.size > 0) {
       for (const [name, serverId] of [...toolServers]) {
