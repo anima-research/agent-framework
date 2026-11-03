@@ -202,10 +202,11 @@ describe('unpromptedChannel: a no-trigger turn is told, and published to, the un
       assert.deepEqual(t.published(), [OPS]);
     });
 
-    it('channel_publish naming no channel goes there too, in explicit prose routing', async () => {
+    it('channel_publish naming no channel goes there too, in explicit prose routing, and servers are told the same channel', async () => {
       const t = await setup(OPS, { speech: 'delivery', proseRouting: 'explicit' });
       await t.wake({ reason: 'test', source: 'framework' }, [publishCall('a note'), done()]);
       assert.deepEqual(t.published(), [OPS]);
+      assert.equal(t.context()?.defaultOutgoing?.channelId, OPS);
     });
 
     it("a heartbeat's turn doesn't take it: its plain speech is held as a draft", async () => {

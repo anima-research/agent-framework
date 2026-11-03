@@ -2567,7 +2567,9 @@ export class ChannelRegistry {
     // declared it inbound-only, since speech isn't posted there): a conversation
     // fork's home channel, else this turn's channel (single trunk agent — item-3
     // redux: its locus, else its triggering channel), else the global default
-    // (a no-trigger turn's, but not a heartbeat's, whose turn takes none).
+    // (a no-trigger turn's, but not a heartbeat's, whose turn takes none), with
+    // the configured unprompted channel in it where the turn takes it: the
+    // channel channel_publish naming none publishes to, in every prose mode.
     // Without this, a fork
     // was advertised the global locus but published somewhere else; and a trunk
     // agent was told the wrong channel under concurrency.
