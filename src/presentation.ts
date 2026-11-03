@@ -1308,7 +1308,7 @@ export class AgentPresentation {
     agent: PresentedAgent,
     ids: readonly MessageId[],
     occasion: PresentationOccasion,
-    extra?: { unstamped?: number; cutAt?: MessageId },
+    extra?: { unstamped?: number; cutAt?: MessageId; next?: string },
     bodies?: readonly PendingBody[],
     quiet = false,
   ): { entered: Set<MessageId>; error?: unknown } {
@@ -1324,7 +1324,7 @@ export class AgentPresentation {
     const entered = new Set(ids.filter((id) => cm.ordinalOf(id) !== undefined));
     const memo = this.memos.get(cm);
     if (memo && memo.length === lengthBefore) memo.length = cm.indexLength();
-    if (error !== undefined) this.failed(agent, occasion, error);
+    if (error !== undefined) this.failed(agent, occasion, error, ids.filter((id) => !entered.has(id)), extra?.next);
     if (entered.size > 0) {
       if (!quiet) {
         const unstamped = extra?.unstamped !== undefined && bodies
@@ -1377,9 +1377,27 @@ export class AgentPresentation {
     }
   }
 
-  private failed(agent: PresentedAgent, occasion: PresentationOccasion, error: unknown): void {
-    console.error(`[presentation] ${agent.name}: presenting at ${occasion} failed; what it didn't present waits for the next point:`, error);
-    this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion, error: describe(error) });
+  /**
+   * A presentation that failed, logged and traced (presentation:failed):
+   * `ids` are the rows it named that didn't enter the window (a body by
+   * the id that names it), where they are known, and `next` says what
+   * becomes of them.
+   */
+  private failed(
+    agent: PresentedAgent,
+    occasion: PresentationOccasion,
+    error: unknown,
+    ids?: readonly MessageId[],
+    next = "what it didn't present waits for the next point",
+  ): void {
+    const left = ids !== undefined && ids.length > 0 ? [...ids] : undefined;
+    const named = left
+      ? ` ${left.length} row${left.length === 1 ? '' : 's'} (${left.slice(0, 10).join(', ')}${left.length > 10 ? ', …' : ''})`
+      : '';
+    console.error(`[presentation] ${agent.name}: presenting${named} at ${occasion} failed; ${next}:`, error);
+    this.host.emitTrace({
+      type: 'presentation:failed', agentName: agent.name, occasion, error: describe(error), ...(left ? { messageIds: left } : {}),
+    });
   }
 }
 

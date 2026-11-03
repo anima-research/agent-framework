@@ -1339,6 +1339,11 @@ export type TraceEvent =
       agentName: string;
       occasion: PresentationOccasion;
       error: string;
+      /** The rows the presentation named that didn't enter the window,
+       *  each body by the id that names it, where they are known (a write
+       *  of the window that failed). Absent where a read failed before the
+       *  rows could be named. */
+      messageIds?: string[];
     })
   | (TraceEventBase & {
       /** At a tool boundary's hand-off, the newest rows of the agent's

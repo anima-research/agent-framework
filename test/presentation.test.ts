@@ -962,4 +962,21 @@ describe('the presentation module at the point after one that failed', () => {
     const reply = storeOwnRow(r.mira, 'mira', text('a reply in legacy mode'));
     assert.equal(r.sub.has(reply), true, 'the idle subconscious takes it at once');
   });
+
+  // AF #844 bot review finding 34.
+  it('a failed presentation names the rows that stay out of the window, in its trace and its log', async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('mira');
+    const ids = ['one', 'two'].map((t) => r.write(r.oren, 'someone', text(t), ['mira']));
+    r.alive.delete('mira');
+    failNextPresent(r.mira.cm);
+    const lines: string[] = [];
+    const { error } = console;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    try { r.presentation.presentAtEnd(r.mira); } finally { console.error = error; }
+    assert.deepEqual(ofType(r.traces, 'presentation:failed').map((t) => [t.occasion, (t as { messageIds?: string[] }).messageIds]), [['turn-end', ids]]);
+    assert.ok(lines.some((line) => line.includes('presenting 2 rows') && ids.every((id) => line.includes(id))), lines.join('\n'));
+    assert.deepEqual(ids.map((id) => r.mira.has(id)), [false, false], 'they wait');
+  });
 });
