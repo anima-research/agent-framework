@@ -7,7 +7,7 @@ import { ensureStateRegistered } from './module-registry.js';
 import { classifyBlock } from './mcpl/references.js';
 import { resultClaimsOf, rfc005TextOf, toolResultDataToHistoryString } from './tool-result-history.js';
 import { safeSlice } from './safe-slice.js';
-import { asOwnRow } from './dendrite/audience.js';
+import { asOwnRow, presentLandedThenRethrow } from './dendrite/audience.js';
 
 export const TOOL_RESULT_GUARD_NOTICE = 'Tool result withheld by the guard. The tool has already executed.';
 export type WithheldNoticeKind = 'ran' | 'refused' | 'error';
@@ -367,7 +367,12 @@ export class ToolResultGuard {
   ): MessageId {
     metadata = asOwnRow(metadata, this.agentName);
     if (!this.enabled) {
-      const id = this.cm.addMessage('user', content, metadata);
+      let id: MessageId;
+      try {
+        id = this.cm.addMessage('user', content, metadata);
+      } catch (error) {
+        presentLandedThenRethrow(error, this.agentName, this.ownRowSink, (row) => this.cm.getMessage(row) !== null);
+      }
       this.ownRowSink?.([id]);
       return id;
     }
@@ -410,7 +415,14 @@ export class ToolResultGuard {
     // chunk is ever summarized from the placeholder; released after the
     // settlement edit. Holds are in-memory only — a reopened manager has none,
     // which is correct since a reopened guard has no pending batch.
-    const messageId = this.cm.addMessage('user', withheld, metadata, undefined, { holdCompression: true });
+    // A write that throws with rows of it stored presents them, as one that
+    // returned would be, and throws on with no batch pending, as before.
+    let messageId: MessageId;
+    try {
+      messageId = this.cm.addMessage('user', withheld, metadata, undefined, { holdCompression: true });
+    } catch (error) {
+      presentLandedThenRethrow(error, this.agentName, this.ownRowSink, (row) => this.cm.getMessage(row) !== null);
+    }
     this.pending = { id, messageId, content, withheld, wireResults,
       branch: this.cm.currentBranch().name, submitted: false, durable: false, kept, notices };
     // Told before the durability barrier below, so the sync that makes the

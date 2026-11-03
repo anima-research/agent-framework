@@ -52,6 +52,7 @@
  */
 import type { ContentBlock } from '@animalabs/membrane';
 import type { AddMessageOptions, ContextManager, MessageId, MessageMetadata } from '@animalabs/context-manager';
+import { WriteLandedError, WriteOutcomeUnknownError } from '@animalabs/context-manager';
 import { isAnotherAgentsInjection } from '../stored-injections.js';
 import type { AgentName, ObserveEdge } from './types.js';
 
@@ -160,7 +161,10 @@ export function observedRowFor(
 /** What `storeOwnRow` writes through: an agent, or anything that names one and holds its context. */
 export interface OwnRowWriter {
   readonly name: AgentName;
-  getContextManager(): Pick<ContextManager, 'addMessage'>;
+  /** With `getMessage`, a write whose outcome the store can't tell presents
+   *  the rows it may have stored that the store reads as held
+   *  (presentLandedThenRethrow); without it, only those it knows landed. */
+  getContextManager(): Pick<ContextManager, 'addMessage'> & Partial<Pick<ContextManager, 'getMessage'>>;
   /**
    * Told the ids of the agent's own rows once they are stored (the
    * presentation index's own-row sink, #291), each once its write has
@@ -195,7 +199,76 @@ export function storeOwnRow(
   options?: AddMessageOptions,
   present = true,
 ): MessageId {
-  const id = agent.getContextManager().addMessage(participant, content, asOwnRow(metadata, agent.name), undefined, options);
+  const cm = agent.getContextManager();
+  let id: MessageId;
+  try {
+    id = cm.addMessage(participant, content, asOwnRow(metadata, agent.name), undefined, options);
+  } catch (error) {
+    presentLandedThenRethrow(
+      error,
+      agent.name,
+      present && agent.ownRowsStored ? (ids) => agent.ownRowsStored!(ids) : undefined,
+      cm.getMessage ? (row) => cm.getMessage!(row) !== null : undefined,
+    );
+  }
   if (present) agent.ownRowsStored?.([id]);
   return id;
+}
+
+/**
+ * The catch of a write of an agent's own row whose add threw (storeOwnRow,
+ * and the tool-result guard's two writes of the results row): the rows of
+ * the write the store holds are told to `told`, the own-row sink, as the
+ * write's id would have been, then the add's error is thrown on. The write
+ * is answered by that error, as before the presentation index: what its
+ * caller does on it is the caller's. A row of it that is stored is out of
+ * the window until presented, like any stored row, and presented here so
+ * that an own row written after it can't enter the window ahead of it.
+ *
+ * - WriteLandedError: its `landed` rows, in store order.
+ * - WriteOutcomeUnknownError: its `landed` rows, then those its `unknown`
+ *   names (the store holds all of these or none) that `holds` reads as
+ *   stored, as addMessage presents such a write's rows (presentedThoughUnknown
+ *   in framework.ts, whose afterStore reads the rows too). Without `holds`,
+ *   or where its read throws, its `landed` rows only.
+ * - Any other error: none of the write is stored, so nothing is told.
+ *
+ * Without `told` (a writer that holds its row back, storeOwnRow's
+ * `present: false`, or one with no sink) nothing is told. A sink that
+ * throws is logged; the add's error is the one thrown.
+ */
+export function presentLandedThenRethrow(
+  error: unknown,
+  agentName: string,
+  told: ((ids: readonly MessageId[]) => void) | undefined,
+  holds?: (id: MessageId) => boolean,
+): never {
+  const stored = told ? storedOfThrownWrite(error, holds) : [];
+  if (stored.length > 0) {
+    try {
+      told!(stored);
+    } catch (presentError) {
+      console.error(
+        `[store] agent=${agentName}: a write's add threw with ${stored.length === 1 ? `its row ${stored[0]}` : `rows ${stored.join(', ')}`} ` +
+          'stored, and telling its own-row sink of them threw too:',
+        presentError,
+      );
+    }
+  }
+  throw error;
+}
+
+/** The rows of a write whose add threw that the store holds, by its error (presentLandedThenRethrow). */
+function storedOfThrownWrite(error: unknown, holds: ((id: MessageId) => boolean) | undefined): MessageId[] {
+  if (error instanceof WriteLandedError) return [...error.landed];
+  if (!(error instanceof WriteOutcomeUnknownError)) return [];
+  let unknown: MessageId[] = [];
+  if (holds && error.unknown.length > 0) {
+    try {
+      unknown = error.unknown.filter((id) => holds(id));
+    } catch {
+      unknown = [];
+    }
+  }
+  return [...error.landed, ...unknown];
 }
