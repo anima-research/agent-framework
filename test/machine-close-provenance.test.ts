@@ -1,7 +1,7 @@
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, destinationKey } from '../src/mcpl/channel-registry.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 
@@ -46,7 +46,7 @@ function makeRegistry() {
     internals.desiredStates.get(internals.lifecycleKey('discord', channelId));
 
   // Register the channel the way a live server would surface it.
-  (registry as unknown as { channels: Map<string, unknown> }).channels.set('discord:c1', {
+  (registry as unknown as { channels: Map<string, unknown> }).channels.set(destinationKey({ serverId: 'discord', channelId: 'c1' }), {
     serverId: 'discord', descriptor: { id: 'c1', type: 'discord', label: '#commons' }, open: false,
   });
   registry.handleIncoming('discord', {

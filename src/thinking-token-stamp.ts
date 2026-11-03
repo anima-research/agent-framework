@@ -26,9 +26,13 @@ import type { ContentBlock } from '@animalabs/membrane';
  * the hidden thinking is the bulk of the output, and this stamp is what makes
  * the compiled budget honest (see context-manager `SIGNATURE_CHARS_PER_TOKEN`).
  *
- * Wire safety: membrane's Anthropic formatter builds thinking blocks field
- * by field (`type`, `thinking`, `signature`), so the stamp never reaches the
- * provider; the signature itself is copied, never edited.
+ * Wire safety: the stamp is context-manager's pricing metadata, and no field
+ * a provider takes. The Messages API refuses a block that carries it
+ * ("Extra inputs are not permitted"), and membrane (0.5.87 and 0.6.0) sends a
+ * `redacted_thinking` block to Anthropic and Bedrock with every field it has.
+ * So an agent's request builders drop the stamp from the compiled messages
+ * (`withoutTokenEstimates`), and the stored block, which context-manager
+ * prices, keeps it. The signature itself is copied, never edited.
  */
 const PROSE_CHARS_PER_TOKEN = 2.9;
 const DENSE_CHARS_PER_TOKEN = 2.3;
@@ -92,4 +96,31 @@ export function stampThinkingTokenEstimates(blocks: ContentBlock[], outputTokens
     const tokenEstimate = Math.max(1, Math.round((residual * w) / totalWeight));
     return { ...block, tokenEstimate } as ContentBlock;
   });
+}
+
+/**
+ * A request's messages with no top-level block carrying `tokenEstimate`. Both
+ * of an agent's request builders call it on the compiled messages: a
+ * framework turn's (`Agent.assembleActivationRequest`) and the direct API's
+ * (`Agent.runInferenceWithInjections`). A block that carries the stamp is
+ * copied without it, and so is the message that holds it. Every other
+ * message and block is passed on as it is, and nothing is changed in place,
+ * so the stored block keeps its stamp.
+ */
+export function withoutTokenEstimates<T extends { content: ContentBlock[] }>(messages: T[]): T[] {
+  return messages.map((message) => {
+    if (!message.content.some(isStamped)) return message;
+    return {
+      ...message,
+      content: message.content.map((block) => {
+        if (!isStamped(block)) return block;
+        const { tokenEstimate: _stamp, ...unstamped } = block as ContentBlock & { tokenEstimate?: unknown };
+        return unstamped as ContentBlock;
+      }),
+    };
+  });
+}
+
+function isStamped(block: ContentBlock): boolean {
+  return typeof block === 'object' && block !== null && 'tokenEstimate' in block;
 }

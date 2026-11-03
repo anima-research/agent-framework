@@ -7,6 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AgentFramework } from '../src/framework.js';
+import { NON_STRING_TEXT_PLACEHOLDER } from '../src/mcpl/visible-content.js';
 
 function makeFw() {
   return Object.create(AgentFramework.prototype) as any;
@@ -38,4 +39,20 @@ test('error results pass through unchanged', () => {
   const result = fw.toMembraneToolResult('call-4', { success: false, error: 'boom', isError: true }, 100);
   assert.equal(result.isError, true);
   assert.equal(result.content, 'boom');
+});
+
+test('beside an image, a text block whose text is not a string shows the placeholder, and a reference is still a stub', () => {
+  // The native blocks used to give way to the JSON fallback, which sent the
+  // image as base64 text and the reference's uri as it was.
+  const fw = makeFw();
+  const result = fw.toMembraneToolResult('call-5', { success: true, data: [
+    { type: 'text', text: { a: 1 } },
+    { type: 'image', data: 'AAAA', mimeType: 'image/png' },
+    { type: 'resource', uri: 'https://signed.example/f?token=RAW_TOKEN', mimeType: 'text/plain', sizeBytes: 10, name: 'f.txt', disposition: 'never' },
+  ] });
+  assert.ok(Array.isArray(result.content), String(result.content).slice(0, 200));
+  assert.deepEqual(result.content[0], { type: 'text', text: NON_STRING_TEXT_PLACEHOLDER });
+  assert.equal(result.content[1].type, 'image');
+  assert.ok(result.content[2].text.startsWith('[ref_'), result.content[2].text);
+  assert.ok(!JSON.stringify(result.content).includes('RAW_TOKEN'));
 });

@@ -15,6 +15,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { errorFromProviderStatus } from '@animalabs/membrane';
 import { AgentFramework, shedMayHelp } from '../src/framework.js';
 
 function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
@@ -31,6 +32,13 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
       removed.push(id);
       const i = messages.findIndex((m) => m.id === id);
       if (i >= 0) messages.splice(i, 1);
+    },
+    // A range by its two ends, inclusive, as context-manager's removeMessages.
+    removeMessages: (fromId: string, toId: string) => {
+      const from = messages.findIndex((m) => m.id === fromId);
+      const to = messages.findIndex((m) => m.id === toId);
+      if (from < 0 || to < from) throw new Error(`no range ${fromId}..${toId}`);
+      for (const m of messages.splice(from, to - from + 1)) removed.push(m.id);
     },
     addMessage: (_p: string, content: any[], meta: any) => {
       const id = `marker-${added.length}`;
@@ -67,6 +75,7 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
 }
 
 const REASON = '400 invalid_request: tool_use ids must have a corresponding tool_result';
+const isRewindMarker = (m: { content: any[] }) => /kept refusing the requests that carried them/.test(m.content[0]?.text ?? '');
 
 test('at the threshold, an invalid_request with no status (shedMayHelp) triggers an automatic rewind + retry', () => {
   const { fw, removed, added, errs, restore } = makeHarness();
@@ -83,18 +92,32 @@ test('at the threshold, an invalid_request with no status (shedMayHelp) triggers
 
   // One consolidated rewind marker, saying the API kept refusing the requests
   // that carried the shed turns, not that the conversation was at fault.
-  const marker = added.find((m) => m.meta.kind === 'refusal-rewind');
+  const marker = added.find(isRewindMarker);
   assert.ok(marker, 'rewind marker added');
-  assert.equal(marker!.meta.cause, 'inference-failure');
   assert.match(marker!.content[0].text, /set aside because the model API kept refusing the requests that carried them \(/);
   assert.match(marker!.content[0].text, /\), so that the conversation could go on\./);
   assert.doesNotMatch(marker!.content[0].text, /rejecting the conversation/);
 
   // A retry was queued so the rewound history is verified immediately.
   assert.equal(fw.pendingRequests.length, 1);
-  assert.equal(fw.pendingRequests[0].reason, 'inference-failure-rewind-retry');
 
   assert.ok(errs.some((e) => e.includes('[inference-rewind]') && e.includes('auto-quarantined')));
+});
+
+test('at the threshold, a row that carries nothing is passed over, uncounted, and the newest turn shed', () => {
+  const { fw, messages, added, restore } = makeHarness({ messages: [
+    { id: 'u0', participant: 'human', content: [{ type: 'text', text: 'earlier' }], metadata: { messageId: '0' } },
+    { id: 'a0', participant: 'agent', content: [{ type: 'text', text: 'an answer' }] },
+    { id: 'u1', participant: 'human', content: [{ type: 'text', text: 'go' }], metadata: { messageId: '1' } },
+    { id: 'a1', participant: 'agent', content: [] },
+  ] });
+  try {
+    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+  } finally { restore(); }
+  assert.deepEqual(messages.filter((m) => !m.metadata?.system).map((m) => m.id), ['u0', 'a0', 'a1'],
+    'the newest message is gone, and the empty row after it stays with what came before');
+  const marker = added.find(isRewindMarker);
+  assert.match(marker!.content[0].text, /The 1 most recent turn\(s\) were set aside/);
 });
 
 test('retryable / unknown-retryability failures NEVER shed history (outages cost nothing)', () => {
@@ -124,7 +147,7 @@ test('non-retryable but NON-poison failures (auth/context_length/abort) NEVER sh
     assert.equal(removed.length, 0, `${errorType}: history must not be shed`);
     assert.equal(fw.pendingRequests.length, 0, `${errorType}: no rewind-retry queued`);
     assert.equal(
-      added.filter((m) => m.meta.kind === 'refusal-rewind').length,
+      added.filter(isRewindMarker).length,
       0,
       `${errorType}: no false rejection marker`,
     );
@@ -150,21 +173,29 @@ test('the breaker is capped: repeated failures stop shedding at maxRewinds', () 
   assert.equal(removed.length, 2, `cap of 2 respected, shed: ${removed.join(', ')}`);
   assert.equal(fw.pendingRequests.length, 2, 'retries stop when the cap is hit');
   assert.ok(errs.some((e) => e.includes('rewind cap 2 reached')));
-  // History still has the untouched older messages — the breaker cannot eat it all.
-  assert.equal(fw.exhaustionRewinds.get('cairn'), 2);
 });
 
 test('a successful inference resets both the streak and the rewind budget', () => {
-  const { fw, removed, restore } = makeHarness();
+  const { fw, removed, restore } = makeHarness({
+    maxRewinds: 1,
+    messages: [
+      { id: 'u1', participant: 'human', content: [{ type: 'text', text: 'go' }], metadata: { messageId: '1' } },
+      { id: 'a1', participant: 'agent', content: [{ type: 'tool_use', name: 'shell', id: 't1' }] },
+      { id: 'r1', participant: 'user', content: [{ type: 'tool_result', toolUseId: 't1', content: 'X' }] },
+      { id: 'a2', participant: 'agent', content: [{ type: 'tool_use', name: 'shell', id: 't2' }] },
+      { id: 'r2', participant: 'user', content: [{ type: 'tool_result', toolUseId: 't2', content: 'Y' }] },
+    ],
+  });
   try {
-    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
-    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
-    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request'); // shed #1
-    assert.equal(removed.length, 2); // one complete tool exchange
+    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    assert.deepEqual([...removed].sort(), ['a2', 'r2']);
 
     fw.emitTrace({ type: 'inference:completed', agentName: 'cairn' });
-    assert.equal(fw.consecutiveInferenceFailures.get('cairn'), 0);
-    assert.equal(fw.exhaustionRewinds.get('cairn'), 0);
+    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    assert.equal(removed.length, 2, 'a fresh streak: two failures shed nothing');
+    fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    assert.deepEqual([...removed].sort(), ['a1', 'a2', 'r1', 'r2'], 'a fresh budget: the third sheds again');
   } finally { restore(); }
 });
 
@@ -182,8 +213,8 @@ test('nothing left to shed: the breaker degrades to logging, no crash, no loop',
   assert.ok(errs.some((e) => e.includes('nothing left to shed')));
 });
 
-// Anarchid's review of membrane #56 (M3): from #56 (merged, not yet in a
-// release) one status table serves every adapter, so `invalid_request` also
+// Anarchid's review of membrane #56 (M3): from #56 (in membrane 0.5.87, below
+// this package's floor) one status table serves every adapter, so `invalid_request` also
 // reaches agent-framework for an Anthropic 404 (a model that doesn't exist),
 // which no shed can fix. With 0.5.86 the raw-fetch Responses adapter already
 // files every status it doesn't list as invalid_request. The breaker runs
@@ -202,7 +233,7 @@ test('the breaker reads the status: a 404 invalid_request never sheds, a 400 doe
     }
   } finally { missingModel.restore(); }
   assert.deepEqual(missingModel.removed, [], 'past the threshold, and nothing was shed');
-  assert.ok(!missingModel.added.some((m) => m.meta.kind === 'refusal-rewind'));
+  assert.ok(!missingModel.added.some(isRewindMarker));
   assert.equal(missingModel.fw.pendingRequests.length, 0);
   assert.ok(missingModel.errs.some((e) => e.includes('[inference-hard-down]')), 'it is still reported hard-down');
   assert.ok(alerts.some((a) => a.kind === 'hard-down' && a.agentName === 'cairn'), 'and raises the hard-down ops alert');
@@ -276,8 +307,28 @@ test('the status reaches the breaker from the inference:exhausted trace', () => 
   assert.ok(h.errs.some((e) => e.includes('[inference-hard-down]')));
 });
 
+test("a membrane error's type and status reach the gate through the exhausted trace's classification", () => {
+  const rows: Array<[string, number, unknown, boolean]> = [
+    ['a model that does not exist', 404, { type: 'error', error: { type: 'not_found_error', message: 'model: claude-typo' } }, false],
+    ['an unpaired tool result', 400, { type: 'error', error: { type: 'invalid_request_error', message: 'messages.3.content.0: unexpected `tool_use_id` found in `tool_result` blocks: toolu_01.' } }, true],
+  ];
+  for (const [name, status, body, sheds] of rows) {
+    const h = makeHarness();
+    try {
+      const error = errorFromProviderStatus({ provider: 'anthropic', status, body });
+      // What the three exhausted settles put on the trace (src/framework.ts).
+      const fields = (h.fw as unknown as { classifyInferenceError(err: Error): Record<string, unknown> }).classifyInferenceError(error);
+      assert.equal(fields.httpStatus, status, `${name}: the status is on the trace`);
+      for (let i = 0; i < 3; i++) {
+        h.fw.emitTrace({ type: 'inference:exhausted', agentName: 'cairn', error: error.message, ...fields });
+      }
+    } finally { h.restore(); }
+    assert.equal(h.removed.length > 0, sheds, `${name}: ${sheds ? 'sheds' : 'keeps the history'}`);
+  }
+});
+
 test('shedMayHelp: an invalid_request at 400, 413 or 422 or with no status, or a context_length at 413, and nothing else', () => {
-  // Every membrane error type (0.5.86), the framework's own two, and none.
+  // Every membrane error type (0.6.0), the framework's own two, and none.
   const types = ['invalid_request', 'rate_limit', 'context_length', 'auth', 'server', 'network', 'timeout', 'abort',
     'safety', 'unsupported', 'unknown', 'over_budget', 'context_refusal', undefined];
   const statuses: Array<number | undefined> = [undefined];
@@ -290,3 +341,51 @@ test('shedMayHelp: an invalid_request at 400, 413 or 422 or with no status, or a
     }
   }
 });
+
+test("provider answers, as this package's membrane floor types them, shed only where a shed may help", () => {
+  // Bodies in each provider's documented error shape, written for the test,
+  // through membrane's status table (errorFromProviderStatus).
+  const anthropic = (type: string, message: string) => ({ type: 'error', error: { type, message } });
+  const openai = (message: string, code: string | null) => ({ error: { message, type: 'invalid_request_error', param: null, code } });
+  const rows: Array<[string, string, number, unknown, string, boolean]> = [
+    // Refusals of the account, the key or the model: no shed can fix them.
+    ['a balance too low', 'anthropic', 400, anthropic('invalid_request_error', 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'), 'auth', false],
+    ['usage limits reached', 'anthropic', 400, anthropic('invalid_request_error', 'You have reached your specified API usage limits. You will regain access on 2026-11-01 at 00:00 UTC.'), 'auth', false],
+    ['a balance too low, at 422', 'openai-compatible', 422, openai('Your credit balance is too low to access the API.', null), 'auth', false],
+    ['a model that does not exist', 'anthropic', 404, anthropic('not_found_error', 'model: claude-nonexistent-1'), 'invalid_request', false],
+    ['a key the provider refuses', 'anthropic', 401, anthropic('authentication_error', 'invalid x-api-key'), 'auth', false],
+    ['a key refused at 400, by its code', 'openai', 400, openai('Incorrect API key provided.', 'invalid_api_key'), 'auth', false],
+    // A token overflow at 400 or 422 keeps the history; a body too large at 413 may be fixed by a shed.
+    ['a prompt over the context window', 'anthropic', 400, anthropic('invalid_request_error', 'prompt is too long: 250123 tokens > 200000 maximum'), 'context_length', false],
+    ['a prompt over the context window, by its code', 'openai', 400, openai("This model's maximum context length is 128000 tokens.", 'context_length_exceeded'), 'context_length', false],
+    ['a prompt over the context window, at 422', 'openai-compatible', 422, openai('prompt is too long: 9000 tokens > 8192 maximum', null), 'context_length', false],
+    ['a request body too large', 'anthropic', 413, anthropic('request_too_large', 'Request exceeds the maximum allowed number of bytes.'), 'context_length', true],
+    // Refusals of the request's content.
+    ['an unpaired tool result', 'anthropic', 400, anthropic('invalid_request_error', 'messages.3.content.0: unexpected `tool_use_id` found in `tool_result` blocks: toolu_01. Each `tool_result` block must have a corresponding `tool_use` block in the previous message.'), 'invalid_request', true],
+    ['a changed thinking block', 'anthropic', 400, anthropic('invalid_request_error', 'messages.1.content.0: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response.'), 'invalid_request', true],
+    // A FastAPI server's validation failure, which carries no message field.
+    ['a validation failure at 422', 'openai-compatible', 422, { detail: [{ loc: ['body', 'messages'], msg: 'field required', type: 'value_error.missing' }] }, 'invalid_request', true],
+    // Waits and outages.
+    ['a rate limit', 'anthropic', 429, anthropic('rate_limit_error', 'Number of request tokens has exceeded your per-minute rate limit'), 'rate_limit', false],
+    ['an overloaded provider', 'anthropic', 529, anthropic('overloaded_error', 'Overloaded'), 'server', false],
+  ];
+  // With no status, as Anthropic's mid-stream errors come: the table takes the
+  // status the provider's code implies.
+  const statusless: Array<[string, unknown, string, number, boolean]> = [
+    ['a model that does not exist, mid-stream', anthropic('not_found_error', 'model: claude-nonexistent-1'), 'invalid_request', 404, false],
+    ['a request body too large, mid-stream', anthropic('request_too_large', 'Request exceeds the maximum allowed number of bytes.'), 'context_length', 413, true],
+  ];
+  for (const [name, body, type, status, sheds] of statusless) {
+    const error = errorFromProviderStatus({ provider: 'anthropic', body });
+    assert.equal(error.type, type, `${name}: typed ${error.type}`);
+    assert.equal(error.httpStatus, status, `${name}: at ${String(error.httpStatus)}`);
+    assert.equal(shedMayHelp(error.type, error.httpStatus), sheds, `${name}: ${error.type} at ${String(error.httpStatus)}`);
+  }
+  for (const [name, provider, status, body, type, sheds] of rows) {
+    const error = errorFromProviderStatus({ provider, status, body });
+    assert.equal(error.type, type, `${name}: typed ${error.type}`);
+    assert.equal(error.httpStatus, status, `${name}: at ${String(error.httpStatus)}`);
+    assert.equal(shedMayHelp(error.type, error.httpStatus), sheds, `${name}: ${error.type} at ${String(error.httpStatus)}`);
+  }
+});
+

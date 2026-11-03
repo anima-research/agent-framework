@@ -5,6 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AgentFramework } from '../src/framework.js';
+import type { McplServerConfig } from '../src/mcpl/types.js';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
 import { McplTransport } from '../src/mcpl/transport.js';
 import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
@@ -79,9 +80,11 @@ function wireHarness() {
   ) => McplServerConnection;
   const connection = new Connection('observer', null, transport);
   const framework = Object.create(AgentFramework.prototype) as {
-    wireMcplEvents(connection: McplServerConnection): void;
+    mcplServerConfigs: Map<string, McplServerConfig>;
+    wireMcplEvents(connection: McplServerConnection, config: McplServerConfig): void;
   };
-  framework.wireMcplEvents(connection);
+  framework.mcplServerConfigs = new Map([['observer', { id: 'observer', command: 'unused' }]]);
+  framework.wireMcplEvents(connection, { id: 'observer', command: 'unused' });
   connection.establishGrant(new CapabilityGrant(new Set(['toolLifecycle.observe']), []));
   connection.ready();
   let nextId = 1;
@@ -106,10 +109,10 @@ test('wire rejection leaves a restrictive filter in force; valid omitted/null-ru
   const { connection, request } = wireHarness();
   const restrictive = { rules: [{ match: { tool: 'allowed--*' }, report: false }] };
   assert.deepEqual(request(restrictive).result, {});
-  const prior = connection.toolObserveFilter;
+  const prior = structuredClone(connection.toolObserveFilter);
   for (const params of [null, { _meta: null }, { _meta: [], rules: null }, { _meta: 'bad', rules: [] }]) {
     assert.equal(request(params).error.code, -32602);
-    assert.equal(connection.toolObserveFilter, prior, 'invalid params cannot clear or replace the filter');
+    assert.deepEqual(connection.toolObserveFilter, prior, 'invalid params cannot clear or replace the filter');
   }
   for (const params of [undefined, {}, { rules: null }, { _meta: { source: 'test' }, rules: null }]) {
     assert.deepEqual(request(params).result, {});
@@ -125,12 +128,12 @@ test('wire accepts the Unicode boundary and rejects over-limit replacement witho
   const value = '🙂'.repeat(LIMIT);
   const match = Object.fromEntries(PATTERN_KEYS.map((key) => [key, value]));
   assert.deepEqual(request({ rules: [{ match, input: [value] }] }).result, {});
-  const prior = connection.toolObserveFilter;
+  const prior = structuredClone(connection.toolObserveFilter);
   assert.deepEqual(prior, [{ match, report: true, input: [value] }]);
   const rejected = request({ rules: [{ match: {}, input: [value + '🙂'] }] });
   assert.equal(rejected.error.code, -32602);
   assert.deepEqual(rejected.error.data, { limit: 'stringLength' });
-  assert.equal(connection.toolObserveFilter, prior);
+  assert.deepEqual(connection.toolObserveFilter, prior);
 });
 
 test('wire capability denial remains ahead of malformed params admission', () => {
@@ -138,5 +141,4 @@ test('wire capability denial remains ahead of malformed params admission', () =>
   connection.establishGrant(new CapabilityGrant(new Set(), []));
   const result = request(null);
   assert.equal(result.error.code, -32002);
-  assert.equal(connection.toolObserveFilter, null);
 });

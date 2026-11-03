@@ -18,7 +18,7 @@ import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
 import { AgentFramework } from '../src/index.js';
 import { PushHandler, type McplPushEvent } from '../src/mcpl/push-handler.js';
-import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, destinationKey } from '../src/mcpl/channel-registry.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import { isSilentHeartbeatMarker, isVisiblyEmptyContent } from '../src/mcpl/visible-content.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
@@ -32,6 +32,9 @@ const EMPTY_SHAPES: Array<[string, unknown[]]> = [
   ["''", [{ type: 'text', text: '' }]],
   ['whitespace-only text', [{ type: 'text', text: ' \n\t ' }]],
   ['several blank text blocks', [{ type: 'text', text: '' }, { type: 'text', text: '  ' }]],
+  // MCP's embedded resource shows as the block its contents make, here blank
+  // text (Ada-1017, room-203 #207161, #207631).
+  ['an embedded resource whose text is blank', [{ type: 'resource', resource: { uri: 'memo://blank', mimeType: 'text/plain', text: ' \n ' } }]],
 ];
 const IMAGE = { type: 'image', data: 'AAAA', mimeType: 'image/png' };
 const MARKER_ORIGIN = { source: 'heartbeat', reason: 'schedule', silent: true };
@@ -162,7 +165,7 @@ function channelHarness() {
     (t) => { traces.push(t); },
   );
   (registry as unknown as { channels: Map<string, unknown> }).channels
-    .set('discord:chan', { serverId: 'discord', descriptor: { id: 'chan', type: 'discord', label: 'chan' }, open: false });
+    .set(destinationKey({ serverId: 'discord', channelId: 'chan' }), { serverId: 'discord', descriptor: { id: 'chan', type: 'discord', label: 'chan' }, open: false });
   const send = async (...contents: unknown[][]) => {
     let response: { results: Array<{ messageId: string; accepted: boolean; reason?: string }> } | undefined;
     await registry.handleIncoming('discord', {

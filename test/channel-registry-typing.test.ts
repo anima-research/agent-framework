@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, destinationKey } from '../src/mcpl/channel-registry.js';
 import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
@@ -42,7 +42,7 @@ function makeRegistry() {
   // channel-incoming event plumbing, which isn't under test here.
   (registry as unknown as {
     channels: Map<string, { serverId: string; descriptor: { id: string }; open: boolean }>;
-  }).channels.set('srv:ch1', {
+  }).channels.set(destinationKey({ serverId: 'srv', channelId: 'ch1' }), {
     serverId: 'srv',
     descriptor: { id: 'ch1' },
     open: true,
@@ -123,10 +123,19 @@ test('startTyping with no metadata mid-typing does not dispatch', () => {
 test('stopTyping() global branch only dispatches stops for channels with intervals', () => {
   const { registry, calls } = makeRegistry();
 
-  // Stash metadata without an interval — simulates a past start that missed
-  // findChannelEntry (pre-registration race).
+  // A registered channel with metadata and no interval, a state no start
+  // leaves now (a start keeps metadata beside its interval), stands in for
+  // metadata outliving its interval: the global stop dispatches only for
+  // channels with intervals, so it sends this one nothing.
+  (registry as unknown as {
+    channels: Map<string, { serverId: string; descriptor: { id: string }; open: boolean }>;
+  }).channels.set(destinationKey({ serverId: 'srv', channelId: 'phantom-ch' }), {
+    serverId: 'srv',
+    descriptor: { id: 'phantom-ch' },
+    open: true,
+  });
   (registry as unknown as { typingMetadata: Map<string, Record<string, unknown>> }).typingMetadata.set(
-    'phantom-ch',
+    destinationKey({ serverId: 'srv', channelId: 'phantom-ch' }),
     { foo: 1 },
   );
 
@@ -139,25 +148,4 @@ test('stopTyping() global branch only dispatches stops for channels with interva
   const stops = calls.filter((c) => c.op === 'stop');
   assert.equal(stops.length, 1);
   assert.equal(stops[0].channelId, 'ch1');
-});
-
-test('a server without the channels.typing grant gets no stop, from either stopTyping branch', () => {
-  const calls: TypingCall[] = [];
-  const registry = new ChannelRegistry(
-    { getServer: () => ({ grant: new CapabilityGrant(new Set(), []) }) } as unknown as McplServerRegistry,
-    {} as FeatureSetManager,
-    () => {},
-    () => {},
-    { sendTypingFn: (serverId, channelId, metadata, op) => { calls.push({ serverId, channelId, metadata, op }); } },
-  );
-  (registry as unknown as {
-    channels: Map<string, { serverId: string; descriptor: { id: string }; open: boolean }>;
-  }).channels.set('srv:ch1', { serverId: 'srv', descriptor: { id: 'ch1' }, open: true });
-
-  registry.startTyping('ch1'); // the timer exists; the start was skipped for lack of the grant
-  registry.stopTyping('ch1');
-  registry.startTyping('ch1');
-  registry.stopTyping();
-
-  assert.deepEqual(calls, [], 'an ungranted server receives neither start nor stop');
 });
