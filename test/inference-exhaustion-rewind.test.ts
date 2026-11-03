@@ -82,14 +82,17 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   fw.activeTurnTokens = new Map();
   fw.breakerProbes = new Set();
   fw.store = { currentBranch: () => ({ name: 'main' }) };
-  fw.auxiliaryMembraneFor = () => ({ complete: async () => createMockResponse([{ type: 'text', text: 'ok' }]) });
+  const probes: NormalizedRequest[] = [];
+  fw.auxiliaryMembraneFor = () => ({
+    complete: async (probe: NormalizedRequest) => { probes.push(probe); return createMockResponse([{ type: 'text', text: 'ok' }]); },
+  });
 
   const errs: string[] = [];
   const orig = console.error;
   console.error = (...a: unknown[]) => { errs.push(a.join(' ')); };
   const restore = () => { console.error = orig; };
 
-  return { fw, cm, messages, removed, added, errs, restore };
+  return { fw, cm, messages, removed, added, errs, restore, probes, listeners };
 }
 
 const REASON = '400 invalid_request: tool_use ids must have a corresponding tool_result';
@@ -140,17 +143,19 @@ test('at the threshold, a row that carries nothing is passed over, uncounted, an
   assert.match(marker!.content[0].text, /The 1 most recent turn\(s\) were set aside/);
 });
 
-test('retryable / unknown-retryability failures NEVER shed history (outages cost nothing)', () => {
-  const { fw, removed, restore } = makeHarness();
+test('retryable / unknown-retryability failures NEVER shed history (outages cost nothing)', async () => {
+  const { fw, removed, probes, restore } = makeHarness();
   try {
     for (let i = 0; i < 6; i++) fw.noteInferenceExhausted('cairn', '529 overloaded', true, 'server');
     for (let i = 0; i < 6; i++) fw.noteInferenceExhausted('cairn', 'weird transport error', undefined, undefined);
+    await settle();
   } finally { restore(); }
   assert.equal(removed.length, 0, 'transient failures must not consume history');
   assert.equal(fw.pendingRequests.length, 0);
+  assert.equal(probes.length, 0, 'and send no probe');
 });
 
-test('non-retryable but NON-poison failures (auth/context_length/abort) NEVER shed history', () => {
+test('non-retryable but NON-poison failures (auth/context_length/abort) NEVER shed history', async () => {
   // The breaker keys on the membrane error type and the HTTP status
   // (shedMayHelp), not on `retryable`. membrane marks auth (expired key),
   // context_length, abort, safety and unsupported all non-retryable, but for
@@ -159,12 +164,14 @@ test('non-retryable but NON-poison failures (auth/context_length/abort) NEVER sh
   // with a rewind marker saying the API kept refusing them, on an expired API
   // key is exactly the category error this guards.
   for (const errorType of ['auth', 'context_length', 'abort', 'safety', 'unsupported']) {
-    const { fw, removed, added, restore } = makeHarness();
+    const { fw, removed, added, probes, restore } = makeHarness();
     try {
       // Well past the hard-down threshold, all with retryable === false.
       for (let i = 0; i < 6; i++) fw.noteInferenceExhausted('cairn', `non-retryable ${errorType}`, false, errorType);
+      await settle();
     } finally { restore(); }
     assert.equal(removed.length, 0, `${errorType}: history must not be shed`);
+    assert.equal(probes.length, 0, `${errorType}: no probe`);
     assert.equal(fw.pendingRequests.length, 0, `${errorType}: no rewind-retry queued`);
     assert.equal(
       added.filter(isRewindMarker).length,
@@ -199,7 +206,7 @@ test('the breaker is capped: repeated failures stop shedding at maxRewinds', asy
 });
 
 test('a successful inference resets both the streak and the rewind budget', async () => {
-  const { fw, removed, restore } = makeHarness({
+  const { fw, removed, probes, restore } = makeHarness({
     maxRewinds: 1,
     messages: [
       { id: 'u1', participant: 'human', content: [{ type: 'text', text: 'go' }], metadata: { messageId: '1' } },
@@ -221,6 +228,7 @@ test('a successful inference resets both the streak and the rewind budget', asyn
     fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
     await settle();
     assert.deepEqual([...removed].sort(), ['a1', 'a2', 'r1', 'r2'], 'a fresh budget: the third sheds again');
+    assert.equal(probes.length, 2, 'a fresh episode: the third probes again before it sheds');
   } finally { restore(); }
 });
 
@@ -257,8 +265,10 @@ test('the breaker reads the status: a 404 invalid_request never sheds, a 400 doe
       missingModel.fw.noteInferenceExhausted('cairn', '404 model: claude-typo not found', false, 'invalid_request',
         { httpStatus: 404, providerErrorCode: 'not_found_error' });
     }
+    await settle();
   } finally { missingModel.restore(); }
   assert.deepEqual(missingModel.removed, [], 'past the threshold, and nothing was shed');
+  assert.equal(missingModel.probes.length, 0, 'and no probe went out');
   assert.ok(!missingModel.added.some(isRewindMarker));
   assert.equal(missingModel.fw.pendingRequests.length, 0);
   assert.ok(missingModel.errs.some((e) => e.includes('[inference-hard-down]')), 'it is still reported hard-down');
@@ -282,8 +292,10 @@ test('the current failure decides the shed, whatever failed before it in the str
     for (const httpStatus of [400, 400, 404]) {
       ending404.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request', { httpStatus });
     }
+    await settle();
   } finally { ending404.restore(); }
   assert.deepEqual(ending404.removed, [], '400, 400, 404: nothing is shed at the third failure');
+  assert.equal(ending404.probes.length, 0, '400, 400, 404: no probe went out');
   assert.ok(ending404.errs.some((e) => e.includes('[inference-hard-down]')), 'though it is hard-down');
 
   // 404, 404, then a 400 at the threshold: the 400 sheds.
@@ -318,21 +330,25 @@ test('a 413 sheds under either label it arrives with, and a context_length at 40
       for (let i = 0; i < 5; i++) {
         overflow.fw.noteInferenceExhausted('cairn', 'prompt is too long', false, 'context_length', { httpStatus });
       }
+      await settle();
     } finally { overflow.restore(); }
     assert.deepEqual(overflow.removed, [], `context_length at ${httpStatus} keeps the history`);
+    assert.equal(overflow.probes.length, 0, `context_length at ${httpStatus} sends no probe`);
     assert.ok(overflow.errs.some((e) => e.includes('[inference-hard-down]')), `context_length at ${httpStatus} is still reported hard-down`);
   }
 });
 
-test('the status reaches the breaker from the inference:exhausted trace', () => {
+test('the status reaches the breaker from the inference:exhausted trace', async () => {
   const h = makeHarness();
   try {
     for (let i = 0; i < 4; i++) {
       h.fw.emitTrace({ type: 'inference:exhausted', agentName: 'cairn', error: '404 model: claude-typo not found',
         retryable: false, errorType: 'invalid_request', httpStatus: 404, providerErrorCode: 'not_found_error' });
     }
+    await settle();
   } finally { h.restore(); }
   assert.deepEqual(h.removed, [], 'the trace carried the 404 to the gate');
+  assert.equal(h.probes.length, 0, 'so no probe went out');
   assert.ok(h.errs.some((e) => e.includes('[inference-hard-down]')));
 });
 
@@ -402,6 +418,61 @@ test('a probe answered after the agent moved on sets its answer aside: nothing i
     assert.equal(probes, what === 'the framework stopping' ? 1 : 2,
       `${what}: the next failure ${what === 'the framework stopping' ? 'sends no probe, once stopping' : 'sends a probe of its own'}`);
   }
+});
+
+test('a failed request reaches the breaker once: a later failure with no request of its own on the wire sends no probe and sheds nothing', async () => {
+  const h = makeHarness();
+  h.fw.failedRequests = new Map();
+  try {
+    for (let i = 0; i < 3; i++) {
+      h.fw.failedRequests.set('cairn', { messages: [], config: { model: 'zz-model', maxTokens: 100 } });
+      h.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    }
+    await settle();
+    h.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    await settle();
+  } finally { h.restore(); }
+  assert.equal(h.probes.length, 1, 'one probe, for the request on the wire at the threshold');
+  assert.deepEqual([...h.removed].sort(), ['a1', 'r1'], 'and only the shed it answered');
+  assert.ok(h.errs.some((e) => e.includes('sheds nothing: no request reached the breaker')), 'the fourth failure says why it sheds nothing');
+});
+
+test('a settled probe leaves nothing behind, however it ends: its history listener is detached and stop() no longer waits on it', async () => {
+  const ends: Array<[string, (h: ReturnType<typeof makeHarness>) => void]> = [
+    ['answered', () => {}],
+    ['refused', (h) => { h.fw.auxiliaryMembraneFor = () => ({ complete: async () => { throw new Error('zz refused'); } }); }],
+    ['set aside', (h) => {
+      h.fw.auxiliaryMembraneFor = () => ({
+        complete: async () => { h.cm.editMessage('u1', [{ type: 'text', text: 'edited' }]); return createMockResponse([{ type: 'text', text: 'ok' }]); },
+      });
+    }],
+  ];
+  for (const [how, arrange] of ends) {
+    const h = makeHarness();
+    arrange(h);
+    try {
+      for (let i = 0; i < 3; i++) h.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+      await settle();
+    } finally { h.restore(); }
+    assert.equal(h.fw.breakerProbes.size, 0, `${how}: the probe has left the set stop() waits on`);
+    assert.equal(h.listeners.size, 0, `${how}: its history listener is detached`);
+  }
+});
+
+test('a shed that fails after its probe was answered says the history may already have changed', async () => {
+  const h = makeHarness();
+  const add = h.cm.addMessage;
+  h.cm.addMessage = (p: string, content: any[], meta: any) => {
+    if (meta?.kind === 'refusal-rewind') throw new Error('zz the store refused the marker');
+    return add(p, content, meta);
+  };
+  try {
+    for (let i = 0; i < 3; i++) h.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+    await settle();
+  } finally { h.restore(); }
+  assert.deepEqual([...h.removed].sort(), ['a1', 'r1'], 'the shed had begun');
+  assert.ok(h.errs.some((e) => e.includes('may already have shed part of the history') && e.includes('zz the store refused the marker')),
+    'the line says the history may have changed, with the error');
 });
 
 test('a failure with no request on the wire sends no probe and sheds nothing, in a run whose history a probe already implicated too', async () => {

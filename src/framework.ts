@@ -3371,9 +3371,9 @@ function boundFailureFields(record: Record<string, unknown>): Record<string, unk
  *   usage limits reached) are auth, and a context overflow, by its code or
  *   text, is context_length. A 401, 402 or 403 is auth, a 408 timeout, a 429
  *   rate_limit, a 404 invalid_request and a 413 context_length; other 4xx
- *   are invalid_request. So a 413 the table types sheds, an Anthropic one
- *   included, while a context_length at 400 or 422, a token overflow, keeps
- *   the history, and so does an account refusal, which is auth. An adapter
+ *   are invalid_request. So shedMayHelp holds for a 413 the table types,
+ *   an Anthropic one included, and not for a context_length at 400 or 422,
+ *   a token overflow, or for an account refusal, which is auth. An adapter
  *   can type a failure before the table does, as Anthropic's does for a
  *   gateway's aggregate error (server). A failure with no HTTP status takes
  *   the status its provider code implies when the table knows the code, as
@@ -32084,7 +32084,7 @@ export class AgentFramework {
       console.error(`[inference-rewind] agent=${name} kept its history: ${message}`);
       this.opsAlert('history-kept', name, message, { data: { probe: same ? 'fails-without-history' : 'could-not-tell', ...answered } });
     }).catch((error: unknown) => {
-      console.error(`[inference-rewind] agent=${name}: the breaker's probe failed: ${describeFailureWithFrames(error)}`);
+      console.error(`[inference-rewind] agent=${name}: the breaker failed while acting on its probe's answer, and may already have shed part of the history: ${describeFailureWithFrames(error)}`);
     }).finally(() => {
       detach();
       this.breakerProbes.delete(probe);
