@@ -1148,8 +1148,8 @@ export type TraceEvent =
    * `branch-moved`, the derivation's checkpoint is no longer on the host's
    * branch, or its last look was framed on another branch than the
    * resident's window reads now; `scope-ended`, its tune-out had ended
-   * before the look was asked for. The `tune-out:reader-fork` of the
-   * derivation follows.
+   * before the look was asked for. It is followed by `tune-out:reader-fork`,
+   * or `tune-out:reader-fork-failed` when the derivation fails.
    */
   | (TraceEventBase & {
       type: 'tune-out:reader-rederived';
