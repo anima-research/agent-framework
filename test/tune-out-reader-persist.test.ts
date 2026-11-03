@@ -1072,4 +1072,17 @@ describe('resumeAgent and the derivation notice', () => {
     assert.equal(owners.get('f'), undefined, 'its own cleanup takes it out');
   });
 
+  it("tells the source of a derivation that is no reader the ordinary line, whatever persist metadata the host gave it", { timeout: 60_000 }, async () => {
+    const framework = await create({ derivationNotice: (_record: unknown, _from: string, line: string) => line, collapseDerivationNoticesAfter: 0 });
+    const task = await framework.deriveAgent({
+      name: 'task-1', from: 'scout', kind: 'task-fork', metadata: { persist: 'resident', resync: 'window' },
+      framing: [{ participant: 'user', content: [text('do it')] }],
+    });
+    await framework.runEphemeralToCompletion(task.agent, task.contextManager);
+    const line = framework.getAgent('scout')!.getContextManager().getAllMessages()
+      .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'agent-lifecycle')
+      .map((m) => textOf(m)).find((l) => l.includes('task-1'));
+    assert.ok(line?.includes('a task-fork on your weights (test-model), reading your context up to this point; '), line);
+    assert.ok(!line?.includes('look'), line);
+  });
 });

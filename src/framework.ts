@@ -12377,8 +12377,11 @@ export class AgentFramework {
         : ` on ${record.model}`;
     // A persisted reader (subconscious.persist, recorded in its metadata)
     // reads the context it was derived with, and with resync 'window' is
-    // handed what entered the source's context after it at each look.
-    const persisted = record.metadata?.persist === 'epoch' || record.metadata?.persist === 'resident';
+    // handed what entered the source's context after it at each look. The
+    // metadata is the host's to set on any derivation: only a reader fork's
+    // reads as a persisted reader's.
+    const persisted = record.kind === 'subconscious-fork'
+      && (record.metadata?.persist === 'epoch' || record.metadata?.persist === 'resident');
     const inherited = record.inherit?.mode === 'shared'
       ? !persisted
         ? 'reading your context up to this point'
