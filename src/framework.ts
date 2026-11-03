@@ -23862,9 +23862,13 @@ export class AgentFramework {
    * Write a builder's channel notices in order, each on its own: one that
    * can't be written is logged, and the rest are still written. A reader's
    * notice that says the primary was told comes after the primary's, and is
-   * written in its `untold` words where the primary's write failed, so it
-   * never says the primary was told of a notice that wasn't written. A
-   * write is stored at once (#291), and one for an agent mid-turn enters its
+   * written in its `untold` words where the primary's write threw, so it
+   * never says the primary was told of a notice whose write threw. A write
+   * a surgery's hold keeps in memory, or one kept for a manager that refuses
+   * its work, counts as written (addMessage returns '' for it, without
+   * throwing): if storing the primary's fails at the release, or a restart
+   * loses it, the reader's notice, stored too, still says the primary was
+   * told. A write is stored at once (#291), and one for an agent mid-turn enters its
    * window at its next point (its tool boundary hears it, or its turn's end
    * presents it). Through framework.addMessage, so a notice an open forces
    * inside a live turn is stored and presented as any write is, rather than
