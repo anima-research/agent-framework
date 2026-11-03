@@ -18244,16 +18244,19 @@ export class AgentFramework {
             // path).
             // The shown mark moves at every boundary that injects into its
             // stream.
-            // The mark is the store's head, a scalar, as a compile's is: it
-            // also covers what was stored since the compile without being
-            // carried, such as another slot's messages, and a write stored
-            // into this slot since (a fresh tool_result, a routed channel
-            // message). That over-cover can't be left out.
-            // Under a context manager's thinking-binding record
-            // (`thinkingBinding.binds`), such a write sits in the next
-            // compile where the stream's notes named other rows, so the
-            // replies after it go without their thinking, whatever the mark
-            // says; deferring those writers is the fix.
+            // The mark is readMarkOf's, as a compile's is. On a presented
+            // window it covers by the window's index length: the rows the
+            // window holds, the injected ones among them, and no row stored
+            // since and not presented to this agent. In legacy mode it is
+            // the store's head, a scalar: it also covers what was stored
+            // since the compile without being carried, such as another
+            // slot's messages, and a write stored into this slot since (a
+            // fresh tool_result, a routed channel message). That over-cover
+            // can't be left out. There, under a context manager's
+            // thinking-binding record (`thinkingBinding.binds`), such a
+            // write sits in the next compile where the stream's notes named
+            // other rows, so the replies after it go without their
+            // thinking, whatever the mark says.
             if (midTurnInjections.length > 0) {
               // Shown: the stream carries them (CoalescerHost.isUnshown).
               agent.markContextShown();
@@ -20537,8 +20540,9 @@ export class AgentFramework {
     // the row, #291), so a row presented to a window and never consumed there
     // is taken back as one never presented is, and leaves every window that
     // held it with the record: the remover's by context-manager's removal,
-    // every other one's by retractRemovedElsewhere. No request that carried
-    // it was answered, so no later request's prefix needs it. A row a reader
+    // every other one's by retractRemovedElsewhere. No request of its
+    // readers' carried it (no consumed mark covers it), so no later
+    // request's prefix needs it. A row a reader
     // fork was handed as framing stays (AF-5), and the coalescer places the
     // newer occurrence after it.
     if (this.framedToAReader(p.messageId as MessageId)) return false;
@@ -23086,7 +23090,9 @@ export class AgentFramework {
    *
    * None while the host is quiesced (the window is frozen for surgery). In
    * the residents' shared slot another reader's turn doesn't matter (#291):
-   * the row is the agent's own, in no window but its own. A clock that
+   * the row is the agent's own, in no other resident's window unless that
+   * resident observes the agent (AgentConfig.observes), which takes it at
+   * its own points. A clock that
    * can't be planned or stored is logged and skipped: it never holds up what
    * it would have preceded. One whose write threw after it landed is the
    * window's all the same, so it's returned, and a tool boundary injects it.
@@ -23285,9 +23291,10 @@ export class AgentFramework {
    *  While the agent's context is in legacy mode, its window is the slot's
    *  record, a co-resident's rows and clock rows among them. Once it
    *  presents rows (#291), the window is the rows presented to it, in their
-   *  order: a co-resident's clock row isn't the agent's, and a row stored
-   *  and not presented yet comes after the clock its start writes, so
-   *  neither is read. */
+   *  order: a co-resident's clock row isn't in it unless the agent observes
+   *  that co-resident (AgentConfig.observes), and then the newest clock row
+   *  the window holds is read, whosever it is; a row stored and not
+   *  presented yet comes after the clock its start writes, so it isn't read. */
   private lastClockOf(agent: Agent): { newestRowAt: number | undefined; lastClockAt: number | undefined } {
     const cm = agent.getContextManager();
     if (cm.windowMode() === 'presented') {
@@ -23546,8 +23553,9 @@ export class AgentFramework {
    * ensureInitialDesiredState) only where the agent it's addressed to can
    * call it for every channel it names (canCloseChannels): a conversation
    * fork may close only its home channel, and an agent's allowedTools can leave
-   * channel_close out. The other residents can read it too, where several
-   * share one slot (#291); a fork's seed leaves it out (primaryNoticeTexts).
+   * channel_close out. Where several residents share one slot it is stored
+   * in the slot they share, but stamped for the agent it's addressed to
+   * (#291); a fork's seed leaves it out (primaryNoticeTexts).
    * Where an
    * agent's own send opened a channel it can't close, the primary is told by
    * name too, if it's registered and can close it, and the agent is told
@@ -23813,8 +23821,9 @@ export class AgentFramework {
    * channel_open as the way to try again only where the agent it's addressed
    * to can call it: a conversation fork's channel_open is refused outright
    * (dispatchChannelToolCall), and an agent's allowedTools can leave it out.
-   * The other residents can read it too, where several share one slot
-   * (#291); a fork's seed leaves it out (primaryNoticeTexts).
+   * Where several residents share one slot it is stored in the slot they
+   * share, but stamped for the agent it's addressed to (#291); a fork's
+   * seed leaves it out (primaryNoticeTexts).
    * Where the channel is selected for opening, it says so and why, as
    * speech's failure does, and what that means: where the host couldn't
    * record putting the channel's decision back, a later delivery or
@@ -31349,7 +31358,9 @@ export class AgentFramework {
     // the agent the write names, never as anyone's own row. A write that
     // carries a tune-out's hold (heldFromResidents) is for nobody, whatever
     // agent's store it lands in, as an inbound message a tune-out holds is
-    // (inboundAudience): no resident is shown it. A write that names no
+    // (inboundAudience): no resident is shown it. One that names an agent
+    // whose own view keeps held traffic (the persistent subconscious) is for
+    // that agent (defaultAudience). A write that names no
     // agent is for the agents that take untargeted inbound in the slot it
     // lands in (untargetedAudience), not for the agent it is delivered to,
     // so the record tells it from a write for the primary. A stamp the
@@ -31543,10 +31554,12 @@ export class AgentFramework {
    */
   private placeWakeLines(agent: Agent, lines: readonly WakeLine[]): void {
     // Each resident the wake was for writes the line into its own window, as
-    // its own row, at its own start (#291): a co-resident's line enters no
-    // other window, so it can't land under the message or after another
-    // resident's answer. For an agent whose window isn't presented, the
-    // delivery agent's start alone writes the slot's one line.
+    // its own row, at its own start (#291): a resident's line enters no
+    // other resident's window but an observer's (AgentConfig.observes), as
+    // the turn it starts does, so in its own window it can't land under the
+    // message or after another resident's answer. For an agent whose window
+    // isn't presented, the delivery agent's start alone writes the slot's
+    // one line.
     const slot = this.deliveryAgent();
     if (!slot || (agent !== slot && !this.presents(agent))) return;
     const open = lines.filter((line) => !this.placedWakeLines.get(line)?.has(agent.name));

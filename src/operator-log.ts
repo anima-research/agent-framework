@@ -168,9 +168,11 @@ export interface SurgeryMarksPreview {
   /** Removed messages that carry a Discord address at all. */
   addressable: number;
   /**
-   * Of the messages removed, how many no live agent's window holds (#291):
-   * stored and never presented to an agent, or taken out of every window
-   * since. Their marks tell Discord of messages no agent was being shown.
+   * Of the messages removed, how many no live agent is shown (#291): no
+   * window holds them (stored and never presented to an agent, or taken out
+   * of every window since), or only windows whose view leaves them out (a
+   * row a tune-out holds, which a window written down from the record
+   * holds). Their marks tell Discord of messages no agent was being shown.
    * Set only when the agent's context is presented.
    */
   neverPresented?: number;

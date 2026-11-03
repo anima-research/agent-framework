@@ -169,7 +169,8 @@ export interface ObserveEdge {
   fromSequence?: number;
   /**
    * Only messages from this one on, by message id, which names one row on
-   * every branch and in every agent's presentation order (#291).
+   * every branch and in every agent's presentation order (#291). Not read
+   * yet: an edge that sets it shows the rows one without it shows.
    */
   fromMessageId?: string;
   /** Whether held (policy-diverted) traffic in that slot is visible. */

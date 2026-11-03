@@ -757,8 +757,10 @@ the target stay after it (`keptInWindowAfterTarget`), since no branch cut
 separates them from it: a rollback that only they follow is refused and
 names them, and `suppressMessages`, or the host's `hide` by Discord message
 id, takes them out. The preview's `neverPresented` counts the messages it
-removes that no agent's window holds. The host command's `/undo n` counts
-back over the rows of the agent's own slot in its window. A removal in place
+removes that no live agent is shown: no window holds them, or only windows
+whose view leaves them out (a row a tune-out holds). The host command's
+`/undo n` counts back over the rows of the agent's own slot in its window. A
+removal in place
 (a `hide`, a suppression on its fork, a module's or the coalescer's removal)
 takes the rows out of every other live agent's window on that branch that
 held them too, each at its own place; a window on a branch whose record
