@@ -11,14 +11,15 @@ import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { WindowedPassthroughStrategy } from '@animalabs/context-manager';
 import type { MessageId, StoredMessage } from '@animalabs/context-manager';
 import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
 import { AgentFramework, WorkspaceModule, defaultReaderFraming } from '../src/index.js';
-import type { FrameworkConfig, ReaderFramingContext, TraceEvent } from '../src/index.js';
+import type { AgentConfig, FrameworkConfig, ReaderFramingContext, TraceEvent } from '../src/index.js';
 import type { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
-import { MockMembrane } from './helpers/mock-membrane.js';
+import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { WireMembrane, final } from './helpers/wire-membrane.js';
-import { GateModule, waitCall } from './helpers/dendrite.js';
+import { GateModule, RoutedMembrane, waitCall } from './helpers/dendrite.js';
 import { tuneOutTool } from '../src/framework.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/tune-out-mcpl-server.mjs');
@@ -88,6 +89,14 @@ describe('a persisted reader: configuration', () => {
     await assert.rejects(create({ persist: 'epoch', resync: 'all' }), /subconscious\.resync must be 'window' or 'none', not another string/);
     await assert.rejects(create({ pendingRound: 'none' }), /subconscious\.pendingRound must be an object, as deriveAgent's pendingRound takes it, or a function/);
     await assert.rejects(create({ pendingRound: [] }), /subconscious\.pendingRound must be an object/);
+  });
+
+  it('takes a resyncLimit of whole numbers, and refuses another', async () => {
+    await create({ persist: 'resident', resyncLimit: { rows: 200, chars: 0 } });
+    await create({ persist: 'resident', resyncLimit: {} });
+    await assert.rejects(create({ persist: 'resident', resyncLimit: { rows: -1 } }), /subconscious\.resyncLimit\.rows must be a whole number, 0 or more: /);
+    await assert.rejects(create({ persist: 'resident', resyncLimit: { chars: '9000' } }), /subconscious\.resyncLimit\.chars must be a whole number, 0 or more, not a string: /);
+    await assert.rejects(create({ persist: 'resident', resyncLimit: 200 }), /subconscious\.resyncLimit must be an object/);
   });
 });
 
@@ -469,7 +478,7 @@ describe('a persisted reader: derived again, and when not', () => {
     assert.equal(failed[1]!.returned, 0, "the late look's rows go nowhere: it was the last reader they had");
   });
 
-  it('derives it again when its name has no ended record: a derivation whose run was refused', { timeout: 120_000 }, async () => {
+  it('derives it again when its name has no ended record: a derivation whose run was refused; after a restart, resumes the later generation', { timeout: 180_000 }, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'reader-persist-norecord-'));
     dirs.push(dir);
     const t = await boot(dir, { persist: 'epoch' });
@@ -480,9 +489,48 @@ describe('a persisted reader: derived again, and when not', () => {
     await waitFor('the refused look', () => t.traces.some((e) => e.type === 'tune-out:reader-fork-failed'));
     assert.equal(t.framework.getAgentRecord(g(1)), null, 'premise: derived, its run refused, never registered');
     await t.framework.resume();
+    t.membrane.script('reader', final([text('G2 report.')]));
     t.look(epochId, [t.hold(epochId, 'HELD-2')]);
     await t.looked(g(2), 1);
     assert.deepEqual(rederived(t.traces), [[g(1), g(2), 'no-record']]);
+    await t.framework.stop();
+    frameworks.splice(frameworks.indexOf(t.framework), 1);
+
+    // After a restart g1 has its branch and no record, g2 an ended record:
+    // the generation resumed is g2, the one that ran.
+    const second = await boot(dir, { persist: 'epoch' });
+    assert.equal(second.framework.getAgentRecord(g(1)), null, 'premise: g1 has no record after the restart either');
+    assert.ok(second.internals.store.listBranches().some((b) => b.name === `dendrite/${g(1)}`), "premise: g1's branch is there");
+    second.look(epochId, [second.hold(epochId, 'HELD-3')]);
+    await second.looked(g(2), 2);
+    assert.deepEqual(second.forkTraces().map((f) => [f.agentName, f.incarnation, f.resumed]), [[g(2), 2, true]]);
+    assert.deepEqual(rederived(second.traces), []);
+    const body = JSON.stringify(second.membrane.callsFor('reader')[0]!.messages);
+    assert.ok(body.includes('HELD-2') && body.includes('G2 report.'), "its request holds g2's history");
+  });
+
+  it("derives it again, traced, when the registry can't reach its record but its branch is in the store", { timeout: 180_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-unreached-'));
+    dirs.push(dir);
+    const first = await boot(dir, { persist: 'resident' });
+    const epochId = first.enter();
+    first.look(epochId, [first.hold(epochId, 'HELD-1')]);
+    await first.looked('reader/scout/g1', 1);
+    await first.framework.stop();
+    frameworks.splice(frameworks.indexOf(first.framework), 1);
+    // As when its ended record is on another branch's log, or past what the registry keeps.
+    const second = await boot(dir, { persist: 'resident' });
+    const registry = (second.framework as unknown as { registry: { inspect(name: string): unknown } }).registry;
+    const inspect = registry.inspect.bind(registry);
+    registry.inspect = (name: string) => (name === 'reader/scout/g1' ? undefined : inspect(name));
+    try {
+      second.look(epochId, [second.hold(epochId, 'HELD-2')]);
+      await second.looked('reader/scout/g2', 1);
+    } finally {
+      registry.inspect = inspect;
+    }
+    assert.deepEqual(rederived(second.traces), [['reader/scout/g1', 'reader/scout/g2', 'no-record']]);
+    assert.ok(!second.internals.store.listBranches().some((b) => b.name.startsWith('dendrite/reader/scout/g1~')), 'g1 is not derived again under its own name');
   });
 
   it('asks beforeDerive at every derivation and every resumption, and a refused resumption is a failed look, never a derivation', { timeout: 120_000 }, async () => {
@@ -543,12 +591,14 @@ describe('a persisted reader: what the resident and the reader are told', () => 
       'a line each for the first two, none for the third, a count line at the fourth');
     assert.equal(textOf(told[0]!),
       '[Agent lifecycle: reader/scout/g1 was derived from you as a subconscious-fork on your weights (test-model), reading your ' +
-      'context up to this point, and handed what entered your context after it at each later look; its result returns to you ' +
-      'as a message; it ends when its task does (idle 10 min), and ends with you.]');
+      'context up to this point, and at each later look handed an account of the messages your context took since the look ' +
+      'before (not your stored context injections); its result returns to you as a message; it ends when its task does ' +
+      '(idle 10 min), and ends with you.]');
     assert.equal(textOf(told[1]!),
       '[Agent lifecycle: reader/scout/g1 was resumed (incarnation 2) as a subconscious-fork on your weights (test-model), reading ' +
-      'your context up to the point it was derived, and handed what entered your context after it at each look; its result ' +
-      'returns to you as a message; it ends when its task does (idle 10 min), and ends with you.]');
+      'your context up to the point it was derived, and at each look handed an account of the messages your context took since ' +
+      'the look before (not your stored context injections); its result returns to you as a message; it ends when its task ' +
+      'does (idle 10 min), and ends with you.]');
     assert.match(textOf(told[2]!), /^\[Agent lifecycle: 1 subconscious-fork has been derived from you, and resumed 3 times, since \d\d:\d\d UTC \(2 since the last note\); the latest, reader\/scout\/g1, is a subconscious-fork/);
     assert.deepEqual((told[2]!.metadata as { dendrite: { collapsed: unknown } }).dendrite.collapsed, { count: 4, sinceLastNote: 2, resumed: 3 });
   });
@@ -558,10 +608,18 @@ describe('a persisted reader: what the resident and the reader are told', () => 
     const fork = 'A reader reads it instead: a fork of your context, run on a cadence and when a message there mentions you, ' +
       'which can report to you in its own words and cancel the tune-out. ';
     assert.ok(later({ kind: 'forks', persist: 'epoch', resync: 'window' }).includes(fork +
-      'Within one tune-out, later runs resume that fork, each handed what entered your context since the run before; ' +
-      'a new fork is made only when it can\'t be resumed. People who mention you'));
+      'Within one tune-out, later runs resume that fork, each handed an account of the messages your context took since the ' +
+      'run before (not your stored context injections); a new fork is made when it can\'t be resumed, or for a run after the ' +
+      'tune-out ended. People who mention you'));
+    assert.ok(later({ kind: 'forks', persist: 'epoch', resync: 'none' }).includes(fork +
+      'Within one tune-out, later runs resume that fork; a new fork is made when it can\'t be resumed, or for a run after the ' +
+      'tune-out ended. People who mention you'));
+    assert.ok(later({ kind: 'forks', persist: 'resident', resync: 'window' }).includes(fork +
+      'Later runs resume that fork, across tune-outs, each handed an account of the messages your context took since the run ' +
+      'before (not your stored context injections); a new fork is made when it can\'t be resumed. People who mention you'));
     assert.ok(later({ kind: 'forks', persist: 'resident', resync: 'none' }).includes(fork +
-      'Later runs resume that fork, across tune-outs; a new fork is made only when it can\'t be resumed. People who mention you'));
+      'Later runs resume that fork, across tune-outs; a new fork is made when it can\'t be resumed. People who mention you'));
+    assert.ok(!/think/i.test(later({ kind: 'forks', persist: 'resident', resync: 'window' })), 'says nothing of thinking');
     assert.ok(later({ kind: 'forks' }).includes(fork + 'People who mention you'), 'a fork per look: as before');
     for (const persist of ['epoch', 'resident'] as const) {
       assert.ok(!/subconscious|judg/i.test(JSON.stringify(tuneOutTool({ kind: 'forks', persist, resync: 'window' }))));
@@ -664,5 +722,377 @@ describe('a persisted reader: what the resident and the reader are told', () => 
       await t.framework.stop();
       frameworks.splice(frameworks.indexOf(t.framework), 1);
     }
+  });
+});
+
+describe('a persisted reader: a look that fails, and what goes back', () => {
+  const failed = (traces: TraceEvent[]) => traces.filter((e) => e.type === 'tune-out:reader-fork-failed') as unknown as Array<{
+    agentName: string; error: string; returned: number; reported: boolean;
+  }>;
+  const framingRows = async (framework: AgentFramework, name: string) => (await framework.inspectAgentContext(name)).getAllMessages()
+    .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'tune-out-reader-framing');
+
+  it('gives a refused resumption its held rows back each time it is refused, and a later run holds them once', { timeout: 120_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-refused-twice-'));
+    dirs.push(dir);
+    const t = await boot(dir, { persist: 'resident' });
+    const epochId = t.enter();
+    const name = 'reader/scout/g1';
+    t.look(epochId, [t.hold(epochId, 'HELD-1')]);
+    await t.looked(name, 1);
+    await t.framework.quiesce({ reason: 'test' });
+    const unread = t.hold(epochId, 'HELD-2 unread');
+    t.look(epochId, [unread]);
+    await waitFor('the first refusal', () => failed(t.traces).length >= 1);
+    // The coordinator hands it again, as it was given back; refused again.
+    t.look(epochId, [unread]);
+    await waitFor('the second refusal', () => failed(t.traces).length >= 2);
+    assert.deepEqual(failed(t.traces).map((f) => f.returned), [1, 1], 'no run read HELD-2, so each refusal gives it back');
+    assert.equal(t.framework.getAgentRecord(name)!.incarnation, 1, 'premise: no incarnation began');
+    const framings = await framingRows(t.framework, name);
+    assert.deepEqual(framings.map((m) => (m.metadata as { incarnation?: number }).incarnation), [1, 2, 2],
+      "each framing row says the incarnation it was made for: the refused ones, the one that didn't begin");
+    await t.framework.resume();
+    t.membrane.script('reader', final([text('After the refusals.')]));
+    t.look(epochId, [unread, t.hold(epochId, 'HELD-3')]);
+    await t.looked(name, 2);
+    const body = JSON.stringify(t.membrane.callsFor('reader').at(-1)!.messages);
+    assert.equal(body.split('HELD-2 unread').length - 1, 1, 'HELD-2 once: in the framing the first refused look stored');
+    assert.ok(body.includes('HELD-3'));
+    assert.equal(t.forkTraces().at(-1)!.held, 1, 'handed HELD-3: its branch holds HELD-2 already');
+  });
+
+  it('runs no look queued behind a running one once stop() has begun; after the restart the reader is resumed', { timeout: 180_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-stop-queued-'));
+    dirs.push(dir);
+    const first = await boot(dir, { persist: 'resident' });
+    const epochId = first.enter();
+    const g = (k: number) => `reader/scout/g${k}`;
+    first.look(epochId, [first.hold(epochId, 'HELD-1')]);
+    await first.looked(g(1), 1);
+    let release!: () => void;
+    first.membrane.hold('reader', new Promise<void>((r) => { release = r; }));
+    first.look(epochId, [first.hold(epochId, 'HELD-2 running')]);
+    await waitFor('the second look is running', () => first.membrane.callsFor('reader').length === 2);
+    first.look(epochId, [first.hold(epochId, 'HELD-3 queued')]);
+    const seen = first.traces.length;
+    const stopping = first.framework.stop(10_000);
+    setTimeout(() => release(), 300);
+    frameworks.splice(frameworks.indexOf(first.framework), 1);
+    await stopping;
+    await new Promise((r) => setTimeout(r, 300));
+    const after = first.traces.slice(seen)
+      .filter((e) => e.type.startsWith('tune-out:reader'))
+      .map((e) => [e.type, (e as unknown as { agentName: string }).agentName]);
+    // The running look's own end may be traced (its prose, or its failure); the queued look derives,
+    // resumes and fails nothing.
+    assert.ok(!after.some(([type, agent]) => agent !== g(1) || type === 'tune-out:reader-fork' || type === 'tune-out:reader-rederived'),
+      JSON.stringify(after));
+
+    const second = await boot(dir, { persist: 'resident' });
+    assert.deepEqual(second.internals.store.listBranches().map((b) => b.name).filter((b) => b.startsWith('dendrite/reader/')), [`dendrite/${g(1)}`],
+      'no generation was derived for the queued look');
+    // After a restart the coordinator's cursor is gone: the epoch's held rows are handed again.
+    const all = second.rows().filter((m) => (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId);
+    second.look(epochId, all);
+    await second.looked(g(1), 3);
+    assert.deepEqual(second.forkTraces().map((f) => [f.agentName, f.incarnation, f.resumed]), [[g(1), 3, true]]);
+    assert.ok(JSON.stringify(second.membrane.callsFor('reader')[0]!.messages).includes('HELD-3 queued'));
+  });
+
+  it('is a failed look, its rows given back, when planning it throws', { timeout: 120_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-plan-throws-'));
+    dirs.push(dir);
+    const t = await boot(dir, { persist: 'resident' });
+    const epochId = t.enter();
+    const registry = (t.framework as unknown as { registry: { inspect(name: string): unknown } }).registry;
+    const inspect = registry.inspect.bind(registry);
+    registry.inspect = (name: string) => {
+      if (name.startsWith('reader/')) throw new Error('store read failed (test)');
+      return inspect(name);
+    };
+    try {
+      t.look(epochId, [t.hold(epochId, 'HELD-1')]);
+      await waitFor('the failed look', () => failed(t.traces).length > 0, 10_000);
+    } finally {
+      registry.inspect = inspect;
+    }
+    const [f] = failed(t.traces);
+    assert.deepEqual([f!.agentName, f!.returned], ['reader/scout', 1]);
+    assert.match(f!.error, /store read failed \(test\)/);
+  });
+
+  it('is a failed look, its rows given back, when its resident ended before it ran', { timeout: 120_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-resident-ended-'));
+    dirs.push(dir);
+    const t = await boot(dir, { persist: 'resident' });
+    const epochId = t.enter();
+    // The look as it starts after waiting behind another, the resident gone meanwhile.
+    const fw = t.framework as unknown as {
+      subconsciousConfig: unknown;
+      persistedReaderLook(primary: string, cfg: unknown, persist: string, identity: string, invocation: Invocation, scopeEnded: boolean): Promise<void>;
+    };
+    await fw.persistedReaderLook('gone', fw.subconsciousConfig, 'resident', 'reader/gone', {
+      serverId: 'disc', channelId: CHANNEL, epochId, trigger: 'cadence', notice: '[Tune-out cadence: test]',
+      backlog: [t.hold(epochId, 'HELD-1')], dispositions: null,
+    }, false);
+    const [f] = failed(t.traces);
+    assert.deepEqual([f?.agentName, f?.returned, f?.error], ['reader/gone', 1, 'the resident ended before the look ran']);
+  });
+
+  it("fails a resumed look when the host's branch moved while the reader was reopened; the next look plans again", { timeout: 120_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-moved-'));
+    dirs.push(dir);
+    const t = await boot(dir, { persist: 'resident' });
+    const epochId = t.enter();
+    const g = (k: number) => `reader/scout/g${k}`;
+    const trunk = t.internals.store.currentBranch().name;
+    t.look(epochId, [t.hold(epochId, 'HELD-1')]);
+    await t.looked(g(1), 1);
+    t.internals.store.createBranchAt('later', trunk, t.internals.store.currentSequence());
+    const fw = t.framework as unknown as { reopenAgentContext: (...args: unknown[]) => Promise<unknown> };
+    const reopen = fw.reopenAgentContext.bind(fw);
+    let moves = 0;
+    fw.reopenAgentContext = async (...args: unknown[]) => {
+      if (moves++ === 0) await t.framework.switchBranch('later');
+      return reopen(...args);
+    };
+    t.look(epochId, [t.hold(epochId, 'HELD-2')]);
+    await waitFor('the failed look', () => failed(t.traces).length > 0);
+    await t.framework.runUntilIdle();
+    const [f] = failed(t.traces);
+    assert.deepEqual([f!.agentName, f!.returned], [g(1), 1]);
+    assert.match(f!.error, new RegExp(`branch moved from ${trunk} to later`));
+    assert.equal(t.framework.getAgentRecord(g(1))!.incarnation, 1, 'no incarnation began');
+    assert.equal(t.forkTraces().length, 1);
+    t.look(epochId, [t.hold(epochId, 'HELD-3')]);
+    await t.looked(g(2), 1);
+    assert.deepEqual(t.traces.filter((e) => e.type === 'tune-out:reader-rederived').map((e) => (e as unknown as { reason: string }).reason), ['branch-moved'],
+      "planned on the branch it runs on: its last look was framed on the other");
+  });
+
+  it("counts held rows as handed only from a framing its window holds: an undone framing's are handed again", { timeout: 120_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-undone-'));
+    dirs.push(dir);
+    const t = await boot(dir, { persist: 'resident' });
+    const epochId = t.enter();
+    const name = 'reader/scout/g1';
+    const first = t.hold(epochId, 'HELD-1');
+    t.look(epochId, [first]);
+    await t.looked(name, 1);
+    const second = t.hold(epochId, 'HELD-2 undone');
+    t.look(epochId, [second]);
+    await t.looked(name, 2);
+    // The reader's second turn is undone: its framing leaves its window.
+    const cm = await t.framework.inspectAgentContext(name);
+    const framing = cm.getAllMessages().filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'tune-out-reader-framing').at(-1)!;
+    const turn = cm.getPresentedMessages().filter((m) => m.sequence >= framing.sequence).map((m) => m.id);
+    cm.retractRows(turn, { undone: true });
+    assert.equal(cm.windowStatusOf(framing.id), 'undone', 'premise');
+    // As after a restart: the epoch's whole backlog.
+    t.look(epochId, [first, second, t.hold(epochId, 'HELD-3')]);
+    await t.looked(name, 3);
+    assert.equal(t.forkTraces().at(-1)!.held, 2, 'HELD-2 and HELD-3: the undone framing hands nothing');
+    const last = JSON.stringify(t.membrane.callsFor('reader').at(-1)!.messages.at(-1));
+    assert.ok(last.includes('HELD-2 undone') && last.includes('HELD-3') && !last.includes('HELD-1'), last);
+  });
+
+  it("starts each look's report count afresh: a report from a run the host resumed the reader for doesn't stand for the next look's", { timeout: 120_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-report-'));
+    dirs.push(dir);
+    const t = await boot(dir, { persist: 'resident' });
+    const epochId = t.enter();
+    const name = 'reader/scout/g1';
+    t.look(epochId, [t.hold(epochId, 'HELD-1')]);
+    await t.looked(name, 1);
+    // The host resumes the reader itself, and it reports.
+    t.membrane.script('reader',
+      createMockResponse([{ type: 'tool_use', id: 'host-report', name: 'deliver_summary', input: { channelId: CHANNEL, text: 'HOST-RUN report' } }], 'tool_use'),
+      final([text('host run done')]));
+    const run = await t.framework.resumeAgent(name, { model: 'test-model', systemPrompt: 'You are scout.', proseRouting: 'disabled' });
+    await t.framework.runEphemeralToCompletion(run.agent, run.contextManager);
+    await t.framework.runUntilIdle();
+    assert.equal(t.internals.tuneOutCoordinator.readerReported(name), true, 'premise: the host-resumed run reported');
+    // The next look ends in prose, with no deliver_summary of its own.
+    const delivered = () => t.traces.filter((e) => e.type === 'tune-out:reader-prose-delivered') as unknown as Array<{ agentName: string; chars: number }>;
+    const before = delivered().length;
+    t.membrane.script('reader', final([text('LOOK-PROSE report')]));
+    t.look(epochId, [t.hold(epochId, 'HELD-2')]);
+    await t.looked(name, 3);
+    assert.deepEqual(delivered().slice(before).map((e) => [e.agentName, e.chars]), [[name, 'LOOK-PROSE report'.length]], "the look's prose is its report");
+    assert.ok(t.rows().some((m) => textOf(m).includes('LOOK-PROSE report')));
+  });
+});
+
+describe('a persisted reader: the resync, bounded and unreadable', () => {
+  it("hands a resumed look the newest rows its resyncLimit allows, says how many older ones it leaves out, and hands those at no later look", { timeout: 180_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-bound-rows-'));
+    dirs.push(dir);
+    const contexts: ReaderFramingContext[] = [];
+    const t = await boot(dir, { persist: 'resident', resyncLimit: { rows: 3 }, framing: (ctx: ReaderFramingContext) => { contexts.push(ctx); return defaultReaderFraming(ctx); } });
+    const epochId = t.enter();
+    const name = 'reader/scout/g1';
+    t.membrane.script('scout', final([text('NOTED-1')]));
+    t.look(epochId, [t.hold(epochId, 'HELD-1')]);
+    await t.looked(name, 1);
+    await waitFor("scout's turn on the report", () => t.rows().some((m) => textOf(m) === 'NOTED-1'));
+    for (let n = 1; n <= 3; n++) await t.residentTurn(`GAP-${n} said`, `GAP-${n} reply`);
+    t.membrane.script('scout', final([text('NOTED-2')]));
+    t.look(epochId, [t.hold(epochId, 'HELD-2')]);
+    await t.looked(name, 2);
+    await waitFor("scout's turn on the second report", () => t.rows().some((m) => textOf(m) === 'NOTED-2'));
+    t.look(epochId, [t.hold(epochId, 'HELD-3')]);
+    await t.looked(name, 3);
+
+    const second = contexts[1]!;
+    const marks = (await t.framework.inspectAgentContext(name)).getAllMessages()
+      .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'tune-out-reader-framing')
+      .map((m) => (m.metadata as { residentThrough: number }).residentThrough);
+    // What scout's window took between the marks, but the reader's report mail: an unbounded resync's rows.
+    const cm = t.scout().getContextManager();
+    const between = cm.getPresentedMessages().filter((m) => {
+      const at = cm.ordinalOf(m.id) as unknown as number;
+      return at > marks[0]! && at <= marks[1]! && (m.metadata as { dendrite?: { from?: { agent?: string } } } | undefined)?.dendrite?.from?.agent !== name;
+    });
+    assert.ok(between.some((m) => textOf(m) === 'GAP-1 said') && between.length > 3, 'premise: more rows entered than the bound');
+    assert.deepEqual(second.residentRows!.map((m) => m.id), between.slice(-3).map((m) => m.id), 'the newest three, in window order');
+    assert.equal(second.residentRowsOmitted, between.length - 3, 'the rest, counted');
+    const sent = JSON.stringify(t.membrane.callsFor('reader')[1]!.messages.at(-1));
+    assert.ok(sent.includes(`[In scout's context since your last look: ${between.length} messages; the oldest ${between.length - 3} are not shown here]`), sent);
+    const third = contexts[2]!;
+    assert.ok(!third.residentRows!.some((m) => textOf(m).startsWith('GAP-')), 'the rows left out are never handed later: the mark is at the window end');
+    assert.equal(third.residentRowsOmitted, undefined, 'nothing left out at the third look');
+    assert.equal(t.forkTraces()[1]!.resynced, 3, 'the trace counts the rows handed');
+  });
+
+  it("by default fits the resync in the reader strategy's per-message room, so the held traffic after it is not cut", { timeout: 180_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-bound-room-'));
+    dirs.push(dir);
+    const contexts: ReaderFramingContext[] = [];
+    const capped = () => new WindowedPassthroughStrategy({ maxMessageTokens: 150 });
+    const t = await boot(dir, {
+      persist: 'resident', strategyFactory: capped,
+      framing: (ctx: ReaderFramingContext) => { contexts.push(ctx); return defaultReaderFraming(ctx); },
+    }, {
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', proseRouting: 'disabled', strategy: capped() }],
+    } as never);
+    const epochId = t.enter();
+    const name = 'reader/scout/g1';
+    t.membrane.script('scout', final([text('NOTED-1')]));
+    t.look(epochId, [t.hold(epochId, 'HELD-1')]);
+    await t.looked(name, 1);
+    await waitFor("scout's turn on the report", () => t.rows().some((m) => textOf(m) === 'NOTED-1'));
+    for (let n = 1; n <= 4; n++) await t.residentTurn(`GAP-${n} a line of the resident's traffic, long enough to fill some room`, `GAP-${n} a reply of the resident's, long enough to fill some room too`);
+    t.look(epochId, [t.hold(epochId, 'HELD-2 the last held line')]);
+    await t.looked(name, 2);
+    const second = contexts[1]!;
+    assert.ok((second.residentRowsOmitted ?? 0) > 0, 'some rows are left out');
+    const shown = second.residentRows!.map((m) => textOf(m));
+    assert.ok(shown.includes("GAP-4 a reply of the resident's, long enough to fill some room too") && !shown.some((h) => h.startsWith('GAP-1')),
+      `the newest are shown, the oldest left out: ${JSON.stringify(shown)}`);
+    const framing = defaultReaderFraming(second);
+    const chars = framing.reduce((sum, b) => sum + (b.type === 'text' ? (b as { text: string }).text.length : 0), 0);
+    assert.ok(chars <= 150 * 4, `the framing fits the room: ${chars}`);
+    const sent = JSON.stringify(t.membrane.callsFor('reader')[1]!.messages.at(-1));
+    assert.ok(sent.includes('antra: HELD-2 the last held line') && !sent.includes('content omitted') && !sent.includes('[truncated'), sent);
+  });
+
+  it("with resync 'window', tells a resumed reader when what entered the resident's context can't be read", { timeout: 180_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-unread-'));
+    dirs.push(dir);
+    const contexts: ReaderFramingContext[] = [];
+    const t = await boot(dir, { persist: 'resident', framing: (ctx: ReaderFramingContext) => { contexts.push(ctx); return defaultReaderFraming(ctx); } });
+    const fw = t.framework as unknown as { residentMark(primary: string): unknown };
+    const mark = fw.residentMark.bind(fw);
+    const epochId = t.enter();
+    const name = 'reader/scout/g1';
+    try {
+      // Derived while the resident's window gives no mark: its framing records none.
+      fw.residentMark = () => undefined;
+      t.look(epochId, [t.hold(epochId, 'HELD-1')]);
+      await t.looked(name, 1);
+      // Its window gives one now, and no framing on its branch says where it stood.
+      fw.residentMark = mark;
+      t.look(epochId, [t.hold(epochId, 'HELD-2')]);
+      await t.looked(name, 2);
+      // And none at this look.
+      fw.residentMark = () => undefined;
+      t.look(epochId, [t.hold(epochId, 'HELD-3')]);
+      await t.looked(name, 3);
+    } finally {
+      fw.residentMark = mark;
+    }
+    assert.deepEqual(contexts.map((c) => [c.residentRows, c.residentRowsUnavailable]),
+      [[undefined, undefined], [undefined, 'no-mark'], [undefined, 'not-presented']]);
+    assert.deepEqual(t.forkTraces().map((f) => f.resynced), [0, undefined, undefined], 'resynced is left out where the rows could not be read');
+    for (const n of [1, 2]) {
+      const sent = JSON.stringify(t.membrane.callsFor('reader')[n]!.messages.at(-1));
+      assert.ok(sent.includes("[What entered scout's context since your last look could not be read; none of it is shown here.]"), sent);
+    }
+  });
+
+  it('writes the omission and the unreadable gap as facts in the default framing', () => {
+    const row = (participant: string, said: string) =>
+      ({ id: `r-${Math.random()}`, sequence: 0, participant, content: [{ type: 'text', text: said }], metadata: {} }) as unknown as StoredMessage;
+    const ctx: ReaderFramingContext = {
+      resident: 'scout', fork: 'reader/scout/g1', voice: 'Read for scout.', channelId: CHANNEL, epochId: 'abcdef0123', trigger: 'cadence',
+      notice: '[Tune-out cadence: test]', dispositions: null, backlog: [], resumed: true, incarnation: 2,
+    };
+    const all = (c: ReaderFramingContext) => defaultReaderFraming(c).map((b) => (b as { text?: string }).text ?? '').join('\n');
+    assert.ok(all({ ...ctx, residentRows: [row('scout', 'newest')], residentRowsOmitted: 600 })
+      .includes("[In scout's context since your last look: 601 messages; the oldest 600 are not shown here]\nscout: newest"));
+    assert.ok(all({ ...ctx, residentRows: [row('scout', 'newest')], residentRowsOmitted: 1 })
+      .includes("[In scout's context since your last look: 2 messages; the oldest is not shown here]"));
+    assert.ok(all({ ...ctx, residentRows: [], residentRowsOmitted: 3 }).includes("[In scout's context since your last look: 3 messages; none is shown here]"));
+    assert.ok(all({ ...ctx, residentRowsUnavailable: 'no-mark' })
+      .includes("[What entered scout's context since your last look could not be read; none of it is shown here.]"));
+  });
+});
+
+describe('resumeAgent and the derivation notice', () => {
+  const create = async (dendrite: Record<string, unknown> = {}) => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-dendrite-'));
+    dirs.push(dir);
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 's.chronicle'),
+      membrane: new RoutedMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      modules: [],
+      syncIntervalMs: 0,
+      ...(Object.keys(dendrite).length > 0 ? { dendrite } : {}),
+    } as never);
+    frameworks.push(framework);
+    await framework.start();
+    return framework;
+  };
+
+  it("leaves a later incarnation's tool presentation as it is when an earlier one's cleanup runs", { timeout: 60_000 }, async () => {
+    const framework = await create();
+    const owners = (framework as unknown as { toolSurfaceOwners: Map<string, string> }).toolSurfaceOwners;
+    const derived = await framework.deriveAgent({ name: 'f', from: 'scout', framing: [{ participant: 'user', content: [text('go')] }] });
+    await framework.runEphemeralToCompletion(derived.agent, derived.contextManager);
+    const { name: _name, ...config } = (framework as unknown as { agentConfigs: Map<string, AgentConfig> }).agentConfigs.get('scout')!;
+    const second = await framework.resumeAgent('f', config);
+    await framework.runEphemeralToCompletion(second.agent, second.contextManager);
+    const third = await framework.resumeAgent('f', config);
+    assert.equal(owners.get('f'), 'scout', "premise: the third incarnation shows scout's presentation");
+    second.cleanup();
+    assert.equal(owners.get('f'), 'scout', "the second incarnation's cleanup leaves the third's");
+    third.cleanup();
+    assert.equal(owners.get('f'), undefined, 'its own cleanup takes it out');
+  });
+
+  it("tells the source of a derivation that is no reader the ordinary line, whatever persist metadata the host gave it", { timeout: 60_000 }, async () => {
+    const framework = await create({ derivationNotice: (_record: unknown, _from: string, line: string) => line, collapseDerivationNoticesAfter: 0 });
+    const task = await framework.deriveAgent({
+      name: 'task-1', from: 'scout', kind: 'task-fork', metadata: { persist: 'resident', resync: 'window' },
+      framing: [{ participant: 'user', content: [text('do it')] }],
+    });
+    await framework.runEphemeralToCompletion(task.agent, task.contextManager);
+    const line = framework.getAgent('scout')!.getContextManager().getAllMessages()
+      .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'agent-lifecycle')
+      .map((m) => textOf(m)).find((l) => l.includes('task-1'));
+    assert.ok(line?.includes('a task-fork on your weights (test-model), reading your context up to this point; '), line);
+    assert.ok(!line?.includes('look'), line);
   });
 });

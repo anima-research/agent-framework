@@ -1972,8 +1972,9 @@ function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
  * subconscious's `thinkingBinding` assertThinkingBinding refuses, whichever
  * its reader, or whose persistent subconscious's `foreignRounds` is neither
  * of its modes (assertOneOfSetting), or whose reader forks' `persist` or
- * `resync` is none of its modes, or `pendingRound` neither an object nor a
- * function. A subconscious that isn't on has its
+ * `resync` is none of its modes, `resyncLimit` not an object of whole
+ * numbers, or `pendingRound` neither an object nor a function. A
+ * subconscious that isn't on has its
  * `allowChannelSpeech`, `thinkingBinding` and `foreignRounds` left
  * unchecked, since nothing reads them then.
  */
@@ -2015,6 +2016,19 @@ function assertFrameworkSwitches(config: FrameworkConfig): void {
           '\'window\' or leaving it out hands a resumed reader the rows the resident\'s window took since its last look, ' +
             'and \'none\' hands it the held traffic alone',
         );
+        if (holdsSettings('subconscious.resyncLimit', config.subconscious.resyncLimit, '{ rows: 200 }')) {
+          for (const key of ['rows', 'chars'] as const) {
+            const value: unknown = config.subconscious.resyncLimit[key];
+            if (value === undefined || value === null || (typeof value === 'number' && Number.isInteger(value) && value >= 0)) continue;
+            throw new Error(
+              `subconscious.resyncLimit.${key} must be a whole number, 0 or more${typeof value === 'number' ? '' : `, not ${kindOf(value)}`}: ` +
+                (key === 'rows'
+                  ? 'the most of the resident\'s rows a resumed reader is handed; left out, no count bound'
+                  : 'the most characters those rows take as the default framing writes them; left out, the room the reader\'s ' +
+                    'strategy gives one message less the rest of the framing'),
+            );
+          }
+        }
         const round: unknown = config.subconscious.pendingRound;
         if (round !== undefined && typeof round !== 'function' && (round === null || typeof round !== 'object' || Array.isArray(round))) {
           throw new Error(
@@ -2122,8 +2136,8 @@ export function tuneOutTool(reader: TuneOutReader): import('./types/index.js').T
         (reader.persist === undefined
           ? ''
           : `${reader.persist === 'epoch' ? 'Within one tune-out, later runs resume that fork' : 'Later runs resume that fork, across tune-outs'}` +
-            `${reader.resync === 'none' ? '' : ', each handed what entered your context since the run before'}` +
-            '; a new fork is made only when it can\'t be resumed. ')
+            `${reader.resync === 'none' ? '' : ', each handed an account of the messages your context took since the run before (not your stored context injections)'}` +
+            `; a new fork is made when it can't be resumed${reader.persist === 'epoch' ? ', or for a run after the tune-out ended' : ''}. `)
       : 'No reader is configured here, so none reads it meanwhile: it is held for you, and delivered when you cancel ' +
         'the tune-out or durationSeconds runs out. ';
   return {
@@ -6317,6 +6331,12 @@ export class AgentFramework {
     // once a stop() is admitted, so no new lifecycle begins beside it.)
     for (const [name, run] of this.ephemeralRuns) run.settle.reject(ephemeralRunStopped(name));
     for (const agent of this.agents.values()) step(() => { agent.unpinTurnInputs(); });
+    // A persisted reader's looks (invokePersistedReader) run one after another
+    // outside the event loop: the one whose run was just ended settles, and
+    // each queued behind it starts nothing once admission is closed
+    // (persistedReaderLook). Waited for so none touches the store after it
+    // is torn down.
+    await waitFor([...this.readerLooks].map(([identity, promise]) => ({ label: `reader looks:${identity}`, promise })));
 
     // Admission closed when stop() began. What admitted operations start now,
     // such as a surgery's config materialization, joins the set, so wait until
@@ -11599,7 +11619,9 @@ export class AgentFramework {
     // A shared derivation on its source's tools shows the source's tool
     // presentation, as deriveAgent set it up (toolSurfaceOwners): its tool
     // block is the front of the prefix it shares. The run's end clears it,
-    // as it does a derivation's; a cleanup before the run does here.
+    // as it does a derivation's; a cleanup before the run does here, while
+    // this candidate is still the one being resumed: a later incarnation's
+    // entry is the same name and owner, and its own to clear.
     const source = record.inherit?.mode === 'shared' ? record.inherit.from : undefined;
     const sourceConfig = source !== undefined && this.agents.has(source) ? this.agentConfigs.get(source) : undefined;
     const surfaceOwner = source !== undefined && sourceConfig && sameAllowedTools(fullConfig.allowedTools, sourceConfig.allowedTools)
@@ -11607,8 +11629,9 @@ export class AgentFramework {
       : undefined;
     if (surfaceOwner !== undefined) this.toolSurfaceOwners.set(name, surfaceOwner);
     const cleanup = () => {
-      if (this.resumesPending.get(name) === agent) this.resumesPending.delete(name);
-      if (surfaceOwner !== undefined && !this.agents.has(name) && this.toolSurfaceOwners.get(name) === surfaceOwner) {
+      const pending = this.resumesPending.get(name) === agent;
+      if (pending) this.resumesPending.delete(name);
+      if (pending && surfaceOwner !== undefined && !this.agents.has(name) && this.toolSurfaceOwners.get(name) === surfaceOwner) {
         this.toolSurfaceOwners.delete(name);
       }
       this.releasedByCleanup.add(agent);
@@ -12354,14 +12377,20 @@ export class AgentFramework {
         : ` on ${record.model}`;
     // A persisted reader (subconscious.persist, recorded in its metadata)
     // reads the context it was derived with, and with resync 'window' is
-    // handed what entered the source's context after it at each look.
-    const persisted = record.metadata?.persist === 'epoch' || record.metadata?.persist === 'resident';
+    // handed, at each look, an account of the rows the source's context took
+    // since the look before (residentRowsSince), its stored context
+    // injections left out. The
+    // metadata is the host's to set on any derivation: only a reader fork's
+    // reads as a persisted reader's.
+    const persisted = record.kind === 'subconscious-fork'
+      && (record.metadata?.persist === 'epoch' || record.metadata?.persist === 'resident');
     const inherited = record.inherit?.mode === 'shared'
       ? !persisted
         ? 'reading your context up to this point'
         : (record.incarnation > 1 ? 'reading your context up to the point it was derived' : 'reading your context up to this point') +
           (record.metadata?.resync === 'window'
-            ? `, and handed what entered your context after it at each ${record.incarnation > 1 ? '' : 'later '}look`
+            ? `, and at each ${record.incarnation > 1 ? '' : 'later '}look handed an account of the messages your context took ` +
+              'since the look before (not your stored context injections)'
             : '')
       : 'with a copy of your context';
     const route = record.relationships.resultTo;
@@ -17741,8 +17770,13 @@ export class AgentFramework {
    * Where a persisted reader's look starts: the identity's current
    * generation, resumed, when the registry has an ended record of it in
    * scope and nothing below says to derive it again; otherwise a derivation
-   * under the first generation's name no agent has had in this process or
-   * in the registry. Derived again (`reason`), the current generation having
+   * under the first generation's name no agent has had in this process, in
+   * the registry or in the store. A generation counts as used when the
+   * registry has a record of it or the store a branch a derivation made for
+   * it (`dendrite/<name>`, or `~n` after it): a derivation whose run was
+   * refused has its branch and no record, and a record can be out of the
+   * registry's reach on another branch. The current generation is the
+   * newest used one. Derived again (`reason`), the current generation having
    * been used:
    *
    * - `'no-record'`: the registry has no ended record of its name, or (with
@@ -17763,12 +17797,19 @@ export class AgentFramework {
     scopeEnded: boolean,
   ): { name: string; resume?: AgentRecord; previous?: string; reason?: ReaderRederivedReason } {
     const nameOf = (k: number): string => `${identity}/g${k}`;
+    // The agent names the store has a derivation's branch for (deriveAgent
+    // names it `dendrite/<name>`, `~n` after it when that is taken).
+    const branched = new Set<string>();
+    for (const { name } of this.store.listBranches()) {
+      if (name.startsWith('dendrite/')) branched.add(name.slice('dendrite/'.length).replace(/~\d+$/, ''));
+    }
+    const used = (name: string): boolean => this.registry.inspect(name) !== undefined || branched.has(name);
     let k = this.readerGenerations.get(identity);
     if (k === undefined) {
       // The identity's first look in this process: the newest generation
-      // the registry knows of, from an earlier process included.
+      // used, in an earlier process included.
       k = 0;
-      while (this.registry.inspect(nameOf(k + 1))) k++;
+      while (used(nameOf(k + 1))) k++;
       this.readerGenerations.set(identity, k);
     }
     const current = k > 0 ? nameOf(k) : undefined;
@@ -17787,13 +17828,13 @@ export class AgentFramework {
     }
     let next = Math.max(1, k);
     const taken = (name: string): boolean =>
-      this.usedEphemeralAgentNames.has(name) || this.agents.has(name) || this.registry.inspect(name) !== undefined;
+      this.usedEphemeralAgentNames.has(name) || this.agents.has(name) || used(name);
     while (taken(nameOf(next))) next++;
     this.readerGenerations.set(identity, next);
     // A generation that was used and has no ended record: derived again.
     // One whose derivation never got its name (a beforeDerive refusal)
     // is derived under the same name, as the first look was to be.
-    const earlier = current !== undefined && (record !== undefined || this.usedEphemeralAgentNames.has(current));
+    const earlier = current !== undefined && (used(current) || this.usedEphemeralAgentNames.has(current));
     return { name: nameOf(next), ...(earlier ? { previous: current, reason: reason ?? 'no-record' } : {}) };
   }
 
@@ -17803,9 +17844,11 @@ export class AgentFramework {
    * resumes it (resumeAgent): a new incarnation on the branch it left, with
    * the configuration a derivation gives it and this look's epoch, channel
    * and trigger as its metadata. Either way it is handed this look's
-   * framing as one stored row and runs once. A resumption that fails, a
-   * beforeDerive refusal included, is a failed look: its held rows go back
-   * (readerFailed). Never throws.
+   * framing as one stored row and runs once. A look that fails, in its
+   * planning (readerPlan), its derivation or resumption (a beforeDerive
+   * refusal included) or its run, is a failed look: its held rows go back
+   * (readerFailed), and it is traced (`tune-out:reader-fork-failed`). Never
+   * throws.
    */
   private async persistedReaderLook(
     primary: string,
@@ -17815,30 +17858,65 @@ export class AgentFramework {
     invocation: ReaderInvocation,
     scopeEnded: boolean,
   ): Promise<void> {
+    // stop() has begun while this look waited: its run would be refused, so
+    // nothing is planned, derived or resumed for it, and no framing is
+    // stored. Its rows aren't given back: the coordinator has stopped, and
+    // after a restart, where it has no cursor, an epoch's first look is
+    // handed all the epoch holds (stop() waits for the looks: stopOwned).
+    if (this.providerAdmissionClosed) return;
     // The resident ended while this look waited: it ended the reader with it
-    // (onParentEnd 'end'), and nothing resumes after.
+    // (onParentEnd 'end'), and nothing resumes after. No reader read the
+    // look's held rows, which go back as a failed look's do, and the look is
+    // traced as failed under the identity's name, no generation planned.
     const parent = this.agents.get(primary);
     const parentConfig = this.agentConfigs.get(primary);
-    if (!parent || !parentConfig) return;
-    const resync = cfg.resync ?? 'window';
-    const plan = this.readerPlan(identity, primary, persist, resync, invocation, scopeEnded);
-    const name = plan.name;
-    if (plan.reason && plan.previous) {
+    if (!parent || !parentConfig) {
+      const returned = this.tuneOutCoordinator?.readerFailed(invocation) ?? 0;
       this.emitTrace({
-        type: 'tune-out:reader-rederived',
-        agentName: name,
-        previous: plan.previous,
-        reason: plan.reason,
+        type: 'tune-out:reader-fork-failed',
+        agentName: identity,
         serverId: invocation.serverId,
         channelId: invocation.channelId,
         epochId: invocation.epochId,
         trigger: invocation.trigger,
+        error: 'the resident ended before the look ran',
+        reported: false,
+        returned,
       });
+      return;
     }
+    const resync = cfg.resync ?? 'window';
+    // The look's name: its generation's once it is planned, the identity's
+    // for a failure before (a registry or branch read that throws).
+    let name = identity;
     let framed = false;
-    let handed = invocation.backlog;
+    const backlog = invocation.backlog;
+    let handed = backlog;
+    // The held rows a run took on in a framing on the reader's branch
+    // (readerHanded): not given back if this look fails.
+    let taken: ReadonlySet<string> = new Set();
     let candidate: { agent: Agent; contextManager: ContextManager; cleanup: () => void } | undefined;
     try {
+      const plan = this.readerPlan(identity, primary, persist, resync, invocation, scopeEnded);
+      // The host's branch the plan was made on (its checkpoint and mark checks).
+      const plannedOn = this.store.currentBranch().name;
+      name = plan.name;
+      // Whether this look reported (readerReported) is this look's alone: a
+      // run the host resumed the reader for between looks may have reported
+      // under the same name.
+      this.tuneOutCoordinator?.forgetReader(name);
+      if (plan.reason && plan.previous) {
+        this.emitTrace({
+          type: 'tune-out:reader-rederived',
+          agentName: name,
+          previous: plan.previous,
+          reason: plan.reason,
+          serverId: invocation.serverId,
+          channelId: invocation.channelId,
+          epochId: invocation.epochId,
+          trigger: invocation.trigger,
+        });
+      }
       const base = {
         resident: primary,
         fork: name,
@@ -17860,22 +17938,32 @@ export class AgentFramework {
         resync,
         ...(branch !== undefined ? { residentBranch: branch } : {}),
       };
-      // The framing row says what the reader was handed: the held rows, and
-      // where the resident's window stood (the ordinal of the last row it
-      // held, on its branch), from which the next look reads what it took
-      // since (readerHanded).
-      const framingRow = (held: StoredMessage[], mark: { branch: string; through: number } | undefined): MessageMetadata => ({
+      // The framing row says what the reader was handed: the held rows, the
+      // incarnation it was made for, which a run took on only if the record
+      // reaches it, and where the resident's window stood (the ordinal of the
+      // last row it held, on its branch), from which the next look reads what
+      // it took since (readerHanded).
+      const framingRow = (
+        held: StoredMessage[],
+        incarnation: number,
+        mark: { branch: string; through: number } | undefined,
+      ): MessageMetadata => ({
         system: true,
         kind: 'tune-out-reader-framing',
         channelId: invocation.channelId,
         epochId: invocation.epochId,
         trigger: invocation.trigger,
+        incarnation,
         heldMessageIds: held.map((m) => m.id),
         ...(mark ? { residentThrough: mark.through, residentBranch: mark.branch } : {}),
       }) as MessageMetadata;
       const readerConfig = { model: cfg.model, proseRouting: 'disabled' as const, ...readerModelFields(cfg) };
       let incarnation: number;
       let residentRows: StoredMessage[] | undefined;
+      // How many older rows resyncLimit leaves out of residentRows.
+      let omitted = 0;
+      // With resync 'window', why a resumed look's resident rows couldn't be read.
+      let unavailable: ReaderFramingContext['residentRowsUnavailable'];
       if (plan.resume) {
         // The configuration deriveAgent gives a reader, built again: it is
         // not stored with the agent.
@@ -17888,6 +17976,14 @@ export class AgentFramework {
           }, true),
           { metadata },
         );
+        // The reopen waits for the store: a branch switch meanwhile leaves
+        // the plan's checks, and the metadata's branch, of another branch.
+        // The look fails (the catch cleans the candidate up), and the next
+        // plans on the branch it runs on.
+        const now = this.store.currentBranch().name;
+        if (now !== plannedOn) {
+          throw new Error(`the host's branch moved from ${plannedOn} to ${now} while ${name} was being resumed`);
+        }
         incarnation = plan.resume.incarnation + 1;
         // From here to the stored row nothing waits, so the rows read and
         // the mark recorded are of one instant of the resident's window.
@@ -17896,19 +17992,33 @@ export class AgentFramework {
         // What its own branch holds already, as an earlier framing's, a
         // failed look's included: not handed again (after a restart the
         // coordinator's cursor is gone, and an epoch's first look is handed
-        // all it held).
-        handed = invocation.backlog.filter((m) => !before.held.has(m.id));
-        if (resync === 'window' && mark && before.through !== undefined) {
-          residentRows = this.residentRowsSince(primary, name, before.through);
+        // all it held). A failed look's framing is in the window of the next
+        // run that takes the reader on.
+        handed = backlog.filter((m) => !before.held.has(m.id));
+        taken = before.taken;
+        // Read from the resident's window index, from the mark the last
+        // framing on its branch recorded: with no index (its window isn't
+        // presented) or no such mark, the framing says they couldn't be read.
+        // The newest that fit the bound are handed (fitResidentRows); this
+        // framing's mark is the window's end, so those left out are handed
+        // at no later look.
+        const resumed = { ...base, backlog: handed, resumed: true, incarnation };
+        if (resync === 'window') {
+          if (!mark) unavailable = 'not-presented';
+          else if (before.through === undefined) unavailable = 'no-mark';
+          else {
+            const fit = this.fitResidentRows(candidate.agent, cfg.resyncLimit, resumed, this.residentRowsSince(primary, name, before.through));
+            residentRows = fit.shown;
+            omitted = fit.omitted;
+          }
         }
         const content = (cfg.framing ?? defaultReaderFraming)({
-          ...base,
-          backlog: handed,
-          resumed: true,
-          incarnation,
+          ...resumed,
           ...(residentRows ? { residentRows } : {}),
+          ...(omitted > 0 ? { residentRowsOmitted: omitted } : {}),
+          ...(unavailable ? { residentRowsUnavailable: unavailable } : {}),
         });
-        storeOwnRow(candidate.agent, 'user', content, framingRow(handed, mark));
+        storeOwnRow(candidate.agent, 'user', content, framingRow(handed, incarnation, mark));
       } else {
         incarnation = 1;
         const context: ReaderFramingContext = {
@@ -17935,7 +18045,7 @@ export class AgentFramework {
           // its checkpoint (context-manager's derive is synchronous up to its
           // seeded stores), so the mark is the checkpoint's, and the
           // derivation holds the resident's window up to it.
-          framing: [{ participant: 'user', content, metadata: framingRow(handed, this.residentMark(primary)) }],
+          framing: [{ participant: 'user', content, metadata: framingRow(handed, incarnation, this.residentMark(primary)) }],
           metadata,
         });
       }
@@ -17955,7 +18065,9 @@ export class AgentFramework {
         held: handed.length,
         incarnation,
         resumed: plan.resume !== undefined,
-        resynced: residentRows?.length ?? 0,
+        // Left out where the rows couldn't be read: none were handed, and
+        // none were known to have entered.
+        ...(unavailable ? {} : { resynced: residentRows?.length ?? 0 }),
       });
       const outcome = await this.runEphemeralToCompletion(candidate.agent, candidate.contextManager);
       const prose = outcome.speech.trim();
@@ -17981,10 +18093,11 @@ export class AgentFramework {
       // being resumed until it is cleaned up, and the next look resumes it.
       candidate?.cleanup();
       const reported = this.tuneOutCoordinator?.readerReported(name) ?? false;
-      // The rows it was handed go back, not those its branch held already.
+      // The rows it was handed go back, and those its branch held only in a
+      // framing no run took on (a refused look's), but not those a run took.
       // The invocation itself goes, since the coordinator knows its late
       // look by the object (lateFork) and derives no other for one that fails.
-      invocation.backlog = handed;
+      invocation.backlog = backlog.filter((m) => !taken.has(m.id));
       const returned = reported ? 0 : (this.tuneOutCoordinator?.readerFailed(invocation) ?? 0);
       this.emitTrace({
         type: 'tune-out:reader-fork-failed',
@@ -18018,21 +18131,88 @@ export class AgentFramework {
   /**
    * What a persisted reader's branch says it was handed, read from its
    * framing rows past its derivation's checkpoint: every held row any of
-   * them handed it, and the resident's window mark on the last of them
-   * framed on `branch`, or none.
+   * them handed it (`held`); those of them a run took on (`taken`), from a
+   * framing made for an incarnation the ended `record` reaches, where one
+   * made for a later incarnation is a refused look's, which no run read;
+   * and the resident's window mark on the last of them framed on `branch`,
+   * or none. A framing an undo took out of the reader's window (`'undone'`)
+   * is in no window it will read, and counts for none of these; a failed
+   * look's, out of the window until a run takes the reader on, counts.
    */
-  private readerHanded(cm: ContextManager, record: AgentRecord, branch: string | undefined): { held: Set<string>; through?: number } {
+  private readerHanded(
+    cm: ContextManager,
+    record: AgentRecord,
+    branch: string | undefined,
+  ): { held: Set<string>; taken: Set<string>; through?: number } {
     const checkpoint = record.inherit?.atSequence ?? Number.NEGATIVE_INFINITY;
+    const presented = cm.windowMode() === 'presented';
     const held = new Set<string>();
+    const taken = new Set<string>();
     let through: number | undefined;
     for (const m of cm.getAllMessages()) {
       if (m.sequence <= checkpoint) continue;
-      const meta = m.metadata as { kind?: unknown; heldMessageIds?: unknown; residentThrough?: unknown; residentBranch?: unknown } | undefined;
+      const meta = m.metadata as {
+        kind?: unknown; incarnation?: unknown; heldMessageIds?: unknown; residentThrough?: unknown; residentBranch?: unknown;
+      } | undefined;
       if (meta?.kind !== 'tune-out-reader-framing') continue;
-      if (Array.isArray(meta.heldMessageIds)) for (const id of meta.heldMessageIds) if (typeof id === 'string') held.add(id);
+      if (presented && cm.windowStatusOf(m.id) === 'undone') continue;
+      const ran = typeof meta.incarnation !== 'number' || meta.incarnation <= record.incarnation;
+      if (Array.isArray(meta.heldMessageIds)) {
+        for (const id of meta.heldMessageIds) {
+          if (typeof id !== 'string') continue;
+          held.add(id);
+          if (ran) taken.add(id);
+        }
+      }
       if (typeof meta.residentThrough === 'number' && branch !== undefined && meta.residentBranch === branch) through = meta.residentThrough;
     }
-    return { held, ...(through !== undefined ? { through } : {}) };
+    return { held, taken, ...(through !== undefined ? { through } : {}) };
+  }
+
+  /**
+   * The newest of `rows`, the resident's since a resumed persisted reader's
+   * last look, that its framing shows (ForkReaderConfig.resyncLimit): at
+   * most `limit.rows` of them, whose block, as defaultReaderFraming writes it
+   * with the count of those left out, takes at most `limit.chars`
+   * characters; with no `chars`, the room the reader's strategy gives one
+   * message (strategyDerivedToolResultChars) less what the default framing
+   * writes for `context` without them, so the whole framing fits that room.
+   * A strategy keeps a message's first characters up to its room and cuts
+   * the rest, and the default framing puts the held traffic last, so a
+   * framing past it would lose its newest rows and the held traffic. Rows go
+   * whole or not at all, kept from the newest; `omitted` counts the rest.
+   */
+  private fitResidentRows(
+    reader: Agent,
+    limit: ForkReaderConfig['resyncLimit'],
+    context: ReaderFramingContext,
+    rows: StoredMessage[],
+  ): { shown: StoredMessage[]; omitted: number } {
+    const chars = (blocks: ContentBlock[]): number =>
+      blocks.reduce((sum, b) => sum + (b.type === 'text' ? (b as Extract<ContentBlock, { type: 'text' }>).text.length : 0), 0);
+    const rest = chars(defaultReaderFraming(context));
+    const room = this.strategyDerivedToolResultChars(reader);
+    const most = limit?.chars ?? (room !== undefined ? room - rest : undefined);
+    const newest = (k: number): StoredMessage[] => rows.slice(rows.length - k);
+    const fits = (k: number): boolean => most === undefined || chars(defaultReaderFraming({
+      ...context,
+      residentRows: newest(k),
+      ...(k < rows.length ? { residentRowsOmitted: rows.length - k } : {}),
+    })) - rest <= most;
+    let k = Math.min(rows.length, limit?.rows ?? rows.length);
+    if (!fits(k)) {
+      // Each row kept lengthens the block (bar a digit of the count), so the
+      // most that fit is found by halving; none fitting shows none.
+      let lo = 0;
+      let hi = k - 1;
+      while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2);
+        if (fits(mid)) lo = mid;
+        else hi = mid - 1;
+      }
+      k = lo;
+    }
+    return { shown: newest(k), omitted: rows.length - k };
   }
 
   /**

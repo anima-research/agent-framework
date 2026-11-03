@@ -334,6 +334,30 @@ export interface ForkReaderConfig extends SubconsciousConfigBase {
    */
   resync?: 'window' | 'none';
   /**
+   * How much of the resident's window a resumed reader is handed with
+   * `resync: 'window'`: the newest rows it took since the reader's last
+   * look, as many as fit both bounds, and a count of the older ones left out
+   * (ReaderFramingContext.residentRowsOmitted). The framing row's mark is
+   * the window's end either way, so a row left out is never handed at a
+   * later look.
+   *
+   * - `rows`: the most rows handed. Left out, no count bound.
+   * - `chars`: the most characters the rows take as the default framing
+   *   writes them (defaultReaderFraming), their count line included. Left
+   *   out, the room the reader's strategy gives one message
+   *   (`maxMessageTokens`, at four characters a token, as the tune-out
+   *   dump's bound is read) less what the default framing's other parts
+   *   take at that look (header, voice, dispositions, held traffic), so the
+   *   framing fits that room whole: such a strategy keeps a message's first
+   *   characters up to its room and cuts the rest, and the held traffic
+   *   comes last. A strategy with no per-message cap gives no bound.
+   *
+   * A row's media blocks are kept as they are, and count as no characters,
+   * as the strategy's cut counts them; how many images a compile keeps is
+   * the reader's strategy's image limits'.
+   */
+  resyncLimit?: { rows?: number; chars?: number };
+  /**
    * The resident's tool round in flight when a reader is derived, as
    * `DeriveAgentOptions.pendingRound` takes it, or a function of the look's
    * framing context that returns it. Left out, or returning undefined, the
@@ -405,10 +429,26 @@ export interface ReaderFramingContext {
    * was shown, the mail it was sent). Left out are the reader's own mail and
    * rows under its name, the resident's stored context injections, and held
    * traffic, which the resident's window doesn't take and which comes as
-   * `backlog`. Left out on any other look, and when the resident's window
-   * isn't presented.
+   * `backlog`. With `resyncLimit`, the newest of them (residentRowsOmitted).
+   * Left out on any other look, and when they can't be read
+   * (residentRowsUnavailable).
    */
   residentRows?: StoredMessage[];
+  /**
+   * With `residentRows`: how many older rows the resident's window took
+   * since the reader's last look `resyncLimit` leaves out of them. Left out
+   * when it leaves out none.
+   */
+  residentRowsOmitted?: number;
+  /**
+   * With `persist` `'epoch'` or `'resident'` and `resync: 'window'`, on a
+   * resumed look whose rows can't be read, why: `'not-presented'`, the
+   * resident's window isn't presented, so there is no index to read it
+   * from; `'no-mark'`, no framing row on the reader's branch records where
+   * the resident's window stood on the branch it reads now. `residentRows`
+   * is left out then.
+   */
+  residentRowsUnavailable?: 'not-presented' | 'no-mark';
 }
 
 /** Why a persisted reader was derived again rather than resumed (ForkReaderConfig.persist). */
@@ -418,8 +458,10 @@ export type ReaderRederivedReason = 'no-record' | 'branch-moved' | 'scope-ended'
  * The default reader-fork framing: a header naming the channel, epoch and
  * trigger; the notice; the voice block; standing dispositions if any; with
  * `residentRows` (a resumed persisted reader's), the rows the resident's
- * context took since the last look, under a count line, each as a line
- * (residentRowLines); then the held traffic as `author: text` lines with
+ * context took since the last look, under a count line that says how many
+ * older ones `residentRowsOmitted` leaves out, each as a line
+ * (residentRowLines), or with `residentRowsUnavailable`, a line saying they
+ * could not be read; then the held traffic as `author: text` lines with
  * non-text blocks (images, documents) preserved in order as the source
  * supplied them.
  */
@@ -429,7 +471,10 @@ export function defaultReaderFraming(ctx: ReaderFramingContext): ContentBlock[] 
     `${ctx.notice}\n\n${ctx.voice}` +
     (ctx.dispositions ? `\n\n[Standing dispositions]\n${ctx.dispositions}` : '');
   const content: ContentBlock[] = [{ type: 'text', text: header }];
-  if (ctx.residentRows !== undefined) content.push(...residentRowLines(ctx.resident, ctx.residentRows));
+  if (ctx.residentRows !== undefined) content.push(...residentRowLines(ctx.resident, ctx.residentRows, ctx.residentRowsOmitted ?? 0));
+  else if (ctx.residentRowsUnavailable !== undefined) {
+    content.push({ type: 'text', text: `\n[What entered ${ctx.resident}'s context since your last look could not be read; none of it is shown here.]` });
+  }
   if (ctx.backlog.length === 0) {
     content.push({ type: 'text', text: '\n[Nothing new has been held since your last look.]' });
     return content;
@@ -458,7 +503,8 @@ export function defaultReaderFraming(ctx: ReaderFramingContext): ContentBlock[] 
 
 /**
  * The rows a resident's context took since a persisted reader's last look,
- * as the default framing writes them: a count line, then a line per row,
+ * as the default framing writes them: a count line, of `rows` and the
+ * `omitted` older ones, which it says are not shown, then a line per row,
  * `author: text`, its tool calls and results as the transcript the
  * persistent subconscious is sent a resident's rounds in (foreignRowAsSent:
  * the tool's name and its input or outcome in brief, no thinking), and its
@@ -466,11 +512,12 @@ export function defaultReaderFraming(ctx: ReaderFramingContext): ContentBlock[] 
  * row under the anonymous participant, the author its metadata names; one
  * that names none, a tool result's or a notice's, goes with no author.
  */
-function residentRowLines(resident: string, rows: readonly StoredMessage[]): ContentBlock[] {
-  if (rows.length === 0) return [{ type: 'text', text: `\n[Nothing has entered ${resident}'s context since your last look.]` }];
-  const n = rows.length;
+function residentRowLines(resident: string, rows: readonly StoredMessage[], omitted = 0): ContentBlock[] {
+  if (rows.length === 0 && omitted === 0) return [{ type: 'text', text: `\n[Nothing has entered ${resident}'s context since your last look.]` }];
+  const n = rows.length + omitted;
+  const cut = omitted === 0 ? '' : omitted === n ? '; none is shown here' : `; the oldest ${omitted === 1 ? 'is' : `${omitted} are`} not shown here`;
   const content: ContentBlock[] = [];
-  const lines: string[] = [`\n[In ${resident}'s context since your last look: ${n} message${n === 1 ? '' : 's'}]`];
+  const lines: string[] = [`\n[In ${resident}'s context since your last look: ${n} message${n === 1 ? '' : 's'}${cut}]`];
   const flush = () => {
     if (lines.length > 0) content.push({ type: 'text', text: lines.splice(0).join('\n') });
   };
