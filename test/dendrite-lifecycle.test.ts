@@ -330,8 +330,9 @@ describe('Dendrite lifecycle', () => {
     assert.deepEqual(landed[0]!.metadata.audience, ['oren'], 'stamped for its recipient');
     assert.equal(landed[0]!.metadata.ownRowOf, undefined, 'and as nobody\'s own row: the sender\'s words, meant for oren');
     assert.deepEqual(framework.listHeldMail(), [], 'a delivered result is no longer held');
-    // (Co-residents share one message slot today, so mira can read it too;
-    // what the route decides is who it is addressed to and who is woken.)
+    // (Co-residents share one message slot, so the result is stored in the
+    // slot mira reads too, but stamped for oren: mira's window doesn't take
+    // it. The route decides who it is addressed to and who is woken.)
     assert.equal(membrane.callsFor('mira').length, 0, 'the primary is not woken for a result routed elsewhere');
   });
 

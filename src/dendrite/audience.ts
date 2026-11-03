@@ -42,13 +42,15 @@
  *
  * Both keys are the framework's. A write through the framework's
  * `addMessage` is stamped there and a stamp its metadata carried (a copy of
- * a stored row's, say) is replaced, as `deferredWriteId` is. The stamp is
- * metadata only: compiles and requests don't read it, so they are what they
- * were. Rows stored before the stamp existed carry none; `audienceOf` says
- * so by returning undefined. A write an earlier version left in its
- * deferred queue is stamped when the importer stores it at boot, as any
- * write through `addMessage` is, so it isn't stored unstamped after the
- * upgrade.
+ * a stored row's, say) is replaced, as `deferredWriteId` is. The compile
+ * (context-manager's) doesn't read the stamp, so a window compiles as the
+ * same rows unstamped do; the presentation index does, so another
+ * resident's own rows no longer enter a resident's window unless it
+ * observes that resident (AgentConfig.observes). Rows stored before the
+ * stamp existed carry none; `audienceOf` says so by returning undefined. A
+ * write an earlier version left in its deferred queue is stamped when the
+ * importer stores it at boot, as any write through `addMessage` is, so it
+ * isn't stored unstamped after the upgrade.
  */
 import type { ContentBlock } from '@animalabs/membrane';
 import type { AddMessageOptions, ContextManager, MessageId, MessageMetadata } from '@animalabs/context-manager';
@@ -109,7 +111,9 @@ export function isOwnRowOf(metadata: unknown, agent: AgentName): boolean {
  * "held from the resident", read by the compiled-view filter, the mid-turn
  * injection and the presentation index (#291) alike (#232 H1), so the window
  * and the wire agree. Such a row is stamped for nobody (an empty audience),
- * whatever store it lands in.
+ * whatever store it lands in, unless its write names an agent whose own
+ * view keeps held traffic, such as the persistent subconscious, which it is
+ * for.
  */
 export const heldFromResidents = (metadata: Record<string, unknown> | undefined): boolean =>
   !!(metadata as { tuneOut?: unknown } | undefined)?.tuneOut;
@@ -172,8 +176,10 @@ export interface OwnRowWriter {
 /**
  * Store a row in `agent`'s own context, stamped as its own row (asOwnRow).
  * Every writer that stores into an agent's context directly, past the
- * framework's `addMessage`, stores the agent's own rows through this, so
- * none of them goes unstamped.
+ * framework's `addMessage`, stores the agent's own rows through this, but
+ * the tool-result guard, which stamps the results it writes itself
+ * (asOwnRow, ToolResultGuard.storeResults) and tells its own-row sink of
+ * them, so none of them goes unstamped.
  *
  * With `present` (the default), the writer is told of the row once the add
  * has returned (`ownRowsStored`), never from inside it, where a sharded body

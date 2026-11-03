@@ -7,11 +7,13 @@
  * stored) isn't stored again, and a changed one is appended then. While the
  * host is quiesced, compile() places it instead. (Another reader of the
  * shared slot mid-turn no longer holds it back, #291: the row is the agent's
- * own, in no window but its own.) Rows these tests write into a context past
- * the framework enter the windows at a point the test runs (presentAll). A module's
- * injection can opt out (placedEachCompile) and is placed as before; an MCPL
- * server's can't. A stored row is marked with its agent and namespace, and
- * every other agent's view leaves it out.
+ * own, in no window but its own and those of shared forks derived from it.)
+ * Rows these tests write into a context past the framework enter the windows
+ * at a point the test runs (presentAll). A module's injection can opt out
+ * (placedEachCompile) and is placed as before; an MCPL server's can't. A
+ * stored row is marked with its agent and namespace, and every other
+ * agent's view leaves it out, but a shared fork's derived from the agent,
+ * which inherits it.
  */
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';

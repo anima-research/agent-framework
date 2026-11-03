@@ -1353,10 +1353,10 @@ export type TraceEvent =
   | (TraceEventBase & {
       /**
        * Rows were taken out of an agent's window. Every reason but `shed`
-       * is a removal from the record made through another agent's context,
-       * which context-manager tombstones in that context's window only: the
-       * rows it removed leave this agent's window too, each at its own
-       * place, so no other row's place moves (`hide`, `suppress` on its
+       * and `elsewhere` is a removal from the record made through another
+       * agent's context, which context-manager tombstones in that context's
+       * window only: the rows it removed leave this agent's window too, each
+       * at its own place, so no other row's place moves (`hide`, `suppress` on its
        * fork, a coalescer's `coalescer`, a module's `module`, a suppression
        * a start finished, `resume`, and a refusal rewind's shed from a
        * window that is still the record, `rewind`), or that no live context

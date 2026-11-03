@@ -24,6 +24,14 @@
     the result carries no `settled`. So neither takes 0.28.0's `agent-busy` refusals while another agent sharing
     the store is busy or a conversation agent is being created, a coalesced update or retraction made meanwhile
     isn't held back, and neither judges a conversation agent for disposal, as a move does.
+  - **A resident is shown another resident's rows only through `observes`** (decision 1): its window takes its own
+    rows, the rows meant for it (their audience stamp, the 291-audience-stamp entry) and the own rows of each agent
+    it observes (`AgentConfig.observes`, none by default, the 291-resident-observes entry). In 0.32.0 a resident's
+    view was the whole shared slot but held traffic and the other residents' stored context injections, so it was
+    shown each co-resident's rounds, replies, tool results and notes, and the mail and messages meant for them. Rows
+    stored before the upgrade carry no stamp and stay in the window its write-down takes from the record; a row
+    stored since that is another resident's own enters a resident's window only through `observes`, and one meant
+    only for another resident (its mail, a message addressed to it) enters none of the others'.
   - **Context-manager's MANIFEST:** the first window write-down that holds rows, or any presentation of more than
     one row, moves the store's MANIFEST to version 2, which chronicle 0.5.0 and earlier refuse, and so does a release
     whose chronicle range resolves one, such as agent-framework 0.30.0 or context-manager 0.24.0 (context-manager's
@@ -32,4 +40,7 @@
 
   **Migration:** drop `presentationIndex` from the configuration. A host that listened for `undo:completed`,
   `redo:completed`, or `branch:switched` with reason `undo`/`redo`, to refresh a view listens for `window:undone`.
-  A host that relied on undo reverting a mount or the inference log uses `rollbackToMessage`.
+  A host that relied on undo reverting a mount or the inference log uses `rollbackToMessage`. A host whose
+  residents read each other's rounds sets `observes` on each resident, naming the others: an edge is one way, so
+  two residents that share their rounds each name the other. Mail and messages meant for a co-resident stay out of
+  a resident's window either way.

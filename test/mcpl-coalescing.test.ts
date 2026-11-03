@@ -1340,8 +1340,9 @@ test('a batch-only turn whose batch a plain occurrence replaces while its assemb
   await f.send('push/event', f.params('1', 'replaced_fallback', { deferred: true, initial: true }));
   const coalescer = (f.framework as unknown as TurnInternals).pushCoalescer;
   const assemble = coalescer.assemble.bind(coalescer);
-  // The replacement lands while the turn is alive, so it waits in the
-  // deferred queue: this turn's compile wouldn't show it.
+  // The replacement lands while the turn is alive: it is stored at once and
+  // kept out of this turn's window, the batch-only turn is withdrawn, and the
+  // replacement's own wake starts the turn that reads it.
   coalescer.assemble = async (...a) => {
     coalescer.assemble = assemble;
     const r = await f.send('push/event', f.params('2', 'plain_replacement'));

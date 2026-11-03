@@ -4,9 +4,9 @@
  * an error result, and stores the round and its results. The results are
  * built first, as the ordinary tool boundary builds them, and a spill makes
  * that a workspace write; the round and its results are stored back to back
- * once it is done. A write that lands meanwhile and isn't deferred, here
- * another resident's answer in the shared slot, is stored when it lands,
- * before both, never between the round's tool_use and its result. (Before
+ * once it is done. A write that lands meanwhile, here another resident's
+ * answer in the shared slot, is stored when it lands, before both, never
+ * between the round's tool_use and its result. (Before
  * this, the round was stored ahead of the build and its results after it, so
  * such a write landed between them.)
  *
@@ -17,9 +17,9 @@
  * read results only from a round waiting for its tools, so each call was
  * framed with a note that it was still running.)
  *
- * A message for prime that comes in meanwhile waits, as any write for an
- * agent whose turn is alive does, and is stored after the round and its
- * results, never between them.
+ * A message for prime that comes in meanwhile is stored at once, as any
+ * write is, before the round and its results, and enters prime's window at
+ * its next presentation point, after them, never between them.
  *
  * A stop or an operator's abandon that lands while the results are built
  * drops the round, as at an ordinary tool boundary: neither the round nor

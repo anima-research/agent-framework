@@ -6,9 +6,11 @@
  * branch. Before, the framework counted every row after the target as
  * removed and marked their Discord messages, though the cut kept some.
  * Now the rows removed are exactly those stored after the cut; those the
- * window took after the target leave it as arrived and not presented, are
- * reported (`returnedToArrivals`), and wait outside the window until the
- * agent's next turn start, so the cut holds until it speaks again; the rows
+ * window took after the target leave it and are reported
+ * (`returnedToArrivals`): the agent's own rows among them enter it again at
+ * its next presentation point (the surgery's release), and the rest, arrived
+ * and not presented, wait outside the window until the agent's next turn
+ * start, so for them the cut holds until it speaks again; the rows
  * one write presented together with the target stay after it and are
  * reported too (`keptInWindowAfterTarget`), and a rollback that would
  * change nothing because of them names them and the removals that can take

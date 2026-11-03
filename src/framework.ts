@@ -2089,10 +2089,12 @@ export function tuneOutTool(reader: TuneOutReader): import('./types/index.js').T
   const who = reader.kind === 'persistent' ? reader.name : 'the reader';
   const reads = reader.kind === 'persistent'
     ? `${reader.name}, the reader configured here, reads it instead. It runs on a cadence and when a message there ` +
-      'mentions you, and can report to you in its own words and cancel the tune-out. '
+      'that your wake rules let through mentions you or is from an author they privilege, and can report to you in ' +
+      'its own words and cancel the tune-out. '
     : reader.kind === 'forks'
-      ? 'A reader reads it instead: a fork of your context, run on a cadence and when a message there mentions you, ' +
-        'which can report to you in its own words and cancel the tune-out. '
+      ? 'A reader reads it instead: a fork of your context, run on a cadence and when a message there that your wake ' +
+        'rules let through mentions you or is from an author they privilege. It can report to you in its own words ' +
+        'and cancel the tune-out. '
       : 'No reader is configured here, so none reads it meanwhile: it is held for you, and delivered when you cancel ' +
         'the tune-out or durationSeconds runs out. ';
   return {
@@ -2447,8 +2449,8 @@ export interface HostModeStatus {
    * Context writes kept in memory, to be stored later: those a live
    * operator surgery's hold keeps until its release, and those kept for an
    * agent whose context manager refuses its work after a failed
-   * re-initialization, until a switchBranch() re-initializes it; 0
-   * otherwise. Before #291 it counted the writes held in the deferred queue,
+   * re-initialization, until a branch move (switchBranch, a rollback or a
+   * suppression) re-initializes it; 0 otherwise. Before #291 it counted the writes held in the deferred queue,
    * which this release no longer keeps: a write made while quiesced is
    * stored at once, and no agent is shown another's until resume.
    *
@@ -9300,10 +9302,11 @@ export class AgentFramework {
    * a turn token, which spans dequeue → settled teardown, a continuation of
    * the turn on its way to its start, or the turn's retry, which a provider
    * hold keeps or which waits to start: turnHolders). Idempotent. While
-   * quiesced a write is stored at once, as always, and the presentation
-   * index presents no agent another's row until resume (#291): every
-   * window is frozen but for each agent's own rows, a draining turn's tool
-   * boundaries included.
+   * quiesced a write is stored at once, as always, unless a surgery's hold
+   * or a context manager refusing its work keeps it in memory, and the
+   * presentation index presents no agent another's row until resume
+   * (#291): every window is frozen but for each agent's own rows, a
+   * draining turn's tool boundaries included.
    *
    * On drain timeout the host STAYS quiesced (`drained: false` in the
    * result); with `abandon: true` the undrained streams are cancelled via a
@@ -16566,9 +16569,11 @@ export class AgentFramework {
    * presented window (#291), where the cut is the write that presented the
    * target, rows stored after the target and before that write stay in the
    * record. Those of them the agent's window holds were presented after
-   * the target: they leave the window as arrived and not presented
-   * (`returnedToArrivals`, named by `returnedIds`), and enter it again at
-   * the agent's next turn start. The rows of the agent's window after the
+   * the target: they leave the window (`returnedToArrivals`, named by
+   * `returnedIds`); the agent's own rows among them enter it again at its
+   * next presentation point (the surgery's release), and the rest, as
+   * arrived and not presented, at the agent's next turn start. The rows of
+   * the agent's window after the
    * target that the write presenting it presented too (`keptInWindow`, a
    * batch: one write, one presentation point) stay in the window, since no
    * branch cut separates them from the target. Both are set only on a
@@ -18243,16 +18248,19 @@ export class AgentFramework {
             // path).
             // The shown mark moves at every boundary that injects into its
             // stream.
-            // The mark is the store's head, a scalar, as a compile's is: it
-            // also covers what was stored since the compile without being
-            // carried, such as another slot's messages, and a write stored
-            // into this slot since (a fresh tool_result, a routed channel
-            // message). That over-cover can't be left out.
-            // Under a context manager's thinking-binding record
-            // (`thinkingBinding.binds`), such a write sits in the next
-            // compile where the stream's notes named other rows, so the
-            // replies after it go without their thinking, whatever the mark
-            // says; deferring those writers is the fix.
+            // The mark is readMarkOf's, as a compile's is. On a presented
+            // window it covers by the window's index length: the rows the
+            // window holds, the injected ones among them, and no row stored
+            // since and not presented to this agent. In legacy mode it is
+            // the store's head, a scalar: it also covers what was stored
+            // since the compile without being carried, such as another
+            // slot's messages, and a write stored into this slot since (a
+            // fresh tool_result, a routed channel message). That over-cover
+            // can't be left out. There, under a context manager's
+            // thinking-binding record (`thinkingBinding.binds`), such a
+            // write sits in the next compile where the stream's notes named
+            // other rows, so the replies after it go without their
+            // thinking, whatever the mark says.
             if (midTurnInjections.length > 0) {
               // Shown: the stream carries them (CoalescerHost.isUnshown).
               agent.markContextShown();
@@ -20536,8 +20544,9 @@ export class AgentFramework {
     // the row, #291), so a row presented to a window and never consumed there
     // is taken back as one never presented is, and leaves every window that
     // held it with the record: the remover's by context-manager's removal,
-    // every other one's by retractRemovedElsewhere. No request that carried
-    // it was answered, so no later request's prefix needs it. A row a reader
+    // every other one's by retractRemovedElsewhere. No request of its
+    // readers' carried it (no consumed mark covers it), so no later
+    // request's prefix needs it. A row a reader
     // fork was handed as framing stays (AF-5), and the coalescer places the
     // newer occurrence after it.
     if (this.framedToAReader(p.messageId as MessageId)) return false;
@@ -23085,7 +23094,9 @@ export class AgentFramework {
    *
    * None while the host is quiesced (the window is frozen for surgery). In
    * the residents' shared slot another reader's turn doesn't matter (#291):
-   * the row is the agent's own, in no window but its own. A clock that
+   * the row is the agent's own, in no other resident's window unless that
+   * resident observes the agent (AgentConfig.observes), which takes it at
+   * its own points. A clock that
    * can't be planned or stored is logged and skipped: it never holds up what
    * it would have preceded. One whose write threw after it landed is the
    * window's all the same, so it's returned, and a tool boundary injects it.
@@ -23284,9 +23295,10 @@ export class AgentFramework {
    *  While the agent's context is in legacy mode, its window is the slot's
    *  record, a co-resident's rows and clock rows among them. Once it
    *  presents rows (#291), the window is the rows presented to it, in their
-   *  order: a co-resident's clock row isn't the agent's, and a row stored
-   *  and not presented yet comes after the clock its start writes, so
-   *  neither is read. */
+   *  order: a co-resident's clock row isn't in it unless the agent observes
+   *  that co-resident (AgentConfig.observes), and then the newest clock row
+   *  the window holds is read, whosever it is; a row stored and not
+   *  presented yet comes after the clock its start writes, so it isn't read. */
   private lastClockOf(agent: Agent): { newestRowAt: number | undefined; lastClockAt: number | undefined } {
     const cm = agent.getContextManager();
     if (cm.windowMode() === 'presented') {
@@ -23545,8 +23557,9 @@ export class AgentFramework {
    * ensureInitialDesiredState) only where the agent it's addressed to can
    * call it for every channel it names (canCloseChannels): a conversation
    * fork may close only its home channel, and an agent's allowedTools can leave
-   * channel_close out. The other residents can read it too, where several
-   * share one slot (#291); a fork's seed leaves it out (primaryNoticeTexts).
+   * channel_close out. Where several residents share one slot it is stored
+   * in the slot they share, but stamped for the agent it's addressed to
+   * (#291); a fork's seed leaves it out (primaryNoticeTexts).
    * Where an
    * agent's own send opened a channel it can't close, the primary is told by
    * name too, if it's registered and can close it, and the agent is told
@@ -23812,8 +23825,9 @@ export class AgentFramework {
    * channel_open as the way to try again only where the agent it's addressed
    * to can call it: a conversation fork's channel_open is refused outright
    * (dispatchChannelToolCall), and an agent's allowedTools can leave it out.
-   * The other residents can read it too, where several share one slot
-   * (#291); a fork's seed leaves it out (primaryNoticeTexts).
+   * Where several residents share one slot it is stored in the slot they
+   * share, but stamped for the agent it's addressed to (#291); a fork's
+   * seed leaves it out (primaryNoticeTexts).
    * Where the channel is selected for opening, it says so and why, as
    * speech's failure does, and what that means: where the host couldn't
    * record putting the channel's decision back, a later delivery or
@@ -24851,13 +24865,13 @@ export class AgentFramework {
     const target = this.noticeTargetFor(name, 'prose-bounce');
     if (target) {
       try {
-        // Through framework.addMessage, NOT the context manager directly: while
-        // the turn is still streaming this defers the notice to the next tool
-        // boundary, where it is BOTH stored in order and injected into the live
+        // Through framework.addMessage, NOT the context manager directly: it
+        // stamps the notice for the bouncing agent (noticeTargetFor), stores it
+        // at once and keeps it out of the window until the agent's next
+        // presentation point. While the turn is still streaming that is its
+        // next tool boundary, which presents it and injects it into the live
         // stream (hear-while-acting) — the model sees the error and can correct
-        // the prefix within the same turn. A direct append here would land the
-        // notice before the turn's assistant blocks (cache bust, invisible
-        // until the next compile). Addressed to the bouncing agent (noticeTargetFor).
+        // the prefix within the same turn — or else the turn's end.
         const id = this.addMessage(
           'user',
           [{ type: 'text', text: notice }],
@@ -28762,8 +28776,10 @@ export class AgentFramework {
    * - Refused unless the agent is idle with no turn alive: puppeting
    *   mid-turn would corrupt the turn state machine and the live stream's
    *   wire ordering. For its own duration the puppet HOLDS the turn-alive
-   *   marker (wakes requeue, cross-turn writers defer), so a wake landing
-   *   during the tool's execution cannot start a turn underneath the pair.
+   *   marker (wakes requeue, and a write meanwhile is stored at once and
+   *   kept out of the window until the agent's next presentation point, the
+   *   puppet's end), so a wake landing during the tool's execution cannot
+   *   start a turn underneath the pair.
    * - Refused for tools outside the agent's own surface (the tools it may
    *   call, availableToolsForPresentation), and for skip_reply, by name or
    *   through a toolsets--act that reaches it, which ends the turn it's
@@ -28850,8 +28866,9 @@ export class AgentFramework {
     // straight through the context manager into a turn that never saw it,
     // the exact wire-order corruption this method exists to avoid. Holding
     // a turn token is the same invariant the scheduler respects (turn-alive
-    // requeues wakes) and the addMessage guard reads (cross-turn writers
-    // defer), so for the duration this behaves like a turn with no stream.
+    // requeues wakes) and addMessage reads (a write meanwhile is stored at
+    // once and kept out of the window until the agent's next presentation
+    // point), so for the duration this behaves like a turn with no stream.
     // Token-matched release in finally, same leak-proofing as
     // startAgentStream: a token nobody clears wedges the agent.
     const turnToken = this.nextTurnToken++;
@@ -28876,10 +28893,12 @@ export class AgentFramework {
 
       // Store the pair through the same shapes the ordinary path uses. Build
       // the result blocks BEFORE storing the tool_use: the spill path awaits.
-      // A message arriving during either await is deferred by the turn
-      // token (as during a real tool call) and lands AFTER the pair, never
-      // between tool_use and its tool_result. The two addMessage calls
-      // below are synchronous and adjacent — nothing can interleave.
+      // A message arriving during either await is stored at once and kept
+      // out of the window until the agent's next presentation point (as
+      // during a real tool call): the puppet's end presents it AFTER the
+      // pair, never between tool_use and its tool_result. The two
+      // addMessage calls below are synchronous and adjacent — nothing can
+      // interleave.
       const { bound } = this.resolveToolResultInlineCap(agent);
       const { blocks } = await this.buildStoredToolResultContent(
         agentName,
@@ -31343,7 +31362,9 @@ export class AgentFramework {
     // the agent the write names, never as anyone's own row. A write that
     // carries a tune-out's hold (heldFromResidents) is for nobody, whatever
     // agent's store it lands in, as an inbound message a tune-out holds is
-    // (inboundAudience): no resident is shown it. A write that names no
+    // (inboundAudience): no resident is shown it. One that names an agent
+    // whose own view keeps held traffic (the persistent subconscious) is for
+    // that agent (defaultAudience). A write that names no
     // agent is for the agents that take untargeted inbound in the slot it
     // lands in (untargetedAudience), not for the agent it is delivered to,
     // so the record tells it from a write for the primary. A stamp the
@@ -31354,12 +31375,14 @@ export class AgentFramework {
     }
     // A write is stored at once (#291): each reader's window takes it at
     // that reader's points (presentation.afterStore below), so a write
-    // stored while a turn of its agent's is alive stays out of that turn.
-    // Only a surgery's hold keeps a write out of the store while the
-    // operator's switch is awaited: it is held in memory, as given, and its
-    // release replays it through here (releaseSurgeryHeldWrites). It goes in
-    // no window and no store before then, so its placement names only its
-    // agent.
+    // stored while a turn of its agent's is alive stays out of that turn's
+    // window until one of its tool boundaries hears it or the turn ends.
+    // Two holds keep a write out of the store. A surgery's, while the
+    // operator's switch is awaited: the write is held in memory, as given,
+    // and its release replays it through here (releaseSurgeryHeldWrites). It
+    // goes in no window and no store before then, so its placement names
+    // only its agent. The other is a context manager refusing its work
+    // (below).
     const kept = (): SurgeryHeldWrite => {
       const { placement: _placement, ...rest } = opts ?? {};
       return {
@@ -31535,10 +31558,12 @@ export class AgentFramework {
    */
   private placeWakeLines(agent: Agent, lines: readonly WakeLine[]): void {
     // Each resident the wake was for writes the line into its own window, as
-    // its own row, at its own start (#291): a co-resident's line enters no
-    // other window, so it can't land under the message or after another
-    // resident's answer. For an agent whose window isn't presented, the
-    // delivery agent's start alone writes the slot's one line.
+    // its own row, at its own start (#291): a resident's line enters no
+    // other resident's window but an observer's (AgentConfig.observes), as
+    // the turn it starts does, so in its own window it can't land under the
+    // message or after another resident's answer. For an agent whose window
+    // isn't presented, the delivery agent's start alone writes the slot's
+    // one line.
     const slot = this.deliveryAgent();
     if (!slot || (agent !== slot && !this.presents(agent))) return;
     const open = lines.filter((line) => !this.placedWakeLines.get(line)?.has(agent.name));

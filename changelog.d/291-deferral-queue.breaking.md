@@ -3,8 +3,11 @@
   (see the presentation index's entries). Only two things keep a write out of the store, each holding it in memory
   with the id `''`: a live operator surgery (a rollback, a suppression, a branch switch), whose release stores it in
   arrival order, and an agent's context manager that refuses its work after a failed re-initialization, which keeps
-  each write for the agent until a `switchBranch()` re-initializes it and that switch's release stores them in
-  arrival order. An agent that ends while either keeps writes for it takes them out as it ends, not at the release:
+  each write for the agent until a branch move (a `switchBranch()`, a rollback or a suppression) re-initializes it
+  and that move's release stores them in arrival order. Nothing caps the writes kept for such a manager: each one
+  for its agent stays in memory until a move re-initializes it, and `HostModeStatus.deferredWrites` counts them
+  (the `context-reinit-failed` alert that names the refusal says writes are kept meanwhile). An agent that ends
+  while either keeps writes for it takes them out as it ends, not at the release:
   those the primary takes in its place, a module's write for a run or a fork, a failed reply's notice or a channel
   notice it could act on, go on to it (held by a hold still up until its release, as any write), and the rest are
   dropped, logged, with an `ops:alert` of kind `store-held-lost` for the agent (`data`: `count`, `passedOn`, `kinds`,
@@ -64,10 +67,15 @@
     for it, `queryMessages` and `findMessageByExternalId` read the store, and its release stores it as it was first
     given. A module that must change such a write keeps the change and applies it once the row is stored: the release
     traces each write synchronously as it stores it, `message:added` with source `surgery-release` and the stored id,
-    as the Discord module does for an edit or a delete of a message whose create was kept. `ModuleMessage.held`
-    keeps its name with a new meaning: the row is stored and not in the window of the agent the read is for (not yet
-    presented to it, or taken out as an undone turn's); its `id`, `sequence` and `timestamp` are the store's. It is
-    never set on an agent whose window is the record. `queryMessages` answers the stored rows in store order, each
+    as the Discord module does for an edit or a delete of a message whose create was kept. A write that carries
+    `metadata.external` maps its external id to the row it stored, so a second write under an id already mapped
+    maps it to the newer row during its agent's turn too, and `findMessageByExternalId` answers that row; a write
+    held for a live turn mapped the id to `''`, and the lookup answered the first row the store held under it.
+    `ModuleMessage.held` keeps its name with a new meaning: the row is stored and not in the window of the agent the
+    read is for (not yet presented to it, taken out as an undone turn's, or never presented to it: another agent's
+    own row, a row meant for another agent, a row a tune-out holds, for a resident); its `id`, `sequence` and
+    `timestamp` are the store's. It is never set on an agent whose window is the record. `queryMessages` answers
+    the stored rows in store order, each
     so marked, with the store's `totalCount`: rows of held writes are no longer appended as the newest. An edit or a
     removal of a row reaches it in the store, and changes what any window holding it sends next. For one release,
     `getMessage`, `editMessage` and `removeMessage` (and a process answer's edits and removals) still take a `held:`
@@ -77,8 +85,9 @@
     `ReaderInvocation.backlog` (and `ReaderFramingContext.backlog`) holds every message, as stored rows.
     `ReaderFramingContext.queuedCount` is deprecated and never set. A cancel's notice to the subconscious no longer
     carries held messages as `tune-out-cancel-held` rows after it: its view holds them stored. The trace
-    `tune-out:reader-fork` loses `queued`. With no queue, a cancel's release fails to be made durable only where
-    the store's sync fails (`commitDeliveries` answers false), so no queue over its cap keeps a tune-out in force
+    `tune-out:reader-fork` loses `queued`. With no queue, a cancel's release fails to be stored or made durable
+    only where its write throws or the store's sync fails (`commitDeliveries` answers false), so no queue over its
+    cap keeps a tune-out in force
     (the tune-out-cancel-order entry); a dump's record of what it covered (`released`) names a held message by its
     id, and one an earlier release queued, which the boot's import stores, by its queued write's id, as that
     release's records name it.
@@ -105,7 +114,9 @@
 
   **Migration:** a module that kept a `held:` handle across the upgrade can keep using it for one release, and
   should store the id `addMessage` answers from now on. A module that filtered `held` rows out of a query as not
-  stored yet keeps working: they are now the rows the agent hasn't been shown. A host that read `deferredWrites` to
+  stored yet drops that filter: every row a query answers is stored, and `held` now also marks rows that never
+  enter the agent's window (another agent's own rows, rows meant for another agent, rows a tune-out holds, for a
+  resident), which such a filter leaves out for good. A host that read `deferredWrites` to
   know whether a quiesce held anything finds nothing held by it: a write made during a quiesce is stored at once
   (unless one of the two holds above keeps it), an agent's own rows enter its window as they are written, and the
   rest enter the window of each agent with no turn alive at resume, and a draining turn's agent's at that turn's

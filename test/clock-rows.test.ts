@@ -688,10 +688,11 @@ describe('clock rows in the framework', () => {
   });
 
   // Ported for #291: a clock row is its resident's own row, in no other
-  // resident's window, so another resident's live turn holds none back. This
-  // test once had the clock wait for the assistant's turn to end, since in
-  // the shared record it would have sat inside that turn.
-  it('writes a clock for one resident while another resident\'s turn is alive, in no window but its own', async () => {
+  // resident's window unless that resident observes it, so another
+  // resident's live turn holds none back. This test once had the clock wait
+  // for the assistant's turn to end, since in the shared record it would
+  // have sat inside that turn.
+  it('writes a clock for one resident while another resident\'s turn is alive, in no window but its own, as neither observes the other', async () => {
     const x = await make(undefined, { agents: [{ name: 'other', clock: { intervalMinutes: 10 } }], membrane: new AnsweringMembrane() });
     const writeFor = (name: string, text: string) =>
       (x.framework as any).addMessage('user', [{ type: 'text', text }], {}, { forAgent: name });

@@ -847,8 +847,8 @@ describe('after a branch move, every agent on the store compiles without a resta
   });
 
   // context-manager names the rows a failed write stored (WriteLandedError),
-  // so the release goes by its error: any other means none landed, and the
-  // store isn't read back to tell.
+  // so the release goes by its error: any other but WriteOutcomeUnknownError
+  // (below) means none landed, and the store isn't read back to tell.
   it("a held write whose store throws at the release, none of it landing, is told of as lost without a read-back of the store, even one that couldn't be read", async () => {
     const quiet = console.error;
     console.error = () => {};

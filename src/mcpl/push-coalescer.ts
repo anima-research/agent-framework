@@ -799,8 +799,9 @@ export class PushCoalescer<E = unknown> {
   /**
    * Remove the occupant and the run it builds on, newest first, auditing each
    * as `kind`. Every member is unread: refreshOccupant has just run, under the
-   * lock. The host's removal may still refuse one, such as a held write the
-   * host can't tell isn't already stored. A member the host
+   * lock. The host's removal may still refuse one, such as a row a reader
+   * fork was handed as framing, or any while a surgery holds the store. A
+   * member the host
    * can't remove may be read, so the walk stops there, leaving it and the
    * renders it builds on, and the history becomes `unknown`.
    * Returns false then. It doesn't touch `state.occupant`, which still names
