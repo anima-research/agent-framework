@@ -2577,7 +2577,9 @@ export class ChannelRegistry {
     // An ephemeral run takes no global fallback (takesGlobalFallback): not the
     // all-except hold's channel, not the latest inbound message's channel as
     // its outgoing one, nor that message as the one it is replying to.
-    const fallback = this.configuredUnprompted(agentName) ?? (agentName !== undefined ? this.globalFallbackFor(agentName) : this.sharedFallback());
+    const fallback = agentName !== undefined
+      ? this.globalFallbackFor(agentName, () => this.configuredUnprompted(agentName))
+      : this.sharedFallback();
     // A turn that deliberately has no channel (null) takes no fallback.
     const outgoing = home ?? (active !== undefined ? active : fallback);
 
@@ -5786,7 +5788,9 @@ export class ChannelRegistry {
     if (home) return home;
     // A turn that deliberately has no channel (null) takes no fallback.
     const active = this.activeChannelResolver?.(conversationId);
-    return active !== undefined ? active : this.configuredUnprompted(conversationId) ?? this.globalFallbackFor(conversationId);
+    return active !== undefined
+      ? active
+      : this.globalFallbackFor(conversationId, () => this.configuredUnprompted(conversationId));
   }
 
   private configuredUnprompted(conversationId: string | undefined): ChannelRef | null {
@@ -5802,19 +5806,21 @@ export class ChannelRegistry {
    * result, so neither the all-except hold's channel nor the latest inbound
    * message's is ever its destination.
    */
-  private globalFallbackFor(conversationId: string): ChannelRef | null {
-    return this.takesGlobalFallback?.(conversationId) === false ? null : this.sharedFallback();
+  private globalFallbackFor(conversationId: string, unprompted?: () => ChannelRef | null): ChannelRef | null {
+    return this.takesGlobalFallback?.(conversationId) === false ? null : this.sharedFallback(unprompted);
   }
 
   /**
    * What every conversation that takes the global fallback falls back to when
    * neither a home channel nor its own delivery names one: the all-except
-   * hold's channel while one is open, else the latest delivered inbound
-   * channel under the legacy locus rule, else none — the prose stays private
-   * (architecture channel §3 carve-out, 2026-10-06).
+   * hold's channel while one is open, else, for a turn's locus, the
+   * configured unprompted channel where the turn takes it (resolveLocus),
+   * else the latest delivered inbound channel under the legacy locus rule,
+   * else none — the prose stays private (architecture channel §3 carve-out,
+   * 2026-10-06).
    */
-  private sharedFallback(): ChannelRef | null {
-    return this.focusChannelResolver?.() ?? this.fallbackLocus();
+  private sharedFallback(unprompted?: () => ChannelRef | null): ChannelRef | null {
+    return this.focusChannelResolver?.() ?? unprompted?.() ?? this.fallbackLocus();
   }
 
   private fallbackLocus(): ChannelRef | null {

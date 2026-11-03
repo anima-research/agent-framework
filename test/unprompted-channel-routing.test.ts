@@ -20,6 +20,9 @@ import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 import type { ChannelContext } from '../src/mcpl/types.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { jsonLines } from './helpers/json-lines.js';
+import { fixture } from './helpers/coalescing-fixture.js';
+import { SUB, internals, registerOpen, channellessTurnLocus } from './helpers/admission.js';
+import type { FrameworkConfig } from '../src/types/framework.js';
 
 const OPS = 'discord:g1:ops';
 const BUSY = 'discord:g1:busy';
@@ -251,5 +254,54 @@ describe('unpromptedChannel: a no-trigger turn is told, and published to, the un
     await t.channelless('check-in');
     assert.deepEqual(t.published(), [BUSY]);
     assert.equal(t.context()?.defaultOutgoing?.channelId, BUSY);
+  });
+});
+
+describe('unpromptedChannel and the tune-out holds', () => {
+  const withUnprompted = () => fixture({ framework: { subconscious: SUB, unpromptedChannel: 'ops' } as Partial<FrameworkConfig> });
+
+  it("what servers are told follows the same order: an explicit-mode turn's channel context names the excepted channel while the hold is open", async () => {
+    const f = await fixture({
+      framework: { subconscious: SUB, unpromptedChannel: 'ops' } as Partial<FrameworkConfig>,
+      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', proseRouting: 'explicit' }],
+    });
+    f.membrane.responses.length = 0;
+    (f.membrane as unknown as { responseIndex: number }).responseIndex = 0;
+    const told = async (): Promise<string | undefined> => {
+      f.membrane.pushResponse(createMockResponse([]));
+      (f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+        agentName: 'agent', reason: 'test', source: 'test', timestamp: Date.now(),
+      });
+      await f.framework.runUntilIdle();
+      const registry = internals(f).channelRegistry as unknown as {
+        buildChannelContext(agentName: string, serverId: string): { defaultOutgoing?: { channelId: string } } | undefined;
+      };
+      return registry.buildChannelContext('agent', 'editor')?.defaultOutgoing?.channelId;
+    };
+    try {
+      await registerOpen(f, 'work', 'noisy', 'ops');
+      assert.equal(await told(), 'ops', 'no hold: the unprompted channel');
+      assert.ok(internals(f).tuneOutCoordinator!.enterAllExcept(
+        { serverId: 'editor', channelId: 'work' }, { durationSeconds: 120, backlogCap: 10 }, 'agent-tool',
+      ).ok);
+      assert.equal(await told(), 'work', 'the hold: the channel the agent kept');
+    } finally { await f.close(); }
+  });
+
+  it("an all-except hold's channel outranks it: a turn no channel prompted speaks in the excepted channel while the hold is open, and in the unprompted channel before and after", async () => {
+    const f = await withUnprompted();
+    try {
+      await registerOpen(f, 'work', 'noisy', 'ops');
+      assert.equal(await channellessTurnLocus(f), 'ops', 'no hold: the unprompted channel');
+      const entered = internals(f).tuneOutCoordinator!.enterAllExcept(
+        { serverId: 'editor', channelId: 'work' }, { durationSeconds: 120, backlogCap: 10 }, 'agent-tool',
+      );
+      assert.ok(entered.ok);
+      assert.equal(await channellessTurnLocus(f), 'work', 'the hold: the channel the agent kept');
+      assert.ok(internals(f).tuneOutCoordinator!.cancelAllExcept('agent-tool', 'test').ok);
+      f.alwaysRespond();
+      await f.framework.runUntilIdle();
+      assert.equal(await channellessTurnLocus(f), 'ops', 'the hold ended: the unprompted channel again');
+    } finally { await f.close(); }
   });
 });
