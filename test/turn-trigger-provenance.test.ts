@@ -1955,7 +1955,33 @@ describe('private wins, one way', () => {
         rig.framework.pushEvent({ type: 'external-message', source: 'console', content: 'for your eyes only', metadata: {} } as never);
         await rig.until(() => stored(rig).includes('for your eyes only'), 'the private message stored');
         assert.deepEqual(await aideTurn(), [], 'the turn that reads it speaks in no channel');
+        assert.ok(JSON.stringify(rig.membrane.calls.at(-1)).includes('for your eyes only'), "control: the aide's request held the message");
         assert.deepEqual(await aideTurn(), [ROOM], 'control: a later channel turn speaks in its channel');
+      } finally {
+        await rig.close();
+      }
+    });
+
+    it("a private-marked row that only its own resident's view keeps leaves another resident's channel turn speaking in its channel", async () => {
+      const rig = await surfaceRig({ otherAgents: ['aide'] });
+      try {
+        const aideTurn = async () => {
+          const before = rig.routed.length;
+          const starts = rig.starts.filter((s) => s.agentName === 'aide').length;
+          rig.i.pendingRequests.push({ ...roomWake(), agentName: 'aide' });
+          await rig.until(() => rig.starts.filter((s) => s.agentName === 'aide').length > starts
+            && rig.framework.getAgent('aide')!.state.status === 'idle' && idle(rig), "the aide's channel turn");
+          await rig.framework.runUntilIdle();
+          return rig.routed.slice(before).map((r) => r.locus);
+        };
+        assert.deepEqual(await aideTurn(), [ROOM], "control: the aide's channel turn speaks in its channel");
+        storeAs(rig.framework, 'scout', {
+          contextInjection: { agent: 'scout', namespace: 'notes', contentHash: 'h1', part: 0, parts: 1 },
+          dendrite: { privateTurn: true },
+        });
+        await rig.until(() => stored(rig).includes('for your eyes only'), 'the row stored');
+        assert.deepEqual(await aideTurn(), [ROOM], "a row the aide's view leaves out doesn't make its turn private");
+        assert.ok(!JSON.stringify(rig.membrane.calls.at(-1)).includes('for your eyes only'), "control: the aide's request didn't hold the row");
       } finally {
         await rig.close();
       }
@@ -2031,11 +2057,12 @@ describe('private wins, one way', () => {
 
     it("a channel turn's script report the agent answered, in a store a second framework opens in the same process, leaves that framework's nudges as on main", async () => {
       const storeDir = mkdtempSync(join(tmpdir(), 'answered-report-second-framework-'));
+      let turnId = 0;
       try {
         const first = await surfaceRig({ storeDir });
         try {
           await firstTurn(first, false);
-          const turnId = routingOf(first.framework).turnId as number;
+          turnId = routingOf(first.framework).turnId as number;
           const starts = first.starts.length;
           await (first.framework as unknown as {
             scriptWake(agentName: string, scriptId: string, text: string, label: string, startTurnId: number): Promise<void>;
@@ -2048,6 +2075,10 @@ describe('private wins, one way', () => {
         }
         const next = await surfaceRig({ storeDir });
         try {
+          const report = next.framework.getAgent('scout')!.getContextManager().getAllMessages()
+            .find((m) => JSON.stringify(m.content).includes('lint passed'));
+          assert.equal((report?.metadata as Record<string, unknown> | undefined)?.callerTurnId, turnId,
+            "control: the second framework's store holds the report with its turn id");
           const { channelTurn, nudge } = restarted(next);
           assert.deepEqual(await channelTurn(), [ROOM], 'control: a channel turn speaks in its channel');
           assert.deepEqual(await nudge(), [LOUNGE], 'a nudge speaks as on main, in the fallback channel');

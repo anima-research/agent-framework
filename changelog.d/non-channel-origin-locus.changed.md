@@ -14,11 +14,10 @@
   own wake may still wait in a gate window, or the message woke nothing, and
   for an ordinary resident whichever resident of its shared slot the message
   was stored for. So is a resident's first start in a framework made on its
-  store, as after a restart, when the resident hasn't answered since a
-  private surface's message, a result or mail from a private turn's work, or
-  a report from a script a turn started, whichever turn it was, a silent
-  heartbeat tick's rows being no answer: what the earlier run had noted went
-  with it. So is
+  store, as after a restart, when no row of the resident's own, other than a
+  silent heartbeat tick's, follows a private surface's message, a result or
+  mail from a private turn's work, or a report from a script a turn started,
+  whichever turn it was: what the earlier run had noted went with it. So is
   the turn of its own that a wake starts after waiting on a private turn,
   because that turn's continuation (a budget restart or a held retry) starts
   alone, or a quiesce parked the wake while the turn ran. A turn that takes in
@@ -47,21 +46,24 @@
   (`agent_request_inference`), answers the agent's context as it stands, so it
   is private exactly when, as it starts, the agent's stored history holds a
   private surface's message, or a result or mail from a private turn's work
-  (`dendrite.privateTurn`), or when it is the first start after a restart
-  that the rule above makes private. That holds however the context came to
-  end where it does, through the framework's `undo`, `redo` or operator
-  surgery, a host's own move of its branch, or a restart. A gate policy that
-  holds `api:inference-request` is the exception: the request it lets through
-  later is no retake, and its turn takes the wake's route. A retake whose
-  history holds none speaks as before.
+  (`dendrite.privateTurn`), or when, as any start can, it takes a note that
+  private input waits: the restart rule above, or private input stored for
+  the agent since its last start that wasn't a silent heartbeat tick, which
+  an undo, redo or branch move leaves noted. That holds however the context
+  came to end where it does, through the framework's `undo`, `redo` or
+  operator surgery, a host's own move of its branch, or a restart. A gate
+  policy that holds `api:inference-request` is the exception: the request
+  it lets through later is no retake, and its turn takes the wake's route. A
+  retake whose history holds none, and that takes no such note, speaks as
+  before.
   Otherwise it is private, even after a channel turn, and even where the
   context now shows that input only in a summary, and its delivery receipt
   says how to publish with a send. A script's wake message is private input,
   as a private surface's message is, when the script's start turn is private
   as the message is stored or injected: a turn that reads it is private, and a
   tool boundary that injects it makes its turn private from there. A retake
-  doesn't count it, since the turn it names belongs to the run that stored
-  it. An agent
+  doesn't count it: it reads only the marks above, which mean the same in
+  any run. An agent
   derived from, or spawned by, an agent whose turn is open and private
   (`deriveAgent`, or `createEphemeralAgent` with `inherit` or `spawnedBy`, a
   tune-out reader fork included) is that turn's work, and so is an

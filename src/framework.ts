@@ -21863,7 +21863,7 @@ export class AgentFramework {
       if (reader && reader !== agent && this.isOrdinaryResident(reader)) {
         this.noteSpokenTo(reader.name, metadata);
         this.noteArrival(reader.name, metadata, messageId);
-        this.notePrivateInput(reader.name, metadata);
+        if (this.agentSees(reader, metadata)) this.notePrivateInput(reader.name, metadata);
       }
     }
   }
