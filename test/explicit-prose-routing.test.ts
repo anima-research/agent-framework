@@ -2855,6 +2855,10 @@ describe('explicit prose routing', () => {
         } as unknown as ProcessEvent);
         await framework.runUntilIdle();
         assert.deepEqual(routed, c[kind], `${c.mode}, ${kind} turn: ${JSON.stringify(c.text)}`);
+        if (c[kind].length === 0) {
+          const receipt = context(framework).texts.find((t) => t.startsWith('[delivered]')) ?? '';
+          assert.match(receipt, /kept private \(private turn/, `${c.mode}, ${kind} turn: its speech was kept private: ${receipt}`);
+        }
         await framework.stop();
       }
     }
@@ -3000,6 +3004,9 @@ describe('explicit prose routing', () => {
       trigger(framework, true);
       await framework.runUntilIdle();
       assert.ok(context(framework).texts.some((t) => t.startsWith('[prose-routing]') && t.includes('#missing')), 'control: the envelope before it bounced');
+      const results = framework.getAgent('assistant')!.getContextManager().getAllMessages()
+        .flatMap((m) => m.content as Array<{ type: string; toolUseId?: string }>).filter((b) => b.type === 'tool_result').map((b) => b.toolUseId);
+      assert.ok(results.includes('d2'), `control: the round's later boundary was reached, its second drafts call answered: ${JSON.stringify(results)}`);
       assert.deepEqual(routed, []);
       const drafts = (framework as unknown as { proseDrafts: { open(a: string): Array<{ text: string }> } }).proseDrafts.open('assistant');
       assert.deepEqual(drafts.map((d) => d.text), [], 'nothing holds the words to resend');

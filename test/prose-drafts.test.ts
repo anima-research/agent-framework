@@ -4769,6 +4769,7 @@ describe('a heartbeat turn that takes in private input keeps its plain speech pr
           await h.until(() => !(h.framework as unknown as { activeTurnTokens: Map<string, unknown> }).activeTurnTokens.has('scout'), 'turn end');
           await h.framework.runUntilIdle();
           assert.equal(h.membrane.calls.length, before + 1, 'control: one start took every wake');
+          assert.ok(h.texts().includes('Words of the heartbeat turn.'), 'control: the turn spoke');
           assert.deepEqual(h.publishes(), []);
           if (operator !== 'none') {
             assert.deepEqual(h.drafts(), [], 'nothing is held as a draft');
@@ -4795,6 +4796,7 @@ describe('a heartbeat turn that takes in private input keeps its plain speech pr
             createMockResponse([text('Before the operator spoke.'), call('m1', 'robot--move', {})], 'tool_use'),
             createMockResponse([text('After the operator spoke.')]),
           ], 'scout', 'heartbeat');
+          assert.ok(h.texts().includes('After the operator spoke.'), "control: the turn spoke after the tool call");
           assert.deepEqual(h.publishes(), []);
           const held = h.drafts().map((d) => d.text);
           assert.ok(held.includes('Before the operator spoke.'), `control: the heartbeat turn's words before the call are held: ${JSON.stringify(held)}`);

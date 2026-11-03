@@ -624,6 +624,7 @@ describe('a private turn and the focus', () => {
       assert.equal(internals(f).tuneOutCoordinator!.getAllExcept()?.params.except.channelId, 'work', 'control: the focus holds');
       assert.ok(stored(f).some((m) => JSON.stringify(m.content).includes('This turn holds private input, so its plain speech stays private;')),
         "the focus result says this turn's speech stays private");
+      assert.ok(has(f, 'zz-the code is 4417'), 'premise: the private turn spoke');
       assert.deepEqual([...typing], [], 'the private turn shows typing in no channel');
       f.membrane.pushResponse(say('zz-a room answer'));
       await incoming(f, 'work', 'w1', 'agent, are you there?', MENTION);

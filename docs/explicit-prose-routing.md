@@ -78,7 +78,9 @@ In a round that calls `drafts`, with any action, what the round would bounce
 or hold for lack of a destination is held as a draft with no notice instead of
 bouncing: a later `drafts` listing shows it, and the turn's receipt or, in
 `explicit` mode, which writes none, a later turn's catch-up notice names it,
-but nothing offers it for resend while the turn runs. In a `locus` or `hybrid`
+but nothing offers it for resend while the turn runs. A private turn's
+unprefixed prose with no sticky target is kept private there too, as above,
+with its notice and no draft. In a `locus` or `hybrid`
 turn a send has silenced, the round's plain speech aimed where a send may have
 posted stays in the agent's context instead, counted in the receipt as kept
 private, and what a `>>>` envelope addressed there is held with no notice. A
@@ -89,6 +91,10 @@ its own narration round after round, inside one turn, where the bounce-wake
 cap doesn't reach (#701). Outside a silenced turn, what the round would
 deliver is delivered, an unprefixed line to the turn's sticky target included,
 and a refused target, a malformed envelope or a failed delivery still bounces.
+In a private turn such a bounce holds no draft, words it adds to an
+`{{unsent}}` resend included: its notice says the words were kept private and
+how to publish, or, when the send threw, that they may have gone out. Only a
+bare `{{unsent}}` resend keeps the draft it sent.
 Only the framework's own `drafts` tool makes such a round, not a module's or
 server's tool of that bare name. An envelope beside a script whose code
 mentions `drafts` waits for the script. In XML tool mode, where a turn's prose
@@ -119,7 +125,8 @@ depends on the route:
 - **Hold** (an envelope that bounces, or one an explicit send held back): the
   bounce's words are copied into the new draft with `{{unsent}}` written out,
   and the draft carries the same risk (`inheritedRisk`), so it reads
-  unconfirmed until a confirmed delivery.
+  unconfirmed until a confirmed delivery. An envelope that bounces in a
+  private turn holds no new draft (above).
 
 ## What explicit mode retires (for that agent)
 
@@ -148,10 +155,11 @@ The grammar is never injected into context. The mode switch appends one short
 durable notice (persisted per agent, so reboots never re-notice); the first
 undelivered text produces a bounce notice carrying the exact resend syntax —
 the model learns by doing, and the knowledge accretes into its own history.
-The one place a first undelivered line doesn't bounce is a round that calls
-`drafts` (above): there the line is held with no notice, and the agent is
-told of it by a later `drafts` listing and a later turn's catch-up notice,
-so a line written there teaches no syntax.
+A first undelivered line doesn't bounce in two places. In a private turn it
+is kept private, and its notice says how to publish. In a round of any other
+turn that calls `drafts` (above), the line is held with no notice, and the
+agent is told of it by a later `drafts` listing and a later turn's catch-up
+notice, so a line written there teaches no syntax.
 When the agent's `allowedTools` permits `prose_help`, the full reference is
 available on demand through that tool. Its result is model-requested content. The system prompt is never touched: those
 bytes belong to the recipe, and the deepest KV prefix must not vary with

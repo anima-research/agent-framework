@@ -766,7 +766,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     );
     await framework.stop();
   });
-  it('a WebUI turn after Discord traffic freezes null and keeps prose private', async () => {
+  it('a private-surface turn asks the registry for no locus, though it has a channel to give, and keeps its prose private', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'private WebUI reply' }]));
     const framework = await makeFramework();
     const i = internals(framework) as ReturnType<typeof internals> & { channelRegistry: Record<string, unknown> };
@@ -791,7 +791,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.stop();
   });
 
-  it('a WebUI turn overrides even a resident home channel', async () => {
+  it("a private-surface turn asks the registry for no locus, though it would give one as the resident's own, and keeps its prose private", async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'private resident reply' }]));
     const framework = await makeFramework();
     const i = internals(framework) as ReturnType<typeof internals> & { channelRegistry: Record<string, unknown> };

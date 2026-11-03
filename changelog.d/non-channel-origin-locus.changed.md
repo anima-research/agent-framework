@@ -19,9 +19,12 @@
   follows a private surface's message, a result or mail from a private turn's
   work, or a report from a script a turn started, whichever turn it was: what
   the earlier run had noted went with it. So is
-  the turn of its own that a wake starts after waiting on a private turn,
-  because that turn's continuation (a budget restart or a held retry) starts
-  alone, or a quiesce parked the wake while the turn ran. A turn that takes in
+  the turn of its own that a wake starts after waiting beside a private
+  turn's own continuation: a budget restart or a held retry that started
+  alone, or one that passed a quiesce in the same pass that parked the wake.
+  A wake that waited on a private turn with no continuation beside it starts
+  a channel's later turn, private only as any other start is. A turn that
+  takes in
   private input stays private for the rest of it: a start that continues it
   with a private wake or stored private input, or a tool boundary that injects
   a private surface's message, removes its locus, its trigger channel and its
@@ -65,9 +68,10 @@
   tool boundary that injects it makes its turn private from there. A retake
   doesn't count it: it reads only the marks above, which mean the same in
   any run. An agent
-  derived from, or spawned by, an agent whose turn is open and private
-  (`deriveAgent`, or `createEphemeralAgent` with `inherit` or `spawnedBy`, a
-  tune-out reader fork included) is that turn's work, and so is an
+  derived from, or spawned by, an agent whose turn is open and private, or
+  an agent that is such a turn's work (`deriveAgent`, or
+  `createEphemeralAgent` with `inherit` or `spawnedBy`, a tune-out reader
+  fork included), is that turn's work, and so is an
   ephemeral run handed mail from such work: what it sends is private input
   too, its result, its messages and the notice that a restart interrupted
   it, and its record says so (`AgentRecord.privateTurn`). So is mail an
@@ -120,19 +124,24 @@
   private (`SpeechContext.nonChannelOrigin`), and the built-in Discord
   module posts none of it and edits its thoughts into no message.
 
-  A private turn's `channel_publish` must name its channel: a call without
-  `channelId` is refused, a conversation fork's included, and the refusal says
-  `channel_list` shows the channel ids, to an agent that may call it. So must
-  a script's whose starting turn is private, as that turn stands at the call,
-  whichever turn watches the script then. `channel_publish`'s description says
-  so, so every agent's tool list changes once. The model's call is refused
-  before it opens, as the dispatcher's other refusals are, so its result
-  carries `refused` (`ToolResult.refused`); a script's reaches the script as
-  an Error. A private turn's `channel_open` doesn't move the locus, and says
-  so, and neither does its entering an all-except hold (`focus`, or
-  `tune_out` with `scope: 'all-except'`), whose answer says the turn's plain
-  speech stays private. The `focus` and `tune_out` descriptions name that
-  exception, so every resident's tool list changes once more. Its `sleep`
+  A private turn's `channel_publish` must name its channel: a call whose
+  `channelId` is missing, empty or not a string is refused, a conversation
+  fork's included, and the refusal says `channel_list` shows the channel ids,
+  to an agent that may call it. So must a script's whose starting turn is
+  private, as that turn stands at the call, whichever turn watches the script
+  then, a call it makes through `toolsets--act` included, and a host's
+  `executeToolCall` that carries a private turn's id (`callerTurnId`).
+  `channel_publish`'s description says so, so the tool list of every agent
+  offered `channel_publish` changes once. The model's call is refused before
+  it opens, as the dispatcher's other refusals are, so its result carries
+  `refused` (`ToolResult.refused`); a script's reaches the script as an
+  Error, and a host's is a failed result. A private turn's `channel_open`
+  doesn't move the locus, and in locus and hybrid mode its answer says so.
+  Neither does its entering an all-except hold (`focus`, or `tune_out` with
+  `scope: 'all-except'`), whose answer says the turn's plain speech stays
+  private, a conversation fork's included. The `focus` and `tune_out`
+  descriptions name that exception, so the tool list of every resident
+  offered them changes once more. Its `sleep`
   announcement isn't posted. When the model refuses (a refusal
   stop), a private turn's refusal reacts on no message, and its failure record
   names no channel.

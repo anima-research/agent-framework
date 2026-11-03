@@ -103,6 +103,10 @@ describe('non-channel surface classification', () => {
         await rig.until(() => rig.starts.length >= 1 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the turn the notice wakes');
         await rig.framework.runUntilIdle();
         assert.deepEqual(rig.routed.map((r) => r.locus), fromFramework ? [LOUNGE] : []);
+        if (!fromFramework) {
+          const receipt = rig.texts().find((t) => t.startsWith('[delivered]')) ?? '';
+          assert.match(receipt, /1 plain-speech segment\(s\) kept private \(private turn/, `the turn spoke, and its speech was kept private: ${receipt}`);
+        }
       } finally {
         await rig.close();
       }
@@ -122,6 +126,12 @@ describe('surface provenance through the real scheduler', () => {
     });
     const i = internals(framework);
     const routed: Array<{ text: string; locus: string | null }> = [];
+    const starts: InferenceRequest[] = [];
+    const start = i.startAgentStream.bind(framework);
+    i.startAgentStream = async (agent, trigger) => {
+      if (trigger) starts.push(trigger);
+      return start(agent, trigger);
+    };
     i.pendingRequests.push({ agentName: 'scout', reason: 'mcpl:push-event', source: 'feeds', timestamp: Date.now() });
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
       getChannelTools: () => [], resolveLocus: () => ref(LOUNGE),
@@ -132,6 +142,12 @@ describe('surface provenance through the real scheduler', () => {
     }, { get: (target, prop: string) => prop in target ? target[prop as keyof typeof target] : () => undefined });
     framework.pushEvent({ type: 'external-message', source: 'tui', content: 'private question', metadata: {}, triggerInference: true });
     await framework.runUntilIdle();
+    assert.equal(starts.length, 1, `one start: ${JSON.stringify(starts)}`);
+    const batchKey = Object.getOwnPropertySymbols(starts[0]!).find((key) => key.description === 'merged-batch');
+    const batch = batchKey ? (starts[0] as unknown as Record<symbol, InferenceRequest[]>)[batchKey]! : [];
+    assert.deepEqual(batch.map((r) => r.reason).sort(), ['external-message', 'mcpl:push-event'], 'the start took both wakes');
+    const said = framework.getAgent('scout')!.getContextManager().getAllMessages().some((m) => JSON.stringify(m.content).includes('OPERATOR-ONLY'));
+    assert.ok(said, 'the turn spoke');
     assert.deepEqual(routed, []);
     await framework.stop();
     rmSync(tempDir, { recursive: true, force: true });
@@ -2557,7 +2573,7 @@ describe('private wins, one way', () => {
     }
   });
 
-  it("under 'delivery', a private turn's boundary that injects an unaddressed follow-up where the turn sent names the room with the injections", async () => {
+  it("under 'delivery', a private turn's boundary that injects an unaddressed follow-up from a room the turn has engaged names the room with the injections", async () => {
     let framework: AgentFramework | undefined;
     const tool = robot(() => {
       (routingOf(framework!).engaged as Set<string>).add(destinationKey(ref(ROOM)));

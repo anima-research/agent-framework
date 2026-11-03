@@ -2549,6 +2549,7 @@ describe('present while acting', () => {
           agentName: 'assistant', reason: 'external-message', source: 'tui', timestamp: Date.now(), nonChannelOrigin: true,
         });
       await framework.runUntilIdle();
+      assert.ok(agent.getContextManager().getAllMessages().some((m) => JSON.stringify(m.content).includes('Still private after open.')), 'the turn spoke after the open');
       assert.deepEqual(routed, []);
       const said = JSON.stringify(pushed);
       assert.ok(said.includes('plain speech stays private'), said);

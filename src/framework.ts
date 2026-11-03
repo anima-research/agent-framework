@@ -17014,7 +17014,9 @@ export class AgentFramework {
           // aside, which counts as its message) still cannot move the pin —
           // the 2026-07-21 Cairn hijack protection is unchanged; this extends
           // the ratified addressed-outranks-ambient principle from turn start
-          // to boundaries. Locus mode only (explicit mode has no pin).
+          // to boundaries. Locus mode only (explicit mode has no pin). A
+          // private turn isn't re-pinned: its boundary names the channel in a
+          // notice instead (noticeChannelMessages).
           // Skipped on endTurn/overBudget: no further prose this stream, and
           // a stale "for this turn" notice would be pure noise.
           //
@@ -23400,8 +23402,10 @@ export class AgentFramework {
   }
 
   /**
-   * A routing envelope that could not be delivered: its words are held as a
-   * draft (the `{{unsent}}` source) and the resident is told, privately.
+   * A routing envelope that could not be delivered: outside a private turn,
+   * its words are held as a draft (the `{{unsent}}` source); in one, they're
+   * kept private with no draft, unless the envelope is a bare `{{unsent}}`
+   * resend. Either way the resident is told, privately.
    * `{{unsent}}` in it follows the re-bounce rule (unsentWords).
    */
   private bounceProse(

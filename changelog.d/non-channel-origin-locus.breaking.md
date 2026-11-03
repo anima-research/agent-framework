@@ -23,8 +23,9 @@
   `api:inference-request` makes the request it lets through later no
   retake, so the turn it wakes takes the wake's route. The answer to what a
   subagent or fork started, or handed an operator's words, during a private
-  turn sends back by `deliverAgentResult` or agent mail is private too, a
-  channel turn that takes it in included.
+  turn sends back by `deliverAgentResult` or agent mail is private too, and
+  so is what that work starts in turn, a channel turn that takes it in
+  included.
   - **Who needs to act:** a host that counts on every addressed channel
     message getting a reply of its own, on an `unstick` or `nudge`
     answering in its channel (for ordinary residents, whose stored history
@@ -32,11 +33,32 @@
     addressed), or on a subagent's outcome being answered in a channel,
     when its operators talk to the same agent through a private surface. A
     host with a private surface needs to keep its gate from holding
-    `api:inference-request`.
-  - **Migration:** nothing to change in code. The resident answers such a
-    message with an explicit send, as the notice says.
+    `api:inference-request`. A host whose own speech handler publishes (any
+    but the built-in Discord module's) gets a private turn's speech too,
+    marked `SpeechContext.nonChannelOrigin`. A bridge that sends a channel's
+    messages as `external-message` events with no `metadata.channelId` now
+    has them read as a private surface's, so their turns are private and
+    reply in no channel.
+  - **Migration:** a speech handler that publishes posts nothing when
+    `SpeechContext.nonChannelOrigin` is set, and a bridge names each
+    message's channel in `metadata.channelId`. Otherwise nothing changes in
+    code: the resident answers such a message with an explicit send, as the
+    notice says.
+  - **Upgrade:** work in flight across the upgrade carries no private mark.
+    A subagent's record or held mail, or a script's report deferred, under a
+    release before this one reads as ordinary, since this release marks only
+    private work and a report with no turn id may come from a script started
+    outside any turn. A row stored before this release with a surface stamp
+    (`inboundSource.kind: 'surface'`), as earlier releases gave the
+    framework's own MCPL tool-list notice when a module stored it, counts as
+    a private surface's message, so while one is in an agent's stored
+    history its retakes are private, and so is its first start after the
+    upgrade when no row of its own follows the stamped one, on a host with
+    no private surface too.
   - **Unchanged:** other than a retake, a start that holds no private input
     replies in its channel as before, and so does a channel's later turn
-    after a private one, unless its message arrived while the private turn
-    was open. What's private is the turn, not the operator's words: that
-    later turn's context still holds them.
+    after a private one, its message arriving while the private turn was
+    open included, unless its wake waited beside that turn's own
+    continuation (a budget restart or a held retry that started alone, or
+    one that passed a quiesce in the same pass). What's private is the turn,
+    not the operator's words: that later turn's context still holds them.
