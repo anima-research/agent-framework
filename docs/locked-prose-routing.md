@@ -42,9 +42,19 @@ A move is recorded in `framework/state` (`proseLocks`) before it applies, so a
 failed write moves nothing. It applies to the calling turn's later rounds and
 to every later turn, across restarts. What the resident wrote in the same
 round as the call goes where speech went before it: a round's routing is
-decided from the locus that round had. A call made outside the resident's turn
-(a puppet's, or a host's `executeToolCall`) moves the lock later turns start
-from, and leaves a turn already under way where it is.
+decided from the locus that round had.
+
+A call made outside the resident's turn (a puppet's, or a host's
+`executeToolCall`) moves the lock later turns start from, and leaves a turn
+already under way where it is. Its result says so. The resident may never read
+that result, so the move isn't counted as told: the next turn starts with a
+`[routing]` notice of where its speech goes.
+
+On a stream whose prose is routed only when it ends (membrane's XML tool path,
+which has no per-round content), the words written before a move and after it
+can't be told apart. A move during such a stream holds all of that stream's
+plain speech as drafts, sending none of it to either destination, and the
+move's result says so. Later turns speak at the new destination.
 
 ## Drafts
 
@@ -63,8 +73,9 @@ each turn's start the way a `>>` target is. A channel its server hasn't
 registered yet resolves once it has; until then that turn's plain speech is
 held as drafts, and the operator log says why. With no `proseLock`, plain
 speech is held as drafts until the resident chooses. Once the resident has
-chosen, its choice outranks the recipe's. A stored choice that can't be read
-holds speech as drafts rather than fall back to the recipe's.
+chosen, its choice outranks the recipe's. A stored choice that can't be
+read, or whose stored entry names no destination, holds speech as drafts
+rather than fall back to the recipe's.
 
 ## Unchanged from locus mode
 
@@ -84,12 +95,14 @@ has a lock of its own, and neither is offered `prose_locus`.
 
 - Entering locked mode appends one short `[prose-routing]` notice, once,
   naming where plain speech goes and that `prose_locus` moves it.
-- A `prose_locus` move is answered in its own tool result, and nothing else
-  announces it.
+- A `prose_locus` move made in the resident's turn is answered in its own
+  tool result, and nothing else announces it.
 - When the lock changes some other way, the next turn starts with the usual
-  `[routing]` announce-on-change notice. That happens when a recipe
-  `proseLock` channel registers after turns that held speech as drafts, or
-  when a stored lock can't be read for a turn.
+  `[routing]` announce-on-change notice. That happens after a move made from
+  outside the turn, or when a recipe `proseLock` channel registers after turns
+  that held speech as drafts.
+- Notices name `prose_locus` only where the resident's `allowedTools` let it
+  call it.
 - Every turn that wrote plain speech ends with its `[delivered]` receipt.
 
 Leaving locked mode keeps the stored lock, which applies again if the agent
