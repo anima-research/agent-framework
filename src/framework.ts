@@ -573,8 +573,8 @@ function injectedBlockTokens(block: ContentBlock): number {
  */
 function inboundOnlySpeechNote(serverId: string): string {
   return (
-    `${serverId} declared this channel inbound-only, so plain speech there is refused ` +
-    `and stays in your archive. To speak there, use ${serverId}'s own tools.`
+    `${serverId} declared this channel inbound-only, and plain speech there is refused, ` +
+    `so no channel there posts it. To speak there, use ${serverId}'s own tools.`
   );
 }
 
@@ -20998,7 +20998,7 @@ export class AgentFramework {
       const places = await asked;
       if (places.length > 0) {
         if (!round.final) round.routing.liveSpeech = true;
-        console.error(`[routeSpeech] ${agent.name}: turn has no channel; ${text.length} chars shown by ${places.join(' · ')}, none posted to a channel`);
+        console.error(`[routeSpeech] ${agent.name}: turn has no channel; ${text.length} chars shown by ${places.map(logValue).join(' · ')}, none posted to a channel`);
         return null;
       }
       return this.channelRegistry!.routeSpeech(agent.name, text, locus);

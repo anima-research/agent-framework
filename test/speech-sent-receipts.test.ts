@@ -278,7 +278,21 @@ describe('plain speech a module says it showed', () => {
     const f = await host([surface], membrane);
     await turn(f);
     const lines = errors.filter((e) => e.startsWith('[routeSpeech]'));
-    assert.deepEqual(lines, [`[routeSpeech] resident: turn has no channel; 9 chars shown by ${SENT_TO}, none posted to a channel`]);
+    assert.deepEqual(lines, ['[routeSpeech] resident: turn has no channel; 9 chars shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", none posted to a channel']);
+  });
+
+  it("a place a module names is logged as a field, its invisible characters escaped, and kept readable in the receipt", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const surface = new Surface();
+    surface.answer = { sentTo: 'the terminal\u202e(page)' };
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi there.' }]));
+    const f = await host([surface], membrane);
+    await turn(f);
+    const lines = errors.filter((e) => e.startsWith('[routeSpeech]'));
+    assert.deepEqual(lines, ['[routeSpeech] resident: turn has no channel; 9 chars shown by "the\\u0020terminal\\u202e(page)", none posted to a channel']);
+    assert.equal(receipt(f), '[delivered] plain speech → sent to the terminal\u202e(page) · no channel posted it');
   });
 
   it("the line for a reply no module showed still says 'no locus', as connectome-doctor reads it", async (t) => {

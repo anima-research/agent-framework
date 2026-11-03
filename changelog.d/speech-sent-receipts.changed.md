@@ -19,4 +19,7 @@
 - **Residents:** the `[routing]` notice for a turn with no channel reads "Your
   plain speech currently has no channel, so no channel posts it.", and an
   addressed-elsewhere notice on such a turn reads "Your plain speech has no
-  channel this turn", where each said it "stays in your archive".
+  channel this turn", where each said it "stays in your archive". The note
+  for a channel its server declared inbound-only, in the `[routing]` notices
+  and in `channel_open`'s result, reads "plain speech there is refused, so no
+  channel there posts it", where it said it "stays in your archive".

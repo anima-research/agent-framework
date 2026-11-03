@@ -12,8 +12,10 @@
   turn's `[delivered]` receipt waits up to the same bound for answers still
   due. Private envelopes, explicit sends, a heartbeat's held prose and an
   ephemeral run's speech with no channel, which is its caller's result, are
-  never asked about. Answer from what the module already holds: the turn's
-  receipt, and the agent's next turn, wait for every answer up to the bound.
+  never asked about. Answer from what the module already holds: for a turn
+  that ends with its reply or a tool, the turn's receipt and the agent's next
+  turn wait for every answer up to the bound. A turn that fails or is
+  stopped writes no receipt and doesn't wait.
 - `SpeechRoutedContext`: `final` (the turn's final reply: its speech after
   its last tool call, a refused XML attempt or a call cut off unrun being
   none), `turnId`, and

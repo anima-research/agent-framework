@@ -206,10 +206,11 @@ export interface Module {
    * pieces, and never about private envelopes, explicit sends, a heartbeat's
    * held prose or an ephemeral run's speech with no channel, which is its
    * caller's result. A module that throws, or hasn't answered within
-   * `SPEECH_RECEIPT_WAIT_MS`, names no place, as `{}` does. The turn's
-   * receipt, and the agent's next turn, wait for every answer up to that
-   * bound, so answer from what the module already holds rather than after a
-   * round trip.
+   * `SPEECH_RECEIPT_WAIT_MS`, names no place, as `{}` does. For a turn that
+   * ends with its reply or a tool, the turn's receipt and the agent's next
+   * turn wait for every answer up to that bound, so answer from what the
+   * module already holds rather than after a round trip. A turn that fails
+   * or is stopped writes no receipt and doesn't wait.
    */
   onSpeechRouted?(
     agentName: string,
