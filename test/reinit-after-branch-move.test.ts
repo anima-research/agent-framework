@@ -2807,8 +2807,14 @@ describe('an undo while a maintenance tick runs', () => {
       const head = store.currentBranch().name;
       assert.equal(framework.undoLastTurn('a').undone, true, "the undo doesn't wait for the tick");
       assert.equal(store.currentBranch().name, head, 'no branch moved under the tick');
+      // The fake reads ready as soon as its tick starts, so what the pass
+      // does once the tick is let go is waited for by the pass itself.
+      const pass = (framework as unknown as { maintenancePass: Promise<void> | null }).maintenancePass;
+      assert.ok(pass, "b's tick runs in a maintenance pass");
       gated.release!();
-      await until(() => framework.getAgent('b')!.getContextManager().isReady(), "b's tick to finish", 8_000);
+      await pass;
+      await settled();
+      assert.equal(framework.getAgent('b')!.getContextManager().isReady(), true, "b's tick finished");
       assert.deepEqual(alerts, [], JSON.stringify(alerts));
     } finally {
       gated.release?.();
