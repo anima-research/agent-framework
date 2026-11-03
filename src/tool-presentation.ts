@@ -337,7 +337,10 @@ export class ToolPresentation {
     if (!available.some((t) => t.name === name)) {
       const near = closestNames(name, available.map((t) => t.name));
       let held = false;
-      try { held = Object.hasOwn(parsePresentation(this.read()).tools, name); } catch { held = false; }
+      try {
+        const tools = parsePresentation(this.read()).tools;
+        held = Object.hasOwn(tools, name) && (tools[name].visible !== undefined || tools[name].description !== undefined);
+      } catch { held = false; }
       throw new PresentationRefusal(`Nothing was changed: you have no tool named ${quoted(name)} right now, shown or hidden.${near.length ? ` Did you mean ${quotedList(near, 'or', JSON.stringify)}?` : ''}`
         + (held
           ? ' Your file keeps a setting under this name, but you have no tool by that name right now. The setting stays, and you can change it if you have a tool by that name.'
