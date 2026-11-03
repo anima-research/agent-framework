@@ -102,7 +102,12 @@ interface Backlog {
   compileGate?: { nth: number; until: Promise<void> };
   bindings: { compile: unknown[]; dryRun: unknown[]; preview: unknown[] };
   thrown: Error[]; previewBudgets: unknown[];
-  spare?: number; foldsDeeper?: boolean | 'throws'; notePrice?: number | 'throws';
+  spare?: number; foldsDeeper?: boolean | 'throws';
+  /** The note's price by the strategy's estimate, 47 when unset; 'none' gives the strategy no estimate. */
+  notePrice?: number | 'throws' | 'none';
+  /** A dry compile at a budget smaller than the first one's refuses. */
+  dryShort?: boolean;
+  dryBudgets: unknown[];
 }
 const fits = (b: Backlog): boolean => b.fit || b.ticks >= b.fitAt;
 const pending = (b: Backlog): boolean => b.alwaysPending || (!fits(b) && b.ticks < b.readyAt);
@@ -121,7 +126,7 @@ async function withBacklog<T>(backlog: Partial<Backlog>, run: (b: Backlog) => Pr
     alwaysPending: false, stalled: false, previewless: false, refuseCompiles: 0,
     previews: 0, dryRuns: 0, dryRunsRunning: 0, mostDryRunsRunning: 0, compiles: 0,
     dryRunsAcrossFit: 0, noProgress: false, bindings: { compile: [], dryRun: [], preview: [] },
-    thrown: [], previewBudgets: [],
+    thrown: [], previewBudgets: [], dryBudgets: [],
     ...backlog,
   };
   refusalName = b.refusalName ?? 'OverBudgetError';
@@ -133,6 +138,9 @@ async function withBacklog<T>(backlog: Partial<Backlog>, run: (b: Backlog) => Pr
     if ((args[2] as { dryRun?: boolean } | undefined)?.dryRun === true) {
       b.bindings.dryRun.push((args[2] as { thinkingBinding?: unknown }).thinkingBinding);
       b.dryRuns++;
+      b.dryBudgets.push(args[0]);
+      const asked = (args[0] as { maxTokens?: number } | undefined)?.maxTokens ?? 100_000;
+      const first = (b.dryBudgets[0] as { maxTokens?: number } | undefined)?.maxTokens ?? 100_000;
       b.mostDryRunsRunning = Math.max(b.mostDryRunsRunning, ++b.dryRunsRunning);
       try {
         const fitsNow = fits(b);
@@ -140,6 +148,7 @@ async function withBacklog<T>(backlog: Partial<Backlog>, run: (b: Backlog) => Pr
         if (b.dryRunMs) await new Promise((r) => setTimeout(r, b.dryRunMs));
         if (!fitsNow && fits(b)) b.dryRunsAcrossFit++;
         if (!fitsNow && !b.dryRunResolves) throw overBudget();
+        if (b.dryShort && asked < first) throw overBudget();
       } finally {
         b.dryRunsRunning--;
       }
@@ -194,10 +203,10 @@ async function withBacklog<T>(backlog: Partial<Backlog>, run: (b: Backlog) => Pr
     return pending(b) ? { description: b.pendingDescription ?? 'zz compression pending', started: new Date() } : null;
   };
   const priced = PassthroughStrategy.prototype as unknown as { estimateTokens?: (content: unknown) => number };
-  if (b.notePrice !== undefined) {
+  if (b.notePrice !== 'none') {
     priced.estimateTokens = function () {
       if (b.notePrice === 'throws') throw new Error('zz no estimate');
-      return b.notePrice!;
+      return typeof b.notePrice === 'number' ? b.notePrice : 47;
     };
   }
   if (!b.noProgress) {
@@ -291,8 +300,13 @@ class InboxModule implements Module {
   async handleToolCall(): Promise<never> { throw new Error('no tools'); }
   async onProcess(event: ProcessEvent): Promise<EventResponse> {
     if (event.type !== 'external-message') return {};
+    const metadata = (event as { metadata?: Record<string, unknown> }).metadata;
     return {
-      addMessages: [{ participant: 'User', content: (event as { content: unknown }).content as never }],
+      addMessages: [{
+        participant: 'User',
+        content: (event as { content: unknown }).content as never,
+        ...(metadata && Object.keys(metadata).length > 0 ? { metadata } : {}),
+      }],
       requestInference: true,
     };
   }
@@ -484,11 +498,11 @@ async function residentTurn(options: {
   const hold = framework as unknown as { checkBudgetHold?: (agentName: string) => Promise<void> };
   const checkBudgetHold = hold.checkBudgetHold?.bind(framework);
   if (checkBudgetHold) hold.checkBudgetHold = (agentName: string) => { looks++; return checkBudgetHold(agentName); };
-  const send = (text: string) => framework.pushEvent({
+  const send = (text: string, metadata: Record<string, unknown> = {}) => framework.pushEvent({
     type: 'external-message',
     source: 'test',
     content: [{ type: 'text', text }],
-    metadata: {},
+    metadata,
     triggerInference: true,
   } as unknown as ProcessEvent);
   framework.start();
@@ -695,6 +709,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         t.send('Are you there?');
         assert.ok(await pollUntil(() => t.of('inference:exhausted').length === 1, 5_000));
         assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['nothing_pending']);
+        assert.equal(noteCount(storedText(t.framework)), 0, "no note: compression made no room");
         const exhausted = t.of('inference:exhausted')[0]!;
         assert.equal(exhausted.errorType, 'over_budget');
         assert.match(String(exhausted.error), /the turn was first held \d+ s ago; compression had nothing left to do and it still didn't fit/);
@@ -714,12 +729,13 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     { name: 'the spare is short, and a deeper fold fits it', spare: 5, foldsDeeper: true, notePrice: 47, looks: 2, noted: true },
     { name: 'the spare is short, and no deeper fold fits it', spare: 5, foldsDeeper: false, notePrice: 47, looks: 2, noted: false },
     { name: 'the spare is short, and the look at the smaller budget fails', spare: 5, foldsDeeper: 'throws', notePrice: 47, looks: 2, noted: false },
-    { name: "the strategy can't price the note", spare: 5, notePrice: 'throws', looks: 1, noted: true },
-    { name: 'the strategy has no estimate', spare: 5, looks: 1, noted: true },
+    { name: "the strategy can't price the note", spare: 5, notePrice: 'throws', looks: 1, noted: false },
+    { name: 'the strategy has no estimate', spare: 5, notePrice: 'none', looks: 1, noted: false },
+    { name: 'the preview gives no figures, and the smaller budget fits the note', notePrice: 47, looks: 2, noted: true },
   ] as const;
   for (const c of noteCases) {
     it(`decides the note at the check that finds the fit: ${c.name}`, async () => {
-      await withBacklog({ spare: c.spare, foldsDeeper: 'foldsDeeper' in c ? c.foldsDeeper : undefined, notePrice: 'notePrice' in c ? c.notePrice : undefined }, async (backlog) => {
+      await withBacklog({ spare: 'spare' in c ? c.spare : undefined, foldsDeeper: 'foldsDeeper' in c ? c.foldsDeeper : undefined, notePrice: 'notePrice' in c ? c.notePrice : undefined }, async (backlog) => {
         const t = await residentTurn({ maintenanceIntervalMs: 50 });
         try {
           t.send('Are you there?');
@@ -739,6 +755,120 @@ describe('a compile refused for budget holds its turn (#304)', () => {
       });
     });
   }
+
+  const dryNoteCases = [
+    { name: 'the note fits at the smaller budget', notePrice: 47, dryShort: false, smaller: true, noted: true },
+    { name: "the note fits at the smaller budget, beside the tool-result guard's reserve", notePrice: 47, dryShort: false, smaller: true, noted: true, reserve: 500 },
+    { name: "the note doesn't fit at the smaller budget", notePrice: 47, dryShort: true, smaller: true, noted: false },
+    { name: 'the strategy has no estimate', notePrice: 'none', dryShort: false, smaller: false, noted: false },
+  ] as const;
+  for (const c of dryNoteCases) {
+    it(`on the dry-compile path, decides the note by a dry compile at the budget less its price: ${c.name}`, async () => {
+      await withBacklog({ previewless: true, notePrice: c.notePrice, dryShort: c.dryShort }, async (backlog) => {
+        const t = await residentTurn({ maintenanceIntervalMs: 50 });
+        try {
+          t.send('Are you there?');
+          assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.dryRuns >= 1, 5_000));
+          const agent = t.framework.getAgent('prime')!;
+          if ('reserve' in c) Object.defineProperty(agent.toolResultGuard, 'pendingWireReserveTokens', { get: () => c.reserve, configurable: true });
+          const next = agent.nextCompileBudget();
+          if ('reserve' in c) assert.equal(next.reserveForResponse, 4_000 + c.reserve, "premise: the next compile's budget carries the guard's reserve");
+          backlog.fit = true;
+          assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000), 'the turn runs');
+          assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
+          const smaller = (backlog.dryBudgets as Array<{ maxTokens: number; reserveForResponse: number } | undefined>)
+            .filter((budget) => budget !== undefined && budget.maxTokens < next.maxTokens);
+          assert.deepEqual(smaller, c.smaller ? [{ maxTokens: next.maxTokens - 47, reserveForResponse: next.reserveForResponse }] : [],
+            "one dry compile at the next compile's budget less the note's price");
+          assert.equal(noteCount(JSON.stringify(turnCalls(t.membrane)[0])), c.noted ? 1 : 0);
+          assert.equal(noteCount(storedText(t.framework)), c.noted ? 1 : 0);
+        } finally {
+          await t.close();
+        }
+      });
+    });
+  }
+
+  it('tells an agent addressed from another channel while its turn was held that the turn waited for compression', async () => {
+    await withBacklog({}, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      // A channel registry with every channel open and named, as the speech
+      // routing tests stub it, so an addressed message becomes an arrival.
+      const registry: Record<string, unknown> = {
+        resolveLocus: () => ({ serverId: 'stub', channelId: 'discord:guild:chanA' }),
+        routeSpeech: async (_agent: string, _text: string, locus?: { serverId: string; channelId: string } | null) =>
+          (locus ? { delivered: true, serverId: locus.serverId, channelId: locus.channelId } : null),
+        getDefaultPublishChannel: () => null,
+        isChannelOpen: () => true,
+        getDescriptor: () => undefined,
+        getChannelTools: () => [],
+        channelsNamed: (name: string) => [{ serverId: 'stub', channelId: name }],
+        nameShown: (channel: { channelId: string }) => channel.channelId,
+      };
+      (t.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(registry, {
+        get: (target, prop: string) => (prop in target ? target[prop] : () => undefined),
+      });
+      try {
+        t.send('Are you there?', { channelId: 'discord:guild:chanA' });
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        t.send('hey, over here?', { channelId: 'discord:dm:antra', tags: ['chat:addressed'] });
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        backlog.fit = true;
+        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000), 'the turn runs');
+        const notices = stored(t.framework).filter((m) => m.metadata.kind === 'routing-notice').map((m) => m.text);
+        const notice = notices.find((text) => text.includes('addressed you from discord:dm:antra'));
+        assert.ok(notice, `the released start announces the arrival: ${JSON.stringify(notices)}`);
+        assert.ok(notice!.includes('while your turn waited for compression'), `and says what the turn waited on: ${notice}`);
+        assert.ok(!notice!.includes('provider hold'), notice);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("gives a held turn's pending work and its last change in healthSnapshot()", async () => {
+    await withBacklog({ stalled: true, pendingDescription: 'zz 3 chunks pending' }, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      const hold = () => (t.framework.healthSnapshot() as { agents: Array<{ name: string; budgetHold: Record<string, unknown> | null }> })
+        .agents.find((a) => a.name === 'prime')!.budgetHold!;
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        const first = hold();
+        assert.equal(first.pending, 'zz 3 chunks pending', "context-manager's description of its pending work, read now");
+        assert.equal(first.changedAt, first.since, 'nothing it watches has changed since it started');
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        assert.equal(hold().changedAt, first.since, 'a pass that changes nothing moves nothing');
+        backlog.pendingDescription = 'zz 2 chunks pending';
+        backlog.progress = 1;
+        assert.ok(await pollUntil(() => (hold().changedAt as number) > (first.since as number), 2_000), 'compression moving is a change it saw');
+        assert.equal(hold().pending, 'zz 2 chunks pending');
+        backlog.fit = true;
+        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000));
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("bounds the pending description in healthSnapshot() as the hold's start line bounds it", async () => {
+    await withBacklog({ stalled: true, pendingDescription: `zz ${'pending work '.repeat(300)}` }, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        const pending = String((t.framework.healthSnapshot() as { agents: Array<{ name: string; budgetHold: { pending?: unknown } | null }> })
+          .agents.find((a) => a.name === 'prime')!.budgetHold!.pending);
+        assert.ok(pending.length <= 2_000 && pending.length > 1_000, `cut at 2,000 (${pending.length})`);
+        assert.match(pending, /characters omitted/);
+        backlog.fit = true;
+        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000));
+      } finally {
+        await t.close();
+      }
+    });
+  });
 
   it("releases a held list past the engine's spread limit without throwing, with every request in the queue", async () => {
     await withBacklog({}, async (backlog) => {
@@ -796,11 +926,13 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         await step(1_000);
       }
     };
-    const strategy = PassthroughStrategy.prototype as unknown as { releaseCompressionPause?: (model?: string) => boolean };
+    const strategy = PassthroughStrategy.prototype as unknown as { releaseCompressionPause?: (model?: string) => boolean; estimateTokens?: () => number };
     try {
       await withCompressionCalls({ fitAt: 2, workUntil: 2 }, async (c) => {
         const t = await residentTurn({ maintenanceIntervalMs: 60_000 });
         strategy.releaseCompressionPause = () => { c.pauseAfter = Infinity; return true; };
+        // The note goes only where it's priced and fits.
+        strategy.estimateTokens = () => 47;
         const complete = t.membrane.complete.bind(t.membrane);
         let compressionCalls = 0;
         t.membrane.complete = async (request: NormalizedRequest) => {
@@ -837,6 +969,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
       });
     } finally {
       delete strategy.releaseCompressionPause;
+      delete strategy.estimateTokens;
       tc.mock.timers.reset();
     }
   });
@@ -935,7 +1068,8 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
         assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['check_failed']);
         assert.equal(backlog.previewError, undefined, 'the preview met the error');
-        assert.ok(JSON.stringify(t.membrane.calls[0]).includes('[budget-hold]'), 'the turn that ran says why it waited');
+        assert.equal(noteCount(JSON.stringify(t.membrane.calls[0])), 0, "no note: the check didn't find room");
+        assert.equal(noteCount(storedText(t.framework)), 0);
       } finally {
         await t.close();
       }
