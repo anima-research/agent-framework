@@ -53,7 +53,8 @@
  * earlier release stored unstamped and the agent's own and its arrivals
  * (decision 1).
  * Nothing in it throws into a writer: a failed presentation is traced and
- * its rows stay out of the window for the next point.
+ * its rows stay out of the window for the next point. A fresh turn start's
+ * also fails the start (presentAtStart).
  *
  * It never imports framework.ts, which imports it.
  */
@@ -457,6 +458,9 @@ interface ScanMemo {
 interface Adopted {
   /** Set when the window couldn't be written down: the agent stays in legacy mode for this process. */
   pinnedLegacy?: string;
+  /** Set while taking out the rows a write-down took in that aren't the agent's (retractForeign) has failed:
+   *  tried again at its next turn start or point at rest until it succeeds. */
+  retractPending?: true;
 }
 
 const describe = (error: unknown): string => (error instanceof Error ? error.message : String(error));
@@ -473,11 +477,13 @@ export class AgentPresentation {
   private generation = 0;
   /** Rows handed each reader fork as framing (noteFramed), in memory. */
   private readonly framed = new Map<AgentName, Set<MessageId>>();
+  /** Reader forks whose framing may not all be in their window yet: framed before they were taken on, or whose framing's presentation failed. */
+  private readonly framedPending = new Set<AgentName>();
   private readonly listeners = new Map<AgentName, Set<(event: PresentedEvent) => void>>();
   /** Own rows whose presentation at their write failed, per manager (presentOwn), until they enter its window. */
   private readonly failedOwn = new WeakMap<WindowManager, Set<MessageId>>();
-  /** Arrivals a rollback took out of each manager's window, kept out of it at rest until the agent's next turn start (holdUntilStart). */
-  private readonly heldUntilStart = new WeakMap<WindowManager, Set<MessageId>>();
+  /** Arrivals a rollback took out of each manager's window, kept out of it at rest until the agent's next turn start (holdUntilStart), on the branch the rollback left the store on. */
+  private readonly heldUntilStart = new WeakMap<WindowManager, { branch: string; ids: Set<MessageId> }>();
   /** Read-only handles on the slots a manager merges, by namespace (slotOfRow): made only for a reader whose context merges more than one. */
   private readonly slotReaders = new WeakMap<WindowManager, Map<string | null, MessageStore>>();
 
@@ -497,7 +503,8 @@ export class AgentPresentation {
    * Take an agent on. Once per manager object: a manager in legacy mode has
    * its window written down (presentRows([]), which also finishes a
    * write-down cut short), the stamped rows it took in that are elsewhere to
-   * the agent are taken out (retractForeign), and the agent's own rows
+   * the agent are taken out (retractForeign; where that fails, at the
+   * agent's next turn start or point at rest), and the agent's own rows
    * stored and not in its window are presented to it, in record order (an
    * undone turn's rows are not: getUnpresentedMessages leaves them out). A
    * window that can't be
@@ -560,7 +567,7 @@ export class AgentPresentation {
     try {
       if (failure !== undefined) {
         state.pinnedLegacy = describe(failure);
-        this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion: 'rebase', error: state.pinnedLegacy });
+        this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion: 'rebase', error: state.pinnedLegacy, legacy: true });
         return;
       }
       if (cm.isClosed()) return;
@@ -569,9 +576,11 @@ export class AgentPresentation {
       agent.setOwnRowSink?.((ids) => this.presentOwn(agent, ids));
       this.retractForeign(agent, 'rebase');
       this.repair(agent, 'rebase');
+      // A reader fork's framing that its window doesn't hold on this branch.
+      this.presentFramed(agent);
     } catch (error) {
       state.pinnedLegacy = describe(error);
-      this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion: 'rebase', error: state.pinnedLegacy });
+      this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion: 'rebase', error: state.pinnedLegacy, legacy: true });
     }
   }
 
@@ -580,7 +589,8 @@ export class AgentPresentation {
    * (presentRows([]), which also finishes a write-down cut short), and say
    * whether the window is presented after it. A write-down that fails, or
    * leaves the manager in legacy mode, pins the agent in legacy mode
-   * (`state.pinnedLegacy`), traced as presentation:failed at `occasion`. A
+   * (`state.pinnedLegacy`), traced as presentation:failed at `occasion`
+   * with `legacy`, which the host logs and alerts. A
    * write-down that throws once its record is written (the store's own work
    * after a write, such as a snapshot, failing) has written the window
    * down: the manager reads its index again after any throw, so a window
@@ -598,7 +608,7 @@ export class AgentPresentation {
       } catch (error) {
         if (!readsPresented(cm)) {
           state.pinnedLegacy = describe(error);
-          this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion, error: state.pinnedLegacy });
+          this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion, error: state.pinnedLegacy, legacy: true });
           return false;
         }
         console.warn(`[presentation] ${agent.name}: writing its window down at ${occasion} threw after the window was written (${describe(error)}); its window is presented`);
@@ -607,7 +617,7 @@ export class AgentPresentation {
     }
     if (cm.windowMode() !== 'presented') {
       state.pinnedLegacy = 'the window is not in presented mode after its write-down';
-      this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion, error: state.pinnedLegacy });
+      this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion, error: state.pinnedLegacy, legacy: true });
       return false;
     }
     if (wrote && occasion === 'rebase') {
@@ -635,34 +645,53 @@ export class AgentPresentation {
    * module presents is taken out here: it presents own rows and arrivals
    * only, and a reader fork's framing, which is passed over. Traced as
    * presentation:retracted, reason `elsewhere`; a failure is traced as
-   * presentation:failed at `occasion` and leaves the rows for the next
-   * adopt or rebase. Never throws.
+   * presentation:failed at `occasion`, and the rows stay in the window
+   * until the agent's next turn start or point at rest takes them out
+   * (`retractPending`, tried there until it succeeds), or the next adopt or
+   * rebase. Never throws.
    */
-  private retractForeign(agent: PresentedAgent, occasion: 'adopt' | 'rebase'): void {
+  private retractForeign(agent: PresentedAgent, occasion: PresentationOccasion): void {
+    const cm = agent.getContextManager();
+    const state = this.adopted.get(cm);
     try {
-      const cm = agent.getContextManager();
       if (!this.presenting(agent)) return;
-      const facts = readerFacts(this.host.registry, agent.name);
-      // An agent the registry doesn't know has no slot to weigh a row by.
-      if (facts.ownSlot === undefined) return;
-      const framed = this.framed.get(agent.name);
-      const window = cm.getPresentedMessages();
-      const foreign: MessageId[] = [];
-      for (let i = 0; i < window.length; i++) {
-        const row = window[i]!;
-        // A body is taken out whole by its first shard.
-        if (i > 0 && continuesBody(window[i - 1], row)) continue;
-        if (audienceOf(row.metadata) === undefined || framed?.has(row.id)) continue;
-        if (facts.derivedAt !== undefined && row.sequence <= facts.derivedAt) continue;
-        if (bearingOf(row, facts, this.slotOfRow(cm, facts, row.id)) === 'elsewhere') foreign.push(row.id);
+      const foreign = this.foreignRows(agent);
+      if (foreign.length > 0) {
+        cm.retractRows(foreign);
+        this.memos.delete(cm);
+        this.host.emitTrace({ type: 'presentation:retracted', agentName: agent.name, messageIds: foreign, reason: 'elsewhere' });
       }
-      if (foreign.length === 0) return;
-      cm.retractRows(foreign);
-      this.memos.delete(cm);
-      this.host.emitTrace({ type: 'presentation:retracted', agentName: agent.name, messageIds: foreign, reason: 'elsewhere' });
+      if (state) delete state.retractPending;
     } catch (error) {
-      this.failed(agent, occasion, error);
+      if (state) state.retractPending = true;
+      console.error(`[presentation] ${agent.name}: taking the rows that aren't its out of its window at ${occasion} failed; they stay in it until its next turn start or point at rest takes them out:`, error);
+      this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion, error: describe(error) });
     }
+  }
+
+  /** The rows of the agent's window retractForeign takes out, each body by its first shard; none for an agent the registry has no slot for. */
+  private foreignRows(agent: PresentedAgent): MessageId[] {
+    const cm = agent.getContextManager();
+    const facts = readerFacts(this.host.registry, agent.name);
+    // An agent the registry doesn't know has no slot to weigh a row by.
+    if (facts.ownSlot === undefined) return [];
+    const framed = this.framed.get(agent.name);
+    const window = cm.getPresentedMessages();
+    const foreign: MessageId[] = [];
+    for (let i = 0; i < window.length; i++) {
+      const row = window[i]!;
+      // A body is taken out whole by its first shard.
+      if (i > 0 && continuesBody(window[i - 1], row)) continue;
+      if (audienceOf(row.metadata) === undefined || framed?.has(row.id)) continue;
+      if (facts.derivedAt !== undefined && row.sequence <= facts.derivedAt) continue;
+      if (bearingOf(row, facts, this.slotOfRow(cm, facts, row.id)) === 'elsewhere') foreign.push(row.id);
+    }
+    return foreign;
+  }
+
+  /** retractForeign again, where it failed before (`retractPending`). */
+  private retryRetraction(agent: PresentedAgent, occasion: PresentationOccasion): void {
+    if (this.adopted.get(agent.getContextManager())?.retractPending) this.retractForeign(agent, occasion);
   }
 
   /** Let an agent go: its sink off, and what the module kept for it (its memo, its framing, its held arrivals) dropped. */
@@ -675,6 +704,7 @@ export class AgentPresentation {
     this.heldUntilStart.delete(cm);
     this.slotReaders.delete(cm);
     this.framed.delete(agent.name);
+    this.framedPending.delete(agent.name);
     this.generation++;
   }
 
@@ -683,13 +713,16 @@ export class AgentPresentation {
    * its own rows stored and not in its window (the own-row sweep, traced as
    * presentation:repaired), then whatever it is owed at rest (presentAtEnd).
    * Boot runs it once every agent is taken on and the stored rows are in,
-   * whether or not an adopt repaired anything.
+   * whether or not an adopt repaired anything. An agent in `restExcept` has
+   * its own rows swept and nothing else: the boot couldn't read what it is
+   * owed to ask the wakes its rows owe, so they stay out of its window for
+   * its next point, and a later boot reads them again.
    */
-  repairAndRest(): void {
+  repairAndRest(options: { restExcept?: ReadonlySet<AgentName> } = {}): void {
     for (const agent of this.host.liveAgents()) {
       if (!this.presenting(agent) || this.host.turnAlive(agent.name)) continue;
       this.repair(agent);
-      this.presentAtRest(agent, 'at-rest');
+      if (!options.restExcept?.has(agent.name)) this.presentAtRest(agent, 'at-rest');
     }
   }
 
@@ -707,7 +740,9 @@ export class AgentPresentation {
   /**
    * Present the agent's own rows now, in the order given, those not in its
    * window yet, even while the host is frozen; then tell the other readers
-   * of its slot (afterStore). The own-row sink calls it. It is for a row the
+   * of its slot (afterStore), whatever became of that: a presentation that
+   * threw, or an agent the module doesn't present for (a failed rebase
+   * leaves its sink on). The own-row sink calls it. It is for a row the
    * agent's stream carries (its round, its results, a notice injected at its
    * boundary), one written before its next compile or after its stream's
    * last request, or one written while it has no turn alive: any other row
@@ -728,18 +763,23 @@ export class AgentPresentation {
    * sweep. Never throws.
    */
   presentOwn(agent: PresentedAgent, ids: ReadonlyArray<MessageId | undefined>): void {
-    let tried: readonly MessageId[] = unique(ids);
+    const cm = agent.getContextManager();
+    // Every row this call tries, the ones an earlier failed write kept
+    // among them, from before the first read: a read that throws keeps them
+    // all (keepFailedOwn), so none of them is put behind the rows written
+    // after it.
+    let tried: readonly MessageId[] = unique([...(this.failedOwn.get(cm) ?? []), ...ids]);
     try {
-      if (!this.presenting(agent)) return;
-      const cm = agent.getContextManager();
-      tried = unique([...this.failedOwnOf(agent), ...ids]).filter((id) => cm.ordinalOf(id) === undefined);
-      this.present(agent, tried, 'write');
-      this.keepFailedOwn(agent, tried);
-      this.afterStore(agent, ids);
+      if (this.presenting(agent)) {
+        tried = unique([...this.failedOwnOf(agent), ...ids]).filter((id) => cm.ordinalOf(id) === undefined);
+        this.present(agent, tried, 'write');
+        this.keepFailedOwn(agent, tried);
+      }
     } catch (error) {
       this.failed(agent, 'write', error);
       this.keepFailedOwn(agent, tried);
     }
+    this.afterStore(agent, ids);
   }
 
   /**
@@ -747,7 +787,11 @@ export class AgentPresentation {
    * slot (its owners and its observers) whose turn isn't alive, and the
    * writer itself, is presented what it is owed at once, when one of the
    * rows is an arrival for it (present at rest). A reader with a turn alive
-   * takes them at its next point. Frozen, only own rows present. Never throws.
+   * takes them at its next point. Frozen, only own rows present. The module
+   * needn't present for the writer: one left in legacy mode tells the
+   * readers of its slot too. Each reader is weighed apart, so one whose
+   * window can't be read is traced and the others are still told. Never
+   * throws.
    */
   afterStore(writer: PresentedAgent, ids: ReadonlyArray<MessageId | undefined>): void {
     try {
@@ -757,17 +801,22 @@ export class AgentPresentation {
       const rows = stored.map((id) => writerCm.getMessage(id)).filter((row): row is StoredMessage => row !== null);
       const slot = this.host.registry.ownSlotOf(writer.name);
       const readers = new Set<AgentName>([writer.name, ...(slot ? this.host.registry.readersOf(slot) : [])]);
-      for (const reader of this.host.liveAgents()) {
-        if (!readers.has(reader.name) || !this.presenting(reader) || this.host.turnAlive(reader.name)) continue;
-        const facts = readerFacts(this.host.registry, reader.name);
-        // The rows are in the writer's own slot: the reader's own when it
-        // is the writer or shares that slot (bearingOf compares the ref),
-        // else a slot it observes, weighed by its edges on that slot.
-        const from: RowSlot | undefined = reader === writer ? 'own' : slot;
-        // A row the writer's own slot doesn't hold (none found) can't be
-        // weighed here; the reader's own scan weighs it.
-        const owed = rows.length < stored.length || rows.some((row) => bearingOf(row, facts, from) !== 'elsewhere');
-        if (owed) this.presentAtRest(reader, 'at-rest');
+      for (const reader of [...this.host.liveAgents()]) {
+        if (!readers.has(reader.name)) continue;
+        try {
+          if (!this.presenting(reader) || this.host.turnAlive(reader.name)) continue;
+          const facts = readerFacts(this.host.registry, reader.name);
+          // The rows are in the writer's own slot: the reader's own when it
+          // is the writer or shares that slot (bearingOf compares the ref),
+          // else a slot it observes, weighed by its edges on that slot.
+          const from: RowSlot | undefined = reader === writer ? 'own' : slot;
+          // A row the writer's own slot doesn't hold (none found) can't be
+          // weighed here; the reader's own scan weighs it.
+          const owed = rows.length < stored.length || rows.some((row) => bearingOf(row, facts, from) !== 'elsewhere');
+          if (owed) this.presentAtRest(reader, 'at-rest');
+        } catch (error) {
+          this.failed(reader, 'at-rest', error);
+        }
       }
     } catch (error) {
       this.failed(writer, 'at-rest', error);
@@ -782,15 +831,31 @@ export class AgentPresentation {
    * fresh or resumed, its own rows only. Returns the arrivals presented, one
    * per body, for the start to weigh. A fresh start ends a rollback's hold
    * on the arrivals its cut returned (holdUntilStart): they enter with the
-   * rest, in record order.
+   * rest, in record order. A fresh start's presentation that fails (a read
+   * of the window or the record that throws, or a write of the window that
+   * leaves a row out) is traced, and then throws, so the start fails rather
+   * than compile without what it was started for, which waits outside the
+   * window for the next point. The backstop's is traced, and its compile
+   * goes on.
    */
   presentAtStart(agent: PresentedAgent, occasion: 'turn-start' | 'assembly' | 'compile'): StoredMessage[] {
     if (!this.presenting(agent)) return [];
     // The sweep below decides the own rows a failed write left (presentOwn).
     this.failedOwn.delete(agent.getContextManager());
+    const fresh = occasion !== 'compile';
     // A fresh start is where a rollback's returned arrivals enter (holdUntilStart).
-    if (occasion !== 'compile') this.heldUntilStart.delete(agent.getContextManager());
-    return this.presentPending(agent, occasion, occasion !== 'compile' && !this.host.frozen());
+    if (fresh) this.heldUntilStart.delete(agent.getContextManager());
+    // And where rows a write-down took in that aren't the agent's, whose
+    // retraction failed, leave before its compile, and a reader fork's
+    // framing whose presentation failed enters.
+    if (fresh) this.retryRetraction(agent, occasion);
+    if (fresh && this.framedPending.has(agent.name)) this.presentFramed(agent);
+    const { arrivals, failure } = this.presentPending(agent, occasion, fresh && !this.host.frozen(), false,
+      fresh ? "the start fails, and what it didn't present waits for the next point" : undefined);
+    if (fresh && failure !== undefined) {
+      throw new Error(`${agent.name}'s turn start could not present what it is owed (at ${occasion}): ${describe(failure)}`, { cause: failure });
+    }
+    return arrivals;
   }
 
   /**
@@ -867,17 +932,27 @@ export class AgentPresentation {
    * or a row stored for the agent while it is idle, so the cut the
    * operator made is what the agent's window holds until it speaks again.
    * A tool boundary isn't held back (a turn alive started since). An own
-   * row among them isn't held: own rows enter at every point, as ever. In
-   * memory: a restart presents them at its pass at rest, and an agent let
-   * go (forget) drops them. Rows given again add to those held. Never throws.
+   * row among them isn't held: own rows enter at every point, as ever. The
+   * hold is the branch's the store is on (the rollback's): on another
+   * branch the same stored rows are arrivals as any, and back on this one
+   * they are held again until the agent's next turn start. In memory: a
+   * restart presents them at its pass at rest, and an agent let go (forget)
+   * drops them. Rows given again on the same branch add to those held, and
+   * on another replace them. Never throws.
    */
   holdUntilStart(agent: PresentedAgent, ids: readonly MessageId[]): void {
     const named = unique(ids);
     if (named.length === 0) return;
     const cm = agent.getContextManager();
-    const held = this.heldUntilStart.get(cm) ?? new Set<MessageId>();
-    for (const id of named) held.add(id);
-    this.heldUntilStart.set(cm, held);
+    try {
+      const branch = cm.currentBranch().name;
+      const held = this.heldUntilStart.get(cm);
+      const kept = held?.branch === branch ? held.ids : new Set<MessageId>();
+      for (const id of named) kept.add(id);
+      this.heldUntilStart.set(cm, { branch, ids: kept });
+    } catch (error) {
+      console.error(`[presentation] ${agent.name}: could not hold ${named.length} row(s) out of its window until its next turn start; they enter at its next presentation point:`, error);
+    }
   }
 
   /**
@@ -929,12 +1004,14 @@ export class AgentPresentation {
    * fork framed before it is taken on has them presented at its adopt. Its
    * window's filter (the residents', which a reader fork inherits) keeps
    * them out of its compiles, where its framing row shows them; nothing
-   * else of its window moves.
+   * else of its window moves. Rows whose presentation fails enter at the
+   * fork's next turn start, or after a move of the store's branch (rebase).
    */
   noteFramed(agent: PresentedAgent, rowIds: readonly MessageId[]): void {
     const set = this.framed.get(agent.name) ?? new Set<MessageId>();
     for (const id of rowIds) set.add(id);
     this.framed.set(agent.name, set);
+    this.framedPending.add(agent.name);
     this.presentFramed(agent);
   }
 
@@ -946,6 +1023,7 @@ export class AgentPresentation {
    */
   forgetFramed(agent: AgentName): void {
     this.framed.delete(agent);
+    this.framedPending.delete(agent);
   }
 
   /**
@@ -958,6 +1036,26 @@ export class AgentPresentation {
   owedOf(agent: PresentedAgent): StoredMessage[] {
     if (!this.presenting(agent)) return [];
     return this.pending(agent, true).map((body) => body.shards[0]!);
+  }
+
+  /**
+   * Whether a row just stored in the agent's own slot, and presented at
+   * rest by afterStore if at all, is out of its window though the agent is
+   * owed it (its own row, or an arrival): a presentation that failed, or
+   * the host's freeze, kept it out. A row that is nothing to the agent (held
+   * from a resident, stamped for another) isn't. Yes where the window can't
+   * be read to tell; no for an agent the module doesn't present for.
+   */
+  notPresented(agent: PresentedAgent, id: MessageId): boolean {
+    try {
+      if (!this.presenting(agent)) return false;
+      const cm = agent.getContextManager();
+      if (cm.windowStatusOf(id) !== 'out') return false;
+      const row = cm.getMessage(id);
+      return row === null || bearingOf(row, readerFacts(this.host.registry, agent.name), 'own') !== 'elsewhere';
+    } catch {
+      return true;
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -1154,13 +1252,17 @@ export class AgentPresentation {
   /** presentAtEnd under a named occasion; a rollback's held arrivals wait (holdUntilStart). */
   private presentAtRest(agent: PresentedAgent, occasion: 'turn-end' | 'at-rest'): StoredMessage[] {
     if (!this.presenting(agent) || this.host.turnAlive(agent.name)) return [];
-    return this.presentPending(agent, occasion, !this.host.frozen(), true);
+    this.retryRetraction(agent, occasion);
+    return this.presentPending(agent, occasion, !this.host.frozen(), true).arrivals;
   }
 
   /** The rows the agent was handed as framing (noteFramed) that its window doesn't hold yet, presented in the order handed. */
   private presentFramed(agent: PresentedAgent): void {
     const framed = this.framed.get(agent.name);
-    if (!framed || framed.size === 0) return;
+    if (!framed || framed.size === 0) {
+      this.framedPending.delete(agent.name);
+      return;
+    }
     try {
       if (!this.presenting(agent)) return;
       const cm = agent.getContextManager();
@@ -1168,7 +1270,10 @@ export class AgentPresentation {
       // fork derived from a presented window holds those rows its parent's
       // window was written down with.
       const unpresented = new Set(cm.getUnpresentedMessages().map((m) => m.id));
-      this.present(agent, [...framed].filter((id) => unpresented.has(id)), 'framing');
+      const { error } = this.present(agent, [...framed].filter((id) => unpresented.has(id)), 'framing');
+      // Pending until a presentation of them doesn't fail: the fork's next
+      // turn start tries again (presentAtStart).
+      if (error === undefined) this.framedPending.delete(agent.name);
     } catch (error) {
       this.failed(agent, 'framing', error);
     }
@@ -1189,23 +1294,36 @@ export class AgentPresentation {
   /**
    * Present the agent's own pending rows, and its arrivals when `arrivals`
    * (but those a rollback holds for its next start, with `atRest`), in one
-   * call; return the arrivals that entered whole.
+   * call; return the arrivals that entered whole, and the error when the
+   * presentation failed: a read that threw, or a write that left a row it
+   * named out. `next` is what the failure's log says becomes of its rows.
    */
-  private presentPending(agent: PresentedAgent, occasion: PresentationOccasion, arrivals: boolean, atRest = false): StoredMessage[] {
+  private presentPending(
+    agent: PresentedAgent,
+    occasion: PresentationOccasion,
+    arrivals: boolean,
+    atRest = false,
+    next?: string,
+  ): { arrivals: StoredMessage[]; failure?: unknown } {
     try {
       const cm = agent.getContextManager();
       const bodies = this.pending(agent, arrivals, atRest);
-      if (bodies.length === 0) return [];
-      const { entered } = this.present(agent, bodies.map((body) => body.shards[0]!.id), occasion, {
+      if (bodies.length === 0) return { arrivals: [] };
+      const heads = bodies.map((body) => body.shards[0]!.id);
+      const { entered, error } = this.present(agent, heads, occasion, {
         unstamped: bodies.filter((body) => body.unstamped).length,
+        ...(next !== undefined ? { next } : {}),
       }, bodies);
-      return bodies
-        .filter((body) => body.bearing === 'arrival' && entered.has(body.shards[0]!.id)
-          && body.shards.every((shard) => cm.ordinalOf(shard.id) !== undefined))
-        .map((body) => body.shards[0]!);
+      return {
+        arrivals: bodies
+          .filter((body) => body.bearing === 'arrival' && entered.has(body.shards[0]!.id)
+            && body.shards.every((shard) => cm.ordinalOf(shard.id) !== undefined))
+          .map((body) => body.shards[0]!),
+        ...(error !== undefined && heads.some((id) => !entered.has(id)) ? { failure: error } : {}),
+      };
     } catch (error) {
-      this.failed(agent, occasion, error);
-      return [];
+      this.failed(agent, occasion, error, undefined, next);
+      return { arrivals: [], failure: error };
     }
   }
 
@@ -1218,17 +1336,25 @@ export class AgentPresentation {
    */
   private pending(agent: PresentedAgent, arrivals: boolean, atRest = false): PendingBody[] {
     const cm = agent.getContextManager();
-    const held = atRest ? this.heldUntilStart.get(cm) : undefined;
-    const unpresented = cm.getUnpresentedMessages();
     const facts = readerFacts(this.host.registry, agent.name);
     const factsKey = JSON.stringify(facts);
     const branch = cm.currentBranch().name;
+    // A rollback's hold is its branch's: on another the rows are arrivals as any.
+    const hold = atRest ? this.heldUntilStart.get(cm) : undefined;
+    const held = hold?.branch === branch ? hold.ids : undefined;
     const length = cm.indexLength();
     let memo = this.memos.get(cm);
     if (!memo || memo.generation !== this.generation || memo.branch !== branch || memo.length !== length || memo.facts !== factsKey) {
       memo = { generation: this.generation, branch, length, facts: factsKey, scanFrom: -Infinity };
       this.memos.set(cm, memo);
     }
+    // Every unpresented row at or below the memo's mark was elsewhere, so the
+    // listing starts after it (context-manager finds the place by a search):
+    // a scan walks the rows stored since, not every row of others' the
+    // record holds.
+    const unpresented = memo.scanFrom === -Infinity
+      ? cm.getUnpresentedMessages()
+      : cm.getUnpresentedMessages({ afterSequence: memo.scanFrom });
     const bodies: PendingBody[] = [];
     let firstOwed: number | undefined;
     let newest = memo.scanFrom;
@@ -1292,7 +1418,7 @@ export class AgentPresentation {
     agent: PresentedAgent,
     ids: readonly MessageId[],
     occasion: PresentationOccasion,
-    extra?: { unstamped?: number; cutAt?: MessageId },
+    extra?: { unstamped?: number; cutAt?: MessageId; next?: string },
     bodies?: readonly PendingBody[],
     quiet = false,
   ): { entered: Set<MessageId>; error?: unknown } {
@@ -1308,7 +1434,7 @@ export class AgentPresentation {
     const entered = new Set(ids.filter((id) => cm.ordinalOf(id) !== undefined));
     const memo = this.memos.get(cm);
     if (memo && memo.length === lengthBefore) memo.length = cm.indexLength();
-    if (error !== undefined) this.failed(agent, occasion, error);
+    if (error !== undefined) this.failed(agent, occasion, error, ids.filter((id) => !entered.has(id)), extra?.next);
     if (entered.size > 0) {
       if (!quiet) {
         const unstamped = extra?.unstamped !== undefined && bodies
@@ -1361,9 +1487,27 @@ export class AgentPresentation {
     }
   }
 
-  private failed(agent: PresentedAgent, occasion: PresentationOccasion, error: unknown): void {
-    console.error(`[presentation] ${agent.name}: presenting at ${occasion} failed; what it didn't present waits for the next point:`, error);
-    this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion, error: describe(error) });
+  /**
+   * A presentation that failed, logged and traced (presentation:failed):
+   * `ids` are the rows it named that didn't enter the window (a body by
+   * the id that names it), where they are known, and `next` says what
+   * becomes of them.
+   */
+  private failed(
+    agent: PresentedAgent,
+    occasion: PresentationOccasion,
+    error: unknown,
+    ids?: readonly MessageId[],
+    next = "what it didn't present waits for the next point",
+  ): void {
+    const left = ids !== undefined && ids.length > 0 ? [...ids] : undefined;
+    const named = left
+      ? ` ${left.length} row${left.length === 1 ? '' : 's'} (${left.slice(0, 10).join(', ')}${left.length > 10 ? ', …' : ''})`
+      : '';
+    console.error(`[presentation] ${agent.name}: presenting${named} at ${occasion} failed; ${next}:`, error);
+    this.host.emitTrace({
+      type: 'presentation:failed', agentName: agent.name, occasion, error: describe(error), ...(left ? { messageIds: left } : {}),
+    });
   }
 }
 

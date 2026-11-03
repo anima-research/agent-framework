@@ -5554,13 +5554,15 @@ export class AgentFramework {
     // agent taken on (repairAndRest): its own rows stored and not in its
     // window, then what it is owed at rest, now that the stored rows are in.
     // Each agent's window was written down at its registration, before them.
+    // An agent whose owed rows couldn't be read for their wakes is left out of
+    // the pass at rest, so those rows stay out of its window and a later boot
+    // reads them again (`restExcept`).
     // Then each window lets go of the rows its record no longer holds that no
     // live context heard removed (retractAbsentRows): an offline recovery's
     // suppressions, made with the host stopped through one agent's context.
-    framework.wakeForUnpresentedTuneOutRows();
-    framework.wakeForUnpresentedMail();
+    const unreadAtBoot = new Set([...framework.wakeForUnpresentedTuneOutRows(), ...framework.wakeForUnpresentedMail()]);
     framework.bootFreeze = false;
-    framework.presentation?.repairAndRest();
+    framework.presentation?.repairAndRest({ restExcept: unreadAtBoot });
     framework.presentation?.retractAbsentRows();
     await framework.passOnInterruptedNotices(interruptedAgents);
     framework.reconcileAgentRegistry(interruptedAgents);
@@ -10094,12 +10096,15 @@ export class AgentFramework {
    * (repairAndRest). Earlier releases kept such a row in the deferred queue,
    * whose restore asked for the same wake; the importer still asks for it
    * for a release it stores (importPersistedDeferredWrites), and is not
-   * asked twice. A row in the window already was presented while the agent
-   * had no turn alive, its wake run or lost with the turn as before #291.
-   * Nothing for an agent the index doesn't present for, and a window that
-   * can't be read is logged and asks for nothing.
+   * asked twice. A row in the window already was presented at rest or
+   * injected at a tool boundary, its wake run or lost with the turn as
+   * before #291. Nothing for an agent the index doesn't present for. A
+   * window that can't be read is logged and asks for nothing, and its agent
+   * is returned: the boot's pass leaves what it is owed out of its window
+   * (repairAndRest's `restExcept`), so a later boot reads it again.
    */
-  private wakeForUnpresentedTuneOutRows(): void {
+  private wakeForUnpresentedTuneOutRows(): Set<string> {
+    const unread = new Set<string>();
     const owed: Array<{ agentName: string | null; kinds: readonly string[]; reason: string }> = [
       { agentName: this.primaryAgentName, kinds: ['tune-out-cancel'], reason: 'tune-out released (restored)' },
       {
@@ -10116,13 +10121,15 @@ export class AgentFramework {
       try {
         rows = this.presentation!.owedOf(agent);
       } catch (error) {
-        console.error(`[tune-out] could not read what ${agent.name}'s window is owed at boot, so no wake is asked for a tune-out's row in it:`, error);
+        console.error(`[tune-out] could not read what ${agent.name}'s window is owed at boot, so no wake is asked for a tune-out's row in it, and the boot's pass leaves what it is owed out of its window for a later boot to read again:`, error);
+        unread.add(agent.name);
         continue;
       }
       const kindOf = (m: StoredMessage): unknown => (m.metadata as { kind?: unknown } | undefined)?.kind;
       if (!rows.some((m) => kinds.includes(kindOf(m) as string))) continue;
       this.pendingRequests.push({ agentName: agent.name, reason, source: 'tune-out', timestamp: Date.now() });
     }
+    return unread;
   }
 
   /**
@@ -10151,16 +10158,22 @@ export class AgentFramework {
    * Mail in the window already was presented at rest, or sent in a request
    * of the turn's (at its tool boundary), its wake run or lost as before
    * #291, and asks for none; nor does a wake with the same reason already
-   * pending. A window that can't be read is logged and asks for nothing.
+   * pending. A window that can't be read is logged and asks for nothing, and
+   * its agent is returned, as wakeForUnpresentedTuneOutRows returns one. The
+   * wakes are asked in memory: once the pass has presented the rows, a
+   * process that ends, or a create() that fails, before they run loses them,
+   * and the next boot, which finds the rows in the window, asks for none.
    */
-  private wakeForUnpresentedMail(): void {
+  private wakeForUnpresentedMail(): Set<string> {
+    const unread = new Set<string>();
     for (const agent of this.agents.values()) {
       if (!this.presents(agent)) continue;
       let rows: StoredMessage[];
       try {
         rows = this.presentation!.owedOf(agent);
       } catch (error) {
-        console.error(`[dendrite] could not read what ${agent.name}'s window is owed at boot, so no wake is asked for mail stored in it:`, error);
+        console.error(`[dendrite] could not read what ${agent.name}'s window is owed at boot, so no wake is asked for mail stored in it, and the boot's pass leaves what it is owed out of its window for a later boot to read again:`, error);
+        unread.add(agent.name);
         continue;
       }
       for (const row of rows) {
@@ -10172,6 +10185,7 @@ export class AgentFramework {
         this.pendingRequests.push({ agentName: agent.name, reason, source: 'dendrite', timestamp: Date.now() });
       }
     }
+    return unread;
   }
 
   /**
@@ -19063,7 +19077,9 @@ export class AgentFramework {
    * A fork's channel message, routed or a correction for it, written into
    * the fork's store (storeInFork, #291: stored at once, stamped for the fork
    * alone, and presented at the fork's next point, at once when no turn of
-   * its is alive), and where it went: the fork, with the stored id. While a
+   * its is alive), and where it went: the fork, with the stored id, and
+   * `presented: false` where the row is out of the fork's window after its
+   * write, as addMessage's placement says (placedUnpresented). While a
    * surgery holds the store, storeInFork keeps the write in memory
    * (surgeryHeldWrites) and the hold's release stores it, and while the
    * fork's context manager refuses its work it keeps it for the move that
@@ -19071,8 +19087,17 @@ export class AgentFramework {
    * alone, with no id yet. `mayBeStored`: storeInFork's.
    */
   private writeToFork(agent: Agent, content: ContentBlock[], metadata: Record<string, unknown>, mayBeStored?: boolean): CoalescingPlacement {
+    // Read before the write, as addMessage reads it: whether the fork's turn
+    // keeps the row out of its window. A placement that says so
+    // (`presented: false`) keeps a coalesced render the turn never read
+    // replaceable, and wakes the fork to read it.
+    const turnLive = this.logicalTurnAlive(agent);
+    const keptOut = this.keptOutOfWindow(agent, content, turnLive);
     const id = this.storeInFork(agent, content, metadata as MessageMetadata, mayBeStored);
-    return id ? { agent: agent.name, messageId: id } : { agent: agent.name };
+    if (!id) return { agent: agent.name };
+    return this.placedUnpresented(agent, keptOut, !turnLive, id)
+      ? { agent: agent.name, messageId: id, presented: false }
+      : { agent: agent.name, messageId: id };
   }
 
   /**
@@ -22981,6 +23006,34 @@ export class AgentFramework {
   }
 
   /**
+   * Whether a write stored for `agent` now waits outside its window for a
+   * later point (#291), read before the write: while the host is quiesced,
+   * or while a logical turn of the agent's is alive (`turnLive`,
+   * logicalTurnAlive), but for a fresh tool_result (a draining turn's
+   * continuation depends on it) and a write while the agent's start is
+   * assembling, which that start presents before its compile.
+   */
+  private keptOutOfWindow(agent: Agent, content: readonly ContentBlock[], turnLive: boolean): boolean {
+    return !content.some((b) => b.type === 'tool_result')
+      && (this.quiesced || (turnLive && !this.assembling.has(agent.name)));
+  }
+
+  /**
+   * Whether a write stored for `agent` as `id` is placed as not presented
+   * to it (`presented: false`), which a coalesced render's delivery reads
+   * to keep the render replaceable and wake its agent to read it: kept out
+   * of the agent's window by its turn or a quiesced host (`keptOut`,
+   * keptOutOfWindow), or stored while no logical turn of the agent's was
+   * alive (`atRest`) and out of its window after its presentation at rest,
+   * which failed (presentation.notPresented). Only for an agent the index
+   * presents for.
+   */
+  private placedUnpresented(agent: Agent, keptOut: boolean, atRest: boolean, id: MessageId): boolean {
+    if (!this.presents(agent)) return false;
+    return keptOut || (atRest && this.presentation!.notPresented(agent, id));
+  }
+
+  /**
    * A channel message stored straight into a fork's own store, past
    * addMessage, as the fork writes are (a correction
    * handleMcplChannelIncoming delivers, a message routeConversationIncoming
@@ -22996,7 +23049,6 @@ export class AgentFramework {
    * FrameworkWriteOptions.mayBeStored, read back in the fork's store.
    */
   private storeInFork(target: Agent, content: ContentBlock[], metadata: MessageMetadata, mayBeStored?: boolean): MessageId {
-    const presents = this.presents(target);
     const kept = (): SurgeryHeldWrite => ({
       participant: 'user', content, metadata,
       direct: { agentName: target.name, ...(mayBeStored ? { mayBeStored: true as const } : {}) },
@@ -23031,14 +23083,14 @@ export class AgentFramework {
           return '' as MessageId;
         }
         if ('unknown' in thrown) {
-          if (presents) this.presentation!.afterStore(target, presentedThoughUnknown(thrown.unknown));
+          this.presentation?.afterStore(target, presentedThoughUnknown(thrown.unknown));
           throw error;
         }
         id = thrown.landed[0]!;
         rows = thrown.landed;
       }
     }
-    if (presents) this.presentation!.afterStore(target, rows);
+    this.presentation?.afterStore(target, rows);
     return id;
   }
 
@@ -25603,7 +25655,10 @@ export class AgentFramework {
     if (attempt === 0 && !resumesTurn) this.storeDueClock(agent, 'turn-start');
     // Its own rows not in its window yet and its arrivals, in the order they
     // were stored. Each arrival is weighed for the turn as it enters
-    // (adoptPresentation).
+    // (adoptPresentation). A presentation that fails throws, so the start
+    // fails (startAgentStream ends its turn) rather than compile without
+    // what it was started for, which waits outside its window for the next
+    // point.
     if (attempt === 0 && !resumesTurn && this.presents(agent)) this.presentation!.presentAtStart(agent, 'turn-start');
 
     // RFC-006 §5: deferred batches for this agent render now, at the assembly
@@ -25666,7 +25721,8 @@ export class AgentFramework {
     // its window now, before its checkpoint, so it is in this request, in
     // the order it was stored: among it, a render this assembly joined that
     // another agent's assembly placed for this agent (freeze's `joined`,
-    // vector 25). Not while quiesced, when others' rows are frozen.
+    // vector 25). Not while quiesced, when others' rows are frozen. One that
+    // fails throws, and fails the start, as the turn start's does.
     if (assembled && !this.quiesced && this.presents(agent)) this.presentation!.presentAtStart(agent, 'assembly');
 
     // The batched-wake lines the gate left to this start (WakeLine), decided
@@ -31521,9 +31577,8 @@ export class AgentFramework {
     // (a draining turn's continuation depends on it) and a write while the
     // agent's start is assembling, which that start presents before its
     // compile unless the host is quiesced.
-    const freshToolResult = content.some(b => b.type === 'tool_result');
     const turnLive = this.logicalTurnAlive(agent);
-    const midTurn = !freshToolResult && (this.quiesced || (turnLive && !this.assembling.has(agent.name)));
+    const midTurn = this.keptOutOfWindow(agent, content, turnLive);
     // A clock row due goes first (storeDueClock), when no logical turn of the
     // agent's is alive or its turn is assembling before its compile: the
     // clock is in whatever request comes next. A write stored while a turn of
@@ -31563,7 +31618,7 @@ export class AgentFramework {
           // answered by that error, not as stored, and the rows the error
           // names are presented as a landed write's are (an imported write's
           // by the boot's pass, and its next boot finds it by its id).
-          if (!opts?.imported && this.presents(agent)) this.presentation!.afterStore(agent, presentedThoughUnknown(thrown.unknown));
+          if (!opts?.imported) this.presentation?.afterStore(agent, presentedThoughUnknown(thrown.unknown));
           throw error;
         } else {
           // context-manager's initialization fence: the manager refuses every
@@ -31580,19 +31635,24 @@ export class AgentFramework {
     if (opts?.placement) {
       opts.placement.agent = agent.name;
       opts.placement.messageId = stored;
-      // Stored mid-turn: not in that agent's window until the turn's next
-      // point, so a wake for it reads it (readsRowFor), and a render placed
-      // for that turn isn't materialized by it. Never for a write a start
-      // assembled for itself, which its start presents before its compile,
-      // but while the host is quiesced, when it doesn't.
-      if (midTurn && this.presents(agent)) opts.placement.presented = false;
     }
     this.releaseLandedMail(metadata, agent.name);
     this.noteStored(agent, metadata, stored);
     // Each reader of the row's slot whose turn isn't alive is presented it
-    // now (present at rest); the others at their next point. An imported
-    // write is presented by the boot's pass after the import (repairAndRest).
-    if (!opts?.imported && this.presents(agent)) this.presentation!.afterStore(agent, rows);
+    // now (present at rest); the others at their next point. So is it when
+    // the agent's own window is the record (legacy mode): the other readers
+    // of its slot are told all the same. An imported write is presented by
+    // the boot's pass after the import (repairAndRest).
+    if (!opts?.imported) this.presentation?.afterStore(agent, rows);
+    // Not presented to its agent (placedUnpresented): stored mid-turn, so not
+    // in that agent's window until the turn's next point, and a render placed
+    // for that turn isn't materialized by it; or stored at rest and left out
+    // of the window by its presentation, which failed. Never for a write a
+    // start assembled for itself, which its start presents before its
+    // compile, but while the host is quiesced, when it doesn't.
+    if (opts?.placement && this.placedUnpresented(agent, midTurn, !turnLive && !opts.imported, stored)) {
+      opts.placement.presented = false;
+    }
     return stored;
   }
 
@@ -32756,6 +32816,18 @@ export class AgentFramework {
     }
     if (event.type === 'inference:completed' || event.type === 'inference:exhausted' || event.type === 'inference:aborted') {
       this.endStatedWaitRun(event.agentName as string);
+    }
+    // An agent the presentation index left in legacy mode (a write-down at
+    // its registration or after a branch move that failed, or a context that
+    // couldn't follow a move): its context is the whole record until a later
+    // move of the store's branch writes its window down. A host with no trace
+    // listener hears of it in the log and as an ops alert.
+    if (event.type === 'presentation:failed' && event.legacy) {
+      const after = event.occasion === 'rebase' ? "a move of the store's branch" : 'its registration';
+      const message = `its window is not presented after ${after} (${event.error}), so its context is the whole record ` +
+        "(legacy mode) until a later move of the store's branch writes its window down";
+      console.error(`[presentation] agent=${event.agentName} ${boundFailureText(message)}`);
+      this.opsAlert('presentation-legacy', event.agentName, message, { data: { occasion: event.occasion } });
     }
 
     const traceEvent = {
