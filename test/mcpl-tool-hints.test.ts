@@ -1004,6 +1004,26 @@ test('a tools/list page holding an entry that isn\'t a tool changes nothing the 
   } finally { await t.done(); }
 });
 
+test('a tools/list whose later page holds an entry that isn\'t a tool changes nothing the host believes', async () => {
+  let malformed = false;
+  const t = await setup((msg, peer, state) => {
+    if (msg.method !== 'tools/list' || !malformed) return false;
+    if ((msg.params as Json | undefined)?.cursor === undefined) peer.reply(msg.id, { tools: TOOLS.slice(0, 3), nextCursor: 'p2', _meta: { 'mcpl/rev': state.rev } });
+    else peer.reply(msg.id, { tools: [TOOLS[3], null], nextCursor: null, _meta: { 'mcpl/rev': state.rev } });
+    return true;
+  });
+  try {
+    t.server.peer.notify('tools/hints', t.state.hint([{ name: 'peek', visible: true }]));
+    await waitFor(() => notices(t.fw).some((x) => x.includes('peek()')), 'peek announced');
+    malformed = true;
+    t.server.peer.notify('notifications/tools/list_changed', {});
+    await waitFor(() => t.server.received.some((m) => m.method === 'tools/list' && (m.params as Json | undefined)?.cursor === 'p2'), 'the second page asked for');
+    // The second page's answer was sent before look's request, on an ordered transport.
+    assert.match(await look(t.fw), /peek\(\)/, 'peek is still known and visible');
+    assert.ok(!notices(t.fw).some((x) => x.includes('now unavailable: peek')), 'nothing was told gone');
+  } finally { await t.done(); }
+});
+
 test('a toolsets/list result with no open list is ignored', async () => {
   let malformed = false;
   const t = await setup((msg, peer, state) => {

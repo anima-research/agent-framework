@@ -325,6 +325,7 @@ test('a kept tool is unclassed after its server\'s close, until the server lists
 
     Object.assign(h.server('b'), { fails: true, isConnected: false, willReconnect: true });
     h.connection('b').emit('close', null, null);
+    assert.deepEqual(classOf(), { tool: 'mcpl--b--read', class: [], source: 'none', serverId: 'b' }, 'the close forgot its class');
     await h.internals.refreshMcplTools();
     assert.deepEqual(h.names(), ['mcpl--b--read'], 'kept while it reconnects');
     assert.deepEqual(classOf(), { tool: 'mcpl--b--read', class: [], source: 'none', serverId: 'b' }, 'its class went with the close');
@@ -332,6 +333,22 @@ test('a kept tool is unclassed after its server\'s close, until the server lists
     Object.assign(h.server('b'), { fails: false, isConnected: true });
     await h.internals.refreshMcplTools();
     assert.deepEqual(classOf(), { tool: 'mcpl--b--read', class: ['comms'], source: 'server', serverId: 'b' }, 'its next listing classes it again');
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('a server whose handshake advertised no tools keeps nothing while it reconnects, and logs nothing', async (t) => {
+  const logged = t.mock.method(console, 'error', () => {});
+  const h = await harness(['b']);
+  try {
+    Object.assign(h.server('b'), { mcpToolsAdvertised: false, lists: tools('read') });
+    await h.internals.refreshMcplTools();
+    assert.deepEqual(h.names(), ['mcpl--b--read'], 'it listed a tool though it advertised none');
+    Object.assign(h.server('b'), { fails: true, isConnected: false, willReconnect: true });
+    await h.internals.refreshMcplTools();
+    assert.deepEqual(h.names(), [], 'none of its tools are kept');
+    assert.deepEqual(logged.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes('tools/list failed')), []);
   } finally {
     await h.cleanup();
   }
