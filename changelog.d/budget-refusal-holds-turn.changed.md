@@ -28,7 +28,11 @@
     `inference:failed`, as an attempt a provider hold keeps does, and then the
     new trace `inference:held`; `inference:hold_ended` follows when the hold
     ends, and the turn's next start emits `inference:started` again.
-    `healthSnapshot()` gives each agent's `budgetHold` (or null).
+    `healthSnapshot()` gives each agent's `budgetHold` (or null): since when
+    it holds, when it last saw something it watches change (`changedAt`, its
+    start until then), context-manager's description of its pending work now
+    (`pending`, bounded to 2,000 characters, or null), the held count, and
+    the refusal's type and figures.
   - A held turn raises no ops alert, since it goes on. Before, the refused
     compile's exhaustion raised `context-refusal`; a hold that ends without a
     fit and whose turn's compile is refused again still does. The hold's start
@@ -42,20 +46,26 @@
     a failure counts as a pass without one. The hold's first drive of
     compression logs a `[budget-hold]` line with its tick count unless a call
     fails in it, and a later drive logs one only when it stops early.
-- **Agents:** the turn's next start once its hold ends, with a fit or without,
+- **Agents:** the turn's next start once a check finds its context fits
   stores a note in the agent's history saying why it waited, where the turn
   reads it, as an `afterUser` context injection is stored (while the window is
   held, the compile places it instead): "[budget-hold] Your context didn't fit
   its budget (100,201 tokens against 48,568), so this turn waited 7 min for
-  compression to make room." When the check that releases the turn finds its
-  context fits, the note goes only where it fits too: where the plan's spare
-  covers the note's price, by the strategy's own estimate (`estimateTokens`),
-  or where a preview at the budget less that price fits. Otherwise, and
-  where that preview fails, the turn runs without this release's note, and
-  its wait stays in `inference:hold_ended`'s trace; a note an earlier
-  release of the same hold stored stays in the history. A strategy that gives
-  no preview figures or no estimate, or whose estimate throws, leaves the
-  note stored as before. A smaller budget stands in for the stored row, so
+  compression to make room." The note goes only where it fits too: where the
+  plan's spare covers the note's price, by the strategy's own estimate
+  (`estimateTokens`), or where a look at the budget less that price fits,
+  a preview or, for a strategy whose preview gives no verdict, a dry compile.
+  That dry compile, like the one that finds the fit, leaves out the module
+  and MCPL injections a start gathers, since gathering them can run
+  inference or call servers (`previewActivation`'s doc). Otherwise, where
+  that look fails, and where the strategy gives no estimate or its estimate
+  throws, the turn runs without this release's note, and its wait stays in
+  `inference:hold_ended`'s trace; a note an earlier release of the same hold
+  stored stays in the history. A hold that ends without a fit, because
+  compression had nothing left to do or the check failed, stores no note.
+  A message that addresses the agent from another channel while its turn is
+  held is announced at the released start as having come "while your turn
+  waited for compression". A smaller budget stands in for the stored row, so
   the edge of the recent window can differ from the compile's. A placed note doesn't make the picker
   fold deeper, so while the window is held, where only a deeper fold had room
   for the note, the request goes past its budget by up to the note's price,

@@ -48,7 +48,11 @@
     context injection, the hold's own note among them, or of a clock row), the
     agent's runtime settings, the budget its next compile plans at, or its
     context manager's pins and document marks, since removing one can let
-    messages it kept raw fold to summaries they already have. A turn
+    messages it kept raw fold to summaries they already have. Those are the
+    changes known to move the verdict; a chunk's lock (the autobiographical
+    strategy's `lockChunk`, which this framework doesn't call) isn't among
+    them, so a turn held until an unlock lets it fit waits for the next of
+    those changes. A turn
     released and refused again is held again, as of the refusal that first
     held it, and isn't released again until one of those changes.
   - **When it ends without a fit:** once compression has nothing pending and
@@ -77,11 +81,14 @@
       its failure count kept, still paces its next call. The wait is
       recorded in the store, so a restart doesn't lift it, and a restart
       drops the held turn.
-    - **Work nothing bounds:** a compression call that doesn't return, and
-      compression whose pending work isn't a call, such as a quarantine
-      clean-up under the compression-state lock that never ends, keep the
-      turn held with no signal of their own. Where the provider's client
-      times the call out, it fails, and is reported as above. A chunk or a
+    - **Work nothing bounds:** compression whose pending work isn't a call,
+      such as a quarantine clean-up under the compression-state lock that
+      never ends, keeps the turn held with no signal of its own, and so does
+      a compression call that doesn't return where the host sets
+      `inferenceBounds: false`. Otherwise the framework gives each
+      compression call a time limit (`progressTimeoutMs`) from its inference
+      bounds, so one that doesn't return fails and is reported as above. A
+      chunk or a
       merge blocked by a message held from compression waits too; this
       framework holds a message only as it stores it, which blocks no chunk
       or merge already made, so only a host's own later hold meets that.
