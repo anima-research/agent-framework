@@ -1090,8 +1090,10 @@ describe('after a branch move, every agent on the store compiles without a resta
 
   it('a hold let go before its threshold says nothing after it', async () => {
     shortenHoldAlert(1_000);
+    const before = longHoldAlerts().length;
     await framework.switchBranch(framework.getStore().currentBranch().name);
     const atRelease = longHoldAlerts().length;
+    assert.equal(atRelease, before, 'nothing while it was held: it was let go before its threshold');
     await new Promise((resolve) => setTimeout(resolve, 1_500));
     assert.equal(longHoldAlerts().length, atRelease, 'its timer went with the hold');
   });
@@ -1154,10 +1156,31 @@ describe('after a branch move, every agent on the store compiles without a resta
   });
 
   it("stop() waits for a branch switch's re-initialization before the store closes", async () => {
-    const switching = framework.switchBranch(framework.getStore().currentBranch().name);
+    // Held at a's re-initialization, which stop() must be seen waiting on, so
+    // a stop() that didn't wait would return first, or never be seen
+    // waiting, however long its own shutdown work.
+    const pass = gatedSwitch('a');
     let reinitEnded = false;
-    void switching.then(() => { reinitEnded = true; });
-    await framework.stop();
+    void pass.switched.then(() => { reinitEnded = true; });
+    await pass.reached;
+    const operations = (framework as unknown as { operatorOperations: Set<{ label: string; promise: Promise<void> }> }).operatorOperations;
+    const hold = [...operations].find((op) => op.label.startsWith('surgery:'));
+    assert.ok(hold, `the switch holds the store as an operation stop() waits for: ${JSON.stringify([...operations].map((op) => op.label))}`);
+    let waitedOn = false;
+    const then = hold.promise.then.bind(hold.promise) as (onFulfilled?: unknown, onRejected?: unknown) => Promise<unknown>;
+    Object.defineProperty(hold.promise, 'then', {
+      value: (onFulfilled?: unknown, onRejected?: unknown) => { waitedOn = true; return then(onFulfilled, onRejected); },
+    });
+    let stopped = false;
+    const stopping = framework.stop().then(() => { stopped = true; });
+    try {
+      await until(() => waitedOn || stopped, "stop() to wait on the switch's hold", 10_000);
+      assert.equal(stopped, false, 'stop() is still waiting while the re-initialization is held');
+      assert.equal(waitedOn, true, "stop() waits on the switch's hold");
+    } finally {
+      pass.open();
+    }
+    await stopping;
     assert.equal(reinitEnded, true, 'the re-initialization finished before stop() returned');
   });
 
@@ -1573,6 +1596,7 @@ describe('after a branch move, every agent on the store compiles without a resta
 describe('conversation forks and a branch move', () => {
   type ForkInternals = Internals & {
     createConversationAgent(name: string, home: { serverId: string; channelId: string }): Promise<{ getContextManager(): ContextManager }>;
+    conversationSpawnsInFlight: Set<string>;
   };
 
   it("a fork created while a branch switch's managers re-initialize waits for them, and compiles", { timeout: 30_000 }, async () => {
@@ -1612,10 +1636,19 @@ describe('conversation forks and a branch move', () => {
       };
       const switching = framework.switchBranch(framework.getStore().currentBranch().name);
       const spawning = internals.createConversationAgent('a-chan-g1', { serverId: 'world', channelId: 'world:chan' });
-      await until(() => atGate, "the template's re-initialization to reach its gate", 10_000);
-      await settled();
-      assert.equal(order.length, 0, `the spawn waits, and nothing has compiled the template: ${JSON.stringify(order)}`);
-      open();
+      let spawnSettled = false;
+      void spawning.then(() => { spawnSettled = true; }, () => { spawnSettled = true; });
+      try {
+        await until(() => atGate, "the template's re-initialization to reach its gate", 10_000);
+        await settled();
+        assert.equal(order.length, 0, `the spawn waits, and nothing has compiled the template: ${JSON.stringify(order)}`);
+        // Waiting at the hold, before the spawn goes on to open the fork's
+        // manager: a spawn past it would be in flight already.
+        assert.equal(spawnSettled, false, 'the spawn is pending');
+        assert.equal(internals.conversationSpawnsInFlight.has('a-chan-g1'), false, "the spawn waits at the hold, short of opening the fork's manager");
+      } finally {
+        open();
+      }
       await switching;
       const fork = await spawning;
       (cmA as unknown as { compile: typeof compile }).compile = compile;
@@ -2774,8 +2807,14 @@ describe('an undo while a maintenance tick runs', () => {
       const head = store.currentBranch().name;
       assert.equal(framework.undoLastTurn('a').undone, true, "the undo doesn't wait for the tick");
       assert.equal(store.currentBranch().name, head, 'no branch moved under the tick');
+      // The fake reads ready as soon as its tick starts, so what the pass
+      // does once the tick is let go is waited for by the pass itself.
+      const pass = (framework as unknown as { maintenancePass: Promise<void> | null }).maintenancePass;
+      assert.ok(pass, "b's tick runs in a maintenance pass");
       gated.release!();
-      await until(() => framework.getAgent('b')!.getContextManager().isReady(), "b's tick to finish", 8_000);
+      await pass;
+      await settled();
+      assert.equal(framework.getAgent('b')!.getContextManager().isReady(), true, "b's tick finished");
       assert.deepEqual(alerts, [], JSON.stringify(alerts));
     } finally {
       gated.release?.();
@@ -2876,12 +2915,17 @@ describe('a move while a maintenance tick is already running', () => {
         const setStrategy = cm.setStrategy.bind(cm);
         cm.setStrategy = (strategy: unknown) => { calls.push(name); return setStrategy(strategy); };
       }
+      const pass = (framework as unknown as { maintenancePass: Promise<void> | null }).maintenancePass;
+      assert.ok(pass, 'the tick runs in a maintenance pass');
       const undone = framework.undoLastTurn('a');
       assert.equal(undone.undone, true, 'the undo is done while the tick runs');
       assert.equal(undone.settled, undefined);
       gated.release!();
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      assert.deepEqual(calls, [], 'no manager re-initialized');
+      // A re-initialization a move schedules runs once the pass it waits
+      // for is over: the pass's end, not a delay, is where to look.
+      await pass;
+      await settled();
+      assert.deepEqual(calls, [], 'no manager re-initialized, once the pass is over');
     });
   });
 
@@ -3166,15 +3210,38 @@ describe('the window follows a branch move (#291)', () => {
   });
 
   it('a switchBranch to a branch made before the write-down writes the window down there, and it stays presented', async () => {
-    const h = await boot({ mira: () => new PassthroughStrategy(), oren: () => new PassthroughStrategy() });
+    const dir = mkdtempSync(join(tmpdir(), 'af-window-follows-'));
+    dirs.push(dir);
+    const storePath = join(dir, 'store.chronicle');
+    // A store an earlier release wrote: rows in the residents' slot, no
+    // window index. The branch is made where that release left it, before
+    // this one's registration writes the windows down on main.
+    let beforeWriteDown!: number;
+    {
+      const store = JsStore.openOrCreate({ path: storePath });
+      const cm = await StoreWindow.open({ store, ...residentContextOptions('mira'), strategy: new PassthroughStrategy() });
+      for (const t of ['old-1', 'old-2']) cm.addMessage('someone', blocks(t), {});
+      assert.equal(cm.windowMode(), 'legacy', 'setup: the store predates the index');
+      beforeWriteDown = store.currentSequence();
+      cm.close();
+      store.close();
+    }
+    const h = await boot({ mira: () => new PassthroughStrategy(), oren: () => new PassthroughStrategy() }, storePath);
     const main = h.store.currentBranch().name;
-    h.store.createBranchAt('old', main, 1);
+    h.store.createBranchAt('old', main, beforeWriteDown);
+    const from = h.traces.length;
     await h.framework.switchBranch('old');
     for (const name of ['mira', 'oren']) {
       assert.equal(h.cm(name).windowMode(), 'presented', `${name}'s window on old`);
       assert.equal(h.internals.presents(h.framework.getAgent(name)!), true, name);
+      const rows = h.cm(name).getAllMessages().filter((m) => /^old-\d$/.test((m.content[0] as { text?: string }).text ?? ''));
+      assert.deepEqual(rows.map((m) => h.cm(name).windowStatusOf(m.id)), ['in', 'in'], `the earlier release's rows in ${name}'s window on old`);
     }
-    assert.ok(rebaseTraces(h.traces).every((t) => t.type === 'presentation:presented'));
+    assert.deepEqual(
+      rebaseTraces(h.traces.slice(from)).map((t) => [t.type, t.agentName]).sort(),
+      [['presentation:presented', 'mira'], ['presentation:presented', 'oren']],
+      'each window written down on old, which had none',
+    );
     // A row written now enters the idle agent's window at once, as at rest.
     const row = h.internals.addMessage('someone', blocks('on old'), {}, { forAgent: 'oren' });
     assert.equal(h.cm('oren').windowStatusOf(row), 'in');
@@ -3265,28 +3332,31 @@ describe('the window follows a branch move (#291)', () => {
       const folded = foldedBy(h.cm(name));
       assert.equal(removed.filter((id) => folded.has(id)).length, removed.length, `setup: ${name}'s summaries fold every row to be removed`);
     }
+    // Errors are read until each window has been checked and its kept rows
+    // folded again, so a strategy's refusal that comes after the
+    // suppression's own turn of the loop, as an async notification's does,
+    // is read too.
     const refused: string[] = [];
     const error = console.error;
     console.error = (...args: unknown[]) => { refused.push(args.map(String).join(' ')); error(...args); };
-    let r: Awaited<ReturnType<AgentFramework['suppressMessages']>>;
     try {
-      r = await h.framework.suppressMessages('mira', { messageIds: removed });
+      const r = await h.framework.suppressMessages('mira', { messageIds: removed });
       await settled();
+      assert.equal(r.messagesRemoved, removed.length);
+      const gone = new Set(removed);
+      for (const name of ['mira', 'oren']) {
+        const cm = h.cm(name);
+        assert.deepEqual([...new Set(removed.map((id) => cm.windowStatusOf(id as MessageId)))], ['absent'], `out of ${name}'s window`);
+        const folded = foldedBy(cm);
+        assert.deepEqual(removed.filter((id) => folded.has(id)), [], `no summary of ${name}'s folds a removed row`);
+        assert.deepEqual((await renderedBy(cm)).filter((id) => gone.has(id)), [], `${name}'s compile renders no removed row`);
+        await drain(cm);
+        const refolded = foldedBy(cm);
+        assert.deepEqual(removed.filter((id) => refolded.has(id)), [], `nor once ${name}'s kept rows are folded again`);
+        assert.deepEqual((await renderedBy(cm)).filter((id) => gone.has(id)), [], `${name}'s compile then renders none either`);
+      }
     } finally {
       console.error = error;
-    }
-    assert.equal(r.messagesRemoved, removed.length);
-    const gone = new Set(removed);
-    for (const name of ['mira', 'oren']) {
-      const cm = h.cm(name);
-      assert.deepEqual([...new Set(removed.map((id) => cm.windowStatusOf(id as MessageId)))], ['absent'], `out of ${name}'s window`);
-      const folded = foldedBy(cm);
-      assert.deepEqual(removed.filter((id) => folded.has(id)), [], `no summary of ${name}'s folds a removed row`);
-      assert.deepEqual((await renderedBy(cm)).filter((id) => gone.has(id)), [], `${name}'s compile renders no removed row`);
-      await drain(cm);
-      const refolded = foldedBy(cm);
-      assert.deepEqual(removed.filter((id) => refolded.has(id)), [], `nor once ${name}'s kept rows are folded again`);
-      assert.deepEqual((await renderedBy(cm)).filter((id) => gone.has(id)), [], `${name}'s compile then renders none either`);
     }
     assert.deepEqual(refused.filter((line) => /onRetracted failed|requires reinitialization/.test(line)), [], "no strategy refused the rows' leaving");
     await h.bothServe('after the suppression');

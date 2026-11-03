@@ -19,7 +19,7 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from '@babel/parser';
 
@@ -32,19 +32,30 @@ interface Site {
   scope: string[];
   /** The source of the innermost of them, or of the file when there is none. */
   scopeText: string;
+  /** Where it is called: the source of the metadata it is given (its third
+   *  argument, '' when there is none). Undefined where it isn't called. */
+  metadata?: string;
 }
 
 type Node = { type: string; start?: number | null; end?: number | null; loc?: { start: { line: number } } | null; [field: string]: unknown };
 const isNode = (v: unknown): v is Node => typeof v === 'object' && v !== null && typeof (v as Node).type === 'string';
 const child = (n: Node | undefined, field: string): Node | undefined => (n && isNode(n[field]) ? n[field] as Node : undefined);
 const isFunction = (n: Node | undefined) => n?.type === 'ArrowFunctionExpression' || n?.type === 'FunctionExpression';
-// A key's name: an identifier not computed, a string, or a private name.
+/** A string or a template with no substitutions: its text. */
+const literalText = (n: Node | undefined): string | undefined => {
+  if (n?.type === 'StringLiteral') return n.value as string;
+  if (n?.type === 'TemplateLiteral' && (n.expressions as unknown[]).length === 0) {
+    return ((n.quasis as Node[])[0]?.value as { cooked?: string | null } | undefined)?.cooked ?? undefined;
+  }
+  return undefined;
+};
+// A key's name: an identifier not computed, a string or a template with no
+// substitutions, or a private name.
 const keyName = (key: Node | undefined, computed: unknown): string | undefined => {
   if (!key) return undefined;
   if (!computed && key.type === 'Identifier') return key.name as string;
-  if (key.type === 'StringLiteral') return key.value as string;
   if (key.type === 'PrivateName') return `#${(child(key, 'id')?.name as string)}`;
-  return undefined;
+  return literalText(key);
 };
 
 /**
@@ -99,29 +110,74 @@ function walkSources(
 
 /**
  * Each reference in `sources` to a member named `addMessage`, read as Babel's
- * TypeScript parser reads the source: `x.addMessage`, `x?.addMessage` and
- * `x['addMessage']`, called or not, and an `addMessage` taken out of an
- * object by destructuring (its receiver is what is destructured, or
- * `(destructured)` where that isn't a declaration's value). Comments aren't
- * read.
+ * TypeScript parser reads the source: `x.addMessage`, `x?.addMessage`,
+ * `x['addMessage']` and `` x[`addMessage`] ``, and `x[name]` where the file
+ * binds `name` to one of those strings anywhere (a scope-blind reading, so
+ * it can only find too much), called or not, and an `addMessage` taken out
+ * of an object by destructuring (its receiver is what is destructured, or
+ * `(destructured)` where that isn't a declaration's value). A key it can't
+ * read without running the code (`x['add' + 'Message']`, a name given as an
+ * argument) isn't found. Comments aren't read.
  */
 function scanAddMessageSites(sources: Array<{ name: string; text: string }>): Site[] {
   const sites: Site[] = [];
+  // Each file's names bound to a string, and the computed members keyed by
+  // a name, read once the file's bindings are all known.
+  const bound = new Map<string, Map<string, string>>();
+  const byName: Array<{ file: string; name: string; site: Site }> = [];
+  // Each call, by its callee, so a member can find the call it is called by.
+  const callOf = new WeakMap<Node, Node>();
   walkSources(sources, (file, node, scope, scopeText, slice, declared) => {
-    const site = (receiver: string) => sites.push({ file, line: node.loc!.start.line, receiver, scope, scopeText });
-    if ((node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression')
-      && keyName(child(node, 'property'), node.computed) === 'addMessage') {
-      site(slice(child(node, 'object')!));
+    if (node.type === 'CallExpression' || node.type === 'OptionalCallExpression') callOf.set(child(node, 'callee')!, node);
+    if (node.type === 'VariableDeclarator' && child(node, 'id')?.type === 'Identifier') {
+      const text = literalText(child(node, 'init'));
+      if (text !== undefined) {
+        if (!bound.has(file)) bound.set(file, new Map());
+        bound.get(file)!.set(child(node, 'id')!.name as string, text);
+      }
+    }
+    const at = (receiver: string): Site => {
+      const call = callOf.get(node);
+      const metadata = call && (call.arguments as Node[])[2];
+      return {
+        file, line: node.loc!.start.line, receiver, scope, scopeText,
+        ...(call ? { metadata: metadata ? slice(metadata) : '' } : {}),
+      };
+    };
+    if (node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') {
+      const property = child(node, 'property');
+      if (keyName(property, node.computed) === 'addMessage') sites.push(at(slice(child(node, 'object')!)));
+      else if (node.computed && property?.type === 'Identifier') {
+        byName.push({ file, name: property.name as string, site: at(slice(child(node, 'object')!)) });
+      }
     }
     if (node.type === 'ObjectPattern') {
       for (const property of node.properties as Node[]) {
         if (property.type === 'ObjectProperty' && keyName(child(property, 'key'), property.computed) === 'addMessage') {
-          site(declared ? slice(declared) : '(destructured)');
+          sites.push(at(declared ? slice(declared) : '(destructured)'));
         }
       }
     }
   });
-  return sites;
+  for (const { file, name, site } of byName) if (bound.get(file)?.get(name) === 'addMessage') sites.push(site);
+  const order = new Map(sources.map((s, i) => [s.name, i]));
+  return sites.sort((a, b) => order.get(a.file)! - order.get(b.file)! || a.line - b.line);
+}
+
+/** Each `.ts` file under src, named by its path from there with `/` between
+ *  its parts, as the lists name it, whatever the platform's separator. */
+function srcSources(): Array<{ name: string; text: string }> {
+  const src = fileURLToPath(new URL('../../src/', import.meta.url));
+  const sources: Array<{ name: string; text: string }> = [];
+  const walk = (dir: string): void => {
+    for (const name of readdirSync(dir)) {
+      const full = join(dir, name);
+      if (statSync(full).isDirectory()) walk(full);
+      else if (name.endsWith('.ts')) sources.push({ name: relative(src, full).split(sep).join('/'), text: readFileSync(full, 'utf8') });
+    }
+  };
+  walk(src);
+  return sources;
 }
 
 /**
@@ -181,17 +237,8 @@ function classify(sites: Site[]) {
 }
 
 it('every write into a context in src goes through the framework\'s addMessage, or is a direct write that stamps its row', () => {
-  const src = fileURLToPath(new URL('../../src/', import.meta.url));
-  const sources: Array<{ name: string; text: string }> = [];
-  const walk = (dir: string): void => {
-    for (const name of readdirSync(dir)) {
-      const full = join(dir, name);
-      if (statSync(full).isDirectory()) walk(full);
-      else if (name.endsWith('.ts')) sources.push({ name: full.slice(src.length), text: readFileSync(full, 'utf8') });
-    }
-  };
-  walk(src);
-  assert.ok(sources.some((s) => s.name.includes('/')), "the walk reaches src's subdirectories");
+  const sources = srcSources();
+  assert.ok(sources.some((s) => s.name === 'dendrite/audience.ts'), "the walk reaches src's subdirectories, named as the lists name them");
 
   const sites = scanAddMessageSites(sources);
   const { throughTheFramework, direct } = classify(sites);
@@ -209,10 +256,25 @@ it('every write into a context in src goes through the framework\'s addMessage, 
 
   for (const site of direct) {
     const { stamp, what } = DIRECT_WRITES[keyOf(site)]!;
-    assert.ok(site.scopeText.includes(STAMPED_BY[stamp]),
-      `${where(site)} (${what}) is listed as stamped by ${STAMPED_BY[stamp]}), which its scope doesn't call`);
+    assert.ok(stampsItsRow(site, STAMPED_BY[stamp]),
+      `${where(site)} (${what}) is listed as stamped by ${STAMPED_BY[stamp]}), and the metadata it passes isn't stamped so`);
   }
 });
+
+/**
+ * Whether a direct write passes metadata stamped by `helper` (its call, as
+ * `asOwnRow(`): metadata that calls it, or that names a variable its scope
+ * assigns from it (`metadata = asOwnRow(…)`, then `addMessage(…, metadata)`).
+ * Read from the source, each write for itself, so one write of two in a
+ * scope that passes something else is found.
+ */
+function stampsItsRow(site: Site, helper: string): boolean {
+  if (!site.metadata) return false;
+  if (site.metadata.includes(helper)) return true;
+  const call = helper.replace('(', '\\(');
+  return [...site.metadata.matchAll(/[A-Za-z_$][\w$]*/g)].some(([name]) =>
+    new RegExp(`(?:^|[^\\w$.])${name.replace(/\$/g, '\\$')}\\s*=\\s*${call}`).test(site.scopeText));
+}
 
 it('the scan finds addMessage however it is reached, and names the scope it is in', () => {
   const text = [
@@ -234,6 +296,8 @@ it('the scan finds addMessage however it is reached, and names the scope it is i
     '}',
     'export const hooks = { write: (cm: { addMessage(): void }) => cm.addMessage() };',
     'export function free(cm: { addMessage(): void }) { cm?.addMessage(); }',
+    "export function named(cm: Record<string, (...args: unknown[]) => void>) { const method = 'addMessage'; cm[method]('user', []); cm[`addMessage`]('user', []); }",
+    'export function given(cm: Record<string, () => void>, key: string) { cm[key](); }',
   ].join('\n');
   const sites = scanAddMessageSites([{ name: 'writer.ts', text }]);
   assert.deepEqual(sites.map((s) => [s.line, s.receiver, s.scope.join('.')]), [
@@ -245,8 +309,14 @@ it('the scan finds addMessage however it is reached, and names the scope it is i
     [11, 'this', 'Writer.store'],
     [17, 'cm', 'hooks.write'],
     [18, 'cm', 'free'],
+    // A template with no substitutions, and a name the file binds to the
+    // string; a name it doesn't bind isn't read.
+    [19, 'cm', 'named'],
+    [19, 'cm', 'named'],
   ]);
   assert.ok(sites[0]!.scopeText.startsWith('store(') && sites[0]!.scopeText.includes('asOwnRow('), "a site's scope text is its method's");
+  assert.deepEqual(sites.slice(0, 4).map((s) => s.metadata), ["asOwnRow(undefined, 'a')", '', '', undefined],
+    "a call's metadata, '' where it passes none, and nothing where it isn't called");
 
   // Read with the lists above: none of these is the framework's, and none is listed.
   const { throughTheFramework, direct } = classify(sites);
@@ -256,14 +326,31 @@ it('the scan finds addMessage however it is reached, and names the scope it is i
   const inFramework = scanAddMessageSites([{ name: 'framework.ts', text: 'export class AgentFramework { a() { this.addMessage(); } }\nclass Other { a() { this.addMessage(); } }' }]);
   assert.deepEqual(classify(inFramework).direct.map((s) => s.scope.join('.')), ['Other.a']);
   assert.throws(() => scanAddMessageSites([{ name: 'broken.ts', text: 'const = ;' }]), /^Error: broken\.ts: /);
+
+  // Each write's metadata is read for itself: in a scope that stamps one
+  // write's, another that passes something else is unstamped.
+  const writes = scanAddMessageSites([{ name: 'guard.ts', text: [
+    'class Guard {',
+    '  store(cm: C, metadata: M, raw: M) {',
+    "    metadata = asOwnRow(metadata, 'a');",
+    "    cm.addMessage('user', [], metadata);",
+    "    cm.addMessage('user', [], raw);",
+    "    cm.addMessage('user', [], withAudience(raw, ['a']));",
+    "    cm.addMessage('user', []);",
+    '  }',
+    '}',
+  ].join('\n') }]);
+  assert.deepEqual(writes.map((s) => [stampsItsRow(s, STAMPED_BY.own), stampsItsRow(s, STAMPED_BY.audience)]),
+    [[true, false], [false, false], [false, true], [false, false]]);
 });
 
 /**
  * Each call in `sources` of a function or method named `name`: where, in
- * which scope, and how many arguments it is given.
+ * which scope, how many arguments it is given, and the source of its sixth
+ * (storeOwnRow's `present`), if it has one.
  */
-function scanCalls(sources: Array<{ name: string; text: string }>, name: string): Array<Site & { args: number }> {
-  const sites: Array<Site & { args: number }> = [];
+function scanCalls(sources: Array<{ name: string; text: string }>, name: string): Array<Site & { args: number; sixth?: Node }> {
+  const sites: Array<Site & { args: number; sixth?: Node }> = [];
   walkSources(sources, (file, node, scope, scopeText) => {
     if (node.type !== 'CallExpression' && node.type !== 'OptionalCallExpression') return;
     const callee = child(node, 'callee');
@@ -273,7 +360,8 @@ function scanCalls(sources: Array<{ name: string; text: string }>, name: string)
         ? keyName(child(callee, 'property'), callee.computed)
         : undefined;
     if (called !== name) return;
-    sites.push({ file, line: node.loc!.start.line, receiver: name, scope, scopeText, args: (node.arguments as unknown[]).length });
+    const args = node.arguments as Node[];
+    sites.push({ file, line: node.loc!.start.line, receiver: name, scope, scopeText, args: args.length, ...(args[5] ? { sixth: args[5] } : {}) });
   });
   return sites;
 }
@@ -334,16 +422,7 @@ const OWN_ROW_WRITERS: Record<string, { count: number; when: 'turn' | 'end' | 'u
 };
 
 it("every writer of an agent's own rows is classified by when it writes, and one that may write into another turn holds its row back", () => {
-  const src = fileURLToPath(new URL('../../src/', import.meta.url));
-  const sources: Array<{ name: string; text: string }> = [];
-  const walk = (dir: string): void => {
-    for (const name of readdirSync(dir)) {
-      const full = join(dir, name);
-      if (statSync(full).isDirectory()) walk(full);
-      else if (name.endsWith('.ts')) sources.push({ name: full.slice(src.length), text: readFileSync(full, 'utf8') });
-    }
-  };
-  walk(src);
+  const sources = srcSources();
   // storeOwnRow's own definition is in dendrite/audience.ts and calls nothing named so.
   const calls = scanCalls(sources, 'storeOwnRow');
   assert.ok(calls.length > 20, `found ${calls.length} own-row writes; the scan has lost them`);
@@ -357,9 +436,14 @@ it("every writer of an agent's own rows is classified by when it writes, and one
     if (when === 'held-back') continue;
     assert.ok(call.args <= 5, `${where(call)} (${what}) is listed as presenting at its write, and passes \`present\``);
   }
-  const heldBack = calls.filter((call) => OWN_ROW_WRITERS[keyOf(call)]!.when === 'held-back');
-  for (const key of Object.keys(OWN_ROW_WRITERS).filter((key) => OWN_ROW_WRITERS[key]!.when === 'held-back')) {
-    assert.ok(heldBack.some((call) => keyOf(call) === key && call.args === 6), `${key} holds a row back with storeOwnRow's \`present\``);
+  // Each call of a held-back writer, not one per scope, passes `present`,
+  // and passes it as a value its scope decides: a literal true presents the
+  // row into whatever turn holds the agent.
+  for (const call of calls.filter((c) => OWN_ROW_WRITERS[keyOf(c)]!.when === 'held-back')) {
+    const { what } = OWN_ROW_WRITERS[keyOf(call)]!;
+    assert.equal(call.args, 6, `${where(call)} (${what}) holds its row back with storeOwnRow's \`present\`, its sixth argument`);
+    assert.ok(!(call.sixth?.type === 'BooleanLiteral' && call.sixth.value === true),
+      `${where(call)} (${what}) passes \`present\` as true, which presents the row into a turn it isn't part of`);
   }
   // A row whose write threw after it landed is told to the own-row sink by
   // hand (ownRowsStored), only by a writer that presents at its write.

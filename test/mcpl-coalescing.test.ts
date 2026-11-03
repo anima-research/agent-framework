@@ -2746,7 +2746,8 @@ for (const when of ['after', 'before'] as const) {
       const row = cm.getAllMessages().find((m) => JSON.stringify(m.content).includes('throwing_render'))!;
       assert.equal(cm.windowStatusOf(row.id), 'in', 'it is presented');
       assert.equal(f.window().split('throwing_render').length - 1, 1, 'once');
-      assert(requests.some((r) => r.includes('throwing_render')), 'and a request reads it');
+      assert.deepEqual(requests.map((r) => r.split('throwing_render').length - 1).filter((n) => n > 0), [1],
+        'and one request reads it, once');
       assert(!kinds.includes('deliver-failed'), 'the delivery is not taken as failed');
     } else {
       assert(!context.includes('throwing_render'), 'the render is not stored');

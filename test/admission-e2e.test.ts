@@ -494,6 +494,7 @@ describe('admission: the hold is decided once, before any side effect', () => {
 
     const g = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig>, dir: ended });
     try {
+      assert.equal(inWindow(g, '<tuned-out-backlog'), true, 'the restarted host loaded the release, presented already');
       assert.equal(internals(g).pendingRequests.some((r) => /tune-out released/.test(r.reason)), false,
         'its wake ran or was lost with the process, as before #291');
     } finally { await g.close(); }

@@ -676,7 +676,7 @@ describe('a stop at a tool boundary', () => {
 });
 
 describe('a tool boundary nobody stops', () => {
-  it("stores the round's tool_use with its results once the write is done, and a message sent meanwhile after them", async () => {
+  it("stores the round's tool_use with its results once the write is done; a message sent meanwhile, stored at once, enters the window after them", async () => {
     const b = await holdAtToolBoundary();
     try {
       // While the write runs, the turn is alive, so the message is stored
@@ -693,7 +693,7 @@ describe('a tool boundary nobody stops', () => {
       const toolUse = blocks.indexOf('tool_use:call_fetch');
       assert.ok(toolUse >= 0, "the round's tool_use is stored");
       assert.equal(blocks[toolUse + 1], 'tool_result:call_fetch', 'its result is stored right after it');
-      assert.ok(blocks.indexOf('text:meanwhile') > toolUse + 1, 'the message sent during the write lands after the round');
+      assert.ok(blocks.indexOf('text:meanwhile') > toolUse + 1, 'the message sent during the write enters the window after the round');
       assert.equal(b.traces.filter(isDropped).length, 0, 'nothing was dropped');
       await b.stop();
     } finally {

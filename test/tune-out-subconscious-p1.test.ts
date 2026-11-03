@@ -140,12 +140,22 @@ describe("the persistent subconscious reads what a tune-out held while the resid
         const body = JSON.stringify(wake.messages);
         for (const t of tags) assert.ok(body.includes(t), `its wake request holds ${t}`);
         assert.deepEqual(atRequest, ['stored', 'stored', 'stored'], 'all three were stored by then');
-        for (const call of h.membrane.callsFor('scout')) {
-          const seen = JSON.stringify(call.messages);
-          for (const t of tags) assert.ok(!seen.includes(t), `no request of the resident's holds ${t}`);
-        }
         h.gates.release('p1');
         await h.framework.runUntilIdle();
+        // A turn of the resident's once all three are stored, in either arm,
+        // so the idle arm has a request to read too. Every request of the
+        // resident's, and all its tool boundaries injected, read once its
+        // turns are over.
+        h.membrane.script('scout', final([text('Scout again.')]));
+        h.internals.pendingRequests.push({ agentName: 'scout', reason: 'test', source: 'test', timestamp: Date.now() });
+        await waitFor("the resident's turn after the held traffic", () => h.storedHas('Scout again.'));
+        await h.framework.runUntilIdle();
+        const resident = h.membrane.streams.filter((s) => s.agent === 'scout');
+        assert.equal(resident.length, mode === 'mid-turn' ? 2 : 1, "the resident's requests: its turn's, if it had one, and the one after");
+        for (const { request, stream } of resident) {
+          const seen = JSON.stringify(request.messages) + JSON.stringify(stream.receivedToolResultOptions.map((o) => o?.injectedMessages ?? []));
+          for (const t of tags) assert.ok(!seen.includes(t), `no request of the resident's, nor what its boundary injected, holds ${t}`);
+        }
         for (const t of tags) {
           assert.equal(h.cm('scout').getAllMessages().filter((m) => textOf(m).includes(t)).length, 1, `${t} is stored once`);
         }
