@@ -18976,7 +18976,9 @@ export class AgentFramework {
    * A fork's channel message, routed or a correction for it, written into
    * the fork's store (storeInFork, #291: stored at once, stamped for the fork
    * alone, and presented at the fork's next point, at once when no turn of
-   * its is alive), and where it went: the fork, with the stored id. While a
+   * its is alive), and where it went: the fork, with the stored id, and
+   * `presented: false` where the row is out of the fork's window after its
+   * write, as addMessage's placement says (placedUnpresented). While a
    * surgery holds the store, storeInFork keeps the write in memory
    * (surgeryHeldWrites) and the hold's release stores it, and while the
    * fork's context manager refuses its work it keeps it for the move that
@@ -18984,8 +18986,17 @@ export class AgentFramework {
    * alone, with no id yet. `mayBeStored`: storeInFork's.
    */
   private writeToFork(agent: Agent, content: ContentBlock[], metadata: Record<string, unknown>, mayBeStored?: boolean): CoalescingPlacement {
+    // Read before the write, as addMessage reads it: whether the fork's turn
+    // keeps the row out of its window. A placement that says so
+    // (`presented: false`) keeps a coalesced render the turn never read
+    // replaceable, and wakes the fork to read it.
+    const turnLive = this.logicalTurnAlive(agent);
+    const keptOut = this.keptOutOfWindow(agent, content, turnLive);
     const id = this.storeInFork(agent, content, metadata as MessageMetadata, mayBeStored);
-    return id ? { agent: agent.name, messageId: id } : { agent: agent.name };
+    if (!id) return { agent: agent.name };
+    return this.placedUnpresented(agent, keptOut, !turnLive, id)
+      ? { agent: agent.name, messageId: id, presented: false }
+      : { agent: agent.name, messageId: id };
   }
 
   /**
@@ -22884,6 +22895,34 @@ export class AgentFramework {
    */
   private presentAtEndOf(agent: Agent | undefined): void {
     if (agent && this.presents(agent)) this.presentation!.presentAtEnd(agent);
+  }
+
+  /**
+   * Whether a write stored for `agent` now waits outside its window for a
+   * later point (#291), read before the write: while the host is quiesced,
+   * or while a logical turn of the agent's is alive (`turnLive`,
+   * logicalTurnAlive), but for a fresh tool_result (a draining turn's
+   * continuation depends on it) and a write while the agent's start is
+   * assembling, which that start presents before its compile.
+   */
+  private keptOutOfWindow(agent: Agent, content: readonly ContentBlock[], turnLive: boolean): boolean {
+    return !content.some((b) => b.type === 'tool_result')
+      && (this.quiesced || (turnLive && !this.assembling.has(agent.name)));
+  }
+
+  /**
+   * Whether a write stored for `agent` as `id` is placed as not presented
+   * to it (`presented: false`), which a coalesced render's delivery reads
+   * to keep the render replaceable and wake its agent to read it: kept out
+   * of the agent's window by its turn or a quiesced host (`keptOut`,
+   * keptOutOfWindow), or stored while no logical turn of the agent's was
+   * alive (`atRest`) and out of its window after its presentation at rest,
+   * which failed (presentation.notPresented). Only for an agent the index
+   * presents for.
+   */
+  private placedUnpresented(agent: Agent, keptOut: boolean, atRest: boolean, id: MessageId): boolean {
+    if (!this.presents(agent)) return false;
+    return keptOut || (atRest && this.presentation!.notPresented(agent, id));
   }
 
   /**
@@ -31407,9 +31446,8 @@ export class AgentFramework {
     // (a draining turn's continuation depends on it) and a write while the
     // agent's start is assembling, which that start presents before its
     // compile unless the host is quiesced.
-    const freshToolResult = content.some(b => b.type === 'tool_result');
     const turnLive = this.logicalTurnAlive(agent);
-    const midTurn = !freshToolResult && (this.quiesced || (turnLive && !this.assembling.has(agent.name)));
+    const midTurn = this.keptOutOfWindow(agent, content, turnLive);
     // A clock row due goes first (storeDueClock), when no logical turn of the
     // agent's is alive or its turn is assembling before its compile: the
     // clock is in whatever request comes next. A write stored while a turn of
@@ -31466,12 +31504,6 @@ export class AgentFramework {
     if (opts?.placement) {
       opts.placement.agent = agent.name;
       opts.placement.messageId = stored;
-      // Stored mid-turn: not in that agent's window until the turn's next
-      // point, so a wake for it reads it (readsRowFor), and a render placed
-      // for that turn isn't materialized by it. Never for a write a start
-      // assembled for itself, which its start presents before its compile,
-      // but while the host is quiesced, when it doesn't.
-      if (midTurn && this.presents(agent)) opts.placement.presented = false;
     }
     this.releaseLandedMail(metadata, agent.name);
     this.noteStored(agent, metadata, stored);
@@ -31481,6 +31513,15 @@ export class AgentFramework {
     // of its slot are told all the same. An imported write is presented by
     // the boot's pass after the import (repairAndRest).
     if (!opts?.imported) this.presentation?.afterStore(agent, rows);
+    // Not presented to its agent (placedUnpresented): stored mid-turn, so not
+    // in that agent's window until the turn's next point, and a render placed
+    // for that turn isn't materialized by it; or stored at rest and left out
+    // of the window by its presentation, which failed. Never for a write a
+    // start assembled for itself, which its start presents before its
+    // compile, but while the host is quiesced, when it doesn't.
+    if (opts?.placement && this.placedUnpresented(agent, midTurn, !turnLive && !opts.imported, stored)) {
+      opts.placement.presented = false;
+    }
     return stored;
   }
 

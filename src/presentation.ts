@@ -988,6 +988,26 @@ export class AgentPresentation {
     return this.pending(agent, true).map((body) => body.shards[0]!);
   }
 
+  /**
+   * Whether a row just stored in the agent's own slot, and presented at
+   * rest by afterStore if at all, is out of its window though the agent is
+   * owed it (its own row, or an arrival): a presentation that failed, or
+   * the host's freeze, kept it out. A row that is nothing to the agent (held
+   * from a resident, stamped for another) isn't. Yes where the window can't
+   * be read to tell; no for an agent the module doesn't present for.
+   */
+  notPresented(agent: PresentedAgent, id: MessageId): boolean {
+    try {
+      if (!this.presenting(agent)) return false;
+      const cm = agent.getContextManager();
+      if (cm.windowStatusOf(id) !== 'out') return false;
+      const row = cm.getMessage(id);
+      return row === null || bearingOf(row, readerFacts(this.host.registry, agent.name), 'own') !== 'elsewhere';
+    } catch {
+      return true;
+    }
+  }
+
   // --------------------------------------------------------------------------
   // Reads
   // --------------------------------------------------------------------------
