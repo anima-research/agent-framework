@@ -908,11 +908,15 @@ export function quietBurstKey(r: InferenceRequest): string {
     : `channel\u0000${r.channelServerId ?? r.source}\u0000${r.channelId}`;
 }
 
-/** A burst key for a log line: `channel discord:g:salon` or `source tsm`. */
+/** A burst key for a log line: `channel discord:g:salon` or `source tsm`,
+ *  each part shown as logValue shows it, so an id can't forge a line. */
 function describeQuietBurst(key: string): string {
   const [kind, ...rest] = key.split('\u0000');
-  return kind === 'channel' ? `channel ${rest.join(':')}` : `source ${rest.join(':')}`;
+  return `${kind} ${rest.map((part) => logValue(part)).join(':')}`;
 }
+
+/** Why a held burst's turn starts (quiet-period:released). */
+export type QuietReleaseCause = 'quiet' | 'cap' | 'other-wake' | 'gone';
 
 /** What an idle agent's queued requests do under a message quiet period. */
 export interface QuietSplit {
@@ -920,65 +924,111 @@ export interface QuietSplit {
   start: InferenceRequest[];
   /** The requests that go back to the queue and wait for a later pass. */
   hold: InferenceRequest[];
-  /** The burst `start` is, when the quiet period chose it: its key and the
-   *  age of its oldest wake. Unset when the batch starts for another reason. */
-  burst?: { key: string; heldMs: number };
-  /** The keys of the bursts still held, each with the ms until it is ready. */
+  /** The bursts `start` holds wakes of, by key, with why they start. */
+  started: Map<string, QuietReleaseCause>;
+  /** The keys of the bursts still held, each with the ms until it is ready
+   *  (0 for a ready burst that waits only for its own turn). */
   waiting: Map<string, number>;
+}
+
+/** When a burst's clock began: the oldest wake it stands for, carried across
+ *  a wake's replacement (a coalesced batch's) or a quiesce's coalescing, so
+ *  `maxWaitMs` counts from the first wake, not the latest (QUIET_SINCE). */
+function quietSince(r: InferenceRequest): number {
+  return (r as MarkedRequest)[QUIET_SINCE] ?? r.timestamp;
+}
+
+/** Marks `r` as standing for a burst whose oldest wake was at `since`. */
+function carryQuietSince(r: InferenceRequest, since: number): void {
+  if (since < r.timestamp) (r as MarkedRequest)[QUIET_SINCE] = since;
 }
 
 /**
  * Splits an idle agent's queued requests into the ones that start its turn
- * now and the ones that wait (FrameworkConfig.messageQuietPeriod). A batch
- * holding any wake that is no message wake starts whole, now: a channel
- * message's or a server event's wake (other than the heartbeat's) is a
- * message wake unless it continues or retries the agent's turn. Otherwise
- * each burst (quietBurstKey) is ready `quietMs` after its newest wake or
- * `maxWaitMs` after its oldest, whichever is first. The ready burst that has
- * waited longest starts, with every wake that names no channel, and the
- * other bursts go back to the queue: one turn per burst, each speaking in
- * its burst's channel. With nothing ready, everything waits.
+ * now and the ones that wait (FrameworkConfig.messageQuietPeriod). A message
+ * wake is a channel message's or a server event's (other than the
+ * heartbeat's) that neither continues nor retries the agent's turn. Each
+ * burst (quietBurstKey) is ready `quietMs` after its newest wake or
+ * `maxWaitMs` after its oldest (quietSince), whichever is first.
+ *
+ * - Only message wakes queued: the ready burst that has waited longest
+ *   starts, with its wakes alone, and every other burst goes back to the
+ *   queue on its own clock: one turn per burst, each speaking in its burst's
+ *   channel. With nothing ready, everything waits.
+ * - Any other wake queued (a timer, an operator's, a continuation): it starts
+ *   now, with the wakes that name no channel and at most one channel's burst:
+ *   the channel the other wake itself names, else the ready burst that has
+ *   waited longest, else none. The other channels' bursts keep waiting, so
+ *   the turn never speaks for a channel it didn't start for.
  */
 export function quietSplit(
   requests: readonly InferenceRequest[],
   now: number,
   quiet: { quietMs: number; maxWaitMs: number } | undefined,
 ): QuietSplit {
+  const started = new Map<string, QuietReleaseCause>();
   const waiting = new Map<string, number>();
-  if (!quiet || quiet.quietMs <= 0 || requests.length === 0 || requests.some((r) => !isMessageWake(r))) {
-    return { start: [...requests], hold: [], waiting };
+  if (!quiet || quiet.quietMs <= 0 || requests.length === 0) {
+    return { start: [...requests], hold: [], started, waiting };
   }
-  const bursts = new Map<string, { oldest: number; newest: number; wakes: InferenceRequest[] }>();
+  const others = requests.filter((r) => !isMessageWake(r));
+  const otherSet = new Set(others);
+  const bursts = new Map<string, { oldest: number; newest: number; channel: boolean }>();
   for (const r of requests) {
+    if (otherSet.has(r)) continue;
     const key = quietBurstKey(r);
+    const since = quietSince(r);
     const burst = bursts.get(key);
     if (burst) {
-      burst.wakes.push(r);
-      if (r.timestamp < burst.oldest) burst.oldest = r.timestamp;
+      if (since < burst.oldest) burst.oldest = since;
       if (r.timestamp > burst.newest) burst.newest = r.timestamp;
     } else {
-      bursts.set(key, { oldest: r.timestamp, newest: r.timestamp, wakes: [r] });
+      bursts.set(key, { oldest: since, newest: r.timestamp, channel: r.channelId !== undefined });
     }
   }
-  let ready: { key: string; oldest: number } | undefined;
-  for (const [key, burst] of bursts) {
-    const left = Math.max(0, Math.min(quiet.quietMs - (now - burst.newest), quiet.maxWaitMs - (now - burst.oldest)));
-    if (left > 0) waiting.set(key, left);
-    else if (!ready || burst.oldest < ready.oldest) ready = { key, oldest: burst.oldest };
+  const readiness = (burst: { oldest: number; newest: number }): { left: number; cause: QuietReleaseCause } => {
+    const quietLeft = quiet.quietMs - (now - burst.newest);
+    const capLeft = quiet.maxWaitMs - (now - burst.oldest);
+    return quietLeft <= capLeft ? { left: Math.max(0, quietLeft), cause: 'quiet' } : { left: Math.max(0, capLeft), cause: 'cap' };
+  };
+  // The ready burst that has waited longest, among channel bursts when
+  // `channelsOnly`.
+  const longestReady = (channelsOnly: boolean): string | undefined => {
+    let pick: { key: string; oldest: number } | undefined;
+    for (const [key, burst] of bursts) {
+      if (channelsOnly && !burst.channel) continue;
+      if (readiness(burst).left > 0) continue;
+      if (!pick || burst.oldest < pick.oldest) pick = { key, oldest: burst.oldest };
+    }
+    return pick?.key;
+  };
+  const startKeys = new Set<string>();
+  if (others.length > 0) {
+    const named = others.map((r) => (r.channelId === undefined ? undefined : quietBurstKey(r))).find((k) => k !== undefined && bursts.has(k));
+    const chosen = named ?? longestReady(true);
+    for (const [key, burst] of bursts) if (!burst.channel) startKeys.add(key);
+    if (chosen !== undefined) startKeys.add(chosen);
+    for (const key of startKeys) started.set(key, 'other-wake');
+  } else {
+    const chosen = longestReady(false);
+    if (chosen !== undefined) {
+      startKeys.add(chosen);
+      started.set(chosen, readiness(bursts.get(chosen)!).cause);
+    }
   }
-  if (!ready) return { start: [], hold: [...requests], waiting };
-  const chosen = ready.key;
-  const start = requests.filter((r) => r.channelId === undefined || quietBurstKey(r) === chosen);
-  const hold = requests.filter((r) => !start.includes(r));
-  for (const r of start) waiting.delete(quietBurstKey(r));
-  return { start, hold, burst: { key: chosen, heldMs: now - ready.oldest }, waiting };
+  for (const [key, burst] of bursts) if (!startKeys.has(key)) waiting.set(key, readiness(burst).left);
+  const start = requests.filter((r) => otherSet.has(r) || startKeys.has(quietBurstKey(r)));
+  const startSet = new Set(start);
+  const hold = requests.filter((r) => !startSet.has(r));
+  return { start, hold, started, waiting };
 }
 
 /** A wake a message made: a channel message's or a server event's, other
- *  than the heartbeat's, that neither continues nor retries a turn. */
+ *  than the heartbeat's (isHeartbeatWake), that neither continues nor
+ *  retries a turn. */
 function isMessageWake(r: InferenceRequest): boolean {
   return (r.reason === 'mcpl:channel-incoming' || r.reason === 'mcpl:push-event')
-    && r.source !== 'heartbeat'
+    && !isHeartbeatWake(r)
     && !continuesTurn(r) && !carriesContinuation(r) && mergedBatch(r) === undefined;
 }
 
@@ -1344,13 +1394,14 @@ const TURN_RETRY: unique symbol = Symbol('turn-retry');
  */
 const MERGED_BATCH: unique symbol = Symbol('merged-batch');
 const REARMED: unique symbol = Symbol('rearmed');
+const QUIET_SINCE: unique symbol = Symbol('quiet-since');
 const TURN_CARRY: unique symbol = Symbol('turn-carry');
 interface TurnCarry {
   silence: TurnSilence | null;
   sends: SendsReached | null;
   read: number;
 }
-type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [TURN_CARRY]?: TurnCarry; [REARMED]?: true };
+type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [QUIET_SINCE]?: number };
 
 function isRearmed(request: InferenceRequest | undefined): boolean {
   return request !== undefined && (request as MarkedRequest)[REARMED] === true;
@@ -2607,6 +2658,12 @@ const testAbandonGraces = new WeakMap<AgentFramework, number>();
  * abandon reaches past the grace, so no turn can end within it and a short
  * grace only brings the abandon's report sooner.
  */
+/** Test-only: marks a wake as standing for a burst whose oldest wake was at
+ *  `since`, as a coalesced batch's replacement or a quiesce's coalescing does. */
+export function carryQuietSinceForTests(request: InferenceRequest, since: number): void {
+  carryQuietSince(request, since);
+}
+
 export function setAbandonGraceForTests(framework: AgentFramework, ms: number): void {
   testAbandonGraces.set(framework, ms);
 }
@@ -3987,9 +4044,10 @@ export class AgentFramework {
   private quietPeriod: { quietMs: number; maxWaitMs: number } | undefined;
   /** The bursts a quiet period holds now, by agent then by burst key
    *  (quietBurstKey), each with when its hold began: one trace and one
-   *  stderr line per burst, and the hold's length when it ends. Pruned by
-   *  the pass that reads the agent's queue, so a burst withdrawn or dropped
-   *  while held leaves nothing behind; cleared with the agent. */
+   *  stderr line per burst, and the hold's length when it ends. Pruned
+   *  (pruneQuietHolds) wherever an agent's queued requests leave the queue
+   *  without a start, so a burst withdrawn or dropped while held leaves
+   *  nothing behind; cleared with the agent. */
   private quietHolds = new Map<string, Map<string, number>>();
   private turnRearms: Map<string, number> = new Map();
   private exhaustingRearms: Set<string> = new Set();
@@ -19026,8 +19084,25 @@ export class AgentFramework {
   }
 
   private async wakeForCoalescedBatch(occ: CoalescedOccurrence<CoalescedDelivery>): Promise<void> {
-    this.cancelCoalescedWakes(coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key));
+    const subject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
+    // The wake this notice replaces began the batch's burst: under a message
+    // quiet period the new wake carries its age (QUIET_SINCE), so a batch
+    // that keeps updating still starts at `maxWaitMs` from its first wake.
+    const since = new Map<string, number>();
+    if (this.quietPeriod) {
+      for (const r of this.pendingRequests) {
+        if (r.coalescingSubject !== subject) continue;
+        since.set(r.agentName, Math.min(since.get(r.agentName) ?? Infinity, quietSince(r)));
+      }
+    }
+    this.cancelCoalescedWakes(subject);
     await this.queueCoalescedWakes(occ);
+    if (since.size > 0) {
+      for (const r of this.pendingRequests) {
+        const was = r.coalescingSubject === subject ? since.get(r.agentName) : undefined;
+        if (was !== undefined) carryQuietSince(r, was);
+      }
+    }
   }
 
   /** Queue a wake for each agent of the batch's audience, when its latest
@@ -19114,6 +19189,30 @@ export class AgentFramework {
 
   /** Withdraw unstarted wakes whose sole cause is this subject (§4.2), and
    *  a merged start whose every request is withdrawn. */
+  /** Ends the quiet-period holds of `agentName`'s bursts that are no longer
+   *  queued (quietHolds): each gets a `quiet-period:released` trace with the
+   *  cause `gone`. `queuedKeys` are the bursts still in its queue. Called
+   *  wherever an agent's queued requests are taken away without a start: a
+   *  withdrawal, a read-drop or a policy skip that empties its batch, the
+   *  pass's sweep of agents with nothing queued, and the split itself. */
+  private pruneQuietHolds(agentName: string, queuedKeys: ReadonlySet<string>, now = Date.now()): void {
+    const held = this.quietHolds?.get(agentName);
+    if (!held) return;
+    for (const [key, since] of held) {
+      if (queuedKeys.has(key)) continue;
+      held.delete(key);
+      this.emitTrace({ type: 'quiet-period:released', agentName, burst: key, wakes: 0, heldMs: now - since, cause: 'gone' });
+    }
+    if (held.size === 0) this.quietHolds.delete(agentName);
+  }
+
+  /** The burst keys of an agent's queued message wakes, for pruneQuietHolds. */
+  private queuedQuietKeys(agentName: string): Set<string> {
+    const keys = new Set<string>();
+    for (const r of this.pendingRequests) if (r.agentName === agentName && isMessageWake(r)) keys.add(quietBurstKey(r));
+    return keys;
+  }
+
   private cancelCoalescedWakes(subject: string): void {
     // A wake of the subject's merged into a start
     // (MERGED_BATCH) is withdrawn from the start's batch, so no stop puts
@@ -19133,6 +19232,7 @@ export class AgentFramework {
     for (const pass of this.passRequests ?? []) for (const requests of pass.values()) requests.forEach(unrecord);
     const withdrawn = (r: InferenceRequest): boolean => r.coalescingSubject === subject || emptied.has(r);
     this.pendingRequests = this.pendingRequests.filter((r) => !withdrawn(r));
+    for (const agentName of [...(this.quietHolds?.keys() ?? [])]) this.pruneQuietHolds(agentName, this.queuedQuietKeys(agentName));
     for (const cooldown of this.providerAccelerationCooldowns.values()) {
       const held = cooldown.heldRequests.length;
       cooldown.heldRequests = cooldown.heldRequests.filter((r) => !withdrawn(r));
@@ -19610,6 +19710,11 @@ export class AgentFramework {
 
     // Clear pending (we'll re-add if inference doesn't run)
     this.pendingRequests = [];
+    // A burst held for an agent with nothing queued now ended without a
+    // start (quietHolds): its hold is traced as gone.
+    for (const agentName of [...(this.quietHolds?.keys() ?? [])]) {
+      if (!requestsByAgent.has(agentName)) this.pruneQuietHolds(agentName, new Set(), now);
+    }
 
     // Check each agent
     for (const [agentName, groupedRequests] of requestsByAgent) {
@@ -19743,9 +19848,14 @@ export class AgentFramework {
           // A heartbeat's wake keeps its own key, so a later channel-less wake
           // can't absorb it: resumed together, they make a heartbeat's batch
           // (heartbeatTurn), as they would have without the quiesce.
-          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${isHeartbeatWake(request) ? 'h' : ''}|${request.coalescingSubject ?? ''}|${request.readsDeferredWrite ?? ''}|${request.readsStoredMessage ?? ''}`;
+          // Under a message quiet period, a burst is a channel's (quietBurstKey),
+          // so two channels' wakes park apart, and the one kept carries the
+          // burst's age (QUIET_SINCE), so its cap counts from the first wake.
+          const burst = this.quietPeriod && isMessageWake(request) ? quietBurstKey(request) : '';
+          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${isHeartbeatWake(request) ? 'h' : ''}|${request.coalescingSubject ?? ''}|${request.readsDeferredWrite ?? ''}|${request.readsStoredMessage ?? ''}|${burst}`;
           const prev = newestByKey.get(key);
           const kept = !prev || request.timestamp >= prev.timestamp ? request : prev;
+          if (prev) carryQuietSince(kept, Math.min(quietSince(prev), quietSince(request)));
           // The wake it absorbs hands on its lines (WakeLine): each event's
           // line stays to be decided when the host resumes.
           const lines = prev ? mergeWakeLines([prev, request]) : undefined;
@@ -19865,6 +19975,7 @@ export class AgentFramework {
         console.error(`[wake] ${agentName}: dropped ${read.length} wake(s) for writes an answered request carried, and that it spoke after in the wake's channel where it carries one not marked ambient, or that were removed` +
           (requests.length === 0 ? '; no turn starts' : ''));
         if (requests.length === 0) {
+          this.pruneQuietHolds(agentName, new Set(), now);
           this.endPendingPrimary(agentName);
           continue;
         }
@@ -19877,35 +19988,34 @@ export class AgentFramework {
       // starts a turn with its wakes (quietSplit), and the other bursts go
       // back to the queue as the resumesLogicalTurn split above sends its
       // siblings back, so chatter in one channel neither delays another's
-      // turn nor takes its reply. Each wake keeps what the gate and the
-      // ingress gave it; only the start waits. The loop's next pass reads
-      // the queue again (runLoop's backoff), so the requests go back as a
-      // busy agent's do, with no timer of their own. A batch holding any
-      // other wake starts whole, now. The read-drop above runs first, so a
-      // wake about to be dropped neither sets a burst's deadline nor waits.
-      // The map is read as surgeryHold is: a prototype-built harness leaves
-      // both slots undefined, which reads as "nothing held".
+      // turn nor takes its reply. A wake that is no message starts now, with
+      // at most one channel's burst (quietSplit). Each wake keeps what the
+      // gate and the ingress gave it; only the start waits. The loop's next
+      // pass reads the queue again (runLoop's backoff), so the requests go
+      // back as a busy agent's do, with no timer of their own. The read-drop
+      // above runs first, so a wake about to be dropped neither sets a
+      // burst's deadline nor waits. The map is read as surgeryHold is: a
+      // prototype-built harness leaves both slots undefined, which reads as
+      // "nothing held".
       const split = quietSplit(requests, now, this.quietPeriod);
-      if (split.hold.length > 0 || split.waiting.size > 0 || this.quietHolds?.get(agentName)?.size) {
+      let quietRelease: Map<string, QuietReleaseCause> | undefined;
+      if (split.waiting.size > 0 || split.started.size > 0 || this.quietHolds?.get(agentName)?.size) {
         const holds = (this.quietHolds ??= new Map());
+        // A burst no longer queued ended its hold without a start.
+        const queued = new Set([...split.waiting.keys(), ...split.started.keys()]);
+        this.pruneQuietHolds(agentName, queued, now);
         let held = holds.get(agentName);
-        if (!held) holds.set(agentName, (held = new Map()));
-        // A burst no longer queued (withdrawn, dropped as read, or started)
-        // ends its hold: its entry goes, so its next burst is traced anew.
-        for (const key of [...held.keys()]) if (!split.waiting.has(key)) held.delete(key);
         for (const [key, leftMs] of split.waiting) {
-          if (held.has(key)) continue;
+          if (held?.has(key)) continue;
+          if (!held) holds.set(agentName, (held = new Map()));
           held.set(key, now);
-          const wakes = requests.filter((r) => quietBurstKey(r) === key).length;
+          const wakes = requests.filter((r) => isMessageWake(r) && quietBurstKey(r) === key).length;
           this.emitTrace({ type: 'quiet-period:held', agentName, burst: key, wakes, readyInMs: leftMs });
           console.error(`[quiet-period] agent=${agentName}: holding the turn for a message burst (${wakes} wake(s) so far, ${describeQuietBurst(key)})`);
         }
-        if (held.size === 0) holds.delete(agentName);
-      }
-      if (split.burst) {
-        this.emitTrace({
-          type: 'quiet-period:released', agentName, burst: split.burst.key, wakes: split.start.length, heldMs: split.burst.heldMs,
-        });
+        // The bursts this start ends the hold of: traced once the start is
+        // accepted (below), with how long each was held.
+        for (const [key, cause] of split.started) if (held?.has(key)) (quietRelease ??= new Map()).set(key, cause);
       }
       if (split.hold.length > 0) this.pendingRequests.push(...split.hold);
       if (split.start.length === 0) continue;
@@ -19933,6 +20043,7 @@ export class AgentFramework {
         // A primary a provider hold left pending stays pending while a wake
         // this batch sent back to the queue (above) waits to run, as when
         // dropContinuations drops one.
+        this.pruneQuietHolds(agentName, this.queuedQuietKeys(agentName), now);
         if (!this.pendingRequests.some((r) => r.agentName === agentName)) this.endPendingPrimary(agentName);
         continue;
       }
@@ -20115,6 +20226,19 @@ export class AgentFramework {
       // it takes its token it stands for them all.
       if (requests.length > 1 && requests.some((r) => !continuesTurn(r))) start[MERGED_BATCH] = [...requests];
       else delete start[MERGED_BATCH];
+      // The start is accepted: the bursts whose hold it ends are traced
+      // (quiet-period:released), paired with their quiet-period:held.
+      if (quietRelease) {
+        const held = this.quietHolds?.get(agentName);
+        for (const [key, cause] of quietRelease) {
+          const since = held?.get(key);
+          if (since === undefined) continue;
+          held!.delete(key);
+          const wakes = requests.filter((r) => isMessageWake(r) && quietBurstKey(r) === key).length;
+          this.emitTrace({ type: 'quiet-period:released', agentName, burst: key, wakes, heldMs: now - since, cause });
+        }
+        if (held?.size === 0) this.quietHolds.delete(agentName);
+      }
       await this.startAgentStream(agent, start);
     }
   }

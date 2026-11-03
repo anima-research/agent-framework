@@ -410,17 +410,26 @@ export interface FrameworkConfig {
    * and then starts a turn with its wakes alone, the other bursts waiting
    * their own turns. So chatter in one channel neither delays another
    * channel's turn nor takes its reply: each turn speaks in its burst's
-   * channel, as on `main`. A message wake is a channel message's or a server
-   * event's (`mcpl:channel-incoming`, `mcpl:push-event`) other than the
-   * heartbeat's. Each message's own decision stays what the gate gives it:
-   * who wakes a sleeping agent, where a reply goes, what tune-out and
-   * conversation routing see. A batch holding any other wake (a timer, an
-   * operator, a tool result, a continuation or a retry of the agent's turn)
-   * starts whole, now. The hold is observable as `quiet-period:held` and
-   * `quiet-period:released` traces. Held wakes live only in the queue: as
-   * with any queued wake, `stop()` within the hold drops them, and the
-   * message, stored at ingress, waits in context for the next wake. Off
-   * when omitted.
+   * channel. A message wake is a channel message's or a server event's
+   * (`mcpl:channel-incoming`, `mcpl:push-event`) other than the heartbeat's.
+   * Each message's own decision stays what the gate gives it: who wakes a
+   * sleeping agent, where a reply goes, what tune-out and conversation
+   * routing see. Messages held are already in context, so an ambient burst
+   * that another burst's turn has read is dropped as read, as on `main`, and
+   * what the agent says about it goes in that turn's channel; an addressed
+   * burst keeps its own turn. Any other wake (a timer, an operator's, a tool
+   * result) isn't held: it starts now, with the wakes that name no channel
+   * and at most one channel's burst (the channel it names, else the ready
+   * burst that waited longest), the other channels' bursts still waiting. A
+   * backlog that waited out a busy turn is past its cap, so it starts one
+   * turn per channel, oldest first, where `main` starts one merged turn. A
+   * deferred coalesced batch pending when a turn assembles is taken by that
+   * turn, as any turn's assembly takes it on `main`. The hold is observable
+   * as `quiet-period:held` and `quiet-period:released` traces. Held wakes
+   * live only in the queue: as with any queued wake, `stop()` within the
+   * hold drops them, and the message, stored at ingress, waits in context for
+   * the next wake (a coalesced batch, stored as pending, is restored and
+   * wakes again). Off when omitted.
    */
   messageQuietPeriod?: { quietMs: number; maxWaitMs?: number };
 

@@ -8,10 +8,12 @@
   bursts wait their own turns, so chatter in one channel neither delays
   another's turn nor takes its reply. Each message's own decision stays what
   the gate gives it: who wakes a sleeping agent, where a reply goes, what
-  tune-out and conversation routing see. A batch holding any other wake (a
-  timer, an operator, a tool result, a continuation or a retry of the
-  agent's turn) starts now; the heartbeat is no message wake. The hold is
-  traced (`quiet-period:held`, `quiet-period:released`). Held wakes are
-  queued wakes: a `stop()` within the hold drops them, and the message,
-  stored at ingress, waits in context for the next wake. (#179, carried by
-  #856.)
+  tune-out and conversation routing see. An ambient burst that another
+  burst's turn has read is dropped as read, as on `main`; an addressed one
+  keeps its turn. Any other wake (a timer, an operator, a tool result) isn't
+  held: it starts now with at most one channel's burst, the others still
+  waiting; the heartbeat is no message wake. A backlog past its cap after a
+  busy turn starts one turn per channel, oldest first. The hold is traced
+  (`quiet-period:held`, `quiet-period:released`). Held wakes are queued
+  wakes: a `stop()` within the hold drops them, and the message, stored at
+  ingress, waits in context for the next wake. (#179, carried by #856.)

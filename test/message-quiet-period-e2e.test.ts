@@ -6,8 +6,9 @@
  * sees: how many turns a burst makes, and in which channel each reply lands.
  *
  * The gate is `always` with no debounce, so each message is its own wake and
- * the quiet period alone decides when the turns start. MockMembrane answers
- * each turn with one line of prose, which the default `locus` routing
+ * the quiet period alone decides when the turns start. The membrane answers
+ * each turn with one line of prose, queued up front, one response per turn
+ * (OneResponsePerTurnMembrane, R2-6), which the default `locus` routing
  * publishes to the turn's channel.
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
@@ -16,7 +17,8 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
-import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import type { InferenceRequest } from '../src/types/agent.js';
+import { OneResponsePerTurnMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { jsonLines } from './helpers/json-lines.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/wake-locus-mcpl-server.mjs');
@@ -39,7 +41,7 @@ describe('messageQuietPeriod through MCPL ingress', () => {
   let tempDir: string;
   let statusPath: string;
   let commandPath: string;
-  let membrane: MockMembrane;
+  let membrane: OneResponsePerTurnMembrane;
   let framework: AgentFramework;
   let n = 0;
 
@@ -48,7 +50,7 @@ describe('messageQuietPeriod through MCPL ingress', () => {
     statusPath = join(tempDir, 'status.jsonl');
     commandPath = join(tempDir, 'commands.txt');
     writeFileSync(commandPath, '');
-    membrane = new MockMembrane();
+    membrane = new OneResponsePerTurnMembrane();
     framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
@@ -78,6 +80,7 @@ describe('messageQuietPeriod through MCPL ingress', () => {
   const incoming = (channelId: string, text: string, mode: 'ambient' | 'addressed' = 'ambient'): void =>
     command(`incoming ${channelId} m-${++n} ${mode} ${text}`);
   const dm = (text: string): void => command(`dm ev-${++n} 134 ${RAW_DM} ${text}`);
+  const sent = (event: string): number => jsonLines<{ event: string }>(statusPath).filter((e) => e.event === event).length;
   const publishes = (): string[] => jsonLines<{ event: string; channelId?: string }>(statusPath)
     .filter((e) => e.event === 'publish')
     .map((e) => e.channelId!);
@@ -102,14 +105,11 @@ describe('messageQuietPeriod through MCPL ingress', () => {
 
   it('two channels each addressed while the agent is idle: one turn per channel, each reply in its own channel (R1-1)', async () => {
     await start({ quietMs: 400 });
-    // One response per turn: the mock hands a turn's stream every response
-    // queued so far, so the second is queued once the first turn has spoken.
     reply('to room');
+    reply('to general');
     incoming(ROOM, 'scout, a question in room', 'addressed');
     await sleep(200);
     incoming(GENERAL, 'scout, a question in general', 'addressed');
-    await waitFor(() => publishes().length >= 1, "room's reply");
-    reply('to general');
     await waitFor(() => publishes().length >= 2, 'both replies');
     assert.deepEqual(publishes(), [ROOM, GENERAL], 'one turn per channel, oldest burst first, each speaking where it was asked');
     await sleep(500);
@@ -127,6 +127,7 @@ describe('messageQuietPeriod through MCPL ingress', () => {
     incoming(ROOM, 'a remark in room');
     await sleep(200);
     incoming(GENERAL, 'a remark in general');
+    await waitFor(() => sent('incoming-sent') >= 2, 'both messages sent');
     await waitFor(() => publishes().length >= 1, "room's reply");
     assert.deepEqual(publishes(), [ROOM]);
     await sleep(1_200);
@@ -134,9 +135,31 @@ describe('messageQuietPeriod through MCPL ingress', () => {
     assert.deepEqual(publishes(), [ROOM], 'nothing landed in general');
   });
 
+  it("a timer while two addressed channels are held starts neither's turn for it: each channel is answered in itself (R2-1)", async () => {
+    await start({ quietMs: 600 });
+    // The timer's turn says nothing, so where its prose would fall back to
+    // doesn't enter the publish log.
+    membrane.pushResponse(createMockResponse([]));
+    reply('to room');
+    reply('to general');
+    const internals = framework as unknown as { pendingRequests: InferenceRequest[] };
+    incoming(ROOM, 'scout, a question in room', 'addressed');
+    await sleep(150);
+    incoming(GENERAL, 'scout, a question in general', 'addressed');
+    await waitFor(() => sent('incoming-sent') >= 2, 'both messages sent');
+    // A self-wake timer lands while both bursts are held: the framework's
+    // own wake, pushed as the gate's timer pushes it.
+    internals.pendingRequests.push({ agentName: 'scout', reason: 'self-wake', source: 'gate', timestamp: Date.now() });
+    await waitFor(() => membrane.calls.length >= 1, "the timer's turn");
+    await waitFor(() => publishes().length >= 2, 'both channels answered');
+    assert.deepEqual(publishes(), [ROOM, GENERAL], 'each question answered in its own channel, oldest first');
+    assert.equal(membrane.calls.length, 3, 'the timer\'s turn, then one per channel');
+  });
+
   it("a DM's turn is not delayed by chatter elsewhere, and its reply stays in the DM (R1-1)", async () => {
     await start({ quietMs: 600, maxWaitMs: 5_000 });
     reply('answering the DM');
+    reply('joining the room');
     const t0 = Date.now();
     dm('are you there?');
     // Chatter in the room every 150 ms for about 2 s: the room's burst is
@@ -150,7 +173,6 @@ describe('messageQuietPeriod through MCPL ingress', () => {
     } finally {
       clearInterval(chatter);
     }
-    reply('joining the room');
     // The room's chatter is ambient: what the DM's turn carried is read and
     // starts no turn; what landed after it compiled may. Either way, nothing
     // the room said is answered in the DM.
