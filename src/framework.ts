@@ -15032,7 +15032,8 @@ export class AgentFramework {
    * An operator's operation: refused once stop() has begun, and waited for
    * by stop() while it runs. It is written to the operator log as a
    * `checkout` (`requester` and `note` as the caller gives them), a refusal
-   * or failure with its error.
+   * or failure with its error, but for the refusal once stop() has begun,
+   * which throws before anything is written.
    *
    * The branch moves under every agent sharing the store, so the switch
    * reserves the store as a surgery does: every agent must be idle with no
