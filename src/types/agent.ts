@@ -258,17 +258,10 @@ export interface AgentConfig {
      *   `thinking-binding-loss` ops alert, once per incident and again if a
      *   call drops more. The provider reports drops only on a request that
      *   carries the drop control; without it, such a block is refused;
-     * - the agent is told, in a `[reasoning] <agent>:` system notice of kind
-     *   `reasoning-loss` stored for it as the framework's other notices are,
-     *   when a committing compile leaves out a stored reply's reasoning at a
-     *   change of the request's head, at a branch's first compile, or in a
-     *   fold or other change to an earlier message that takes a reply of the
-     *   current turn, and, with `dropBlock` set too, when the provider drops
-     *   blocks it can place as the agent's stored replies or the stream's
-     *   rounds, once per incident and again when a call drops more. The
-     *   framework hears compiles through `Agent.onThinkingStrip` from the
-     *   agent's first stream on, unless a host has set its own, so an agent
-     *   driven only through the direct API is never told.
+     * - the agent is told nothing of reasoning left out or dropped: no line
+     *   about the mechanics of its own memory or reasoning is put in its
+     *   context. Hosts can observe compiles' strips through
+     *   `Agent.onThinkingStrip`;
      * The record and the notes
      * vouch for requests as agent-framework hands them to membrane, so a
      * membrane `beforeRequest` hook that changes a request must change every

@@ -49,6 +49,7 @@ import type { InboundSource } from './inbound-source.js';
 import { McplRequestError, type McplServerConnection } from './server-connection.js';
 import { readSkipReplyWake, skipReplyNote, type SkipReplyEarlierWake } from './skip-reply-wake.js';
 import { isProseTargetToken } from './prose-grammar.js';
+import type { TraceEventInput } from '../types/trace.js';
 
 // ============================================================================
 // Typing indicator interval (Discord typing lasts ~10s, so 7s keeps it alive)
@@ -200,7 +201,7 @@ function substitutedChannel(
  */
 const CHANNEL_LABEL_HISTORY_LOG_ID = 'mcpl/channel-label-history';
 
-type DesiredChannelState = 'open' | 'closed' | 'tuned-out';
+export type DesiredChannelState = 'open' | 'closed' | 'tuned-out';
 
 /**
  * Parameters of an active tune-out (issue #77), carried on the
@@ -1177,7 +1178,7 @@ export class ChannelRegistry {
   private serverRegistry: McplServerRegistry;
   private featureSetManager: FeatureSetManager;
   private pushEventFn: (event: ProcessEvent) => void;
-  private emitTraceFn: (event: { type: string; [key: string]: unknown }) => void;
+  private emitTraceFn: (event: TraceEventInput) => void;
   private sendTypingFn?: (
     serverId: string,
     channelId: string,
@@ -1581,7 +1582,7 @@ export class ChannelRegistry {
     serverRegistry: McplServerRegistry,
     featureSetManager: FeatureSetManager,
     pushEventFn: (event: ProcessEvent) => void,
-    emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
+    emitTraceFn: (event: TraceEventInput) => void,
     options?: ChannelRegistryOptions & {
       sendTypingFn?: (
         serverId: string,
@@ -2303,8 +2304,9 @@ export class ChannelRegistry {
   }
 
   /** The explicit 'stop' for a channel whose typing ended, while its
-   *  server still registers it. */
+   *  server still registers it and holds the grant its start needed. */
   private sendTypingStop(ref: ChannelRef): void {
+    if (!this.typingGranted(ref)) return;
     if (this.sendTypingFn && this.entryAt(ref)) {
       this.sendTypingFn(ref.serverId, ref.channelId, this.typingMetadata.get(destinationKey(ref)), 'stop');
     }
@@ -3965,15 +3967,19 @@ export class ChannelRegistry {
    * (typing timer lifecycle is still managed for when the callback is wired).
    */
   private sendTypingNotification(ref: ChannelRef): void {
-    // §14.1: channels/typing requires channels.typing in the grant. Silent
-    // skip — a typing indicator is cosmetic and per-7s, so a diagnostic per
-    // tick would be noise.
-    if (!CapabilityGrant.of(this.serverRegistry.getServer(ref.serverId)).has('channels.typing')) return;
+    // Silent skip — a typing indicator is cosmetic and per-7s, so a
+    // diagnostic per tick would be noise.
+    if (!this.typingGranted(ref)) return;
     if (this.sendTypingFn) {
       this.sendTypingFn(ref.serverId, ref.channelId, this.typingMetadata.get(destinationKey(ref)));
     }
     // TODO: When server-connection exposes a public sendNotification or
     // sendTyping method, wire it here directly instead of using a callback.
+  }
+
+  /** §14.1: channels/typing, start and stop alike, requires channels.typing in the grant. */
+  private typingGranted(ref: ChannelRef): boolean {
+    return CapabilityGrant.of(this.serverRegistry.getServer(ref.serverId)).has('channels.typing');
   }
 
   // ==========================================================================
