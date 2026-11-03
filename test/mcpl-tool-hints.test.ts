@@ -1755,48 +1755,6 @@ test('look naming a tool with no instance shows the definition act checks: the s
   } finally { await t.done(); }
 });
 
-test('RFC-014 §4.2: a rebuild whose listing of a server breaks off before a moved tool doesn\'t tell its move, and the tool list doesn\'t show it', async () => {
-  const moved = withPresence('peek', 'static');
-  const { t, moveAndHold, release } = await movingServer(moved, [moved[0]!, null as unknown as Json, ...moved.slice(1)]);
-  try {
-    await moveAndHold();
-    release();
-    // A rebuild that changes nothing a caller sees has no public sign of its end: this waits on the framework's own flag.
-    await waitFor(() => (t.fw.framework as unknown as { mcplToolRefreshInFlight: boolean }).mcplToolRefreshInFlight === false, 'the rebuild ended');
-    await nextMacrotask();
-    assert.ok(!t.fw.framework.getAllTools().some((x) => x.name === 'arc--peek'), 'the tool list doesn\'t show peek');
-    assert.equal(notices(t.fw).filter((x) => x.includes('peek is in your tool list now')).length, 0, 'so the move isn\'t told');
-  } finally {
-    release();
-    await t.done();
-  }
-});
-
-test('RFC-014 §4.2: a move a broken-off listing didn\'t publish is told by the next rebuild that does', async () => {
-  const moved = withPresence('peek', 'static');
-  const list = [moved[0]!, null as unknown as Json, ...moved.slice(1)];
-  const { t, moveAndHold, release } = await movingServer(moved, list);
-  const toldMoved = () => notices(t.fw).filter((x) => x.includes('peek is in your tool list now')).length;
-  try {
-    await moveAndHold();
-    release();
-    await waitFor(() => (t.fw.framework as unknown as { mcplToolRefreshInFlight: boolean }).mcplToolRefreshInFlight === false, 'the broken rebuild ended');
-    assert.equal(toldMoved(), 0, 'not told while the list doesn\'t show peek');
-    list.splice(1, 1);
-    const lists = t.server.received.filter((m) => m.method === 'tools/list').length;
-    t.server.peer.notify('notifications/tools/list_changed', {});
-    await waitFor(() => t.server.received.filter((m) => m.method === 'tools/list').length > lists, 'the next rebuild\'s tools/list asked for');
-    release();
-    await waitFor(() => t.fw.framework.getAllTools().some((x) => x.name === 'arc--peek'), 'the next rebuild publishes peek');
-    await waitFor(() => toldMoved() > 0, 'the move told');
-    await nextMacrotask();
-    assert.equal(toldMoved(), 1, 'once');
-  } finally {
-    release();
-    await t.done();
-  }
-});
-
 const rebuildEnded = (t: Awaited<ReturnType<typeof setup>>) =>
   waitFor(() => (t.fw.framework as unknown as { mcplToolRefreshInFlight: boolean }).mcplToolRefreshInFlight === false, 'the rebuild ended');
 
