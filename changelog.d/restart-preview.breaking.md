@@ -68,8 +68,16 @@
     nothing. A declined restart keeps the pin, so the stream that goes on
     keeps them raw. A taken restart's compile drops it only where it
     refuses with the pin held, as that pin's entry says.
-  - **Unchanged:** a restart whose preview fits, the `physicalWindowTokens`
-    restart, a strategy with no preview (such as `PassthroughStrategy`) or
-    with no fold plan to preview (the hierarchical path), which restarts as
-    before, and a boundary past `maxStreamTokens` while
-    the framework stops, which ends the turn with its stream.
+  - **A restart whose preview fits** is taken as before, after the preview:
+    a full dry select of the restart's compile, which the compile then runs
+    again. So is one on the hierarchical path whose preview's dry select
+    succeeds and then reports no fold plan to preview. Such a restart runs
+    the select twice where it ran it once before this release.
+  - **Unchanged:** the `physicalWindowTokens` restart, a strategy with no
+    preview (such as `PassthroughStrategy`), which restarts as before, and a
+    boundary past `maxStreamTokens` while the framework stops, which ends
+    the turn with its stream.
+- **Hosts with a table or `switch` that must cover every `TraceEvent['type']`:**
+  the union names one more type, `inference:restart_declined`, so a
+  `Record<TraceEvent['type'], …>`, or a `switch` checked exhaustively with
+  `never`, needs an entry for it.
