@@ -22,8 +22,10 @@
   was alive: #814's mark for a message stored as it arrived (0.28.0's
   entry for it), read onto the presentation index. The wake is
   dropped only once an answered request carried the row, which that
-  request's mark says by the row's place in the agent's window, so a
-  request that never carried the row keeps its wake. A resumed turn (a
+  request's mark says by the row's place in the agent's window, or once
+  the row is gone from the agent's store on its current branch (removed,
+  or left on a branch it has moved from), so a request that never carried
+  a stored row keeps its wake. A resumed turn (a
   context-budget restart, or a tool-result guard's retry a provider held)
   presents nothing that arrived meanwhile, so such a row's wake still starts
   its turn.

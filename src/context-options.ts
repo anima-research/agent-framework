@@ -5,7 +5,12 @@
  * ended one's context again with the same view (reopenAgentContext). A host
  * that opens one of these contexts itself, to audit a store say, opens it
  * with them too, so what it reads is what the agent's compiles read:
- * `ContextManager.open({ store, ...subconsciousContextOptions({ serves }) })`.
+ * `ContextManager.open({ store, ...subconsciousContextOptions({ serves,
+ * name, reAnchorFraction, maxMessageTokens }) })`, with `serves` the
+ * primary's name, `name` and `reAnchorFraction` the host's
+ * `subconscious.name` and `subconscious.reAnchorFraction`, and
+ * `maxMessageTokens` the primary's `strategy.maxMessageTokens`, which the
+ * framework mirrors.
  *
  * - A resident reads the residents' shared slot (no `isolate`), its context
  *   state under `agents/<name>`. Its view leaves out what a tune-out holds
