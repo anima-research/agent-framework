@@ -136,6 +136,18 @@ test('a modern server needs a real deadline', () => {
   }
 });
 
+test("a deadline that can't be printed is refused with a placeholder for it, not thrown", () => {
+  // JSON can hold it, and String() throws on it: its toString isn't callable.
+  const unprintable = JSON.parse('{"toString": 1}') as unknown as number;
+  assert.throws(() => String(unprintable), TypeError);
+  for (const c of [cfg({ url: 'https://x/mcp', requestTimeoutMs: unprintable }), cfg({ command: 'srv', protocol: 'modern', requestTimeoutMs: unprintable })]) {
+    assert.match(
+      serverConfigProblems(c).join(),
+      /requestTimeoutMs must be an integer from 1 to 2147483647 for a modern server \(got \[a value that cannot be printed\]\)/,
+    );
+  }
+});
+
 test('a legacy deadline above the timer limit is refused; every value that worked passes', () => {
   for (const bad of [MAX_TIMER_MS + 1, Number.POSITIVE_INFINITY]) {
     for (const c of [cfg({ command: 'srv', requestTimeoutMs: bad }), cfg({ url: 'wss://x/mcpl', requestTimeoutMs: bad })]) {

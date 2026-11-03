@@ -25,7 +25,11 @@ import type {
 } from './types.js';
 import type { FeatureSetManager } from './feature-set-manager.js';
 import { McplFeatureSetError } from './feature-set-manager.js';
+import { hostStoppedWhileHandling } from './errors.js';
 import type { HookOrchestrator } from './hook-orchestrator.js';
+import { logValue } from './log-value.js';
+import { streamBounds, wholeCallMs, withHostSetting, type InferenceBounds } from '../inference-bounds.js';
+import type { TraceEventInput } from '../types/trace.js';
 
 // ============================================================================
 // Responder interface
@@ -35,11 +39,14 @@ import type { HookOrchestrator } from './hook-orchestrator.js';
 interface Responder {
   respond(result: McplInferenceRequestResult): void;
   respondError(code: number, message: string, data?: unknown): void;
-  /** The JSON-RPC request ID, used for streaming chunk correlation. */
-  requestId?: string | number;
+  /** The JSON-RPC request ID, used for streaming chunk correlation: a
+   *  request sent with id null is answered whole, since its chunks couldn't
+   *  name it. */
+  requestId?: string | number | null;
   /** Sends a streamed chunk on the transport the request came on, as its
    *  answer is sent. */
   sendChunk?(params: InferenceChunkParams): void;
+  signal?: AbortSignal;
 }
 
 // ============================================================================
@@ -180,14 +187,20 @@ export class InferenceRouter {
   private hookOrchestrator: HookOrchestrator;
   private featureSetManager: FeatureSetManager;
   private routingPolicy: InferenceRoutingPolicy | null;
-  private emitTraceFn: (event: { type: string; [key: string]: unknown }) => void;
+  private emitTraceFn: (event: TraceEventInput) => void;
+  /** The refusals for want of a model that have been logged: one line per
+   *  server with no policy, and per server and feature set with one, so a
+   *  server that keeps asking doesn't flood the operator's log. */
+  private loggedRefusals = new Set<string>();
+  private running = new Set<{ serverId: string; stop: AbortController; answered: Promise<void> }>();
 
   constructor(
     membrane: Membrane,
     hookOrchestrator: HookOrchestrator,
     featureSetManager: FeatureSetManager,
     routingPolicy: InferenceRoutingPolicy | null,
-    emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
+    emitTraceFn: (event: TraceEventInput) => void,
+    private readonly inferenceBounds: () => InferenceBounds | null = () => null,
   ) {
     this.membrane = membrane;
     this.hookOrchestrator = hookOrchestrator;
@@ -201,7 +214,7 @@ export class InferenceRouter {
    *
    * 1. Validate feature set
    * 2. Check loop prevention (reject if inside a hook)
-   * 3. Resolve model from routing policy
+   * 3. Resolve model from routing policy, refusing when it names none
    * 4. Build membrane request
    * 5. Run inference, streaming its visible text as chunks when asked
    * 6. Answer with the result, or with the error for any ending that isn't
@@ -211,6 +224,31 @@ export class InferenceRouter {
     serverId: string,
     params: McplInferenceRequestParams,
     responder: Responder,
+  ): Promise<void> {
+    const stop = new AbortController();
+    let ended!: () => void;
+    const entry = { serverId, stop, answered: new Promise<void>((resolve) => { ended = resolve; }) };
+    this.running.add(entry);
+    try {
+      await this.answer(serverId, params, responder, stop.signal);
+    } finally {
+      this.running.delete(entry);
+      ended();
+    }
+  }
+
+  stopAll(): Array<{ label: string; promise: Promise<void> }> {
+    return [...this.running].map(({ serverId, stop, answered }) => {
+      stop.abort();
+      return { label: `inference/request:${serverId}`, promise: answered };
+    });
+  }
+
+  private async answer(
+    serverId: string,
+    params: McplInferenceRequestParams,
+    responder: Responder,
+    stopped: AbortSignal,
   ): Promise<void> {
     // 1. Validate feature set
     try {
@@ -233,11 +271,80 @@ export class InferenceRouter {
       return;
     }
 
-    // 3. Resolve model
+    // Streaming needs a way to send chunks and an id to tag them with;
+    // without either, the request is answered whole.
+    const sendChunk = params.stream ? responder.sendChunk?.bind(responder) : undefined;
+    const chunkRequestId = sendChunk ? responder.requestId : undefined;
+    const streamed = chunkRequestId != null;
+
+    // 3. Resolve model. With no routing policy, or one that names no model
+    // for this feature set, the operator has chosen no model for this
+    // server's inference: refused rather than guessed, since a model picked
+    // here would run, on whatever credentials and at whatever price it
+    // carries, for a server the operator never chose it for. The answer is
+    // -32603, the code the router answers a failed inference with, as it
+    // answered this request when it reached the provider with no model; the
+    // server's grant can still list inferenceRequest, so not -32002.
     const model = this.resolveModel(
       params.featureSet,
       params.conversationId,
     );
+    if (model === undefined) {
+      const policy = Boolean(this.routingPolicy);
+      // One reason, quoted for where it goes: JSON for the server, logValue
+      // for the host log.
+      const reason = (quote: (value: string) => string) => policy
+        ? `the inference routing policy (inferenceRouting) names no model for feature set ${quote(params.featureSet)}`
+        : 'the host sets no inference routing policy (inferenceRouting)';
+      const message = `inference/request refused: ${reason(JSON.stringify)}, so the host has no model to run it on; ` +
+        "it stays refused until the host's operator configures one";
+      // Logged once per server with no policy, and once per server and
+      // feature set with one, since each feature set the policy misses is
+      // its own entry to add; validateInbound (step 1) bounds feature sets
+      // to those the server declares.
+      const key = JSON.stringify(policy ? [serverId, params.featureSet] : [serverId]);
+      if (!this.loggedRefusals.has(key)) {
+        this.loggedRefusals.add(key);
+        console.error(
+          `[mcpl] ${logValue(serverId)}: inference/request refused: ${reason(logValue)}; ` +
+            (policy
+              ? 'give it a default, or a byFeature or wildcards entry for that feature set. ' +
+                'This line prints once per server and feature set'
+              : 'set inferenceRouting in the framework config to choose the model server-initiated inference runs on. ' +
+                'This line prints once per server') +
+            '; later refusals are answered and traced but not logged.',
+        );
+      }
+      // The failure a trace watcher saw when this request failed at the
+      // provider, still seen; no inference_start, since none started.
+      this.emitTraceFn({
+        type: 'mcpl:inference_fail',
+        serverId,
+        model: null,
+        error: message,
+        streamed,
+      });
+      responder.respondError(-32603, message);
+      return;
+    }
+
+    const signal = responder.signal ? AbortSignal.any([stopped, responder.signal]) : stopped;
+    let stopAnswered = false;
+    const answerStop = () => {
+      if (responder.signal?.aborted) return;
+      stopAnswered = true;
+      const answer = hostStoppedWhileHandling();
+      this.emitTraceFn({ type: 'mcpl:inference_fail', serverId, model, error: answer.message, streamed });
+      // A throw from an abort listener would be uncaught.
+      try {
+        responder.respondError(answer.code, answer.message);
+      } catch {}
+    };
+    stopped.addEventListener('abort', answerStop, { once: true });
+    const settled = (): boolean => {
+      stopped.removeEventListener('abort', answerStop);
+      return stopAnswered;
+    };
 
     // Emit trace: inference start
     this.emitTraceFn({
@@ -263,18 +370,14 @@ export class InferenceRouter {
       },
     };
 
-    // Streaming needs a way to send chunks and an id to tag them with;
-    // without either, the request is answered whole.
-    const sendChunk = params.stream ? responder.sendChunk?.bind(responder) : undefined;
-    const chunkRequestId = sendChunk ? responder.requestId : undefined;
-    const streamed = chunkRequestId != null;
-
+    if (stopAnswered) return;
     try {
       // 5. Run inference. Both modes end in membrane's response, and one
       // builder makes the result from it.
       const response = chunkRequestId != null
-        ? await this.streamResponse(request, chunkRequestId, sendChunk!)
-        : await this.membrane.complete(request);
+        ? await this.streamResponse(request, chunkRequestId, sendChunk!, signal)
+        : await this.membrane.complete(request, { ...this.wholeCallBound(request), signal });
+      if (settled()) return;
 
       // 6. Answer
       const result = resultFrom(response, model);
@@ -294,22 +397,23 @@ export class InferenceRouter {
 
       responder.respond(result);
     } catch (err) {
+      if (settled()) return;
       // Every ending that isn't a completion lands here, in either mode:
       // membrane's error, a stream that stopped early, a tool call, or a
       // stop FinishReason can't name. The answer is the JSON-RPC error, never
       // a result carrying what arrived.
+      const transportClosed = responder.signal?.aborted === true;
       this.emitTraceFn({
         type: 'mcpl:inference_fail',
         serverId,
         model,
-        error: err instanceof Error ? err.message : String(err),
+        error: transportClosed ? 'the transport the request came on closed' : err instanceof Error ? err.message : String(err),
         streamed,
       });
 
-      responder.respondError(
-        -32603,
-        err instanceof Error ? err.message : 'Inference failed',
-      );
+      if (!transportClosed) {
+        responder.respondError(-32603, err instanceof Error ? err.message : 'Inference failed');
+      }
     }
   }
 
@@ -325,42 +429,42 @@ export class InferenceRouter {
    * 2. Exact feature set match
    * 3. Wildcard pattern match (first match wins)
    * 4. Default from policy
-   * 5. Fallback string 'default'
+   *
+   * Only an entry naming a model counts: one that is empty or not a string
+   * names none and is passed over, as a missing one is. That includes what a
+   * server-sent conversation id or feature set such as `constructor` or
+   * `__proto__` finds on Object.prototype, which is never a string. A
+   * conversation id that is falsy reads no override.
+   *
+   * Undefined with no policy, or when none of these names a model: the
+   * request is then refused.
    */
   private resolveModel(
     featureSet: string,
     conversationId?: string,
-  ): string {
-    if (!this.routingPolicy) {
-      return 'default';
+  ): string | undefined {
+    const policy = this.routingPolicy;
+    if (!policy) {
+      return undefined;
     }
+    const named = (value: unknown): string | undefined =>
+      typeof value === 'string' && value !== '' ? value : undefined;
 
-    // Check per-conversation override
-    if (conversationId && this.routingPolicy.overrides?.[conversationId]) {
-      return this.routingPolicy.overrides[conversationId];
-    }
-
-    // Check exact feature set match
-    if (this.routingPolicy.byFeature?.[featureSet]) {
-      return this.routingPolicy.byFeature[featureSet];
-    }
-
-    // Check wildcard patterns
-    if (this.routingPolicy.wildcards) {
-      for (const [pattern, matchedModel] of Object.entries(this.routingPolicy.wildcards)) {
-        if (wildcardMatch(pattern, featureSet)) {
-          return matchedModel;
-        }
-      }
-    }
-
-    // Default
-    return this.routingPolicy.default;
+    return (conversationId ? named(policy.overrides?.[conversationId]) : undefined)
+      ?? named(policy.byFeature?.[featureSet])
+      // First wildcard that matches and names a model.
+      ?? Object.entries(policy.wildcards ?? {}).find(([pattern, m]) => named(m) && wildcardMatch(pattern, featureSet))?.[1]
+      ?? named(policy.default);
   }
 
   // ==========================================================================
   // Private: Streaming
   // ==========================================================================
+
+  private wholeCallBound(request: NormalizedRequest): { progressTimeoutMs?: number } {
+    const bounds = this.inferenceBounds();
+    return bounds === null ? {} : { progressTimeoutMs: wholeCallMs(bounds, request.config.maxTokens) };
+  }
 
   /**
    * Run the inference as a stream, sending each visible text delta to the
@@ -379,8 +483,9 @@ export class InferenceRouter {
     request: NormalizedRequest,
     requestId: string | number,
     sendChunk: (params: InferenceChunkParams) => void,
+    signal: AbortSignal,
   ): Promise<NormalizedResponse> {
-    const stream = this.membrane.streamYielding(request);
+    const stream = this.membrane.streamYielding(request, { ...streamBounds(this.inferenceBounds(), request.config.maxTokens), signal });
     let index = 0;
 
     for await (const event of stream) {
@@ -392,7 +497,7 @@ export class InferenceRouter {
           // XML tool mode the chunks can miss text the content holds: prose
           // naming a tag the stream parser opens a block for, or a thinking
           // block cut off before its close tag.
-          if (event.meta.visible) {
+          if (event.meta.visible && !signal.aborted) {
             sendChunk({ requestId, index: index++, delta: event.content });
           }
           break;
@@ -403,7 +508,7 @@ export class InferenceRouter {
         case 'error':
           throw event.error;
         case 'aborted':
-          throw new Error(`The inference stopped before it finished (${event.reason})`);
+          throw new Error(`The inference stopped before it finished (${event.reason}${event.message ? `: ${event.reason === 'timeout' ? withHostSetting(event.message) : event.message}` : ''})`);
       }
     }
     throw new Error('The inference stream ended without a result');

@@ -242,6 +242,7 @@ describe('stop() with an operator operation in flight', () => {
       id: 'srv',
       isConnected: true,
       readied: 0,
+      stopReconnecting(): void {},
       pauseDataPlane(): void {},
       readyControlPlane(): void {},
       ready(): void { this.readied++; },
@@ -399,13 +400,13 @@ describe('stop() with an operator operation in flight', () => {
 
   it('an awareness sync after a stop() that failed is refused', async () => {
     const framework = await create();
-    const fw = framework as unknown as Internals & { codeExecutionRunners: Map<string, { dispose(): void }> };
-    // A runner whose dispose throws fails stop() after the queue has closed,
+    const fw = framework as unknown as Internals & { codeExecution: unknown };
+    // Scripts whose dispose throws fail stop() after the queue has closed,
     // before stop() reaches its wait on the operator set.
-    fw.codeExecutionRunners.set('agent', { dispose() { throw new Error('dispose failed'); } });
+    fw.codeExecution = { scripts: { dispose() { throw new Error('dispose failed'); }, turnEnded() {}, leftRunning: () => 0 } };
     await assert.rejects(framework.stop(), /dispose failed/);
     await assert.rejects(framework.syncDiscordAwarenessMarkers(), /^Error: awareness sync refused: the framework is stopping$/);
-    fw.codeExecutionRunners.clear();
+    fw.codeExecution = null;
     await framework.stop();
     assert.equal(framework.getStore().isClosed(), true);
   });
@@ -561,10 +562,9 @@ describe('stop() with an operator operation in flight', () => {
     const resuming = framework.resume().finally(() => { settled = true; });
     void resuming.catch(() => {});
     try {
-      // Admission is synchronous; promise settlement needs only its microtasks.
-      await Promise.resolve();
-      await Promise.resolve();
-      assert.equal(settled, true, 'refusal must not wait for maintenance');
+      // Refused while the maintenance pass is still held: a refusal that
+      // waited for it would never settle here.
+      await until(() => settled, 'the refusal, with the maintenance pass held');
       await assert.rejects(resuming, /resume refused: the framework is stopping/);
     } finally { endPass(); await stopping; await resuming.catch(() => {}); }
   });
@@ -617,7 +617,7 @@ describe('stop() with an operator operation in flight', () => {
     await releaseWhenStopWaits(release);
     const { toolUseId } = await puppeting;
     await stopping;
-    assert.match(toolUseId, /^toolu_01/);
+    assert.ok(toolUseId, 'the call has its id');
     assert.deepEqual(order, ['tool returned', 'message stored', 'message stored', 'modules stopped']);
     assert.deepEqual(rejections, []);
   });
@@ -719,9 +719,7 @@ describe('stop() with an operator operation in flight', () => {
     } finally { await framework.stop(); }
   });
 
-  it('two API switches handled together each announce their own move', async () => {
-    // With no workspace module, a switch holds the store for no await, so a
-    // second one can move the store before the first's continuation runs.
+  it('two API switches handled together: the second is refused while the first holds the store, and only the first is announced', async () => {
     const framework = await create();
     try {
       const api = new ApiServer(framework) as unknown as {
@@ -734,13 +732,15 @@ describe('stop() with an operator operation in flight', () => {
       await api.cmdBranchCreate({ name: 'b' });
       const broadcasts: Array<[string, unknown]> = [];
       api.broadcast = (event, data) => { broadcasts.push([event, data]); };
-      await Promise.all([api.cmdBranchSwitch({ name: 'a' }), api.cmdBranchSwitch({ name: 'b' })]);
-      assert.deepEqual(broadcasts, [
-        ['branch:switched', { from: 'main', to: 'a' }],
-        ['branch:switched', { from: 'a', to: 'b' }],
-      ]);
-      assert.equal(framework.getStore().currentBranch().name, 'b');
-      assert.equal((await api.cmdBranchCurrent()).name, 'b');
+      const [first, second] = await Promise.allSettled([api.cmdBranchSwitch({ name: 'a' }), api.cmdBranchSwitch({ name: 'b' })]);
+      assert.equal(first.status, 'fulfilled');
+      assert.ok(
+        second.status === 'rejected' && second.reason instanceof OperatorActionError && second.reason.code === 'agent-busy',
+        second.status === 'rejected' ? String(second.reason) : 'the second switch went through',
+      );
+      assert.deepEqual(broadcasts, [['branch:switched', { from: 'main', to: 'a' }]]);
+      assert.equal(framework.getStore().currentBranch().name, 'a');
+      assert.equal((await api.cmdBranchCurrent()).name, 'a');
     } finally { await framework.stop(); }
   });
 

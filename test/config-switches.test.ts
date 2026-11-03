@@ -82,6 +82,8 @@ const THINKING_ENABLED = 'true asks the provider for extended thinking, ' + does
 const AUTO_REWIND = 'true redacts the turn that tripped a refusal and runs again, up to maxRewinds times, ' + doesnt;
 const TOOL_RESULT_GUARD = 'true turns on tool-output admission, with one guarded retry after a provider refusal, ' + doesnt;
 const TOOL_WRAPPER_PROSE_GUARD = 'true keeps a response whose whole prose is a tool-call-shaped wrapper from running or entering the agent\'s history, ' + doesnt;
+const AUTO_CONTINUE_MAX =
+  'the most turns in a row that continue without skip_reply before the agent waits for the next event';
 
 describe('config switches', () => {
   it('create() refuses a framework switch that is not true or false, and a settings object other than an object, null or false', async () => {
@@ -107,6 +109,8 @@ describe('config switches', () => {
       refused({ refusalHandling: 'on' }, 'refusalHandling must be an object, such as { autoRewind: true }, not a string'),
       refused({ toolResultGuard: 0 }, `toolResultGuard must be true or false, not a number: ${TOOL_RESULT_GUARD}`),
       refused({ toolWrapperProseGuard: { on: true } }, `toolWrapperProseGuard must be true or false, not an object: ${TOOL_WRAPPER_PROSE_GUARD}`),
+      refused({ autoContinue: 'true' }, 'autoContinue must be true, false or an object such as { maxConsecutive: 3 }, not a string (true and false go unquoted)'),
+      refused({ autoContinue: { maxConsecutive: 0 } }, `autoContinue.maxConsecutive must be a whole number from 1 to 20, not a number below 1: ${AUTO_CONTINUE_MAX}`),
     ]);
   });
 
@@ -123,6 +127,11 @@ describe('config switches', () => {
         return true;
       });
       assert.deepEqual(workerStates(), [], 'the refused config registered no state under its name');
+      await assert.rejects(framework.createEphemeralAgent({ ...worker, autoContinue: { maxConsecutive: 21 } } as never), (error: Error) => {
+        assert.equal(error.message, `Agent "worker" autoContinue.maxConsecutive must be a whole number from 1 to 20, not a number above 20: ${AUTO_CONTINUE_MAX}`);
+        return true;
+      });
+      assert.deepEqual(workerStates(), [], 'a refused autoContinue registered no state under its name either');
       const created = await framework.createEphemeralAgent(worker);
       assert.notDeepEqual(workerStates(), [], 'a created agent registers its states under its name');
       created.cleanup();

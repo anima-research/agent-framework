@@ -17,11 +17,12 @@
  *
  * Second review round (#140) added three more representations of the same
  * failure, each pinned below:
- *   6. truncation/spill never drops an image slot the resident saw, and
- *      keeps none they didn't see: a result carrying images keeps past its
- *      cut the image slots its live copy showed, the newest 64 of them; a
- *      text result, whose live copy is its stored text, keeps none past the
- *      cut; and no cut ends in part of a slot (#403).
+ *   6. truncation/spill keeps the image slots the resident saw, and keeps
+ *      none they didn't see: a result carrying images keeps past its cut
+ *      the image slots its live copy showed, the newest 64 of them that fit
+ *      the readers' bound, saying how many it left out; a text result,
+ *      whose live copy is its stored text, keeps none past the cut; and no
+ *      cut ends in part of a slot (#403).
  *   7. a save dispatched in the same batch as the snapshot waits for it.
  *   8. refs are namespaced per ledger — a stale ref resolves to nothing,
  *      and a direct `ref` is saved through its occurrence in context.
@@ -30,13 +31,20 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
+import {
+  AnthropicXmlFormatter,
+  NativeFormatter,
+  OpenAIResponsesFormatter,
+  parseToolCalls,
+} from '@animalabs/membrane';
 import type {
   EventResponse,
   Module,
+  ModuleContext,
   ProcessEvent,
   ToolDefinition,
   ToolResult,
@@ -72,8 +80,8 @@ import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
  *  connecting to them: a ws:// or wss:// url for one the host connects to over
  *  a network, a command alone for a stdio server. */
 function configureServers(framework: AgentFramework, configs: Array<{ id: string; url?: string; command?: string; autofetch?: { maxTotalBytes?: number } }>): void {
-  const known = (framework as unknown as { mcplServerConfigs: Map<string, unknown> }).mcplServerConfigs;
-  for (const config of configs) known.set(config.id, config);
+  const configure = (framework as unknown as { setMcplServerConfig(config: unknown): void }).setMcplServerConfig.bind(framework);
+  for (const config of configs) configure(config);
 }
 
 const PNG = Buffer.from(
@@ -114,6 +122,15 @@ const SPLIT_TEXTS = {
   split_quoted: `${'x'.repeat(500)}\n${QUOTED_LINE}`,
   giant_line: QUOTED_LINE,
 } as const;
+/** A text result with an attachment line inside its cap (1000) but past the
+ *  head a bound of 1000 leaves it, with room for the notice. */
+const MID_SLOT_TEXT = `${'x'.repeat(500)}\n${attachmentLine(0)}\n${'x'.repeat(1000)}`;
+/** A text result within a cap of 1000, with an attachment line past what a
+ *  bound of 1200 leaves the head beside the notice's room. */
+const NEAR_SLOT_TEXT = `${'x'.repeat(700)}\n${attachmentLine(0)}\n${'x'.repeat(100)}`;
+/** 24 attachment lines, 12 of them images: under a cap of 4000 its block is
+ *  shown whole, and its slots take more than the notice's room leaves. */
+const LISTING_24 = Array.from({ length: 24 }, (_, i) => attachmentLine(i)).join('\n');
 
 /** World module: `snap` returns a native PNG image block; the other tools
  *  are the review's representations of the same result, one shape each. */
@@ -121,9 +138,16 @@ class SnapModule implements Module {
   readonly name = 'world';
   /** The `quote` tool cites this ref — set by the test once it knows it. */
   quotedRef = 'img_zzzzzz_1';
-  /** Delay before `snap` resolves — proves the same-batch barrier waits. */
-  snapDelayMs = 0;
-  async start(): Promise<void> {}
+  snapAfterCall: string | null = null;
+  private readonly started = new Set<string>();
+  private readonly onStarted = new Set<() => void>();
+  async start(ctx: ModuleContext): Promise<void> {
+    ctx.onTrace((event) => {
+      if (event.type !== 'tool:started') return;
+      this.started.add(event.callId);
+      for (const check of [...this.onStarted]) check();
+    });
+  }
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] {
     const schema = { type: 'object', properties: {} } as const;
@@ -143,6 +167,10 @@ class SnapModule implements Module {
       { name: 'snap_quoting', description: 'A picture, then a caption quoting a reference line.', inputSchema: schema },
       { name: 'snap_named_ref', description: 'A picture, then a referenced one with a long name.', inputSchema: schema },
       ...Object.keys(SPLIT_TEXTS).map((name) => ({ name, description: 'Text cut inside a stub-shaped line.', inputSchema: schema })),
+      { name: 'mid_slot', description: 'Text with an attachment line inside the cap.', inputSchema: schema },
+      { name: 'near_slot', description: 'Text within the cap, with an attachment line near its end.', inputSchema: schema },
+      { name: 'snap_listed', description: 'Text, a snapshot, then 24 attachment lines.', inputSchema: schema },
+      { name: 'snap_noted', description: 'A short note, then a picture.', inputSchema: schema },
       { name: 'quiet_failure', description: 'A failure not flagged as an error.', inputSchema: schema },
       { name: 'loud_failure', description: 'An error result.', inputSchema: schema },
     ];
@@ -195,6 +223,14 @@ class SnapModule implements Module {
       case 'split_quoted':
       case 'giant_line':
         return { success: true, data: [{ type: 'text', text: SPLIT_TEXTS[call.name as keyof typeof SPLIT_TEXTS] }] };
+      case 'mid_slot':
+        return { success: true, data: [{ type: 'text', text: MID_SLOT_TEXT }] };
+      case 'near_slot':
+        return { success: true, data: [{ type: 'text', text: NEAR_SLOT_TEXT }] };
+      case 'snap_noted':
+        return { success: true, data: [{ type: 'text', text: 'n'.repeat(290) }, png] };
+      case 'snap_listed':
+        return { success: true, data: [{ type: 'text', text: 'x'.repeat(3000) }, png, { type: 'text', text: LISTING_24 }] };
       case 'quiet_failure':
         // No data, so its error text is what history stores, and it quotes
         // a placeholder from before retention existed.
@@ -211,7 +247,15 @@ class SnapModule implements Module {
           data: [png, { type: 'image', uri: 'https://cam.example/sri-named.png', name: `${'n'.repeat(200)}.png`, mimeType: 'image/png', sizeBytes: 1200 }],
         };
       default:
-        if (this.snapDelayMs > 0) await new Promise((r) => setTimeout(r, this.snapDelayMs));
+        if (this.snapAfterCall !== null) {
+          const id = this.snapAfterCall;
+          await new Promise<void>((resolve, reject) => {
+            const bound = setTimeout(() => { this.onStarted.delete(check); reject(new Error(`the call ${id} never started`)); }, 10_000);
+            const check = () => { if (this.started.has(id)) { clearTimeout(bound); this.onStarted.delete(check); resolve(); } };
+            this.onStarted.add(check);
+            check();
+          });
+        }
         return { success: true, data: [{ type: 'text', text: 'watchtower, facing north' }, png] };
     }
   }
@@ -251,6 +295,9 @@ async function startTurn(opts: {
   /** The agent's resolved inline cap, below the configurable minimum, as a
    *  small strategy bound gives one. */
   inlineCap?: number;
+  /** With inlineCap, the smallest per-message bound among the readers of
+   *  the agent's store, which a stored copy must fit. */
+  inlineBound?: number;
   world?: (module: SnapModule) => void;
   workspace?: (workspace: WorkspaceModule) => void;
 }): Promise<Harness> {
@@ -278,7 +325,9 @@ async function startTurn(opts: {
   workspace.initStore(framework.getStore());
   if (opts.inlineCap !== undefined) {
     const cap = opts.inlineCap;
-    (framework as unknown as { resolveToolResultInlineCap: () => { cap: number } }).resolveToolResultInlineCap = () => ({ cap });
+    const bound = opts.inlineBound;
+    (framework as unknown as { resolveToolResultInlineCap: () => { cap: number; bound: number | undefined } })
+      .resolveToolResultInlineCap = () => ({ cap, bound });
   }
   // Install the ledger up front so tests know the nonce its refs will carry.
   const ledger = opts.ledger ?? new ToolImageLedger();
@@ -384,6 +433,97 @@ describe('save_recent_image provenance (issue #104)', () => {
     }
   });
 
+  it('each file a save to a mount without autoMaterialize writes says it waits for a materialize, and disk has them only after one', async () => {
+    const h = await startTurn({
+      prefix: 'sri-disk-',
+      responses: [
+        [snapCall('call_snap')],
+        [saveCall('call_save', { path: 'files/pic.png', index: 0, count: 2 })],
+        done,
+      ],
+    });
+    try {
+      const files = saved(await waitForToolResult(h.framework, 'call_save'));
+      assert.deepEqual(files.map((f) => [f.path, f.disk]), [['files/pic-0.png', 'waits for materialize'], ['files/pic-1.png', 'waits for materialize']]);
+      assert.deepEqual(['pic-0.png', 'pic-1.png'].map((name) => existsSync(join(h.mountDir, name))), [false, false], 'not on disk before a materialize');
+      await h.workspace.handleToolCall({ id: 'call_materialize', name: 'materialize', input: { path: 'files' }, callerAgentName: 'prime' });
+      assert.ok(readFileSync(join(h.mountDir, 'pic-0.png')).equals(PNG), 'the snapshot is on disk after it');
+      assert.ok(readFileSync(join(h.mountDir, 'pic-1.png')).equals(GIF), 'the attachment is on disk after it');
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("another agent's stored context injection isn't in the caller's view, so its image takes no slot: index 0 is the attachment", async () => {
+    const h = await startTurn({
+      prefix: 'sri-other-injection-',
+      responses: [
+        [saveCall('call_save0', { path: 'files/avatar.gif', index: 0 })],
+        done,
+      ],
+      // After the attachment, a resident sharing the slot stored an injection
+      // carrying an image (stored-injections.ts): prime's view leaves it out.
+      seedHistory: (framework) => framework.getAgent('prime')!.getContextManager().addMessage('system_context:lessons', [
+        { type: 'text', text: "helper's lesson" },
+        { type: 'image', source: { type: 'base64', data: PNG.toString('base64'), mediaType: 'image/png' } },
+      ] as ContentBlock[], { system: true, kind: 'context-injection', contextInjection: { agent: 'helper', namespace: 'lessons', contentHash: 'h', part: 0, parts: 1 } }),
+    });
+    try {
+      const first = saved(await waitForToolResult(h.framework, 'call_save0'));
+      assert.strictEqual(first[0]!.source, 'attachment');
+      assert.strictEqual(first[0]!.sha256, sha(GIF));
+      assert.ok((await fileBytes(h, 'files/avatar.gif'))?.equals(GIF), "index 0 is the attachment, not the other agent's image");
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a row a tune-out holds from the residents isn't in the caller's view, so its image takes no slot: index 0 is the attachment", async () => {
+    const h = await startTurn({
+      prefix: 'sri-tuned-out-',
+      responses: [
+        [saveCall('call_save0', { path: 'files/avatar.gif', index: 0 })],
+        done,
+      ],
+      seedHistory: (framework) => framework.getAgent('prime')!.getContextManager().addMessage('user', [
+        { type: 'text', text: 'diverted' },
+        { type: 'image', source: { type: 'base64', data: PNG.toString('base64'), mediaType: 'image/png' } },
+      ] as ContentBlock[], { tuneOut: { epochId: 'epoch-1' } }),
+    });
+    try {
+      const first = saved(await waitForToolResult(h.framework, 'call_save0'));
+      assert.strictEqual(first[0]!.source, 'attachment');
+      assert.strictEqual(first[0]!.sha256, sha(GIF));
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("the caller's own stored context injection is in its view, so its image takes index 0", async () => {
+    const h = await startTurn({
+      prefix: 'sri-own-injection-',
+      responses: [
+        [saveCall('call_save0', { path: 'files/lesson.png', index: 0 })],
+        done,
+      ],
+      seedHistory: (framework) => framework.getAgent('prime')!.getContextManager().addMessage('system_context:lessons', [
+        { type: 'text', text: 'my lesson' },
+        { type: 'image', source: { type: 'base64', data: PNG.toString('base64'), mediaType: 'image/png' } },
+      ] as ContentBlock[], { system: true, kind: 'context-injection', contextInjection: { agent: 'prime', namespace: 'lessons', contentHash: 'h', part: 0, parts: 1 } }),
+    });
+    try {
+      const first = saved(await waitForToolResult(h.framework, 'call_save0'));
+      assert.strictEqual(first[0]!.sha256, sha(PNG));
+      assert.ok((await fileBytes(h, 'files/lesson.png'))?.equals(PNG), "index 0 is the caller's own injection image");
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('fails at the exact index when the newest image was evicted — never saves the older attachment', async () => {
     // A ledger that holds nothing: every retained image is evicted at once,
     // which is what a restart or a blown budget looks like from the scan.
@@ -433,6 +573,10 @@ describe('save_recent_image provenance (issue #104)', () => {
       const result = await waitForToolResult(h.framework, 'call_save');
       assert.strictEqual(result.isError, true);
       assert.match(result.content, /index 0 is a tool-result image from world--snap \(call call_old\) recorded without a retention ref/);
+      // An embedded image nested in a tool's data is kept only as its
+      // placeholder too, and a re-run records it the same way.
+      assert.match(result.content, /nested in the tool's data rather than its content/);
+      assert.match(result.content, /unless the image came nested in its data, which a re-run records the same way/);
       assert.ok((await fileBytes(h, 'files/phoenix.png')) === null, 'the older GIF must not be written under the PNG name');
     } finally {
       await h.framework.stop();
@@ -1107,6 +1251,42 @@ describe('save_recent_image provenance (issue #104)', () => {
     }
   });
 
+  it("under a reader's bound, a result carrying an image keeps its notice and the slots its live copy showed, all within the bound", async () => {
+    const h = await startTurn({
+      prefix: 'sri-captioned-bound-',
+      inlineCap: 1000,
+      inlineBound: 1000,
+      responses: [
+        [{ type: 'tool_use', id: 'call_captioned', name: 'world--snap_captioned', input: {} } as ContentBlock],
+        [saveCall('call_save_snap', { path: 'files/snap.png', index: 1 })],
+        [saveCall('call_save_gif', { path: 'files/avatar.gif', index: 2 })],
+        done,
+      ],
+    });
+    try {
+      const stored = await waitForToolResult(h.framework, 'call_captioned');
+      // The cap is the bound, so the head moves back until the notice and the
+      // kept slots fit after it: a reader's cut at the bound loses none.
+      assert.ok(stored.content.length <= 1000, `the stored copy is ${stored.content.length} characters`);
+      assert.match(stored.content, /\n\n\[truncated — showing \d+ of \d+ chars; full content: workspace file [^\]]+\]\n\[2 image slot\(s\) fell past the cut; /);
+      assert.deepStrictEqual(
+        parseImagePlaceholders(stored.content).map((s) => (s.kind === 'inline' ? s.ref : s.text)),
+        [refOf(h, 1), attachmentLine(0)],
+      );
+      // The inventory counted the slots as the bound cut them: index 1 is the
+      // snapshot and index 2 the older GIF.
+      const snap = saved(await waitForToolResult(h.framework, 'call_save_snap'));
+      assert.strictEqual(snap[0]!.toolCallId, 'call_captioned');
+      assert.strictEqual(snap[0]!.sha256, sha(PNG));
+      const gif = saved(await waitForToolResult(h.framework, 'call_save_gif'));
+      assert.strictEqual(gif[0]!.source, 'attachment');
+      assert.strictEqual(gif[0]!.sha256, sha(GIF));
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('a result whose array the converters give up on keeps nothing past its cut: its live copy is its stored text', async () => {
     const h = await startTurn({
       prefix: 'sri-mystery-cut-',
@@ -1179,13 +1359,310 @@ describe('save_recent_image provenance (issue #104)', () => {
     }
   });
 
+  it("under a reader's bound, kept slots longer than the notice's spare room move the head back far enough for all of them to fit", async () => {
+    const h = await startTurn({
+      prefix: 'sri-listed-bound-',
+      inlineCap: 4000,
+      inlineBound: 4000,
+      responses: [[{ type: 'tool_use', id: 'call_listed', name: 'world--snap_listed', input: {} } as ContentBlock], done],
+    });
+    try {
+      // Each block is within the cap, so the live copy showed the snapshot and
+      // every line. Cut at the cap, the stored copy would pass the bound; the
+      // head moves back past the snapshot and the listing, and each of their
+      // slots is kept after the notice, the copy still within the bound.
+      const stored = await waitForToolResult(h.framework, 'call_listed');
+      assert.ok(stored.content.length <= 4000, `the stored copy is ${stored.content.length} characters`);
+      assert.match(stored.content, /^x+\n\n\[truncated — showing \d+ of \d+ chars; full content: workspace file [^\]]+\]\n\[13 image slot\(s\) fell past the cut; /);
+      assert.deepStrictEqual(
+        parseImagePlaceholders(stored.content).map((s) => (s.kind === 'inline' ? s.ref : s.text)),
+        [refOf(h, 1), ...Array.from({ length: 12 }, (_, i) => attachmentLine(2 * i))],
+      );
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("under a reader's bound, where kept slots hold the head below the cap, the notice doesn't offer raising the cap, which would keep no more", async () => {
+    const h = await startTurn({
+      prefix: 'sri-listed-noraise-',
+      inlineCap: 3000,
+      inlineBound: 4000,
+      responses: [[{ type: 'tool_use', id: 'call_listed', name: 'world--snap_listed', input: {} } as ContentBlock], done],
+    });
+    try {
+      // The cap of 3000 is under the bound less the notice's room (3360), but
+      // the 13 kept slots take more than the 360 between them, so the head
+      // moves back below the cap, as it would under any higher cap.
+      const stored = await waitForToolResult(h.framework, 'call_listed');
+      const head = /^x*/.exec(stored.content)![0];
+      assert.ok(head.length < 3000, `the head is ${head.length} characters`);
+      assert.match(stored.content, /\[13 image slot\(s\) fell past the cut; /);
+      assert.doesNotMatch(stored.content, /raise the inline cap/);
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("under a reader's bound that holds only some of the kept slots, the newest that fit are kept and the rest are said to be left out", async () => {
+    const h = await startTurn({
+      prefix: 'sri-listed-some-',
+      inlineCap: 4000,
+      inlineBound: 1500,
+      responses: [[{ type: 'tool_use', id: 'call_listed', name: 'world--snap_listed', input: {} } as ContentBlock], done],
+    });
+    try {
+      // The 13 slots the live copy showed take more than the 860 characters
+      // the bound leaves beside the notice, so the head is empty and the
+      // oldest slots are left out until the rest fit.
+      const stored = await waitForToolResult(h.framework, 'call_listed');
+      assert.ok(stored.content.length <= 1500, `the stored copy is ${stored.content.length} characters`);
+      const all = [refOf(h, 1), ...Array.from({ length: 12 }, (_, i) => attachmentLine(2 * i))];
+      const kept = parseImagePlaceholders(stored.content).map((s) => (s.kind === 'inline' ? s.ref : s.text));
+      assert.ok(kept.length > 0 && kept.length < all.length, `${kept.length} slots kept`);
+      assert.deepStrictEqual(kept, all.slice(-kept.length), 'the newest slots, in order');
+      assert.ok(stored.content.includes(`[13 image slot(s) fell past the cut. The last ${kept.length} are kept here in order so save_recent_image still counts them; the ${13 - kept.length} before them are left out, and it doesn't count them:]`), stored.content.slice(-400));
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("under a reader's bound, a text result's cut counts no slot it moved back past, before its commit or after", async () => {
+    const h = await startTurn({
+      prefix: 'sri-mid-slot-',
+      inlineCap: 1000,
+      inlineBound: 1000,
+      responses: [
+        [
+          { type: 'tool_use', id: 'call_mid', name: 'world--mid_slot', input: {} } as ContentBlock,
+          saveCall('call_save_batch', { path: 'files/batch.gif', index: 0 }),
+        ],
+        [saveCall('call_save_after', { path: 'files/after.gif', index: 0 })],
+        done,
+      ],
+    });
+    try {
+      // The cap would keep the attachment line, at 501; the bound moves the
+      // head back before it, alone or beside the save, and a text result
+      // keeps nothing past its cut.
+      const stored = await waitForToolResult(h.framework, 'call_mid');
+      assert.ok(stored.content.length <= 1000, `the stored copy is ${stored.content.length} characters`);
+      assert.deepStrictEqual(parseImagePlaceholders(stored.content), []);
+      // So the save in its batch, counted before the commit, and the save
+      // after it both reach past it to the GIF.
+      for (const id of ['call_save_batch', 'call_save_after']) {
+        const receipt = saved(await waitForToolResult(h.framework, id));
+        assert.strictEqual(receipt[0]!.source, 'attachment', id);
+        assert.strictEqual(receipt[0]!.sha256, sha(GIF), id);
+      }
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a save in its batch that counts a result by its share marks the round, which is stored by its share though it fits", async () => {
+    const h = await startTurn({
+      prefix: 'sri-mid-slot-marked-',
+      inlineCap: 1000,
+      inlineBound: 2000,
+      responses: [
+        [
+          { type: 'tool_use', id: 'call_mid', name: 'world--mid_slot', input: {} } as ContentBlock,
+          saveCall('call_save_batch', { path: 'files/batch.gif', index: 0 }),
+        ],
+        done,
+      ],
+    });
+    try {
+      // Alone, the result keeps the attachment line, at 501, in a head cut at
+      // the cap, and the round would fit. Beside the save its share is 1000,
+      // whose fit leaves a head of 360, before the line. The two ways differ,
+      // so the save counts by the share and marks the round, which is then
+      // stored by it: the stored copy holds no slot, and index 0 is the GIF.
+      const stored = await waitForToolResult(h.framework, 'call_mid');
+      assert.ok(stored.content.length <= 1000, `the stored copy is ${stored.content.length} characters`);
+      assert.deepStrictEqual(parseImagePlaceholders(stored.content), []);
+      const receipt = saved(await waitForToolResult(h.framework, 'call_save_batch'));
+      assert.strictEqual(receipt[0]!.source, 'attachment');
+      assert.strictEqual(receipt[0]!.sha256, sha(GIF));
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a save in its batch counts a result within the cap as stored whole alone, so the round it marks is stored by its share", async () => {
+    const h = await startTurn({
+      prefix: 'sri-near-slot-',
+      inlineCap: 1000,
+      inlineBound: 1200,
+      responses: [
+        [
+          { type: 'tool_use', id: 'call_near', name: 'world--near_slot', input: {} } as ContentBlock,
+          saveCall('call_save_batch', { path: 'files/batch.gif', index: 0 }),
+        ],
+        done,
+      ],
+    });
+    try {
+      // Alone, the result is within the cap and would be stored whole, its
+      // attachment line at 701 included. By its share beside the save, 600,
+      // the line is cut away. The two ways differ, so the round is marked and
+      // stored by its share: the stored copy holds no slot, as the save counted.
+      const stored = await waitForToolResult(h.framework, 'call_near');
+      assert.ok(stored.content.length <= 600, `the stored copy is ${stored.content.length} characters`);
+      assert.deepStrictEqual(parseImagePlaceholders(stored.content), []);
+      const receipt = saved(await waitForToolResult(h.framework, 'call_save_batch'));
+      assert.strictEqual(receipt[0]!.sha256, sha(GIF));
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a save in its batch counts a result carrying an image as its share of the bound will store it", async () => {
+    const h = await startTurn({
+      prefix: 'sri-captioned-share-',
+      inlineCap: 1000,
+      inlineBound: 1000,
+      responses: [
+        [
+          { type: 'tool_use', id: 'call_captioned', name: 'world--snap_captioned', input: {} } as ContentBlock,
+          saveCall('call_save_batch', { path: 'files/batch.gif', index: 0 }),
+        ],
+        done,
+      ],
+    });
+    try {
+      // Alone, the snapshot would keep its two slots under the bound; by its
+      // share beside the save, 500, under the notice's room, it keeps none.
+      // The two ways differ, so the save counts by the share and marks the
+      // round, which is then stored by it.
+      const stored = await waitForToolResult(h.framework, 'call_captioned');
+      assert.deepStrictEqual(parseImagePlaceholders(stored.content), []);
+      assert.match(stored.content, /\n\[2 image slot\(s\) fell past the cut and are left out, and save_recent_image doesn't count them\.\]$/);
+      // So the save, counted before the commit, takes index 0 as the older
+      // GIF, not a slot the stored copy doesn't hold.
+      const receipt = saved(await waitForToolResult(h.framework, 'call_save_batch'));
+      assert.strictEqual(receipt[0]!.source, 'attachment');
+      assert.strictEqual(receipt[0]!.sha256, sha(GIF));
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a save in its batch counts a result no longer than its notice as stored whole, as its share stores it", async () => {
+    const h = await startTurn({
+      prefix: 'sri-short-share-',
+      inlineCap: 1000,
+      inlineBound: 100,
+      responses: [
+        [
+          { type: 'tool_use', id: 'call_snap', name: 'world--snap', input: {} } as ContentBlock,
+          saveCall('call_save_batch', { path: 'files/batch.png', index: 0 }),
+        ],
+        done,
+      ],
+    });
+    try {
+      // Beside the save its share is 50, under the snapshot's text, and the
+      // notice a cut would store in its place is longer than the text, so
+      // it is stored whole, its image slot with it. The save, counted
+      // before the commit, counts it the same way: index 0 is the snapshot.
+      const stored = await waitForToolResult(h.framework, 'call_snap');
+      assert.match(stored.content, /^watchtower, facing north/);
+      assert.doesNotMatch(stored.content, /truncated/);
+      assert.equal(parseImagePlaceholders(stored.content).length, 1);
+      // The save's own receipt is past its share too, so its bytes are read
+      // from the file it wrote.
+      await waitForToolResult(h.framework, 'call_save_batch');
+      const bytes = await fileBytes(h, 'files/batch.png');
+      assert.ok(bytes, 'the save wrote its file');
+      assert.strictEqual(sha(bytes), sha(PNG));
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("under a share, an image result no longer than its notice and the note on its left-out slot is stored whole", async () => {
+    const h = await startTurn({
+      prefix: 'sri-noted-share-',
+      inlineCap: 1000,
+      inlineBound: 600,
+      responses: [
+        [
+          { type: 'tool_use', id: 'call_noted', name: 'world--snap_noted', input: {} } as ContentBlock,
+          saveCall('call_save_batch', { path: 'files/batch.png', index: 0 }),
+        ],
+        done,
+      ],
+    });
+    try {
+      // Beside the save its share is 300, under the result's text and its
+      // notice's room. Its cut would keep no head and no slot, and store the
+      // notice and the note that its slot was left out, which together are
+      // longer than the text: so it is stored whole, its slot with it, and
+      // the save counts it so.
+      const stored = await waitForToolResult(h.framework, 'call_noted');
+      assert.match(stored.content, /^n{290}/);
+      assert.doesNotMatch(stored.content, /truncated|left out/);
+      assert.equal(parseImagePlaceholders(stored.content).length, 1);
+      await waitForToolResult(h.framework, 'call_save_batch');
+      const bytes = await fileBytes(h, 'files/batch.png');
+      assert.ok(bytes, 'the save wrote its file');
+      assert.strictEqual(sha(bytes), sha(PNG));
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a turn that fits, with a save beside an image result past its share but no longer than its notice and note, is stored as each result would be alone", async () => {
+    const h = await startTurn({
+      prefix: 'sri-noted-fits-',
+      inlineCap: 2000,
+      inlineBound: 960,
+      responses: [
+        [
+          { type: 'tool_use', id: 'call_quiet', name: 'world--quiet_failure', input: {} } as ContentBlock,
+          { type: 'tool_use', id: 'call_noted', name: 'world--snap_noted', input: {} } as ContentBlock,
+          saveCall('call_save_batch', { path: 'files/batch.png', index: 0 }),
+        ],
+        done,
+      ],
+    });
+    try {
+      // Three calls under a bound of 960: a share of 320, under the result's
+      // text. By its share the result would keep its slot whole, as it would
+      // alone, so the save marks nothing, and the turn, which fits, is stored
+      // as each result would be alone: the save's receipt whole beside it.
+      const stored = await waitForToolResult(h.framework, 'call_noted');
+      assert.ok(stored.content.length > 320, `the result is past its share (${stored.content.length})`);
+      assert.match(stored.content, /^n{290}/);
+      assert.equal(parseImagePlaceholders(stored.content).length, 1);
+      const receipt = await waitForToolResult(h.framework, 'call_save_batch');
+      const quiet = await waitForToolResult(h.framework, 'call_quiet');
+      assert.ok(stored.content.length + receipt.content.length + quiet.content.length <= 960, 'the turn fits its bound');
+      assert.strictEqual(saved(receipt)[0]!.sha256, sha(PNG), 'the receipt is stored whole, and the save took the snapshot');
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('a save dispatched in the SAME batch as the snapshot waits for it and saves it', async () => {
     // One tool_use round: [snap, save]. Module calls are only enqueued while
     // the save runs at once — without the barrier the inventory is empty at
     // scan time and the older GIF gets saved under the snapshot's name.
     const h = await startTurn({
       prefix: 'sri-same-batch-',
-      world: (world) => { world.snapDelayMs = 150; },
+      world: (world) => { world.snapAfterCall = 'call_save'; },
       responses: [
         [snapCall('call_snap'), saveCall('call_save', { path: 'files/batched.png', index: 0 })],
         done,
@@ -1215,7 +1692,7 @@ describe('save_recent_image provenance (issue #104)', () => {
     // at review time and never by a test.
     const h = await startTurn({
       prefix: 'sri-same-batch-rev-',
-      world: (world) => { world.snapDelayMs = 150; },
+      world: (world) => { world.snapAfterCall = 'call_save'; },
       responses: [
         [saveCall('call_save', { path: 'files/batched-rev.png', index: 0 }), snapCall('call_snap')],
         done,
@@ -1401,6 +1878,351 @@ describe('save_recent_image provenance (issue #104)', () => {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Nullable selectors. A caller whose provider presents every property as
+// required sends all three selectors; null or an empty string (like
+// omission) must mean "not this selector", while any other SUPPLIED value is
+// checked and never read as absent: " ", false or [] read as 0 would save
+// the newest image instead of the one the caller named.
+// ---------------------------------------------------------------------------
+
+/** One XML tool call as a model on the XML path writes it. Tags are assembled
+ *  from pieces so this file holds no literal tool-call markup. */
+function xmlCall(name: string, params: Record<string, string>): string {
+  const tag = (t: string): string => `<${t}>`;
+  const close = (t: string): string => `</${t}>`;
+  const FC = 'function' + '_calls';
+  return [
+    tag(FC),
+    `<invoke name="${name}">`,
+    ...Object.entries(params).map(([k, v]) => `<parameter name="${k}">${v}${close('parameter')}`),
+    close('invoke'),
+    close(FC),
+  ].join('\n');
+}
+
+/** The definition the framework actually offers when a workspace is registered. */
+async function offeredDefinition(): Promise<ToolDefinition> {
+  const tempDir = mkdtempSync(join(tmpdir(), 'sri-schema-'));
+  const mountDir = join(tempDir, 'mount');
+  mkdirSync(mountDir, { recursive: true });
+  const workspace = new WorkspaceModule({ mounts: [{ name: 'files', path: mountDir, mode: 'read-write', watch: 'never' }] });
+  const framework = await AgentFramework.create({
+    storePath: join(tempDir, 'store'),
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all' }],
+    modules: [workspace as unknown as Module],
+    syncIntervalMs: 0,
+  });
+  try {
+    workspace.initStore(framework.getStore());
+    const definition = framework.getAllTools().find((t) => t.name === 'save_recent_image');
+    assert.ok(definition, 'save_recent_image is offered with a workspace');
+    return structuredClone(definition);
+  } finally {
+    await framework.stop();
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+/** The input membrane's XML parser hands the framework for that call, parsed
+ *  as membrane parses a round's calls: against the tools it declared. */
+function parsedXmlInput(params: Record<string, string>, definition: ToolDefinition): Record<string, unknown> {
+  const parsed = parseToolCalls(xmlCall('save_recent_image', params), { tools: [definition] });
+  assert.ok(parsed && parsed.calls.length === 1, 'membrane parses the XML call');
+  return parsed.calls[0]!.input;
+}
+
+const failed = (result: { content: string; isError: boolean }): string => {
+  assert.strictEqual(result.isError, true, `expected a refusal, got: ${result.content}`);
+  return result.content;
+};
+
+describe('save_recent_image selectors: omission, null and the empty string all mean unused', () => {
+  it('sparse and every-property calls each save the image they name', async () => {
+    const ledger = new ToolImageLedger();
+    const ref1 = `img_${ledger.nonce}_1`;
+    const xmlEveryProperty = parsedXmlInput({ path: 'files/xml.gif', ref: 'null', index: '1', count: 'null' }, await offeredDefinition());
+    assert.deepStrictEqual(xmlEveryProperty, { path: 'files/xml.gif', ref: null, index: 1, count: null },
+      'the XML path delivers null selectors as null');
+    const h = await startTurn({
+      prefix: 'sri-nullable-',
+      ledger,
+      responses: [
+        [snapCall('call_snap')],
+        [
+          // Sparse callers: only the selector in use.
+          saveCall('call_sparse', { path: 'files/sparse.png' }),
+          saveCall('call_sparse_ref', { path: 'files/sparse-ref.png', ref: ref1 }),
+          saveCall('call_sparse_pos', { path: 'files/sparse-pos.gif', index: 1, count: 1 }),
+          // Every-property callers: null for the selector not in use, both modes.
+          saveCall('call_every_pos', { path: 'files/every-pos.gif', ref: null, index: 1, count: null }),
+          saveCall('call_every_ref', { path: 'files/every-ref.png', ref: ref1, index: null, count: null }),
+          saveCall('call_every_range', { path: 'files/range.png', ref: null, index: null, count: 2 }),
+          // ...index 0 beside the nulls, and every selector null: both the newest image.
+          saveCall('call_every_newest', { path: 'files/every-newest.png', ref: null, index: 0, count: null }),
+          saveCall('call_every_unused', { path: 'files/every-unused.png', ref: null, index: null, count: null }),
+          // Every-property callers that fill the unused selector with an empty string.
+          saveCall('call_empty_pos', { path: 'files/empty-pos.gif', ref: '', index: 1, count: '' }),
+          saveCall('call_empty_ref', { path: 'files/empty-ref.png', ref: ref1, index: '', count: '' }),
+          saveCall('call_empty_all', { path: 'files/empty-all.png', ref: '', index: '', count: '' }),
+          // The narrow compatibility form: decimal-digit strings.
+          saveCall('call_digits', { path: 'files/digits.gif', ref: null, index: '1', count: '1' }),
+          // ...with surrounding whitespace trimmed: the digits still name the same image.
+          saveCall('call_padded', { path: 'files/padded.gif', ref: null, index: ' 1', count: '1 ' }),
+          saveCall('call_padded_range', { path: 'files/prange.png', ref: null, index: null, count: ' 2 ' }),
+          // What the XML path delivers for an every-property call.
+          saveCall('call_xml', xmlEveryProperty),
+        ],
+        done,
+      ],
+    });
+    try {
+      await waitForToolResult(h.framework, 'call_snap');
+      const expectPng = async (callId: string, path: string, imageIndex: number): Promise<void> => {
+        const s = saved(await waitForToolResult(h.framework, callId));
+        assert.strictEqual(s.length, 1, callId);
+        assert.strictEqual(s[0]!.sha256, sha(PNG), `${callId} saved the snapshot`);
+        assert.strictEqual(s[0]!.imageIndex, imageIndex, callId);
+        assert.ok((await fileBytes(h, path))?.equals(PNG), `${callId} wrote the snapshot`);
+      };
+      const expectGif = async (callId: string, path: string): Promise<void> => {
+        const s = saved(await waitForToolResult(h.framework, callId));
+        assert.strictEqual(s.length, 1, callId);
+        assert.strictEqual(s[0]!.sha256, sha(GIF), `${callId} saved the older attachment`);
+        assert.strictEqual(s[0]!.imageIndex, 1, callId);
+        assert.ok((await fileBytes(h, path))?.equals(GIF), `${callId} wrote the attachment`);
+      };
+      await expectPng('call_sparse', 'files/sparse.png', 0);
+      await expectPng('call_sparse_ref', 'files/sparse-ref.png', 0);
+      await expectGif('call_sparse_pos', 'files/sparse-pos.gif');
+      await expectGif('call_every_pos', 'files/every-pos.gif');
+      await expectPng('call_every_ref', 'files/every-ref.png', 0);
+      await expectPng('call_every_newest', 'files/every-newest.png', 0);
+      await expectPng('call_every_unused', 'files/every-unused.png', 0);
+      await expectGif('call_digits', 'files/digits.gif');
+      await expectGif('call_padded', 'files/padded.gif');
+      await expectGif('call_empty_pos', 'files/empty-pos.gif');
+      await expectPng('call_empty_ref', 'files/empty-ref.png', 0);
+      await expectPng('call_empty_all', 'files/empty-all.png', 0);
+      await expectGif('call_xml', 'files/xml.gif');
+
+      const range = saved(await waitForToolResult(h.framework, 'call_every_range'));
+      assert.deepStrictEqual(range.map((f) => f.sha256), [sha(PNG), sha(GIF)], 'count 2 with null index is the newest two');
+      assert.ok((await fileBytes(h, 'files/range-0.png'))?.equals(PNG));
+      assert.ok((await fileBytes(h, 'files/range-1.png'))?.equals(GIF));
+      const padded = saved(await waitForToolResult(h.framework, 'call_padded_range'));
+      assert.deepStrictEqual(padded.map((f) => f.sha256), [sha(PNG), sha(GIF)], 'a padded count of 2 saves the newest two');
+      assert.ok((await fileBytes(h, 'files/prange-0.png'))?.equals(PNG));
+      assert.ok((await fileBytes(h, 'files/prange-1.png'))?.equals(GIF));
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a supplied selector is checked, never read as absent; only a real conflict is refused as one', async () => {
+    const ledger = new ToolImageLedger();
+    const ref1 = `img_${ledger.nonce}_1`;
+    const REF_FORMAT = /`ref` must look like "img_k7x3q2_7"/;
+    const INDEX = /`index` must be a non-negative integer/;
+    const COUNT = /`count` must be an integer in 1\.\.20/;
+    const CONFLICT = /`ref` is mutually exclusive with `index`\/`count` — pass null \(or omit\) for the selector you are not using/;
+    const HINT = 'pass null, or leave it out, for a selector you are not using';
+    const cases: Array<{ id: string; input: Record<string, unknown>; refusal: RegExp; hint?: boolean }> = [
+      { id: 'ref_blank', input: { ref: '   ' }, refusal: REF_FORMAT },
+      // A malformed ref beside an index or count in use carries the unused-selector
+      // hint; a ref that is the caller's only selector doesn't.
+      { id: 'ref_malformed_with_index', input: { ref: 'img_1', index: 1, count: null }, refusal: REF_FORMAT, hint: true },
+      { id: 'ref_malformed_with_count', input: { ref: 'img_1', index: null, count: 2 }, refusal: REF_FORMAT, hint: true },
+      { id: 'ref_malformed_with_index_zero', input: { ref: 'img_1', index: 0 }, refusal: REF_FORMAT, hint: true },
+      { id: 'ref_malformed', input: { ref: 'img_1' }, refusal: REF_FORMAT },
+      { id: 'ref_number', input: { ref: 5 }, refusal: REF_FORMAT },
+      { id: 'ref_false', input: { ref: false, index: null, count: null }, refusal: REF_FORMAT },
+      { id: 'ref_array', input: { ref: [] }, refusal: REF_FORMAT },
+      // An array holding a valid ref reads as that ref to a regex test.
+      { id: 'ref_in_array', input: { ref: [ref1] }, refusal: REF_FORMAT },
+      { id: 'index_blank', input: { ref: null, index: ' ', count: null }, refusal: INDEX },
+      { id: 'index_false', input: { index: false }, refusal: INDEX },
+      { id: 'index_true', input: { index: true }, refusal: INDEX },
+      { id: 'index_array', input: { index: [] }, refusal: INDEX },
+      { id: 'index_decimal_text', input: { index: '1.0' }, refusal: INDEX },
+      { id: 'index_negative', input: { index: -1 }, refusal: INDEX },
+      { id: 'index_fraction', input: { index: 1.5 }, refusal: INDEX },
+      // Past the integers a number holds exactly, digits would read as another number.
+      { id: 'index_unsafe_digits', input: { index: '9007199254740993' }, refusal: INDEX },
+      { id: 'index_unsafe_number', input: { index: 9007199254740992 }, refusal: INDEX },
+      // An index and a count are one selector: neither refusal invites dropping the other.
+      { id: 'index_bad_with_count', input: { index: '1.5', count: 2 }, refusal: INDEX },
+      { id: 'index_bad_beside_empty_count', input: { index: '1.5', count: '' }, refusal: INDEX },
+      { id: 'count_true', input: { ref: null, index: null, count: true }, refusal: COUNT },
+      { id: 'count_array', input: { count: [2] }, refusal: COUNT },
+      { id: 'count_zero', input: { count: 0 }, refusal: COUNT },
+      { id: 'count_decimal_text', input: { count: '2.0' }, refusal: COUNT },
+      { id: 'count_blank', input: { count: ' ' }, refusal: COUNT },
+      { id: 'count_bad_with_index', input: { index: 0, count: 21 }, refusal: COUNT },
+      { id: 'count_over', input: { count: 21 }, refusal: COUNT },
+      { id: 'conflict_count', input: { ref: ref1, count: 2 }, refusal: CONFLICT },
+      { id: 'conflict_index', input: { ref: ref1, index: 0, count: null }, refusal: CONFLICT },
+    ];
+    const h = await startTurn({
+      prefix: 'sri-supplied-',
+      ledger,
+      responses: [
+        [snapCall('call_snap')],
+        cases.map((c) => saveCall(`call_${c.id}`, { path: `files/${c.id}.png`, ...c.input })),
+        done,
+      ],
+    });
+    try {
+      await waitForToolResult(h.framework, 'call_snap');
+      for (const c of cases) {
+        const message = failed(await waitForToolResult(h.framework, `call_${c.id}`));
+        assert.match(message, c.refusal, c.id);
+        // A refusal advises dropping a selector only beside another in use, so it
+        // never reads as advice to drop the caller's one selector.
+        if (c.refusal !== CONFLICT) assert.strictEqual(message.includes(HINT), c.hint === true, `${c.id}: hint`);
+        assert.strictEqual(await fileBytes(h, `files/${c.id}.png`), null, `${c.id} wrote nothing`);
+      }
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Validates a call against the schema keywords save_recent_image uses. Any
+ * other keyword throws rather than being ignored, so this can't pass a schema
+ * it doesn't understand.
+ */
+const SCHEMA_KEYWORDS = new Set(['type', 'properties', 'required', 'description', 'additionalProperties']);
+function schemaErrors(schema: Record<string, unknown>, value: Record<string, unknown>): string[] {
+  const known = (node: Record<string, unknown>): void => {
+    for (const key of Object.keys(node)) {
+      if (!SCHEMA_KEYWORDS.has(key)) throw new Error(`schemaErrors does not understand keyword "${key}"`);
+    }
+  };
+  const matches = (v: unknown, type: string): boolean => {
+    switch (type) {
+      case 'object': return typeof v === 'object' && v !== null && !Array.isArray(v);
+      case 'string': return typeof v === 'string';
+      case 'integer': return typeof v === 'number' && Number.isInteger(v);
+      case 'number': return typeof v === 'number';
+      case 'null': return v === null;
+      default: throw new Error(`schemaErrors does not understand type "${type}"`);
+    }
+  };
+  known(schema);
+  const errors: string[] = [];
+  // Providers require a tool's input schema to describe an object.
+  if (schema.type === undefined) {
+    errors.push('root: no type');
+  } else {
+    const rootTypes = (Array.isArray(schema.type) ? schema.type : [schema.type]) as string[];
+    if (!rootTypes.some((t) => matches(value, t))) errors.push(`root: an object is not ${rootTypes.join(' | ')}`);
+  }
+  const properties = (schema.properties ?? {}) as Record<string, Record<string, unknown>>;
+  for (const name of (schema.required ?? []) as string[]) {
+    if (!(name in value)) errors.push(`missing required ${name}`);
+  }
+  for (const [name, v] of Object.entries(value)) {
+    const property = properties[name];
+    if (!property) {
+      if (schema.additionalProperties === false) errors.push(`unexpected ${name}`);
+      continue;
+    }
+    known(property);
+    const types = (Array.isArray(property.type) ? property.type : [property.type]) as string[];
+    if (!types.some((t) => matches(v, t))) errors.push(`${name}: ${JSON.stringify(v)} is not ${types.join(' | ')}`);
+  }
+  return errors;
+}
+
+describe('save_recent_image schema as each provider path is sent it (installed membrane)', () => {
+  it('the checker itself rejects a schema whose root does not describe an object', () => {
+    const properties = { path: { type: 'string' } };
+    assert.deepStrictEqual(schemaErrors({ type: 'object', properties }, { path: 'files/a.png' }), []);
+    assert.deepStrictEqual(schemaErrors({ type: 'string', properties }, { path: 'files/a.png' }), ['root: an object is not string']);
+    assert.deepStrictEqual(schemaErrors({ properties }, { path: 'files/a.png' }), ['root: no type']);
+  });
+
+  const REF = 'img_k7x3q2_7';
+  const SHAPES: Array<Record<string, unknown>> = [
+    { path: 'files/a.png' },
+    { path: 'files/a.png', ref: REF },
+    { path: 'files/a.png', index: 1, count: 2 },
+    { path: 'files/a.png', ref: null, index: 1, count: 2 },
+    { path: 'files/a.png', ref: REF, index: null, count: null },
+    { path: 'files/a.png', ref: null, index: null, count: null },
+  ];
+
+  const options = (tools: ToolDefinition[], toolMode?: 'xml' | 'native') => ({
+    participantMode: 'simple' as const,
+    assistantParticipant: 'Claude',
+    humanParticipant: 'User',
+    systemPrompt: 'You are prime.',
+    tools,
+    ...(toolMode ? { toolMode } : {}),
+  });
+
+  it('Anthropic native input_schema accepts sparse and every-property calls', async () => {
+    const definition = await offeredDefinition();
+    const built = new NativeFormatter().buildMessages([], options([definition], 'native'));
+    const tool = (built.nativeTools as Array<{ name: string; input_schema: Record<string, unknown> }>)
+      .find((t) => t.name === 'save_recent_image');
+    assert.ok(tool, 'native tools carry save_recent_image');
+    for (const shape of SHAPES) assert.deepStrictEqual(schemaErrors(tool.input_schema, shape), [], JSON.stringify(shape));
+    assert.notDeepStrictEqual(schemaErrors(tool.input_schema, { path: 'files/a.png', ref: 5 }), [],
+      'the validator can refuse a wrong type');
+  });
+
+  it('Responses function parameters accept sparse and every-property calls', async () => {
+    const definition = await offeredDefinition();
+    const built = new OpenAIResponsesFormatter().buildMessages([], options([definition]));
+    const tool = (built.nativeTools as Array<{ type: string; name: string; parameters: Record<string, unknown> }>)
+      .find((t) => t.name === 'save_recent_image');
+    assert.ok(tool, 'Responses tools carry save_recent_image');
+    assert.strictEqual(tool.type, 'function');
+    for (const shape of SHAPES) assert.deepStrictEqual(schemaErrors(tool.parameters, shape), [], JSON.stringify(shape));
+  });
+
+  it('XML tool definitions mark every selector nullable and require only path', async () => {
+    const definition = await offeredDefinition();
+    const built = new AnthropicXmlFormatter({ toolInjectionMode: 'system' }).buildMessages([], options([definition], 'xml'));
+    const system = JSON.stringify(built.systemContent);
+    const start = system.indexOf('<tool name=\\"save_recent_image\\">');
+    assert.ok(start >= 0, 'the XML system prompt defines save_recent_image');
+    const section = system.slice(start, system.indexOf('</tool>', start));
+    const parameter = (name: string): string => {
+      const match = new RegExp(`<parameter name=\\\\"${name}\\\\"[^>]*>`).exec(section);
+      assert.ok(match, `parameter ${name} is rendered`);
+      return match[0];
+    };
+    for (const [name, base] of [['ref', 'string'], ['index', 'integer'], ['count', 'integer']] as const) {
+      // Each selector's own base type, with null marked one of the two ways
+      // membrane renders it: as written (type="string,null", membrane 0.5.86)
+      // or as nullable="true" (0.5.87 on). Nothing else is accepted here.
+      const nullable = new RegExp(`type=\\\\"${base}(?:,null\\\\"|\\\\"[^>]*nullable=\\\\"true\\\\")`);
+      assert.match(parameter(name), nullable, `${name} is ${base}, marked nullable`);
+      assert.doesNotMatch(parameter(name), /required=/, `${name} is not required`);
+    }
+    assert.match(parameter('path'), /required=\\"true\\"/, 'path is required');
+    const refText = (definition.inputSchema as unknown as { properties: Record<string, { description?: string }> }).properties.ref?.description ?? '';
+    assert.match(refText, /pass null for the selector you are not using/, "ref's description says how to leave a selector unused");
+
+    // And what the model writes back for an every-property call parses to the
+    // shape the native schema accepts.
+    const input = parsedXmlInput({ path: 'files/a.png', ref: 'null', index: '1', count: '2' }, definition);
+    assert.deepStrictEqual(input, { path: 'files/a.png', ref: null, index: 1, count: 2 });
+    // Parsed against the declared tool, a ref of one space stays one space, which
+    // the handler refuses; guessed without it, it would come back "", unused.
+    const spaced = parsedXmlInput({ path: 'files/a.png', ref: ' ', index: 'null', count: 'null' }, definition);
+    assert.strictEqual(spaced.ref, ' ', 'a declared string keeps its whitespace');
+    assert.deepStrictEqual(schemaErrors(definition.inputSchema as unknown as Record<string, unknown>, input), []);
   });
 });
 
@@ -1661,7 +2483,6 @@ describe('ToolImageLedger', () => {
       mimeType: `image/${'p'.repeat(240)}`,
       sizeBytes: Number.MAX_SAFE_INTEGER,
       rejectedFields: [],
-      truncatedFields: [],
       ...extra,
     });
     // The longest stub buildReferenceStub writes: every label at its bound,
@@ -1681,11 +2502,46 @@ describe('ToolImageLedger', () => {
       ['bound', {}, 'srv'],
       ['unbound', {}, undefined],
     ];
+    // And the reasons a fetch would be refused before it dials, each at its
+    // longest: a server's id is bounded as a label is, and a refused scheme
+    // isn't named.
+    const longServer = (kind: string) => `${kind}-${'s'.repeat(400)}`;
+    const host = {};
+    // srv is dialed on the references' own origin, so its rows reach the
+    // expiry's reasons and the fetch the stub offers.
+    referenceRegistry.setServerAddress('srv', { url: 'wss://example.invalid' }, host);
+    referenceRegistry.setServerAddress(longServer('stdio'), 'no-address', host);
+    referenceRegistry.setServerAddress(longServer('elsewhere'), { url: 'wss://elsewhere.invalid' }, host);
+    referenceRegistry.setServerAddress(longServer('dialed'), { url: 'wss://example.invalid' }, host);
+    referenceRegistry.setServerAddress(longServer('garbled'), { url: 'not a url' }, host);
+    endings.push(
+      ['no address', {}, longServer('stdio')],
+      ['unknown server', {}, longServer('unknown')],
+      ['server address', {}, longServer('garbled')],
+      ['third-party origin', {}, longServer('elsewhere')],
+      ['scheme', { uri: `${'x'.repeat(400)}://example.invalid/sri-longest-scheme.png` }, longServer('dialed')],
+      ['user name or password', { uri: 'https://user:pass@example.invalid/sri-longest-userinfo.png' }, longServer('dialed')],
+    );
+    const reasons: Record<string, string> = {
+      passed: '— the reference is expired',
+      unparseable: '— the reference is treated as expired, since its expiry time can\'t be read',
+      rejected: '— the reference is treated as expired, since its expiry time isn\'t in a form this host accepts',
+      bound: '— fetch with fetch_reference',
+      unbound: '— it\'s not tied to any server',
+      'no address': '— this host doesn\'t connect to the "stdio-s',
+      'unknown server': '— this host no longer has the "unknown-s',
+      'server address': '— the "garbled-s',
+      'third-party origin': '— third-party origin:',
+      scheme: '— scheme not allowed: this host fetches only',
+      'user name or password': '— its address carries a user name or password',
+    };
     for (const [name, extra, serverId] of endings) {
       const stub = longestId(buildReferenceStub(testimony(name, extra), 'o'.repeat(400), serverId));
       assert.ok(stub.length < REFERENCE_STUB_MAX_CHARS, `${name}: ${stub.length}`);
       assert.strictEqual(parseImagePlaceholders(stub).length, 1, name);
+      assert.ok(stub.includes(reasons[name]!), `${name}: ${stub}`);
     }
+    referenceRegistry.forgetServerAddress('srv', host);
     // A placeholder: RFC 6838 bounds a type or subtype name at 127
     // characters, so normalizeMediaType keeps the longest essence and refuses
     // one character more, and the size and ref take a safe integer's digits.
@@ -1709,7 +2565,10 @@ describe('ToolImageLedger', () => {
   });
 });
 
-it('a write that throws before its tree entry names the images already saved', async () => {
+it("a write that throws before its tree entry names the images already saved, and the error it sends the host's operator to is in the host's log", async () => {
+  const logged: unknown[][] = [];
+  const realError = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args); };
   const h = await startTurn({
     prefix: 'sri-throw-',
     responses: [
@@ -1728,10 +2587,98 @@ it('a write that throws before its tree entry names the images already saved', a
   });
   try {
     const result = await waitForToolResult(h.framework, 'call_save');
+    console.error = realError;
     assert.equal(result.isError, true);
     assert.match(result.content, /injected tree exception/);
     assert.match(result.content, /already saved: files\/images-0.png/);
+    assert.match(result.content, /whoever runs this host can find the whole error in this host's log/);
+    assert.ok(logged.some((args) => args.some((a) => a instanceof Error && a.message === 'injected tree exception')), `logged: ${JSON.stringify(logged.map((args) => args.map(String)))}`);
+  } finally { console.error = realError; await h.framework.stop(); rmSync(h.tempDir, { recursive: true, force: true }); }
+});
+
+const ROOT_WRITES = typeof process.getuid === 'function' && process.getuid() === 0;
+
+it("a write the store refuses says why in plain words and who can fix it, and names the images already saved", {
+  skip: (process.platform === 'win32' && 'POSIX permissions') || (ROOT_WRITES && 'root writes past permissions'),
+}, async () => {
+  const h = await startTurn({
+    prefix: 'sri-store-refuses-',
+    responses: [
+      [snapCall('call_snap')],
+      [saveCall('call_save', { path: 'files/images.png', index: 0, count: 2 })],
+      done,
+    ],
+    workspace: (workspace) => {
+      const write = workspace.writeBinary.bind(workspace);
+      let writes = 0;
+      workspace.writeBinary = async (...args) => {
+        if (++writes !== 2) return write(...args);
+        // The second image meets the store as a locked disk leaves it: given
+        // a byte more, it's a blob the store doesn't hold yet, and the
+        // store's directories can't be written, so the store's own write
+        // throws.
+        const [path, bytes, ...rest] = args;
+        const mounts = (workspace as unknown as { mounts: Map<string, { config: { path: string } }> }).mounts;
+        const dirs = [join(dirname(mounts.get('files')!.config.path), 'store')];
+        for (let i = 0; i < dirs.length; i++) {
+          for (const entry of readdirSync(dirs[i]!, { withFileTypes: true })) if (entry.isDirectory()) dirs.push(join(dirs[i]!, entry.name));
+        }
+        for (const dir of dirs) chmodSync(dir, 0o555);
+        try {
+          return await write(path, Buffer.concat([bytes, Buffer.from([0])]), ...rest);
+        } finally {
+          for (const dir of dirs) chmodSync(dir, 0o755);
+        }
+      };
+    },
+  });
+  try {
+    const result = await waitForToolResult(h.framework, 'call_save');
+    assert.equal(result.isError, true);
+    assert.ok(result.content.includes('save_recent_image: failed writing "files/images-1.png": permission denied. '
+      + "Calling again won't change that; whoever runs this host can change the permissions. (already saved: files/images-0.png)"), result.content);
+    assert.doesNotMatch(result.content, /IO error|os error/);
   } finally { await h.framework.stop(); rmSync(h.tempDir, { recursive: true, force: true }); }
+});
+
+it("a write the workspace refuses, as while its store awaits reopening, reaches the agent in the workspace's own words, and is in the host's log", async () => {
+  const logged: unknown[][] = [];
+  const realError = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args); };
+  const h = await startTurn({
+    prefix: 'sri-refused-',
+    responses: [
+      [snapCall('call_snap')],
+      [saveCall('call_save', { path: 'files/images.png', index: 0, count: 2 })],
+      done,
+    ],
+    workspace: (workspace) => {
+      const write = workspace.writeBinary.bind(workspace);
+      let writes = 0;
+      workspace.writeBinary = async (...args) => {
+        if (++writes === 2) {
+          // An append to the record of what disk last agreed with fails, so
+          // the workspace awaits its store's reopening and refuses changes.
+          const inner = workspace as unknown as { store: { appendJson: (...a: unknown[]) => unknown }; agreement: { set: (...a: unknown[]) => unknown } };
+          const append = inner.store.appendJson;
+          inner.store.appendJson = () => { throw Object.assign(new Error('IO error: No space left on device (os error 28)'), { code: 'GenericFailure' }); };
+          assert.throws(() => inner.agreement.set('files', 'other.txt', { kind: 'absent' }));
+          inner.store.appendJson = append;
+        }
+        return write(...args);
+      };
+    },
+  });
+  try {
+    const result = await waitForToolResult(h.framework, 'call_save');
+    console.error = realError;
+    assert.equal(result.isError, true);
+    assert.ok(result.content.includes('save_recent_image: failed writing "files/images-1.png": the workspace can\'t check its files against disk until its store is reopened: '
+      + 'an append to its record of what disk last agreed with failed inside the store, so that record may lack what the append held. '
+      + "Calling again won't change that; whoever runs this host can reopen it with a restart. (already saved: files/images-0.png)"), result.content);
+    assert.ok(logged.some((args) => args.some((a) => a instanceof Error && a.message.startsWith("the workspace can't check its files against disk until its store is reopened"))),
+      `logged: ${JSON.stringify(logged.map((args) => args.map(String)))}`);
+  } finally { console.error = realError; await h.framework.stop(); rmSync(h.tempDir, { recursive: true, force: true }); }
 });
 
 it('a save whose write fails after its tree entry, through the workspace itself, is reported saved with its failure', async () => {

@@ -16,8 +16,7 @@ type Internals = {
   ownedStoreClosed: boolean;
   queue: { isClosed: boolean; close(): void };
   retryWaitWakers: Set<() => void>;
-  codeExecutionRunners: Map<string, unknown>;
-  backgroundScripts: Map<string, unknown>;
+  codeExecution: unknown;
   deferredMessages: unknown[];
   [field: string]: unknown;
 };
@@ -116,7 +115,7 @@ const sentCompletes: string[] = [];
  * stop() for its first pass, or while it waits (from the liveness watchdog's
  * stop(), which runs between its two passes) for its pass after the waits.
  * Other agents, such as the run whose end releases its window, read their
- * unread replies as usual.
+ * unread notices as usual.
  */
 function postponedReleases(framework: AgentFramework, error: Error, when: 'before stop()' | 'while stop() waits'): () => void {
   unreadPassed.length = 0;
@@ -130,14 +129,14 @@ function postponedReleases(framework: AgentFramework, error: Error, when: 'befor
   if (when === 'before stop()') postpone();
   else watchdog.stop = function (this: unknown) { postpone(); return stop.call(this); };
   const owner = framework as unknown as Record<string, unknown>;
-  const usual = (owner.unreadFailedReplies as (agent: unknown) => unknown[]).bind(framework);
-  owner.unreadFailedReplies = (agent: { name: string }) => {
+  const usual = (owner.releasedWindow as (agent: unknown, held: Set<string>) => unknown).bind(framework);
+  owner.releasedWindow = (agent: { name: string }, held: Set<string>) => {
     if (agent.name === 'first') throw error;
-    if (agent.name !== 'second') return usual(agent);
+    if (agent.name !== 'second') return usual(agent, held);
     unreadPassed.push(agent.name);
-    return [];
+    return { unread: [], held: new Map() };
   };
-  return () => { delete owner.unreadFailedReplies; watchdog.stop = stop; };
+  return () => { delete owner.releasedWindow; watchdog.stop = stop; };
 }
 
 function checkPostponedReleases(framework: AgentFramework): void {
@@ -160,17 +159,10 @@ const ROWS: Row[] = [
   { step: 'closing the queue', own: 'queue', inject: (fw, e) => throwIn(internals(fw), 'queue', 'close', e) },
   { step: "the tune-out coordinator's stop()", inject: (fw, e) => throwIn(internals(fw), 'tuneOutCoordinator', 'stop', e) },
   {
-    step: "a code_execution runner's dispose()",
+    step: "code_execution's scripts' dispose()",
     inject: (fw, e) => {
-      internals(fw).codeExecutionRunners.set('worker', throwingStub('dispose', e));
-      return () => {};
-    },
-  },
-  {
-    step: "a background script's dispose()",
-    inject: (fw, e) => {
-      internals(fw).backgroundScripts.set('script', { status: 'finished', cancelled: false, runner: throwingStub('dispose', e) });
-      return () => {};
+      internals(fw).codeExecution = { scripts: throwingStub('dispose', e) };
+      return () => { internals(fw).codeExecution = null; };
     },
   },
   { step: "cancelling provider admission", inject: (fw, e) => patchMethod(fw, 'cancelProviderAdmission', e) },
@@ -436,18 +428,26 @@ describe("stop()'s waits on the tool-result guard's annotations", () => {
 
   it('one that a module starts and that rejects while stop() waits settles the wait before the final sync, and the store closes', async (t) => {
     let framework!: AgentFramework;
+    let calls!: string[];
     const built = await frameworkToStop(t, new MockMembrane(), () => {
       // Started as the module stops; its timer fires once stop() has reached
       // its second wait, which follows the modules' stop with no timer of its
       // own between.
-      annotate(framework, new Promise((_resolve, reject) => {
+      const late = new Promise<void>((_resolve, reject) => {
         setTimeout(() => reject(new Error('zz a late annotation failed')), 0);
-      }));
+      });
+      late.catch(() => { calls.push('annotation settled'); });
+      annotate(framework, late);
     });
     framework = built.framework;
-    const { calls } = built;
+    calls = built.calls;
+    // Each store sync from here on, in the same list.
+    const store = framework.getStore();
+    const sync = store.sync.bind(store);
+    store.sync = () => { calls.push('sync'); sync(); };
     await framework.stop();
-    assert.deepEqual(calls, ['start', 'stop']);
+    assert.deepEqual(calls.filter((call) => call !== 'sync'), ['start', 'stop', 'annotation settled']);
+    assert.ok(calls.lastIndexOf('sync') > calls.indexOf('annotation settled'), `the final sync after the annotation settled: ${JSON.stringify(calls)}`);
     assert.equal(internals(framework).ownedStoreClosed, true, 'the store closed');
   });
 });

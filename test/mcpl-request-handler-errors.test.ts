@@ -109,7 +109,7 @@ for (const [event, component, method] of [
   });
 }
 
-test('notification rejection is traced without inventing a response', async () => {
+test('a notification\'s rejection is traced, with no request id', async () => {
   const { framework, connection, traces } = harness();
   framework.channelRegistry = { async handleChanged() { throw new Error('notification failed'); } };
   connection.emit('channels-changed', {});
@@ -186,7 +186,7 @@ test('a real inference handler whose result write throws answers with its own er
     { async complete() { return createMockResponse([{ type: 'text', text: 'done' }]); } } as never,
     { isInHook: false } as never,
     { validateInbound() {} } as never,
-    null,
+    { default: 'test-model' },
     (event) => traces.push(event),
   );
   const reply = responder();
@@ -213,7 +213,7 @@ test('a real inference handler whose inference fails answers -32603 with the fai
     { async complete() { throw new Error('the provider refused the request'); } } as never,
     { isInHook: false } as never,
     { validateInbound() {} } as never,
-    null,
+    { default: 'test-model' },
     (event) => traces.push(event),
   );
   const reply = responder();
@@ -426,18 +426,49 @@ for (const release of ['live', 'ready', 'readyControlPlane'] as const) {
   });
 }
 
-for (const value of [null, 42, 'hi', true]) {
-  test('non-object inbound ' + JSON.stringify(value) + ' is ignored like a non-JSON line, with no failure report', (t) => {
+for (const value of [null, 42, 'hi', true, []]) {
+  test('non-object inbound ' + JSON.stringify(value) + ' is dropped and logged by its length as JSON that isn\'t an object, with no failure report', (t) => {
     const { connection, transport } = wireHarness();
     const errors: unknown[][] = [];
     t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args); });
     const reported: unknown[] = [];
     connection.on('error', (error: unknown) => { reported.push(error); });
-    transport.emit('line', JSON.stringify(value));
-    assert.deepEqual(errors, []);
+    const line = JSON.stringify(value);
+    transport.emit('line', line);
+    assert.deepEqual(errors, [[`MCP server "srv" sent a line of length ${line.length} that is JSON but not an object, so it was dropped`]]);
     assert.deepEqual(reported, []);
   });
 }
+
+for (const [line, length, why] of [
+  ['[info] listening on 3000', 24, "isn't JSON"],
+  ['\u{1F600} not json', 10, "isn't JSON"],
+  ['\u2028', 1, "isn't JSON"],
+  [' \t{"jsonrpc":', 13, "starts like a JSON object but doesn't parse"],
+] as const) {
+  test(`a dropped line ${JSON.stringify(line)} is logged by its length in characters and why it was dropped, never its content`, (t) => {
+    const { transport } = wireHarness();
+    const errors: unknown[][] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args); });
+    transport.emit('line', line);
+    assert.deepEqual(errors, [[`MCP server "srv" sent a line of length ${length} that ${why}, so it was dropped`]]);
+  });
+}
+
+test('the first three dropped lines on a connection are logged, then one line says more go unlogged, and another connection starts its own three', (t) => {
+  const errors: unknown[][] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args); });
+  const first = wireHarness();
+  for (const line of ['one', 'two', '', 'three', 'four', 'five']) first.transport.emit('line', line);
+  const second = wireHarness();
+  second.transport.emit('line', 'again');
+  const dropped = (length: number) => [`MCP server "srv" sent a line of length ${length} that isn't JSON, so it was dropped`];
+  assert.deepEqual(errors, [
+    dropped(3), dropped(3), dropped(5),
+    ['MCP server "srv" sent another line that isn\'t a JSON object, so it was dropped; more such lines on this connection are dropped without a log line'],
+    dropped(5),
+  ]);
+});
 
 test('a throwing orphaned-response listener is contained, and later messages still arrive', (t) => {
   const { connection, transport, traces } = wireHarness();
@@ -453,8 +484,9 @@ test('a throwing orphaned-response listener is contained, and later messages sti
   assert.equal(traces.filter((e) => e.type === 'mcpl:server-error').length, 1);
 });
 
-test('a method that is not a string is not dispatched, even if it stringifies to a known method', () => {
+test('a method that is not a string is not dispatched, even if it stringifies to a known method', (t) => {
   const { connection, transport } = wireHarness();
+  t.mock.method(console, 'error', () => {});
   let received = false;
   connection.removeAllListeners('tools-list-changed');
   connection.on('tools-list-changed', () => { received = true; });
@@ -601,20 +633,19 @@ test('a request for a method nothing handles is answered -32601; such a notifica
   const logged: string[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
   transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 31, method: 'no/such-method' }));
-  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 32, method: ['host/command'] }));
-  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 33, method: 7 }));
+  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: null, method: 'no/such-method' }));
   transport.emit('line', JSON.stringify({ jsonrpc: '2.0', method: 'no/such-notification' }));
   const replies = transport.lines.map((line) => JSON.parse(line));
+  // A method that isn't a string is an invalid request, answered -32600
+  // (test/mcpl-request-envelope.test.ts).
   assert.deepEqual(replies.map((r) => [r.id, r.error?.code, r.error?.message]), [
     [31, -32601, 'Method not found'],
-    [32, -32601, 'Method not found'],
-    [33, -32601, 'Method not found'],
+    [null, -32601, 'Method not found'],
   ]);
   // One line per answered request, naming the method; none for the notification.
   assert.deepEqual(logged, [
     "[mcpl] srv: answered -32601 to a request for method no/such-method, which this host doesn't handle",
-    "[mcpl] srv: answered -32601 to a request for a method of type object, which this host doesn't handle",
-    "[mcpl] srv: answered -32601 to a request for a method of type number, which this host doesn't handle",
+    "[mcpl] srv: answered -32601 to a request for method no/such-method, which this host doesn't handle",
   ]);
 });
 
@@ -928,13 +959,15 @@ test('a failed request is answered -32603 with its own id, while its trace bound
   const { framework, traces, transport } = wireHarness();
   t.mock.method(console, 'error', () => {});
   framework.channelRegistry = { async handleRegister() { throw new Error('register failed'); } };
-  for (const id of ['a\u0000b\nc\u202e', true]) {
+  // null is the one id a request can carry that is neither a string nor a
+  // number; any other is refused before dispatch (mcpl-request-envelope).
+  for (const id of ['a\u0000b\nc\u202e', null]) {
     transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id, method: 'channels/register', params: { channels: [] } }));
   }
   await settle();
   assert.deepEqual(
     transport.lines.map((line) => JSON.parse(line)).map((reply) => [reply.id, reply.error?.code]),
-    [['a\u0000b\nc\u202e', -32603], [true, -32603]],
+    [['a\u0000b\nc\u202e', -32603], [null, -32603]],
   );
   assert.deepEqual(failureTraces(traces).map((trace) => trace.requestId), ['a?b?c?', undefined]);
 });
@@ -1077,7 +1110,8 @@ test("a trace listener that throws a value no printer can inspect is logged as t
     assert.deepEqual(reply.errors, [{ code: -32603, message: 'Internal error', data: undefined }]);
     assert.equal(failureTraces(traces).length, 1, 'the listener before the throwing one has the trace');
     assert.equal(failureTraces(after).length, 1, 'the listener after the throwing one has it too');
-    assert.deepEqual(logged, [
+    // Both lines, in whichever order they're written.
+    assert.deepEqual([...logged].sort(), [
       'Trace listener error: "[object Object]"',
       '[mcpl] srv channels-register handler failed: "register failed"',
     ]);

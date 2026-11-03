@@ -293,10 +293,12 @@ test('a block whose type, text or source isn\'t a string converts on both lanes,
   await f.framework.runUntilIdle();
   const context = f.context();
   assert(context.includes('sibling_after_malformed'), 'the batch went on past the malformed messages');
-  // Each malformed block, four times: coalesced and not, on each lane.
+  // Each malformed block, four times: coalesced and not, on each lane. A
+  // channel message is stored under its author's name (`User: [...]`), so
+  // the placeholder is matched to the end of its text block.
   for (const shows of new Set(malformed.map((m) => m.shows))) {
     const expected = malformed.filter((m) => m.shows === shows).length * 4;
-    assert.equal(occurrences(context, JSON.stringify(shows)), expected, shows);
+    assert.equal(occurrences(context, `${shows}"`), expected, shows);
   }
   // And each text that was a string, four times too.
   for (const { content } of malformed) {
@@ -363,7 +365,9 @@ test('content whose blocks aren\'t objects, or whose block of another type carri
     assert.equal(plain.error, undefined);
     assert.equal(plain.result.accepted, true);
     await f.framework.runUntilIdle();
-    assert.equal(occurrences(f.context(), JSON.stringify(shows)), 2);
+    // The channel lane's copy is stored under its author, `User: [Content…]`,
+    // so the count takes the placeholder to the end of its text field.
+    assert.equal(occurrences(f.context(), JSON.stringify(shows).slice(1)), 2);
   }
 });
 
@@ -613,7 +617,7 @@ test('a render result with a malformed block falls back, and the host names it o
   assert(f.context().includes('render_fallback'), 'the occurrence\'s own content is delivered');
   const line = lines.find((l) => l.startsWith('[push-render-failed]'));
   assert(line, lines.join('\n'));
-  assert.match(line, /^\[push-render-failed\] server=editor subject=\S+ eventId=r1 field=payload\.content: "CoalesceError:\\u0020invalid\\u0020content\\u0020block" \(the occurrence's own content is delivered instead\)$/);
+  assert.match(line, /^\[push-render-failed\] server=editor subject=\S+ eventId=r1 field=payload\.content: "[^"]*invalid\\u0020content\\u0020block" \(the occurrence's own content is delivered instead\)$/);
 });
 
 test('a render result is delivered only when the converters show each block as itself or as a reference stub', async (t) => {

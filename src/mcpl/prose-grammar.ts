@@ -19,6 +19,13 @@ export interface ProsePrefix {
   body: string;
 }
 
+/** Whether a `>>` (or `>>>`) prefix line reads `name` as a target: one token,
+ *  and not `skip_reply`, which the line reads as private speech. For a name
+ *  offered to an agent to write after `>>`. */
+export function isProseTargetToken(name: string): boolean {
+  return /^\S+$/.test(name) && name !== 'skip_reply';
+}
+
 /** A REAL prefix line: `>>` immediately followed by a target token. */
 export const PROSE_PREFIX_LINE = /^>>\S/;
 

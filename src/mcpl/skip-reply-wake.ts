@@ -43,6 +43,41 @@ export function readSkipReplyWake(input: unknown): SkipReplyWake {
   return { kind: 'wake', seconds: Math.floor(Math.min(SKIP_REPLY_WAKE_MAX_SECONDS, seconds)) };
 }
 
+/**
+ * A wake the heartbeat has due before a skip_reply's self-wake: its next tick
+ * or a reminder, one the agent's rules would let wake it as they stand when
+ * the self-wake is armed. `what` names it to the agent ("your heartbeat
+ * (…)"); `inSeconds` is how far off it is then.
+ */
+export interface SkipReplyEarlierWake {
+  inSeconds: number;
+  what: string;
+}
+
+/**
+ * The note a skip_reply's result carries: that the turn ended, and, when the
+ * agent set a wake, when it fires unless something wakes the agent first.
+ * When the heartbeat has a wake due sooner, the note adds it, and what it
+ * would mean: any turn start cancels a pending self-wake
+ * (EventGate.onInferenceStarted), so a timer the agent still wants after the
+ * heartbeat's turn is one it sets again then, for the time that was left.
+ *
+ * It says when the heartbeat is due, not that it will wake the agent: the
+ * rules can change before then, a rate limit can have no token left, a
+ * gate.js or a host's inference policy can hold the wake back, and a batch or
+ * a queued request can wake the agent sooner. Each of those leaves the note
+ * true.
+ */
+export function skipReplyNote(selfWakeSeconds: number | undefined, earlier?: SkipReplyEarlierWake): string {
+  if (selfWakeSeconds === undefined) return 'Turn ended; nothing sent.';
+  const note = `Turn ended; nothing sent. Self-wake in ~${selfWakeSeconds}s unless something wakes you first.`;
+  if (earlier === undefined) return note;
+  const what = earlier.what.charAt(0).toUpperCase() + earlier.what.slice(1);
+  const left = Math.max(1, selfWakeSeconds - earlier.inSeconds);
+  return `${note} ${what} is due sooner, in ~${earlier.inSeconds}s; if it wakes you, the self-wake is cancelled, `
+    + `so set it again for the ~${left}s left if you still want it.`;
+}
+
 /** The refusal the model reads when its host has no EventGate to set a timer. */
 export const SKIP_REPLY_WAKE_NO_GATE_REFUSAL =
   "Your turn didn't end, and no wake was set: this host can't wake you on a timer, so skip_reply can't take wake_in_seconds here. To end the turn and wait for the next message, call skip_reply without it. Anything you meant to come back to, do now.";

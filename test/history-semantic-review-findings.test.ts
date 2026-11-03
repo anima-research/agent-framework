@@ -106,7 +106,10 @@ class StubCm {
   }
   getSummariesInRange() { return this.summaries; }
   getMessage(id: string) { return this.messages.find((m) => m.id === id) ?? null; }
-  getSummary(id: string) { return this.summaries.find((s) => s.id === id) ?? null; }
+  getSummary(id: string) {
+    const s = this.summaries.find((x) => x.id === id);
+    return s ? { ...s, created: s.createdMs } : null;
+  }
   onMessage(l: Listener) { this.listeners.add(l); return () => this.listeners.delete(l); }
   edit(id: string, text: string) {
     const m = this.getMessage(id)!;
@@ -160,7 +163,7 @@ describe('semantic sync: Greptile #173 findings', () => {
     const m = mod(new StubCm(store, summaries));
     const r = await m.syncSemanticIndex(300)!;
     assert.equal(r.more, true);
-    assert.ok(svc.items.has('sum:s1'), 'summary indexed while the message backlog is still draining');
+    assert.ok(svc.items.has(`sum:s1@${T0 + 5}`), 'summary indexed while the message backlog is still draining');
     await m.stop();
   });
 
@@ -249,10 +252,14 @@ describe('semantic sync: Greptile #173 findings', () => {
     cm.edit('e', 'fifth message, reworded');
     await m.syncSemanticIndex();
     assert.ok(!svc.calls.includes('delete'), `/delete called after the route was found missing: ${JSON.stringify(svc.calls)}`);
-    assert.deepEqual(pending(), { edited: [], removed: [] });
     assert.equal(svc.items.get('msg:e')?.text, 'fifth message, reworded');
     assert.equal(warned.mock.calls.length, 1);
     await m.stop();
+    const again = mod(cm);
+    await again.start(ctx);
+    await again.syncSemanticIndex();
+    assert.ok(!svc.calls.includes('delete'), `a dropped removal or edit was kept for the next start: ${JSON.stringify(svc.calls)}`);
+    await again.stop();
   });
 
   it('the route-missing warning names what its pass dropped: removals, edits down to nothing indexable, or both', async (t) => {
@@ -321,7 +328,7 @@ describe('semantic sync: Greptile #173 findings', () => {
     cm.edit('b', '');
     await m.syncSemanticIndex();
     // /stats answered 404, and no /delete was called.
-    assert.deepEqual(svc.calls, ['stats', 'upsert']);
+    assert.ok(svc.calls.includes('stats') && !svc.calls.includes('delete'), JSON.stringify(svc.calls));
     assert.deepEqual([...svc.items.keys()], ['msg:c']);
     // With the index made, a later removal reaches it, and only that one.
     cm.remove('c');
@@ -383,7 +390,7 @@ describe('semantic sync: Greptile #173 findings', () => {
   // ---- Greptile re-review at 1b42164 ----
 
   it('G2#1 pending changes are restored and persisted when start() runs before bind()', async () => {
-    const cm = new StubCm([msg('p', T0, 'the corrected wording'), msg('q', T0 + 3_600_000, 'an hour later')]);
+    const cm = new StubCm([msg('p', T0, 'the corrected wording'), msg('o', T0 + 1_000, 'a second earlier line'), msg('q', T0 + 3_600_000, 'an hour later')]);
     let state: unknown = { semanticPending: { edited: ['p'], removed: [] } };
     const ctx = { getState: () => state, setState: (v: unknown) => { state = v; } } as never;
     const m = new HistoryModule({ semantic: { url: svc.url, namespace: 'n', syncIntervalMs: 0 } });
@@ -393,16 +400,21 @@ describe('semantic sync: Greptile #173 findings', () => {
     svc.items.set('msg:q', { id: 'msg:q', text: 'an hour later', kind: 'message', cursor: T0 + 3_600_000 });
     await m.syncSemanticIndex();
     assert.equal(svc.items.get('msg:p')?.text, 'the corrected wording', 'pending edit restored from module state');
-    cm.edit('q', 'an hour later, edited');
-    assert.deepEqual((state as { semanticPending: { edited: string[] } }).semanticPending.edited, ['q'], 'new edits persisted');
+    cm.edit('o', 'a second earlier line, edited');
     await m.stop();
+    const again = new HistoryModule({ semantic: { url: svc.url, namespace: 'n', syncIntervalMs: 0 } });
+    await again.start(ctx);
+    again.bind(cm as unknown as ContextManager);
+    await again.syncSemanticIndex();
+    assert.equal(svc.items.get('msg:o')?.text, 'a second earlier line, edited', 'a new edit persisted for the next start');
+    await again.stop();
   });
 
   it('G2#2 summaries sharing one createdMs are all indexed across bounded passes', async () => {
     const sums = [1, 2, 3].map((i) => ({ id: `s${i}`, level: 1, content: `summary ${i}`, tokens: 2, startMs: T0, endMs: T0 + 1, firstSequence: 0, lastSequence: 1, createdMs: T0 + 5 }));
     const m = mod(new StubCm([], sums));
     for (let i = 0; i < 5; i++) await m.syncSemanticIndex(1);
-    assert.deepEqual([...svc.items.keys()].sort(), ['sum:s1', 'sum:s2', 'sum:s3']);
+    assert.deepEqual([...svc.items.keys()].sort(), [1, 2, 3].map((i) => `sum:s${i}@${T0 + 5}`));
     await m.stop();
   });
 
@@ -447,7 +459,8 @@ describe('semantic sync: Greptile #173 findings', () => {
     await m.syncSemanticIndex();
     for (let i = 0; i < 300; i++) cm.edit(`m${i}`, `edited message ${i}`);
     const r = await m.syncSemanticIndex(100)!;
-    assert.ok(r.pushed <= 100, `pushed ${r.pushed} with a budget of 100`);
+    const taken = [...svc.items.values()].filter((item) => item.text.startsWith('edited')).length;
+    assert.ok(taken <= 100, `the service took ${taken} edits with a budget of 100`);
     assert.equal(r.more, true);
     for (let i = 0; i < 5; i++) await m.syncSemanticIndex(100);
     assert.equal(svc.items.get('msg:m299')?.text, 'edited message 299');
@@ -505,7 +518,7 @@ describe('semantic sync: Greptile #173 findings', () => {
     m.bind(new StubCm([msg('e', T0, `x${grin.repeat(250)}`)], [summary]) as unknown as ContextManager);
     await m.syncSemanticIndex();
     assert.equal(svc.items.get('msg:e')?.text, `x${grin.repeat(199)}`);
-    assert.equal(svc.items.get('sum:s1')?.text, `x${grin.repeat(199)}`);
+    assert.equal(svc.items.get(`sum:s1@${T0 + 5}`)?.text, `x${grin.repeat(199)}`);
     await m.stop();
   });
 

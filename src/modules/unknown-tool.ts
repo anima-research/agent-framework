@@ -5,7 +5,10 @@ import type { ToolDefinition } from '../types/events.js';
  * tool, so nothing ran, and which tools the module has, read from its own
  * getTools() so the list can't drift. The registry hands every `module--name`
  * to its module, even one the module doesn't declare, since some modules route
- * undeclared names on purpose, so this answer is the module's to give.
+ * undeclared names on purpose, so this answer is the module's to give. On the
+ * dispatcher's path it comes after the call has opened (RFC-007), and an
+ * in-process route opens none, so either way its result is a failure whose
+ * text says nothing ran, not a refusal (ToolResult.refused).
  */
 export function unknownToolMessage(module: string, name: string, tools: readonly Pick<ToolDefinition, 'name'>[]): string {
   const missing = `There's no tool "${module}--${name}", so nothing ran.`;
