@@ -39,10 +39,14 @@ const message = {
   triggerInference: true,
 } as unknown as ProcessEvent;
 
-/** A tool that, on its first call, has the message arrive while it runs. */
+/** A tool that, on its first call, has the message arrive while it runs,
+ *  and holds that call until `until` (the other agent's request), capped. */
 class ArrivingDuringTool implements Module {
   readonly name = 'hold';
   arrive: (() => void) | null = null;
+  until: Promise<void> = Promise.resolve();
+  /** True only while that first call is held. */
+  holding = false;
   async start(_ctx: ModuleContext): Promise<void> {}
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] {
@@ -52,9 +56,18 @@ class ArrivingDuringTool implements Module {
     const arrive = this.arrive;
     this.arrive = null;
     if (arrive) {
-      arrive();
-      // Long enough for the other agent's woken turn to run meanwhile.
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      this.holding = true;
+      try {
+        arrive();
+        // Until the other agent's woken turn has made its request, however
+        // long that takes; the cap only keeps a wake that never comes from
+        // hanging the test, which the probes below then fail.
+        let timer!: ReturnType<typeof setTimeout>;
+        await Promise.race([this.until, new Promise((resolve) => { timer = setTimeout(resolve, 10_000); })]);
+        clearTimeout(timer);
+      } finally {
+        this.holding = false;
+      }
     }
     return { success: true, data: { ok: true } };
   }
@@ -65,12 +78,14 @@ class ArrivingDuringTool implements Module {
   }
 }
 
-/** What the helper's context held when its request was made. */
-type Probe = { stored: boolean; presented: boolean; assistantAlive: boolean };
+/** What the helper's context held when its request was made, and whether the
+ *  assistant's first tool call, during which the message arrived, still held. */
+type Probe = { stored: boolean; presented: boolean; holding: boolean };
 type Result = {
   helperRequests: number;
   helperCarried: boolean;
   probes: Probe[];
+  /** At the boundary of the tool call it arrived during. */
   assistantHeard: boolean;
   audience: string[] | undefined;
   modes: string[];
@@ -86,11 +101,15 @@ async function run(duringFirstTurn: boolean): Promise<Result> {
   const requests: Array<{ agent: string; texts: string[]; probe?: Probe }> = [];
   const streams: MockYieldingStream[] = [];
   let first = true;
-  let probe: () => Probe = () => ({ stored: false, presented: false, assistantAlive: false });
+  let probe: () => Probe = () => ({ stored: false, presented: false, holding: false });
+  const module = new ArrivingDuringTool();
+  let helperAsked: () => void = () => {};
+  module.until = new Promise<void>((resolve) => { helperAsked = resolve; });
   (membrane as unknown as { streamYielding: (req: NormalizedRequest) => MockYieldingStream }).streamYielding = (req) => {
     membrane.calls.push(req);
     const agent = JSON.stringify(req.system ?? '').includes('You help') ? 'helper' : 'assistant';
     requests.push({ agent, texts: textsOf(req.messages), ...(agent === 'helper' ? { probe: probe() } : {}) });
+    if (agent === 'helper') helperAsked();
     // The first agent's first turn calls the tool; every other turn just answers.
     const responses = first && duringFirstTurn
       ? [createMockResponse([text('checking'), { type: 'tool_use', id: 'c1', name: 'hold--wait', input: {} } as ContentBlock], 'tool_use'), createMockResponse([text('done')])]
@@ -101,7 +120,6 @@ async function run(duringFirstTurn: boolean): Promise<Result> {
     streams.push(stream);
     return stream;
   };
-  const module = new ArrivingDuringTool();
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store.chronicle'),
     membrane: membrane.asMembrane(),
@@ -118,7 +136,7 @@ async function run(duringFirstTurn: boolean): Promise<Result> {
     return {
       stored: !!row,
       presented: !!row && helperCm.ordinalOf(row.id) !== undefined,
-      assistantAlive: framework.getAgent('assistant')!.state.status !== 'idle',
+      holding: module.holding,
     };
   };
   try {
@@ -132,13 +150,14 @@ async function run(duringFirstTurn: boolean): Promise<Result> {
     await new Promise((resolve) => setTimeout(resolve, 300));
     await framework.runUntilIdle();
     const helper = requests.filter((r) => r.agent === 'helper');
-    const injected = streams.flatMap((s) => s.receivedToolResultOptions.flatMap((o) => o?.injectedMessages ?? []));
+    // What the assistant's first stream, whose tool call the message arrived
+    // during, was handed at that call's boundary.
+    const injected = (streams[0]?.receivedToolResultOptions ?? []).flatMap((o) => o?.injectedMessages ?? []);
     return {
       helperRequests: helper.length,
       helperCarried: helper.some((r) => carries(r.texts)),
       probes: helper.map((r) => r.probe!),
-      assistantHeard: requests.some((r) => r.agent === 'assistant' && carries(r.texts))
-        || carries(textsOf(injected as Array<{ content: unknown[] }>)),
+      assistantHeard: carries(textsOf(injected as Array<{ content: unknown[] }>)),
       audience: audienceOf(question()?.metadata)?.audience,
       modes: ['assistant', 'helper'].map((name) => framework.getAgent(name)!.getContextManager().windowMode()),
     };
@@ -158,10 +177,10 @@ it("an agent woken for a message that arrives during another agent's turn gets a
   console.log(`the message arriving during the assistant's tool call: ${JSON.stringify(held)}`);
   assert.equal(held.helperRequests, 1, 'the helper was woken once');
   assert.equal(held.helperCarried, true, "the helper's request carries the message");
-  assert.deepEqual(held.probes.map((p) => [p.stored, p.assistantAlive]), [[true, true]],
-    "it was stored by the helper's request, while the assistant's turn was alive");
+  assert.deepEqual(held.probes.map((p) => [p.stored, p.holding]), [[true, true]],
+    "it was stored by the helper's request, while the assistant's tool call it arrived during still held");
   assert.deepEqual(held.probes.map((p) => p.presented), [true], "and in the helper's window then");
   assert.deepEqual([...(held.audience ?? [])].sort(), ['assistant', 'helper'], 'stored for both residents');
-  assert.equal(held.assistantHeard, true, 'the assistant heard it, at its boundary or a later request');
+  assert.equal(held.assistantHeard, true, "the assistant heard it at that call's tool boundary");
   assert.deepEqual(held.modes, ['presented', 'presented'], 'both contexts follow their windows');
 });
