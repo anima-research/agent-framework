@@ -36763,7 +36763,7 @@ export class AgentFramework {
   private dispatchChannelToolCall(agentName: string, call: ToolCall, earlierWake?: SkipReplyEarlierWake): void {
     // Conversation forks act only on their home channel.
     const home = this.homeOf(agentName);
-    const madeIn = this.workTurnOf(call);
+    const madeIn = call.name === 'channel_publish' ? this.workTurnOf(call) : undefined;
     const privateTurn = call.name === 'channel_publish' && (madeIn !== undefined
       ? this.isPrivateTurn(madeIn)
       : !this.scriptCallStarts.has(call.id) && this.turnRouting?.get(agentName)?.nonChannelOrigin === true);
