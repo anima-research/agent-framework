@@ -8,14 +8,17 @@
  */
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { WriteLandedError, WriteOutcomeUnknownError, type ContextManager, type MessageId } from '@animalabs/context-manager';
+import { JsStore } from '@animalabs/chronicle';
+import { ContextManager as StoreWindow, WriteLandedError, WriteOutcomeUnknownError, type ContextManager, type MessageId } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
-import { AgentFramework } from '../src/index.js';
-import type { Agent } from '../src/index.js';
+import { AgentFramework, workerSpec } from '../src/index.js';
+import type { Agent, AgentSpec } from '../src/index.js';
+import type { FrameworkConfig } from '../src/types/framework.js';
 import { storeOwnRow } from '../src/dendrite/audience.js';
+import { GateModule, RoutedMembrane, say, until, waitCall } from './helpers/dendrite.js';
 import { WireMembrane } from './helpers/wire-membrane.js';
 
 const text = (t: string) => ({ type: 'text', text: t }) as ContentBlock;
@@ -154,4 +157,97 @@ describe('an own row whose add throws with rows of it stored (AF #844 findings 2
       });
     }
   }
+});
+
+describe('the boot\'s worker-ended notice and the results it reads (AF #844 findings 7, 48)', () => {
+  const stores: JsStore[] = [];
+  afterEach(async () => {
+    // The frameworks over an app-owned store stop before it closes.
+    while (frameworks.length) { try { await frameworks.pop()!.stop(); } catch { /* stopped */ } }
+    while (stores.length) { try { stores.pop()!.close(); } catch { /* closed */ } }
+  });
+
+  async function rig() {
+    const dir = mkdtempSync(join(tmpdir(), 'af-review8-ended-'));
+    dirs.push(dir);
+    const store = JsStore.openOrCreate({ path: join(dir, 'store.chronicle') });
+    stores.push(store);
+    const paths = { agentRegistryPath: join(dir, 'registry.json'), agentRegistryEndedPath: join(dir, 'ended.json') };
+    const membrane = new RoutedMembrane();
+    const boot = async (gates = new GateModule()) => {
+      const framework = await AgentFramework.create({
+        store, ...paths, membrane: membrane.asMembrane(),
+        agents: ['mira', 'oren'].map((name) => ({ name, model: 'test-model', systemPrompt: `You are ${name}.` })),
+        modules: [gates], syncIntervalMs: 0,
+      } as FrameworkConfig);
+      frameworks.push(framework);
+      return framework;
+    };
+    /** Start worker `w` for oren, blocked on a gate, in a fresh framework whose process then "dies" (left running, never stopped). */
+    const startBlocked = async (finish: boolean) => {
+      const gates = new GateModule();
+      const framework = await boot(gates);
+      framework.start();
+      membrane.script('w', waitCall('g-w'), say('the result of w'));
+      const spec: Omit<AgentSpec, 'name'> = workerSpec('w', { spawnedBy: 'oren', resultTo: { to: 'oren', as: 'message' } });
+      const { agent, contextManager } = await framework.createEphemeralAgent({ name: 'w', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all' }, spec);
+      contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+      const settled = framework.runEphemeralToCompletion(agent, contextManager).catch(() => undefined);
+      await until(() => gates.entered.has('g-w'), 'w to block on its gate');
+      if (finish) {
+        framework.deliverAgentResult('w', [{ type: 'text', text: 'the result of w' }]);
+        assert.equal(rowsOf(framework, 'oren', 'the result of w').length, 1, 'w\'s result reaches oren');
+        gates.release('g-w');
+        await settled;
+      }
+      return framework;
+    };
+    /** w leaves the registry's memory: its counter and its end leave the recovery files, so its name starts again at incarnation 1. */
+    const ageOut = () => {
+      const registry = JSON.parse(readFileSync(paths.agentRegistryPath, 'utf8')) as { incarnations: Record<string, number> };
+      delete registry.incarnations.w;
+      writeFileSync(paths.agentRegistryPath, JSON.stringify(registry));
+      const ended = JSON.parse(readFileSync(paths.agentRegistryEndedPath, 'utf8')) as { ended: Array<{ name: string }> };
+      writeFileSync(paths.agentRegistryEndedPath, JSON.stringify({ ...ended, ended: ended.ended.filter((r) => r.name !== 'w') }));
+    };
+    return { boot, startBlocked, ageOut, paths };
+  }
+  const rowsOf = (framework: AgentFramework, agent: string, needle: string) =>
+    framework.getAgent(agent)!.getContextManager().getAllMessages().filter((m) => textOf(m).includes(needle));
+
+  it('an earlier worker\'s result under the same name and incarnation doesn\'t stand for a new one\'s', async () => {
+    const r = await rig();
+    await r.startBlocked(true); // w#1 delivers its result to oren and ends
+    await r.boot(); // the process restarted; w ended before it, so nobody is told
+    r.ageOut();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await r.startBlocked(false); // a new w, incarnation 1 again, is live when the process dies
+    const after = await r.boot();
+    assert.equal(after.getAgentRecord('w')?.incarnation, 1, 'the new w is incarnation 1, as the old one was');
+    assert.equal(rowsOf(after, 'oren', 'the result of w').length, 1, 'oren holds the old w\'s result');
+    assert.equal(rowsOf(after, 'oren', 'the host restarted while "w"').length, 1, 'and is told the new w ended without one');
+  });
+
+  it('a result lookup that throws leaves the worker out of this boot\'s notice and settling, and the next boot asks again', async () => {
+    const r = await rig();
+    await r.startBlocked(false); // w is live when the process dies, no result delivered
+    const query = StoreWindow.prototype.queryMessages;
+    StoreWindow.prototype.queryMessages = function (this: StoreWindow, filter: Parameters<StoreWindow['queryMessages']>[0]) {
+      if ((filter as { metadata?: Record<string, unknown> })?.metadata?.['dendrite.kind'] === 'result') throw new Error('EIO: simulated read failure');
+      return query.call(this, filter);
+    } as StoreWindow['queryMessages'];
+    let unreadable: AgentFramework;
+    let logged: string[];
+    try {
+      ({ value: unreadable, logged } = await quietly(() => r.boot()));
+    } finally { StoreWindow.prototype.queryMessages = query; }
+    assert.deepEqual(rowsOf(unreadable, 'oren', 'the host restarted while'), [], 'oren isn\'t told w ended without a result while its store can\'t be read for one');
+    assert.ok(logged.some((line) => line.includes('could not read oren\'s store for a result w delivered')), 'the failed read is logged');
+    assert.ok((JSON.parse(readFileSync(r.paths.agentRegistryPath, 'utf8')) as { records: Array<{ name: string }> }).records.some((rec) => rec.name === 'w'),
+      'w stays in the registry, its end unwritten');
+    const next = await r.boot();
+    assert.equal(rowsOf(next, 'oren', 'the host restarted while "w"').length, 1, 'the next boot reads oren\'s store and tells it');
+    assert.ok(!(JSON.parse(readFileSync(r.paths.agentRegistryPath, 'utf8')) as { records: Array<{ name: string }> }).records.some((rec) => rec.name === 'w'),
+      'and writes w\'s end');
+  });
 });

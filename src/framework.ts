@@ -12697,6 +12697,9 @@ export class AgentFramework {
     for (const outcome of this.registry.reconcile().unconfigured) this.settleEndedAgent(outcome);
 
     const byRecipient = new Map<string, AgentRecord[]>();
+    // Those whose recipient's store couldn't be read for their result: left
+    // out of this boot's notice and settling, so the next boot asks again.
+    const unread: AgentRecord[] = [];
     for (const record of interrupted) {
       this.emitTrace({
         type: 'dendrite:agent-ended',
@@ -12711,7 +12714,9 @@ export class AgentFramework {
       // A result it had already handed over needs no apology: one still
       // held, delivered below, or one its recipient's store holds already.
       if (this.registry.listMail({ from: record.name }).some((mail) => mail.kind === 'result')) continue;
-      if (this.resultStoredFor(record, route.to)) continue;
+      const stored = this.resultStoredFor(record, route.to);
+      if (stored === undefined) unread.push(record);
+      if (stored !== false) continue;
       byRecipient.set(route.to, [...(byRecipient.get(route.to) ?? []), record]);
     }
     for (const [recipient, all] of byRecipient) {
@@ -12761,7 +12766,7 @@ export class AgentFramework {
     if (interrupted.length > 0) {
       try {
         this.store.sync();
-        this.registry.settleInterrupted();
+        this.registry.settleInterrupted(unread);
       } catch (error) {
         console.error('[dendrite] the restart notices could not be synced; the interrupted records stay in the registry, and the next boot tells their recipients again unless the notice is found:', error);
       }
@@ -12809,23 +12814,38 @@ export class AgentFramework {
    * does (#291). It counts as handed over even while it is out of the
    * recipient's window, the turn it arrived in cut off by the restart: the
    * boot asked that recipient's wake for it again (wakeForUnpresentedMail),
-   * and its pass presented it. False where the store can't be read, which
-   * is logged: the recipient is told the agent ended without a result, as
-   * with none.
+   * and its pass presented it.
+   *
+   * A result counts only where it was produced (dendrite.producedAt, which
+   * every delivered result carries) at or after the record was created: a
+   * single-use name whose counter aged out of the registry starts again at
+   * incarnation 1, so an earlier agent of that name and incarnation may have
+   * delivered one to the same recipient.
+   *
+   * Undefined where the store can't be read, which is logged: whether the
+   * result was handed over is unknown, so the boot leaves the record out of
+   * its notice and of its settling (settleInterrupted), and the next boot
+   * asks again.
    */
-  private resultStoredFor(record: AgentRecord, recipient: string): boolean {
+  private resultStoredFor(record: AgentRecord, recipient: string): boolean | undefined {
     try {
       const cm = this.agents.get(recipient)?.getContextManager();
       if (!cm) return false;
       return cm.queryMessages({
         metadata: { 'dendrite.kind': 'result', 'dendrite.from.agent': record.name, 'dendrite.from.incarnation': record.incarnation },
       }).messages.some((m) => {
-        const to = (m.metadata as { dendrite?: { to?: unknown } } | undefined)?.dendrite?.to;
-        return to === undefined || to === recipient;
+        const dendrite = (m.metadata as { dendrite?: { to?: unknown; producedAt?: unknown } } | undefined)?.dendrite;
+        const producedAt = dendrite?.producedAt;
+        return (dendrite?.to === undefined || dendrite.to === recipient)
+          && typeof producedAt === 'number' && producedAt >= record.createdAt;
       });
     } catch (error) {
-      console.error(`[dendrite] could not read ${recipient}'s store for a result ${record.name} delivered before the restart:`, error);
-      return false;
+      console.error(
+        `[dendrite] could not read ${recipient}'s store for a result ${record.name} delivered before the restart; ` +
+          `${recipient} isn't told ${record.name} ended without a result, and the next boot asks again:`,
+        error,
+      );
+      return undefined;
     }
   }
 

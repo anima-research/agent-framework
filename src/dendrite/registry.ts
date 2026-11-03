@@ -815,12 +815,16 @@ export class AgentRegistry {
    * the newest `endedRetention`. An end whose write fails is reported and
    * stays pending, so the snapshot still lists it and a later settlement (the
    * next boot's) writes it; a failed snapshot write is reported too.
+   * `unsettled` names jobs the host couldn't tell of yet (by name and
+   * incarnation): they stay pending, as such a failed end does.
    * @internal For the framework's boot, once the interrupted jobs'
    * recipients are told; not a host API.
    */
-  settleInterrupted(): void {
+  settleInterrupted(unsettled: ReadonlyArray<Pick<AgentRecord, 'name' | 'incarnation'>> = []): void {
     if (this.interruptedPending.size === 0) return;
+    const kept = new Set(unsettled.map((record) => `${record.name}#${record.incarnation}`));
     for (const [key, { ended }] of [...this.interruptedPending]) {
+      if (kept.has(key)) continue;
       try {
         this.appendEndedFn?.(clone(ended));
       } catch (error) {
