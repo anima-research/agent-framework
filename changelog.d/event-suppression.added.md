@@ -39,3 +39,11 @@
   `AgentFramework.reviewSuppression()` runs one now. New traces:
   `gate:suppressed`, `gate:suppression-review`; `admission:decided` gains
   `suppressed`.
+- **Hosts rolling back:** a release without suppression doesn't read the
+  stamp, so after a rollback every suppressed row renders again where it was
+  stored, and the residents' next compile carries them (a prompt-cache miss
+  from the first, and memory folded from them); suppress rules keep their
+  `defer`, so nothing wakes for them. The changed `wake_add_rule` definition
+  and the two new tools change the tool definitions once, in the built-in
+  settings toolset, or in the tool list on a host without host presentation.
+  The review's calls count toward the agent's usage, as the reply judge's do.

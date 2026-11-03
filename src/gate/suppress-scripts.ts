@@ -11,10 +11,14 @@
  * The scripts run on one worker thread, called synchronously from the gate
  * (Atomics.wait) with a timeout, as gate.js is (gate-script.ts): a robustness
  * boundary for code the agent wrote, not a security sandbox. Every failure
- * shows the event: a script that throws, times out, isn't a function, or
+ * lets the event go on to the rules after the script's (as a script that
+ * says show does): a script that throws, times out, isn't a function, or
  * leaves a state that can't be kept. Its state then stays as it was, and the
- * failure is counted and named in gate_status. A script that times out has
- * its worker terminated and started again.
+ * failure is counted and named in gate_status. A timeout stops the worker; a
+ * fresh one loads every script again, one at a time, so a script whose own
+ * loading hangs is set aside without the others. A script that times out
+ * MAX_CONSECUTIVE_TIMEOUTS times in a row stops being run until its rule
+ * changes, so a looping script doesn't cost every event its timeout.
  *
  * The worker starts with the first rule that has a script, so a gate with
  * none runs no thread.
@@ -32,10 +36,13 @@ export const MAX_SUPPRESS_STATE_BYTES = 64 * 1024;
 const SAB_SIZE = 8 + 2 * MAX_SUPPRESS_STATE_BYTES + 16_384;
 /** How long one event's call may take before the script is stopped and the event shown (ms). */
 export const DEFAULT_SUPPRESS_SCRIPT_TIMEOUT_MS = 50;
-/** How long compiling the scripts may take, the worker's start included (ms). */
+/** How long compiling one script may take, the worker's start included (ms). */
 const LOAD_TIMEOUT_MS = 3_000;
-/** How soon after a state changes it's written to disk (ms). */
+/** Timeouts in a row after which a script isn't run again until its rule changes. */
+export const MAX_CONSECUTIVE_TIMEOUTS = 3;
+/** How soon after a state changes it's written to disk (ms), and how long a failed write waits to be tried again. */
 const SAVE_DELAY_MS = 2_000;
+const SAVE_RETRY_MS = 30_000;
 
 /** What a script is given for each event. */
 export interface SuppressScriptEvent {
@@ -55,6 +62,8 @@ export interface SuppressScriptEvent {
 /** How a rule's script has run, for gate_status. */
 export interface SuppressScriptStatus {
   loaded: boolean;
+  /** Present when the script no longer runs until its rule changes: why. */
+  disabled?: string;
   runs: number;
   hidden: number;
   errors: number;
@@ -69,10 +78,12 @@ interface RuleScript {
   hash: string;
   state: Record<string, unknown>;
   loaded: boolean;
+  disabled: string | null;
   runs: number;
   hidden: number;
   errors: number;
   timeouts: number;
+  timeoutsInARow: number;
   lastError: string | null;
 }
 
@@ -81,24 +92,36 @@ interface SavedStates {
   rules: Record<string, { script: string; state: Record<string, unknown> }>;
 }
 
+type Answer = Record<string, unknown> | { timeout: true };
+
 const hashOf = (script: string): string => createHash('sha256').update(script).digest('hex');
 const message = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
+
+/** Saved states as read from disk: entries that aren't a script hash and an object state are skipped. */
+function readSaved(raw: unknown): Map<string, { script: string; state: Record<string, unknown> }> {
+  const out = new Map<string, { script: string; state: Record<string, unknown> }>();
+  if (!isRecord(raw) || raw.version !== 1 || !isRecord(raw.rules)) return out;
+  for (const [name, entry] of Object.entries(raw.rules)) {
+    if (isRecord(entry) && typeof entry.script === 'string' && isRecord(entry.state)) out.set(name, { script: entry.script, state: entry.state });
+  }
+  return out;
+}
 
 export class SuppressScripts {
   /** The worker and its own shared buffer: a worker stopped after a timeout may still write to the buffer it had. */
   private channel?: { worker: Worker; ctrl: Int32Array; data: Uint8Array };
   private readonly dec = new TextDecoder();
   private readonly rules = new Map<string, RuleScript>();
-  /** States read from disk, by rule, kept until the rule with that script is synced. */
-  private saved: SavedStates['rules'] = {};
+  /** States read from disk, by rule, kept until the rule with that script is synced or forgotten. */
+  private saved = new Map<string, { script: string; state: Record<string, unknown> }>();
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private disposed = false;
 
   constructor(private readonly opts: { statePath?: string; timeoutMs?: number } = {}) {
     if (opts.statePath && existsSync(opts.statePath)) {
       try {
-        const raw = JSON.parse(readFileSync(opts.statePath, 'utf-8')) as Partial<SavedStates>;
-        if (raw?.version === 1 && raw.rules && typeof raw.rules === 'object') this.saved = raw.rules;
+        this.saved = readSaved(JSON.parse(readFileSync(opts.statePath, 'utf-8')));
       } catch (error) {
         console.error(`[gate] suppress-rule states in ${opts.statePath} can't be read, so every rule's state starts afresh:`, error);
       }
@@ -123,23 +146,24 @@ export class SuppressScripts {
     for (const [name, script] of wanted) {
       if (this.rules.has(name)) continue;
       const hash = hashOf(script);
-      const saved = this.saved[name];
+      const saved = this.saved.get(name);
+      this.saved.delete(name);
       this.rules.set(name, {
-        script, hash, state: saved && saved.script === hash ? saved.state : {}, loaded: false,
-        runs: 0, hidden: 0, errors: 0, timeouts: 0, lastError: null,
+        script, hash, state: saved && saved.script === hash ? saved.state : {}, loaded: false, disabled: null,
+        runs: 0, hidden: 0, errors: 0, timeouts: 0, timeoutsInARow: 0, lastError: null,
       });
       changed = true;
     }
     if (!changed) return;
-    this.saved = {};
     this.scheduleSave();
     if (this.rules.size === 0) { this.stopWorker(); return; }
     this.load();
   }
 
-  /** Forget a rule's script and state (a rule removed or redefined); the next sync compiles it afresh. */
+  /** Forget a rule's script and state (a rule removed or redefined), a state saved for it before a restart included. */
   forget(name: string): void {
-    if (this.rules.delete(name)) this.scheduleSave();
+    const had = this.rules.delete(name) || this.saved.delete(name);
+    if (had) this.scheduleSave();
   }
 
   /**
@@ -148,37 +172,50 @@ export class SuppressScripts {
    */
   check(script: string): string | null {
     const answer = this.call({ type: 'check', script }, LOAD_TIMEOUT_MS);
-    if ('timeout' in answer) return `compiling it took over ${LOAD_TIMEOUT_MS / 1000} s`;
+    if ('timeout' in answer) {
+      this.load(); // the worker was stopped: the rules' scripts go to a fresh one
+      return `compiling it took over ${LOAD_TIMEOUT_MS / 1000} s`;
+    }
     return typeof answer.error === 'string' ? answer.error : null;
   }
 
   /**
-   * Run a rule's script for one event. `commit` keeps the state it leaves;
-   * without it (a probe) the state is as before. Undefined when the rule has
-   * no script; `{ error }` when the event is to be shown because the script
-   * failed.
+   * Run a rule's script for one event. `commit` keeps the state it leaves and
+   * counts the run; without it (a probe) the state is as before. Undefined
+   * when the rule has no script; `{ error }` when the script failed, and the
+   * event goes on to the rules after it.
    */
   run(name: string, event: SuppressScriptEvent, commit: boolean): { hide: boolean } | { error: string } | undefined {
     const rule = this.rules.get(name);
     if (!rule) return undefined;
+    if (rule.disabled) return { error: rule.disabled };
     if (!rule.loaded) return { error: rule.lastError ?? 'the script is not loaded' };
     const answer = this.call({ type: 'eval', name, event, state: rule.state }, this.timeoutMs);
-    if (!commit) {
-      if ('timeout' in answer) return { error: `it took over ${this.timeoutMs} ms` };
-      return typeof answer.error === 'string' ? { error: answer.error } : { hide: answer.hide === true };
-    }
-    rule.runs++;
     if ('timeout' in answer) {
-      rule.timeouts++;
-      rule.lastError = `it took over ${this.timeoutMs} ms, so it was stopped and the event shown`;
-      return { error: rule.lastError };
+      // The worker was stopped; every script goes to a fresh one.
+      const error = `it took over ${this.timeoutMs} ms, so it was stopped`;
+      if (commit) {
+        rule.runs++;
+        rule.timeouts++;
+        rule.timeoutsInARow++;
+        rule.lastError = error;
+        if (rule.timeoutsInARow >= MAX_CONSECUTIVE_TIMEOUTS) {
+          rule.disabled = `it took over ${this.timeoutMs} ms ${rule.timeoutsInARow} times in a row, so it isn't run again until its rule changes`;
+          rule.lastError = rule.disabled;
+        }
+      }
+      this.load();
+      return { error };
     }
+    if (!commit) return typeof answer.error === 'string' ? { error: answer.error } : { hide: answer.hide === true };
+    rule.runs++;
+    rule.timeoutsInARow = 0;
     if (typeof answer.error === 'string') {
       rule.errors++;
       rule.lastError = answer.error;
       return { error: answer.error };
     }
-    const next = answer.state && typeof answer.state === 'object' && !Array.isArray(answer.state) ? answer.state as Record<string, unknown> : {};
+    const next = isRecord(answer.state) ? answer.state : {};
     if (JSON.stringify(next) !== JSON.stringify(rule.state)) {
       rule.state = next;
       this.scheduleSave();
@@ -192,7 +229,8 @@ export class SuppressScripts {
     const rule = this.rules.get(name);
     if (!rule) return undefined;
     return {
-      loaded: rule.loaded, runs: rule.runs, hidden: rule.hidden, errors: rule.errors, timeouts: rule.timeouts,
+      loaded: rule.loaded, ...(rule.disabled ? { disabled: rule.disabled } : {}),
+      runs: rule.runs, hidden: rule.hidden, errors: rule.errors, timeouts: rule.timeouts,
       lastError: rule.lastError, stateBytes: Buffer.byteLength(JSON.stringify(rule.state)),
     };
   }
@@ -218,24 +256,44 @@ export class SuppressScripts {
     this.save();
   }
 
+  /**
+   * Load every script that isn't set aside into the worker, one at a time,
+   * on a clean slate. A script whose loading times out is set aside (it
+   * would stop the worker each time), and the rest are loaded again on the
+   * fresh worker that follows.
+   */
   private load(): void {
-    const answer = this.call({ type: 'load', rules: [...this.rules].map(([name, r]) => ({ name, script: r.script })) }, LOAD_TIMEOUT_MS);
-    const errors = !('timeout' in answer) && answer.errors && typeof answer.errors === 'object' ? answer.errors as Record<string, string> : {};
-    for (const [name, rule] of this.rules) {
-      if ('timeout' in answer) {
-        rule.loaded = false;
-        rule.lastError = `loading the scripts took over ${LOAD_TIMEOUT_MS / 1000} s`;
-      } else if (errors[name] !== undefined) {
-        rule.loaded = false;
-        rule.lastError = `it doesn't compile: ${errors[name]}`;
-      } else {
-        rule.loaded = true;
+    for (let attempt = 0; attempt <= this.rules.size; attempt++) {
+      const reset = this.call({ type: 'reset' }, LOAD_TIMEOUT_MS);
+      if ('timeout' in reset || typeof reset.error === 'string') {
+        const why = 'timeout' in reset ? `the script worker didn't answer within ${LOAD_TIMEOUT_MS / 1000} s` : reset.error as string;
+        for (const rule of this.rules.values()) { rule.loaded = false; rule.lastError = rule.disabled ?? why; }
+        return;
       }
+      let restarted = false;
+      for (const [name, rule] of this.rules) {
+        if (rule.disabled) { rule.loaded = false; continue; }
+        const answer = this.call({ type: 'load', name, script: rule.script }, LOAD_TIMEOUT_MS);
+        if ('timeout' in answer) {
+          rule.loaded = false;
+          rule.disabled = `compiling it took over ${LOAD_TIMEOUT_MS / 1000} s, so it isn't run until its rule changes`;
+          rule.lastError = rule.disabled;
+          restarted = true;
+          break;
+        }
+        if (typeof answer.error === 'string') {
+          rule.loaded = false;
+          rule.lastError = `it doesn't compile: ${answer.error}`;
+        } else {
+          rule.loaded = true;
+        }
+      }
+      if (!restarted) return;
     }
   }
 
-  /** One message to the worker, waited for: its answer, or a timeout, after which the worker is started again. */
-  private call(msg: Record<string, unknown>, timeoutMs: number): Record<string, unknown> | { timeout: true } {
+  /** One message to the worker, waited for: its answer, or a timeout, after which the worker is stopped (the caller loads the scripts again). */
+  private call(msg: Record<string, unknown>, timeoutMs: number): Answer {
     if (this.disposed) return { error: 'the gate is stopped' };
     const channel = this.ensureWorker();
     if (!channel) return { error: 'the script worker could not start' };
@@ -248,9 +306,6 @@ export class SuppressScripts {
     }
     if (Atomics.wait(ctrl, 0, 0, timeoutMs) === 'timed-out') {
       this.stopWorker();
-      // The scripts the worker held are loaded again, on a fresh worker, for the events after.
-      if (msg.type === 'eval') this.load();
-      else for (const rule of this.rules.values()) rule.loaded = false;
       return { timeout: true };
     }
     const length = Atomics.load(ctrl, 1);
@@ -282,24 +337,27 @@ export class SuppressScripts {
     this.channel = undefined;
   }
 
-  private scheduleSave(): void {
+  private scheduleSave(delayMs = SAVE_DELAY_MS): void {
     if (!this.opts.statePath || this.saveTimer || this.disposed) return;
-    this.saveTimer = setTimeout(() => { this.saveTimer = null; this.save(); }, SAVE_DELAY_MS);
+    this.saveTimer = setTimeout(() => { this.saveTimer = null; this.save(); }, delayMs);
     this.saveTimer.unref?.();
   }
 
   private save(): void {
     const path = this.opts.statePath;
     if (!path) return;
-    const out: SavedStates = { version: 1, rules: {} };
-    for (const [name, rule] of this.rules) out.rules[name] = { script: rule.hash, state: rule.state };
+    // A null-prototype object, so a rule named "__proto__" is an entry like any other.
+    const rules: SavedStates['rules'] = Object.create(null);
+    for (const [name, saved] of this.saved) rules[name] = saved;
+    for (const [name, rule] of this.rules) rules[name] = { script: rule.hash, state: rule.state };
     try {
       mkdirSync(dirname(path), { recursive: true });
       const temp = `${path}.${process.pid}.tmp`;
-      writeFileSync(temp, `${JSON.stringify(out, null, 2)}\n`);
+      writeFileSync(temp, `${JSON.stringify({ version: 1, rules }, null, 2)}\n`);
       renameSync(temp, path);
     } catch (error) {
-      console.error(`[gate] suppress-rule states couldn't be written to ${path}; they're kept in memory:`, error);
+      console.error(`[gate] suppress-rule states couldn't be written to ${path}; they're kept in memory and written again shortly:`, error);
+      this.scheduleSave(SAVE_RETRY_MS);
     }
   }
 }

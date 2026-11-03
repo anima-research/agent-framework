@@ -51,6 +51,18 @@ class NotesModule implements Module {
   }
 }
 
+/** A module that only asks for a wake on `notes:new`, as a second module answering the same event might. */
+class WakeOnNotes implements Module {
+  readonly name = 'wake-on-notes';
+  async start(_ctx: ModuleContext): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] { return []; }
+  async handleToolCall(_call: ToolCall): Promise<ToolResult> { return { success: false, error: 'none', isError: true }; }
+  async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
+    return (event as { type: string }).type === 'notes:new' ? { requestInference: true } : {};
+  }
+}
+
 const GATE = (policies: unknown[] = []) => ({ gate: { onboarding: false, config: { default: 'always', policies } } }) as Partial<FrameworkConfig>;
 const S = (description: string) => ({ description });
 const HIDE_NOISY = { name: 'hide-noisy', match: { source: 'editor', channel: 'noisy' }, behavior: 'defer', suppress: S('chatter in #noisy') };
@@ -63,7 +75,7 @@ describe('event suppression', () => {
       await incoming(f, 'noisy', 'n1', 'noise one');
       await settle(f);
       const row = find(f, 'noise one');
-      assert.deepEqual(suppressedOf(row), { rule: 'hide-noisy', eventType: 'mcpl:channel-incoming' });
+      assert.deepEqual(suppressedOf(row), { rule: 'hide-noisy', eventType: 'mcpl:channel-incoming', source: 'editor' });
       assert.equal(await inView(f, 'noise one'), false, 'not in the compiled view');
 
       await incoming(f, 'noisy', 'n2', 'agent, look at this', MENTION);
@@ -116,7 +128,7 @@ describe('event suppression', () => {
       await settle(f);
       const rows = stored(f).slice(before);
       assert.deepEqual(rows.map((m) => textOf(m)), ['ping 1'], 'one row stored, and nothing ahead of it');
-      assert.deepEqual(suppressedOf(rows[0]), { rule: 'hide-pings', eventType: 'mcpl:push-event' });
+      assert.deepEqual(suppressedOf(rows[0]), { rule: 'hide-pings', eventType: 'mcpl:push-event', source: 'editor' });
       assert.equal(await inView(f, 'ping 1'), false);
 
       // An event the rule doesn't match still wakes (default "always").
@@ -133,13 +145,27 @@ describe('event suppression', () => {
     try {
       f.framework.pushEvent({ type: 'notes:new', source: 'notes', content: 'chatter: nothing to see' } as unknown as ProcessEvent);
       await settle(f);
-      assert.deepEqual(suppressedOf(find(f, 'chatter: nothing')), { rule: 'hide-notes', eventType: 'notes:new' });
+      assert.deepEqual(suppressedOf(find(f, 'chatter: nothing')), { rule: 'hide-notes', eventType: 'notes:new', source: 'notes' });
       assert.equal(await inView(f, 'chatter: nothing'), false);
 
       f.framework.pushEvent({ type: 'notes:new', source: 'notes', content: 'important: read me' } as unknown as ProcessEvent);
       await f.turn();
       assert.equal(await inView(f, 'important: read me'), true);
     } finally { await f.close(); }
+  });
+
+  it('a second module that only asks for a wake on a suppressed event wakes nobody, whichever answers first', async () => {
+    const rule = { name: 'hide-notes', match: { scope: ['notes:new'] }, behavior: 'defer', suppress: S('every note') };
+    for (const modules of [[new WakeOnNotes(), new NotesModule()], [new NotesModule(), new WakeOnNotes()]]) {
+      const f = await fixture({ framework: { ...GATE([rule]), modules } });
+      try {
+        f.framework.pushEvent({ type: 'notes:new', source: 'notes', content: 'a hidden note' } as unknown as ProcessEvent);
+        await settle(f);
+        assert.ok(suppressedOf(find(f, 'a hidden note')));
+        const stats = (await tool(f, 'suppression_stats', {})).data as { rules: Array<{ bySource: Record<string, number> }> };
+        assert.deepEqual(stats.rules[0].bySource, { notes: 1 }, 'a module\'s row is counted under its source');
+      } finally { await f.close(); }
+    }
   });
 
   it('a server\'s [toolsets] notice is suppressed as its "mcpl:tool-changes" event', async () => {
@@ -149,7 +175,7 @@ describe('event suppression', () => {
         .recordToolsetNotice('editor', 'eye: left your tool list', { invite: false });
       assert.equal(told, true);
       const row = find(f, 'eye: left your tool list');
-      assert.deepEqual(suppressedOf(row), { rule: 'hide-tool-flaps', eventType: 'mcpl:tool-changes' });
+      assert.deepEqual(suppressedOf(row), { rule: 'hide-tool-flaps', eventType: 'mcpl:tool-changes', source: 'editor' });
       assert.equal(await inView(f, 'eye: left your tool list'), false);
     } finally { await f.close(); }
   });
@@ -245,7 +271,7 @@ describe('event suppression', () => {
       await ping(f, 'p2', 'ping 2');
       await ping(f, 'p3', 'ping 3');
       await settle(f);
-      assert.deepEqual(suppressedOf(find(f, 'ping 2')), { rule: 'one-ping-a-while', eventType: 'mcpl:push-event' });
+      assert.deepEqual(suppressedOf(find(f, 'ping 2')), { rule: 'one-ping-a-while', eventType: 'mcpl:push-event', source: 'editor' });
       assert.ok(suppressedOf(find(f, 'ping 3')));
       const status = (await tool(f, 'gate_status', {})).data as { policies: Array<{ name: string; matchCount: number; suppress?: { scriptStatus?: { runs: number; hidden: number } } }> };
       assert.equal(status.policies[0].matchCount, 2);
@@ -253,7 +279,7 @@ describe('event suppression', () => {
 
       const broken = await tool(f, 'wake_add_rule', { name: 'bad', match: { source: 'editor' }, suppress: { description: 'x', script: '"not a function"' } });
       assert.equal(broken.isError, true);
-      assert.match(String(broken.error), /suppress\.script doesn't make a function \(the script is string, not a function/);
+      assert.match(String(broken.error), /suppress\.script can't be used \(the script is string, not a function/);
       const added = await tool(f, 'wake_add_rule', { name: 'shouty', match: { source: 'editor' }, suppress: { description: 'all caps', script: '(e) => e.text === e.text.toUpperCase()' } });
       assert.equal(added.success, true, String(added.error));
     } finally { await f.close(); }
@@ -321,6 +347,30 @@ describe('event suppression', () => {
       assert.match(textOf(notice), /the build is on fire/);
       assert.ok(internals(f).pendingRequests.some((r) => r.agentName === 'agent' && r.reason === 'suppression-review'), 'the flag wakes the resident');
       assert.equal(await inView(f, '[suppression review]'), true);
+    } finally { await f.close(); }
+  });
+
+  it('a deferred coalesced push is decided once, at its wake, and its row reads that decision', async () => {
+    const counting = { name: 'count', match: { source: 'editor', scope: ['mcpl:push-event'] }, behavior: 'defer',
+      suppress: { description: 'counts', script: '(e, state) => { state.n = (state.n ?? 0) + 1; return false; }' } };
+    const f = await fixture({ framework: GATE([counting]) });
+    try {
+      await f.send('push/event', f.params('1', 'fallback', { deferred: true }));
+      await f.framework.runUntilIdle();
+      assert.ok(f.context().includes('document_diff'), 'rendered at assembly and shown, as the one decision said');
+      const gate = (f.framework as unknown as { eventGate: { suppressScriptState(name: string): unknown } }).eventGate;
+      assert.deepEqual(gate.suppressScriptState('count'), { n: 1 }, 'the script was asked once');
+    } finally { await f.close(); }
+  });
+
+  it('a deferred coalesced push suppressed at its wake is stored now, stamped, and wakes nobody', async () => {
+    const f = await fixture({ framework: GATE([{ name: 'hide-doc', match: { source: 'editor', scope: ['mcpl:push-event'] }, behavior: 'defer', suppress: S('document notices') }]) });
+    try {
+      await f.send('push/event', f.params('1', 'fallback', { deferred: true }));
+      await eventually(() => stored(f).some((m) => textOf(m).includes('document_diff')), 'the batch stored');
+      await settle(f);
+      assert.deepEqual(suppressedOf(find(f, 'document_diff')), { rule: 'hide-doc', eventType: 'mcpl:push-event', source: 'editor' });
+      assert.equal(await inView(f, 'document_diff'), false);
     } finally { await f.close(); }
   });
 });

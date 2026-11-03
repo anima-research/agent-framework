@@ -79,7 +79,7 @@ test('framework preview, generated workspace read and both edit dispatch paths a
 
 
   // The tool list is the advertised definitions less the host's built-in toolset.
-  const settingsToolset=['agent_settings','wake_add_rule','wake_remove_rule','gate_status','suppression_stats','event_tags','set_tool_visibility','set_tool_description','heartbeat--heartbeat_status','heartbeat--heartbeat_trigger','workspace--status'];
+  const settingsToolset=['agent_settings','wake_add_rule','wake_remove_rule','gate_status','suppression_stats','dump_suppressed','event_tags','set_tool_visibility','set_tool_description','heartbeat--heartbeat_status','heartbeat--heartbeat_trigger','workspace--status'];
   const listed=(preview.tools??[]).map(t=>t.name);
   assert.ok(!listed.includes(target),'a hidden tool leaves the tool list');
   assert.deepEqual(listed.filter(n=>settingsToolset.includes(n)),[],"the built-in toolset's tools are not listed");

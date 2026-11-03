@@ -13,9 +13,14 @@
  * flagged, with the flagged events shown; a flagged event wakes it.
  *
  * What was reviewed is kept in a small file beside gate.json
- * (`suppression-review.json`): the time reviewed through, so a restart picks
- * up where the last review stopped, and each rule's description as last seen,
- * so the events a rule hid before it was removed are still judged against it.
+ * (`suppression-review.json`), written as the review starts and after each
+ * review: the time reviewed through, so a restart picks up where the last
+ * review stopped; for a rule the reviewer couldn't answer about, where its
+ * events still to be reviewed begin, so the next review takes them again; and
+ * each rule's description as last seen (the framework tells the review when a
+ * rule hides a row), so the events a rule hid before it was removed are still
+ * judged against it. The review reads a sample of each rule's events, each
+ * cut short, not every event whole.
  * The reviewer reads; it never decides what's suppressed and never edits a
  * rule. The notice is the framework's own and is never suppressed.
  */
@@ -101,25 +106,37 @@ export interface SuppressionReviewDeps {
   statePath?: string;
   /** Whether a review may run now (not while the host is quiesced or stopping); a review not run waits for the next. */
   mayRun?(): boolean;
+  /** Whether the agent has dump_suppressed (a workspace), for the notice to point at it. */
+  dumpAvailable?(): boolean;
   now?(): number;
 }
 
 interface ReviewState {
   version: 1;
   reviewedThrough: number;
-  descriptions: Record<string, string>;
+  /** Rules the reviewer couldn't answer about: where their events still to be reviewed begin (ms). */
+  retryFrom: Map<string, number>;
+  descriptions: Map<string, string>;
 }
 
-/** Whether a file's JSON is a review state this release can use. */
+const entriesOf = (value: unknown): Array<[string, unknown]> =>
+  value && typeof value === 'object' && !Array.isArray(value) ? Object.entries(value) : [];
+
+/** The review state a file holds, or null when there's none; one that can't be used is named in the log and read as none. */
 function readState(path: string): ReviewState | null {
   if (!existsSync(path)) return null;
   try {
-    const raw = JSON.parse(readFileSync(path, 'utf-8')) as Partial<ReviewState>;
-    if (raw?.version !== 1 || typeof raw.reviewedThrough !== 'number' || !Number.isFinite(raw.reviewedThrough)) return null;
-    const descriptions: Record<string, string> = {};
-    for (const [name, text] of Object.entries(raw.descriptions ?? {})) if (typeof text === 'string') descriptions[name] = text;
-    return { version: 1, reviewedThrough: raw.reviewedThrough, descriptions };
-  } catch {
+    const raw = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>;
+    if (raw?.version !== 1 || typeof raw.reviewedThrough !== 'number' || !Number.isFinite(raw.reviewedThrough)) {
+      throw new Error('it holds no version 1 state with a reviewedThrough time');
+    }
+    const descriptions = new Map<string, string>();
+    for (const [name, text] of entriesOf(raw.descriptions)) if (typeof text === 'string') descriptions.set(name, text);
+    const retryFrom = new Map<string, number>();
+    for (const [name, ms] of entriesOf(raw.retryFrom)) if (typeof ms === 'number' && Number.isFinite(ms)) retryFrom.set(name, ms);
+    return { version: 1, reviewedThrough: raw.reviewedThrough, retryFrom, descriptions };
+  } catch (error) {
+    console.error(`[gate] the suppression review's progress in ${path} can't be read, so it reviews from now on:`, error);
     return null;
   }
 }
@@ -212,8 +229,12 @@ export function parseReviewAnswer(text: string, count: number): { flagged: numbe
   if (!raw || typeof raw !== 'object') return undefined;
   const { fits, flagged, note } = raw as { fits?: unknown; flagged?: unknown; note?: unknown };
   if (flagged !== undefined && !Array.isArray(flagged)) return undefined;
-  const numbers = [...new Set((flagged ?? []).filter((n): n is number => Number.isInteger(n) && n >= 1 && n <= count))].sort((a, b) => a - b);
-  if (typeof fits !== 'boolean' && numbers.length === 0 && flagged === undefined) return undefined;
+  const named = flagged ?? [];
+  const numbers = [...new Set(named.filter((n): n is number => Number.isInteger(n) && n >= 1 && n <= count))].sort((a, b) => a - b);
+  if (typeof fits !== 'boolean' && flagged === undefined) return undefined;
+  // An answer that says they don't all fit, or names events, but names none
+  // it was shown can't be taken as "they fit": it's no answer.
+  if (numbers.length === 0 && (fits === false || named.length > 0)) return undefined;
   return { flagged: numbers, note: typeof note === 'string' ? cut(oneLine(note), 300) : '' };
 }
 
@@ -228,8 +249,8 @@ function spanOf(ms: number): string {
   return hours < 48 ? `${hours} hours` : `${Math.round(hours / 24)} days`;
 }
 
-/** The `[suppression review]` notice the agent is told. */
-export function reviewNoticeText(summary: SuppressionReviewSummary): string {
+/** The `[suppression review]` notice the agent is told; `dump` when it has dump_suppressed to point at. */
+export function reviewNoticeText(summary: SuppressionReviewSummary, opts: { dump?: boolean } = {}): string {
   const lines = [
     `[${NOTICE_TAG.suppressionReview}] Since ${clockOf(summary.fromMs)} (${spanOf(summary.toMs - summary.fromMs)}), `
       + `your suppress rules hid ${summary.total} event${summary.total === 1 ? '' : 's'}`
@@ -242,14 +263,15 @@ export function reviewNoticeText(summary: SuppressionReviewSummary): string {
     if (r.verdict === 'fits') said = `The reviewer ${read} and found they fit.`;
     else if (r.verdict === 'flagged') said = `The reviewer ${read} and flagged ${r.flagged.length}${r.note ? `: ${r.note}` : '.'}`;
     else if (r.verdict === 'unjudged') said = 'There was no description to judge them against.';
-    else said = `The reviewer couldn't answer this time${r.note ? ` (${r.note})` : ''}.`;
+    else said = "The reviewer couldn't answer this time; they'll be reviewed again next time.";
     lines.push(`- ${named} hid ${r.suppressed}. ${said}`);
+    // The flagged events, each cut short: the first few, and how many more.
     for (const e of r.flagged.slice(0, NOTICE_FLAGGED_SHOWN)) {
       lines.push(`  · [${e.at}]${e.source ? ` ${e.source}` : ''}${e.author ? ` · ${e.author}` : ''}: ${JSON.stringify(cut(oneLine(e.text), NOTICE_EVENT_CHARS))} (id ${e.id})`);
     }
     if (r.flagged.length > NOTICE_FLAGGED_SHOWN) lines.push(`  · and ${r.flagged.length - NOTICE_FLAGGED_SHOWN} more`);
   }
-  lines.push('suppression_stats and dump_suppressed show what a rule hid; wake_add_rule edits a rule, and wake_remove_rule removes one.');
+  lines.push(`${opts.dump === false ? 'suppression_stats shows' : 'suppression_stats and dump_suppressed show'} what a rule hid; wake_add_rule edits a rule, and wake_remove_rule removes one.`);
   return lines.join('\n');
 }
 
@@ -261,14 +283,25 @@ export class SuppressionReview {
   private stopped = false;
   private readonly inFlight = new Set<AbortController>();
   private reviewedThrough: number;
-  private descriptions: Record<string, string>;
+  private readonly retryFrom: Map<string, number>;
+  private readonly descriptions: Map<string, string>;
 
   constructor(private readonly deps: SuppressionReviewDeps, options: SuppressionReviewOptions = {}) {
     this.settings = reviewSettings(options);
     this.now = deps.now ?? Date.now;
     const state = deps.statePath ? readState(deps.statePath) : null;
     this.reviewedThrough = state?.reviewedThrough ?? this.now();
-    this.descriptions = state?.descriptions ?? {};
+    this.retryFrom = state?.retryFrom ?? new Map();
+    this.descriptions = state?.descriptions ?? new Map();
+    // Where the review starts is kept at once, so a restart before the first
+    // review still reviews from here.
+    if (!state) this.saveState();
+  }
+
+  /** A rule's description as it stands when it hides a row: the one its rows are judged against later, though the rule be gone by then. */
+  noteRule(name: string, description: string): void {
+    if (this.descriptions.get(name) === description) return;
+    this.descriptions.set(name, description);
   }
 
   get intervalMs(): number { return this.settings.intervalMs; }
@@ -318,25 +351,31 @@ export class SuppressionReview {
     const fromMs = this.reviewedThrough;
     const toMs = this.now();
     const inForce = new Map(this.deps.rules().map((r) => [r.name, r]));
-    for (const rule of inForce.values()) this.descriptions[rule.name] = rule.description;
+    for (const rule of inForce.values()) this.descriptions.set(rule.name, rule.description);
+    // A rule the reviewer couldn't answer about last time is reviewed from
+    // where its unreviewed events begin.
+    const fromOf = (name: string): number => Math.min(this.retryFrom.get(name) ?? fromMs, fromMs);
+    const earliest = Math.min(fromMs, ...this.retryFrom.values());
 
     const byRule = new Map<string, SuppressedEventRecord[]>();
-    for (const record of this.deps.records(agentName, fromMs, toMs)) {
+    for (const record of this.deps.records(agentName, earliest, toMs)) {
+      if (Date.parse(record.at) < fromOf(record.rule)) continue;
       const list = byRule.get(record.rule) ?? [];
       list.push(record);
       byRule.set(record.rule, list);
     }
     const rules: RuleReview[] = [];
     for (const [name, records] of byRule) {
+      if (this.stopped) return null;
       const rule = inForce.get(name);
-      const description = rule?.description ?? this.descriptions[name];
+      const description = rule?.description ?? this.descriptions.get(name);
       const base = { rule: name, ...(description ? { description } : {}), inForce: rule !== undefined, suppressed: records.length };
       if (!description) {
         rules.push({ ...base, read: 0, verdict: 'unjudged', flagged: [] });
         continue;
       }
       const sample = spread(records, this.settings.maxEventsPerRule);
-      rules.push(await this.judge(agentName, { name, description, ...(rule ?? {}) }, sample, records.length, { fromMs, toMs }, base));
+      rules.push(await this.judge(agentName, { name, description, ...(rule ?? {}) }, sample, records.length, { fromMs: fromOf(name), toMs }, base));
     }
     const summary: SuppressionReviewSummary = {
       fromMs, toMs, rules,
@@ -348,11 +387,11 @@ export class SuppressionReview {
     if (this.stopped) return null;
     const tell = summary.total > 0 && (this.settings.notify === 'always' || summary.flagged > 0);
     if (tell) {
-      this.deps.deliver(agentName, reviewNoticeText(summary), summary.flagged > 0 && this.settings.wakeOnFlag, summary);
+      this.deps.deliver(agentName, reviewNoticeText(summary, { dump: this.deps.dumpAvailable?.() ?? true }), summary.flagged > 0 && this.settings.wakeOnFlag, summary);
     }
     this.deps.emitTrace?.({
       type: 'gate:suppression-review',
-      agentName, fromMs, toMs, total: summary.total, flagged: summary.flagged, delivered: tell,
+      agentName, fromMs: earliest, toMs, total: summary.total, flagged: summary.flagged, delivered: tell,
       rules: rules.map((r) => ({ rule: r.rule, suppressed: r.suppressed, read: r.read, verdict: r.verdict, flagged: r.flagged.length })),
     });
     for (const r of rules) {
@@ -361,6 +400,18 @@ export class SuppressionReview {
       }
     }
     this.reviewedThrough = toMs;
+    // The rules the reviewer couldn't answer about keep where their events
+    // begin; every other rule is reviewed through now.
+    for (const r of rules) {
+      // Kept for at most a week of events, so a reviewer that keeps failing doesn't read back without end.
+      if (r.verdict === 'error') this.retryFrom.set(r.rule, Math.max(fromOf(r.rule), toMs - MAX_REVIEW_INTERVAL_MS));
+      else this.retryFrom.delete(r.rule);
+    }
+    // Descriptions are kept for the rules in force and the ones with events
+    // still to review; the rest have nothing left to be judged.
+    for (const name of [...this.descriptions.keys()]) {
+      if (!inForce.has(name) && !this.retryFrom.has(name)) this.descriptions.delete(name);
+    }
     this.saveState();
     return summary;
   }
@@ -412,7 +463,10 @@ export class SuppressionReview {
     try {
       mkdirSync(dirname(path), { recursive: true });
       const temp = `${path}.${process.pid}.tmp`;
-      const state: ReviewState = { version: 1, reviewedThrough: this.reviewedThrough, descriptions: this.descriptions };
+      const state = {
+        version: 1, reviewedThrough: this.reviewedThrough,
+        retryFrom: Object.fromEntries(this.retryFrom), descriptions: Object.fromEntries(this.descriptions),
+      };
       writeFileSync(temp, `${JSON.stringify(state, null, 2)}\n`);
       renameSync(temp, path);
     } catch (error) {

@@ -79,12 +79,29 @@ const DEFAULT_RECENT = 3;
 const MAX_KEYS = 10;
 
 /** The record a row carries when a suppress rule took it, or undefined. */
-export function suppressionRecordOf(metadata: Record<string, unknown> | undefined): { rule: string; eventType?: string } | undefined {
+export function suppressionRecordOf(metadata: Record<string, unknown> | undefined): { rule: string; eventType?: string; source?: string } | undefined {
   const record = metadata?.suppressed;
   if (!record || typeof record !== 'object') return undefined;
-  const { rule, eventType } = record as { rule?: unknown; eventType?: unknown };
+  const { rule, eventType, source } = record as { rule?: unknown; eventType?: unknown; source?: unknown };
   if (typeof rule !== 'string') return undefined;
-  return typeof eventType === 'string' && eventType !== '' ? { rule, eventType } : { rule };
+  return {
+    rule,
+    ...(typeof eventType === 'string' && eventType !== '' ? { eventType } : {}),
+    ...(typeof source === 'string' && source !== '' ? { source } : {}),
+  };
+}
+
+/** Where a suppressed row came from: the source its record names (a module's, which its metadata may not), else its server. */
+function sourceOf(row: SuppressionStatsRow, record: { source?: string } | undefined): string | undefined {
+  if (record?.source) return record.source;
+  const serverId = row.metadata?.serverId;
+  return typeof serverId === 'string' && serverId !== '' ? serverId : undefined;
+}
+
+/** The author a row names: a channel message's `author.name`, or a push event's `authorName`. */
+function authorOf(md: Record<string, unknown>): string | undefined {
+  const name = (md.author as { name?: unknown } | undefined)?.name ?? md.authorName;
+  return typeof name === 'string' && name !== '' ? name : undefined;
 }
 
 const textOf = (row: SuppressionStatsRow): string =>
@@ -102,28 +119,27 @@ function previewOf(text: string): string {
   return chars.length <= SUPPRESSION_PREVIEW_CHARS ? line : `${chars.slice(0, SUPPRESSION_PREVIEW_CHARS - 1).join('')}…`;
 }
 
-/** Counts, the largest first; past MAX_KEYS, the rest summed as "(others)". */
+/** Counts, the largest first; past MAX_KEYS, the rest summed as "(others)". Built from entries, so any name, "__proto__" included, is a key of its own. */
 function topCounts(counts: Map<string, number>): Record<string, number> {
   const sorted = [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
-  const out: Record<string, number> = {};
-  for (const [key, n] of sorted.slice(0, MAX_KEYS)) out[key] = n;
+  const entries: Array<[string, number]> = sorted.slice(0, MAX_KEYS);
   const rest = sorted.slice(MAX_KEYS).reduce((sum, [, n]) => sum + n, 0);
-  if (rest > 0) out['(others)'] = rest;
-  return out;
+  if (rest > 0) entries.push(['(others)', rest]);
+  return Object.fromEntries(entries);
 }
 
-function shown(row: SuppressionStatsRow, eventType: string | undefined): SuppressedEventShown {
+function shown(row: SuppressionStatsRow, record: { eventType?: string; source?: string } | undefined): SuppressedEventShown {
   const md = row.metadata ?? {};
-  const source = typeof md.serverId === 'string' && md.serverId !== '' ? md.serverId : undefined;
+  const source = sourceOf(row, record);
   const channel = typeof md.channelId === 'string' && md.channelId !== '' ? md.channelId : undefined;
-  const authorName = (md.author as { name?: unknown } | undefined)?.name;
+  const author = authorOf(md);
   return {
     id: row.id,
     at: isoOf(msOf(row.timestamp)),
-    eventType: eventType ?? 'unknown',
+    eventType: record?.eventType ?? 'unknown',
     ...(source ? { source } : {}),
     ...(channel ? { channel } : {}),
-    ...(typeof authorName === 'string' && authorName !== '' ? { author: authorName } : {}),
+    ...(author ? { author } : {}),
     preview: previewOf(textOf(row)),
   };
 }
@@ -143,7 +159,7 @@ export function suppressionStats(
   interface Tally {
     suppressed: number; characters: number; first: number; last: number;
     bySource: Map<string, number>; byEventType: Map<string, number>;
-    recent: Array<{ row: SuppressionStatsRow; eventType: string | undefined }>;
+    recent: Array<{ row: SuppressionStatsRow; record: { eventType?: string; source?: string } }>;
   }
   const tallies = new Map<string, Tally>();
   let total = 0;
@@ -164,12 +180,12 @@ export function suppressionStats(
     tally.characters += characters;
     if (at < tally.first) tally.first = at;
     if (at > tally.last) tally.last = at;
-    const source = typeof row.metadata?.serverId === 'string' && row.metadata.serverId !== '' ? row.metadata.serverId : '(none)';
+    const source = sourceOf(row, record) ?? '(none)';
     tally.bySource.set(source, (tally.bySource.get(source) ?? 0) + 1);
     const eventType = record.eventType ?? 'unknown';
     tally.byEventType.set(eventType, (tally.byEventType.get(eventType) ?? 0) + 1);
     if (recentWanted > 0) {
-      tally.recent.push({ row, eventType: record.eventType });
+      tally.recent.push({ row, record });
       if (tally.recent.length > recentWanted) tally.recent.shift();
     }
     total++;
@@ -187,7 +203,7 @@ export function suppressionStats(
       ...(tally ? { first: isoOf(tally.first), last: isoOf(tally.last) } : {}),
       bySource: tally ? topCounts(tally.bySource) : {},
       byEventType: tally ? topCounts(tally.byEventType) : {},
-      recent: tally ? tally.recent.slice().reverse().map(({ row, eventType }) => shown(row, eventType)) : [],
+      recent: tally ? tally.recent.slice().reverse().map(({ row, record }) => shown(row, record)) : [],
     };
   };
 
@@ -204,7 +220,7 @@ export function suppressionStats(
   return { rules: out, total, totalCharacters };
 }
 
-/** One suppressed row, whole, as a dump or the review reads it. */
+/** One suppressed row, as a dump or the review reads it: its text in full, any other block named. */
 export interface SuppressedEventRecord {
   id: string;
   /** ISO 8601. */
@@ -233,7 +249,7 @@ function fullTextOf(row: SuppressionStatsRow): string {
     .join('\n');
 }
 
-/** The suppressed rows among `rows`, oldest first, whole. */
+/** The suppressed rows among `rows`, oldest first, their text in full; times are when each was stored. */
 export function suppressedRecords(rows: Iterable<SuppressionStatsRow>, opts: SuppressedRecordsOptions = {}): SuppressedEventRecord[] {
   const out: SuppressedEventRecord[] = [];
   for (const row of rows) {
@@ -242,7 +258,7 @@ export function suppressedRecords(rows: Iterable<SuppressionStatsRow>, opts: Sup
     const at = msOf(row.timestamp);
     if (opts.sinceMs !== undefined && !(at >= opts.sinceMs)) continue;
     if (opts.untilMs !== undefined && !(at < opts.untilMs)) continue;
-    const { source, channel, author } = shown(row, record.eventType);
+    const { source, channel, author } = shown(row, record);
     out.push({
       id: row.id,
       at: isoOf(at),
@@ -275,13 +291,19 @@ export function renderSuppressedDump(
     : `[${r.at}] ${r.rule} · ${r.eventType}${r.source ? ` · ${r.source}` : ''}${r.channel ? ` · ${r.channel}` : ''}`
       + `${r.author ? ` · ${r.author}` : ''} · ${r.id}\n${r.text}\n\n`;
   const entries = records.map(entry);
+  const header = (omitted: number) => format === 'jsonl' ? '' : `# ${opts.title}\n${omitted > 0 ? `(${omitted} older events left out to fit)\n` : ''}\n`;
+  const total = entries.reduce((n, e) => n + Buffer.byteLength(e), 0);
+  // Everything, when it fits with the plain header; otherwise the newest that
+  // fit beside the header that names how many were left out.
+  if (Buffer.byteLength(header(0)) + total <= opts.maxBytes) {
+    return { content: header(0) + entries.join(''), written: entries.length, omitted: 0 };
+  }
+  const room = opts.maxBytes - Buffer.byteLength(header(entries.length));
   let bytes = 0;
   let from = entries.length;
-  const header = (omitted: number) => format === 'jsonl' ? '' : `# ${opts.title}\n${omitted > 0 ? `(${omitted} older events left out to fit)\n` : ''}\n`;
-  const headerBytes = Buffer.byteLength(header(entries.length));
   while (from > 0) {
     const size = Buffer.byteLength(entries[from - 1]!);
-    if (headerBytes + bytes + size > opts.maxBytes) break;
+    if (bytes + size > room) break;
     bytes += size;
     from--;
   }

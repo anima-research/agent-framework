@@ -10,13 +10,15 @@
  * Protocol: the parent posts one message at a time and blocks in
  * Atomics.wait until this worker writes the JSON answer into the shared
  * buffer and flips the control word.
- *   - `{ type: 'load', rules: [{ name, script }] }` compiles each script (an
- *     expression that evaluates to a function) and answers
- *     `{ errors: { [name]: message } }`; a rule not named is dropped.
+ *   - `{ type: 'reset' }` drops every script held: `{}`.
+ *   - `{ type: 'load', name, script }` compiles one script (an expression
+ *     that evaluates to a function) and keeps it under the rule's name:
+ *     `{ error? }`.
  *   - `{ type: 'check', script }` compiles one without keeping it: `{ error? }`.
  *   - `{ type: 'eval', name, event, state }` calls the rule's function with
  *     the event and the state, and answers `{ hide, state }`: the state as
- *     the script left it. A script may be async.
+ *     the script left it, and `hide` true only where the script returned
+ *     true. A script may be async.
  */
 import { parentPort, workerData } from 'node:worker_threads';
 
@@ -50,16 +52,15 @@ function compile(script: string): SuppressFn {
   return made as SuppressFn;
 }
 
-parentPort?.on('message', (msg: { type?: string; rules?: Array<{ name: string; script: string }>; script?: string; name?: string; event?: unknown; state?: unknown }) => {
+parentPort?.on('message', (msg: { type?: string; script?: string; name?: string; event?: unknown; state?: unknown }) => {
+  if (msg?.type === 'reset') {
+    fns.clear();
+    answer({});
+    return;
+  }
   if (msg?.type === 'load') {
-    const errors: Record<string, string> = {};
-    const keep = new Set<string>();
-    for (const { name, script } of msg.rules ?? []) {
-      keep.add(name);
-      try { fns.set(name, compile(script)); } catch (e) { fns.delete(name); errors[name] = message(e); }
-    }
-    for (const name of [...fns.keys()]) if (!keep.has(name)) fns.delete(name);
-    answer({ errors });
+    const name = msg.name ?? '';
+    try { fns.set(name, compile(msg.script ?? '')); answer({}); } catch (e) { fns.delete(name); answer({ error: message(e) }); }
     return;
   }
   if (msg?.type === 'check') {
@@ -79,7 +80,8 @@ parentPort?.on('message', (msg: { type?: string; rules?: Array<{ name: string; s
       if (kept === undefined || enc.encode(kept).length > maxStateBytes) {
         return answer({ error: `its state is over the ${maxStateBytes.toLocaleString('en-US')} bytes it may keep` });
       }
-      answer({ hide: Boolean(hide), state: JSON.parse(kept) });
+      // Only true hides: anything else, a truthy string included, shows the event.
+      answer({ hide: hide === true, state: JSON.parse(kept) });
     } catch (e) {
       answer({ error: message(e) });
     }

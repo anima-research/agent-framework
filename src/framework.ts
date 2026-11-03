@@ -4991,6 +4991,7 @@ export class AgentFramework {
           emitTrace: (e) => framework.emitTrace(e),
           statePath: join(dirname(configPath), 'suppression-review.json'),
           mayRun: () => !framework.quiesced && !framework.stopHasBegun(),
+          dumpAvailable: () => framework.getWorkspaceModule() !== undefined,
         }, review || {});
       }
     }
@@ -13084,7 +13085,7 @@ export class AgentFramework {
         '`{ name: "hide-eye-flaps", match: { source: "body", scope: ["mcpl:tool-changes"] }, suppress: { description: "the eye going on and off" } }`, ' +
         'and give it a `script` for logic of your own, such as showing one in ten minutes: ' +
         '`(event, state) => { if (event.at - (state.shown ?? 0) < 600000) return true; state.shown = event.at; return false; }`. ' +
-        'suppression_stats shows what each suppress rule has hidden, and dump_suppressed writes it to a file.',
+        'suppression_stats shows what each suppress rule has hidden, and dump_suppressed, where you have a workspace, writes it to a file.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -13182,14 +13183,14 @@ export class AgentFramework {
             description:
               'Keep the events this rule takes out of your context. Without it, a rule that doesn\'t wake you still ' +
               'shows you its events. Suppressed events are still stored: suppression_stats counts them and shows a few, ' +
-              'dump_suppressed writes them to a file, and history finds them. But they\'re never shown to you, never ' +
+              'dump_suppressed writes them to a file where you have a workspace, and history finds them. But they\'re never shown to you, never ' +
               'wake you, and never go into your memory. It\'s decided as each event arrives, so a rule hides only what ' +
               'arrives after you add it, and removing the rule doesn\'t bring back what it hid. Needs a match that ' +
               'narrows it. Leave behavior out: the rule is saved with behavior "defer". It never hides a message ' +
               'addressed to you (a mention, a reply, a DM), the heartbeat, or console input: the rules after it decide ' +
               'those. An MCPL server\'s [toolsets] notices of tool changes are its "mcpl:tool-changes" events. ' +
-              'Every so often a small model reads what each rule hid against its description and tells you, ' +
-              'flagging anything that doesn\'t fit.',
+              'Where your host runs the suppression review, a small model also reads, every so often, a sample of what ' +
+              'each rule hid against its description, and tells you of anything that may not fit.',
             properties: {
               description: {
                 type: 'string',
@@ -13202,8 +13203,8 @@ export class AgentFramework {
                   'called for each event the match takes; true hides it. event has eventType, source, channel, author, ' +
                   'tags, text, at (when it arrived, in ms) and metadata. state is this rule\'s own object, kept between ' +
                   'events and across restarts, for you to read and change: to count, remember what you\'ve seen, or keep ' +
-                  'a window. It starts empty, and again when you change the script. A script that throws or takes over ' +
-                  '50 ms shows the event. Left out, every event the match takes is hidden.',
+                  'a window. It starts empty, and again when you change the script. A script that throws or takes too ' +
+                  'long counts as saying show, and so does any answer but true. Left out, every event the match takes is hidden.',
               },
             },
             required: ['description'],
@@ -13303,7 +13304,7 @@ export class AgentFramework {
   private static readonly SUPPRESSION_STATS_TOOL: import('./types/index.js').ToolDefinition = {
     name: 'suppression_stats',
     description:
-      'Show what your suppress rules (wake_add_rule with suppress: true) have kept out of your context. For each rule: ' +
+      'Show what your suppress rules (wake_add_rule with suppress) have kept out of your context. For each rule: ' +
       'how many events it hid, how much text they held, when the first and last arrived, which servers and event types ' +
       'they came from, and the newest few with a short preview. It reads the stored events themselves, so it counts ' +
       'every one since the rule was added, across restarts, on the branch your memory is on. A rule you removed still ' +
@@ -17379,24 +17380,25 @@ export class AgentFramework {
     const namesChannel = typeof eventChannel === 'string' && eventChannel !== '';
     const localInput = event.type === 'external-message' || event.type === 'api:message';
     const source = 'source' in event ? (event as { source: string }).source : 'unknown';
-    // Suppression (a gate rule with `suppress: true`), asked once for the
-    // response, before its messages are written: a suppressed event's
-    // messages are stored with the record and rendered nowhere, and it wakes
-    // nobody. Console and API input never is, nor a tool's call or result;
-    // an MCPL event was decided at admission, where its own row was written.
-    const suppressible = (response.addMessages?.length ?? 0) > 0 && !surface && !localInput
-      && event.type !== 'tool-call' && event.type !== 'tool-result' && !event.type.startsWith('mcpl:');
-    // Decided once for the event, whichever module's response asks first: a
-    // windowed rule's window opens at that decision.
+    // Suppression (a gate rule with `suppress`), decided once for the event,
+    // by the first response that adds messages or asks for a wake: a
+    // suppressed event's messages are stored with the record and rendered
+    // nowhere, and no response wakes anyone for it. Console and API input
+    // never is, nor a tool's call or result. An MCPL event was decided at
+    // admission, where its own row was written, and its modules' responses
+    // read that decision.
+    const suppressible = ((response.addMessages?.length ?? 0) > 0 || !!response.requestInference) && !surface && !localInput
+      && event.type !== 'tool-call' && event.type !== 'tool-result';
     let suppressedRule: string | null = null;
     if (suppressible) {
       const decided = this.eventSuppression.get(event);
       if (decided !== undefined) suppressedRule = decided;
-      else {
+      else if (!event.type.startsWith('mcpl:')) {
         suppressedRule = this.suppressionFor({ ...extractGateFields(event), eventType: event.type, serverId: source, channelId: namesChannel ? String(eventChannel) : '' });
         this.eventSuppression.set(event, suppressedRule);
       }
     }
+    const suppressionAsked = suppressible && !event.type.startsWith('mcpl:') && !!this.eventGate && this.viewHidesSuppressed(this.deliveryAgent());
     let added: { agent?: string; deferredId?: string; messageId?: string } | undefined;
     if (response.addMessages) {
       for (const [i, msg] of response.addMessages.entries()) {
@@ -17409,7 +17411,7 @@ export class AgentFramework {
         if (surface) metadata = { ...metadata, [INBOUND_SOURCE_KEY]: surface };
         const placement: { agent?: string; deferredId?: string; messageId?: string } = {};
         const id = this.addMessage(msg.participant, localInput ? markNoticeOpenings(msg.content) : msg.content, metadata, {
-          placement, ...(suppressedRule !== null ? { suppressedBy: { rule: suppressedRule, eventType: event.type } } : {}),
+          placement, ...(suppressedRule !== null ? { suppressedBy: { rule: suppressedRule, eventType: event.type, source } } : {}),
         });
         if (response.addMessages.length === 1 && !surface && !namesChannel && metadata?.channelId === undefined) added = placement;
         this.emitTrace({ type: 'message:added', messageId: id, source: event.type });
@@ -17451,6 +17453,7 @@ export class AgentFramework {
           eventType: event.type,
           serverId: source,
           channelId: '',
+          ...(suppressionAsked ? { suppressionAsked: true } : {}),
         });
         if (!decision.trigger) return;
       }
@@ -17482,8 +17485,28 @@ export class AgentFramework {
   // Built-in MCPL event → context message conversion
   // ==========================================================================
 
-  /** Each module event's suppression, decided by the first response that adds messages for it (applyProcessResponse). */
+  /** Each event's suppression, decided once: by its MCPL lane at admission, or by the first module response that adds messages or asks for a wake (applyProcessResponse). */
   private readonly eventSuppression = new WeakMap<object, string | null>();
+  /** A coalesced push occurrence's suppression, decided at its wake and read when its row is written, by `${serverId}\u0000${eventId}`. */
+  private readonly coalescedSuppression = new Map<string, string | null>();
+
+  private rememberCoalescedSuppression(serverId: string, eventId: string | undefined, rule: string | null): void {
+    if (!eventId) return;
+    const key = `${serverId}\u0000${eventId}`;
+    this.coalescedSuppression.delete(key);
+    this.coalescedSuppression.set(key, rule);
+    if (this.coalescedSuppression.size > 10_000) this.coalescedSuppression.delete(this.coalescedSuppression.keys().next().value!);
+  }
+
+  /** The suppression a coalesced occurrence's wake decided, taken for its row (admitInbound's `decided`); none when its wake never asked. */
+  private coalescedDecision(serverId: string, eventId: string | undefined): { decided?: string | null } {
+    if (!eventId) return {};
+    const key = `${serverId}\u0000${eventId}`;
+    if (!this.coalescedSuppression.has(key)) return {};
+    const decided = this.coalescedSuppression.get(key)!;
+    this.coalescedSuppression.delete(key);
+    return { decided };
+  }
 
   /** The servers and keys whose drop withoutHostKeys has logged, each as
    *  `${serverId}\u0000${key}`. */
@@ -17656,7 +17679,9 @@ export class AgentFramework {
         author: event.author,
         ...(event.tags ? { tags: event.tags } : {}),
       },
-    }, { suppressible: !this.conversationRouter });
+    }, { suppressible: !this.conversationRouter, ...(event.coalescingSubject ? this.coalescedDecision(event.serverId, event.eventId) : {}) });
+    // Modules answering this event read the same decision (applyProcessResponse).
+    this.eventSuppression.set(event, decision.suppressed?.rule ?? null);
     metadata.triggered = decision.wake;
     if (decision.held) {
       // The admission record rides the message; the hold's own bookkeeping
@@ -17752,7 +17777,7 @@ export class AgentFramework {
     // A suppressed one is stored with its record (suppressedRow) and rendered
     // nowhere, and is never the latest delivered inbound either.
     const placement: CoalescingPlacement = { agent: '' };
-    const suppressedBy = decision.suppressed ? { rule: decision.suppressed.rule, eventType: 'mcpl:channel-incoming' } : undefined;
+    const suppressedBy = decision.suppressed ? { rule: decision.suppressed.rule, eventType: 'mcpl:channel-incoming', source: event.serverId } : undefined;
     const id = this.addMessage('user', incomingContent, AgentFramework.withStoredDigest(metadata, incomingContent), {
       placement, bypassDeferralFor: event.assemblingFor, ...(suppressedBy ? { suppressedBy } : {}),
     });
@@ -19180,6 +19205,7 @@ export class AgentFramework {
     // A deferred batch is admitted when it asks for its wake: the hold and
     // the gate decide now; its materialized delivery at assembly is vetoed
     // (`triggerInference: false`) and so is not shown to the gate again.
+    const remembered = this.coalescedSuppression.get(`${occ.serverId}\u0000${occ.eventId}`);
     const decision = this.admitInbound({
       lane: 'push',
       serverId: occ.serverId,
@@ -19202,7 +19228,20 @@ export class AgentFramework {
         eventType: 'mcpl:push-event',
         ...(occ.tags ? { tags: occ.tags } : {}),
       },
-    });
+    }, remembered !== undefined ? { decided: remembered } : {});
+    // Decided once for the occurrence: its row, written later, reads this
+    // decision rather than asking again (coalescedDecision), since a rule's
+    // script answers once per event.
+    this.rememberCoalescedSuppression(occ.serverId, occ.eventId, decision.suppressed?.rule ?? null);
+    if (decision.suppressed && !plain && this.pushCoalescer) {
+      // A suppressed batch wakes nobody, so no turn's assembly would store
+      // it; it's stored now, stamped, and consumed, as a held batch is.
+      const coalescer = this.pushCoalescer;
+      void this.coalescedAudience(occ)
+        .then((audience) => (audience[0] !== undefined ? coalescer.materializeNow(audience[0], subject) : false))
+        .catch((err) => console.error(`[coalescing] a suppressed batch for ${logValue(subject)} could not be stored:`, err));
+      return;
+    }
     if (decision.held && !plain && this.pushCoalescer) {
       // A held batch wakes nobody, so no turn's assembly would store it while
       // the hold lasts, and readers of held traffic and the release would
@@ -19522,7 +19561,9 @@ export class AgentFramework {
         eventType: 'mcpl:push-event',
         ...(event.tags ? { tags: event.tags } : {}),
       },
-    });
+    }, event.coalescingSubject ? this.coalescedDecision(event.serverId, event.eventId) : {});
+    // Modules answering this event read the same decision (applyProcessResponse).
+    this.eventSuppression.set(event, decision.suppressed?.rule ?? null);
     metadata.triggered = decision.wake;
     if (decision.held && triggerChannel) {
       metadata.tuneOut = { epochId: decision.held.epochId };
@@ -19536,7 +19577,7 @@ export class AgentFramework {
     if (!silentHeartbeat) {
       // A suppressed event is stored with its record (suppressedRow) and
       // rendered nowhere; admission decided nothing else for it.
-      const suppressedBy = decision.suppressed ? { rule: decision.suppressed.rule, eventType: 'mcpl:push-event' } : undefined;
+      const suppressedBy = decision.suppressed ? { rule: decision.suppressed.rule, eventType: 'mcpl:push-event', source: event.serverId } : undefined;
       const id = this.addMessage('user', content, AgentFramework.withStoredDigest(metadata, content), {
         placement, bypassDeferralFor: event.assemblingFor, ...(suppressedBy ? { suppressedBy } : {}),
       });
@@ -21816,8 +21857,13 @@ export class AgentFramework {
     for (let end = cm.getMessageCount(); end > 0;) {
       const span = Math.min(end, AgentFramework.CLOCK_SCAN_ROWS);
       const { messages } = cm.getMessageWindow(end - span, span, { resolveBlobs: false });
-      if (newestRowAt === undefined && messages.length > 0) {
-        newestRowAt = new Date(messages[messages.length - 1]!.timestamp).getTime();
+      // The newest row the window renders: a suppressed row arriving isn't time the agent saw pass.
+      if (newestRowAt === undefined) {
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (suppressedRow(messages[i]!.metadata as Record<string, unknown> | undefined)) continue;
+          newestRowAt = new Date(messages[i]!.timestamp).getTime();
+          break;
+        }
       }
       for (let i = messages.length - 1; i >= 0; i--) {
         const stamp = clockStampOf(messages[i]!.metadata);
@@ -29853,7 +29899,7 @@ export class AgentFramework {
        * (suppressedRow). Only the framework stamps: a `suppressed` the given
        * metadata carries is dropped, as `deferredWriteId` is.
        */
-      suppressedBy?: { rule: string; eventType: string };
+      suppressedBy?: { rule: string; eventType: string; source?: string };
     }
   ): MessageId {
     // `deferredWriteId` is the framework's: a write from the queue is stored
@@ -29884,7 +29930,8 @@ export class AgentFramework {
       metadata = rest as MessageMetadata;
     }
     if (!opts?.fromQueue && opts?.suppressedBy) {
-      metadata = { ...metadata, suppressed: { rule: opts.suppressedBy.rule, eventType: opts.suppressedBy.eventType } } as MessageMetadata;
+      const { rule, eventType, source } = opts.suppressedBy;
+      metadata = { ...metadata, suppressed: { rule, eventType, ...(source ? { source } : {}) } } as MessageMetadata;
     }
     // Content context-manager won't store is refused here, as the store's own
     // write refuses it, whether this write is stored now or deferred: the
@@ -30024,7 +30071,8 @@ export class AgentFramework {
     // A turn starting, streaming or waiting on its tools writes after the
     // message, and the line says which message the wake is for.
     if (this.turnAlive(agent)) return false;
-    if (this.deferredMessages.some((m) => (m.forAgent ?? this.primaryAgentName) === agent.name)) return false;
+    // A queued write the agent won't see (a suppressed one) isn't a message after it.
+    if (this.deferredMessages.some((m) => (m.forAgent ?? this.primaryAgentName) === agent.name && this.agentSees(agent, m.metadata))) return false;
     return this.isNewestIn(agent, entry);
   }
 
@@ -33532,7 +33580,7 @@ export class AgentFramework {
         'user',
         [{ type: 'text', text: noticeText }],
         { system: true, kind: 'mcpl-toolsets', serverId, ...(opts.invite ? { invite: true } : {}) } as MessageMetadata,
-        rule !== null ? { suppressedBy: { rule, eventType: TOOL_CHANGES_EVENT_TYPE } } : undefined,
+        rule !== null ? { suppressedBy: { rule, eventType: TOOL_CHANGES_EVENT_TYPE, source: serverId } } : undefined,
       );
       if (rule !== null) this.noteSuppressedWrite(rule, { eventType: TOOL_CHANGES_EVENT_TYPE, serverId, channelId: '' });
       return true;
@@ -37028,7 +37076,7 @@ export class AgentFramework {
         if (problem !== null) {
           finish({
             success: false,
-            error: `wake_add_rule: suppress.script doesn't make a function (${problem}), so nothing was saved. `
+            error: `wake_add_rule: suppress.script can't be used (${problem}), so nothing was saved. `
               + 'Give the source of a function such as (event, state) => event.text.includes("ping").',
             isError: true,
           });
@@ -37512,19 +37560,35 @@ export class AgentFramework {
     }
   }
 
-  /** Count a write a suppress rule took, once addMessage has taken it (stored, or queued behind a turn) (EventGate.noteSuppressed). */
+  /**
+   * Count a write a suppress rule took, once addMessage has taken it (stored,
+   * or queued behind a turn) (EventGate.noteSuppressed), and tell the review
+   * the rule's description as it stands now, so the rows are judged against
+   * it even when the rule is gone by the next review.
+   */
   private noteSuppressedWrite(rule: string, info: Pick<GateEventInfo, 'eventType' | 'serverId' | 'channelId'>): void {
     this.eventGate?.noteSuppressed(rule, info);
+    const description = this.eventGate?.policyInForce(rule)?.suppress?.description;
+    if (description) this.suppressionReview?.noteRule(rule, description);
   }
 
   private admitInbound(
     env: InboundEnvelope,
-    /** False where the event may land in a conversation fork's store, which has no view filter. */
-    opts: { suppressible?: boolean } = {},
+    /**
+     * `suppressible`: false where the event may land in a conversation fork's
+     * store, which has no view filter. `decided`: the suppression decided for
+     * this occurrence earlier (a coalesced push's, at its wake), used instead
+     * of asking again, since a rule's script answers once per event.
+     */
+    opts: { suppressible?: boolean; decided?: string | null } = {},
   ): AdmissionDecision & { gateDecision?: GateDecision } {
     // The gate's whole decision, for wake onboarding (which rule let the event
     // go by); admission itself reads only whether it wakes.
     let gateDecision: GateDecision | undefined;
+    // Suppression is asked where the row lands in a view that hides it; the
+    // gate is told it was, so a suppress rule that let the event by doesn't
+    // decide its wake (EventGate.passesOverSuppress).
+    const asked = opts.suppressible !== false && !!this.eventGate && this.viewHidesSuppressed(this.deliveryAgent());
     const gateInfo = (e: InboundEnvelope) => ({
       content: e.gateContent,
       eventType: String(e.gateMetadata.eventType ?? 'unknown'),
@@ -37532,10 +37596,13 @@ export class AgentFramework {
       channelId: typeof e.gateMetadata.channelId === 'string' ? e.gateMetadata.channelId : '',
       metadata: e.gateMetadata,
       tags: Array.isArray(e.gateMetadata.tags) ? (e.gateMetadata.tags as string[]) : undefined,
+      ...(asked ? { suppressionAsked: true } : {}),
     });
     const decision = admit(env, {
       untargetedRecipients: () => this.registry.untargetedRecipients(),
-      ...(opts.suppressible !== false ? { suppressionFor: (e: InboundEnvelope) => this.suppressionFor(gateInfo(e)) } : {}),
+      ...(asked
+        ? { suppressionFor: (e: InboundEnvelope) => (opts.decided !== undefined ? opts.decided : this.suppressionFor(gateInfo(e))) }
+        : {}),
       holdFor: (serverId, channelId) => {
         const hold = this.tuneOutCoordinator?.holdFor(serverId, channelId) ?? null;
         return hold ? { kind: 'tune-out', epochId: hold.epochId, serverId, channelId } : null;
@@ -38798,10 +38865,11 @@ export class AgentFramework {
         ...(sinceMs !== undefined ? { sinceMs } : {}),
       });
       const named = typeof input.rule === 'string' && input.rule !== '' ? input.rule : undefined;
+      const within = sinceMs !== undefined ? ` since ${new Date(sinceMs).toISOString()}` : '';
       const note = stats.rules.length === 0
         ? (named !== undefined
-          ? `No suppress rule is named ${quotedValue(named)}, and no stored event was suppressed by one of that name.`
-          : 'You have no suppress rules, and no stored event was suppressed. wake_add_rule with suppress: true adds one.')
+          ? `No suppress rule is named ${quotedValue(named)}, and no stored event${within} was suppressed by one of that name.`
+          : `You have no suppress rules, and no stored event${within} was suppressed. wake_add_rule with suppress adds one.`)
         : undefined;
       finish({
         success: true,
@@ -38875,10 +38943,20 @@ export class AgentFramework {
       const last = records[records.length - 1]!.at;
       const title = `Suppressed events${rule !== undefined ? ` of rule ${JSON.stringify(rule)}` : ''}, ${first} to ${last} (${records.length})`;
       const dump = renderSuppressedDump(records, format, { maxBytes: DUMP_MAX_BYTES, title });
-      const byRule: Record<string, number> = {};
-      for (const r of records.slice(dump.omitted)) byRule[r.rule] = (byRule[r.rule] ?? 0) + 1;
-      const result = await workspace.writeBinary(path, Buffer.from(dump.content, 'utf8'), 'text/plain', { agentName });
-      if (!result.success && (result.data as { inChronicle?: boolean } | undefined)?.inChronicle !== true) {
+      if (dump.written === 0) {
+        refuse(`the newest event alone is over the ${Math.round(DUMP_MAX_BYTES / 1024 / 1024)} MB a file holds, so nothing was written. `
+          + 'Give until to write the events before it.');
+        return;
+      }
+      const counted = new Map<string, number>();
+      for (const r of records.slice(dump.omitted)) counted.set(r.rule, (counted.get(r.rule) ?? 0) + 1);
+      const byRule = Object.fromEntries(counted);
+      // Written on the branch the rows were read from, or not at all.
+      const agent = this.agents.get(agentName) ?? this.deliveryAgent();
+      const branch = agent?.getContextManager().currentBranch().name;
+      const result = await workspace.writeBinary(path, Buffer.from(dump.content, 'utf8'), 'text/plain', { agentName, ...(branch ? { branch } : {}) });
+      const storeOnly = !result.success && (result.data as { inChronicle?: boolean } | undefined)?.inChronicle === true;
+      if (!result.success && !storeOnly) {
         refuse(`writing ${path} failed: ${result.error ?? 'the workspace gave no reason'}. Nothing was written.`);
         return;
       }
@@ -38886,6 +38964,7 @@ export class AgentFramework {
         success: true,
         data: {
           path,
+          ...(storeOnly ? { diskNote: `${path} is in the workspace, where its tools read it, but its copy on disk failed: ${result.error ?? 'no reason given'}.` } : {}),
           written: dump.written,
           ...(dump.omitted > 0 ? { omitted: dump.omitted, note: `The ${dump.omitted} oldest events didn't fit in ${Math.round(DUMP_MAX_BYTES / 1024 / 1024)} MB; give since, until or rule for the rest.` } : {}),
           bytes: Buffer.byteLength(dump.content),

@@ -84,6 +84,22 @@ describe('reading a suppress rule', () => {
   });
 });
 
+describe('a suppress rule read past a problem in gate.json does not suppress', () => {
+  for (const [what, rule] of [
+    ['a misspelled script field', { name: 'r', match: { source: 'body' }, behavior: 'defer', suppress: { description: 'x', scirpt: '() => false' } }],
+    ['an empty script', { name: 'r', match: { source: 'body' }, behavior: 'defer', suppress: { description: 'x', script: '' } }],
+    ['a null script', { name: 'r', match: { source: 'body' }, behavior: 'defer', suppress: { description: 'x', script: null } }],
+    ['a match read without a malformed part', { name: 'r', match: { source: 'body', tagsAny: 'chat:ambient' }, behavior: 'defer', suppress: { description: 'x' } }],
+  ] as const) {
+    it(`${what}: the rule defers instead, and gate_status says why`, () => {
+      const gate = makeGate({ default: 'always', policies: [rule] });
+      assert.equal(gate.policyInForce('r')?.suppress, undefined);
+      assert.equal(gate.suppressionFor(ev(['chat:ambient'])), null);
+      assert.ok(gate.getStatus().errors.some((e) => /Rule "r"/.test(e)), 'named in gate_status');
+    });
+  }
+});
+
 describe('suppressionFor', () => {
   it('names the suppress rule that takes the event, without a side effect', () => {
     const traces: Array<Record<string, unknown>> = [];
@@ -128,11 +144,15 @@ describe('suppressionFor', () => {
     assert.equal(sampled.suppressionFor(ev([])), 'hide-body');
   });
 
-  it('evaluate and probe pass over suppress rules', () => {
-    const gate = makeGate({ default: 'defer', policies: [HIDE_BODY] });
-    const ambient = ev(['chat:ambient']);
-    assert.equal(gate.evaluate(ambient).policyName, null, 'the default decides, not the suppress rule');
-    assert.equal(gate.probe(ambient).policyName, null);
+  it('evaluate and probe pass over a suppress rule for an event suppression was asked about, and defer by it otherwise', () => {
+    const gate = makeGate({ default: 'always', policies: [HIDE_BODY] });
+    const asked = ev(['chat:ambient'], { suppressionAsked: true });
+    assert.equal(gate.evaluate(asked).policyName, null, 'the default decides, not the suppress rule');
+    assert.equal(gate.probe(asked).policyName, null);
+    // Where suppression wasn't asked (no view to hide the row from), the rule's behavior, defer, applies.
+    const unasked = ev(['chat:ambient']);
+    assert.deepEqual([gate.evaluate(unasked).policyName, gate.evaluate(unasked).trigger], ['hide-body', false]);
+    assert.equal(gate.evaluate(ev(['chat:addressed'])).policyName, null, 'an addressed event is always let by');
   });
 
   it('a rule edited in gate.json is read again before the next decision', () => {
@@ -186,7 +206,8 @@ describe('suppress rules with a script of the agent\'s own (suppress.script)', (
     writeFileSync(CONFIG_PATH, JSON.stringify({ default: 'always', policies }));
     const gate = new EventGate({
       configPath: CONFIG_PATH, emitTrace: () => {}, addMessage: () => '', requestInference: () => {}, getAgentNames: () => ['agent'],
-      now: () => t, ...(timeoutMs !== undefined ? { suppressScriptTimeoutMs: timeoutMs } : {}),
+      // A generous timeout unless the test is about timeouts, so a loaded machine doesn't fail a script that answers.
+      now: () => t, suppressScriptTimeoutMs: timeoutMs ?? 2_000,
     });
     gates.push(gate);
     return { gate, advance: (ms: number) => { t += ms; } };
@@ -229,7 +250,7 @@ describe('suppress rules with a script of the agent\'s own (suppress.script)', (
     const throws = clocked([{ ...EYE, suppress: { description: 'x', script: '(event) => { throw new Error("boom"); }' } }]);
     assert.equal(throws.gate.decideSuppression(ev([])), null);
     assert.match(String(throws.gate.getStatus().policies[0].suppress?.scriptStatus?.lastError), /boom/);
-    const loops = clocked([{ ...EYE, suppress: { description: 'x', script: '() => { for (;;) {} }' } }], 30);
+    const loops = clocked([{ ...EYE, suppress: { description: 'x', script: '() => { for (;;) {} }' } }], 40);
     assert.equal(loops.gate.decideSuppression(ev([])), null);
     const status = loops.gate.getStatus().policies[0].suppress?.scriptStatus;
     assert.equal(status?.timeouts, 1);
@@ -238,6 +259,36 @@ describe('suppress rules with a script of the agent\'s own (suppress.script)', (
     assert.equal(huge.gate.decideSuppression(ev([])), null);
     assert.match(String(huge.gate.getStatus().policies[0].suppress?.scriptStatus?.lastError), /over the 65,536 bytes/);
     assert.deepEqual(huge.gate.suppressScriptState('eye'), {}, 'the state stays as it was');
+  });
+
+  it('only true hides: a truthy answer of another kind shows the event', () => {
+    const { gate } = clocked([{ ...EYE, suppress: { description: 'x', script: '() => "yes"' } }]);
+    assert.equal(gate.decideSuppression(ev([])), null);
+  });
+
+  it('a looping script stops only itself: the next rule\'s script still runs, and after three timeouts in a row it is set aside', () => {
+    const { gate } = clocked([
+      { name: 'loops', match: { source: 'body' }, behavior: 'defer', suppress: { description: 'x', script: '() => { for (;;) {} }' } },
+      { name: 'hides', match: { source: 'body' }, behavior: 'defer', suppress: { description: 'y', script: '() => true' } },
+    ], 40);
+    for (let i = 0; i < 3; i++) assert.equal(gate.decideSuppression(ev([])), 'hides', `event ${i + 1}: the next rule decides`);
+    const [loops, hides] = gate.getStatus().policies.map((p) => p.suppress?.scriptStatus);
+    assert.equal(loops?.timeouts, 3);
+    assert.match(String(loops?.disabled), /3 times in a row, so it isn't run again until its rule changes/);
+    assert.equal(hides?.loaded, true, 'loaded again on each fresh worker');
+    const started = Date.now();
+    assert.equal(gate.decideSuppression(ev([])), 'hides');
+    assert.ok(Date.now() - started < 40, 'a script set aside costs no timeout');
+  });
+
+  it('the probe table lets a probe on past a script that says show, and gate_status reports a script before any event', () => {
+    const { gate } = clocked([
+      { name: 'quiet', match: { source: 'discord', tagsAny: ['chat:ambient'] }, behavior: 'defer', suppress: { description: 'x', script: '() => false' } },
+      { name: 'ambient-wakes', match: { tagsAny: ['chat:ambient'] }, behavior: 'always' },
+    ]);
+    assert.equal(gate.getStatus().policies[0].suppress?.scriptStatus?.loaded, true);
+    const ambient = gate.probeTable().find((r) => r.probe === 'ambient (human)')!;
+    assert.deepEqual([ambient.policy, ambient.wouldWake], ['ambient-wakes', true]);
   });
 
   it('a script that is not a function is caught before it is saved, and shows events if it reaches gate.json', () => {

@@ -206,8 +206,8 @@ export interface GatePolicy {
 export interface SuppressConfig {
   /**
    * What the rule is for, in the agent's words ("the eye going on and off").
-   * Required: the periodic review (SuppressionReviewOptions) judges each
-   * event the rule hid against it.
+   * Required: the periodic review (SuppressionReviewOptions), where the host
+   * runs it, checks a sample of the events the rule hid against it.
    */
   description: string;
   /**
@@ -490,6 +490,14 @@ export interface GateEventInfo {
   paths?: string[];
   /** Event tags (MCPL RFC-001), already implication-expanded by the host. */
   tags?: string[];
+  /**
+   * Set when the framework asked whether the event is suppressed before it
+   * asked about its wake (decideSuppression), so a suppress rule that
+   * matches it let it by. Left out, a suppress rule defers the events it
+   * matches, as its behavior says: suppression wasn't asked, as for an event
+   * that lands where no view hides suppressed rows.
+   */
+  suppressionAsked?: boolean;
 }
 
 /** An MCPL event whose content the framework stored at arrival, as a

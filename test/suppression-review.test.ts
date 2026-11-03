@@ -92,6 +92,8 @@ describe('the review\'s settings and helpers', () => {
     assert.deepEqual(parseReviewAnswer('{"fits": true, "flagged": []}', 5), { flagged: [], note: '' });
     assert.equal(parseReviewAnswer('they all fit', 5), undefined);
     assert.equal(parseReviewAnswer('{"flagged": "3"}', 5), undefined);
+    assert.equal(parseReviewAnswer('{"fits": false, "flagged": []}', 5), undefined, 'they don\'t all fit, but none is named: no answer');
+    assert.equal(parseReviewAnswer('{"fits": true, "flagged": [9]}', 5), undefined, 'it names only events it wasn\'t shown: no answer');
   });
 });
 
@@ -157,8 +159,9 @@ describe('a review', () => {
     });
     const summary = await h.run();
     assert.deepEqual(summary?.rules.map((r) => [r.rule, r.verdict]), [['a', 'error'], ['b', 'error']]);
-    assert.match(h.delivered[0].text, /"a" \(aa\) hid 1\. The reviewer couldn't answer this time \(overloaded\)\./);
-    assert.match(h.delivered[0].text, /"b" \(bb\) hid 1\. The reviewer couldn't answer this time \(its answer held no verdict/);
+    assert.match(h.delivered[0].text, /"a" \(aa\) hid 1\. The reviewer couldn't answer this time; they'll be reviewed again next time\./);
+    assert.match(h.delivered[0].text, /"b" \(bb\) hid 1\. The reviewer couldn't answer this time/);
+    assert.match(String(summary?.rules[0].note), /overloaded/, 'the cause is kept for the log and the trace');
     assert.equal(h.delivered[0].wake, false, 'an error is no flag');
   });
 
@@ -193,7 +196,7 @@ describe('a review', () => {
     const h = harness({ statePath, records: [rec('hide-ears', 1, 'chatter')] });
     (h.review as unknown as { deps: SuppressionReviewDeps }).deps.deliver = () => { throw new Error('store refused'); };
     await assert.rejects(h.run(), /store refused/);
-    assert.equal(existsSync(statePath), false, 'nothing recorded as reviewed');
+    assert.equal(JSON.parse(readFileSync(statePath, 'utf-8')).reviewedThrough, T0, 'reviewed through no further than where it started');
   });
 
   it('notices name every rule, and the text stays one notice', () => {
@@ -218,6 +221,38 @@ describe('a review', () => {
     release();
     assert.equal(await running, null);
     assert.equal(h.delivered.length, 0);
-    assert.equal(existsSync(statePath), false);
+    assert.equal(JSON.parse(readFileSync(statePath, 'utf-8')).reviewedThrough, T0, 'nothing recorded as reviewed');
+  });
+
+  it('a rule the reviewer couldn\'t answer about is reviewed again next time, from where its events begin', async () => {
+    const statePath = join(dir, 'suppression-review.json');
+    const h = harness({ statePath, records: [rec('hide-ears', 1, 'first period')], answers: [new Error('overloaded')] });
+    const first = await h.run();
+    assert.equal(first?.rules[0].verdict, 'error');
+    h.setRecords([rec('hide-ears', 1, 'first period'), rec('hide-ears', 2, 'second period', T0 + 3 * HOUR)]);
+    const second = await h.run(T0 + 4 * HOUR);
+    assert.equal(second?.rules[0].verdict, 'fits');
+    assert.equal(second?.rules[0].suppressed, 2, 'the first period\'s event is judged again with the second\'s');
+    const third = await h.run(T0 + 6 * HOUR);
+    assert.equal(third?.total, 0, 'and once answered, not again');
+    assert.deepEqual(JSON.parse(readFileSync(statePath, 'utf-8')).retryFrom, {});
+  });
+
+  it('a description noted when a rule hides a row is used after the rule is gone, and then dropped', async () => {
+    const statePath = join(dir, 'suppression-review.json');
+    const h = harness({ statePath, records: [rec('brief', 1, 'x')], rules: [] });
+    h.review.noteRule('brief', 'a rule that lived an hour');
+    const summary = await h.run();
+    assert.equal(summary?.rules[0].description, 'a rule that lived an hour');
+    assert.equal(summary?.rules[0].verdict, 'fits');
+    assert.deepEqual(JSON.parse(readFileSync(statePath, 'utf-8')).descriptions, {}, 'nothing left to judge it for');
+  });
+
+  it('the notice leaves dump_suppressed out where there is no workspace', async () => {
+    const h = harness({ statePath: null, records: [rec('hide-ears', 1, 'x')] });
+    (h.review as unknown as { deps: SuppressionReviewDeps }).deps.dumpAvailable = () => false;
+    await h.run();
+    assert.match(h.delivered[0].text, /suppression_stats shows what a rule hid/);
+    assert.ok(!h.delivered[0].text.includes('dump_suppressed'));
   });
 });
