@@ -457,7 +457,7 @@ describe('after a branch move, every agent on the store compiles without a resta
     assert.deepEqual(reinitAlerts().map((alert) => alert.agentName), ['b']);
     for (const words of written) assert.ok(!textsOfCm('b').includes(words), `not stored before the recovery: ${words}`);
     assert.ok(!logged.some((line) => line.includes("couldn't be stored at its release")), logged.join('\n'));
-    assert.equal(logged.filter((line) => line.includes('agent=b') && line.includes('waits in memory until switchBranch() re-initializes it')).length, 1,
+    assert.equal(logged.filter((line) => line.includes('agent=b') && line.includes('waits in memory until a branch move (switchBranch, rollback or suppression) re-initializes it')).length, 1,
       `the wait is logged once, as it begins: ${logged.join('\n')}`);
     assert.equal(framework.getHostModeStatus().deferredWrites, 3, 'the three writes wait in memory');
     assert.equal(added.length, 0, `none is traced before it is stored: ${JSON.stringify(added)}`);
@@ -604,7 +604,7 @@ describe('after a branch move, every agent on the store compiles without a resta
       assert.deepEqual(alerts.map((alert) => alert.agentName), ['b']);
       const message = alerts[0]!.message;
       assert.ok(message.startsWith("The branch switch moved the store's branch"), message);
-      says(message, 'refuses its work', 'switchBranch() to the current branch re-initializes it', 'stores the writes kept in memory for it meanwhile; a restart loses them');
+      says(message, 'refuses its work', 'until a branch move, such as switchBranch() to the current branch, re-initializes it', 'stores the writes kept in memory for it meanwhile; a restart loses them');
       assert.match(message, /Its re-initialization failed: .*injected initialization failure\.$/, 'the cause comes last');
       assert.ok(textsOfCm('a').includes('for a, during the hold'), "a's write was stored at the release");
       await framework.stop();
@@ -647,7 +647,8 @@ describe('after a branch move, every agent on the store compiles without a resta
     assert.equal(lines.length, 1, `one line, for b: ${lines.join('\n')}`);
     says(lines[0]!, '[stop] agent=b: 3 writes for b kept in memory are not stored by this stop',
       '3 kept while its context manager refuses its work, which are lost', 'Kinds: 2 message, 1 agent-message.',
-      'The mail among them (1) stays held in the registry, and the next boot delivers it.');
+      'The mail among them (1) stays held in the registry, and the next boot delivers it to its recipient, or, where that ' +
+        'recipient is gone by then, keeps it held there, marked recipient-gone.');
     const lost = traces.filter((t): t is Extract<TraceEvent, { type: 'ops:alert' }> => t.type === 'ops:alert' && t.kind === 'store-held-lost');
     assert.deepEqual(lost.map((alert) => [alert.agentName, alert.data]), [
       ['b', { count: 3, keptForRecovery: 3, heldBySurgery: 0, kinds: { message: 2, 'agent-message': 1 }, mail: 1 }],
@@ -1308,13 +1309,13 @@ describe('after a branch move, every agent on the store compiles without a resta
       a.initializeStrategy = initializeStrategy;
     }
     assert.equal(framework.getStore().currentBranch().name, 'main');
-    says(message, 'RESTORE TO main selected it', 'FAILED', 'refuses its work until switchBranch() to the current branch re-initializes it');
+    says(message, 'RESTORE TO main selected it', 'FAILED', 'refuses its work until a branch move, such as switchBranch() to the current branch, re-initializes it');
     assert.doesNotMatch(message, /still on failed-twice/);
     const alerts = reinitAlerts().filter((alert) => alert.agentName === 'a');
     assert.equal(alerts.length, 1, JSON.stringify(reinitAlerts()));
     const alert = alerts[0]!.message;
     assert.ok(alert.startsWith('The rollback failed and the store was put back'), alert);
-    says(alert, 'refuses its work', 'switchBranch() to the current branch re-initializes it', 'stores the writes kept in memory for it meanwhile; a restart loses them', 'The store is on main.');
+    says(alert, 'refuses its work', 'until a branch move, such as switchBranch() to the current branch, re-initializes it', 'stores the writes kept in memory for it meanwhile; a restart loses them', 'The store is on main.');
     assert.match(alert, /Its re-initialization failed: .*injected strategy init failure\.$/, 'the cause comes last');
   });
 
@@ -1340,12 +1341,12 @@ describe('after a branch move, every agent on the store compiles without a resta
     }
     assert.equal(framework.getStore().currentBranch().name, 'failed-thrice');
     says(message, 'RESTORE TO main ALSO FAILED (injected restore refusal)', 'the store is still on failed-thrice',
-      'refuses its work until switchBranch() to main re-initializes it');
+      'refuses its work until a branch move, such as switchBranch() to main, re-initializes it');
     const alerts = reinitAlerts().filter((alert) => alert.agentName === 'a');
     assert.equal(alerts.length, 1, JSON.stringify(reinitAlerts()));
     const alert = alerts[0]!.message;
     assert.ok(alert.startsWith("The rollback failed and the store couldn't be put back"), alert);
-    says(alert, 'refuses its work', 'switchBranch() to the branch it should run on re-initializes it', 'stores the writes kept in memory for it meanwhile; a restart loses them');
+    says(alert, 'refuses its work', 'until a branch move, such as switchBranch() to the branch it should run on, re-initializes it', 'stores the writes kept in memory for it meanwhile; a restart loses them');
     assert.ok(alert.endsWith(' The store is on failed-thrice, and the restore to main failed: injected restore refusal.'), alert);
     assert.doesNotMatch(alert, /moved the store's branch/);
   });
@@ -1413,12 +1414,12 @@ describe('after a branch move, every agent on the store compiles without a resta
       a.initializeStrategy = initializeStrategy;
     }
     assert.equal(framework.getStore().currentBranch().name, 'main');
-    says(message, 'RESTORE TO main selected it', 'FAILED (injected strategy init failure)', 'refuses its work until switchBranch() to the current branch re-initializes it');
+    says(message, 'RESTORE TO main selected it', 'FAILED (injected strategy init failure)', 'refuses its work until a branch move, such as switchBranch() to the current branch, re-initializes it');
     const alerts = reinitAlerts().filter((alert) => alert.agentName === 'a');
     assert.equal(alerts.length, 1, JSON.stringify(reinitAlerts()));
     const alert = alerts[0]!.message;
     assert.ok(alert.startsWith('The suppression failed and the store was put back'), alert);
-    says(alert, 'refuses its work', 'switchBranch() to the current branch re-initializes it', 'stores the writes kept in memory for it meanwhile; a restart loses them');
+    says(alert, 'refuses its work', 'until a branch move, such as switchBranch() to the current branch, re-initializes it', 'stores the writes kept in memory for it meanwhile; a restart loses them');
     assert.ok(alert.endsWith(' The store is on main. Its re-initialization failed: injected strategy init failure.'), alert);
   });
 
@@ -1442,7 +1443,7 @@ describe('after a branch move, every agent on the store compiles without a resta
     }
     const kept = keptHead(webhook.posted, 'a', 'context-reinit-failed');
     assert.ok(kept.startsWith("The rollback failed and the store couldn't be put back"), kept);
-    says(kept, 'switchBranch() to the branch it should run on re-initializes it', 'stores the writes kept in memory for it meanwhile; a restart loses them');
+    says(kept, 'until a branch move, such as switchBranch() to the branch it should run on, re-initializes it', 'stores the writes kept in memory for it meanwhile; a restart loses them');
   });
 
   it('a suppression whose fork is refused before the store moved re-initializes no other manager and raises no alert', async () => {
@@ -2953,7 +2954,8 @@ describe("a re-initialization alert's opening", () => {
     // #291: no queue keeps a write. A refusing manager's writes wait in
     // memory until a branch move re-initializes it and stores them, and a hold
     // keeps its writes in memory until its release.
-    const remedy = 're-initializes it and stores the writes kept in memory for it meanwhile; a restart loses them.';
+    const remedy = 're-initializes it and stores the writes kept in memory for it meanwhile; a restart loses them, ' +
+      'except mail, which stays held in the registry.';
     for (const [queued, says] of [[0, '0 writes'], [1, '1 write'], [2, '2 writes']] as const) {
       const { opening } = longHoldAlert({ move: 'branch switch', agentName: 'a', heldSeconds: 61, queued, waitingForMaintenance: false });
       assert.ok(opening.includes(` wait in memory (${says} now). `), opening);

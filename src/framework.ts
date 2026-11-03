@@ -1887,7 +1887,10 @@ function heldWritesTold(writes: readonly SurgeryHeldWrite[]): { kinds: Record<st
   }
   const mail = writes.filter((write) => typeof (write.metadata as { dendrite?: { mailId?: unknown } } | undefined)?.dendrite?.mailId === 'string').length;
   const told = 'Kinds: ' + Object.entries(kinds).map(([kind, count]) => `${count} ${kind}`).join(', ') + '.' +
-    (mail > 0 ? ` The mail among them (${mail}) stays held in the registry, and the next boot delivers it.` : '');
+    (mail > 0
+      ? ` The mail among them (${mail}) stays held in the registry, and the next boot delivers it to its recipient, or, ` +
+        'where that recipient is gone by then, keeps it held there, marked recipient-gone.'
+      : '');
   return { kinds, mail, told };
 }
 
@@ -2582,6 +2585,13 @@ interface FrameworkWriteOptions {
    * (storedOccurrenceRows).
    */
   mayBeStored?: true;
+  /**
+   * Set by releaseSurgeryHeldWrites alone, on the write it replays: that
+   * write is stored now, where any other write made while the replay runs
+   * is kept behind the writes still waiting (replayingHeld). Never kept on
+   * a write held again.
+   */
+  replayed?: true;
 }
 
 /** A body of an agent's window, by the row that names it (AgentFramework.windowBodiesFrom). */
@@ -3259,13 +3269,15 @@ export type ReinitMove = (typeof REINIT_MOVES)[number];
 // #291: no queue keeps a write for a manager that refuses its work. Each
 // write for its agent waits in memory instead (heldForRecovery), its writer
 // answered as a held write's is, until a branch move re-initializes the manager
-// and its release stores them in arrival order; a restart loses them, and an
-// agent that ends first passes on the ones the primary takes in its place.
-const RECOVERY = 're-initializes it and stores the writes kept in memory for it meanwhile; a restart loses them.';
+// and its release stores them in arrival order; a restart loses them, but for
+// mail, which stays held in the registry for the next boot, and an agent that
+// ends first passes on the ones the primary takes in its place.
+const RECOVERY = 're-initializes it and stores the writes kept in memory for it meanwhile; a restart loses them, ' +
+  'except mail, which stays held in the registry.';
 
 export function refusedWorkAlert(move: ReinitMove, cause: string): ReinitAlertText {
   const opening = `The ${move} moved the store's branch, and this agent's context manager failed to re-initialize. ` +
-    `It refuses its work until switchBranch() to the current branch ${RECOVERY}`;
+    `It refuses its work until a branch move, such as switchBranch() to the current branch, ${RECOVERY}`;
   return { opening, message: `${opening} Its re-initialization failed: ${cause}.` };
 }
 
@@ -3278,7 +3290,7 @@ export function restoreAlert(restore: {
   const { move, source, now, selected, managerCurrent, cause } = restore;
   if (selected) {
     const opening = `The ${move} failed and the store was put back, but this agent's context manager failed to re-initialize. ` +
-      `It refuses its work until switchBranch() to the current branch ${RECOVERY}`;
+      `It refuses its work until a branch move, such as switchBranch() to the current branch, ${RECOVERY}`;
     return { opening, message: `${opening} The store is on ${source}. Its re-initialization failed: ${cause}.` };
   }
   const where = ` The store is on ${now}, and the restore to ${source} failed: ${cause}.`;
@@ -3289,7 +3301,7 @@ export function restoreAlert(restore: {
     return { opening, message: `${opening}${where}` };
   }
   const opening = `The ${move} failed and the store couldn't be put back, so this agent's context manager refuses its work ` +
-    `until switchBranch() to the branch it should run on ${RECOVERY}`;
+    `until a branch move, such as switchBranch() to the branch it should run on, ${RECOVERY}`;
   return { opening, message: `${opening}${where}` };
 }
 
@@ -4574,6 +4586,13 @@ export class AgentFramework {
    */
   private readonly surgeryHeldWrites: SurgeryHeldWrite[] = [];
   /**
+   * Set while releaseSurgeryHeldWrites replays what a hold kept: the writes
+   * still to replay stay in surgeryHeldWrites, a write made meanwhile (a
+   * listener of a replayed write's trace) is kept behind them, and the
+   * tune-out's writesHeld reads true, as during the hold.
+   */
+  private replayingHeld = false;
+  /**
    * Writes for an agent whose context manager refuses its work, by the
    * agent's name, each agent's in arrival order: its re-initialization after
    * a branch move failed (reinitializeManagers), and context-manager's
@@ -4585,7 +4604,20 @@ export class AgentFramework {
    * passes on the ones the primary takes in its place (passHeldWritesOn).
    */
   private readonly heldForRecovery = new Map<string, SurgeryHeldWrite[]>();
-  private readonly managersRefusingWork = new WeakSet<ContextManager>();
+  /**
+   * The context managers that refuse their work until a re-initialization
+   * succeeds, each with what failed: a move's re-initialization of it
+   * (reinitializeManagers), or a failed surgery's restore that selected the
+   * branch and couldn't initialize it (restoreSourceBranch).
+   */
+  private readonly managersRefusingWork = new WeakMap<ContextManager, string>();
+  /**
+   * The agents whose foreignRounds the framework sets (applyForeignRounds),
+   * each with the mode its configuration names: a resident that observes
+   * another (AgentConfig.foreignRounds), and the persistent subconscious
+   * (its config's). Recorded at registration.
+   */
+  private readonly foreignRoundsConfigured = new WeakMap<Agent, 'transcript' | 'raw'>();
   /** Tell the first adoption candidate when task work is orphaned (config.dendrite.announceOrphans). */
   private announceOrphans = true;
   /**
@@ -5229,6 +5261,34 @@ export class AgentFramework {
     // branches. This runs before modules, MCPL connections, or inbound traffic.
     await framework.resumePreparedDiscordSuppressions();
 
+    // Restore persisted quiesce mode (issue #122) before the modules start,
+    // and so BEFORE initializeMcpl: the flag must be set before startup
+    // opens any plane, or it would open the data planes on a host that shut
+    // down mid-maintenance. Staged connections boot with both planes closed,
+    // so a quiesced boot needs no re-pause: readyMcplPlanes consults the
+    // flag and holds data planes (control planes come up normally). Before
+    // the modules start, so a write a module makes from its start() on a
+    // quiesced host is one to a quiesced host, as the importer's below are:
+    // it takes no clock row (storeDueClock), and enters no window until
+    // resume. The event gate's suppression is wired once the gate exists
+    // (below).
+    //
+    // The record lives OUTSIDE branch history (a recovery/ file next to the
+    // store): a historical rollback must not be able to erase the marker of
+    // the very surgery it belongs to. So did the deferred-write queue an
+    // earlier release kept, which the importer reads from there.
+    framework.hostModePath = config.hostModePath
+      ?? (config.storePath ? join(config.storePath, 'recovery', 'host-mode.json') : undefined);
+    framework.deferredWritesPath = config.deferredWritesPath
+      ?? (config.storePath ? join(config.storePath, 'recovery', 'deferred-writes.json') : undefined);
+    const hostMode = framework.readHostMode();
+    if (hostMode?.quiesced) {
+      framework.hostModeRecordMayBeQuiesced = true;
+      framework.quiesced = true;
+      framework.quiesceReason = hostMode.reason;
+      framework.quiescedAt = hostMode.since;
+    }
+
     // Add modules
     for (const module of config.modules) {
       await framework.addModule(module);
@@ -5476,34 +5536,10 @@ export class AgentFramework {
       framework.toolResultInlineMaxCharsOverride.set(agentName, cap);
     }
 
-    // Restore persisted quiesce mode (issue #122) BEFORE initializeMcpl: the
-    // flag must be set before startup opens any plane, or it would open the
-    // data planes on a host that shut down mid-maintenance. Staged
-    // connections boot with both planes closed, so a quiesced boot needs no
-    // re-pause — readyMcplPlanes consults the flag and holds data planes
-    // (control planes come up normally). The gate already exists at this
-    // point, so the suppression is wired here too.
-    //
-    // The record lives OUTSIDE branch history (a recovery/ file next to the
-    // store): a historical rollback must not be able to erase the marker of
-    // the very surgery it belongs to. So did the deferred-write queue an
-    // earlier release kept, which the importer reads from there.
-    framework.hostModePath = config.hostModePath
-      ?? (config.storePath ? join(config.storePath, 'recovery', 'host-mode.json') : undefined);
-    framework.deferredWritesPath = config.deferredWritesPath
-      ?? (config.storePath ? join(config.storePath, 'recovery', 'deferred-writes.json') : undefined);
+    // The quiesced flags were set before the modules started (above); the
+    // gate exists now, so a quiesced boot's suppression is wired here.
     {
-      const hostMode = framework.readHostMode();
-      // The quiesced flags first, before anything is stored: a write the
-      // importer stores below is then one to a quiesced host, which takes no
-      // clock row and enters no window of another agent's until resume.
-      if (hostMode?.quiesced) {
-        framework.hostModeRecordMayBeQuiesced = true;
-        framework.quiesced = true;
-        framework.quiesceReason = hostMode.reason;
-        framework.quiescedAt = hostMode.since;
-        framework.eventGate?.setQuiesced(true);
-      }
+      if (hostMode?.quiesced) framework.eventGate?.setQuiesced(true);
       // A queue of deferred writes an earlier release left (#291, one
       // release): each write is stored once, in the order it arrived, and
       // the record cleared, whatever the host's mode. Each agent's window was
@@ -5674,7 +5710,7 @@ export class AgentFramework {
           // work, would be kept there too, and lost to a crash before it is
           // stored, while the epoch's end is on disk at once: the cancel
           // waits (releaseSurgeryHeldWrites runs it).
-          writesHeld: () => framework.surgeryHold !== null
+          writesHeld: () => framework.surgeryHold !== null || framework.replayingHeld
             || [framework.primaryAgentName, framework.subconsciousAgentName]
               .some((name) => name != null && (framework.waitsForRecovery(name) || framework.refusesItsWork(name))),
           historyTool: () => framework.residentHistoryTool(),
@@ -15092,7 +15128,8 @@ export class AgentFramework {
    * An operator's operation: refused once stop() has begun, and waited for
    * by stop() while it runs. It is written to the operator log as a
    * `checkout` (`requester` and `note` as the caller gives them), a refusal
-   * or failure with its error.
+   * or failure with its error, but for the refusal once stop() has begun,
+   * which throws before anything is written.
    *
    * The branch moves under every agent sharing the store, so the switch
    * reserves the store as a surgery does: every agent must be idle with no
@@ -15157,16 +15194,21 @@ export class AgentFramework {
    * surgery's restore): every live agent's context follows the move. Its
    * context manager is re-initialized for the branch the store is on
    * (reinitializeManagers, #353), every one but `except`'s, the agent the
-   * move was made through, whose own switchBranch or fork initialized it
-   * (a manager that didn't make the move keeps its strategy at the old
+   * move was made through, whose own switchBranch or fork initialized it,
+   * or whose failed surgery's restore left it refusing its work, which
+   * counts here as a failed re-initialization, reported by the restore and
+   * not returned (a manager that didn't make the move keeps its strategy at the old
    * branch generation otherwise, and an AutobiographicalStrategy refuses
    * every compile until a re-initialization). Then the presentation index
    * rebases each agent on the new branch (#291): a window the branch has
    * none of (a branch made before the agent's write-down, a rollback into
    * rows the write-down presented) is written down, and the agent's own
    * rows not in its window are presented, so an agent that presented before
-   * the move presents after it. Arrivals wait for the reservation's
-   * release, which presents what each agent is owed. Redo entries are
+   * the move presents after it, and an agent whose configuration names how
+   * other agents' rounds go out to it is sent them so where its window is
+   * presented now, as stored where it isn't (applyForeignRounds). Arrivals
+   * wait for the reservation's release, which presents what each agent is
+   * owed. Redo entries are
    * dropped, every agent's: each was an undo on a window of the branch the
    * store left. Returns the managers whose re-initialization failed, for
    * the caller to report (reportReinitFailures) before it releases the
@@ -15186,12 +15228,23 @@ export class AgentFramework {
       this.subconsciousAnchor?.branchMoved();
       this.redoStacks.clear();
       failures = await this.reinitializeManagers(except);
+      // The agent the move was made through initialized its own manager,
+      // or failed to: a failed surgery's restore that left it refusing its
+      // work (restoreSourceBranch) reported it, and it counts here as a
+      // manager whose re-initialization failed, so its kept writes stay
+      // kept and its window in legacy mode.
+      const fenced = except === undefined ? undefined : this.agents.get(except)?.getContextManager();
+      const refusal = fenced ? this.managersRefusingWork?.get(fenced) : undefined;
+      const unrecovered: ManagerReinitFailure[] = refusal === undefined ? failures : [...failures, { agentName: except!, error: refusal }];
       // A manager that refused its work, and doesn't now, has the writes
       // kept for it meanwhile stored at the move's release, first.
-      this.recoverHeldWrites(failures);
+      this.recoverHeldWrites(unrecovered);
       for (const agent of this.agents.values()) {
-        const failed = failures.find((f) => f.agentName === agent.name);
+        const failed = unrecovered.find((f) => f.agentName === agent.name);
         this.presentation?.rebase(agent, failed && 'error' in failed ? failed.error : undefined);
+        // The rebase can present a window a write-down left in legacy mode,
+        // or leave one in it.
+        this.applyForeignRounds(agent);
       }
       return failures;
     } catch (error) {
@@ -15282,7 +15335,13 @@ export class AgentFramework {
    * on a store without the batched form) is refused with
    * OperatorActionError 'failed' and can be redone: a redo puts back what
    * left, in its order, and its checkpoint stays for another undo to finish
-   * it. An undo that took nothing out throws its error and keeps nothing.
+   * it. So is an undo whose rows all left and whose checkpoint save then
+   * failed: the checkpoint stays saved, and the next undo, which finds
+   * nothing of its turn left in the window past it, saves the checkpoints
+   * without it and keeps no redo of nothing (the entry kept puts the rows
+   * back). An undo that took nothing out throws its error and keeps
+   * nothing. Each refusal after rows left is traced (`window:undone`) and
+   * recorded with its error.
    */
   private undoOnWindow(agent: Agent, requester?: OperatorRequester): {
     undone: boolean;
@@ -15306,6 +15365,38 @@ export class AgentFramework {
     const own = tail.filter((row) => row.own).map((row) => row.id);
     const others = tail.filter((row) => !row.own).map((row) => row.id);
     const branch = this.store.currentBranch().name;
+    const record = (window: { retracted: number; represented: number }, error?: string) => this.recordOperatorAction({
+      kind: 'undo-turn',
+      agent: agentName,
+      ...(requester ? { requester } : {}),
+      params: { turnIndex: checkpoint.turnIndex },
+      result: { sourceBranch: branch, targetBranch: branch, window },
+      ...(error !== undefined ? { error } : {}),
+    });
+    // An undo of this turn took its rows out and its checkpoint stayed (its
+    // save failed, or it was cut short and what was left past it has left
+    // since): with nothing of the turn left in the window, this undo saves
+    // the checkpoints without it, and keeps no redo of nothing, since the
+    // entry that undo kept puts the rows back.
+    const unfinished = this.redoStacks.get(agentName)?.at(-1);
+    if (tail.length === 0 && unfinished && unfinished.branchName === branch && sameCheckpoint(unfinished.checkpoint, checkpoint)) {
+      const window = { retracted: 0, represented: 0 };
+      try {
+        this.saveTurnCheckpoints(agentName, checkpoints);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        record(window, reason);
+        throw new OperatorActionError(
+          'failed',
+          `Undo of ${agentName}'s turn ${checkpoint.turnIndex}: its rows are out of the window already, and saving its ` +
+            `checkpoints failed again (${reason}). redo() puts them back, or another undo finishes it`,
+          { cause: error },
+        );
+      }
+      this.emitTrace({ type: 'window:undone', agentName, retracted: 0 });
+      record(window);
+      return { undone: true, turnIndex: checkpoint.turnIndex, fromBranch: branch, toBranch: branch, window };
+    }
     const entry: RedoEntry = {
       branchName: branch,
       checkpoint,
@@ -15331,16 +15422,8 @@ export class AgentFramework {
       // for another undo, which takes out what is still in the window past it.
       entry.window.lengthAfterUndo = cm.indexLength();
       const reason = error instanceof Error ? error.message : String(error);
-      const window = { retracted: left, represented: 0 };
       this.emitTrace({ type: 'window:undone', agentName, retracted: left });
-      this.recordOperatorAction({
-        kind: 'undo-turn',
-        agent: agentName,
-        ...(requester ? { requester } : {}),
-        params: { turnIndex: checkpoint.turnIndex },
-        result: { sourceBranch: branch, targetBranch: branch, window },
-        error: reason,
-      });
+      record({ retracted: left, represented: 0 }, reason);
       throw new OperatorActionError(
         'failed',
         `Undo of ${agentName}'s turn ${checkpoint.turnIndex} was cut short: ${left} of the ${tail.length} rows it takes out of the window left it ` +
@@ -15349,16 +15432,31 @@ export class AgentFramework {
       );
     }
     entry.window.lengthAfterUndo = cm.indexLength();
-    this.saveTurnCheckpoints(agentName, checkpoints);
     const window = { retracted: tail.length, represented: 0 };
+    try {
+      this.saveTurnCheckpoints(agentName, checkpoints);
+    } catch (error) {
+      // Nothing left the window: nothing to redo.
+      if (tail.length === 0) {
+        redoStack.pop();
+        throw error;
+      }
+      // The rows are out and the entry is kept for a redo. The checkpoint
+      // stays saved, so the next undo finds it with nothing of its turn
+      // left past it, and finishes the save (above).
+      const reason = error instanceof Error ? error.message : String(error);
+      this.emitTrace({ type: 'window:undone', agentName, retracted: tail.length });
+      record(window, reason);
+      const rows = tail.length === 1 ? '1 row' : `${tail.length} rows`;
+      throw new OperatorActionError(
+        'failed',
+        `Undo of ${agentName}'s turn ${checkpoint.turnIndex} took its ${rows} out of the window, and saving its checkpoints ` +
+          `failed (${reason}). redo() puts ${tail.length === 1 ? 'it' : 'them'} back, or another undo finishes it`,
+        { cause: error },
+      );
+    }
     this.emitTrace({ type: 'window:undone', agentName, retracted: tail.length });
-    this.recordOperatorAction({
-      kind: 'undo-turn',
-      agent: agentName,
-      ...(requester ? { requester } : {}),
-      params: { turnIndex: checkpoint.turnIndex },
-      result: { sourceBranch: branch, targetBranch: branch, window },
-    });
+    record(window);
     return { undone: true, turnIndex: checkpoint.turnIndex, fromBranch: branch, toBranch: branch, window };
   }
 
@@ -15451,25 +15549,65 @@ export class AgentFramework {
    * marks that covered the rows at the undo cover them again
    * (retakeMarks). The checkpoint goes back, unless an undo cut short left
    * it in place.
+   *
+   * A step that fails once the window has changed (the retraction partway,
+   * the rows' return, the checkpoint save) refuses the redo with
+   * OperatorActionError 'failed', saying how many rows left and how many
+   * returned, traced (`window:undone`) and recorded with its error; the
+   * entry stays, and another redo finishes it, from the window as it then
+   * is. One that changed nothing throws its error as it is. The caller,
+   * redo(), takes the entry off the stack and traces and records a redo
+   * that went through, after this returns.
    */
   private redoOnWindow(agent: Agent, entry: RedoEntry, below: readonly RedoEntry[], requester?: OperatorRequester): {
-    redone: boolean;
-    fromBranch?: string;
-    toBranch?: string;
-    window?: { retracted: number; represented: number };
+    redone: true;
+    fromBranch: string;
+    toBranch: string;
+    window: { retracted: number; represented: number };
   } {
     const agentName = agent.name;
     const cm = agent.getContextManager();
     const { tail, lengthAfterUndo, kept } = entry.window;
+    const branch = this.store.currentBranch().name;
+    const rowsOf = (n: number) => (n === 1 ? '1 row' : `${n} rows`);
+    const cutShort = (error: unknown, what: string, window: { retracted: number; represented: number }): never => {
+      if (window.retracted === 0 && window.represented === 0) throw error;
+      const reason = error instanceof Error ? error.message : String(error);
+      this.emitTrace({ type: 'window:undone', agentName, ...window });
+      this.recordOperatorAction({
+        kind: 'redo-turn',
+        agent: agentName,
+        ...(requester ? { requester } : {}),
+        result: { sourceBranch: branch, targetBranch: branch, window },
+        error: reason,
+      });
+      throw new OperatorActionError(
+        'failed',
+        `Redo of ${agentName}'s turn ${entry.checkpoint.turnIndex} was cut short: ${what} (${reason}). Another redo() finishes it`,
+        { cause: error },
+      );
+    };
     const undoneIds = new Set(tail.map((row) => row.id));
     const since = this.windowBodiesFrom(cm, 0, agent)
       .filter((row) => undoneIds.has(row.id) || (row.ordinal >= lengthAfterUndo && !kept.has(row.id)))
       .map((row) => row.id);
-    if (since.length > 0) cm.retractRows(since);
+    try {
+      if (since.length > 0) cm.retractRows(since);
+    } catch (error) {
+      const left = since.filter((id) => cm.ordinalOf(id) === undefined).length;
+      cutShort(error, `${left} of the ${rowsOf(since.length)} it takes out of the window first left it, and none of the turn's returned`,
+        { retracted: left, represented: 0 });
+    }
     const back = tail
       .filter((row) => { const status = cm.windowStatusOf(row.id); return status === 'undone' || status === 'out'; })
       .map((row) => row.id);
-    if (back.length > 0) cm.presentRows(back);
+    try {
+      if (back.length > 0) cm.presentRows(back);
+    } catch (error) {
+      const returnedNow = back.filter((id) => cm.ordinalOf(id) !== undefined).length;
+      cutShort(error, `the ${rowsOf(since.length)} it took out of the window first left it, and ${returnedNow} of the ` +
+        `${rowsOf(back.length)} of the turn it puts back returned`, { retracted: since.length, represented: returnedNow });
+    }
     const returned = new Set(back);
     for (const older of below) {
       for (const row of tail) {
@@ -15486,16 +15624,15 @@ export class AgentFramework {
     const at = checkpoints.findIndex((checkpoint) => sameCheckpoint(checkpoint, entry.checkpoint));
     if (at === -1) checkpoints.push({ ...entry.checkpoint, ...boundary });
     else checkpoints[at] = { ...checkpoints[at]!, ...boundary };
-    this.saveTurnCheckpoints(agentName, checkpoints);
-    const branch = this.store.currentBranch().name;
     const window = { retracted: since.length, represented: back.length };
-    this.emitTrace({ type: 'window:undone', agentName, retracted: since.length, represented: back.length });
-    this.recordOperatorAction({
-      kind: 'redo-turn',
-      agent: agentName,
-      ...(requester ? { requester } : {}),
-      result: { sourceBranch: branch, targetBranch: branch, window },
-    });
+    try {
+      this.saveTurnCheckpoints(agentName, checkpoints);
+    } catch (error) {
+      // The turn is back. Another redo takes its rows out and puts them back
+      // where they are, and saves the checkpoint.
+      cutShort(error, `the ${rowsOf(back.length)} of the turn ${back.length === 1 ? 'is' : 'are'} back in the window` +
+        `${since.length > 0 ? ` (the ${rowsOf(since.length)} it took out first left it)` : ''}, and saving its checkpoints failed`, window);
+    }
     return { redone: true, fromBranch: branch, toBranch: branch, window };
   }
 
@@ -15510,7 +15647,9 @@ export class AgentFramework {
    * took out and the agent's next point presents after, isn't covered. A
    * mark the agent no longer holds (a compile moved it since the undo) is
    * left as it is: what it covers is what the agent read later. Each undo
-   * still to redo below records the new mark in place of the old. A failure
+   * still to redo below records the new mark in place of the old, and so
+   * does this one's entry, for a redo that finishes this one where it was
+   * cut short after the rows came back (redoOnWindow). A failure
    * is logged and leaves the marks as they were: the rows put back then
    * read as unread until the agent's next mark.
    */
@@ -15528,7 +15667,7 @@ export class AgentFramework {
       }
       if (replacements.size === 0) return;
       agent.replaceReadMarks(replacements);
-      for (const older of below) {
+      for (const older of [...below, entry]) {
         for (const recorded of older.marks) recorded.mark = replacements.get(recorded.mark) ?? recorded.mark;
       }
     } catch (error) {
@@ -15588,7 +15727,18 @@ export class AgentFramework {
       throw new OperatorActionError('agent-busy', `Cannot redo: a turn of ${agentName}'s is alive`);
     }
     const result = this.redoOnWindow(agent, top, redoStack.slice(0, -1), requester);
-    redoStack.pop();
+    // Off the stack before its trace: a listener's undo of the turn again
+    // keeps its own entry, on top. By identity, as a listener of a trace the
+    // redo's own steps emit may have pushed one already.
+    const at = redoStack.lastIndexOf(top);
+    if (at !== -1) redoStack.splice(at, 1);
+    this.emitTrace({ type: 'window:undone', agentName, ...result.window });
+    this.recordOperatorAction({
+      kind: 'redo-turn',
+      agent: agentName,
+      ...(requester ? { requester } : {}),
+      result: { sourceBranch: result.fromBranch, targetBranch: result.toBranch, window: result.window },
+    });
     return result;
   }
 
@@ -15762,7 +15912,7 @@ export class AgentFramework {
         await cm.setStrategy(cm.getStrategy());
         this.managersRefusingWork?.delete(cm);
       } catch (error) {
-        if (cm) this.managersRefusingWork?.add(cm);
+        if (cm) this.managersRefusingWork?.set(cm, failureDescription(error));
         if (this.agents.get(agentName) === agent) {
           failures.push({ agentName, error: failureDescription(error) });
         }
@@ -15822,7 +15972,8 @@ export class AgentFramework {
     this.heldForRecovery.set(agentName, [write]);
     console.error(
       `[surgery] agent=${agentName}: its context manager refuses its work, so this write for it, and each one after it, ` +
-      'waits in memory until switchBranch() re-initializes it and stores them (a restart loses them)' +
+      'waits in memory until a branch move (switchBranch, rollback or suppression) re-initializes it and stores them ' +
+      '(a restart loses them, except mail, which stays held in the registry)' +
       (refusal === undefined ? '' : `: ${errorMessage(refusal)}`),
     );
   }
@@ -15843,7 +15994,7 @@ export class AgentFramework {
    * no queue persists (#291), told of once per agent they are for, by a log
    * line and an ops alert of kind `store-held-lost` naming how many and of
    * what kinds. Those kept for an agent whose context manager refuses its
-   * work (heldForRecovery) are lost: no switchBranch() follows a stop. Those
+   * work (heldForRecovery) are lost: no branch move follows a stop. Those
    * a surgery's hold still keeps (surgeryHeldWrites, a hold whose operation
    * outlived stop()'s wait for it) are stored only if it releases before the
    * process exits. Mail among them stays held in the registry, and the next
@@ -15868,7 +16019,7 @@ export class AgentFramework {
       const { kinds, mail, told } = heldWritesTold(writes);
       const parts = [
         ...(recovery.length > 0
-          ? [`${recovery.length} kept while its context manager refuses its work, which are lost: no switchBranch() re-initializes it after a stop`]
+          ? [`${recovery.length} kept while its context manager refuses its work, which are lost: no branch move re-initializes it after a stop`]
           : []),
         ...(hold.length > 0
           ? [`${hold.length} a ${verb}'s hold still keeps, its operation having outlived stop()'s wait, which are stored only if it releases before the process exits`]
@@ -16201,15 +16352,15 @@ export class AgentFramework {
       const detail = restoreError instanceof Error ? restoreError.message : String(restoreError);
       const now = this.store.currentBranch().name;
       const selected = now === sourceBranch;
-      if (selected || !managerCurrent) this.managersRefusingWork?.add(cm);
+      if (selected || !managerCurrent) this.managersRefusingWork?.set(cm, detail);
       const status = selected
         ? `RESTORE TO ${sourceBranch} selected it, but re-initializing the agent's context manager for it FAILED (${detail}); ` +
-          'the agent refuses its work until switchBranch() to the current branch re-initializes it'
+          'the agent refuses its work until a branch move, such as switchBranch() to the current branch, re-initializes it'
         : managerCurrent
           ? `RESTORE TO ${sourceBranch} ALSO FAILED (${detail}); the store is still on ${now}, where the agent's ` +
             'context manager is current, so the agent serves from that branch until switchBranch() moves it'
           : `RESTORE TO ${sourceBranch} ALSO FAILED (${detail}); the store is still on ${now}, ` +
-            `and the agent refuses its work until switchBranch() to ${sourceBranch} re-initializes it`;
+            `and the agent refuses its work until a branch move, such as switchBranch() to ${sourceBranch}, re-initializes it`;
       console.error(`[operator] agent=${agentName} ${status}`);
       try {
         const named = move === 'suppression' ? { move, managerCurrent } : { move };
@@ -16287,7 +16438,10 @@ export class AgentFramework {
      * stay in the window after the target: a branch cut can't separate
      * them from it. Not removed, so not counted in `messagesRemoved` and
      * not marked; suppressMessages, or the host's hide by Discord message
-     * id, takes them out. Set only on a presented window.
+     * id, takes them out: a suppression through the agent whose own slot
+     * holds each, this one, or for a row of a slot it observes (a
+     * persistent subconscious's residents' rows), that slot's owner. Set
+     * only on a presented window.
      */
     keptInWindowAfterTarget?: number;
   }> {
@@ -16349,6 +16503,9 @@ export class AgentFramework {
           branchName = cm.branchAt(tailMessageId as MessageId, targetBranch);
           await cm.switchBranch(branchName);
           moved = true;
+          // Its own switch initialized its manager: one that refused its
+          // work doesn't now.
+          this.managersRefusingWork?.delete(cm);
           // The store moved under every other agent: their contexts follow it
           // now (followBranchMove), so the agent's window is presented on the
           // new branch before the rows the cut returned are held below.
@@ -16545,6 +16702,9 @@ export class AgentFramework {
         try {
           createdBranch = await cm.fork(targetBranch);
           moved = true;
+          // Its own fork initialized its manager: one that refused its work
+          // doesn't now.
+          this.managersRefusingWork?.delete(cm);
           // The fork moved the store under every other agent: their contexts
           // follow it now (followBranchMove), before any removal reaches
           // their windows. A strategy still at the old branch generation
@@ -16672,7 +16832,8 @@ export class AgentFramework {
    * branch cut separates them from the target. Both are set only on a
    * presented window. A rollback that neither removes a row nor returns
    * one is refused as a no-op, saying why: rows presented with the target
-   * are named, with the removals that can take them out.
+   * are named, with the removals that can take them out, and through which
+   * agent a suppression does (suppressionThrough).
    */
   private planRollback(agentName: string, messageId: string): {
     cm: ContextManager;
@@ -16728,8 +16889,8 @@ export class AgentFramework {
           `Message ${messageId} was presented to ${agentName} in one write with the ${n} message${n === 1 ? '' : 's'} ` +
           `after it in its window (the first: ${named}), and a branch cut can't separate the rows one write presented, ` +
           `so a rollback to it would change nothing; to take ${n === 1 ? 'that message' : 'those messages'} out, ` +
-          `suppress ${n === 1 ? 'it' : 'them'} (suppressMessages), or hide ${n === 1 ? 'it' : 'them'} by Discord message id ` +
-          "(the host's hide command)");
+          `suppress ${n === 1 ? 'it' : 'them'} (${this.suppressionThrough(agentName, cm, kept)}), or hide ` +
+          `${n === 1 ? 'it' : 'them'} by Discord message id (the host's hide command)`);
       }
       throw new OperatorActionError('invalid', after > 0
         // Rows follow it in the record, but the cut keeps every one of them,
@@ -16746,6 +16907,61 @@ export class AgentFramework {
       discarded,
       ...(window ? { returnedToArrivals: window.returned.length, returnedIds: window.returned, keptInWindow: window.kept } : {}),
     };
+  }
+
+  /**
+   * Through which agent a suppression takes `rows` of `agentName`'s window
+   * out, for a refusal's advice: a suppression looks for its ids in the
+   * agent's own slot (planSuppression), so a row of a slot the agent
+   * observes, merged into its window, is suppressed through an owner of
+   * that slot whose own slot holds it (observedRowOwner). Plain
+   * `suppressMessages` when every row is in the agent's own slot.
+   */
+  private suppressionThrough(agentName: string, cm: ContextManager, rows: readonly StoredMessage[]): string {
+    let own = 0;
+    const merged = new Map<string | undefined, number>();
+    for (const row of rows) {
+      let inOwnSlot = true;
+      try { inOwnSlot = cm.getMessage(row.id as MessageId) !== null; } catch { /* read as its own: the plain advice */ }
+      if (inOwnSlot) { own++; continue; }
+      const owner = this.observedRowOwner(agentName, row.id as MessageId);
+      merged.set(owner, (merged.get(owner) ?? 0) + 1);
+    }
+    if (merged.size === 0) return 'suppressMessages';
+    const observed = `a slot ${agentName} observes`;
+    if (own === 0 && merged.size === 1) {
+      const [[owner, n]] = [...merged];
+      const pronoun = n === 1 ? 'it is' : 'they are';
+      return owner
+        ? `suppressMessages on ${owner}: ${pronoun} in ${owner}'s own slot, which ${agentName} observes`
+        : `suppressMessages on an agent whose own slot holds ${n === 1 ? 'it' : 'them'}: ${pronoun} in ${observed}`;
+    }
+    const parts = [
+      ...(own > 0 ? [`on ${agentName} for the ${own} in its own slot`] : []),
+      ...[...merged].map(([owner, n]) => owner
+        ? `on ${owner} for the ${n} in ${owner}'s own slot, which ${agentName} observes`
+        : `on an agent whose own slot holds the ${n} in ${observed}`),
+    ];
+    return `suppressMessages ${parts.slice(0, -1).join(', ')}${parts.length > 1 ? ' and ' : ''}${parts.at(-1)}`;
+  }
+
+  /**
+   * The live agent whose own slot holds `id`, a row of a slot `agentName`
+   * observes: an owner of one of the slots its observe edges read
+   * (readerFacts' observed slots), other than itself. Undefined when none
+   * is found or the registry can't be read.
+   */
+  private observedRowOwner(agentName: string, id: MessageId): string | undefined {
+    try {
+      for (const { owners } of readerFacts(this.registry, agentName).observed) {
+        for (const owner of owners) {
+          if (owner === agentName) continue;
+          const cm = this.agents.get(owner)?.getContextManager();
+          if (cm && !cm.isClosed() && cm.getMessage(id) !== null) return owner;
+        }
+      }
+    } catch { /* unknown: the advice says an owner */ }
+    return undefined;
   }
 
   /** Whether a slot `cm` merges beside its own holds the row, which its own slot doesn't. */
@@ -16839,15 +17055,36 @@ export class AgentFramework {
       : this.planSuppression(agentName, [...new Set((target as { suppress: string[] }).suppress.map(String))]).targeted;
     // On a presented window (#291): which of the rows no live window holds,
     // and, for a rollback, which rows the cut keeps that leave the window
-    // and which it keeps in it, after the target.
+    // and which it keeps in it, after the target. A row no window is read
+    // to hold, where a window's lookup failed, isn't known to be in none:
+    // it is left out of the count, and logged.
     const presented = this.presents(this.agents.get(agentName));
-    const windowFacts = presented
-      ? {
-          neverPresented: messages.filter((m) => this.holderNames(m.id as MessageId, m.metadata).length === 0).length,
-          ...(plan?.returnedToArrivals !== undefined ? { returnedToArrivals: plan.returnedToArrivals } : {}),
-          ...(plan?.keptInWindow !== undefined ? { keptInWindowAfterTarget: plan.keptInWindow.length } : {}),
-        }
-      : {};
+    let windowFacts = {};
+    if (presented) {
+      let neverPresented = 0;
+      let unknown = 0;
+      const unreadable = new Map<string, string>();
+      for (const m of messages) {
+        const holders = this.holderNames(m.id as MessageId, m.metadata);
+        if (holders.names.length > 0) continue;
+        if (holders.unreadable.length === 0) { neverPresented++; continue; }
+        unknown++;
+        for (const { agent, error } of holders.unreadable) if (!unreadable.has(agent)) unreadable.set(agent, error);
+      }
+      if (unknown > 0) {
+        console.error(
+          `[operator] preview for ${agentName}: ${unknown === 1 ? '1 message' : `${unknown} messages`} it removes ` +
+            `${unknown === 1 ? 'is' : 'are'} in no window read, and ${[...unreadable.keys()].join(', ')}'s window couldn't ` +
+            `be read for ${unknown === 1 ? 'it' : 'them'}, so neverPresented leaves ${unknown === 1 ? 'it' : 'them'} out: ` +
+            [...unreadable].map(([agent, error]) => `${agent}: ${error}`).join('; '),
+        );
+      }
+      windowFacts = {
+        neverPresented,
+        ...(plan?.returnedToArrivals !== undefined ? { returnedToArrivals: plan.returnedToArrivals } : {}),
+        ...(plan?.keptInWindow !== undefined ? { keptInWindowAfterTarget: plan.keptInWindow.length } : {}),
+      };
+    }
     const scopeView = (scope: DiscordAwarenessScope): SurgeryMarksPreview['scopes'][DiscordAwarenessScope] => {
       const { refs } = selectDiscordAwarenessRefs(messages, { scope });
       const channels = new Map<string, number>();
@@ -16870,24 +17107,28 @@ export class AgentFramework {
   /**
    * The live agents whose window holds a row now (#291): each whose context
    * reads it `'in'` (windowStatusOf), every agent whose window is still the
-   * record and whose record holds it among them. A row a tune-out holds from
-   * residents is held by no agent whose window leaves such rows out: a
-   * write-down took them in, and its view never shows them.
+   * record and whose record holds it among them (`names`). A row a tune-out
+   * holds from residents is held by no agent whose window leaves such rows
+   * out: a write-down took them in, and its view never shows them. An agent
+   * whose lookup throws is in `unreadable`, with the error: whether its
+   * window holds the row isn't known.
    */
-  private holderNames(id: MessageId, metadata?: unknown): string[] {
+  private holderNames(id: MessageId, metadata?: unknown): { names: string[]; unreadable: Array<{ agent: string; error: string }> } {
     const held = heldFromResidents(metadata as Record<string, unknown> | undefined);
     const names: string[] = [];
+    const unreadable: Array<{ agent: string; error: string }> = [];
     for (const agent of this.agents.values()) {
       const cm = agent.getContextManager();
       try {
         if (cm.isClosed() || cm.windowStatusOf(id) !== 'in') continue;
-      } catch {
+      } catch (error) {
+        unreadable.push({ agent: agent.name, error: thrownText(error) });
         continue;
       }
       if (held && readerFacts(this.registry, agent.name).hidesHeld) continue;
       names.push(agent.name);
     }
-    return names;
+    return { names, unreadable };
   }
 
   /** The awareness ledger's batches and retract requests, for operator surfaces. */
@@ -17352,7 +17593,8 @@ export class AgentFramework {
     // An agent that observes another is sent its rounds as its
     // configuration's foreignRounds says, a transcript by default, as the
     // persistent subconscious is (foreign-rounds.ts).
-    if ((config.observes?.length ?? 0) > 0 && this.presents(agent)) agent.setForeignRounds(config.foreignRounds ?? 'transcript');
+    if ((config.observes?.length ?? 0) > 0) this.foreignRoundsConfigured.set(agent, config.foreignRounds ?? 'transcript');
+    this.applyForeignRounds(agent);
     this.agentConfigs.set(config.name, config);
 
     // First non-ephemeral agent becomes the primary for message routing
@@ -17488,7 +17730,8 @@ export class AgentFramework {
     // configuration's foreignRounds says, a transcript by default, its own
     // as stored (foreign-rounds.ts, #291 answer 13): the one change its
     // requests take at the switch.
-    if (this.presents(agent)) agent.setForeignRounds(cfg.foreignRounds ?? 'transcript');
+    this.foreignRoundsConfigured.set(agent, cfg.foreignRounds ?? 'transcript');
+    this.applyForeignRounds(agent);
     this.subconsciousConfig = cfg;
     return agent;
   }
@@ -22929,6 +23172,23 @@ export class AgentFramework {
   }
 
   /**
+   * How another agent's rounds go out in `agent`'s requests
+   * (Agent.setForeignRounds), for an agent whose configuration names a mode
+   * (foreignRoundsConfigured): that mode while the presentation index
+   * presents its window, and as stored (`'raw'`) while its window is the
+   * record, as before the index. Set at its registration and again after
+   * each branch move's rebase (followBranchMove), which can present a
+   * window whose write-down failed at registration, or leave one in legacy
+   * mode. Nothing for any other agent, which reads no other agent's rounds.
+   */
+  private applyForeignRounds(agent: Agent): void {
+    // Read defensively: a framework built from its prototype holds none.
+    const configured = this.foreignRoundsConfigured?.get(agent);
+    if (configured === undefined) return;
+    agent.setForeignRounds(this.presents(agent) ? configured : 'raw');
+  }
+
+  /**
    * Take a newly registered agent on (presentation.adopt: its window
    * written down, its own rows stored and not in it presented, its own-row
    * sink installed), and weigh each row of another writer that enters its
@@ -23039,8 +23299,10 @@ export class AgentFramework {
    * handleMcplChannelIncoming delivers, a message routeConversationIncoming
    * routes), stamped for the fork alone. While a surgery holds the store it
    * is held in memory instead (surgeryHeldWrites) and '' returned, and so
-   * is it while the fork's context manager refuses its work after a failed
-   * re-initialization (heldForRecovery, as addMessage keeps a write);
+   * is it while a hold's release replays what the hold kept, but for the
+   * write the replay stores (`replayed`), and while the fork's context
+   * manager refuses its work after a failed re-initialization
+   * (heldForRecovery, as addMessage keeps a write);
    * stored, it enters the fork's window at once when no turn of the fork's
    * is alive, else at the fork's next point (afterStore). One whose store
    * threw after its row landed is stored as that row, and one whose store
@@ -23048,13 +23310,13 @@ export class AgentFramework {
    * presented (landedThoughThrown), as addMessage's. `mayBeStored`: as
    * FrameworkWriteOptions.mayBeStored, read back in the fork's store.
    */
-  private storeInFork(target: Agent, content: ContentBlock[], metadata: MessageMetadata, mayBeStored?: boolean): MessageId {
+  private storeInFork(target: Agent, content: ContentBlock[], metadata: MessageMetadata, mayBeStored?: boolean, replayed?: boolean): MessageId {
     const kept = (): SurgeryHeldWrite => ({
       participant: 'user', content, metadata,
       direct: { agentName: target.name, ...(mayBeStored ? { mayBeStored: true as const } : {}) },
       heldFor: target, heldAt: Date.now(),
     });
-    if (this.surgeryHold) {
+    if (this.surgeryHold || (this.replayingHeld && !replayed)) {
       this.surgeryHeldWrites.push(kept());
       return '' as MessageId;
     }
@@ -23110,7 +23372,14 @@ export class AgentFramework {
    * is stored). The Discord module relies on that to apply the edits and
    * deletes it kept for a message whose create the hold kept, which no
    * module can reach before it lands (ModuleContext.addMessage). Keep it so,
-   * or give such a module a callback the release calls in its place. A
+   * or give such a module a callback the release calls in its place. The
+   * writes are taken off the queue one at a time, and while they replay
+   * (replayingHeld) the ones still waiting stay listed (the tune-out's
+   * getSurgeryHeldMessages, HostModeStatus.deferredWrites), a write such a
+   * listener makes is kept behind them, and the tune-out's writesHeld reads
+   * true, so a cancel a listener asks for waits for the replay's end, as it
+   * does during the hold. A hold a listener begins meanwhile stops the
+   * replay, and its own release stores the rest. A
    * write for an agent whose context manager refuses its
    * work is kept in memory for it again (heldForRecovery), never dropped,
    * and is traced when a later move stores it. An agent that ends during
@@ -23132,65 +23401,29 @@ export class AgentFramework {
    * line and an ops alert of kind `store-held-lost`.
    */
   private releaseSurgeryHeldWrites(): void {
+    // A release met while this one replays (a recovery with no hold, a
+    // listener's move released at once) leaves the writes to it: its loop
+    // takes each one queued meanwhile, in order.
+    if (this.replayingHeld) return;
     // Read defensively: a framework built from its prototype, as some
     // suites build one, holds none.
-    const held = this.surgeryHeldWrites?.splice(0) ?? [];
+    const queue = this.surgeryHeldWrites;
     const lost = new Map<string, { writes: SurgeryHeldWrite[]; unknown: WriteOutcomeUnknownError[]; reason: string }>();
-    for (const write of held) {
-      const target = write.direct ? this.agents.get(write.direct.agentName) : this.deliveryAgent(write.opts?.forAgent);
-      try {
-        const gone = this.heldWriteTargetGone(write);
-        if (gone !== undefined) {
-          this.passHeldWritesOn(gone, [write]);
-          continue;
-        }
-        let id: MessageId;
-        if (write.direct) {
-          const target = this.agents.get(write.direct.agentName)!;
-          if (!this.logicalTurnAlive(target) && takesClockBefore(write.participant, write.content, write.metadata, target.name)) {
-            this.storeDueClock(target, 'event');
-          }
-          id = this.storeInFork(target, write.content, write.metadata ?? {}, write.direct.mayBeStored);
-        } else {
-          id = this.addMessage(write.participant, write.content, write.metadata, write.opts);
-        }
-        if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'surgery-release' });
-      } catch (error) {
-        // A write whose rows landed though its store threw is stored, and
-        // answered, by addMessage and storeInFork (landedThoughThrown). One
-        // whose store can't tell what of it landed is answered by
-        // context-manager's error, the rows it names presented: it may be
-        // lost, and the rows it names as stored are traced. Any other throw
-        // stored none of it.
-        const unknown = error instanceof WriteOutcomeUnknownError ? error : undefined;
-        if (unknown) {
-          console.error(
-            `[surgery] a write held while the store was held threw at its release, and context-manager can't tell what of ` +
-              `it landed (${outcomeUnknownText(unknown)}), so it may be lost:`,
-            error,
-          );
-          if (unknown.landed.length > 0) this.emitTrace({ type: 'message:added', messageId: unknown.landed[0]!, source: 'surgery-release' });
-        } else {
-          console.error(`[surgery] a write held while the store was held couldn't be stored at its release, so it is lost:`, error);
-        }
-        const agentName = target?.name ?? write.direct?.agentName ?? write.opts?.forAgent ?? 'the primary';
-        // Traced at once, by the address the write gave it, for the module
-        // that wrote it: its record of the write ends here (the Discord
-        // module's of a create with no row).
-        const external = write.metadata?.external as { source?: unknown; id?: unknown } | undefined;
-        this.emitTrace({
-          type: 'message:lost', source: 'surgery-release', agentName,
-          ...(typeof external?.source === 'string' && typeof external.id === 'string' ? { external: { source: external.source, id: external.id } } : {}),
-          ...(unknown ? { mayBeStored: true as const } : {}),
-        });
-        const entry = lost.get(agentName) ?? { writes: [], unknown: [], reason: thrownText(error) };
-        entry.writes.push(write);
-        if (unknown) entry.unknown.push(unknown);
-        lost.set(agentName, entry);
+    let replayed = 0;
+    this.replayingHeld = true;
+    try {
+      // One at a time, so the writes still to replay stay listed
+      // (getSurgeryHeldMessages, deferredWrites). A hold begun meanwhile (a
+      // listener's move) keeps the rest for its own release.
+      while (queue && queue.length > 0 && !this.surgeryHold) {
+        replayed++;
+        this.replayHeldWrite(queue.shift()!, lost);
       }
+    } finally {
+      this.replayingHeld = false;
     }
-    if (held.length > 0) {
-      console.error(`[surgery] ${held.length} write(s) held while the store was held were replayed in arrival order`);
+    if (replayed > 0) {
+      console.error(`[surgery] ${replayed} write(s) held while the store was held were replayed in arrival order`);
     }
     for (const [agentName, { writes, unknown, reason }] of lost) this.tellHeldWritesLost(agentName, writes, unknown, reason);
     // A tune-out's cancel asked for while the writes were held waited for
@@ -23201,6 +23434,64 @@ export class AgentFramework {
       this.tuneOutCoordinator?.runDeferredCancels();
     } catch (error) {
       console.error('[surgery] the tune-out cancels asked for during the hold could not run at its release:', error);
+    }
+  }
+
+  /** One write of releaseSurgeryHeldWrites's replay, stored by the path it was held on; one that fails is noted in `lost`, by agent. */
+  private replayHeldWrite(
+    write: SurgeryHeldWrite,
+    lost: Map<string, { writes: SurgeryHeldWrite[]; unknown: WriteOutcomeUnknownError[]; reason: string }>,
+  ): void {
+    const target = write.direct ? this.agents.get(write.direct.agentName) : this.deliveryAgent(write.opts?.forAgent);
+    try {
+      const gone = this.heldWriteTargetGone(write);
+      if (gone !== undefined) {
+        this.passHeldWritesOn(gone, [write]);
+        return;
+      }
+      let id: MessageId;
+      if (write.direct) {
+        const target = this.agents.get(write.direct.agentName)!;
+        if (!this.logicalTurnAlive(target) && takesClockBefore(write.participant, write.content, write.metadata, target.name)) {
+          this.storeDueClock(target, 'event');
+        }
+        id = this.storeInFork(target, write.content, write.metadata ?? {}, write.direct.mayBeStored, true);
+      } else {
+        id = this.addMessage(write.participant, write.content, write.metadata, { ...write.opts, replayed: true });
+      }
+      if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'surgery-release' });
+    } catch (error) {
+      // A write whose rows landed though its store threw is stored, and
+      // answered, by addMessage and storeInFork (landedThoughThrown). One
+      // whose store can't tell what of it landed is answered by
+      // context-manager's error, the rows it names presented: it may be
+      // lost, and the rows it names as stored are traced. Any other throw
+      // stored none of it.
+      const unknown = error instanceof WriteOutcomeUnknownError ? error : undefined;
+      if (unknown) {
+        console.error(
+          `[surgery] a write held while the store was held threw at its release, and context-manager can't tell what of ` +
+            `it landed (${outcomeUnknownText(unknown)}), so it may be lost:`,
+          error,
+        );
+        if (unknown.landed.length > 0) this.emitTrace({ type: 'message:added', messageId: unknown.landed[0]!, source: 'surgery-release' });
+      } else {
+        console.error(`[surgery] a write held while the store was held couldn't be stored at its release, so it is lost:`, error);
+      }
+      const agentName = target?.name ?? write.direct?.agentName ?? write.opts?.forAgent ?? 'the primary';
+      // Traced at once, by the address the write gave it, for the module
+      // that wrote it: its record of the write ends here (the Discord
+      // module's of a create with no row).
+      const external = write.metadata?.external as { source?: unknown; id?: unknown } | undefined;
+      this.emitTrace({
+        type: 'message:lost', source: 'surgery-release', agentName,
+        ...(typeof external?.source === 'string' && typeof external.id === 'string' ? { external: { source: external.source, id: external.id } } : {}),
+        ...(unknown ? { mayBeStored: true as const } : {}),
+      });
+      const entry = lost.get(agentName) ?? { writes: [], unknown: [], reason: thrownText(error) };
+      entry.writes.push(write);
+      if (unknown) entry.unknown.push(unknown);
+      lost.set(agentName, entry);
     }
   }
 
@@ -23730,9 +24021,13 @@ export class AgentFramework {
    * Write a builder's channel notices in order, each on its own: one that
    * can't be written is logged, and the rest are still written. A reader's
    * notice that says the primary was told comes after the primary's, and is
-   * written in its `untold` words where the primary's write failed, so it
-   * never says the primary was told of a notice that wasn't written. A
-   * write is stored at once (#291), and one for an agent mid-turn enters its
+   * written in its `untold` words where the primary's write threw, so it
+   * never says the primary was told of a notice whose write threw. A write
+   * a surgery's hold keeps in memory, or one kept for a manager that refuses
+   * its work, counts as written (addMessage returns '' for it, without
+   * throwing): if storing the primary's fails at the release, or a restart
+   * loses it, the reader's notice, stored too, still says the primary was
+   * told. A write is stored at once (#291), and one for an agent mid-turn enters its
    * window at its next point (its tool boundary hears it, or its turn's end
    * presents it). Through framework.addMessage, so a notice an open forces
    * inside a live turn is stored and presented as any write is, rather than
@@ -31534,7 +31829,7 @@ export class AgentFramework {
     // only its agent. The other is a context manager refusing its work
     // (below).
     const kept = (): SurgeryHeldWrite => {
-      const { placement: _placement, ...rest } = opts ?? {};
+      const { placement: _placement, replayed: _replayed, ...rest } = opts ?? {};
       return {
         participant, content,
         ...(given !== undefined ? { metadata: given } : {}),
@@ -31543,7 +31838,9 @@ export class AgentFramework {
         heldAt: Date.now(),
       };
     };
-    if (this.surgeryHold && !opts?.imported) {
+    // While the release replays what the hold kept, a write made meanwhile,
+    // a listener's, waits behind the ones still to replay (replayingHeld).
+    if ((this.surgeryHold || (this.replayingHeld && !opts?.replayed)) && !opts?.imported) {
       this.surgeryHeldWrites.push(kept());
       if (opts?.placement) opts.placement.agent = agent.name;
       return '' as MessageId;
@@ -33659,8 +33956,12 @@ export class AgentFramework {
             throw new Error(`The close wasn't recorded: ${err instanceof Error ? err.message : String(err)}`);
           }
           if (!released.ok) throw new Error(`The close wasn't recorded: ${released.error}`);
+          // A cancel that waits is told as the tune-out tools tell one
+          // (cancelWaitsNote): what it waits for, that asking again doesn't
+          // end the wait sooner, that its length isn't known, and that a stop
+          // before it runs loses it.
           return released.deferred
-            ? 'The focus on it ends once an operator\'s change to the store is over, or a context that refuses writes is re-initialized by the host, and what the other channels held is delivered then.'
+            ? `The close cancels the all-except hold that excepts it. ${cancelWaitsNote('The all-except hold')}`
             : 'The focus on it ended, and what the other channels held was delivered.';
         },
         focusChannelResolver: () => this.tuneOutCoordinator?.focusChannel() ?? null,
