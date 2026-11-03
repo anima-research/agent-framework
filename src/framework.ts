@@ -1972,8 +1972,9 @@ function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
  * subconscious's `thinkingBinding` assertThinkingBinding refuses, whichever
  * its reader, or whose persistent subconscious's `foreignRounds` is neither
  * of its modes (assertOneOfSetting), or whose reader forks' `persist` or
- * `resync` is none of its modes, or `pendingRound` neither an object nor a
- * function. A subconscious that isn't on has its
+ * `resync` is none of its modes, `resyncLimit` not an object of whole
+ * numbers, or `pendingRound` neither an object nor a function. A
+ * subconscious that isn't on has its
  * `allowChannelSpeech`, `thinkingBinding` and `foreignRounds` left
  * unchecked, since nothing reads them then.
  */
@@ -2015,6 +2016,19 @@ function assertFrameworkSwitches(config: FrameworkConfig): void {
           '\'window\' or leaving it out hands a resumed reader the rows the resident\'s window took since its last look, ' +
             'and \'none\' hands it the held traffic alone',
         );
+        if (holdsSettings('subconscious.resyncLimit', config.subconscious.resyncLimit, '{ rows: 200 }')) {
+          for (const key of ['rows', 'chars'] as const) {
+            const value: unknown = config.subconscious.resyncLimit[key];
+            if (value === undefined || value === null || (typeof value === 'number' && Number.isInteger(value) && value >= 0)) continue;
+            throw new Error(
+              `subconscious.resyncLimit.${key} must be a whole number, 0 or more${typeof value === 'number' ? '' : `, not ${kindOf(value)}`}: ` +
+                (key === 'rows'
+                  ? 'the most of the resident\'s rows a resumed reader is handed; left out, no count bound'
+                  : 'the most characters those rows take as the default framing writes them; left out, the room the reader\'s ' +
+                    'strategy gives one message less the rest of the framing'),
+            );
+          }
+        }
         const round: unknown = config.subconscious.pendingRound;
         if (round !== undefined && typeof round !== 'function' && (round === null || typeof round !== 'object' || Array.isArray(round))) {
           throw new Error(
@@ -17933,6 +17947,8 @@ export class AgentFramework {
       const readerConfig = { model: cfg.model, proseRouting: 'disabled' as const, ...readerModelFields(cfg) };
       let incarnation: number;
       let residentRows: StoredMessage[] | undefined;
+      // How many older rows resyncLimit leaves out of residentRows.
+      let omitted = 0;
       // With resync 'window', why a resumed look's resident rows couldn't be read.
       let unavailable: ReaderFramingContext['residentRowsUnavailable'];
       if (plan.resume) {
@@ -17970,17 +17986,23 @@ export class AgentFramework {
         // Read from the resident's window index, from the mark the last
         // framing on its branch recorded: with no index (its window isn't
         // presented) or no such mark, the framing says they couldn't be read.
+        // The newest that fit the bound are handed (fitResidentRows); this
+        // framing's mark is the window's end, so those left out are handed
+        // at no later look.
+        const resumed = { ...base, backlog: handed, resumed: true, incarnation };
         if (resync === 'window') {
           if (!mark) unavailable = 'not-presented';
           else if (before.through === undefined) unavailable = 'no-mark';
-          else residentRows = this.residentRowsSince(primary, name, before.through);
+          else {
+            const fit = this.fitResidentRows(candidate.agent, cfg.resyncLimit, resumed, this.residentRowsSince(primary, name, before.through));
+            residentRows = fit.shown;
+            omitted = fit.omitted;
+          }
         }
         const content = (cfg.framing ?? defaultReaderFraming)({
-          ...base,
-          backlog: handed,
-          resumed: true,
-          incarnation,
+          ...resumed,
           ...(residentRows ? { residentRows } : {}),
+          ...(omitted > 0 ? { residentRowsOmitted: omitted } : {}),
           ...(unavailable ? { residentRowsUnavailable: unavailable } : {}),
         });
         storeOwnRow(candidate.agent, 'user', content, framingRow(handed, incarnation, mark));
@@ -18132,6 +18154,52 @@ export class AgentFramework {
       if (typeof meta.residentThrough === 'number' && branch !== undefined && meta.residentBranch === branch) through = meta.residentThrough;
     }
     return { held, taken, ...(through !== undefined ? { through } : {}) };
+  }
+
+  /**
+   * The newest of `rows`, the resident's since a resumed persisted reader's
+   * last look, that its framing shows (ForkReaderConfig.resyncLimit): at
+   * most `limit.rows` of them, whose block, as defaultReaderFraming writes it
+   * with the count of those left out, takes at most `limit.chars`
+   * characters; with no `chars`, the room the reader's strategy gives one
+   * message (strategyDerivedToolResultChars) less what the default framing
+   * writes for `context` without them, so the whole framing fits that room.
+   * A strategy keeps a message's first characters up to its room and cuts
+   * the rest, and the default framing puts the held traffic last, so a
+   * framing past it would lose its newest rows and the held traffic. Rows go
+   * whole or not at all, kept from the newest; `omitted` counts the rest.
+   */
+  private fitResidentRows(
+    reader: Agent,
+    limit: ForkReaderConfig['resyncLimit'],
+    context: ReaderFramingContext,
+    rows: StoredMessage[],
+  ): { shown: StoredMessage[]; omitted: number } {
+    const chars = (blocks: ContentBlock[]): number =>
+      blocks.reduce((sum, b) => sum + (b.type === 'text' ? (b as Extract<ContentBlock, { type: 'text' }>).text.length : 0), 0);
+    const rest = chars(defaultReaderFraming(context));
+    const room = this.strategyDerivedToolResultChars(reader);
+    const most = limit?.chars ?? (room !== undefined ? room - rest : undefined);
+    const newest = (k: number): StoredMessage[] => rows.slice(rows.length - k);
+    const fits = (k: number): boolean => most === undefined || chars(defaultReaderFraming({
+      ...context,
+      residentRows: newest(k),
+      ...(k < rows.length ? { residentRowsOmitted: rows.length - k } : {}),
+    })) - rest <= most;
+    let k = Math.min(rows.length, limit?.rows ?? rows.length);
+    if (!fits(k)) {
+      // Each row kept lengthens the block (bar a digit of the count), so the
+      // most that fit is found by halving; none fitting shows none.
+      let lo = 0;
+      let hi = k - 1;
+      while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2);
+        if (fits(mid)) lo = mid;
+        else hi = mid - 1;
+      }
+      k = lo;
+    }
+    return { shown: newest(k), omitted: rows.length - k };
   }
 
   /**

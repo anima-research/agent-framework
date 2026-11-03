@@ -90,6 +90,14 @@ describe('a persisted reader: configuration', () => {
     await assert.rejects(create({ pendingRound: 'none' }), /subconscious\.pendingRound must be an object, as deriveAgent's pendingRound takes it, or a function/);
     await assert.rejects(create({ pendingRound: [] }), /subconscious\.pendingRound must be an object/);
   });
+
+  it('takes a resyncLimit of whole numbers, and refuses another', async () => {
+    await create({ persist: 'resident', resyncLimit: { rows: 200, chars: 0 } });
+    await create({ persist: 'resident', resyncLimit: {} });
+    await assert.rejects(create({ persist: 'resident', resyncLimit: { rows: -1 } }), /subconscious\.resyncLimit\.rows must be a whole number, 0 or more: /);
+    await assert.rejects(create({ persist: 'resident', resyncLimit: { chars: '9000' } }), /subconscious\.resyncLimit\.chars must be a whole number, 0 or more, not a string: /);
+    await assert.rejects(create({ persist: 'resident', resyncLimit: 200 }), /subconscious\.resyncLimit must be an object/);
+  });
 });
 
 /** A framework with reader forks and the tune-out fixture server, on `dir`'s store; a second boot on one `dir` is a restart. */
@@ -882,7 +890,77 @@ describe('a persisted reader: a look that fails, and what goes back', () => {
 });
 
 describe('a persisted reader: the resync, bounded and unreadable', () => {
+  it("hands a resumed look the newest rows its resyncLimit allows, says how many older ones it leaves out, and hands those at no later look", { timeout: 180_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-bound-rows-'));
+    dirs.push(dir);
+    const contexts: ReaderFramingContext[] = [];
+    const t = await boot(dir, { persist: 'resident', resyncLimit: { rows: 3 }, framing: (ctx: ReaderFramingContext) => { contexts.push(ctx); return defaultReaderFraming(ctx); } });
+    const epochId = t.enter();
+    const name = 'reader/scout/g1';
+    t.membrane.script('scout', final([text('NOTED-1')]));
+    t.look(epochId, [t.hold(epochId, 'HELD-1')]);
+    await t.looked(name, 1);
+    await waitFor("scout's turn on the report", () => t.rows().some((m) => textOf(m) === 'NOTED-1'));
+    for (let n = 1; n <= 3; n++) await t.residentTurn(`GAP-${n} said`, `GAP-${n} reply`);
+    t.membrane.script('scout', final([text('NOTED-2')]));
+    t.look(epochId, [t.hold(epochId, 'HELD-2')]);
+    await t.looked(name, 2);
+    await waitFor("scout's turn on the second report", () => t.rows().some((m) => textOf(m) === 'NOTED-2'));
+    t.look(epochId, [t.hold(epochId, 'HELD-3')]);
+    await t.looked(name, 3);
 
+    const second = contexts[1]!;
+    const marks = (await t.framework.inspectAgentContext(name)).getAllMessages()
+      .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'tune-out-reader-framing')
+      .map((m) => (m.metadata as { residentThrough: number }).residentThrough);
+    // What scout's window took between the marks, but the reader's report mail: an unbounded resync's rows.
+    const cm = t.scout().getContextManager();
+    const between = cm.getPresentedMessages().filter((m) => {
+      const at = cm.ordinalOf(m.id) as unknown as number;
+      return at > marks[0]! && at <= marks[1]! && (m.metadata as { dendrite?: { from?: { agent?: string } } } | undefined)?.dendrite?.from?.agent !== name;
+    });
+    assert.ok(between.some((m) => textOf(m) === 'GAP-1 said') && between.length > 3, 'premise: more rows entered than the bound');
+    assert.deepEqual(second.residentRows!.map((m) => m.id), between.slice(-3).map((m) => m.id), 'the newest three, in window order');
+    assert.equal(second.residentRowsOmitted, between.length - 3, 'the rest, counted');
+    const sent = JSON.stringify(t.membrane.callsFor('reader')[1]!.messages.at(-1));
+    assert.ok(sent.includes(`[In scout's context since your last look: ${between.length} messages; the oldest ${between.length - 3} are not shown here]`), sent);
+    const third = contexts[2]!;
+    assert.ok(!third.residentRows!.some((m) => textOf(m).startsWith('GAP-')), 'the rows left out are never handed later: the mark is at the window end');
+    assert.equal(third.residentRowsOmitted, undefined, 'nothing left out at the third look');
+    assert.equal(t.forkTraces()[1]!.resynced, 3, 'the trace counts the rows handed');
+  });
+
+  it("by default fits the resync in the reader strategy's per-message room, so the held traffic after it is not cut", { timeout: 180_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-bound-room-'));
+    dirs.push(dir);
+    const contexts: ReaderFramingContext[] = [];
+    const capped = () => new WindowedPassthroughStrategy({ maxMessageTokens: 150 });
+    const t = await boot(dir, {
+      persist: 'resident', strategyFactory: capped,
+      framing: (ctx: ReaderFramingContext) => { contexts.push(ctx); return defaultReaderFraming(ctx); },
+    }, {
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', proseRouting: 'disabled', strategy: capped() }],
+    } as never);
+    const epochId = t.enter();
+    const name = 'reader/scout/g1';
+    t.membrane.script('scout', final([text('NOTED-1')]));
+    t.look(epochId, [t.hold(epochId, 'HELD-1')]);
+    await t.looked(name, 1);
+    await waitFor("scout's turn on the report", () => t.rows().some((m) => textOf(m) === 'NOTED-1'));
+    for (let n = 1; n <= 4; n++) await t.residentTurn(`GAP-${n} a line of the resident's traffic, long enough to fill some room`, `GAP-${n} a reply of the resident's, long enough to fill some room too`);
+    t.look(epochId, [t.hold(epochId, 'HELD-2 the last held line')]);
+    await t.looked(name, 2);
+    const second = contexts[1]!;
+    assert.ok((second.residentRowsOmitted ?? 0) > 0, 'some rows are left out');
+    const shown = second.residentRows!.map((m) => textOf(m));
+    assert.ok(shown.includes("GAP-4 a reply of the resident's, long enough to fill some room too") && !shown.some((h) => h.startsWith('GAP-1')),
+      `the newest are shown, the oldest left out: ${JSON.stringify(shown)}`);
+    const framing = defaultReaderFraming(second);
+    const chars = framing.reduce((sum, b) => sum + (b.type === 'text' ? (b as { text: string }).text.length : 0), 0);
+    assert.ok(chars <= 150 * 4, `the framing fits the room: ${chars}`);
+    const sent = JSON.stringify(t.membrane.callsFor('reader')[1]!.messages.at(-1));
+    assert.ok(sent.includes('antra: HELD-2 the last held line') && !sent.includes('content omitted') && !sent.includes('[truncated'), sent);
+  });
 
   it("with resync 'window', tells a resumed reader when what entered the resident's context can't be read", { timeout: 180_000 }, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'reader-persist-unread-'));
@@ -918,6 +996,22 @@ describe('a persisted reader: the resync, bounded and unreadable', () => {
     }
   });
 
+  it('writes the omission and the unreadable gap as facts in the default framing', () => {
+    const row = (participant: string, said: string) =>
+      ({ id: `r-${Math.random()}`, sequence: 0, participant, content: [{ type: 'text', text: said }], metadata: {} }) as unknown as StoredMessage;
+    const ctx: ReaderFramingContext = {
+      resident: 'scout', fork: 'reader/scout/g1', voice: 'Read for scout.', channelId: CHANNEL, epochId: 'abcdef0123', trigger: 'cadence',
+      notice: '[Tune-out cadence: test]', dispositions: null, backlog: [], resumed: true, incarnation: 2,
+    };
+    const all = (c: ReaderFramingContext) => defaultReaderFraming(c).map((b) => (b as { text?: string }).text ?? '').join('\n');
+    assert.ok(all({ ...ctx, residentRows: [row('scout', 'newest')], residentRowsOmitted: 600 })
+      .includes("[In scout's context since your last look: 601 messages; the oldest 600 are not shown here]\nscout: newest"));
+    assert.ok(all({ ...ctx, residentRows: [row('scout', 'newest')], residentRowsOmitted: 1 })
+      .includes("[In scout's context since your last look: 2 messages; the oldest is not shown here]"));
+    assert.ok(all({ ...ctx, residentRows: [], residentRowsOmitted: 3 }).includes("[In scout's context since your last look: 3 messages; none is shown here]"));
+    assert.ok(all({ ...ctx, residentRowsUnavailable: 'no-mark' })
+      .includes("[What entered scout's context since your last look could not be read; none of it is shown here.]"));
+  });
 });
 
 describe('resumeAgent and the derivation notice', () => {
