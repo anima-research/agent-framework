@@ -591,12 +591,14 @@ describe('a persisted reader: what the resident and the reader are told', () => 
       'a line each for the first two, none for the third, a count line at the fourth');
     assert.equal(textOf(told[0]!),
       '[Agent lifecycle: reader/scout/g1 was derived from you as a subconscious-fork on your weights (test-model), reading your ' +
-      'context up to this point, and handed what entered your context after it at each later look; its result returns to you ' +
-      'as a message; it ends when its task does (idle 10 min), and ends with you.]');
+      'context up to this point, and at each later look handed an account of the messages your context took since the look ' +
+      'before (not your stored context injections); its result returns to you as a message; it ends when its task does ' +
+      '(idle 10 min), and ends with you.]');
     assert.equal(textOf(told[1]!),
       '[Agent lifecycle: reader/scout/g1 was resumed (incarnation 2) as a subconscious-fork on your weights (test-model), reading ' +
-      'your context up to the point it was derived, and handed what entered your context after it at each look; its result ' +
-      'returns to you as a message; it ends when its task does (idle 10 min), and ends with you.]');
+      'your context up to the point it was derived, and at each look handed an account of the messages your context took since ' +
+      'the look before (not your stored context injections); its result returns to you as a message; it ends when its task ' +
+      'does (idle 10 min), and ends with you.]');
     assert.match(textOf(told[2]!), /^\[Agent lifecycle: 1 subconscious-fork has been derived from you, and resumed 3 times, since \d\d:\d\d UTC \(2 since the last note\); the latest, reader\/scout\/g1, is a subconscious-fork/);
     assert.deepEqual((told[2]!.metadata as { dendrite: { collapsed: unknown } }).dendrite.collapsed, { count: 4, sinceLastNote: 2, resumed: 3 });
   });
@@ -606,10 +608,18 @@ describe('a persisted reader: what the resident and the reader are told', () => 
     const fork = 'A reader reads it instead: a fork of your context, run on a cadence and when a message there mentions you, ' +
       'which can report to you in its own words and cancel the tune-out. ';
     assert.ok(later({ kind: 'forks', persist: 'epoch', resync: 'window' }).includes(fork +
-      'Within one tune-out, later runs resume that fork, each handed what entered your context since the run before; ' +
-      'a new fork is made only when it can\'t be resumed. People who mention you'));
+      'Within one tune-out, later runs resume that fork, each handed an account of the messages your context took since the ' +
+      'run before (not your stored context injections); a new fork is made when it can\'t be resumed, or for a run after the ' +
+      'tune-out ended. People who mention you'));
+    assert.ok(later({ kind: 'forks', persist: 'epoch', resync: 'none' }).includes(fork +
+      'Within one tune-out, later runs resume that fork; a new fork is made when it can\'t be resumed, or for a run after the ' +
+      'tune-out ended. People who mention you'));
+    assert.ok(later({ kind: 'forks', persist: 'resident', resync: 'window' }).includes(fork +
+      'Later runs resume that fork, across tune-outs, each handed an account of the messages your context took since the run ' +
+      'before (not your stored context injections); a new fork is made when it can\'t be resumed. People who mention you'));
     assert.ok(later({ kind: 'forks', persist: 'resident', resync: 'none' }).includes(fork +
-      'Later runs resume that fork, across tune-outs; a new fork is made only when it can\'t be resumed. People who mention you'));
+      'Later runs resume that fork, across tune-outs; a new fork is made when it can\'t be resumed. People who mention you'));
+    assert.ok(!/think/i.test(later({ kind: 'forks', persist: 'resident', resync: 'window' })), 'says nothing of thinking');
     assert.ok(later({ kind: 'forks' }).includes(fork + 'People who mention you'), 'a fork per look: as before');
     for (const persist of ['epoch', 'resident'] as const) {
       assert.ok(!/subconscious|judg/i.test(JSON.stringify(tuneOutTool({ kind: 'forks', persist, resync: 'window' }))));

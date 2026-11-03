@@ -2136,8 +2136,8 @@ export function tuneOutTool(reader: TuneOutReader): import('./types/index.js').T
         (reader.persist === undefined
           ? ''
           : `${reader.persist === 'epoch' ? 'Within one tune-out, later runs resume that fork' : 'Later runs resume that fork, across tune-outs'}` +
-            `${reader.resync === 'none' ? '' : ', each handed what entered your context since the run before'}` +
-            '; a new fork is made only when it can\'t be resumed. ')
+            `${reader.resync === 'none' ? '' : ', each handed an account of the messages your context took since the run before (not your stored context injections)'}` +
+            `; a new fork is made when it can't be resumed${reader.persist === 'epoch' ? ', or for a run after the tune-out ended' : ''}. `)
       : 'No reader is configured here, so none reads it meanwhile: it is held for you, and delivered when you cancel ' +
         'the tune-out or durationSeconds runs out. ';
   return {
@@ -12377,7 +12377,9 @@ export class AgentFramework {
         : ` on ${record.model}`;
     // A persisted reader (subconscious.persist, recorded in its metadata)
     // reads the context it was derived with, and with resync 'window' is
-    // handed what entered the source's context after it at each look. The
+    // handed, at each look, an account of the rows the source's context took
+    // since the look before (residentRowsSince), its stored context
+    // injections left out. The
     // metadata is the host's to set on any derivation: only a reader fork's
     // reads as a persisted reader's.
     const persisted = record.kind === 'subconscious-fork'
@@ -12387,7 +12389,8 @@ export class AgentFramework {
         ? 'reading your context up to this point'
         : (record.incarnation > 1 ? 'reading your context up to the point it was derived' : 'reading your context up to this point') +
           (record.metadata?.resync === 'window'
-            ? `, and handed what entered your context after it at each ${record.incarnation > 1 ? '' : 'later '}look`
+            ? `, and at each ${record.incarnation > 1 ? '' : 'later '}look handed an account of the messages your context took ` +
+              'since the look before (not your stored context injections)'
             : '')
       : 'with a copy of your context';
     const route = record.relationships.resultTo;
