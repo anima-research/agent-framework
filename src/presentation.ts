@@ -482,8 +482,8 @@ export class AgentPresentation {
   private readonly listeners = new Map<AgentName, Set<(event: PresentedEvent) => void>>();
   /** Own rows whose presentation at their write failed, per manager (presentOwn), until they enter its window. */
   private readonly failedOwn = new WeakMap<WindowManager, Set<MessageId>>();
-  /** Arrivals a rollback took out of each manager's window, kept out of it at rest until the agent's next turn start (holdUntilStart). */
-  private readonly heldUntilStart = new WeakMap<WindowManager, Set<MessageId>>();
+  /** Arrivals a rollback took out of each manager's window, kept out of it at rest until the agent's next turn start (holdUntilStart), on the branch the rollback left the store on. */
+  private readonly heldUntilStart = new WeakMap<WindowManager, { branch: string; ids: Set<MessageId> }>();
   /** Read-only handles on the slots a manager merges, by namespace (slotOfRow): made only for a reader whose context merges more than one. */
   private readonly slotReaders = new WeakMap<WindowManager, Map<string | null, MessageStore>>();
 
@@ -929,17 +929,27 @@ export class AgentPresentation {
    * or a row stored for the agent while it is idle, so the cut the
    * operator made is what the agent's window holds until it speaks again.
    * A tool boundary isn't held back (a turn alive started since). An own
-   * row among them isn't held: own rows enter at every point, as ever. In
-   * memory: a restart presents them at its pass at rest, and an agent let
-   * go (forget) drops them. Rows given again add to those held. Never throws.
+   * row among them isn't held: own rows enter at every point, as ever. The
+   * hold is the branch's the store is on (the rollback's): on another
+   * branch the same stored rows are arrivals as any, and back on this one
+   * they are held again until the agent's next turn start. In memory: a
+   * restart presents them at its pass at rest, and an agent let go (forget)
+   * drops them. Rows given again on the same branch add to those held, and
+   * on another replace them. Never throws.
    */
   holdUntilStart(agent: PresentedAgent, ids: readonly MessageId[]): void {
     const named = unique(ids);
     if (named.length === 0) return;
     const cm = agent.getContextManager();
-    const held = this.heldUntilStart.get(cm) ?? new Set<MessageId>();
-    for (const id of named) held.add(id);
-    this.heldUntilStart.set(cm, held);
+    try {
+      const branch = cm.currentBranch().name;
+      const held = this.heldUntilStart.get(cm);
+      const kept = held?.branch === branch ? held.ids : new Set<MessageId>();
+      for (const id of named) kept.add(id);
+      this.heldUntilStart.set(cm, { branch, ids: kept });
+    } catch (error) {
+      console.error(`[presentation] ${agent.name}: could not hold ${named.length} row(s) out of its window until its next turn start; they enter at its next presentation point:`, error);
+    }
   }
 
   /**
@@ -1323,10 +1333,12 @@ export class AgentPresentation {
    */
   private pending(agent: PresentedAgent, arrivals: boolean, atRest = false): PendingBody[] {
     const cm = agent.getContextManager();
-    const held = atRest ? this.heldUntilStart.get(cm) : undefined;
     const facts = readerFacts(this.host.registry, agent.name);
     const factsKey = JSON.stringify(facts);
     const branch = cm.currentBranch().name;
+    // A rollback's hold is its branch's: on another the rows are arrivals as any.
+    const hold = atRest ? this.heldUntilStart.get(cm) : undefined;
+    const held = hold?.branch === branch ? hold.ids : undefined;
     const length = cm.indexLength();
     let memo = this.memos.get(cm);
     if (!memo || memo.generation !== this.generation || memo.branch !== branch || memo.length !== length || memo.facts !== factsKey) {

@@ -1056,4 +1056,24 @@ describe('the presentation module at the point after one that failed', () => {
     const arrival = r.write(r.oren, 'someone', text('for mira'), ['mira']);
     assert.deepEqual(r.presentation.owedOf(r.mira).map((m) => m.id), [arrival], 'a row stored after them is found');
   });
+
+  // AF #844 bot review finding 62.
+  it("arrivals a rollback holds until the next start are held on its branch only", async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('mira');
+    const returned = r.write(r.oren, 'someone', text('returned'), ['mira']);
+    r.alive.delete('mira');
+    r.presentation.holdUntilStart(r.mira, [returned]);
+    assert.deepEqual(r.presentation.presentAtEnd(r.mira), [], 'setup: held at rest');
+    const main = r.store.currentBranch().name;
+    r.store.createBranchAt('other', main, r.store.currentSequence());
+    r.store.switchBranch('other');
+    for (const agent of r.live.values()) r.presentation.rebase(agent);
+    assert.deepEqual(r.presentation.presentAtEnd(r.mira).map((m) => m.id), [returned], 'on another branch it is an arrival as any');
+    r.store.switchBranch(main);
+    for (const agent of r.live.values()) r.presentation.rebase(agent);
+    assert.deepEqual(r.presentation.presentAtEnd(r.mira), [], 'back on its branch, still held');
+    assert.deepEqual(r.presentation.presentAtStart(r.mira, 'turn-start').map((m) => m.id), [returned], 'until the next start');
+  });
 });
