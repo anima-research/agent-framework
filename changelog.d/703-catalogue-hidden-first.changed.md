@@ -26,4 +26,7 @@
   the instruction to copy the name from the catalogue's index, which lists
   only available tools. When this host can't read or parse the file, the
   refusal can't tell whether it holds the name, and gives that
-  instruction.
+  instruction. An entry that holds no setting, as restoring a tool's only
+  description leaves it, is no longer named "Not currently available"
+  once its tool goes away, as 0.32.0 named it, so the diagnostics and the
+  refusal agree on which names the file keeps a setting for.

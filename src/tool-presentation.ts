@@ -57,6 +57,7 @@ const count = (n: number): string => n.toLocaleString('en-US');
 
 /** A text's length in code points, so a character outside the Basic Multilingual Plane, such as 😀, counts once where UTF-16 counts it twice. */
 const characters = (text: string): number => [...text].length;
+const holdsSetting = (entry: ToolOverride): boolean => entry.visible !== undefined || entry.description !== undefined;
 
 /** A text's first `n` characters, never splitting a code point. */
 const firstCharacters = (text: string, n: number): string => [...text].slice(0, n).join('');
@@ -234,7 +235,7 @@ export class ToolPresentation {
       } catch (error) { diagnostics.push(`The description defaults for ${JSON.stringify(profile.source)} can't be used (${problemText(error)}), so its tools show their installed descriptions, or yours where you set one. Ask whoever runs this host to fix that defaults file.`); }
     }
     const names = new Set(tools.map(t => t.name));
-    for (const name of Object.keys(doc.tools)) if (!names.has(name)) diagnostics.push(`Not currently available: ${quoted(name)}`);
+    for (const name of Object.keys(doc.tools)) if (!names.has(name) && holdsSetting(doc.tools[name])) diagnostics.push(`Not currently available: ${quoted(name)}`);
     const entries = tools.map(tool => {
       const override = Object.hasOwn(doc.tools, tool.name) ? doc.tools[tool.name] : undefined;
       // Always retain a usable discovery signpost, even when its wording is overridden.
@@ -339,7 +340,7 @@ export class ToolPresentation {
       let held = false;
       try {
         const tools = parsePresentation(this.read()).tools;
-        held = Object.hasOwn(tools, name) && (tools[name].visible !== undefined || tools[name].description !== undefined);
+        held = Object.hasOwn(tools, name) && holdsSetting(tools[name]);
       } catch { held = false; }
       throw new PresentationRefusal(`Nothing was changed: you have no tool named ${quoted(name)} right now, shown or hidden.${near.length ? ` Did you mean ${quotedList(near, 'or', JSON.stringify)}?` : ''}`
         + (held
