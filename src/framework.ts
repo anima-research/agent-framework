@@ -21400,7 +21400,9 @@ export class AgentFramework {
    * locus mode does. Neither has a lock of its own.
    */
   private proseRoutingOf(agent: Agent): NonNullable<AgentConfig['proseRouting']> {
-    const mode = agent.proseRouting;
+    // An agent's mode is always set (Agent defaults it); a stand-in for one
+    // may leave it out, which reads as the default, as `?? 'locus'` did here.
+    const mode = agent.proseRouting ?? 'locus';
     if (mode !== 'locked') return mode;
     return this.homeOf(agent.name) || this.usedEphemeralAgentNames.get(agent.name) === 'run' ? 'locus' : mode;
   }
