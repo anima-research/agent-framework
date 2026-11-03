@@ -210,3 +210,52 @@ describe('an agent left in legacy mode (AF #844 bot review finding 6)', () => {
     }
   });
 });
+
+describe("the boot's pass over an agent whose owed rows couldn't be read for their wakes (AF #844 bot review finding 36)", () => {
+  it('leaves them out of its window, so the next boot asks the wake they owe', async () => {
+    const storePath = join(dir(), 'store');
+    const boot = () => AgentFramework.create({
+      storePath,
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'You are agent.' }],
+      modules: [],
+      syncIntervalMs: 0,
+    } as Parameters<typeof AgentFramework.create>[0]);
+    await (await boot()).stop();
+    // A tune-out's release an earlier release left queued: its import asks
+    // for the wake it owes, which this process never runs.
+    mkdirSync(join(storePath, 'recovery'), { recursive: true });
+    writeFileSync(join(storePath, 'recovery', 'deferred-writes.json'), JSON.stringify({ version: 2, pending: [{
+      id: 't1', seq: 1, participant: 'user', content: text('[Tune-out: #room cancelled]'), heldAt: 1_700_000_000_000,
+      metadata: { system: true, kind: 'tune-out-cancel', channelId: 'room' },
+    }] }));
+    const owedOf = AgentPresentation.prototype.owedOf;
+    let fail = true;
+    AgentPresentation.prototype.owedOf = function (this: AgentPresentation, agent) {
+      if (fail) { fail = false; throw new Error('a transient read failure'); }
+      return owedOf.call(this, agent);
+    };
+    let first: { result: AgentFramework; lines: string[] };
+    try {
+      first = await logged(boot);
+    } finally {
+      AgentPresentation.prototype.owedOf = owedOf;
+    }
+    try {
+      const cm = first.result.getAgent('agent')!.getContextManager();
+      const release = cm.getAllMessages().find((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'tune-out-cancel');
+      assert.ok(release, 'setup: the release is stored');
+      assert.ok(first.lines.some((line) => line.includes("could not read what agent's window is owed at boot")), first.lines.join('\n'));
+      assert.equal(cm.windowStatusOf(release.id), 'out', "the boot's pass leaves it out of the agent's window");
+    } finally {
+      await first.result.stop();
+    }
+    const second = await boot();
+    try {
+      const pending = (second as unknown as Internals).pendingRequests;
+      assert.ok(pending.some((r) => r.agentName === 'agent' && r.reason === 'tune-out released (restored)'), JSON.stringify(pending));
+    } finally {
+      await second.stop();
+    }
+  });
+});

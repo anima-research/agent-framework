@@ -713,13 +713,16 @@ export class AgentPresentation {
    * its own rows stored and not in its window (the own-row sweep, traced as
    * presentation:repaired), then whatever it is owed at rest (presentAtEnd).
    * Boot runs it once every agent is taken on and the stored rows are in,
-   * whether or not an adopt repaired anything.
+   * whether or not an adopt repaired anything. An agent in `restExcept` has
+   * its own rows swept and nothing else: the boot couldn't read what it is
+   * owed to ask the wakes its rows owe, so they stay out of its window for
+   * its next point, and a later boot reads them again.
    */
-  repairAndRest(): void {
+  repairAndRest(options: { restExcept?: ReadonlySet<AgentName> } = {}): void {
     for (const agent of this.host.liveAgents()) {
       if (!this.presenting(agent) || this.host.turnAlive(agent.name)) continue;
       this.repair(agent);
-      this.presentAtRest(agent, 'at-rest');
+      if (!options.restExcept?.has(agent.name)) this.presentAtRest(agent, 'at-rest');
     }
   }
 

@@ -5552,13 +5552,15 @@ export class AgentFramework {
     // agent taken on (repairAndRest): its own rows stored and not in its
     // window, then what it is owed at rest, now that the stored rows are in.
     // Each agent's window was written down at its registration, before them.
+    // An agent whose owed rows couldn't be read for their wakes is left out of
+    // the pass at rest, so those rows stay out of its window and a later boot
+    // reads them again (`restExcept`).
     // Then each window lets go of the rows its record no longer holds that no
     // live context heard removed (retractAbsentRows): an offline recovery's
     // suppressions, made with the host stopped through one agent's context.
-    framework.wakeForUnpresentedTuneOutRows();
-    framework.wakeForUnpresentedMail();
+    const unreadAtBoot = new Set([...framework.wakeForUnpresentedTuneOutRows(), ...framework.wakeForUnpresentedMail()]);
     framework.bootFreeze = false;
-    framework.presentation?.repairAndRest();
+    framework.presentation?.repairAndRest({ restExcept: unreadAtBoot });
     framework.presentation?.retractAbsentRows();
     await framework.passOnInterruptedNotices(interruptedAgents);
     framework.reconcileAgentRegistry(interruptedAgents);
@@ -10053,12 +10055,15 @@ export class AgentFramework {
    * (repairAndRest). Earlier releases kept such a row in the deferred queue,
    * whose restore asked for the same wake; the importer still asks for it
    * for a release it stores (importPersistedDeferredWrites), and is not
-   * asked twice. A row in the window already was presented while the agent
-   * had no turn alive, its wake run or lost with the turn as before #291.
-   * Nothing for an agent the index doesn't present for, and a window that
-   * can't be read is logged and asks for nothing.
+   * asked twice. A row in the window already was presented at rest or
+   * injected at a tool boundary, its wake run or lost with the turn as
+   * before #291. Nothing for an agent the index doesn't present for. A
+   * window that can't be read is logged and asks for nothing, and its agent
+   * is returned: the boot's pass leaves what it is owed out of its window
+   * (repairAndRest's `restExcept`), so a later boot reads it again.
    */
-  private wakeForUnpresentedTuneOutRows(): void {
+  private wakeForUnpresentedTuneOutRows(): Set<string> {
+    const unread = new Set<string>();
     const owed: Array<{ agentName: string | null; kinds: readonly string[]; reason: string }> = [
       { agentName: this.primaryAgentName, kinds: ['tune-out-cancel'], reason: 'tune-out released (restored)' },
       {
@@ -10075,13 +10080,15 @@ export class AgentFramework {
       try {
         rows = this.presentation!.owedOf(agent);
       } catch (error) {
-        console.error(`[tune-out] could not read what ${agent.name}'s window is owed at boot, so no wake is asked for a tune-out's row in it:`, error);
+        console.error(`[tune-out] could not read what ${agent.name}'s window is owed at boot, so no wake is asked for a tune-out's row in it, and the boot's pass leaves what it is owed out of its window for a later boot to read again:`, error);
+        unread.add(agent.name);
         continue;
       }
       const kindOf = (m: StoredMessage): unknown => (m.metadata as { kind?: unknown } | undefined)?.kind;
       if (!rows.some((m) => kinds.includes(kindOf(m) as string))) continue;
       this.pendingRequests.push({ agentName: agent.name, reason, source: 'tune-out', timestamp: Date.now() });
     }
+    return unread;
   }
 
   /**
@@ -10110,16 +10117,22 @@ export class AgentFramework {
    * Mail in the window already was presented at rest, or sent in a request
    * of the turn's (at its tool boundary), its wake run or lost as before
    * #291, and asks for none; nor does a wake with the same reason already
-   * pending. A window that can't be read is logged and asks for nothing.
+   * pending. A window that can't be read is logged and asks for nothing, and
+   * its agent is returned, as wakeForUnpresentedTuneOutRows returns one. The
+   * wakes are asked in memory: once the pass has presented the rows, a
+   * process that ends, or a create() that fails, before they run loses them,
+   * and the next boot, which finds the rows in the window, asks for none.
    */
-  private wakeForUnpresentedMail(): void {
+  private wakeForUnpresentedMail(): Set<string> {
+    const unread = new Set<string>();
     for (const agent of this.agents.values()) {
       if (!this.presents(agent)) continue;
       let rows: StoredMessage[];
       try {
         rows = this.presentation!.owedOf(agent);
       } catch (error) {
-        console.error(`[dendrite] could not read what ${agent.name}'s window is owed at boot, so no wake is asked for mail stored in it:`, error);
+        console.error(`[dendrite] could not read what ${agent.name}'s window is owed at boot, so no wake is asked for mail stored in it, and the boot's pass leaves what it is owed out of its window for a later boot to read again:`, error);
+        unread.add(agent.name);
         continue;
       }
       for (const row of rows) {
@@ -10131,6 +10144,7 @@ export class AgentFramework {
         this.pendingRequests.push({ agentName: agent.name, reason, source: 'dendrite', timestamp: Date.now() });
       }
     }
+    return unread;
   }
 
   /**
