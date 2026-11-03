@@ -1419,7 +1419,8 @@ interface TurnRouting {
   /**
    * Locus and hybrid mode: where the turn's unpinned plain prose lands.
    * Frozen when the turn opens (home channel for a fork, else the trigger
-   * channel, else the global default), so ambient chatter, reactions and
+   * channel, else the global default, with the configured unprompted channel
+   * in it where the turn takes it), so ambient chatter, reactions and
    * system markers can't move it (2026-07-21 Cairn lounge misroute). Since
    * 2026-07-31 a re-pin moves it (repinTurnLocus): an addressed message, or a
    * follow-up in a channel the turn engaged. The agent's own channel_open
@@ -4380,8 +4381,6 @@ export class AgentFramework {
    *  subsystem can be lazily initialized by connectMcplServer when the
    *  framework started with zero configured servers. */
   private mcplInferenceRoutingConfig: import('./mcpl/types.js').InferenceRoutingPolicy | null = null;
-  /** Configured unprompted channel for no-trigger turns (heartbeats, timers) — see
-   *  ChannelRegistryOptions.unpromptedChannel. */
   private mcplUnpromptedChannel: string | null = null;
   /** The awareness ledger; null for a framework with neither storePath nor
    *  discordAwarenessOutboxPath, which refuses a marks choice. */
@@ -24082,7 +24081,8 @@ export class AgentFramework {
       // channel/DM-triggered turn, with its server, and none for a
       // no-trigger turn, which doesn't inherit a previous turn's channel: a
       // heartbeat's takes no locus at all (TurnRouting.heartbeat), and any
-      // other falls back to the global default. A wake whose channel,
+      // other falls back to the global default, with the configured
+      // unprompted channel in it where the turn takes it. A wake whose channel,
       // given without its server, names no one registered channel (a host's
       // id that two servers' channels answer to, or that none does) has none
       // either, and takes no fallback: it was for a channel, and the latest
@@ -24105,7 +24105,8 @@ export class AgentFramework {
       else delete routing.channelBorne;
       // Resolve the turn's outbound locus now: the home channel for forks,
       // else the trigger channel, else the global default, which an
-      // ephemeral run never takes (takesGlobalFallback). Ambient mid-turn
+      // ephemeral run never takes (takesGlobalFallback), with the configured
+      // unprompted channel in it where the turn takes it. Ambient mid-turn
       // injections must not redirect the agent's plain prose (ambient
       // chatter and reactions hijacked it before, 2026-07-21); only an
       // addressed message, a follow-up in a channel the turn engaged
@@ -32232,7 +32233,8 @@ export class AgentFramework {
         // a later start of the turn is told where its unprefixed speech lands
         // unless a hybrid `>>>` destination takes it. Empty for a no-trigger
         // turn until its locus is resolved, so that resolution takes the
-        // global fallback (none for an ephemeral run), and the turn then keeps
+        // global fallback, the configured unprompted channel among it (none
+        // for an ephemeral run), and the turn then keeps
         // that channel; null for a heartbeat's turn, which takes none
         // (TurnRouting.heartbeat).
         activeChannelResolver: (agentName) => {
@@ -32250,8 +32252,6 @@ export class AgentFramework {
           return !(routing?.channelBorne || routing?.heartbeat || routing?.silent);
         },
         eventGatePresent: this.eventGate !== null,
-        // Configured unprompted channel: where a no-trigger turn's speech goes
-        // instead of the last-active channel (heartbeat containment).
         unpromptedChannel: this.mcplUnpromptedChannel ?? undefined,
         // A channel tool reads the connect and restart marks a tool call's
         // "connecting" text reads (mcplConnectInFlight, mcplServerAbsentText).

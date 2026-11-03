@@ -1,13 +1,3 @@
-/**
- * Configured unprompted channel for no-trigger turns (heartbeats, timers).
- *
- * Without `unpromptedChannel`, a turn with no triggering channel resolves its speech
- * locus to `defaultPublishChannel` — the most-recent inbound across ALL
- * channels — so a heartbeat check-in lands wherever a message last happened to
- * arrive. With it, such turns speak in the configured channel, while a fork's
- * home or a real triggering channel still wins.
- */
-
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
