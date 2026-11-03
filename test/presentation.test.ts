@@ -1040,4 +1040,20 @@ describe('the presentation module at the point after one that failed', () => {
     assert.equal(kid.has(later), true, "presented at the fork's next start");
     assert.deepEqual(ofType(r.traces, 'presentation:presented').filter((t) => t.agentName === 'kid' && t.occasion === 'framing').map((t) => t.count), [1]);
   });
+
+  // AF #844 bot review finding 55.
+  it("a scan of an agent's pending rows starts after the rows it found elsewhere before, and finds what is stored after them", async () => {
+    const r = await rig();
+    r.adoptAll();
+    const foreign = ['one', 'two', 'three'].map((t) => r.write(r.oren, 'someone', text(t), ['oren']));
+    const asked: Array<number | undefined> = [];
+    const list = r.mira.cm.getUnpresentedMessages.bind(r.mira.cm);
+    r.mira.cm.getUnpresentedMessages = (options) => { asked.push(options?.afterSequence); return list(options); };
+    assert.deepEqual(r.presentation.owedOf(r.mira), [], "oren's rows are nothing to mira");
+    assert.deepEqual(r.presentation.owedOf(r.mira), []);
+    assert.deepEqual(asked, [undefined, r.oren.cm.getMessage(foreign.at(-1)!)!.sequence], 'the second scan lists only the rows after those it weighed');
+    r.alive.add('mira');
+    const arrival = r.write(r.oren, 'someone', text('for mira'), ['mira']);
+    assert.deepEqual(r.presentation.owedOf(r.mira).map((m) => m.id), [arrival], 'a row stored after them is found');
+  });
 });

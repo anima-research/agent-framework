@@ -1324,7 +1324,6 @@ export class AgentPresentation {
   private pending(agent: PresentedAgent, arrivals: boolean, atRest = false): PendingBody[] {
     const cm = agent.getContextManager();
     const held = atRest ? this.heldUntilStart.get(cm) : undefined;
-    const unpresented = cm.getUnpresentedMessages();
     const facts = readerFacts(this.host.registry, agent.name);
     const factsKey = JSON.stringify(facts);
     const branch = cm.currentBranch().name;
@@ -1334,6 +1333,13 @@ export class AgentPresentation {
       memo = { generation: this.generation, branch, length, facts: factsKey, scanFrom: -Infinity };
       this.memos.set(cm, memo);
     }
+    // Every unpresented row at or below the memo's mark was elsewhere, so the
+    // listing starts after it (context-manager finds the place by a search):
+    // a scan walks the rows stored since, not every row of others' the
+    // record holds.
+    const unpresented = memo.scanFrom === -Infinity
+      ? cm.getUnpresentedMessages()
+      : cm.getUnpresentedMessages({ afterSequence: memo.scanFrom });
     const bodies: PendingBody[] = [];
     let firstOwed: number | undefined;
     let newest = memo.scanFrom;
