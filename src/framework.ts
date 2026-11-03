@@ -4584,6 +4584,13 @@ export class AgentFramework {
    */
   private readonly heldForRecovery = new Map<string, SurgeryHeldWrite[]>();
   private readonly managersRefusingWork = new WeakSet<ContextManager>();
+  /**
+   * The agents whose foreignRounds the framework sets (applyForeignRounds),
+   * each with the mode its configuration names: a resident that observes
+   * another (AgentConfig.foreignRounds), and the persistent subconscious
+   * (its config's). Recorded at registration.
+   */
+  private readonly foreignRoundsConfigured = new WeakMap<Agent, 'transcript' | 'raw'>();
   /** Tell the first adoption candidate when task work is orphaned (config.dendrite.announceOrphans). */
   private announceOrphans = true;
   /**
@@ -15069,8 +15076,11 @@ export class AgentFramework {
    * none of (a branch made before the agent's write-down, a rollback into
    * rows the write-down presented) is written down, and the agent's own
    * rows not in its window are presented, so an agent that presented before
-   * the move presents after it. Arrivals wait for the reservation's
-   * release, which presents what each agent is owed. Redo entries are
+   * the move presents after it, and an agent whose configuration names how
+   * other agents' rounds go out to it is sent them so where its window is
+   * presented now, as stored where it isn't (applyForeignRounds). Arrivals
+   * wait for the reservation's release, which presents what each agent is
+   * owed. Redo entries are
    * dropped, every agent's: each was an undo on a window of the branch the
    * store left. Returns the managers whose re-initialization failed, for
    * the caller to report (reportReinitFailures) before it releases the
@@ -15096,6 +15106,9 @@ export class AgentFramework {
       for (const agent of this.agents.values()) {
         const failed = failures.find((f) => f.agentName === agent.name);
         this.presentation?.rebase(agent, failed && 'error' in failed ? failed.error : undefined);
+        // The rebase can present a window a write-down left in legacy mode,
+        // or leave one in it.
+        this.applyForeignRounds(agent);
       }
       return failures;
     } catch (error) {
@@ -17351,7 +17364,8 @@ export class AgentFramework {
     // An agent that observes another is sent its rounds as its
     // configuration's foreignRounds says, a transcript by default, as the
     // persistent subconscious is (foreign-rounds.ts).
-    if ((config.observes?.length ?? 0) > 0 && this.presents(agent)) agent.setForeignRounds(config.foreignRounds ?? 'transcript');
+    if ((config.observes?.length ?? 0) > 0) this.foreignRoundsConfigured.set(agent, config.foreignRounds ?? 'transcript');
+    this.applyForeignRounds(agent);
     this.agentConfigs.set(config.name, config);
 
     // First non-ephemeral agent becomes the primary for message routing
@@ -17487,7 +17501,8 @@ export class AgentFramework {
     // configuration's foreignRounds says, a transcript by default, its own
     // as stored (foreign-rounds.ts, #291 answer 13): the one change its
     // requests take at the switch.
-    if (this.presents(agent)) agent.setForeignRounds(cfg.foreignRounds ?? 'transcript');
+    this.foreignRoundsConfigured.set(agent, cfg.foreignRounds ?? 'transcript');
+    this.applyForeignRounds(agent);
     this.subconsciousConfig = cfg;
     return agent;
   }
@@ -22904,6 +22919,23 @@ export class AgentFramework {
    */
   private presents(agent: Agent | undefined): boolean {
     return !!agent && !!this.presentation?.presenting(agent);
+  }
+
+  /**
+   * How another agent's rounds go out in `agent`'s requests
+   * (Agent.setForeignRounds), for an agent whose configuration names a mode
+   * (foreignRoundsConfigured): that mode while the presentation index
+   * presents its window, and as stored (`'raw'`) while its window is the
+   * record, as before the index. Set at its registration and again after
+   * each branch move's rebase (followBranchMove), which can present a
+   * window whose write-down failed at registration, or leave one in legacy
+   * mode. Nothing for any other agent, which reads no other agent's rounds.
+   */
+  private applyForeignRounds(agent: Agent): void {
+    // Read defensively: a framework built from its prototype holds none.
+    const configured = this.foreignRoundsConfigured?.get(agent);
+    if (configured === undefined) return;
+    agent.setForeignRounds(this.presents(agent) ? configured : 'raw');
   }
 
   /**
