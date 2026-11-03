@@ -3332,28 +3332,31 @@ describe('the window follows a branch move (#291)', () => {
       const folded = foldedBy(h.cm(name));
       assert.equal(removed.filter((id) => folded.has(id)).length, removed.length, `setup: ${name}'s summaries fold every row to be removed`);
     }
+    // Errors are read until each window has been checked and its kept rows
+    // folded again, so a strategy's refusal that comes after the
+    // suppression's own turn of the loop, as an async notification's does,
+    // is read too.
     const refused: string[] = [];
     const error = console.error;
     console.error = (...args: unknown[]) => { refused.push(args.map(String).join(' ')); error(...args); };
-    let r: Awaited<ReturnType<AgentFramework['suppressMessages']>>;
     try {
-      r = await h.framework.suppressMessages('mira', { messageIds: removed });
+      const r = await h.framework.suppressMessages('mira', { messageIds: removed });
       await settled();
+      assert.equal(r.messagesRemoved, removed.length);
+      const gone = new Set(removed);
+      for (const name of ['mira', 'oren']) {
+        const cm = h.cm(name);
+        assert.deepEqual([...new Set(removed.map((id) => cm.windowStatusOf(id as MessageId)))], ['absent'], `out of ${name}'s window`);
+        const folded = foldedBy(cm);
+        assert.deepEqual(removed.filter((id) => folded.has(id)), [], `no summary of ${name}'s folds a removed row`);
+        assert.deepEqual((await renderedBy(cm)).filter((id) => gone.has(id)), [], `${name}'s compile renders no removed row`);
+        await drain(cm);
+        const refolded = foldedBy(cm);
+        assert.deepEqual(removed.filter((id) => refolded.has(id)), [], `nor once ${name}'s kept rows are folded again`);
+        assert.deepEqual((await renderedBy(cm)).filter((id) => gone.has(id)), [], `${name}'s compile then renders none either`);
+      }
     } finally {
       console.error = error;
-    }
-    assert.equal(r.messagesRemoved, removed.length);
-    const gone = new Set(removed);
-    for (const name of ['mira', 'oren']) {
-      const cm = h.cm(name);
-      assert.deepEqual([...new Set(removed.map((id) => cm.windowStatusOf(id as MessageId)))], ['absent'], `out of ${name}'s window`);
-      const folded = foldedBy(cm);
-      assert.deepEqual(removed.filter((id) => folded.has(id)), [], `no summary of ${name}'s folds a removed row`);
-      assert.deepEqual((await renderedBy(cm)).filter((id) => gone.has(id)), [], `${name}'s compile renders no removed row`);
-      await drain(cm);
-      const refolded = foldedBy(cm);
-      assert.deepEqual(removed.filter((id) => refolded.has(id)), [], `nor once ${name}'s kept rows are folded again`);
-      assert.deepEqual((await renderedBy(cm)).filter((id) => gone.has(id)), [], `${name}'s compile then renders none either`);
     }
     assert.deepEqual(refused.filter((line) => /onRetracted failed|requires reinitialization/.test(line)), [], "no strategy refused the rows' leaving");
     await h.bothServe('after the suppression');
