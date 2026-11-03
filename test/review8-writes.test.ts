@@ -252,11 +252,12 @@ describe('the boot\'s worker-ended notice and the results it reads (AF #844 find
   });
 });
 
-describe('window reads whose failure a caller tells from an answer (AF #844 finding 51)', () => {
+describe('window reads whose failure a caller tells from an answer (AF #844 findings 51, 52)', () => {
   type WindowInternals = {
     presentation: { holders(id: MessageId): unknown[] };
     isUnreadStoredMessage(agent: Agent, id: MessageId): boolean;
     windowHolders(id: MessageId): Agent[] | undefined;
+    windowRowOf(cm: ContextManager, id: MessageId, agentName: string): unknown;
     addMessage(participant: string, content: ContentBlock[]): MessageId;
   };
 
@@ -281,4 +282,12 @@ describe('window reads whose failure a caller tells from an answer (AF #844 find
     }
   });
 
+  it('a presented window that can\'t be read for an injected row is logged with the agent and the row', async () => {
+    const h = await bootOne();
+    const internals = h.framework as unknown as WindowInternals;
+    const cm = { windowMode: () => 'presented', getPresentedMessages() { throw new Error('read failed'); } } as unknown as ContextManager;
+    const { value, logged } = await quietly(() => internals.windowRowOf(cm, 'row-7' as MessageId, 'mira'));
+    assert.equal(value, null, 'the row reads as not held, as before');
+    assert.ok(logged.some((line) => line.includes('mira') && line.includes('row-7') && line.includes('read failed')), logged.join('\n'));
+  });
 });

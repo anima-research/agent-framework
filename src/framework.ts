@@ -32918,13 +32918,21 @@ export class AgentFramework {
    * manager merges: getMessage reads the manager's own slot alone, and the
    * subconscious hears the residents' rows at its tool boundary from the slot
    * it watches (#291). Null in legacy mode, where nothing is heard from
-   * another slot, and for a row the window doesn't hold.
+   * another slot, and for a row the window doesn't hold; null too where the
+   * window can't be read, which is logged naming `agentName` and the row,
+   * so a note that then records the row as not stored can be told from one
+   * whose row is absent.
    */
-  private windowRowOf(cm: ContextManager, id: MessageId): StoredMessage | null {
+  private windowRowOf(cm: ContextManager, id: MessageId, agentName: string): StoredMessage | null {
     try {
       if (cm.windowMode() !== 'presented') return null;
       return cm.getPresentedMessages().find((m) => m.id === id) ?? null;
-    } catch {
+    } catch (error) {
+      console.error(
+        `[thinking-binding] ${agentName}: could not read its window for the injected row ${id}, so this stream's note ` +
+          'records that row as not stored:',
+        error,
+      );
       return null;
     }
   }
@@ -32944,7 +32952,7 @@ export class AgentFramework {
       const rendered = cm.renderAsNewest(ids);
       const carried = new Map<MessageId, { participant: string; content: ContentBlock[] } | null>();
       ids.forEach((id, i) => {
-        const stored = cm.getMessage(id) ?? (injected.has(id) ? this.windowRowOf(cm, id) : null);
+        const stored = cm.getMessage(id) ?? (injected.has(id) ? this.windowRowOf(cm, id, agent.name) : null);
         const content = rendered ? rendered[i]! : stored?.content ?? null;
         // An injected row as the boundary sent it (Agent.injectedAsSent).
         const sent = content && stored && injected.has(id) ? agent.injectedAsSent(stored.participant, content) : content;
