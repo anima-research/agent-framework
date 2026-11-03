@@ -1939,6 +1939,12 @@ function assertFrameworkSwitches(config: FrameworkConfig): void {
         'and false or leaving it out doesn\'t',
     );
   }
+  const unprompted: unknown = config.unpromptedChannel;
+  if (unprompted !== undefined && unprompted !== null && (typeof unprompted !== 'string' || unprompted.trim() === '')) {
+    throw new Error(
+      `unpromptedChannel must name a channel, such as "discord:<guildId>:<channelId>", not ${typeof unprompted === 'string' ? 'a blank string' : kindOf(unprompted)}`,
+    );
+  }
   // The heartbeat: true or an object turns it on; false, null or leaving it
   // out leaves it off. Any other value (a "false" read from text, a 0) is
   // refused rather than read as on.

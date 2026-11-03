@@ -493,7 +493,10 @@ export interface FrameworkConfig {
    * or an ephemeral run's (its prose is its caller's result). One value, for
    * every agent on the framework. A registered channel's id, e.g.
    * `discord:{guildId}:{channelId}`, or, to pick one server's where two
-   * register that id, `{serverId}:{channelId}`.
+   * register that id, `{serverId}:{channelId}`. `create()` refuses a value
+   * that isn't a string or is blank. One that names no registered channel,
+   * or several, when a turn would take it is logged once, and the turn takes
+   * what it would without the setting.
    */
   unpromptedChannel?: string;
 

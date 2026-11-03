@@ -234,6 +234,42 @@ describe('unpromptedChannel: a no-trigger turn is told, and published to, the un
     });
   });
 
+  describe('its value', () => {
+    for (const [value, kind] of [['', 'a blank string'], ['   ', 'a blank string'], [42, 'a number']] as const) {
+      it(`create() refuses ${JSON.stringify(value)}, naming the setting and the value's kind`, async () => {
+        await assert.rejects(
+          AgentFramework.create({
+            storePath: join(tempDir, 'refused.chronicle'),
+            membrane: membrane.asMembrane(),
+            agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+            modules: [],
+            unpromptedChannel: value as never,
+          }),
+          new RegExp(`^Error: unpromptedChannel must name a channel, such as "discord:<guildId>:<channelId>", not ${kind}$`),
+        );
+      });
+    }
+
+    it('one that names no registered channel: such a turn takes what it would without it, and the host logs that once', async () => {
+      const logged: string[] = [];
+      const error = console.error;
+      console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+      try {
+        const t = await setup('discord:g1:nowhere', { speech: 'delivery' });
+        await t.channelless('first');
+        await t.channelless('second');
+        assert.deepEqual(t.published(), []);
+        assert.ok(!t.routingNotices().some((n) => n.includes('nowhere')), JSON.stringify(t.routingNotices()));
+        assert.deepEqual(logged.filter((l) => l.includes('unpromptedChannel')), [
+          '[routing] unpromptedChannel discord:g1:nowhere names no registered channel, so a turn no channel message prompted '
+            + 'takes the fallback it takes without the setting until the setting names one. Logged once.',
+        ]);
+      } finally {
+        console.error = error;
+      }
+    });
+  });
+
   it('with activity in another channel, a turn no channel caused speaks in the unprompted channel, not the busy channel', async () => {
     const t = await setup(OPS);
     await t.busyElsewhere();

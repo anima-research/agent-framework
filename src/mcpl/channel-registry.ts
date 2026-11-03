@@ -1215,6 +1215,7 @@ export class ChannelRegistry {
   private takesGlobalFallback?: (conversationId: string) => boolean;
   private serverConnecting?: (serverId: string) => boolean;
   private unpromptedChannel?: string;
+  private unpromptedChannelWarned = false;
   private takesUnpromptedChannel?: (conversationId: string) => boolean;
   private store?: JsStore;
 
@@ -5797,7 +5798,18 @@ export class ChannelRegistry {
     if (!this.unpromptedChannel) return null;
     if (conversationId !== undefined && this.takesUnpromptedChannel?.(conversationId) === false) return null;
     const named = this.entriesNamed(this.unpromptedChannel);
-    return named.length === 1 ? refOf(named[0]!) : null;
+    if (named.length === 1) return refOf(named[0]!);
+    if (!this.unpromptedChannelWarned) {
+      this.unpromptedChannelWarned = true;
+      const why = named.length === 0
+        ? 'names no registered channel'
+        : `names ${named.length} registered channels (name one with its server, as "serverId:channelId")`;
+      console.error(
+        `[routing] unpromptedChannel ${logValue(this.unpromptedChannel)} ${why}, so a turn no channel message prompted `
+          + 'takes the fallback it takes without the setting until the setting names one. Logged once.',
+      );
+    }
+    return null;
   }
 
   /**
