@@ -1328,14 +1328,15 @@ export type TraceEvent =
   | (TraceEventBase & {
       /** A presentation failed; the rows it didn't present stay out of the
        *  agent's window for its next presentation point. At a fresh turn's
-       *  start (`turn-start`, `assembly`), the start fails too. At `adopt`, the
-       *  agent's window couldn't be written down (another version's index
-       *  format, or a failed write), and the agent stays in legacy mode: its
-       *  window is the whole record, as before the index. At `rebase`, after
-       *  the store's branch moved, its window couldn't be written down on
-       *  the new branch, or its context's strategy couldn't follow the move
-       *  (`error` says which), and it stays in legacy mode until the next
-       *  move. */
+       *  start (`turn-start`, `assembly`), the start fails too. With
+       *  `legacy`, the agent was left in legacy mode, its window the whole
+       *  record as before the index, until a later move of the store's
+       *  branch writes its window down: at `adopt`, its window couldn't be
+       *  written down (another version's index format, or a failed write);
+       *  at `rebase`, after the store's branch moved, its window couldn't be
+       *  written down on the new branch, or its context's strategy couldn't
+       *  follow the move (`error` says which). The framework logs that and
+       *  raises an ops alert (`presentation-legacy`). */
       type: 'presentation:failed';
       agentName: string;
       occasion: PresentationOccasion;
@@ -1345,6 +1346,8 @@ export type TraceEvent =
        *  of the window that failed). Absent where a read failed before the
        *  rows could be named. */
       messageIds?: string[];
+      /** Set where the failure left the agent in legacy mode. */
+      legacy?: true;
     })
   | (TraceEventBase & {
       /** At a tool boundary's hand-off, the newest rows of the agent's

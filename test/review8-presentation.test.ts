@@ -192,3 +192,21 @@ describe("a write's placement (AF #844 bot review findings 4 and 13)", () => {
     assert(f.lastRequest().includes('second_text') && !f.lastRequest().includes('late_render'), "the fork's next turn reads the replacement");
   });
 });
+
+describe('an agent left in legacy mode (AF #844 bot review finding 6)', () => {
+  it("is logged and alerted at its registration, naming its window as the record until a branch move", async () => {
+    const store = storeWithForeignIndex(join(dir(), 'store.chronicle'), 'mira');
+    const { result: r, lines } = await logged(() => residents({ store }));
+    try {
+      const failed = r.traces.filter((t) => t.type === 'presentation:failed') as Array<{ agentName: string; occasion: string; legacy?: true }>;
+      assert.deepEqual(failed.map((t) => [t.agentName, t.occasion, t.legacy]), [['mira', 'adopt', true]]);
+      const alerts = r.traces.filter((t) => t.type === 'ops:alert' && (t as { kind?: string }).kind === 'presentation-legacy') as Array<{ agentName: string; message: string }>;
+      assert.deepEqual(alerts.map((t) => t.agentName), ['mira']);
+      assert.match(alerts[0]!.message, /its context is the whole record \(legacy mode\) until a later move of the store's branch/);
+      assert.ok(lines.some((line) => line.startsWith('[presentation] agent=mira its window is not presented after its registration')), lines.join('\n'));
+    } finally {
+      await r.framework.stop();
+      store.close();
+    }
+  });
+});

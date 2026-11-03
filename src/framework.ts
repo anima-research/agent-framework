@@ -32684,6 +32684,18 @@ export class AgentFramework {
     if (event.type === 'inference:completed' || event.type === 'inference:exhausted' || event.type === 'inference:aborted') {
       this.endStatedWaitRun(event.agentName as string);
     }
+    // An agent the presentation index left in legacy mode (a write-down at
+    // its registration or after a branch move that failed, or a context that
+    // couldn't follow a move): its context is the whole record until a later
+    // move of the store's branch writes its window down. A host with no trace
+    // listener hears of it in the log and as an ops alert.
+    if (event.type === 'presentation:failed' && event.legacy) {
+      const after = event.occasion === 'rebase' ? "a move of the store's branch" : 'its registration';
+      const message = `its window is not presented after ${after} (${event.error}), so its context is the whole record ` +
+        "(legacy mode) until a later move of the store's branch writes its window down";
+      console.error(`[presentation] agent=${event.agentName} ${boundFailureText(message)}`);
+      this.opsAlert('presentation-legacy', event.agentName, message, { data: { occasion: event.occasion } });
+    }
 
     const traceEvent = {
       ...event,

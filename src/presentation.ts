@@ -561,7 +561,7 @@ export class AgentPresentation {
     try {
       if (failure !== undefined) {
         state.pinnedLegacy = describe(failure);
-        this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion: 'rebase', error: state.pinnedLegacy });
+        this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion: 'rebase', error: state.pinnedLegacy, legacy: true });
         return;
       }
       if (cm.isClosed()) return;
@@ -572,7 +572,7 @@ export class AgentPresentation {
       this.repair(agent, 'rebase');
     } catch (error) {
       state.pinnedLegacy = describe(error);
-      this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion: 'rebase', error: state.pinnedLegacy });
+      this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion: 'rebase', error: state.pinnedLegacy, legacy: true });
     }
   }
 
@@ -581,7 +581,8 @@ export class AgentPresentation {
    * (presentRows([]), which also finishes a write-down cut short), and say
    * whether the window is presented after it. A write-down that fails, or
    * leaves the manager in legacy mode, pins the agent in legacy mode
-   * (`state.pinnedLegacy`), traced as presentation:failed at `occasion`. A
+   * (`state.pinnedLegacy`), traced as presentation:failed at `occasion`
+   * with `legacy`, which the host logs and alerts. A
    * write-down that throws once its record is written (the store's own work
    * after a write, such as a snapshot, failing) has written the window
    * down: the manager reads its index again after any throw, so a window
@@ -599,7 +600,7 @@ export class AgentPresentation {
       } catch (error) {
         if (!readsPresented(cm)) {
           state.pinnedLegacy = describe(error);
-          this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion, error: state.pinnedLegacy });
+          this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion, error: state.pinnedLegacy, legacy: true });
           return false;
         }
         console.warn(`[presentation] ${agent.name}: writing its window down at ${occasion} threw after the window was written (${describe(error)}); its window is presented`);
@@ -608,7 +609,7 @@ export class AgentPresentation {
     }
     if (cm.windowMode() !== 'presented') {
       state.pinnedLegacy = 'the window is not in presented mode after its write-down';
-      this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion, error: state.pinnedLegacy });
+      this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion, error: state.pinnedLegacy, legacy: true });
       return false;
     }
     if (wrote && occasion === 'rebase') {
