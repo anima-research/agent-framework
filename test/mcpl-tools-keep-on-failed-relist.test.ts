@@ -22,9 +22,10 @@ type Internals = {
   mcplToolFeatureSets: Map<string, string>;
   refreshMcplTools(): Promise<void>;
   noteMcplServerClosed(serverId: string): void;
+  wireMcplEvents(connection: unknown, config: unknown): void;
 };
 
-type Listed = { name: string; featureSet?: string } | null;
+type Listed = { name: string; featureSet?: string; classes?: string[] } | null;
 
 /** A stand-in MCPL server with main's connection fields. Its `lists` answers
  *  tools/list, or throws when `fails` is set; `beforeAnswer` runs as its
@@ -37,7 +38,7 @@ type Server = {
   isConnected: boolean;
   willReconnect: boolean;
   mcpToolsAdvertised: boolean;
-  beforeAnswer?: () => void;
+  beforeAnswer?: () => void | Promise<void>;
 };
 
 async function harness(ids: string[]) {
@@ -54,12 +55,13 @@ async function harness(ids: string[]) {
   const connection = (s: Server) => Object.defineProperties(Object.assign(new EventEmitter(), {
     id: s.id,
     sendToolsList: async () => {
-      s.beforeAnswer?.();
+      await s.beforeAnswer?.();
       if (s.fails) throw new Error(s.error ?? `connection to "${s.id}" is closed`);
       return {
         tools: s.lists.map((t) => t === null ? null : {
           name: t.name, description: t.name, inputSchema: { type: 'object' },
           ...(t.featureSet === undefined ? {} : { featureSet: t.featureSet }),
+          ...(t.classes === undefined ? {} : { _meta: { 'mcpl/class': t.classes } }),
         }),
       };
     },
@@ -67,6 +69,8 @@ async function harness(ids: string[]) {
       reached.push(`${s.id}:${tool}`);
       return { content: [{ type: 'text', text: `${s.id}:${tool}` }] };
     },
+    stopReconnecting: () => {},
+    close: async () => {},
   }), {
     isConnected: { get: () => s.isConnected },
     willReconnect: { get: () => s.willReconnect },
@@ -77,6 +81,7 @@ async function harness(ids: string[]) {
   internals.mcplServerRegistry = {
     getAllServers: () => [...connections.values()],
     getServer: (id: string) => connections.get(id) ?? null,
+    closeAll: async () => {},
   };
   internals.mcplServerConfigs = new Map(ids.map((id) => [id, { id, command: 'node' }]));
   internals.mcplPrefixMap = new Map(ids.map((id) => [`mcpl--${id}`, id]));
@@ -85,7 +90,8 @@ async function harness(ids: string[]) {
     internals,
     reached,
     server: (id: string) => servers.get(id)!,
-    names: () => internals.mcplTools.map((t) => t.name).sort(),
+    connection: (id: string) => connections.get(id)!,
+    names: () => internals.mcplTools.map((t) => t.name),
     cleanup: async () => {
       internals.mcplServerRegistry = registry;
       await fw.stop();
@@ -111,8 +117,8 @@ test('a failed re-list keeps that server\'s known tools; others refresh normally
     Object.assign(h.server('b'), { fails: true, isConnected: false, willReconnect: true, error: `refused with ${secret}` });
     h.server('a').lists = tools('send', 'react');
     await h.internals.refreshMcplTools();
-    assert.deepEqual(h.names(), ['mcpl--a--react', 'mcpl--a--send', 'mcpl--b--read', 'mcpl--b--write'],
-      'b keeps its tools while it reconnects; a picks up its new one');
+    assert.deepEqual(h.names(), ['mcpl--a--send', 'mcpl--a--react', 'mcpl--b--read', 'mcpl--b--write'],
+      'b keeps its tools, in their place, while it reconnects; a picks up its new one');
     const lines = logged.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes('"b"'));
     assert.equal(lines.length, 1, lines.join('\n'));
     assert.match(lines[0], /^\[mcpl\] server "b": tools\/list failed \(refused with .+\); keeping its 2 known tool\(s\)$/);
@@ -120,7 +126,7 @@ test('a failed re-list keeps that server\'s known tools; others refresh normally
 
     Object.assign(h.server('b'), { fails: false, isConnected: true });
     await h.internals.refreshMcplTools();
-    assert.deepEqual(h.names(), ['mcpl--a--react', 'mcpl--a--send', 'mcpl--b--read', 'mcpl--b--write']);
+    assert.deepEqual(h.names(), ['mcpl--a--send', 'mcpl--a--react', 'mcpl--b--read', 'mcpl--b--write']);
   } finally {
     await h.cleanup();
   }
@@ -178,8 +184,9 @@ test('a server that no longer serves keeps nothing: lost for good, or lost while
     await h.internals.refreshMcplTools();
     assert.deepEqual(h.names(), ['mcpl--c--ping'], 'a halted server\'s tools leave');
     assert.equal(h.internals.mcplToolServers.has('mcpl--b--read'), false);
-    assert.deepEqual(logged.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes('keeping')), [],
-      'and nothing says they were kept');
+    assert.deepEqual(logged.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes('"b"')),
+      ['[mcpl] server "b": tools/list failed (connection to "b" is closed); none of its tools are offered'],
+      'and the line says so');
 
     // Reconnecting when its list fails, then halted while c's list is awaited.
     Object.assign(h.server('b'), { fails: false, isConnected: true, willReconnect: true });
@@ -220,6 +227,106 @@ test('the tool policy and prefix in force decide which kept tools stay', async (
     h.internals.mcplServerConfigs.set('b', { id: 'b', command: 'node', toolPrefix: 'files' });
     await h.internals.refreshMcplTools();
     assert.deepEqual(h.names(), [], 'a tool under a prefix no longer configured isn\'t kept');
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('a re-list that fails keeps what is published when it publishes, so an older re-list\'s newer listing stands', async () => {
+  const h = await harness(['b', 'c']);
+  try {
+    h.server('b').lists = tools('read');
+    h.server('c').lists = tools('ping');
+    await h.internals.refreshMcplTools();
+
+    let releaseOlder!: () => void;
+    const older = new Promise<void>((resolve) => { releaseOlder = resolve; });
+    let releaseNewer!: () => void;
+    const newer = new Promise<void>((resolve) => { releaseNewer = resolve; });
+    let bCalls = 0;
+    let cCalls = 0;
+    h.server('b').beforeAnswer = async () => {
+      bCalls += 1;
+      if (bCalls === 1) {
+        // The older re-list's listing of b answers b's newer tools once released.
+        await older;
+        Object.assign(h.server('b'), { fails: false, lists: tools('read', 'write') });
+      } else {
+        h.server('b').fails = true;
+      }
+    };
+    h.server('c').beforeAnswer = async () => {
+      cCalls += 1;
+      if (cCalls === 1) await newer;
+    };
+    const ticks = async () => { for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve)); };
+
+    const first = h.internals.refreshMcplTools();
+    await ticks();
+    const second = h.internals.refreshMcplTools();
+    await ticks();
+    assert.equal(bCalls, 2, 'the newer re-list has failed b and waits on c');
+    releaseOlder();
+    await first;
+    assert.deepEqual(h.names(), ['mcpl--b--read', 'mcpl--b--write', 'mcpl--c--ping'], 'the older re-list published b\'s newer listing');
+    releaseNewer();
+    await second;
+    assert.deepEqual(h.names(), ['mcpl--b--read', 'mcpl--b--write', 'mcpl--c--ping'], 'the newer re-list kept what was published, not what it saw at b\'s failure');
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('a first listing that breaks off offers nothing, and its line says so', async (t) => {
+  const logged = t.mock.method(console, 'error', () => {});
+  const h = await harness(['b']);
+  try {
+    h.server('b').lists = [{ name: 'read' }, null];
+    await h.internals.refreshMcplTools();
+    assert.deepEqual(h.names(), []);
+    const lines = logged.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes('"b"'));
+    assert.equal(lines.length, 1, lines.join('\n'));
+    assert.match(lines[0], /^\[mcpl\] server "b": tools\/list failed \(.+\); none of its tools are offered$/);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('a failed re-list once stop() has begun logs nothing', async (t) => {
+  const logged = t.mock.method(console, 'error', () => {});
+  const h = await harness(['b']);
+  try {
+    h.server('b').lists = tools('read');
+    await h.internals.refreshMcplTools();
+    h.server('b').fails = true;
+    let stopping: Promise<void> | undefined;
+    h.server('b').beforeAnswer = () => { stopping = h.fw.stop(); };
+    await h.internals.refreshMcplTools();
+    await stopping;
+    assert.deepEqual(logged.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes('tools/list failed')), []);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('a kept tool is unclassed after its server\'s close, until the server lists again', async () => {
+  const h = await harness(['b']);
+  try {
+    h.server('b').lists = [{ name: 'read', classes: ['comms'] }];
+    await h.internals.refreshMcplTools();
+    h.internals.wireMcplEvents(h.connection('b'), h.internals.mcplServerConfigs.get('b'));
+    const classOf = () => h.fw.listToolClasses().find((tool) => tool.tool === 'mcpl--b--read');
+    assert.deepEqual(classOf(), { tool: 'mcpl--b--read', class: ['comms'], source: 'server', serverId: 'b' });
+
+    Object.assign(h.server('b'), { fails: true, isConnected: false, willReconnect: true });
+    h.connection('b').emit('close', null, null);
+    await h.internals.refreshMcplTools();
+    assert.deepEqual(h.names(), ['mcpl--b--read'], 'kept while it reconnects');
+    assert.deepEqual(classOf(), { tool: 'mcpl--b--read', class: [], source: 'none', serverId: 'b' }, 'its class went with the close');
+
+    Object.assign(h.server('b'), { fails: false, isConnected: true });
+    await h.internals.refreshMcplTools();
+    assert.deepEqual(classOf(), { tool: 'mcpl--b--read', class: ['comms'], source: 'server', serverId: 'b' }, 'its next listing classes it again');
   } finally {
     await h.cleanup();
   }
