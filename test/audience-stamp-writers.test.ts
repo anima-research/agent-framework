@@ -19,7 +19,7 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from '@babel/parser';
 
@@ -164,6 +164,22 @@ function scanAddMessageSites(sources: Array<{ name: string; text: string }>): Si
   return sites.sort((a, b) => order.get(a.file)! - order.get(b.file)! || a.line - b.line);
 }
 
+/** Each `.ts` file under src, named by its path from there with `/` between
+ *  its parts, as the lists name it, whatever the platform's separator. */
+function srcSources(): Array<{ name: string; text: string }> {
+  const src = fileURLToPath(new URL('../../src/', import.meta.url));
+  const sources: Array<{ name: string; text: string }> = [];
+  const walk = (dir: string): void => {
+    for (const name of readdirSync(dir)) {
+      const full = join(dir, name);
+      if (statSync(full).isDirectory()) walk(full);
+      else if (name.endsWith('.ts')) sources.push({ name: relative(src, full).split(sep).join('/'), text: readFileSync(full, 'utf8') });
+    }
+  };
+  walk(src);
+  return sources;
+}
+
 /**
  * Receivers whose `addMessage` is the framework's own, which stamps every
  * write (AgentFramework.addMessage), by the file they're in.
@@ -221,17 +237,8 @@ function classify(sites: Site[]) {
 }
 
 it('every write into a context in src goes through the framework\'s addMessage, or is a direct write that stamps its row', () => {
-  const src = fileURLToPath(new URL('../../src/', import.meta.url));
-  const sources: Array<{ name: string; text: string }> = [];
-  const walk = (dir: string): void => {
-    for (const name of readdirSync(dir)) {
-      const full = join(dir, name);
-      if (statSync(full).isDirectory()) walk(full);
-      else if (name.endsWith('.ts')) sources.push({ name: full.slice(src.length), text: readFileSync(full, 'utf8') });
-    }
-  };
-  walk(src);
-  assert.ok(sources.some((s) => s.name.includes('/')), "the walk reaches src's subdirectories");
+  const sources = srcSources();
+  assert.ok(sources.some((s) => s.name === 'dendrite/audience.ts'), "the walk reaches src's subdirectories, named as the lists name them");
 
   const sites = scanAddMessageSites(sources);
   const { throughTheFramework, direct } = classify(sites);
@@ -415,16 +422,7 @@ const OWN_ROW_WRITERS: Record<string, { count: number; when: 'turn' | 'end' | 'u
 };
 
 it("every writer of an agent's own rows is classified by when it writes, and one that may write into another turn holds its row back", () => {
-  const src = fileURLToPath(new URL('../../src/', import.meta.url));
-  const sources: Array<{ name: string; text: string }> = [];
-  const walk = (dir: string): void => {
-    for (const name of readdirSync(dir)) {
-      const full = join(dir, name);
-      if (statSync(full).isDirectory()) walk(full);
-      else if (name.endsWith('.ts')) sources.push({ name: full.slice(src.length), text: readFileSync(full, 'utf8') });
-    }
-  };
-  walk(src);
+  const sources = srcSources();
   // storeOwnRow's own definition is in dendrite/audience.ts and calls nothing named so.
   const calls = scanCalls(sources, 'storeOwnRow');
   assert.ok(calls.length > 20, `found ${calls.length} own-row writes; the scan has lost them`);

@@ -20,7 +20,7 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from '@babel/parser';
 
@@ -175,14 +175,16 @@ const inImporter = (use: Use): boolean =>
   use.file === IMPORTER.file || use.scope === IMPORTER.scope || use.scope.startsWith(`${IMPORTER.scope}.`);
 const where = (use: Use): string => `${use.file}:${use.line} ${use.name}${use.extra ? ` (+${use.extra})` : ''} (in ${use.scope || 'the file'})`;
 
-/** Every source file under `root` whose name ends in one of `endings`, named by its path from there. */
+/** Every source file under `root` whose name ends in one of `endings`, named
+ *  by its path from there with `/` between its parts, as the lists name it,
+ *  whatever the platform's separator. */
 function sourcesUnder(root: string, endings: readonly string[]): Array<{ name: string; text: string }> {
   const sources: Array<{ name: string; text: string }> = [];
   const walk = (dir: string): void => {
     for (const name of readdirSync(dir)) {
       const full = join(dir, name);
       if (statSync(full).isDirectory()) walk(full);
-      else if (endings.some((ending) => name.endsWith(ending))) sources.push({ name: full.slice(root.length), text: readFileSync(full, 'utf8') });
+      else if (endings.some((ending) => name.endsWith(ending))) sources.push({ name: relative(root, full).split(sep).join('/'), text: readFileSync(full, 'utf8') });
     }
   };
   walk(root);
