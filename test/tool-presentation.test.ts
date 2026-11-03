@@ -318,6 +318,12 @@ test('an edit naming a name the file holds but the resident has no tool for says
   assert.ok(r4.error!.startsWith('Nothing was changed: you have no tool named '),r4.error);
   assert.ok(!r4.error!.includes(keeps),'a name the file holds only through its prototype is no setting');
   assert.ok(r4.error!.includes('Copy the exact name'),'so it gives the index instruction');
+  for (const setting of [{description:'my words'},{description:''}]) {
+   writeFileSync(path,JSON.stringify({version:1,tools:{[held]:setting}}));
+   const rs=p.edit('set_tool_visibility',{name:held,visible:true},tools);
+   assert.ok(rs.error!.endsWith(` ${keeps}`),`a description alone, ${JSON.stringify(setting.description)} included, is a setting: ${rs.error}`);
+   assert.ok(!rs.error!.includes('Copy the exact name'),rs.error);
+  }
   writeFileSync(path,JSON.stringify({version:1,tools:{exampel:{visible:false}}}));
   assert.equal(p.edit('set_tool_visibility',{name:'exampel',visible:true},tools).error,
    `Nothing was changed: you have no tool named "exampel" right now, shown or hidden. Did you mean "example"? ${keeps}`,'a held name close to an available one gets the guess and the setting sentence');
