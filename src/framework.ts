@@ -35442,7 +35442,7 @@ export class AgentFramework {
     const listedServers = new Set<string>();
     // A server whose listing failed, where its kept tools go in the list,
     // and its error, redacted, for the line that says what was published.
-    const failed: Array<{ serverId: string; at: number; error: string; advertised: boolean }> = [];
+    const failed: Array<{ serverId: string; at: number; error: string }> = [];
     const closesOf = (serverId: string): number => this.mcplServerCloses?.get(serverId) ?? 0;
     // Each server's close count as its listing began.
     const closesAtListing = new Map<string, number>();
@@ -35525,14 +35525,13 @@ export class AgentFramework {
         // effect, listed nothing; count it as listed so tool-pattern checks do
         // not wait on it forever. (A server that advertised tools but failed
         // to list them stays unknown.)
-        if (server.isConnected && !server.mcpToolsAdvertised) {
-          listedServers.add(server.id);
+        if (!server.mcpToolsAdvertised) {
+          if (server.isConnected) listedServers.add(server.id);
         } else {
           failed.push({
             serverId: server.id,
             at: tools.length,
             error: redactServerText(error instanceof Error ? error.message : String(error), config ?? {}),
-            advertised: server.mcpToolsAdvertised,
           });
         }
       }
@@ -35639,8 +35638,7 @@ export class AgentFramework {
       kept.set(serverId, names.length);
     }
     if (!this.stopHasBegun()) {
-      for (const { serverId, error, advertised } of failed) {
-        if (!advertised) continue;
+      for (const { serverId, error } of failed) {
         const count = kept.get(serverId) ?? 0;
         console.error(`[mcpl] server "${serverId}": tools/list failed (${error}); ${count > 0 ? `keeping its ${count} known tool(s)` : 'none of its tools are offered'}`);
       }
