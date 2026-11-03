@@ -16,6 +16,7 @@ import { cutToFit, quotedJson, quotedValue, suppliedValue } from '../supplied-te
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
+import { SuppressScripts, type SuppressScriptEvent } from './suppress-scripts.js';
 import { firstCatchAll } from './rule-scope.js';
 import { canonical, duplicateName, lastRecipePath, noChanges, reconcileLine, reconcileWithRecipe, ruleName, type WrittenConfig } from './recipe-reconcile.js';
 import { closestNames, isNearMiss } from '../closest-names.js';
@@ -28,6 +29,7 @@ import type {
   GateConfig,
   GatePolicy,
   GatePolicyMatch,
+  SuppressConfig,
   GateBehavior,
   GateDecision,
   GateEntryRef,
@@ -440,7 +442,7 @@ function behaviorFingerprint(b: import('./types.js').GateBehavior): string {
 // default), it now loads without it.
 
 const CONFIG_FIELDS = ['default', 'policies'];
-const POLICY_FIELDS = ['name', 'match', 'behavior', 'resets', 'passthrough'];
+const POLICY_FIELDS = ['name', 'match', 'behavior', 'resets', 'passthrough', 'suppress'];
 const MATCH_FIELDS = [
   'scope', 'source', 'channel', 'mount', 'pathGlob', 'tagsAny', 'tagsAll', 'tagsNone', 'metadataTrue', 'filter',
 ];
@@ -449,6 +451,7 @@ const BEHAVIOR_KINDS = ['debounce', 'rate_limit', 'passive_sample', 'judge'] as 
 const RATE_LIMIT_FIELDS = ['tokens', 'refillIntervalMs', 'keyBy'];
 const PASSIVE_SAMPLE_FIELDS = ['every', 'keyBy'];
 const JUDGE_FIELDS = ['debounceMs', 'maxWaitMs', 'instructions'];
+const SUPPRESS_FIELDS = ['description', 'script'];
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -674,6 +677,7 @@ function fieldLevels(file: string, named: (path: string) => string = asGateNames
     { name: `"${named('behavior.rate_limit')}"`, fields: RATE_LIMIT_FIELDS },
     { name: `"${named('behavior.passive_sample')}"`, fields: PASSIVE_SAMPLE_FIELDS },
     { name: `"${named('behavior.judge')}"`, fields: JUDGE_FIELDS },
+    { name: '"suppress"', fields: SUPPRESS_FIELDS },
   ];
 }
 
@@ -930,6 +934,7 @@ function readRule(raw: unknown, unnamed: string, file = 'gate.json', named: (pat
   const match = readMatch(r, obj.match);
   const resets = readResets(r, obj.resets);
   const passthrough = readPassthrough(r, obj.passthrough, kind);
+  const suppress = readSuppress(r, obj.suppress, obj.behavior, match);
   const reading: RuleReading = {
     where: r.where, problems: r.problems, notes: r.notes, quiet: kind === 'skip' || kind === 'defer' || r.noTokens === true,
   };
@@ -937,6 +942,7 @@ function readRule(raw: unknown, unnamed: string, file = 'gate.json', named: (pat
     const policy: GatePolicy = { name, match, behavior };
     if (resets) policy.resets = resets;
     if (passthrough) policy.passthrough = true;
+    if (suppress) policy.suppress = suppress;
     reading.policy = policy;
     if (r.matchesAll) reading.matchesAll = true;
   }
@@ -1326,8 +1332,7 @@ function readMatch(r: Reader, value: unknown): GatePolicyMatch {
   // Left with nothing that narrows it once something in it was named, it
   // matches every event. Empty lists and nulls alone always meant no
   // constraint, and name nothing.
-  const narrows = Object.entries(match).some(([field, v]) => !(field === 'scope' && Array.isArray(v) && v.length === 0));
-  if (!narrows && r.problems.length + r.notes.length > named) r.matchesAll = true;
+  if (!matchNarrows(match) && r.problems.length + r.notes.length > named) r.matchesAll = true;
   return match;
 }
 
@@ -1372,6 +1377,88 @@ function readPassthrough(r: Reader, value: unknown, kind: BehaviorKind | undefin
       + `an event it matches without waking on it; with ${given}, leave passthrough out`,
   });
   return false;
+}
+
+/** Whether a match narrows what it matches: anything but an empty scope. */
+export function matchNarrows(match: GatePolicyMatch): boolean {
+  return Object.entries(match).some(([field, v]) => !(field === 'scope' && Array.isArray(v) && v.length === 0));
+}
+
+/** Longest suppress description, in characters: the review sends it with every rule it judges. */
+export const MAX_SUPPRESS_DESCRIPTION = 2_000;
+/** Longest suppress script, in characters. */
+export const MAX_SUPPRESS_SCRIPT = 20_000;
+const SUPPRESS_EXAMPLE = '{"description": "the eye going on and off"}';
+
+/**
+ * A rule's `suppress`. Every problem with it is read as a rule that doesn't
+ * suppress, which is how a release without suppression reads the rule:
+ * its behavior then decides the event, and the event is rendered. The
+ * behavior has to be written out as "defer" (or "skip"), not left to
+ * default, because such a release reads a rule with no behavior as
+ * "always" and would wake the agent on every event the rule was meant to
+ * hide.
+ */
+function readSuppress(r: Reader, value: unknown, behavior: unknown, match: GatePolicyMatch): SuppressConfig | undefined {
+  if (value === undefined || value === false) return undefined;
+  const without = "so the rule doesn't suppress, and its behavior decides its events as for any other rule";
+  if (!isPlainObject(value)) {
+    r.problems.push({ text: `suppress is ${shownValue(value)}, where an object such as ${SUPPRESS_EXAMPLE} is needed`, read: without });
+    return undefined;
+  }
+  const given = withoutEmpty(`${r.where}: suppress`, value, r.notes);
+  readFieldNames(r, 'suppress', given, SUPPRESS_FIELDS);
+  const problems = r.problems.length;
+  const config: SuppressConfig = { description: '' };
+  if (typeof given.description !== 'string' || given.description.trim() === '') {
+    r.problems.push({
+      text: `suppress.description is ${given.description === undefined ? 'missing' : shownValue(given.description)}, where the rule's `
+        + 'purpose in a few words is needed: the review checks what the rule hides against it',
+      read: without,
+    });
+  } else if ([...given.description].length > MAX_SUPPRESS_DESCRIPTION) {
+    r.problems.push({
+      text: `suppress.description is ${[...given.description].length.toLocaleString('en-US')} characters, over the `
+        + `${MAX_SUPPRESS_DESCRIPTION.toLocaleString('en-US')} allowed`,
+      read: without,
+    });
+  } else {
+    config.description = given.description.trim();
+  }
+  if (given.script !== undefined) {
+    if (typeof given.script !== 'string' || given.script.trim() === '') {
+      r.problems.push({ text: `suppress.script is ${shownValue(given.script)}, where the source of a function such as "(event, state) => false" is needed`, read: without });
+    } else if ([...given.script].length > MAX_SUPPRESS_SCRIPT) {
+      r.problems.push({
+        text: `suppress.script is ${[...given.script].length.toLocaleString('en-US')} characters, over the ${MAX_SUPPRESS_SCRIPT.toLocaleString('en-US')} allowed`,
+        read: without,
+      });
+    } else {
+      // Parsed only, never run here: the script runs on its worker.
+      try {
+        new Function(`"use strict";\nreturn (${given.script}\n);`);
+        config.script = given.script;
+      } catch (e) {
+        r.problems.push({ text: `suppress.script doesn't parse (${quotedValue(errorText(e))})`, read: without });
+      }
+    }
+  }
+  if (behavior !== 'defer' && behavior !== 'skip') {
+    r.problems.push({
+      text: `suppress is given, and a rule that suppresses needs "behavior": "defer" written out, so a release that `
+        + `doesn't know "suppress" defers its events instead of waking you on them; it has `
+        + (behavior === undefined ? 'no behavior' : `behavior ${shownValue(behavior)}`),
+      read: without,
+    });
+  }
+  if (!matchNarrows(match)) {
+    r.problems.push({
+      text: 'suppress is given, and the rule matches every event: a suppress rule needs a match that narrows it '
+        + '(a source, a channel, a scope, tags, a mount or path, metadata or a filter), so it can\'t hide everything',
+      read: without,
+    });
+  }
+  return r.problems.length === problems ? config : undefined;
 }
 
 /** What a load or a start does with a rule. */
@@ -1955,7 +2042,9 @@ export function findShadowedPolicies(policies: GatePolicy[], eventTypesFrom?: Ev
   const out: ShadowWarning[] = [];
   for (let i = 0; i < policies.length; i++) {
     const earlier = policies[i];
-    if (earlier.passthrough) continue;
+    // A suppress rule lets addressed events and the heartbeat's by, so it
+    // can't be said to take every event of a later rule.
+    if (earlier.passthrough || earlier.suppress) continue;
     for (let j = i + 1; j < policies.length; j++) {
       const found = subsumedEventTypes(earlier, policies[j], eventTypesFrom);
       if (found) {
@@ -2116,6 +2205,8 @@ export class EventGate {
 
   // Per-policy stats
   private stats = new Map<string, PolicyStats>();
+  /** Suppress rules' scripts and their state (suppress-scripts.ts), kept beside gate.json. */
+  private readonly suppressScripts: SuppressScripts;
 
   // The shadow lint's last findings (see refreshShadowWarnings), recomputed
   // on every config change and fingerprinted so an unchanged set doesn't
@@ -2214,6 +2305,8 @@ export class EventGate {
     now?: () => number;
     /** Per-event timeout (ms) for the optional gate.js script. Default 50. */
     scriptTimeoutMs?: number;
+    /** How long a suppress rule's script may take for one event before the event is shown (ms). Default 50. */
+    suppressScriptTimeoutMs?: number;
     /** The reply judge `judge` rules ask (JudgeConfig). Absent: a judge
      *  rule's batch is delivered as a debounce's, and gate_status says so. */
     judge?: JudgeFn;
@@ -2253,6 +2346,11 @@ export class EventGate {
     eventTypesFrom?: EventTypesFrom;
   }) {
     this.configPath = opts.configPath;
+    // Before the rules are read: a start's merge can clear a rule's state, its script's included.
+    this.suppressScripts = new SuppressScripts({
+      statePath: join(dirname(opts.configPath), 'suppress-state.json'),
+      ...(opts.suppressScriptTimeoutMs !== undefined ? { timeoutMs: opts.suppressScriptTimeoutMs } : {}),
+    });
     this.privilegedUsersPath = opts.privilegedUsersPath;
     this.emitTrace = opts.emitTrace;
     this.addMessageFn = opts.addMessage;
@@ -2789,7 +2887,11 @@ export class EventGate {
   private clearStateFor(was: GateConfig, next: GateConfig): { removed: string[]; cleared: string[] } {
     const behaviorsByName = (config: GateConfig): Map<string, string> => {
       const byName = new Map<string, string[]>();
-      for (const p of config.policies) byName.set(p.name, [...(byName.get(p.name) ?? []), behaviorFingerprint(p.behavior)]);
+      for (const p of config.policies) {
+        // A suppress rule's script is part of what it is: a changed script starts from a fresh state.
+        const fingerprint = behaviorFingerprint(p.behavior) + (p.suppress ? ` suppress:${p.suppress.script ?? ''}` : '');
+        byName.set(p.name, [...(byName.get(p.name) ?? []), fingerprint]);
+      }
       return new Map([...byName].map(([name, behaviors]) => [name, JSON.stringify(behaviors)]));
     };
     const before = behaviorsByName(was);
@@ -3244,6 +3346,10 @@ export class EventGate {
       decision = this.computeDecision({ name: 'gate.js', match: {}, behavior: scripted }, info);
     } else {
       for (const compiled of this.compiledPolicies) {
+        // A suppress rule never decides a wake: an event it takes was
+        // suppressed before the gate was asked (suppressionFor), and one that
+        // reaches here is one it lets by.
+        if (compiled.policy.suppress) continue;
         if (!this.compiledMatches(compiled, info)) continue;
         const candidate = this.computeDecision(compiled.policy, info);
         if (candidate.trigger || !compiled.policy.passthrough) {
@@ -3448,6 +3554,7 @@ export class EventGate {
   private clearPolicyState(name: string): void {
     const debounce = this.debounceTimers.get(name);
     if (debounce) clearTimeout(debounce.timer);
+    this.suppressScripts.forget(name);
     this.rateLimitBuckets.delete(name);
     this.passiveSampleCounters.delete(name);
     this.rateLimitDenied.delete(name);
@@ -3503,6 +3610,7 @@ export class EventGate {
    */
   probe(info: GateEventInfo): GateDecision {
     for (const compiled of this.compiledPolicies) {
+      if (compiled.policy.suppress) continue; // as evaluate passes over them
       if (!this.compiledMatches(compiled, info)) continue;
       const trigger = this.wouldTrigger(compiled.policy, info);
       if (trigger || !compiled.policy.passthrough) {
@@ -3511,6 +3619,121 @@ export class EventGate {
     }
     const trigger = (this.config.default ?? 'always') === 'always';
     return { trigger, policyName: null, behavior: this.config.default ?? 'always' };
+  }
+
+  /**
+   * The suppress rule that takes this event, or null when none does.
+   * Side-effect-free, like probe: no counter moves, no batch forms, nothing
+   * is traced, and a rule's script runs on a copy of its state, which is
+   * then dropped. The probe table and other dry runs ask this; the
+   * framework asks decideSuppression instead, once per event.
+   *
+   * It reads the rules as evaluate does, first match deciding: a rule ahead
+   * of the suppress rule that matches the event decides it instead (it isn't
+   * suppressed), unless it's a passthrough rule that wouldn't fire. A rule
+   * with a script (`suppress.script`) takes an event its match takes only
+   * when the script says to hide it; otherwise the event goes on to the rules
+   * after it, as one the rule doesn't match does. Sleep and gate.js aren't
+   * consulted: they decide wakes, and suppression decides what's rendered.
+   *
+   * Never suppressed, whatever the rules say: an event addressed to the
+   * agent (tagged `chat:addressed`: a mention, a reply, a DM) and the
+   * heartbeat's (the agent's own clock). A suppress rule lets them by to the
+   * rules after it, and its script isn't asked. The framework itself never
+   * asks about console or API input.
+   */
+  suppressionFor(info: GateEventInfo): string | null {
+    return this.walkSuppression(info, false);
+  }
+
+  /**
+   * suppressionFor, for an event that is arriving now: each script asked
+   * keeps the state it leaves, whatever later rules do with the event. Ask
+   * once per event.
+   */
+  decideSuppression(info: GateEventInfo): string | null {
+    return this.walkSuppression(info, true);
+  }
+
+  private walkSuppression(info: GateEventInfo, commit: boolean): string | null {
+    this.reloadIfChanged();
+    this.syncSuppressScripts();
+    if (info.serverId === 'heartbeat') return null;
+    const addressed = Array.isArray(info.tags) && info.tags.includes('chat:addressed');
+    let event: SuppressScriptEvent | undefined;
+    for (const compiled of this.compiledPolicies) {
+      if (!this.compiledMatches(compiled, info)) continue;
+      const suppress = compiled.policy.suppress;
+      if (suppress) {
+        if (addressed) continue;
+        if (suppress.script !== undefined) {
+          event ??= this.suppressScriptEvent(info);
+          const ran = this.suppressScripts.run(compiled.policy.name, event, commit);
+          // A script that failed shows the event: it goes on to the rules after.
+          if (!ran || !('hide' in ran) || !ran.hide) continue;
+        }
+        return compiled.policy.name;
+      }
+      if (compiled.policy.passthrough && !this.wouldTrigger(compiled.policy, info)) continue;
+      return null;
+    }
+    return null;
+  }
+
+  /** The scripts in step with the rules in force (SuppressScripts.sync: only changed ones are compiled). */
+  private syncSuppressScripts(): void {
+    this.suppressScripts.sync(this.config.policies.map((p) => ({ name: p.name, ...(p.suppress?.script !== undefined ? { script: p.suppress.script } : {}) })));
+  }
+
+  /** What a suppress script is given for an event: plain JSON, its metadata included where it can be. */
+  private suppressScriptEvent(info: GateEventInfo): SuppressScriptEvent {
+    let metadata: Record<string, unknown> = {};
+    try { metadata = JSON.parse(JSON.stringify(info.metadata ?? {})) as Record<string, unknown>; } catch { metadata = {}; }
+    const channel = this.routeChannelFor(info) ?? (info.channelId || undefined);
+    const author = this.extractAuthorId(info.metadata);
+    return {
+      eventType: info.eventType,
+      source: info.serverId,
+      ...(channel ? { channel } : {}),
+      ...(author ? { author } : {}),
+      tags: [...(info.tags ?? [])],
+      text: info.content,
+      at: this.now(),
+      metadata,
+    };
+  }
+
+  /**
+   * Whether a suppress script compiles to a function, on the scripts' worker:
+   * an error's text, or null. wake_add_rule asks before it saves a rule.
+   */
+  checkSuppressScript(script: string): string | null {
+    return this.suppressScripts.check(script);
+  }
+
+  /** A suppress rule's script state as it stands (a copy), for a host or a test. */
+  suppressScriptState(name: string): Record<string, unknown> | undefined {
+    this.syncSuppressScripts();
+    return this.suppressScripts.stateOf(name);
+  }
+
+  /**
+   * Count an event the framework suppressed by `name` (suppressionFor's
+   * answer) once its row is written. The rule's stats count it as a match, so
+   * gate_status shows how many events each suppress rule took since start.
+   */
+  noteSuppressed(name: string, info: Pick<GateEventInfo, 'eventType' | 'serverId' | 'channelId'>): void {
+    const policyStats = this.stats.get(name) ?? { matchCount: 0, lastMatchTimestamp: null };
+    policyStats.matchCount++;
+    policyStats.lastMatchTimestamp = this.now();
+    this.stats.set(name, policyStats);
+    this.emitTrace({
+      type: 'gate:suppressed',
+      policyName: name,
+      eventType: info.eventType,
+      ...(info.serverId ? { serverId: info.serverId } : {}),
+      ...(info.channelId ? { channelId: info.channelId } : {}),
+    });
   }
 
   /** The canonical synthetic events the probe table runs: chat shapes as MCPL delivers them, and a heartbeat. */
@@ -3588,6 +3811,10 @@ export class EventGate {
    */
   probeTable(): GateProbeRow[] {
     return this.probeEvents().map(({ label, info }) => {
+      const suppressedBy = this.suppressionFor(info);
+      if (suppressedBy !== null) {
+        return { probe: label, eventType: info.eventType, policy: suppressedBy, behavior: 'suppress', wouldWake: false };
+      }
       const d = this.probe(info);
       return {
         probe: label,
@@ -4609,6 +4836,9 @@ export class EventGate {
         behavior: p.behavior,
         matchCount: stats?.matchCount ?? 0,
         lastMatchTimestamp: stats?.lastMatchTimestamp ?? null,
+        ...(p.suppress
+          ? { suppress: { ...p.suppress, ...(p.suppress.script !== undefined && this.suppressScripts.status(p.name) ? { scriptStatus: this.suppressScripts.status(p.name)! } : {}) } }
+          : {}),
       };
       if (typeof p.behavior === 'object' && 'debounce' in p.behavior) {
         result.debounceState = {
@@ -4715,6 +4945,7 @@ export class EventGate {
 
   dispose(): void {
     this.gateScript.dispose();
+    this.suppressScripts.dispose();
     for (const state of this.debounceTimers.values()) {
       clearTimeout(state.timer);
     }

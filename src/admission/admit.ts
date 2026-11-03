@@ -22,6 +22,11 @@
  * gets the same disposition. A reader of the slot (the subconscious, or a
  * reader fork) sees held traffic through its own view; that is not a
  * delivery decision of this stage.
+ *
+ * Suppression is the other disposition: a suppress rule (a gate rule with
+ * `suppress: true`) took the event, so it's stored and never rendered, for
+ * any reader. It's decided first. A suppressed event is never held, never
+ * shown to the gate, never woken for, and never the locus.
  */
 
 export interface InboundEnvelope {
@@ -73,12 +78,25 @@ export interface AdmissionPolicy {
     evaluate(env: InboundEnvelope): boolean;
     probe(env: InboundEnvelope): boolean;
   };
+  /**
+   * The suppress rule that takes this event, or null. Side-effect-free (the
+   * gate's suppressionFor); null where the event would land in a view that
+   * doesn't hide suppressed rows. Left out, nothing is suppressed.
+   */
+  suppressionFor?(env: InboundEnvelope): string | null;
+}
+
+/** The record a suppressed event's row carries: the rule that took it. */
+export interface SuppressionRecord {
+  rule: string;
 }
 
 export interface AdmissionDecision {
   recipients: string[];
   /** Null = delivered into the recipients' view; otherwise held, with the record to stamp. */
   held: HoldRecord | null;
+  /** Null unless a suppress rule took the event: then it's stored, never rendered, and nothing else is decided for it. */
+  suppressed: SuppressionRecord | null;
   /** Whether the recipients may be woken by this event. */
   wake: boolean;
   /**
@@ -93,21 +111,30 @@ export interface AdmissionDecision {
 
 export function admit(env: InboundEnvelope, policy: AdmissionPolicy): AdmissionDecision {
   const recipients = env.targetAgents ?? policy.untargetedRecipients();
+
+  // Suppressed: stored where it arrived and never rendered, so nothing
+  // downstream acts for anyone. Not held (a reader would see it), not shown
+  // to the gate (no batch forms, no counter moves), not a wake, not the locus.
+  const rule = policy.suppressionFor?.(env) ?? null;
+  if (rule !== null) {
+    return { recipients, held: null, suppressed: { rule }, wake: false, gatePass: false, locus: false };
+  }
+
   const held = env.channelId ? policy.holdFor(env.serverId, env.channelId) : null;
 
   if (held) {
     // Held: nothing downstream may act for the recipients. The gate is only
     // asked what it would have done — no batch forms, no counter moves.
     const gatePass = env.vetoed ? false : (policy.gate ? policy.gate.probe(env) : true);
-    return { recipients, held, wake: false, gatePass, locus: false };
+    return { recipients, held, suppressed: null, wake: false, gatePass, locus: false };
   }
 
   if (env.vetoed) {
-    return { recipients, held: null, wake: false, gatePass: false, locus: true };
+    return { recipients, held: null, suppressed: null, wake: false, gatePass: false, locus: true };
   }
 
   // Deliverable: now the gate may take its side effects (a debounce batch
   // is the gate's own deferred wake and is consumed later by the same rule).
   const gatePass = policy.gate ? policy.gate.evaluate(env) : true;
-  return { recipients, held: null, wake: gatePass, gatePass, locus: true };
+  return { recipients, held: null, suppressed: null, wake: gatePass, gatePass, locus: true };
 }

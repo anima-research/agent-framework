@@ -530,10 +530,88 @@ are registered for every agent, MCPL or none, unless a module holds the name.
   a day per server). `gate_status.catchAll` names the catch-all; `event_tags`
   shows each server's offer. `gate.onboarding: false` turns it off.
 
+- **Event suppression** (`EventGate.decideSuppression`, `src/gate/suppress-scripts.ts`,
+  `src/gate/suppression-stats.ts`, `src/gate/suppression-review.ts`). A wake
+  rule with `suppress: { description, script? }` keeps the events it takes out
+  of the agent's context entirely. A rule that only doesn't wake still shows
+  its events. A suppressed event is stored in the chronicle as it arrives,
+  with `metadata.suppressed = { rule, eventType }`. Every view filter the
+  framework sets leaves stamped rows out: the residents', the subconscious's,
+  and every view derived from them. So a suppressed row is never compiled,
+  never injected at a tool boundary, never folded into memory, and never
+  woken for. It never becomes the speech locus and never brings a clock row
+  in ahead of it. The decision is made once, at arrival, before the hold, the
+  veto and the gate, so the gate's counters and debounce batches never see
+  the event. Because the view reads only the stamp, editing or removing the
+  rule changes only what arrives afterwards; the rows already hidden stay
+  hidden, which keeps each row's visibility fixed, as context-manager's
+  `viewFilter` requires.
+  - **The rule.** It needs `behavior: "defer"` written out, so an earlier
+    release that doesn't know `suppress` defers those events instead of
+    waking on them, a match that narrows it, and a `description` of what it's
+    for, which the review checks against. Three kinds of event are never
+    suppressed and go on to the next rules: an event addressed to the agent
+    (`chat:addressed`), the heartbeat's, and console or API input. A suppress
+    rule never decides a wake: `evaluate` and `probe` pass over it, and so do
+    the rule-order notes and the catch-all check.
+  - **The agent's own logic.** `script` is the source of a function
+    `(event, state) => boolean`, called for each event the rule's match takes;
+    true hides it, and anything else lets the event on to the rules after it.
+    `event` carries the event type, source, channel, author, tags, text,
+    arrival time (`at`, ms) and metadata. `state` is the rule's own JSON object
+    (at most 64 KB), which the script reads and changes as it likes, so a rule
+    can hide repeats, count, or keep a window of its own. The framework keeps
+    it between events and across restarts in `suppress-state.json` beside
+    gate.json, and starts it afresh when the script changes or the rule is
+    removed (not for a new description). Scripts run on one worker thread,
+    called synchronously with a 50 ms timeout (`gate.suppressScriptTimeoutMs`), as
+    gate.js is: a robustness boundary for the agent's own code, not a security
+    sandbox. A script that throws, times out, isn't a function, or leaves a
+    state it can't keep shows the event, keeps its state as it was, and is
+    named in `gate_status` (`suppress.scriptStatus`). wake_add_rule compiles a
+    script on the worker before it saves the rule. `suppressionFor` runs a
+    script on a copy of its state, for the probe table; the arrival paths call
+    `decideSuppression`, once per event, which keeps the state the script
+    leaves. The worker starts with the first rule that has a script.
+  - **Covered:** MCPL channel messages and push events (admission), a
+    module's events (every message its response adds, and its wake), and a
+    server's `[toolsets]` notices, gated as its `mcpl:tool-changes` events.
+    Not covered: deliveries into a conversation fork's own store, which has no
+    view filter.
+  - **Tools.** `wake_add_rule { …, suppress: {…} }` adds a suppress rule (saved
+    with behavior "defer"), and `wake_remove_rule` removes it. `gate_status`
+    shows each suppress rule's settings and how its script has run, and counts
+    what it suppressed since start. `suppression_stats { rule?, recent?, since? }`
+    reads the stamped rows in the caller's message slot on its current
+    branch, so its counts cover every start and follow the branch. Per rule it
+    reports the count, the text size, the first and last arrival, a breakdown
+    by source and event type, and the newest rows with a one-line preview.
+    Rules removed since are listed with `inForce: false`.
+    `dump_suppressed { path?, rule?, since?, until?, format? }` writes the
+    rows, whole, to a workspace file: a transcript, or JSON lines. At most
+    4 MB; past that, the newest that fit, and the result counts the rest.
+    Hosts read the same rows with `AgentFramework.suppressedEvents()`.
+  - **Review.** Every `gate.suppressionReview.intervalMs` (two hours by
+    default), for each rule that hid events since the last review, a small
+    model (`model`, Claude Haiku 5.5 by default, on the reply judge's
+    membrane) reads the rule's description, its match, its script and the events it hid,
+    a sample of at most `maxEventsPerRule` (60) spread across the period. It
+    flags any that don't fit the description or that the agent would
+    plausibly need to see. The agent gets a `[suppression review]` notice
+    naming each rule, what it hid and what was flagged, with the flagged
+    events shown. A flag wakes the agent (`wakeOnFlag`, default true). With
+    `notify: "flagged"` the agent is told only of a flag; with the default,
+    `"always"`, after every review in which something was hidden. The notice
+    is the framework's own and never suppressed. Progress and each rule's
+    last description are kept in `suppression-review.json` beside gate.json,
+    so a restart resumes and a removed rule's events are still judged.
+    `gate.suppressionReview: false` turns it off; `AgentFramework.reviewSuppression()`
+    runs one now. The `gate:suppression-review` trace records each review.
+
 - **The built-in toolset, `settings`.** The host tools an agent reaches for
   rarely: `agent_settings`, `wake_add_rule`, `wake_remove_rule`,
   `wake_accept_suggestions`, `wake_decline`,
-  `gate_status`, `event_tags`, `set_tool_visibility`, `set_tool_description`,
+  `gate_status`, `suppression_stats`, `dump_suppressed`, `event_tags`, `set_tool_visibility`, `set_tool_description`,
   `heartbeat--heartbeat_status`, `heartbeat--heartbeat_trigger`,
   `workspace--status`, every module utility (`Module.getUtilities`), and a
   module's tools it places there (`Module.toolPlacement` answering
