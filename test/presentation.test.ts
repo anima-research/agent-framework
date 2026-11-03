@@ -997,4 +997,27 @@ describe('the presentation module at the point after one that failed', () => {
     assert.equal(r.mira.has(own), false);
     assert.deepEqual(r.presentation.presentAtStart(r.mira, 'turn-start').map((m) => m.id), [arrival], 'the next start presents it');
   });
+
+  // AF #844 bot review finding 20.
+  it("rows a write-down took in that aren't the agent's, whose retraction failed at adopt, leave its window at its next turn start", async () => {
+    const r = await rig();
+    r.presentation.adopt(r.mira);
+    const dm = r.write(r.mira, 'alice', text('a DM for mira alone'), ['mira']);
+    const reply = storeOwnRow(r.mira, 'mira', text("mira's private reply"));
+    const both = r.write(r.mira, 'someone', text('for both'), ['mira', 'oren']);
+    const retract = r.oren.cm.retractRows.bind(r.oren.cm);
+    let fail = true;
+    r.oren.cm.retractRows = (ids, options) => {
+      if (fail) { fail = false; throw new Error('a transient write failure'); }
+      return retract(ids, options);
+    };
+    quietly(() => r.presentation.adopt(r.oren));
+    assert.deepEqual([r.oren.has(dm), r.oren.has(reply)], [true, true], "setup: mira's rows are in oren's window");
+    assert.deepEqual(ofType(r.traces, 'presentation:failed').map((t) => [t.agentName, t.occasion]), [['oren', 'adopt']]);
+    r.presentation.presentAtStart(r.oren, 'turn-start');
+    assert.deepEqual([r.oren.has(dm), r.oren.has(reply), r.oren.has(both)], [false, false, true], 'taken out at its next start');
+    assert.deepEqual(ofType(r.traces, 'presentation:retracted').map((t) => [t.agentName, t.reason, t.messageIds]), [['oren', 'elsewhere', [dm, reply]]]);
+    r.presentation.presentAtEnd(r.oren);
+    assert.equal(ofType(r.traces, 'presentation:retracted').length, 1, 'and not again');
+  });
 });

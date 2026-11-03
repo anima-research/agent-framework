@@ -1336,7 +1336,11 @@ export type TraceEvent =
        *  at `rebase`, after the store's branch moved, its window couldn't be
        *  written down on the new branch, or its context's strategy couldn't
        *  follow the move (`error` says which). The framework logs that and
-       *  raises an ops alert (`presentation-legacy`). */
+       *  raises an ops alert (`presentation-legacy`). Without it, at
+       *  `adopt` or `rebase`, presenting the agent's own rows failed, or
+       *  taking out the rows the write-down took in that aren't the
+       *  agent's did, which is tried again at its next turn start or point
+       *  at rest. */
       type: 'presentation:failed';
       agentName: string;
       occasion: PresentationOccasion;
