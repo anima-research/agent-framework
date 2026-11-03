@@ -707,7 +707,9 @@ export class AgentPresentation {
   /**
    * Present the agent's own rows now, in the order given, those not in its
    * window yet, even while the host is frozen; then tell the other readers
-   * of its slot (afterStore). The own-row sink calls it. It is for a row the
+   * of its slot (afterStore), whatever became of that: a presentation that
+   * threw, or an agent the module doesn't present for (a failed rebase
+   * leaves its sink on). The own-row sink calls it. It is for a row the
    * agent's stream carries (its round, its results, a notice injected at its
    * boundary), one written before its next compile or after its stream's
    * last request, or one written while it has no turn alive: any other row
@@ -735,15 +737,16 @@ export class AgentPresentation {
     // after it.
     let tried: readonly MessageId[] = unique([...(this.failedOwn.get(cm) ?? []), ...ids]);
     try {
-      if (!this.presenting(agent)) return;
-      tried = unique([...this.failedOwnOf(agent), ...ids]).filter((id) => cm.ordinalOf(id) === undefined);
-      this.present(agent, tried, 'write');
-      this.keepFailedOwn(agent, tried);
-      this.afterStore(agent, ids);
+      if (this.presenting(agent)) {
+        tried = unique([...this.failedOwnOf(agent), ...ids]).filter((id) => cm.ordinalOf(id) === undefined);
+        this.present(agent, tried, 'write');
+        this.keepFailedOwn(agent, tried);
+      }
     } catch (error) {
       this.failed(agent, 'write', error);
       this.keepFailedOwn(agent, tried);
     }
+    this.afterStore(agent, ids);
   }
 
   /**
@@ -751,7 +754,11 @@ export class AgentPresentation {
    * slot (its owners and its observers) whose turn isn't alive, and the
    * writer itself, is presented what it is owed at once, when one of the
    * rows is an arrival for it (present at rest). A reader with a turn alive
-   * takes them at its next point. Frozen, only own rows present. Never throws.
+   * takes them at its next point. Frozen, only own rows present. The module
+   * needn't present for the writer: one left in legacy mode tells the
+   * readers of its slot too. Each reader is weighed apart, so one whose
+   * window can't be read is traced and the others are still told. Never
+   * throws.
    */
   afterStore(writer: PresentedAgent, ids: ReadonlyArray<MessageId | undefined>): void {
     try {
@@ -761,17 +768,22 @@ export class AgentPresentation {
       const rows = stored.map((id) => writerCm.getMessage(id)).filter((row): row is StoredMessage => row !== null);
       const slot = this.host.registry.ownSlotOf(writer.name);
       const readers = new Set<AgentName>([writer.name, ...(slot ? this.host.registry.readersOf(slot) : [])]);
-      for (const reader of this.host.liveAgents()) {
-        if (!readers.has(reader.name) || !this.presenting(reader) || this.host.turnAlive(reader.name)) continue;
-        const facts = readerFacts(this.host.registry, reader.name);
-        // The rows are in the writer's own slot: the reader's own when it
-        // is the writer or shares that slot (bearingOf compares the ref),
-        // else a slot it observes, weighed by its edges on that slot.
-        const from: RowSlot | undefined = reader === writer ? 'own' : slot;
-        // A row the writer's own slot doesn't hold (none found) can't be
-        // weighed here; the reader's own scan weighs it.
-        const owed = rows.length < stored.length || rows.some((row) => bearingOf(row, facts, from) !== 'elsewhere');
-        if (owed) this.presentAtRest(reader, 'at-rest');
+      for (const reader of [...this.host.liveAgents()]) {
+        if (!readers.has(reader.name)) continue;
+        try {
+          if (!this.presenting(reader) || this.host.turnAlive(reader.name)) continue;
+          const facts = readerFacts(this.host.registry, reader.name);
+          // The rows are in the writer's own slot: the reader's own when it
+          // is the writer or shares that slot (bearingOf compares the ref),
+          // else a slot it observes, weighed by its edges on that slot.
+          const from: RowSlot | undefined = reader === writer ? 'own' : slot;
+          // A row the writer's own slot doesn't hold (none found) can't be
+          // weighed here; the reader's own scan weighs it.
+          const owed = rows.length < stored.length || rows.some((row) => bearingOf(row, facts, from) !== 'elsewhere');
+          if (owed) this.presentAtRest(reader, 'at-rest');
+        } catch (error) {
+          this.failed(reader, 'at-rest', error);
+        }
       }
     } catch (error) {
       this.failed(writer, 'at-rest', error);

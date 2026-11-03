@@ -22902,7 +22902,6 @@ export class AgentFramework {
    * FrameworkWriteOptions.mayBeStored, read back in the fork's store.
    */
   private storeInFork(target: Agent, content: ContentBlock[], metadata: MessageMetadata, mayBeStored?: boolean): MessageId {
-    const presents = this.presents(target);
     const kept = (): SurgeryHeldWrite => ({
       participant: 'user', content, metadata,
       direct: { agentName: target.name, ...(mayBeStored ? { mayBeStored: true as const } : {}) },
@@ -22937,14 +22936,14 @@ export class AgentFramework {
           return '' as MessageId;
         }
         if ('unknown' in thrown) {
-          if (presents) this.presentation!.afterStore(target, presentedThoughUnknown(thrown.unknown));
+          this.presentation?.afterStore(target, presentedThoughUnknown(thrown.unknown));
           throw error;
         }
         id = thrown.landed[0]!;
         rows = thrown.landed;
       }
     }
-    if (presents) this.presentation!.afterStore(target, rows);
+    this.presentation?.afterStore(target, rows);
     return id;
   }
 
@@ -31446,7 +31445,7 @@ export class AgentFramework {
           // answered by that error, not as stored, and the rows the error
           // names are presented as a landed write's are (an imported write's
           // by the boot's pass, and its next boot finds it by its id).
-          if (!opts?.imported && this.presents(agent)) this.presentation!.afterStore(agent, presentedThoughUnknown(thrown.unknown));
+          if (!opts?.imported) this.presentation?.afterStore(agent, presentedThoughUnknown(thrown.unknown));
           throw error;
         } else {
           // context-manager's initialization fence: the manager refuses every
@@ -31473,9 +31472,11 @@ export class AgentFramework {
     this.releaseLandedMail(metadata, agent.name);
     this.noteStored(agent, metadata, stored);
     // Each reader of the row's slot whose turn isn't alive is presented it
-    // now (present at rest); the others at their next point. An imported
-    // write is presented by the boot's pass after the import (repairAndRest).
-    if (!opts?.imported && this.presents(agent)) this.presentation!.afterStore(agent, rows);
+    // now (present at rest); the others at their next point. So is it when
+    // the agent's own window is the record (legacy mode): the other readers
+    // of its slot are told all the same. An imported write is presented by
+    // the boot's pass after the import (repairAndRest).
+    if (!opts?.imported) this.presentation?.afterStore(agent, rows);
     return stored;
   }
 

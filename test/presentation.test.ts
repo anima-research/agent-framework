@@ -935,4 +935,31 @@ describe('the presentation module at the point after one that failed', () => {
     r.presentation.presentAtEnd(r.mira);
     assert.deepEqual(r.mira.window().slice(-3), ['A: a reply', 'B: its results', 'C: the next reply'], 'in the order they were stored');
   });
+
+  // AF #844 bot review finding 54.
+  it("an own row whose presentation throws once it is stored still enters an idle observer's window at once", async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('mira');
+    const ordinal = r.mira.cm.ordinalOf.bind(r.mira.cm);
+    let fail = true;
+    r.mira.cm.ordinalOf = (id) => {
+      if (fail) { fail = false; throw new Error('a transient read failure'); }
+      return ordinal(id);
+    };
+    const reply = quietly(() => storeOwnRow(r.mira, 'mira', text("mira's reply")));
+    assert.deepEqual(ofType(r.traces, 'presentation:failed').map((t) => [t.agentName, t.occasion]), [['mira', 'write']], 'setup');
+    assert.equal(r.sub.has(reply), true, 'the idle subconscious takes it through its observe edge at once');
+  });
+
+  // AF #844 bot review finding 79.
+  it("a writer a failed rebase left in legacy mode still tells the idle readers of its slot of its own rows", async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('mira');
+    quietly(() => r.presentation.rebase(r.mira, new Error("its strategy couldn't follow the move")));
+    assert.equal(r.presentation.presenting(r.mira), false, 'setup: mira is left in legacy mode');
+    const reply = storeOwnRow(r.mira, 'mira', text('a reply in legacy mode'));
+    assert.equal(r.sub.has(reply), true, 'the idle subconscious takes it at once');
+  });
 });
