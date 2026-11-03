@@ -309,7 +309,8 @@ test('an edit naming a name the file holds but the resident has no tool for says
   writeFileSync(path,'not json');
   const r3=p.edit('set_tool_visibility',{name:held,visible:true},tools);
   assert.ok(r3.error!.startsWith('Nothing was changed: you have no tool named '),r3.error);
-  assert.ok(!r3.error!.includes(keeps),'a file that can\'t be parsed holds no setting');
+  assert.ok(!r3.error!.includes(keeps),'with a file it can\'t parse, the refusal can\'t tell whether the name is held');
+  assert.ok(r3.error!.includes('Copy the exact name'),'so it gives the index instruction');
   writeFileSync(path,JSON.stringify({version:1,tools:{[held]:{visible:false}}}));
   const r4=p.edit('set_tool_visibility',{name:'toString',visible:true},tools);
   assert.ok(r4.error!.startsWith('Nothing was changed: you have no tool named '),r4.error);
