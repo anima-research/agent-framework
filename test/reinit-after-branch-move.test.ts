@@ -1596,6 +1596,7 @@ describe('after a branch move, every agent on the store compiles without a resta
 describe('conversation forks and a branch move', () => {
   type ForkInternals = Internals & {
     createConversationAgent(name: string, home: { serverId: string; channelId: string }): Promise<{ getContextManager(): ContextManager }>;
+    conversationSpawnsInFlight: Set<string>;
   };
 
   it("a fork created while a branch switch's managers re-initialize waits for them, and compiles", { timeout: 30_000 }, async () => {
@@ -1635,10 +1636,19 @@ describe('conversation forks and a branch move', () => {
       };
       const switching = framework.switchBranch(framework.getStore().currentBranch().name);
       const spawning = internals.createConversationAgent('a-chan-g1', { serverId: 'world', channelId: 'world:chan' });
-      await until(() => atGate, "the template's re-initialization to reach its gate", 10_000);
-      await settled();
-      assert.equal(order.length, 0, `the spawn waits, and nothing has compiled the template: ${JSON.stringify(order)}`);
-      open();
+      let spawnSettled = false;
+      void spawning.then(() => { spawnSettled = true; }, () => { spawnSettled = true; });
+      try {
+        await until(() => atGate, "the template's re-initialization to reach its gate", 10_000);
+        await settled();
+        assert.equal(order.length, 0, `the spawn waits, and nothing has compiled the template: ${JSON.stringify(order)}`);
+        // Waiting at the hold, before the spawn goes on to open the fork's
+        // manager: a spawn past it would be in flight already.
+        assert.equal(spawnSettled, false, 'the spawn is pending');
+        assert.equal(internals.conversationSpawnsInFlight.has('a-chan-g1'), false, "the spawn waits at the hold, short of opening the fork's manager");
+      } finally {
+        open();
+      }
       await switching;
       const fork = await spawning;
       (cmA as unknown as { compile: typeof compile }).compile = compile;
