@@ -148,6 +148,10 @@ test('a disabled turn shows typing where its waiting wake came from, though that
     agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'a', timestamp: Date.now(),
     channelId: 'general', channelServerId: 'a', addressed: true,
   });
+  r.i.channelRegistry.enterTuneOut('a', 'general', {
+    epochId: 'e1', cadenceSeconds: 300, backlogCap: 20, maxWakes: 3, startedAtSequence: 0,
+  }, 'test');
+  assert.ok(r.i.channelRegistry.getTuneOutState('a', 'general'), "premise: the registry holds a's general tuned out");
   await r.run();
   assert.equal(r.started(), 1, 'control: the turn ran');
   assert.deepEqual([...new Set(starts(r.typing))], ['a start general'], r.typing.join(', '));
