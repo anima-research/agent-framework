@@ -1987,6 +1987,40 @@ describe('private wins, one way', () => {
       }
     });
 
+    it("a private-marked row that only its own resident's view keeps, stored before a restart, leaves another resident's first start in the next run speaking in its channel", async () => {
+      const storeDir = mkdtempSync(join(tmpdir(), 'hidden-row-restart-'));
+      const aideTurn = async (rig: Rig) => {
+        const before = rig.routed.length;
+        const starts = rig.starts.filter((s) => s.agentName === 'aide').length;
+        rig.i.pendingRequests.push({ ...roomWake(), agentName: 'aide' });
+        await rig.until(() => rig.starts.filter((s) => s.agentName === 'aide').length > starts
+          && rig.framework.getAgent('aide')!.state.status === 'idle' && idle(rig), "the aide's channel turn");
+        await rig.framework.runUntilIdle();
+        return rig.routed.slice(before).map((r) => r.locus);
+      };
+      try {
+        const first = await surfaceRig({ storeDir, otherAgents: ['aide'] });
+        try {
+          assert.deepEqual(await aideTurn(first), [ROOM], "control: the aide's channel turn speaks in its channel");
+          storeAs(first.framework, 'scout', {
+            contextInjection: { agent: 'scout', namespace: 'notes', contentHash: 'h1', part: 0, parts: 1 },
+            dendrite: { privateTurn: true },
+          });
+          await first.until(() => stored(first).includes('for your eyes only'), 'the row stored');
+        } finally {
+          await first.close();
+        }
+        const next = await surfaceRig({ storeDir, otherAgents: ['aide'] });
+        try {
+          assert.deepEqual(await aideTurn(next), [ROOM], "a row the aide's view leaves out doesn't make its first start private");
+        } finally {
+          await next.close();
+        }
+      } finally {
+        rmSync(storeDir, { recursive: true, force: true });
+      }
+    });
+
     it("a private surface's message a silent heartbeat tick read before a restart keeps the next run's first start out of every channel", async () => {
       const storeDir = mkdtempSync(join(tmpdir(), 'silent-tick-private-restart-'));
       try {
@@ -2049,6 +2083,45 @@ describe('private wins, one way', () => {
           assert.deepEqual(await channelTurn(), [ROOM], 'control: a later channel turn speaks in its channel');
         } finally {
           await next.close();
+        }
+      } finally {
+        rmSync(storeDir, { recursive: true, force: true });
+      }
+    });
+
+    it("a channel turn's script report deferred across an update's restart, landed by the next run and read by no start before another restart, keeps the third run's first start out of every channel", async () => {
+      const storeDir = mkdtempSync(join(tmpdir(), 'landed-report-second-restart-'));
+      try {
+        const first = await surfaceRig({ storeDir });
+        try {
+          await firstTurn(first, false);
+          const turnId = routingOf(first.framework).turnId as number;
+          await first.framework.quiesce({ reason: 'update' });
+          await (first.framework as unknown as {
+            scriptWake(agentName: string, scriptId: string, text: string, label: string, startTurnId: number): Promise<void>;
+          }).scriptWake('scout', 's1', '[script s1] the build finished', 's1-ended', turnId);
+          first.i.pendingRequests.length = 0;
+          assert.equal(first.framework.getHostModeStatus().deferredWrites, 1, 'control: the report is deferred, and kept');
+        } finally {
+          await first.close();
+        }
+        const second = await surfaceRig({ storeDir });
+        try {
+          if (second.framework.getHostModeStatus().quiesced) await second.framework.resume();
+          second.i.pendingRequests.length = 0;
+          assert.ok(stored(second).includes('the build finished'), 'control: the second run stored the report');
+          await second.framework.runUntilIdle();
+          assert.equal(second.starts.length, 0, 'control: no start read it in the second run');
+        } finally {
+          await second.close();
+        }
+        const third = await surfaceRig({ storeDir });
+        try {
+          const { channelTurn } = restarted(third);
+          assert.deepEqual(await channelTurn(), [], "the start that reads the report speaks in no channel");
+          assert.deepEqual(await channelTurn(), [ROOM], 'control: a later channel turn speaks in its channel');
+        } finally {
+          await third.close();
         }
       } finally {
         rmSync(storeDir, { recursive: true, force: true });

@@ -12,12 +12,13 @@
   window, after a quiesce or a provider hold. So is a start that is the first
   to read a private surface's message stored before it, though the message's
   own wake may still wait in a gate window, or the message woke nothing, and
-  for an ordinary resident whichever resident of its shared slot the message
-  was stored for. So is a resident's first start in a framework made on its
-  store, as after a restart, when no row of the resident's own, other than a
-  silent heartbeat tick's, follows a private surface's message, a result or
-  mail from a private turn's work, or a report from a script a turn started,
-  whichever turn it was: what the earlier run had noted went with it. So is
+  for an ordinary resident whose view keeps the message, whichever resident
+  of its shared slot it was stored for. So is a resident's first start in a
+  framework made on its store, as after a restart, when, in what its view
+  keeps, no row of the resident's own, other than a silent heartbeat tick's,
+  follows a private surface's message, a result or mail from a private turn's
+  work, or a report from a script a turn started, whichever turn it was: what
+  the earlier run had noted went with it. So is
   the turn of its own that a wake starts after waiting on a private turn,
   because that turn's continuation (a budget restart or a held retry) starts
   alone, or a quiesce parked the wake while the turn ran. A turn that takes in
