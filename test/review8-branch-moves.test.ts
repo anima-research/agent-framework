@@ -5,7 +5,7 @@
  */
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AutobiographicalStrategy } from '@animalabs/context-manager';
@@ -305,3 +305,52 @@ describe('a branch move made through an agent whose manager its restore left ref
     await framework.getAgent('a')!.getContextManager().compile({ maxTokens: 100_000, reserveForResponse: 1_000 }, undefined, { dryRun: true });
   });
 });
+
+// 63: the persisted quiesce flags were set after the modules started, so a
+// module's start() write on a host that stopped quiesced was handled as one
+// to a serving host: it took a clock row, and entered the agent's window at
+// once.
+describe('a module that writes from start() on a host booting quiesced (AF #844 bot review 63)', () => {
+  async function bootWithStartWrite(quiesced: boolean) {
+    const dir = mkdtempSync(join(tmpdir(), 'af-review8-2b-quiesced-'));
+    dirs.push(dir);
+    const storePath = join(dir, 'store');
+    const hostModePath = join(dir, 'host-mode.json');
+    if (quiesced) writeFileSync(hostModePath, JSON.stringify({ version: 1, quiesced: true, reason: 'maintenance', since: Date.now() }));
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      const framework = await AgentFramework.create({
+        storePath,
+        hostModePath,
+        membrane: new MockMembrane().asMembrane(),
+        timeZone: 'UTC',
+        agents: [{ name: 'a', model: 'test-model', systemPrompt: 'You are a.', clock: { intervalMinutes: 10 } }],
+        modules: [{
+          name: 'starter',
+          async start(ctx: ModuleContext) { ctx.addMessage('someone', [text('written at start')]); },
+          async stop() {},
+          getTools: () => [],
+          async handleToolCall() { return { success: true }; },
+          async onProcess() { return {}; },
+        } as Module],
+        syncIntervalMs: 0,
+        maintenanceIntervalMs: 0,
+      } as never);
+      frameworks.push(framework);
+      const cm = framework.getAgent('a')!.getContextManager();
+      const rows = cm.getAllMessages();
+      const written = rows.find((m) => textOf(m) === 'written at start');
+      assert.ok(written, 'the write is stored');
+      return { clocks: rows.filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'clock').length, status: cm.windowStatusOf(written.id) };
+    } finally {
+      console.error = quiet;
+    }
+  }
+
+  it('takes no clock row, and stays out of the window until resume, as a write the importer stores then does', async () => {
+    assert.deepEqual(await bootWithStartWrite(false), { clocks: 1, status: 'in' }, 'premise: on a serving host it takes one, and enters the window');
+    assert.deepEqual(await bootWithStartWrite(true), { clocks: 0, status: 'out' });
+  });
+});
+

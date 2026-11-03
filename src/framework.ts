@@ -5254,6 +5254,34 @@ export class AgentFramework {
     // branches. This runs before modules, MCPL connections, or inbound traffic.
     await framework.resumePreparedDiscordSuppressions();
 
+    // Restore persisted quiesce mode (issue #122) before the modules start,
+    // and so BEFORE initializeMcpl: the flag must be set before startup
+    // opens any plane, or it would open the data planes on a host that shut
+    // down mid-maintenance. Staged connections boot with both planes closed,
+    // so a quiesced boot needs no re-pause: readyMcplPlanes consults the
+    // flag and holds data planes (control planes come up normally). Before
+    // the modules start, so a write a module makes from its start() on a
+    // quiesced host is one to a quiesced host, as the importer's below are:
+    // it takes no clock row (storeDueClock), and enters no window until
+    // resume. The event gate's suppression is wired once the gate exists
+    // (below).
+    //
+    // The record lives OUTSIDE branch history (a recovery/ file next to the
+    // store): a historical rollback must not be able to erase the marker of
+    // the very surgery it belongs to. So did the deferred-write queue an
+    // earlier release kept, which the importer reads from there.
+    framework.hostModePath = config.hostModePath
+      ?? (config.storePath ? join(config.storePath, 'recovery', 'host-mode.json') : undefined);
+    framework.deferredWritesPath = config.deferredWritesPath
+      ?? (config.storePath ? join(config.storePath, 'recovery', 'deferred-writes.json') : undefined);
+    const hostMode = framework.readHostMode();
+    if (hostMode?.quiesced) {
+      framework.hostModeRecordMayBeQuiesced = true;
+      framework.quiesced = true;
+      framework.quiesceReason = hostMode.reason;
+      framework.quiescedAt = hostMode.since;
+    }
+
     // Add modules
     for (const module of config.modules) {
       await framework.addModule(module);
@@ -5501,34 +5529,10 @@ export class AgentFramework {
       framework.toolResultInlineMaxCharsOverride.set(agentName, cap);
     }
 
-    // Restore persisted quiesce mode (issue #122) BEFORE initializeMcpl: the
-    // flag must be set before startup opens any plane, or it would open the
-    // data planes on a host that shut down mid-maintenance. Staged
-    // connections boot with both planes closed, so a quiesced boot needs no
-    // re-pause — readyMcplPlanes consults the flag and holds data planes
-    // (control planes come up normally). The gate already exists at this
-    // point, so the suppression is wired here too.
-    //
-    // The record lives OUTSIDE branch history (a recovery/ file next to the
-    // store): a historical rollback must not be able to erase the marker of
-    // the very surgery it belongs to. So did the deferred-write queue an
-    // earlier release kept, which the importer reads from there.
-    framework.hostModePath = config.hostModePath
-      ?? (config.storePath ? join(config.storePath, 'recovery', 'host-mode.json') : undefined);
-    framework.deferredWritesPath = config.deferredWritesPath
-      ?? (config.storePath ? join(config.storePath, 'recovery', 'deferred-writes.json') : undefined);
+    // The quiesced flags were set before the modules started (above); the
+    // gate exists now, so a quiesced boot's suppression is wired here.
     {
-      const hostMode = framework.readHostMode();
-      // The quiesced flags first, before anything is stored: a write the
-      // importer stores below is then one to a quiesced host, which takes no
-      // clock row and enters no window of another agent's until resume.
-      if (hostMode?.quiesced) {
-        framework.hostModeRecordMayBeQuiesced = true;
-        framework.quiesced = true;
-        framework.quiesceReason = hostMode.reason;
-        framework.quiescedAt = hostMode.since;
-        framework.eventGate?.setQuiesced(true);
-      }
+      if (hostMode?.quiesced) framework.eventGate?.setQuiesced(true);
       // A queue of deferred writes an earlier release left (#291, one
       // release): each write is stored once, in the order it arrived, and
       // the record cleared, whatever the host's mode. Each agent's window was
