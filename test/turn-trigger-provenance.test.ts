@@ -333,6 +333,68 @@ describe('Turn trigger provenance', () => {
     assert.equal(handed.at(-1)?.counterparty, 'discord:user:bob');
     await framework.stop();
   });
+  for (const marked of [true, false]) {
+    it(`a held merged start that takes in an equal request ${marked ? "continuing a private turn starts private once the hold's release judges its batch again" : 'with no mark starts in its channel once the hold releases it, as on main'}`, async () => {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi bob' }]));
+      const framework = await makeFramework();
+      const i = internals(framework) as ReturnType<typeof internals> & {
+        withAuxiliaryAdmission<T>(agentName: string, run: () => Promise<T>, model?: string): Promise<T>;
+        providerAccelerationCooldowns: Map<string, { heldRequests: InferenceRequest[] }>;
+        notePrivateTurn(turnId: number): void;
+        requestForTurn(agentName: string, reason: string, source: string, callerTurnId?: number): void;
+      };
+      const handed: Array<InferenceRequest | undefined> = [];
+      const orig = i.startAgentStream.bind(framework) as (...args: unknown[]) => Promise<void>;
+      (i as unknown as { startAgentStream: (...args: unknown[]) => Promise<void> }).startAgentStream = (...args) => {
+        handed.push(args[1] as InferenceRequest | undefined);
+        return orig(...args);
+      };
+      const t = Date.now();
+      let fail!: (error: Error) => void;
+      const auxiliary = i.withAuxiliaryAdmission('scout', () => new Promise<void>((_, reject) => { fail = reject; }), 'test-model').catch(() => {});
+      i.pendingRequests.push(
+        { agentName: 'scout', reason: 'timer', source: 'clock', timestamp: t - 3_000 },
+        { agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: t - 1_000,
+          channelId: 'discord:g:bob-room', counterparty: 'discord:user:bob', addressed: true },
+      );
+      await i.processInferenceRequests();
+      fail(new MembraneError({ type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 60_000,
+        message: 'rate limit reached', rawError: { status: 429 } } as ConstructorParameters<typeof MembraneError>[0]));
+      await auxiliary;
+      const deadline = performance.now() + 10_000;
+      while ((i.providerAccelerationCooldowns.get('scout')?.heldRequests.length ?? 0) === 0) {
+        assert.ok(performance.now() < deadline, 'the merged wake held by the wait');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const held = i.providerAccelerationCooldowns.get('scout')!.heldRequests[0]!;
+      assert.ok(Object.getOwnPropertySymbols(held).some((key) => key.description === 'merged-batch'), 'premise: the hold keeps a merged start');
+      // The same request as the one held, by every field the hold compares,
+      // which continues a private turn (as a held turn's retry continues its turn).
+      const duplicate: Record<PropertyKey, unknown> = Object.fromEntries(Object.entries(held));
+      if (marked) {
+        const privateTurn = 9_999;
+        i.notePrivateTurn(privateTurn);
+        i.requestForTurn('scout', 'carrier', 'test', privateTurn);
+        const carrier = i.pendingRequests.pop()! as unknown as Record<symbol, unknown>;
+        for (const key of Object.getOwnPropertySymbols(carrier)) duplicate[key] = carrier[key];
+      }
+      i.pendingRequests.push(duplicate as unknown as InferenceRequest);
+      await i.processInferenceRequests();
+      assert.equal(i.providerAccelerationCooldowns.get('scout')?.heldRequests.length, 1, 'premise: the hold kept one request for both');
+      framework.releaseProviderWait('scout');
+      await i.processInferenceRequests();
+      await framework.runUntilIdle();
+      const start = handed.at(-1);
+      if (marked) {
+        assert.equal(start?.nonChannelOrigin, true, `the start is private: ${JSON.stringify(start)}`);
+        assert.equal(start?.channelId, undefined, 'and names no channel');
+      } else {
+        assert.equal(start?.nonChannelOrigin, undefined, `control: the start isn't private: ${JSON.stringify(start)}`);
+        assert.equal(start?.channelId, 'discord:g:bob-room', 'control: it starts in its channel');
+      }
+      await framework.stop();
+    });
+  }
 });
 
 const ROOM = 'discord:g:room';
@@ -862,6 +924,51 @@ describe('private wins, one way', () => {
     }
   });
 
+  for (const channelId of [1, ROOM] as const) {
+    it(`a private turn's channel_publish ${typeof channelId === 'number' ? 'whose channelId is a number, not a string, is refused as one naming no channel is, and reaches no channel' : 'naming its channel by id posts there'}`, async () => {
+      const rig = await surfaceRig();
+      try {
+        const published: Array<Record<string, unknown> | undefined> = [];
+        (rig.state.channelRegistry as Record<string, unknown>).handleChannelToolCall = async (name: string, input: Record<string, unknown> | undefined) => {
+          if (name === 'channel_publish') published.push(input);
+          return { success: true, data: { published: true } };
+        };
+        rig.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'p1', name: 'channel_publish', input: { content: 'hello', channelId } }] as never, 'tool_use'));
+        rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }]));
+        rig.framework.pushEvent(tuiMessage());
+        await rig.until(() => rig.starts.length >= 1 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the private turn');
+        await rig.framework.runUntilIdle();
+        assert.ok(stored(rig).includes('"p1"'), 'control: the call was made');
+        if (typeof channelId === 'number') {
+          assert.ok(stored(rig).includes(NO_DEFAULT_CHANNEL), `it is refused as private: ${stored(rig).slice(-3000)}`);
+          assert.deepEqual(published, [], 'nothing reached a channel');
+        } else {
+          assert.ok(!stored(rig).includes(NO_DEFAULT_CHANNEL), 'a channel named by id is not refused');
+          assert.deepEqual(published.map((p) => p?.channelId), [ROOM], 'it posts where it names');
+        }
+      } finally {
+        await rig.close();
+      }
+    });
+  }
+
+  for (const denied of [true, false]) {
+    it(`a private turn's channel_publish refusal ${denied ? 'names no channel_list to an agent refused it at dispatch' : 'names channel_list to an agent that may call it'}`, async () => {
+      const rig = await surfaceRig({ agent: denied ? { denyToolsAtDispatch: ['channel_list'] } : {} });
+      try {
+        rig.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'p1', name: 'channel_publish', input: { content: 'hello' } }] as never, 'tool_use'));
+        rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }]));
+        rig.framework.pushEvent(tuiMessage());
+        await rig.until(() => rig.starts.length >= 1 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the private turn');
+        await rig.framework.runUntilIdle();
+        assert.ok(stored(rig).includes(NO_DEFAULT_CHANNEL), `control: refused as private: ${stored(rig).slice(-3000)}`);
+        assert.equal(stored(rig).includes('channel_list shows the channel ids'), !denied, stored(rig).slice(-3000));
+      } finally {
+        await rig.close();
+      }
+    });
+  }
+
   for (const hadDestination of [false, true]) {
     it(`an explicit-mode turn that ${hadDestination ? 'had' : 'had no'} destination is told it's private when private input comes in, and its plain answer is kept private, with no draft`, async () => {
       let framework: AgentFramework | undefined;
@@ -1208,11 +1315,6 @@ describe('private wins, one way', () => {
       assert.equal(results[0]?.success, false, "a fork's: refused too");
       assert.match(results[0]!.error!, /private/, "for the turn's privacy");
       delete record.homeChannel;
-      const canUse = (rig.framework as unknown as { canAgentUseTool(a: string, t: string): boolean }).canAgentUseTool;
-      (rig.framework as unknown as { canAgentUseTool(a: string, t: string): boolean }).canAgentUseTool = (a, t) => t !== 'channel_list' && canUse.call(rig.framework, a, t);
-      results.length = 0;
-      internalsOf.dispatchChannelToolCall('scout', { id: 'c2', name: 'channel_publish', input: { content: 'hello' } });
-      assert.ok(!results[0]!.error!.includes('channel_list'), results[0]!.error);
     } finally {
       await rig.close();
     }
@@ -2836,6 +2938,61 @@ describe("an agent derived or spawned while its parent's turn is open", () => {
         await rig.until(() => rig.texts().includes('zz-answering the helper') && rig.framework.getAgent('scout')!.state.status === 'idle', "the parent's turn on the result");
         assert.deepEqual(rig.routed.filter((r) => r.text === 'zz-answering the helper'),
           privateTurn ? [] : [{ text: 'zz-answering the helper', locus: LOUNGE }], JSON.stringify(rig.routed));
+      } finally {
+        releaseHold();
+        await rig.close();
+      }
+    });
+  }
+
+  for (const privateTurn of [true, false]) {
+    it(`a worker a ${privateTurn ? 'private' : "room's"} turn spawned, spawning one of its own in a turn of its own, gives it a result its grandparent answers ${privateTurn ? 'in no channel' : "where a channel-less turn's speech goes"}`, async () => {
+      let framework: AgentFramework | undefined;
+      let spawned: Promise<{ agent: unknown; contextManager: unknown }> | undefined;
+      let releaseHold = (): void => {};
+      let held = false;
+      const hold = {
+        name: 'hold',
+        async start() {}, async stop() {},
+        getTools: () => [{ name: 'wait', description: 'Wait', inputSchema: { type: 'object', properties: {} } }],
+        async handleToolCall() {
+          held = true;
+          await new Promise<void>((r) => { releaseHold = r; });
+          return { success: true, data: 'released' };
+        },
+        async onProcess() { return {}; },
+      } as unknown as Module;
+      const tool = robot(() => {
+        spawned = framework!.createEphemeralAgent({ name: 'helper', model: 'test-model', systemPrompt: 'helper', allowedTools: 'all' } as never, workerOf('helper', 'scout')) as never;
+      });
+      const rig = await surfaceRig({ modules: [tool, hold] });
+      framework = rig.framework;
+      try {
+        rig.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'm1', name: 'robot--move', input: {} }] as never, 'tool_use'));
+        rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'asked the helper' }]));
+        if (privateTurn) rig.framework.pushEvent(tuiMessage('for your eyes only: find the door code'));
+        else rig.i.pendingRequests.push(roomWake());
+        await rig.until(() => spawned !== undefined && rig.framework.getAgent('scout')!.state.status === 'idle', 'the turn that spawned the helper');
+        const helper = await spawned!;
+        // The helper's own turn, which takes in no private input, spawns the finder while it waits in a tool.
+        rig.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'w1', name: 'hold--wait', input: {} }] as never, 'tool_use'));
+        rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'helper done' }]));
+        const helperRun = rig.framework.runEphemeralToCompletion(helper.agent as never, helper.contextManager as never);
+        void helperRun.catch(() => {});
+        await rig.whileRunning(() => held, 'the helper waits in a tool');
+        const { name: _name, ...spec } = workerSpec('finder', { spawnedBy: 'helper', resultTo: { to: 'scout', as: 'message' } });
+        const finder = await rig.framework.createEphemeralAgent({ name: 'finder', model: 'test-model', systemPrompt: 'finder' } as never, spec);
+        rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'the code is 4417' }]));
+        const run = rig.framework.runEphemeralToCompletion(finder.agent, finder.contextManager);
+        let ran = false;
+        void run.then(() => { ran = true; }, () => { ran = true; });
+        await rig.whileRunning(() => ran, 'the finder ran');
+        await run;
+        rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'zz-answering the finder' }]));
+        rig.framework.deliverAgentResult('finder', [{ type: 'text', text: 'the code is 4417' }]);
+        await rig.whileRunning(() => rig.texts().includes('zz-answering the finder') && rig.framework.getAgent('scout')!.state.status === 'idle', "the grandparent's turn on the result");
+        assert.deepEqual(rig.routed.filter((r) => r.text === 'zz-answering the finder'),
+          privateTurn ? [] : [{ text: 'zz-answering the finder', locus: LOUNGE }], JSON.stringify(rig.routed));
       } finally {
         releaseHold();
         await rig.close();

@@ -10,6 +10,7 @@ import type { FrameworkConfig } from '../src/types/framework.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { EventResponse, Module, ProcessEvent, ProcessState } from '../src/index.js';
 import { createMockResponse, HeldStream } from './helpers/mock-membrane.js';
+import { bindAsConversationFork } from './helpers/dendrite.js';
 import {
   SUB, internals, textOf, stored, held, has, find, MENTION,
   incoming, dm, registerOpen, enter, settle, channellessTurnLocus,
@@ -629,6 +630,27 @@ describe('a private turn and the focus', () => {
       await f.framework.runUntilIdle();
       await eventually(() => sent(f, 'zz-a room answer').length > 0, "control: the room's turn speaks in work");
       assert.ok(typing.includes('work'), `control: the room's turn shows typing in work: ${JSON.stringify(typing)}`);
+      assert.deepEqual(sent(f, 'zz-the code is 4417'), [], 'the private words reached no channel');
+    } finally { await f.close(); }
+  });
+
+  it("a conversation fork's private turn that enters a focus is told its plain speech stays private, not that it stays in its home", async () => {
+    const f = await fixture({ framework: { modules: [new SurfaceModule()], tuneOut: { enabled: true } } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'home');
+      clear(f);
+      bindAsConversationFork(f.framework, 'agent', { serverId: 'editor', channelId: 'home' });
+      f.membrane.pushResponse(focusCall({ channelId: 'work', durationSeconds: 120 }));
+      f.membrane.pushResponse(say('zz-the code is 4417'));
+      (f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+        agentName: 'agent', reason: 'external-message', source: 'tui', timestamp: Date.now(), nonChannelOrigin: true,
+      });
+      await f.framework.runUntilIdle();
+      assert.equal(internals(f).tuneOutCoordinator!.getAllExcept()?.params.except.channelId, 'work', 'control: the focus holds');
+      const results = stored(f).map((m) => JSON.stringify(m.content));
+      assert.ok(results.some((text) => text.includes('This turn holds private input, so its plain speech stays private;')),
+        `the focus result says this turn's speech stays private: ${results.slice(-4).join('\n')}`);
+      assert.ok(!results.some((text) => text.includes('Your plain speech stays in')), "it doesn't say this turn's speech stays in the fork's home");
       assert.deepEqual(sent(f, 'zz-the code is 4417'), [], 'the private words reached no channel');
     } finally { await f.close(); }
   });

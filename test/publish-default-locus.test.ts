@@ -98,6 +98,43 @@ describe('channel_publish without channelId', () => {
     } finally { await f.close(); }
   });
 
+  it("a host's call carrying an open private turn's id meets the private turn's rule: refused, though a focus holds another channel", async () => {
+    const f = await fixture({ framework: { tuneOut: { enabled: true } } as never });
+    try {
+      await registerOpen(f, 'work');
+      const coordinator = (f.framework as unknown as { tuneOutCoordinator: { enterAllExcept(ref: unknown, opts: unknown, source: string): { ok: boolean } } }).tuneOutCoordinator;
+      assert.ok(coordinator.enterAllExcept({ serverId: 'editor', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool').ok, 'premise: a focus on work');
+      f.membrane.responses.length = 0; // the fixture pre-scripts an `ok`
+      (f.membrane as unknown as { responseIndex: number }).responseIndex = 0;
+      f.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }]));
+      const fw = f.framework as unknown as { openLogical: Map<string, { turnId?: number; nonChannelOrigin?: boolean }> };
+      const m = f.membrane as unknown as { responses: unknown[]; responseIndex: number; calls: unknown[]; lastStream: unknown };
+      let open: { turnId?: number; nonChannelOrigin?: boolean } | undefined;
+      let host: Promise<{ success: boolean; error?: string }> | undefined;
+      // While the private turn is open, the host calls as the agent, carrying the turn's id.
+      f.membrane.streamYielding = ((request: unknown) => {
+        m.calls.push(request);
+        const remaining = m.responses.slice(m.responseIndex);
+        m.responseIndex = m.responses.length;
+        open ??= fw.openLogical.get('agent');
+        host ??= f.framework.executeToolCall({ id: 'h1', name: 'channel_publish', input: { content: 'zz-host' }, callerAgentName: 'agent', callerTurnId: open?.turnId } as never) as never;
+        const stream = new HeldStream(host.then(() => undefined), remaining as never);
+        m.lastStream = stream;
+        return stream;
+      }) as never;
+      // A wake from a private surface: the turn is private.
+      (f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+        agentName: 'agent', reason: 'external-message', source: 'tui', timestamp: Date.now(), nonChannelOrigin: true,
+      });
+      await f.framework.runUntilIdle();
+      assert.ok(open?.turnId !== undefined && open.nonChannelOrigin === true, 'premise: the call carried an open private turn');
+      const result = await host!;
+      assert.equal(result.success, false, 'refused');
+      assert.match(result.error ?? '', /This private turn has no default channel/);
+      assert.equal(publishOf(f, 'zz-host'), undefined, 'nothing was posted');
+    } finally { await f.close(); }
+  });
+
   it('defaults to the turn locus: the waking delivery, then a channel opened this turn', async () => {
     const f = await fixture();
     try {

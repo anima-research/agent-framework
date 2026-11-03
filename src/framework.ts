@@ -1316,9 +1316,18 @@ function callerTurnsOf(request: InferenceRequest): number[] {
 
 function carryWakes(request: InferenceRequest, others: readonly InferenceRequest[]): void {
   carryWakeChannels(request, others.flatMap(wakeChannelsOf));
-  const turns = [...new Set([...callerTurnsOf(request), ...others.flatMap(callerTurnsOf)])];
+  for (const other of others) carryTurnMarks(request, other);
+}
+
+function carryTurnMarks(request: InferenceRequest, from: InferenceRequest): void {
+  const turns = [...new Set([...callerTurnsOf(request), ...callerTurnsOf(from)])];
   if (turns.length > 0) (request as MarkedRequest)[CALLER_TURNS] = turns;
-  if (others.some((o) => (o as MarkedRequest)[RETAKE])) (request as MarkedRequest)[RETAKE] = true;
+  if ((from as MarkedRequest)[RETAKE]) (request as MarkedRequest)[RETAKE] = true;
+}
+
+function namesChannel(input: unknown): boolean {
+  const channelId = (input as { channelId?: unknown } | null | undefined)?.channelId;
+  return typeof channelId === 'string' && channelId !== '';
 }
 
 function isRearmed(request: InferenceRequest | undefined): boolean {
@@ -10983,8 +10992,8 @@ export class AgentFramework {
         }
       }
       let inherit = spec?.inherit;
-      const fromPrivateTurn = (inherit !== undefined && this.privateTurnOpen(inherit.from))
-        || (spec?.spawnedBy !== undefined && this.privateTurnOpen(spec.spawnedBy));
+      const fromPrivateTurn = (inherit !== undefined && this.sentFromPrivateWork(inherit.from))
+        || (spec?.spawnedBy !== undefined && this.sentFromPrivateWork(spec.spawnedBy));
 
       if (inherit?.mode === 'shared') {
         // Shared reads, separate writes: the child's context is the parent's
@@ -19784,7 +19793,12 @@ export class AgentFramework {
       // passes, and the read check and the policy decide on them all; the
       // merge below records the batch anew.
       if (requests.some((r) => mergedBatch(r) !== undefined)) {
-        requests = requests.flatMap((r) => mergedBatch(r) ?? [r]);
+        requests = requests.flatMap((r) => {
+          const batch = mergedBatch(r);
+          if (!batch) return [r];
+          for (const member of batch) carryTurnMarks(member, r);
+          return batch;
+        });
       }
 
       // A provider's stated wait on this agent's primary model, including one
@@ -27637,6 +27651,10 @@ export class AgentFramework {
       // inferred from which method was used: only the ModuleRegistry closure
       // carries module provenance (see handleToolClose).
       case 'channel': {
+        const refusal = call.callerAgentName && call.callerTurnId !== undefined
+          ? this.privatePublishRefusal(call.callerAgentName, call, this.isPrivateTurn(call.callerTurnId))
+          : undefined;
+        if (refusal !== undefined) return failed({ success: false, error: refusal, isError: true });
         const turn = call.name === 'channel_publish' && call.callerAgentName ? this.callingTurnOf(call.callerAgentName, call) : undefined;
         const input = call.name === 'channel_publish' && call.callerAgentName
           ? this.publishInputWithTurnLocus(call.input, call.callerAgentName, turn)
@@ -28706,10 +28724,9 @@ export class AgentFramework {
       : this.stopHasBegun() ? 'this host is stopping; nothing was done'
       : !parsed ? `${toolName}'s arguments weren't JSON; nothing was done`
       : input === undefined ? `${toolName}'s arguments must be an object; nothing was done`
-      : toolName === 'channel_publish' && !input.channelId
+      : toolName === 'channel_publish' && !namesChannel(input)
         && context.startTurnId !== undefined && this.isPrivateTurn(context.startTurnId)
-        ? "this script's turn is private and has no default channel, so channel_publish requires an explicit channelId"
-          + `${this.canAgentUseTool(agentName, 'channel_list') ? '; channel_list shows the channel ids' : ''}; nothing was posted`
+        ? this.scriptPrivatePublishRefusal(agentName)
       : undefined;
     // A call that reaches the host while a run or wait call watches the
     // script (context.watch) counts toward that call's round (ScriptRound),
@@ -36678,15 +36695,21 @@ export class AgentFramework {
     };
   }
 
+  private scriptPrivatePublishRefusal(agentName: string): string {
+    return "this script's turn is private and has no default channel, so channel_publish requires an explicit channelId"
+      + `${this.mayCallTool(agentName, 'channel_list') ? '; channel_list shows the channel ids' : ''}; nothing was posted`;
+  }
+
   private privatePublishRefusal(
     agentName: string,
-    call: { name: string; input?: unknown },
+    call: { id?: string; name: string; input?: unknown },
     privateTurn: boolean,
   ): string | undefined {
     if (call.name !== 'channel_publish' || !privateTurn) return undefined;
-    if ((call.input as { channelId?: unknown } | undefined)?.channelId) return undefined;
+    if (namesChannel(call.input)) return undefined;
+    if (call.id !== undefined && this.scriptCallStarts.has(call.id)) return this.scriptPrivatePublishRefusal(agentName);
     return 'This private turn has no default channel; channel_publish requires an explicit channelId.'
-      + (this.canAgentUseTool(agentName, 'channel_list') ? ' channel_list shows the channel ids.' : '');
+      + (this.mayCallTool(agentName, 'channel_list') ? ' channel_list shows the channel ids.' : '');
   }
 
   /**
@@ -36739,10 +36762,10 @@ export class AgentFramework {
   private dispatchChannelToolCall(agentName: string, call: ToolCall, earlierWake?: SkipReplyEarlierWake): void {
     // Conversation forks act only on their home channel.
     const home = this.homeOf(agentName);
-    const madeIn = call.callerTurnId;
-    const privateTurn = call.name === 'channel_publish' && !this.scriptCallStarts.has(call.id) && (madeIn !== undefined
+    const madeIn = this.workTurnOf(call);
+    const privateTurn = call.name === 'channel_publish' && (madeIn !== undefined
       ? this.isPrivateTurn(madeIn)
-      : this.turnRouting?.get(agentName)?.nonChannelOrigin === true);
+      : !this.scriptCallStarts.has(call.id) && this.turnRouting?.get(agentName)?.nonChannelOrigin === true);
     const error = this.privatePublishRefusal(agentName, call, privateTurn);
     if (error !== undefined) {
       const result = this.refusedResult(agentName, call.id, error);
@@ -37457,7 +37480,9 @@ export class AgentFramework {
       }
       const except = "except on a turn that has no channel, such as a heartbeat's, or one that holds private input";
       const speech = home
-        ? `Your plain speech stays in ${this.channelShown(home)}, your conversation's channel.`
+        ? open?.nonChannelOrigin
+          ? `This turn holds private input, so its plain speech stays private; from your next turn it stays in ${this.channelShown(home)}, your conversation's channel.`
+          : `Your plain speech stays in ${this.channelShown(home)}, your conversation's channel.`
         : open?.nonChannelOrigin
           ? `This turn holds private input, so its plain speech stays private; from your next turn it lands in the excepted channel while this holds, ${except}.`
           : open?.locus && !sameChannel(open.locus, resolved)

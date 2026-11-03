@@ -13,7 +13,7 @@ import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ErrorAction, ErrorPolicy, EventResponse, InferenceRequest, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
-import { AgentFramework } from '../src/index.js';
+import { AgentFramework, WorkspaceModule } from '../src/index.js';
 import { storableToolResult } from '../src/module-registry.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
 import type { ContentBlock, NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
@@ -1204,8 +1204,8 @@ describe('a round whose run or wait call watches a script that can change its ro
   ];
 
   async function scriptRound(mode: 'locus' | 'hybrid' | 'explicit' | 'disabled', responses: ReturnType<typeof createMockResponse>[],
-    config: { sameRoundThinkTextPolicy?: 'private'; allowedTools?: string[] } = {},
-    options: { codeExecution?: boolean; channelPublish?: boolean; toolCallTimeoutMs?: number; serveWakes?: boolean } = {}) {
+    config: { sameRoundThinkTextPolicy?: 'private'; allowedTools?: string[]; denyToolsAtDispatch?: string[]; toolPresentation?: { path: string; cataloguePath: string } } = {},
+    options: { codeExecution?: boolean; channelPublish?: boolean; toolCallTimeoutMs?: number; serveWakes?: boolean; modules?: Module[] } = {}) {
     const { tempDir, storePath } = tempStorePath('ce-round-');
     const membrane = new MockMembrane();
     for (const response of responses) membrane.pushResponse(response);
@@ -1223,7 +1223,7 @@ describe('a round whose run or wait call watches a script that can change its ro
       storePath,
       membrane: membrane.asMembrane(),
       agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'Act.', proseRouting: mode, ...config }],
-      modules: [module],
+      modules: [module, ...(options.modules ?? [])],
       syncIntervalMs: 0,
       ...(options.codeExecution === false ? {} : { codeExecution: { enabled: true, ...(options.toolCallTimeoutMs === undefined ? {} : { toolCallTimeoutMs: options.toolCallTimeoutMs }) } }),
     });
@@ -2428,15 +2428,12 @@ describe('a round whose run or wait call watches a script that can change its ro
     });
   }
 
-  it("a script's refusal in a private turn points to channel_list only for an agent that may call it", async () => {
+  it("a script's refusal in a private turn points to channel_list only for an agent that may call it, not one refused it at dispatch", async () => {
     const h = await scriptRound('locus', [
       createMockResponse([scriptCall({ code: publishing('{ content: "from the script" }'), yield_time_ms: 30_000 })] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
-    ], {}, { channelPublish: true });
+    ], { denyToolsAtDispatch: ['channel_list'] }, { channelPublish: true });
     try {
-      const fw = h.framework as unknown as { canAgentUseTool(agentName: string, tool: string): boolean };
-      const canUse = fw.canAgentUseTool.bind(h.framework);
-      fw.canAgentUseTool = (agentName, tool) => tool !== 'channel_list' && canUse(agentName, tool);
       h.framework.pushEvent(surface());
       await h.framework.runUntilIdle();
       assert.ok(scriptNote(h).includes(REFUSED), `control: refused: ${scriptNote(h)}`);
@@ -2445,6 +2442,54 @@ describe('a round whose run or wait call watches a script that can change its ro
       await h.done();
     }
   });
+
+  it("a script's channel_publish whose channelId is a number, not a string, is refused in a private turn as one naming no channel is, and posts nothing", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([scriptCall({ code: publishing('{ channelId: 1, content: "from the script" }'), yield_time_ms: 30_000 })] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ], {}, { channelPublish: true });
+    try {
+      h.framework.pushEvent(surface());
+      await h.framework.runUntilIdle();
+      assert.ok(scriptNote(h).includes(REFUSED), scriptNote(h));
+      assert.ok(!h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
+    } finally {
+      await h.done();
+    }
+  });
+
+  for (const privateTurn of [true, false]) {
+    it(`a script's channel_publish through toolsets--act, hidden into the settings toolset, that names no channel is ${privateTurn ? 'refused in a private turn, and posts nothing' : "a channel turn's, which publishes as main does"}`, async () => {
+      const mount = mkdtempSync(join(tmpdir(), 'ce-act-'));
+      const workspace = new WorkspaceModule({ mounts: [{ name: 'work', path: mount, mode: 'read-write', watch: 'never' }] });
+      const acting = '{ tool: "channel_publish", args: { content: "from the script" } }';
+      const h = await scriptRound('locus', [
+        createMockResponse([scriptCall({
+          code: `let note; try { await tools["toolsets--act"](${acting}); note = "posted"; } catch (e) { note = String(e && e.message); } await tools["test--echo"]({ note });`,
+          yield_time_ms: 30_000,
+        })] as ContentBlock[], 'tool_use'),
+        createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+      ], { toolPresentation: { path: join(mount, 'tools.json'), cataloguePath: 'work/tools.md' } }, { channelPublish: true, modules: [workspace] });
+      try {
+        for (const [name, input] of [['set_tool_visibility', { name: 'channel_publish', visible: false }], ['toolsets--open', { toolset: 'settings' }]] as const) {
+          const result = await h.framework.executeToolCall({ id: `setup-${name}`, name, input, callerAgentName: 'assistant' } as never);
+          assert.ok(result.success, `premise: ${name}: ${result.error}`);
+        }
+        h.framework.pushEvent(surface(privateTurn ? undefined : 'world:test'));
+        await h.framework.runUntilIdle();
+        if (privateTurn) {
+          assert.ok(scriptNote(h).includes('has no default channel'), scriptNote(h));
+          assert.ok(!h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
+        } else {
+          assert.equal(scriptNote(h), 'note:posted');
+          assert.ok(h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
+        }
+      } finally {
+        await h.done();
+        rmSync(mount, { recursive: true, force: true });
+      }
+    });
+  }
 
   it("a script's channel_publish that names its channel goes there, in a private turn too", async () => {
     const h = await scriptRound('locus', [
