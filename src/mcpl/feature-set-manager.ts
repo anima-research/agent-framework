@@ -19,6 +19,7 @@ import {
   UNKNOWN_FEATURE_SET,
 } from './errors.js';
 import { isKnownCapabilityPath } from './capability-grant.js';
+import type { TraceEventInput } from '../types/trace.js';
 import { logValue } from './log-value.js';
 
 // ============================================================================
@@ -136,7 +137,7 @@ export class FeatureSetManager {
    *   turned off. Omit for scratch derivations (nothing is installed).
    */
   constructor(
-    private readonly emitTrace?: (event: { type: string; [key: string]: unknown }) => void,
+    private readonly emitTrace?: (event: TraceEventInput) => void,
   ) {}
 
   /**
