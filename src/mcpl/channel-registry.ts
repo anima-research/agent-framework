@@ -1091,13 +1091,13 @@ interface ChannelRegistryOptions {
    * message across ALL channels (markers aside) and misroutes a reply to
    * whichever channel last spoke under concurrency (item-3 redux). The
    * framework keeps both on the live turn's routing state and exposes them
-   * here. For a heartbeat / no-trigger turn it resolves to undefined until the
-   * turn's locus is resolved, so that
-   * resolution takes the global fallback, which the turn then keeps.
-   * Consulted AFTER `homeChannelResolver` (a fork's home always wins), BEFORE
-   * `defaultPublishChannel`. Null where the turn deliberately has no channel,
-   * as one woken for a channel id two servers register, given without its
-   * server: that takes no fallback either.
+   * here. For a no-trigger turn it resolves to undefined until the turn's
+   * locus is resolved, so that resolution takes the global fallback, which the
+   * turn then keeps. Consulted AFTER `homeChannelResolver` (a fork's home
+   * always wins), BEFORE the global fallback. Null where the turn deliberately
+   * has no channel, as a heartbeat's turn, or one woken for a channel id two
+   * servers register, given without its server: that takes no fallback
+   * either.
    */
   activeChannelResolver?: (agentName: string) => ChannelRef | null | undefined;
   /**
@@ -1619,7 +1619,7 @@ export class ChannelRegistry {
           description: tool.description
             .replace(
               'otherwise, while a focus holds, the channel it keeps.',
-              'otherwise, while a focus holds, the channel it keeps; otherwise, on a turn your own skip_reply wake or the end of your sleep started, the channel this host names for such turns.',
+              'otherwise, while a focus holds, the channel it keeps; otherwise, on a turn your own skip_reply wake or the end of your sleep started, or one continuing it, the channel this host names for such turns.',
             )
             .replace('A turn with no channel of its own, such as', 'A turn with no channel by design, such as'),
         };
@@ -5813,7 +5813,10 @@ export class ChannelRegistry {
     if (!this.unpromptedChannel) return null;
     if (conversationId !== undefined && this.takesUnpromptedChannel?.(conversationId) === false) return null;
     const named = this.entriesNamed(this.unpromptedChannel);
-    if (named.length === 1 && !isInboundOnly(named[0]!)) return refOf(named[0]!);
+    if (named.length === 1 && !isInboundOnly(named[0]!)) {
+      this.unpromptedChannelWarned = false;
+      return refOf(named[0]!);
+    }
     if (!this.unpromptedChannelWarned) {
       this.unpromptedChannelWarned = true;
       const why = named.length === 0
@@ -5823,7 +5826,8 @@ export class ChannelRegistry {
           : `names ${named.length} registered channels (name one with its server, as "serverId:channelId")`;
       console.error(
         `[routing] unpromptedChannel ${logValue(this.unpromptedChannel)} ${why}, so a turn the agent's own timer starts `
-          + 'takes the fallback it takes without the setting until the setting names a channel it can speak in. Logged once.',
+          + 'takes the fallback it takes without the setting until the setting names a channel it can speak in. '
+          + 'Not logged again until it has.',
       );
     }
     return null;

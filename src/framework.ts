@@ -21055,6 +21055,10 @@ export class AgentFramework {
     return routing.heartbeat && !routing.locus ? { heartbeatTurn: true } : {};
   }
 
+  private unpromptedTurnMark(routing: TurnRouting): { [UNPROMPTED]?: true } {
+    return routing.unprompted && !routing.locus ? { [UNPROMPTED]: true } : {};
+  }
+
   /** Hold a heartbeat turn's plain speech as drafts ('no-destination'), named by `round`'s notice. */
   private holdHeartbeatProse(agent: Agent, texts: string[], round: ProseRound): Draft[] {
     console.error(`[prose] ${agent.name}: heartbeat turn — ${texts.length} plain-speech segment(s) held as drafts (no destination)`);
@@ -22281,6 +22285,7 @@ export class AgentFramework {
       source: 'framework',
       timestamp: Date.now(),
       ...this.heartbeatTurnMark(routing),
+      ...this.unpromptedTurnMark(routing),
     });
   }
 
@@ -22373,6 +22378,7 @@ export class AgentFramework {
       ...channel,
       autoContinueRun: { stop, ...(opts.heldAfterSend ? { heldAfterSend: true } : {}) },
       ...this.heartbeatTurnMark(routing),
+      ...this.unpromptedTurnMark(routing),
     });
   }
 
@@ -23223,6 +23229,7 @@ export class AgentFramework {
         source: 'framework',
         timestamp: Date.now(),
         ...this.heartbeatTurnMark(round.routing),
+        ...this.unpromptedTurnMark(round.routing),
       });
     }
   }
@@ -32252,8 +32259,7 @@ export class AgentFramework {
         // message's channel is nobody's choice for it (#551). By name, so a
         // speech dispatch that comes after the run's release still counts.
         takesGlobalFallback: (conversationId) => this.usedEphemeralAgentNames.get(conversationId) !== 'run',
-        takesUnpromptedChannel: (conversationId) =>
-          this.usedEphemeralAgentNames.get(conversationId) !== 'run' && this.turnRouting.get(conversationId)?.unprompted === true,
+        takesUnpromptedChannel: (conversationId) => this.openLogical.get(conversationId)?.unprompted === true,
         eventGatePresent: this.eventGate !== null,
         unpromptedChannel: this.mcplUnpromptedChannel ?? undefined,
         // A channel tool reads the connect and restart marks a tool call's

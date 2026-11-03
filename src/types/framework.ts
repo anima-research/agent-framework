@@ -492,7 +492,10 @@ export interface FrameworkConfig {
    * `channel_publish` naming no channel in any prose routing mode, which
    * servers are told as the turn's default outgoing channel. An all-except
    * hold's channel still comes first while one is open, and without the
-   * setting such a turn follows `speech.locus`. No other turn takes it: not
+   * setting such a turn follows `speech.locus`. A turn the framework opens to
+   * continue such a turn that had no locus of its own, as in explicit or
+   * disabled routing, takes it too: a `!` continuation, autoContinue's next
+   * turn, or a bounced reply's wake. No other turn takes it: not
    * one a message prompted, from a channel, a module, a person at a console
    * or another agent; not a heartbeat's or a reminder's (its plain speech is
    * held as drafts); not a conversation fork's or an ephemeral run's; and not

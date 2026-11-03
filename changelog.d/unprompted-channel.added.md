@@ -6,7 +6,10 @@
   hold's channel still comes first while one is open. Without the setting,
   such a turn takes the global fallback: the hold's channel, else none under
   the default `speech.locus: 'delivery'`, or the latest inbound message's
-  channel under `'latest-inbound'`. No other turn takes it: not one a message
+  channel under `'latest-inbound'`. A turn the framework opens to continue
+  such a turn that had no locus of its own, as in explicit or disabled
+  routing, takes it too: a `!` continuation, autoContinue's next turn, or a
+  bounced reply's wake. No other turn takes it: not one a message
   prompted, from a channel, a module, a person at a console or another
   agent; not a heartbeat's or a reminder's; not a conversation fork's or an
   ephemeral run's; and not a start merged from a timer's wake and any other
