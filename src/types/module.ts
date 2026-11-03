@@ -750,8 +750,10 @@ export interface EventResponse {
   /**
    * Messages to add to the conversation. Each row says who it is for in
    * `metadata.audience` (#291): the agents a `requestInference` list names
-   * that are registered (the agent the row is delivered to, when none of
-   * them is); for `true` or no request, as for any write that names no
+   * that are registered and read the slot the row lands in (the agent the
+   * row is delivered to, when none of them is registered); for `true`, no
+   * request, or a list whose registered agents don't read that slot (an
+   * isolated job, a conversation fork), as for any write that names no
    * agent, the agents that take untargeted inbound in the slot it lands in
    * (every resident on a residents' host). A message that carries a
    * tune-out's hold is for nobody.

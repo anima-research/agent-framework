@@ -2191,7 +2191,9 @@ export class EventGate {
     forAgent?: string,
     /** Out-param: where the message landed, for the wake that goes with it. */
     placement?: WritePlacement,
-    /** The agents the row is for; absent: the host's default for the write. */
+    /** The agents the row is for; absent: the host's default for the write.
+     *  The host stamps those of them that read where it stores the row, and
+     *  its default when none does. */
     audience?: readonly string[],
   ) => unknown;
   private requestInferenceFn: (agentName: string, reason: string, source: string, provenance?: WakeProvenance, after?: WritePlacement) => void;

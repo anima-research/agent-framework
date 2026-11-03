@@ -2603,15 +2603,18 @@ interface WindowBody {
   ordinal: number;
   sequence: number;
   /** Whether it is the agent's own row (ownWindowRow): its stamp's, or for a
-   *  row stored before the stamp, its voice's or its own calls' results. */
+   *  row stored before the stamp, its voice's, its own calls' results, or a
+   *  framework notice whose metadata names it as its owner. */
   own: boolean;
 }
 
 /**
  * Whether a row of `agent`'s window is its own (AgentFramework.windowBodiesFrom):
  * a stamped row by its stamp; an unstamped one, which an earlier release
- * stored, when it is stored under the agent's voice, or holds tool results
- * and every one answers a call in `ownCalls`. The tool calls of each own row
+ * stored, when it is stored under the agent's voice, holds tool results
+ * and every one answers a call in `ownCalls`, or is a framework notice of a
+ * kind this release writes as its owner's own row whose metadata names the
+ * agent as that owner (legacyNoticeOwner). The tool calls of each own row
  * are added to `ownCalls`, so pass the window's rows in order.
  */
 function ownWindowRow(row: StoredMessage, agent: Pick<Agent, 'name' | 'isOwnParticipant'>, ownCalls: Set<string>): boolean {
@@ -2620,9 +2623,38 @@ function ownWindowRow(row: StoredMessage, agent: Pick<Agent, 'name' | 'isOwnPart
   const own = stamp
     ? stamp.ownRowOf === agent.name
     : agent.isOwnParticipant(nameAsStored(row.participant))
+      || legacyNoticeOwner(row.metadata) === agent.name
       || (results.length > 0 && results.every((b) => ownCalls.has((b as { toolUseId?: string }).toolUseId ?? '')));
   if (own) for (const b of row.content) if (b.type === 'tool_use') ownCalls.add((b as { id: string }).id);
   return own;
+}
+
+/**
+ * The agent an unstamped framework notice (`system: true`) names as its
+ * owner, for a kind this release writes as its owner's own row
+ * (storeOwnRow): a drafts notice (`prose-drafts`) or a delivery receipt
+ * that names drafts, by `draftOwner`; an `[auto-continue]` row, by
+ * `agentName`; a stored context injection, by its mark's `agent`. An
+ * earlier release stored these with no stamp, a notice under `user`, in
+ * the slot its agent's context reads, which on a residents' host every
+ * resident reads. Undefined for any other row, and for one of these kinds
+ * whose metadata names no owner (a receipt that names no drafts), which an
+ * undo takes out as it does any other arrival.
+ */
+function legacyNoticeOwner(metadata: MessageMetadata | undefined): string | undefined {
+  const meta = metadata as Record<string, unknown> | undefined;
+  if (meta?.system !== true) return undefined;
+  switch (meta.kind) {
+    case 'prose-drafts':
+    case 'delivery-receipt':
+      return typeof meta.draftOwner === 'string' ? meta.draftOwner : undefined;
+    case 'auto-continue':
+      return typeof meta.agentName === 'string' ? meta.agentName : undefined;
+    case STORED_INJECTION_KIND:
+      return storedInjectionMarkOf(meta)?.agent;
+    default:
+      return undefined;
+  }
 }
 
 /** What an undo on the window (#291, decision 4) keeps for its redo. */
@@ -5384,10 +5416,17 @@ export class AgentFramework {
         ...(judge && judgeOptions?.timeoutMs !== undefined ? { judgeTimeoutMs: judgeOptions.timeoutMs } : {}),
         ...(judge && judgeOptions?.onError !== undefined ? { judgeOnError: judgeOptions.onError } : {}),
         emitTrace: (e) => framework.emitTrace(e),
-        addMessage: (p, c, m, forAgent, placement, audience) => framework.addMessage(p, c, m as MessageMetadata,
-          forAgent || placement || audience
-            ? { ...(forAgent ? { forAgent } : {}), ...(placement ? { placement } : {}), ...(audience ? { audience } : {}) }
-            : undefined),
+        // A batch's line names the agents of its group, and is stored where a
+        // write that names no agent is: for those of them that read that
+        // slot, or as such a write when none does (readersNamed), as a
+        // process response's messages are.
+        addMessage: (p, c, m, forAgent, placement, given) => {
+          const audience = given && given.length > 0 && !forAgent ? framework.readersNamed(given) : given;
+          return framework.addMessage(p, c, m as MessageMetadata,
+            forAgent || placement || audience
+              ? { ...(forAgent ? { forAgent } : {}), ...(placement ? { placement } : {}), ...(audience ? { audience } : {}) }
+              : undefined);
+        },
         requestInference: (agentName, reason, source, provenance, after) => {
           framework.pendingRequests.push({
             agentName, reason, source, timestamp: Date.now(),
@@ -15488,9 +15527,11 @@ export class AgentFramework {
    * undo still takes) carries none, and the presentation index reads it as
    * an arrival, so an undo that took it out as arrived would see it come
    * back at the agent's next point: it is the agent's own when it is stored
-   * under the agent's voice (isOwnParticipant), or holds only results of
+   * under the agent's voice (isOwnParticipant), holds only results of
    * calls an own row of the window made, which such a release stored under
-   * `user`.
+   * `user`, or is a framework notice whose metadata names the agent as its
+   * owner (legacyNoticeOwner: a drafts notice, an `[auto-continue]` row, a
+   * stored injection), which such a release stored under `user` too.
    */
   private windowBodiesFrom(cm: ContextManager, from: number, agent: Agent): WindowBody[] {
     const bodies: WindowBody[] = [];
@@ -18780,11 +18821,13 @@ export class AgentFramework {
     const eventChannel = (event as { metadata?: { channelId?: unknown } }).metadata?.channelId;
     const namesChannel = typeof eventChannel === 'string' && eventChannel !== '';
     // Who the messages are for (#291's audience stamp): the agents the
-    // response's inference request names (requestedAudience). A request for
-    // every agent (`true`), or none, leaves them to addMessage, which stamps
-    // a write that names no agent for the agents that take untargeted
-    // inbound in its slot: the agents `true` wakes there. A message that
-    // carries a tune-out's hold is for nobody, whatever the request.
+    // response's inference request names that read the slot the messages
+    // land in (requestedAudience). A request for every agent (`true`), or
+    // none, or one naming only agents that don't read that slot, leaves them
+    // to addMessage, which stamps a write that names no agent for the agents
+    // that take untargeted inbound in its slot: the agents `true` wakes
+    // there. A message that carries a tune-out's hold is for nobody,
+    // whatever the request.
     const requested = this.requestedAudience(response.requestInference);
     const localInput = event.type === 'external-message' || event.type === 'api:message';
     let added: WritePlacement | undefined;
@@ -18870,21 +18913,42 @@ export class AgentFramework {
   /**
    * Who a module's process response's messages are for when its inference
    * request names agents (#291's audience stamp): those of them registered
-   * here, once each, in the order named, whether or not the event gate then
-   * lets their wake through; the delivery agent when it names none
-   * registered. The messages are stored where a write that names no agent
-   * is, the delivery agent's store, whoever these are: on a residents' host
-   * the shared slot every resident reads. An agent named here that doesn't
-   * read that slot is stamped all the same, as an inbound message's target
-   * is. Undefined for a request for every agent (`true`), for none, or for
-   * an empty list, which leave the stamp to addMessage (untargetedAudience).
+   * here that read the slot the messages land in (readersNamed), once each,
+   * in the order named, whether or not the event gate then lets their wake
+   * through; the delivery agent when it names none registered. The messages
+   * are stored where a write that names no agent is, the delivery agent's
+   * store, whoever these are: on a residents' host the shared slot every
+   * resident reads. Undefined for a request for every agent (`true`), for
+   * none, for an empty list, or for one whose registered agents don't read
+   * that slot (an isolated job, a conversation fork), which leave the stamp
+   * to addMessage (untargetedAudience): stamped for those agents alone, the
+   * messages would be in no window.
    */
   private requestedAudience(requested: EventResponse['requestInference']): string[] | undefined {
     if (!Array.isArray(requested) || requested.length === 0) return undefined;
     const named = [...new Set(requested)].filter((name) => this.agents.has(name));
-    if (named.length > 0) return named;
+    if (named.length > 0) return this.readersNamed(named);
     const delivery = this.deliveryAgent();
     return delivery ? [delivery.name] : undefined;
+  }
+
+  /**
+   * Of the agents a write that names no agent (no `forAgent`) is said to be
+   * for (`named`, non-empty), those that read the slot it lands in, the
+   * delivery agent's own: its owners and the agents that observe it (the
+   * registry's readersOf), in the order named. Undefined when none of them
+   * reads it, so the write takes addMessage's stamp for a write that names
+   * no agent in that slot (defaultAudience): a stamp naming only agents
+   * that can't read the slot puts the row in no window. Where the registry
+   * places no slot for the delivery agent, `named` as given.
+   */
+  private readersNamed(named: readonly string[]): string[] | undefined {
+    const delivery = this.deliveryAgent();
+    const slot = delivery ? this.registry.ownSlotOf(delivery.name) : undefined;
+    if (!slot) return [...named];
+    const readers = this.registry.readersOf(slot);
+    const reading = named.filter((name) => readers.includes(name));
+    return reading.length > 0 ? reading : undefined;
   }
 
   // ==========================================================================
@@ -38995,10 +39059,13 @@ export class AgentFramework {
    * stamp): the event's recipients, as its row's stamp names them
    * (inboundAudience), so it reads as following "the one above" only where
    * that one is, and a co-resident the event wasn't for is neither shown it
-   * nor woken by it. It goes through addMessage, which stores it at once and
-   * presents it to each of them at rest or at their next point, as it does
-   * the event; a wake for it reads its row (readsRowFor), as the event's
-   * own wake does.
+   * nor woken by it. It is stored where a write that names no agent is, so
+   * it is for those of them that read that slot; where none does (an event
+   * for a conversation fork alone), it is stamped as a write that names no
+   * agent (readersNamed), and its wake still goes to the recipients. It
+   * goes through addMessage, which stores it at once and presents it to
+   * each of them at rest or at their next point, as it does the event; a
+   * wake for it reads its row (readsRowFor), as the event's own wake does.
    */
   private considerWakeOnboarding(event: {
     serverId: string;
@@ -39022,12 +39089,16 @@ export class AgentFramework {
       const text = this.wakeOnboardingText(offer, { policyName: d.policyName, behavior: String(d.behavior), tags: event.tags ?? [], wake });
       // An event with no recipients wakes those that take untargeted inbound, as on main.
       const readers = event.recipients.length > 0 ? [...event.recipients] : this.registry.untargetedRecipients();
+      // The notice is stored where a write that names no agent is: for those
+      // of them that read that slot, or as such a write when none does
+      // (readersNamed), as a process response's messages are.
+      const audience = readers.length > 0 ? this.readersNamed(readers) : readers;
       const placement: WritePlacement = {};
       this.addMessage(
         'user',
         [{ type: 'text', text }],
         { system: true, kind: 'wake-onboarding', serverId: event.serverId } as MessageMetadata,
-        { placement, audience: readers },
+        { placement, ...(audience ? { audience } : {}) },
       );
       // Recorded once the notice is stored: a notice that failed to be written is offered again.
       // An earlier acceptance's rule names stay on record while the new question is open.
