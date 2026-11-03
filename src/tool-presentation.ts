@@ -32,7 +32,8 @@ const MAX_BYTES = 256 * 1024;
  */
 const NONBLOCK = typeof constants.O_NONBLOCK === 'number' ? constants.O_NONBLOCK : 0;
 const MAX_DESCRIPTION_CHARS = 32768;
-const protectedNames = new Set(['set_tool_visibility', 'set_tool_description', 'workspace--read']);
+// The toolsets meta-tools are how a hidden tool is reached again, so they stay.
+const protectedNames = new Set(['set_tool_visibility', 'set_tool_description', 'workspace--read', 'toolsets--open', 'toolsets--act', 'toolsets--look', 'toolsets--close']);
 export const isPresentationTool = (name: string): boolean => name === 'set_tool_visibility' || name === 'set_tool_description';
 const hash = (value: string): string => createHash('sha256').update(value).digest('hex');
 
@@ -85,7 +86,8 @@ function quotedList(names: string[], conjunction: 'and' | 'or' = 'and', quote: (
 
 /**
  * Every problem that keeps a document from being used, each by where it is;
- * none for a usable one. A defaults file (`descriptionsOnly`) may set
+ * none for a usable one. An object with no keys never reaches this:
+ * parseDocument() reads it as the empty document first. A defaults file (`descriptionsOnly`) may set
  * descriptions only, since visibility is the resident's to choose.
  */
 function documentProblems(doc: unknown, descriptionsOnly: boolean): string[] {
@@ -123,8 +125,16 @@ function documentProblems(doc: unknown, descriptionsOnly: boolean): string[] {
 
 function parseDocument(raw: string, descriptionsOnly: boolean): PresentationDocument {
   let doc: unknown;
-  try { doc = JSON.parse(raw); }
+  // Some Windows editors save UTF-8 with a leading U+FEFF, which read() keeps
+  // and JSON.parse refuses; drop exactly one, as parseGateJson does (#758).
+  try { doc = JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw); }
   catch (error) { throw new PresentationFileError([`it isn't valid JSON: ${errorMessage(error)}`]); }
+  // An object with no keys carries no settings, so it's the empty document,
+  // as a missing resident file is: it's what an operator writes by hand to
+  // start one. A missing defaults file is still reported, by read().
+  // A 0-byte file isn't JSON and still refuses, since the store's
+  // temp-and-rename never writes one: that's what a lost file looks like.
+  if (doc && typeof doc === 'object' && !Array.isArray(doc) && Object.keys(doc).length === 0) return { version: 1, tools: {} };
   const problems = documentProblems(doc, descriptionsOnly);
   if (problems.length) throw new PresentationFileError(problems);
   return doc as PresentationDocument;
@@ -166,7 +176,7 @@ function lockLeftBehind(error: unknown): string {
 }
 
 export function presentationTools(path: string): ToolDefinition[] {
-  const signpost = ` Read the generated catalogue with workspace--read {"path":${JSON.stringify(path)},"limit":140}. Hidden tools remain available; changes affect the next newly compiled request, not an in-flight stream.`;
+  const signpost = ` Read the generated catalogue with workspace--read {"path":${JSON.stringify(path)},"limit":140}. A hidden tool moves out of your tool list into the host's "settings" toolset (an MCPL server's tool, into that server's tab): toolsets--look lists it there, and toolsets--act calls it once that toolset is open. Changes affect the next newly compiled request, not an in-flight stream.`;
   return [
     {name:'set_tool_visibility', description:'Show or hide a tool definition. Hiding does not revoke permission.' + signpost,
       inputSchema:{type:'object',properties:{name:{type:'string'},visible:{type:'boolean'}},required:['name','visible'],additionalProperties:false}},
@@ -335,7 +345,7 @@ export class ToolPresentation {
     if (field === 'description' && typeof args.description === 'string' && characters(args.description) > MAX_DESCRIPTION_CHARS)
       throw new PresentationRefusal(`Nothing was changed: the description is ${count(characters(args.description))} characters, over the ${count(MAX_DESCRIPTION_CHARS)} allowed. Shorten it and call set_tool_description again.`);
     if (field === 'visible' && args.visible === false && protectedNames.has(name))
-      throw new PresentationRefusal(`Nothing was changed: ${name} can't be hidden, since workspace--read, set_tool_visibility and set_tool_description are how you read the catalogue and undo these changes. Calling this again won't change that.`);
+      throw new PresentationRefusal(`Nothing was changed: ${name} can't be hidden, since workspace--read, set_tool_visibility, set_tool_description and the toolsets-- tools are how you read the catalogue, reach hidden tools and undo these changes. Calling this again won't change that.`);
     return name;
   }
 }
@@ -350,7 +360,7 @@ export function renderCatalogue(snapshot: PresentationSnapshot): string {
     '# Tool catalogue — generated from currently available tools', '',
     `Revision: ${snapshot.revision}`, '',
     `${snapshot.entries.length} tools: ${visible} visible, ${snapshot.entries.length-visible} hidden.`,
-    'Visible = supplied in new requests. Hidden = stored away, still available.',
+    'Visible = not hidden by you: in your tool list, unless the host keeps it in its "settings" toolset or a server\'s tab (toolsets--look shows those). Hidden = moved into the "settings" toolset, or its MCPL server\'s tab: toolsets--look shows it, toolsets--act calls it once that toolset is open.',
     'These are your visibility choices, not fixed primary/secondary rankings.',
     'Copy exact names from the index; similar-sounding names may not exist.',
     'Index by source: line N.',

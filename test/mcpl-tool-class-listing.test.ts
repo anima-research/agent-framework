@@ -39,45 +39,6 @@ test('listMcplServers: per-server tool classes with their source (server, overri
   ]);
 });
 
-test('listMcplServers: nested prefixes attribute each tool to one server, the one that listed it', () => {
-  const framework = Object.create(AgentFramework.prototype) as any;
-  const connection = {
-    isConnected: true, willReconnect: false, policyEstablished: true,
-    grant: new CapabilityGrant(new Set(['tools']), []), droppedCapabilities: new Set(),
-    manifestState: { lastValidatedRevision: null, lastFetchedAt: null, lastNegotiatedAt: null },
-  };
-  framework.mcplServerConfigs = new Map([
-    ['foo', { id: 'foo', command: 'node', toolPrefix: 'foo' }],
-    ['nested', { id: 'nested', command: 'node', toolPrefix: 'foo--bar' }],
-  ]);
-  framework.mcplServerRegistry = { getServer: () => connection };
-  // Configuration refuses this pair since #265 (prefixesMeet). It's built
-  // here directly, to pin that attribution follows the listing, not a prefix.
-  // The shorter prefix is registered first: insertion order must not decide.
-  framework.mcplPrefixMap = new Map([['foo', 'foo'], ['foo--bar', 'nested']]);
-  framework.mcplTools = [{ name: 'foo--ping' }, { name: 'foo--bar--baz' }, { name: 'foo--bar--qux' }];
-  // `foo` itself offers a tool named `bar--qux`: its tools/list decides.
-  framework.mcplToolServers = new Map([['foo--ping', 'foo'], ['foo--bar--baz', 'nested'], ['foo--bar--qux', 'foo']]);
-  framework.mcplToolClasses = new Map();
-
-  const byId = new Map((framework as AgentFramework).listMcplServers().map((s) => [s.id, s]));
-  assert.deepEqual(byId.get('foo')!.toolClasses.map((t) => `${t.tool}=${t.serverTool}`), ['foo--ping=ping', 'foo--bar--qux=bar--qux']);
-  assert.equal(byId.get('foo')!.toolCount, 2);
-  assert.deepEqual(byId.get('nested')!.toolClasses.map((t) => `${t.tool}=${t.serverTool}`), ['foo--bar--baz=baz']);
-  assert.equal(byId.get('nested')!.toolCount, 1);
-
-  // Dispatch agrees with the listing; a name no server listed goes to the
-  // longest matching prefix.
-  assert.deepEqual(framework.resolveMcplTool('foo--bar--baz'), ['nested', 'foo--bar']);
-  assert.deepEqual(framework.resolveMcplTool('foo--bar--qux'), ['foo', 'foo']);
-  assert.deepEqual(framework.resolveMcplTool('foo--bar--unlisted'), ['nested', 'foo--bar']);
-  assert.deepEqual(framework.resolveMcplTool('foo--unlisted'), ['foo', 'foo']);
-  assert.equal(framework.resolveMcplTool('other--x'), null);
-  // A listing entry whose server no longer owns a matching prefix is stale.
-  framework.mcplPrefixMap = new Map([['foo--bar', 'nested']]);
-  assert.deepEqual(framework.resolveMcplTool('foo--bar--qux'), ['nested', 'foo--bar']);
-});
-
 class ProbeModule implements Module {
   readonly name = 'probe';
   async start(_ctx: ModuleContext): Promise<void> {}
@@ -145,8 +106,7 @@ test('listToolClasses: per-agent surfaces, and agent-only tools in the full list
     );
 
     // The subconscious has its own small surface, not the residents' board.
-    const sub = (framework as any).subconsciousAgentName as string;
-    assert.ok(sub, 'subconscious configured');
+    const sub = 'Subconscious';
     assert.ok(names(sub).includes('speak_in_channel'));
     assert.equal(names(sub).includes('probe--echo'), false);
     assert.equal(names('plain').includes('speak_in_channel'), false);

@@ -2,8 +2,9 @@
  * Held prose drafts: a resident's plain speech that was not sent.
  *
  * Plain speech is held back for reasons that are right in themselves: an
- * explicit send in the same round suppresses the round's prose (so a "sent
- * it" postscript is not posted twice), a turn may have no destination, and a
+ * explicit send suppresses plain speech aimed where it may have posted, in
+ * its round and the turn's later ones (so a "sent it" postscript is not
+ * posted twice), a turn may have no destination, and a
  * malformed or unresolvable routing prefix bounces. Before drafts, the held words were
  * kept only as a count (or, in explicit mode, as one in-memory latest-wins
  * clipboard): the law was right, and the penalty was amnesia. A draft keeps
@@ -53,7 +54,7 @@ export const PROSE_DRAFT_RECORD_TYPE = 'framework/prose-draft';
 
 /** Why words were held instead of sent. */
 export type DraftReason =
-  /** An explicit send in the same round suppressed the round's plain speech. */
+  /** An explicit send in its turn may have posted where the speech was going. */
   | 'explicit-send'
   /** The speech had no destination (no route this turn, or a failed envelope). */
   | 'no-destination'

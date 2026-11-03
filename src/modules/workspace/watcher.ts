@@ -38,13 +38,13 @@ export interface WatcherLifecycle {
   onReattach?: () => void;
 }
 
-interface RootIdentity {
+export interface RootIdentity {
   dev: number;
   ino: number;
   birthtimeMs: number;
 }
 
-const identityOf = (stat: Stats): RootIdentity => ({ dev: stat.dev, ino: stat.ino, birthtimeMs: stat.birthtimeMs });
+export const identityOf = (stat: Stats): RootIdentity => ({ dev: stat.dev, ino: stat.ino, birthtimeMs: stat.birthtimeMs === stat.ctimeMs ? 0 : stat.birthtimeMs });
 
 /**
  * Manages filesystem watching for a single mount.
@@ -126,10 +126,15 @@ export class MountWatcher {
       // another mount's directory, the mount's ignore list and editors' swap
       // and backup files. chokidar 4
       // compares a string given here with the whole absolute path, so the
-      // list itself would match nothing.
-      ignored: (path: string) => {
+      // list itself would match nothing. It asks without stats before it
+      // stats a path, asking again with them before it watches the path, and
+      // when a path it watches is removed. So where it gives no kind, no
+      // directory-only pattern matches: a directory one matches never passed
+      // the check with its stats, so it is never watched, and its removal
+      // never reported.
+      ignored: (path: string, stats?: Stats) => {
         const relative = this.toRelative(path);
-        return relative !== null && passedOverAt(relative, ignore, this.others) !== undefined;
+        return relative !== null && passedOverAt(relative, ignore, this.others, stats?.isDirectory() ?? false) !== undefined;
       },
       // Its filter for editors' files tested the whole path, so a directory
       // with a dot in its name hid every `*.swp` beneath it, and the walk
@@ -476,10 +481,12 @@ export class MountWatcher {
   private sameIdentity(a: RootIdentity, b: RootIdentity): boolean {
     // birthtimeMs tells a root made again from a removed one whose inode
     // number it took, unless both were made within one tick of the clock or
-    // the file system keeps no birth time. A held root's removal shows in its
-    // link count instead, and where the root isn't held the rename's force
-    // covers those.
-    return a.dev === b.dev && a.ino === b.ino && a.birthtimeMs === b.birthtimeMs;
+    // either side's birth time can't be read (0: none kept, or one equal to
+    // the ctime, as where statx is unavailable or nothing has changed in the
+    // root since it was made). A held root's removal shows in its link count
+    // instead, and where the root isn't held the rename's force covers those.
+    return a.dev === b.dev && a.ino === b.ino
+      && (a.birthtimeMs === 0 || b.birthtimeMs === 0 || a.birthtimeMs === b.birthtimeMs);
   }
 
   private isErrno(err: unknown, code: string): boolean {

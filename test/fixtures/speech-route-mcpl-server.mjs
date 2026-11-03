@@ -1,8 +1,9 @@
 // MCPL fixture for speech routing, drafts and provenance tests.
 //
-// Registers the channels in CHANNELS (JSON array of {id,label}; two Discord
+// Registers the channels in CHANNELS (JSON array of {id,label,direction?}; two Discord
 // guild channels by default) and, on command, sends inbound traffic over
-// BOTH MCPL lanes. The TEST appends one JSON object per line to COMMAND_PATH:
+// BOTH MCPL lanes. The TEST appends one JSON object per line to COMMAND_PATH,
+// each acted on once its newline is written (writtenLines):
 //   {"op":"incoming","channelId":…,"messageId":…,"mode":"ambient"|"addressed",
 //    "text":…, "threadId"?, "metadata"?, "eventId"?, "coalesce"?}
 //   {"op":"dm","eventId":…,"authorId":…,"authorName"?,"rawChannelId":…,"text":…,
@@ -11,10 +12,12 @@
 //    "content"? (content blocks, instead of text; [] included)}
 //   {"op":"rename","channelId":…,"label":…}             (channels/changed)
 //   {"op":"publish-mode","mode":"delivered"|"not-delivered"|"no-receipt"|"error"|"hang"}
+//   {"op":"send-mode","mode":"delivered"|"no-channel"|"error"|"hang","answers"?:channelId}  (SEND_TOOL=1)
 //   {"op":"history","channelId":…,"history":[ChannelIncomingMessage…]}
 // Host-side channels/publish and channels/open calls are recorded to
 // STATUS_PATH as JSONL ({event:'publish', channelId, text, messageId}).
-import { appendFileSync, existsSync, readFileSync } from 'node:fs';
+import { appendFileSync } from 'node:fs';
+import { writtenLines } from './command-lines.mjs';
 import { createInterface } from 'node:readline';
 
 const statusPath = process.env.STATUS_PATH;
@@ -38,14 +41,15 @@ let nextId = 500;
 let processedCommands = 0;
 let publishMode = 'delivered';
 let publishErrorData;
+let sendMode = 'delivered';
+let sendAnswers;
 let posted = 0;
 const histories = new Map();
 
 const textBlock = (text) => [{ type: 'text', text }];
 
 function pollCommands() {
-  if (!commandPath || !existsSync(commandPath)) return;
-  const lines = readFileSync(commandPath, 'utf8').split('\n').filter(Boolean);
+  const lines = writtenLines(commandPath);
   for (const line of lines.slice(processedCommands)) {
     processedCommands++;
     const c = JSON.parse(line);
@@ -127,11 +131,16 @@ function pollCommands() {
       publishMode = c.mode;
       publishErrorData = c.detail;
       log('publish-mode', { mode: c.mode });
+    } else if (c.op === 'send-mode') {
+      sendMode = c.mode;
+      sendAnswers = c.answers;
+      log('send-mode', { mode: c.mode });
     } else if (c.op === 'history') {
       histories.set(c.channelId, c.history);
     }
   }
 }
+// publish-outcome's two-part pin pauses four of these between a line's parts.
 const pollTimer = setInterval(pollCommands, 25);
 
 const rl = createInterface({ input: process.stdin });
@@ -176,7 +185,7 @@ rl.on('line', (line) => {
       method: 'channels/register',
       params: {
         channels: CHANNELS.map((c) => ({
-          id: c.id, type: 'discord', label: c.label, direction: 'bidirectional', initiallyOpen: true,
+          id: c.id, type: 'discord', label: c.label, direction: c.direction ?? 'bidirectional', initiallyOpen: true,
         })),
       },
     });
@@ -188,7 +197,7 @@ rl.on('line', (line) => {
     const history = msg.params?.history ? histories.get(channelId) : undefined;
     log('channel-opened', { channelId, history: !!history });
     reply(msg.id, {
-      channel: { id: channel.id, type: 'discord', label: channel.label, direction: 'bidirectional' },
+      channel: { id: channel.id, type: 'discord', label: channel.label, direction: channel.direction ?? 'bidirectional' },
       ...(history ? { history } : {}),
     });
     return;
@@ -222,7 +231,28 @@ rl.on('line', (line) => {
     return;
   }
   if (msg.method === 'tools/list') {
-    reply(msg.id, { tools: [] });
+    reply(msg.id, {
+      tools: process.env.SEND_TOOL === '1'
+        ? [{
+            name: 'send_message',
+            description: 'Send a message to a channel.',
+            inputSchema: { type: 'object', properties: { channelId: { type: 'string' }, text: { type: 'string' } }, required: ['channelId', 'text'] },
+          }]
+        : [],
+    });
+    return;
+  }
+  if (msg.method === 'tools/call' && msg.params?.name === 'send_message' && process.env.SEND_TOOL === '1') {
+    const args = msg.params?.arguments ?? {};
+    log('send', { channelId: args.channelId, text: args.text, mode: sendMode });
+    if (sendMode === 'hang') return;
+    if (sendMode === 'error') {
+      reply(msg.id, { content: [{ type: 'text', text: `Discord refused part 2. Attempted destination: ${args.channelId}` }], isError: true });
+    } else if (sendMode === 'no-channel') {
+      reply(msg.id, { content: [{ type: 'text', text: 'sent' }] });
+    } else {
+      reply(msg.id, { content: [{ type: 'text', text: JSON.stringify({ messageId: `sent-${++posted}`, channelId: sendAnswers ?? args.channelId }) }] });
+    }
     return;
   }
   if (msg.method === 'tools/call') {

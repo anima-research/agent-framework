@@ -55,15 +55,19 @@ class QueuedStreamsMembrane extends MockMembrane {
   }
 }
 
+/** A tool whose result is the data given: by default a 30,000-character
+ *  blob, or the blocks of a content array, such as an image beside what a
+ *  test puts there. */
 class BlobToolModule implements Module {
   readonly name = 'canned';
+  constructor(private readonly result: Pick<ToolResult, 'data' | 'dataIsContent'> = { data: { blob: 'x'.repeat(30_000) } }) {}
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] {
     return [{ name: 'fetch', description: 'blob', inputSchema: { type: 'object', properties: {} } }];
   }
   async handleToolCall(): Promise<ToolResult> {
-    return { success: true, data: { blob: 'x'.repeat(30_000) } };
+    return { success: true, ...this.result };
   }
   async onProcess(event: ProcessEvent): Promise<EventResponse> {
     if (event.type === 'external-message') {
@@ -426,6 +430,55 @@ describe('physical-window mid-turn restart (issue #92)', () => {
   // it. The restart trace's inputTokens is the projection, so the tests below
   // pin it whole.
   const APPENDED = 6_049;
+
+  it("counts an embedded resource's image as the image it's sent as", async () => {
+    // A 170k prompt with 2k output and the 32k reserve crosses the window
+    // whatever the round adds, so each turn restarts once and its projection
+    // shows what the image round added: the same for an MCP image block and
+    // for an embedded resource's image blob, each sent as a native image.
+    const png = Buffer.from('89504e470d0a1a0a', 'hex').toString('base64');
+    const projected = async (blocks: unknown[]) => {
+      const t = await windowTurn([
+        [
+          round('call_1', { inputTokens: 20_000, cacheReadTokens: 150_000, outputTokens: 2_000 }),
+          round(null, { inputTokens: 21_000, cacheReadTokens: 300_000, outputTokens: 2_500 }),
+        ],
+        afterRestart,
+      ], new BlobToolModule({ data: blocks, dataIsContent: true }));
+      try {
+        assert.ok(t.done, 'the turn should finish');
+        assert.strictEqual(t.restarts.length, 1);
+        return t.restarts[0]!.inputTokens!;
+      } finally {
+        await t.close();
+      }
+    };
+    const image = { type: 'image', data: png, mimeType: 'image/png' };
+    const inline = await projected([image]);
+    const embedded = await projected([{ type: 'resource', resource: { uri: 'file:///zz/shot.png', mimeType: 'image/png', blob: png } }]);
+    assert.ok(inline >= 170_000 + 2_000 + 32_000 + 1_600, String(inline));
+    assert.strictEqual(embedded, inline);
+    // An image whose result's markers pass the cap together goes as the
+    // stored text (goesNative), so it adds nothing beyond that text: the
+    // projection counts the images the live copy sends, not the ones the
+    // data holds. 400 embedded pdfs' markers, 77 characters each, pass the
+    // default cap of 24,000; the same markers alone project within a few
+    // tokens of them beside the image, where 1,600 for the image would show.
+    const pdf = { type: 'resource', resource: { uri: 'file:///zz/doc.pdf', mimeType: 'application/pdf', blob: png } };
+    const markers = Array.from({ length: 400 }, () => pdf);
+    const besideImage = await projected([image, ...markers]);
+    const alone = await projected(markers);
+    assert.ok(Math.abs(besideImage - alone) < 100, `${besideImage} beside the image, ${alone} alone`);
+    // Beside an image the live copy goes natively, each text block cut at
+    // the cap on its own, so each embedded text counts as the text sent, not
+    // as the stored copy, which is cut at the cap once (Ada-1017, room-203
+    // #207161): a second 30,000-character text adds about the cap's 6,000
+    // tokens more.
+    const text = { type: 'resource', resource: { uri: 'file:///zz/notes.txt', mimeType: 'text/plain', text: 'z'.repeat(30_000) } };
+    const one = await projected([image, text]);
+    const two = await projected([image, text, text]);
+    assert.ok(two - one > 5_000, `${two} with two texts, ${one} with one`);
+  });
 
   it('counts a cache-write prompt term toward a restart', async () => {
     // 10k fresh + 30k cache write + 120k cache read = a 160k prompt; with 2k

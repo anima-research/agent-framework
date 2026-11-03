@@ -24,15 +24,27 @@ structured provider `stopReason: 'refusal'`, not keywords in output, ordinary
 provider errors, or natural-language refusal text.
 
 On that signal, every result in the batch is withheld. Tool calls, result IDs,
-and error flags remain intact; each entire payload becomes the guard's notice,
+and error flags remain intact; each entire payload becomes the guard's notice.
+For a result that isn't an error it is
 
 > Tool result withheld by the guard. The tool has already executed.
 
-followed by where the original is (see "Where a withheld original goes"
-below), and, for the workspace's `materialize`, `sync` and `delete`, the fields
-of their results that say what they acted on. The same holds for every withheld
-settlement: a refusal, an aborted stream, a batch that was never submitted, and
-one whose audit sync failed.
+for a call that was refused and never ran (`ToolResult.refused`),
+
+> Tool result withheld by the guard. The tool didn't run.
+
+and for any other error result (`isError`), which can come before or after the
+tool runs,
+
+> Tool result withheld by the guard. The call returned an error, and this notice can't say whether the tool ran.
+
+The notice is followed by where the original is (see "Where a withheld original
+goes" below); for an error result whose original was written to a workspace
+file, by "Read it before calling again."; and, for the workspace's
+`materialize`, `sync` and `delete`, by the fields of their results that say
+what they acted on. The same holds for every withheld settlement: a refusal, an
+aborted stream, a batch that was never submitted, and one whose audit sync
+failed.
 
 The refused attempt's partial assistant output is discarded. Inference is
 retried once on the same model, within the same logical turn; executed tools
@@ -159,7 +171,9 @@ exchange, its unsubmitted payload is not admitted to memory.
 Each withheld result's original is written, as the result was stored (its
 text; for a result over the inline cap, its capped text, whose own note names
 the file with the whole output), to a file under the `tool-results/`
-directory of the first writable mount without an include, named
+directory of the first writable mount without an include that isn't
+configured direct (a direct mount's directory is a checkout, whether it runs
+direct or as 'chronicle'), named
 `<date>-withheld-<batch>-<index>-<toolUseId>.txt` with any character outside
 `A-Za-z0-9._-` replaced and the name cut to 80 characters. Its stub names it:
 
@@ -168,7 +182,7 @@ directory of the first writable mount without an include, named
 
 Otherwise the stub names the guard's audit record, for an operator:
 
-- with no writable mount without an include, or once the framework is
+- with no writable mount without an include that isn't configured direct, or once the framework is
   stopping: "Its result is kept in the guard's audit record
   (framework/tool-result-guard), for an operator.";
 - when the write failed: "Writing its result to workspace file … failed, so it
@@ -224,7 +238,7 @@ Two audit records describe it, each with `batchId`, `messageId` and
   `{ toolUseId, path }` is a written file; with `error`, a failed write; with
   `unfinished: true`, a write still under way at the deadline. `{ toolUseId,
   error }` is a write that threw. `{ toolUseId, skipped }` is no write:
-  `no_workspace_file` (no writable mount without an include, or the framework
+  `no_workspace_file` (no writable mount without an include that isn't configured direct, or the framework
   was stopping), `workspace_unanswered` (an earlier write was still under way past its
   deadline), `batch_deadline` (the batch had no time left to start another write), or `branch_changed` (the workspace declined the write before its tree entry was set).
 
@@ -243,7 +257,7 @@ Requests sent by the framework or the direct Agent inference API are compiled af
 
 Concurrent starts on one Agent, a direct inference call beside a framework-driven turn, are not made safe here: an Agent compiles its request while its status still reads idle (or ready), as before this change, and the wait for annotations lengthens that window, by up to the batch's deadline. `abortInference()` returns false during a direct call's initial assembly; a caller's own abort signal is checked before the request is sent, and again after the refusal retry's annotation wait. The direct API reads its unguarded tool results once, after the first compile, and sends the same ones with the refusal retry.
 
-At stop, the framework lets running annotations finish while the workspace is up. An annotation that starts after that drain writes no file and is saved before the store closes. A framework-driven turn that compiled across stop is discarded before its stream is driven, even if the same framework has since restarted. A `start()` after a finished `stop()` starts a new lifecycle, with the spill gate open again; a `start()` made while a `stop()` is still running is refused. These lifecycle gates cover framework-driven turns; direct Agent calls use their caller's abort signal.
+At stop, the framework lets running annotations finish while the workspace is up. An annotation that starts after that drain writes no file and is saved before the store closes. A framework-driven turn that compiled across stop is discarded before its stream is driven. The spill gate closes at that drain. A `stop()` tried again after a failed one reopens it until its own drain, and nothing else does, since a stopped framework doesn't start again (`start()` is refused once a `stop()` is admitted); a new framework on the store has a gate of its own. These lifecycle gates cover framework-driven turns; direct Agent calls use their caller's abort signal.
 
 For example, an operator can inspect records without changing the agent's
 view:
@@ -261,10 +275,6 @@ retroactive and does not rewrite results already accepted into memory.
 
 ## Known limits
 
-- **Explicit-send suppression across a budget restart.** A guard recovery
-  carries the same-turn send suppression, so a text-only recovery after a
-  successful explicit send is not routed (locus/hybrid). Context-budget
-  restarts still re-enter without it (inherited, unchanged here).
 - **Audit growth.** Every guarded batch, accepted ones included, archives
   `originals`, `content`, and `wireResults` indefinitely. There is no
   retention policy and no restore tool; large payloads are blobs, but a full

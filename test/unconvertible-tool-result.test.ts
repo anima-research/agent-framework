@@ -13,7 +13,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { AgentFramework } from '../src/index.js';
-import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ScriptToolResult, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
+import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
+import { scriptCall } from './helpers/script-call.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 function cyclic(): Record<string, unknown> {
@@ -100,12 +101,12 @@ class OddResults implements Module {
   getTools(): ToolDefinition[] {
     return Object.keys(RESULTS).map((name) => ({ name, description: name, inputSchema: { type: 'object', properties: {} } }));
   }
-  /** Two tools also reached through the `utils` meta-tool. */
+  /** Two of the tools again as utilities (`u_` names), reached through toolsets--act. */
   getUtilities(): ToolDefinition[] {
-    return ['cyclic', 'datedata'].map((name) => ({ name, description: name, inputSchema: { type: 'object', properties: {} } }));
+    return ['u_cyclic', 'u_datedata'].map((name) => ({ name, description: name, inputSchema: { type: 'object', properties: {} } }));
   }
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
-    return RESULTS[call.name]!() as ToolResult;
+    return RESULTS[call.name.replace(/^u_/, '')]!() as ToolResult;
   }
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
     if (event.type !== 'external-message') return {};
@@ -149,9 +150,10 @@ async function setUp(t: TestContext, tools: string[], extraModules: Module[] = [
   const logged: string[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
   const membrane = new MockMembrane();
-  // `utils:NAME` runs the module's utility NAME through the utils meta-tool.
-  const toolUse = (tool: string) => tool.startsWith('utils:')
-    ? { type: 'tool_use' as const, id: `call-${tool}`, name: 'utils', input: { action: 'run', name: `odd--${tool.slice('utils:'.length)}`, args: {} } }
+  // `act:NAME` runs the module's utility NAME through toolsets--act, the
+  // host's built-in toolset being open.
+  const toolUse = (tool: string) => tool.startsWith('act:')
+    ? { type: 'tool_use' as const, id: `call-${tool}`, name: 'toolsets--act', input: { tool: `odd--${tool.slice('act:'.length)}`, args: {} } }
     : { type: 'tool_use' as const, id: `call-${tool}`, name: tool.includes('--') || tool === 'read_image' ? tool : `odd--${tool}`, input: tool === 'read_image' ? { path: 'board/x.png' } : {} };
   membrane.pushResponse(createMockResponse(tools.map(toolUse), 'tool_use'));
   membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Noted.' }]));
@@ -166,6 +168,8 @@ async function setUp(t: TestContext, tools: string[], extraModules: Module[] = [
   });
   // Bounded, so a turn that never settled can't keep the file from ending.
   t.after(() => within(framework.stop(), 5_000, 'stop() in cleanup').catch(() => {}));
+  // The host's built-in toolset, where module utilities are, open for act.
+  await framework.executeToolCall({ id: 'open-settings', name: 'toolsets--open', input: { toolset: 'settings' }, callerAgentName: 'assistant' });
   return { framework, membrane, logged, odd };
 }
 
@@ -276,18 +280,17 @@ test('a script reads a quiet failure as its error text, and an unusable result a
   const { framework } = await setUp(t, []);
   // A script's call is answered through the event loop, so it has to run.
   framework.start();
-  const script = (tool: string) => (framework as unknown as {
-    handleScriptToolCall(agent: string, tool: string, args: Record<string, unknown>): Promise<ScriptToolResult>;
-  }).handleScriptToolCall('assistant', `odd--${tool}`, {});
+  const script = (tool: string) => scriptCall(framework, 'assistant', `odd--${tool}`, {});
+  const answer = (text: string, isError: boolean) => ({ refused: false, content: [{ type: 'text', text }], structuredContent: null, isError });
   // A failure the tool doesn't flag reads as the model reads it, isError
-  // false: the script's .is_error follows the result's flag, not its text.
-  assert.deepEqual(await within(script('quietfail'), 10_000, 'the call'), { text: 'unknown channel: c1', isError: false });
-  assert.deepEqual(await within(script('nulldataquiet'), 10_000, 'the call'), { text: 'gone', isError: false });
+  // false: the script's isError follows the result's flag, not its text.
+  assert.deepEqual(await within(script('quietfail'), 10_000, 'the call'), answer('unknown channel: c1', false));
+  assert.deepEqual(await within(script('nulldataquiet'), 10_000, 'the call'), answer('gone', false));
   // Text that only starts like an error isn't flagged as one: the flag is
   // the result's, not the text's prefix.
-  assert.deepEqual(await within(script('prefixquiet'), 10_000, 'the call'), { text: 'Error: quota is fine', isError: false });
-  assert.deepEqual(await within(script('cyclic'), 10_000, 'the call'), { text: `Error: ${unconvertible('cyclic', 'Converting circular structure to JSON')}`, isError: true });
-  assert.deepEqual(await within(script('getterthrows'), 10_000, 'the call'), { text: `Error: ${unreadable('getterthrows', 'a value with no text form')}`, isError: true });
+  assert.deepEqual(await within(script('prefixquiet'), 10_000, 'the call'), answer('Error: quota is fine', false));
+  assert.deepEqual(await within(script('cyclic'), 10_000, 'the call'), answer(unconvertible('cyclic', 'Converting circular structure to JSON'), true));
+  assert.deepEqual(await within(script('getterthrows'), 10_000, 'the call'), answer(unreadable('getterthrows', 'a value with no text form'), true));
   await within(framework.stop(), 10_000, 'stop()');
 });
 
@@ -296,24 +299,38 @@ test("a result the script's serializer can't convert reaches the script as an er
   // error first, so these returns are reached only past it: here, with the
   // dispatch answering a cyclic result directly.
   const { framework } = await setUp(t, []);
-  const internals = framework as unknown as {
-    dispatchScriptToolCall: () => Promise<ToolResult>;
-    handleScriptToolCall(agent: string, tool: string, args: Record<string, unknown>): Promise<ScriptToolResult>;
-  };
+  const internals = framework as unknown as { dispatchScriptToolCall: () => Promise<ToolResult> };
   const reason = 'Converting circular structure to JSON';
+  const expectFailure = (answer: Awaited<ReturnType<typeof scriptCall>>) => {
+    assert.equal(answer.refused, false);
+    if (answer.refused) return;
+    assert.equal(answer.isError, true);
+    assert.equal(answer.structuredContent, null);
+    const text = (answer.content[0] as { text: string }).text;
+    assert.ok(text.startsWith("tool 'odd--cyclic' returned a result that can't be converted to JSON, so the script can't receive it"), text);
+    assert.ok(text.includes(reason), text);
+  };
   internals.dispatchScriptToolCall = async () => ({ success: true, data: cyclic() });
-  const text = await internals.handleScriptToolCall('assistant', 'odd--cyclic', {});
-  assert.equal(text.isError, true);
-  assert.equal(text.structuredJson, undefined);
-  assert.ok(text.text.startsWith("Error: tool 'odd--cyclic' returned a result that can't be converted to JSON, so the script can't receive it"), text.text);
-  assert.ok(text.text.includes(reason), text.text);
+  expectFailure(await scriptCall(framework, 'assistant', 'odd--cyclic', {}));
   internals.dispatchScriptToolCall = async () => ({ success: true, structured: cyclic() });
-  const structured = await internals.handleScriptToolCall('assistant', 'odd--cyclic', {});
-  assert.equal(structured.isError, true);
-  assert.equal(structured.structuredJson, true);
-  const object = JSON.parse(structured.text) as { content: unknown[]; structuredContent: unknown; isError: boolean; error: string };
-  assert.deepEqual({ ...object, error: undefined }, { content: [], structuredContent: null, isError: true, error: undefined });
-  assert.ok(object.error.includes(reason), object.error);
+  expectFailure(await scriptCall(framework, 'assistant', 'odd--cyclic', {}));
+  // The tool's own error, copied into the failure, is cut, so the failure fits any script's memory.
+  internals.dispatchScriptToolCall = async () => ({ success: false, isError: true, error: 'e'.repeat(100_000), structured: cyclic() });
+  const long = await scriptCall(framework, 'assistant', 'odd--cyclic', {});
+  expectFailure(long);
+  if (!long.refused) {
+    const text = (long.content[0] as { text: string }).text;
+    assert.ok(text.length < 20_000 && text.includes('characters dropped here'), String(text.length));
+  }
+  // So is the reason, as a serializer's error with a long message gives it.
+  internals.dispatchScriptToolCall = async () => ({ success: true, structured: { toJSON() { throw new Error('r'.repeat(100_000)); } } });
+  const reasoned = await scriptCall(framework, 'assistant', 'odd--cyclic', {});
+  assert.equal(reasoned.refused, false);
+  if (!reasoned.refused) {
+    const text = (reasoned.content[0] as { text: string }).text;
+    assert.ok(text.startsWith("tool 'odd--cyclic' returned a result that can't be converted to JSON"), text.slice(0, 200));
+    assert.ok(text.length < 20_000 && text.includes('characters dropped here'), String(text.length));
+  }
 });
 
 test("the read_image tool's own handler gets the same check", async (t) => {
@@ -357,9 +374,9 @@ test("a caller that uses the result in process gets the module's own result, as 
   // executeToolCall, ModuleContext.callTool, and a utility through either.
   assert.ok(at(await framework.executeToolCall({ id: 'direct-date', name: 'odd--datedata', input: {} })) instanceof Date);
   assert.ok(at(await odd.ctx!.callTool({ id: 'ctx-date', name: 'odd--datedata', input: {} })) instanceof Date);
-  const viaUtils = { name: 'utils', input: { action: 'run', name: 'odd--datedata', args: {} } };
-  assert.ok(at(await framework.executeToolCall({ id: 'utils-date', ...viaUtils })) instanceof Date);
-  assert.ok(at(await odd.ctx!.callTool({ id: 'ctx-utils-date', ...viaUtils })) instanceof Date);
+  const viaAct = { name: 'toolsets--act', input: { tool: 'odd--u_datedata', args: {} }, callerAgentName: 'assistant' };
+  assert.ok(at(await framework.executeToolCall({ id: 'act-date', ...viaAct })) instanceof Date);
+  assert.ok(at(await odd.ctx!.callTool({ id: 'ctx-utility-date', name: 'odd--u_datedata', input: {} })) instanceof Date);
   // Its flags as the module returned them, and its getters unread.
   assert.deepEqual(await framework.executeToolCall({ id: 'direct-flags', name: 'odd--flagsread', input: {} }),
     { success: 1, isError: 0, endTurn: 0, data: { ok: 1 } });
@@ -373,14 +390,14 @@ test("a caller that uses the result in process gets the module's own result, as 
   await within(framework.stop(), 10_000, 'stop()');
 });
 
-test("the model's call through the utils meta-tool takes the checked form", async (t) => {
-  const { framework, membrane } = await setUp(t, ['utils:cyclic']);
+test("the model's call through toolsets--act takes the checked form", async (t) => {
+  const { framework, membrane } = await setUp(t, ['act:u_cyclic']);
   framework.pushEvent({ type: 'external-message', source: 'test', content: 'Run it.', metadata: {} });
   await within(framework.runUntilIdle(), 10_000, 'the turn');
   assert.equal(framework.getAgent('assistant')!.state.status, 'idle', 'the turn settled');
   const sent = membrane.lastStream!.receivedToolResults[0] as Array<{ content: unknown; isError: boolean }>;
   assert.deepEqual(sent.map((r) => ({ content: r.content, isError: r.isError })),
-    [{ content: unconvertible('cyclic', 'Converting circular structure to JSON'), isError: true }]);
+    [{ content: unconvertible('u_cyclic', 'Converting circular structure to JSON'), isError: true }]);
   await within(framework.stop(), 10_000, 'stop()');
 });
 
@@ -410,6 +427,6 @@ test("the direct Agent API reads each field of its caller's result once", async 
   ];
   const built = (agent as unknown as { buildToolResultMessages(r: unknown[]): Array<{ content: Array<{ content: string }> }> })
     .buildToolResultMessages(results);
-  assert.deepEqual(built[0].content.map((block) => block.content), [JSON.stringify('the payload'), 'what failed']);
+  assert.deepEqual(built[0].content.map((block) => block.content), ['the payload', 'what failed']);
 });
 

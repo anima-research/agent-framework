@@ -1,18 +1,19 @@
 /**
- * `npm test` passes --test-timeout=600000 to Node's runner. Under Node 20 the
- * bound applies to each test file as a whole, from the file's own start: a
- * file still running at ten minutes is cancelled and fails by its path,
- * whether it's stuck in a test or while loading. Under Node 24 it applies to
- * each test and each hook: one still running at ten minutes fails, and the
- * report names its test or suite. A file stuck outside its tests and hooks,
- * such as while loading, runs on until CI's timeout-minutes ends the job.
+ * `npm test` passes --test-timeout=600000 to Node's runner. Under Node 22.12,
+ * as under 20, the bound applies to each test file as a whole, from the file's
+ * own start: a file still running at ten minutes is cancelled and fails by its
+ * path, whether it's stuck in a test or while loading. Under Node 24 it
+ * applies to each test and each hook: one still running at ten minutes fails,
+ * and the report names its test or suite. A file stuck outside its tests and
+ * hooks, such as while loading, runs on until CI's timeout-minutes ends the
+ * job.
  *
- * Ten minutes is loose on purpose: under Node 20 the slowest file,
- * mcpl-runtime-lifecycle, takes about three, and a bound near that could fail
- * a correct change on a loaded runner.
+ * Ten minutes is loose on purpose: the slowest file, mcpl-runtime-lifecycle,
+ * took about three under Node 20, and a bound near that could fail a correct
+ * change on a loaded runner.
  *
  * ci.yml's unforced step passes the same bound. Build & Test's time limit
- * stays at least a passing job's time above it, so that under Node 20 a file
+ * stays at least a passing job's time above it, so that under Node 22.12 a file
  * that sticks within that time fails by name before GitHub cancels the job.
  */
 import { test } from 'node:test';

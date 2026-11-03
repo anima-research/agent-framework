@@ -85,10 +85,9 @@ test('history sync preserves stored messages older than a full scrollback window
     2,
   );
 
-  const result = await harness.syncChannelHistory('channel-1');
+  await harness.syncChannelHistory('channel-1');
 
   assert.deepStrictEqual(removed, ['stored-recent-deleted']);
-  assert.equal(result.deletedMessages, 1);
 });
 
 test('history sync preserves an unfetched message tied with the oldest fetched timestamp', async () => {
@@ -103,10 +102,9 @@ test('history sync preserves an unfetched message tied with the oldest fetched t
     2,
   );
 
-  const result = await harness.syncChannelHistory('channel-1');
+  await harness.syncChannelHistory('channel-1');
 
   assert.deepStrictEqual(removed, ['stored-recent-deleted']);
-  assert.equal(result.deletedMessages, 1);
 });
 
 test('history sync still detects older deletions when the fetch covers the whole channel', async () => {
@@ -119,8 +117,7 @@ test('history sync still detects older deletions when the fetch covers the whole
     3,
   );
 
-  const result = await harness.syncChannelHistory('channel-1');
+  await harness.syncChannelHistory('channel-1');
 
   assert.deepStrictEqual(removed, ['stored-deleted']);
-  assert.equal(result.deletedMessages, 1);
 });

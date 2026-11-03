@@ -137,7 +137,7 @@ test('syncing the path resolves the divergence in the disk direction; a full syn
   assert.ok(((still.data as MaterializeData).skipped ?? []).some((s) => s.reason.includes('script.sh')),
     'a full sync leaves the conflict for an explicit resolution');
   const read = await call(module, 'read', { path: 'work/script.sh' });
-  assert.match(String((read.data as { content: string }).content), /echo v2/, 'the workspace edit survives');
+  assert.match(String((read.structured as { content: string }).content), /echo v2/, 'the workspace edit survives');
 
   // The remedy the skip reason points at: sync this path to adopt the disk version.
   await call(module, 'sync', { path: 'work/script.sh' });
@@ -172,7 +172,7 @@ test('an unreadable but writable disk copy is refused, not treated as absent', a
   assert.equal(data.materialized.length, 0, 'nothing silently written');
   const skip = (data.skipped ?? []).find((s) => s.reason.includes('script.sh'));
   assert.ok(skip, `the unverifiable path must be listed, got: ${JSON.stringify(data)}`);
-  assert.match(skip!.reason, /EACCES/, 'reason carries the filesystem error');
+  assert.match(skip!.reason, /permission denied/, 'reason carries the filesystem error');
   assert.match(skip!.reason, /force/, 'reason names the override');
 
   // force still overwrites deliberately.
@@ -195,7 +195,7 @@ test('untouched disk copies and brand-new files materialize exactly as before', 
   const res = await call(module, 'materialize', {});
   const data = res.data as MaterializeData;
   assert.deepEqual(data.materialized.map((m) => m.path).sort(), ['new.txt', 'script.sh']);
-  assert.equal(data.skipped ?? undefined, undefined, 'no spurious refusals');
+  assert.equal((data.skipped ?? []).length, 0, 'no spurious refusals');
   assert.equal(readFileSync(join(dir, 'script.sh'), 'utf8'), 'echo v2');
   assert.equal(readFileSync(join(dir, 'new.txt'), 'utf8'), 'fresh');
 });
@@ -213,7 +213,7 @@ test('after sync adopts a shell edit, the next agent edit materializes (baseline
   // external change and refuse this forever, sync or no sync.
   const res = await call(module, 'materialize', {});
   const data = res.data as MaterializeData;
-  assert.equal(data.skipped ?? undefined, undefined, `no refusal expected, got: ${JSON.stringify(data)}`);
+  assert.equal((data.skipped ?? []).length, 0, `no refusal expected, got: ${JSON.stringify(data)}`);
   assert.deepEqual(data.materialized.map((m) => m.path), ['script.sh']);
   assert.equal(readFileSync(join(dir, 'script.sh'), 'utf8'), 'echo v3-on-top-of-shell');
 });

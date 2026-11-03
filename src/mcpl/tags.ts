@@ -21,8 +21,10 @@ const CORE_IMPLIES: Readonly<Record<string, readonly string[]>> = {
 /**
  * RFC-001 core tags that mark a message as being ABOUT the conversation
  * rather than part of it: reactions (added or removed), edits and deletions
- * of an existing message. These are markers, not turns — they must not clear
- * explicit-send suppression, count as a new conversational round, or
+ * of an existing message, and (revision 3) `chat:system` notices from the
+ * platform or the place: a join, a pin, the weather changing in a world.
+ * These are markers, not turns — they must not clear explicit-send
+ * suppression, count as a new conversational round, or
  * retarget the default publish channel. An edit can also be the first
  * version of a message the agent sees, and then counts as that message:
  * isMarkerTagged reads the host's mark for the case the coalescer knows
@@ -36,6 +38,7 @@ export const NON_CONVERSATIONAL_TAGS: ReadonlySet<string> = new Set([
   'chat:reaction-remove',
   'chat:edited',
   'chat:deleted',
+  'chat:system',
 ]);
 
 /** True when a (possibly untyped) tag list carries a non-conversational marker tag. */
@@ -54,11 +57,19 @@ export function isMarkerTagged(tags: unknown, firstView: boolean): boolean {
   return hasNonConversationalTag(firstView && Array.isArray(tags) ? tags.filter((t) => t !== 'chat:edited') : tags);
 }
 
+/** True when a (possibly untyped) tag list marks a `chat:system` notice: an
+ *  event about the place, not a message anyone sent (RFC-001 rev 3). */
+export function isSystemNotice(tags: unknown): boolean {
+  return Array.isArray(tags) && tags.includes('chat:system');
+}
+
 /**
  * Expand a raw tag list over the normative core closure, then resolve the
  * §16.2 mutual exclusion: `chat:addressed` and `chat:ambient` cannot both
  * stand after expansion, and addressed wins — a message that is both
  * specifically-to-you and background noise is specifically-to-you.
+ * `chat:system` is another facet (kind, not addressing) and stands beside
+ * either: a pin in a DM is addressed by its place and still a notice.
  *
  * Pure; input order is preserved for the tags that survive, with implied
  * tags appended in first-cause order. Unknown and producer-namespaced tags
