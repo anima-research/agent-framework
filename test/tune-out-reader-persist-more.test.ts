@@ -4,6 +4,7 @@
  *
  * - a look a stop cut off, resumed after the restart;
  * - the resident's rows between two looks, on either side of a restart;
+ * - one `'resident'` identity across two tune-outs;
  */
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -214,5 +215,39 @@ describe('a persisted reader: across a restart', () => {
     assert.equal(second.forkTraces()[0]!.resynced, handed.length, 'the trace counts what it was handed');
     const sent = JSON.stringify(second.membrane.callsFor('reader')[0]!.messages.at(-1));
     assert.ok(sent.includes(`[In scout's context since your last look: ${handed.length} messages]`), sent);
+  });
+});
+
+describe('a persisted reader: across tune-outs', () => {
+  it("with 'resident', resumes the one identity at the next tune-out's look, with that tune-out's epoch on its record", { timeout: 180_000 }, async () => {
+    const dir = newDir('reader-persist-more-epochs-');
+    const t = await boot(dir, { persist: 'resident' });
+    const name = 'reader/scout/g1';
+    const firstEpoch = t.enter();
+    t.membrane.script('reader', final([text('First tune-out, first look.')]));
+    t.look(firstEpoch, [t.hold(firstEpoch, 'HELD-1 in the first tune-out')]);
+    await t.looked(name, 1);
+    t.hold(firstEpoch, 'HELD-2 before the cancel');
+    assert.deepEqual(t.internals.tuneOutCoordinator.cancel('disc', CHANNEL, 'agent-tool', 'test cancel'), { ok: true });
+    await t.looked(name, 2);
+
+    const secondEpoch = t.enter();
+    assert.notEqual(secondEpoch, firstEpoch, 'premise: a second tune-out');
+    t.membrane.script('reader', final([text('Second tune-out, first look.')]));
+    t.look(secondEpoch, [t.hold(secondEpoch, 'HELD-3 in the second tune-out')]);
+    await waitFor("the second tune-out's look", () => t.forkTraces().length + t.failedTraces().length > 2);
+    assert.deepEqual(t.forkTraces().map((f) => [f.agentName, f.incarnation, f.resumed, f.trigger, f.epochId]), [
+      [name, 1, false, 'cadence', firstEpoch],
+      [name, 2, true, 'cancel', firstEpoch],
+      [name, 3, true, 'cadence', secondEpoch],
+    ], 'derived once, then resumed: at the first tune-out\'s cancel and at the second tune-out\'s first look');
+    assert.deepEqual(t.rederived(), [], 'never derived again');
+    await t.looked(name, 3);
+    assert.equal(t.framework.getAgentRecord(name)!.metadata!.epochId, secondEpoch, "its record carries the look's epoch, the second tune-out's");
+    assert.deepEqual(t.internals.store.listBranches().map((b) => b.name).filter((b) => b.startsWith('dendrite/reader/')), [`dendrite/${name}`],
+      'one branch: nothing was derived again');
+    const body = JSON.stringify(t.membrane.callsFor('reader').at(-1)!.messages);
+    assert.ok(body.includes('HELD-1 in the first tune-out') && body.includes('First tune-out, first look.'),
+      'its request holds what it was handed and said in the first tune-out');
   });
 });
