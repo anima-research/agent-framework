@@ -503,6 +503,49 @@ class GatedRepeatFailureStrategy implements ContextStrategy {
   }
 }
 
+class FailsAgainAfterCallStrategy implements ContextStrategy {
+  readonly name = 'fails-again-after-call-test';
+  ticks = 0;
+  entered = false;
+  settled = false;
+  private open?: () => void;
+  private readonly gate = new Promise<void>((resolve) => { this.open = resolve; });
+
+  release(): void {
+    this.open?.();
+  }
+
+  checkReadiness(): ReadinessState {
+    return { ready: false, description: 'compression blocked' };
+  }
+
+  async tick(ctx: StrategyContext): Promise<void> {
+    this.ticks++;
+    if (this.ticks === 2) {
+      this.entered = true;
+      await this.gate;
+      try {
+        await ctx.membrane?.complete({
+          model: 'test-model',
+          config: { model: 'test-model' },
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'compress' }] }],
+        } as unknown as NormalizedRequest);
+      } finally {
+        this.settled = true;
+      }
+    }
+    throw new Error('compression failed');
+  }
+
+  select(
+    _store: MessageStoreView,
+    _log: ContextLogView,
+    _budget: TokenBudget,
+  ): ContextEntry[] {
+    return [];
+  }
+}
+
 /** A strategy whose first tick waits on a gate, then calls its manager's membrane, as a compression would. */
 class CallAfterGateStrategy implements ContextStrategy {
   readonly name = 'call-after-gate-test';
@@ -2752,6 +2795,97 @@ describe('queued context maintenance timer', () => {
       await parked.cleanup();
     }
   });
+
+  it('resume() waiting for a tick that left its pass also waits for a pass that starts meanwhile', { timeout: 10_000 }, async () => {
+    let waits!: { begun: number; pending: number };
+    let resumed!: Promise<ReturnType<AgentFramework['getContextMaintenanceSnapshot']>>;
+    let returned = false;
+    const parked = await parkedBehind('cooldown', {}, async (framework) => {
+      waits = watchMaintenanceWaits(framework);
+      await framework.quiesce();
+      resumed = framework.resume().then(() => {
+        returned = true;
+        return framework.getContextMaintenanceSnapshot();
+      });
+      void resumed.catch(() => {});
+      await waitFor(() => waits.begun === 1);
+    });
+    const ofB = heldUntilReleased();
+    try {
+      const recordOf = (name: string, snapshot = parked.framework.getContextMaintenanceSnapshot()) => snapshot.history
+        .flatMap((run) => run.agents).find((agent) => agent.agentName === name);
+      const recordOfA = () => recordOf('A');
+      await waitFor(() => recordOfA() !== undefined, 2000);
+      parked.turnMembrane.plans.set('B', [{ until: ofB.until }]);
+      parked.b.queued = true;
+      await waitFor(() => parked.turnMembrane.calls.includes('B'), 2000);
+      parked.openGate();
+      await waitFor(() => recordOfA()?.finishedAt !== undefined, 2000);
+      await eventLoopTurns(5);
+      assert.equal(waits.pending, 1, "resume()'s wait is still waiting, on the pass ticking B");
+      assert.equal(returned, false);
+      ofB.release();
+      const atResume = recordOf('B', await resumed);
+      assert.notEqual(atResume?.finishedAt, undefined, "B's work in its pass was finished when resume() returned");
+      assert.equal(atResume?.readyAfter, true);
+    } finally {
+      ofB.release();
+      await parked.cleanup();
+    }
+  });
+
+  for (const asked of [false, true]) {
+    it(asked
+      ? "an operator's maintain keeps its pass in the history though its only tick left it, took no tick and met a failure already reported"
+      : 'a pass whose only tick left it, took no tick and met a failure already reported stays out of the history', { timeout: 10_000 }, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-apart-repeat-'));
+      const strategy = new FailsAgainAfterCallStrategy();
+      const framework = await AgentFramework.create({
+        storePath: join(dir, 'store'),
+        membrane: new CapturingMembrane().asMembrane(),
+        agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy }],
+        modules: [],
+        syncIntervalMs: 0,
+        maintenanceIntervalMs: asked ? 0 : 10,
+      });
+      (framework as any).opsAlert = () => {};
+      const internals = framework as unknown as {
+        providerGate(agentName: string): { deferredAuxiliary: number };
+        providerAccelerationCooldowns: Map<string, Record<string, unknown>>;
+        flushAuxiliaryAdmission(agentName: string): void;
+        maintenanceApart: Map<unknown, unknown>;
+      };
+      const cooldownTimer = setTimeout(() => {}, 60_000);
+      const quiet = console.error;
+      console.error = () => {};
+      try {
+        framework.start();
+        if (asked) await framework.maintenanceTick();
+        const second = asked ? framework.maintenanceTick() : undefined;
+        await waitFor(() => strategy.entered);
+        const now = Date.now();
+        internals.providerAccelerationCooldowns.set('agent', { startedAt: now, until: now + 60_000, timer: cooldownTimer, heldRequests: [], reason: 'test hold', failures: 1 });
+        strategy.release();
+        await waitFor(() => internals.providerGate('agent').deferredAuxiliary === 1);
+        await second;
+        await waitFor(() => framework.getContextMaintenanceSnapshot().history.length === 2);
+        clearTimeout(cooldownTimer);
+        internals.providerAccelerationCooldowns.delete('agent');
+        internals.flushAuxiliaryAdmission('agent');
+        await waitFor(() => strategy.settled && internals.maintenanceApart.size === 0, 2000);
+        await eventLoopTurns(3);
+        const history = framework.getContextMaintenanceSnapshot().history;
+        assert.deepEqual(history.map((run) => run.id), asked ? [2, 1] : [1]);
+        assert.equal(history[0]!.agents[0]!.error, 'compression failed');
+      } finally {
+        console.error = quiet;
+        clearTimeout(cooldownTimer);
+        strategy.release();
+        await framework.stop();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
 
   it('no later pass ticks an agent while its tick that left a pass goes on, and a later pass ticks it once that tick has settled', { timeout: 10_000 }, async () => {
     const second = heldUntilReleased();

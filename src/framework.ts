@@ -7124,10 +7124,19 @@ export class AgentFramework {
     return this.maintenancePass !== null || this.overBudgetDrains.size > 0 || this.maintenanceApart.size > 0;
   }
 
-  /** Wait for the maintenance work that is running, whatever its outcome. */
+  /** Wait for the maintenance work that is running, whatever its outcome, and for any that starts while it waits. */
   private async settleMaintenancePass(): Promise<void> {
-    await Promise.allSettled([...(this.maintenancePass ? [this.maintenancePass] : []), ...this.overBudgetDrains]);
-    while (this.maintenanceApart.size > 0) await Promise.allSettled([...this.maintenanceApart.values()]);
+    const waited = new Set<Promise<unknown>>();
+    for (;;) {
+      const running = [
+        ...(this.maintenancePass ? [this.maintenancePass] : []),
+        ...this.overBudgetDrains,
+        ...this.maintenanceApart.values(),
+      ].filter((work) => !waited.has(work));
+      if (running.length === 0) return;
+      for (const work of running) waited.add(work);
+      await Promise.allSettled(running);
+    }
   }
 
   private async runQueuedMaintenance(): Promise<void> {
@@ -7218,6 +7227,8 @@ export class AgentFramework {
       agents: queued.map(item => item.record),
     };
     this.currentMaintenanceRun = run;
+    const onlyRepeats = (): boolean => run.agents.every((record) => record.ticks === 0 && this.maintenanceRepeats.has(record));
+    let requested = false;
 
     try {
       const running = queued.filter((item): item is Extract<Queued, { failed: false }> => !item.failed);
@@ -7290,7 +7301,14 @@ export class AgentFramework {
                 } catch (error) {
                   tickWithdrawn = tickFailed(error);
                 } finally {
-                  finishAgent(tickWithdrawn);
+                  try {
+                    finishAgent(tickWithdrawn);
+                  } finally {
+                    if (!requested && onlyRepeats()) {
+                      const at = this.maintenanceHistory.indexOf(run);
+                      if (at >= 0) this.maintenanceHistory.splice(at, 1);
+                    }
+                  }
                 }
               })()
                 .catch((error: unknown) => {
@@ -7321,9 +7339,9 @@ export class AgentFramework {
       // adds nothing the history doesn't hold, and a lasting failure would
       // otherwise fill it in minutes, pushing out the runs that did work. One
       // an operator asked for is kept: it's the pass their maintain reports.
-      const requested = this.maintenancePassRequested;
+      requested = this.maintenancePassRequested;
       this.maintenancePassRequested = false;
-      if (requested || !run.agents.every((record) => record.ticks === 0 && this.maintenanceRepeats.has(record))) this.maintenanceHistory.unshift(run);
+      if (requested || !onlyRepeats()) this.maintenanceHistory.unshift(run);
       if (this.maintenanceHistory.length > 50) this.maintenanceHistory.length = 50;
     }
   }
@@ -9981,6 +9999,14 @@ export class AgentFramework {
    * refreshed and ticks are bounded/serialized identically — and return the
    * maintenance snapshot. Works while quiesced by design: `running` stays
    * true in quiesce mode precisely so this machinery stays hot.
+   *
+   * It returns when that pass ends. A tick whose provider call parks at its
+   * agent's provider gate leaves the pass and goes on by itself, so that
+   * agent's entry in the returned snapshot can be unfinished, with no
+   * `finishedAt`. The run's own entry is completed when the tick settles, and
+   * a snapshot taken after that shows it while the run is still in the
+   * history. A pass begun while that tick goes on skips the agent, and
+   * `resume()` waits for the tick.
    */
   async maintenanceTick(): Promise<ContextMaintenanceSnapshot & { ran: boolean }> {
     // A pass already running is stop()'s to wait for; a new one isn't started.

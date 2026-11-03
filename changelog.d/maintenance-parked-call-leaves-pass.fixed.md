@@ -11,4 +11,5 @@
   its ticks, readiness and end, and any failure, which is alerted as one met
   during the pass is. `stop()`, surgeries and `resume()` still wait for the
   tick, and `stop()` and surgeries still withdraw a call parked at the gate.
-  `maintenanceTick()` returns when its pass ends.
+  `resume()` also waits for a pass that starts while it waits for such a
+  tick. `maintenanceTick()` returns when its pass ends.
