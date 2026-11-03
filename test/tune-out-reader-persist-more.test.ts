@@ -5,6 +5,7 @@
  * - a look a stop cut off, resumed after the restart;
  * - the resident's rows between two looks, on either side of a restart;
  * - one `'resident'` identity across two tune-outs;
+ * - what refused resumptions give back.
  */
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -249,5 +250,43 @@ describe('a persisted reader: across tune-outs', () => {
     const body = JSON.stringify(t.membrane.callsFor('reader').at(-1)!.messages);
     assert.ok(body.includes('HELD-1 in the first tune-out') && body.includes('First tune-out, first look.'),
       'its request holds what it was handed and said in the first tune-out');
+  });
+});
+
+describe('a persisted reader: refused resumptions', () => {
+  // Pins the semantics settled for AF #967 finding 2: a resumption refused
+  // after its framing was stored gives its held rows back, a second refusal
+  // included, and the look that then runs holds each of them once.
+  it('gives a held row back at each refused resumption, and the look that runs holds it once', {
+    timeout: 180_000, skip: 'awaits fix/review5-1 (#967 finding 2)',
+  }, async () => {
+    const dir = newDir('reader-persist-more-refused-');
+    const t = await boot(dir, { persist: 'epoch' });
+    const epochId = t.enter();
+    const name = `reader/scout/${epochId.slice(0, 8)}/g1`;
+    t.look(epochId, [t.hold(epochId, 'HELD-1')]);
+    await t.looked(name, 1);
+    // Quiesced, a resumption is made and its framing stored, and its run is
+    // refused at admission; the coordinator hands the returned row to the
+    // next look, which is refused too.
+    await t.framework.quiesce({ reason: 'test' });
+    const second = t.hold(epochId, 'HELD-2 refused twice');
+    t.look(epochId, [second]);
+    await waitFor('the first refusal', () => t.failedTraces().length === 1);
+    t.look(epochId, [second]);
+    await waitFor('the second refusal', () => t.failedTraces().length === 2);
+    assert.deepEqual(t.failedTraces().map((f) => [f.agentName, f.reported, f.returned]), [[name, false, 1], [name, false, 1]],
+      'each refusal gives the row back');
+    assert.equal(t.framework.getAgentRecord(name)!.incarnation, 1, 'premise: no incarnation began');
+
+    await t.framework.resume();
+    t.membrane.script('reader', final([text('After the refusals.')]));
+    t.look(epochId, [second]);
+    await t.looked(name, 2);
+    const ran = t.forkTraces().at(-1)!;
+    assert.deepEqual([ran.agentName, ran.incarnation, ran.resumed], [name, 2, true], 'resumed at incarnation 2: the refusals began none');
+    assert.deepEqual(t.rederived(), [], 'not derived again');
+    const body = JSON.stringify(t.membrane.callsFor('reader').at(-1)!.messages);
+    assert.equal(occurrences(body, 'HELD-2 refused twice'), 1, 'the look that runs holds the row once');
   });
 });
