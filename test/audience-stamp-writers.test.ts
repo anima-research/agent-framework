@@ -339,10 +339,11 @@ it('the scan finds addMessage however it is reached, and names the scope it is i
 
 /**
  * Each call in `sources` of a function or method named `name`: where, in
- * which scope, and how many arguments it is given.
+ * which scope, how many arguments it is given, and the source of its sixth
+ * (storeOwnRow's `present`), if it has one.
  */
-function scanCalls(sources: Array<{ name: string; text: string }>, name: string): Array<Site & { args: number }> {
-  const sites: Array<Site & { args: number }> = [];
+function scanCalls(sources: Array<{ name: string; text: string }>, name: string): Array<Site & { args: number; sixth?: Node }> {
+  const sites: Array<Site & { args: number; sixth?: Node }> = [];
   walkSources(sources, (file, node, scope, scopeText) => {
     if (node.type !== 'CallExpression' && node.type !== 'OptionalCallExpression') return;
     const callee = child(node, 'callee');
@@ -352,7 +353,8 @@ function scanCalls(sources: Array<{ name: string; text: string }>, name: string)
         ? keyName(child(callee, 'property'), callee.computed)
         : undefined;
     if (called !== name) return;
-    sites.push({ file, line: node.loc!.start.line, receiver: name, scope, scopeText, args: (node.arguments as unknown[]).length });
+    const args = node.arguments as Node[];
+    sites.push({ file, line: node.loc!.start.line, receiver: name, scope, scopeText, args: args.length, ...(args[5] ? { sixth: args[5] } : {}) });
   });
   return sites;
 }
@@ -436,9 +438,14 @@ it("every writer of an agent's own rows is classified by when it writes, and one
     if (when === 'held-back') continue;
     assert.ok(call.args <= 5, `${where(call)} (${what}) is listed as presenting at its write, and passes \`present\``);
   }
-  const heldBack = calls.filter((call) => OWN_ROW_WRITERS[keyOf(call)]!.when === 'held-back');
-  for (const key of Object.keys(OWN_ROW_WRITERS).filter((key) => OWN_ROW_WRITERS[key]!.when === 'held-back')) {
-    assert.ok(heldBack.some((call) => keyOf(call) === key && call.args === 6), `${key} holds a row back with storeOwnRow's \`present\``);
+  // Each call of a held-back writer, not one per scope, passes `present`,
+  // and passes it as a value its scope decides: a literal true presents the
+  // row into whatever turn holds the agent.
+  for (const call of calls.filter((c) => OWN_ROW_WRITERS[keyOf(c)]!.when === 'held-back')) {
+    const { what } = OWN_ROW_WRITERS[keyOf(call)]!;
+    assert.equal(call.args, 6, `${where(call)} (${what}) holds its row back with storeOwnRow's \`present\`, its sixth argument`);
+    assert.ok(!(call.sixth?.type === 'BooleanLiteral' && call.sixth.value === true),
+      `${where(call)} (${what}) passes \`present\` as true, which presents the row into a turn it isn't part of`);
   }
   // A row whose write threw after it landed is told to the own-row sink by
   // hand (ownRowsStored), only by a writer that presents at its write.
