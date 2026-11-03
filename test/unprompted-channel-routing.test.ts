@@ -1,7 +1,7 @@
 /**
- * Configured home channel for no-trigger turns (heartbeats, timers).
+ * Configured unprompted channel for no-trigger turns (heartbeats, timers).
  *
- * Without `homeChannel`, a turn with no triggering channel resolves its speech
+ * Without `unpromptedChannel`, a turn with no triggering channel resolves its speech
  * locus to `defaultPublishChannel` — the most-recent inbound across ALL
  * channels — so a heartbeat check-in lands wherever a message last happened to
  * arrive. With it, such turns speak in the configured channel, while a fork's
@@ -21,14 +21,14 @@ import type { ChannelContext } from '../src/mcpl/types.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { jsonLines } from './helpers/json-lines.js';
 
-const HOME = 'discord:g1:home';
+const OPS = 'discord:g1:ops';
 const BUSY = 'discord:g1:busy';
 const TRIGGER = 'discord:g1:trigger';
 const FORK_HOME = 'discord:g1:fork-home';
 const ref = (channelId: string): ChannelRef => ({ serverId: 'discord', channelId });
 
 function makeRegistry(opts: {
-  homeChannel?: string;
+  unpromptedChannel?: string;
   homeChannelResolver?: (agentName: string) => ChannelRef | undefined;
   activeChannelResolver?: (agentName: string) => ChannelRef | null | undefined;
 }) {
@@ -43,7 +43,7 @@ function makeRegistry(opts: {
     channels: Map<string, { serverId: string; descriptor: { id: string; type: string; label: string }; open: boolean }>;
     defaultPublishChannel: ChannelRef | null;
   };
-  for (const id of [HOME, BUSY, TRIGGER, FORK_HOME]) {
+  for (const id of [OPS, BUSY, TRIGGER, FORK_HOME]) {
     raw.channels.set(destinationKey(ref(id)), { serverId: 'discord', descriptor: { id, type: 'discord', label: id }, open: true });
   }
   // The global most-recent-inbound locus: some unrelated channel was busy.
@@ -51,25 +51,25 @@ function makeRegistry(opts: {
   return registry;
 }
 
-describe('homeChannel: speech locus for no-trigger turns', () => {
-  it('a no-trigger turn resolves to the configured home channel, not the last-active one', () => {
-    const registry = makeRegistry({ homeChannel: HOME, activeChannelResolver: () => undefined });
-    assert.deepEqual(registry.resolveLocus('agent'), ref(HOME));
+describe('unpromptedChannel: speech locus for no-trigger turns', () => {
+  it('a no-trigger turn resolves to the configured unprompted channel, not the last-active one', () => {
+    const registry = makeRegistry({ unpromptedChannel: OPS, activeChannelResolver: () => undefined });
+    assert.deepEqual(registry.resolveLocus('agent'), ref(OPS));
   });
 
-  it('without homeChannel the global most-recent-inbound fallback is unchanged', () => {
+  it('without unpromptedChannel the global most-recent-inbound fallback is unchanged', () => {
     const registry = makeRegistry({ activeChannelResolver: () => undefined });
     assert.deepEqual(registry.resolveLocus('agent'), ref(BUSY));
   });
 
-  it('a triggering channel still wins over the home channel', () => {
-    const registry = makeRegistry({ homeChannel: HOME, activeChannelResolver: () => ref(TRIGGER) });
+  it('a triggering channel still wins over the unprompted channel', () => {
+    const registry = makeRegistry({ unpromptedChannel: OPS, activeChannelResolver: () => ref(TRIGGER) });
     assert.deepEqual(registry.resolveLocus('agent'), ref(TRIGGER));
   });
 
   it("a conversation fork's home still wins over everything", () => {
     const registry = makeRegistry({
-      homeChannel: HOME,
+      unpromptedChannel: OPS,
       homeChannelResolver: () => ref(FORK_HOME),
       activeChannelResolver: () => ref(TRIGGER),
     });
@@ -77,7 +77,7 @@ describe('homeChannel: speech locus for no-trigger turns', () => {
   });
 });
 
-describe('homeChannel: a no-trigger turn is told, and published to, the home channel', () => {
+describe('unpromptedChannel: a no-trigger turn is told, and published to, the unprompted channel', () => {
   const FIXTURE = join(import.meta.dirname, 'fixtures/speech-route-mcpl-server.mjs');
   let tempDir: string;
   let statusPath: string;
@@ -86,7 +86,7 @@ describe('homeChannel: a no-trigger turn is told, and published to, the home cha
   let framework: AgentFramework | undefined;
 
   beforeEach(() => {
-    tempDir = mkdtempSync(join(tmpdir(), 'home-channel-delivery-'));
+    tempDir = mkdtempSync(join(tmpdir(), 'unprompted-channel-delivery-'));
     statusPath = join(tempDir, 'status.jsonl');
     commandPath = join(tempDir, 'commands.jsonl');
     writeFileSync(commandPath, '');
@@ -108,12 +108,12 @@ describe('homeChannel: a no-trigger turn is told, and published to, the home cha
   };
 
   /**
-   * A trunk agent on a real MCPL server with HOME and BUSY registered and
+   * A trunk agent on a real MCPL server with OPS and BUSY registered and
    * open. Channel messages are stored without waking it, and the previous
    * locus rule (latest inbound) is the fallback, so activity in BUSY is what
    * a turn with no channel of its own would otherwise follow.
    */
-  async function setup(homeChannel?: string) {
+  async function setup(unpromptedChannel?: string) {
     framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
@@ -127,10 +127,10 @@ describe('homeChannel: a no-trigger turn is told, and published to, the home cha
         args: [FIXTURE],
         env: {
           STATUS_PATH: statusPath, COMMAND_PATH: commandPath,
-          CHANNELS: JSON.stringify([{ id: HOME, label: '#home' }, { id: BUSY, label: '#busy' }]),
+          CHANNELS: JSON.stringify([{ id: OPS, label: '#ops' }, { id: BUSY, label: '#busy' }]),
         },
       }],
-      ...(homeChannel ? { homeChannel } : {}),
+      ...(unpromptedChannel ? { unpromptedChannel } : {}),
     });
     await framework.start();
     const fw = framework;
@@ -173,24 +173,24 @@ describe('homeChannel: a no-trigger turn is told, and published to, the home cha
     return { published, context, channelless, busyElsewhere, routingNotices };
   }
 
-  it('with activity in another channel, a turn no channel caused speaks in HOME, not the busy channel', async () => {
-    const t = await setup(HOME);
+  it('with activity in another channel, a turn no channel caused speaks in the unprompted channel, not the busy channel', async () => {
+    const t = await setup(OPS);
     await t.busyElsewhere();
     await t.channelless('check-in');
-    assert.deepEqual(t.published(), [HOME], 'published to the home channel only');
-    assert.equal(t.context()?.defaultOutgoing?.channelId, HOME, 'the server is told its speech lands in HOME');
-    assert.ok(t.routingNotices().some((n) => n.includes(HOME)), 'the routing notice names HOME');
+    assert.deepEqual(t.published(), [OPS], 'published to the unprompted channel only');
+    assert.equal(t.context()?.defaultOutgoing?.channelId, OPS, 'the server is told its speech lands there');
+    assert.ok(t.routingNotices().some((n) => n.includes(OPS)), 'the routing notice names it');
     assert.ok(!t.routingNotices().some((n) => n.includes(BUSY)), 'and never the busy channel');
   });
 
-  it('with no prior inbound message at all, such a turn still speaks in HOME', async () => {
-    const t = await setup(HOME);
+  it('with no prior inbound message at all, such a turn still speaks in the unprompted channel', async () => {
+    const t = await setup(OPS);
     await t.channelless('first words');
-    assert.deepEqual(t.published(), [HOME]);
-    assert.equal(t.context()?.defaultOutgoing?.channelId, HOME);
+    assert.deepEqual(t.published(), [OPS]);
+    assert.equal(t.context()?.defaultOutgoing?.channelId, OPS);
   });
 
-  it('control: without homeChannel the same turn follows the busy channel', async () => {
+  it('control: without unpromptedChannel the same turn follows the busy channel', async () => {
     const t = await setup();
     await t.busyElsewhere();
     await t.channelless('check-in');

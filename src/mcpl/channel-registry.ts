@@ -1101,7 +1101,7 @@ interface ChannelRegistryOptions {
    */
   activeChannelResolver?: (agentName: string) => ChannelRef | null | undefined;
   /**
-   * Configured HOME channel for turns with no channel provenance (heartbeats,
+   * Configured UNPROMPTED channel for turns with no channel provenance (heartbeats,
    * timers). Without it, such a turn's plain-text speech falls through to
    * `defaultPublishChannel` — the most-recent inbound across ALL channels — so
    * a heartbeat check-in lands in whatever channel last had activity,
@@ -1110,7 +1110,7 @@ interface ChannelRegistryOptions {
    * wins), BEFORE `defaultPublishChannel`. Channel descriptor id form, e.g.
    * `discord:{guildId}:{channelId}`.
    */
-  homeChannel?: string;
+  unpromptedChannel?: string;
   /**
    * Whether a conversation takes the process-global fallback, the channel of
    * the most recent delivered inbound message: as where its plain speech lands
@@ -1211,7 +1211,7 @@ export class ChannelRegistry {
   private activeChannelResolver?: (agentName: string) => ChannelRef | null | undefined;
   private takesGlobalFallback?: (conversationId: string) => boolean;
   private serverConnecting?: (serverId: string) => boolean;
-  private homeChannel?: string;
+  private unpromptedChannel?: string;
   private store?: JsStore;
 
   /**
@@ -1637,7 +1637,7 @@ export class ChannelRegistry {
     this.homeChannelResolver = options?.homeChannelResolver;
     this.activeChannelResolver = options?.activeChannelResolver;
     this.takesGlobalFallback = options?.takesGlobalFallback;
-    this.homeChannel = options?.homeChannel;
+    this.unpromptedChannel = options?.unpromptedChannel;
     this.serverConnecting = options?.serverConnecting;
     this.store = options?.store;
     this.initializeLifecycleStore();
@@ -2572,7 +2572,7 @@ export class ChannelRegistry {
     // An ephemeral run takes no global fallback (takesGlobalFallback): not the
     // all-except hold's channel, not the latest inbound message's channel as
     // its outgoing one, nor that message as the one it is replying to.
-    const fallback = this.configuredHome() ?? (agentName !== undefined ? this.globalFallbackFor(agentName) : this.sharedFallback());
+    const fallback = this.configuredUnprompted() ?? (agentName !== undefined ? this.globalFallbackFor(agentName) : this.sharedFallback());
     // A turn that deliberately has no channel (null) takes no fallback.
     const outgoing = home ?? (active !== undefined ? active : fallback);
 
@@ -5781,12 +5781,12 @@ export class ChannelRegistry {
     if (home) return home;
     // A turn that deliberately has no channel (null) takes no fallback.
     const active = this.activeChannelResolver?.(conversationId);
-    return active !== undefined ? active : this.configuredHome() ?? this.globalFallbackFor(conversationId);
+    return active !== undefined ? active : this.configuredUnprompted() ?? this.globalFallbackFor(conversationId);
   }
 
-  private configuredHome(): ChannelRef | null {
-    if (!this.homeChannel) return null;
-    const named = this.entriesNamed(this.homeChannel);
+  private configuredUnprompted(): ChannelRef | null {
+    if (!this.unpromptedChannel) return null;
+    const named = this.entriesNamed(this.unpromptedChannel);
     return named.length === 1 ? refOf(named[0]!) : null;
   }
 

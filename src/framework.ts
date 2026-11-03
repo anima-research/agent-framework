@@ -4373,9 +4373,9 @@ export class AgentFramework {
    *  subsystem can be lazily initialized by connectMcplServer when the
    *  framework started with zero configured servers. */
   private mcplInferenceRoutingConfig: import('./mcpl/types.js').InferenceRoutingPolicy | null = null;
-  /** Configured home channel for no-trigger turns (heartbeats, timers) — see
-   *  ChannelRegistryOptions.homeChannel. */
-  private mcplHomeChannel: string | null = null;
+  /** Configured unprompted channel for no-trigger turns (heartbeats, timers) — see
+   *  ChannelRegistryOptions.unpromptedChannel. */
+  private mcplUnpromptedChannel: string | null = null;
   /** The awareness ledger; null for a framework with neither storePath nor
    *  discordAwarenessOutboxPath, which refuses a marks choice. */
   private readonly discordAwarenessOutbox: DiscordAwarenessOutbox | null;
@@ -4981,7 +4981,7 @@ export class AgentFramework {
     // Stored for lazy MCPL initialization (connectMcplServer on a framework
     // that started with zero configured servers).
     framework.mcplInferenceRoutingConfig = config.inferenceRouting ?? null;
-    framework.mcplHomeChannel = config.homeChannel ?? null;
+    framework.mcplUnpromptedChannel = config.unpromptedChannel ?? null;
 
     // Client-side programmatic tool calling (code_execution). Made only when
     // enabled — everything downstream gates on the field. create() checked
@@ -32233,9 +32233,9 @@ export class AgentFramework {
         // speech dispatch that comes after the run's release still counts.
         takesGlobalFallback: (conversationId) => this.usedEphemeralAgentNames.get(conversationId) !== 'run',
         eventGatePresent: this.eventGate !== null,
-        // Configured home channel: where a no-trigger turn's speech goes
+        // Configured unprompted channel: where a no-trigger turn's speech goes
         // instead of the last-active channel (heartbeat containment).
-        homeChannel: this.mcplHomeChannel ?? undefined,
+        unpromptedChannel: this.mcplUnpromptedChannel ?? undefined,
         // A channel tool reads the connect and restart marks a tool call's
         // "connecting" text reads (mcplConnectInFlight, mcplServerAbsentText).
         // This host is connecting to a server while a connect or restart of

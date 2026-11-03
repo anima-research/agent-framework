@@ -483,12 +483,12 @@ export interface FrameworkConfig {
   inferenceRouting?: InferenceRoutingPolicy;
 
   /**
-   * Home channel for turns with no channel provenance (heartbeats, timers):
+   * Unprompted channel for turns with no channel provenance (heartbeats, timers):
    * plain-text speech on such a turn routes here instead of the last-active
    * channel. Channel descriptor id form, e.g. `discord:{guildId}:{channelId}`.
    * A real triggering channel (or a fork's home) still takes precedence.
    */
-  homeChannel?: string;
+  unpromptedChannel?: string;
 
   /** EventGate config. If omitted, all events trigger inference (unchanged default). */
   gate?: GateOptions;
