@@ -49,9 +49,8 @@ async function harness(ids: string[]) {
   });
   const internals = fw as unknown as Internals;
   const reached: string[] = [];
-  const servers = new Map<string, Server>(ids.map((id) => [id, {
-    id, lists: [], fails: false, isConnected: true, willReconnect: true, mcpToolsAdvertised: true,
-  }]));
+  const fresh = (id: string): Server => ({ id, lists: [], fails: false, isConnected: true, willReconnect: true, mcpToolsAdvertised: true });
+  const servers = new Map<string, Server>(ids.map((id) => [id, fresh(id)]));
   const connection = (s: Server) => Object.defineProperties(Object.assign(new EventEmitter(), {
     id: s.id,
     sendToolsList: async () => {
@@ -91,6 +90,18 @@ async function harness(ids: string[]) {
     reached,
     server: (id: string) => servers.get(id)!,
     connection: (id: string) => connections.get(id)!,
+    /** Lost for good: no reconnect, and the registry drops it. */
+    lose: (id: string) => {
+      Object.assign(servers.get(id)!, { isConnected: false, willReconnect: false });
+      connections.delete(id);
+    },
+    /** A new connection under the id, as a connect makes. */
+    connectAgain: (id: string) => {
+      const s = fresh(id);
+      servers.set(id, s);
+      connections.set(id, connection(s));
+      return s;
+    },
     names: () => internals.mcplTools.map((t) => t.name),
     cleanup: async () => {
       internals.mcplServerRegistry = registry;
@@ -338,6 +349,7 @@ test('a failed re-list once stop() has begun logs nothing', async (t) => {
     let stopping: Promise<void> | undefined;
     h.server('b').beforeAnswer = () => { stopping = h.fw.stop(); };
     await h.internals.refreshMcplTools();
+    assert.ok(stopping, 'the listing began stop()');
     await stopping;
     assert.deepEqual(logged.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes('tools/list failed')), []);
   } finally {
@@ -446,6 +458,40 @@ test('a server that reconnects without advertising tools before the re-list publ
       Object.assign(h.server('b'), { isConnected: true, mcpToolsAdvertised: false });
     };
     await h.internals.refreshMcplTools();
+    assert.deepEqual(h.names(), ['mcpl--c--ping']);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('a new connection under the id of a server lost for good keeps none of its tools while the refresh that removes them waits', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const h = await harness(['b', 'c']);
+  try {
+    h.server('b').lists = tools('read');
+    h.server('c').lists = tools('ping');
+    await h.internals.refreshMcplTools();
+
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let waiting!: () => void;
+    const removalWaits = new Promise<void>((resolve) => { waiting = resolve; });
+    let cCalls = 0;
+    h.server('c').beforeAnswer = async () => {
+      cCalls += 1;
+      if (cCalls === 1) {
+        waiting();
+        await held;
+      }
+    };
+    h.lose('b');
+    const removal = h.internals.refreshMcplTools();
+    await removalWaits;
+    h.connectAgain('b').fails = true;
+    await h.internals.refreshMcplTools();
+    assert.deepEqual(h.names(), ['mcpl--c--ping'], 'the new connection\'s failed first listing keeps none of the lost server\'s tools');
+    release();
+    await removal;
     assert.deepEqual(h.names(), ['mcpl--c--ping']);
   } finally {
     await h.cleanup();
