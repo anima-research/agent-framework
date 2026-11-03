@@ -414,3 +414,40 @@ test('kept tools of servers on either side of a listed one stay in their places'
     await h.cleanup();
   }
 });
+
+test('a server whose handshake advertised no tools keeps nothing when it closes while a later server lists', async () => {
+  const h = await harness(['b', 'c']);
+  try {
+    Object.assign(h.server('b'), { mcpToolsAdvertised: false, lists: tools('read') });
+    h.server('c').lists = tools('ping');
+    await h.internals.refreshMcplTools();
+    assert.deepEqual(h.names(), ['mcpl--b--read', 'mcpl--c--ping'], 'it listed a tool though it advertised none');
+    h.server('c').beforeAnswer = () => {
+      h.internals.noteMcplServerClosed('b');
+      Object.assign(h.server('b'), { isConnected: false, willReconnect: true });
+    };
+    await h.internals.refreshMcplTools();
+    assert.deepEqual(h.names(), ['mcpl--c--ping']);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('a server that reconnects without advertising tools before the re-list publishes keeps none of the old session\'s tools', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const h = await harness(['b', 'c']);
+  try {
+    h.server('b').lists = tools('read');
+    h.server('c').lists = tools('ping');
+    await h.internals.refreshMcplTools();
+    h.server('b').fails = true;
+    h.server('c').beforeAnswer = () => {
+      h.internals.noteMcplServerClosed('b');
+      Object.assign(h.server('b'), { isConnected: true, mcpToolsAdvertised: false });
+    };
+    await h.internals.refreshMcplTools();
+    assert.deepEqual(h.names(), ['mcpl--c--ping']);
+  } finally {
+    await h.cleanup();
+  }
+});
