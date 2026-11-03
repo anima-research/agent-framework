@@ -253,11 +253,15 @@ export async function createOfflineRecoveryBranch(
 
     let createdBranch: string | undefined;
     try {
-      // branchAt uses the target message's origin sequence. No message
-      // content is compiled or submitted to Membrane during this operation.
-      // Creating the branch is part of the body: a failure here settles the
-      // batch like a failed switch or redaction.
-      createdBranch = contextManager.branchAt(target.id, targetBranch);
+      // branchAt uses the target message's origin sequence. With no anchor
+      // nothing is rewound, so the branch starts at the head instead: what
+      // was written after the newest message, a removal or a summary, stays.
+      // No message content is compiled or submitted to Membrane during this
+      // operation. Creating the branch is part of the body: a failure here
+      // settles the batch like a failed switch or redaction.
+      createdBranch = anchorCount === 0
+        ? store.createBranchAt(targetBranch, sourceBranch, store.currentSequence()).name
+        : contextManager.branchAt(target.id, targetBranch);
       await contextManager.switchBranch(createdBranch);
       // Each interval is removed by its messages' ids, so the order doesn't
       // change the result. removeStoredInterval takes a single message outside

@@ -13120,7 +13120,8 @@ export class AgentFramework {
             description:
               'Simple behavior: "always" (wake now) or "defer" (don\'t wake; still enters ' +
               'context). For debounce / rate-limit / sampling, use debounceMs / rateLimit / ' +
-              'passiveSample below instead of this field. Exactly one behavior must be given.',
+              'passiveSample below instead of this field. Exactly one behavior must be given, ' +
+              'except with suppress, which saves "defer" and keeps the event out of context.',
           },
           debounceMs: {
             type: 'number',
@@ -13284,7 +13285,8 @@ export class AgentFramework {
           ? { ...value, description:
               'Simple behavior: "always" (wake now) or "defer" (don\'t wake; still enters ' +
               'context). For debounce / rate-limit / sampling / the reply judge, use debounceMs / rateLimit / ' +
-              'passiveSample / judge below instead of this field. Exactly one behavior must be given.' }
+              'passiveSample / judge below instead of this field. Exactly one behavior must be given, ' +
+              'except with suppress, which saves "defer" and keeps the event out of context.' }
           : value;
         if (key === 'passiveSample') judged.judge = JUDGE_PARAMETER;
       }
@@ -19241,6 +19243,8 @@ export class AgentFramework {
         .map((b) => b.text)
         .join('\n'),
       gateMetadata: {
+        // The scope's channel, where the origin names none, so a channel rule matches.
+        ...(channelId ? { channelId } : {}),
         ...(origin ?? {}),
         serverId: occ.serverId,
         featureSet: push.featureSet,

@@ -553,9 +553,10 @@ export interface GatePolicyStats {
   /**
    * Present on a suppress rule: its settings, and with a script, how the
    * script has run since this process started. Its `matchCount` and
-   * `lastMatchTimestamp` count the events it suppressed since then.
-   * `suppression_stats` reads the stamped rows themselves, so its counts
-   * cover every start.
+   * `lastMatchTimestamp` count the events it took since then: those it
+   * suppressed, and those it only deferred where suppression wasn't asked
+   * (a channel under conversation routing). `suppression_stats` reads the
+   * stamped rows themselves, so its counts cover every start.
    */
   suppress?: SuppressConfig & { scriptStatus?: import('./suppress-scripts.js').SuppressScriptStatus };
   debounceState?: {

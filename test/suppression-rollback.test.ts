@@ -80,4 +80,34 @@ describe('rolling back past suppress rules', () => {
       await reader.close();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+
+  it('with no anchor it branches from the head: a second run keeps the rows out, and a removal after the newest row stays', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'suppression-rollback-'));
+    const path = join(dir, 'store');
+    try {
+      const manager = await ContextManager.open({ path, namespace: 'agents/agent' });
+      manager.addMessage('user', [{ type: 'text', text: 'kept' }]);
+      const edited = manager.addMessage('user', [{ type: 'text', text: 'removed by hand' }]);
+      manager.addMessage('user', [{ type: 'text', text: HIDDEN }], { suppressed: { rule: 'r', eventType: 'x' } });
+      manager.addMessage('agent', [{ type: 'text', text: 'newest' }]);
+      // Written after the newest row, so a branch at that row's sequence wouldn't have it.
+      manager.removeMessage(edited);
+      await manager.close();
+
+      const texts = async (): Promise<string[]> => {
+        const reader = await ContextManager.open({ path, namespace: 'agents/agent' });
+        try {
+          return reader.getAllMessages().map((m) => (m.content[0] as { text: string }).text);
+        } finally { await reader.close(); }
+      };
+      const first = await createOfflineRecoveryBranch({ storePath: path, agentName: 'agent', removeSuppressed: true });
+      assert.equal(first.messagesSuppressed, 1);
+      assert.deepEqual(await texts(), ['kept', 'newest']);
+
+      const second = await createOfflineRecoveryBranch({ storePath: path, agentName: 'agent', removeSuppressed: true });
+      assert.equal(second.messagesSuppressed, 0);
+      assert.equal(second.sourceBranch, first.targetBranch);
+      assert.deepEqual(await texts(), ['kept', 'newest'], 'the second run brings back neither');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
 });

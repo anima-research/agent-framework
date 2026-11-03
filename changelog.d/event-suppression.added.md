@@ -47,7 +47,10 @@
   stopped. A release without suppression doesn't read the stamp, and where
   compression formed a summary around a hidden row, it refuses the store at
   open (`StoreTopologyError`). The command makes and activates a branch without
-  the hidden rows; the source branch keeps them. Suppress rules load as `defer`
+  the hidden rows; the source branch keeps them. It cleans the agent's own
+  branch, not a derived context's (`dendrite/…`), so finish any such context
+  first. With an anchor it starts at that message, where a row an earlier run
+  removed is back, so run it last with no anchor. Suppress rules load as `defer`
   in every release back to 0.22, so nothing wakes for their events; 0.22 to
   0.26 drop `suppress` from gate.json at their first rule edit.
 - The changed `wake_add_rule` definition and the two new tools change the tool
@@ -55,7 +58,3 @@
   host without host presentation, where it's one prompt-cache miss. The review's calls count toward the agent's
   usage, as the reply judge's do, and a wake on a flag is a full turn of the
   agent's own model.
-- **Module authors:** `metadata.suppressed` is now the framework's: a module's or
-  server's own value under that key is dropped on write. A row a module reads
-  through its context is marked `heldFromResidents` when a suppress rule hid it,
-  as a tuned-out row is.

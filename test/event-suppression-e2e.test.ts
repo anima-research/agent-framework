@@ -228,9 +228,11 @@ describe('event suppression', () => {
     }
     const f = await fixture({ framework: { ...GATE([{ name: 'hide-pings', match: { scope: ['mcpl:push-event'], filter: { type: 'text', pattern: 'ping' } }, behavior: 'defer', suppress: S('pings') }]), modules: [new NamedOnPush()] } });
     try {
+      const before = f.membrane.calls.length;
       await ping(f, 'p1', 'ping 1');
       await settle(f);
       assert.ok(suppressedOf(find(f, 'ping 1')));
+      assert.equal(f.membrane.calls.length, before, 'the wake it named was withheld');
     } finally { await f.close(); }
   });
 
@@ -471,6 +473,18 @@ describe('event suppression', () => {
       await settle(f);
       assert.deepEqual(suppressedOf(find(f, 'document_diff')), { rule: 'hide-doc', eventType: 'mcpl:push-event', source: 'editor' });
       assert.equal(await inView(f, 'document_diff'), false);
+    } finally { await f.close(); }
+  });
+
+  it('a channel rule takes a deferred coalesced push by its scope\'s channel, where its origin names none', async () => {
+    const f = await fixture({ framework: GATE([{ name: 'hide-chat', match: { source: 'editor', scope: ['mcpl:push-event'], channel: 'chat' }, behavior: 'defer', suppress: S('document notices in chat') }]) });
+    try {
+      await f.register();
+      await f.send('push/event', f.params('1', 'fallback', { deferred: true, channelId: 'chat' }));
+      await eventually(() => stored(f).some((m) => textOf(m).includes('document_diff')), 'the batch stored');
+      await settle(f);
+      // Its row is a channel message, a channel-scoped batch's delivery.
+      assert.deepEqual(suppressedOf(find(f, 'document_diff')), { rule: 'hide-chat', eventType: 'mcpl:channel-incoming', source: 'editor' });
     } finally { await f.close(); }
   });
 
