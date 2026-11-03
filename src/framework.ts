@@ -816,7 +816,8 @@ const PROSE_LOCUS_TOOL: import('./types/index.js').ToolDefinition = {
     'Leave `to` out (or null) to see where it goes now. `to`: "#channel", "@person" or a channel id posts your ' +
     'plain speech there; "drafts" holds it as drafts instead, posted nowhere unless you resend them with the drafts ' +
     'tool. A change applies from your next round; what you wrote beside the call goes where your speech went before. ' +
-    'Send tools are unaffected.',
+    'Where a turn\'s words are sent only when it ends, a change applies from your next turn and holds this turn\'s ' +
+    'plain speech as drafts; the result says which. Send tools are unaffected.',
   inputSchema: {
     type: 'object' as const,
     properties: {
@@ -1463,15 +1464,15 @@ interface TurnRouting {
    * null), and holds its plain speech as drafts.
    */
   locked?: true;
-  /**
-   * Locked mode: how many times prose_locus has moved this turn's locus. A
-   * stream whose prose is routed only at its end (no verbatim round content,
-   * membrane's XML tool path) can't tell which words came before a move, so
-   * one during it holds all of its plain speech as drafts.
-   */
-  lockMoves?: number;
-  /** Locked mode: a stream of the turn routes its prose only at its end (see lockMoves). */
+  /** Locked mode: a stream of the turn routes its prose only at its end (no verbatim round content, membrane's XML tool path). */
   endRouted?: true;
+  /**
+   * Locked mode: prose_locus moved the lock during a turn whose prose is
+   * routed only at its end (endRouted), so which words came before the move
+   * can't be told. The rest of the turn's plain speech, every later stream's
+   * included, is held as drafts, as the move's result says.
+   */
+  heldForMove?: true;
   /**
    * Locus, hybrid and locked mode: where the turn's unpinned plain prose
    * lands. Locked mode's is the agent's lock (TurnRouting.locked); the rest
@@ -18335,7 +18336,7 @@ export class AgentFramework {
             const canMove = this.canAgentUseTool(reader!.name, PROSE_LOCUS_TOOL.name);
             return sameChannel(lock, channel)
               ? `1. Reply — your plain speech goes to this channel: write your reply with no prefix; ${tunedOut ? 'it will be delivered there.' : delivered}\n`
-              : `1. Reply — your plain speech ${this.proseLockShown(lock)}, not here. To reply here, ${sendTool}${canMove ? ', or point prose_locus here' : ''}.\n`;
+              : `1. Reply — your plain speech ${this.proseLockShown(lock, reader!.name)}, not here. To reply here, ${sendTool}${canMove ? ', or point prose_locus here' : ''}.\n`;
           })()
         : mode === 'locus' && tunedOut
           ? `1. Reply — ${plainSpeechRule} it will be delivered there. If that is another channel, or you see none, to reply here, ` +
@@ -20123,8 +20124,12 @@ export class AgentFramework {
   private publishInputWithTurnLocus(input: unknown, agentName: string, callingTurn: TurnRouting | undefined): unknown {
     const given = (input as { channelId?: unknown } | null | undefined)?.channelId;
     if (typeof given === 'string') return input;
+    // A locked turn's default is its lock, or none: never what the registry
+    // resolves now, which reads the agent's latest routing (a silent start's).
     const locus = callingTurn
-      ? callingTurn.locus ?? this.channelRegistry?.resolveLocus(agentName) ?? null
+      ? callingTurn.locked
+        ? callingTurn.locus ?? null
+        : callingTurn.locus ?? this.channelRegistry?.resolveLocus(agentName) ?? null
       : this.homeOf(agentName) ?? null;
     if (!locus) return input;
     // The pair: a serverId beside a channelId names that server's channel.
@@ -21408,16 +21413,20 @@ export class AgentFramework {
 
   /**
    * The prose routing an agent's turns run under: its configured mode, except
-   * that a locked agent's conversation fork, bound to its home channel, and
-   * its ephemeral run, whose plain speech is its caller's result, route as
-   * locus mode does. Neither has a lock of its own.
+   * for a locked agent's conversation fork and ephemeral run, which have no
+   * lock of their own. A fork is bound to its home channel, so it routes as
+   * locus mode does. A run's plain speech is its caller's result, and it
+   * publishes none: run as locus mode, its narration between tool calls would
+   * post to the channel inferred for its turn, which the lock exists to
+   * prevent, so it runs disabled, as a disabled resident's run does.
    */
   private proseRoutingOf(agent: Agent): NonNullable<AgentConfig['proseRouting']> {
     // An agent's mode is always set (Agent defaults it); a stand-in for one
     // may leave it out, which reads as the default, as `?? 'locus'` did here.
     const mode = agent.proseRouting ?? 'locus';
     if (mode !== 'locked') return mode;
-    return this.homeOf(agent.name) || this.usedEphemeralAgentNames.get(agent.name) === 'run' ? 'locus' : mode;
+    if (this.usedEphemeralAgentNames.get(agent.name) === 'run') return 'disabled';
+    return this.homeOf(agent.name) ? 'locus' : mode;
   }
 
   /**
@@ -21426,10 +21435,18 @@ export class AgentFramework {
    * hasn't chosen. Throws when the state can't be read.
    */
   private readProseLock(agentName: string): ChannelRef | 'drafts' | undefined {
-    const data = this.store.getStateJson(FRAMEWORK_STATE_ID) as { proseLocks?: Record<string, unknown> } | null;
-    const value = data?.proseLocks?.[agentName];
+    const data = this.store.getStateJson(FRAMEWORK_STATE_ID) as { proseLocks?: unknown } | null;
+    const locks = data?.proseLocks;
+    if (locks === undefined) return undefined;
+    // A container that isn't a record holds choices that can't be read; it
+    // isn't taken as none, which would fall back to the recipe's destination.
+    if (!locks || typeof locks !== 'object' || Array.isArray(locks)) {
+      throw new Error(`the stored prose locks ${JSON.stringify(locks)} aren't a record`);
+    }
+    // Own keys only: an agent named after an Object.prototype member has no inherited choice.
+    if (!Object.hasOwn(locks, agentName)) return undefined;
+    const value = (locks as Record<string, unknown>)[agentName];
     if (value === PROSE_LOCK_DRAFTS) return 'drafts';
-    if (value === undefined) return undefined;
     if (value && typeof value === 'object') {
       const { serverId, channelId } = value as { serverId?: unknown; channelId?: unknown };
       if (typeof serverId === 'string' && serverId && typeof channelId === 'string' && channelId) return { serverId, channelId };
@@ -21443,10 +21460,22 @@ export class AgentFramework {
   private writeProseLock(agentName: string, lock: ChannelRef | 'drafts'): void {
     const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
     const state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
-    const locks = { ...((state.proseLocks as Record<string, unknown> | undefined) ?? {}) };
-    locks[agentName] = lock === 'drafts' ? PROSE_LOCK_DRAFTS : { serverId: lock.serverId, channelId: lock.channelId };
+    const stored = state.proseLocks;
+    const locks: Record<string, unknown> = stored && typeof stored === 'object' && !Array.isArray(stored) ? { ...stored } : {};
+    Object.defineProperty(locks, agentName, {
+      value: lock === 'drafts' ? PROSE_LOCK_DRAFTS : { serverId: lock.serverId, channelId: lock.channelId },
+      enumerable: true, writable: true, configurable: true,
+    });
     state.proseLocks = locks;
     this.store.setStateJson(FRAMEWORK_STATE_ID, state);
+    // A move away from a channel must survive a crash right after it's
+    // answered, or the old lock comes back. The write is in the store either
+    // way, so a sync that fails only widens that window, and is logged.
+    try {
+      this.store.sync();
+    } catch (err) {
+      console.error(`[prose] ${agentName}: the store didn't sync after the prose lock was written:`, err);
+    }
   }
 
   /**
@@ -21483,10 +21512,11 @@ export class AgentFramework {
   }
 
   /** Where a locked agent's plain speech goes, as the agent is told it: a verb phrase after "your plain speech". */
-  private proseLockShown(lock: ChannelRef | null, now = false): string {
-    return lock
-      ? `${now ? 'now ' : ''}goes to ${this.channelShown(lock)}`
-      : `is ${now ? 'now ' : ''}held as drafts, posted nowhere unless you resend them with the drafts tool`;
+  private proseLockShown(lock: ChannelRef | null, agentName: string, now = false): string {
+    if (lock) return `${now ? 'now ' : ''}goes to ${this.channelShown(lock)}`;
+    // The drafts tool is named only to an agent that may call it.
+    return `is ${now ? 'now ' : ''}held as drafts, posted nowhere` +
+      (this.canAgentUseTool(agentName, 'drafts') ? ' unless you resend them with the drafts tool' : '');
   }
 
   /**
@@ -21508,7 +21538,7 @@ export class AgentFramework {
       ? callingTurn.locus ?? null
       : this.proseLockLocus(agent));
     if (input.to === undefined || input.to === null) {
-      return { success: true, data: { proseLocus: `Your plain speech ${this.proseLockShown(current())}.` } };
+      return { success: true, data: { proseLocus: `Your plain speech ${this.proseLockShown(current(), agentName)}.` } };
     }
     if (typeof input.to !== 'string' || !input.to.trim()) {
       return refuse('to must be "#channel", "@person", a channel id or "drafts". Nothing was changed.');
@@ -21519,7 +21549,7 @@ export class AgentFramework {
       lock = 'drafts';
     } else {
       const registry = this.channelRegistry;
-      if (!registry) return refuse(`No channels are configured, so there is no channel to point your plain speech at. It still ${this.proseLockShown(current())}.`);
+      if (!registry) return refuse(`No channels are configured, so there is no channel to point your plain speech at. It still ${this.proseLockShown(current(), agentName)}.`);
       // Resolved as a `>>` target is: inside its turn, a name the turn's own
       // channel answers to means that channel.
       const resolved = registry.resolveProseTarget(spec, { forSpeech: true, own: callingTurn ? this.ownChannels(callingTurn) : [] });
@@ -21527,14 +21557,14 @@ export class AgentFramework {
         const cand = resolved.candidates?.length
           ? ` It could mean: ${resolved.candidates.join(', ')}.${registry.publishRouteFor(resolved.candidates) ?? ''}`
           : '';
-        return refuse(`"${spec}" did not resolve: ${suppliedValue(resolved.error)}.${cand} Your plain speech still ${this.proseLockShown(current())}.`);
+        return refuse(`"${spec}" did not resolve: ${suppliedValue(resolved.error)}.${cand} Your plain speech still ${this.proseLockShown(current(), agentName)}.`);
       }
       lock = { serverId: resolved.serverId, channelId: resolved.channelId };
     }
     try {
       this.writeProseLock(agentName, lock);
     } catch (err) {
-      return refuse(`The change wasn't recorded (${thrownText(err)}), so your plain speech still ${this.proseLockShown(current())}.`);
+      return refuse(`The change wasn't recorded (${thrownText(err)}), so your plain speech still ${this.proseLockShown(current(), agentName)}.`);
     }
     const locus = lock === 'drafts' ? null : lock;
     const movesTurn = !!callingTurn?.locked && this.openLogical.get(agentName) === callingTurn;
@@ -21546,11 +21576,15 @@ export class AgentFramework {
       // and the next turn's announce-on-change tells it where it speaks.
       return {
         success: true,
-        data: { proseLocus: `Your plain speech ${this.proseLockShown(locus, true)} from your next turn, until you change it. A turn under way keeps where it was.` },
+        data: { proseLocus: `Your plain speech ${this.proseLockShown(locus, agentName, true)} from your next turn, until you change it. A turn under way keeps where it was.` },
       };
     }
     const turn = callingTurn!;
-    if (!sameChannel(turn.locus ?? null, locus)) turn.lockMoves = (turn.lockMoves ?? 0) + 1;
+    if (sameChannel(turn.locus ?? null, locus)) {
+      // Pointed where it already goes: nothing moves, and nothing is held.
+      return { success: true, data: { proseLocus: `Your plain speech already ${this.proseLockShown(locus, agentName)}.` } };
+    }
+    if (turn.endRouted) turn.heldForMove = true;
     if (locus) {
       turn.locus = locus;
       noteTurnChannel(turn, locus);
@@ -21568,12 +21602,12 @@ export class AgentFramework {
     return {
       success: true,
       data: {
-        proseLocus: turn.endRouted
+        proseLocus: turn.heldForMove
           // A turn whose words are routed together at its end can't tell
-          // which came before this move (lockMoves).
-          ? `Your plain speech ${this.proseLockShown(locus, true)} from your next turn, until you change it. ` +
+          // which came before this move (heldForMove).
+          ? `Your plain speech ${this.proseLockShown(locus, agentName, true)} from your next turn, until you change it. ` +
             "This turn's plain speech is routed when it ends, all of it together, so it is held as drafts instead."
-          : `Your plain speech ${this.proseLockShown(locus, true)}, on this turn's later rounds and on later turns, until you change it.`,
+          : `Your plain speech ${this.proseLockShown(locus, agentName, true)}, on this turn's later rounds and on later turns, until you change it.`,
       },
     };
   }
@@ -21611,7 +21645,7 @@ export class AgentFramework {
     let text: string;
     if (locus === null) {
       text = locked
-        ? `[${NOTICE_TAG.routing}] Your plain speech ${this.proseLockShown(null)}. Use an explicit send tool to reach a channel.`
+        ? `[${NOTICE_TAG.routing}] Your plain speech ${this.proseLockShown(null, agentName)}. Use an explicit send tool to reach a channel.`
         : `[${NOTICE_TAG.routing}] Your plain speech currently has no channel — it stays in ` +
           'your archive. Use an explicit send tool to reach a channel.';
     } else {
@@ -23518,7 +23552,7 @@ export class AgentFramework {
     }
     const lock = mode === 'locked' ? this.proseLockLocus(agent) : undefined;
     const text = lock !== undefined
-      ? lockedModePrimer(this.proseLockShown(lock), this.canAgentUseTool(agent.name, PROSE_LOCUS_TOOL.name))
+      ? lockedModePrimer(this.proseLockShown(lock, agent.name), this.canAgentUseTool(agent.name, PROSE_LOCUS_TOOL.name))
       : proseModePrimer(mode as Exclude<typeof mode, 'locked'>, this.canAgentUseTool(agent.name, 'prose_help'));
     try {
       const id = agent.getContextManager().addMessage(
@@ -25036,8 +25070,6 @@ export class AgentFramework {
     // The turn-alive guard also keeps this turn's routing current at entry.
     // Retain it for queued deliveries and receipts after a tool ends the turn.
     const streamRouting = this.routingOf(agent.name);
-    // Locked mode: the lock moves this stream began after (TurnRouting.lockMoves).
-    const lockMovesAtStart = streamRouting.lockMoves ?? 0;
     let hadToolCalls = false;
     let generationLost = false;
 
@@ -25588,7 +25620,7 @@ export class AgentFramework {
             const liveRound = !!this.channelRegistry && !!roundContent && roundContent.length > 0;
             if (liveRound) liveProseRouting = true;
             // Set before the round's calls dispatch, so a prose_locus among
-            // them knows this turn's words wait for its end (lockMoves).
+            // them knows this turn's words wait for its end (heldForMove).
             else if (turnProseRouting === 'locked' && this.channelRegistry) streamRouting.endRouted = true;
             // Whether this round's tool-result batch (and anything queued
             // with it) will be presented to the model before it speaks
@@ -26347,6 +26379,11 @@ export class AgentFramework {
                       console.error('text-only prose delivery failed:', err);
                     }
                   }
+                } else if (turnProseRouting === 'locked' && streamRouting.heldForMove) {
+                  // A later stream of a turn whose lock moved while its words
+                  // waited for its end: held, as the move said (heldForMove).
+                  console.error(`[routing] ${agent.name}: text-only prose held as drafts (the lock moved during a turn routed at its end)`);
+                  this.holdProseDrafts(agent, speechSegments, 'no-destination', { routing: textOnlyHold.routing, notice: 'later' });
                 } else {
                   // Route to the TURN-FROZEN locus, like every other speech
                   // path. This dispatch runs AFTER the agent is idle, so a live
@@ -26466,12 +26503,12 @@ export class AgentFramework {
                 }
               } else if (thinkPrivate) {
                 thinkHeld();
-              } else if (turnProseRouting === 'locked' && !liveProseRouting && (streamRouting.lockMoves ?? 0) !== lockMovesAtStart) {
-                // The whole stream's words are routed now, together, and
-                // prose_locus moved the lock while they were written: which
-                // came before the move can't be told, so none goes to either
-                // destination. They're held as drafts, named in the receipt,
-                // as the move's own result said they would be.
+              } else if (turnProseRouting === 'locked' && streamRouting.heldForMove) {
+                // The stream's words are routed now, together, and prose_locus
+                // moved the lock during the turn: which came before the move
+                // can't be told, so none goes to either destination. They're
+                // held as drafts, named in the receipt, as the move's own
+                // result said they would be.
                 console.error(
                   `[routing] ${agent.name}: tool-call turn -> ${segments.length} prose segment(s) held as drafts (the lock moved during a turn routed at its end)`,
                 );
@@ -27677,9 +27714,10 @@ export class AgentFramework {
         return this.draftsToolResult(origin.agentName, call.input);
       case 'prose-help':
         return { success: true, data: PROSE_ROUTING_HELP };
-      // prose_locus: the calling agent's own lock. A call made inside its
-      // turn, as a script's is, moves that turn's later rounds too
-      // (callingTurnOf); one made outside it (a puppet's, a host's
+      // prose_locus: the calling agent's own lock. Like prose_help it's a
+      // direct verb, outside a script's tool surface (scriptTools). A call
+      // that carries a turn of the agent's still moves that turn's later
+      // rounds (callingTurnOf); one made outside it (a puppet's, a host's
       // executeToolCall) moves the lock its later turns start from, and
       // leaves a turn under way where it is.
       case 'prose-locus':
@@ -29836,7 +29874,8 @@ export class AgentFramework {
       // applies to the calling turn's later rounds and to later turns.
       case 'prose-locus': {
         const result = this.proseLocusToolResult(agentName, enrichedCall.input, this.callingTurnOf(agentName, enrichedCall));
-        this.emitTrace({ type: 'tool:completed', module: 'framework', tool: 'prose_locus', callId: enrichedCall.id, durationMs: 0 });
+        if (result.success) this.emitTrace({ type: 'tool:completed', module: 'framework', tool: 'prose_locus', callId: enrichedCall.id, durationMs: 0 });
+        else this.emitTrace({ type: 'tool:failed', module: 'framework', tool: 'prose_locus', callId: enrichedCall.id, error: result.error ?? '' });
         this.pushEvent({
           type: 'tool-result',
           callId: enrichedCall.id,
@@ -32555,6 +32594,13 @@ export class AgentFramework {
         // global fallback (none for an ephemeral run), and the turn then keeps
         // that channel; null for a heartbeat's turn, which takes none
         // (TurnRouting.heartbeat).
+        // A turn with no channel of its own (a heartbeat's, or a wake for a
+        // channel that names none) is replying to no message. A locked
+        // turn's null locus (drafts) is where it speaks, not what it answers.
+        channellessTurn: (agentName) => {
+          const routing = this.turnRouting.get(agentName);
+          return !!routing && !routing.locus && !routing.triggerChannel && !!(routing.noChannel || routing.heartbeat);
+        },
         activeChannelResolver: (agentName) => {
           const routing = this.turnRouting.get(agentName);
           // A locked turn's channel is its lock, or none: the channel that
@@ -36855,7 +36901,7 @@ export class AgentFramework {
                 data: {
                   routing: sameChannel(callingTurn.locus, opened)
                     ? 'Your plain speech lands in this channel.'
-                    : `Your plain speech still ${this.proseLockShown(callingTurn.locus ?? null)}.${this.proseLocusMoves(agentName)} Other channels need an explicit send tool.`,
+                    : `Your plain speech still ${this.proseLockShown(callingTurn.locus ?? null, agentName)}.${this.proseLocusMoves(agentName)} Other channels need an explicit send tool.`,
                   ...(result.data as Record<string, unknown> | undefined),
                 },
               };
@@ -37423,7 +37469,7 @@ export class AgentFramework {
       const speech = home
         ? `Your plain speech stays in ${this.channelShown(home)}, your conversation's channel.`
         : speaker && this.proseRoutingOf(speaker) === 'locked'
-          ? `Your plain speech still ${this.proseLockShown(open?.locked ? open.locus ?? null : this.proseLockLocus(speaker))}.${this.proseLocusMoves(agentName)}`
+          ? `Your plain speech still ${this.proseLockShown(open?.locked ? open.locus ?? null : this.proseLockLocus(speaker), agentName)}.${this.proseLocusMoves(agentName)}`
         : open?.locus && !sameChannel(open.locus, resolved)
           ? `This turn's plain speech still lands in ${this.channelShown(open.locus)}; from your next turn it lands in the excepted channel while this holds, except on a turn that has no channel, such as a heartbeat's.`
           : open && (open.noChannel || open.heartbeat)

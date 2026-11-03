@@ -35,7 +35,7 @@ Offered only to a locked agent (and only where its `allowedTools` permit it).
 | Call | Effect |
 | --- | --- |
 | `prose_locus {}` (or `to: null`) | Reports where plain speech goes now. |
-| `prose_locus { to: "#channel" }`, `"@person"`, a channel id | Points plain speech there. The target resolves the way a `>>` target does: inside a turn, a name one of the turn's own channels answers to means that channel; an ambiguous or unknown name is refused with candidates, and moves nothing. |
+| `prose_locus { to: "#channel" }`, `"@person"`, a channel id | Points plain speech there. The target resolves the way a `>>` target does: inside a turn, an id one of the turn's own channels has means that channel; a name that is ambiguous or matches nothing is refused, naming its candidates where there are any, and moves nothing. Pointing it where it already goes changes nothing. |
 | `prose_locus { to: "drafts" }` | Holds plain speech as drafts: posted nowhere unless the resident resends them with the `drafts` tool. |
 
 A move is recorded in `framework/state` (`proseLocks`) before it applies, so a
@@ -50,11 +50,12 @@ already under way where it is. Its result says so. The resident may never read
 that result, so the move isn't counted as told: the next turn starts with a
 `[routing]` notice of where its speech goes.
 
-On a stream whose prose is routed only when it ends (membrane's XML tool path,
+On a turn whose prose is routed only when it ends (membrane's XML tool path,
 which has no per-round content), the words written before a move and after it
-can't be told apart. A move during such a stream holds all of that stream's
-plain speech as drafts, sending none of it to either destination, and the
-move's result says so. Later turns speak at the new destination.
+can't be told apart. A move during such a turn holds the rest of the turn's
+plain speech as drafts, every later stream of it included (a budget restart's,
+a retry's), sending none of it to either destination, and the move's result
+says so. Later turns speak at the new destination.
 
 ## Drafts
 
@@ -87,9 +88,13 @@ rather than fall back to the recipe's.
 
 ## Who doesn't lock
 
-A locked agent's conversation fork routes to its home channel, and its
-ephemeral runs return their speech to their caller, as in locus mode: neither
-has a lock of its own, and neither is offered `prose_locus`.
+Neither a locked agent's conversation fork nor its ephemeral run has a lock
+of its own, and neither is offered `prose_locus`. A fork routes to its home
+channel, as in locus mode. A run routes as `disabled`: it publishes no plain
+speech, as a `disabled` resident's run doesn't, since in locus mode its
+narration between tool calls would post to the channel inferred for its turn.
+connectome-host launches a locked resident's subagents as `disabled` for the
+same reason.
 
 ## What the resident is told
 
@@ -99,11 +104,13 @@ has a lock of its own, and neither is offered `prose_locus`.
   tool result, and nothing else announces it.
 - When the lock changes some other way, the next turn starts with the usual
   `[routing]` announce-on-change notice. That happens after a move made from
-  outside the turn, or when a recipe `proseLock` channel registers after turns
-  that held speech as drafts.
-- Notices name `prose_locus` only where the resident's `allowedTools` let it
-  call it.
-- Every turn that wrote plain speech ends with its `[delivered]` receipt.
+  outside the turn, unless that turn is the agent's first in locked mode,
+  whose primer names the lock instead, or when a recipe `proseLock` channel
+  registers after turns that held speech as drafts.
+- Notices name `prose_locus`, and the `drafts` tool, only where the
+  resident's `allowedTools` let it call them.
+- A turn whose plain speech was delivered or held ends with its `[delivered]`
+  receipt. One whose delivery failed gets the failure marker instead.
 
 Leaving locked mode keeps the stored lock, which applies again if the agent
 returns to locked mode.
