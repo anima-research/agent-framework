@@ -268,11 +268,28 @@ describe('a refused turn is marked on the message it answers, and its failure na
     const quiesced = r.f.framework.quiesce({ reason: 'test window' });
     release();
     await quiesced;
+    const parked = () => (r.f.framework as unknown as { pendingRequests: Array<{ reason: string }> }).pendingRequests
+      .filter((q) => q.reason === 'mcpl:channel-incoming');
+    await eventually(() => parked().length === 1, 'the two messages park as one wake');
     await r.f.framework.resume();
     await eventually(() => r.records.length === 1, 'the resumed turn, refused');
     await r.markSent();
     assert.deepEqual(r.marked(), []);
     assert.equal(r.records[0]!.locus, ROOM);
+  });
+
+  it('a provider hold that takes two wakes for different messages as one keeps neither message; for one message, it keeps it', async (t) => {
+    const r = await rig(t);
+    const fw = r.f.framework as unknown as { holdRequest(held: Array<Record<string, unknown>>, request: Record<string, unknown>): void };
+    const wake = (messageId: string) => ({ agentName: 'agent', reason: 'mcpl:channel-incoming', source: 'editor', timestamp: 1, channelId: ROOM, channelServerId: 'editor', answersMessageId: messageId });
+    const one: Array<Record<string, unknown>> = [];
+    fw.holdRequest(one, wake('m-1'));
+    fw.holdRequest(one, wake('m-1'));
+    assert.deepEqual(one.map((w) => w.answersMessageId), ['m-1'], 'control: two wakes for one message keep it');
+    const two: Array<Record<string, unknown>> = [];
+    fw.holdRequest(two, wake('m-1'));
+    fw.holdRequest(two, wake('m-2'));
+    assert.deepEqual(two.map((w) => w.answersMessageId), [undefined]);
   });
 
   it('every resident a message wakes marks that message when its turn is refused', async (t) => {
@@ -306,6 +323,18 @@ describe('a refused turn is marked on the message it answers, and its failure na
 
 describe('the retry a rewind queues answers the message the shed turn answered', () => {
   const rewinding = { agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', refusalHandling: { retries: 0, autoRewind: true, maxRewinds: 1 } }], framework: { gate: QUIET_AMBIENT } as never };
+
+  it('a turn of an ephemeral run that a channel message woke: its refusal and its rewind\'s retry, refused again, mark nothing and log no locus', async (t) => {
+    const r = await rig(t, rewinding);
+    (r.f.framework as unknown as { usedEphemeralAgentNames: Map<string, string> }).usedEphemeralAgentNames.set('agent', 'run');
+    r.streams.push(() => new MockYieldingStream([refusal()]), () => new MockYieldingStream([refusal()]));
+    await r.incoming(ROOM, 'm-run');
+    await eventually(() => r.records.length === 2, 'the refusal, and its retry\'s');
+    await r.f.framework.runUntilIdle();
+    assert.equal(r.f.membrane.calls.length, 2, 'premise: the turn and its retry each made one call');
+    assert.deepEqual(r.records.map((x) => x.locus), [null, null]);
+    assert.deepEqual(r.marked(), []);
+  });
 
   it('a refusal rewind\'s retry speaks in the refused message\'s channel', async (t) => {
     const r = await rig(t, rewinding);

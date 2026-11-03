@@ -3550,6 +3550,11 @@ function mergeWakeLines(requests: readonly InferenceRequest[]): WakeLine[] | und
   return byEntry.size > 0 ? [...byEntry.values()] : undefined;
 }
 
+function answersSameMessage(a: InferenceRequest, b: InferenceRequest | undefined): boolean {
+  return a.answersMessageId === b?.answersMessageId
+    && a.channelId === b?.channelId && a.channelServerId === b?.channelServerId;
+}
+
 /** A batched-wake line's identity: its event's stored entry. */
 function wakeLineKey(line: WakeLine): string {
   const { eventType, serverId, channelId, messageId, eventId } = line.entry;
@@ -6493,6 +6498,7 @@ export class AgentFramework {
       held.push(request);
       return;
     }
+    if (!answersSameMessage(same, request)) same.answersMessageId = undefined;
     if (isTurnRetry(request)) (same as MarkedRequest)[TURN_RETRY] = true;
     // A merged start's batch (MERGED_BATCH) stays recorded on the request
     // kept in its place, which then stands for it, as the start did.
@@ -19666,9 +19672,10 @@ export class AgentFramework {
           // A heartbeat's wake keeps its own key, so a later channel-less wake
           // can't absorb it: resumed together, they make a heartbeat's batch
           // (heartbeatTurn), as they would have without the quiesce.
-          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${isHeartbeatWake(request) ? 'h' : ''}|${request.coalescingSubject ?? ''}|${request.readsDeferredWrite ?? ''}|${request.readsStoredMessage ?? ''}|${request.answersMessageId ?? ''}`;
+          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${isHeartbeatWake(request) ? 'h' : ''}|${request.coalescingSubject ?? ''}|${request.readsDeferredWrite ?? ''}|${request.readsStoredMessage ?? ''}`;
           const prev = newestByKey.get(key);
           const kept = !prev || request.timestamp >= prev.timestamp ? request : prev;
+          if (prev && !answersSameMessage(prev, request)) kept.answersMessageId = undefined;
           // The wake it absorbs hands on its lines (WakeLine): each event's
           // line stays to be decided when the host resumes.
           const lines = prev ? mergeWakeLines([prev, request]) : undefined;
@@ -19953,8 +19960,7 @@ export class AgentFramework {
           ? trigger?.readsDeferredWrite : undefined,
         readsStoredMessage: requests.every((r) => r.readsStoredMessage === trigger?.readsStoredMessage)
           ? trigger?.readsStoredMessage : undefined,
-        answersMessageId: requests.every((r) => r.answersMessageId === trigger?.answersMessageId
-          && r.channelId === trigger?.channelId && r.channelServerId === trigger?.channelServerId)
+        answersMessageId: requests.every((r) => answersSameMessage(r, trigger))
           ? trigger?.answersMessageId : undefined,
         // Every merged wake's handed line, each event's once: the turn's start
         // decides each (beginAgentTurn).
@@ -24075,7 +24081,7 @@ export class AgentFramework {
         ? this.channelNamed(trigger.channelId, trigger.channelServerId)
         : undefined;
       noteTurnChannel(routing, routing.triggerChannel);
-      if (routing.triggerChannel) {
+      if (routing.triggerChannel && this.usedEphemeralAgentNames.get(agent.name) !== 'run') {
         routing.answers = { channel: routing.triggerChannel, ...(trigger?.answersMessageId ? { messageId: trigger.answersMessageId } : {}) };
       }
       const unresolvedTrigger = !!trigger?.channelId && routing.triggerChannel === undefined;

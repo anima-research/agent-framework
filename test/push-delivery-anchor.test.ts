@@ -103,10 +103,13 @@ describe('a push that delivers a new message becomes the latest delivered inboun
       const [method, params] = coalescedCreate(origin);
       const first = await f.send(method, params);
       assert.match(JSON.stringify(first), /durable/, 'premise: the first acceptance failed');
+      assert.equal(fw.parkedAnchors.size, 1, 'premise: the older message\'s anchor is parked');
       await newer(f);
       await f.framework.runUntilIdle();
       assert.equal(fw.channelRegistry.incomingFor('agent')?.messageId, 'm-newer', 'premise: the newer message is the latest inbound');
-      await f.send(method, params);
+      const resent = await f.send(method, params);
+      assert.match(JSON.stringify(resent), /"accepted":true/, 'premise: the resend is accepted');
+      assert.equal(fw.parkedAnchors.size, 0, 'premise: its acceptance took the parked anchor');
       assert.equal(fw.channelRegistry.incomingFor('agent')?.messageId, 'm-newer');
     });
 
@@ -122,10 +125,12 @@ describe('a push that delivers a new message becomes the latest delivered inboun
       const [method, params] = coalescedCreate(origin);
       const sent = f.send(method, params);
       await eventually(() => holding, 'the create delivered, its commit held');
+      assert.equal(fw.parkedAnchors.size, 1, 'premise: the older message\'s anchor is parked');
       await newer(f);
       await f.framework.runUntilIdle();
       release();
-      await sent;
+      assert.match(JSON.stringify(await sent), /"accepted":true/, 'premise: the create is accepted');
+      assert.equal(fw.parkedAnchors.size, 0, 'premise: its acceptance took the parked anchor');
       assert.equal(fw.channelRegistry.incomingFor('agent')?.messageId, 'm-newer');
     });
   }
@@ -137,11 +142,12 @@ describe('a push that delivers a new message becomes the latest delivered inboun
     });
     await f.framework.runUntilIdle();
     const { messageId: _none, ...unnamed } = origin(ADMIN, 'unused');
-    await f.send('push/event', {
+    const reply = await f.send('push/event', {
       featureSet: 'doc', eventId: 'e-unnamed', timestamp: TS, origin: unnamed, tags: ADDRESSED,
       coalesce: { key: 'notice:1', initial: true, channelId: ADMIN },
       payload: { content: [{ type: 'text', text: 'a push that names no message' }] },
     });
+    assert.match(JSON.stringify(reply), /"accepted":true/, 'premise: the push is accepted');
     await f.framework.runUntilIdle();
     assert.equal(fw.channelRegistry.incomingFor('agent')?.messageId, 'm-room');
   });
@@ -157,10 +163,10 @@ describe('a push that delivers a new message becomes the latest delivered inboun
       coalesce: { key: 'message:m-deferred', initial: true, deferred: true, channelId: ADMIN },
       payload: { content: [{ type: 'text', text: '@agent a deferred message' }] },
     };
-    await f.send('push/event', deferred);
+    assert.match(JSON.stringify(await f.send('push/event', deferred)), /"accepted":true/, 'premise: the deferred create is accepted');
     await eventually(() => f.renders.length === 1, 'the deferred create rendered at assembly');
     await f.framework.runUntilIdle();
-    await f.send('push/event', deferred);
+    assert.match(JSON.stringify(await f.send('push/event', deferred)), /"accepted":true/, 'premise: the resend is accepted');
     const incoming = fw.channelRegistry.incomingFor('agent');
     assert.deepEqual(incoming && { channelId: incoming.channel.channelId, messageId: incoming.messageId }, { channelId: ROOM, messageId: 'm-room' });
   });

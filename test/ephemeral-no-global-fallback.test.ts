@@ -35,6 +35,8 @@ type Registry = {
   routeSpeech(conversationId: string, text: string, locus: Ref | null): Promise<unknown>;
   deliverSpeech(conversationId: string, text: string, locus: Ref | null, opts?: unknown): Promise<unknown>;
   handleChannelToolCall(toolName: string, input: unknown, origin?: unknown): Promise<{ success: boolean; error?: string }>;
+  noteDelivered(channel: Ref, messageId: string): void;
+  incomingFor(agentName?: string): { channel: Ref; messageId: string } | undefined;
 };
 const registry = (f: Fixture) => (f.framework as unknown as { channelRegistry: Registry }).channelRegistry;
 
@@ -226,6 +228,8 @@ describe('an ephemeral run takes no global fallback (#551)', () => {
       const records: Array<Record<string, unknown>> = [];
       t.mock.method(fw, 'logFailure', (record: Record<string, unknown>) => { records.push(record); });
 
+      registry(f).noteDelivered(editor(SIDE), 's-later');
+      assert.deepEqual(registry(f).incomingFor('agent')?.channel, editor(SIDE), 'premise: the latest inbound is in side');
       fw.noteRefusal('sub-logged', 'other');
       fw.noteRefusal('agent', 'other');
       assert.deepEqual(records.map((r) => [r.agent, r.kind, r.locus]), [['sub-logged', 'refusal', null], ['agent', 'refusal', BUSY]]);
