@@ -265,6 +265,7 @@ test('the catalogue opens on what the resident hid, each with its source and the
   const none=renderCatalogue(p.resolve(tools,sources));
   assert.ok(!none.includes('## Hidden'),none); assert.match(none,/4 tools: 4 visible, 0 hidden\./);
   const noneLines=none.split('\n');
+  assert.ok(noneLines.indexOf('## Index by source')>0,none);
   assert.ok(noneLines.includes(`Index by source: line ${noneLines.indexOf('## Index by source')+1}.`),none);
  } finally {rmSync(dir,{recursive:true,force:true});}
 });
@@ -306,6 +307,7 @@ test('an edit naming a name the file holds but the resident has no tool for says
   assert.equal(r2.success,false);
   assert.ok(r2.error!.startsWith('Nothing was changed: you have no tool named '),r2.error);
   assert.ok(!r2.error!.includes(keeps),'a name that differs past the cut gets no such sentence');
+  assert.ok(r2.error!.includes('Copy the exact name'),'so it gives the index instruction');
   writeFileSync(path,'not json');
   const r3=p.edit('set_tool_visibility',{name:held,visible:true},tools);
   assert.ok(r3.error!.startsWith('Nothing was changed: you have no tool named '),r3.error);
@@ -315,6 +317,26 @@ test('an edit naming a name the file holds but the resident has no tool for says
   const r4=p.edit('set_tool_visibility',{name:'toString',visible:true},tools);
   assert.ok(r4.error!.startsWith('Nothing was changed: you have no tool named '),r4.error);
   assert.ok(!r4.error!.includes(keeps),'a name the file holds only through its prototype is no setting');
+  assert.ok(r4.error!.includes('Copy the exact name'),'so it gives the index instruction');
+  writeFileSync(path,JSON.stringify({version:1,tools:{exampel:{visible:false}}}));
+  assert.equal(p.edit('set_tool_visibility',{name:'exampel',visible:true},tools).error,
+   `Nothing was changed: you have no tool named "exampel" right now, shown or hidden. Did you mean "example"? ${keeps}`,'a held name close to an available one gets the guess and the setting sentence');
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test('a name whose entry holds no setting, as restoring its only description leaves it, gets the index instruction',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'presentation-emptied-'));
+ try {
+  const path=join(dir,'tools.json'), p=new ToolPresentation({path,cataloguePath:'board/tools.md'});
+  const tools=[...presentationTargets('example','workspace--read'),...presentationTools('board/tools.md')];
+  const withAway=[...tools,...presentationTargets('away--gone')];
+  assert.equal(p.edit('set_tool_description',{name:'away--gone',description:'my words'},withAway).success,true);
+  assert.equal(p.edit('set_tool_description',{name:'away--gone',description:null},withAway).success,true);
+  assert.deepEqual(JSON.parse(readFileSync(path,'utf8')).tools['away--gone'],{},'restoring the only setting leaves an empty entry');
+  const r=p.edit('set_tool_visibility',{name:'away--gone',visible:false},tools);
+  assert.equal(r.success,false);
+  assert.ok(!r.error!.includes('Your file keeps a setting'),'an empty entry keeps no setting');
+  assert.ok(r.error!.includes('Copy the exact name'),r.error);
  } finally {rmSync(dir,{recursive:true,force:true});}
 });
 
