@@ -220,6 +220,28 @@ describe("a shared fork of an isolated-slot reader's view", () => {
     assert.ok(reopened.includes('HELD-ROW'), 'and shows the held row');
     assert.ok(reopened.includes('FORK-OWN') && reopened.includes('MIRA-SAID'), "and its own injection and the residents' row");
   });
+
+  it("leaves out a suppressed row while it shows a held one, in the subconscious's own view and in a fork of it", async () => {
+    const mira = framework.getAgent('mira')!;
+    const sub = framework.getAgent('Subconscious')!;
+    const suppressed = { suppressed: { rule: 'quiet-bots', eventType: 'chat:message' } };
+    mira.getContextManager().addMessage('user', [text('MIRA-SAID')]);
+    mira.getContextManager().addMessage('Antra', [text('HELD-ROW')], { tuneOut: { epochId: 'e1' } } as never);
+    mira.getContextManager().addMessage('Antra', [text('SUPPRESSED-ROW')], suppressed as never);
+    const own = await compiled(sub.getContextManager());
+    assert.ok(own.includes('MIRA-SAID') && own.includes('HELD-ROW'), "the premise: the subconscious reads the residents' slot, held rows included");
+    assert.ok(!own.includes('SUPPRESSED-ROW'), "the subconscious's compile leaves out the suppressed row");
+    assert.equal(internals(framework).agentSees(sub, suppressed), false, 'and so does its agentSees');
+    const fork = await framework.deriveAgent({
+      name: 'fork-1',
+      from: sub.name,
+      framing: [{ participant: 'user', content: [text(FRAMING)] }],
+    });
+    const forked = await compiled(fork.contextManager);
+    assert.ok(forked.includes('HELD-ROW'), "the premise: the fork, like its source, shows the held row");
+    assert.ok(!forked.includes('SUPPRESSED-ROW'), 'and leaves out the suppressed one');
+    assert.ok(!(await compiled(mira.getContextManager())).includes('SUPPRESSED-ROW'), "as the resident's view does");
+  });
 });
 
 describe("a shared child of a resident with former names", () => {
