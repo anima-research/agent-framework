@@ -45,7 +45,7 @@ it('agent_settings is one typed tool for the hot runtime surface', async () => {
         type: 'string',
         enum: ['public', 'private'],
         description:
-          'Routing policy for ordinary text emitted in the same native assistant round as think(). ' +
+          'Routing policy for ordinary text emitted in the same assistant round as think(). ' +
           "Omitted in the recipe preserves the compatibility carry-forward: public.",
       },
     );
