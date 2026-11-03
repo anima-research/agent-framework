@@ -714,6 +714,35 @@ describe('a persisted reader: a look that fails, and what goes back', () => {
   const framingRows = async (framework: AgentFramework, name: string) => (await framework.inspectAgentContext(name)).getAllMessages()
     .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'tune-out-reader-framing');
 
+  it('gives a refused resumption its held rows back each time it is refused, and a later run holds them once', { timeout: 120_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-refused-twice-'));
+    dirs.push(dir);
+    const t = await boot(dir, { persist: 'resident' });
+    const epochId = t.enter();
+    const name = 'reader/scout/g1';
+    t.look(epochId, [t.hold(epochId, 'HELD-1')]);
+    await t.looked(name, 1);
+    await t.framework.quiesce({ reason: 'test' });
+    const unread = t.hold(epochId, 'HELD-2 unread');
+    t.look(epochId, [unread]);
+    await waitFor('the first refusal', () => failed(t.traces).length >= 1);
+    // The coordinator hands it again, as it was given back; refused again.
+    t.look(epochId, [unread]);
+    await waitFor('the second refusal', () => failed(t.traces).length >= 2);
+    assert.deepEqual(failed(t.traces).map((f) => f.returned), [1, 1], 'no run read HELD-2, so each refusal gives it back');
+    assert.equal(t.framework.getAgentRecord(name)!.incarnation, 1, 'premise: no incarnation began');
+    const framings = await framingRows(t.framework, name);
+    assert.deepEqual(framings.map((m) => (m.metadata as { incarnation?: number }).incarnation), [1, 2, 2],
+      "each framing row says the incarnation it was made for: the refused ones, the one that didn't begin");
+    await t.framework.resume();
+    t.membrane.script('reader', final([text('After the refusals.')]));
+    t.look(epochId, [unread, t.hold(epochId, 'HELD-3')]);
+    await t.looked(name, 2);
+    const body = JSON.stringify(t.membrane.callsFor('reader').at(-1)!.messages);
+    assert.equal(body.split('HELD-2 unread').length - 1, 1, 'HELD-2 once: in the framing the first refused look stored');
+    assert.ok(body.includes('HELD-3'));
+    assert.equal(t.forkTraces().at(-1)!.held, 1, 'handed HELD-3: its branch holds HELD-2 already');
+  });
 
   it('runs no look queued behind a running one once stop() has begun; after the restart the reader is resumed', { timeout: 180_000 }, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'reader-persist-stop-queued-'));

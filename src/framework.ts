@@ -17867,7 +17867,11 @@ export class AgentFramework {
     // for a failure before (a registry or branch read that throws).
     let name = identity;
     let framed = false;
-    let handed = invocation.backlog;
+    const backlog = invocation.backlog;
+    let handed = backlog;
+    // The held rows a run took on in a framing on the reader's branch
+    // (readerHanded): not given back if this look fails.
+    let taken: ReadonlySet<string> = new Set();
     let candidate: { agent: Agent; contextManager: ContextManager; cleanup: () => void } | undefined;
     try {
       const plan = this.readerPlan(identity, primary, persist, resync, invocation, scopeEnded);
@@ -17905,16 +17909,22 @@ export class AgentFramework {
         resync,
         ...(branch !== undefined ? { residentBranch: branch } : {}),
       };
-      // The framing row says what the reader was handed: the held rows, and
-      // where the resident's window stood (the ordinal of the last row it
-      // held, on its branch), from which the next look reads what it took
-      // since (readerHanded).
-      const framingRow = (held: StoredMessage[], mark: { branch: string; through: number } | undefined): MessageMetadata => ({
+      // The framing row says what the reader was handed: the held rows, the
+      // incarnation it was made for, which a run took on only if the record
+      // reaches it, and where the resident's window stood (the ordinal of the
+      // last row it held, on its branch), from which the next look reads what
+      // it took since (readerHanded).
+      const framingRow = (
+        held: StoredMessage[],
+        incarnation: number,
+        mark: { branch: string; through: number } | undefined,
+      ): MessageMetadata => ({
         system: true,
         kind: 'tune-out-reader-framing',
         channelId: invocation.channelId,
         epochId: invocation.epochId,
         trigger: invocation.trigger,
+        incarnation,
         heldMessageIds: held.map((m) => m.id),
         ...(mark ? { residentThrough: mark.through, residentBranch: mark.branch } : {}),
       }) as MessageMetadata;
@@ -17941,8 +17951,10 @@ export class AgentFramework {
         // What its own branch holds already, as an earlier framing's, a
         // failed look's included: not handed again (after a restart the
         // coordinator's cursor is gone, and an epoch's first look is handed
-        // all it held).
-        handed = invocation.backlog.filter((m) => !before.held.has(m.id));
+        // all it held). A failed look's framing is in the window of the next
+        // run that takes the reader on.
+        handed = backlog.filter((m) => !before.held.has(m.id));
+        taken = before.taken;
         if (resync === 'window' && mark && before.through !== undefined) {
           residentRows = this.residentRowsSince(primary, name, before.through);
         }
@@ -17953,7 +17965,7 @@ export class AgentFramework {
           incarnation,
           ...(residentRows ? { residentRows } : {}),
         });
-        storeOwnRow(candidate.agent, 'user', content, framingRow(handed, mark));
+        storeOwnRow(candidate.agent, 'user', content, framingRow(handed, incarnation, mark));
       } else {
         incarnation = 1;
         const context: ReaderFramingContext = {
@@ -17980,7 +17992,7 @@ export class AgentFramework {
           // its checkpoint (context-manager's derive is synchronous up to its
           // seeded stores), so the mark is the checkpoint's, and the
           // derivation holds the resident's window up to it.
-          framing: [{ participant: 'user', content, metadata: framingRow(handed, this.residentMark(primary)) }],
+          framing: [{ participant: 'user', content, metadata: framingRow(handed, incarnation, this.residentMark(primary)) }],
           metadata,
         });
       }
@@ -18026,10 +18038,11 @@ export class AgentFramework {
       // being resumed until it is cleaned up, and the next look resumes it.
       candidate?.cleanup();
       const reported = this.tuneOutCoordinator?.readerReported(name) ?? false;
-      // The rows it was handed go back, not those its branch held already.
+      // The rows it was handed go back, and those its branch held only in a
+      // framing no run took on (a refused look's), but not those a run took.
       // The invocation itself goes, since the coordinator knows its late
       // look by the object (lateFork) and derives no other for one that fails.
-      invocation.backlog = handed;
+      invocation.backlog = backlog.filter((m) => !taken.has(m.id));
       const returned = reported ? 0 : (this.tuneOutCoordinator?.readerFailed(invocation) ?? 0);
       this.emitTrace({
         type: 'tune-out:reader-fork-failed',
@@ -18063,21 +18076,38 @@ export class AgentFramework {
   /**
    * What a persisted reader's branch says it was handed, read from its
    * framing rows past its derivation's checkpoint: every held row any of
-   * them handed it, and the resident's window mark on the last of them
-   * framed on `branch`, or none.
+   * them handed it (`held`); those of them a run took on (`taken`), from a
+   * framing made for an incarnation the ended `record` reaches, where one
+   * made for a later incarnation is a refused look's, which no run read;
+   * and the resident's window mark on the last of them framed on `branch`,
+   * or none.
    */
-  private readerHanded(cm: ContextManager, record: AgentRecord, branch: string | undefined): { held: Set<string>; through?: number } {
+  private readerHanded(
+    cm: ContextManager,
+    record: AgentRecord,
+    branch: string | undefined,
+  ): { held: Set<string>; taken: Set<string>; through?: number } {
     const checkpoint = record.inherit?.atSequence ?? Number.NEGATIVE_INFINITY;
     const held = new Set<string>();
+    const taken = new Set<string>();
     let through: number | undefined;
     for (const m of cm.getAllMessages()) {
       if (m.sequence <= checkpoint) continue;
-      const meta = m.metadata as { kind?: unknown; heldMessageIds?: unknown; residentThrough?: unknown; residentBranch?: unknown } | undefined;
+      const meta = m.metadata as {
+        kind?: unknown; incarnation?: unknown; heldMessageIds?: unknown; residentThrough?: unknown; residentBranch?: unknown;
+      } | undefined;
       if (meta?.kind !== 'tune-out-reader-framing') continue;
-      if (Array.isArray(meta.heldMessageIds)) for (const id of meta.heldMessageIds) if (typeof id === 'string') held.add(id);
+      const ran = typeof meta.incarnation !== 'number' || meta.incarnation <= record.incarnation;
+      if (Array.isArray(meta.heldMessageIds)) {
+        for (const id of meta.heldMessageIds) {
+          if (typeof id !== 'string') continue;
+          held.add(id);
+          if (ran) taken.add(id);
+        }
+      }
       if (typeof meta.residentThrough === 'number' && branch !== undefined && meta.residentBranch === branch) through = meta.residentThrough;
     }
-    return { held, ...(through !== undefined ? { through } : {}) };
+    return { held, taken, ...(through !== undefined ? { through } : {}) };
   }
 
   /**
