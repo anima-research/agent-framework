@@ -33,6 +33,10 @@ const GONE = [
   'flushDeferredWrites', 'ackDeferredWrites', 'handOffDeferredWrites', 'persistDeferredWrites',
   'writeDeferredWritesForQuiesce', 'restorePersistedDeferredWrites', 'fromQueue', 'deferredId',
   'DeferredWrite', 'DrainedWrite', 'storedCopiesOf', 'logDeferredWriteError', 'passOnFromReleasedWindow',
+  // Main's persistence of the queue: its writer, its durable copy and slot,
+  // its record, and its fell-behind and caught-up accounting.
+  'writeDeferredWrites', 'durableDeferredWrites', 'writeDeferredWritesSlot', 'deferredWritesRecord', 'DeferredWritesOutcome',
+  'deferredWritesBehind', 'deferredWritesFellBehind', 'deferredWritesCaughtUp', 'deferredWritesCapLogged',
   // The module API's handles onto queued writes, and the wakes that read them.
   'heldHandle', 'heldWritesFor', 'heldRows', 'settleUnknownLandings', 'deferredWriteDone', 'readsDeferredWrite',
   'readsDeferredFor', 'resolvePlacement', 'refuseUnsettled',
