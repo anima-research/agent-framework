@@ -178,7 +178,9 @@ export type TraceEvent =
        *  hybrid mode a `>>>` envelope can send the text itself elsewhere.
        *  Explicit mode: the channel its typing shows, where the start's wake
        *  came from, or, at a start whose wake names none, such as a budget
-       *  restart, the one the turn already shows. */
+       *  restart, the one the turn already shows. Disabled mode, and a silent
+       *  turn in any mode: none, though the turn may show typing, since its
+       *  text is never sent to a channel. */
       channelId?: string;
     })
   | (TraceEventBase & {
@@ -203,7 +205,9 @@ export type TraceEvent =
        *  hybrid mode a `>>>` envelope can send the text itself elsewhere.
        *  Explicit mode: the channel its typing shows, where the start's wake
        *  came from, or, at a start whose wake names none, such as a budget
-       *  restart, the one the turn already shows. */
+       *  restart, the one the turn already shows. Disabled mode, and a silent
+       *  turn in any mode: none, though the turn may show typing, since its
+       *  text is never sent to a channel. */
       channelId?: string;
     })
   | (TraceEventBase & {
