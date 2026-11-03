@@ -14,8 +14,9 @@
  *   it is written: the agent a write names (`forAgent`); for an admitted
  *   inbound message, the recipients admission delivered it to; for a
  *   module's process response whose inference request names agents, those
- *   of them registered. A write that names no agent (a module's write, a
- *   process response that asks every agent or none to read) is for the
+ *   of them registered that read the slot it lands in. A write that names
+ *   no agent (a module's write, a process response that asks every agent
+ *   or none to read, or only agents that don't read that slot) is for the
  *   agents that take untargeted inbound and own the slot it lands in: on a
  *   residents' host every resident, as each reads the shared slot; with one
  *   resident that resident alone, as before. It falls back to the agent the
@@ -25,11 +26,14 @@
  *   tells an untargeted row from one written for the primary. A message a
  *   tune-out holds is meant for none of them, so its list is empty.
  *   Observers of a slot (the subconscious watching the residents' slot) are
- *   a relationship in the registry, not part of the list. A target is
- *   stamped as named even where it doesn't read the slot the row lands in
- *   (an inbound message or a response naming a worker or a conversation
- *   fork, stored in the residents' slot): how such a row is presented is
- *   left to the presentation index.
+ *   a relationship in the registry, not part of the list. An inbound
+ *   message's target is stamped as named even where it doesn't read the
+ *   slot the row lands in (a worker or a conversation fork, stored in the
+ *   residents' slot): how such a row is presented is left to the
+ *   presentation index. A process response's messages, the gate's batched
+ *   line and the wake-onboarding notice are stamped for the agents they
+ *   name that read that slot, and as a write that names no agent when none
+ *   of them does, so they reach the windows that read the slot, as on main.
  * - `metadata.ownRowOf` names the agent whose own row it is: one stored by
  *   that agent's turn or act (its rounds, its tool results, a puppeted
  *   call), or by the framework for that agent's own turn (a clock row, a
