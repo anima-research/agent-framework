@@ -15186,7 +15186,13 @@ export class AgentFramework {
    * on a store without the batched form) is refused with
    * OperatorActionError 'failed' and can be redone: a redo puts back what
    * left, in its order, and its checkpoint stays for another undo to finish
-   * it. An undo that took nothing out throws its error and keeps nothing.
+   * it. So is an undo whose rows all left and whose checkpoint save then
+   * failed: the checkpoint stays saved, and the next undo, which finds
+   * nothing of its turn left in the window past it, saves the checkpoints
+   * without it and keeps no redo of nothing (the entry kept puts the rows
+   * back). An undo that took nothing out throws its error and keeps
+   * nothing. Each refusal after rows left is traced (`window:undone`) and
+   * recorded with its error.
    */
   private undoOnWindow(agent: Agent, requester?: OperatorRequester): {
     undone: boolean;
@@ -15210,6 +15216,38 @@ export class AgentFramework {
     const own = tail.filter((row) => row.own).map((row) => row.id);
     const others = tail.filter((row) => !row.own).map((row) => row.id);
     const branch = this.store.currentBranch().name;
+    const record = (window: { retracted: number; represented: number }, error?: string) => this.recordOperatorAction({
+      kind: 'undo-turn',
+      agent: agentName,
+      ...(requester ? { requester } : {}),
+      params: { turnIndex: checkpoint.turnIndex },
+      result: { sourceBranch: branch, targetBranch: branch, window },
+      ...(error !== undefined ? { error } : {}),
+    });
+    // An undo of this turn took its rows out and its checkpoint stayed (its
+    // save failed, or it was cut short and what was left past it has left
+    // since): with nothing of the turn left in the window, this undo saves
+    // the checkpoints without it, and keeps no redo of nothing, since the
+    // entry that undo kept puts the rows back.
+    const unfinished = this.redoStacks.get(agentName)?.at(-1);
+    if (tail.length === 0 && unfinished && unfinished.branchName === branch && sameCheckpoint(unfinished.checkpoint, checkpoint)) {
+      const window = { retracted: 0, represented: 0 };
+      try {
+        this.saveTurnCheckpoints(agentName, checkpoints);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        record(window, reason);
+        throw new OperatorActionError(
+          'failed',
+          `Undo of ${agentName}'s turn ${checkpoint.turnIndex}: its rows are out of the window already, and saving its ` +
+            `checkpoints failed again (${reason}). redo() puts them back, or another undo finishes it`,
+          { cause: error },
+        );
+      }
+      this.emitTrace({ type: 'window:undone', agentName, retracted: 0 });
+      record(window);
+      return { undone: true, turnIndex: checkpoint.turnIndex, fromBranch: branch, toBranch: branch, window };
+    }
     const entry: RedoEntry = {
       branchName: branch,
       checkpoint,
@@ -15235,16 +15273,8 @@ export class AgentFramework {
       // for another undo, which takes out what is still in the window past it.
       entry.window.lengthAfterUndo = cm.indexLength();
       const reason = error instanceof Error ? error.message : String(error);
-      const window = { retracted: left, represented: 0 };
       this.emitTrace({ type: 'window:undone', agentName, retracted: left });
-      this.recordOperatorAction({
-        kind: 'undo-turn',
-        agent: agentName,
-        ...(requester ? { requester } : {}),
-        params: { turnIndex: checkpoint.turnIndex },
-        result: { sourceBranch: branch, targetBranch: branch, window },
-        error: reason,
-      });
+      record({ retracted: left, represented: 0 }, reason);
       throw new OperatorActionError(
         'failed',
         `Undo of ${agentName}'s turn ${checkpoint.turnIndex} was cut short: ${left} of the ${tail.length} rows it takes out of the window left it ` +
@@ -15253,16 +15283,31 @@ export class AgentFramework {
       );
     }
     entry.window.lengthAfterUndo = cm.indexLength();
-    this.saveTurnCheckpoints(agentName, checkpoints);
     const window = { retracted: tail.length, represented: 0 };
+    try {
+      this.saveTurnCheckpoints(agentName, checkpoints);
+    } catch (error) {
+      // Nothing left the window: nothing to redo.
+      if (tail.length === 0) {
+        redoStack.pop();
+        throw error;
+      }
+      // The rows are out and the entry is kept for a redo. The checkpoint
+      // stays saved, so the next undo finds it with nothing of its turn
+      // left past it, and finishes the save (above).
+      const reason = error instanceof Error ? error.message : String(error);
+      this.emitTrace({ type: 'window:undone', agentName, retracted: tail.length });
+      record(window, reason);
+      const rows = tail.length === 1 ? '1 row' : `${tail.length} rows`;
+      throw new OperatorActionError(
+        'failed',
+        `Undo of ${agentName}'s turn ${checkpoint.turnIndex} took its ${rows} out of the window, and saving its checkpoints ` +
+          `failed (${reason}). redo() puts ${tail.length === 1 ? 'it' : 'them'} back, or another undo finishes it`,
+        { cause: error },
+      );
+    }
     this.emitTrace({ type: 'window:undone', agentName, retracted: tail.length });
-    this.recordOperatorAction({
-      kind: 'undo-turn',
-      agent: agentName,
-      ...(requester ? { requester } : {}),
-      params: { turnIndex: checkpoint.turnIndex },
-      result: { sourceBranch: branch, targetBranch: branch, window },
-    });
+    record(window);
     return { undone: true, turnIndex: checkpoint.turnIndex, fromBranch: branch, toBranch: branch, window };
   }
 
@@ -15355,25 +15400,65 @@ export class AgentFramework {
    * marks that covered the rows at the undo cover them again
    * (retakeMarks). The checkpoint goes back, unless an undo cut short left
    * it in place.
+   *
+   * A step that fails once the window has changed (the retraction partway,
+   * the rows' return, the checkpoint save) refuses the redo with
+   * OperatorActionError 'failed', saying how many rows left and how many
+   * returned, traced (`window:undone`) and recorded with its error; the
+   * entry stays, and another redo finishes it, from the window as it then
+   * is. One that changed nothing throws its error as it is. The caller,
+   * redo(), takes the entry off the stack and traces and records a redo
+   * that went through, after this returns.
    */
   private redoOnWindow(agent: Agent, entry: RedoEntry, below: readonly RedoEntry[], requester?: OperatorRequester): {
-    redone: boolean;
-    fromBranch?: string;
-    toBranch?: string;
-    window?: { retracted: number; represented: number };
+    redone: true;
+    fromBranch: string;
+    toBranch: string;
+    window: { retracted: number; represented: number };
   } {
     const agentName = agent.name;
     const cm = agent.getContextManager();
     const { tail, lengthAfterUndo, kept } = entry.window;
+    const branch = this.store.currentBranch().name;
+    const rowsOf = (n: number) => (n === 1 ? '1 row' : `${n} rows`);
+    const cutShort = (error: unknown, what: string, window: { retracted: number; represented: number }): never => {
+      if (window.retracted === 0 && window.represented === 0) throw error;
+      const reason = error instanceof Error ? error.message : String(error);
+      this.emitTrace({ type: 'window:undone', agentName, ...window });
+      this.recordOperatorAction({
+        kind: 'redo-turn',
+        agent: agentName,
+        ...(requester ? { requester } : {}),
+        result: { sourceBranch: branch, targetBranch: branch, window },
+        error: reason,
+      });
+      throw new OperatorActionError(
+        'failed',
+        `Redo of ${agentName}'s turn ${entry.checkpoint.turnIndex} was cut short: ${what} (${reason}). Another redo() finishes it`,
+        { cause: error },
+      );
+    };
     const undoneIds = new Set(tail.map((row) => row.id));
     const since = this.windowBodiesFrom(cm, 0, agent)
       .filter((row) => undoneIds.has(row.id) || (row.ordinal >= lengthAfterUndo && !kept.has(row.id)))
       .map((row) => row.id);
-    if (since.length > 0) cm.retractRows(since);
+    try {
+      if (since.length > 0) cm.retractRows(since);
+    } catch (error) {
+      const left = since.filter((id) => cm.ordinalOf(id) === undefined).length;
+      cutShort(error, `${left} of the ${rowsOf(since.length)} it takes out of the window first left it, and none of the turn's returned`,
+        { retracted: left, represented: 0 });
+    }
     const back = tail
       .filter((row) => { const status = cm.windowStatusOf(row.id); return status === 'undone' || status === 'out'; })
       .map((row) => row.id);
-    if (back.length > 0) cm.presentRows(back);
+    try {
+      if (back.length > 0) cm.presentRows(back);
+    } catch (error) {
+      const returnedNow = back.filter((id) => cm.ordinalOf(id) !== undefined).length;
+      cutShort(error, `the ${rowsOf(since.length)} it took out of the window first left it, and ${returnedNow} of the ` +
+        `${rowsOf(back.length)} of the turn it puts back returned`, { retracted: since.length, represented: returnedNow });
+    }
     const returned = new Set(back);
     for (const older of below) {
       for (const row of tail) {
@@ -15390,16 +15475,15 @@ export class AgentFramework {
     const at = checkpoints.findIndex((checkpoint) => sameCheckpoint(checkpoint, entry.checkpoint));
     if (at === -1) checkpoints.push({ ...entry.checkpoint, ...boundary });
     else checkpoints[at] = { ...checkpoints[at]!, ...boundary };
-    this.saveTurnCheckpoints(agentName, checkpoints);
-    const branch = this.store.currentBranch().name;
     const window = { retracted: since.length, represented: back.length };
-    this.emitTrace({ type: 'window:undone', agentName, retracted: since.length, represented: back.length });
-    this.recordOperatorAction({
-      kind: 'redo-turn',
-      agent: agentName,
-      ...(requester ? { requester } : {}),
-      result: { sourceBranch: branch, targetBranch: branch, window },
-    });
+    try {
+      this.saveTurnCheckpoints(agentName, checkpoints);
+    } catch (error) {
+      // The turn is back. Another redo takes its rows out and puts them back
+      // where they are, and saves the checkpoint.
+      cutShort(error, `the ${rowsOf(back.length)} of the turn ${back.length === 1 ? 'is' : 'are'} back in the window` +
+        `${since.length > 0 ? ` (the ${rowsOf(since.length)} it took out first left it)` : ''}, and saving its checkpoints failed`, window);
+    }
     return { redone: true, fromBranch: branch, toBranch: branch, window };
   }
 
@@ -15414,7 +15498,9 @@ export class AgentFramework {
    * took out and the agent's next point presents after, isn't covered. A
    * mark the agent no longer holds (a compile moved it since the undo) is
    * left as it is: what it covers is what the agent read later. Each undo
-   * still to redo below records the new mark in place of the old. A failure
+   * still to redo below records the new mark in place of the old, and so
+   * does this one's entry, for a redo that finishes this one where it was
+   * cut short after the rows came back (redoOnWindow). A failure
    * is logged and leaves the marks as they were: the rows put back then
    * read as unread until the agent's next mark.
    */
@@ -15432,7 +15518,7 @@ export class AgentFramework {
       }
       if (replacements.size === 0) return;
       agent.replaceReadMarks(replacements);
-      for (const older of below) {
+      for (const older of [...below, entry]) {
         for (const recorded of older.marks) recorded.mark = replacements.get(recorded.mark) ?? recorded.mark;
       }
     } catch (error) {
@@ -15492,7 +15578,18 @@ export class AgentFramework {
       throw new OperatorActionError('agent-busy', `Cannot redo: a turn of ${agentName}'s is alive`);
     }
     const result = this.redoOnWindow(agent, top, redoStack.slice(0, -1), requester);
-    redoStack.pop();
+    // Off the stack before its trace: a listener's undo of the turn again
+    // keeps its own entry, on top. By identity, as a listener of a trace the
+    // redo's own steps emit may have pushed one already.
+    const at = redoStack.lastIndexOf(top);
+    if (at !== -1) redoStack.splice(at, 1);
+    this.emitTrace({ type: 'window:undone', agentName, ...result.window });
+    this.recordOperatorAction({
+      kind: 'redo-turn',
+      agent: agentName,
+      ...(requester ? { requester } : {}),
+      result: { sourceBranch: result.fromBranch, targetBranch: result.toBranch, window: result.window },
+    });
     return result;
   }
 
