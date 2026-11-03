@@ -3210,15 +3210,38 @@ describe('the window follows a branch move (#291)', () => {
   });
 
   it('a switchBranch to a branch made before the write-down writes the window down there, and it stays presented', async () => {
-    const h = await boot({ mira: () => new PassthroughStrategy(), oren: () => new PassthroughStrategy() });
+    const dir = mkdtempSync(join(tmpdir(), 'af-window-follows-'));
+    dirs.push(dir);
+    const storePath = join(dir, 'store.chronicle');
+    // A store an earlier release wrote: rows in the residents' slot, no
+    // window index. The branch is made where that release left it, before
+    // this one's registration writes the windows down on main.
+    let beforeWriteDown!: number;
+    {
+      const store = JsStore.openOrCreate({ path: storePath });
+      const cm = await StoreWindow.open({ store, ...residentContextOptions('mira'), strategy: new PassthroughStrategy() });
+      for (const t of ['old-1', 'old-2']) cm.addMessage('someone', blocks(t), {});
+      assert.equal(cm.windowMode(), 'legacy', 'setup: the store predates the index');
+      beforeWriteDown = store.currentSequence();
+      cm.close();
+      store.close();
+    }
+    const h = await boot({ mira: () => new PassthroughStrategy(), oren: () => new PassthroughStrategy() }, storePath);
     const main = h.store.currentBranch().name;
-    h.store.createBranchAt('old', main, 1);
+    h.store.createBranchAt('old', main, beforeWriteDown);
+    const from = h.traces.length;
     await h.framework.switchBranch('old');
     for (const name of ['mira', 'oren']) {
       assert.equal(h.cm(name).windowMode(), 'presented', `${name}'s window on old`);
       assert.equal(h.internals.presents(h.framework.getAgent(name)!), true, name);
+      const rows = h.cm(name).getAllMessages().filter((m) => /^old-\d$/.test((m.content[0] as { text?: string }).text ?? ''));
+      assert.deepEqual(rows.map((m) => h.cm(name).windowStatusOf(m.id)), ['in', 'in'], `the earlier release's rows in ${name}'s window on old`);
     }
-    assert.ok(rebaseTraces(h.traces).every((t) => t.type === 'presentation:presented'));
+    assert.deepEqual(
+      rebaseTraces(h.traces.slice(from)).map((t) => [t.type, t.agentName]).sort(),
+      [['presentation:presented', 'mira'], ['presentation:presented', 'oren']],
+      'each window written down on old, which had none',
+    );
     // A row written now enters the idle agent's window at once, as at rest.
     const row = h.internals.addMessage('someone', blocks('on old'), {}, { forAgent: 'oren' });
     assert.equal(h.cm('oren').windowStatusOf(row), 'in');
