@@ -32,6 +32,9 @@ interface Site {
   scope: string[];
   /** The source of the innermost of them, or of the file when there is none. */
   scopeText: string;
+  /** Where it is called: the source of the metadata it is given (its third
+   *  argument, '' when there is none). Undefined where it isn't called. */
+  metadata?: string;
 }
 
 type Node = { type: string; start?: number | null; end?: number | null; loc?: { start: { line: number } } | null; [field: string]: unknown };
@@ -122,7 +125,10 @@ function scanAddMessageSites(sources: Array<{ name: string; text: string }>): Si
   // a name, read once the file's bindings are all known.
   const bound = new Map<string, Map<string, string>>();
   const byName: Array<{ file: string; name: string; site: Site }> = [];
+  // Each call, by its callee, so a member can find the call it is called by.
+  const callOf = new WeakMap<Node, Node>();
   walkSources(sources, (file, node, scope, scopeText, slice, declared) => {
+    if (node.type === 'CallExpression' || node.type === 'OptionalCallExpression') callOf.set(child(node, 'callee')!, node);
     if (node.type === 'VariableDeclarator' && child(node, 'id')?.type === 'Identifier') {
       const text = literalText(child(node, 'init'));
       if (text !== undefined) {
@@ -130,7 +136,14 @@ function scanAddMessageSites(sources: Array<{ name: string; text: string }>): Si
         bound.get(file)!.set(child(node, 'id')!.name as string, text);
       }
     }
-    const at = (receiver: string): Site => ({ file, line: node.loc!.start.line, receiver, scope, scopeText });
+    const at = (receiver: string): Site => {
+      const call = callOf.get(node);
+      const metadata = call && (call.arguments as Node[])[2];
+      return {
+        file, line: node.loc!.start.line, receiver, scope, scopeText,
+        ...(call ? { metadata: metadata ? slice(metadata) : '' } : {}),
+      };
+    };
     if (node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') {
       const property = child(node, 'property');
       if (keyName(property, node.computed) === 'addMessage') sites.push(at(slice(child(node, 'object')!)));
@@ -236,10 +249,25 @@ it('every write into a context in src goes through the framework\'s addMessage, 
 
   for (const site of direct) {
     const { stamp, what } = DIRECT_WRITES[keyOf(site)]!;
-    assert.ok(site.scopeText.includes(STAMPED_BY[stamp]),
-      `${where(site)} (${what}) is listed as stamped by ${STAMPED_BY[stamp]}), which its scope doesn't call`);
+    assert.ok(stampsItsRow(site, STAMPED_BY[stamp]),
+      `${where(site)} (${what}) is listed as stamped by ${STAMPED_BY[stamp]}), and the metadata it passes isn't stamped so`);
   }
 });
+
+/**
+ * Whether a direct write passes metadata stamped by `helper` (its call, as
+ * `asOwnRow(`): metadata that calls it, or that names a variable its scope
+ * assigns from it (`metadata = asOwnRow(…)`, then `addMessage(…, metadata)`).
+ * Read from the source, each write for itself, so one write of two in a
+ * scope that passes something else is found.
+ */
+function stampsItsRow(site: Site, helper: string): boolean {
+  if (!site.metadata) return false;
+  if (site.metadata.includes(helper)) return true;
+  const call = helper.replace('(', '\\(');
+  return [...site.metadata.matchAll(/[A-Za-z_$][\w$]*/g)].some(([name]) =>
+    new RegExp(`(?:^|[^\\w$.])${name.replace(/\$/g, '\\$')}\\s*=\\s*${call}`).test(site.scopeText));
+}
 
 it('the scan finds addMessage however it is reached, and names the scope it is in', () => {
   const text = [
@@ -280,6 +308,8 @@ it('the scan finds addMessage however it is reached, and names the scope it is i
     [19, 'cm', 'named'],
   ]);
   assert.ok(sites[0]!.scopeText.startsWith('store(') && sites[0]!.scopeText.includes('asOwnRow('), "a site's scope text is its method's");
+  assert.deepEqual(sites.slice(0, 4).map((s) => s.metadata), ["asOwnRow(undefined, 'a')", '', '', undefined],
+    "a call's metadata, '' where it passes none, and nothing where it isn't called");
 
   // Read with the lists above: none of these is the framework's, and none is listed.
   const { throughTheFramework, direct } = classify(sites);
@@ -289,6 +319,22 @@ it('the scan finds addMessage however it is reached, and names the scope it is i
   const inFramework = scanAddMessageSites([{ name: 'framework.ts', text: 'export class AgentFramework { a() { this.addMessage(); } }\nclass Other { a() { this.addMessage(); } }' }]);
   assert.deepEqual(classify(inFramework).direct.map((s) => s.scope.join('.')), ['Other.a']);
   assert.throws(() => scanAddMessageSites([{ name: 'broken.ts', text: 'const = ;' }]), /^Error: broken\.ts: /);
+
+  // Each write's metadata is read for itself: in a scope that stamps one
+  // write's, another that passes something else is unstamped.
+  const writes = scanAddMessageSites([{ name: 'guard.ts', text: [
+    'class Guard {',
+    '  store(cm: C, metadata: M, raw: M) {',
+    "    metadata = asOwnRow(metadata, 'a');",
+    "    cm.addMessage('user', [], metadata);",
+    "    cm.addMessage('user', [], raw);",
+    "    cm.addMessage('user', [], withAudience(raw, ['a']));",
+    "    cm.addMessage('user', []);",
+    '  }',
+    '}',
+  ].join('\n') }]);
+  assert.deepEqual(writes.map((s) => [stampsItsRow(s, STAMPED_BY.own), stampsItsRow(s, STAMPED_BY.audience)]),
+    [[true, false], [false, false], [false, true], [false, false]]);
 });
 
 /**
