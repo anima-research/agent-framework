@@ -1,7 +1,8 @@
 /**
  * How the default reader framing writes a row (AF #967 bot review findings
- * 5 and 23): the resident's rows a resumed persisted reader is handed
- * (`residentRows`), each under its author, and a line for every row the
+ * 5, 23 and 24): the resident's rows a resumed persisted reader is handed
+ * (`residentRows`) and the held traffic, each row's text and media in the
+ * order the row holds them, under its author, and a line for every row the
  * count line counts.
  */
 import { describe, it } from 'node:test';
@@ -10,7 +11,7 @@ import type { StoredMessage } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import { defaultReaderFraming } from '../src/index.js';
 import type { ReaderFramingContext } from '../src/index.js';
-import { ANONYMOUS_PARTICIPANT } from '../src/author-presentation.js';
+import { ANONYMOUS_PARTICIPANT, presentAuthor } from '../src/author-presentation.js';
 
 const IMAGE = { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'AAAA' } } as ContentBlock;
 const text = (t: string) => ({ type: 'text', text: t }) as ContentBlock;
@@ -32,6 +33,16 @@ const NOTHING_HELD = '\n[Nothing new has been held since your last look.]';
 const NOTHING_ENTERED = "\n[Nothing has entered scout's context since your last look.]";
 
 describe("the resident's rows in the reader framing", () => {
+  it('keeps a row\'s text and media in their order: text A, the image, then text B, unprefixed (finding 24)', () => {
+    const out = defaultReaderFraming(resynced([row('scout', [text('A'), IMAGE, text('B')])]));
+    assert.deepEqual(shape(out), [
+      "\n[In scout's context since your last look: 1 message]\nscout: A",
+      '<image>',
+      'B',
+      NOTHING_HELD,
+    ]);
+  });
+
   it("names the author of a row that holds media and no text, before its media (finding 5)", () => {
     const out = defaultReaderFraming(resynced([
       row('scout', [text('here is the chart')]),
@@ -78,4 +89,61 @@ describe("the resident's rows in the reader framing", () => {
   it('with no rows, says nothing entered, as before', () => {
     assert.deepEqual(shape(defaultReaderFraming(resynced([]))), [NOTHING_ENTERED, NOTHING_HELD]);
   });
+});
+
+describe('the held traffic in the reader framing', () => {
+  const held = (messages: StoredMessage[]) => defaultReaderFraming({ ...base, backlog: messages });
+
+  it("keeps a held message's text and media in their order: text A, the image, then text B, unprefixed (finding 24)", () => {
+    const out = held([row(ANONYMOUS_PARTICIPANT, [text('A'), IMAGE, text('B')], by('antra')), row(ANONYMOUS_PARTICIPANT, [text('next')], by('bo'))]);
+    assert.deepEqual(shape(out), [
+      '\n[Held in disc:guild:noisy since your last look: 2 messages]\nantra: A',
+      '<image>',
+      'B\nbo: next',
+    ]);
+  });
+
+  it('a held message with media and no text, or text then media, reads as before', () => {
+    const out = held([
+      row(ANONYMOUS_PARTICIPANT, [IMAGE], by('mira')),
+      row(ANONYMOUS_PARTICIPANT, [text('look'), IMAGE], by('antra')),
+      row(ANONYMOUS_PARTICIPANT, [text('one'), text('two')], by('bo')),
+      row(ANONYMOUS_PARTICIPANT, [], by('bo')),
+    ]);
+    assert.deepEqual(shape(out), [
+      '\n[Held in disc:guild:noisy since your last look: 4 messages]\nmira: ',
+      '<image>',
+      'antra: look',
+      '<image>',
+      'bo: one\ntwo\nbo: ',
+    ]);
+  });
+
+  it('a held message stored media first names its author before the media, and its text after as stored', () => {
+    const stored = presentAuthor({ ...row(ANONYMOUS_PARTICIPANT, [IMAGE, text('hello?')], by('antra')) });
+    assert.deepEqual(stored.content, [IMAGE, text('antra: hello?')], 'premise: presentAuthor names the author in the first text block');
+    assert.deepEqual(shape(held([stored])), [
+      '\n[Held in disc:guild:noisy since your last look: 1 message]\nantra: ',
+      '<image>',
+      'antra: hello?',
+    ]);
+  });
+});
+
+describe('both formatters write a row alike', () => {
+  for (const [label, content] of [
+    ['text, media, text', [text('A'), IMAGE, text('B')]],
+    ['media, text', [IMAGE, text('A')]],
+    ['media alone', [IMAGE]],
+    ['text, media, media, text', [text('A'), IMAGE, IMAGE, text('B')]],
+    ['text, text', [text('A'), text('B')]],
+  ] as const) {
+    it(label, () => {
+      const message = row(ANONYMOUS_PARTICIPANT, [...content], by('antra'));
+      const resident = shape(defaultReaderFraming(resynced([message]))).slice(0, -1);
+      const backlog = shape(defaultReaderFraming({ ...base, backlog: [message] }));
+      const afterCount = (blocks: string[]) => [blocks[0]!.split('\n').slice(2).join('\n'), ...blocks.slice(1)];
+      assert.deepEqual(afterCount(resident), afterCount(backlog));
+    });
+  }
 });

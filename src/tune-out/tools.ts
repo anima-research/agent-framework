@@ -441,16 +441,7 @@ export function defaultReaderFraming(ctx: ReaderFramingContext): ContentBlock[] 
   };
   for (const message of ctx.backlog) {
     const author = (message.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? message.participant;
-    const text = message.content
-      .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
-      .map((b) => b.text)
-      .join('\n');
-    lines.push(authorLine(author, text));
-    const media = message.content.filter((b) => b.type !== 'text');
-    if (media.length > 0) {
-      flush();
-      content.push(...media);
-    }
+    writeRowInOrder(message.content, author, '', lines, content);
   }
   flush();
   return content;
@@ -462,12 +453,13 @@ export function defaultReaderFraming(ctx: ReaderFramingContext): ContentBlock[] 
  * `author: text`, its tool calls and results as the transcript the
  * persistent subconscious is sent a resident's rounds in (foreignRowAsSent:
  * the tool's name and its input or outcome in brief, no thinking), and its
- * non-text blocks as they are. A row's author is its participant, or for a
- * row under the anonymous participant, the author its metadata names; one
- * that names none, a tool result's or a notice's, goes with no author. Each
- * row counted has its line: a row with media and no text has `author: `
- * before its media (with no author to name, its media alone), and a row
- * with nothing to send reads `[no text]`.
+ * non-text blocks as they are, each where it stands in the row
+ * (writeRowInOrder, as the held traffic is written). A row's author is its
+ * participant, or for a row under the anonymous participant, the author its
+ * metadata names; one that names none, a tool result's or a notice's, goes
+ * with no author. Each row counted has its line: a row that opens with media
+ * has `author: ` before it (with no author to name, its media alone), and a
+ * row with nothing to send reads `[no text]`.
  */
 function residentRowLines(resident: string, rows: readonly StoredMessage[]): ContentBlock[] {
   if (rows.length === 0) return [{ type: 'text', text: `\n[Nothing has entered ${resident}'s context since your last look.]` }];
@@ -481,23 +473,51 @@ function residentRowLines(resident: string, rows: readonly StoredMessage[]): Con
   const callNames = new Map<string, string>();
   for (const row of rows) for (const b of row.content) if (b.type === 'tool_use') callNames.set(b.id, b.name);
   for (const row of rows) {
-    const sent = foreignRowAsSent(row.content, { callNames });
     const author = row.participant === ANONYMOUS_PARTICIPANT
       ? (row.metadata as { author?: { name?: string } } | undefined)?.author?.name
       : row.participant;
-    const text = sent
-      .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
-      .map((b) => b.text)
-      .join('\n');
-    const media = sent.filter((b) => b.type !== 'text');
-    const said = text.length > 0 || media.length > 0 ? text : NOTHING_SAID;
-    if (author !== undefined) lines.push(authorLine(author, said));
-    else if (said.length > 0) lines.push(said);
-    if (media.length > 0) {
-      flush();
-      content.push(...media);
-    }
+    writeRowInOrder(foreignRowAsSent(row.content, { callNames }), author, NOTHING_SAID, lines, content);
   }
   flush();
   return content;
+}
+
+/**
+ * One row of a reader framing, written onto `lines` (the text block being
+ * built) and `content` in the order of its blocks. The row's text runs into
+ * a line, and its first line is `author: text` when it has an author to name
+ * (authorLine). At a non-text block (an image, a document) the line ends,
+ * `lines` goes into `content` as a text block, the block follows it, and the
+ * text after it runs into a new line, with no author. A row that opens with
+ * a non-text block has `author: ` before it (nothing, with no author to
+ * name), and a row with neither text nor other blocks reads `empty`, under
+ * its author when it has one.
+ */
+function writeRowInOrder(
+  blocks: readonly ContentBlock[],
+  author: string | undefined,
+  empty: string,
+  lines: string[],
+  content: ContentBlock[],
+): void {
+  let run: string[] = [];
+  let opened = false;
+  const endLine = () => {
+    const said = run.join('\n');
+    run = [];
+    if (!opened && author !== undefined) lines.push(authorLine(author, said));
+    else if (said.length > 0) lines.push(said);
+    opened = true;
+  };
+  for (const block of blocks) {
+    if (block.type === 'text') {
+      run.push(block.text);
+      continue;
+    }
+    endLine();
+    if (lines.length > 0) content.push({ type: 'text', text: lines.splice(0).join('\n') });
+    content.push(block);
+  }
+  if (!opened && run.join('\n').length === 0) run = [empty];
+  endLine();
 }
