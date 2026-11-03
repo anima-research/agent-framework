@@ -797,6 +797,24 @@ describe('a handed line across readers, a flush, a quiesce and a hold', () => {
       assert.equal(texts(b).filter((t) => t.includes('LINE-SCOUT-FIRST')).length, 0, 'no wake line after an answered DM');
     } finally { await done(b); }
   });
+  it("a line with a write the delivery agent's start left out for a held slot is written by another reader's later start, with no lines of its own", async () => {
+    const b = await bare(['scout', 'mira']);
+    try {
+      const messageId = b.internals.addMessage('antra', [{ type: 'text', text: 'are you there?' }], { serverId: 'discord', eventId: 'ev-1', channelId: 'discord:dm:1' });
+      storeChatter(b);
+      const line = { ...dmLine('ev-1', 'LINE-OWED'), after: { agent: 'scout', messageId } };
+      b.internals.activeTurnTokens.set('mira', 1);
+      try {
+        b.internals.placeWakeLines(b.framework.getAgent('scout'), [line]);
+      } finally {
+        b.internals.activeTurnTokens.delete('mira');
+      }
+      assert.equal(texts(b).filter((t) => t.includes('LINE-OWED')).length, 0, 'premise: held, not written');
+      b.internals.placeWakeLines(b.framework.getAgent('mira'), []);
+      assert.equal(texts(b).filter((t) => t.includes('LINE-OWED')).length, 1);
+    } finally { await done(b); }
+  });
+
   it("a line whose write went to another agent's window isn't owed to the slot: a later resident start writes none", async () => {
     const dir = mkdtempSync(join(tmpdir(), 'wake-line-fork-write-'));
     const framework = await AgentFramework.create({

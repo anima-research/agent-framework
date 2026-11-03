@@ -1365,7 +1365,7 @@ describe('a batched wake writes its line only when it says something', () => {
     assert.deepStrictEqual(inferenceRequests[0].lines?.[0]?.entry, asked[0]);
   });
 
-  it('one message with something after it: the line stays', () => {
+  it('one message with no write and something after it: the line stays', () => {
     const { gate, messages, inferenceRequests } = makeGate(config('quiet-not-newest.json'), { isNewestEntry: () => false });
     gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'hi', metadata: { messageId: 'm1' } }));
     fire(gate, 'chat');
@@ -1375,7 +1375,7 @@ describe('a batched wake writes its line only when it says something', () => {
     assert.strictEqual(inferenceRequests[0].lines, undefined, 'written now, so not handed on');
   });
 
-  it('several messages: the line stays, and the framework is not asked', () => {
+  it('several messages with no write: the line stays, and the framework is not asked', () => {
     let asked = 0;
     const { gate, messages } = makeGate(config('quiet-several.json'), { isNewestEntry: () => { asked++; return true; } });
     gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'a', metadata: { messageId: 'm1' } }));
@@ -1386,7 +1386,7 @@ describe('a batched wake writes its line only when it says something', () => {
     assert.strictEqual(asked, 0);
   });
 
-  it('an event whose content the line quotes (not stored at arrival): the line stays, and the framework is not asked', () => {
+  it('an event with no write whose content the line quotes (not stored at arrival): the line stays, and the framework is not asked', () => {
     let asked = 0;
     const { gate, messages } = makeGate(config('quiet-quoted.json'), { isNewestEntry: () => { asked++; return true; } });
     gate.evaluate(event({ eventType: 'workspace:file-changed', serverId: '', channelId: '', content: 'notes.md changed' }));
@@ -1492,7 +1492,7 @@ describe('a batched wake writes its line only when it says something', () => {
     assert.strictEqual(inferenceRequests[0].lines, undefined);
   });
 
-  it('a callback that throws keeps the line; without one, every wake writes it, as before', () => {
+  it('with no write, a callback that throws keeps the line; without one, every wake writes it, as before', () => {
     const throwing = makeGate(config('quiet-throws.json'), { isNewestEntry: () => { throw new Error('boom'); } });
     throwing.gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'hi', metadata: { messageId: 'm1' } }));
     fire(throwing.gate, 'chat');

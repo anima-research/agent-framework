@@ -163,6 +163,23 @@ describe('judge rules: verdicts', () => {
     });
   }
 
+  it("a reply asks isAnswered when the judge answers: an event answered while the judge read keeps the wake", async () => {
+    const judge = scriptedJudge();
+    const answered = new Set<string>();
+    const { gate, wakes, messages } = makeGate(writeConfig('reply-asked-late.json', JUDGED), {
+      judge: judge.fn, isNewestEntry: () => false, isAnswered: (after) => answered.has(after.messageId!),
+    });
+    gate.evaluate(chat('answered while the judge read'), { agent: 'agent', messageId: 'row-1' });
+    gate.evaluate(chat('still open'), { agent: 'agent', messageId: 'row-2' });
+    await until(() => judge.waiting() === 1, 'the judge is asked');
+    answered.add('row-1');
+    judge.answer({ reply: true, reason: 'a direct question', inputTokens: 1 });
+    await until(() => wakes.length === 1, 'the wake');
+    assert.strictEqual(wakes[0]!.lines, undefined, 'the answered event keeps the wake, so nothing is handed');
+    assert.strictEqual(messages.length, 1);
+    gate.dispose();
+  });
+
   for (const [doubt, isAnswered] of [
     ['no isAnswered', undefined],
     ['an isAnswered that throws', () => { throw new Error('no'); }],

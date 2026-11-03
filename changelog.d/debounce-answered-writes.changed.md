@@ -10,7 +10,7 @@
   messages, counted together under each name the channel was shown by, where
   each batch's line was written on its own. A start that finds the host
   quiesced or another reader of the window with a turn alive writes none, and
-  the next start of any reader writes them. A line left out because its one
+  the next start of any reader decides them again. A line left out because its one
   event, a channel message or a push, is still the newest entry there is
   decided again only by the delivery agent's later starts of its wake, as a
   newest message's line is, and so is the line of an event written to another
@@ -29,11 +29,11 @@
   window, or a queued request that names no message, keeps it certain, and
   so does a batch that wakes more than one agent.
 - `gate:wake-line-omitted` is traced at the start of any agent that reads the
-  window, for each line still owed there that the start leaves out, each
-  time, where it was traced only at the delivery agent's starts of the line's
+  window, for each line still owed there that the start leaves out as newest
+  or for a held slot, each time, where it was traced only at the delivery agent's starts of the line's
   own wake.
 - `gate:judge-verdict`'s `woke` still says whether the batch was delivered to
   wake the agent, and such a delivery may now start no turn.
-- **Prompt cache:** `wake_add_rule`'s `debounceMs` description changes, so the
-  first request after the upgrade that carries that tool misses the cache
-  from its tool block on.
+- **Prompt cache:** `wake_add_rule`'s descriptions of `debounceMs` and of its
+  judge change, so the first request after the upgrade that carries that
+  tool misses the cache from its tool block on.

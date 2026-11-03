@@ -203,6 +203,9 @@ describe('Conversation routing', () => {
         assert.equal(after?.messageId, stored?.id, "and the fork's own stored message");
         await framework.runUntilIdle();
         assert.ok(!turns.slice(1).includes(fork), "the fork's batched wake was dropped");
+        const trunkLines = framework.getAgent('trunk')!.getContextManager().getAllMessages()
+          .filter((m) => (m.metadata as { source?: string } | undefined)?.source === 'gate:debounce');
+        assert.equal(trunkLines.length, 0, "no line in the trunk's window for a message the fork answered");
       } finally {
         await framework.stop();
       }

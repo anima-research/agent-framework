@@ -3591,7 +3591,8 @@ const JUDGE_PARAMETER: ToolParameter = {
     'Ask the reply judge first: batch matching events like debounceMs, then a small, cheap model reads your ' +
     'context (its newest part) with your instructions and decides whether to wake you now. When it says wait, ' +
     'you aren\'t woken (the events stay in your context, as for "defer"); the next batch is judged afresh. ' +
-    'If the judge fails or times out you are woken, unless your host set it to stay quiet then. ' +
+    'If the judge fails or times out you are woken, unless your host set it to stay quiet then or you\'ve ' +
+    'already read and answered every event in the batch. ' +
     'Its verdicts and reasons are in gate_status.',
   properties: {
     debounceMs: { type: 'number', description: 'Quiet period (ms) before the batch is judged (100–300000).' },
@@ -29835,8 +29836,9 @@ export class AgentFramework {
    * writes itself (the locus notice among them), and before the agent's
    * answer to the wake.
    *
-   * - A line whose event the delivery agent has read and answered is left
-   *   out (wakeLineDone, as the wake's drop judges it).
+   * - A line whose event the agent its write went to (the delivery agent
+   *   where it has none) has read and answered is dropped (wakeLineDone, as
+   *   the wake's drop judges it).
    * - A wake's one line whose event is still the newest entry is left out,
    *   unless a line of the wake already written is still unanswered: no
    *   message follows the wake's, so it is the wake's whole cause, and the
@@ -29851,28 +29853,34 @@ export class AgentFramework {
    *   delivery agent's next boundary, never reaching this request
    *   (overlapping turns in the slot, #286).
    *
-   * A line left out is traced. Each line is written once (placedWakeLines),
-   * across the wake's retries and holds, whichever copy of its trigger a
-   * start carries: every request for the wake carries the same line. A line
-   * left out, or whose write fails, stays undecided: one owed to the slot for
-   * the next start of a reader, any other for a later fresh start of its
-   * wake.
+   * A line left out as newest or for a held slot is traced. Each line is
+   * written once (placedWakeLines), across the wake's retries and holds,
+   * whichever copy of its trigger a start carries: every request for the wake
+   * carries the same line. A line owed to the slot and left out for a held
+   * slot, or whose write fails, stays undecided for the next start of a
+   * reader; any other, one left out as newest among them, for the delivery
+   * agent's later fresh starts of its wake.
    */
   private placeWakeLines(agent: Agent, lines: readonly WakeLine[] = []): void {
     const slot = this.deliveryAgent();
     if (!slot || !this.residentHoldsTraffic(agent.name)) return;
     const kept = (line: WakeLine) => !this.owedToSlot(line) || this.newestWakeLines.has(line);
+    const done = (line: WakeLine) => {
+      if (!isWrite(line.after) || line.after.agent === slot.name) return this.wakeLineDone(slot, line);
+      const writer = this.agents.get(line.after.agent);
+      return writer === undefined || this.wakeLineDone(writer, line);
+    };
     for (const line of lines) if (!kept(line) && !this.placedWakeLines.has(line)) this.owedWakeLines.add(line);
     for (const line of this.owedWakeLines) {
-      if (this.wakeLineDone(slot, line)) this.owedWakeLines.delete(line);
+      if (done(line)) this.owedWakeLines.delete(line);
     }
     const own = agent === slot
-      ? lines.filter((line) => kept(line) && !this.placedWakeLines.has(line) && !this.wakeLineDone(slot, line))
+      ? lines.filter((line) => kept(line) && !this.placedWakeLines.has(line) && !done(line))
       : [];
     const open = [...this.owedWakeLines, ...own];
     if (open.length === 0) return;
     const held = this.slotHeldFrom(agent);
-    const writtenCause = lines.some((line) => this.placedWakeLines.has(line) && !this.wakeLineDone(slot, line));
+    const writtenCause = lines.some((line) => this.placedWakeLines.has(line) && !done(line));
     const leftOut = held || (open.length === 1 && !writtenCause && this.isNewestIn(slot, open[0].entry));
     if (leftOut) {
       const reason = held ? 'held' : 'newest';
