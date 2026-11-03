@@ -24,7 +24,7 @@ const FORK_HOME = 'discord:g1:fork-home';
 const ref = (channelId: string): ChannelRef => ({ serverId: 'discord', channelId });
 const line = (value: string, why: string): string =>
   `[routing] unpromptedChannel ${value} ${why}, so a turn the agent's own timer starts `
-  + 'takes the fallback it takes without the setting until the setting names a channel it can speak in. Not logged again until it has.';
+  + 'takes the fallback it takes without the setting until the setting names a channel it can speak in. Not logged again until a turn has used it.';
 
 async function logged(run: () => void | Promise<void>): Promise<string[]> {
   const lines: string[] = [];
@@ -136,7 +136,7 @@ describe("channel_publish's description", () => {
 
   it('with unpromptedChannel and an event gate, it names the channel for a timer\'s turn among the defaults, and nothing else changes', () => {
     const tool = publishTool({ unpromptedChannel: OPS, eventGatePresent: true });
-    assert.equal(tool.description, "Publish a message to a channel. If channelId is omitted, publishes where your plain speech goes this turn: your conversation's channel if you are bound to one; otherwise the channel of the message that woke this turn, or one you opened during it; otherwise, while a focus holds, the channel it keeps; otherwise, on a turn your own skip_reply wake or the end of your sleep started, or one continuing it, the channel this host names for such turns. Where none of those names a channel, nothing is posted, unless this host is set to use the channel of the latest incoming message instead. A turn with no channel by design, such as a heartbeat's, has no default, so it names one. A subagent has no default, so it must name a channel.");
+    assert.equal(tool.description, "Publish a message to a channel. If channelId is omitted, publishes where your plain speech goes this turn: your conversation's channel if you are bound to one; otherwise the channel of the message that woke this turn, or one you opened during it; otherwise, while a focus holds, the channel it keeps; otherwise, on a turn your own skip_reply wake or the end of your sleep started (or a turn continuing one, when your plain speech isn't routed), the channel this host names for such turns. Where none of those names a channel, nothing is posted, unless this host is set to use the channel of the latest incoming message instead. A turn with no channel by design, such as a heartbeat's, has no default, so it names one. A subagent has no default, so it must name a channel.");
     assert.deepEqual({ ...tool, description: MAIN }, publishTool({ eventGatePresent: true }));
   });
 });
@@ -346,6 +346,38 @@ describe('unpromptedChannel on a real MCPL server', () => {
       await t.sleepEnd([done()], [[publishCall('still on it'), done()]]);
       assert.deepEqual(t.published(), [OPS]);
     });
+
+    it("in explicit prose routing, a ' !' continuation of a timer's turn keeps its default", async () => {
+      const t = await setup(OPS, { proseRouting: 'explicit' });
+      await t.sleepEnd([say(`>>${BUSY} ! one more thing`)], [[publishCall('the thing'), done()]]);
+      assert.deepEqual(t.published(), [BUSY, OPS]);
+    });
+
+    it("in explicit prose routing, the wake a timer's turn's bounced reply asks for keeps its default", async () => {
+      const t = await setup(OPS, { proseRouting: 'explicit' });
+      await t.sleepEnd([say('no target')], [[publishCall('resent'), done()]]);
+      assert.deepEqual(t.published(), [OPS]);
+    });
+
+    it("a quiesce parks a timer's wake apart from another wake with the same reason, so neither absorbs the other", async () => {
+      const t = await setup(OPS);
+      const internals = t.framework as unknown as {
+        pendingRequests: Array<{ agentName: string; source: string }>;
+        processInferenceRequests(): Promise<void>;
+        quiesced: boolean;
+        eventGate: { requestInferenceFn(agentName: string, reason: string, source: string): void };
+      };
+      internals.quiesced = true;
+      try {
+        internals.eventGate.requestInferenceFn('scout', 'woken', 'self-wake');
+        internals.eventGate.requestInferenceFn('scout', 'woken', 'gate');
+        await internals.processInferenceRequests();
+        assert.deepEqual(internals.pendingRequests.filter((r) => r.agentName === 'scout').map((r) => r.source).sort(), ['gate', 'self-wake']);
+      } finally {
+        internals.quiesced = false;
+        internals.pendingRequests.length = 0;
+      }
+    });
   });
 
   describe("the turns that don't: they keep what they do without it", () => {
@@ -397,7 +429,8 @@ describe('unpromptedChannel on a real MCPL server', () => {
       const t = await setup(OPS);
       await t.wake({ reason: 'heartbeat', source: 'heartbeat', suppressProse: true }, [publishCall('a note'), done()]);
       assert.deepEqual(t.published(), []);
-      assert.deepEqual(t.toolResults().map((r) => r.isError), [true], JSON.stringify(t.toolResults()));
+      assert.equal(t.toolResults().length, 1);
+      assert.match(JSON.stringify(t.toolResults()[0]), /Nothing was posted: channel_publish needs a `channelId`, and there's no channel to default to yet\./);
     });
 
     it("an ephemeral run: its prose is its caller's result", async () => {

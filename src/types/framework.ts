@@ -505,8 +505,9 @@ export interface FrameworkConfig {
    * register that id, `{serverId}:{channelId}`. `create()` refuses a value
    * that is neither a string nor null, or is blank; null reads as not set. A
    * value that names no registered channel, several, or one its server
-   * declared inbound-only, when a turn would take it, is logged once, and the
-   * turn takes what it would without the setting. `channel_publish`'s
+   * declared inbound-only, when a turn would take it, is logged, and logged
+   * again only after a turn has used it since; the turn takes what it would
+   * without the setting. `channel_publish`'s
    * description names it among the defaults only on a framework with an
    * event gate, the only one with such turns; on any other the description
    * is as it is without the setting.

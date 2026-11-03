@@ -1619,7 +1619,7 @@ export class ChannelRegistry {
           description: tool.description
             .replace(
               'otherwise, while a focus holds, the channel it keeps.',
-              'otherwise, while a focus holds, the channel it keeps; otherwise, on a turn your own skip_reply wake or the end of your sleep started, or one continuing it, the channel this host names for such turns.',
+              'otherwise, while a focus holds, the channel it keeps; otherwise, on a turn your own skip_reply wake or the end of your sleep started (or a turn continuing one, when your plain speech isn\'t routed), the channel this host names for such turns.',
             )
             .replace('A turn with no channel of its own, such as', 'A turn with no channel by design, such as'),
         };
@@ -5827,7 +5827,7 @@ export class ChannelRegistry {
       console.error(
         `[routing] unpromptedChannel ${logValue(this.unpromptedChannel)} ${why}, so a turn the agent's own timer starts `
           + 'takes the fallback it takes without the setting until the setting names a channel it can speak in. '
-          + 'Not logged again until it has.',
+          + 'Not logged again until a turn has used it.',
       );
     }
     return null;
