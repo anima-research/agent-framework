@@ -483,10 +483,17 @@ export interface FrameworkConfig {
   inferenceRouting?: InferenceRoutingPolicy;
 
   /**
-   * Unprompted channel for turns with no channel provenance (heartbeats, timers):
-   * plain-text speech on such a turn routes here instead of the last-active
-   * channel. Channel descriptor id form, e.g. `discord:{guildId}:{channelId}`.
-   * A real triggering channel (or a fork's home) still takes precedence.
+   * The channel for a turn no channel message prompted, while the turn has no
+   * channel of its own: a self-scheduled wake's or a sleep's end, say. Plain
+   * speech in locus or hybrid prose routing goes there, and so does
+   * `channel_publish` naming no channel, where without it they follow
+   * `speech.locus`. It never applies to a turn a channel message prompted,
+   * addressed or not, nor to a conversation fork's turn, a heartbeat's, silent
+   * or not (its plain speech is held as drafts, a silent tick's suppressed),
+   * or an ephemeral run's (its prose is its caller's result). One value, for
+   * every agent on the framework. A registered channel's id, e.g.
+   * `discord:{guildId}:{channelId}`, or, to pick one server's where two
+   * register that id, `{serverId}:{channelId}`.
    */
   unpromptedChannel?: string;
 

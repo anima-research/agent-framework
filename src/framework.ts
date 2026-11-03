@@ -32238,7 +32238,11 @@ export class AgentFramework {
         // message's channel is nobody's choice for it (#551). By name, so a
         // speech dispatch that comes after the run's release still counts.
         takesGlobalFallback: (conversationId) => this.usedEphemeralAgentNames.get(conversationId) !== 'run',
-        takesUnpromptedChannel: (conversationId) => this.turnRouting.get(conversationId)?.channelBorne !== true,
+        takesUnpromptedChannel: (conversationId) => {
+          if (this.usedEphemeralAgentNames.get(conversationId) === 'run') return false;
+          const routing = this.turnRouting.get(conversationId);
+          return !(routing?.channelBorne || routing?.heartbeat || routing?.silent);
+        },
         eventGatePresent: this.eventGate !== null,
         // Configured unprompted channel: where a no-trigger turn's speech goes
         // instead of the last-active channel (heartbeat containment).

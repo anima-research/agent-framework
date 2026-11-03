@@ -113,13 +113,19 @@ describe('unpromptedChannel: a no-trigger turn is told, and published to, the un
    * locus rule (latest inbound) is the fallback, so activity in BUSY is what
    * a turn with no channel of its own would otherwise follow.
    */
-  async function setup(unpromptedChannel?: string) {
+  async function setup(
+    unpromptedChannel?: string,
+    opts: { speech?: 'delivery' | 'latest-inbound'; proseRouting?: 'locus' | 'explicit' } = {},
+  ) {
     framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
-      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      agents: [{
+        name: 'scout', model: 'test-model', systemPrompt: 'You are scout.',
+        ...(opts.proseRouting ? { proseRouting: opts.proseRouting } : {}),
+      }],
       modules: [],
-      speech: { locus: 'latest-inbound' },
+      speech: { locus: opts.speech ?? 'latest-inbound' },
       gate: { config: { policies: [], default: 'skip' } },
       mcplServers: [{
         id: 'discord',
@@ -136,7 +142,7 @@ describe('unpromptedChannel: a no-trigger turn is told, and published to, the un
     const fw = framework;
     const internals = fw as unknown as {
       channelRegistry: ChannelRegistry;
-      pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number }>;
+      pendingRequests: Array<Record<string, unknown>>;
     };
     await until(() => internals.channelRegistry.listChannelsRaw().length >= 2, 'registration');
     const registry = internals.channelRegistry;
@@ -146,13 +152,17 @@ describe('unpromptedChannel: a no-trigger turn is told, and published to, the un
     const published = (): string[] => jsonLines<{ event: string; channelId?: string }>(statusPath)
       .filter((e) => e.event === 'publish').map((e) => e.channelId!);
 
-    /** Run one turn that no channel message caused, which says `text`. */
-    async function channelless(text: string) {
-      membrane.pushResponse(createMockResponse([{ type: 'text', text }]));
+    async function wake(request: Record<string, unknown>, responses: Array<ReturnType<typeof createMockResponse>>) {
+      for (const r of responses) membrane.pushResponse(r);
       const before = membrane.calls.length;
-      internals.pendingRequests.push({ agentName: 'scout', reason: 'test', source: 'framework', timestamp: Date.now() });
+      internals.pendingRequests.push({ agentName: 'scout', timestamp: Date.now(), ...request });
       await until(() => membrane.calls.length > before, 'turn start');
       await fw.runUntilIdle();
+    }
+
+    /** Run one turn that no channel message caused, which says `text`. */
+    async function channelless(text: string) {
+      await wake({ reason: 'test', source: 'framework' }, [createMockResponse([{ type: 'text', text }])]);
     }
 
     /** Some other channel had activity: the global most-recent-inbound locus. */
@@ -170,8 +180,53 @@ describe('unpromptedChannel: a no-trigger turn is told, and published to, the un
         .map((b) => b.text);
     }
 
-    return { published, context, channelless, busyElsewhere, routingNotices };
+    return { framework: fw, published, context, wake, channelless, busyElsewhere, routingNotices };
   }
+
+  const publishCall = (content: string) => createMockResponse(
+    [{ type: 'tool_use', id: 'p1', name: 'channel_publish', input: { content } } as never],
+    'tool_use',
+  );
+  const done = () => createMockResponse([]);
+
+  describe('which turns take it', () => {
+    it('a self-scheduled wake speaks in the unprompted channel, under the default speech.locus too', async () => {
+      const t = await setup(OPS, { speech: 'delivery' });
+      await t.wake({ reason: 'self-scheduled wake (skip_reply, 60s)', source: 'self-wake' }, [createMockResponse([{ type: 'text', text: 'back' }])]);
+      assert.deepEqual(t.published(), [OPS]);
+    });
+
+    it('channel_publish naming no channel goes there too, in explicit prose routing', async () => {
+      const t = await setup(OPS, { speech: 'delivery', proseRouting: 'explicit' });
+      await t.wake({ reason: 'test', source: 'framework' }, [publishCall('a note'), done()]);
+      assert.deepEqual(t.published(), [OPS]);
+    });
+
+    it("a heartbeat's turn doesn't take it: its plain speech is held as a draft", async () => {
+      const t = await setup(OPS, { speech: 'delivery' });
+      await t.wake({ reason: 'heartbeat', source: 'heartbeat' }, [createMockResponse([{ type: 'text', text: 'still here' }])]);
+      assert.deepEqual(t.published(), []);
+      assert.ok(t.routingNotices().some((n) => n.includes('came from your heartbeat')), JSON.stringify(t.routingNotices()));
+    });
+
+    it("a silent heartbeat tick doesn't take it: its channel_publish naming no channel posts nothing", async () => {
+      const t = await setup(OPS, { speech: 'delivery' });
+      await t.wake({ reason: 'heartbeat', source: 'heartbeat', suppressProse: true }, [publishCall('a note'), done()]);
+      assert.deepEqual(t.published(), []);
+    });
+
+    it("an ephemeral run doesn't take it: its prose is its caller's result", async () => {
+      const t = await setup(OPS, { speech: 'delivery' });
+      const created = await t.framework.createEphemeralAgent({ name: 'sub', model: 'test-model', systemPrompt: 'Do the task.', proseRouting: 'locus' });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Find it and report back.' }]);
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'the result' }]));
+      const run = t.framework.runEphemeralToCompletion(created.agent, created.contextManager);
+      await t.framework.runUntilIdle();
+      await run;
+      await t.framework.runUntilIdle();
+      assert.deepEqual(t.published(), []);
+    });
+  });
 
   it('with activity in another channel, a turn no channel caused speaks in the unprompted channel, not the busy channel', async () => {
     const t = await setup(OPS);

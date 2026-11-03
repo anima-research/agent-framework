@@ -1101,20 +1101,17 @@ interface ChannelRegistryOptions {
    */
   activeChannelResolver?: (agentName: string) => ChannelRef | null | undefined;
   /**
-   * Configured UNPROMPTED channel for turns with no channel provenance (heartbeats,
-   * timers). Without it, such a turn's plain-text speech falls through to
-   * `defaultPublishChannel` — the most-recent inbound across ALL channels — so
-   * a heartbeat check-in lands in whatever channel last had activity,
-   * including public ones. Consulted AFTER `homeChannelResolver` and
-   * `activeChannelResolver` (a fork's home / a real triggering channel always
-   * wins), BEFORE `defaultPublishChannel`. Channel descriptor id form, e.g.
-   * `discord:{guildId}:{channelId}`.
+   * FrameworkConfig.unpromptedChannel: where a turn that takes it
+   * (takesUnpromptedChannel) and has no home and no channel of its own is
+   * placed, ahead of the process-global fallback. A name, as entriesNamed
+   * reads one.
    */
   unpromptedChannel?: string;
   /**
    * Whether the conversation's current turn takes `unpromptedChannel` where it
    * has no channel of its own: false for a turn a channel message prompted
-   * (InferenceRequest.channelBorne). Absent, every turn does.
+   * (InferenceRequest.channelBorne), a heartbeat's and an ephemeral run's.
+   * Absent, every turn does.
    */
   takesUnpromptedChannel?: (conversationId: string) => boolean;
   /**
