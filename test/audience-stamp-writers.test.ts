@@ -38,13 +38,21 @@ type Node = { type: string; start?: number | null; end?: number | null; loc?: { 
 const isNode = (v: unknown): v is Node => typeof v === 'object' && v !== null && typeof (v as Node).type === 'string';
 const child = (n: Node | undefined, field: string): Node | undefined => (n && isNode(n[field]) ? n[field] as Node : undefined);
 const isFunction = (n: Node | undefined) => n?.type === 'ArrowFunctionExpression' || n?.type === 'FunctionExpression';
-// A key's name: an identifier not computed, a string, or a private name.
+/** A string or a template with no substitutions: its text. */
+const literalText = (n: Node | undefined): string | undefined => {
+  if (n?.type === 'StringLiteral') return n.value as string;
+  if (n?.type === 'TemplateLiteral' && (n.expressions as unknown[]).length === 0) {
+    return ((n.quasis as Node[])[0]?.value as { cooked?: string | null } | undefined)?.cooked ?? undefined;
+  }
+  return undefined;
+};
+// A key's name: an identifier not computed, a string or a template with no
+// substitutions, or a private name.
 const keyName = (key: Node | undefined, computed: unknown): string | undefined => {
   if (!key) return undefined;
   if (!computed && key.type === 'Identifier') return key.name as string;
-  if (key.type === 'StringLiteral') return key.value as string;
   if (key.type === 'PrivateName') return `#${(child(key, 'id')?.name as string)}`;
-  return undefined;
+  return literalText(key);
 };
 
 /**
@@ -99,29 +107,48 @@ function walkSources(
 
 /**
  * Each reference in `sources` to a member named `addMessage`, read as Babel's
- * TypeScript parser reads the source: `x.addMessage`, `x?.addMessage` and
- * `x['addMessage']`, called or not, and an `addMessage` taken out of an
- * object by destructuring (its receiver is what is destructured, or
- * `(destructured)` where that isn't a declaration's value). Comments aren't
- * read.
+ * TypeScript parser reads the source: `x.addMessage`, `x?.addMessage`,
+ * `x['addMessage']` and `` x[`addMessage`] ``, and `x[name]` where the file
+ * binds `name` to one of those strings anywhere (a scope-blind reading, so
+ * it can only find too much), called or not, and an `addMessage` taken out
+ * of an object by destructuring (its receiver is what is destructured, or
+ * `(destructured)` where that isn't a declaration's value). A key it can't
+ * read without running the code (`x['add' + 'Message']`, a name given as an
+ * argument) isn't found. Comments aren't read.
  */
 function scanAddMessageSites(sources: Array<{ name: string; text: string }>): Site[] {
   const sites: Site[] = [];
+  // Each file's names bound to a string, and the computed members keyed by
+  // a name, read once the file's bindings are all known.
+  const bound = new Map<string, Map<string, string>>();
+  const byName: Array<{ file: string; name: string; site: Site }> = [];
   walkSources(sources, (file, node, scope, scopeText, slice, declared) => {
-    const site = (receiver: string) => sites.push({ file, line: node.loc!.start.line, receiver, scope, scopeText });
-    if ((node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression')
-      && keyName(child(node, 'property'), node.computed) === 'addMessage') {
-      site(slice(child(node, 'object')!));
+    if (node.type === 'VariableDeclarator' && child(node, 'id')?.type === 'Identifier') {
+      const text = literalText(child(node, 'init'));
+      if (text !== undefined) {
+        if (!bound.has(file)) bound.set(file, new Map());
+        bound.get(file)!.set(child(node, 'id')!.name as string, text);
+      }
+    }
+    const at = (receiver: string): Site => ({ file, line: node.loc!.start.line, receiver, scope, scopeText });
+    if (node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') {
+      const property = child(node, 'property');
+      if (keyName(property, node.computed) === 'addMessage') sites.push(at(slice(child(node, 'object')!)));
+      else if (node.computed && property?.type === 'Identifier') {
+        byName.push({ file, name: property.name as string, site: at(slice(child(node, 'object')!)) });
+      }
     }
     if (node.type === 'ObjectPattern') {
       for (const property of node.properties as Node[]) {
         if (property.type === 'ObjectProperty' && keyName(child(property, 'key'), property.computed) === 'addMessage') {
-          site(declared ? slice(declared) : '(destructured)');
+          sites.push(at(declared ? slice(declared) : '(destructured)'));
         }
       }
     }
   });
-  return sites;
+  for (const { file, name, site } of byName) if (bound.get(file)?.get(name) === 'addMessage') sites.push(site);
+  const order = new Map(sources.map((s, i) => [s.name, i]));
+  return sites.sort((a, b) => order.get(a.file)! - order.get(b.file)! || a.line - b.line);
 }
 
 /**
@@ -234,6 +261,8 @@ it('the scan finds addMessage however it is reached, and names the scope it is i
     '}',
     'export const hooks = { write: (cm: { addMessage(): void }) => cm.addMessage() };',
     'export function free(cm: { addMessage(): void }) { cm?.addMessage(); }',
+    "export function named(cm: Record<string, (...args: unknown[]) => void>) { const method = 'addMessage'; cm[method]('user', []); cm[`addMessage`]('user', []); }",
+    'export function given(cm: Record<string, () => void>, key: string) { cm[key](); }',
   ].join('\n');
   const sites = scanAddMessageSites([{ name: 'writer.ts', text }]);
   assert.deepEqual(sites.map((s) => [s.line, s.receiver, s.scope.join('.')]), [
@@ -245,6 +274,10 @@ it('the scan finds addMessage however it is reached, and names the scope it is i
     [11, 'this', 'Writer.store'],
     [17, 'cm', 'hooks.write'],
     [18, 'cm', 'free'],
+    // A template with no substitutions, and a name the file binds to the
+    // string; a name it doesn't bind isn't read.
+    [19, 'cm', 'named'],
+    [19, 'cm', 'named'],
   ]);
   assert.ok(sites[0]!.scopeText.startsWith('store(') && sites[0]!.scopeText.includes('asOwnRow('), "a site's scope text is its method's");
 
