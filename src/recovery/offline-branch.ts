@@ -25,7 +25,9 @@ export interface OfflineRecoveryBranchOptions {
    * write that presented the anchor, so rows stored after the anchor and
    * before that write stay on the branch: those the window took after the
    * anchor enter it again at the agent's next presentation point, after the
-   * anchor. Only rows stored after the cut are removed and counted.
+   * anchor. Only rows stored after the cut are removed and counted. A
+   * suppression may name any row the branch keeps, one the cut keeps after
+   * the anchor too.
    */
   messageId?: string;
   /** Exact internal ContextManager message ID that remains as the anchor (the cut as for `messageId`). */
@@ -213,9 +215,13 @@ export async function createOfflineRecoveryBranch(
 
     validateAnchorBoundary(contextManager, targetIndex, total, target);
 
+    // The rows the branch keeps are the record's first `total -
+    // removedCount`: a suppression may name any of them, those stored after
+    // the anchor and kept by a presented window's cut too (in the record
+    // before a presentation, the last kept row is the anchor).
     const suppression = buildSuppressionPlan(
       contextManager,
-      targetIndex,
+      total - removedCount - 1,
       options.suppressMessageIds ?? [],
       options.suppressRanges ?? [],
     );
@@ -574,7 +580,7 @@ function validateRemovalIntegrity(
 
 function buildSuppressionPlan(
   contextManager: ContextManager,
-  targetIndex: number,
+  lastKeptIndex: number,
   rawMessageIds: string[],
   rawRanges: Array<{ fromMessageId: string; toMessageId: string }>,
 ): { intervals: SuppressionInterval[]; carriers: DiscordMessageMetadataCarrier[]; messageCount: number } {
@@ -590,10 +596,10 @@ function buildSuppressionPlan(
   if (wanted.size === 0) return { intervals: [], carriers: [], messageCount: 0 };
 
   const locations = new Map<string, MessageLocation>();
-  for (let offset = 0; offset <= targetIndex; offset += RECOVERY_SCAN_WINDOW) {
+  for (let offset = 0; offset <= lastKeptIndex; offset += RECOVERY_SCAN_WINDOW) {
     const messages = contextManager.getMessageWindow(
       offset,
-      Math.min(RECOVERY_SCAN_WINDOW, targetIndex - offset + 1),
+      Math.min(RECOVERY_SCAN_WINDOW, lastKeptIndex - offset + 1),
       { resolveBlobs: false },
     ).messages;
     for (let i = 0; i < messages.length; i++) {
