@@ -1209,14 +1209,14 @@ describe('present while acting', () => {
     });
   }
 
-  it("during a capacity hold, a store that can't be read at the deferred compile leaves the arrival waiting outside the window rather than drop it", async () => {
+  it("during a capacity hold, a store that can't be read at the deferred compile fails the start rather than drop the arrival, and a later start reads it", async () => {
     // Adapted from a reviewer's probe: a read that fails says nothing about
     // whether the message is there, so it can't count as a withdrawal. Since
     // #291 the arrival is stored at once and enters the window at the start's
-    // presentation point, whose read is the one that fails: the point logs
-    // it and leaves the arrival for the next point, and the start compiles
-    // without it. (With the deferral queue, the start's own read of the
-    // arrival failed the start; this test once expected that.)
+    // presentation point, whose read is the one that fails: the start fails,
+    // as it did when its read of the deferral queue failed (AF #844 bot
+    // review finding 5), rather than compile without the arrival, which
+    // waits outside the window for the next point.
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'On it.' },
       { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
@@ -1243,30 +1243,28 @@ describe('present while acting', () => {
     const error = console.error;
     console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
     try {
-      await release(framework);
+      await assert.rejects(release(framework), /store unavailable/);
     } finally {
       console.error = error;
       cm.getMessage = getMessage;
     }
 
-    assert.ok(errors.some((e) => e.includes('[presentation] assistant: presenting at turn-start failed') && e.includes('store unavailable')),
+    assert.ok(errors.some((e) => e.includes('[presentation] assistant: presenting at turn-start failed; the start fails') && e.includes('store unavailable')),
       errors.join('\n'));
-    assert.equal(membrane.calls.length, 2, 'the deferred compile ran');
-    const compiled = JSON.stringify(membrane.calls[1]!.messages);
-    assert.ok(!compiled.includes('a question for you'), 'without the arrival its point could not read');
+    assert.equal(membrane.calls.length, 1, 'the deferred compile never ran');
+    assert.deepEqual(routed, [{ text: 'On it.', locus: 'chan-live-1' }], 'and the turn spoke nowhere else');
+    assert.deepEqual(movedTo(framework), [], 'nor told the agent of a move');
     assert.ok(cm.getMessage(arrival.id), 'the arrival is still stored');
     assert.ok(!cm.getPresentedMessages().some((m) => m.id === arrival.id), 'and waits outside the window for the next point');
-    assert.deepEqual(routed, [
-      { text: 'On it.', locus: 'chan-live-1' },
-      { text: 'Here is the rest.', locus: 'chan-live-1' },
-    ], 'the turn answered where it was');
-    assert.deepEqual(movedTo(framework), [], 'the agent was told of no move');
 
+    // The failed start's trigger is dropped, as main drops one whose start
+    // throws (startAgentStream), the arrival's wake merged into it: a later
+    // wake's start presents the arrival before its compile.
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Answering it.' }] as ContentBlock[]));
     trigger(framework);
     await framework.runUntilIdle();
-    assert.equal(membrane.calls.length, 3, 'a next turn ran');
-    assert.ok(JSON.stringify(membrane.calls[2]!.messages).includes('a question for you'), "a later point presents the arrival: the next turn's request carries it");
+    assert.equal(membrane.calls.length, 2, 'a next turn ran');
+    assert.ok(JSON.stringify(membrane.calls[1]!.messages).includes('a question for you'), "the next turn's request carries the arrival");
     assert.ok(cm.getPresentedMessages().some((m) => m.id === arrival.id), 'in the window');
 
     await framework.stop();

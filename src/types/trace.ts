@@ -1327,7 +1327,8 @@ export type TraceEvent =
     })
   | (TraceEventBase & {
       /** A presentation failed; the rows it didn't present stay out of the
-       *  agent's window for its next presentation point. At `adopt`, the
+       *  agent's window for its next presentation point. At a fresh turn's
+       *  start (`turn-start`, `assembly`), the start fails too. At `adopt`, the
        *  agent's window couldn't be written down (another version's index
        *  format, or a failed write), and the agent stays in legacy mode: its
        *  window is the whole record, as before the index. At `rebase`, after

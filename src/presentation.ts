@@ -53,7 +53,8 @@
  * earlier release stored unstamped and the agent's own and its arrivals
  * (decision 1).
  * Nothing in it throws into a writer: a failed presentation is traced and
- * its rows stay out of the window for the next point.
+ * its rows stay out of the window for the next point. A fresh turn start's
+ * also fails the start (presentAtStart).
  *
  * It never imports framework.ts, which imports it.
  */
@@ -798,15 +799,26 @@ export class AgentPresentation {
    * fresh or resumed, its own rows only. Returns the arrivals presented, one
    * per body, for the start to weigh. A fresh start ends a rollback's hold
    * on the arrivals its cut returned (holdUntilStart): they enter with the
-   * rest, in record order.
+   * rest, in record order. A fresh start's presentation that fails (a read
+   * of the window or the record that throws, or a write of the window that
+   * leaves a row out) is traced, and then throws, so the start fails rather
+   * than compile without what it was started for, which waits outside the
+   * window for the next point. The backstop's is traced, and its compile
+   * goes on.
    */
   presentAtStart(agent: PresentedAgent, occasion: 'turn-start' | 'assembly' | 'compile'): StoredMessage[] {
     if (!this.presenting(agent)) return [];
     // The sweep below decides the own rows a failed write left (presentOwn).
     this.failedOwn.delete(agent.getContextManager());
+    const fresh = occasion !== 'compile';
     // A fresh start is where a rollback's returned arrivals enter (holdUntilStart).
-    if (occasion !== 'compile') this.heldUntilStart.delete(agent.getContextManager());
-    return this.presentPending(agent, occasion, occasion !== 'compile' && !this.host.frozen());
+    if (fresh) this.heldUntilStart.delete(agent.getContextManager());
+    const { arrivals, failure } = this.presentPending(agent, occasion, fresh && !this.host.frozen(), false,
+      fresh ? "the start fails, and what it didn't present waits for the next point" : undefined);
+    if (fresh && failure !== undefined) {
+      throw new Error(`${agent.name}'s turn start could not present what it is owed (at ${occasion}): ${describe(failure)}`, { cause: failure });
+    }
+    return arrivals;
   }
 
   /**
@@ -1170,7 +1182,7 @@ export class AgentPresentation {
   /** presentAtEnd under a named occasion; a rollback's held arrivals wait (holdUntilStart). */
   private presentAtRest(agent: PresentedAgent, occasion: 'turn-end' | 'at-rest'): StoredMessage[] {
     if (!this.presenting(agent) || this.host.turnAlive(agent.name)) return [];
-    return this.presentPending(agent, occasion, !this.host.frozen(), true);
+    return this.presentPending(agent, occasion, !this.host.frozen(), true).arrivals;
   }
 
   /** The rows the agent was handed as framing (noteFramed) that its window doesn't hold yet, presented in the order handed. */
@@ -1205,23 +1217,36 @@ export class AgentPresentation {
   /**
    * Present the agent's own pending rows, and its arrivals when `arrivals`
    * (but those a rollback holds for its next start, with `atRest`), in one
-   * call; return the arrivals that entered whole.
+   * call; return the arrivals that entered whole, and the error when the
+   * presentation failed: a read that threw, or a write that left a row it
+   * named out. `next` is what the failure's log says becomes of its rows.
    */
-  private presentPending(agent: PresentedAgent, occasion: PresentationOccasion, arrivals: boolean, atRest = false): StoredMessage[] {
+  private presentPending(
+    agent: PresentedAgent,
+    occasion: PresentationOccasion,
+    arrivals: boolean,
+    atRest = false,
+    next?: string,
+  ): { arrivals: StoredMessage[]; failure?: unknown } {
     try {
       const cm = agent.getContextManager();
       const bodies = this.pending(agent, arrivals, atRest);
-      if (bodies.length === 0) return [];
-      const { entered } = this.present(agent, bodies.map((body) => body.shards[0]!.id), occasion, {
+      if (bodies.length === 0) return { arrivals: [] };
+      const heads = bodies.map((body) => body.shards[0]!.id);
+      const { entered, error } = this.present(agent, heads, occasion, {
         unstamped: bodies.filter((body) => body.unstamped).length,
+        ...(next !== undefined ? { next } : {}),
       }, bodies);
-      return bodies
-        .filter((body) => body.bearing === 'arrival' && entered.has(body.shards[0]!.id)
-          && body.shards.every((shard) => cm.ordinalOf(shard.id) !== undefined))
-        .map((body) => body.shards[0]!);
+      return {
+        arrivals: bodies
+          .filter((body) => body.bearing === 'arrival' && entered.has(body.shards[0]!.id)
+            && body.shards.every((shard) => cm.ordinalOf(shard.id) !== undefined))
+          .map((body) => body.shards[0]!),
+        ...(error !== undefined && heads.some((id) => !entered.has(id)) ? { failure: error } : {}),
+      };
     } catch (error) {
-      this.failed(agent, occasion, error);
-      return [];
+      this.failed(agent, occasion, error, undefined, next);
+      return { arrivals: [], failure: error };
     }
   }
 

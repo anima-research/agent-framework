@@ -979,4 +979,22 @@ describe('the presentation module at the point after one that failed', () => {
     assert.ok(lines.some((line) => line.includes('presenting 2 rows') && ids.every((id) => line.includes(id))), lines.join('\n'));
     assert.deepEqual(ids.map((id) => r.mira.has(id)), [false, false], 'they wait');
   });
+
+  // AF #844 bot review findings 5 and 13: a failed fresh start fails the start.
+  it("a fresh start whose presentation fails throws, and its arrival waits for the next point; the compile's backstop only traces", async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('mira');
+    const arrival = r.write(r.oren, 'someone', text('a question for mira'), ['mira']);
+    failNextPresent(r.mira.cm);
+    quietly(() => assert.throws(() => r.presentation.presentAtStart(r.mira, 'turn-start'),
+      (error: Error) => error.message.includes("mira's turn start could not present what it is owed") && error.message.includes('a transient write failure')));
+    assert.equal(r.mira.has(arrival), false, 'the arrival waits outside the window');
+    assert.deepEqual(ofType(r.traces, 'presentation:failed').map((t) => [t.occasion, (t as { messageIds?: string[] }).messageIds]), [['turn-start', [arrival]]]);
+    const own = storeOwnRow(r.mira, 'user', text('a notice held back'), undefined, undefined, false);
+    failNextPresent(r.mira.cm);
+    assert.deepEqual(quietly(() => r.presentation.presentAtStart(r.mira, 'compile')), [], "the backstop's failure doesn't throw");
+    assert.equal(r.mira.has(own), false);
+    assert.deepEqual(r.presentation.presentAtStart(r.mira, 'turn-start').map((m) => m.id), [arrival], 'the next start presents it');
+  });
 });

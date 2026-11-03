@@ -25494,7 +25494,10 @@ export class AgentFramework {
     if (attempt === 0 && !resumesTurn) this.storeDueClock(agent, 'turn-start');
     // Its own rows not in its window yet and its arrivals, in the order they
     // were stored. Each arrival is weighed for the turn as it enters
-    // (adoptPresentation).
+    // (adoptPresentation). A presentation that fails throws, so the start
+    // fails (startAgentStream ends its turn) rather than compile without
+    // what it was started for, which waits outside its window for the next
+    // point.
     if (attempt === 0 && !resumesTurn && this.presents(agent)) this.presentation!.presentAtStart(agent, 'turn-start');
 
     // RFC-006 §5: deferred batches for this agent render now, at the assembly
@@ -25557,7 +25560,8 @@ export class AgentFramework {
     // its window now, before its checkpoint, so it is in this request, in
     // the order it was stored: among it, a render this assembly joined that
     // another agent's assembly placed for this agent (freeze's `joined`,
-    // vector 25). Not while quiesced, when others' rows are frozen.
+    // vector 25). Not while quiesced, when others' rows are frozen. One that
+    // fails throws, and fails the start, as the turn start's does.
     if (assembled && !this.quiesced && this.presents(agent)) this.presentation!.presentAtStart(agent, 'assembly');
 
     // The batched-wake lines the gate left to this start (WakeLine), decided
