@@ -12837,12 +12837,24 @@ export class AgentFramework {
    * mail then; a second delivery here would put it in the window twice
    * under one mail id. A copy for another recipient is not that write, as a
    * stored one isn't.
+   *
+   * A copy found is released only once the store has synced, as
+   * releaseLandedMail releases: the copy may be in memory only (an import
+   * whose sync failed), and the release is written to the registry's own
+   * recovery file at once. A sync that fails leaves the mail held and
+   * undelivered, for the next boot's check.
    */
   private deliverHeldMail(mail: HeldMail, wake = true): void {
     const recipient = this.agents.get(mail.to);
     if (recipient) {
       const already = recipient.getContextManager().queryMessages({ metadata: { 'dendrite.mailId': mail.id } });
       if (already.messages.some((message) => isMailCopyFor(message.metadata, mail))) {
+        try {
+          this.store.sync();
+        } catch (error) {
+          console.error(`[dendrite] mail ${mail.id} is in ${mail.to}'s store but the store did not sync, so it stays held until the next boot settles it:`, error);
+          return;
+        }
         this.registry.releaseMail(mail.id);
         return;
       }

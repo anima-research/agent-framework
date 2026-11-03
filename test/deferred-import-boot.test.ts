@@ -434,6 +434,51 @@ describe('the deferred-write importer (#291, AF-6)', () => {
     } finally { h.close(); }
   });
 
+  // AF #844 bot review finding 28: the boot's check of held mail releases
+  // it on a copy in the recipient's store only once the store has synced:
+  // after an import whose sync failed, the copy may be in memory only.
+  it("keeps imported mail held when the store doesn't sync before the boot would release it on the unsynced copy", async () => {
+    const h = await host();
+    const proto = JsStore.prototype as unknown as { sync(this: JsStore): void };
+    const sync = proto.sync;
+    const quiet = console.error;
+    try {
+      let framework = await h.boot();
+      let mailId: string;
+      try {
+        const registry = (framework as unknown as { registry: { holdMail(mail: Record<string, unknown>): { id: string } } }).registry;
+        mailId = registry.holdMail({ kind: 'message', from: { agent: 'helper', incarnation: 1 }, to: 'agent', content: text('unsynced mail') }).id;
+      } finally { await framework.stop(); }
+      h.writeQueue([entry('mail-2', 1, 'unsynced mail', {
+        participant: 'helper', forAgent: 'agent',
+        metadata: { kind: 'agent-message', dendrite: { mailId, kind: 'message', from: { agent: 'helper', incarnation: 1 }, to: 'agent' } },
+      })]);
+      // Every sync from the import on fails, through the boot's check of held mail.
+      proto.sync = function (this: JsStore) {
+        const stack = new Error().stack ?? '';
+        if (stack.includes('importPersistedDeferredWrites') || stack.includes('deliverHeldMail')) {
+          throw Object.assign(new Error('injected EIO syncing'), { code: 'EIO' });
+        }
+        return sync.call(this);
+      };
+      console.error = () => {};
+      try { framework = await h.boot(); } finally { proto.sync = sync; console.error = quiet; }
+      try {
+        assert.equal(withText(framework, 'unsynced mail').length, 1, 'the import stored it, in memory');
+        assert.deepEqual(framework.listHeldMail().map((m) => m.id), [mailId], 'the mail stays held: its copy never reached the disk');
+      } finally { await framework.stop(); }
+      framework = await h.boot();
+      try {
+        assert.equal(withText(framework, 'unsynced mail').length, 1, 'the next boot finds the copy and delivers no second one');
+        assert.deepEqual(framework.listHeldMail(), [], 'and releases it, synced');
+      } finally { await framework.stop(); }
+    } finally {
+      proto.sync = sync;
+      console.error = quiet;
+      h.close();
+    }
+  });
+
   it("owes a tune-out release's agent the wake its cancel requested", async () => {
     const h = await host();
     try {
