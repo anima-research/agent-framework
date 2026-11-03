@@ -25,8 +25,8 @@ function makeRegistry(granted = true) {
 
   const registry = new ChannelRegistry(
     // §14.1: the typing gate reads the server's grant now — a bare {} stub
-    // has no getServer and crashes. Model a post-policy server with
-    // channels.typing granted so the tests exercise dispatch, not denial.
+    // has no getServer and crashes. Model a post-policy server, with
+    // channels.typing granted unless a test asks for one without it.
     {
       getServer: () => ({
         grant: new CapabilityGrant(new Set(granted ? ['channels.typing'] : []), []),
