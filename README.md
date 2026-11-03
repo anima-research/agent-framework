@@ -541,8 +541,9 @@ are registered for every agent, MCPL or none, unless a module holds the name.
   never injected at a tool boundary, never folded into memory, and never
   woken for. It never becomes the speech locus and never brings a clock row
   in ahead of it. The decision is made once, at arrival, before the hold, the
-  veto and the gate, so the gate's wake counters and debounce batches never
-  see the event (the suppress rule's own `matchCount` counts what it took). Because the view reads only the stamp, editing or removing the
+  veto and the gate's evaluate, so no debounce batch forms for the event. The
+  suppress rule's `matchCount` counts what it took, and a passthrough rule ahead
+  of it counts it too, so a sampler fires on schedule. Because the view reads only the stamp, editing or removing the
   rule changes only what arrives afterwards; the rows already hidden stay
   hidden, which keeps each row's visibility fixed, as context-manager's
   `viewFilter` requires. **Rollback needs a step.** A release without
@@ -591,7 +592,7 @@ are registered for every agent, MCPL or none, unless a module holds the name.
     (`suppress.scriptStatus`). A timeout restarts the worker, which loads every
     script again one at a time; a script that times out three times in its
     last twenty runs, probes included, isn't run again until its script
-    changes, and a worker that fails to start is tried again with a later
+    changes or the host restarts, and a worker that fails to start is tried again with a later
     event, later each time. wake_add_rule compiles a
     script on the worker before it saves the rule. `suppressionFor` runs a
     script on a copy of its state, for the probe table; the arrival paths call
@@ -633,7 +634,7 @@ are registered for every agent, MCPL or none, unless a module holds the name.
     notice naming each rule, what it hid and what was flagged, with the first
     five flagged events of each rule shown, each cut short. A rule the
     reviewer couldn't answer about is reviewed again next time, from where its
-    events begin (at most a week back; older events aren't reviewed again). A flag wakes the agent (`wakeOnFlag`, default true). With
+    events begin (at most a week back; older events aren't reviewed again). A flag wakes the agent (`wakeOnFlag`, default true), unless it's asleep. With
     `notify: "flagged"` the agent is told only of a flag; with the default,
     `"always"`, after every review in which something was hidden. The notice
     is the framework's own and never suppressed. Progress, retries and each

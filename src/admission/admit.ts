@@ -115,7 +115,8 @@ export function admit(env: InboundEnvelope, policy: AdmissionPolicy): AdmissionD
 
   // Suppressed: stored where it arrived and never rendered, so nothing
   // downstream acts for anyone. Not held (a reader would see it), not shown
-  // to the gate (no batch forms, no counter moves), not a wake, not the locus.
+  // to the gate's evaluate (no batch forms; the passthrough rules ahead of its
+  // rule have counted it), not a wake, not the locus.
   const rule = policy.suppressionFor?.(env) ?? null;
   if (rule !== null) {
     return { recipients, held: null, suppressed: { rule }, wake: false, gatePass: false, locus: false };

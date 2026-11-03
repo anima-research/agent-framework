@@ -187,15 +187,27 @@ describe('event suppression', () => {
     }
   });
 
-  it('API input is never suppressed, and a suppress rule doesn\'t defer its wake; nor a tagged addressed module event', async () => {
-    const f = await fixture({ framework: { ...GATE([
-      { name: 'hide-api', match: { scope: ['api:message'] }, behavior: 'defer', suppress: S('api chatter') },
-      { name: 'hide-notes', match: { scope: ['notes:new'] }, behavior: 'defer', suppress: S('every note') },
-    ]), modules: [new NotesModule()] } });
+  it('API input is never suppressed, and a suppress rule doesn\'t defer its wake', async () => {
+    class ApiMessages extends WakeOnNotes {
+      override async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
+        const e = event as { type: string; content?: string };
+        return e.type === 'api:message' ? { addMessages: [{ participant: 'user', content: [{ type: 'text', text: String(e.content) }] }], requestInference: true } : {};
+      }
+    }
+    const f = await fixture({ framework: { ...GATE([{ name: 'hide-api', match: { scope: ['api:message'] }, behavior: 'defer', suppress: S('api chatter') }]), modules: [new ApiMessages()] } });
     try {
-      const gate = (f.framework as unknown as { eventGate: { evaluate(i: unknown): { trigger: boolean } } }).eventGate;
-      assert.equal(gate.evaluate({ content: 'hi', eventType: 'api:message', serverId: 'api', channelId: '', suppressionAsked: true }).trigger, true);
-      f.framework.pushEvent({ type: 'notes:new', source: 'notes', content: 'a note for you', tags: ['chat:addressed'] } as unknown as ProcessEvent);
+      const before = f.membrane.calls.length;
+      f.framework.pushEvent({ type: 'api:message', participant: 'user', content: 'from the api' } as unknown as ProcessEvent);
+      await f.turn();
+      assert.equal(suppressedOf(find(f, 'from the api')), undefined);
+      assert.ok(f.membrane.calls.length > before, 'it woke the agent');
+    } finally { await f.close(); }
+  });
+
+  it('a module event tagged as addressed, directly or by implication, is never suppressed', async () => {
+    const f = await fixture({ framework: { ...GATE([{ name: 'hide-notes', match: { scope: ['notes:new'] }, behavior: 'defer', suppress: S('every note') }]), modules: [new NotesModule()] } });
+    try {
+      f.framework.pushEvent({ type: 'notes:new', source: 'notes', content: 'a note for you', tags: ['chat:mention'] } as unknown as ProcessEvent);
       await f.turn();
       assert.equal(suppressedOf(find(f, 'a note for you')), undefined, 'an addressed module event isn\'t suppressed');
       assert.equal(await inView(f, 'a note for you'), true);
@@ -206,6 +218,39 @@ describe('event suppression', () => {
     const { asModuleRow } = await import('../src/held-writes.js');
     assert.equal(asModuleRow({ metadata: { suppressed: { rule: 'r', eventType: 'x' } } }).heldFromResidents, true);
     assert.equal(asModuleRow({ metadata: {} }).heldFromResidents, undefined);
+  });
+
+  it('a named wake for an event already suppressed at admission wakes nobody', async () => {
+    class NamedOnPush extends WakeOnNotes {
+      override async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
+        return (event as { type: string }).type === 'mcpl:push-event' ? { requestInference: ['agent'] } : {};
+      }
+    }
+    const f = await fixture({ framework: { ...GATE([{ name: 'hide-pings', match: { scope: ['mcpl:push-event'], filter: { type: 'text', pattern: 'ping' } }, behavior: 'defer', suppress: S('pings') }]), modules: [new NamedOnPush()] } });
+    try {
+      await ping(f, 'p1', 'ping 1');
+      await settle(f);
+      assert.ok(suppressedOf(find(f, 'ping 1')));
+    } finally { await f.close(); }
+  });
+
+  it('a review\'s flag waits out a sleep: the notice is stored, and nothing wakes', async () => {
+    const f = await fixture({ framework: GATE([HIDE_NOISY]) });
+    try {
+      await registerOpen(f, 'noisy');
+      await incoming(f, 'noisy', 'n1', 'help, is anyone there');
+      await settle(f);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      const slept = await tool(f, 'sleep', { seconds: 600, announce: false });
+      assert.equal(slept.success, true, String(slept.error));
+      f.membrane.responses.length = 0;
+      (f.membrane as unknown as { responseIndex: number }).responseIndex = 0;
+      f.membrane.pushResponse(createMockResponse([{ type: 'text', text: '{"fits": false, "flagged": [1], "note": "someone asks for help"}' }]));
+      const summary = await f.framework.reviewSuppression();
+      assert.equal(summary?.flagged, 1);
+      assert.ok(find(f, '[suppression review]'), 'the notice is stored');
+      assert.ok(!internals(f).pendingRequests.some((r) => r.reason === 'suppression-review'), 'and no turn is queued');
+    } finally { await f.close(); }
   });
 
   it('a response that only wakes an agent it names isn\'t decided: the named wake stands', async () => {
@@ -435,7 +480,8 @@ describe('event suppression', () => {
     const f = await fixture({ framework: GATE([second]) });
     try {
       await f.send('push/event', f.params('1', 'fallback', { deferred: true }));
-      await f.send('push/event', f.params('2', 'fallback', { deferred: true }));
+      const joined = await f.send('push/event', f.params('2', 'fallback', { deferred: true }));
+      assert.equal(joined.result.coalesce.outcome, 'replaced', 'the two share a batch');
       await eventually(() => stored(f).some((m) => textOf(m).includes('document_diff')), 'the batch stored');
       await settle(f);
       assert.ok(suppressedOf(find(f, 'document_diff')), 'its latest occurrence was hidden, so the batch is, and nothing woke for it');
@@ -449,7 +495,8 @@ describe('event suppression', () => {
     try {
       f.alwaysRespond();
       await f.send('push/event', { ...f.params('1', 'fallback', { deferred: true }), tags: ['chat:mention', 'chat:addressed'] });
-      await f.send('push/event', f.params('2', 'fallback', { deferred: true }));
+      const joined = await f.send('push/event', f.params('2', 'fallback', { deferred: true }));
+      assert.equal(joined.result.coalesce.outcome, 'replaced', 'the two share a batch');
       await f.framework.runUntilIdle();
       assert.ok(f.context().includes('document_diff'), 'stored at the turn the batch\'s wake started');
       assert.equal(suppressedOf(find(f, 'document_diff')), undefined);
@@ -462,7 +509,8 @@ describe('event suppression', () => {
     try {
       f.alwaysRespond();
       await f.send('push/event', f.params('1', 'hello one', { deferred: true }));
-      await f.send('push/event', f.params('2', 'ping two'));
+      const displaced = await f.send('push/event', f.params('2', 'ping two'));
+      assert.equal(displaced.result.coalesce.outcome, 'replaced', 'it took the batch\'s place');
       await f.framework.runUntilIdle();
       assert.deepEqual(suppressedOf(find(f, 'ping two')), { rule: 'hide-pings', eventType: 'mcpl:push-event', source: 'editor' });
       assert.equal(await inView(f, 'ping two'), false);

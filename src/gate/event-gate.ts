@@ -1481,7 +1481,8 @@ function readSuppress(r: Reader, value: unknown, behavior: unknown, match: GateP
   // A match field the gate doesn't read would, left aside, hide more than was
   // written: the condition it was meant to add is gone.
   if (isPlainObject(rawMatch)) {
-    const unreadMatch = Object.keys(rawMatch).filter((key) => !MATCH_FIELDS.includes(key));
+    const rawFilter = isPlainObject(rawMatch.filter) ? Object.keys(rawMatch.filter).filter((key) => !FILTER_FIELDS.includes(key)).map((key) => `filter.${key}`) : [];
+    const unreadMatch = [...Object.keys(rawMatch).filter((key) => !MATCH_FIELDS.includes(key)), ...rawFilter];
     if (unreadMatch.length > 0) {
       r.problems.push({ text: `suppress is given, and match has ${quotedList(unreadMatch)}, which the gate doesn't read, so the rule would hide more than was written`, read: without });
     }

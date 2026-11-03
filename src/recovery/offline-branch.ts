@@ -465,8 +465,20 @@ function validateRemovalIntegrity(
   intervals: SuppressionInterval[],
 ): void {
   if (intervals.length === 0) return;
-  const removed = (index: number) => intervals.some((interval) =>
-    index >= interval.start && index <= interval.end);
+  // Sorted starts with each one's running furthest end, searched per row: a
+  // store can hold a removal for every third row (--remove-suppressed).
+  const sorted = [...intervals].sort((a, b) => a.start - b.start);
+  const reach: number[] = [];
+  for (const interval of sorted) reach.push(Math.max(interval.end, reach.at(-1) ?? -1));
+  const removed = (index: number) => {
+    let lo = 0;
+    let hi = sorted.length - 1;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      if (sorted[mid]!.start <= index) lo = mid; else hi = mid - 1;
+    }
+    return sorted[lo]!.start <= index && index <= reach[lo]!;
+  };
   const toolUses = new Map<string, boolean>();
   const toolResults = new Map<string, boolean>();
   // The message before, in store order: a selection splits a body when a

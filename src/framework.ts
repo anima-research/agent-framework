@@ -93,7 +93,7 @@ import { ModuleRegistry, checkedToolResult, droppedToolResultLine, ensureStateRe
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { prefixesMeet, prefixesMeetError } from './mcpl/prefix-rule.js';
 import { logDetail, logValue } from './mcpl/log-value.js';
-import { isMarkerTagged, isSystemNotice } from './mcpl/tags.js';
+import { expandCoreTags, isMarkerTagged, isSystemNotice } from './mcpl/tags.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
 import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
@@ -13183,7 +13183,7 @@ export class AgentFramework {
             description:
               'Keep the events this rule takes out of your context. Without it, a rule that doesn\'t wake you still ' +
               'shows you its events. Suppressed events are still stored: suppression_stats counts them and shows a few, ' +
-              'dump_suppressed writes them to a file where you have a workspace, and history finds them. But they\'re never shown to you, never ' +
+              'dump_suppressed writes them to a file where you have a workspace, and history tools, where you have them, find them. But they\'re never shown to you, never ' +
               'wake you, and never go into your memory. It\'s decided as each event arrives, so a rule hides only what ' +
               'arrives after you add it, and removing the rule doesn\'t bring back what it hid. Needs a match that ' +
               'narrows it. Leave behavior out: the rule is saved with behavior "defer". It never hides a message ' +
@@ -17392,17 +17392,17 @@ export class AgentFramework {
     const suppressible = ((response.addMessages?.length ?? 0) > 0 || response.requestInference === true) && !surface && !localInput
       && event.type !== 'tool-call' && event.type !== 'tool-result';
     let suppressedRule: string | null = null;
-    if (suppressible) {
-      const decided = this.eventSuppression.get(event);
-      if (decided !== undefined) suppressedRule = decided;
-      else if (!event.type.startsWith('mcpl:')) {
+    const decided = this.eventSuppression.get(event);
+    if (decided !== undefined) suppressedRule = decided;
+    else if (suppressible) {
+      if (!event.type.startsWith('mcpl:')) {
         // The event's tags too, which the addressed exemption reads. (The wake
         // gate below isn't given them: its rules have never matched a module
         // event's tags, and that isn't changed here.)
         const eventTags = (event as { tags?: unknown }).tags;
         suppressedRule = this.suppressionFor({
           ...extractGateFields(event), eventType: event.type, serverId: source, channelId: namesChannel ? String(eventChannel) : '',
-          ...(Array.isArray(eventTags) ? { tags: eventTags.filter((t): t is string => typeof t === 'string') } : {}),
+          ...(Array.isArray(eventTags) ? { tags: expandCoreTags(eventTags.filter((t): t is string => typeof t === 'string')) } : {}),
         });
         this.eventSuppression.set(event, suppressedRule);
       }
@@ -17504,15 +17504,6 @@ export class AgentFramework {
 
   /** Each event's suppression, decided once: by its MCPL lane at admission, or by the first module response that adds messages or asks for a wake (applyProcessResponse). */
   private readonly eventSuppression = new WeakMap<object, string | null>();
-  /**
-   * The coalesced subjects whose pending batch holds an occurrence addressed
-   * to the agent. A batch's row follows its latest occurrence's decision, and
-   * an addressed event is never suppressed, so a later occurrence in such a
-   * batch isn't asked: the batch is shown. Cleared when a row is written for
-   * the subject, which consumes the batch.
-   */
-  private readonly coalescedAddressed = new Set<string>();
-
   /** The servers and keys whose drop withoutHostKeys has logged, each as
    *  `${serverId}\u0000${key}`. */
   private readonly hostKeysDropped = new Set<string>();
@@ -17689,7 +17680,6 @@ export class AgentFramework {
     }, { suppressible: !this.conversationRouter, ...(event.suppressionDecision !== undefined ? { decided: event.suppressionDecision } : {}) });
     // Modules answering this event read the same decision (applyProcessResponse).
     this.eventSuppression.set(event, decision.suppressed?.rule ?? null);
-    if (event.coalescingSubject) this.coalescedAddressed.delete(event.coalescingSubject);
     metadata.triggered = decision.wake;
     if (decision.held) {
       // The admission record rides the message; the hold's own bookkeeping
@@ -19130,7 +19120,9 @@ export class AgentFramework {
     const firstViewMark = occ.firstView ? { firstView: true } : {};
     // The occurrence's suppression, when its wake decided it; its row reads
     // that, and a row that decides keeps its answer for the occurrence's later wakes.
-    const decided = occ.suppressionDecision !== undefined ? { suppressionDecision: occ.suppressionDecision } : {};
+    const decided = occ.batchAddressed
+      ? { suppressionDecision: null }
+      : occ.suppressionDecision !== undefined ? { suppressionDecision: occ.suppressionDecision } : {};
     const keepDecision = (event: object): void => {
       const rule = this.eventSuppression.get(event);
       if (rule !== undefined) occ.suppressionDecision = rule;
@@ -19230,12 +19222,10 @@ export class AgentFramework {
     const suppressible = !(occ.scope.kind === 'channel' && this.conversationRouter);
     // Decided once per occurrence: a later wake for it reads that decision. A
     // batch holding an addressed occurrence is shown, whatever comes after it
-    // (coalescedAddressed), and its row follows its latest occurrence's decision.
-    if (isAddressedMessage(occ.tags)) this.coalescedAddressed.add(subject);
-    const pinned = this.coalescedAddressed.has(subject);
-    const remembered = occ.suppressionDecision !== undefined
-      ? { decided: occ.suppressionDecision }
-      : pinned ? { decided: null } : {};
+    // (CoalescedOccurrence.batchAddressed).
+    const remembered = occ.batchAddressed
+      ? { decided: null }
+      : occ.suppressionDecision !== undefined ? { decided: occ.suppressionDecision } : {};
     const decision = this.admitInbound({
       lane: 'push',
       serverId: occ.serverId,
@@ -19268,7 +19258,7 @@ export class AgentFramework {
     if (decision.suppressed && !plain && this.pushCoalescer) {
       const coalescer = this.pushCoalescer;
       void this.coalescedAudience(occ)
-        .then((audience) => (audience[0] !== undefined ? coalescer.materializeNow(audience[0], subject) : false))
+        .then((audience) => (audience[0] !== undefined ? coalescer.materializeNow(audience[0], subject, occ.eventId) : false))
         .catch((err) => console.error(`[coalescing] a suppressed batch for ${logValue(subject)} could not be stored:`, err));
       return;
     }
@@ -19594,7 +19584,6 @@ export class AgentFramework {
     }, event.suppressionDecision !== undefined ? { decided: event.suppressionDecision } : {});
     // Modules answering this event read the same decision (applyProcessResponse).
     this.eventSuppression.set(event, decision.suppressed?.rule ?? null);
-    if (event.coalescingSubject) this.coalescedAddressed.delete(event.coalescingSubject);
     metadata.triggered = decision.wake;
     if (decision.held && triggerChannel) {
       metadata.tuneOut = { epochId: decision.held.epochId };
@@ -37553,7 +37542,8 @@ export class AgentFramework {
     this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'suppression-review' } as MessageMetadata, {
       ...(forAgent ? { forAgent } : {}), placement,
     });
-    if (!wake || !this.agents.has(agentName)) return;
+    // A sleep the agent asked for stands: the notice waits for its next turn.
+    if (!wake || !this.agents.has(agentName) || this.eventGate?.getSleepState()) return;
     this.pendingRequests.push({
       agentName, reason: 'suppression-review', source: 'gate', timestamp: Date.now(),
       ...this.readsWriteFor(placement, agentName),

@@ -21,7 +21,8 @@
   script changes or the rule is removed. Scripts run on a worker thread with
   a 50 ms timeout (`gate.suppressScriptTimeoutMs`); one that fails or times
   out lets the event on to the rules after it, and one that times out three
-  times in a row is set aside until its script changes. wake_add_rule compiles
+  times in its last twenty runs is set aside until its script changes or the
+  host restarts. wake_add_rule compiles
   a script before saving it.
 - `suppression_stats { rule?, recent?, since? }` and `dump_suppressed { path?,
   rule?, since?, until?, format? }`, in the built-in settings toolset, read
@@ -54,3 +55,7 @@
   host without host presentation, where it's one prompt-cache miss. The review's calls count toward the agent's
   usage, as the reply judge's do, and a wake on a flag is a full turn of the
   agent's own model.
+- **Module authors:** `metadata.suppressed` is now the framework's: a module's or
+  server's own value under that key is dropped on write. A row a module reads
+  through its context is marked `heldFromResidents` when a suppress rule hid it,
+  as a tuned-out row is.

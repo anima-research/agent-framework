@@ -192,6 +192,7 @@ export class SuppressScripts {
   forget(name: string): void {
     const had = this.rules.delete(name) || this.saved.delete(name);
     if (had) this.scheduleSave();
+    if (this.rules.size === 0) this.stopWorker();
   }
 
   /**

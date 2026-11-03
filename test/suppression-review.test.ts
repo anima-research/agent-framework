@@ -186,6 +186,7 @@ describe('a review', () => {
     const second = harness({ statePath, records: later, rules: [], start: T0 + 4 * HOUR });
     assert.equal(second.review.nextReviewAfter, T0 + 4 * HOUR, 'it picks up from where the last review stopped');
     const summary = await second.run(T0 + 4 * HOUR);
+    assert.equal(second.requests.length, 1, 'the reviewer read the row');
     assert.equal(summary?.fromMs, T0 + 2 * HOUR);
     assert.deepEqual(summary?.rules.map((r) => [r.rule, r.suppressed, r.inForce, r.description]), [['hide-ears', 1, false, 'ambient chatter from the room']]);
     assert.match(second.delivered[0].text, /"hide-ears" \(ambient chatter from the room\), since removed, hid 1/);
@@ -212,6 +213,7 @@ describe('a review', () => {
       fromMs: T0, toMs: T0 + 2 * HOUR, total: 7, flagged: 6,
       rules: [{ rule: 'r', description: 'd', inForce: true, suppressed: 7, read: 7, verdict: 'flagged', flagged: Array.from({ length: 6 }, (_, i) => rec('r', i, `x${i}`)) }],
     });
+    assert.match(text, /"r" \(d\) hid 7/);
     assert.match(text, /· and 1 more/);
     assert.match(text, /suppression_stats and dump_suppressed show what a rule hid/);
   });

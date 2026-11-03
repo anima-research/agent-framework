@@ -93,6 +93,7 @@ describe('a suppress rule read past a problem in gate.json does not suppress', (
     ['a field suppress doesn\'t read', { name: 'r', match: { source: 'body' }, behavior: 'defer', suppress: { description: 'x', condition: 'only repeats' } }],
     ['a match of wildcards alone', { name: 'r', match: { source: '*' }, behavior: 'defer', suppress: { description: 'x' } }],
     ['a match field the gate doesn\'t read', { name: 'r', match: { source: 'body', unlessQuiet: true }, behavior: 'defer', suppress: { description: 'x' } }],
+    ['a filter field the gate doesn\'t read', { name: 'r', match: { source: 'body', filter: { type: 'text', pattern: 'eye', caseSensitive: true } }, behavior: 'defer', suppress: { description: 'x' } }],
   ] as const) {
     it(`${what}: the rule defers instead, and gate_status says why`, () => {
       const gate = makeGate({ default: 'always', policies: [rule] });
@@ -250,10 +251,12 @@ describe('suppress rules with a script of the agent\'s own (suppress.script)', (
   });
 
   it('suppressionFor runs the script on a copy of its state, which it drops', () => {
-    const { gate } = clocked([EYE]);
+    const { gate } = clocked([EYE, { name: 'counts', match: { source: 'discord' }, behavior: 'defer', suppress: { description: 'x', script: '(e, state) => { state.n = (state.n ?? 0) + 1; return false; }' } }]);
     assert.equal(gate.suppressionFor(ev([])), null);
     assert.equal(gate.suppressionFor(ev([])), null, 'asking twice changed nothing');
     gate.probeTable();
+    assert.ok((gate.getStatus().policies[1].suppress?.scriptStatus?.runs ?? 0) === 0, 'a probe counts no run');
+    assert.deepEqual(gate.suppressScriptState('counts'), {}, 'the probes reached this script and left no state');
     assert.deepEqual(gate.suppressScriptState('eye'), {});
     assert.equal(gate.decideSuppression(ev([])), null, 'the first real arrival is still the one shown');
     assert.equal(gate.suppressionFor(ev([])), 'eye');
@@ -409,6 +412,7 @@ describe('suppress rules with a script of the agent\'s own (suppress.script)', (
     second.gate.addPolicy({ ...EYE, suppress: { description: 'a new description', script: ONE_IN_TEN.replace('600000', '300000') } });
     assert.deepEqual(second.gate.suppressScriptState('eye'), { 'mcpl:push-event': 1_000_000 }, 'a new description keeps it');
     second.gate.removePolicy('eye');
+    assert.equal((second.gate as unknown as { suppressScripts: { channel?: unknown } }).suppressScripts.channel, undefined, 'no scripts, no thread');
     second.gate.addPolicy({ ...EYE, suppress: { description: 'eye flaps', script: ONE_IN_TEN.replace('600000', '300000') } });
     assert.deepEqual(second.gate.suppressScriptState('eye'), {}, 'a rule removed and added again starts afresh');
   });
@@ -417,6 +421,7 @@ describe('suppress rules with a script of the agent\'s own (suppress.script)', (
     const first = clocked([EYE]);
     first.gate.decideSuppression(ev([]));
     first.gate.dispose();
+    assert.ok(Object.keys(JSON.parse(readFileSync(join(TMP_DIR, 'suppress-state.json'), 'utf-8')).rules.eye.state).length > 0, 'a state was saved');
     const second = clocked([]);
     second.gate.getStatus(); // the first sync, with no rule of that name
     second.gate.addPolicy(EYE);
