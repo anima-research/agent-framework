@@ -18080,7 +18080,9 @@ export class AgentFramework {
    * framing made for an incarnation the ended `record` reaches, where one
    * made for a later incarnation is a refused look's, which no run read;
    * and the resident's window mark on the last of them framed on `branch`,
-   * or none.
+   * or none. A framing an undo took out of the reader's window (`'undone'`)
+   * is in no window it will read, and counts for none of these; a failed
+   * look's, out of the window until a run takes the reader on, counts.
    */
   private readerHanded(
     cm: ContextManager,
@@ -18088,6 +18090,7 @@ export class AgentFramework {
     branch: string | undefined,
   ): { held: Set<string>; taken: Set<string>; through?: number } {
     const checkpoint = record.inherit?.atSequence ?? Number.NEGATIVE_INFINITY;
+    const presented = cm.windowMode() === 'presented';
     const held = new Set<string>();
     const taken = new Set<string>();
     let through: number | undefined;
@@ -18097,6 +18100,7 @@ export class AgentFramework {
         kind?: unknown; incarnation?: unknown; heldMessageIds?: unknown; residentThrough?: unknown; residentBranch?: unknown;
       } | undefined;
       if (meta?.kind !== 'tune-out-reader-framing') continue;
+      if (presented && cm.windowStatusOf(m.id) === 'undone') continue;
       const ran = typeof meta.incarnation !== 'number' || meta.incarnation <= record.incarnation;
       if (Array.isArray(meta.heldMessageIds)) {
         for (const id of meta.heldMessageIds) {

@@ -823,6 +823,31 @@ describe('a persisted reader: a look that fails, and what goes back', () => {
   });
 
 
+  it("counts held rows as handed only from a framing its window holds: an undone framing's are handed again", { timeout: 120_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-undone-'));
+    dirs.push(dir);
+    const t = await boot(dir, { persist: 'resident' });
+    const epochId = t.enter();
+    const name = 'reader/scout/g1';
+    const first = t.hold(epochId, 'HELD-1');
+    t.look(epochId, [first]);
+    await t.looked(name, 1);
+    const second = t.hold(epochId, 'HELD-2 undone');
+    t.look(epochId, [second]);
+    await t.looked(name, 2);
+    // The reader's second turn is undone: its framing leaves its window.
+    const cm = await t.framework.inspectAgentContext(name);
+    const framing = cm.getAllMessages().filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'tune-out-reader-framing').at(-1)!;
+    const turn = cm.getPresentedMessages().filter((m) => m.sequence >= framing.sequence).map((m) => m.id);
+    cm.retractRows(turn, { undone: true });
+    assert.equal(cm.windowStatusOf(framing.id), 'undone', 'premise');
+    // As after a restart: the epoch's whole backlog.
+    t.look(epochId, [first, second, t.hold(epochId, 'HELD-3')]);
+    await t.looked(name, 3);
+    assert.equal(t.forkTraces().at(-1)!.held, 2, 'HELD-2 and HELD-3: the undone framing hands nothing');
+    const last = JSON.stringify(t.membrane.callsFor('reader').at(-1)!.messages.at(-1));
+    assert.ok(last.includes('HELD-2 undone') && last.includes('HELD-3') && !last.includes('HELD-1'), last);
+  });
 
 });
 
