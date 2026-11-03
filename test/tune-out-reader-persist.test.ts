@@ -699,6 +699,23 @@ describe('a persisted reader: a look that fails, and what goes back', () => {
     assert.match(f!.error, /store read failed \(test\)/);
   });
 
+  it('is a failed look, its rows given back, when its resident ended before it ran', { timeout: 120_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-resident-ended-'));
+    dirs.push(dir);
+    const t = await boot(dir, { persist: 'resident' });
+    const epochId = t.enter();
+    // The look as it starts after waiting behind another, the resident gone meanwhile.
+    const fw = t.framework as unknown as {
+      subconsciousConfig: unknown;
+      persistedReaderLook(primary: string, cfg: unknown, persist: string, identity: string, invocation: Invocation, scopeEnded: boolean): Promise<void>;
+    };
+    await fw.persistedReaderLook('gone', fw.subconsciousConfig, 'resident', 'reader/gone', {
+      serverId: 'disc', channelId: CHANNEL, epochId, trigger: 'cadence', notice: '[Tune-out cadence: test]',
+      backlog: [t.hold(epochId, 'HELD-1')], dispositions: null,
+    }, false);
+    const [f] = failed(t.traces);
+    assert.deepEqual([f?.agentName, f?.returned, f?.error], ['reader/gone', 1, 'the resident ended before the look ran']);
+  });
 
 
 

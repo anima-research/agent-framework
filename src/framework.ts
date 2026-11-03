@@ -17818,10 +17818,26 @@ export class AgentFramework {
     scopeEnded: boolean,
   ): Promise<void> {
     // The resident ended while this look waited: it ended the reader with it
-    // (onParentEnd 'end'), and nothing resumes after.
+    // (onParentEnd 'end'), and nothing resumes after. No reader read the
+    // look's held rows, which go back as a failed look's do, and the look is
+    // traced as failed under the identity's name, no generation planned.
     const parent = this.agents.get(primary);
     const parentConfig = this.agentConfigs.get(primary);
-    if (!parent || !parentConfig) return;
+    if (!parent || !parentConfig) {
+      const returned = this.tuneOutCoordinator?.readerFailed(invocation) ?? 0;
+      this.emitTrace({
+        type: 'tune-out:reader-fork-failed',
+        agentName: identity,
+        serverId: invocation.serverId,
+        channelId: invocation.channelId,
+        epochId: invocation.epochId,
+        trigger: invocation.trigger,
+        error: 'the resident ended before the look ran',
+        reported: false,
+        returned,
+      });
+      return;
+    }
     const resync = cfg.resync ?? 'window';
     // The look's name: its generation's once it is planned, the identity's
     // for a failure before (a registry or branch read that throws).
