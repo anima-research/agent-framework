@@ -6852,11 +6852,11 @@ export class AgentFramework {
     if (hold?.state !== 'holding' || !agent) return;
     const pending = this.compressionPending(agent);
     const signature = this.budgetHoldSignature(agent, pending);
-    if (signature !== undefined && signature === hold.lookedAt) return;
     if (signature !== undefined && signature !== hold.seen) {
       if (hold.seen !== undefined) hold.changedAt = Date.now();
       hold.seen = signature;
     }
+    if (signature !== undefined && signature === hold.lookedAt) return;
     const preview = this.budgetHoldPreview(agent);
     let verdict = preview?.verdict;
     let note: string | null = null;
