@@ -17895,6 +17895,10 @@ export class AgentFramework {
       // The host's branch the plan was made on (its checkpoint and mark checks).
       const plannedOn = this.store.currentBranch().name;
       name = plan.name;
+      // Whether this look reported (readerReported) is this look's alone: a
+      // run the host resumed the reader for between looks may have reported
+      // under the same name.
+      this.tuneOutCoordinator?.forgetReader(name);
       if (plan.reason && plan.previous) {
         this.emitTrace({
           type: 'tune-out:reader-rederived',

@@ -887,6 +887,31 @@ describe('a persisted reader: a look that fails, and what goes back', () => {
     assert.ok(last.includes('HELD-2 undone') && last.includes('HELD-3') && !last.includes('HELD-1'), last);
   });
 
+  it("starts each look's report count afresh: a report from a run the host resumed the reader for doesn't stand for the next look's", { timeout: 120_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-report-'));
+    dirs.push(dir);
+    const t = await boot(dir, { persist: 'resident' });
+    const epochId = t.enter();
+    const name = 'reader/scout/g1';
+    t.look(epochId, [t.hold(epochId, 'HELD-1')]);
+    await t.looked(name, 1);
+    // The host resumes the reader itself, and it reports.
+    t.membrane.script('reader',
+      createMockResponse([{ type: 'tool_use', id: 'host-report', name: 'deliver_summary', input: { channelId: CHANNEL, text: 'HOST-RUN report' } }], 'tool_use'),
+      final([text('host run done')]));
+    const run = await t.framework.resumeAgent(name, { model: 'test-model', systemPrompt: 'You are scout.', proseRouting: 'disabled' });
+    await t.framework.runEphemeralToCompletion(run.agent, run.contextManager);
+    await t.framework.runUntilIdle();
+    assert.equal(t.internals.tuneOutCoordinator.readerReported(name), true, 'premise: the host-resumed run reported');
+    // The next look ends in prose, with no deliver_summary of its own.
+    const delivered = () => t.traces.filter((e) => e.type === 'tune-out:reader-prose-delivered') as unknown as Array<{ agentName: string; chars: number }>;
+    const before = delivered().length;
+    t.membrane.script('reader', final([text('LOOK-PROSE report')]));
+    t.look(epochId, [t.hold(epochId, 'HELD-2')]);
+    await t.looked(name, 3);
+    assert.deepEqual(delivered().slice(before).map((e) => [e.agentName, e.chars]), [[name, 'LOOK-PROSE report'.length]], "the look's prose is its report");
+    assert.ok(t.rows().some((m) => textOf(m).includes('LOOK-PROSE report')));
+  });
 });
 
 describe('a persisted reader: the resync, bounded and unreadable', () => {
