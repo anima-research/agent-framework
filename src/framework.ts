@@ -16567,9 +16567,11 @@ export class AgentFramework {
    * presented window (#291), where the cut is the write that presented the
    * target, rows stored after the target and before that write stay in the
    * record. Those of them the agent's window holds were presented after
-   * the target: they leave the window as arrived and not presented
-   * (`returnedToArrivals`, named by `returnedIds`), and enter it again at
-   * the agent's next turn start. The rows of the agent's window after the
+   * the target: they leave the window (`returnedToArrivals`, named by
+   * `returnedIds`); the agent's own rows among them enter it again at its
+   * next presentation point (the surgery's release), and the rest, as
+   * arrived and not presented, at the agent's next turn start. The rows of
+   * the agent's window after the
    * target that the write presenting it presented too (`keptInWindow`, a
    * batch: one write, one presentation point) stay in the window, since no
    * branch cut separates them from the target. Both are set only on a

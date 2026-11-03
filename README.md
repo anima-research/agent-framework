@@ -750,9 +750,11 @@ const result = await framework.rollbackToMessage('cairn', {
 An agent's context follows its own window (#291), so the cut is the write
 that presented the target: a rollback removes only the rows stored after
 that write, and the rows stored before it that the window took after the
-target leave the window and wait outside it until the agent's next turn
-start, so the cut holds until the agent speaks again (`returnedToArrivals`,
-on the result and the preview). Rows that one write presented together with
+target leave the window (`returnedToArrivals`, on the result and the
+preview). The agent's own rows among them enter it again at its next
+presentation point, the surgery's release; the rest wait outside it until
+the agent's next turn start, so for them the cut holds until the agent
+speaks again. Rows that one write presented together with
 the target stay after it (`keptInWindowAfterTarget`), since no branch cut
 separates them from it: a rollback that only they follow is refused and
 names them, and `suppressMessages`, or the host's `hide` by Discord message

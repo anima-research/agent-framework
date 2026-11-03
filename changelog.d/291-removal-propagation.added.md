@@ -1,9 +1,11 @@
 - `rollbackToMessage`'s result, and `previewSurgeryMarks` for a rollback, carry `returnedToArrivals` on a presented
   window (#291): the rows after the target in the agent's window that the cut keeps in the record. They leave the
-  window as arrived and not presented, and wait outside it until the agent's next turn start, which presents them
-  after what its window holds then: the surgery's release, a resume, a turn's end and a row stored for the agent
-  while it is idle don't bring them back, so the operator's cut is what the agent's window holds until it speaks
-  again. A restart before then presents them at its pass at rest. Both also carry `keptInWindowAfterTarget`: the
+  window, and the agent's own rows among them enter it again at its next presentation point, the surgery's release,
+  as own rows enter at every point. The others are arrived and not presented, and wait outside it until the agent's
+  next turn start, which presents them after what its window holds then: the surgery's release, a resume, a turn's
+  end and a row stored for the agent while it is idle don't bring them back, so for them the operator's cut is what
+  the agent's window holds until it speaks again. A restart before then presents them at its pass at rest. Both
+  also carry `keptInWindowAfterTarget`: the
   rows after the target that one write presented together with it (a batch, such as two messages that arrived while
   the agent was busy and entered at its turn's end), which stay in the window after the target, since a branch cut
   can't separate them from it. Neither is removed or marked. `SurgeryMarksPreview.neverPresented` counts the

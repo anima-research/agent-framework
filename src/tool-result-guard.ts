@@ -596,8 +596,9 @@ export class ToolResultGuard {
         let deadlineSpent = false;
         for (const [index, block] of pending.content.entries()) {
           if (block.type !== 'tool_result') continue;
-          // Once the store has left the batch's branch (a rollback, an undo, a
-          // host's switch), write no more. This result and every later one is
+          // Once the store has left the batch's branch (a rollback, a
+          // suppression, a host's switch; an undo moves no branch), write no
+          // more. This result and every later one is
           // skipped, and its original stays in the audit record. Nothing
           // yields from here to the edit's own branch check, so while the
           // store is away the stub stays as it is. A write already under way
@@ -627,8 +628,8 @@ export class ToolResultGuard {
           // Declined where it would have committed, since the workspace had
           // left the batch's branch. Nothing was written, and no more are, as
           // for the results the branch check above stops. If the branch is
-          // back by the edit, as after an undo and a redo, the stubs of this
-          // result and the later ones name the audit record.
+          // back by the edit, as after a host's switch away and back, the stubs
+          // of this result and the later ones name the audit record.
           if (spill && 'skipped' in spill && spill.skipped === 'branch_changed') branchLeft = true;
           // A batch that used its deadline is said once, here, where the
           // batch is known; the host returns the skip without a line.

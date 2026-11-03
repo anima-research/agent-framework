@@ -25,8 +25,10 @@
  * in a turn that is later undone stays usable (the words were genuinely
  * written and held back), and a delivered draft stays delivered. The
  * notices that name a draft are conversation, so they do follow the branch: a draft counts as
- * named while a message naming it is on the current branch, and one a
- * rollback or branch move has left unnamed is named again.
+ * named while a message naming it is on the current branch and, on a
+ * presented window, not taken out of it by an undo; one a rollback or
+ * branch move has left unnamed, or whose notice an undo took out of the
+ * window, is named again.
  *
  * Drafts are kept, not hoarded. Each resident's KEEP_NEWEST newest drafts
  * are always kept; an older one, in any state, is let go at the journal's
