@@ -1899,18 +1899,87 @@ describe('private wins, one way', () => {
       };
     };
 
-    it("a private surface's message stored before a restart, which woke nothing and no start read, keeps the next run's first start out of every channel", async () => {
-      const storeDir = mkdtempSync(join(tmpdir(), 'unread-private-restart-'));
+    const storeAs = (framework: AgentFramework, participant: string, metadata: unknown) =>
+      (framework as unknown as { addMessage(participant: string, content: unknown, metadata: unknown): unknown }).addMessage(
+        participant, [{ type: 'text', text: 'for your eyes only' }], metadata);
+    const surface = () => ({ inboundSource: { kind: 'surface', surface: 'tui', acceptedAt: Date.now() } });
+    for (const [what, store] of [
+      ["a private surface's message", (rig: Rig) => {
+        rig.framework.pushEvent({ type: 'external-message', source: 'console', content: 'for your eyes only', metadata: {} } as never);
+      }],
+      ["a private turn's work's mail", (rig: Rig) => { storeAs(rig.framework, 'helper', { dendrite: { privateTurn: true } }); }],
+      ["a private surface's message under the resident's own name", (rig: Rig) => { storeAs(rig.framework, 'scout', surface()); }],
+    ] as const) {
+      it(`${what} stored before a restart, which woke nothing and no start read, keeps the next run's first start out of every channel`, async () => {
+        const storeDir = mkdtempSync(join(tmpdir(), 'unread-private-restart-'));
+        try {
+          const first = await surfaceRig({ storeDir, quietSources: ['console'] });
+          try {
+            await firstTurn(first, false);
+            assert.deepEqual(first.routed.map((r) => r.locus), [ROOM], "control: the first run's turn is a channel turn");
+            const starts = first.starts.length;
+            store(first);
+            await first.until(() => stored(first).includes('for your eyes only'), 'the private input stored');
+            await first.framework.runUntilIdle();
+            assert.equal(first.starts.length, starts, 'control: no start read it in the first run');
+          } finally {
+            await first.close();
+          }
+          const next = await surfaceRig({ storeDir, quietSources: ['console'] });
+          try {
+            const { channelTurn } = restarted(next);
+            assert.deepEqual(await channelTurn(), [], 'the start that reads it speaks in no channel');
+            assert.deepEqual(await channelTurn(), [ROOM], 'control: a later channel turn speaks in its channel');
+          } finally {
+            await next.close();
+          }
+        } finally {
+          rmSync(storeDir, { recursive: true, force: true });
+        }
+      });
+    }
+
+    it("a private surface's message stored for one resident keeps another resident's next channel turn, which reads it in their shared slot, out of every channel", async () => {
+      const rig = await surfaceRig({ quietSources: ['console'], otherAgents: ['aide'] });
+      try {
+        const aideIdle = () => rig.framework.getAgent('aide')!.state.status === 'idle' && idle(rig);
+        const aideTurn = async () => {
+          const before = rig.routed.length;
+          const starts = rig.starts.filter((s) => s.agentName === 'aide').length;
+          rig.i.pendingRequests.push({ ...roomWake(), agentName: 'aide' });
+          await rig.until(() => rig.starts.filter((s) => s.agentName === 'aide').length > starts && aideIdle(), "the aide's channel turn");
+          await rig.framework.runUntilIdle();
+          return rig.routed.slice(before).map((r) => r.locus);
+        };
+        assert.deepEqual(await aideTurn(), [ROOM], "control: the aide's channel turn speaks in its channel");
+        rig.framework.pushEvent({ type: 'external-message', source: 'console', content: 'for your eyes only', metadata: {} } as never);
+        await rig.until(() => stored(rig).includes('for your eyes only'), 'the private message stored');
+        assert.deepEqual(await aideTurn(), [], 'the turn that reads it speaks in no channel');
+        assert.deepEqual(await aideTurn(), [ROOM], 'control: a later channel turn speaks in its channel');
+      } finally {
+        await rig.close();
+      }
+    });
+
+    it("a private surface's message a silent heartbeat tick read before a restart keeps the next run's first start out of every channel", async () => {
+      const storeDir = mkdtempSync(join(tmpdir(), 'silent-tick-private-restart-'));
       try {
         const first = await surfaceRig({ storeDir, quietSources: ['console'] });
         try {
           await firstTurn(first, false);
-          assert.deepEqual(first.routed.map((r) => r.locus), [ROOM], "control: the first run's turn is a channel turn");
-          const starts = first.starts.length;
           first.framework.pushEvent({ type: 'external-message', source: 'console', content: 'for your eyes only', metadata: {} } as never);
           await first.until(() => stored(first).includes('for your eyes only'), 'the private message stored');
+          const starts = first.starts.length;
+          first.i.pendingRequests.push({
+            agentName: 'scout', reason: 'heartbeat', source: 'heartbeat', timestamp: Date.now(),
+            suppressProse: true, silentHeartbeat: { eventId: 'tick-1', serverId: 'heartbeat' },
+          });
+          await first.until(() => first.starts.length > starts && idle(first), 'the silent tick');
           await first.framework.runUntilIdle();
-          assert.equal(first.starts.length, starts, 'control: no start read it in the first run');
+          const rows = first.framework.getAgent('scout')!.getContextManager().getAllMessages();
+          const asked = rows.findIndex((m) => JSON.stringify(m.content).includes('for your eyes only'));
+          assert.ok(rows.slice(asked + 1).some((m) => m.participant === 'scout' && (m.metadata as { silentHeartbeat?: unknown } | undefined)?.silentHeartbeat),
+            "control: the tick stored a row of the resident's own after the message");
         } finally {
           await first.close();
         }
@@ -1950,8 +2019,8 @@ describe('private wins, one way', () => {
         try {
           const { channelTurn, nudge } = restarted(next);
           assert.deepEqual(await channelTurn(), [], "the start that reads the earlier run's report speaks in no channel");
+          assert.deepEqual(await nudge(), [LOUNGE], 'a nudge right after it speaks as on main, in the fallback channel');
           assert.deepEqual(await channelTurn(), [ROOM], 'control: a later channel turn speaks in its channel');
-          assert.deepEqual(await nudge(), [LOUNGE], 'a nudge after it speaks as on main, in the fallback channel');
         } finally {
           await next.close();
         }

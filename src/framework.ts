@@ -15,7 +15,7 @@ import { classifyFailure, retryDecision, MEMBRANE_RETRY_SETTINGS, type RetrySett
 import { deadlineCut, isDeadlineExpiry, resolveInferenceBounds, wholeCallMs, type InferenceBounds } from './inference-bounds.js';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, stripUnpairedToolBlocks, continuesBody, MalformedContentError, malformedContentPlaces, CompressionWithdrawn } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
-import { SILENT_HEARTBEAT_SEPARATOR, type RequestOnlyPrompt, type RequestOnlyStamps } from './silent-heartbeat.js';
+import { SILENT_HEARTBEAT_SEPARATOR, silentHeartbeatOf, type RequestOnlyPrompt, type RequestOnlyStamps } from './silent-heartbeat.js';
 import {
   SUBCONSCIOUS_TOOLS,
   SUBCONSCIOUS_TOOL_NAMES,
@@ -1613,9 +1613,9 @@ function holdsUnansweredPrivateInput(cm: ContextManager, agentName: string, sees
     for (let i = messages.length - 1; i >= 0; i--) {
       const message = messages[i];
       if (!sees(message.metadata)) continue;
-      if (message.participant === agentName) return false;
       if (isMarkedPrivateInput(message.metadata)) return true;
       if (typeof (message.metadata as Record<string, unknown> | undefined)?.[CALLER_TURN_KEY] === 'number') return true;
+      if (message.participant === agentName && !silentHeartbeatOf(message.metadata)) return false;
     }
   }
   return false;
@@ -21863,6 +21863,7 @@ export class AgentFramework {
       if (reader && reader !== agent && this.isOrdinaryResident(reader)) {
         this.noteSpokenTo(reader.name, metadata);
         this.noteArrival(reader.name, metadata, messageId);
+        this.notePrivateInput(reader.name, metadata);
       }
     }
   }
