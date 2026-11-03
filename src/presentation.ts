@@ -477,6 +477,8 @@ export class AgentPresentation {
   private generation = 0;
   /** Rows handed each reader fork as framing (noteFramed), in memory. */
   private readonly framed = new Map<AgentName, Set<MessageId>>();
+  /** Reader forks whose framing may not all be in their window yet: framed before they were taken on, or whose framing's presentation failed. */
+  private readonly framedPending = new Set<AgentName>();
   private readonly listeners = new Map<AgentName, Set<(event: PresentedEvent) => void>>();
   /** Own rows whose presentation at their write failed, per manager (presentOwn), until they enter its window. */
   private readonly failedOwn = new WeakMap<WindowManager, Set<MessageId>>();
@@ -574,6 +576,8 @@ export class AgentPresentation {
       agent.setOwnRowSink?.((ids) => this.presentOwn(agent, ids));
       this.retractForeign(agent, 'rebase');
       this.repair(agent, 'rebase');
+      // A reader fork's framing that its window doesn't hold on this branch.
+      this.presentFramed(agent);
     } catch (error) {
       state.pinnedLegacy = describe(error);
       this.host.emitTrace({ type: 'presentation:failed', agentName: agent.name, occasion: 'rebase', error: state.pinnedLegacy, legacy: true });
@@ -700,6 +704,7 @@ export class AgentPresentation {
     this.heldUntilStart.delete(cm);
     this.slotReaders.delete(cm);
     this.framed.delete(agent.name);
+    this.framedPending.delete(agent.name);
     this.generation++;
   }
 
@@ -838,8 +843,10 @@ export class AgentPresentation {
     // A fresh start is where a rollback's returned arrivals enter (holdUntilStart).
     if (fresh) this.heldUntilStart.delete(agent.getContextManager());
     // And where rows a write-down took in that aren't the agent's, whose
-    // retraction failed, leave before its compile.
+    // retraction failed, leave before its compile, and a reader fork's
+    // framing whose presentation failed enters.
     if (fresh) this.retryRetraction(agent, occasion);
+    if (fresh && this.framedPending.has(agent.name)) this.presentFramed(agent);
     const { arrivals, failure } = this.presentPending(agent, occasion, fresh && !this.host.frozen(), false,
       fresh ? "the start fails, and what it didn't present waits for the next point" : undefined);
     if (fresh && failure !== undefined) {
@@ -984,12 +991,14 @@ export class AgentPresentation {
    * fork framed before it is taken on has them presented at its adopt. Its
    * window's filter (the residents', which a reader fork inherits) keeps
    * them out of its compiles, where its framing row shows them; nothing
-   * else of its window moves.
+   * else of its window moves. Rows whose presentation fails enter at the
+   * fork's next turn start, or after a move of the store's branch (rebase).
    */
   noteFramed(agent: PresentedAgent, rowIds: readonly MessageId[]): void {
     const set = this.framed.get(agent.name) ?? new Set<MessageId>();
     for (const id of rowIds) set.add(id);
     this.framed.set(agent.name, set);
+    this.framedPending.add(agent.name);
     this.presentFramed(agent);
   }
 
@@ -1001,6 +1010,7 @@ export class AgentPresentation {
    */
   forgetFramed(agent: AgentName): void {
     this.framed.delete(agent);
+    this.framedPending.delete(agent);
   }
 
   /**
@@ -1236,7 +1246,10 @@ export class AgentPresentation {
   /** The rows the agent was handed as framing (noteFramed) that its window doesn't hold yet, presented in the order handed. */
   private presentFramed(agent: PresentedAgent): void {
     const framed = this.framed.get(agent.name);
-    if (!framed || framed.size === 0) return;
+    if (!framed || framed.size === 0) {
+      this.framedPending.delete(agent.name);
+      return;
+    }
     try {
       if (!this.presenting(agent)) return;
       const cm = agent.getContextManager();
@@ -1244,7 +1257,10 @@ export class AgentPresentation {
       // fork derived from a presented window holds those rows its parent's
       // window was written down with.
       const unpresented = new Set(cm.getUnpresentedMessages().map((m) => m.id));
-      this.present(agent, [...framed].filter((id) => unpresented.has(id)), 'framing');
+      const { error } = this.present(agent, [...framed].filter((id) => unpresented.has(id)), 'framing');
+      // Pending until a presentation of them doesn't fail: the fork's next
+      // turn start tries again (presentAtStart).
+      if (error === undefined) this.framedPending.delete(agent.name);
     } catch (error) {
       this.failed(agent, 'framing', error);
     }

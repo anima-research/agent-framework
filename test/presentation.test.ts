@@ -1020,4 +1020,24 @@ describe('the presentation module at the point after one that failed', () => {
     r.presentation.presentAtEnd(r.oren);
     assert.equal(ofType(r.traces, 'presentation:retracted').length, 1, 'and not again');
   });
+
+  // AF #844 bot review finding 53.
+  it("framing whose presentation into a fork's window failed enters at the fork's next turn start", async () => {
+    const r = await rig();
+    r.adoptAll();
+    r.alive.add('mira');
+    const inherited = storeOwnRow(r.mira, 'mira', text("mira's reply"));
+    const later = r.write(r.oren, 'someone', text('a row the fork is handed'), ['mira']);
+    const kidCm = await r.mira.cm.derive({ branch: 'kid-branch', strategy: new PassthroughStrategy() });
+    closers.push(() => kidCm.close());
+    const kid = new TestAgent('kid', kidCm, ['kid', 'mira']);
+    r.live.set('kid', kid);
+    r.presentation.adopt(kid);
+    failNextPresent(kid.cm);
+    quietly(() => r.presentation.noteFramed(kid, [inherited, later]));
+    assert.equal(kid.has(later), false, 'setup: its presentation failed');
+    r.presentation.presentAtStart(kid, 'turn-start');
+    assert.equal(kid.has(later), true, "presented at the fork's next start");
+    assert.deepEqual(ofType(r.traces, 'presentation:presented').filter((t) => t.agentName === 'kid' && t.occasion === 'framing').map((t) => t.count), [1]);
+  });
 });
