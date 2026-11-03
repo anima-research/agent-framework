@@ -72,8 +72,9 @@ export interface CoalescingPlacement {
    *  recovery), which counts as read and can't be removed. */
   messageId?: string;
   /** Set on a stored placement that wasn't presented to `agent` at its
-   *  write, because a turn of the agent's was alive (#291's presentation
-   *  index): the turn being assembled doesn't read it. */
+   *  write: a turn of the agent's was alive, or its presentation at rest
+   *  failed (#291's presentation index). No request of the agent's reads it
+   *  until it is presented. */
   presented?: false;
 }
 

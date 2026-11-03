@@ -2558,7 +2558,8 @@ interface FrameworkWriteOptions {
    *  again), and, for the wake that goes with it (readsRowFor), whether
    *  it was stored and not presented to that agent (`presented: false`):
    *  stored while a turn of the agent's was alive, outside its start's
-   *  assembly. A write a surgery's hold keeps names only its agent. */
+   *  assembly, or at rest with a presentation that failed. A write a
+   *  surgery's hold keeps names only its agent. */
   placement?: WritePlacement;
   /**
    * Who the message is for, when that is decided before it gets here:
