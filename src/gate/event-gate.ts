@@ -2283,11 +2283,13 @@ export class EventGate {
      *  was given it) has answered a request that carried it, its answer's
      *  publication not required: `false` only when the host knows it hasn't.
      *  Asked when a reply judge answers reply, for each event of the batch it
-     *  judged that has a write: an event answered then keeps the wake, since
-     *  the judge answered after that answer, and only the others are handed
-     *  on with their writes, for the wake to be dropped once they're answered
-     *  too. Absent, or an answer other than `false` (a throw included): the
-     *  event counts as answered then. */
+     *  judged that has a write: an event answered before the judge answered
+     *  keeps the wake and loses its write, so the batch is delivered as any
+     *  batch with an event without a write is: its line written at delivery
+     *  and nothing handed, or, for one message still the newest entry then,
+     *  its line handed to the delivery agent's start. Absent, or an answer
+     *  other than `false` (a throw included): the event counts as answered
+     *  then. */
     isAnswered?: (after: WritePlacement) => boolean;
     /** The event types the gate can see from a source, when the host knows
      *  them (an MCPL server's id: MCPL_GATE_EVENT_TYPES), else undefined.

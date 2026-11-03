@@ -22,6 +22,8 @@
   failed, timed out or made no call, with `onError: "wake"`), and on a reply
   verdict, except for an event in a request the agent had already answered
   when the judge answered, whether or not it had published there: the judge
-  answered after it, so its reply stands, and such a batch's line is written
-  when the batch is delivered, naming every event. A deferred
+  answered after it, so its reply stands, and such a batch keeps the base's
+  rule: its line is written when it's delivered, naming every event, or, for
+  one message still the newest entry then, handed to the delivery agent's
+  start. A deferred
   render's batched wake is unchanged.

@@ -516,8 +516,9 @@ export interface GatePolicyStats {
     judging: boolean;
     /** Events held for the judge until the agent's turn (or the host's quiesce) ends. */
     heldCount: number;
-    /** Verdicts so far: reply (the batch delivered to wake the agent, as
-     *  JudgeConfig says), wait (the batch let go by), and judge failures. */
+    /** Verdicts so far: reply (the batch sent on to delivery to wake the
+     *  agent, as JudgeConfig says), wait (the batch let go by), and judge
+     *  failures. */
     verdicts: { reply: number; wait: number; error: number };
     /** The newest verdict. */
     last?: {

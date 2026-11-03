@@ -698,10 +698,9 @@ export interface InferenceRequest {
   /** Timestamp of the event the wake provenance was taken from (ms). */
   wakeAt?: number;
   /** Batched-wake lines the gate handed to this wake rather than wrote
-   *  (WakeLine), decided by a fresh start of its turn as WakeLine says: each
-   *  written once into the window it names, or left for a later fresh start
-   *  of the same wake. A retry, or a start that resumes a logical turn,
-   *  decides none. */
+   *  (WakeLine), decided by fresh starts as WakeLine says, each written once
+   *  into the window it names. A retry, or a start that resumes a logical
+   *  turn, decides none. */
   wakeLines?: WakeLine[];
   /** Suppress every automatic plain-prose delivery for this logical turn.
    * Explicit tool calls remain available. Used by authenticated silent wakes. */

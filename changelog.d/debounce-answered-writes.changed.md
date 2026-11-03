@@ -32,8 +32,8 @@
   window, for each line still owed there that the start leaves out as newest
   or for a held slot, each time, where it was traced only at the delivery agent's starts of the line's
   own wake.
-- `gate:judge-verdict`'s `woke` still says whether the batch was delivered to
-  wake the agent, and such a delivery may now start no turn.
+- `gate:judge-verdict`'s `woke` still says whether the gate goes on to deliver
+  the batch to wake the agent, and such a delivery may now start no turn.
 - **Prompt cache:** `wake_add_rule`'s descriptions of `debounceMs` and of its
   judge change, so the first request after the upgrade that carries that
   tool misses the cache from its tool block on.
