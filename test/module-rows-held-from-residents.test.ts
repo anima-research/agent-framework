@@ -520,6 +520,3 @@ describe("a message a tune-out holds stays out of what the residents are shown, 
     }
   });
 });
-
-describe("the framework's tune-out hooks", () => {
-});

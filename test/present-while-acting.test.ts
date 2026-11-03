@@ -457,7 +457,7 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
-  it("an ADDRESSED mid-turn injection moves no private turn's locus", async () => {
+  it("under 'latest-inbound', an ADDRESSED mid-turn injection moves no private turn's locus, where it moves a channel turn's (above)", async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'Station four, proceeding.' },
       { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
@@ -466,7 +466,7 @@ describe('present while acting', () => {
       { type: 'text', text: 'Still answering the operator.' },
     ] as ContentBlock[]));
 
-    const framework = await createFramework();
+    const framework = await createFramework({ speech: { locus: 'latest-inbound' } });
     const routed = stubChannelRegistry(framework);
     module.interjection = 'hey, quick question over here?';
     module.interjectionMetadata = { channelId: 'discord:dm:antra', tags: ['chat:addressed'] };

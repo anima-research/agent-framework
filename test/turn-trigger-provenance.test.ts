@@ -349,17 +349,13 @@ describe('Turn trigger provenance', () => {
     assert.equal(handed.at(-1)?.counterparty, 'discord:user:bob');
     await framework.stop();
   });
-  for (const mark of ['private turn', 'retake', 'own', 'shared', 'withdrawn', 'kept plain', 'private wake', 'kept private wake', 'none'] as const) {
+  for (const mark of ['retake', 'own', 'kept plain', 'kept private wake', 'none'] as const) {
     it(`a held merged start ${{
-      'private turn': "that takes in an equal request continuing a private turn gives each of its requests that turn at the dedup, and starts private once the hold's release judges its batch again",
       retake: "that takes in an equal retake gives each of its requests the retake at the dedup, and starts private over a history that holds a private surface's message",
       own: "whose request continues a private turn gives that turn to no other request, through a dedup or the hold's release",
-      shared: "that takes in an equal request continuing the private turn one of its requests continues gives that turn to the other request too",
-      withdrawn: "whose request continuing a private turn is withdrawn as a coalesced wake starts its other request in its channel, with none of the withdrawn one's turn",
       'kept plain': "taken in by an equal plain request the hold kept gives each of its requests the kept request's private turn, and starts private",
-      'private wake': "that takes in an equal private wake makes each of its requests a private wake, so withdrawing the request that made it private still starts it private",
       'kept private wake': "taken in by an equal private wake the hold kept makes each of its requests a private wake, so withdrawing the request that made it private still starts it private",
-      none: 'with no mark starts in its channel once the hold releases it, over a history that holds a private surface\'s message, as on main',
+      none: "that takes in an equal request with no mark makes no request private, and starts in its channel once the hold releases it, over a history that holds a private surface's message, as on main",
     }[mark]}`, async () => {
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi bob' }]));
       const framework = await makeFramework();
@@ -394,8 +390,8 @@ describe('Turn trigger provenance', () => {
       let fail!: (error: Error) => void;
       const auxiliary = i.withAuxiliaryAdmission('scout', () => new Promise<void>((_, reject) => { fail = reject; }), 'test-model').catch(() => {});
       const timer: Record<PropertyKey, unknown> = { agentName: 'scout', reason: 'timer', source: 'clock', timestamp: t - 3_000 };
-      const withdraws = mark === 'withdrawn' || mark === 'private wake' || mark === 'kept private wake';
-      if (mark === 'own' || mark === 'shared' || withdraws) timer[callerTurns] = [privateTurn];
+      const withdraws = mark === 'kept private wake';
+      if (mark === 'own' || withdraws) timer[callerTurns] = [privateTurn];
       if (withdraws) timer.coalescingSubject = 'zz-subject';
       const room: Record<PropertyKey, unknown> = { agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: t - 1_000,
         channelId: 'discord:g:bob-room', counterparty: 'discord:user:bob', addressed: true };
@@ -415,18 +411,15 @@ describe('Turn trigger provenance', () => {
       assert.ok(batchKey, 'premise: the hold keeps a merged start');
       const batch = (held as unknown as Record<symbol, unknown[]>)[batchKey!]!;
       assert.ok(batch.length === 2 && batch.includes(timer) && batch.includes(room), 'premise: its batch is the two requests pushed');
-      if (mark === 'private turn' || mark === 'retake' || mark === 'shared' || mark === 'own' || mark === 'private wake') {
+      if (mark === 'retake' || mark === 'own' || mark === 'none') {
         const duplicate: Record<PropertyKey, unknown> = Object.fromEntries(Object.entries(held));
         if (mark === 'retake') duplicate[retake] = true;
-        else if (mark !== 'own' && mark !== 'private wake') duplicate[callerTurns] = [privateTurn];
-        if (mark === 'private wake') assert.equal(duplicate.nonChannelOrigin, true, 'premise: the equal request is a private wake, as the private start is');
         i.pendingRequests.push(duplicate as unknown as InferenceRequest);
         await i.processInferenceRequests();
         assert.equal(hold.heldRequests.length, 1, 'premise: the hold kept one request for both');
         if (mark === 'retake') assert.deepEqual([timer[retake], room[retake]], [true, true], 'at the dedup, each request takes the retake');
         else if (mark === 'own') assert.equal(room[callerTurns], undefined, "the dedup gives no request another request's own turn");
-        else if (mark === 'private wake') assert.deepEqual([timer.nonChannelOrigin, room.nonChannelOrigin], [true, true], 'at the dedup, each request becomes a private wake');
-        else assert.deepEqual([timer[callerTurns], room[callerTurns]], [[privateTurn], [privateTurn]], 'at the dedup, each request takes the turn');
+        else assert.deepEqual([timer.nonChannelOrigin, room.nonChannelOrigin], [undefined, undefined], 'the dedup makes no request a private wake');
       }
       if (mark === 'kept private wake') {
         const plain: Record<PropertyKey, unknown> = Object.fromEntries(Object.entries(held));
@@ -456,7 +449,7 @@ describe('Turn trigger provenance', () => {
       await framework.runUntilIdle();
       const start = handed.at(-1);
       const routing = i.turnRouting.get('scout');
-      if (mark === 'none' || mark === 'withdrawn') {
+      if (mark === 'none') {
         assert.notEqual(routing?.nonChannelOrigin, true, `the start isn't private: ${JSON.stringify(start)}`);
         assert.equal(start?.channelId, 'discord:g:bob-room', 'it starts in its channel');
       } else {
@@ -467,7 +460,6 @@ describe('Turn trigger provenance', () => {
         assert.deepEqual(timer[callerTurns], [privateTurn], 'the request keeps its own turn');
         assert.equal(room[callerTurns], undefined, 'and the other request takes none of it');
       }
-      if (mark === 'withdrawn') assert.equal(room[callerTurns], undefined, "the other request takes none of the withdrawn one's turn");
       await framework.stop();
     });
   }
@@ -649,6 +641,28 @@ describe('private wins, one way', () => {
       await rig.until(() => rig.starts.length >= 1, 'the turn');
       await rig.framework.runUntilIdle();
       assert.equal(rig.starts.length, 1, JSON.stringify(rig.starts));
+      assert.deepEqual(rig.routed, [], 'nothing is routed');
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("a quiesce that keeps the newer of two parked wakes with one reason keeps the older one's private turn on it, so the resumed start speaks in no channel", async () => {
+    const rig = await surfaceRig();
+    try {
+      const internalsOf = rig.framework as unknown as { notePrivateTurn(turnId: number): void; requestForTurn(agentName: string, reason: string, source: string, callerTurnId?: number): void };
+      internalsOf.notePrivateTurn(9_999);
+      await rig.framework.quiesce();
+      const now = Date.now();
+      internalsOf.requestForTurn('scout', 'timer', 'clock', 9_999);
+      const caused = rig.i.pendingRequests.pop()! as { timestamp: number };
+      caused.timestamp = now;
+      rig.i.pendingRequests.push(caused as never, { agentName: 'scout', reason: 'timer', source: 'clock', timestamp: now + 1 });
+      await rig.i.processInferenceRequests();
+      assert.equal(rig.i.pendingRequests.length, 1, 'premise: the quiesce kept one of the two');
+      await rig.framework.resume();
+      await rig.until(() => rig.starts.length >= 1, 'the turn after resume');
+      await rig.framework.runUntilIdle();
       assert.deepEqual(rig.routed, [], 'nothing is routed');
     } finally {
       await rig.close();
@@ -1029,22 +1043,20 @@ describe('private wins, one way', () => {
     });
   }
 
-  for (const denied of [true, false]) {
-    it(`a private turn's channel_publish refusal ${denied ? 'names no channel_list to an agent refused it at dispatch' : 'names channel_list to an agent that may call it'}`, async () => {
-      const rig = await surfaceRig({ agent: denied ? { denyToolsAtDispatch: ['channel_list'] } : {} });
-      try {
-        rig.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'p1', name: 'channel_publish', input: { content: 'hello' } }] as never, 'tool_use'));
-        rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }]));
-        rig.framework.pushEvent(tuiMessage());
-        await rig.until(() => rig.starts.length >= 1 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the private turn');
-        await rig.framework.runUntilIdle();
-        assert.ok(stored(rig).includes(NO_DEFAULT_CHANNEL), `control: refused as private: ${stored(rig).slice(-3000)}`);
-        assert.equal(stored(rig).includes('channel_list shows the channel ids'), !denied, stored(rig).slice(-3000));
-      } finally {
-        await rig.close();
-      }
-    });
-  }
+  it("a private turn's channel_publish refusal names no channel_list to an agent refused it at dispatch", async () => {
+    const rig = await surfaceRig({ agent: { denyToolsAtDispatch: ['channel_list'] } });
+    try {
+      rig.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'p1', name: 'channel_publish', input: { content: 'hello' } }] as never, 'tool_use'));
+      rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }]));
+      rig.framework.pushEvent(tuiMessage());
+      await rig.until(() => rig.starts.length >= 1 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the private turn');
+      await rig.framework.runUntilIdle();
+      assert.ok(stored(rig).includes(NO_DEFAULT_CHANNEL), `control: refused as private: ${stored(rig).slice(-3000)}`);
+      assert.ok(!stored(rig).includes('channel_list shows the channel ids'), stored(rig).slice(-3000));
+    } finally {
+      await rig.close();
+    }
+  });
 
   for (const hadDestination of [false, true]) {
     it(`an explicit-mode turn that ${hadDestination ? 'had' : 'had no'} destination is told it's private when private input comes in, and its plain answer is kept private, with no draft`, async () => {
@@ -1309,46 +1321,6 @@ describe('private wins, one way', () => {
     }
   });
 
-  it("a channel_publish that names no channel is judged by the turn it was made in, and a script's by its start turn alone, whichever turn is live", async () => {
-    const rig = await surfaceRig();
-    try {
-      const results: Array<{ id: string; success: boolean; error?: string }> = [];
-      const internalsOf = rig.framework as unknown as {
-        notePrivateTurn(turnId: number): void;
-        dispatchChannelToolCall(agentName: string, call: { id: string; name: string; input: unknown; callerTurnId?: number }): void;
-        scriptCallStarts: Map<string, unknown>;
-        pushEvent(event: unknown): void;
-        channelRegistry: Record<string, unknown>;
-      };
-      internalsOf.channelRegistry.handleChannelToolCall = async () => ({ success: true, data: { posted: true } });
-      const push = internalsOf.pushEvent.bind(rig.framework);
-      internalsOf.pushEvent = (event: unknown) => {
-        const e = event as { type?: string; callId?: string; result?: { success: boolean; error?: string } };
-        if (e.type === 'tool-result' && e.result) results.push({ id: e.callId!, ...e.result });
-        else push(event);
-      };
-      const live = routingOf(rig.framework);
-      live.nonChannelOrigin = true;
-      internalsOf.notePrivateTurn(live.turnId as number);
-      const earlier = (live.turnId as number) + 7;
-      const publish = (id: string, callerTurnId?: number) => internalsOf.dispatchChannelToolCall('scout', {
-        id, name: 'channel_publish', input: { content: 'hello' }, ...(callerTurnId !== undefined ? { callerTurnId } : {}),
-      });
-      publish('in-live', live.turnId as number);
-      publish('in-earlier', earlier);
-      internalsOf.scriptCallStarts.set('from-script', { turnId: earlier, readThrough: null });
-      publish('from-script', live.turnId as number);
-      internalsOf.scriptCallStarts.delete('from-script');
-      await new Promise((r) => setImmediate(r));
-      const outcome = (id: string) => results.find((r) => r.id === id)?.success;
-      assert.equal(outcome('in-live'), false, 'made in the private turn: refused');
-      assert.equal(outcome('in-earlier'), true, 'made in a channel turn: posted, though the live turn is private');
-      assert.equal(outcome('from-script'), true, "a script's call is the bridge's to judge");
-    } finally {
-      await rig.close();
-    }
-  });
-
   it("channel_publish's description says a turn that has taken in private input names its channel", async () => {
     const registry = new ChannelRegistry({ getServer: () => undefined } as never, {} as never, () => {}, () => {});
     const publish = registry.getChannelTools().find((t) => t.name === 'channel_publish')!;
@@ -1561,7 +1533,7 @@ describe('private wins, one way', () => {
     }
   });
 
-  it("a private turn's refusal rewind retries privately, and its record names no channel, even where a fallback exists (a focus hold or 'latest-inbound')", async () => {
+  it("a private turn's refusal rewind retries privately, and its record names no channel, even where a fallback channel exists", async () => {
     const rig = await surfaceRig({ agent: { refusalHandling: { autoRewind: true, maxRewinds: 1 } } });
     try {
       const records: Array<Record<string, unknown>> = [];
@@ -1652,16 +1624,6 @@ describe('private wins, one way', () => {
       }
     };
 
-    it("a nudge after a private turn speaks in no channel, even where a fallback exists (a focus hold or 'latest-inbound')", async () => {
-      const rig = await surfaceRig();
-      try {
-        await privateTurn(rig);
-        assert.deepEqual(await nudge(rig), []);
-      } finally {
-        await rig.close();
-      }
-    });
-
     it("a nudge after a channel turn speaks as on main, in the fallback channel", async () => {
       const rig = await surfaceRig();
       try {
@@ -1672,7 +1634,7 @@ describe('private wins, one way', () => {
       }
     });
 
-    it("an unstick after a private turn speaks in no channel, even where a fallback exists (a focus hold or 'latest-inbound')", async () => {
+    it("an unstick after a private turn speaks in no channel, even where a fallback channel exists", async () => {
       const rig = await surfaceRig();
       try {
         await privateTurn(rig);
@@ -1682,7 +1644,7 @@ describe('private wins, one way', () => {
       }
     });
 
-    it("an inference request through the API after a private turn speaks in no channel, even where a fallback exists (a focus hold or 'latest-inbound')", async () => {
+    it("an inference request through the API after a private turn speaks in no channel, even where a fallback channel exists", async () => {
       const rig = await surfaceRig({ modules: [new ApiModule()] });
       try {
         await privateTurn(rig);
@@ -1702,7 +1664,7 @@ describe('private wins, one way', () => {
       }
     });
 
-    it("a nudge asked for while a channel turn runs, which then takes in private input, speaks in no channel, even where a fallback exists (a focus hold or 'latest-inbound')", async () => {
+    it("a nudge asked for while a channel turn runs, which then takes in private input, speaks in no channel, even where a fallback channel exists", async () => {
       let framework: AgentFramework | undefined;
       const tool = robot(() => {
         assert.ok(framework!.nudgeAgent('scout', 'host-console').ok);
@@ -1726,7 +1688,7 @@ describe('private wins, one way', () => {
       }
     });
 
-    it("a nudge after the host's own undo, twice, back to a private question speaks in no channel, even where a fallback exists (a focus hold or 'latest-inbound')", async () => {
+    it("a nudge after the host's own undo, twice, back to a private question speaks in no channel, even where a fallback channel exists", async () => {
       const rig = await surfaceRig();
       try {
         await privateTurn(rig);
@@ -1741,7 +1703,7 @@ describe('private wins, one way', () => {
       }
     });
 
-    it("a nudge after a channel turn that followed a private exchange speaks in no channel, even where a fallback exists (a focus hold or 'latest-inbound'): its context still holds the private input", async () => {
+    it("a nudge after a channel turn that followed a private exchange speaks in no channel, even where a fallback channel exists: its context still holds the private input", async () => {
       const rig = await surfaceRig();
       try {
         await privateTurn(rig);
@@ -1792,7 +1754,7 @@ describe('private wins, one way', () => {
       });
     });
 
-    it("after a restart, a nudge following a private turn speaks in no channel, even where a fallback exists (a focus hold or 'latest-inbound')", async () => {
+    it("after a restart, a nudge following a private turn speaks in no channel, even where a fallback channel exists", async () => {
       await acrossRestart(privateTurn, async (rig) => {
         assert.deepEqual(await nudge(rig), []);
       });
@@ -1841,7 +1803,7 @@ describe('private wins, one way', () => {
       }
     });
 
-    it("a nudge merged with a channel's wake after a private turn speaks in no channel, even where a fallback exists (a focus hold or 'latest-inbound')", async () => {
+    it("a nudge merged with a channel's wake after a private turn speaks in no channel, even where a fallback channel exists", async () => {
       const rig = await surfaceRig();
       try {
         await privateTurn(rig);
@@ -1876,7 +1838,7 @@ describe('private wins, one way', () => {
     };
 
     for (const fromPrivate of [true, false]) {
-      it(`a ' !' continuation of a ${fromPrivate ? 'private turn speaks in no channel, even where a fallback exists (a focus hold or \'latest-inbound\')' : 'channel turn speaks as on main, in the fallback channel'}`, async () => {
+      it(`a ' !' continuation of a ${fromPrivate ? 'private turn speaks in no channel, even where a fallback channel exists' : 'channel turn speaks as on main, in the fallback channel'}`, async () => {
         const rig = await surfaceRig({ agent: { proseRouting: 'hybrid' } });
         try {
           rig.membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>>#elsewhere ! on it' }]));
@@ -1896,7 +1858,7 @@ describe('private wins, one way', () => {
     ];
     for (const [what, call] of toolTurns) {
       for (const fromPrivate of [true, false]) {
-        it(`${what}, armed by the model in a ${fromPrivate ? 'private turn, speaks in no channel, even where a fallback exists (a focus hold or \'latest-inbound\')' : 'channel turn, speaks as on main'}`, async () => {
+        it(`${what}, armed by the model in a ${fromPrivate ? 'private turn, speaks in no channel, even where a fallback channel exists' : 'channel turn, speaks as on main'}`, async () => {
           const rig = await surfaceRig({ gate: { config: { policies: [], default: 'always' } } });
           try {
             rig.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'arm', ...(call as object) } as never], 'tool_use'));
@@ -1938,7 +1900,7 @@ describe('private wins, one way', () => {
     }
 
     for (const fromPrivate of [true, false]) {
-      it(`a retry after inference failures shed history, from a ${fromPrivate ? 'private turn, speaks in no channel, even where a fallback exists (a focus hold or \'latest-inbound\')' : 'channel turn, speaks as on main'}`, async () => {
+      it(`a retry after inference failures shed history, from a ${fromPrivate ? 'private turn, speaks in no channel, even where a fallback channel exists' : 'channel turn, speaks as on main'}`, async () => {
         const rig = await surfaceRig();
         try {
           await firstTurn(rig, fromPrivate);
@@ -1954,7 +1916,7 @@ describe('private wins, one way', () => {
       });
     }
 
-    it("a script's wake queued while its turn was a channel's speaks in no channel once that turn turns private first, even where a fallback exists (a focus hold or 'latest-inbound')", async () => {
+    it("a script's wake queued while its turn was a channel's speaks in no channel once that turn turns private first, even where a fallback channel exists", async () => {
       const rig = await surfaceRig();
       try {
         await firstTurn(rig, false);
@@ -2605,7 +2567,7 @@ describe('private wins, one way', () => {
     }
   });
 
-  it("a private turn's boundary that injects a room's addressed message names the room with the injections, and moves nothing", async () => {
+  it("a private turn's boundary that injects a room's addressed message names the room with the injections", async () => {
     let framework: AgentFramework | undefined;
     const tool = robot(() => {
       (framework as unknown as { addMessage(participant: string, content: unknown, metadata: unknown): unknown }).addMessage(

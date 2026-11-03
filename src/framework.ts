@@ -1325,11 +1325,6 @@ function carryTurnMarks(request: InferenceRequest, from: InferenceRequest): void
   if ((from as MarkedRequest)[RETAKE]) (request as MarkedRequest)[RETAKE] = true;
 }
 
-function namesChannel(input: unknown): boolean {
-  const channelId = (input as { channelId?: unknown } | null | undefined)?.channelId;
-  return typeof channelId === 'string' && channelId !== '';
-}
-
 function isRearmed(request: InferenceRequest | undefined): boolean {
   return request !== undefined && (request as MarkedRequest)[REARMED] === true;
 }
@@ -28732,9 +28727,6 @@ export class AgentFramework {
       : this.stopHasBegun() ? 'this host is stopping; nothing was done'
       : !parsed ? `${toolName}'s arguments weren't JSON; nothing was done`
       : input === undefined ? `${toolName}'s arguments must be an object; nothing was done`
-      : toolName === 'channel_publish' && !namesChannel(input)
-        && context.startTurnId !== undefined && this.isPrivateTurn(context.startTurnId)
-        ? this.scriptPrivatePublishRefusal(agentName)
       : undefined;
     // A call that reaches the host while a run or wait call watches the
     // script (context.watch) counts toward that call's round (ScriptRound),
@@ -36703,21 +36695,21 @@ export class AgentFramework {
     };
   }
 
-  private scriptPrivatePublishRefusal(agentName: string): string {
-    return "this script's turn is private and has no default channel, so channel_publish requires an explicit channelId, a channel's id as a non-empty string"
-      + `${this.mayCallTool(agentName, 'channel_list') ? '; channel_list shows the channel ids' : ''}; nothing was posted`;
-  }
-
   private privatePublishRefusal(
     agentName: string,
     call: { id?: string; name: string; input?: unknown },
     privateTurn: boolean,
   ): string | undefined {
     if (call.name !== 'channel_publish' || !privateTurn) return undefined;
-    if (namesChannel(call.input)) return undefined;
-    if (call.id !== undefined && this.scriptCallStarts.has(call.id)) return this.scriptPrivatePublishRefusal(agentName);
+    const channelId = (call.input as { channelId?: unknown } | null | undefined)?.channelId;
+    if (typeof channelId === 'string' && channelId !== '') return undefined;
+    const listed = this.mayCallTool(agentName, 'channel_list');
+    if (call.id !== undefined && this.scriptCallStarts.has(call.id)) {
+      return "this script's turn is private and has no default channel, so channel_publish requires an explicit channelId, a channel's id as a non-empty string"
+        + `${listed ? '; channel_list shows the channel ids' : ''}; nothing was posted`;
+    }
     return "This private turn has no default channel; channel_publish requires an explicit channelId, a channel's id as a non-empty string. Nothing was posted."
-      + (this.mayCallTool(agentName, 'channel_list') ? ' channel_list shows the channel ids.' : '');
+      + (listed ? ' channel_list shows the channel ids.' : '');
   }
 
   /**
