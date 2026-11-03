@@ -63,7 +63,8 @@ class WakeOnNotes implements Module {
   }
 }
 
-const GATE = (policies: unknown[] = []) => ({ gate: { onboarding: false, config: { default: 'always', policies } } }) as Partial<FrameworkConfig>;
+// A generous script timeout, so a loaded CI machine doesn't fail a script that answers.
+const GATE = (policies: unknown[] = []) => ({ gate: { onboarding: false, suppressScriptTimeoutMs: 2_000, config: { default: 'always', policies } } }) as Partial<FrameworkConfig>;
 const S = (description: string) => ({ description });
 const HIDE_NOISY = { name: 'hide-noisy', match: { source: 'editor', channel: 'noisy' }, behavior: 'defer', suppress: S('chatter in #noisy') };
 
@@ -198,7 +199,7 @@ describe('event suppression', () => {
       assert.match(String(loose.error), /"script", a field of "suppress".*Put it in "suppress"/, 'a suppress field given on its own is refused, naming where it goes');
       const everything = await tool(f, 'wake_add_rule', { name: 'x', suppress: S('everything') });
       assert.equal(everything.isError, true);
-      assert.match(String(everything.error), /matches every event/);
+      assert.match(String(everything.error), /names nothing it hides/);
 
       const added = await tool(f, 'wake_add_rule', { name: 'hide-noisy', match: { channel: 'noisy' }, suppress: S('chatter in #noisy') });
       assert.equal(added.success, true, String(added.error));
@@ -312,7 +313,7 @@ describe('event suppression', () => {
 
       const jsonl = await tool(f, 'dump_suppressed', { format: 'jsonl', rule: 'hide-noisy' });
       assert.equal(jsonl.success, true, String(jsonl.error));
-      assert.match((jsonl.data as { path: string }).path, /^notes\/suppressed\/hide-noisy-\d{8}T\d{6}Z\.jsonl$/, 'a default path in the first writable mount');
+      assert.match((jsonl.data as { path: string }).path, /^notes\/suppressed\/hide-noisy-\d{8}T\d{9}Z\.jsonl$/, 'a default path in the first writable mount');
       const bad = await tool(f, 'dump_suppressed', { format: 'csv' });
       assert.equal(bad.isError, true);
     } finally { await f.close(); rmSync(dir, { recursive: true, force: true }); }
@@ -371,6 +372,21 @@ describe('event suppression', () => {
       await settle(f);
       assert.deepEqual(suppressedOf(find(f, 'document_diff')), { rule: 'hide-doc', eventType: 'mcpl:push-event', source: 'editor' });
       assert.equal(await inView(f, 'document_diff'), false);
+    } finally { await f.close(); }
+  });
+
+  it('a coalesced batch follows its latest occurrence, as its wake does: each occurrence is asked once', async () => {
+    const second = { name: 'second', match: { source: 'editor', scope: ['mcpl:push-event'] }, behavior: 'defer',
+      suppress: { description: 'the second of each pair', script: '(e, state) => { state.n = (state.n ?? 0) + 1; return state.n === 2; }' } };
+    const f = await fixture({ framework: GATE([second]) });
+    try {
+      await f.send('push/event', f.params('1', 'fallback', { deferred: true }));
+      await f.send('push/event', f.params('2', 'fallback', { deferred: true }));
+      await eventually(() => stored(f).some((m) => textOf(m).includes('document_diff')), 'the batch stored');
+      await settle(f);
+      assert.ok(suppressedOf(find(f, 'document_diff')), 'its latest occurrence was hidden, so the batch is, and nothing woke for it');
+      const gate = (f.framework as unknown as { eventGate: { suppressScriptState(name: string): unknown } }).eventGate;
+      assert.deepEqual(gate.suppressScriptState('second'), { n: 2 }, 'each occurrence asked once');
     } finally { await f.close(); }
   });
 });

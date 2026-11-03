@@ -8,7 +8,8 @@
   bring no clock row in. Editing or removing the rule changes only what
   arrives afterwards. Events addressed to the agent (`chat:addressed`), the
   heartbeat's, and console or API input are never suppressed, and a suppress
-  rule never decides a wake. Covers MCPL channel messages and push events, a
+  rule decides no wake for an event suppression was asked about (where it
+  wasn't, it defers). Covers MCPL channel messages and push events, a
   module's events with their messages and wake, and a server's `[toolsets]`
   notices (gated as `mcpl:tool-changes`). `wake_add_rule` takes `suppress`;
   `gate_status` shows each suppress rule's settings and how its script has
@@ -19,14 +20,15 @@
   in `suppress-state.json` beside gate.json and started afresh when the
   script changes or the rule is removed. Scripts run on a worker thread with
   a 50 ms timeout (`gate.suppressScriptTimeoutMs`); one that fails or times
-  out shows the event. wake_add_rule compiles
+  out lets the event on to the rules after it, and one that times out three
+  times in a row is set aside until its script changes. wake_add_rule compiles
   a script before saving it.
 - `suppression_stats { rule?, recent?, since? }` and `dump_suppressed { path?,
   rule?, since?, until?, format? }`, in the built-in settings toolset, read
-  the stamped rows on the current branch. The first reports, per rule, the
+  the stamped rows on the current branch (times are when each was stored). The first reports, per rule, the
   count, the text size, the first and last arrival, a breakdown by source and
   event type, and the newest few with a preview (a removed rule with
-  `inForce: false`). The second writes the rows whole to a workspace file, as
+  `inForce: false`). The second writes the rows to a workspace file, their text in full and other blocks named, as
   a transcript or JSON lines, at most 4 MB. `AgentFramework.suppressedEvents()`
   gives hosts the same rows.
 - The suppression review (`gate.suppressionReview`, on by default): every two

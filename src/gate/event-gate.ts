@@ -17,7 +17,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
 import { SuppressScripts, type SuppressScriptEvent } from './suppress-scripts.js';
-import { firstCatchAll } from './rule-scope.js';
+import { firstCatchAll, namesSomething } from './rule-scope.js';
 import { canonical, duplicateName, lastRecipePath, noChanges, reconcileLine, reconcileWithRecipe, ruleName, type WrittenConfig } from './recipe-reconcile.js';
 import { closestNames, isNearMiss } from '../closest-names.js';
 import { MAX_TIMER_MS } from '../deadline-timer.js';
@@ -677,7 +677,6 @@ function fieldLevels(file: string, named: (path: string) => string = asGateNames
     { name: `"${named('behavior.rate_limit')}"`, fields: RATE_LIMIT_FIELDS },
     { name: `"${named('behavior.passive_sample')}"`, fields: PASSIVE_SAMPLE_FIELDS },
     { name: `"${named('behavior.judge')}"`, fields: JUDGE_FIELDS },
-    { name: '"suppress"', fields: SUPPRESS_FIELDS },
   ];
 }
 
@@ -1384,6 +1383,19 @@ export function matchNarrows(match: GatePolicyMatch): boolean {
   return Object.entries(match).some(([field, v]) => !(field === 'scope' && Array.isArray(v) && v.length === 0));
 }
 
+/**
+ * Whether a suppress rule's match names what it hides: an event type, or a
+ * source, channel, mount, path or tag pattern that isn't only wildcards
+ * (namesSomething), a metadata flag, or a content filter. A pattern of
+ * wildcards alone, such as `source: "*"`, or only `tagsNone`, takes every
+ * event, which a suppress rule may not.
+ */
+function suppressMatchNarrows(match: GatePolicyMatch): boolean {
+  if ((match.scope ?? []).length > 0 || (match.metadataTrue ?? []).length > 0 || match.filter !== undefined) return true;
+  if ([match.source, match.channel, match.mount, match.pathGlob].some(namesSomething)) return true;
+  return [...(match.tagsAny ?? []), ...(match.tagsAll ?? [])].some(namesSomething);
+}
+
 /** Longest suppress description, in characters: the review sends it with every rule it judges. */
 export const MAX_SUPPRESS_DESCRIPTION = 2_000;
 /** Longest suppress script, in characters. */
@@ -1411,8 +1423,17 @@ function readSuppress(r: Reader, value: unknown, behavior: unknown, match: GateP
   if (Object.hasOwn(value, 'script') && (value.script === null || value.script === '')) {
     r.problems.push({ text: `suppress.script is ${shownValue(value.script)}, where the source of a function such as "(event, state) => false" is needed`, read: without });
   }
+  const before = r.problems.length;
   const given = withoutEmpty(`${r.where}: suppress`, value, r.notes);
+  const reported = r.problems.length;
   readFieldNames(r, 'suppress', given, SUPPRESS_FIELDS);
+  // A field it doesn't read can't be left aside here, as elsewhere in a
+  // rule: one meant as a condition, left out, would hide every event the
+  // match takes.
+  const unread = Object.keys(given).filter((key) => !SUPPRESS_FIELDS.includes(key));
+  if (unread.length > 0 && r.problems.length === reported) {
+    r.problems.push({ text: `suppress has ${quotedList(unread)}, and a suppress rule reads only "description" and "script"`, read: without });
+  }
   const config: SuppressConfig = { description: '' };
   if (typeof given.description !== 'string' || given.description.trim() === '') {
     r.problems.push({
@@ -1455,10 +1476,11 @@ function readSuppress(r: Reader, value: unknown, behavior: unknown, match: GateP
       read: without,
     });
   }
-  if (!matchNarrows(match)) {
+  if (!suppressMatchNarrows(match)) {
     r.problems.push({
-      text: 'suppress is given, and the rule matches every event: a suppress rule needs a match that narrows it '
-        + '(a source, a channel, a scope, tags, a mount or path, metadata or a filter), so it can\'t hide everything',
+      text: 'suppress is given, and the rule\'s match names nothing it hides: a suppress rule needs a match that names '
+        + 'a scope, a source, a channel, tags, a mount or path, metadata or a filter (not a pattern of wildcards alone), '
+        + 'so it can\'t hide everything',
       read: without,
     });
   }
@@ -1466,7 +1488,7 @@ function readSuppress(r: Reader, value: unknown, behavior: unknown, match: GateP
   // (a slip of a field, a match read without a part of it) matches more, or
   // decides otherwise, than its author wrote, and hiding is what can't be
   // seen to go wrong. Its behavior decides its events instead.
-  if (r.problems.length > 0 && !r.problems.some((p) => p.text.startsWith('suppress'))) {
+  if (before > 0) {
     r.problems.push({ text: 'suppress is given on a rule with problems, and a rule suppresses only when it has none', read: without });
   }
   return r.problems.length === 0 ? config : undefined;

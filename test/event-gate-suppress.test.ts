@@ -55,9 +55,9 @@ describe('reading a suppress rule', () => {
     assert.throws(() => gate.addPolicy({ name: 'y', match: { source: 'body' }, suppress: S }),
       /needs "behavior": "defer" written out.*it has no behavior/);
     assert.throws(() => gate.addPolicy({ name: 'z', match: {}, behavior: 'defer', suppress: S }),
-      /suppress is given, and the rule matches every event/);
+      /suppress is given, and the rule's match names nothing it hides/);
     assert.throws(() => gate.addPolicy({ name: 'w', match: { scope: [] }, behavior: 'defer', suppress: S }),
-      /the rule matches every event/, 'an empty scope narrows nothing');
+      /names nothing it hides/, 'an empty scope narrows nothing');
     assert.throws(() => gate.addPolicy({ name: 'v', match: { source: 'body' }, behavior: 'defer', suppress: true }),
       /suppress is true, where an object such as \{"description": "the eye going on and off"\} is needed/);
     assert.throws(() => gate.addPolicy({ name: 'u', match: { source: 'body' }, behavior: 'defer', suppress: {} }),
@@ -90,6 +90,8 @@ describe('a suppress rule read past a problem in gate.json does not suppress', (
     ['an empty script', { name: 'r', match: { source: 'body' }, behavior: 'defer', suppress: { description: 'x', script: '' } }],
     ['a null script', { name: 'r', match: { source: 'body' }, behavior: 'defer', suppress: { description: 'x', script: null } }],
     ['a match read without a malformed part', { name: 'r', match: { source: 'body', tagsAny: 'chat:ambient' }, behavior: 'defer', suppress: { description: 'x' } }],
+    ['a field suppress doesn\'t read', { name: 'r', match: { source: 'body' }, behavior: 'defer', suppress: { description: 'x', condition: 'only repeats' } }],
+    ['a match of wildcards alone', { name: 'r', match: { source: '*' }, behavior: 'defer', suppress: { description: 'x' } }],
   ] as const) {
     it(`${what}: the rule defers instead, and gate_status says why`, () => {
       const gate = makeGate({ default: 'always', policies: [rule] });
@@ -98,6 +100,16 @@ describe('a suppress rule read past a problem in gate.json does not suppress', (
       assert.ok(gate.getStatus().errors.some((e) => /Rule "r"/.test(e)), 'named in gate_status');
     });
   }
+});
+
+describe('a rule without suppress reads as before', () => {
+  it('a top-level description on an ordinary rule is a note, and the rule is saved', () => {
+    const gate = makeGate({ default: 'always', policies: [] });
+    const notes: string[] = [];
+    gate.addPolicy({ name: 'mentions', match: { tagsAny: ['chat:mention'] }, behavior: 'always', description: 'wake on mentions' }, { onIgnoredFields: (n) => notes.push(...n) });
+    assert.equal(gate.policyInForce('mentions')?.behavior, 'always');
+    assert.ok(notes.some((n) => /"description", which the gate doesn't read/.test(n)), notes.join(' | '));
+  });
 });
 
 describe('suppressionFor', () => {
@@ -270,15 +282,14 @@ describe('suppress rules with a script of the agent\'s own (suppress.script)', (
     const { gate } = clocked([
       { name: 'loops', match: { source: 'body' }, behavior: 'defer', suppress: { description: 'x', script: '() => { for (;;) {} }' } },
       { name: 'hides', match: { source: 'body' }, behavior: 'defer', suppress: { description: 'y', script: '() => true' } },
-    ], 40);
+    ], 150);
     for (let i = 0; i < 3; i++) assert.equal(gate.decideSuppression(ev([])), 'hides', `event ${i + 1}: the next rule decides`);
     const [loops, hides] = gate.getStatus().policies.map((p) => p.suppress?.scriptStatus);
     assert.equal(loops?.timeouts, 3);
-    assert.match(String(loops?.disabled), /3 times in a row, so it isn't run again until its rule changes/);
+    assert.match(String(loops?.disabled), /3 times in a row, so it isn't run again until its script changes/);
     assert.equal(hides?.loaded, true, 'loaded again on each fresh worker');
-    const started = Date.now();
     assert.equal(gate.decideSuppression(ev([])), 'hides');
-    assert.ok(Date.now() - started < 40, 'a script set aside costs no timeout');
+    assert.equal(gate.getStatus().policies[0].suppress?.scriptStatus?.timeouts, 3, 'a script set aside isn\'t run, so it costs no timeout');
   });
 
   it('the probe table lets a probe on past a script that says show, and gate_status reports a script before any event', () => {
@@ -329,5 +340,15 @@ describe('suppress rules with a script of the agent\'s own (suppress.script)', (
     second.gate.removePolicy('eye');
     second.gate.addPolicy({ ...EYE, suppress: { description: 'eye flaps', script: ONE_IN_TEN.replace('600000', '300000') } });
     assert.deepEqual(second.gate.suppressScriptState('eye'), {}, 'a rule removed and added again starts afresh');
+  });
+
+  it('a state saved for a rule gone from gate.json at the next start is retired, not given to a rule made later', () => {
+    const first = clocked([EYE]);
+    first.gate.decideSuppression(ev([]));
+    first.gate.dispose();
+    const second = clocked([]);
+    second.gate.getStatus(); // the first sync, with no rule of that name
+    second.gate.addPolicy(EYE);
+    assert.deepEqual(second.gate.suppressScriptState('eye'), {});
   });
 });

@@ -279,33 +279,36 @@ export type SuppressedDumpFormat = 'jsonl' | 'text';
 /**
  * A dump's file content, at most `maxBytes` (UTF-8): the newest records that
  * fit, oldest first, and how many older ones were left out to fit. A
- * transcript opens with a header naming what it holds.
+ * transcript opens with a header naming what it holds (`title`, given how
+ * many it holds and the oldest's time) and, when some were left out, how many.
  */
 export function renderSuppressedDump(
   records: readonly SuppressedEventRecord[],
   format: SuppressedDumpFormat,
-  opts: { maxBytes: number; title: string },
+  opts: { maxBytes: number; title: string | ((written: number, first: string) => string) },
 ): { content: string; written: number; omitted: number } {
   const entry = (r: SuppressedEventRecord): string => format === 'jsonl'
     ? `${JSON.stringify(r)}\n`
     : `[${r.at}] ${r.rule} · ${r.eventType}${r.source ? ` · ${r.source}` : ''}${r.channel ? ` · ${r.channel}` : ''}`
       + `${r.author ? ` · ${r.author}` : ''} · ${r.id}\n${r.text}\n\n`;
   const entries = records.map(entry);
-  const header = (omitted: number) => format === 'jsonl' ? '' : `# ${opts.title}\n${omitted > 0 ? `(${omitted} older events left out to fit)\n` : ''}\n`;
-  const total = entries.reduce((n, e) => n + Buffer.byteLength(e), 0);
-  // Everything, when it fits with the plain header; otherwise the newest that
-  // fit beside the header that names how many were left out.
-  if (Buffer.byteLength(header(0)) + total <= opts.maxBytes) {
-    return { content: header(0) + entries.join(''), written: entries.length, omitted: 0 };
-  }
-  const room = opts.maxBytes - Buffer.byteLength(header(entries.length));
+  const titleOf = (from: number): string => typeof opts.title === 'string'
+    ? opts.title
+    : opts.title(entries.length - from, records[from]?.at ?? '');
+  const header = (from: number): string => format === 'jsonl'
+    ? ''
+    : `# ${titleOf(from)}\n${from > 0 ? `(${from} older events left out to fit)\n` : ''}\n`;
+  // The most records, newest first, that fit beside the header they make:
+  // the header names how many were left out, so it's sized for each count.
   let bytes = 0;
   let from = entries.length;
+  let best = entries.length;
   while (from > 0) {
-    const size = Buffer.byteLength(entries[from - 1]!);
-    if (bytes + size > room) break;
-    bytes += size;
+    bytes += Buffer.byteLength(entries[from - 1]!);
     from--;
+    if (Buffer.byteLength(header(from)) + bytes <= opts.maxBytes) best = from;
+    else if (bytes > opts.maxBytes) break;
   }
-  return { content: header(from) + entries.slice(from).join(''), written: entries.length - from, omitted: from };
+  if (best === entries.length) return { content: '', written: 0, omitted: entries.length };
+  return { content: header(best) + entries.slice(best).join(''), written: entries.length - best, omitted: best };
 }

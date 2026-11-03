@@ -196,8 +196,9 @@ export interface GatePolicy {
    * first-match, with three exceptions: an event addressed to the agent
    * (`chat:addressed`), a heartbeat, and console or API input are never
    * suppressed. The rule lets them by, and the rules after it decide them.
-   * A suppress rule never decides a wake (`evaluate` and `probe` pass over
-   * it), since an event it didn't suppress is one it let by.
+   * A suppress rule decides no wake for an event suppression was asked about
+   * (`evaluate` and `probe` pass over it there, `GateEventInfo.suppressionAsked`);
+   * where suppression wasn't asked, it defers, as its behavior says.
    */
   suppress?: SuppressConfig;
 }
@@ -213,14 +214,16 @@ export interface SuppressConfig {
   /**
    * The agent's own logic for the rule, when matching isn't enough: the
    * source of a function `(event, state) => boolean`, called for each event
-   * the rule's match takes, true hiding it. `event` is the event's type,
+   * the rule's match takes that reaches it (one an earlier rule decides, an
+   * addressed one, or the heartbeat's never does), only `true` hiding it. `event` is the event's type,
    * source, channel, author, tags, text, arrival time (`at`, ms) and
    * metadata. `state` is the rule's own JSON object, which the script reads
    * and changes as it likes, kept between events and across restarts
    * (suppress-scripts.ts), and started afresh when the script changes or the
    * rule is removed. So a rule can hide repeats, count, or keep a window of
-   * its own. A script that throws or runs past its time shows the event.
-   * Left out, every event the rule matches is hidden.
+   * its own. A script that throws or runs past its time counts as saying
+   * show: the event goes on to the rules after it. Left out, every event the
+   * rule matches is hidden.
    */
   script?: string;
 }

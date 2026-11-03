@@ -550,18 +550,21 @@ are registered for every agent, MCPL or none, unless a module holds the name.
   where it was stored, and the residents' next compile carries them (a
   prompt-cache miss from the first one, and memory folded from them).
   Suppress rules keep their `defer` there, so nothing wakes for them.
-  - **The rule.** It needs `behavior: "defer"` written out, so an earlier
+  - **The rule.** It needs `behavior: "defer"` (or the legacy `"skip"`) written out, so an earlier
     release that doesn't know `suppress` defers those events instead of
     waking on them, a match that narrows it, and a `description` of what it's
     for, which the review checks against. Three kinds of event are never
     suppressed and go on to the next rules: an event addressed to the agent
     (`chat:addressed`), the heartbeat's, and console or API input. A suppress
-    rule never decides a wake: `evaluate` and `probe` pass over it, and so do
-    the rule-order notes and the catch-all check. Where suppression isn't
+    rule decides no wake for an event suppression was asked about: `evaluate`
+    and `probe` pass over it there, and the rule-order notes and the catch-all
+    check pass over it always. Where suppression isn't
     asked, as for an event delivered to a conversation fork's own store, a
     suppress rule defers the events it matches, as its behavior says.
   - **The agent's own logic.** `script` is the source of a function
-    `(event, state) => boolean`, called for each event the rule's match takes;
+    `(event, state) => boolean`, called for each event the rule's match takes
+    that reaches it (not one an earlier rule decides, an addressed one, or the
+    heartbeat's);
     true hides it, and anything else (a truthy string included) lets the event
     on to the rules after it.
     `event` carries the event type, source, channel, author, tags, text,
@@ -577,8 +580,9 @@ are registered for every agent, MCPL or none, unless a module holds the name.
     state it can't keep lets the event on to the rules after it, as one that
     says show does, keeps its state as it was, and is named in `gate_status`
     (`suppress.scriptStatus`). A timeout restarts the worker, which loads every
-    script again one at a time; a script that times out three times in a row
-    isn't run again until its rule changes. wake_add_rule compiles a
+    script again one at a time; a script that times out three times in a row,
+    probes included, isn't run again until its script changes, and a worker
+    that fails to start is tried again with a later event. wake_add_rule compiles a
     script on the worker before it saves the rule. `suppressionFor` runs a
     script on a copy of its state, for the probe table; the arrival paths call
     `decideSuppression`, once per event, which keeps the state the script

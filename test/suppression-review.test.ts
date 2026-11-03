@@ -211,12 +211,17 @@ describe('a review', () => {
   it('a review the host stops while the reviewer is asked tells nothing and records nothing', async () => {
     const statePath = join(dir, 'suppression-review.json');
     let release: () => void = () => {};
+    let entered!: () => void;
+    const asked = new Promise<void>((resolve) => { entered = resolve; });
     const h = harness({ statePath, records: [rec('hide-ears', 1, 'chatter')] });
     (h.review as unknown as { deps: SuppressionReviewDeps }).deps.membraneFor = () => ({
-      complete: () => new Promise((resolve) => { release = () => resolve({ content: [{ type: 'text', text: '{"fits": true, "flagged": []}' }], stopReason: 'end_turn' }); }),
+      complete: () => new Promise((resolve) => {
+        release = () => resolve({ content: [{ type: 'text', text: '{"fits": true, "flagged": []}' }], stopReason: 'end_turn' });
+        entered();
+      }),
     }) as unknown as Membrane;
     const running = h.run();
-    await new Promise((resolve) => setImmediate(resolve));
+    await asked; // the reviewer is being asked
     h.review.stop();
     release();
     assert.equal(await running, null);

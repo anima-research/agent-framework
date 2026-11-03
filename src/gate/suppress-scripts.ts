@@ -17,8 +17,10 @@
  * failure is counted and named in gate_status. A timeout stops the worker; a
  * fresh one loads every script again, one at a time, so a script whose own
  * loading hangs is set aside without the others. A script that times out
- * MAX_CONSECUTIVE_TIMEOUTS times in a row stops being run until its rule
- * changes, so a looping script doesn't cost every event its timeout.
+ * MAX_CONSECUTIVE_TIMEOUTS times in a row, probes included, stops being run
+ * until its script changes, so a looping script doesn't cost every event its
+ * timeout. A worker that fails to start or answer is tried again with a
+ * later event.
  *
  * The worker starts with the first rule that has a script, so a gate with
  * none runs no thread.
@@ -38,8 +40,10 @@ const SAB_SIZE = 8 + 2 * MAX_SUPPRESS_STATE_BYTES + 16_384;
 export const DEFAULT_SUPPRESS_SCRIPT_TIMEOUT_MS = 50;
 /** How long compiling one script may take, the worker's start included (ms). */
 const LOAD_TIMEOUT_MS = 3_000;
-/** Timeouts in a row after which a script isn't run again until its rule changes. */
+/** Timeouts in a row after which a script isn't run again until its script changes. */
 export const MAX_CONSECUTIVE_TIMEOUTS = 3;
+/** How long after the worker failed to start or answer a later event tries loading the scripts again (ms). */
+const WORKER_RETRY_MS = 5_000;
 /** How soon after a state changes it's written to disk (ms), and how long a failed write waits to be tried again. */
 const SAVE_DELAY_MS = 2_000;
 const SAVE_RETRY_MS = 30_000;
@@ -98,13 +102,16 @@ const hashOf = (script: string): string => createHash('sha256').update(script).d
 const message = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 
-/** Saved states as read from disk: entries that aren't a script hash and an object state are skipped. */
-function readSaved(raw: unknown): Map<string, { script: string; state: Record<string, unknown> }> {
+/** Saved states as read from disk: entries that aren't a script hash and an object state are skipped and named; a file of another shape throws. */
+function readSaved(raw: unknown, path: string): Map<string, { script: string; state: Record<string, unknown> }> {
   const out = new Map<string, { script: string; state: Record<string, unknown> }>();
-  if (!isRecord(raw) || raw.version !== 1 || !isRecord(raw.rules)) return out;
+  if (!isRecord(raw) || raw.version !== 1 || !isRecord(raw.rules)) throw new Error('it holds no version 1 states');
+  const skipped: string[] = [];
   for (const [name, entry] of Object.entries(raw.rules)) {
     if (isRecord(entry) && typeof entry.script === 'string' && isRecord(entry.state)) out.set(name, { script: entry.script, state: entry.state });
+    else skipped.push(name);
   }
+  if (skipped.length > 0) console.error(`[gate] suppress-rule states in ${path}: ${skipped.map((n) => JSON.stringify(n)).join(', ')} can't be read, so those rules start afresh`);
   return out;
 }
 
@@ -117,11 +124,15 @@ export class SuppressScripts {
   private saved = new Map<string, { script: string; state: Record<string, unknown> }>();
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private disposed = false;
+  /** Whether the first sync, with every rule in force, has run: saved states it didn't take are then retired. */
+  private synced = false;
+  /** When loading last failed for want of a worker (not a script's own error), so a later event tries again. */
+  private workerFailedAt: number | null = null;
 
   constructor(private readonly opts: { statePath?: string; timeoutMs?: number } = {}) {
     if (opts.statePath && existsSync(opts.statePath)) {
       try {
-        this.saved = readSaved(JSON.parse(readFileSync(opts.statePath, 'utf-8')));
+        this.saved = readSaved(JSON.parse(readFileSync(opts.statePath, 'utf-8')), opts.statePath);
       } catch (error) {
         console.error(`[gate] suppress-rule states in ${opts.statePath} can't be read, so every rule's state starts afresh:`, error);
       }
@@ -153,6 +164,13 @@ export class SuppressScripts {
         runs: 0, hidden: 0, errors: 0, timeouts: 0, timeoutsInARow: 0, lastError: null,
       });
       changed = true;
+    }
+    // States saved for rules that weren't in force at the first sync are
+    // retired: the rule was removed while the host was down, and one made
+    // later under the name starts afresh.
+    if (!this.synced) {
+      this.synced = true;
+      if (this.saved.size > 0) { this.saved.clear(); changed = true; }
     }
     if (!changed) return;
     this.scheduleSave();
@@ -189,20 +207,21 @@ export class SuppressScripts {
     const rule = this.rules.get(name);
     if (!rule) return undefined;
     if (rule.disabled) return { error: rule.disabled };
+    // A load that failed for want of a worker is tried again, at most every few seconds.
+    if (!rule.loaded && this.workerFailedAt !== null && Date.now() - this.workerFailedAt > WORKER_RETRY_MS) this.load();
     if (!rule.loaded) return { error: rule.lastError ?? 'the script is not loaded' };
     const answer = this.call({ type: 'eval', name, event, state: rule.state }, this.timeoutMs);
     if ('timeout' in answer) {
-      // The worker was stopped; every script goes to a fresh one.
+      // The worker was stopped; every script goes to a fresh one. A probe's
+      // timeout counts toward setting the script aside too: it costs the same.
       const error = `it took over ${this.timeoutMs} ms, so it was stopped`;
-      if (commit) {
-        rule.runs++;
-        rule.timeouts++;
-        rule.timeoutsInARow++;
-        rule.lastError = error;
-        if (rule.timeoutsInARow >= MAX_CONSECUTIVE_TIMEOUTS) {
-          rule.disabled = `it took over ${this.timeoutMs} ms ${rule.timeoutsInARow} times in a row, so it isn't run again until its rule changes`;
-          rule.lastError = rule.disabled;
-        }
+      if (commit) rule.runs++;
+      rule.timeouts++;
+      rule.timeoutsInARow++;
+      rule.lastError = error;
+      if (rule.timeoutsInARow >= MAX_CONSECUTIVE_TIMEOUTS) {
+        rule.disabled = `it took over ${this.timeoutMs} ms ${rule.timeoutsInARow} times in a row, so it isn't run again until its script changes`;
+        rule.lastError = rule.disabled;
       }
       this.load();
       return { error };
@@ -267,9 +286,11 @@ export class SuppressScripts {
       const reset = this.call({ type: 'reset' }, LOAD_TIMEOUT_MS);
       if ('timeout' in reset || typeof reset.error === 'string') {
         const why = 'timeout' in reset ? `the script worker didn't answer within ${LOAD_TIMEOUT_MS / 1000} s` : reset.error as string;
-        for (const rule of this.rules.values()) { rule.loaded = false; rule.lastError = rule.disabled ?? why; }
+        for (const rule of this.rules.values()) { rule.loaded = false; rule.lastError = rule.disabled ?? `${why}; it's tried again with a later event`; }
+        this.workerFailedAt = Date.now();
         return;
       }
+      this.workerFailedAt = null;
       let restarted = false;
       for (const [name, rule] of this.rules) {
         if (rule.disabled) { rule.loaded = false; continue; }

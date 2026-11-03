@@ -302,6 +302,8 @@ export class SuppressionReview {
   noteRule(name: string, description: string): void {
     if (this.descriptions.get(name) === description) return;
     this.descriptions.set(name, description);
+    // Kept at once: a restart before the next review still judges the rows by it.
+    this.saveState();
   }
 
   get intervalMs(): number { return this.settings.intervalMs; }
@@ -334,10 +336,12 @@ export class SuppressionReview {
 
   /**
    * Review what was hidden since the last review, tell the agent, and record
-   * how far it reviewed. Null when no review ran: one is already running, no
-   * agent is registered, or the host isn't taking one now (mayRun). A review
-   * whose notice couldn't be written throws, and the next review covers its
-   * period again.
+   * how far it reviewed. A call while a review runs gets that review's
+   * result. Null when no review ran: no agent is registered, the host isn't
+   * taking one now (mayRun, asked again before the agent is told), or the
+   * agent changed while the reviewer was asked; the next review covers the
+   * period. A review whose notice couldn't be written throws, and the next
+   * review covers its period again.
    */
   runOnce(): Promise<SuppressionReviewSummary | null> {
     if (this.running) return this.running;
@@ -356,7 +360,6 @@ export class SuppressionReview {
     // where its unreviewed events begin.
     const fromOf = (name: string): number => Math.min(this.retryFrom.get(name) ?? fromMs, fromMs);
     const earliest = Math.min(fromMs, ...this.retryFrom.values());
-
     const byRule = new Map<string, SuppressedEventRecord[]>();
     for (const record of this.deps.records(agentName, earliest, toMs)) {
       if (Date.parse(record.at) < fromOf(record.rule)) continue;
@@ -378,13 +381,14 @@ export class SuppressionReview {
       rules.push(await this.judge(agentName, { name, description, ...(rule ?? {}) }, sample, records.length, { fromMs: fromOf(name), toMs }, base));
     }
     const summary: SuppressionReviewSummary = {
-      fromMs, toMs, rules,
+      fromMs: rules.length > 0 ? Math.min(...rules.map((r) => fromOf(r.rule))) : fromMs, toMs, rules,
       total: rules.reduce((n, r) => n + r.suppressed, 0),
       flagged: rules.reduce((n, r) => n + r.flagged.length, 0),
     };
-    // Stopped while the reviewer was asked: nothing is told and nothing
-    // recorded, so a later start reviews this period again.
-    if (this.stopped) return null;
+    // Stopped, quiesced, or the agent changed while the reviewer was asked:
+    // nothing is told and nothing recorded, so a later review takes this
+    // period again.
+    if (this.stopped || (this.deps.mayRun && !this.deps.mayRun()) || this.deps.agentName() !== agentName) return null;
     const tell = summary.total > 0 && (this.settings.notify === 'always' || summary.flagged > 0);
     if (tell) {
       this.deps.deliver(agentName, reviewNoticeText(summary, { dump: this.deps.dumpAvailable?.() ?? true }), summary.flagged > 0 && this.settings.wakeOnFlag, summary);
@@ -409,8 +413,16 @@ export class SuppressionReview {
     }
     // Descriptions are kept for the rules in force and the ones with events
     // still to review; the rest have nothing left to be judged.
+    // The rules in force read again now, so a rule added (and its rows
+    // noted) while the reviewer was asked keeps its description. One that's
+    // gone is dropped once nothing of it is left to judge: its rows were
+    // judged here, or it was in force when this review began and hid
+    // nothing in its period. One noted during this review is kept: its rows
+    // come in the next.
+    const nowInForce = new Set(this.deps.rules().map((r) => r.name));
     for (const name of [...this.descriptions.keys()]) {
-      if (!inForce.has(name) && !this.retryFrom.has(name)) this.descriptions.delete(name);
+      if (nowInForce.has(name) || this.retryFrom.has(name)) continue;
+      if (byRule.has(name) || inForce.has(name)) this.descriptions.delete(name);
     }
     this.saveState();
     return summary;

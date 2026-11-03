@@ -24,7 +24,7 @@
  * delivery decision of this stage.
  *
  * Suppression is the other disposition: a suppress rule (a gate rule with
- * `suppress: true`) took the event, so it's stored and never rendered, for
+ * a `suppress` object) took the event, so it's stored and never rendered, for
  * any reader. It's decided first. A suppressed event is never held, never
  * shown to the gate, never woken for, and never the locus.
  */
