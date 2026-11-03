@@ -14,6 +14,9 @@ import { AgentFramework, OperatorActionError } from '../src/index.js';
 import type { Agent, EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { GateModule, until } from './helpers/dendrite.js';
 import { WireMembrane, final } from './helpers/wire-membrane.js';
+import { fixture } from './helpers/coalescing-fixture.js';
+import type { FrameworkConfig } from '../src/types/framework.js';
+import { SUB, internals as admissionInternals, textOf as storedText, find, registerOpen, enter } from './helpers/admission.js';
 
 const text = (t: string) => ({ type: 'text', text: t }) as ContentBlock;
 const textOf = (row: { content: ContentBlock[] }) => row.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('');
@@ -196,3 +199,44 @@ describe('undo and redo, when a later step fails (AF #844 bot review 10, 49, 123
     assert.deepEqual(h.windowTexts(), window);
   });
 });
+
+// 21: the release cleared the hold and took every held write off the queue
+// before it replayed any. A synchronous listener of the first replayed
+// write's trace that cancelled a tune-out found writesHeld false and an
+// empty held list, so the cancel ran then and dumped its backlog without
+// the held message the replay had still to store.
+describe("a surgery's release, while it replays the writes its hold kept (AF #844 bot review 21)", () => {
+  it("a tune-out cancel a listener asks for mid-replay waits for the rest, and its backlog has the message replayed after it", async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enter(f, 'noisy', { backlogCap: 10 });
+      const registry = admissionInternals(f).channelRegistry;
+      const coordinator = admissionInternals(f).tuneOutCoordinator!;
+      const epochId = registry.getTuneOutState('editor', 'noisy')!.params.epochId;
+      const framework = f.framework as unknown as {
+        addMessage(p: string, c: unknown[], m: Record<string, unknown>): string;
+        reserveStoreForSurgery(verb: string, agentName: string): () => void;
+      };
+      const release = framework.reserveStoreForSurgery('roll back', 'agent');
+      assert.equal(framework.addMessage('antra', [{ type: 'text', text: 'first, in work' }], { channelId: 'work', serverId: 'editor' }), '', 'premise: held by the hold');
+      assert.equal(framework.addMessage('antra', [{ type: 'text', text: 'second, held from noisy' }], {
+        tuneOut: { epochId }, channelId: 'noisy', serverId: 'editor', author: { id: 'U1', name: 'antra' },
+      }), '');
+      let answer: ReturnType<typeof coordinator.cancel> | undefined;
+      let waiting: number | undefined;
+      const off = f.framework.onTrace((t) => {
+        if (t.type !== 'message:added' || t.source !== 'surgery-release' || answer) return;
+        waiting = f.framework.getHostModeStatus().deferredWrites;
+        answer = coordinator.cancel('editor', 'noisy', 'agent-tool', 'test');
+      });
+      release();
+      off();
+      assert.equal(waiting, 1, 'the write still to replay is counted as held');
+      assert.deepEqual(answer, { ok: true, deferred: true }, 'the cancel waits for the replay');
+      assert.equal(registry.getTuneOutState('editor', 'noisy'), null, 'and runs at its end');
+      assert.match(storedText(find(f, '<tuned-out-backlog')), /second, held from noisy/, 'its backlog has the message replayed after the cancel was asked');
+    } finally { await f.close(); }
+  });
+});
+

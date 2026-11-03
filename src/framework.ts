@@ -2580,6 +2580,13 @@ interface FrameworkWriteOptions {
    * (storedOccurrenceRows).
    */
   mayBeStored?: true;
+  /**
+   * Set by releaseSurgeryHeldWrites alone, on the write it replays: that
+   * write is stored now, where any other write made while the replay runs
+   * is kept behind the writes still waiting (replayingHeld). Never kept on
+   * a write held again.
+   */
+  replayed?: true;
 }
 
 /** A body of an agent's window, by the row that names it (AgentFramework.windowBodiesFrom). */
@@ -4572,6 +4579,13 @@ export class AgentFramework {
    */
   private readonly surgeryHeldWrites: SurgeryHeldWrite[] = [];
   /**
+   * Set while releaseSurgeryHeldWrites replays what a hold kept: the writes
+   * still to replay stay in surgeryHeldWrites, a write made meanwhile (a
+   * listener of a replayed write's trace) is kept behind them, and the
+   * tune-out's writesHeld reads true, as during the hold.
+   */
+  private replayingHeld = false;
+  /**
    * Writes for an agent whose context manager refuses its work, by the
    * agent's name, each agent's in arrival order: its re-initialization after
    * a branch move failed (reinitializeManagers), and context-manager's
@@ -5677,7 +5691,7 @@ export class AgentFramework {
           // work, would be kept there too, and lost to a crash before it is
           // stored, while the epoch's end is on disk at once: the cancel
           // waits (releaseSurgeryHeldWrites runs it).
-          writesHeld: () => framework.surgeryHold !== null
+          writesHeld: () => framework.surgeryHold !== null || framework.replayingHeld
             || [framework.primaryAgentName, framework.subconsciousAgentName]
               .some((name) => name != null && (framework.waitsForRecovery(name) || framework.refusesItsWork(name))),
           historyTool: () => framework.residentHistoryTool(),
@@ -23021,8 +23035,10 @@ export class AgentFramework {
    * handleMcplChannelIncoming delivers, a message routeConversationIncoming
    * routes), stamped for the fork alone. While a surgery holds the store it
    * is held in memory instead (surgeryHeldWrites) and '' returned, and so
-   * is it while the fork's context manager refuses its work after a failed
-   * re-initialization (heldForRecovery, as addMessage keeps a write);
+   * is it while a hold's release replays what the hold kept, but for the
+   * write the replay stores (`replayed`), and while the fork's context
+   * manager refuses its work after a failed re-initialization
+   * (heldForRecovery, as addMessage keeps a write);
    * stored, it enters the fork's window at once when no turn of the fork's
    * is alive, else at the fork's next point (afterStore). One whose store
    * threw after its row landed is stored as that row, and one whose store
@@ -23030,14 +23046,14 @@ export class AgentFramework {
    * presented (landedThoughThrown), as addMessage's. `mayBeStored`: as
    * FrameworkWriteOptions.mayBeStored, read back in the fork's store.
    */
-  private storeInFork(target: Agent, content: ContentBlock[], metadata: MessageMetadata, mayBeStored?: boolean): MessageId {
+  private storeInFork(target: Agent, content: ContentBlock[], metadata: MessageMetadata, mayBeStored?: boolean, replayed?: boolean): MessageId {
     const presents = this.presents(target);
     const kept = (): SurgeryHeldWrite => ({
       participant: 'user', content, metadata,
       direct: { agentName: target.name, ...(mayBeStored ? { mayBeStored: true as const } : {}) },
       heldFor: target, heldAt: Date.now(),
     });
-    if (this.surgeryHold) {
+    if (this.surgeryHold || (this.replayingHeld && !replayed)) {
       this.surgeryHeldWrites.push(kept());
       return '' as MessageId;
     }
@@ -23093,7 +23109,14 @@ export class AgentFramework {
    * is stored). The Discord module relies on that to apply the edits and
    * deletes it kept for a message whose create the hold kept, which no
    * module can reach before it lands (ModuleContext.addMessage). Keep it so,
-   * or give such a module a callback the release calls in its place. A
+   * or give such a module a callback the release calls in its place. The
+   * writes are taken off the queue one at a time, and while they replay
+   * (replayingHeld) the ones still waiting stay listed (the tune-out's
+   * getSurgeryHeldMessages, HostModeStatus.deferredWrites), a write such a
+   * listener makes is kept behind them, and the tune-out's writesHeld reads
+   * true, so a cancel a listener asks for waits for the replay's end, as it
+   * does during the hold. A hold a listener begins meanwhile stops the
+   * replay, and its own release stores the rest. A
    * write for an agent whose context manager refuses its
    * work is kept in memory for it again (heldForRecovery), never dropped,
    * and is traced when a later move stores it. An agent that ends during
@@ -23115,56 +23138,29 @@ export class AgentFramework {
    * line and an ops alert of kind `store-held-lost`.
    */
   private releaseSurgeryHeldWrites(): void {
+    // A release met while this one replays (a recovery with no hold, a
+    // listener's move released at once) leaves the writes to it: its loop
+    // takes each one queued meanwhile, in order.
+    if (this.replayingHeld) return;
     // Read defensively: a framework built from its prototype, as some
     // suites build one, holds none.
-    const held = this.surgeryHeldWrites?.splice(0) ?? [];
+    const queue = this.surgeryHeldWrites;
     const lost = new Map<string, { writes: SurgeryHeldWrite[]; unknown: WriteOutcomeUnknownError[]; reason: string }>();
-    for (const write of held) {
-      const target = write.direct ? this.agents.get(write.direct.agentName) : this.deliveryAgent(write.opts?.forAgent);
-      try {
-        const gone = this.heldWriteTargetGone(write);
-        if (gone !== undefined) {
-          this.passHeldWritesOn(gone, [write]);
-          continue;
-        }
-        let id: MessageId;
-        if (write.direct) {
-          const target = this.agents.get(write.direct.agentName)!;
-          if (!this.logicalTurnAlive(target) && takesClockBefore(write.participant, write.content, write.metadata, target.name)) {
-            this.storeDueClock(target, 'event');
-          }
-          id = this.storeInFork(target, write.content, write.metadata ?? {}, write.direct.mayBeStored);
-        } else {
-          id = this.addMessage(write.participant, write.content, write.metadata, write.opts);
-        }
-        if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'surgery-release' });
-      } catch (error) {
-        // A write whose rows landed though its store threw is stored, and
-        // answered, by addMessage and storeInFork (landedThoughThrown). One
-        // whose store can't tell what of it landed is answered by
-        // context-manager's error, the rows it names presented: it may be
-        // lost, and the rows it names as stored are traced. Any other throw
-        // stored none of it.
-        const unknown = error instanceof WriteOutcomeUnknownError ? error : undefined;
-        if (unknown) {
-          console.error(
-            `[surgery] a write held while the store was held threw at its release, and context-manager can't tell what of ` +
-              `it landed (${outcomeUnknownText(unknown)}), so it may be lost:`,
-            error,
-          );
-          if (unknown.landed.length > 0) this.emitTrace({ type: 'message:added', messageId: unknown.landed[0]!, source: 'surgery-release' });
-        } else {
-          console.error(`[surgery] a write held while the store was held couldn't be stored at its release, so it is lost:`, error);
-        }
-        const agentName = target?.name ?? write.direct?.agentName ?? write.opts?.forAgent ?? 'the primary';
-        const entry = lost.get(agentName) ?? { writes: [], unknown: [], reason: thrownText(error) };
-        entry.writes.push(write);
-        if (unknown) entry.unknown.push(unknown);
-        lost.set(agentName, entry);
+    let replayed = 0;
+    this.replayingHeld = true;
+    try {
+      // One at a time, so the writes still to replay stay listed
+      // (getSurgeryHeldMessages, deferredWrites). A hold begun meanwhile (a
+      // listener's move) keeps the rest for its own release.
+      while (queue && queue.length > 0 && !this.surgeryHold) {
+        replayed++;
+        this.replayHeldWrite(queue.shift()!, lost);
       }
+    } finally {
+      this.replayingHeld = false;
     }
-    if (held.length > 0) {
-      console.error(`[surgery] ${held.length} write(s) held while the store was held were replayed in arrival order`);
+    if (replayed > 0) {
+      console.error(`[surgery] ${replayed} write(s) held while the store was held were replayed in arrival order`);
     }
     for (const [agentName, { writes, unknown, reason }] of lost) this.tellHeldWritesLost(agentName, writes, unknown, reason);
     // A tune-out's cancel asked for while the writes were held waited for
@@ -23175,6 +23171,55 @@ export class AgentFramework {
       this.tuneOutCoordinator?.runDeferredCancels();
     } catch (error) {
       console.error('[surgery] the tune-out cancels asked for during the hold could not run at its release:', error);
+    }
+  }
+
+  /** One write of releaseSurgeryHeldWrites's replay, stored by the path it was held on; one that fails is noted in `lost`, by agent. */
+  private replayHeldWrite(
+    write: SurgeryHeldWrite,
+    lost: Map<string, { writes: SurgeryHeldWrite[]; unknown: WriteOutcomeUnknownError[]; reason: string }>,
+  ): void {
+    const target = write.direct ? this.agents.get(write.direct.agentName) : this.deliveryAgent(write.opts?.forAgent);
+    try {
+      const gone = this.heldWriteTargetGone(write);
+      if (gone !== undefined) {
+        this.passHeldWritesOn(gone, [write]);
+        return;
+      }
+      let id: MessageId;
+      if (write.direct) {
+        const target = this.agents.get(write.direct.agentName)!;
+        if (!this.logicalTurnAlive(target) && takesClockBefore(write.participant, write.content, write.metadata, target.name)) {
+          this.storeDueClock(target, 'event');
+        }
+        id = this.storeInFork(target, write.content, write.metadata ?? {}, write.direct.mayBeStored, true);
+      } else {
+        id = this.addMessage(write.participant, write.content, write.metadata, { ...write.opts, replayed: true });
+      }
+      if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'surgery-release' });
+    } catch (error) {
+      // A write whose rows landed though its store threw is stored, and
+      // answered, by addMessage and storeInFork (landedThoughThrown). One
+      // whose store can't tell what of it landed is answered by
+      // context-manager's error, the rows it names presented: it may be
+      // lost, and the rows it names as stored are traced. Any other throw
+      // stored none of it.
+      const unknown = error instanceof WriteOutcomeUnknownError ? error : undefined;
+      if (unknown) {
+        console.error(
+          `[surgery] a write held while the store was held threw at its release, and context-manager can't tell what of ` +
+            `it landed (${outcomeUnknownText(unknown)}), so it may be lost:`,
+          error,
+        );
+        if (unknown.landed.length > 0) this.emitTrace({ type: 'message:added', messageId: unknown.landed[0]!, source: 'surgery-release' });
+      } else {
+        console.error(`[surgery] a write held while the store was held couldn't be stored at its release, so it is lost:`, error);
+      }
+      const agentName = target?.name ?? write.direct?.agentName ?? write.opts?.forAgent ?? 'the primary';
+      const entry = lost.get(agentName) ?? { writes: [], unknown: [], reason: thrownText(error) };
+      entry.writes.push(write);
+      if (unknown) entry.unknown.push(unknown);
+      lost.set(agentName, entry);
     }
   }
 
@@ -31490,7 +31535,7 @@ export class AgentFramework {
     // no window and no store before then, so its placement names only its
     // agent.
     const kept = (): SurgeryHeldWrite => {
-      const { placement: _placement, ...rest } = opts ?? {};
+      const { placement: _placement, replayed: _replayed, ...rest } = opts ?? {};
       return {
         participant, content,
         ...(given !== undefined ? { metadata: given } : {}),
@@ -31499,7 +31544,9 @@ export class AgentFramework {
         heldAt: Date.now(),
       };
     };
-    if (this.surgeryHold && !opts?.imported) {
+    // While the release replays what the hold kept, a write made meanwhile,
+    // a listener's, waits behind the ones still to replay (replayingHeld).
+    if ((this.surgeryHold || (this.replayingHeld && !opts?.replayed)) && !opts?.imported) {
       this.surgeryHeldWrites.push(kept());
       if (opts?.placement) opts.placement.agent = agent.name;
       return '' as MessageId;
