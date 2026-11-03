@@ -470,7 +470,7 @@ describe('a persisted reader: derived again, and when not', () => {
     assert.equal(failed[1]!.returned, 0, "the late look's rows go nowhere: it was the last reader they had");
   });
 
-  it('derives it again when its name has no ended record: a derivation whose run was refused', { timeout: 120_000 }, async () => {
+  it('derives it again when its name has no ended record: a derivation whose run was refused; after a restart, resumes the later generation', { timeout: 180_000 }, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'reader-persist-norecord-'));
     dirs.push(dir);
     const t = await boot(dir, { persist: 'epoch' });
@@ -481,9 +481,48 @@ describe('a persisted reader: derived again, and when not', () => {
     await waitFor('the refused look', () => t.traces.some((e) => e.type === 'tune-out:reader-fork-failed'));
     assert.equal(t.framework.getAgentRecord(g(1)), null, 'premise: derived, its run refused, never registered');
     await t.framework.resume();
+    t.membrane.script('reader', final([text('G2 report.')]));
     t.look(epochId, [t.hold(epochId, 'HELD-2')]);
     await t.looked(g(2), 1);
     assert.deepEqual(rederived(t.traces), [[g(1), g(2), 'no-record']]);
+    await t.framework.stop();
+    frameworks.splice(frameworks.indexOf(t.framework), 1);
+
+    // After a restart g1 has its branch and no record, g2 an ended record:
+    // the generation resumed is g2, the one that ran.
+    const second = await boot(dir, { persist: 'epoch' });
+    assert.equal(second.framework.getAgentRecord(g(1)), null, 'premise: g1 has no record after the restart either');
+    assert.ok(second.internals.store.listBranches().some((b) => b.name === `dendrite/${g(1)}`), "premise: g1's branch is there");
+    second.look(epochId, [second.hold(epochId, 'HELD-3')]);
+    await second.looked(g(2), 2);
+    assert.deepEqual(second.forkTraces().map((f) => [f.agentName, f.incarnation, f.resumed]), [[g(2), 2, true]]);
+    assert.deepEqual(rederived(second.traces), []);
+    const body = JSON.stringify(second.membrane.callsFor('reader')[0]!.messages);
+    assert.ok(body.includes('HELD-2') && body.includes('G2 report.'), "its request holds g2's history");
+  });
+
+  it("derives it again, traced, when the registry can't reach its record but its branch is in the store", { timeout: 180_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reader-persist-unreached-'));
+    dirs.push(dir);
+    const first = await boot(dir, { persist: 'resident' });
+    const epochId = first.enter();
+    first.look(epochId, [first.hold(epochId, 'HELD-1')]);
+    await first.looked('reader/scout/g1', 1);
+    await first.framework.stop();
+    frameworks.splice(frameworks.indexOf(first.framework), 1);
+    // As when its ended record is on another branch's log, or past what the registry keeps.
+    const second = await boot(dir, { persist: 'resident' });
+    const registry = (second.framework as unknown as { registry: { inspect(name: string): unknown } }).registry;
+    const inspect = registry.inspect.bind(registry);
+    registry.inspect = (name: string) => (name === 'reader/scout/g1' ? undefined : inspect(name));
+    try {
+      second.look(epochId, [second.hold(epochId, 'HELD-2')]);
+      await second.looked('reader/scout/g2', 1);
+    } finally {
+      registry.inspect = inspect;
+    }
+    assert.deepEqual(rederived(second.traces), [['reader/scout/g1', 'reader/scout/g2', 'no-record']]);
+    assert.ok(!second.internals.store.listBranches().some((b) => b.name.startsWith('dendrite/reader/scout/g1~')), 'g1 is not derived again under its own name');
   });
 
   it('asks beforeDerive at every derivation and every resumption, and a refused resumption is a failed look, never a derivation', { timeout: 120_000 }, async () => {

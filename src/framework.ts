@@ -17747,8 +17747,13 @@ export class AgentFramework {
    * Where a persisted reader's look starts: the identity's current
    * generation, resumed, when the registry has an ended record of it in
    * scope and nothing below says to derive it again; otherwise a derivation
-   * under the first generation's name no agent has had in this process or
-   * in the registry. Derived again (`reason`), the current generation having
+   * under the first generation's name no agent has had in this process, in
+   * the registry or in the store. A generation counts as used when the
+   * registry has a record of it or the store a branch a derivation made for
+   * it (`dendrite/<name>`, or `~n` after it): a derivation whose run was
+   * refused has its branch and no record, and a record can be out of the
+   * registry's reach on another branch. The current generation is the
+   * newest used one. Derived again (`reason`), the current generation having
    * been used:
    *
    * - `'no-record'`: the registry has no ended record of its name, or (with
@@ -17769,12 +17774,19 @@ export class AgentFramework {
     scopeEnded: boolean,
   ): { name: string; resume?: AgentRecord; previous?: string; reason?: ReaderRederivedReason } {
     const nameOf = (k: number): string => `${identity}/g${k}`;
+    // The agent names the store has a derivation's branch for (deriveAgent
+    // names it `dendrite/<name>`, `~n` after it when that is taken).
+    const branched = new Set<string>();
+    for (const { name } of this.store.listBranches()) {
+      if (name.startsWith('dendrite/')) branched.add(name.slice('dendrite/'.length).replace(/~\d+$/, ''));
+    }
+    const used = (name: string): boolean => this.registry.inspect(name) !== undefined || branched.has(name);
     let k = this.readerGenerations.get(identity);
     if (k === undefined) {
       // The identity's first look in this process: the newest generation
-      // the registry knows of, from an earlier process included.
+      // used, in an earlier process included.
       k = 0;
-      while (this.registry.inspect(nameOf(k + 1))) k++;
+      while (used(nameOf(k + 1))) k++;
       this.readerGenerations.set(identity, k);
     }
     const current = k > 0 ? nameOf(k) : undefined;
@@ -17793,13 +17805,13 @@ export class AgentFramework {
     }
     let next = Math.max(1, k);
     const taken = (name: string): boolean =>
-      this.usedEphemeralAgentNames.has(name) || this.agents.has(name) || this.registry.inspect(name) !== undefined;
+      this.usedEphemeralAgentNames.has(name) || this.agents.has(name) || used(name);
     while (taken(nameOf(next))) next++;
     this.readerGenerations.set(identity, next);
     // A generation that was used and has no ended record: derived again.
     // One whose derivation never got its name (a beforeDerive refusal)
     // is derived under the same name, as the first look was to be.
-    const earlier = current !== undefined && (record !== undefined || this.usedEphemeralAgentNames.has(current));
+    const earlier = current !== undefined && (used(current) || this.usedEphemeralAgentNames.has(current));
     return { name: nameOf(next), ...(earlier ? { previous: current, reason: reason ?? 'no-record' } : {}) };
   }
 
