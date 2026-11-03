@@ -135,7 +135,11 @@
   to an agent that may call it. So must a script's whose starting turn is
   private, as that turn stands at the call, whichever turn watches the script
   then, a call it makes through `toolsets--act` included, and a host's
-  `executeToolCall` that carries a private turn's id (`callerTurnId`).
+  `executeToolCall` that carries a private turn's id (`callerTurnId`). Two
+  kinds of turn id the framework can't place count as a private turn's,
+  failing closed: one given out in this process before the framework was
+  created, and one no newer than a private turn it has dropped from its
+  record of the latest 4,096.
   `channel_publish`'s description says so, so the tool list of every agent
   offered `channel_publish` changes once. The model's call is refused before
   it opens, as the dispatcher's other refusals are, so its result carries

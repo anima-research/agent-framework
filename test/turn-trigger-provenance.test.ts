@@ -432,7 +432,8 @@ describe('Turn trigger provenance', () => {
         const plain: Record<PropertyKey, unknown> = Object.fromEntries(Object.entries(held));
         assert.equal(plain.nonChannelOrigin, true, 'premise: the kept request is a private wake, as the private start is');
         hold.heldRequests.splice(0, 1, plain as unknown as InferenceRequest);
-        i.holdRequest(hold.heldRequests, held);
+        i.pendingRequests.push(held);
+        await i.processInferenceRequests();
         assert.deepEqual(hold.heldRequests, [plain], 'premise: the hold kept the private wake for both');
         assert.deepEqual([timer.nonChannelOrigin, room.nonChannelOrigin], [true, true], "each request of the start's batch becomes a private wake");
       }
@@ -445,7 +446,8 @@ describe('Turn trigger provenance', () => {
         const plain: Record<PropertyKey, unknown> = Object.fromEntries(Object.entries(held));
         plain[callerTurns] = [privateTurn];
         hold.heldRequests.splice(0, 1, plain as unknown as InferenceRequest);
-        i.holdRequest(hold.heldRequests, held);
+        i.pendingRequests.push(held);
+        await i.processInferenceRequests();
         assert.deepEqual(hold.heldRequests, [plain], 'premise: the hold kept the plain request for both');
         assert.deepEqual([timer[callerTurns], room[callerTurns]], [[privateTurn], [privateTurn]], "each request of the start's batch takes the kept request's turn");
       }

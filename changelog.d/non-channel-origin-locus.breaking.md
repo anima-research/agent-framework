@@ -40,11 +40,15 @@
     has them read as a private surface's, so their turns are private and
     reply in no channel. A host whose `executeToolCall` of `channel_publish`
     carries a private turn's id (`callerTurnId`) and names no channel now
-    gets a failed result.
+    gets a failed result, and so does one carrying either of two kinds of
+    turn id the framework can't place: one given out in this process before
+    the framework was created, and one no newer than a private turn it has
+    dropped from its record of the latest 4,096.
   - **Migration:** a speech handler that publishes posts nothing when
     `SpeechContext.nonChannelOrigin` is set, a bridge names each message's
     channel in `metadata.channelId`, and a host's `executeToolCall` of
-    `channel_publish` that carries a private turn's id names its channel.
+    `channel_publish` that carries a private turn's id, or either kind of id
+    the framework can't place, names its channel.
     Otherwise nothing changes in code: the resident answers such a message
     with an explicit send, as the notice says.
   - **Upgrade:** work in flight across the upgrade carries no private mark.

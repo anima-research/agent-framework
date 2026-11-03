@@ -2492,7 +2492,7 @@ describe('a round whose run or wait call watches a script that can change its ro
     });
   }
 
-  it("a script a private turn started, left running past that turn into a channel turn, is refused a channel_publish through toolsets--act that names no channel", async () => {
+  it("a script a private turn started, left running past that turn, is refused a channel_publish through toolsets--act that names no channel while a channel turn watches it", async () => {
     const mount = mkdtempSync(join(tmpdir(), 'ce-act-late-'));
     const workspace = new WorkspaceModule({ mounts: [{ name: 'work', path: mount, mode: 'read-write', watch: 'never' }] });
     const acting = '{ tool: "channel_publish", args: { content: "from the watcher" } }';
@@ -2511,14 +2511,25 @@ describe('a round whose run or wait call watches a script that can change its ro
       h.framework.pushEvent(surface());
       await h.framework.runUntilIdle();
       assert.equal(h.framework.getHostModeStatus().backgroundScripts, 1, 'control: the script was left running');
-      h.framework.pushEvent(surface('world:test'));
-      await h.framework.runUntilIdle();
-      const routing = (h.framework as unknown as { turnRouting: Map<string, { nonChannelOrigin?: boolean }> }).turnRouting.get('assistant');
-      assert.notEqual(routing?.nonChannelOrigin, true, "premise: the agent's latest turn is a channel's");
-      h.module.releaseSlow();
-      await driven(h, () => h.log.some((e) => e.startsWith('note:')));
-      assert.ok(scriptNote(h).includes('has no default channel'), scriptNote(h));
-      assert.ok(!h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
+      h.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'gate1', name: 'test--gate', input: {} }] as ContentBlock[], 'tool_use'));
+      h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]));
+      const bound = setTimeout(() => { h.module.releaseSlow(); h.module.releaseGate(); }, 15_000);
+      try {
+        h.framework.pushEvent(surface('world:test'));
+        const watching = h.framework.runUntilIdle();
+        await until(() => h.log.includes('tool:gate'), 'the channel turn to hold in its gate');
+        const routing = (h.framework as unknown as { turnRouting: Map<string, { nonChannelOrigin?: boolean }> }).turnRouting.get('assistant');
+        assert.notEqual(routing?.nonChannelOrigin, true, "premise: the turn watching the script is a channel's");
+        h.module.releaseSlow();
+        await until(() => h.log.some((e) => e.startsWith('note:')), 'the script to report its call');
+        assert.ok(!h.log.includes('gate:returned'), 'premise: the call came while the channel turn watched');
+        assert.ok(scriptNote(h).includes('has no default channel'), scriptNote(h));
+        assert.ok(!h.log.includes('tool:channel_publish'), JSON.stringify(h.log));
+        h.module.releaseGate();
+        await watching;
+      } finally {
+        clearTimeout(bound);
+      }
     } finally {
       await h.done();
       rmSync(mount, { recursive: true, force: true });
