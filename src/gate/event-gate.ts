@@ -200,7 +200,9 @@ export interface WakeProvenance {
   routeServerId?: string;
   /** The channels a batch came from, each its registered id and server, in
    *  the order they first appear, when no event of it addressed the agent:
-   *  those the host resolved, one or more. A `chat:system` notice counts
+   *  those the host resolved, one or more. A channel some events gave with
+   *  its server and others without is listed once each way, since only the
+   *  host can tell they're one. A `chat:system` notice counts
    *  neither as addressing the agent nor as a channel, except as a
    *  coalesced render's latest occurrence, which the gate takes as a
    *  message (GateEventInfo.folds). The wake has no route, and the turn's
