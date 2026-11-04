@@ -59,6 +59,7 @@
 import type { ContentBlock } from '@animalabs/membrane';
 import type { AddMessageOptions, ContextManager, MessageId, MessageMetadata } from '@animalabs/context-manager';
 import { WriteLandedError, WriteOutcomeUnknownError } from '@animalabs/context-manager';
+import { suppressionRecordOf } from '../gate/suppression-stats.js';
 import { isAnotherAgentsInjection } from '../stored-injections.js';
 import type { AgentName, ObserveEdge } from './types.js';
 
@@ -124,6 +125,22 @@ export const heldFromResidents = (metadata: Record<string, unknown> | undefined)
   !!(metadata as { tuneOut?: unknown } | undefined)?.tuneOut;
 
 /**
+ * The suppression record on a stored message: a suppress rule took it as it
+ * arrived (`metadata.suppressed = { rule, eventType }`, stamped by addMessage
+ * from the gate's suppressionFor). ONE predicate for "never rendered", read
+ * by every view filter the framework sets (the residents', the
+ * subconscious's, and through them every derived view's, context-options.ts)
+ * and so by agentSees too: the compile, a tool boundary's injection and the
+ * arrival and unread checks agree. The presentation index (#291) presents
+ * such a row to nobody (bearingOf, observedRowFor), the reader of held
+ * traffic included, and addMessage stamps it for nobody (an empty
+ * audience). The stamp never changes, so the view stays deterministic per
+ * row, as context-manager's viewFilter requires.
+ */
+export const suppressedRow = (metadata: Record<string, unknown> | undefined): boolean =>
+  suppressionRecordOf(metadata) !== undefined;
+
+/**
  * Whether a row of a slot an agent observes is for that agent (#291,
  * decision 1): what an observe edge shows of the slot it reads. `observer`
  * is the agent the edge is on, and `owners` are the agents whose own slot it
@@ -134,6 +151,8 @@ export const heldFromResidents = (metadata: Record<string, unknown> | undefined)
  * - A row stored under the observer's own name: no. It is the observer's
  *   delivery into the slot (the subconscious's summary or note into the
  *   residents' slot), which its own round already holds.
+ * - A row a suppress rule hid (suppressedRow): no. It renders for no
+ *   reader, the reader of held traffic included.
  * - A row a tune-out holds: only through an edge that shows held traffic
  *   (`includeHeld`, the subconscious's).
  * - A row with no audience stamp (stored before the stamp, or by a host's
@@ -159,6 +178,7 @@ export function observedRowFor(
 ): boolean {
   if (isAnotherAgentsInjection(row.metadata, context.observer)) return false;
   if (row.participant === context.observer) return false;
+  if (suppressedRow(row.metadata as Record<string, unknown> | undefined)) return false;
   if (heldFromResidents(row.metadata as Record<string, unknown> | undefined)) return edge.includeHeld === true;
   const stamp = audienceOf(row.metadata);
   if (!stamp) return true;

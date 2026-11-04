@@ -53,7 +53,8 @@ export type ModuleContextInjection = ContextInjection & { placedEachCompile?: tr
 /**
  * A message as a module context's reads answer it: a stored row, marked
  * `held` when it isn't in the window of the agent the read is for, and
- * `heldFromResidents` when a tune-out holds it from the residents.
+ * `heldFromResidents` when a tune-out or a suppress rule holds it from the
+ * residents.
  */
 export type ModuleMessage = StoredMessage & {
   /**
@@ -92,8 +93,11 @@ export type ModuleMessage = StoredMessage & {
    * channel's `fetch_history` or the history module's `extract`. A module
    * that builds on what the residents see, such as one choosing from the
    * recent conversation, leaves a marked row out, and one that matches
-   * what's stored, such as a sync's dedupe, keeps it. Absent on every other
-   * row.
+   * what's stored, such as a sync's dedupe, keeps it. A row a suppress rule
+   * hid (`metadata.suppressed`) is marked too: no view shows it, the
+   * subconscious's included, and no window presents it, so once the
+   * agent's window is written down it reads `held` too. Absent on every
+   * other row.
    */
   heldFromResidents?: true;
 };
@@ -494,9 +498,9 @@ export interface ModuleContext {
   /**
    * Get a stored message by its id, marked as ModuleMessage says: `held`
    * when it isn't in the delivery agent's window, `heldFromResidents` when a
-   * tune-out holds it from the residents. For one release it also takes the
-   * `held:` handle a release before #291 answered, and gives the row that
-   * write landed as.
+   * tune-out or a suppress rule holds it from the residents. For one release
+   * it also takes the `held:` handle a release before #291 answered, and
+   * gives the row that write landed as.
    */
   getMessage(id: MessageId): ModuleMessage | null;
 
@@ -506,9 +510,9 @@ export interface ModuleContext {
    * The rows come in store order, each marked as ModuleMessage says: `held`
    * when it isn't in the window of the agent the read is for (stored and not
    * yet presented to it, or undone), and `heldFromResidents` when a tune-out
-   * holds it from the residents. Writes a release before #291 left queued
-   * show once create() has imported them, after every module's start()
-   * (addMessage).
+   * or a suppress rule holds it from the residents. Writes a release before
+   * #291 left queued show once create() has imported them, after every
+   * module's start() (addMessage).
    *
    * It reads the primary's window (the first registered agent's when none
    * is primary), or with `opts.forAgent`, the named agent's: a conversation

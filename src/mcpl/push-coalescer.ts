@@ -103,6 +103,20 @@ export interface CoalescedOccurrence<E = unknown> {
   identity?: { messageId?: string; author?: { id: string; name: string }; threadId?: string };
   /** The event the ordinary path would have queued — the host delivers it. */
   event: E;
+  /**
+   * The suppress rule that took this occurrence, or null when none did, once
+   * the host has decided (its wake, or its row, whichever came first). Decided
+   * once for the occurrence, since a rule's script answers once per event:
+   * its row and any later wake read this. Snapshots carry it.
+   */
+  suppressionDecision?: string | null;
+  /**
+   * Set on a batch's latest occurrence when the batch holds an occurrence
+   * addressed to the agent (`chat:addressed`), this one or an earlier one. An
+   * addressed event is never suppressed, so such a batch is shown, whatever its
+   * latest occurrence would be decided. Snapshots carry it.
+   */
+  batchAddressed?: true;
   /** Set by the coalescer: deliver into this agent only (§3.2 audience may
    *  narrow, never widen — a replacement or notice follows the prior delivery). */
   deliverTo?: string;
@@ -1000,6 +1014,7 @@ export class PushCoalescer<E = unknown> {
       // Later notices stay in the batch's audience.
       occurrence = { ...occurrence, deliverTo: state.batch.latest.deliverTo };
     }
+    if (occurrence.tags?.includes('chat:addressed') || state.batch?.latest.batchAddressed) occurrence = { ...occurrence, batchAddressed: true };
     const notice: DeferredNotice = { eventId: occurrence.eventId, timestamp: occurrence.timestamp, ...(occurrence.data !== undefined ? { data: structuredClone(occurrence.data) } : {}) };
     if (state.batch) {
       state.batch.notices.push(notice);
@@ -1066,10 +1081,15 @@ export class PushCoalescer<E = unknown> {
    * A batch that opened while another render ran is rendered once that
    * render settles. Resolves whether it materialized.
    */
-  async materializeNow(agentName: string, subject: string): Promise<boolean> {
+  async materializeNow(agentName: string, subject: string, onlyIfLatest?: string): Promise<boolean> {
     for (;;) {
       if (this.suspended) return false;
-      const started = await this.locked(() => this.freeze(subject, agentName));
+      // `onlyIfLatest`: a newer occurrence took the batch over while this
+      // waited for the lock, and its own decision and wake are the batch's.
+      const started = await this.locked(() => {
+        if (onlyIfLatest !== undefined && this.subjects.get(subject)?.batch?.latest.eventId !== onlyIfLatest) return Promise.resolve(undefined);
+        return this.freeze(subject, agentName);
+      });
       if (!started || started === 'declined') return false;
       await started.done;
       this.persist();

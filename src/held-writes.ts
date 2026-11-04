@@ -1,3 +1,4 @@
+import { suppressionRecordOf } from './gate/suppression-stats.js';
 import type { ContextManager, MessageId, StoredMessage } from '@animalabs/context-manager';
 
 /**
@@ -34,7 +35,8 @@ export type ModuleRowWindow = Pick<ContextManager, 'windowMode' | 'ordinalOf'>;
  *   (framework.ts, createAgent), and a tool boundary never presents one to a
  *   resident, so a marked row is one the store keeps and no resident is
  *   shown (ModuleMessage.heldFromResidents says where its text can still
- *   reach one).
+ *   reach one). So is a row a suppress rule hid (`metadata.suppressed`),
+ *   which no view shows either, nor any window presents.
  * - `held` when that agent's window (`window`) presents rows and doesn't
  *   hold it (#291): stored and not yet presented to the agent, which its
  *   next presentation point does, or taken out of it as an undone turn's,
@@ -50,7 +52,8 @@ export function asModuleRow<T extends Pick<StoredMessage, 'id' | 'metadata'>>(
   row: T,
   window?: ModuleRowWindow,
 ): T & { heldFromResidents?: true; held?: true } {
-  const fromResidents = !!(row.metadata as { tuneOut?: unknown } | undefined)?.tuneOut;
+  const metadata = row.metadata as Record<string, unknown> | undefined;
+  const fromResidents = !!metadata?.tuneOut || suppressionRecordOf(metadata) !== undefined;
   const held = window !== undefined && window.windowMode() === 'presented' && window.ordinalOf(row.id) === undefined;
   if (!fromResidents && !held) return row;
   return { ...row, ...(fromResidents ? { heldFromResidents: true as const } : {}), ...(held ? { held: true as const } : {}) };
