@@ -192,6 +192,29 @@ describe('Turn trigger provenance', () => {
     await framework.stop();
   });
 
+  it("a `!` continuation of a turn whose wake named a channel this host couldn't resolve carries no batch channel, though a batch's wake joined it", async () => {
+    const framework = await makeFramework();
+    const i = internals(framework) as unknown as ReturnType<typeof internals> & {
+      agents: Map<string, unknown>;
+      requestProseContinuation(agent: unknown, routing: unknown): void;
+    };
+    const room = { serverId: 'discord', channelId: 'discord:g:room' };
+    const routing = i.routingOf('scout') as ReturnType<ReturnType<typeof internals>['routingOf']> & { continuation?: boolean };
+    routing.noChannel = true;
+    routing.wakeChannels = [room];
+    routing.continuation = true;
+    i.requestProseContinuation(i.agents.get('scout'), routing);
+    const asked = i.pendingRequests.at(-1);
+    assert.equal(asked?.reason, 'prose-continuation', 'premise: the turn asked for its continuation');
+    assert.equal(asked?.wakeChannels, undefined);
+    delete routing.noChannel;
+    routing.continuation = true;
+    i.requestProseContinuation(i.agents.get('scout'), routing);
+    assert.deepEqual(i.pendingRequests.at(-1)?.wakeChannels, [room], 'a turn that had its channels carries them');
+    i.pendingRequests.length = 0;
+    await framework.stop();
+  });
+
   it("two ambient batches parked while the host is quiesced, coalesced into one, name both batches' channels at resume", async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi' }]));
     const framework = await makeFramework();

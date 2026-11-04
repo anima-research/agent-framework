@@ -206,7 +206,8 @@ export interface WakeProvenance {
    *  neither as addressing the agent nor as a channel, except as a
    *  coalesced render's latest occurrence, which the gate takes as a
    *  message (GateEventInfo.folds). The wake has no route, and the turn's
-   *  no-locus notice names them. */
+   *  no-locus notice names them, unless the turn's own wake named a channel
+   *  that resolves to none. */
   batchChannels?: Array<{ channelId: string; serverId?: string }>;
   /** Timestamp (ms) of the chosen event. With none chosen, of the batch's
    *  newest event that isn't a `chat:system` notice (a coalesced render's
