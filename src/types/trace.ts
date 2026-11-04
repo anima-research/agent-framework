@@ -1136,6 +1136,28 @@ export type TraceEvent =
       wakeCount: number;
       maxWakes: number;
     })
+  /**
+   * A tune-out's cancel asked for while writes were held in memory, queued
+   * for the release and its retry, taken off the queue with what it was for
+   * left undone. `hold-ended`: the hold of the epoch it was asked for
+   * (`epochId`) ended without it, so it ends nothing, and no later hold
+   * there (`currentEpochId`, the one in force when it was dropped, if one
+   * was). `note-undelivered`: another cancel ended its hold, and delivering
+   * the note it carried failed (`error`). `noteLost`: it carried a reader's
+   * note, which is not delivered. For the all-except hold (`scope`), the
+   * channel is its excepted one.
+   */
+  | (TraceEventBase & {
+      type: 'tune-out:deferred-cancel-dropped';
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      scope?: 'all-except';
+      reason: 'hold-ended' | 'note-undelivered';
+      currentEpochId?: string;
+      noteLost: boolean;
+      error?: string;
+    })
 
   /** A reader fork ended in prose without `deliver_summary`; its final prose was delivered as its report. */
   | (TraceEventBase & {
