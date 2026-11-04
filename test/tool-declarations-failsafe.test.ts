@@ -114,7 +114,7 @@ async function pollUntil(cond: () => boolean, timeoutMs = 10_000): Promise<boole
 const usageOf = (n: number) => ({ inputTokens: 10 + n, outputTokens: 5, cacheCreationTokens: 200 + n, cacheReadTokens: 3000 + n });
 const inputOf = (n: number) => { const u = usageOf(n); return u.inputTokens + u.cacheCreationTokens + u.cacheReadTokens; };
 
-async function turns(opts: { binds: boolean; refuse: (request: NormalizedRequest) => Error | undefined; second?: string[]; third?: boolean; providerHold?: () => { holdMs: number; reason: string } }) {
+async function turns(opts: { binds: boolean; refuse: (request: NormalizedRequest) => Error | undefined; second?: string[]; third?: boolean; providerHold?: () => { holdMs: number; reason: string }; asFork?: boolean }) {
   const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-failsafe-'));
   const membrane = new MockMembrane();
   let turn = 0;
@@ -137,6 +137,18 @@ async function turns(opts: { binds: boolean; refuse: (request: NormalizedRequest
     errorPolicy: { maxRetries: 0, onInferenceError: (_e: Error, _name: string, attempt: number) => { policyCalls.push(attempt); return { retry: false }; } },
     ...(opts.providerHold ? { providerHold: opts.providerHold } : {}),
   });
+  const internals = framework as unknown as {
+    registry: { homeChannel(name: string): unknown; ownsProviderScheduling(name: string): boolean };
+    providerWaits: { active(agentName: string, model: string): unknown };
+  };
+  if (opts.asFork) {
+    // The registry's answers for a conversation fork: a home channel, and no provider scheduling of its own.
+    const { registry } = internals;
+    const home = registry.homeChannel.bind(registry);
+    const owns = registry.ownsProviderScheduling.bind(registry);
+    registry.homeChannel = (name) => (name === 'resident' ? { serverId: 'stub', channelId: 'channel:home' } : home(name));
+    registry.ownsProviderScheduling = (name) => (name === 'resident' ? false : owns(name));
+  }
   const traces: TraceEvent[] = [];
   framework.onTrace((event) => { traces.push(event); });
   framework.start();
@@ -154,7 +166,11 @@ async function turns(opts: { binds: boolean; refuse: (request: NormalizedRequest
     tools.names = opts.second ?? ['a', 'b'];
     await send('second', 2);
     inputs.push(input());
-    const afterSecond = { onHead: !agent.declaresEntries(), undoDepth: framework.getUndoRedoState('resident').undoDepth };
+    const afterSecond = {
+      onHead: !agent.declaresEntries(),
+      undoDepth: framework.getUndoRedoState('resident').undoDepth,
+      waitRecorded: internals.providerWaits.active('resident', 'test-model') !== undefined,
+    };
     if (opts.third) {
       await send('third', 3);
       inputs.push(input());
@@ -191,6 +207,14 @@ describe("toolDeclarations' fail-safe", () => {
     assert.equal(run.calls.length, 3, 'the adopting turn, the refused request, its resend');
     assert.equal(carriesChange(run.calls[2]!), false, 'the resend, on the head');
     assert.equal(run.traces.filter((t) => t.type === 'inference:completed').length, 2, 'and the turn ended well');
+  });
+
+  it("records no provider wait from a refusal it resends at once on the head, though the refusal states one, for a conversation fork", async () => {
+    const refusedWithWait = () => Object.assign(refusal(true), { retryAfterMs: 600_000 });
+    const run = await turns({ binds: true, refuse: (r) => (carriesChange(r) ? refusedWithWait() : undefined), asFork: true });
+    assert.equal(run.calls.length, 3, 'the adopting turn, the refused request, its resend');
+    assert.equal(carriesChange(run.calls[2]!), false, 'the resend, on the head');
+    assert.equal(run.waitRecorded, false, 'no wait recorded for its model');
   });
 
   it('counts a failure of the resend from 1, as a retry of the same turn, and never shows the policy the refusal', async () => {
