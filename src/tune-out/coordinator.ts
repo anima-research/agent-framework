@@ -138,12 +138,17 @@ interface WindowStartsState {
  * `noteKept`: the caller's note waits with the cancel, and the answer says
  * what becomes of it: delivered when the hold ends, else told lost to its
  * author (tellNoteLost), a notice that can't be written being traced and
- * tried again (writeLossNotices) until the host stops, and lost untold at a
- * stop before the hold ends. The cancel can't wait for the delivery, which
- * comes only when the hold ends. A reader fork's (`fork`) goes out as its
- * mail even after its run has ended (deliverReaderNote), but a notice of
- * its loss reaches it only while it runs: an ended fork is no agent the
- * framework writes to, and the loss is then traced only (writeLossNotice).
+ * tried again (writeLossNotices) until it is written, and, for the
+ * persistent subconscious (`persistent`), kept in the store too
+ * (writeLossRecord), so the next boot writes one a stop left unwritten
+ * (restoreLossNotices). The waiting cancel, and the note with it, is kept
+ * in memory only: a stop before the hold ends loses both, untold. The
+ * cancel can't wait for the delivery, which comes only when the hold ends.
+ * A reader fork's (`fork`) goes out as its mail even after its run has
+ * ended (deliverReaderNote), but a notice of its loss reaches it only while
+ * it runs: an ended fork is no agent the framework writes to, and the loss
+ * is then traced only (writeLossNotice); a stop drops a fork's notice not
+ * yet written.
  */
 export function cancelWaitsNote(what: string, noteDropped = false, noteKept?: 'persistent' | 'fork'): string {
   const hold = what.charAt(0).toLowerCase() + what.slice(1);
@@ -157,17 +162,18 @@ export function cancelWaitsNote(what: string, noteDropped = false, noteKept?: 'p
     + (noteKept === 'persistent' && !noteDropped
       ? ` Your note waits with the cancel and is delivered when ${hold} ends. If it can't be delivered then, you are `
         + 'told so in your context, and why. If writing that notice fails too, the failure is traced for the host, and '
-        + `the notice is ${retry}written or the host stops.`
+        + `the notice is ${retry}written. The notice is kept in the store as well, unless the store refuses that too: `
+        + 'if the host stops before the notice is written, the host writes it when it starts again, or keeps trying as '
+        + 'above. The waiting cancel and your note aren\'t kept in the store: if the host stops before '
+        + `${hold} ends, both are lost, and you are not told.`
       : '')
     + (noteKept === 'fork' && !noteDropped
       ? ` Your note waits with the cancel and goes to the resident as your mail when ${hold} ends, even if your run `
         + 'has ended by then. If it can\'t be delivered then, you are told so in your context, and why, but only while '
         + 'your run lasts: once it has ended, nothing can be written to you, so the loss reaches no one and is only '
         + 'traced for the host. If writing that notice fails while you still run, the failure is traced for the host, '
-        + `and the notice is ${retry}written, your run ends, or the host stops.`
-      : '')
-    + (noteKept && !noteDropped
-      ? ` If the host stops before ${hold} ends, your note is lost with the cancel, and you are not told.`
+        + `and the notice is ${retry}written, your run ends, or the host stops. If the host stops before ${hold} ends, `
+        + 'your note is lost with the cancel, and you are not told.'
       : '');
 }
 
@@ -359,14 +365,69 @@ type DeferredDrop =
 
 /** A notice to a lost note's author (tellNoteLost), kept until it is written (writeLossNotices). */
 interface LossNotice {
+  /** Tells it from the others kept, in the store's record too (PersistedLossNotice). */
+  id: string;
   /** The hold its cancel was for, and the epoch holding there now (DeferredFor), read when it is written. */
   for: Pick<DeferredFor, 'epochId' | 'serverId' | 'channelId' | 'scope' | 'current'>;
   /** The hold and its cancel's reason, as the log lines name them. */
   what: string;
   /** Why the note was lost, which the notice says. */
   drop: DeferredDrop;
+  /** When it was kept (Date.now()). */
+  keptAtMs: number;
   /** A write of it failed, which was traced (once). */
   traced?: true;
+  /**
+   * Its author is the persistent subconscious, whose context outlives the
+   * process: the notice is kept in the store too (writeLossRecord), so a
+   * stop doesn't lose it. A reader fork's isn't: no fork outlives a stop.
+   */
+  persistent?: true;
+}
+
+/**
+ * A loss notice for the persistent subconscious not written yet (LossNotice),
+ * as `tune-out/<primary>/loss-notices` keeps it (`{ v: 1,
+ * pendingLossNotices }`): whom it is for (`author`), the hold and its
+ * cancel's reason (`what`), the hold's epoch and channel (`for`; the
+ * all-except hold's excepted channel, with `scope`), why the note was lost
+ * (`drop`, whose `error` is the reason the notice gives), when it was kept,
+ * and whether its first failure was traced. The next boot writes it
+ * (restoreLossNotices).
+ */
+interface PersistedLossNotice {
+  id: string;
+  author: string;
+  what: string;
+  for: { epochId: string; serverId: string; channelId: string; scope?: 'all-except' };
+  drop: DeferredDrop;
+  keptAtMs: number;
+  traced?: true;
+}
+
+/** A kept notice in the record's form, or undefined for an entry this version can't read. */
+function readPersistedLossNotice(value: unknown): PersistedLossNotice | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const entry = value as Record<string, unknown>;
+  const at = entry.for as Record<string, unknown> | null | undefined;
+  const drop = entry.drop as Record<string, unknown> | null | undefined;
+  if (typeof entry.id !== 'string' || typeof entry.author !== 'string' || entry.author === ''
+    || typeof entry.what !== 'string' || typeof entry.keptAtMs !== 'number') return undefined;
+  if (!at || typeof at !== 'object' || typeof at.epochId !== 'string' || typeof at.serverId !== 'string'
+    || typeof at.channelId !== 'string' || (at.scope !== undefined && at.scope !== 'all-except')) return undefined;
+  let why: DeferredDrop;
+  if (drop?.reason === 'hold-ended' && (drop.current === undefined || typeof drop.current === 'string')) {
+    why = { reason: 'hold-ended', ...(typeof drop.current === 'string' ? { current: drop.current } : {}) };
+  } else if (drop?.reason === 'note-undelivered' && (drop.by === 'another' || drop.by === 'itself') && typeof drop.error === 'string') {
+    why = { reason: 'note-undelivered', by: drop.by, error: drop.error };
+  } else {
+    return undefined;
+  }
+  return {
+    id: entry.id, author: entry.author, what: entry.what,
+    for: { epochId: at.epochId, serverId: at.serverId, channelId: at.channelId, ...(at.scope === 'all-except' ? { scope: 'all-except' as const } : {}) },
+    drop: why, keptAtMs: entry.keptAtMs, ...(entry.traced === true ? { traced: true as const } : {}),
+  };
 }
 
 /** Ends a backlog line cut to fit in one of the residents' messages. */
@@ -595,10 +656,26 @@ export class TuneOutCoordinator {
    * The notices to a lost queued note's author that weren't written yet
    * (tellNoteLost), by author, in the order the losses came: each is tried
    * again, by runDeferredCancels, at the next release and at the retry,
-   * until it is written. In memory, cleared at stop, as the deferred
-   * cancels are.
+   * until it is written. Those for the persistent subconscious are kept in
+   * the store too (writeLossRecord), and stay there at stop for the next
+   * boot to write (restoreLossNotices); a reader fork's are in memory only,
+   * cleared at stop, as the deferred cancels are.
    */
   private readonly lossNotices = new Map<string, LossNotice[]>();
+  /**
+   * The persistent subconscious's kept notices as the store's record was
+   * last written or read (writeLossRecord, readLossRecord), so that it is
+   * written only when they change.
+   */
+  private lossRecordShape = '[]';
+  /**
+   * The record may not hold the notices kept in memory: its write failed,
+   * or was put off while writes were held. The next change, or the stop,
+   * writes it.
+   */
+  private lossRecordStale = false;
+  /** The record couldn't be read: nothing is written over it until it can be (readLossRecord). */
+  private lossRecordUnread = false;
   /**
    * The one retry of the deferred cancels whose run threw (a release that
    * couldn't be made durable, a store operation that threw), and of the
@@ -744,6 +821,9 @@ export class TuneOutCoordinator {
       this.rebuildTally(serverId, channelId);
     }
     this.pruneLooks();
+    // A loss notice for the subconscious a stop left kept in the store is
+    // written now, the holds' state above restored first, which it reads.
+    this.restoreLossNotices();
   }
 
   /** The tune-outs active now, a channel's and the all-except hold, with where each started in the record. */
@@ -1310,12 +1390,15 @@ export class TuneOutCoordinator {
    * notice is kept (lossNotices) and written now (writeLossNotices). One
    * whose write fails stays kept, its first failure traced, and is tried
    * again at the next release and at the retry, which this arms, until it
-   * is written or the host stops; what dropped the cancel goes on either
-   * way. While writes are held it waits for their release, as the cancels
-   * do. A reader fork that has ended is no agent the framework writes to
-   * any more: it is written nothing, the loss reaching no one, which is
-   * traced (writeLossNotice), and the trace of the drop (dropDeferred) still
-   * names the fork. An author not known is logged.
+   * is written; what dropped the cancel goes on either way. One for the
+   * persistent subconscious is kept in the store as well (writeLossRecord),
+   * so a stop leaves it for the next boot to write (restoreLossNotices); a
+   * reader fork's is lost at a stop, as the fork's run is. While writes are
+   * held it waits for their release, as the cancels do. A reader fork that
+   * has ended is no agent the framework writes to any more: it is written
+   * nothing, the loss reaching no one, which is traced (writeLossNotice),
+   * and the trace of the drop (dropDeferred) still names the fork. An
+   * author not known is logged.
    */
   private tellNoteLost(entry: DeferredCancel, author: string | undefined, drop: DeferredDrop): void {
     if (author === undefined) {
@@ -1323,7 +1406,20 @@ export class TuneOutCoordinator {
       return;
     }
     const { epochId, serverId, channelId, scope, current } = entry.for;
-    const notice: LossNotice = { for: { epochId, serverId, channelId, ...(scope ? { scope } : {}), current }, what: entry.what, drop };
+    // In persistent mode the author is the subconscious (noteAuthorOf), and
+    // no reader fork is configured; with reader forks, a fork.
+    let persistent: boolean;
+    try {
+      persistent = this.hooks.subconsciousName() === author;
+    } catch {
+      persistent = typeof this.hooks.invokeReader !== 'function';
+    }
+    const notice: LossNotice = {
+      id: randomUUID(),
+      for: { epochId, serverId, channelId, ...(scope ? { scope } : {}), current },
+      what: entry.what, drop, keptAtMs: Date.now(),
+      ...(persistent ? { persistent: true as const } : {}),
+    };
     const kept = this.lossNotices.get(author);
     if (kept) kept.push(notice);
     else this.lossNotices.set(author, [notice]);
@@ -1338,7 +1434,9 @@ export class TuneOutCoordinator {
    * for the next try (writeLossNotice). None is written while writes are
    * held (writesHeld): the framework would keep it in memory and answer an
    * empty id, which then couldn't tell a kept write from an ended author's
-   * dropped one. The release or the retry writes them. Never throws.
+   * dropped one. The release or the retry writes them. Then the store's
+   * record of the persistent subconscious's kept notices is brought in
+   * line (writeLossRecord). Never throws.
    */
   private writeLossNotices(author?: string): void {
     for (const name of author !== undefined ? [author] : [...this.lossNotices.keys()]) {
@@ -1350,6 +1448,165 @@ export class TuneOutCoordinator {
       const left = kept.filter((notice) => this.writesHeldNow() || this.writeLossNotice(name, notice) === 'failed');
       const since = this.lossNotices.get(name) ?? [];
       if (left.length + since.length > 0) this.lossNotices.set(name, [...left, ...since]);
+    }
+    this.writeLossRecord();
+  }
+
+  /** Where the persistent subconscious's kept loss notices are kept: a snapshot state, beside the coordinator's others. */
+  private get lossNoticesStateId(): string {
+    return `tune-out/${this.hooks.primaryName() ?? 'default'}/loss-notices`;
+  }
+
+  /** The persistent subconscious's kept notices (lossNotices) in the record's form, in the order kept. */
+  private persistedLossNotices(): PersistedLossNotice[] {
+    const out: PersistedLossNotice[] = [];
+    for (const [author, kept] of this.lossNotices) {
+      for (const notice of kept) {
+        if (!notice.persistent) continue;
+        const { epochId, serverId, channelId, scope } = notice.for;
+        const { drop } = notice;
+        out.push({
+          id: notice.id, author, what: notice.what,
+          for: { epochId, serverId, channelId, ...(scope ? { scope } : {}) },
+          drop: drop.reason === 'hold-ended'
+            ? { reason: 'hold-ended', ...(drop.current !== undefined ? { current: drop.current } : {}) }
+            : { reason: 'note-undelivered', by: drop.by, error: drop.error },
+          keptAtMs: notice.keptAtMs,
+          ...(notice.traced ? { traced: true as const } : {}),
+        });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Keep the persistent subconscious's kept loss notices in the store
+   * (`tune-out/<primary>/loss-notices`, PersistedLossNotice), as they are
+   * in memory: one kept is added, one written leaves. Only when they
+   * changed since the record was last written or read, or a write of it
+   * failed; never while writes are held (writesHeld): the release, the
+   * retry or the stop writes it then. Not over a record that couldn't be
+   * read (readLossRecord, tried again first). A write that fails is logged,
+   * and the notices stay kept in memory, written or tried again as before;
+   * a stop meanwhile loses them. At `stop`, written whenever one is kept,
+   * held writes or not, and answers whether the record holds them. Never
+   * throws.
+   */
+  private writeLossRecord(at?: 'stop'): boolean {
+    try {
+      const notices = this.persistedLossNotices();
+      const shape = JSON.stringify(notices);
+      if (at !== 'stop' && shape === this.lossRecordShape && !this.lossRecordStale) return true;
+      if (at === 'stop' && notices.length === 0 && !this.lossRecordStale && !this.lossRecordUnread) return true;
+      if (at !== 'stop' && this.writesHeldNow()) {
+        this.lossRecordStale = true;
+        return false;
+      }
+      if (this.lossRecordUnread && !this.readLossRecord()) {
+        this.lossRecordStale = true;
+        console.error(`[tune-out] the loss notices kept for the subconscious (${this.lossNoticesStateId}) can't be read, so they aren't written over: `
+          + `${notices.length === 0 ? 'none is' : `${notices.length} kept now ${notices.length === 1 ? 'is' : 'are'}`} not added to them`);
+        return false;
+      }
+      // Read again just now (readLossRecord): what it kept is in memory too.
+      const all = this.persistedLossNotices();
+      this.channelRegistry.writeCoordinatorState(this.lossNoticesStateId, { v: 1, pendingLossNotices: all });
+      this.lossRecordShape = JSON.stringify(all);
+      this.lossRecordStale = false;
+      return true;
+    } catch (err) {
+      this.lossRecordStale = true;
+      console.error(`[tune-out] the loss notices kept for the subconscious (${this.lossNoticesStateId}) couldn't be written to the store, `
+        + `so they are kept in memory only${at === 'stop' ? ', which the stop clears' : ', and a stop before they are written loses them'}: ${thrownReason(err)}`);
+      return false;
+    }
+  }
+
+  /**
+   * Read the persistent subconscious's kept loss notices from the store
+   * (writeLossRecord) into memory (lossNotices), ahead of any kept since for
+   * the same author: at boot (restoreLossNotices), and before the record is
+   * written where it couldn't be read before. Answers whether it was read.
+   * One that throws is logged and answers false: nothing is written over it
+   * until it is read. A record not in this format (`{ v: 1,
+   * pendingLossNotices }`) reads as none kept, logged, and is written over
+   * at the next change; an entry this version can't read is logged and left
+   * out, so the next write drops it.
+   */
+  private readLossRecord(): boolean {
+    let raw: unknown;
+    try {
+      raw = this.channelRegistry.readCoordinatorState(this.lossNoticesStateId);
+    } catch (err) {
+      this.lossRecordUnread = true;
+      console.error(`[tune-out] the loss notices kept for the subconscious (${this.lossNoticesStateId}) can't be read, so none is written now, `
+        + `and nothing is written over them until they can be read: ${thrownReason(err)}`);
+      return false;
+    }
+    this.lossRecordUnread = false;
+    if (raw == null) return true;
+    const record = raw as { v?: unknown; pendingLossNotices?: unknown };
+    if (record.v !== 1 || !Array.isArray(record.pendingLossNotices)) {
+      console.error(`[tune-out] the loss notices kept for the subconscious (${this.lossNoticesStateId}) aren't in a form this version reads, so none is written; the next change writes over them`);
+      return true;
+    }
+    const known = new Set([...this.lossNotices.values()].flat().map((n) => n.id));
+    const restored = new Map<string, LossNotice[]>();
+    let unreadable = 0;
+    for (const value of record.pendingLossNotices) {
+      const entry = readPersistedLossNotice(value);
+      if (!entry) {
+        unreadable++;
+        continue;
+      }
+      if (known.has(entry.id)) continue;
+      known.add(entry.id);
+      const { epochId, serverId, channelId, scope } = entry.for;
+      const notice: LossNotice = {
+        id: entry.id,
+        for: { epochId, serverId, channelId, ...(scope ? { scope } : {}), current: this.epochHoldingAt(serverId, channelId, scope) },
+        what: entry.what, drop: entry.drop, keptAtMs: entry.keptAtMs, persistent: true,
+        ...(entry.traced ? { traced: true as const } : {}),
+      };
+      restored.set(entry.author, [...(restored.get(entry.author) ?? []), notice]);
+    }
+    for (const [author, notices] of restored) this.lossNotices.set(author, [...notices, ...(this.lossNotices.get(author) ?? [])]);
+    if (unreadable > 0) {
+      console.error(`[tune-out] ${unreadable} of the loss notices kept for the subconscious (${this.lossNoticesStateId}) can't be read by this version, `
+        + 'so they are not written, and the next write of the record leaves them out');
+    }
+    // What the store holds, so the next write is made when memory differs:
+    // at once where an entry was left out.
+    this.lossRecordShape = unreadable > 0 ? '' : JSON.stringify(this.persistedLossNotices());
+    return true;
+  }
+
+  /** The epoch holding where a kept notice's cancel was (DeferredFor's `current`): the channel's tune-out, or the all-except hold. */
+  private epochHoldingAt(serverId: string, channelId: string, scope?: 'all-except'): () => string | undefined {
+    return scope === 'all-except'
+      ? () => this.getAllExcept()?.params.epochId
+      : () => this.channelRegistry.getTuneOutState(serverId, channelId)?.params.epochId;
+  }
+
+  /**
+   * At boot (resumeActiveEpochs): the loss notices a stop left kept in the
+   * store for the persistent subconscious (writeLossRecord) are written now,
+   * as tellNoteLost writes them, each with a turn to read it
+   * (writeLossNotice); one written leaves the record, and one whose write
+   * fails stays, kept and tried again at the next release and at the retry,
+   * which this arms. A notice whose author is no agent the framework writes
+   * to now reaches no one, which is traced (`author-gone`), and leaves the
+   * record. Never throws.
+   */
+  private restoreLossNotices(): void {
+    try {
+      if (!this.readLossRecord() || this.lossNotices.size === 0) return;
+      const count = [...this.lossNotices.values()].reduce((n, kept) => n + kept.length, 0);
+      console.error(`[tune-out] ${count} loss notice(s) kept in the store for the subconscious before the last stop ${count === 1 ? 'is' : 'are'} tried again now`);
+      this.writeLossNotices();
+      if (this.lossNotices.size > 0) this.armDeferredRetry();
+    } catch (err) {
+      console.error(`[tune-out] the loss notices kept in the store for the subconscious could not be written at boot: ${thrownReason(err)}`);
     }
   }
 
@@ -3043,12 +3300,24 @@ export class TuneOutCoordinator {
   /** Stop all timers (framework shutdown). */
   stop(): void {
     // A cancel still waiting for held writes ends nothing: the tune-out stays
-    // in force on disk, for the next boot. A loss notice not written yet is
-    // dropped, with a log line naming its author.
+    // in force on disk, for the next boot, and a note it carries is lost with
+    // it. A loss notice not written yet for the persistent subconscious stays
+    // kept in the store (writeLossRecord), for the next boot to write
+    // (restoreLossNotices); a reader fork's, whose run doesn't outlast the
+    // stop, is dropped, as is one the store couldn't keep. Each is logged,
+    // naming its author.
     this.deferredCancels.clear();
+    const recorded = this.writeLossRecord('stop');
     for (const [author, kept] of this.lossNotices) {
       for (const notice of kept) {
-        console.error(`[tune-out] stopping: the notice telling ${author} that the note it left with the cancel of ${notice.what} was not delivered was never written, and is dropped`);
+        const told = `the notice telling ${author} that the note it left with the cancel of ${notice.what} was not delivered`;
+        if (notice.persistent && recorded) {
+          console.error(`[tune-out] stopping: ${told} isn't written yet, and is kept in the store for the next boot to write`);
+        } else if (notice.persistent) {
+          console.error(`[tune-out] stopping: ${told} was never written, and the store couldn't keep it, so it is dropped`);
+        } else {
+          console.error(`[tune-out] stopping: ${told} was never written, and is dropped: a reader fork's run doesn't outlast a stop`);
+        }
       }
     }
     this.lossNotices.clear();

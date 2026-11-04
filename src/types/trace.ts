@@ -1169,11 +1169,14 @@ export type TraceEvent =
    * `tune-out:deferred-cancel-dropped` with `noteLost`) was not written.
    * `write-failed`: writing it threw (`error`). It is kept, and tried again
    * whenever held writes are stored and every 60 s while none are, until it
-   * is written or the host stops; this traces its first failure only, and
-   * each later one is logged. `author-gone`: the framework wrote nothing,
-   * as no agent of that name is registered (a reader fork whose run has
-   * ended): the loss reaches no one, and the notice is not kept. For the
-   * all-except hold (`scope`), the channel is its excepted one.
+   * is written. One for the persistent subconscious is kept in the store
+   * too, so a stop leaves it there and the next boot tries it again; a
+   * reader fork's is dropped at a stop. This traces its first failure only,
+   * a later boot's included, and each later one is logged. `author-gone`:
+   * the framework wrote nothing, as no agent of that name is registered (a
+   * reader fork whose run has ended): the loss reaches no one, and the
+   * notice is not kept. For the all-except hold (`scope`), the channel is
+   * its excepted one.
    */
   | (TraceEventBase & {
       type: 'tune-out:note-loss-untold';

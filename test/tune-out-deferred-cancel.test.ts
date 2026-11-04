@@ -156,6 +156,11 @@ describe('a later cancel of a tune-out whose cancel already waits', () => {
       assert.equal(waiting(answer).waiting, true);
       assert.match(waiting(answer).note ?? '', /Your note waits with the cancel and is delivered when the tune-out ends\./,
         `told what becomes of its note: ${waiting(answer).note}`);
+      assert.match(waiting(answer).note ?? '', /The notice is kept in the store as well, unless the store refuses that too: if the host stops before the notice is written, the host writes it when it starts again/,
+        `told that a loss notice that can't be written survives a stop (Ivy-3594, round 6): ${waiting(answer).note}`);
+      assert.match(waiting(answer).note ?? '', /The waiting cancel and your note aren't kept in the store: if the host stops before the tune-out ends, both are lost, and you are not told\.$/,
+        `and that a stop before the hold ends still loses the cancel and the note: ${waiting(answer).note}`);
+      assert.doesNotMatch(waiting(answer).note ?? '', /or the host stops/, `no longer says a stop ends the notice's retries: ${waiting(answer).note}`);
       release();
       assert.equal(registry.getTuneOutState('editor', 'noisy'), null, 'ended at the release');
       assert.ok(has(f, 'Someone asked for you.'), "the subconscious's note is delivered with the release");
