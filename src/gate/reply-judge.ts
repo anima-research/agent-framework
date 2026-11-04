@@ -208,9 +208,9 @@ function unlabelled(text: string): string {
 
 function safeJson(value: unknown): string {
   try {
-    return JSON.stringify(value) ?? '';
+    return (JSON.stringify(value) ?? '').replace(/[\u0085\u2028\u2029]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
   } catch {
-    return String(value);
+    return unlabelled(String(value));
   }
 }
 
@@ -600,12 +600,14 @@ export class ReplyJudge {
     } catch (err) {
       if ((err as { type?: unknown } | null)?.type !== 'context_length' || built.ratio <= MIN_CHARS_PER_TOKEN) throw err;
       this.anchors.delete(built.agentName);
+      const refused = built;
+      if (request.signal.aborted) throw new Error('the judge was stopped before its request');
+      built = await this.build(request, Date.now(), MIN_CHARS_PER_TOKEN);
       if (request.signal.aborted) throw new Error('the judge was stopped before its request');
       console.error(
-        `[gate] the reply judge's request of ${built.chars} characters, built at ${built.ratio.toFixed(2)} characters a token, `
+        `[gate] the reply judge's request of ${refused.chars} characters, built at ${refused.ratio.toFixed(2)} characters a token, `
         + `was refused as too long, so the batch is asked once more at ${MIN_CHARS_PER_TOKEN} character a token`,
       );
-      built = await this.build(request, Date.now(), MIN_CHARS_PER_TOKEN);
       response = await this.ask(built, request.signal);
     }
     const usage = (response as NormalizedResponse).details?.usage;

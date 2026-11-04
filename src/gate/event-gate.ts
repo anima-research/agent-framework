@@ -4397,7 +4397,7 @@ export class EventGate {
           ...(deciding ? ['the judge answers WAIT when its calls are no longer refused'] : []),
           ...(turnHolds ? ["a turn or the host's quiesce holds it past the refusal's end"] : []),
         ];
-        const later = deciding ? ', at its due time or, if the judge is still deciding the rule\'s batch then, once it decides' : '';
+        const later = `, at its due time${deciding ? ' or, if the judge is still deciding the rule\'s batch then, once it decides' : ''}, or, if a turn is running then, once none is`;
         const unless = toJudge.length > 0 ? `, unless ${toJudge.join(' or ')}, which sends it to the judge` : '';
         if (delivered > 0) {
           wakes.push({ at: state.dueAt, certain: toJudge.length === 0, what: `${rule} batch of ${count(delivered)}, delivered without the judge while its calls are refused${later}${unless}` });
