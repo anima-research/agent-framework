@@ -21747,7 +21747,7 @@ export class AgentFramework {
       );
       this.emitTrace({ type: 'message:added', messageId: mid, source: 'delivery-receipt' });
     } catch (err) {
-      console.error('delivery receipt append failed:', err);
+      console.error(`[delivered] ${agent.name}: its receipt couldn't be recorded; it named ${places.length > 0 ? places.map(logValue).join(' · ') : 'no place'}:`, err);
     }
   }
 
@@ -27805,6 +27805,10 @@ export class AgentFramework {
       // with its scripts returned while its turn waited, is routed, each
       // unanswered send counting as one that may have posted anywhere.
       this.decideWaitingRound(agent, myStreamId, 'its stream ended');
+      // A stream whose agent was released or replaced writes no receipt from
+      // here, so what its turn's asks name is logged as each answers. A turn
+      // whose receipt took its asks (settleSpeechAsks) is left as it is.
+      if (this.agents.get(agent.name) !== agent) this.abandonSpeechAsks(agent.name, streamRouting);
 
       // Spec 14.3: once the deliveries this stream queued have run, close
       // each channel it streamed to (completeOutgoing). Every exit path does,
