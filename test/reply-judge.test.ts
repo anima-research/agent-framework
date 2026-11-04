@@ -150,32 +150,24 @@ describe('reply judge: a request refused as too long', () => {
     assert.ok(size(requests[2]!) < size(requests[1]!), `${size(requests[2]!)} < ${size(requests[1]!)}`);
   });
 
-  it('keeps the lower ratio for later batches, down to one character a token, where a refusal is no longer asked again', async () => {
+  it('asks a refused request once more at one character a token and leaves the estimate as it was, and asks one built at one character a token only once', async () => {
     const { membrane, requests } = refusingMembrane(() => true);
     const judge = judgeOver(membrane);
     const asked: number[] = [];
-    for (let i = 0; i < 3; i++) {
+    const ask = async () => {
       const before = requests.length;
       await quietly(() => assert.rejects(judge.judge(judgeRequest()), /prompt is too long/));
       asked.push(requests.length - before);
-    }
+    };
+    await ask();
+    await ask();
+    assert.strictEqual(judge.estimateRatio(), 3);
+    (judge as unknown as { charsPerToken: number }).charsPerToken = 1;
+    await ask();
     assert.deepStrictEqual(asked, [2, 2, 1]);
-    assert.strictEqual(judge.estimateRatio(), 1);
   });
 
-  it('halves the ratio once for two requests built at it and refused together', async () => {
-    const { membrane, requests } = refusingMembrane(() => true);
-    const judge = judgeOver(membrane);
-    const asking = (content: string) => judgeRequest({ events: [{ eventType: 'mcpl:channel-incoming', channel: '#garden', authorId: 'u1', addressed: false, content, at: Date.now() - 5000 }] });
-    const settled = await quietly(() => Promise.allSettled([judge.judge(asking('call one')), judge.judge(asking('call two'))]));
-    assert.deepStrictEqual(settled.map((s) => s.status), ['rejected', 'rejected']);
-    assert.ok(settled.every((s) => s.status === 'rejected' && /prompt is too long/.test(String(s.reason))), 'premise: each call was refused as too long');
-    const sentBy = (content: string) => requests.filter((r) => JSON.stringify(r).includes(content)).length;
-    assert.deepStrictEqual([sentBy('call one'), sentBy('call two')], [2, 2], 'premise: each call sent its request and its retry');
-    assert.strictEqual(judge.estimateRatio(), 1.5);
-  });
-
-  it('builds its second request at the halved ratio, though another call moves the estimate while its preview is read', async (t) => {
+  it('builds its second request at one character a token, though another call moves the estimate while its preview is read', async (t) => {
     t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
     const { membrane, requests, size } = refusingMembrane(1);
     let previews = 0;
@@ -195,47 +187,11 @@ describe('reply judge: a request refused as too long', () => {
     assert.strictEqual(requests.length, 2);
     assert.strictEqual(previews, 2, 'premise: the estimate moved during the second request\'s preview');
     assert.ok(size(requests[1]!) < size(requests[0]!), `${size(requests[1]!)} < ${size(requests[0]!)}`);
-    const halved = refusingMembrane(0);
-    const atHalf = judgeOver(halved.membrane);
-    (atHalf as unknown as { charsPerToken: number }).charsPerToken = 1.5;
-    await atHalf.judge(judgeRequest({ events }));
-    assert.strictEqual(size(requests[1]!), size(halved.requests[0]!), 'the retry is the request a judge at 1.5 characters a token builds');
-  });
-
-  it('builds its second request at an estimate another refusal lowered below the halved ratio meanwhile', async () => {
-    const { membrane, requests } = refusingMembrane((n) => n <= 3);
-    let previews = 0;
-    let retryAsked!: () => void;
-    const retryPreviewing = new Promise<void>((resolve) => { retryAsked = resolve; });
-    let release!: () => void;
-    const released = new Promise<void>((resolve) => { release = resolve; });
-    const judge = new ReplyJudge({
-      membraneFor: () => membrane, chooseAgent: (n) => n[0],
-      preview: async () => {
-        if (++previews === 2) {
-          retryAsked();
-          await released;
-        }
-        return { messages: conversation(60), config: { model: 'x', maxTokens: 1 } };
-      },
-      options: { maxInputTokens: 4_000 },
-    });
-    const events = Array.from({ length: 30 }, (_, i) => ({
-      eventType: 'mcpl:channel-incoming', channel: '#garden', authorId: `u${i}`, addressed: false,
-      content: `question ${i} about the beds ${'y'.repeat(60)}`, at: Date.now() - 5000 + i,
-    }));
-    await quietly(async () => {
-      const first = judge.judge(judgeRequest({ events }));
-      await retryPreviewing;
-      await assert.rejects(judge.judge(judgeRequest({ events })), /prompt is too long/);
-      assert.strictEqual(judge.estimateRatio(), 1, "premise: the other call's refusals lowered the estimate below the first call's halved ratio");
-      release();
-      await first;
-    });
-    assert.strictEqual(requests.length, 4);
-    const shown = (r: NormalizedRequest) => ((r.messages.at(-1)!.content[0] as { text: string }).text.match(/question \d+ about the beds/g) ?? []).length;
-    assert.ok(shown(requests[2]!) < 30, `premise: the events budget binds at one character a token (${shown(requests[2]!)} shown)`);
-    assert.ok(shown(requests[3]!) <= shown(requests[2]!), `${shown(requests[3]!)} <= ${shown(requests[2]!)}`);
+    const floor = refusingMembrane(0);
+    const atFloor = judgeOver(floor.membrane);
+    (atFloor as unknown as { charsPerToken: number }).charsPerToken = 1;
+    await atFloor.judge(judgeRequest({ events }));
+    assert.strictEqual(size(requests[1]!), size(floor.requests[0]!), 'the retry is the request a judge at one character a token builds');
   });
 
   it("isn't asked again for any other failure", async () => {
@@ -585,9 +541,9 @@ describe('reply judge: the document', () => {
     }
   });
 
-  it("tells the judge the agent sees what was stored as it arrived when something next wakes it, not that the events stay in its context", () => {
+  it("tells the judge that what was stored as it arrived stays stored for when something next wakes the agent, not that the events stay in its context", () => {
     const prompt = judgeSystemPrompt('Scout');
-    assert.ok(prompt.includes("letting the events go by means it won't act on them until something else wakes it (what was stored as it\narrived, it will see then)."), prompt);
+    assert.ok(prompt.includes("letting the events go by means it won't act on them until something else wakes it (what was stored as it\narrived stays stored for then)."), prompt);
     assert.ok(!prompt.includes('stay in its context'), prompt);
   });
 
@@ -711,6 +667,15 @@ describe('reply judge: the document', () => {
       }
       assert.ok(short.endsWith('] hi'), short.slice(-20));
     }
+  });
+
+  it("cuts a long message to its bound, keeping all of it but the cut marker's own length", () => {
+    const text = renderMessage({
+      participant: 'A',
+      content: ['b'.repeat(5_000), 'c'.repeat(5_000), 'd'.repeat(5_000)].map((t) => ({ type: 'text', text: t })),
+    } as unknown as NormalizedMessage);
+    assert.match(text, /\[…3036 characters cut…\]/);
+    assert.ok(text.length >= 11_998 && text.length <= 12_000, String(text.length));
   });
 
   it("escapes markup characters in a participant's name, an event's channel and its author", () => {
