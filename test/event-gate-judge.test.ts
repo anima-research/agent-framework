@@ -672,7 +672,7 @@ describe('judge rules: timing', () => {
     gate.evaluate({ content: 'hi', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c2' });
     const due = (name: string) => (gate as unknown as { debounceTimers: Map<string, { dueAt: number }> }).debounceTimers.get(name)!.dueAt;
     assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => [w.what, w.certain, w.at]), [
-      ['rule "soon"\'s batch of 1 event, delivered without the judge while its calls are refused, at its due time, or, if a turn is running then, once none is', true, due('soon')],
+      ['rule "soon"\'s batch of 1 event, delivered without the judge while its calls are refused', true, due('soon')],
       ['rule "later"\'s batch of 1 event goes to the judge', false, due('later')],
     ]);
     gate.dispose();
@@ -688,7 +688,7 @@ describe('judge rules: timing', () => {
     gate.evaluate(chat('second'));
     gate.onInferenceStarted('other');
     assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => [w.what, w.certain]), [
-      ['rule "ambient"\'s batch of 1 event, delivered without the judge while its calls are refused, at its due time, or, if a turn is running then, once none is', true],
+      ['rule "ambient"\'s batch of 1 event, delivered without the judge while its calls are refused, at its due time or, if a turn is still running then, once none is', true],
     ]);
     const due = (gate as unknown as { debounceTimers: Map<string, { dueAt: number }> }).debounceTimers.get('ambient')!.dueAt;
     await advance(due - Date.now() + 50);
@@ -698,6 +698,37 @@ describe('judge rules: timing', () => {
     assert.strictEqual(judge.requests.length, 1, 'without the judge');
     gate.dispose();
   });
+
+  for (const releasedAt of ['before', 'after'] as const) {
+    it(`under onError 'wake', a batch due while the host is quiesced through a refusal's stated wait is listed with the quiesce, and is ${releasedAt === 'before' ? 'delivered without the judge at the release, which comes before the wait ends' : 'sent to the judge at the release, which comes after the wait ends'}`, async () => {
+      const judge = scriptedJudge();
+      const { gate, wakes } = makeGate(writeConfig(`refused-wake-quiesced-${releasedAt}.json`, JUDGED), { judge: judge.fn, residents: ['agent'] });
+      gate.evaluate(chat('first'));
+      await until(() => judge.waiting() === 1, 'the judge call');
+      judge.fail(refusal("scout's provider calls are held", 5_000));
+      await until(() => judgeState(gate).verdicts.refused === 1 && wakes.length === 1, 'the refused batch delivered');
+      gate.evaluate(chat('second'));
+      gate.setQuiesced(true);
+      assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => [w.what, w.certain]), [[
+        'rule "ambient"\'s batch of 1 event, delivered without the judge while its calls are refused, at its due time or, if the host is still quiesced then, once it isn\'t, unless the host\'s quiesce holds it past the refusal\'s end, which sends it to the judge', false,
+      ]]);
+      const end = refusalEnd(gate);
+      await advance(releasedAt === 'before' ? 1_000 : end - Date.now() + 1_000);
+      await until(() => judgeState(gate).heldCount === 1, 'the batch held through the quiesce');
+      assert.strictEqual(wakes.length, 1, 'premise: nothing delivered while quiesced');
+      assert.strictEqual(Date.now() < end, releasedAt === 'before', 'premise: the release comes on the side of the refusal\'s end named');
+      gate.setQuiesced(false);
+      if (releasedAt === 'before') {
+        await until(() => wakes.length === 2, 'delivered at the release');
+        assert.strictEqual(judge.requests.length, 1, 'without the judge');
+      } else {
+        await until(() => judge.requests.length === 2, 'the judge asked at the release');
+        assert.deepStrictEqual(judge.requests[1]!.events.map((e) => e.content), ['second']);
+        assert.strictEqual(wakes.length, 1, 'not delivered unjudged');
+      }
+      gate.dispose();
+    });
+  }
 
   it("under onError 'wake', while a refusal's stated wait lasts, the wake list counts only a batch's events whose channel isn't held now, and leaves out a batch with none", async () => {
     const judge = scriptedJudge();
@@ -717,7 +748,7 @@ describe('judge rules: timing', () => {
     gate.evaluate({ content: 'hi', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c-held' });
     tunedOut = true;
     assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => [w.what, w.certain]), [
-      ['rule "soon"\'s batch of 1 event, delivered without the judge while its calls are refused, at its due time, or, if a turn is running then, once none is', true],
+      ['rule "soon"\'s batch of 1 event, delivered without the judge while its calls are refused', true],
     ]);
     gate.dispose();
   });
@@ -755,10 +786,10 @@ describe('judge rules: timing', () => {
     await until(() => judgeState(gate).verdicts.refused === 1, 'the refusal recorded');
     gate.evaluate(chat('second'));
     const listed = () => gate.upcomingWakes(['agent']).map((w) => [w.what, w.certain]);
-    assert.deepStrictEqual(listed(), [['rule "ambient"\'s batch of 1 event, delivered without the judge while its calls are refused, at its due time, or, if a turn is running then, once none is', true]], 'premise: certain while no turn runs');
+    assert.deepStrictEqual(listed(), [['rule "ambient"\'s batch of 1 event, delivered without the judge while its calls are refused', true]], 'premise: certain while no turn runs');
     gate.onInferenceStarted('agent');
     assert.deepStrictEqual(listed(), [[
-      'rule "ambient"\'s batch of 1 event, delivered without the judge while its calls are refused, at its due time, or, if a turn is running then, once none is, unless a turn or the host\'s quiesce holds it past the refusal\'s end, which sends it to the judge', false,
+      'rule "ambient"\'s batch of 1 event, delivered without the judge while its calls are refused, at its due time or, if a turn is still running then, once none is, unless a turn holds it past the refusal\'s end, which sends it to the judge', false,
     ]]);
     await until(() => judgeState(gate).heldCount === 1, 'the batch held for the turn');
     assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => [w.what, w.certain, w.when]), [[
@@ -782,7 +813,7 @@ describe('judge rules: timing', () => {
       `rule "ambient"'s batch of 1 event, ${held}`,
     ], 'premise: no turn runs');
     gate.onInferenceStarted('agent');
-    const past = " and, past the refusal's end, while a turn or the host's quiesce holds it";
+    const past = " and, past the refusal's end, while a turn holds it";
     assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => [w.what, w.certain, w.at]), [
       [`rule "ambient"'s batch of 1 event, which joins its held batch when it fires, ${held}${past}`, false, end],
       [`rule "ambient"'s batch of 1 event, ${held}${past}`, false, end],
@@ -814,7 +845,7 @@ describe('judge rules: timing', () => {
     const asked = () => judge.requests.map((r) => [r.policyName, r.events.map((e) => e.content)]);
     return { ...made, judge, internal, listed, due: internal.debounceTimers.get('deciding')!.dueAt, end: internal.judgeRefusal.until, delivered, held, asked };
   };
-  const decidingWake = 'rule "deciding"\'s batch of 1 event, delivered without the judge while its calls are refused, at its due time or, if the judge is still deciding the rule\'s batch then, once it decides, or, if a turn is running then, once none is, unless the judge answers WAIT when its calls are no longer refused, which sends it to the judge';
+  const decidingWake = 'rule "deciding"\'s batch of 1 event, delivered without the judge while its calls are refused, at its due time or, if the judge is still deciding the rule\'s batch then, once it decides, unless the judge answers WAIT when its calls are no longer refused, which sends it to the judge';
   const decidingSkip = 'rule "deciding"\'s batch of 1 event, held for the judge while its calls are refused, unless the judge\'s REPLY to the rule\'s batch it is deciding delivers it first';
 
   for (const order of ['fired first', 'decided first'] as const) {
