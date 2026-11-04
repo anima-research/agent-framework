@@ -131,12 +131,17 @@ interface WindowStartsState {
  * `noteKept`: the caller's note waits with the cancel, and the answer says
  * what becomes of it: delivered when the hold ends, else told lost to its
  * author (tellNoteLost), a notice that can't be written being traced and
- * tried again (writeLossNotices) until the host stops, and lost untold at a
- * stop before the hold ends. The cancel can't wait for the delivery, which
- * comes only when the hold ends. A reader fork's (`fork`) goes out as its
- * mail even after its run has ended (deliverReaderNote), but a notice of
- * its loss reaches it only while it runs: an ended fork is no agent the
- * framework writes to, and the loss is then traced only (writeLossNotice).
+ * tried again (writeLossNotices) until it is written, and, for the
+ * persistent subconscious (`persistent`), kept in the store too
+ * (writeLossRecord), so the next boot writes one a stop left unwritten
+ * (restoreLossNotices). The waiting cancel, and the note with it, is kept
+ * in memory only: a stop before the hold ends loses both, untold. The
+ * cancel can't wait for the delivery, which comes only when the hold ends.
+ * A reader fork's (`fork`) goes out as its mail even after its run has
+ * ended (deliverReaderNote), but a notice of its loss reaches it only while
+ * it runs: an ended fork is no agent the framework writes to, and the loss
+ * is then traced only (writeLossNotice); a stop drops a fork's notice not
+ * yet written.
  */
 export function cancelWaitsNote(what: string, noteDropped = false, noteKept?: 'persistent' | 'fork'): string {
   const hold = what.charAt(0).toLowerCase() + what.slice(1);
@@ -150,17 +155,18 @@ export function cancelWaitsNote(what: string, noteDropped = false, noteKept?: 'p
     + (noteKept === 'persistent' && !noteDropped
       ? ` Your note waits with the cancel and is delivered when ${hold} ends. If it can't be delivered then, you are `
         + 'told so in your context, and why. If writing that notice fails too, the failure is traced for the host, and '
-        + `the notice is ${retry}written or the host stops.`
+        + `the notice is ${retry}written. The notice is kept in the store as well, unless the store refuses that too: `
+        + 'if the host stops before the notice is written, the host writes it when it starts again, or keeps trying as '
+        + 'above. The waiting cancel and your note aren\'t kept in the store: if the host stops before '
+        + `${hold} ends, both are lost, and you are not told.`
       : '')
     + (noteKept === 'fork' && !noteDropped
       ? ` Your note waits with the cancel and goes to the resident as your mail when ${hold} ends, even if your run `
         + 'has ended by then. If it can\'t be delivered then, you are told so in your context, and why, but only while '
         + 'your run lasts: once it has ended, nothing can be written to you, so the loss reaches no one and is only '
         + 'traced for the host. If writing that notice fails while you still run, the failure is traced for the host, '
-        + `and the notice is ${retry}written, your run ends, or the host stops.`
-      : '')
-    + (noteKept && !noteDropped
-      ? ` If the host stops before ${hold} ends, your note is lost with the cancel, and you are not told.`
+        + `and the notice is ${retry}written, your run ends, or the host stops. If the host stops before ${hold} ends, `
+        + 'your note is lost with the cancel, and you are not told.'
       : '');
 }
 

@@ -813,7 +813,7 @@ test("65 follow-up (Isaac-3593, round 3): a kept notice of a cancel dropped for 
   }
 });
 
-test("65 follow-up (Isaac-3593, round 3): the subconscious's cancel_tuneout that waits with its note says when the note is delivered, that a loss is told, and what follows a notice that can't be written", async () => {
+test("65 follow-up (Isaac-3593, round 3; Ivy-3594, round 6): the subconscious's cancel_tuneout that waits with its note says when the note is delivered, that a loss is told, that a notice that can't be written is kept in the store for the next boot, and that a stop loses the waiting cancel and the note", async () => {
   const errors = mock.method(console, 'error', () => {});
   const h = epochSetup();
   try {
@@ -827,8 +827,10 @@ test("65 follow-up (Isaac-3593, round 3): the subconscious's cancel_tuneout that
     const kept = (hold: string) => ` Your note waits with the cancel and is delivered when ${hold} ends. If it can't be `
       + 'delivered then, you are told so in your context, and why. If writing that notice fails too, the failure is '
       + 'traced for the host, and the notice is tried again every 60 s, except while such a change or refusal lasts, and '
-      + `as soon as one ends, until it is written or the host stops. If the host stops before ${hold} ends, your note is `
-      + 'lost with the cancel, and you are not told.';
+      + 'as soon as one ends, until it is written. The notice is kept in the store as well, unless the store refuses '
+      + 'that too: if the host stops before the notice is written, the host writes it when it starts again, or keeps '
+      + 'trying as above. The waiting cancel and your note aren\'t kept in the store: if the host stops before '
+      + `${hold} ends, both are lost, and you are not told.`;
     assert.deepEqual(
       await h.coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'disc:guild:a', serverId: 'disc', text: 'Look here.' }, [], 'Subconscious'),
       { success: true, data: { waiting: true, note: `${waits}The tune-out stays in force until then, and what it held is delivered when it ends. ${stop}${kept('the tune-out')}` } });
