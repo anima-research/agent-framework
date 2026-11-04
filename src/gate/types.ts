@@ -70,8 +70,8 @@ export interface PassiveSampleConfig {
  * more. Rules are read in order, as ever: a mention rule placed ahead
  * of a judge rule wakes the agent without the judge. A judge that fails or
  * times out wakes the agent (fail open),
- * unless the host set its `onError` to `"skip"`. A call the framework refuses
- * without making it isn't a failure, and `onError` decides it as well: under
+ * unless the host set its `onError` to `"skip"`. A call whose request the
+ * framework refuses to send isn't a failure, and `onError` decides it as well: under
  * `"skip"` its batch is held while the judge's calls are refused
  * (ReplyJudgeOptions.onError).
  */
@@ -354,8 +354,8 @@ export interface ReplyJudgeOptions {
   /**
    * What a judge that fails, times out or answers unreadably does: `"wake"`
    * wakes the agent as a debounce would (the default, so a judge outage
-   * never silences the agent); `"skip"` doesn't. It decides a call the
-   * framework refuses without making it too (a hold on the agent's provider
+   * never silences the agent); `"skip"` doesn't. It decides a call whose
+   * request the framework refuses to send too (a hold on the agent's provider
    * calls or on the judge's model, a surgery's hold on the store, or a
    * stopping framework), which isn't counted as a failure. Under `"wake"`,
    * the refused call's batch wakes the agent, and while a refusal's stated
@@ -631,7 +631,7 @@ export interface GatePolicyStats {
     /** Events held for the judge until the agent's turn (or the host's quiesce) ends, or a refusal's hold ends. */
     heldCount: number;
     /** Verdicts so far: woke the agent, let the batch go by, judge failures,
-     *  and calls the framework refused without making them. */
+     *  and calls whose request the framework refused to send. */
     verdicts: { reply: number; wait: number; error: number; refused: number };
     /** The newest verdict. */
     last?: {
