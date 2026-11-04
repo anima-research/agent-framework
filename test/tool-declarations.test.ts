@@ -661,7 +661,7 @@ describe('toolDeclarations', () => {
     const price = priceOf({ type: 'system_change', defineTools: [tool('b')] });
     const [tenth, short] = [price * 10, price * 5 + 1];
 
-    it('moves the changes into the head once they reach a tenth of the input, at a compile that re-renders from before them', async () => {
+    it('moves the changes into the head once they reach a tenth of the input, at a compile that re-renders from the first of them', async () => {
       let at: number | null = null;
       const { agent, context, heads, events } = await withOneChange(tenth, () => at);
       at = changeIndex(context.rows);

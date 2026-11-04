@@ -4,8 +4,8 @@
  * injections (src/stored-injections.ts). context-manager's derive gives the
  * fork its source's view filter, which leaves out every stored injection but
  * the source's own, so the framework replaces it (deriveSharedContext) and
- * records the same predicate for main's checks of whether an agent sees a row
- * (storeViews, agentSees). Reopened after it ends, a fork's context keeps the
+ * records it for main's checks of whether an agent sees a row (storeViews,
+ * agentSees). Reopened after it ends, a fork's context keeps the
  * view it had live, a fork of a fork's included (reopenAgentContext).
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';

@@ -16361,7 +16361,7 @@ export class AgentFramework {
       this.headDeclarationsUnreadable.delete(agentName);
       return head;
     } catch (error) {
-      if (this.headDeclarationsUnreadable.get(agentName) !== branch) console.error(`[head-declarations] ${agentName}: the recorded head could not be read:`, error);
+      if (this.headDeclarationsUnreadable.get(agentName) !== branch) console.error(`[head-declarations] ${agentName}: the recorded head could not be read, so its requests go on its current head, which it records in its place once it can:`, error);
       this.headDeclarationsUnreadable.set(agentName, branch);
       return undefined;
     }
@@ -16373,7 +16373,7 @@ export class AgentFramework {
     try {
       this.store.setStateJson(this.headStateId(agentName), head);
     } catch (error) {
-      console.error(`[head-declarations] ${agentName}: the recorded head could not be stored:`, error);
+      console.error(`[head-declarations] ${agentName}: the recorded head could not be stored, so what was recorded stays, with the agent's change rows, until a later request stores it:`, error);
       return false;
     }
     this.headsOnBranch().set(agentName, head);
@@ -16410,7 +16410,7 @@ export class AgentFramework {
       if (event.type === 'head:moved' && event.forced) {
         const why = event.forced === 'budget'
           ? `a compile was refused over budget with ${event.changesRemoved} system changes kept, so the head took them and the compile ran again`
-          : `the system changes reached ${event.changeTokens} tokens, a fifth of the last response's ${event.inputTokens}, and no compile had taken them into the head at no further cost, so the head took them`;
+          : `the system changes reached ${event.changeTokens} tokens, at least a fifth of the last response's ${event.inputTokens}, and no compile had taken them into the head at no further cost, so the head took them`;
         this.opsAlert('head-consolidated', agent.name,
           `${why}: one whole write${this.thinkingSetAside(agent, 'and the thinking the request held set aside')}`,
           { data: { forced: event.forced, changesRemoved: event.changesRemoved, ...(event.forced === 'share' ? { changeTokens: event.changeTokens, inputTokens: event.inputTokens } : {}) } });

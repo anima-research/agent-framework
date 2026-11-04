@@ -138,7 +138,8 @@ export interface AgentConfig {
    *   later change to the tools, or addition to the system text, goes into
    *   the context as a system change at the point it took effect, which the
    *   provider reads without rewriting what came before. A replacement of
-   *   system text, and consolidation once changes reach a tenth of the input,
+   *   system text, and consolidation once changes reach a tenth of the input
+   *   at a compile that already rewrites them, or a fifth at any compile,
    *   move the head to what's current, with one write. Only for models that
    *   take mid-conversation system messages on the native formatter: the
    *   host's model records say which. Membrane refuses a system change any
@@ -161,7 +162,10 @@ export interface AgentConfig {
    * subconscious's compile, which leaves out every change row but its own,
    * holds its own until a request on the head clears its record, if any, and
    * takes them out); it keeps
-   * each agent's recorded head in its store, so a restart keeps the head;
+   * a resident's and a conversation fork's recorded head in its store, so a
+   * restart keeps it (an ephemeral agent's, a resumed one's included, is kept
+   * in memory, so a resumed agent adopts its current head at its first
+   * request);
    * and when a request carrying a change
    * ends with a refusal membrane recognises, or with a 400 it doesn't file
    * as context overflow or an account refusal (`type` `context_length` or
@@ -171,7 +175,9 @@ export interface AgentConfig {
    * out of its context once its record is cleared (a record the store can't
    * clear keeps them until it can), while its compile, made as an
    * `'entries'` agent's, holds a host's until then. An Agent used without the framework
-   * keeps its head in memory and has no such resend. The direct API
+   * keeps its head in memory and has no such resend, and consolidates past a
+   * share of the input only if its host reports each response's input
+   * (`noteResponseInput`). The direct API
    * (runInference) declares nothing: it sends the tools its caller passes
    * and the current system text, and leaves the context's changes out.
    *

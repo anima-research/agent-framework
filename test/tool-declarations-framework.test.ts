@@ -833,7 +833,7 @@ describe('toolDeclarations in the framework', () => {
           console.error = error;
           internals.store.getStateJson = get;
         }
-        assert.deepEqual(errors, ['[head-declarations] alpha: the recorded head could not be read:'], 'said once on the branch');
+        assert.deepEqual(errors, ['[head-declarations] alpha: the recorded head could not be read, so its requests go on its current head, which it records in its place once it can:'], 'said once on the branch');
         assert.deepEqual((get('framework/head-declarations/alpha') as { tools: ToolDefinition[] }).tools, [tool('a'), tool('c')], 'the record is written again');
         assert.deepEqual((internals.headDeclarations.read('beta') as { tools: ToolDefinition[] }).tools, [tool('b')], "beta's is read as before");
       });

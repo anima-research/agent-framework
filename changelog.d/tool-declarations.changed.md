@@ -1,11 +1,21 @@
-- An agent on its head (`toolDeclarations: 'head'`, the default), which sends
-  no system change, now leaves change rows out of what it compiles too, so a
-  host's `system_change` rows no longer count against its budget. Every
+- An agent on its head (`toolDeclarations: 'head'`, the default) now sends no
+  system change: a host's `system_change` rows in its context, which its
+  requests carried before, stay out of them, and out of what it compiles, so
+  they no longer reach its model or count against its budget. Every
   context manager the framework opens for such an agent leaves them out of its
   view: a resident's, an ephemeral agent's, isolated or derived, a resumed
   agent's and a conversation fork's. An inspection (`inspectAgentContext`)
   still shows the change rows stored. The subconscious's view is as it was,
   since it already left out every change row not its own.
+- The history module's `extract` returns a system change as its type alone
+  with `format: "raw"`, and as `[system change]` with `"text"`, since what it
+  declared may be another agent's tools and system text. Its tool description
+  says so, so an agent with the history module has its tools written to the
+  provider's cache afresh once at the upgrade.
+- Going back to an earlier release after an agent has declared changes under
+  `'entries'`: that release compiles the stored change rows as it does any
+  row, so an agent sends them as written beside its current head, and a
+  resident in the residents' shared slot sends the other residents' as well.
 - A resident's registry record now states its `selfParticipants` and
   `presentAs`, as a derived agent's does, so `inspect` shows them and a
   context reopened from records reads the mapping that ran.

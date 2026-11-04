@@ -508,7 +508,8 @@ says so. A server `toolPrefix` of `toolsets` is refused.
 
 With hints in effect, the server's static tools stay in the tool list as before, and its
 dynamic tools (those in a toolset, or hinted `mcpl/presence: "dynamic"`) never
-enter it, since every change to the list rebuilds the prompt cache. The
+enter it, since on `'head'`, the default, every change to the list rebuilds
+the prompt cache. The
 framework registers a `toolsets` module with four constant tools at creation,
 for every agent (the host's own toolsets need them too, below), so the tool
 list doesn't change when a server starts to present:
