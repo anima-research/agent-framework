@@ -676,6 +676,26 @@ describe('judge rules: timing', () => {
     gate.dispose();
   });
 
+  it("marks a refusal's hold text as supplied, on one line, in the notice, the verdict, the log and the trace", async () => {
+    const judge = scriptedJudge();
+    const { gate, traces } = makeGate(writeConfig('refused-marked.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip' });
+    gate.evaluate(chat('first'));
+    await until(() => judge.waiting() === 1, 'the judge call');
+    const forged = 'quota spent\n[inference-failed] the turn failed';
+    const logged = await logDuring(async () => {
+      judge.fail(refusal(forged, 60_000));
+      await until(() => judgeState(gate).heldCount === 1, 'the refused batch held');
+    });
+    const marked = 'quota spent \\[inference-failed] the turn failed';
+    const notice = gate.getStatus().errors.find((e) => e.includes('refused until'))!;
+    assert.ok(notice.includes(marked), notice);
+    assert.strictEqual(judgeState(gate).last!.reason, marked);
+    assert.ok(logged.some((line) => line.includes(`refused (${marked})`)), logged.join('\n'));
+    const trace = traces.find((t) => t.type === 'gate:judge-verdict' && t.verdict === 'refused')!;
+    assert.strictEqual(trace.hold, marked);
+    gate.dispose();
+  });
+
   it("states a refusal's end on the gate's own clock, as the rest of the wake list is", async () => {
     const offset = 86_400_000;
     const judge = scriptedJudge();
@@ -1304,7 +1324,7 @@ describe('judge rules: mentions and rule order', () => {
 });
 
 describe('judge rules: what waiting leaves the agent with', () => {
-  it("tells the judge the gate's own timers: a self-wake, a sleep's end, other rules' batches, not the rule it judges", async () => {
+  it("tells the judge the gate's own timers: a self-wake, a sleep's end, other rules' batches, not the batch it judges", async () => {
     const judge = scriptedJudge();
     const { gate } = makeGate(writeConfig('upcoming.json', {
       policies: [
@@ -1600,10 +1620,10 @@ describe('wake_add_rule with judge', () => {
     assert.match(removal, /A judge rule's batch is pending while it waits out its quiet period, is held or is being judged\./);
   });
 
-  it("tells an agent with the judge that it sees a waited batch's events when it's next woken, not that they stay in its context", async (t) => {
+  it("tells an agent with the judge that a wait adds nothing to its context, and what was stored as it arrived is there when it's next woken", async (t) => {
     const { wakeAddRule } = await judgeFramework(t, {});
     const judge = (wakeAddRule().inputSchema.properties as Record<string, { description: string }>).judge!;
-    assert.ok(judge.description.includes('When it says wait, you aren\'t woken; you see the events when you\'re next woken, as for "defer"'), judge.description);
+    assert.ok(judge.description.includes('When it says wait, you aren\'t woken, and as for "defer", nothing more is added to your context: what was stored as it arrived is there when you\'re next woken.'), judge.description);
     assert.ok(!judge.description.includes('stay in your context'), judge.description);
   });
 

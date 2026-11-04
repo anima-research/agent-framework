@@ -519,9 +519,9 @@ describe('reply judge: the document', () => {
     }
   });
 
-  it("tells the judge the agent sees events it lets go by when something next wakes it, not that they stay in its context", () => {
+  it("tells the judge the agent sees what was stored as it arrived when something next wakes it, not that the events stay in its context", () => {
     const prompt = judgeSystemPrompt('Scout');
-    assert.ok(prompt.includes("letting the events go by means it won't act on them until something else wakes it (it will see them then)."), prompt);
+    assert.ok(prompt.includes("letting the events go by means it won't act on them until something else wakes it (what was stored as it\narrived, it will see then)."), prompt);
     assert.ok(!prompt.includes('stay in its context'), prompt);
   });
 

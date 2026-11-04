@@ -337,7 +337,7 @@ export interface ReplyJudgeOptions {
    *  `claude-haiku-5-5`. */
   model?: string;
   /**
-   * The most input tokens one judge request may carry, its instructions and
+   * The budget of input tokens for one judge request, its instructions and
    * the batch included; the context document is cut from its oldest end to
    * fit. Default 90,000, under the 100,000 input tokens past which Claude
    * Haiku 5.5 costs five times as much. Tokens are estimated from characters,
@@ -366,8 +366,10 @@ export interface ReplyJudgeOptions {
    * arrive are held with it, a rule keeping its newest 100 events as it does
    * while a turn holds them, and they're judged once the wait ends or the
    * hold is released. A refusal that states no end keeps them held until a
-   * later batch's call, which takes them in, gets a verdict, or the hold is
-   * released.
+   * later batch's call, which takes in its own rule's held batch, gets a
+   * verdict, or the hold is released. A later call that fails lets its batch
+   * go, with the held events it took in, as a failed call's batch goes under
+   * `"skip"`.
    */
   onError?: 'wake' | 'skip';
   /** The judge's effort (`output_config.effort`). Default `"low"`: a short
