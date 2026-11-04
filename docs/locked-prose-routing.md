@@ -127,7 +127,8 @@ same reason.
 - Notices name `prose_locus`, and the `drafts` tool, only where the
   resident's `allowedTools` let it call them.
 - A turn whose plain speech was delivered or held ends with its `[delivered]`
-  receipt. One whose delivery failed gets the failure marker instead.
+  receipt. One whose delivery failed gets the failure marker, and a receipt
+  only for a place a module named.
 
 Leaving locked mode keeps the stored lock, which applies again if the agent
 returns to locked mode.

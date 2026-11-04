@@ -215,13 +215,14 @@ describe('plain speech a module says it showed', () => {
     dir = undefined;
   });
 
-  async function host(modules: Surface[], membrane: MockMembrane, agent: Record<string, unknown> = {}, channels = true) {
+  async function host(modules: Surface[], membrane: MockMembrane, agent: Record<string, unknown> = {}, channels = true, config: Record<string, unknown> = {}) {
     dir = mkdtempSync(join(tmpdir(), 'speech-routed-'));
     framework = await AgentFramework.create({
       storePath: join(dir, 'store.chronicle'),
       membrane: membrane.asMembrane(),
       agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'Resident.', proseRouting: 'locus', ...agent }],
       modules: modules as unknown as Module[],
+      ...config,
     });
     if (channels) await (framework as unknown as { initializeMcpl(servers: []): Promise<void> }).initializeMcpl([]);
     return framework;
@@ -729,8 +730,8 @@ describe('plain speech a module says it showed', () => {
     assert.equal(texts(f).filter((text) => text.startsWith('[inference-failed]')).length, 1, 'premise: the turn failed');
     assert.equal(surface.asked.length, 1, "premise: the round's speech was asked about");
     surface.release();
-    await until(() => errors.some((e) => e.includes('after its turn ended without a receipt')), 'the late place logged');
-    assert.ok(errors.some((e) => e.startsWith('[routeSpeech] resident: shown by') && e.includes('after its turn ended without a receipt')), errors.join('\n'));
+    await until(() => errors.some((e) => e.includes('for speech of a turn that ended without a receipt')), 'the late place logged');
+    assert.ok(errors.includes('[routeSpeech] resident: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
   });
 
   it("a turn stopped while a module's answer is due logs the place it names when it answers", async (t) => {
@@ -748,8 +749,8 @@ describe('plain speech a module says it showed', () => {
     assert.equal(texts(f).filter((text) => text.startsWith('[turn-interrupted]')).length, 1, 'premise: the turn was stopped');
     assert.equal(surface.asked.length, 1, "premise: the round's speech was asked about");
     surface.release();
-    await until(() => errors.some((e) => e.includes('after its turn ended without a receipt')), 'the late place logged');
-    assert.ok(errors.some((e) => e.startsWith('[routeSpeech] resident: shown by') && e.includes('after its turn ended without a receipt')), errors.join('\n'));
+    await until(() => errors.some((e) => e.includes('for speech of a turn that ended without a receipt')), 'the late place logged');
+    assert.ok(errors.includes('[routeSpeech] resident: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
   });
 
   it("a turn whose continuation is dropped while a module's answer is due logs the place it names when it answers", async (t) => {
@@ -775,8 +776,57 @@ describe('plain speech a module says it showed', () => {
     assert.equal(internal.pendingRequests.some((r) => r.reason === 'context_budget_restart'), false, 'premise: the continuation was dropped');
     surface.release();
     await routed;
-    await until(() => errors.some((e) => e.includes('after its turn ended without a receipt')), 'the late place logged');
-    assert.ok(errors.some((e) => e.startsWith('[routeSpeech] resident: shown by') && e.includes('after its turn ended without a receipt')), errors.join('\n'));
+    await until(() => errors.some((e) => e.includes('for speech of a turn that ended without a receipt')), 'the late place logged');
+    assert.ok(errors.includes('[routeSpeech] resident: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
+  });
+
+  it("a turn whose retry's wait stop() ends logs the place a module named before it", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const surface = new Surface();
+    let waiting!: () => void;
+    const inDelay = new Promise<void>((resolve) => { waiting = resolve; });
+    const membrane = new FailsAfterFirstRound();
+    membrane.pushResponse(lookRound('Looking around.'));
+    const f = await host([surface], membrane, {}, true, {
+      errorPolicy: {
+        maxRetries: 1,
+        onInferenceError: (_error: unknown, _agent: unknown, attempt: number) => {
+          waiting();
+          return attempt < 1 ? { retry: true, delayMs: 60_000 } : { retry: false };
+        },
+      },
+    });
+    f.start();
+    push(f, 'hello');
+    await inDelay;
+    assert.equal(surface.asked.length, 1, "premise: the round's speech was asked about");
+    await f.stop();
+    await until(() => errors.some((e) => e.includes('for speech of a turn that ended without a receipt')), 'the late place logged');
+    assert.ok(errors.includes('[routeSpeech] resident: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
+  });
+
+  it("a turn whose held failure stop() ends, once it has closed admission, logs the place a module named before it", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const surface = new Surface();
+    const membrane = new FailsAfterFirstRound();
+    membrane.pushResponse(lookRound('Looking around.'));
+    const f = await host([surface], membrane, {}, true, { providerHold: () => ({ holdMs: 60_000, reason: 'zz-host-hold' }) });
+    let stopped: Promise<void> | undefined;
+    const ends: string[] = [];
+    f.onTrace((event) => {
+      if (event.type === 'inference:aborted') ends.push(String((event as { reason?: string }).reason));
+      if (event.type === 'inference:failed' && !stopped) stopped = f.stop();
+    });
+    f.start();
+    push(f, 'hello');
+    await until(() => stopped !== undefined, 'the failure, and the stop');
+    await stopped;
+    assert.equal(surface.asked.length, 1, "premise: the round's speech was asked about");
+    assert.ok(ends.some((r) => r.includes('dropped before it sends anything')), 'premise: the turn ended as a retry the stop cancels: ' + JSON.stringify(ends));
+    await until(() => errors.some((e) => e.includes('for speech of a turn that ended without a receipt')), 'the late place logged');
+    assert.ok(errors.includes('[routeSpeech] resident: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
   });
 
   it("a turn that fails after a round one module showed, while another hadn't answered, says that round's speech was handed on", async (t) => {

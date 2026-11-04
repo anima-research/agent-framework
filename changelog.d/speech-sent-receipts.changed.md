@@ -60,4 +60,8 @@
   nothing there; it is saved in your archive.", where it read "Nothing was
   posted; it is saved in your archive.", as does an ended speaker's: "The
   framework posted nothing there. <speaker> has ended.", where it read
-  "Nothing was posted. <speaker> has ended.".
+  "Nothing was posted. <speaker> has ended.", and the notice of a turn's
+  unposted tool-round speech reads "[speech-not-posted] The framework posted
+  nothing you wrote before your tool calls in the rounds just above. …",
+  where it read "… Nothing you wrote before your tool calls in the rounds
+  just above was posted. …".

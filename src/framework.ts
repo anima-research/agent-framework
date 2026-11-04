@@ -1666,8 +1666,8 @@ function notFinal(round: ProseRound): ProseRound {
 function logLateAsk(agentName: string, settled: 'receipt' | 'no receipt', asked: Promise<string[]>): void {
   void asked.then((places) => {
     if (places.length === 0) return;
-    console.error(`[routeSpeech] ${agentName}: shown by ${places.map(logValue).join(' · ')} ` +
-      (settled === 'receipt' ? "after the turn's receipt took its asks, which doesn't name it" : 'after its turn ended without a receipt'));
+    console.error(`[routeSpeech] ${agentName}: shown by ${places.map(logValue).join(' · ')}` +
+      (settled === 'receipt' ? " after the turn's receipt took its asks, which doesn't name it" : ', for speech of a turn that ended without a receipt'));
   });
 }
 
@@ -20141,8 +20141,12 @@ export class AgentFramework {
           // line stays to be decided when the host resumes.
           const lines = prev ? mergeWakeLines([prev, request]) : undefined;
           if (lines) kept.wakeLines = lines;
-          const opening = prev ? mergedOpeningMessages([prev, request]) : undefined;
-          if (opening) kept.openingMessages = opening;
+          if (prev) {
+            const pair = [prev, request];
+            const opening = mergedOpeningMessages(pair.some(hasOwnCauseForRun) ? pair.filter(hasOwnCauseForRun) : pair);
+            if (opening) kept.openingMessages = opening;
+            else delete kept.openingMessages;
+          }
           newestByKey.set(key, kept);
         }
         this.pendingRequests.push(...newestByKey.values());
@@ -21754,7 +21758,7 @@ export class AgentFramework {
         'user',
         [{
           type: 'text',
-          text: `[${NOTICE_TAG.speechNotPosted}] Nothing you wrote before your tool calls in the rounds just above was posted. ` +
+          text: `[${NOTICE_TAG.speechNotPosted}] The framework posted nothing you wrote before your tool calls in the rounds just above. ` +
             `If any of it should go out, send it again.`,
         }],
         { system: true, kind: 'speech-not-posted' },
@@ -24422,6 +24426,7 @@ export class AgentFramework {
     if (!this.providerAdmissionClosed) return false;
     const ending = this.agents?.get(agentName);
     if (ending) this.nameUnpostedSpeech(ending, routing);
+    this.abandonSpeechAsks(agentName, routing);
     this.abortDroppedTurn(agentName, turnToken, RETRY_CANCELLED_BY_STOP, startedAt);
     return true;
   }
@@ -25379,6 +25384,7 @@ export class AgentFramework {
           // but the [speech-not-posted] notice; this frame still owns its
           // token, since no retry frame replaced it.
           this.nameUnpostedSpeech(agent, routing);
+          this.abandonSpeechAsks(agent.name, routing);
           this.abortDroppedTurn(agent.name, turnToken, RETRY_CANCELLED_BY_STOP, turnStartedAt);
           if (this.activeTurnTokens.get(agent.name) === turnToken) {
             this.activeTurnTokens.delete(agent.name);
@@ -27259,6 +27265,7 @@ export class AgentFramework {
                 // gives. The finally ends its gate entry and its record. As
                 // in abortDroppedTurn, nothing when another turn of this name
                 // holds the token, whose bracket the event would end.
+                this.abandonSpeechAsks(agent.name, streamRouting);
                 const owner = this.activeTurnTokens.get(agent.name);
                 if (owner === undefined || owner === myTurnToken) {
                   if (this.agents.get(agent.name) === agent) this.nameUnpostedSpeech(agent, streamRouting);

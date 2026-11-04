@@ -1207,13 +1207,15 @@ test("a held wake that a held turn's merged retry, led by an equal wake, folds i
       const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again', 'wake');
       const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
       const start = held.splice(0, 1)[0] as unknown as Record<string, unknown>;
-      const wake: Record<string, unknown> = {};
+      const wake: Record<string, unknown> = { zzInserted: true };
       for (const key of identityKeys) if (start[key] !== undefined) wake[key] = start[key];
       held.push(wake as unknown as Request);
       (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, start);
       assert.equal(held.length, 1, 'premise: the hold folds the merged retry into the held wake');
       assert.equal(held[0], wake as unknown as Request, 'the held wake is the one kept');
       assert.equal(fw.abortInference('resident', 'zz-operator stop'), true);
+      assert.ok((internal as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests.some((r) => r.zzInserted === true),
+        'the abort puts back the wake the hold took in, not only the start\'s own');
       go();
       await waitFor(fw, () => membrane.primary >= 3, 'the held wake, as a turn of its own');
       assert.match(texts(membrane.calls[2]), /zz-during the hold/);
