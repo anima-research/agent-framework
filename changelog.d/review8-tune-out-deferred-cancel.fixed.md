@@ -10,7 +10,11 @@
   cancel's retry. It now records the epoch it was asked for. One whose epoch no longer holds is dropped at the
   release or the retry, ending nothing, and so is one a cancel of a later tune-out there finds waiting, which then
   waits in its place. Each drop is logged and traced as `tune-out:deferred-cancel-dropped`, with the epoch it was
-  for and why. A run that recorded its tune-out's end and failed after it is logged and no longer queued again.
+  for and why, and the author of a note the dropped cancel carried is told in its own context that the note was
+  dropped with it. A run that recorded its tune-out's end and failed after it is logged and no longer queued again.
+  A run that ends its tune-out and then can't write its note, or fails before it does, tells the note's author so
+  and why, and the loss is traced (`note-undelivered`); a note that can't be written no longer stops the rest of
+  that cancel.
 - A reader's note queued with a tune-out cancel that waits for held writes now reaches the resident when another
   cancel ends that tune-out first, unless writing it then fails; its author is then told so, and why. After the
   waiting cancel's first release failed, a resident's cancel, an end time or a close of the excepted channel could
@@ -19,5 +23,6 @@
   under the subconscious's name (a reader fork's as its mail), before the caller's own. If that write fails, the
   note's author is told so in its own context, with the hold, the resident and the error's text, and the loss is
   logged and traced as `tune-out:deferred-cancel-dropped` (`note-undelivered`, with the reason and the author); the
-  cancel still ends the tune-out. A reader fork that has ended by then is not told: the framework writes nothing
-  for an agent that has ended, and logs the notice it drops.
+  cancel still ends the tune-out. Each notice of a lost note gives the persistent subconscious a turn to read it.
+  A reader fork that has ended by then is not told: the framework writes nothing for an agent that has ended, and
+  logs the notice it drops.
