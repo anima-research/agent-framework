@@ -10,7 +10,8 @@ import { fileURLToPath } from 'node:url';
 import { AgentFramework } from '../src/framework.js';
 import { StdioTransport } from '../src/mcpl/transport.js';
 import { admissionConnectErrorOf, AdmissionConnectError } from '../src/mcpl/inbound-admission.js';
-import { McplServerConnection } from '../src/mcpl/server-connection.js';
+import { frameworkAdmissionConfig, McplServerConnection } from '../src/mcpl/server-connection.js';
+import { McplFeatureSetError } from '../src/mcpl/feature-set-manager.js';
 import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
 import { RequiredAdmission, MAX_PENDING_ADMISSIONS, type InboundAdmissionConfig, type AdmissionVerdict } from '../src/mcpl/inbound-admission.js';
 import { fixture, eventually, TS } from './helpers/coalescing-fixture.js';
@@ -68,18 +69,20 @@ test('overload refuses without a queue; another connection retains its budget', 
 });
 
 test('hook input is detached raw data and frozen; optional intent validator is inside preflight', async t => {
-  let observed = false;
+  let observed: any;
+  let validated = false;
   const admission = config(input => {
-    observed = true;
-    assert(Object.isFrozen(input)); assert(Object.isFrozen(input.item)); assert(Object.isFrozen(input.item.metadata.tags));
-    assert.deepEqual([...input.item.tags], ['chat:mention'], 'pre-expansion tags');
-    assert.equal(input.item.metadata.replyIntent.forged, true, 'raw claim is merely evidence');
-    assert.throws(() => { input.item.tags.push('changed'); });
+    observed = input;
     return { store: true, mayWake: false, replyIntent: { private: true } };
   });
-  const f = await fixture({ server: { inboundAdmission: { ...admission, isReplyIntent: () => { throw Error('secret validator'); } } } }); t.after(f.close); await f.register();
+  const f = await fixture({ server: { inboundAdmission: { ...admission, isReplyIntent: () => { validated = true; throw Error('secret validator'); } } } }); t.after(f.close); await f.register();
   const r = await f.send('channels/incoming', { messages: [channel()] });
-  assert.equal(r.result.results[0].reason, 'admission_threw'); assert(observed);
+  assert.equal(r.result.results[0].reason, 'admission_threw');
+  assert(validated, 'the intent validator was reached');
+  assert(Object.isFrozen(observed)); assert(Object.isFrozen(observed.item)); assert(Object.isFrozen(observed.item.metadata.tags));
+  assert.deepEqual([...observed.item.tags], ['chat:mention'], 'pre-expansion tags');
+  assert.equal(observed.item.metadata.replyIntent.forged, true);
+  assert.throws(() => { observed.item.tags.push('changed'); });
 });
 
 for (const lane of ['channels/incoming', 'push/event', 'inference/request'] as const) {
@@ -116,8 +119,8 @@ for (const outcome of ['match', 'absent', 'mismatch', 'throw', 'timeout', 'malfo
       initializeAttestation: { read: (result: any) => { read++; if (outcome === 'throw') throw Error('secret'); if (outcome === 'timeout') { const until = performance.now() + 5; while (performance.now() < until) {} } if (outcome === 'malformed') return () => {}; return outcome === 'absent' ? undefined : result.proof; }, matches: () => outcome !== 'mismatch' },
     };
     const transcript = join(dir, 'wire');
-    const connecting = McplServerConnection.connectWithReconnect({ id: 'endpoint-a', command: process.execPath, args: [peer], reconnect: true,
-      env: { TRANSCRIPT: transcript, ...(outcome === 'protocol' ? { PROTOCOL: 'wrong' } : {}) }, inboundAdmission: admission }, { version: '0.5' });
+    const connecting = McplServerConnection.connectWithReconnect(frameworkAdmissionConfig({ id: 'endpoint-a', command: process.execPath, args: [peer], reconnect: true,
+      env: { TRANSCRIPT: transcript, ...(outcome === 'protocol' ? { PROTOCOL: 'wrong' } : {}) }, inboundAdmission: admission }), { version: '0.5' });
     if (outcome === 'match') { const c = await connecting; t.after(() => c.close()); await c.sendToolsCall('seen', {}); assert.equal(binds, 1); }
     else {
       await assert.rejects(connecting, e => outcome === 'protocol' ? /protocolVersion/.test(String(e)) : /^(AdmissionConnectError: (initialize_attestation_refused|admission_missing))$/.test(String(e)));
@@ -174,10 +177,11 @@ for (const lane of ['push/event', 'inference/request'] as const) for (const chan
     if (change === 'pause') connection.pauseDataPlane();
     if (change === 'remove-binding') connection.requiredAdmission.invalidate();
     if (change === 'replace-connection') { const get = inner.mcplServerRegistry.getServer.bind(inner.mcplServerRegistry); inner.mcplServerRegistry.getServer = () => ({}); restore = () => { inner.mcplServerRegistry.getServer = get; }; }
-    if (change === 'feature') { const validate = inner.featureSetManager.validateInbound; inner.featureSetManager.validateInbound = () => { throw Error('revoked'); }; restore = () => { inner.featureSetManager.validateInbound = validate; }; }
+    if (change === 'feature') { const validate = inner.featureSetManager.validateInbound; inner.featureSetManager.validateInbound = () => { throw new McplFeatureSetError(-32004, 'doc', 'revoked'); }; restore = () => { inner.featureSetManager.validateInbound = validate; }; }
     if (change === 'loop') { const hooks = inner.inferenceRouter.hookOrchestrator; inner.inferenceRouter.hookOrchestrator = { isInHook: true }; restore = () => { inner.inferenceRouter.hookOrchestrator = hooks; }; }
     release({ store: true, mayWake: true }); const r = await response; restore();
-    assert(lane === 'push/event' ? r.result.accepted === false : r.error.code === -32600);
+    if (lane === 'push/event') assert.deepEqual(r.result, { accepted: false, reason: change === 'pause' ? 'admission_not_ready' : change === 'remove-binding' ? 'admission_missing' : 'admission_stale' });
+    else assert.equal(r.error.code, -32600);
     assert.equal(models, 0); assert.equal(f.membrane.calls.length, 0); assert(!f.context().includes('sensitive_body'));
   });
 }
@@ -426,10 +430,10 @@ test('required generic result taps remain usable by an explicitly attached contr
 
 test('required handshake drops null, refuses all data lanes, and buffers a same-chunk ping', async t => {
   let hooks = 0;
-  const connection = await McplServerConnection.connect({
+  const connection = await McplServerConnection.connect(frameworkAdmissionConfig({
     id: 'endpoint-a', command: process.execPath, args: [peer], env: { EARLY: '1' },
     inboundAdmission: config(() => { hooks++; return allow; }),
-  }, { version: '0.5' });
+  }), { version: '0.5' });
   t.after(() => connection.close());
   const answers = await connection.sendToolsCall('answers', {}) as any;
   for (const method of ['channels/incoming', 'push/event', 'inference/request']) {
@@ -443,7 +447,7 @@ test('required handshake drops null, refuses all data lanes, and buffers a same-
 
 test('required startup-staged push waits for ready and a current grant before admission', async t => {
   let calls = 0;
-  const connection = await McplServerConnection.connect({ id: 'endpoint-a', command: process.execPath, args: [peer], inboundAdmission: config(() => { calls++; return allow; }) }, { version: '0.5' });
+  const connection = await McplServerConnection.connect(frameworkAdmissionConfig({ id: 'endpoint-a', command: process.execPath, args: [peer], inboundAdmission: config(() => { calls++; return allow; }) }), { version: '0.5' });
   t.after(() => connection.close());
   connection.on('push-event', async (params, responder) => {
     const verdict = await connection.admissionFor(params).admit('push/event', params);
@@ -467,10 +471,10 @@ test('required held notification from a superseded epoch is refused, never rebou
   // is not needed to observe the stale flush.
   f.notify('push/event', { ...f.params('old', 'old_epoch'), coalesce: undefined });
   await eventually(() => connection.bufferedEvents.length > 0);
+  const traces: any[] = []; f.framework.onTrace(event => traces.push(event));
   const epoch = connection.transportEpoch;
   f.disconnect();
   await eventually(() => connection.transportEpoch > epoch && connection.isConnected && connection.controlPlaneReady);
-  const traces: any[] = []; f.framework.onTrace(event => traces.push(event));
   await f.framework.resume();
   assert(traces.some(e => e.type === 'mcpl:push-event-rejected' && e.reason === 'admission_stale')); assert.equal(calls, 0);
   await f.framework.runUntilIdle(); assert(!f.context().includes('old_epoch'));

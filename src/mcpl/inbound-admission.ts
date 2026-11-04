@@ -58,7 +58,7 @@ function snapshot(value: unknown, seen = new Set<object>()): any {
   const proto = Object.getPrototypeOf(value);
   if (proto !== Object.prototype && proto !== null && !(Array.isArray(value) && proto === Array.prototype)) throw new InvalidData();
   seen.add(value);
-  const out: any = Array.isArray(value) ? [] : Object.create(null);
+  const out: any = Array.isArray(value) ? new Array(value.length) : Object.create(null);
   for (const key of Reflect.ownKeys(value)) {
     if (Array.isArray(value) && key === 'length') continue;
     const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
@@ -86,7 +86,7 @@ export function wakeForbidden(event: object): boolean {
 export interface RequiredIngress {
   readonly key: ConnectionKey;
   /** Reserve at arrival, before callbacks; both lanes share the subject queue. */
-  orderCoalesced?(scope: CoalescingScope, key: string): { ready: Promise<void>; retire(): void };
+  orderCoalesced?(scope: CoalescingScope, key: string): { ready: Promise<void>; retire(): void; overloaded?: boolean };
   check(): RefusalCode | undefined;
   admit(lane: AdmissionLane, item: unknown, signal?: AbortSignal): Promise<AdmissionVerdict>;
 }
@@ -99,7 +99,7 @@ export class RequiredAdmission {
   private readonly capacityWaiters = new Set<() => void>();
   private readonly config: InboundAdmissionConfig;
   constructor(config: InboundAdmissionConfig, readonly connectionId: string) {
-    this.config = Object.freeze({ ...config, ...(config.initializeAttestation ? { initializeAttestation: Object.freeze({ ...config.initializeAttestation }) } : {}) });
+    this.config = Object.freeze({ timeoutMs: config.timeoutMs, bind: config.bind, isReplyIntent: config.isReplyIntent, ...(config.initializeAttestation ? { initializeAttestation: Object.freeze({ read: config.initializeAttestation.read, matches: config.initializeAttestation.matches }) } : {}) });
   }
   isCurrent(key: ConnectionKey): boolean {
     return this.key === key && this.binding?.connection === key;
@@ -197,7 +197,7 @@ export class RequiredAdmission {
  * Every refusal is traced; repeated lines are bounded per server/lane/code. */
 export class AdmissionRefusals {
   private readonly lines = new RefusalLines();
-  report(emitTrace: (event: { type: string; [key: string]: unknown }) => void,
+  report(emitTrace: (event: import('../types/trace.js').TraceEventInput) => void,
     serverId: string, lane: AdmissionLane, reason: RefusalCode, item: unknown): void {
     const p = item !== null && typeof item === 'object' ? item as Record<string, unknown> : {};
     const id = (key: string): string => typeof p[key] === 'string' ? p[key] as string : '';

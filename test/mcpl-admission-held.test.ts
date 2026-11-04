@@ -87,7 +87,8 @@ test('held flush waits for live pre-pause slot owners instead of refusing backlo
   await f.framework.resume();
   assert.equal(calls, MAX_PENDING_ADMISSIONS);
   for (const release of releases) release();
-  assert((await Promise.all([...live, ...held])).every(r => r.result.accepted));
+  assert((await Promise.all(live)).every(r => r.result.reason === 'admission_stale'), 'a pause invalidates in-flight preflights even after resume');
+  assert((await Promise.all(held)).every(r => r.result.accepted));
   assert.equal(calls, MAX_PENDING_ADMISSIONS + 2);
 });
 

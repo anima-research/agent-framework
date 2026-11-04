@@ -197,7 +197,7 @@ export interface McplHostCapabilities {
   featureSets?: boolean;
   channels?: boolean | McplChannelCapabilities;
   /** RFC-014 §6.3: this host presents tool hints. Sent to every server
-   *  with hints (McplServerConfig.toolHints: on unless false). */
+   *  with hints (McplServerConfig.toolHints: on unless false or inboundAdmission is configured). */
   toolHints?: boolean;
 }
 
@@ -228,7 +228,10 @@ export interface McplChannelCapabilities {
  * a restart with the new configuration).
  */
 export interface McplServerConfig {
-  /** Opt-in, fail-closed admission for every inbound data lane. */
+  /** AgentFramework-only opt-in, fail-closed admission for inbound data lanes.
+   * Direct McplServerConnection factories reject this option. Required coalesced
+   * content may be acknowledged before module onProcess completes; module
+   * dispatch remains FIFO per channel, independent of content acknowledgements. */
   inboundAdmission?: InboundAdmissionConfig;
   /** Unique server identifier */
   id: string;
@@ -531,7 +534,8 @@ export interface McplServerConfig {
 
   /**
    * MCPL RFC-014 (tool presence, toolsets and surfaces). On unless set to
-   * `false`: the host advertises `experimental.mcpl.toolHints` and honours
+   * `false` or inboundAdmission is configured (which always disables hints).
+   * When enabled, the host advertises `experimental.mcpl.toolHints` and honours
    * hints (through the `toolsets` meta-tools) only from a server that
    * advertised `toolHints` too. Such a server's static tools stay in the tool
    * list as before, and its dynamic tools (toolset tools, `mcpl/presence:

@@ -605,7 +605,10 @@ export class PushCoalescer<E = unknown> {
     const entry = this.receiptEntry(key);
     if (!entry) return undefined;
     const subject = coalescingSubjectKey(occurrence.serverId, occurrence.binding, occurrence.scope, occurrence.key);
-    return this.locked(() => this.acknowledge(key, entry, subject, occurrence.eventId));
+    return this.locked(() => {
+      if (this.suspended) throw new CoalesceError('serverId', 'host is stopping', -32000, { admitted: true });
+      return this.acknowledge(key, entry, subject, occurrence.eventId);
+    });
   }
 
   /** Whether the admission this receipt records delivered its occurrence as

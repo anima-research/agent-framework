@@ -26,6 +26,7 @@ for (const [name, verdict, reason] of cases) test(`required inference ${name}: n
   (f.framework as any).inferenceRouter.resolveModel = () => { resolves++; return 'test'; };
   const response = await f.send('inference/request', { featureSet: 'doc', messages: [{ role: 'user', content: 'never_infer' }], stream: true });
   assert.deepEqual(response.error, { code: -32600, message: reason });
+  assert.equal(f.notifications.filter(m => ['inference/chunk', 'inference/started'].includes(m.method)).length, 0);
   assert.equal(calls, 1); assert.equal(resolves, 0); assert.equal(f.membrane.calls.length, 0);
 });
 

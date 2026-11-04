@@ -161,9 +161,16 @@ export class PushHandler {
       ? admission.orderCoalesced?.(c.channelId ? { kind: 'channel', id: c.channelId } : { kind: 'featureSet', id: params.featureSet }, c.key)
       : undefined;
     try {
+      if (ticket?.overloaded) {
+        this.admissionRefusals.report(this.emitTraceFn, serverId, 'push/event', 'admission_denied', params);
+        responder?.respond({ accepted: false, reason: 'admission_denied' });
+        return;
+      }
       try {
         this.featureSetManager.validateInbound(serverId, params.featureSet);
       } catch (err) {
+        const reason = err instanceof McplFeatureSetError ? err.message : 'Feature set validation failed';
+        console.error(`[push-event-rejected] server=${serverId} eventId=${logValue(params.eventId ?? '')} reason=${logValue(reason)}`);
         if (err instanceof McplFeatureSetError && responder?.respondError) responder.respondError(err.code, err.message, { featureSet: err.featureSet });
         else responder?.respond({ accepted: false, reason: 'Feature set validation failed' });
         return;
@@ -201,8 +208,6 @@ export class PushHandler {
           else responder?.respond({ accepted: false, reason: err.message });
         });
       };
-      const receipt = replay();
-      if (receipt) { await ticket?.ready; await receipt; return; }
       // Deferred notices aggregate into a later push/render batch, which has
       // no current-key re-admission across reconnect/recovery in this profile.
       // Plain occurrences, including edits and withdrawals, stand on their
@@ -212,6 +217,8 @@ export class PushHandler {
         refuse('admission_unsupported');
         return;
       }
+      const receipt = replay();
+      if (receipt) { await ticket?.ready; await receipt; return; }
       const before = admission.check();
       if (before) { await ticket?.ready; refuse(before); return; }
       const verdict = await admission.admit('push/event', params);
@@ -223,6 +230,7 @@ export class PushHandler {
       const check = () => {
         let reason = admission.check();
         try { this.featureSetManager.validateInbound(serverId, params.featureSet); } catch { reason ??= 'admission_stale'; }
+        try { if (params.coalesce?.channelId) this.assertChannelScopedPush?.(serverId, params.coalesce.channelId); } catch { reason ??= 'admission_stale'; }
         return reason;
       };
       const reason = check();

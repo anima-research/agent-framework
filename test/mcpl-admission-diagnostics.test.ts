@@ -5,7 +5,7 @@ import { fixture, eventually, TS } from './helpers/coalescing-fixture.js';
 
 for (const lane of ['channels/incoming', 'push/event', 'inference/request'] as const) {
   for (const reason of ['admission_denied', 'admission_threw', 'admission_invalid', 'admission_timeout'] as const) {
-    test(`${lane} ${reason}: all refusals traced, notification logs rate limited`, async t => {
+    test(`${lane} ${reason}: all refusals traced, ${lane === 'inference/request' ? 'request' : 'notification'} logs rate limited`, async t => {
       const f = await fixture({ featureSets: { doc: { description: 'doc', uses: ['pushEvents', 'inferenceRequest'] } }, server: { inboundAdmission: {
         timeoutMs: 50, bind: (connection: unknown) => ({ connection, admit: () => {
           if (reason === 'admission_threw') throw Error('private_callback_detail');

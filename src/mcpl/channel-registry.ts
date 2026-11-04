@@ -1911,15 +1911,23 @@ export class ChannelRegistry {
 
     // Reserve the whole batch now, not when a preceding sibling finishes:
     // later requests must not jump ahead of this batch's later subjects.
-    const tickets = admission?.orderCoalesced
-      ? params.messages.map(message => typeof message?.coalesce?.key === 'string'
-        ? admission.orderCoalesced!({ kind: 'channel', id: message.channelId }, message.coalesce.key)
-        : undefined)
-      : [];
+    const tickets: Array<ReturnType<NonNullable<RequiredIngress['orderCoalesced']>> | undefined> = [];
     try {
+      if (admission?.orderCoalesced) {
+        for (const message of params.messages) {
+          tickets.push(typeof message?.coalesce?.key === 'string'
+            ? admission.orderCoalesced({ kind: 'channel', id: message.channelId }, message.coalesce.key)
+            : undefined);
+        }
+      }
       for (const [index, message] of params.messages.entries()) {
         tickets[index - 1]?.retire();
         const ticket = tickets[index];
+        if (ticket?.overloaded) {
+          this.admissionRefusals.report(this.emitTraceFn, serverId, 'channels/incoming', 'admission_denied', message);
+          results.push({ messageId: message.messageId, accepted: false, reason: 'admission_denied' });
+          continue;
+        }
         if (!message || typeof message.channelId !== 'string' || !message.channelId
           || typeof message.messageId !== 'string' || !message.messageId) {
           // The same gate as admission below: with no coalescer wired, a

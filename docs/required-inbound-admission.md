@@ -1,6 +1,8 @@
 # Required inbound admission
 
-`McplServerConfig.inboundAdmission` explicitly enables fail-closed host admission.
+`McplServerConfig.inboundAdmission` explicitly enables fail-closed host admission
+through `AgentFramework` only. Direct `McplServerConnection` factories reject this
+option: raw event listeners do not install the framework's authorized lane adapters.
 Unconfigured connections retain their existing dispatch, holding, hint taps and
 wake policy: there is no default allow hook or new asynchronous preflight.
 
@@ -65,9 +67,10 @@ instead take a per-subject ordering ticket on arrival, before the callback, keye
 by `coalescingSubjectKey(serverId, binding, scope, key)`. Channel deliveries and
 channel-scoped pushes share that queue: a later verdict waits for earlier tickets
 for the subject to retire, including refusals. Channel batches reserve all their
-tickets on arrival and still admit siblings sequentially. Unrelated subjects do
-not wait on one another's callbacks. A pause during a running preflight still
-refuses that item.
+tickets on arrival and still admit siblings sequentially. Independent single-item subjects do not wait on one another's callbacks.
+Batch siblings remain sequential: reserving B behind a slow sibling A also delays
+later traffic for B. Outstanding coalescing tickets are capped at 64 per connection;
+excess occurrences refuse immediately without joining the subject queue. A pause or grant change during a running preflight invalidates it even if restored before the verdict.
 Required connections never advertise `toolHints`, even if `toolHints: true` is
 configured. That explicit combination logs one diagnostic at connect (not on
 automatic transport retries); it is not a configuration error. Under RFC-014 §6.3 the peer must not send hints and should tailor
@@ -127,7 +130,15 @@ is only `mayWake: false`. It is **not** context-only delivery and does not suppr
 maintenance.
 
 Admitted work goes out with the round's results only on a stream that declares
-`supportsInjectedMessages: true`; otherwise it arrives at turn end.
+`supportsInjectedMessages: true`; otherwise it arrives at turn end, except that a direct API boundary with no
+stream drains deferred work immediately for the next compile.
+
+For required coalesced traffic, built-in storage and the durable acknowledgement
+do not await module `onProcess`. Module dispatch starts after acceptance and is
+FIFO per channel (feature-set scope for plain pushes). A hanging module delays
+later module dispatch for that scope, not later content acceptance or replies.
+Module errors are contained; they never retract an acknowledgement. Unconfigured
+coalesced delivery retains its existing completion timing.
 
 Channel-scoped pushes also require the `channels.incoming` grant and a declared
 channel before either receipt replay or the admission callback.

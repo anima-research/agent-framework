@@ -1039,3 +1039,9 @@ npm run typecheck  # Type-check without emitting
 ```
 
 Requires Node.js >= 22.12. Chronicle requires a Rust toolchain for native module compilation (`npm run build` in the chronicle directory).
+
+Required inbound admission is supported only through `AgentFramework`; direct
+`McplServerConnection` factories reject `inboundAdmission`. Required coalesced
+content is stored and acknowledged without awaiting module `onProcess`; module
+dispatch remains FIFO per channel but may run after acknowledgement. See
+[required inbound admission](docs/required-inbound-admission.md) for limits.

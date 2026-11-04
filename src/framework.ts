@@ -1,4 +1,4 @@
-import { admissionConnectErrorOf, admittedEnvelope, attachAdmission, wakeForbidden, type RequiredIngress } from './mcpl/inbound-admission.js';
+import { MAX_PENDING_ADMISSIONS, admissionConnectErrorOf, admittedEnvelope, attachAdmission, wakeForbidden, type RequiredIngress } from './mcpl/inbound-admission.js';
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { presentAuthor } from './author-presentation.js';
 import { constants as bufferConstants } from 'node:buffer';
@@ -965,7 +965,7 @@ import {
 import { SuppressionReview, type ReviewRuleInfo, type SuppressionReviewSummary } from './gate/suppression-review.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
-import { McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
+import { frameworkAdmissionConfig, McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
 import { ToolsetHub, TOOLSETS_MODULE, META_TOOL_NAMES, type ToolsetController } from './mcpl/toolset-host.js';
 import { HostPresentation, BUILTIN_TOOLSET, type HostActTarget } from './host-presentation.js';
 import { isEmptyChange, type Presence } from './mcpl/tool-presence.js';
@@ -4280,6 +4280,8 @@ export class AgentFramework {
   /** Both lanes are admitted in arrival order: a create, edit and delete of
    *  one subject must not overtake one another while routing awaits. */
   private coalescingAdmission: Promise<unknown> = Promise.resolve();
+  private readonly requiredCoalescedModuleTails = new Map<string, Promise<void>>();
+  private readonly coalescingTicketCounts = new Map<string, number>();
   private readonly coalescingTickets = new Map<string, Promise<void>>();
   private coalescingSaveTimer: ReturnType<typeof setTimeout> | null = null;
   private coalescingSnapshotDirty: (() => CoalescingSnapshot) | null = null;
@@ -18954,7 +18956,10 @@ export class AgentFramework {
 
   /** Reserve a subject's effect order before either lane awaits admission. */
   private takeCoalescingTicket(serverId: string, scope: CoalescingScope, key: string) {
+    const count = this.coalescingTicketCounts.get(serverId) ?? 0;
+    if (count >= MAX_PENDING_ADMISSIONS) return { ready: Promise.resolve(), retire() {}, overloaded: true };
     const subject = coalescingSubjectKey(serverId, this.coalescingBinding(serverId), scope, key);
+    this.coalescingTicketCounts.set(serverId, count + 1);
     const ready = this.coalescingTickets.get(subject) ?? Promise.resolve();
     let retire!: () => void;
     const retired = new Promise<void>(resolve => { retire = resolve; });
@@ -18963,6 +18968,9 @@ export class AgentFramework {
     const tail = ready.then(() => retired);
     this.coalescingTickets.set(subject, tail);
     void tail.then(() => {
+      const remaining = this.coalescingTicketCounts.get(serverId)! - 1;
+      if (remaining) this.coalescingTicketCounts.set(serverId, remaining);
+      else this.coalescingTicketCounts.delete(serverId);
       if (this.coalescingTickets.get(subject) === tail) this.coalescingTickets.delete(subject);
     });
     return { ready, retire };
@@ -19234,7 +19242,8 @@ export class AgentFramework {
       const event = { ...occ.event.event, coalescingSubject, ...narrowing, ...firstViewMark, ...decided, ...(assemblingFor ? { assemblingFor } : {}) };
       const placement = await this.handleMcplChannelIncoming(event);
       keepDecision(event);
-      await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
+      if (admittedEnvelope in event) this.scheduleRequiredCoalescedModules(event as unknown as ProcessEvent, occ);
+      else await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
       return placement;
     }
     if (occ.scope.kind === 'channel') {
@@ -19271,7 +19280,8 @@ export class AgentFramework {
       if (envelope) attachAdmission(event, envelope);
       const placement = await this.handleMcplChannelIncoming(event);
       keepDecision(event);
-      await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
+      if (admittedEnvelope in event) this.scheduleRequiredCoalescedModules(event as unknown as ProcessEvent, occ);
+      else await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
       return placement;
     }
     const event: McplPushEvent = {
@@ -19290,8 +19300,23 @@ export class AgentFramework {
     };
     const placement = this.handleMcplPushEvent(event);
     keepDecision(event);
-    await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
+    if (admittedEnvelope in event) this.scheduleRequiredCoalescedModules(event as unknown as ProcessEvent, occ);
+    else await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
     return placement;
+  }
+
+  /** Required content acceptance does not await arbitrary module work. Keep
+   * module dispatch FIFO per channel (or feature-set subject), after the
+   * acceptance's lock/commit; a hung module delays only later module dispatch. */
+  private scheduleRequiredCoalescedModules(event: ProcessEvent, occ: CoalescedOccurrence<CoalescedDelivery>): void {
+    const key = JSON.stringify([occ.serverId, occ.binding, occ.scope]);
+    const prior = this.requiredCoalescedModuleTails.get(key) ?? Promise.resolve();
+    const accepted = this.coalescingAdmission;
+    const run = Promise.all([prior, accepted]).then(() => this.dispatchProcessEventToModules(event)).catch(error => {
+      console.error('[mcpl] required coalesced module dispatch failed:', error);
+    });
+    this.requiredCoalescedModuleTails.set(key, run);
+    void run.then(() => { if (this.requiredCoalescedModuleTails.get(key) === run) this.requiredCoalescedModuleTails.delete(key); });
   }
 
   private async wakeForCoalescedBatch(occ: CoalescedOccurrence<CoalescedDelivery>): Promise<void> {
@@ -34253,7 +34278,7 @@ export class AgentFramework {
       // nothing. A dialing configuration stays the object the framework
       // records the server's text with, since each dial notes what it sent
       // against the object it read (noteDialSent).
-      connectionConfig = { ...config };
+      connectionConfig = { ...config, inboundAdmission: config.inboundAdmission };
       Object.defineProperty(connectionConfig, 'env', {
         enumerable: true,
         configurable: true,
@@ -34283,7 +34308,7 @@ export class AgentFramework {
       // staged open) passes the connection by, so nothing opens its planes
       // before its grant exists.
       connection = await this.mcplServerRegistry.addServer(
-        connectionConfig,
+        frameworkAdmissionConfig(connectionConfig),
         this.mcplHostCapabilitiesFor(config, hints),
         abort.signal,
         (registering) => {
