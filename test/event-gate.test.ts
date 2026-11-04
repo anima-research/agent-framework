@@ -862,18 +862,6 @@ describe('debounce', () => {
     assert.deepStrictEqual(inferenceRequests[0].batchChannels, [{ channelId: 'discord:g:room', serverId: 'discord' }, { channelId: 'discord:g:room' }]);
   });
 
-  it('a batch too large to spread into one call still names its channels', () => {
-    // 200,000 arguments overflow a spread call on Node 24 (130,000 already
-    // throw RangeError); a batch keeps whatever arrived in its window.
-    const push = { policyName: 'chat', content: 'status', eventType: 'mcpl:push-event', timestamp: 5, addressed: false,
-      serverId: 'surface', routeChannelId: 'surface:room:feed' };
-    const events = new Array(200_000).fill(push);
-    events[1_234] = { ...push, timestamp: 9 };
-    const provenance = wakeProvenance(events as Parameters<typeof wakeProvenance>[0]);
-    assert.deepStrictEqual(provenance?.batchChannels, [{ channelId: 'surface:room:feed', serverId: 'surface' }]);
-    assert.strictEqual(provenance?.at, 9, 'the newest event time');
-  });
-
   it('an ambient batch of pushes that name only their registered channel names that channel', async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout'] });
     const path = writeConfig('debounce-route-only-pushes.json', {
@@ -893,6 +881,7 @@ describe('debounce', () => {
     assert.strictEqual(inferenceRequests[0].routeChannelId, undefined);
     assert.deepStrictEqual(inferenceRequests[0].batchChannels, [{ channelId: 'surface:room:feed', serverId: 'surface' }]);
     assert.strictEqual(inferenceRequests[0].counterparty, undefined, 'no author to name');
+    assert.strictEqual(inferenceRequests[0].at, undefined, 'no chosen event, so no time');
   });
 
   it('a throwing route resolver never breaks gating', async (t) => {

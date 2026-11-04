@@ -179,11 +179,12 @@ export interface WakeProvenance {
   channelId?: string;
   /** Server-namespaced author id: `<serverId>:user:<id>` (falls back to the
    *  channel id's first segment only when the event carried no server id).
-   *  A `chat:system` notice is never the chosen event, unless it's a
-   *  coalesced render's latest occurrence (GateEventInfo.folds); a batch in
-   *  which no other event names a channel or an author, and which has no
-   *  `batchChannels`, names the author of its newest notice that has one,
-   *  with that notice's time (`at`), and nothing else of it. */
+   *  A `chat:system` notice, unless it's a coalesced render's latest
+   *  occurrence (GateEventInfo.folds), is never chosen for a batch's route,
+   *  channel or `addressed` flag. In a batch in which no other event names a
+   *  channel or an author, and which has no `batchChannels`, the chosen
+   *  event is its newest notice that has an author, of which the wake names
+   *  only the author and its time (`at`). */
   counterparty?: string;
   /** True when the chosen event was `chat:addressed`. */
   addressed?: boolean;
@@ -211,12 +212,8 @@ export interface WakeProvenance {
    *  no-locus notice names them, unless the turn's own wake named a channel
    *  that resolves to none. */
   batchChannels?: Array<{ channelId: string; serverId?: string }>;
-  /** Timestamp (ms) of the chosen event. With none chosen, of the batch's
-   *  newest event that isn't a `chat:system` notice (a coalesced render's
-   *  latest occurrence counts as a message) when `batchChannels` is
-   *  set, or else of the notice `counterparty` names: so a consumer
-   *  coalescing several requests can order by event recency, not by flush
-   *  order. */
+  /** Timestamp (ms) of the chosen event, so a consumer coalescing several
+   *  requests can order by event recency, not by flush order. */
   at?: number;
   /** The batch's `[Gate: …]` line, when the gate handed it to the wake rather
    *  than wrote it: a WakeLine, the parts its text is rendered from when it's
@@ -320,13 +317,14 @@ function isMetadataTruthy(value: unknown): boolean {
  * chatter — the framework's own locus rule); else the newest event that
  * names either. An addressed event's resolved route counts as its channel;
  * an ambient one's doesn't. Channel, author and addressed all come from
- * that one event, so they can never disagree. A
- * `chat:system` notice is never that event, even one addressed by its place
- * (a pin in a DM), since a notice never decides where the agent's speech
- * goes. A coalesced render whose latest occurrence is a notice isn't taken
- * as one (GateEventInfo.folds). A batch with no such event and no
- * `batchChannels` takes only the author and time of its newest notice that
- * has an author.
+ * that one event, so they can never disagree. A `chat:system` notice is
+ * never chosen for the batch's route, channel or addressed flag, even one
+ * addressed by its place (a pin in a DM), since a notice never decides where
+ * the agent's speech goes; a coalesced render whose latest occurrence is a
+ * notice isn't taken as one (GateEventInfo.folds). A batch with no such event
+ * carries only its `batchChannels` when it has them; else its chosen event is
+ * its newest notice that has an author, of which it takes only the author
+ * and time.
  */
 export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefined {
   const said = events.filter((e) => !e.systemNotice);
@@ -362,7 +360,7 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
       ? { routeChannelId: pick.routeChannelId, ...(pick.serverId ? { routeServerId: pick.serverId } : {}) }
       : {}),
     ...(channels.length > 0 ? { batchChannels: channels } : {}),
-    at: pick?.timestamp ?? said.reduce((at, e) => Math.max(at, e.timestamp), -Infinity),
+    ...(pick ? { at: pick.timestamp } : {}),
   };
 }
 
