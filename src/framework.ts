@@ -10421,7 +10421,8 @@ export class AgentFramework {
    * At boot, the wakes a tune-out's rows still owe their agents (#232 gap
    * 6). A tune-out's release for the resident (`kind: 'tune-out-cancel'`)
    * and its notices for the subconscious (`tune-out-wake`,
-   * `tune-out-cadence`, `tune-out-cancel-report`) are stored at once and
+   * `tune-out-cadence`, `tune-out-cancel-report`,
+   * `tune-out-note-undelivered`) are stored at once and
    * made durable (commitDeliveries), but the wake each asks for is in
    * memory. One stored while a turn of its agent's was alive stays out of
    * that agent's window until the turn's end, and its wake runs after; a
@@ -10444,7 +10445,7 @@ export class AgentFramework {
       { agentName: this.primaryAgentName, kinds: ['tune-out-cancel'], reason: 'tune-out released (restored)' },
       {
         agentName: this.subconsciousAgentName,
-        kinds: ['tune-out-wake', 'tune-out-cadence', 'tune-out-cancel-report'],
+        kinds: ['tune-out-wake', 'tune-out-cadence', 'tune-out-cancel-report', 'tune-out-note-undelivered'],
         reason: 'tune-out (restored)',
       },
     ];
