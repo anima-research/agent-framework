@@ -26,8 +26,12 @@
   what the request carries ahead of its messages. Past a fifth of the input,
   or when a compile is refused over budget, or for dropping messages no
   summary covers, with changes kept, it happens anyway, raising an operator
-  line (`head-consolidated`). A host's own change
-  rows are the host's to remove: the agent neither folds nor removes them. An
+  line (`head-consolidated`). A strategy that merges adjacent summaries, as
+  context-manager's autobiographical strategy does, doesn't merge two across
+  a change row shown between them, so while the agent's own change rows stay
+  in place the input grows beyond the rows' own size, until a consolidation
+  takes them out and for a while after, as the merges catch up. A host's own
+  change rows are the host's to remove: the agent neither folds nor removes them. An
   agent built again on `'head'` clears its recorded head at its first request
   and then takes its own change rows out of its context; a record the store
   can't clear keeps them, and a later request tries again. New trace events:
