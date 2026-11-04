@@ -34798,8 +34798,9 @@ export class AgentFramework {
           const { epochId } = scope.params;
           // Whether this hold has ended, read when an answer is built: after
           // the close's transport round-trip, during which a release that
-          // waited may have run. A record that can't be read is taken for
-          // the hold in force, as the deferred cancels take it.
+          // waited may have run, or after a release that failed part-way. A
+          // record that can't be read is taken for the hold in force, as the
+          // deferred cancels take it.
           const over = (): boolean => {
             try {
               return coordinator.getAllExcept()?.params.epochId !== epochId;
@@ -34812,7 +34813,15 @@ export class AgentFramework {
           try {
             released = coordinator.cancelAllExcept('channel-close', 'the excepted channel was closed');
           } catch (err) {
-            throw new Error(`The close wasn't recorded: ${err instanceof Error ? err.message : String(err)}`);
+            const why = err instanceof Error ? err.message : String(err);
+            // The release records the hold's end once its notice is stored,
+            // and steps follow it (a note's delivery, the resident's wake): a
+            // failure there comes after the end, which the answer says.
+            if (over()) {
+              throw new Error(`The close wasn't recorded: ${/[.!?]$/.test(why) ? why : `${why}.`} `
+                + 'The focus on it ended before that failure, and what the other channels held was delivered.');
+            }
+            throw new Error(`The close wasn't recorded: ${why}`);
           }
           if (!released.ok) throw new Error(`The close wasn't recorded: ${released.error}`);
           if (!released.deferred) return () => endedText;

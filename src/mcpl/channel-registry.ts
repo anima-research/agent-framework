@@ -1018,7 +1018,8 @@ interface ChannelRegistryOptions {
    * built, after its transport's round-trip, so the answer says what holds
    * when it arrives (a release that waited may have run by then). The
    * answer carries it whatever became of the close: as `note` on a success,
-   * after the error on a failure.
+   * after the error on a failure. Throws, with the answer's text, when the
+   * hold's release fails; one that ended the hold before it failed says so.
    */
   onToolClose?: ToolCloseHook;
   /**
@@ -5284,7 +5285,9 @@ export class ChannelRegistry {
       // Closed already, perhaps only by default: the agent's close is still
       // its decision, and is recorded as one (setDesiredState), so a later
       // registration's lift of a default leaves the channel closed.
-      const ended = this.onToolClose?.(entry.serverId, input.channelId);
+      const hook = this.toolCloseHook(refOf(entry));
+      if ('error' in hook) return { success: false, error: hook.error, isError: true };
+      const ended = hook.text;
       try {
         this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
       } catch (err) {
@@ -5336,7 +5339,9 @@ export class ChannelRegistry {
     // A hold around this channel — the all-except scope it is the excepted
     // channel of — ends through the cancel flow: backlog released, end
     // recorded, never by overwriting state (#232 gap 9).
-    const ended = this.onToolClose?.(entry.serverId, input.channelId);
+    const hook = this.toolCloseHook(refOf(entry));
+    if ('error' in hook) return { success: false, error: hook.error, isError: true };
+    const ended = hook.text;
 
     // A decision the log refused changed nothing for the channel, and the
     // answer says so, and what the hook ended all the same. Every answer
@@ -5371,6 +5376,19 @@ export class ChannelRegistry {
       };
     } catch (err) {
       return { success: false, error: withEnded(this.lifecycleFailureText('close', entry, err)), isError: true };
+    }
+  }
+
+  /**
+   * The tool-close hook (onToolClose) for a channel, its throw taken as the
+   * answer's text: a release of the hold that failed is the close's answer,
+   * as the registry's other failures are, never a rejected call.
+   */
+  private toolCloseHook(ref: ChannelRef): { text?: () => string } | { error: string } {
+    try {
+      return { text: this.onToolClose?.(ref.serverId, ref.channelId) };
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : String(err) };
     }
   }
 
