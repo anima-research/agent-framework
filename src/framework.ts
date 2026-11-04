@@ -93,7 +93,7 @@ import { ModuleRegistry, checkedToolResult, droppedToolResultLine, ensureStateRe
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { prefixesMeet, prefixesMeetError } from './mcpl/prefix-rule.js';
 import { logDetail, logValue } from './mcpl/log-value.js';
-import { isMarkerTagged, isSystemNotice } from './mcpl/tags.js';
+import { expandCoreTags, isMarkerTagged, isSystemNotice } from './mcpl/tags.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
 import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
@@ -415,7 +415,7 @@ const PRIMARY_IF_UNREAD_KEY = 'primaryIfUnread';
  * the Discord module's `discordTextFirst` on a row it found by `external`.
  */
 const HOST_METADATA_KEYS = [
-  'system', 'kind', 'draftOwner', 'draftIds', 'tuneOut', 'coalescingSubject', 'firstView',
+  'system', 'kind', 'draftOwner', 'draftIds', 'tuneOut', 'suppressed', 'coalescingSubject', 'firstView',
   'deferredWriteId', 'external', 'openaiResponsesItems', STORED_INJECTION_KEY, PRIMARY_IF_UNREAD_KEY, 'dendrite',
 ] as const;
 
@@ -859,6 +859,8 @@ export const BUILTIN_TOOLSET_TOOLS: ReadonlySet<string> = new Set([
   'wake_accept_suggestions',
   'wake_decline',
   'gate_status',
+  'suppression_stats',
+  'dump_suppressed',
   'event_tags',
   'set_tool_visibility',
   'set_tool_description',
@@ -878,6 +880,8 @@ type ToolRoute =
   | { kind: 'read-image' }
   | { kind: 'fetch-reference' }
   | { kind: 'gate-status' }
+  | { kind: 'suppression-stats' }
+  | { kind: 'dump-suppressed' }
   | { kind: 'tune-out' }
   | { kind: 'subconscious' }
   | { kind: 'sleep' }
@@ -953,6 +957,11 @@ import {
 } from './gate/wake-onboarding.js';
 import { HEARTBEAT_CHANGING_TOOLS, Heartbeat, isHeartbeatMcplServer, type HeartbeatScheduledWake, type HeartbeatWake } from './heartbeat/heartbeat.js';
 import type { GateDecision, GateEntryRef, GateEventInfo, WakeLine } from './gate/types.js';
+import {
+  MAX_RECENT, renderSuppressedDump, suppressedRecords, suppressionRecordOf, suppressionStats,
+  type SuppressedDumpFormat, type SuppressedEventRecord,
+} from './gate/suppression-stats.js';
+import { SuppressionReview, type ReviewRuleInfo, type SuppressionReviewSummary } from './gate/suppression-review.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import { McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
@@ -2878,12 +2887,40 @@ export const heldFromResidents = (metadata: Record<string, unknown> | undefined)
   !!(metadata as { tuneOut?: unknown } | undefined)?.tuneOut;
 
 /**
+ * The event type an MCPL server's `[toolsets]` notice (a tool change with no
+ * result or event to ride on, RFC-014 §8.3) is gated as: from the server's
+ * id, with the notice's text as its content. Only suppress rules read it,
+ * since a notice never wakes the agent.
+ */
+export const TOOL_CHANGES_EVENT_TYPE = 'mcpl:tool-changes';
+
+/**
+ * The suppression record on a stored message: a suppress rule took it as it
+ * arrived (`metadata.suppressed = { rule, eventType }`, stamped by addMessage
+ * from the gate's suppressionFor). ONE predicate for "never rendered", read
+ * by every view filter the framework sets (the residents', the
+ * subconscious's, and through them every derived view's) and so by agentSees
+ * too: the compile, a tool boundary's injection and the arrival and unread
+ * checks agree. The stamp never changes, so the view stays deterministic per
+ * row, as context-manager's viewFilter requires.
+ */
+export const suppressedRow = (metadata: Record<string, unknown> | undefined): boolean =>
+  suppressionRecordOf(metadata) !== undefined;
+
+/** The largest file dump_suppressed writes (bytes), under the workspace's default 5 MB file limit. */
+const DUMP_MAX_BYTES = 4 * 1024 * 1024;
+
+/** The metadata a probe of a view asks about: a suppressed row (viewHidesSuppressed). */
+const SUPPRESSED_PROBE: Record<string, unknown> = Object.freeze({ suppressed: Object.freeze({ rule: '', eventType: '' }) });
+
+/**
  * What a reader of the residents' shared message slot does not see: held
- * messages. Used by every resident, and by a context derived from one when
- * it is reopened.
+ * messages and suppressed ones. Used by every resident, and by a context
+ * derived from one when it is reopened.
  */
 const RESIDENT_VIEW_FILTER = (message: StoredMessage): boolean =>
-  !heldFromResidents(message.metadata as Record<string, unknown> | undefined);
+  !heldFromResidents(message.metadata as Record<string, unknown> | undefined)
+  && !suppressedRow(message.metadata as Record<string, unknown> | undefined);
 
 /** The context-manager surface shared inheritance needs; absent on versions without derivation. */
 interface DerivingContextManager {
@@ -4479,6 +4516,8 @@ export class AgentFramework {
   private judgeWired = false;
   /** Wake onboarding's record of the agent's decisions (null: onboarding off, or no gate). */
   private wakeDecisions: WakeDecisions | null = null;
+  /** The periodic review of what suppress rules hid; null with no gate or with the review off. */
+  private suppressionReview: SuppressionReview | null = null;
   /** The heartbeat (FrameworkConfig.heartbeat), when the host turns it on. */
   private heartbeat: Heartbeat | null = null;
 
@@ -4912,6 +4951,7 @@ export class AgentFramework {
       framework.eventGate = new EventGate({
         configPath,
         initialConfig: config.gate.config,
+        ...(config.gate.suppressScriptTimeoutMs !== undefined ? { suppressScriptTimeoutMs: config.gate.suppressScriptTimeoutMs } : {}),
         privilegedUsersPath: config.gate.privilegedUsersPath,
         ...(judge ? {
           judge: judge.judge,
@@ -5000,6 +5040,29 @@ export class AgentFramework {
           join(dirname(configPath), 'wake-decisions.json'),
           (message) => console.error(`[gate] ${message}`),
         );
+      }
+      // The periodic review of what suppress rules hid (gate/suppression-review.ts),
+      // with its progress kept beside gate.json. Its calls run on the judge's
+      // membrane and count toward the agent's usage as the reply judge's do.
+      const review = config.gate.suppressionReview;
+      if (review !== false && review?.enabled !== false) {
+        framework.suppressionReview = new SuppressionReview({
+          agentName: () => framework.deliveryAgent()?.name,
+          membraneFor: (agentName) => framework.judgeMembraneFor(agentName),
+          records: (agentName, sinceMs, untilMs) => framework.suppressedEvents(agentName, { sinceMs, untilMs }),
+          rules: () => framework.suppressRulesInForce(),
+          deliver: (agentName, text, wake) => framework.deliverSuppressionReview(agentName, text, wake),
+          recordUsage: (agentName, usage) => {
+            framework.usageTracker.onInferenceCompleted(agentName, usage, usage.estimatedCost
+              ? { total: usage.estimatedCost.total, currency: usage.estimatedCost.currency }
+              : undefined);
+            framework.persistUsageState();
+          },
+          emitTrace: (e) => framework.emitTrace(e),
+          statePath: join(dirname(configPath), 'suppression-review.json'),
+          mayRun: () => !framework.quiesced && !framework.stopHasBegun(),
+          dumpAvailable: () => framework.getWorkspaceModule() !== undefined,
+        }, review || {});
       }
     }
 
@@ -5380,6 +5443,7 @@ export class AgentFramework {
       referenceRegistry.setServerAddress(config.id, serverAddressOf(config), this);
     }
     this.heartbeat?.start();
+    this.suppressionReview?.start();
     this.loopPromise = this.runLoop();
 
     // Start periodic sync timer (if enabled)
@@ -5901,6 +5965,7 @@ export class AgentFramework {
     step(() => this.channelRegistry?.stopAll());
 
     // Dispose EventGate (clear debounce timers), and stop the heartbeat's timers
+    step(() => this.suppressionReview?.stop());
     step(() => this.eventGate?.dispose());
     step(() => this.heartbeat?.stop());
     step(() => this.livenessWatchdog?.stop());
@@ -7946,6 +8011,7 @@ export class AgentFramework {
           ...(this.judgeWired ? AgentFramework.JUDGED_WAKE_RULE_TOOLS : AgentFramework.WAKE_RULE_TOOLS),
           ...(this.wakeDecisions ? AgentFramework.WAKE_ONBOARDING_TOOLS : []),
           AgentFramework.EVENT_TAGS_TOOL,
+          AgentFramework.SUPPRESSION_STATS_TOOL,
         ]
       : [];
     return [
@@ -7963,6 +8029,7 @@ export class AgentFramework {
         ? [AgentFramework.SAVE_IMAGE_TOOL, AgentFramework.READ_IMAGE_TOOL,
            AgentFramework.FETCH_REFERENCE_TOOL]
         : []),
+      ...(this.eventGate && this.getWorkspaceModule() ? [AgentFramework.DUMP_SUPPRESSED_TOOL] : []),
       ...(this.codeExecution
         ? [describeCodeExecution(this.codeExecution.settings)]
         : []),
@@ -13084,7 +13151,12 @@ export class AgentFramework {
         '`{ name: "watch-notes", match: { scope: ["workspace:modified"], mount: "project", pathGlob: "notes/*.md" }, behavior: "always" }`.\n' +
         '• Watch a CHANNEL: match on `source` + `channel` (and/or `tagsAny: ["chat:ambient"]`), ' +
         'e.g. `{ name: "watch-cairn", match: { source: "discord", channel: "discord:*:12345", tagsAny: ["chat:ambient"] }, debounceMs: 60000 }` ' +
-        '(the channel must be subscribed for ambient events to arrive — see channel mode).',
+        '(the channel must be subscribed for ambient events to arrive — see channel mode).\n' +
+        '• Keep a noisy stream out of your context with `suppress`, e.g. ' +
+        '`{ name: "hide-tool-flaps", match: { source: "body", scope: ["mcpl:tool-changes"] }, suppress: { description: "the body\'s tools coming and going" } }`, ' +
+        'and give it a `script` for logic of your own, such as showing one in ten minutes: ' +
+        '`(event, state) => { if (event.at - (state.shown ?? 0) < 600000) return true; state.shown = event.at; return false; }`. ' +
+        'suppression_stats shows what each suppress rule has hidden, and dump_suppressed, where you have a workspace, writes it to a file.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -13119,7 +13191,8 @@ export class AgentFramework {
             description:
               'Simple behavior: "always" (wake now) or "defer" (don\'t wake; still enters ' +
               'context). For debounce / rate-limit / sampling, use debounceMs / rateLimit / ' +
-              'passiveSample below instead of this field. Exactly one behavior must be given.',
+              'passiveSample below instead of this field. Exactly one behavior must be given, ' +
+              'except with suppress, which saves "defer" and keeps the event out of context.',
           },
           debounceMs: {
             type: 'number',
@@ -13176,6 +13249,37 @@ export class AgentFramework {
             type: 'array',
             items: { type: 'string' },
             description: 'Names of other rules whose runtime state to clear when this rule fires.',
+          },
+          suppress: {
+            type: 'object',
+            description:
+              'Keep the events this rule takes out of your context. Without it, a rule that doesn\'t wake you still ' +
+              'shows you its events. Suppressed events are still stored: suppression_stats counts them and shows a few, ' +
+              'dump_suppressed writes them to a file where you have a workspace, and history tools, where you have them, find them. But they\'re never shown to you, never ' +
+              'wake you, and never go into your memory. It\'s decided as each event arrives, so a rule hides only what ' +
+              'arrives after you add it, and removing the rule doesn\'t bring back what it hid. Needs a match that ' +
+              'narrows it. Leave behavior out: the rule is saved with behavior "defer". It never hides a message ' +
+              'addressed to you (a mention, a reply, a DM), the heartbeat, or console input: the rules after it decide ' +
+              'those. An MCPL server\'s [toolsets] notices of tool changes are its "mcpl:tool-changes" events. ' +
+              'Where your host runs the suppression review, a small model also reads, every so often, a sample of what ' +
+              'each rule hid against its description, and tells you of anything that may not fit.',
+            properties: {
+              description: {
+                type: 'string',
+                description: 'What the rule is for, in a few words ("the eye going on and off"). Required: the review checks what the rule hides against it.',
+              },
+              script: {
+                type: 'string',
+                description:
+                  'Your own logic, when a match isn\'t enough: the source of a function (event, state) => boolean, ' +
+                  'called for each event the match takes; true hides it. event has eventType, source, channel, author, ' +
+                  'tags, text, at (when it arrived, in ms) and metadata. state is this rule\'s own object, kept between ' +
+                  'events and across restarts, for you to read and change: to count, remember what you\'ve seen, or keep ' +
+                  'a window. It starts empty, and again when you change the script. A script that throws or takes too ' +
+                  'long counts as saying show, and so does any answer but true. Left out, every event the match takes is hidden.',
+              },
+            },
+            required: ['description'],
           },
         },
         required: ['name'],
@@ -13252,7 +13356,8 @@ export class AgentFramework {
           ? { ...value, description:
               'Simple behavior: "always" (wake now) or "defer" (don\'t wake; still enters ' +
               'context). For debounce / rate-limit / sampling / the reply judge, use debounceMs / rateLimit / ' +
-              'passiveSample / judge below instead of this field. Exactly one behavior must be given.' }
+              'passiveSample / judge below instead of this field. Exactly one behavior must be given, ' +
+              'except with suppress, which saves "defer" and keeps the event out of context.' }
           : value;
         if (key === 'passiveSample') judged.judge = JUDGE_PARAMETER;
       }
@@ -13267,6 +13372,46 @@ export class AgentFramework {
         inputSchema: { ...tool.inputSchema, properties: judged },
       };
     });
+
+  /** What the agent's suppress rules have kept out of its context, read from the stamped rows (gate/suppression-stats.ts). Present when a gate is wired. */
+  private static readonly SUPPRESSION_STATS_TOOL: import('./types/index.js').ToolDefinition = {
+    name: 'suppression_stats',
+    description:
+      'Show what your suppress rules (wake_add_rule with suppress) have kept out of your context. For each rule: ' +
+      'how many events it hid, how much text they held, when the first and last were stored, which servers and event types ' +
+      'they came from, and the newest few with a short preview. It reads the stored events themselves, so it counts ' +
+      'every one since the rule was added, across restarts, on the branch your memory is on. A rule you removed still ' +
+      'shows what it hid, with inForce: false.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        rule: { type: 'string', description: 'Only this rule.' },
+        recent: { type: 'number', description: `How many of each rule's newest hidden events to show, with a preview (0 to ${MAX_RECENT}; default 3).` },
+        since: { type: 'string', description: 'Only events stored at or after this time (ISO 8601, e.g. "2026-11-02T00:00:00Z").' },
+      },
+    },
+  };
+
+  /** Writes the stamped rows to a workspace file (gate/suppression-stats.ts). Present when a gate and a workspace are. */
+  private static readonly DUMP_SUPPRESSED_TOOL: import('./types/index.js').ToolDefinition = {
+    name: 'dump_suppressed',
+    description:
+      'Write the events your suppress rules hid to a file in your workspace, their text in full and any other block named, to read them or keep them: ' +
+      'one rule\'s or every rule\'s, over the time you choose. As a transcript ("text", the default) or one JSON ' +
+      'object a line ("jsonl"). Without path, it goes to suppressed/<rule or all>-<time> in your first writable ' +
+      `mount. A file holds at most ${Math.round(DUMP_MAX_BYTES / 1024 / 1024)} MB: past that, the newest events ` +
+      'that fit are written, and the result says how many older ones were left out.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Where to write it, mount-prefixed (e.g. "notes/hidden-events.txt"). An existing file is replaced.' },
+        rule: { type: 'string', description: 'Only this rule\'s events.' },
+        since: { type: 'string', description: 'Only events stored at or after this time (ISO 8601).' },
+        until: { type: 'string', description: 'Only events stored before this time (ISO 8601).' },
+        format: { type: 'string', enum: ['text', 'jsonl'], description: '"text" (default) or "jsonl".' },
+      },
+    },
+  };
 
   /** Discoverability for event tags (MCPL RFC-001): the reserved chat:* core,
    *  each connected server's declared tag ontology, and gate.js status. */
@@ -16075,6 +16220,7 @@ export class AgentFramework {
     // view agree.
     const sees = (metadata: unknown): boolean =>
       !heldFromResidents(metadata as Record<string, unknown> | undefined)
+      && !suppressedRow(metadata as Record<string, unknown> | undefined)
       && !isAnotherAgentsInjection(metadata, config.name);
     // Create context manager for this agent
     const contextManager = await ContextManager.open({
@@ -16096,7 +16242,9 @@ export class AgentFramework {
       // Another agent's stored context injections (stored-injections.ts) are
       // that agent's context, not conversation: they stay out of this view,
       // and so out of its folds, as the residents share this slot. The
-      // resident filter keeps held (tuned-out) rows out as before (`sees`).
+      // resident filter keeps held (tuned-out) rows out as before (`sees`),
+      // and suppressed rows (suppressedRow): stamped as they arrived, they
+      // never render, and stay in the slot for history and suppression_stats.
       viewFilter: (message) => sees(message.metadata),
     });
     this.trackManager(contextManager);
@@ -16172,7 +16320,10 @@ export class AgentFramework {
       // oversized tool results / attachments under the same policy.
       maxMessageTokens: primaryConfig.strategy?.maxMessageTokens,
     });
-    const sees = (metadata: unknown): boolean => !isAnotherAgentsInjection(metadata, name);
+    // Suppressed rows (suppressedRow) are never rendered for anyone, the
+    // reader of held traffic included.
+    const sees = (metadata: unknown): boolean =>
+      !suppressedRow(metadata as Record<string, unknown> | undefined) && !isAnotherAgentsInjection(metadata, name);
     const contextManager = await ContextManager.open({
       store: this.store,
       namespace: `subconscious/${primaryName}`,
@@ -16181,7 +16332,8 @@ export class AgentFramework {
       // tune-out's stamped messages included. The filter, which context-
       // manager applies to the merged view too, leaves out only the
       // residents' stored context injections (stored-injections.ts): their
-      // context, which this agent never saw while they were placed unstored.
+      // context, which this agent never saw while they were placed unstored,
+      // and suppressed rows.
       auxiliaryMessageViews: [{}],
       viewFilter: (message) => sees(message.metadata),
       strategy,
@@ -17305,6 +17457,43 @@ export class AgentFramework {
     const eventChannel = (event as { metadata?: { channelId?: unknown } }).metadata?.channelId;
     const namesChannel = typeof eventChannel === 'string' && eventChannel !== '';
     const localInput = event.type === 'external-message' || event.type === 'api:message';
+    const source = 'source' in event ? (event as { source: string }).source : 'unknown';
+    // Suppression (a gate rule with `suppress`), decided once for the event,
+    // by the first response that adds messages or asks for a wake: a
+    // suppressed event's messages are stored with the record and rendered
+    // nowhere, and no response wakes anyone for it. Console and API input
+    // never is, nor a tool's call or result. An MCPL event was decided at
+    // admission, where its own row was written, and its modules' responses
+    // read that decision.
+    // A response that only wakes agents it names has nothing to hide, and that
+    // wake is an ask of its own (a subagent's, an API call's): it isn't decided.
+    const suppressible = ((response.addMessages?.length ?? 0) > 0 || response.requestInference === true) && !surface && !localInput
+      && event.type !== 'tool-call' && event.type !== 'tool-result';
+    let suppressedRule: string | null = null;
+    const decided = this.eventSuppression.get(event);
+    if (decided !== undefined) suppressedRule = decided;
+    else if (suppressible) {
+      if (!event.type.startsWith('mcpl:')) {
+        // The event's tags too, which the addressed exemption reads. (The wake
+        // gate below isn't given them: its rules have never matched a module
+        // event's tags, and that isn't changed here.)
+        const eventTags = (event as { tags?: unknown }).tags;
+        suppressedRule = this.suppressionFor({
+          ...extractGateFields(event), eventType: event.type, serverId: source, channelId: namesChannel ? String(eventChannel) : '',
+          ...(Array.isArray(eventTags) ? { tags: expandCoreTags(eventTags.filter((t): t is string => typeof t === 'string')) } : {}),
+        });
+        this.eventSuppression.set(event, suppressedRule);
+      }
+    }
+    // What the gate is told when it's asked about the wake: suppression has
+    // had its say wherever a view could hide the row, so a suppress rule
+    // decides no wake here, for an event it let by or for one it never takes
+    // (console and API input, a wake that names its agent). Where no view could
+    // hide it, the rule defers, as its behavior says.
+    const suppressionAsked = !!this.eventGate && this.viewHidesSuppressed(this.deliveryAgent());
+    // Where a suppressed row came from: an MCPL event names its server, not a source.
+    const eventServer = (event as { serverId?: unknown }).serverId;
+    const stampSource = typeof eventServer === 'string' && eventServer !== '' ? eventServer : source;
     let added: { agent?: string; deferredId?: string; messageId?: string } | undefined;
     if (response.addMessages) {
       for (const [i, msg] of response.addMessages.entries()) {
@@ -17316,9 +17505,14 @@ export class AgentFramework {
         }
         if (surface) metadata = { ...metadata, [INBOUND_SOURCE_KEY]: surface };
         const placement: { agent?: string; deferredId?: string; messageId?: string } = {};
-        const id = this.addMessage(msg.participant, localInput ? markNoticeOpenings(msg.content) : msg.content, metadata, { placement });
+        const id = this.addMessage(msg.participant, localInput ? markNoticeOpenings(msg.content) : msg.content, metadata, {
+          placement, ...(suppressedRule !== null ? { suppressedBy: { rule: suppressedRule, eventType: event.type, source: stampSource } } : {}),
+        });
         if (response.addMessages.length === 1 && !surface && !namesChannel && metadata?.channelId === undefined) added = placement;
         this.emitTrace({ type: 'message:added', messageId: id, source: event.type });
+        if (suppressedRule !== null) {
+          this.noteSuppressedWrite(suppressedRule, { eventType: event.type, serverId: stampSource, channelId: namesChannel ? String(eventChannel) : '' });
+        }
       }
     }
 
@@ -17342,10 +17536,10 @@ export class AgentFramework {
       this.moduleRegistry.setModuleState(moduleName, response.stateUpdate);
     }
 
-    // Queue inference requests
-    if (response.requestInference) {
+    // Queue inference requests: none for a suppressed event, which has
+    // nothing in any view to wake for.
+    if (response.requestInference && suppressedRule === null) {
       step.at = 'its inference request';
-      const source = 'source' in event ? (event as { source: string }).source : 'unknown';
 
       // Gate non-MCPL events (MCPL events are already gated in PushHandler/ChannelRegistry)
       if (this.eventGate && event.type !== 'mcpl:push-event' && event.type !== 'mcpl:channel-incoming') {
@@ -17354,6 +17548,7 @@ export class AgentFramework {
           eventType: event.type,
           serverId: source,
           channelId: '',
+          ...(suppressionAsked ? { suppressionAsked: true } : {}),
         });
         if (!decision.trigger) return;
       }
@@ -17385,6 +17580,8 @@ export class AgentFramework {
   // Built-in MCPL event → context message conversion
   // ==========================================================================
 
+  /** Each event's suppression, decided once: by its MCPL lane at admission, or by the first module response that adds messages or asks for a wake (applyProcessResponse). */
+  private readonly eventSuppression = new WeakMap<object, string | null>();
   /** The servers and keys whose drop withoutHostKeys has logged, each as
    *  `${serverId}\u0000${key}`. */
   private readonly hostKeysDropped = new Set<string>();
@@ -17450,6 +17647,8 @@ export class AgentFramework {
     targetAgents?: string[];
     /** RFC-006: set when the coalescer delivers; rides the wake it queues. */
     coalescingSubject?: string;
+    /** The occurrence's suppression, when its wake decided it (CoalescedOccurrence.suppressionDecision). */
+    suppressionDecision?: string | null;
     eventId?: string;
     assemblingFor?: string;
     deliverTo?: string;
@@ -17530,6 +17729,8 @@ export class AgentFramework {
     // whether this counts as the latest delivered inbound. Every path below
     // consumes `decision`; none re-asks the policy.
     const addressed = isAddressedMessage(event.tags);
+    // Under conversation routing the message may go to a fork's own store,
+    // which has no view filter, so nothing on this lane is suppressed there.
     const decision = this.admitInbound({
       lane: 'channel',
       serverId: event.serverId,
@@ -17554,7 +17755,9 @@ export class AgentFramework {
         author: event.author,
         ...(event.tags ? { tags: event.tags } : {}),
       },
-    });
+    }, { suppressible: !this.conversationRouter, ...(event.suppressionDecision !== undefined ? { decided: event.suppressionDecision } : {}) });
+    // Modules answering this event read the same decision (applyProcessResponse).
+    this.eventSuppression.set(event, decision.suppressed?.rule ?? null);
     metadata.triggered = decision.wake;
     if (decision.held) {
       // The admission record rides the message; the hold's own bookkeeping
@@ -17647,11 +17850,19 @@ export class AgentFramework {
     // record and never enters a resident's view; a delivered one is also
     // the latest delivered inbound (the channel context's `incoming`, and
     // the fallback locus under the legacy rule) — a held one never is.
+    // A suppressed one is stored with its record (suppressedRow) and rendered
+    // nowhere, and is never the latest delivered inbound either.
     const placement: CoalescingPlacement = { agent: '' };
-    const id = this.addMessage('user', incomingContent, AgentFramework.withStoredDigest(metadata, incomingContent), { placement, bypassDeferralFor: event.assemblingFor });
+    const suppressedBy = decision.suppressed ? { rule: decision.suppressed.rule, eventType: 'mcpl:channel-incoming', source: event.serverId } : undefined;
+    const id = this.addMessage('user', incomingContent, AgentFramework.withStoredDigest(metadata, incomingContent), {
+      placement, bypassDeferralFor: event.assemblingFor, ...(suppressedBy ? { suppressedBy } : {}),
+    });
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
+    if (suppressedBy) {
+      this.noteSuppressedWrite(suppressedBy.rule, { eventType: suppressedBy.eventType, serverId: event.serverId, channelId: event.channelId });
+    }
     if (decision.locus) this.noteDeliveredOrPark(event);
-    if (!decision.held) {
+    if (!decision.held && !decision.suppressed) {
       this.considerWakeOnboarding({ serverId: event.serverId, tags: event.tags, gateDecision: decision.gateDecision, recipients: decision.recipients, channelId: event.channelId });
     }
 
@@ -19000,6 +19211,15 @@ export class AgentFramework {
     const coalescingSubject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
     const narrowing = occ.deliverTo ? { deliverTo: occ.deliverTo } : {};
     const firstViewMark = occ.firstView ? { firstView: true } : {};
+    // The occurrence's suppression, when its wake decided it; its row reads
+    // that, and a row that decides keeps its answer for the occurrence's later wakes.
+    const decided = occ.batchAddressed
+      ? { suppressionDecision: null }
+      : occ.suppressionDecision !== undefined ? { suppressionDecision: occ.suppressionDecision } : {};
+    const keepDecision = (event: object): void => {
+      const rule = this.eventSuppression.get(event);
+      if (rule !== undefined) occ.suppressionDecision = rule;
+    };
     // The envelope frozen at acceptance travels unchanged; this delivery only
     // adds the fact that it carries the rendered body.
     const frozenSource = (source: InboundSource | undefined): { inboundSource?: InboundSource } =>
@@ -19007,8 +19227,9 @@ export class AgentFramework {
         ? { inboundSource: materialized && source.kind !== 'surface' ? { ...source, materialized: true } : source }
         : {};
     if (occ.event.lane === 'channel') {
-      const event = { ...occ.event.event, coalescingSubject, ...narrowing, ...firstViewMark, ...(assemblingFor ? { assemblingFor } : {}) };
+      const event = { ...occ.event.event, coalescingSubject, ...narrowing, ...firstViewMark, ...decided, ...(assemblingFor ? { assemblingFor } : {}) };
       const placement = await this.handleMcplChannelIncoming(event);
+      keepDecision(event);
       await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
       return placement;
     }
@@ -19038,10 +19259,12 @@ export class AgentFramework {
         eventId: occ.eventId,
         ...narrowing,
         ...firstViewMark,
+        ...decided,
         ...(assemblingFor ? { assemblingFor } : {}),
         ...frozenSource(push.inboundSource),
       };
       const placement = await this.handleMcplChannelIncoming(event);
+      keepDecision(event);
       await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
       return placement;
     }
@@ -19056,9 +19279,11 @@ export class AgentFramework {
       ...(assemblingFor ? { assemblingFor, triggerInference: false } : {}),
       ...(occ.deliverTo ? { targetAgents: [occ.deliverTo] } : {}),
       ...firstViewMark,
+      ...decided,
       ...frozenSource(occ.event.event.inboundSource),
     };
     const placement = this.handleMcplPushEvent(event);
+    keepDecision(event);
     await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
     return placement;
   }
@@ -19085,6 +19310,15 @@ export class AgentFramework {
     // A deferred batch is admitted when it asks for its wake: the hold and
     // the gate decide now; its materialized delivery at assembly is vetoed
     // (`triggerInference: false`) and so is not shown to the gate again.
+    // A channel-scoped push under conversation routing may go to a fork's own
+    // store, which has no view filter, as the channel lane says; it isn't asked.
+    const suppressible = !(occ.scope.kind === 'channel' && this.conversationRouter);
+    // Decided once per occurrence: a later wake for it reads that decision. A
+    // batch holding an addressed occurrence is shown, whatever comes after it
+    // (CoalescedOccurrence.batchAddressed).
+    const remembered = occ.batchAddressed
+      ? { decided: null }
+      : occ.suppressionDecision !== undefined ? { decided: occ.suppressionDecision } : {};
     const decision = this.admitInbound({
       lane: 'push',
       serverId: occ.serverId,
@@ -19100,6 +19334,8 @@ export class AgentFramework {
         .map((b) => b.text)
         .join('\n'),
       gateMetadata: {
+        // The scope's channel, where the origin names none, so a channel rule matches.
+        ...(channelId ? { channelId } : {}),
         ...(origin ?? {}),
         serverId: occ.serverId,
         featureSet: push.featureSet,
@@ -19107,7 +19343,20 @@ export class AgentFramework {
         eventType: 'mcpl:push-event',
         ...(occ.tags ? { tags: occ.tags } : {}),
       },
-    });
+    }, { suppressible, ...remembered });
+    // Its batch's row, written later, reads this decision, since a rule's
+    // script answers once per event. (A copy of the occurrence, as a wake to
+    // read a row has, was decided before it was copied.)
+    if (suppressible) occ.suppressionDecision = decision.suppressed?.rule ?? null;
+    // A suppressed batch wakes nobody, so no turn's assembly would store it;
+    // it's stored now, stamped, and consumed, as a held batch is.
+    if (decision.suppressed && !plain && this.pushCoalescer) {
+      const coalescer = this.pushCoalescer;
+      void this.coalescedAudience(occ)
+        .then((audience) => (audience[0] !== undefined ? coalescer.materializeNow(audience[0], subject, occ.eventId) : false))
+        .catch((err) => console.error(`[coalescing] a suppressed batch for ${logValue(subject)} could not be stored:`, err));
+      return;
+    }
     if (decision.held && !plain && this.pushCoalescer) {
       // A held batch wakes nobody, so no turn's assembly would store it while
       // the hold lasts, and readers of held traffic and the release would
@@ -19427,7 +19676,9 @@ export class AgentFramework {
         eventType: 'mcpl:push-event',
         ...(event.tags ? { tags: event.tags } : {}),
       },
-    });
+    }, event.suppressionDecision !== undefined ? { decided: event.suppressionDecision } : {});
+    // Modules answering this event read the same decision (applyProcessResponse).
+    this.eventSuppression.set(event, decision.suppressed?.rule ?? null);
     metadata.triggered = decision.wake;
     if (decision.held && triggerChannel) {
       metadata.tuneOut = { epochId: decision.held.epochId };
@@ -19439,12 +19690,20 @@ export class AgentFramework {
 
     const placement: CoalescingPlacement = { agent: '' };
     if (!silentHeartbeat) {
-      const id = this.addMessage('user', content, AgentFramework.withStoredDigest(metadata, content), { placement, bypassDeferralFor: event.assemblingFor });
+      // A suppressed event is stored with its record (suppressedRow) and
+      // rendered nowhere; admission decided nothing else for it.
+      const suppressedBy = decision.suppressed ? { rule: decision.suppressed.rule, eventType: 'mcpl:push-event', source: event.serverId } : undefined;
+      const id = this.addMessage('user', content, AgentFramework.withStoredDigest(metadata, content), {
+        placement, bypassDeferralFor: event.assemblingFor, ...(suppressedBy ? { suppressedBy } : {}),
+      });
       this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
+      if (suppressedBy) {
+        this.noteSuppressedWrite(suppressedBy.rule, { eventType: suppressedBy.eventType, serverId: event.serverId, channelId: triggerChannel?.channelId ?? '' });
+      }
     } else {
       console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${logValue(event.eventId ?? '')}`);
     }
-    if (!silentHeartbeat && !decision.held) {
+    if (!silentHeartbeat && !decision.held && !decision.suppressed) {
       this.considerWakeOnboarding({ serverId: event.serverId, tags: event.tags, gateDecision: decision.gateDecision, recipients: decision.recipients, channelId: triggerChannel?.channelId });
     }
 
@@ -19538,8 +19797,8 @@ export class AgentFramework {
   }
 
   /**
-   * Explicit mode's typing channel for one start of a turn, which has no
-   * locus, read once as the start opens (driveStream then shows what the
+   * The typing channel for one start of a turn that has no locus, an
+   * explicit or a disabled mode turn's, read once as the start opens (driveStream then shows what the
    * start showed, TurnRouting.typing): where that start's wake came from,
    * its trigger's channel with its server (channelNamed), so a start batched
    * with a new wake shows typing where that wake came from. Not the turn's
@@ -19553,9 +19812,12 @@ export class AgentFramework {
    * (TurnRouting.noChannel), a wake named without its server isn't read: a
    * retry's trigger names it again, and reading it then could take a
    * channel the turn never had. A wake that gives its server, as every one
-   * the framework makes for a channel does, names that pair.
+   * the framework makes for a channel does, names that pair. A silent wake's
+   * start (InferenceRequest.suppressProse), which runs as disabled mode in
+   * every mode, shows none, though its wake names a channel.
    */
-  private explicitTypingChannel(routing: TurnRouting, trigger: InferenceRequest | undefined): ChannelRef | null {
+  private noLocusTypingChannel(routing: TurnRouting, trigger: InferenceRequest | undefined): ChannelRef | null {
+    if (trigger?.suppressProse) return null;
     // A server is read as channelNamed reads one: an empty one as none given.
     const own = trigger?.channelId && !(routing.noChannel && !trigger.channelServerId)
       ? this.channelNamed(trigger.channelId, trigger.channelServerId)
@@ -21416,7 +21678,13 @@ export class AgentFramework {
   private writeAnnouncedLocus(agentName: string, locus: ChannelRef | null | undefined): void {
     try {
       const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
-      const state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
+      // A damaged slot is left as it is: replacing it would drop the prose
+      // locks it holds, which keep locked speech held until it's repaired.
+      if (data !== null && data !== undefined && !isPlainRecord(data)) {
+        console.error(`[routing] ${agentName}: ${FRAMEWORK_STATE_ID} isn't a record (${shapeOf(data)}); the announced locus wasn't written`);
+        return;
+      }
+      const state = (data ?? {}) as Record<string, unknown>;
       const loci = { ...((state.announcedLoci as Record<string, ChannelRef | null> | undefined) ?? {}) };
       if (locus === undefined) {
         if (!Object.hasOwn(loci, agentName)) return;
@@ -22000,8 +22268,13 @@ export class AgentFramework {
     for (let end = cm.getMessageCount(); end > 0;) {
       const span = Math.min(end, AgentFramework.CLOCK_SCAN_ROWS);
       const { messages } = cm.getMessageWindow(end - span, span, { resolveBlobs: false });
-      if (newestRowAt === undefined && messages.length > 0) {
-        newestRowAt = new Date(messages[messages.length - 1]!.timestamp).getTime();
+      // The newest row the window renders: a suppressed row arriving isn't time the agent saw pass.
+      if (newestRowAt === undefined) {
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (suppressedRow(messages[i]!.metadata as Record<string, unknown> | undefined)) continue;
+          newestRowAt = new Date(messages[i]!.timestamp).getTime();
+          break;
+        }
       }
       for (let i = messages.length - 1; i >= 0; i--) {
         const stamp = clockStampOf(messages[i]!.metadata);
@@ -23605,7 +23878,13 @@ export class AgentFramework {
     const mode = this.proseRoutingOf(agent);
     try {
       const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
-      const state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
+      // A damaged slot is left as it is (writeAnnouncedLocus): no primer is
+      // recorded or appended until it's repaired.
+      if (data !== null && data !== undefined && !isPlainRecord(data)) {
+        console.error(`[prose] ${agent.name}: ${FRAMEWORK_STATE_ID} isn't a record (${shapeOf(data)}); the mode primer waits until it's repaired`);
+        return;
+      }
+      const state = (data ?? {}) as Record<string, unknown>;
       const primed = { ...((state.proseRoutingPrimed as Record<string, string> | undefined) ?? {}) };
       const stored = primed[agent.name];
       if (stored === mode) return;
@@ -24604,11 +24883,11 @@ export class AgentFramework {
     // Same channel choice as driveStream's own startTyping (which stays, is
     // idempotent per channel, and owns the 7s refresh); the catch below stops
     // it on the no-driveStream failure paths (e.g. a compile refusal).
-    // Explicit mode's is where this start's wake came from
-    // (explicitTypingChannel).
+    // Explicit and disabled mode's is where this start's wake came from
+    // (noLocusTypingChannel).
     const earlyTypingChannel =
-      turnProseRouting === 'explicit'
-        ? this.explicitTypingChannel(routing, trigger)
+      turnProseRouting === 'explicit' || turnProseRouting === 'disabled'
+        ? this.noLocusTypingChannel(routing, trigger)
         : turnLocus ?? null;
     if (earlyTypingChannel) this.showTurnTyping(routing, earlyTypingChannel);
 
@@ -25352,22 +25631,21 @@ export class AgentFramework {
     //     can move it between rounds, and followTurnLocus (below) moves the
     //     indicator with it at the next round's first content, or at its
     //     retry after a refusal.
-    //   - explicit mode: there is no locus — indicate on the TRIGGER channel,
-    //     where this start's wake came from, as the start's opening showed
-    //     it (explicitTypingChannel), not read again after its hooks and
-    //     compile. This doesn't violate never-guess: it says "attending to
-    //     what you sent here", which is true regardless of where the reply
-    //     goes. A start whose wake names no channel keeps what the turn
-    //     shows; a heartbeat explicit turn shows none, and a turn with no
-    //     channel doesn't read a wake that gives no server.
+    //   - explicit and disabled mode: there is no locus — indicate on the
+    //     TRIGGER channel, where this start's wake came from, as the start's
+    //     opening showed it (noLocusTypingChannel), not read again after its
+    //     hooks and compile. This doesn't violate never-guess: it says
+    //     "attending to what you sent here", which is true regardless of
+    //     where the reply goes, or whether one goes at all. A start whose
+    //     wake names no channel keeps what the turn shows; a heartbeat's turn
+    //     and a silent wake's show none, and a turn with no channel doesn't
+    //     read a wake that gives no server.
     let typingChannel =
-      turnProseRouting === 'disabled'
-        ? null
-        : turnProseRouting === 'explicit'
-          ? streamRouting.typing ?? null
-          : turnProseRouting === 'locked'
-            ? this.turnSpeaksAt(streamRouting)
-            : resolveTurnLocus();
+      turnProseRouting === 'explicit' || turnProseRouting === 'disabled'
+        ? streamRouting.typing ?? null
+        : turnProseRouting === 'locked'
+          ? this.turnSpeaksAt(streamRouting)
+          : resolveTurnLocus();
     if (typingChannel) this.showTurnTyping(streamRouting, typingChannel);
     // Locus, hybrid and locked mode: move the indicator to the turn's locus
     // when it has moved since the indicator last showed (locked: by
@@ -25375,11 +25653,19 @@ export class AgentFramework {
     const followTurnLocus = (): void => {
       if (turnProseRouting !== 'locus' && turnProseRouting !== 'hybrid' && turnProseRouting !== 'locked') return;
       const locus = turnProseRouting === 'locked' ? this.turnSpeaksAt(streamRouting) : resolveTurnLocus();
+      // A locked turn moved to speak nowhere (drafts, or held after a move)
+      // shows and traces no channel: prose_locus stopped its indicator.
+      if (!locus && turnProseRouting === 'locked') {
+        typingChannel = null;
+        return;
+      }
       // Against the turn's own record, which a locked move to drafts clears.
       if (!locus || sameChannel(locus, streamRouting.typing ?? null)) return;
       this.showTurnTyping(streamRouting, locus);
       typingChannel = locus;
     };
+    const tracedChannelId = (): string | undefined =>
+      (turnProseRouting === 'disabled' ? undefined : typingChannel?.channelId);
 
     // §10.5 inference/lifecycle: `started` now, exactly one terminal in the
     // finally below (the one block every exit path shares). Which terminal
@@ -25546,8 +25832,9 @@ export class AgentFramework {
               blockIndex: event.meta.blockIndex,
               // The channel the typing indicator above shows, the conversation
               // the turn is attending: lets trace consumers tag every chunk
-              // with it, without re-deriving routing.
-              channelId: typingChannel?.channelId,
+              // with it, without re-deriving routing. None in disabled mode,
+              // whose text is never sent to a channel.
+              channelId: tracedChannelId(),
             };
             if (agent.toolResultGuard.hasSubmittedPending || agent.toolResultGuard.recovering) {
               guardHeld.push(trace);
@@ -25578,7 +25865,7 @@ export class AgentFramework {
               content: '',
               blockType: 'text',
               blockIndex: 0,
-              channelId: typingChannel?.channelId,
+              channelId: tracedChannelId(),
             });
             break;
           }
@@ -25591,7 +25878,7 @@ export class AgentFramework {
               phase,
               blockType: block.type,
               blockIndex: index,
-              channelId: typingChannel?.channelId,
+              channelId: tracedChannelId(),
             });
             break;
           }
@@ -27731,6 +28018,10 @@ export class AgentFramework {
         return this.awaitedToolAnswer((deliver) => this.dispatchFetchReferenceToolCall(subject, call, deliver));
       case 'gate-status':
         return this.awaitedToolAnswer((deliver) => this.dispatchGateToolCall(subject, call, deliver));
+      case 'suppression-stats':
+        return this.awaitedToolAnswer((deliver) => this.dispatchSuppressionStatsToolCall(subject, call, deliver));
+      case 'dump-suppressed':
+        return this.awaitedToolAnswer((deliver) => this.dispatchDumpSuppressedToolCall(subject, call, deliver));
 
       // The tune-out tool, in process: the same body the dispatcher runs, its
       // answer awaited here (it can wait for the tune-out's transport).
@@ -29666,6 +29957,8 @@ export class AgentFramework {
     if (name === 'read_image') return { kind: 'read-image' };
     if (name === 'fetch_reference') return { kind: 'fetch-reference' };
     if (name === 'gate_status' && this.eventGate) return { kind: 'gate-status' };
+    if (name === 'suppression_stats' && this.eventGate) return { kind: 'suppression-stats' };
+    if (name === 'dump_suppressed' && this.eventGate && this.getWorkspaceModule()) return { kind: 'dump-suppressed' };
     if ((name === 'tune_out' || name === 'focus') && this.tuneOutCoordinator) return { kind: 'tune-out' };
     if ((SUBCONSCIOUS_TOOL_NAMES as readonly string[]).includes(name)) return { kind: 'subconscious' };
     if ((name === 'sleep' || name === 'wake') && this.eventGate) return { kind: 'sleep' };
@@ -29808,6 +30101,16 @@ export class AgentFramework {
 
       case 'gate-status': {
         this.dispatchGateToolCall(agentName, enrichedCall);
+        return;
+      }
+
+      case 'suppression-stats': {
+        this.dispatchSuppressionStatsToolCall(agentName, enrichedCall);
+        return;
+      }
+
+      case 'dump-suppressed': {
+        this.dispatchDumpSuppressedToolCall(agentName, enrichedCall);
         return;
       }
 
@@ -30086,6 +30389,14 @@ export class AgentFramework {
        * any other write is weighed as if it weren't set.
        */
       bypassDeferralFor?: string;
+      /**
+       * A suppress rule took this message as it arrived (the gate's
+       * suppressionFor, asked by the lane that wrote it): stamped as
+       * `metadata.suppressed`, which every view the framework sets leaves out
+       * (suppressedRow). Only the framework stamps: a `suppressed` the given
+       * metadata carries is dropped, as `deferredWriteId` is.
+       */
+      suppressedBy?: { rule: string; eventType: string; source?: string };
     }
   ): MessageId {
     // `deferredWriteId` is the framework's: a write from the queue is stored
@@ -30106,6 +30417,18 @@ export class AgentFramework {
     if (!opts?.fromQueue && !opts?.markedForRun && metadata && PRIMARY_IF_UNREAD_KEY in metadata) {
       const { [PRIMARY_IF_UNREAD_KEY]: _theFrameworks, ...rest } = metadata as Record<string, unknown>;
       metadata = rest as MessageMetadata;
+    }
+    // And so is the suppression record: a write from the queue keeps the one
+    // stamped when it first came here; any other write carries one only when
+    // its lane says a suppress rule took it, as a module's response that
+    // copied a stored row's metadata mustn't hide its write by carrying one.
+    if (!opts?.fromQueue && metadata && 'suppressed' in metadata) {
+      const { suppressed: _theFrameworks, ...rest } = metadata as Record<string, unknown>;
+      metadata = rest as MessageMetadata;
+    }
+    if (!opts?.fromQueue && opts?.suppressedBy) {
+      const { rule, eventType, source } = opts.suppressedBy;
+      metadata = { ...metadata, suppressed: { rule, eventType, ...(source ? { source } : {}) } } as MessageMetadata;
     }
     // Content context-manager won't store is refused here, as the store's own
     // write refuses it, whether this write is stored now or deferred: the
@@ -30213,8 +30536,11 @@ export class AgentFramework {
     // tool result (which takes none), or no turn of the agent's is alive, or
     // its turn is assembling before its compile, or it comes from stop()'s
     // drain, once every stream it could join has settled: the clock is in
-    // whatever request comes next.
-    if (takesClockBefore(participant, content, metadata, agent.name)) this.storeDueClock(agent, 'event');
+    // whatever request comes next. A suppressed row takes none: it renders
+    // nowhere, and a clock ahead of it would be the one trace it left.
+    if (takesClockBefore(participant, content, metadata, agent.name) && !suppressedRow(metadata as Record<string, unknown> | undefined)) {
+      this.storeDueClock(agent, 'event');
+    }
     const stored = agent.getContextManager().addMessage(
       participant,
       content,
@@ -30242,7 +30568,8 @@ export class AgentFramework {
     // A turn starting, streaming or waiting on its tools writes after the
     // message, and the line says which message the wake is for.
     if (this.turnAlive(agent)) return false;
-    if (this.deferredMessages.some((m) => (m.forAgent ?? this.primaryAgentName) === agent.name)) return false;
+    // A queued write the agent won't see (a suppressed one) isn't a message after it.
+    if (this.deferredMessages.some((m) => (m.forAgent ?? this.primaryAgentName) === agent.name && this.agentSees(agent, m.metadata))) return false;
     return this.isNewestIn(agent, entry);
   }
 
@@ -33748,11 +34075,18 @@ export class AgentFramework {
       return false;
     }
     try {
+      const noticeText = `[${NOTICE_TAG.toolsets}] MCPL server "${serverId}", tool changes:\n${text}`;
+      // A server's delivery, so the agent's suppress rules decide it as one of
+      // the server's events, of type TOOL_CHANGES_EVENT_TYPE: a server whose
+      // tools flap (an eye going on and off) can be kept out of view.
+      const rule = this.suppressionFor({ content: noticeText, eventType: TOOL_CHANGES_EVENT_TYPE, serverId, channelId: '', metadata: { serverId } });
       this.addMessage(
         'user',
-        [{ type: 'text', text: `[${NOTICE_TAG.toolsets}] MCPL server "${serverId}", tool changes:\n${text}` }],
+        [{ type: 'text', text: noticeText }],
         { system: true, kind: 'mcpl-toolsets', serverId, ...(opts.invite ? { invite: true } : {}) } as MessageMetadata,
+        rule !== null ? { suppressedBy: { rule, eventType: TOOL_CHANGES_EVENT_TYPE, source: serverId } } : undefined,
       );
+      if (rule !== null) this.noteSuppressedWrite(rule, { eventType: TOOL_CHANGES_EVENT_TYPE, serverId, channelId: '' });
       return true;
     } catch (error) {
       console.error(`[mcpl] ${serverId}: a tool change notice could not be written:`, error);
@@ -37217,6 +37551,7 @@ export class AgentFramework {
         name?: unknown; match?: unknown; resets?: unknown; position?: unknown;
         insertBefore?: unknown; insertAfter?: unknown; passthrough?: unknown;
         behavior?: unknown; debounceMs?: unknown; rateLimit?: unknown; passiveSample?: unknown; judge?: unknown;
+        suppress?: unknown;
       };
       const behaviorSources = [
         input.behavior !== undefined ? 'behavior' : null,
@@ -37225,6 +37560,47 @@ export class AgentFramework {
         input.passiveSample !== undefined ? 'passiveSample' : null,
         this.judgeWired && input.judge !== undefined ? 'judge' : null,
       ].filter((s): s is string => s !== null);
+      // A suppress rule doesn't wake the agent, and is saved with behavior
+      // "defer" written out (readSuppress says why), which it may also give.
+      // What `suppress` holds is the gate's to check, as it is in gate.json.
+      const suppressing = input.suppress !== undefined && input.suppress !== false;
+      if (suppressing && behaviorSources.some((source) => source !== 'behavior')) {
+        finish({
+          success: false,
+          error: `wake_add_rule got suppress with ${behaviorSources.join(' and ')}, so nothing was saved. A rule that `
+            + 'suppresses never wakes you, so it takes no timing: leave them out (the rule is saved with behavior "defer"). '
+            + 'For timing of your own, such as one event shown in a while, give suppress.script.',
+          isError: true,
+        });
+        return;
+      }
+      if (suppressing && input.behavior !== undefined && input.behavior !== 'defer' && input.behavior !== 'skip') {
+        finish({
+          success: false,
+          error: `wake_add_rule got suppress with behavior ${shownValue(input.behavior)}, so nothing was saved. A rule `
+            + 'that suppresses never wakes you: leave behavior out (the rule is saved with behavior "defer"), or give "defer".',
+          isError: true,
+        });
+        return;
+      }
+      // A script is compiled on the gate's script worker before the rule is
+      // saved, so one that isn't a function is refused here rather than
+      // showing every event it was written to hide.
+      const script = suppressing && input.suppress && typeof input.suppress === 'object'
+        ? (input.suppress as { script?: unknown }).script : undefined;
+      if (typeof script === 'string' && script.trim() !== '') {
+        const problem = this.eventGate!.checkSuppressScript(script);
+        if (problem !== null) {
+          finish({
+            success: false,
+            error: `wake_add_rule: suppress.script can't be used (${problem}), so nothing was saved. `
+              + 'Give the source of a function such as (event, state) => event.text.includes("ping").',
+            isError: true,
+          });
+          return;
+        }
+      }
+      if (suppressing && behaviorSources.length === 0) behaviorSources.push('suppress');
       if (behaviorSources.length === 0) {
         finish({
           success: false,
@@ -37267,6 +37643,7 @@ export class AgentFramework {
         : input.rateLimit !== undefined ? { rate_limit: input.rateLimit }
         : input.passiveSample !== undefined ? { passive_sample: input.passiveSample }
         : this.judgeWired && input.judge !== undefined ? { judge: input.judge }
+        : suppressing && input.behavior === undefined ? 'defer'
         : input.behavior;
 
       // Placement: at most one of position / insertBefore / insertAfter.
@@ -37332,6 +37709,7 @@ export class AgentFramework {
         behavior,
         ...(input.passthrough !== undefined ? { passthrough: input.passthrough } : {}),
         ...(input.resets !== undefined ? { resets: input.resets } : {}),
+        ...(input.suppress !== undefined && input.suppress !== false ? { suppress: input.suppress } : {}),
       };
 
       // Before/after probe table + shadow lint: the moment a rule changes the
@@ -37619,10 +37997,119 @@ export class AgentFramework {
    * framework's policy inputs (recipients, the hold in force, the wake
    * gate), traced. Callers apply it; nothing downstream re-asks.
    */
-  private admitInbound(env: InboundEnvelope): AdmissionDecision & { gateDecision?: GateDecision } {
+  /**
+   * The suppressed rows stored in an agent's message slot (the primary's when
+   * none is named), oldest first, whole: what dump_suppressed writes and the
+   * suppression review reads, for a host to read too. Within `sinceMs` (at or
+   * after) and `untilMs` (before), and of `rule`, when given. The slot is read
+   * on the branch it's on; rows still queued behind a live turn aren't in it.
+   */
+  suppressedEvents(agentName?: string, opts: { rule?: string; sinceMs?: number; untilMs?: number } = {}): SuppressedEventRecord[] {
+    const agent = agentName === undefined ? this.deliveryAgent() : this.agents.get(agentName);
+    if (!agent) return [];
+    return suppressedRecords(agent.getContextManager().getAllMessages() as unknown as Parameters<typeof suppressedRecords>[0], opts);
+  }
+
+  /** Run the suppression review now, as its timer would: null when none is wired or one isn't run now (SuppressionReview.runOnce). */
+  reviewSuppression(): Promise<SuppressionReviewSummary | null> {
+    return this.suppressionReview?.runOnce() ?? Promise.resolve(null);
+  }
+
+  /** The suppress rules in force, as the suppression review knows them. */
+  private suppressRulesInForce(): ReviewRuleInfo[] {
+    if (!this.eventGate) return [];
+    return this.eventGate.getStatus().policies.flatMap((p) => {
+      if (!p.suppress) return [];
+      const match = this.eventGate!.policyInForce(p.name)?.match;
+      return [{
+        name: p.name,
+        description: p.suppress.description,
+        ...(match !== undefined ? { match } : {}),
+        ...(p.suppress.script !== undefined ? { script: p.suppress.script } : {}),
+      }];
+    });
+  }
+
+  /**
+   * Tell the agent what the suppression review found: a notice of the
+   * framework's own (never suppressed, as it's no event), and a wake when the
+   * review flagged something. Throws when the notice can't be written, so the
+   * review covers its period again next time.
+   */
+  private deliverSuppressionReview(agentName: string, text: string, wake: boolean): void {
+    const placement: { agent?: string; deferredId?: string; messageId?: string } = {};
+    const forAgent = agentName === this.primaryAgentName ? undefined : agentName;
+    this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'suppression-review' } as MessageMetadata, {
+      ...(forAgent ? { forAgent } : {}), placement,
+    });
+    // A sleep the agent asked for stands: the notice waits for its next turn.
+    if (!wake || !this.agents.has(agentName) || this.eventGate?.getSleepState()) return;
+    this.pendingRequests.push({
+      agentName, reason: 'suppression-review', source: 'gate', timestamp: Date.now(),
+      ...this.readsWriteFor(placement, agentName),
+    });
+  }
+
+  /**
+   * Whether `agent`'s view leaves suppressed rows out, asked of the view
+   * itself (storeSees): every resident's, the subconscious's and a view
+   * derived from one does; an isolated agent's own store has no view filter,
+   * so a row stamped there would render.
+   */
+  private viewHidesSuppressed(agent: Agent | undefined): boolean {
+    if (!agent) return false;
+    const sees = this.storeSees.get(agent.getContextManager());
+    return !!sees && !sees(SUPPRESSED_PROBE);
+  }
+
+  /**
+   * The suppress rule that takes an event a lane is about to write with
+   * addMessage, or null (EventGate.decideSuppression: asked once per event,
+   * since a windowed rule opens its window for an event it lets by). Null
+   * with no gate, and where the write would land in a view that doesn't hide
+   * suppressed rows (viewHidesSuppressed), since the stamp would hide
+   * nothing there.
+   */
+  private suppressionFor(info: GateEventInfo, forAgent?: string): string | null {
+    if (!this.eventGate || !this.viewHidesSuppressed(this.deliveryAgent(forAgent))) return null;
+    try {
+      return this.eventGate.decideSuppression(info);
+    } catch (error) {
+      // Suppression is the agent's own filter; an error in it renders the event.
+      console.error(`[gate] deciding whether a ${logValue(info.eventType)} event is suppressed failed, so it isn't:`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Count a write a suppress rule took, once addMessage has taken it (stored,
+   * or queued behind a turn) (EventGate.noteSuppressed), and tell the review
+   * the rule's description as it stands now, so the rows are judged against
+   * it even when the rule is gone by the next review.
+   */
+  private noteSuppressedWrite(rule: string, info: Pick<GateEventInfo, 'eventType' | 'serverId' | 'channelId'>): void {
+    this.eventGate?.noteSuppressed(rule, info);
+    const description = this.eventGate?.policyInForce(rule)?.suppress?.description;
+    if (description) this.suppressionReview?.noteRule(rule, description);
+  }
+
+  private admitInbound(
+    env: InboundEnvelope,
+    /**
+     * `suppressible`: false where the event may land in a conversation fork's
+     * store, which has no view filter. `decided`: the suppression decided for
+     * this occurrence earlier (a coalesced push's, at its wake), used instead
+     * of asking again, since a rule's script answers once per event.
+     */
+    opts: { suppressible?: boolean; decided?: string | null } = {},
+  ): AdmissionDecision & { gateDecision?: GateDecision } {
     // The gate's whole decision, for wake onboarding (which rule let the event
     // go by); admission itself reads only whether it wakes.
     let gateDecision: GateDecision | undefined;
+    // Suppression is asked where the row lands in a view that hides it; the
+    // gate is told it was, so a suppress rule that let the event by doesn't
+    // decide its wake (EventGate.passesOverSuppress).
+    const asked = opts.suppressible !== false && !!this.eventGate && this.viewHidesSuppressed(this.deliveryAgent());
     const gateInfo = (e: InboundEnvelope) => ({
       content: e.gateContent,
       eventType: String(e.gateMetadata.eventType ?? 'unknown'),
@@ -37630,9 +38117,13 @@ export class AgentFramework {
       channelId: typeof e.gateMetadata.channelId === 'string' ? e.gateMetadata.channelId : '',
       metadata: e.gateMetadata,
       tags: Array.isArray(e.gateMetadata.tags) ? (e.gateMetadata.tags as string[]) : undefined,
+      ...(asked ? { suppressionAsked: true } : {}),
     });
     const decision = admit(env, {
       untargetedRecipients: () => this.registry.untargetedRecipients(),
+      ...(asked
+        ? { suppressionFor: (e: InboundEnvelope) => (opts.decided !== undefined ? opts.decided : this.suppressionFor(gateInfo(e))) }
+        : {}),
       holdFor: (serverId, channelId) => {
         const hold = this.tuneOutCoordinator?.holdFor(serverId, channelId) ?? null;
         return hold ? { kind: 'tune-out', epochId: hold.epochId, serverId, channelId } : null;
@@ -37659,6 +38150,7 @@ export class AgentFramework {
       messageId: env.messageId,
       recipients: decision.recipients,
       held: decision.held ? decision.held.epochId : null,
+      ...(decision.suppressed ? { suppressed: decision.suppressed.rule } : {}),
       wake: decision.wake,
       gatePass: decision.gatePass,
     });
@@ -37930,9 +38422,9 @@ export class AgentFramework {
         console.error(`[sleep] ${agentName}: the call was made outside the agent's current turn — sleep announcement not posted`);
       } else if (silentTurn) {
         console.error(`[sleep] ${agentName}: the turn was started silent — sleep announcement not posted`);
-      } else if (agent?.proseRouting === 'disabled') {
+      } else if (agent && this.proseRoutingOf(agent) === 'disabled') {
         console.error(`[sleep] ${agentName}: proseRouting=disabled — sleep announcement not posted`);
-      } else if (agent?.proseRouting === 'explicit') {
+      } else if (agent && this.proseRoutingOf(agent) === 'explicit') {
         // Explicit mode: announce to the turn's sticky prose target if the
         // model has set one; otherwise stay quiet — never guess a channel.
         const target = callingTurn.pin;
@@ -38848,6 +39340,171 @@ export class AgentFramework {
         this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
         deliver({ success: false, error: err.message, isError: true });
       });
+  }
+
+  /**
+   * suppression_stats: what the suppress rules have hidden, counted over the
+   * rows stored in the caller's message slot (the residents' shared one, for
+   * a resident), on the branch it's on. Every suppress rule in force is
+   * listed, with what it suppressed since start (the gate's matchCount).
+   */
+  private dispatchSuppressionStatsToolCall(agentName: string, call: ToolCall, deliver = this.pushToolResult(agentName, call, 'gate')): void {
+    this.emitTrace({ type: 'tool:started', module: 'gate', tool: call.name, callId: call.id, input: call.input });
+    const startTime = Date.now();
+    const finish = (result: ToolResult) => {
+      this.traceToolOutcome('gate', call.name, call.id, result, Date.now() - startTime);
+      deliver(result);
+    };
+    try {
+      const input = (call.input ?? {}) as { rule?: unknown; recent?: unknown; since?: unknown };
+      if (input.rule !== undefined && input.rule !== null && (typeof input.rule !== 'string' || input.rule === '')) {
+        finish({ success: false, error: `suppression_stats: rule is ${shownValue(input.rule)}, where a rule's name is needed. Leave it out for every rule.`, isError: true });
+        return;
+      }
+      const recent = input.recent === undefined || input.recent === null ? undefined : Number(input.recent);
+      if (recent !== undefined && !(Number.isFinite(recent) && recent >= 0)) {
+        finish({ success: false, error: `suppression_stats: recent is ${shownValue(input.recent)}, where a number from 0 to ${MAX_RECENT} is needed.`, isError: true });
+        return;
+      }
+      let sinceMs: number | undefined;
+      if (input.since !== undefined && input.since !== null && input.since !== '') {
+        sinceMs = typeof input.since === 'string' ? Date.parse(input.since) : NaN;
+        if (!Number.isFinite(sinceMs)) {
+          finish({ success: false, error: `suppression_stats: since is ${shownValue(input.since)}, where a time such as "2026-11-02T00:00:00Z" is needed.`, isError: true });
+          return;
+        }
+      }
+      const agent = this.agents.get(agentName) ?? this.deliveryAgent();
+      if (!agent) {
+        finish({ success: false, error: 'suppression_stats: no agent is registered, so there is no message slot to read.', isError: true });
+        return;
+      }
+      const status = this.eventGate!.getStatus();
+      const inForce = status.policies.filter((p) => p.suppress).map((p) => ({ name: p.name, sinceStart: p.matchCount }));
+      const cm = agent.getContextManager();
+      const stats = suppressionStats(cm.getAllMessages() as unknown as Parameters<typeof suppressionStats>[0], inForce, {
+        ...(typeof input.rule === 'string' && input.rule !== '' ? { rule: input.rule } : {}),
+        ...(recent !== undefined ? { recent } : {}),
+        ...(sinceMs !== undefined ? { sinceMs } : {}),
+      });
+      const named = typeof input.rule === 'string' && input.rule !== '' ? input.rule : undefined;
+      const within = sinceMs !== undefined ? ` since ${new Date(sinceMs).toISOString()}` : '';
+      const note = stats.rules.length === 0
+        ? (named !== undefined
+          ? `No suppress rule is named ${quotedValue(named)}, and no stored event${within} was suppressed by one of that name.`
+          : `You have no suppress rules, and no stored event${within} was suppressed. wake_add_rule with suppress adds one.`)
+        : undefined;
+      finish({
+        success: true,
+        data: {
+          ...stats,
+          branch: cm.currentBranch().name,
+          ...(sinceMs !== undefined ? { since: new Date(sinceMs).toISOString() } : {}),
+          ...(note ? { note } : {}),
+        },
+      });
+    } catch (error) {
+      finish({ success: false, error: `suppression_stats failed: ${thrownText(error)}`, isError: true });
+    }
+  }
+
+  /**
+   * dump_suppressed: the suppressed rows in the caller's message slot
+   * (suppressedEvents), whole, written to a workspace file as the caller's own
+   * write.
+   */
+  private dispatchDumpSuppressedToolCall(agentName: string, call: ToolCall, deliver = this.pushToolResult(agentName, call, 'gate')): void {
+    this.emitTrace({ type: 'tool:started', module: 'gate', tool: call.name, callId: call.id, input: call.input });
+    const startTime = Date.now();
+    const finish = (result: ToolResult) => {
+      this.traceToolOutcome('gate', call.name, call.id, result, Date.now() - startTime);
+      deliver(result);
+    };
+    const refuse = (error: string) => finish({ success: false, error: `dump_suppressed: ${error}`, isError: true });
+    void (async () => {
+      const input = (call.input ?? {}) as { path?: unknown; rule?: unknown; since?: unknown; until?: unknown; format?: unknown };
+      const given = (value: unknown) => value !== undefined && value !== null && value !== '';
+      for (const field of ['path', 'rule', 'since', 'until'] as const) {
+        if (given(input[field]) && typeof input[field] !== 'string') {
+          refuse(`${field} is ${shownValue(input[field])}, where text is needed. Nothing was written.`);
+          return;
+        }
+      }
+      const format: SuppressedDumpFormat | undefined = !given(input.format) ? 'text'
+        : input.format === 'text' || input.format === 'jsonl' ? input.format : undefined;
+      if (!format) { refuse(`format is ${shownValue(input.format)}, where "text" or "jsonl" is needed. Nothing was written.`); return; }
+      const time = (field: 'since' | 'until'): number | undefined | null => {
+        if (!given(input[field])) return undefined;
+        const ms = Date.parse(input[field] as string);
+        return Number.isFinite(ms) ? ms : null;
+      };
+      const sinceMs = time('since');
+      const untilMs = time('until');
+      for (const [field, ms] of [['since', sinceMs], ['until', untilMs]] as const) {
+        if (ms === null) { refuse(`${field} is ${shownValue(input[field])}, where a time such as "2026-11-02T00:00:00Z" is needed. Nothing was written.`); return; }
+      }
+      const workspace = this.getWorkspaceModule();
+      if (!workspace) { refuse('there is no workspace to write to. suppression_stats shows the counts and the newest events.'); return; }
+      const rule = given(input.rule) ? input.rule as string : undefined;
+      // The caller's slot, or the delivery agent's for a caller that isn't an agent, as suppression_stats reads.
+      const reader = this.agents.get(agentName) ?? this.deliveryAgent();
+      const records = this.suppressedEvents(reader?.name ?? agentName, {
+        ...(rule !== undefined ? { rule } : {}),
+        ...(typeof sinceMs === 'number' ? { sinceMs } : {}),
+        ...(typeof untilMs === 'number' ? { untilMs } : {}),
+      });
+      if (records.length === 0) {
+        finish({ success: true, data: { written: 0, note: `No stored event was suppressed${rule !== undefined ? ` by ${quotedValue(rule)}` : ''}${sinceMs !== undefined || untilMs !== undefined ? ' in that time' : ''}, so nothing was written.` } });
+        return;
+      }
+      let path = given(input.path) ? input.path as string : undefined;
+      if (path === undefined) {
+        const mount = this.firstWritableMountName(workspace);
+        if (!mount) {
+          refuse('no mount takes a file at a default path here. Give path, starting with the name of a mount you can write to.');
+          return;
+        }
+        // To the millisecond, so two dumps in the same second don't share a file.
+        const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('.', '');
+        path = `${mount}/suppressed/${(rule ?? 'all').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 60)}-${stamp}.${format === 'jsonl' ? 'jsonl' : 'txt'}`;
+      }
+      const last = records[records.length - 1]!.at;
+      // Named for what the file holds, once the newest that fit are known.
+      const title = (written: number, first: string) =>
+        `Suppressed events${rule !== undefined ? ` of rule ${JSON.stringify(rule)}` : ''}, ${first} to ${last} (${written})`;
+      const dump = renderSuppressedDump(records, format, { maxBytes: DUMP_MAX_BYTES, title });
+      if (dump.written === 0) {
+        refuse(`the newest event alone is over the ${Math.round(DUMP_MAX_BYTES / 1024 / 1024)} MB a file holds, so nothing was written. `
+          + 'Give until to write the events before it.');
+        return;
+      }
+      const counted = new Map<string, number>();
+      for (const r of records.slice(dump.omitted)) counted.set(r.rule, (counted.get(r.rule) ?? 0) + 1);
+      const byRule = Object.fromEntries(counted);
+      // Written on the branch the store is on now, or not at all, which is the
+      // branch the workspace checks (a derived agent's rows may be on its own).
+      const branch = this.store.currentBranch().name;
+      const result = await workspace.writeBinary(path, Buffer.from(dump.content, 'utf8'), 'text/plain', { agentName, branch });
+      const storeOnly = !result.success && (result.data as { inChronicle?: boolean } | undefined)?.inChronicle === true;
+      if (!result.success && !storeOnly) {
+        refuse(`writing ${path} failed: ${result.error ?? 'the workspace gave no reason'}. Nothing was written.`);
+        return;
+      }
+      finish({
+        success: true,
+        data: {
+          path,
+          ...(storeOnly ? { diskNote: `${path} is in the workspace, where its tools read it, but the rest of its write failed: ${result.error ?? 'no reason given'}.` } : {}),
+          written: dump.written,
+          ...(dump.omitted > 0 ? { omitted: dump.omitted, note: `The ${dump.omitted} oldest events didn't fit in ${Math.round(DUMP_MAX_BYTES / 1024 / 1024)} MB; give since, until or rule for the rest.` } : {}),
+          bytes: Buffer.byteLength(dump.content),
+          byRule,
+          from: records[dump.omitted]!.at,
+          to: last,
+          format,
+        },
+      });
+    })().catch((error) => refuse(`failed: ${thrownText(error)}`));
   }
 
   /** The channel context one server is told for an agent's inference

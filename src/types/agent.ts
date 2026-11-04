@@ -336,7 +336,10 @@ export interface AgentConfig {
    *   Only the `prose_locus` tool moves it, to a channel or to drafts (held,
    *   never posted unless the agent resends them). The choice persists
    *   across turns and restarts. Until the agent first makes one,
-   *   `proseLock` is the destination. See docs/locked-prose-routing.md.
+   *   `proseLock` is the destination. It governs routing through the channel
+   *   registry: a module that handles final speech itself (`onAgentSpeech`,
+   *   such as the in-process Discord module) receives it in every mode, this
+   *   one included. See docs/locked-prose-routing.md.
    */
   proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled' | 'locked';
 

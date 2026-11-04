@@ -1456,7 +1456,7 @@ test("a bounce's example skips a candidate written skip_reply, which a >> line r
 test("explicit mode's typing reads each start's own wake, and a turn that has no channel reads only a wake that gives its server", async (t) => {
   const f = await frameworkWith(t, ['a', 'b'], 'explicit');
   const typingFor = (routing: Record<string, unknown>, trigger: Partial<InferenceRequest> | undefined) =>
-    (f.framework as unknown as { explicitTypingChannel(r: unknown, t: unknown): ChannelRef | null }).explicitTypingChannel(routing, trigger);
+    (f.framework as unknown as { noLocusTypingChannel(r: unknown, t: unknown): ChannelRef | null }).noLocusTypingChannel(routing, trigger);
   // The start's own trigger, with its server, whatever the turn's trigger channel became.
   assert.deepEqual(typingFor({ triggerChannel: a }, { channelId: 'general', channelServerId: 'b' }), b);
   assert.equal(typingFor({ triggerChannel: a }, { reason: 'context_budget_restart' }), null, 'a start whose trigger names no channel, in a turn that has shown none');

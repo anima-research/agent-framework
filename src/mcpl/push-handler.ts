@@ -36,6 +36,8 @@ import type { TraceEventInput } from '../types/trace.js';
  * events.ts modification is deferred.
  */
 export interface McplPushEvent {
+  /** The occurrence's suppression, when a coalesced push's wake decided it (CoalescedOccurrence.suppressionDecision). */
+  suppressionDecision?: string | null;
   type: 'mcpl:push-event';
   serverId: string;
   featureSet: string;

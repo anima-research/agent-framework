@@ -598,6 +598,9 @@ describe('locked prose routing', () => {
     assert.ok(toolResultTexts().some((t) => t.includes('Your plain speech now goes to discord:g:main, on this turn')));
     assert.ok(!toolResultTexts().some((t) => t.includes('held as drafts')));
     assert.deepEqual(routed, [{ text: 'Still main.', locus: 'discord:g:main' }]);
+    const store = (framework as unknown as { store: { getStateJson(id: string): unknown } }).store;
+    assert.deepEqual((store.getStateJson('framework/state') as { proseLocks?: unknown }).proseLocks,
+      { assistant: { serverId: 'stub', channelId: 'discord:g:main' } }, 'recorded as its own choice');
     await framework.stop();
   });
 
@@ -902,7 +905,9 @@ describe('locked prose routing', () => {
   });
 
   it("a silent start of a locked agent gives a send with no channel its lock, or nothing, never the registry's default", async () => {
-    for (const [proseLock, expected] of [['#main', 'discord:g:main'], ['drafts', undefined]] as const) {
+    for (const [proseLock, expected, fromChannel] of [
+      ['#main', 'discord:g:main', false], ['drafts', undefined, false], ['drafts', undefined, true], ['#main', 'discord:g:main', true],
+    ] as const) {
       rmSync(tempDir, { recursive: true, force: true });
       tempDir = mkdtempSync(join(tmpdir(), 'locked-prose-'));
       membrane = new MockMembrane();
@@ -920,8 +925,12 @@ describe('locked prose routing', () => {
       };
       // A silent tick: its prose is suppressed, and the stub registry would
       // resolve #lounge as a default for any turn that asked it.
+      // A silent start either from no channel or woken from #lounge, which
+      // must not become its default either.
       (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
-        agentName: 'assistant', reason: 'heartbeat', source: 'heartbeat', timestamp: Date.now(), suppressProse: true,
+        agentName: 'assistant', reason: fromChannel ? 'message' : 'heartbeat', source: fromChannel ? 'test' : 'heartbeat',
+        timestamp: Date.now(), suppressProse: true,
+        ...(fromChannel ? { channelId: 'discord:g:lounge', channelServerId: 'stub' } : {}),
       });
       await framework.runUntilIdle();
       assert.equal(asked.length, 1, proseLock);

@@ -10,5 +10,8 @@
   as `locus` but tells the agent it's in explicit mode, and doesn't silence
   speech beside a send. Upgrade agent-framework before any recipe sets it; connectome-host needs
   its companion release (anima-research/connectome-host#603) to accept it in
-  a recipe. Agents that don't set the mode route as before. See
+  a recipe. Agents that don't set the mode route as before. The lock governs
+  routing through the channel registry (MCPL channels): a module that handles
+  a turn's final speech itself (`onAgentSpeech`, such as the in-process
+  Discord module) receives it in every mode, this one included. See
   docs/locked-prose-routing.md.
