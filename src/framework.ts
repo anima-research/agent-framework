@@ -3784,6 +3784,7 @@ export class AgentFramework {
   private staleWarnAt = new Map<string, number>();
   /** Per-agent last inference activity (epoch ms), for /healthz + doctor tooling. */
   private lastInferenceAt = new Map<string, { startedAt?: number; endedAt?: number; failedAt?: number; lastError?: string }>();
+  private lastStartFailed = new Set<string>();
   private processLoggingPersist: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
   /** Told once per inbound acceptance (mcpl/inbound-source.ts). An internal
@@ -6260,9 +6261,8 @@ export class AgentFramework {
 
   private failedLastTurnFor(agentName: string): import('./gate/types.js').FailedLastTurn | undefined {
     if (!(this.consecutiveInferenceFailures.get(agentName) ?? 0)) return undefined;
-    const last = this.lastInferenceAt.get(agentName);
-    const at = last?.failedAt;
-    if (at === undefined || (last?.startedAt ?? 0) > at) return undefined;
+    const at = this.lastInferenceAt.get(agentName)?.failedAt;
+    if (at === undefined || !this.lastStartFailed.has(agentName)) return undefined;
     const { queued, held } = this.wakesOnTheirWay(agentName);
     if (queued.length > 0) return { at, again: { kind: 'queued' } };
     return { at, again: held ? { kind: 'held', ...(held.until !== undefined ? { until: held.until } : {}) } : { kind: 'none' } };
@@ -12056,6 +12056,7 @@ export class AgentFramework {
 
   private forgetFailureAccounting(name: string): void {
     this.consecutiveInferenceFailures.delete(name);
+    this.lastStartFailed.delete(name);
     this.exhaustionRewinds.delete(name);
     this.refusalStreak.delete(name);
     this.refusalRewinds.delete(name);
@@ -24485,6 +24486,7 @@ export class AgentFramework {
       this.eventGate?.onInferenceResumed(agent.name);
     }
     this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), startedAt: turnStartedAt });
+    this.lastStartFailed.delete(agent.name);
 
     // Typing indicator, started at TURN START. It says "attending", which is
     // true from the moment the turn is accepted — but it used to start inside
@@ -32193,6 +32195,7 @@ export class AgentFramework {
     const streak = (this.consecutiveInferenceFailures.get(agentName) ?? 0) + 1;
     this.consecutiveInferenceFailures.set(agentName, streak);
     this.lastInferenceAt.set(agentName, { ...this.lastInferenceAt.get(agentName), failedAt: Date.now(), lastError: boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS) });
+    this.lastStartFailed.add(agentName);
 
     // (1) Durable stderr line — works in headless/daemon mode with no client.
     const labels = [

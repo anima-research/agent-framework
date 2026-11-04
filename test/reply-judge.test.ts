@@ -174,10 +174,19 @@ describe('reply judge: a request refused as too long', () => {
       },
       options: { maxInputTokens: 4_000 },
     });
-    await quietly(() => judge.judge(judgeRequest()));
+    const events = Array.from({ length: 30 }, (_, i) => ({
+      eventType: 'mcpl:channel-incoming', channel: '#garden', authorId: `u${i}`, addressed: false,
+      content: `question ${i} about the beds ${'y'.repeat(60)}`, at: Date.now() - 5000 + i,
+    }));
+    await quietly(() => judge.judge(judgeRequest({ events })));
     assert.strictEqual(requests.length, 2);
     assert.strictEqual(previews, 2, 'premise: the estimate moved during the second request\'s preview');
     assert.ok(size(requests[1]!) < size(requests[0]!), `${size(requests[1]!)} < ${size(requests[0]!)}`);
+    const halved = refusingMembrane(0);
+    const atHalf = judgeOver(halved.membrane);
+    (atHalf as unknown as { charsPerToken: number }).charsPerToken = 1.5;
+    await atHalf.judge(judgeRequest({ events }));
+    assert.strictEqual(size(requests[1]!), size(halved.requests[0]!), 'the retry is the request a judge at 1.5 characters a token builds');
   });
 
   it('builds its second request at an estimate another refusal lowered below the halved ratio meanwhile', async () => {
@@ -609,6 +618,28 @@ describe('reply judge: the document', () => {
     const text = renderMessage(msg('Ann', 'the beds need:\r\n- compost\n- <b>water</b> & mulch'));
     assert.strictEqual(text, '[Ann] the beds need:\n  - compost\n  - &lt;b&gt;water&lt;/b&gt; &amp; mulch');
     assert.strictEqual(renderMessage(msg('Ann [mod]\nB', 'hi')), '[Ann &#91;mod&#93; B] hi');
+  });
+
+  it('cuts a long message before quoting it, so the cut splits no entity or character and its marker is quoted like the rest', () => {
+    const long = (blocks: string[], participant = 'Ann') => renderMessage({
+      participant,
+      content: blocks.map((text) => ({ type: 'text', text })),
+    } as unknown as NormalizedMessage);
+    const rest = ['b'.repeat(5_000), 'c'.repeat(5_000)];
+    const emoji = '\u{1F600}'.repeat(2_500);
+    const texts = [
+      long([`${'a'.repeat(5_972)}<${'a'.repeat(27)}`, ...rest]),
+      long([`${'a'.repeat(5_973)}\n${'a'.repeat(26)}`, ...rest]),
+      long(['&'.repeat(6_000), ...rest]),
+      ...['Al', 'Ann', 'Anna', 'Alex'].map((name) => long([emoji, emoji, emoji], name)),
+    ];
+    for (const text of texts) {
+      assert.ok(text.length <= 12_000, String(text.length));
+      assert.match(text, /\[…\d+ characters cut…\]/);
+      assert.ok(!text.replace(/&(amp|lt|gt);/g, '').includes('&'), 'no entity is split');
+      assert.doesNotMatch(text, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/, 'no character is split');
+      assert.ok(text.split('\n').slice(1).every((line) => line.startsWith('  ')), 'every line after the first is quoted');
+    }
   });
 
   it("escapes markup characters in a participant's name, an event's channel and its author", () => {
