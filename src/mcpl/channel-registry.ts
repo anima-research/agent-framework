@@ -1013,11 +1013,17 @@ interface ChannelRegistryOptions {
    * this is ends through the cancel flow (release the backlog, record the
    * end) before the lifecycle state flips to closed. A
    * tuned-out channel's close is refused before this (its cancel ends it).
-   * Returns what it ended, or that the end waits, in a sentence the close's
-   * answer carries whatever became of the close: as `note` on a success,
-   * after the error on a failure.
+   * `unregistered`: the close names the channel after its server stopped
+   * registering it, so no close is recorded or sent (handleToolClose).
+   * Returns, where a hold excepts the channel, what became of that hold:
+   * a function that says it in a sentence, read when the close's answer is
+   * built, after its transport's round-trip, so the answer says what holds
+   * when it arrives (a release that waited may have run by then). The
+   * answer carries it whatever became of the close: as `note` on a success,
+   * after the error on a failure. Throws, with the answer's text, when the
+   * hold's release fails; one that ended the hold before it failed says so.
    */
-  onToolClose?: (serverId: string, channelId: string) => string | undefined;
+  onToolClose?: ToolCloseHook;
   /**
    * The channel unprefixed speech lands in while an all-except hold is
    * active (its exception), else null. Consulted after a fork's home and
@@ -1146,6 +1152,13 @@ interface ChannelRegistryOptions {
 // ChannelRegistry
 // ============================================================================
 
+/** ChannelRegistryOptions.onToolClose: a tool close's end of the all-except hold that excepts its channel. */
+export type ToolCloseHook = (
+  serverId: string,
+  channelId: string,
+  opts?: { unregistered?: true },
+) => (() => string) | undefined;
+
 /**
  * Who is actually making a channel tool call, as established by the
  * framework's own dispatch — model-origin calls come through
@@ -1205,7 +1218,7 @@ export class ChannelRegistry {
   ) => void;
   private shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean;
   private readonly latestInboundLocus: boolean;
-  private onToolClose?: (serverId: string, channelId: string) => string | undefined;
+  private onToolClose?: ToolCloseHook;
   private focusChannelResolver?: () => ChannelRef | null;
   private readonly tuneOutReaderFn?: () => TuneOutReader;
   private onRouteFailure?: ChannelRegistryOptions['onRouteFailure'];
@@ -5236,9 +5249,24 @@ export class ChannelRegistry {
     },
     origin?: ChannelToolOrigin,
   ): Promise<ToolResult> {
-    const resolved = this.resolveToolChannelEntry(input.channelId, input.serverId, origin?.kind === 'agent' ? origin.own : undefined);
+    const own = origin?.kind === 'agent' ? origin.own : undefined;
+    const resolved = this.resolveToolChannelEntry(input.channelId, input.serverId, own);
     const entry = resolved.entry;
     if (!entry) {
+      // The name means the channel the all-except hold excepts, which its
+      // server no longer registers: the close has nothing left to close, and
+      // the hold nothing left to speak into, so it ends as a close of the
+      // registered channel ends it, what it held released, and the answer
+      // says so. A module's close of such a name is refused as any name no
+      // channel answers to: housekeeping over an id no server registers
+      // doesn't end the resident's focus.
+      const gone = origin?.kind === 'module' ? undefined : this.unregisteredFocusNamed(input.channelId, input.serverId, own);
+      if (gone) {
+        const lead = `Server ${quotedValue(gone.serverId)} no longer registers channel ${quotedValue(gone.channelId)}, so no close was recorded or sent.`;
+        const ended = this.toolCloseHook(gone, { unregistered: true });
+        if ('error' in ended) return { success: false, error: `${lead} ${ended.error}`, isError: true };
+        if (ended.text) return { success: false, error: `${lead} ${ended.text()}`, isError: true };
+      }
       return {
         success: false,
         error: resolved.error,
@@ -5278,19 +5306,21 @@ export class ChannelRegistry {
       // Closed already, perhaps only by default: the agent's close is still
       // its decision, and is recorded as one (setDesiredState), so a later
       // registration's lift of a default leaves the channel closed.
-      const ended = this.onToolClose?.(entry.serverId, input.channelId);
+      const hook = this.toolCloseHook(refOf(entry));
+      if ('error' in hook) return { success: false, error: hook.error, isError: true };
+      const ended = hook.text;
       try {
         this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
       } catch (err) {
         return {
           success: false,
-          error: `Channel ${shown} is already closed, but recording the decision to close it failed: ${(err as Error).message}${ended ? ` ${ended}` : ''}`,
+          error: `Channel ${shown} is already closed, but recording the decision to close it failed: ${(err as Error).message}${ended ? ` ${ended()}` : ''}`,
           isError: true,
         };
       }
       return {
         success: true,
-        data: { channelId: input.channelId, serverId: entry.serverId, status: 'already closed', ...(ended ? { note: ended } : {}) },
+        data: { channelId: input.channelId, serverId: entry.serverId, status: 'already closed', ...(ended ? { note: ended() } : {}) },
       };
     }
 
@@ -5330,14 +5360,18 @@ export class ChannelRegistry {
     // A hold around this channel — the all-except scope it is the excepted
     // channel of — ends through the cancel flow: backlog released, end
     // recorded, never by overwriting state (#232 gap 9).
-    const ended = this.onToolClose?.(entry.serverId, input.channelId);
+    const hook = this.toolCloseHook(refOf(entry));
+    if ('error' in hook) return { success: false, error: hook.error, isError: true };
+    const ended = hook.text;
 
     // A decision the log refused changed nothing for the channel, and the
     // answer says so, and what the hook ended all the same. Every answer
     // carries the hook's sentence, a success's as `note`: whether the close
     // went through says nothing of the focus, whose end may wait (an
-    // operator's change to the store in progress).
-    const withEnded = (text: string): string => (ended ? `${text} ${ended}` : text);
+    // operator's change to the store in progress). The sentence is read as
+    // the answer is built, after the transport's round-trip, during which a
+    // release that waited may have run.
+    const withEnded = (text: string): string => (ended ? `${text} ${ended()}` : text);
     try {
       this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
     } catch (err) {
@@ -5359,11 +5393,50 @@ export class ChannelRegistry {
       if (applied.open || now !== 'closed') throw new ChannelLifecycleError(supersededClause('close', now), 'superseded');
       return {
         success: true,
-        data: { channelId: input.channelId, serverId: entry.serverId, status: 'closed', ...(ended ? { note: ended } : {}) },
+        data: { channelId: input.channelId, serverId: entry.serverId, status: 'closed', ...(ended ? { note: ended() } : {}) },
       };
     } catch (err) {
       return { success: false, error: withEnded(this.lifecycleFailureText('close', entry, err)), isError: true };
     }
+  }
+
+  /**
+   * The tool-close hook (onToolClose) for a channel, its throw taken as the
+   * answer's text: a release of the hold that failed is the close's answer,
+   * as the registry's other failures are, never a rejected call.
+   */
+  private toolCloseHook(ref: ChannelRef, opts?: { unregistered?: true }): { text?: () => string } | { error: string } {
+    try {
+      return { text: this.onToolClose?.(ref.serverId, ref.channelId, opts) };
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  /**
+   * The channel the all-except hold excepts (focusChannelResolver), where a
+   * channel tool's name means it though no registered channel answers to the
+   * name, its server no longer registering it: with a serverId, that
+   * server's channel with the id; inside the calling turn, the turn's own
+   * channel the name answers to by its id (ownChannelNamed); otherwise the
+   * hold's channel by its id or its server-qualified name. Undefined where
+   * no hold is in force, where its channel is still registered, where a
+   * registered channel answers to the name, and where the hold's record
+   * can't be read, which leaves the name's refusal as it was.
+   */
+  private unregisteredFocusNamed(name: string, serverId: string | undefined, own: readonly ChannelRef[] | undefined): ChannelRef | undefined {
+    let focus: ChannelRef | null | undefined;
+    try {
+      focus = this.focusChannelResolver?.();
+    } catch {
+      return undefined;
+    }
+    if (!focus || this.entryAt(focus)) return undefined;
+    if (serverId) return sameChannel(focus, { serverId, channelId: name }) ? focus : undefined;
+    const mine = this.ownChannelNamed(name, own);
+    if (mine) return 'channel' in mine && sameChannel(mine.channel, focus) ? focus : undefined;
+    if (this.entriesNamed(name).length > 0) return undefined;
+    return name === focus.channelId || name === qualifiedChannelName(focus) ? focus : undefined;
   }
 
   private async handleToolDecline(input: {
