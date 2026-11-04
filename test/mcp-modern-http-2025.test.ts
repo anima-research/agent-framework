@@ -1461,14 +1461,18 @@ for (const lived of [false, true]) {
 }
 
 for (const before of ['as the first', 'after a session that lived the base interval'] as const) {
-  test(`without \`reconnect\`, an answered session the server ends young ${before} starts a new one at once, and a second young end in a row leaves the server gone`, async () => {
+  test(`without \`reconnect\`, an answered session the server ends young ${before} starts a new one at once, and a second young end in a row leaves the server gone`, async (t) => {
+    // The clock a session's age is read from stands still, so a young end is
+    // young however long a cycle takes, and a lived one is moved on.
+    let clock = 0;
+    t.mock.method(performance, 'now', () => clock);
     const fixture = await splitNodes();
     const interval = 500;
     const connection = await connect(fixture, { reconnectIntervalMs: interval, reconnectMaxIntervalMs: 100 });
     const events = lifecycle(connection);
     const end = async (live: boolean) => {
       await connection.listTools();
-      if (live) await outlive(interval);
+      if (live) clock += interval;
       await connection.callTool('echo', {}).catch(() => {});
     };
     const expected: string[] = [];
