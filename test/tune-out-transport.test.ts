@@ -1524,6 +1524,31 @@ test('a tune-out on record when a start without servers connects one later ends 
   assert.deepEqual(unleased.data, { refusal: 'explicit-open', channelId: CHANNEL, serverId: 'disc' });
 });
 
+test("a tune-out on record when a start with no reader connects a server during an operator's hold on the store is released once the hold is over, its backlog delivered", async (t) => {
+  const store = await tunedOutStore(t, 2);
+  // No reader and no servers: the channel subsystem comes up at the connect,
+  // which meets a surgery's hold on the store. A cancel asked then waits for
+  // the writes, so the release waits as a whole rather than on a coordinator
+  // made for it alone and dropped with the cancel still waiting.
+  const second = await store.start(false, false);
+  const i = second as unknown as RestartInternals & { reserveStoreForSurgery(verb: string, agentName: string): () => void };
+  const release = i.reserveStoreForSurgery('roll back', 'scout');
+  await store.capture(() => second.connectMcplServer(store.server));
+  const registry = i.channelRegistry;
+  assert.notEqual(registry.getTuneOutState('disc', CHANNEL), null, 'the hold stays on record while the writes are held');
+  assert.ok(store.logged.some((l) => l.includes('[tune-out] the tune-outs on record are released once the store takes writes again')), store.logged.join('\n'));
+  const releasedRows = () => second.getAgent('scout')!.getContextManager().getAllMessages()
+    .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'tune-out-cancel');
+  assert.equal(releasedRows().length, 0, 'nothing released yet');
+  await store.capture(async () => { release(); });
+  assert.equal(registry.getTuneOutState('disc', CHANNEL), null, 'ended once the writes are stored');
+  assert.equal(registry.getDesiredState('disc', CHANNEL), 'open', 'decided open again, as a cancel leaves it');
+  assert.equal(releasedRows().length, 1, 'one release');
+  assert.match(JSON.stringify(releasedRows()[0]!.content), /messages=2/, 'both diverted messages in its backlog');
+  assert.match(JSON.stringify(releasedRows()[0]!.content), /no reader is configured/);
+  assert.ok(!store.logged.some((l) => l.includes('nothing will deliver')), store.logged.join('\n'));
+});
+
 test('a tune-out whose release fails at a start with no subconscious stays recorded for the next start, and the log says so', async (t) => {
   const store = await tunedOutStore(t, 1);
   const cancel = ChannelRegistry.prototype.cancelTuneOut;
