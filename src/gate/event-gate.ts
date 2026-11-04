@@ -4223,16 +4223,16 @@ export class EventGate {
       this.holdForJudge(policyName, events, judge);
       return;
     }
-    if (this.judgeRefusing()) {
-      if (this.judgeOnError === 'skip') this.holdForJudge(policyName, events, judge);
-      else this.deliverOrBuffer(events);
-      return;
-    }
     const held = this.judgeHeld.get(policyName);
     if (held) {
       this.judgeHeld.delete(policyName);
       events = [...held.events, ...events];
       this.capJudgeEvents(events);
+    }
+    if (this.judgeRefusing()) {
+      if (this.judgeOnError === 'skip') this.holdForJudge(policyName, events, judge);
+      else this.deliverOrBuffer(events);
+      return;
     }
     judge = this.currentJudge(policyName, judge);
     const fn = this.judgeFn;
@@ -4482,7 +4482,7 @@ export class EventGate {
     const stated = (err as { retryAfterMs?: unknown }).retryAfterMs;
     // A wait that isn't a number of ms a Date can end at states no end (a
     // hold until released): a timer given one would fire at once.
-    const now = Date.now();
+    const now = this.now();
     const end = typeof stated === 'number' ? now + Math.max(0, stated) : undefined;
     const until = end !== undefined && end <= MAX_DATE_MS ? end : undefined;
     if (state.ask > this.judgeNewestOutcome) {
@@ -4524,7 +4524,7 @@ export class EventGate {
     this.judgeRefusalTimer = null;
     const until = this.judgeRefusal?.until;
     if (until === undefined || this.disposed) return;
-    const delay = Math.max(0, until - Date.now());
+    const delay = Math.max(0, until - this.now());
     this.judgeRefusalTimer = setTimeout(() => {
       this.judgeRefusalTimer = null;
       // A wait longer than one timer is waited out in steps.
@@ -4542,7 +4542,7 @@ export class EventGate {
 
   private judgeRefusing(): boolean {
     const until = this.judgeRefusal?.until;
-    return until !== undefined && until > Date.now();
+    return until !== undefined && until > this.now();
   }
 
   private judgeHeldForRefusal(): boolean {
@@ -5152,7 +5152,7 @@ export class EventGate {
 
   private judgeRefusalNotice(): string | null {
     const refusal = this.judgeRefusal;
-    if (refusal === null || (refusal.until !== undefined && refusal.until <= Date.now())) return null;
+    if (refusal === null || (refusal.until !== undefined && refusal.until <= this.now())) return null;
     let held = 0;
     for (const batch of this.judgeHeld.values()) held += batch.events.length;
     const wakes = this.judgeOnError === 'wake';
