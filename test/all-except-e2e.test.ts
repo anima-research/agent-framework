@@ -579,7 +579,7 @@ describe('a private turn and the focus', () => {
 
   for (const rule of ['delivery', 'latest-inbound'] as const) {
     it(`under '${rule}', an operator's message ${rule === 'delivery' ? 'while a focus holds' : 'after a room was answered'} is answered in no channel`, async () => {
-      const f = await fixture({ framework: { modules: [new SurfaceModule()], tuneOut: { enabled: true }, speech: { locus: rule } } as Partial<FrameworkConfig> });
+      const f = await fixture({ framework: { modules: [new SurfaceModule()], subconscious: SUB, speech: { locus: rule } } as Partial<FrameworkConfig> });
       try {
         await registerOpen(f, 'work', 'noisy');
         clear(f);
@@ -606,7 +606,7 @@ describe('a private turn and the focus', () => {
   }
 
   it('a private turn that enters a focus keeps no channel, and is told its plain speech stays private', async () => {
-    const f = await fixture({ framework: { modules: [new SurfaceModule()], tuneOut: { enabled: true } } as Partial<FrameworkConfig> });
+    const f = await fixture({ framework: { modules: [new SurfaceModule()], subconscious: SUB } as Partial<FrameworkConfig> });
     try {
       await registerOpen(f, 'work', 'noisy');
       clear(f);
@@ -636,7 +636,7 @@ describe('a private turn and the focus', () => {
   });
 
   it("a conversation fork's private turn that enters a focus is told its plain speech stays private, not that it stays in its home", async () => {
-    const f = await fixture({ framework: { modules: [new SurfaceModule()], tuneOut: { enabled: true } } as Partial<FrameworkConfig> });
+    const f = await fixture({ framework: { modules: [new SurfaceModule()], subconscious: SUB } as Partial<FrameworkConfig> });
     try {
       await registerOpen(f, 'work', 'home');
       clear(f);
@@ -659,7 +659,7 @@ describe('a private turn and the focus', () => {
 
   it("a locked agent's private turn that enters a focus is told its plain speech stays private, and that a turn that holds none speaks at the lock", async () => {
     const f = await fixture({
-      framework: { modules: [new SurfaceModule()], tuneOut: { enabled: true } } as Partial<FrameworkConfig>,
+      framework: { modules: [new SurfaceModule()], subconscious: SUB } as Partial<FrameworkConfig>,
       agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', proseRouting: 'locked', proseLock: 'home' }],
     });
     try {
@@ -762,7 +762,7 @@ describe('a private turn and the focus', () => {
 
   for (const fromPrivate of [true, false]) {
     it(`under 'latest-inbound', the turn a focus cancel wakes speaks ${fromPrivate ? 'in no channel when a private turn cancelled' : 'in the latest inbound when a room turn cancelled'}`, async () => {
-      const f = await fixture({ framework: { modules: [new SurfaceModule()], tuneOut: { enabled: true }, speech: { locus: 'latest-inbound' } } as Partial<FrameworkConfig> });
+      const f = await fixture({ framework: { modules: [new SurfaceModule()], subconscious: SUB, speech: { locus: 'latest-inbound' } } as Partial<FrameworkConfig> });
       try {
         await registerOpen(f, 'work', 'noisy');
         clear(f);
@@ -772,12 +772,16 @@ describe('a private turn and the focus', () => {
         await eventually(() => sent(f, 'zz-first').length > 0, 'premise: a room turn spoke, so the latest inbound names a channel');
         const r = internals(f).tuneOutCoordinator!.enterAllExcept({ serverId: 'editor', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool');
         assert.ok(r.ok, 'premise: a focus on work');
-        // One stream per turn: the mock hands every queued response to the next stream.
+        // One stream per turn: the mock hands every queued response to the next stream. The cancel wakes the
+        // reader too, whose turn is answered on its own, so it takes none of the resident's.
         const feed = [[focusCall({ mode: 'cancel' }), say('zz-cancelled')], [say('zz-after the release')]];
         const streamYielding = f.membrane.streamYielding.bind(f.membrane);
         f.membrane.streamYielding = (request, options) => {
           const queue = f.membrane as unknown as { responses: unknown[]; responseIndex: number };
-          if (queue.responseIndex >= queue.responses.length) for (const response of feed.shift() ?? []) f.membrane.pushResponse(response);
+          if (queue.responseIndex >= queue.responses.length) {
+            const reader = (request as { system?: string }).system?.includes(SUB.systemPrompt);
+            for (const response of reader ? [say('zz-reader')] : feed.shift() ?? []) f.membrane.pushResponse(response);
+          }
           return streamYielding(request, options);
         };
         if (fromPrivate) f.framework.pushEvent(tuiMessage('please end the focus'));

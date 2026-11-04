@@ -105,7 +105,7 @@ describe('channel_publish without channelId', () => {
         name: 'caller', getTools: () => [], async handleToolCall() { return { success: false, error: 'none' }; },
         async start(ctx: unknown) { context = ctx as typeof context; }, async stop() {}, async onProcess() { return {}; },
       };
-      const f = await fixture({ framework: { tuneOut: { enabled: true }, ...(via === 'module' ? { modules: [caller] } : {}) } as never });
+      const f = await fixture({ framework: { subconscious: SUB, ...(via === 'module' ? { modules: [caller] } : {}) } as never });
       try {
         await registerOpen(f, 'work');
         const coordinator = (f.framework as unknown as { tuneOutCoordinator: { enterAllExcept(ref: unknown, opts: unknown, source: string): { ok: boolean } } }).tuneOutCoordinator;
