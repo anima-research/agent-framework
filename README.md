@@ -466,11 +466,11 @@ and its `family` stays `modern`. On a 2025 revision:
   the session's streams after the server had served it (the standalone
   stream's reopen, or a request stream's resume), as that handler answers a
   2025 session it serves statelessly (its default). A call refused with
-  `-32022` fails as `error-response` with the server's code and data, and
-  isn't replayed. A server that keeps serving a 2025 revision statelessly
-  to a connection that never had a standalone stream isn't followed, unless
-  its upgrade cut a call's stream, whose resume then meets the 405: that
-  connection stays on 2025 until its next connect.
+  `-32022` fails as `error-response` with the server's data, its code in
+  the host's log, and isn't replayed. A server that keeps serving a 2025
+  revision statelessly to a connection that never had a standalone stream
+  isn't followed, unless its upgrade cut a call's stream, whose resume then
+  meets the 405: that connection stays on 2025 until its next connect.
 - Each session the server holds by its id is ended with a `DELETE` when the
   connection lets it go, waiting at most 3 s: at `close()`, and so `stop()`
   or a disconnect, a connect in flight included, and when a connect fails
