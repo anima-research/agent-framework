@@ -1101,6 +1101,15 @@ interface ChannelRegistryOptions {
    */
   activeChannelResolver?: (agentName: string) => ChannelRef | null | undefined;
   /**
+   * Whether the agent's current turn has no channel of its own — a
+   * heartbeat's, or one woken for a channel that names none — so it replies
+   * to no incoming message (incomingFor). Left out, a null from
+   * activeChannelResolver means that, as it always did; given, it separates
+   * a turn with nowhere to speak (a locked turn pointed at drafts) from one
+   * with nothing to answer.
+   */
+  channellessTurn?: (agentName: string) => boolean;
+  /**
    * Whether a conversation takes the process-global fallback, the channel of
    * the most recent delivered inbound message: as where its plain speech lands
    * when it has no home and no channel of its own this turn, as its channel
@@ -1198,6 +1207,7 @@ export class ChannelRegistry {
   }) => void;
   private homeChannelResolver?: (agentName: string) => ChannelRef | undefined;
   private activeChannelResolver?: (agentName: string) => ChannelRef | null | undefined;
+  private channellessTurn?: (agentName: string) => boolean;
   private takesGlobalFallback?: (conversationId: string) => boolean;
   private serverConnecting?: (serverId: string) => boolean;
   private store?: JsStore;
@@ -1624,6 +1634,7 @@ export class ChannelRegistry {
     this.onChannelAutoOpened = options?.onChannelAutoOpened;
     this.homeChannelResolver = options?.homeChannelResolver;
     this.activeChannelResolver = options?.activeChannelResolver;
+    this.channellessTurn = options?.channellessTurn;
     this.takesGlobalFallback = options?.takesGlobalFallback;
     this.serverConnecting = options?.serverConnecting;
     this.store = options?.store;
@@ -2522,7 +2533,9 @@ export class ChannelRegistry {
    * its home.
    */
   incomingFor(agentName?: string): { channel: ChannelRef; messageId: string; threadId?: string } | undefined {
-    if (agentName !== undefined && this.activeChannelResolver?.(agentName) === null && !this.homeChannelResolver?.(agentName)) {
+    const channelless = agentName === undefined ? false
+      : this.channellessTurn ? this.channellessTurn(agentName) : this.activeChannelResolver?.(agentName) === null;
+    if (channelless && !this.homeChannelResolver?.(agentName!)) {
       return undefined;
     }
     // The latest delivered inbound itself, not the speech fallback
@@ -6273,8 +6286,13 @@ export class ChannelRegistry {
             ? 'Nothing was posted: name the channel with channelId. A subagent has no default channel, since its plain '
               + 'speech is returned to whoever called it, so channel_publish sends only to a channel it names.'
             : caller !== undefined && inTurn && this.activeChannelResolver?.(caller) === null
-              ? `Nothing was posted: name the channel with channelId. This turn has no channel of its own, so its plain speech `
-                + `goes to none and channel_publish sends only to a channel it names. ${findIds}`
+              ? (this.channellessTurn && !this.channellessTurn(caller)
+                // The turn came from a channel, but its speech goes to none
+                // (a locked turn held as drafts).
+                ? `Nothing was posted: name the channel with channelId. Your plain speech goes to no channel now, so `
+                  + `channel_publish sends only to a channel it names. ${findIds}`
+                : `Nothing was posted: name the channel with channelId. This turn has no channel of its own, so its plain speech `
+                  + `goes to none and channel_publish sends only to a channel it names. ${findIds}`)
               : `Nothing was posted: channel_publish needs a \`channelId\`, and there's no channel to default to yet. ${findIds}`,
         isError: true,
       };

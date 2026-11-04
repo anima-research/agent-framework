@@ -202,7 +202,9 @@ export interface FrameworkConfig {
    *   inbound message is a global fallback locus for turns without one, and
    *   an addressed message injected mid-turn re-pins the turn's locus.
    *
-   * Held traffic never moves the locus under either rule.
+   * Held traffic never moves the locus under either rule. Neither rule
+   * applies to an agent under locked prose routing (AgentConfig.proseRouting
+   * 'locked'): its turns speak at its lock, whatever arrives.
    */
   speech?: {
     locus?: 'delivery' | 'latest-inbound';
