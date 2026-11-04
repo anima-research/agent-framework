@@ -4337,16 +4337,20 @@ export class EventGate {
    * batches of rules other than `exceptPolicy`, with those rules' events
    * buffered while a turn runs or the host is quiesced. A debounce's batch
    * wakes the agent when it's delivered: when it fires, or, buffered, once no
-   * turn runs and the host isn't quiesced. A judge rule's batch goes to the
-   * judge, whether it's collecting, being decided (with what queued behind
-   * it) or held, so it only may, except that under onError "wake", while a
-   * refusal's stated wait lasts, it wakes the agent without the judge being
-   * asked, and one due before that wait ends is listed so, as certain,
-   * counting only its events whose channel isn't held now, unless a running
-   * turn or the host's quiesce holds it past the wait's end, when it goes to
-   * the judge. Under "skip", one due before that wait ends is listed as held
-   * for the judge until the end. The list is soonest first, with the wakes
-   * whose time is in words (`when`) last.
+   * turn runs and the host isn't quiesced. Without a judge wired, a judge
+   * rule's batch is delivered as a debounce's is, and listed so. With one, a
+   * judge rule's batch goes to the judge, whether it's collecting, being
+   * decided (with what queued behind it) or held, so it only may, except
+   * that under onError "wake", while a refusal's stated wait lasts, it wakes
+   * the agent without the judge being asked, and one due before that wait
+   * ends is listed so, as certain, counting only its events whose channel
+   * isn't held now, unless a running turn or the host's quiesce holds it past
+   * the wait's end, when it goes to the judge. Under "skip", one due before
+   * that wait ends is listed as held for the judge until the end. A batch
+   * collecting while the judge decides one of its rule's batches joins that
+   * call when it fires, so it's listed as going to the judge either way. The
+   * list is soonest first, with the wakes whose time is in words (`when`)
+   * last.
    */
   upcomingWakes(agentNames: string[], exceptPolicy?: string): UpcomingWake[] {
     return this.upcomingWakesBut(agentNames, { policy: exceptPolicy });
@@ -4369,9 +4373,9 @@ export class EventGate {
     for (const [name, state] of this.debounceTimers) {
       if (name === leftOut.policy || state.events.length === 0) continue;
       const rule = `rule ${quotedValue(name)}'s`;
-      if (!state.judge) {
+      if (!state.judge || !this.judgeFn) {
         wakes.push({ at: state.dueAt, certain: true, what: `${rule} debounced batch of ${count(state.events.length)}` });
-      } else if (statedEnd === undefined || state.dueAt >= statedEnd) {
+      } else if (statedEnd === undefined || state.dueAt >= statedEnd || this.judging.has(name)) {
         wakes.push({ at: state.dueAt, certain: false, what: `${rule} batch of ${count(state.events.length)} goes to the judge` });
       } else if (this.judgeOnError === 'skip') {
         const joins = this.judgeHeld.has(name) ? ', which joins its held batch when it fires,' : ',';

@@ -23,7 +23,7 @@ export function oneLine(text: string): string {
 }
 
 const INVISIBLE = '\\p{Cf}\\p{Default_Ignorable_Code_Point}';
-const SKIPPED = `[\\s\\p{Cc}${INVISIBLE}]`;
+export const SKIPPED = `[\\s\\p{Cc}${INVISIBLE}]`;
 const tagWord = (word: string): string =>
   [...word].map((c) => (/[\\^$.*+?()[\]{}|/]/.test(c) ? `\\${c}` : c)).join(`${SKIPPED}*`);
 const NOTICE_OPENING = new RegExp(

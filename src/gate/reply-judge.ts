@@ -41,7 +41,7 @@
 import { NativeFormatter } from '@animalabs/membrane';
 import type { ContentBlock, DetailedUsage, Membrane, NormalizedMessage, NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
 import { safeSlice } from '../safe-slice.js';
-import { normalizeLineBreaks, oneLine } from '../supplied-text.js';
+import { SKIPPED, normalizeLineBreaks, oneLine } from '../supplied-text.js';
 import type { FailedLastTurn, JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudgeOptions, UpcomingWake } from './types.js';
 
 /** The judge's model when the host names none. */
@@ -172,7 +172,7 @@ function quotedCut(text: string, max: number): string {
 function renderBlock(block: ContentBlock): string {
   switch (block.type) {
     case 'text':
-      return cut(block.text, MAX_TEXT_CHARS);
+      return cut(unlabelled(block.text), MAX_TEXT_CHARS);
     case 'image':
     case 'generated_image':
       return '[image]';
@@ -186,14 +186,20 @@ function renderBlock(block: ContentBlock): string {
       return `[calls ${block.name}] ${cut(safeJson(block.input), MAX_TOOL_CHARS)}`;
     case 'tool_result': {
       const body = typeof block.content === 'string'
-        ? block.content
-        : block.content.map((b) => (b.type === 'text' ? b.text : `[${b.type}]`)).join('\n');
+        ? unlabelled(block.content)
+        : block.content.map((b) => (b.type === 'text' ? unlabelled(b.text) : `[${b.type}]`)).join('\n');
       return `[${block.toolName ?? 'tool'} ${block.isError ? 'failed' : 'returned'}] ${cut(body, MAX_TOOL_CHARS)}`;
     }
     default:
       // thinking, redacted thinking, system changes: not the conversation.
       return '';
   }
+}
+
+const LINE_OPENING_BRACKET = new RegExp(`(^|\\n)((?:(?!\\n)${SKIPPED})*)\\[`, 'gu');
+
+function unlabelled(text: string): string {
+  return normalizeLineBreaks(text).replace(LINE_OPENING_BRACKET, '$1$2\\[');
 }
 
 function safeJson(value: unknown): string {
