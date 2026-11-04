@@ -6251,10 +6251,10 @@ export class AgentFramework {
     if (cooldown && !(cooldown.rearm && queued.length > 0)) {
       const releaseWakes = cooldown.heldRequests.length > 0 || !(cooldown.auxiliaryOrigin || cooldown.emptiedBy);
       if (releaseWakes || queued.length > 0) {
-        const bound = cooldown.waitModel !== undefined && model === cooldown.waitModel
-          ? this.providerWaits?.active(agentName, cooldown.waitModel)
-          : undefined;
-        return { queued: [], held: { ...ends(bound ? bound.until : cooldown.until), ...(cooldown.rearm ? { rearm: cooldown.rearm } : {}) } };
+        const wait = model !== undefined ? this.providerWaits?.active(agentName, model) : undefined;
+        const waitHold = cooldown.waitModel !== undefined && model === cooldown.waitModel;
+        const until = wait && (waitHold || wait.until === null || wait.until > cooldown.until) ? wait.until : cooldown.until;
+        return { queued: [], held: { ...ends(until), ...(cooldown.rearm ? { rearm: cooldown.rearm } : {}) } };
       }
     }
     const wait = queued.length > 0 && model !== undefined ? this.providerWaits?.active(agentName, model) : undefined;
@@ -6847,6 +6847,7 @@ export class AgentFramework {
     }
     if (this.extendHostProviderHold(agentName, cooldown)) return;
     clearTimeout(cooldown.timer); this.providerAccelerationCooldowns.delete(agentName);
+    this.eventGate?.providerCallsReleased();
     if (cooldown.waitModel !== undefined) {
       const model = this.agents.get(agentName)?.model;
       console.error(`[provider-wait] agent=${agentName} model=${cooldown.waitModel} ` +
@@ -7063,13 +7064,13 @@ export class AgentFramework {
     // A call that names no model can't be matched to a model's wait, but the
     // hold that stands for unreadable records binds every model, so it binds
     // that call too (EVERY_MODEL: only that hold, or a release of it, says so).
-    const wait = this.providerWaits?.active(agentName, model ?? EVERY_MODEL);
-    if (!wait) return;
     const now = Date.now();
+    const wait = this.providerWaits?.active(agentName, model ?? EVERY_MODEL, now);
+    if (!wait) return;
     throw Object.assign(new MembraneError({
       type: 'rate_limit',
       retryable: true,
-      ...(wait.until !== null ? { retryAfterMs: Math.max(0, wait.until - now) } : {}),
+      ...(wait.until !== null ? { retryAfterMs: wait.until - now } : {}),
       message: providerWaitText(agentName, model ?? EVERY_MODEL, wait),
       rawError: undefined,
     }), { providerAdmission: 'deferred' as const });
@@ -12143,6 +12144,7 @@ export class AgentFramework {
     if (cooldown) {
       clearTimeout(cooldown.timer);
       this.providerAccelerationCooldowns.delete(name);
+      this.eventGate?.providerCallsReleased();
       console.error(`[provider-wait] agent=${name} ended while held` +
         `${cooldown.waitModel !== undefined ? ` on ${cooldown.waitModel}` : ''}: ` +
         `${cooldown.heldRequests.length} held request(s) dropped with it (the recorded wait stays)`);
@@ -13318,7 +13320,7 @@ export class AgentFramework {
         return {
           ...tool,
           description: 'Remove a wake rule (gate.json policy) by name at runtime; a judge rule\'s pending ' +
-            'batches still go to the judge, by the rule as it was. ' + AgentFramework.WAKE_REMOVE_RULE_REST +
+            'batches still go where the rule as it was sends them. ' + AgentFramework.WAKE_REMOVE_RULE_REST +
             ' A judge rule\'s batch is pending while it waits out its quiet period, is held or is being judged.',
         };
       }
@@ -19914,6 +19916,7 @@ export class AgentFramework {
         // the held causes into this one current compile.
         clearTimeout(providerCooldown.timer);
         this.providerAccelerationCooldowns.delete(agentName);
+        this.eventGate?.providerCallsReleased();
         if (providerCooldown.rearm) {
           console.error(`[inference-rearm] agent=${agentName} turn queued again with a wake ` +
             `(${providerCooldown.rearm.number} of ${providerCooldown.rearm.of})`);

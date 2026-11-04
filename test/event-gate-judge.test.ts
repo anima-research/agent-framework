@@ -387,7 +387,7 @@ describe('judge rules: timing', () => {
     gate.onInferenceEnded('agent');
     await until(() => judge.requests.length === 2, 'the judge to be asked after the turn');
     judge.answer({ reply: false, reason: 'already answered' });
-    await advance(10);
+    await until(() => gate.getStatus().policies[0]!.judgeState!.verdicts.wait === 1, 'the WAIT verdict counted');
     assert.strictEqual(wakes.length, 0);
     assert.strictEqual(judge.requests.length, 2, 'one call after the turn');
     gate.dispose();
@@ -700,6 +700,50 @@ describe('judge rules: timing', () => {
     gate.dispose();
   });
 
+  it("under onError 'wake', while a refusal's stated wait lasts and a turn runs, the wake list gives a batch due before the wait ends as one that may go to the judge, and a batch the turn holds as delivered without it only if the refusal still holds then", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('refused-wake-turn-listed.json', JUDGED), { judge: judge.fn, residents: ['agent'] });
+    gate.evaluate(chat('first'));
+    await until(() => judge.waiting() === 1, 'the judge call');
+    judge.fail(refusal("scout's provider calls are held", 60_000));
+    await until(() => judgeState(gate).verdicts.refused === 1, 'the refusal recorded');
+    gate.evaluate(chat('second'));
+    const listed = () => gate.upcomingWakes(['agent']).map((w) => [w.what, w.certain]);
+    assert.deepStrictEqual(listed(), [['rule "ambient"\'s batch of 1 event, delivered without the judge while its calls are refused', true]], 'premise: certain while no turn runs');
+    gate.onInferenceStarted('agent');
+    assert.deepStrictEqual(listed(), [[
+      'rule "ambient"\'s batch of 1 event, delivered without the judge while its calls are refused, unless a turn or the host\'s quiesce holds it past the refusal\'s end, which sends it to the judge', false,
+    ]]);
+    await until(() => judgeState(gate).heldCount === 1, 'the batch held for the turn');
+    assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => [w.what, w.certain, w.when]), [[
+      'rule "ambient"\'s batch of 1 event, held for the judge, or delivered without it if its calls are still refused then', false, 'once no turn or quiesce holds it',
+    ]]);
+    gate.dispose();
+  });
+
+  it("under onError 'skip', while a refusal's stated wait lasts and a turn runs, the wake list says a batch is held past the wait's end while the turn holds it", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('refused-skip-turn-listed.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip', residents: ['agent'] });
+    gate.evaluate(chat('first'));
+    await until(() => judge.waiting() === 1, 'the judge call');
+    judge.fail(refusal("scout's provider calls are held", 60_000));
+    await until(() => judgeState(gate).heldCount === 1, 'the refused batch held');
+    gate.evaluate(chat('second'));
+    const end = (gate as unknown as { judgeRefusal: { until: number } }).judgeRefusal.until;
+    const held = 'held for the judge while its calls are refused';
+    assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => w.what), [
+      `rule "ambient"'s batch of 1 event, which joins its held batch when it fires, ${held}`,
+      `rule "ambient"'s batch of 1 event, ${held}`,
+    ], 'premise: no turn runs');
+    gate.onInferenceStarted('agent');
+    const past = " and, past the refusal's end, while a turn or the host's quiesce holds it";
+    assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => [w.what, w.certain, w.at]), [
+      [`rule "ambient"'s batch of 1 event, which joins its held batch when it fires, ${held}${past}`, false, end],
+      [`rule "ambient"'s batch of 1 event, ${held}${past}`, false, end],
+    ]);
+    gate.dispose();
+  });
+
   const deciding = async (onError: 'wake' | 'skip', name: string, waitMs = 60_000) => {
     const judge = scriptedJudge();
     const made = makeGate(writeConfig(`refused-deciding-${name}.json`, {
@@ -762,10 +806,11 @@ describe('judge rules: timing', () => {
   }
 
   it("under onError 'skip', while a refusal's stated wait lasts, a REPLY to a rule's batch the judge is deciding delivers a later batch of that rule with it", async () => {
-    const { gate, judge, internal, delivered, held } = await deciding('skip', 'skip-reply');
+    const { gate, judge, internal, delivered, held, messages } = await deciding('skip', 'skip-reply');
     await until(() => (internal.judging.get('deciding')?.queued.length ?? 0) === 1, 'the batch waits behind the call');
     judge.answer({ reply: true, reason: 'asked' });
     await until(delivered, 'delivered with the batch the REPLY wakes for');
+    assert.match((messages.at(-1)!.content as Array<{ text: string }>)[0]!.text, /: 2 events matched\]/, "the call's batch and the one behind it");
     assert.strictEqual(held(), 0);
     gate.dispose();
   });
@@ -935,24 +980,6 @@ describe('judge rules: timing', () => {
     assert.deepStrictEqual(judge.requests.at(-1)!.events.map((e) => e.content), ['first', 'second']);
     judge.answer({ reply: false, reason: 'chatter' });
     assert.strictEqual(judgeState(gate).verdicts.refused, 1);
-    gate.dispose();
-  });
-
-  it("under 'skip', a refusal that states no time left is asked again no sooner than a second on, whatever asks", async () => {
-    const judge = scriptedJudge();
-    const { gate } = makeGate(writeConfig('refused-zero.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip', residents: ['agent'] });
-    gate.evaluate(chat('first'));
-    await until(() => judge.waiting() === 1, 'the judge call');
-    const refusedAt = Date.now();
-    judge.fail(refusal("scout's provider calls are held", 0));
-    await until(() => judgeState(gate).heldCount === 1, 'the batch held');
-    gate.onInferenceStarted('agent');
-    gate.onInferenceEnded('agent');
-    gate.evaluate(chat('second'));
-    await until(() => judge.waiting() === 1, 'the batch asked again', 4_000);
-    assert.ok(judge.askedAt[1]! - refusedAt >= 1_000, `asked again ${judge.askedAt[1]! - refusedAt} ms on`);
-    assert.deepStrictEqual(judge.requests.at(-1)!.events.map((e) => e.content), ['first', 'second']);
-    judge.answer({ reply: false, reason: 'chatter' });
     gate.dispose();
   });
 
@@ -1845,8 +1872,8 @@ describe('wake_add_rule with judge', () => {
     assert.strictEqual(shown.isError, false, shown.content);
     assert.strictEqual(JSON.parse(shown.content).ignoredFields, undefined, 'every field the example gives is read');
     const removal = toolNamed('wake_remove_rule').description;
-    assert.match(firstSentence(removal), /a judge rule's pending batches still go to the judge, by the rule as it was\.$/,
-      'the first sentence, all the settings toolset shows of it, says what a removal leaves to the judge');
+    assert.match(firstSentence(removal), /a judge rule's pending batches still go where the rule as it was sends them\.$/,
+      "the first sentence, all the settings toolset shows of it, says what becomes of a removed rule's pending batches");
     assert.match(removal, /A judge rule's batch is pending while it waits out its quiet period, is held or is being judged\./);
   });
 
@@ -2218,6 +2245,96 @@ describe('the framework wires the reply judge', () => {
     }
   });
 
+  async function heldFramework(t: { after: (fn: () => Promise<void> | void) => void }, holds: number[]) {
+    const { MembraneError } = await import('@animalabs/membrane');
+    const { AgentFramework } = await import('../src/index.js');
+    const { MockMembrane } = await import('./helpers/mock-membrane.js');
+    const { mkdtempSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const dir = mkdtempSync(join(tmpdir(), 'gate-judge-held-'));
+    const membrane = new MockMembrane();
+    let consulted = 0;
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', proseRouting: 'disabled' }],
+      modules: [],
+      gate: { configPath: join(dir, 'gate.json'), config: JUDGED, judge: { onError: 'skip' } },
+      providerHold: () => {
+        const holdMs = holds[consulted++];
+        return holdMs === undefined ? undefined : { holdMs, reason: 'quota spent' };
+      },
+    });
+    const original = console.error;
+    console.error = () => {};
+    t.after(async () => {
+      console.error = original;
+      useRealClock();
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    });
+    const eventGate = (framework as unknown as { eventGate: EventGate }).eventGate;
+    const internal = framework as unknown as {
+      holdProviderAcceleration(agent: unknown, error: Error, trigger?: unknown, auxiliary?: boolean): boolean;
+      providerAccelerationCooldowns: Map<string, { until: number }>;
+      providerWaits: { set(agent: string, model: string, retryAfterMs: unknown, reason: string): unknown };
+      pendingRequests: Array<Record<string, unknown>>;
+      upcomingWakesFor(agentName: string): Array<{ at?: number; when?: string; certain: boolean; what: string }>;
+    };
+    let calledAt: number | undefined;
+    const complete = membrane.complete.bind(membrane);
+    membrane.complete = async (request) => { calledAt ??= Date.now(); return complete(request); };
+    const hold = () => internal.holdProviderAcceleration(framework.getAgent('scout'), new MembraneError({
+      type: 'rate_limit', retryable: true, httpStatus: 429, message: 'quota', rawError: { status: 429 },
+    }), undefined, true);
+    const judgeState = () => eventGate.getStatus().policies[0]!.judgeState!;
+    return { framework, membrane, eventGate, internal, hold, judgeState, calledAt: () => calledAt, consulted: () => consulted };
+  }
+
+  it("under onError 'skip', a call refused by a hold past its end, before the hold's timer has let it go, waits for that release, and is judged then", async (t) => {
+    const { createMockResponse } = await import('./helpers/mock-membrane.js');
+    const { membrane, eventGate, internal, hold, judgeState, calledAt } = await heldFramework(t, [3_000]);
+    assert.strictEqual(hold(), true, 'premise: the agent is held');
+    const heldAt = Date.now();
+    internal.providerAccelerationCooldowns.get('scout')!.until = heldAt;
+    eventGate.evaluate(chat('lol'));
+    await until(() => judgeState().heldCount === 1, 'the refused batch to be held');
+    assert.ok(eventGate.getStatus().errors.some((e) => e.includes('no time left') && e.includes('quota spent')), JSON.stringify(eventGate.getStatus().errors));
+    await advance(2_000);
+    assert.strictEqual(judgeState().verdicts.refused, 1, "not asked again before the hold's timer lets it go");
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
+    await until(() => judgeState().verdicts.wait === 1, "the batch judged once the hold's timer lets it go");
+    assert.ok(calledAt() !== undefined && calledAt()! - heldAt >= 3_000, `the judge's call was made ${calledAt() === undefined ? 'never' : `${calledAt()! - heldAt} ms after the hold began`}`);
+    assert.deepStrictEqual(judgeState().verdicts, { reply: 0, wait: 1, error: 0, refused: 1 });
+  });
+
+  it("under onError 'skip', a batch refused under a hold its host extends at its end is held to the new end, and judged once the hold lets go", async (t) => {
+    const { createMockResponse } = await import('./helpers/mock-membrane.js');
+    const { membrane, eventGate, hold, judgeState, calledAt, consulted } = await heldFramework(t, [3_000, 2_000]);
+    assert.strictEqual(hold(), true, 'premise: the agent is held');
+    const heldAt = Date.now();
+    eventGate.evaluate(chat('lol'));
+    await until(() => judgeState().heldCount === 1, 'the refused batch to be held');
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
+    await until(() => judgeState().verdicts.wait === 1, 'the batch judged once the extended hold lets go', 10_000);
+    assert.strictEqual(consulted(), 3, 'premise: the host extended the hold once, then let it go');
+    assert.ok(calledAt()! - heldAt >= 5_000, `the judge's call was made ${calledAt()! - heldAt} ms after the hold began`);
+    assert.deepStrictEqual(judgeState().verdicts, { reply: 0, wait: 1, error: 0, refused: 2 });
+  });
+
+  it("lists a wake a hold keeps as due at the end of a provider wait on the agent's model that outlasts the hold, since the wake waits that out once the hold lets it go", async (t) => {
+    const { internal, hold } = await heldFramework(t, [3_000]);
+    assert.strictEqual(hold(), true, 'premise: the agent is held');
+    internal.pendingRequests.push({ agentName: 'scout', reason: 'a queued test wake', source: 'test', timestamp: Date.now() });
+    const [held] = internal.upcomingWakesFor('scout');
+    assert.ok(held?.at !== undefined && held.at - Date.now() <= 3_000, `premise: held to the hold's end: ${JSON.stringify(held)}`);
+    internal.providerWaits.set('scout', 'test-model', 60_000, 'slow down');
+    const [outlasted] = internal.upcomingWakesFor('scout');
+    assert.ok(outlasted?.at !== undefined && outlasted.at - Date.now() > 50_000, `held to the wait's end: ${JSON.stringify(outlasted)}`);
+    internal.providerWaits.set('scout', 'test-model', Number.POSITIVE_INFINITY, 'until released');
+    assert.deepStrictEqual(internal.upcomingWakesFor('scout'), [{ when: 'when the hold on it is released', certain: true, what: 'a wake held by a provider hold' }]);
+  });
+
   it("under onError 'skip', a batch refused under a surgery's hold on the store is judged once the surgery lets the store go", async (t) => {
     const { createMockResponse } = await import('./helpers/mock-membrane.js');
     const { framework, membrane, eventGate } = await frameworkWith(t, { config: JUDGED, judge: { onError: 'skip' } });
@@ -2304,7 +2421,7 @@ describe('the framework wires the reply judge', () => {
       eventGate.evaluate(chat('lol'));
       await judged(2);
       assert.match(question(), opening);
-      assert.ok(question().includes('Nothing runs it again: if you answer WAIT, what woke it stays unanswered until something wakes scout.'), question());
+      assert.ok(question().includes('Nothing runs it again: if you answer WAIT, whatever of it is unanswered stays so until something wakes scout.'), question());
 
       const later = new MembraneError({ type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 180_000, message: 'slow down', rawError: { status: 429 } });
       assert.strictEqual(internal.holdProviderAcceleration(framework.getAgent('scout'), later), true, 'premise: scout is held, with no turn held');

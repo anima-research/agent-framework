@@ -73,6 +73,20 @@ describe('ProviderWaits', () => {
     } finally { store.close(); }
   }));
 
+  it('reads a wait as of the time it is given, so a caller that states its time left reads the clock once', () => withStoreDir((path) => {
+    const store = JsStore.openOrCreate({ path });
+    try {
+      const time = clock();
+      const waits = new ProviderWaits(store, { now: time.now, ...quiet });
+      const until = time.now() + 60_000;
+      waits.set('ada', 'zz-model', 60_000, 'zz 429');
+      time.advance(60_000);
+      assert.equal(waits.active('ada', 'zz-model'), undefined, 'premise: over by the store\'s clock');
+      assert.equal(waits.active('ada', 'zz-model', until - 1)?.until, until, 'binding a millisecond before its end');
+      assert.equal(waits.active('ada', 'zz-model', until), undefined);
+    } finally { store.close(); }
+  }));
+
   it('never lets a later, shorter wait shorten an outstanding one; indefinite stays indefinite', () => withStoreDir((path) => {
     const store = JsStore.openOrCreate({ path });
     try {
