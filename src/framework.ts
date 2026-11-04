@@ -4732,6 +4732,8 @@ export class AgentFramework {
    * tune-out's writesHeld reads true, as during the hold.
    */
   private replayingHeld = false;
+  /** A release of the tune-outs on record with no reader (releaseTuneOutsWithoutReader) that met held writes, to run once they are stored. */
+  private releaseWithoutReaderWaits = false;
   /**
    * Writes for an agent whose context manager refuses its work, by the
    * agent's name, each agent's in arrival order: its re-initialization after
@@ -24074,6 +24076,15 @@ export class AgentFramework {
     } catch (error) {
       console.error('[surgery] the tune-out cancels asked for during the hold could not run at its release:', error);
     }
+    // A release of the holds on record with no reader that met the hold
+    // (releaseTuneOutsWithoutReader) runs now, for the same reason.
+    if (this.releaseWithoutReaderWaits) {
+      try {
+        this.releaseTuneOutsWithoutReader();
+      } catch (error) {
+        console.error('[surgery] the tune-outs on record could not be released at the hold\'s release:', error);
+      }
+    }
   }
 
   /** One write of releaseSurgeryHeldWrites's replay, stored by the path it was held on; one that fails is noted in `lost`, by agent. */
@@ -39088,6 +39099,21 @@ export class AgentFramework {
    */
   private releaseTuneOutsWithoutReader(): void {
     if (!this.channelRegistry || this.tuneOutCoordinator) return;
+    // A cancel asked while writes are held waits for them (deferCancel), on
+    // the coordinator it was asked of, and runs when they are stored
+    // (releaseSurgeryHeldWrites runs this.tuneOutCoordinator's). One made
+    // here for the release alone would be dropped with its cancels still
+    // waiting, each hold on record and nothing to say so. The release waits
+    // as a whole instead: at a start no write is held, so this is the
+    // late-connect path during an operator's change to the store.
+    if (this.surgeryHold !== null || this.replayingHeld) {
+      if (!this.releaseWithoutReaderWaits) {
+        console.error('[tune-out] the tune-outs on record are released once the store takes writes again (an operator\'s change to it is in progress), so that each release is stored before the tune-out\'s end is recorded');
+      }
+      this.releaseWithoutReaderWaits = true;
+      return;
+    }
+    this.releaseWithoutReaderWaits = false;
     // Nothing is posted in an excepted channel: this is the host's own
     // housekeeping, at a start or when the channel subsystem comes up after
     // one. A hold whose release fails stays on record (releaseAll logs it),
