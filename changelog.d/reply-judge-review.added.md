@@ -2,4 +2,4 @@
   - `EventGate.providerCallsReleased()`, which the framework calls where an operator releases a provider wait and where a surgery lets go of the store, so the judge rules' batches held for a refusal are judged without waiting for the refusal's stated end.
   - `ReplyJudgeDeps.failedLastTurn` and its type `FailedLastTurn` (`at`, and `again`: `none`, `queued`, or `held` with an optional `until`), which the framework supplies so the judge can say a failed turn's wake is on its way, or isn't.
   - `UpcomingWake.when`, the time in words for a wake due at no time anyone can name, such as a turn held until an operator releases its provider wait; shown in place of `at`.
-  - `ReplyJudge.buildRequest()` also returns the `ratio` the request was built at.
+  - `ReplyJudge.buildRequest()` also returns the `ratio` the request was built at, and takes a third argument, the most characters a token it may be built at, for a request asked again; it's built at the estimate when that is lower.

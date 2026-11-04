@@ -149,6 +149,42 @@ describe('reply judge: a request refused as too long', () => {
     assert.ok(size(requests[1]!) < size(requests[0]!), `${size(requests[1]!)} < ${size(requests[0]!)}`);
   });
 
+  it('builds its second request at an estimate another refusal lowered below the halved ratio meanwhile', async () => {
+    const { membrane, requests } = refusingMembrane((n) => n <= 3);
+    let previews = 0;
+    let retryAsked!: () => void;
+    const retryPreviewing = new Promise<void>((resolve) => { retryAsked = resolve; });
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    const judge = new ReplyJudge({
+      membraneFor: () => membrane, chooseAgent: (n) => n[0],
+      preview: async () => {
+        if (++previews === 2) {
+          retryAsked();
+          await released;
+        }
+        return { messages: conversation(60), config: { model: 'x', maxTokens: 1 } };
+      },
+      options: { maxInputTokens: 4_000 },
+    });
+    const events = Array.from({ length: 30 }, (_, i) => ({
+      eventType: 'mcpl:channel-incoming', channel: '#garden', authorId: `u${i}`, addressed: false,
+      content: `question ${i} about the beds ${'y'.repeat(60)}`, at: Date.now() - 5000 + i,
+    }));
+    await quietly(async () => {
+      const first = judge.judge(judgeRequest({ events }));
+      await retryPreviewing;
+      await assert.rejects(judge.judge(judgeRequest({ events })), /prompt is too long/);
+      assert.strictEqual(judge.estimateRatio(), 1, "premise: the other call's refusals lowered the estimate below the first call's halved ratio");
+      release();
+      await first;
+    });
+    assert.strictEqual(requests.length, 4);
+    const shown = (r: NormalizedRequest) => ((r.messages.at(-1)!.content[0] as { text: string }).text.match(/question \d+ about the beds/g) ?? []).length;
+    assert.ok(shown(requests[2]!) < 30, `premise: the events budget binds at one character a token (${shown(requests[2]!)} shown)`);
+    assert.ok(shown(requests[3]!) <= shown(requests[2]!), `${shown(requests[3]!)} <= ${shown(requests[2]!)}`);
+  });
+
   it("isn't asked again for any other failure", async () => {
     const { membrane, requests } = refusingMembrane(1, new MembraneError({ type: 'server', retryable: true, message: 'upstream 500', rawError: { status: 500 } }));
     await assert.rejects(judgeOver(membrane).judge(judgeRequest()), /upstream 500/);
@@ -468,6 +504,7 @@ describe('reply judge: the document', () => {
       failedLastTurn: () => ({ at: now - 30_000, again: queued ? { kind: 'queued' as const } : { kind: 'none' as const } }),
     });
     await judge.judge(judgeRequest());
+    assert.ok(queued, 'premise: the wake list was read');
     const last = (requests[0]!.messages.at(-1)!.content[0] as { text: string }).text;
     assert.ok(last.includes('Nothing runs it again'), last);
     assert.ok(!last.includes('already queued'), last);
