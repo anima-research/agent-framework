@@ -13,8 +13,17 @@
 - **Hosts:** a piece of speech with no channel that a module says it showed
   logs `[routeSpeech] <agent>: turn has no channel; <n> chars shown by
   <places>, routing posted it to no channel` and emits no
-  `mcpl:speech-route-failed` trace, where it emitted one; a piece no module
-  showed still emits it.
+  `mcpl:speech-route-failed` trace, where it emitted one; a routed piece no
+  module showed still emits it. `ChannelRegistry`'s `onRouteFailure` info now
+  carries `text`, the words routed, so a host that logs that info logs the
+  agent's speech.
+- **Hosts:** under a provider hold, a merged start and an equal wake keep each
+  of their wakes once at the hold's release: a wake equal to one already in
+  the start's batch folds into it, as a held turn's equal wakes fold, where
+  two equal members of equal merged starts were both kept and
+  `getHostModeStatus().gatedRequests` counted both; and a held wake that an
+  equal merged start folds into is released with the start's wakes, where it
+  was dropped.
 - **Residents:** speech routed with no channel that no module says it showed
   still gets `[send-undeliverable]`, which now names the piece by its opening words,
   quoted: `Your plain speech "<opening>" (<n> chars) had no channel to go to

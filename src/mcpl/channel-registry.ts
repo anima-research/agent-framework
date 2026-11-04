@@ -5805,8 +5805,8 @@ export class ChannelRegistry {
    * What every conversation that takes the global fallback falls back to when
    * neither a home channel nor its own delivery names one: the all-except
    * hold's channel while one is open, else the latest delivered inbound
-   * channel under the legacy locus rule, else none — the prose stays private
-   * (architecture channel §3 carve-out, 2026-10-06).
+   * channel under the legacy locus rule, else none, and no channel posts the
+   * prose (architecture channel §3 carve-out, 2026-10-06).
    */
   private sharedFallback(): ChannelRef | null {
     return this.focusChannelResolver?.() ?? this.fallbackLocus();

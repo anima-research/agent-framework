@@ -1144,6 +1144,56 @@ test("a wake the hold folds into a held merged start keeps its opening messages 
   });
 });
 
+const identityKeys = ['agentName', 'reason', 'source', 'timestamp', 'channelId', 'channelServerId', 'coalescingSubject',
+  'coalescingBatchSubjects', 'readsDeferredWrite', 'readsStoredMessage', 'wakeLines'];
+
+test("a held wake that an equal merged start folds into keeps its opening messages when the start is released", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again');
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
+      const start = held.splice(0, 1)[0] as unknown as Record<string, unknown>;
+      const wake: Record<string, unknown> = { openingMessages: ['zz-held-first'] };
+      for (const key of identityKeys) if (start[key] !== undefined) wake[key] = start[key];
+      held.push(wake as unknown as Request);
+      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, start);
+      assert.equal(held.length, 1, 'premise: the hold folds the merged start into the held wake');
+      assert.equal(held[0], wake, 'premise: the held wake is the one kept');
+      go();
+      await waitFor(fw, () => membrane.primary >= 3, 'the released start, sent');
+      const routing = (internal as unknown as { turnRouting: Map<string, { openingMessages?: string[] }> }).turnRouting.get('resident');
+      assert.ok(routing?.openingMessages?.includes('zz-held-first'), `the held wake's opening message: ${JSON.stringify(routing?.openingMessages)}`);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a wake folded into a held merged start that equals one of its wakes counts once", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again');
+      const before = fw.getHostModeStatus().gatedRequests;
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
+      const start = held[0] as unknown as Record<string, unknown>;
+      const wake: Record<string, unknown> = { openingMessages: ['zz-again'] };
+      for (const key of identityKeys) if (start[key] !== undefined) wake[key] = start[key];
+      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, wake);
+      assert.equal(held.length, 1, 'premise: the hold folds the equal wake into the merged start');
+      assert.equal(fw.getHostModeStatus().gatedRequests, before, 'the wake it equals already counts');
+      go();
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
 test("a merged start its released wait puts back in the queue counts as the wakes merged into it there, until the next pass takes it", async (t) => {
   await withStoreDir(async (path) => {
     const clock = holdClock(t);

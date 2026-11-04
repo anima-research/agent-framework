@@ -6690,11 +6690,17 @@ export class AgentFramework {
     }
     if (isTurnRetry(request)) (same as MarkedRequest)[TURN_RETRY] = true;
     // A merged start's batch (MERGED_BATCH) stays recorded on the request
-    // kept in its place, which then stands for it, as the start did; a wake
-    // folded into a merged start joins its batch, which its release expands.
-    const batch = mergedBatch(request);
+    // kept in its place, which then stands for it, as the start did. What
+    // folds into a merged start, or a held wake that a merged start folds
+    // into, goes into the batch by this same fold, so the release expands
+    // to each wake once.
     const into = mergedBatch(same);
-    if (batch || into) (same as MarkedRequest)[MERGED_BATCH] = [...new Set([...(into ?? []), ...(batch ?? [request])])];
+    const batch = mergedBatch(request);
+    if (into || batch) {
+      const members = [...(into ?? [{ ...same }])];
+      for (const member of batch ?? [request]) this.holdRequest(members, member);
+      (same as MarkedRequest)[MERGED_BATCH] = members;
+    }
     const opening = mergedOpeningMessages([same, request]);
     if (opening) same.openingMessages = opening;
   }
@@ -21562,7 +21568,8 @@ export class AgentFramework {
    * Called ONLY at logical turn end (stream 'complete', or the endTurn
    * cancel path after the speech chain settles) — never mid-stream, where a
    * window-only insert would diverge from the wire. No-op when the turn
-   * delivered nothing and no module named a place. Failures are already marked separately
+   * delivered, held, suppressed and kept private nothing, failed to hold
+   * nothing, and no module named a place. Failures are already marked separately
    * ([discord-send-failed]); this is the success half.
    */
   private appendProseDeliveryReceipt(agent: Agent, routing: TurnRouting): void {
