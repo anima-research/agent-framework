@@ -453,7 +453,7 @@ and its `family` stays `modern`. On a 2025 revision:
   `reconnect` decides, as for any lost connection, and a revision verdict
   stops it for good, as on any reconnect. Without `reconnect`, that failure
   emits a second `close`, while `willReconnect` reads false: the server is
-  gone. A session that ended less than the base interval
+  gone. An answered session that ended less than the base interval
   (`reconnectIntervalMs`) after it started gets a new one at once only if
   the last session restarted that way had lived the interval, or there was
   none: a server restarted once soon after a connect costs a restart, not
