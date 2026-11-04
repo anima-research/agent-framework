@@ -1311,12 +1311,16 @@ const TURN_RETRY: unique symbol = Symbol('turn-retry');
 const MERGED_BATCH: unique symbol = Symbol('merged-batch');
 const REARMED: unique symbol = Symbol('rearmed');
 const TURN_CARRY: unique symbol = Symbol('turn-carry');
+/** The budget hold whose release pushed this request. Copies keep it, as
+ *  they keep TURN_RETRY and TURN_CARRY, so a provider hold that keeps the
+ *  start and later lets it go can tell that hold (noteProviderTookRelease). */
+const BUDGET_RELEASED: unique symbol = Symbol('budget-released');
 interface TurnCarry {
   silence: TurnSilence | null;
   sends: SendsReached | null;
   read: number;
 }
-type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [TURN_CARRY]?: TurnCarry; [REARMED]?: true };
+type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [BUDGET_RELEASED]?: BudgetHold };
 
 function isRearmed(request: InferenceRequest | undefined): boolean {
   return request !== undefined && (request as MarkedRequest)[REARMED] === true;
@@ -6953,6 +6957,19 @@ export class AgentFramework {
     }
     this.budgetHolds.set(agent.name, hold);
     endStart();
+    // Every turn into holding, a fresh hold or a released turn held again,
+    // raises the alert, as every end raises its clear (budgetHoldEnded). It
+    // comes before the trace, whose listener may end the hold at once, so a
+    // start always comes before its clear.
+    this.opsAlert('context-hold', agent.name, this.contextHoldText(String(error.message)), {
+      skipLog: true,
+      data: {
+        errorType,
+        since: hold.startedAt,
+        ...(hold.budget !== undefined ? { budget: hold.budget } : {}),
+        ...(hold.actual !== undefined ? { actual: hold.actual } : {}),
+      },
+    });
     this.emitTrace({
       type: 'inference:held',
       agentName: agent.name,
@@ -6964,17 +6981,6 @@ export class AgentFramework {
       heldRequests: hold.heldRequests.length,
     });
     if (this.budgetHolds.get(agent.name) !== hold || hold.state !== 'holding') return true;
-    // Every turn into holding, a fresh hold or a released turn held again,
-    // raises the alert, as every end raises its clear (budgetHoldEnded).
-    this.opsAlert('context-hold', agent.name, this.contextHoldText(String(error.message)), {
-      skipLog: true,
-      data: {
-        errorType,
-        since: hold.startedAt,
-        ...(hold.budget !== undefined ? { budget: hold.budget } : {}),
-        ...(hold.actual !== undefined ? { actual: hold.actual } : {}),
-      },
-    });
     if (!existing) this.logBudgetHold(agent, hold);
     else {
       console.error(`[budget-hold] agent=${agent.name} released turn refused again (${errorType}): ${hold.reason} \u2014 ` +
@@ -7217,7 +7223,10 @@ export class AgentFramework {
     this.clearBudgetHoldRecheck(hold);
     const waitedMs = Date.now() - hold.startedAt;
     const released = hold.heldRequests;
-    for (const request of released) this.pendingRequests.push(request);
+    for (const request of released) {
+      (request as MarkedRequest)[BUDGET_RELEASED] = hold;
+      this.pendingRequests.push(request);
+    }
     hold.state = outcome === 'nothing_pending' ? 'spent' : 'released';
     hold.outcome = outcome;
     hold.note = note;
@@ -7291,11 +7300,15 @@ export class AgentFramework {
     return hold !== undefined && hold.state !== 'holding' && hold.providerTook !== true;
   }
 
-  /** A provider hold kept the start a budget hold released, and now lets it
-   *  go: that start waited on the provider. The record and its note stay. */
-  private noteProviderTookRelease(agentName: string): void {
+  /** A provider hold lets `requests` go: where one of them, or one its
+   *  merged batch was made from, is a start the agent's budget hold released
+   *  (BUDGET_RELEASED), that start waited on the provider. The record and
+   *  its note stay. */
+  private noteProviderTookRelease(agentName: string, requests: readonly InferenceRequest[]): void {
     const hold = this.budgetHolds?.get(agentName);
-    if (hold !== undefined && hold.state !== 'holding') hold.providerTook = true;
+    if (hold === undefined || hold.state === 'holding') return;
+    const releasedBy = (request: InferenceRequest) => (request as MarkedRequest)[BUDGET_RELEASED] === hold;
+    if (requests.some((request) => releasedBy(request) || (mergedBatch(request) ?? []).some(releasedBy))) hold.providerTook = true;
   }
 
   private settleBudgetHold(agentName: string): void {
@@ -7466,7 +7479,7 @@ export class AgentFramework {
     this.pendingRequests.push(...requests);
     // A start a budget hold released and this hold then kept waited on the
     // provider when it runs, not on compression.
-    this.noteProviderTookRelease(agentName);
+    this.noteProviderTookRelease(agentName, requests);
     console.error(cooldown.rearm
       ? `[inference-rearm] agent=${agentName} turn queued again (${cooldown.rearm.number} of ${cooldown.rearm.of})`
       : `[provider-cooldown] agent=${agentName} released after ${Date.now() - cooldown.startedAt}ms — ` +

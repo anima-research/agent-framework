@@ -880,6 +880,83 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
+  it('marks a budget release taken by a provider hold only where that hold lets go a start the release pushed', async () => {
+    await withBacklog({ stalled: true }, async () => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      const i = t.framework as unknown as {
+        pendingRequests: Array<Record<string | symbol, unknown>>;
+        providerAccelerationCooldowns: Map<string, unknown>;
+        releaseBudgetHold(name: string, outcome: string, note: string | null): void;
+        releaseProviderAccelerationCooldown(name: string): void;
+      };
+      const providerHold = (held: unknown[]) => ({
+        startedAt: Date.now(), until: Date.now() - 1, timer: setTimeout(() => {}, 0), heldRequests: held, reason: 'zz', failures: 0,
+      });
+      const marked = () => (holdOf(t) as { providerTook?: true } | undefined)?.providerTook === true;
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        i.releaseBudgetHold('prime', 'fit', null);
+        const released = i.pendingRequests.at(-1)!;
+        assert.equal(holdOf(t)?.state, 'released', 'premise: the release pushed its start');
+        i.providerAccelerationCooldowns.set('prime', providerHold([{ agentName: 'prime', reason: 'zz-other', source: 'test', timestamp: Date.now() }]));
+        i.releaseProviderAccelerationCooldown('prime');
+        assert.equal(marked(), false, 'a provider hold letting other requests go leaves the release unmarked');
+        i.providerAccelerationCooldowns.set('prime', providerHold([{ ...released }]));
+        i.releaseProviderAccelerationCooldown('prime');
+        assert.equal(marked(), true, 'one letting the released start go, as a copy of it, marks it');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('names compression again for a released turn a provider hold let go and the budget then held again', async () => {
+    await withBacklog({ stalled: true }, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      const registry: Record<string, unknown> = {
+        resolveLocus: () => ({ serverId: 'stub', channelId: 'discord:guild:chanA' }),
+        routeSpeech: async (_agent: string, _text: string, locus?: { serverId: string; channelId: string } | null) =>
+          (locus ? { delivered: true, serverId: locus.serverId, channelId: locus.channelId } : null),
+        getDefaultPublishChannel: () => null,
+        isChannelOpen: () => true,
+        getDescriptor: () => undefined,
+        getChannelTools: () => [],
+        channelsNamed: (name: string) => [{ serverId: 'stub', channelId: name }],
+        nameShown: (channel: { channelId: string }) => channel.channelId,
+      };
+      (t.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(registry, {
+        get: (target, prop: string) => (prop in target ? target[prop] : () => undefined),
+      });
+      const recordWait = () => (t.framework as unknown as { recordProviderWait(agent: string, model: string, error: Error): unknown })
+        .recordProviderWait('prime', t.framework.getAgent('prime')!.model, new MembraneError({
+          type: 'rate_limit', retryable: true, retryAfterMs: Infinity, message: 'zz quota held until further notice', rawError: undefined,
+        }));
+      try {
+        t.send('Are you there?', { channelId: 'discord:guild:chanA' });
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        recordWait();
+        backlog.fit = true;
+        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1, 5_000), 'the budget hold releases the turn');
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        assert.equal(turnCalls(t.membrane).length, 0, 'premise: the provider wait keeps the released start');
+        backlog.fit = false;
+        t.framework.releaseProviderWait('prime');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 2, 5_000), 'premise: its start is refused for budget again, and held');
+        t.send('hey, over here?', { channelId: 'discord:dm:antra', tags: ['chat:addressed'] });
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        backlog.fit = true;
+        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000), 'the turn runs once its context fits');
+        const notices = stored(t.framework).filter((m) => m.metadata.kind === 'routing-notice').map((m) => m.text);
+        const notice = notices.find((text) => text.includes('addressed you from discord:dm:antra'));
+        assert.ok(notice, `the start announces the arrival: ${JSON.stringify(notices)}`);
+        assert.ok(notice!.includes('while your turn waited for compression'), `and says what the turn waited on last: ${notice}`);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
   it("gives a held turn's pending work and its last change in healthSnapshot()", async () => {
     await withBacklog({ stalled: true, pendingDescription: 'zz 3 chunks pending' }, async (backlog) => {
       const t = await residentTurn({ maintenanceIntervalMs: 50 });
@@ -2320,6 +2397,25 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['nothing_pending']);
         assert.deepEqual(t.of('ops:alert').filter((e) => ['context-hold', 'context-hold-clear', 'context-refusal'].includes(String(e.kind))).map((e) => e.kind),
           ['context-hold', 'context-hold-clear', 'context-refusal']);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('raises context-hold before its clear when a listener of inference:held ends the turn at once', async () => {
+    await withBacklog({ stalled: true }, async () => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      let ended = false;
+      t.framework.onTrace((event) => {
+        if (event.type === 'inference:held' && !ended) { ended = true; t.framework.abortInference('prime'); }
+      });
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1, 5_000));
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped'], 'premise: the listener ended the hold');
+        assert.deepEqual(t.of('ops:alert').filter((e) => String(e.kind).startsWith('context-hold')).map((e) => e.kind),
+          ['context-hold', 'context-hold-clear']);
       } finally {
         await t.close();
       }
