@@ -385,8 +385,13 @@ export class ReplyJudge {
   }
 
   /** Build the judge's request for one batch: the system prompt, the document in chunks, the question. */
-  async buildRequest(
-    request: JudgeRequest, now = Date.now(), atRatio?: number,
+  async buildRequest(request: JudgeRequest, now = Date.now()): Promise<{ request: NormalizedRequest; agentName: string; chars: number }> {
+    const { request: built, agentName, chars } = await this.build(request, now);
+    return { request: built, agentName, chars };
+  }
+
+  private async build(
+    request: JudgeRequest, now: number, atRatio?: number,
   ): Promise<{ request: NormalizedRequest; agentName: string; chars: number; ratio: number }> {
     const agentName = this.chooseAgent(request.agentNames);
     if (!agentName) throw new Error('no agent to judge for');
@@ -555,7 +560,7 @@ export class ReplyJudge {
   }
 
   private async decide(request: JudgeRequest): Promise<JudgeVerdict> {
-    let built = await this.buildRequest(request);
+    let built = await this.build(request, Date.now());
     let response: NormalizedResponse;
     try {
       response = await this.ask(built, request.signal);
@@ -568,7 +573,7 @@ export class ReplyJudge {
         `[gate] the reply judge's request of ${built.chars} characters, built at ${built.ratio.toFixed(2)} characters a token, `
         + `was refused as too long; the estimate is now ${this.charsPerToken.toFixed(2)}, and the batch is asked once more`,
       );
-      built = await this.buildRequest(request, Date.now(), halved);
+      built = await this.build(request, Date.now(), halved);
       response = await this.ask(built, request.signal);
     }
     const usage = (response as NormalizedResponse).details?.usage;
