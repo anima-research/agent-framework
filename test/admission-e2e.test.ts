@@ -231,18 +231,14 @@ describe('admission: the hold is decided once, before any side effect', () => {
     } finally { await f.close(); }
   });
 
-  it('gap 10 / §3.3 — without a reader, tune-out is a silent hold that still releases', async () => {
-    const f = await fixture({ framework: { tuneOut: { enabled: true } } as Partial<FrameworkConfig> });
+  it('without a reader there is no tune-out: no coordinator, no tune_out tool', async () => {
+    const f = await fixture({ framework: { tuneOut: { enabled: false } } as Partial<FrameworkConfig> });
     try {
       await registerOpen(f, 'noisy');
-      const coordinator = internals(f).tuneOutCoordinator;
-      assert.ok(coordinator, 'the coordinator exists without a subconscious');
-      enter(f, 'noisy', { backlogCap: 10 });
-      await incoming(f, 'noisy', 'n1', 'agent?', MENTION);
-      await settle(f);
-      assert.equal(stored(f).filter(held).length, 1, 'held');
-      assert.ok(coordinator!.cancel('editor', 'noisy', 'agent-tool', 'test').ok);
-      assert.match(textOf(find(f, '<tuned-out-backlog')), /antra: agent\?/, 'the release reaches the resident');
+      assert.equal(internals(f).tuneOutCoordinator, null, 'no reader, no hold machinery');
+      const names = f.framework.getAllTools().map((t) => t.name);
+      assert.ok(names.length > 0, 'premise: the framework lists its tools');
+      assert.ok(!names.includes('tune_out'), 'tune_out is not offered');
     } finally { await f.close(); }
   });
 

@@ -2084,6 +2084,13 @@ function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
  * `thinkingBinding` left unchecked, since nothing reads them then.
  */
 function assertFrameworkSwitches(config: FrameworkConfig): void {
+  if ((config.tuneOut as { enabled?: unknown } | null | undefined)?.enabled === true) {
+    throw new Error(
+      'tuneOut.enabled was removed in agent-framework 0.33.0: residents are offered tune_out only with a reader ' +
+        '(subconscious), since a hold nothing summarizes hands the resident an undated backlog all at once. ' +
+        'Remove tuneOut.enabled; to keep tune-out, configure a subconscious as well.',
+    );
+  }
   if (holdsSettings('subconscious', config.subconscious, '{ enabled: true }')) {
     assertBooleanSetting(
       'subconscious.enabled',
@@ -4154,7 +4161,7 @@ export class AgentFramework {
   private subconsciousConfig: SubconsciousConfig | null = null;
   /** Tune-out coordinator (issue #77); non-null iff a reader is configured + channels. */
   private tuneOutCoordinator: TuneOutCoordinator | null = null;
-  /** Residents are offered `tune_out` (a reader is configured, or `tuneOut.enabled`). */
+  /** Residents are offered `tune_out` (a reader is configured). */
   private tuneOutOffered = false;
   /**
    * The reply anchor a coalesced delivery would set, parked until the
@@ -4518,6 +4525,7 @@ export class AgentFramework {
   private mcplToolServers: Map<string, string> = new Map();
   /** Servers whose tools/list answered in the latest refresh. */
   private mcplListedServers: Set<string> = new Set();
+  private mcplPublishedConnections: Map<string, McplServerConnection> = new Map();
   /** refreshMcplTools' starts, and the start whose result was published
    *  last: a refresh that a later-started one has overtaken publishes
    *  nothing, since that one listed every server after it. */
@@ -4922,7 +4930,7 @@ export class AgentFramework {
     framework.beforeDerive = config.dendrite?.beforeDerive;
     framework.derivationNoticeHook = config.dendrite?.derivationNotice;
     framework.speechLocus = config.speech?.locus ?? 'delivery';
-    framework.tuneOutOffered = !!config.subconscious?.enabled || config.tuneOut?.enabled === true;
+    framework.tuneOutOffered = !!config.subconscious?.enabled;
     framework.tuneOutAnnounce = config.tuneOut?.announce !== false;
 
     // What the previous process left in the agent registry. Read before any
@@ -5366,85 +5374,18 @@ export class AgentFramework {
       await framework.ensureToolsetsModule();
     }
 
-    // Tune-out coordinator (issue #77, #232 §3.3): the hold machinery exists
-    // wherever tune_out is offered — with a reader (persistent subconscious
-    // or reader forks) it summarizes and wakes; with `tuneOut.enabled` alone
-    // it is a silent hold, and a persisted epoch is resumed and released
-    // (#232 gap 10). Where neither is configured nothing could ever cancel a
-    // tune-out on record, so each one ends at the start instead
-    // (endTuneOutsWithoutCoordinator), as main has it.
+    // Tune-out coordinator (issue #77): the hold machinery exists wherever
+    // tune_out is offered, which is only with a reader (persistent
+    // subconscious or reader forks): it summarizes and wakes, and a persisted
+    // epoch is resumed and released (#232 gap 10). Without a reader each
+    // tune-out on record is released at the start instead, backlog delivered
+    // (releaseTuneOutsWithoutReader), a hold that 0.32's `tuneOut.enabled`
+    // left included.
     if (framework.channelRegistry && framework.tuneOutOffered) {
-      framework.tuneOutCoordinator = new TuneOutCoordinator(
-        framework.channelRegistry,
-        framework.mcplServerRegistry!,
-        {
-          addMessage: (participant, content, metadata, forAgent) =>
-            framework.addMessage(participant, content, metadata as MessageMetadata,
-              forAgent ? { forAgent } : undefined),
-          requestInference: (agentName, reason, source, callerTurnId) => {
-            framework.requestForTurn(agentName, reason, source, callerTurnId);
-          },
-          subconsciousName: () => framework.subconsciousAgentName,
-          ...(framework.readerForks
-            ? {
-                invokeReader: (invocation: ReaderInvocation) => framework.invokeReaderFork(invocation),
-                deliverFromReader: (reader: string, content: ContentBlock[], metadata: Record<string, unknown>) =>
-                  framework.deliverFromReader(reader, content, metadata),
-              }
-            : {}),
-          primaryName: () => framework.primaryAgentName,
-          getStoredMessages: () => {
-            const primary = framework.primaryAgentName
-              ? framework.agents.get(framework.primaryAgentName) : undefined;
-            return primary ? primary.getContextManager().getAllMessages() : [];
-          },
-          commitDeliveries: () => framework.commitDeliveries(),
-          historyTool: () => framework.residentHistoryTool(),
-          getDeferredMessages: () => {
-            const forPrimary = (m: DeferredWrite): boolean => (m.forAgent ?? framework.primaryAgentName) === framework.primaryAgentName;
-            // Settled first, so a write that landed is in the stored rows
-            // alone (settleUnknownLandings).
-            framework.settleUnknownLandings(forPrimary);
-            return framework.deferredMessages.filter(forPrimary)
-              .sort(bySeq)
-              .map((m) => ({ participant: m.participant, content: m.content, metadata: m.metadata as Record<string, unknown> | undefined, writeId: m.id, heldAt: m.heldAt }));
-          },
-          // Every reader of the shared slot compiles the dump with its own
-          // strategy, so the dump fits the smallest of their bounds.
-          residentMessageChars: () => {
-            let chars: number | undefined;
-            for (const reader of framework.sharedSlotAgents) {
-              const bound = framework.strategyDerivedToolResultChars(reader);
-              if (bound !== undefined && (chars === undefined || bound < chars)) chars = bound;
-            }
-            return chars;
-          },
-          currentSequence: () => framework.store.currentSequence(),
-          setSubconsciousAnchor: (sequence) =>
-            framework.subconsciousStrategy?.setAnchor(sequence),
-          isForkBound: (channel) =>
-            framework.registry.list().some((record) => sameChannel(framework.homeOf(record.name), channel)),
-          isPrivilegedAuthor: (authorId) =>
-            framework.eventGate?.isPrivilegedUser(authorId) ?? false,
-          allowChannelSpeech: () => framework.subconsciousConfig?.allowChannelSpeech === true,
-          holdWithoutReader: () => framework.tuneOutOffered,
-          ...(framework.tuneOutAnnounce
-            ? {
-                // The excepted channel on its server: a bare id two servers
-                // register is refused (publishForAgent).
-                announce: async (serverId: string, channelId: string, text: string) => {
-                  const r = await framework.channelRegistry!.publishForAgent(
-                    { serverId, channelId }, text, framework.primaryAgentName ?? 'resident');
-                  return { success: r.success, ...(r.error ? { error: r.error } : {}) };
-                },
-              }
-            : {}),
-          emitTrace: (e) => framework.emitTrace(e),
-        },
-      );
+      framework.tuneOutCoordinator = framework.makeTuneOutCoordinator();
       framework.tuneOutCoordinator.resumeActiveEpochs();
     } else {
-      framework.endTuneOutsWithoutCoordinator();
+      framework.releaseTuneOutsWithoutReader();
     }
 
     // Modules, agents, MCPL servers and the tune-out tool are all in place:
@@ -8114,7 +8055,10 @@ export class AgentFramework {
     if (this.channelRegistry) {
       channelTools.push(AgentFramework.DRAFTS_TOOL);
     }
-    if (this.tuneOutCoordinator && this.tuneOutOffered) {
+    // Offered while a reader is there to watch a hold, or a hold is still on
+    // record for the resident to check or cancel: not once the persistent
+    // reader has ended and its holds are released (enter would refuse).
+    if (this.tuneOutCoordinator && this.tuneOutOffered && (this.subconsciousAgentName !== null || this.readerForks || this.tuneOutOnRecord())) {
       channelTools.push(AgentFramework.TUNE_OUT_TOOL, AgentFramework.FOCUS_TOOL);
     }
     const gateTools = this.eventGate
@@ -12329,6 +12273,9 @@ export class AgentFramework {
     if (name === this.subconsciousAgentName) {
       this.tuneOutCoordinator?.stopReader();
       this.subconsciousAgentName = null;
+      // No reader is left, and a hold nothing summarizes isn't kept: each
+      // ends now, its backlog to the resident.
+      if (!this.readerForks) this.tuneOutCoordinator?.releaseAll('reader-ended', 'its reader ended', { retry: true });
     }
   }
 
@@ -13156,9 +13103,7 @@ export class AgentFramework {
       'its messages will reach your subconscious where that\'s known. ' +
       'Calling tune_out again for a channel already tuned out keeps its ' +
       'settings, and, where this host can open the channel, tries the open ' +
-      'again if it isn\'t open. Without a subconscious it is a silent hold: ' +
-      'nothing summarizes or wakes you; the backlog is delivered when you ' +
-      'cancel. scope "all-except" holds EVERY channel (DMs and new channels ' +
+      'again if it isn\'t open. scope "all-except" holds EVERY channel (DMs and new channels ' +
       'included) except channelId, for durationSeconds (required); your plain ' +
       'speech lands in that channel meanwhile, except in a turn that has taken ' +
       'in private input; the reader pauses rather than ' +
@@ -35329,8 +35274,11 @@ export class AgentFramework {
     if (!this.mcplServerRegistry || !this.mcplHostCapabilities) {
       await this.initializeMcpl([], this.mcplInferenceRoutingConfig ?? undefined);
       // The lifecycle log's replay restored any tune-out on record, and no
-      // coordinator is made here to carry one.
-      this.endTuneOutsWithoutCoordinator();
+      // coordinator is made here to carry one. With no reader configured,
+      // each ends with its backlog; with one, it ends as before (its backlog
+      // isn't delivered: a coordinator made at this connect would carry it).
+      if (this.tuneOutOffered) this.endTuneOutsWithoutCoordinator();
+      else this.releaseTuneOutsWithoutReader();
     }
 
     const collision = this.mcplPrefixCollision(config, undefined, claim);
@@ -36640,6 +36588,8 @@ export class AgentFramework {
     const toolClasses = new Map<string, ToolClass[]>();
     const toolServers = new Map<string, string>();
     const listedServers = new Set<string>();
+    const results: Array<{ serverId: string; connection: McplServerConnection; staged: { tools: import('./types/index.js').ToolDefinition[]; featureSets: Map<string, string>; classes: Map<string, ToolClass[]>; servers: Map<string, string> }; error?: string }> = [];
+    const modernTools: import('./types/index.js').ToolDefinition[] = [];
     const closesOf = (serverId: string): number => this.mcplServerCloses?.get(serverId) ?? 0;
     // Each server's close count as its listing began.
     const closesAtListing = new Map<string, number>();
@@ -36650,9 +36600,15 @@ export class AgentFramework {
       const config = this.mcplServerConfigs.get(server.id);
       const prefix = config?.toolPrefix ?? `mcpl--${server.id}`;
       closesAtListing.set(server.id, closesOf(server.id));
+      const stage = () => ({
+        tools: [] as import('./types/index.js').ToolDefinition[],
+        featureSets: new Map<string, string>(),
+        classes: new Map<string, ToolClass[]>(),
+        servers: new Map<string, string>(),
+      });
+      const staged = stage();
       try {
         const result = await server.sendToolsList();
-        listedServers.add(server.id);
         const listed = new Set<string>();
         const repeated: string[] = [];
         // RFC-014 §8.1: a toolHints server's dynamic tools are announced in
@@ -36666,10 +36622,10 @@ export class AgentFramework {
         // reach the tool list here (§4.2). The agent is told where each tool
         // went once this refresh publishes a list that shows it there: a move
         // to static once the list offers the tool, a move to dynamic once it
-        // doesn't (a listing that breaks off publishes what it read). The
-        // rest stay pending for a refresh that does.
+        // doesn't. The rest stay pending for a refresh that does, as do all
+        // of a listing that breaks off, which publishes none of what it read.
         const presence = this.toolsetHub?.get(server.id);
-        if (presence?.presence.active) movesListed.set(server.id, { controller: presence, prefix, moves: presence.presence.moves() });
+        const moves = presence?.presence.active ? { controller: presence, prefix, moves: presence.presence.moves() } : undefined;
         const dynamic = (name: string): boolean => !!presence?.presence.active && presence.presence.presenceOf(name) === 'dynamic';
         for (const tool of result.tools) {
           if (!isToolAllowed(tool.name, config)) continue;
@@ -36680,7 +36636,7 @@ export class AgentFramework {
             continue;
           }
           listed.add(namespacedName);
-          toolServers.set(namespacedName, server.id);
+          staged.servers.set(namespacedName, server.id);
           const attributedTool = tool as typeof tool & {
             featureSet?: unknown;
             _meta?: { featureSet?: unknown; [key: string]: unknown };
@@ -36688,7 +36644,7 @@ export class AgentFramework {
           // RFC-008: the server's class hint for this tool. Never shown to
           // the model (the definition below is unchanged by it).
           const declaredClasses = parseDeclaredClasses(attributedTool._meta, namespacedName);
-          if (declaredClasses) toolClasses.set(namespacedName, declaredClasses);
+          if (declaredClasses) staged.classes.set(namespacedName, declaredClasses);
           const featureSet = typeof attributedTool.featureSet === 'string'
             ? attributedTool.featureSet
             : typeof attributedTool._meta?.featureSet === 'string'
@@ -36697,25 +36653,33 @@ export class AgentFramework {
           // MCP tool schemas are generic JSON Schema; cast to membrane's ToolDefinition format
           const schema = tool.inputSchema as import('./types/index.js').ToolDefinition['inputSchema'];
           if (offered) {
-            tools.push({
+            staged.tools.push({
               name: namespacedName,
               description: tool.description ?? '',
               inputSchema: schema,
             });
           }
           if (featureSet !== undefined) {
-            toolFeatureSets.set(namespacedName, featureSet);
+            staged.featureSets.set(namespacedName, featureSet);
           }
         }
+        listedServers.add(server.id);
+        if (moves) movesListed.set(server.id, moves);
         if (repeated.length > 0) repeats.push({ serverId: server.id, tools: repeated });
-      } catch {
-        // Server may not support tools/list — skip silently. A live server
-        // whose handshake advertised no MCP `tools` has, in effect, listed
-        // nothing; count it as listed so tool-pattern checks do not wait on
-        // it forever. (A server that advertised tools but failed to list
-        // them stays unknown.)
-        if (server.isConnected && !server.mcpToolsAdvertised) listedServers.add(server.id);
+      } catch (error) {
+        // A live server whose handshake advertised no MCP `tools` has, in
+        // effect, listed nothing; count it as listed so tool-pattern checks do
+        // not wait on it forever. (A server that advertised tools but failed
+        // to list them stays unknown.)
+        if (!server.mcpToolsAdvertised) {
+          if (server.isConnected) listedServers.add(server.id);
+          results.push({ serverId: server.id, connection: server, staged: stage() });
+        } else {
+          results.push({ serverId: server.id, connection: server, staged: stage(), error: redactServerText(error instanceof Error ? error.message : String(error), config ?? {}) });
+        }
+        continue;
       }
+      results.push({ serverId: server.id, connection: server, staged });
     }
 
     // Modern servers: the same namespacing, tool policy and RFC-008 class
@@ -36737,7 +36701,7 @@ export class AgentFramework {
           toolServers.set(namespacedName, server.id);
           const declaredClasses = parseDeclaredClasses(tool._meta, namespacedName);
           if (declaredClasses) toolClasses.set(namespacedName, declaredClasses);
-          tools.push({
+          modernTools.push({
             name: namespacedName,
             description: tool.description ?? '',
             inputSchema: tool.inputSchema as import('./types/index.js').ToolDefinition['inputSchema'],
@@ -36765,15 +36729,22 @@ export class AgentFramework {
     // for good. Nor does one whose connection closed after its listing
     // began, even if it has reconnected since: the close forgot its class
     // hints as stale (RFC-008), and its reconnect lists the new session.
-    const connections = new Map<string, McplServerConnection | ModernMcpConnection>([
-      ...(this.mcplServerRegistry?.getAllServers() ?? []).map((server) => [server.id, server] as const),
-      ...this.modernServers(),
-    ]);
+    // An MCPL server whose listing doesn't count for that reason, or whose
+    // listing failed, keeps what's published while its connection serves,
+    // advertises tools, and is still the one whose tools were published.
+    const mcplConnections = new Map<string, McplServerConnection>((this.mcplServerRegistry?.getAllServers() ?? []).map((server) => [server.id, server] as const));
+    const connections = new Map<string, McplServerConnection | ModernMcpConnection>([...mcplConnections, ...this.modernServers()]);
     const serving = (serverId: string): boolean => {
       const connection = connections.get(serverId);
       return !!connection && AgentFramework.mcpConnectionServes(connection);
     };
     const over = new Set([...listedServers].filter((serverId) => !serving(serverId) || closesOf(serverId) !== closesAtListing.get(serverId)));
+    const keeps = new Set(results
+      .filter(({ serverId, error }) => serving(serverId)
+        && mcplConnections.get(serverId)?.mcpToolsAdvertised === true
+        && this.mcplPublishedConnections?.get(serverId) === mcplConnections.get(serverId)
+        && (error !== undefined || over.has(serverId)))
+      .map(({ serverId }) => serverId));
     if (over.size > 0) {
       for (const [name, serverId] of [...toolServers]) {
         if (!over.has(serverId)) continue;
@@ -36794,8 +36765,43 @@ export class AgentFramework {
       if (unlisted !== undefined) this.handleToolsListChanged(unlisted);
       return;
     }
+    const kept = new Map<string, number>();
+    const publishedConnections = new Map<string, McplServerConnection>();
+    for (const { serverId, connection, staged } of results) {
+      const publisher = keeps.has(serverId) ? this.mcplPublishedConnections?.get(serverId) : listedServers.has(serverId) ? connection : undefined;
+      if (publisher) publishedConnections.set(serverId, publisher);
+      if (keeps.has(serverId)) {
+        const names = [...(this.mcplToolServers ?? [])]
+          .filter(([, owner]) => owner === serverId)
+          .map(([name]) => name);
+        const known = new Set(names);
+        tools.push(...(this.mcplTools ?? []).filter((tool) => known.has(tool.name)));
+        for (const name of names) {
+          toolServers.set(name, serverId);
+          const featureSet = this.mcplToolFeatureSets?.get(name);
+          if (featureSet !== undefined) toolFeatureSets.set(name, featureSet);
+          const classes = this.mcplToolClasses?.get(name);
+          if (classes !== undefined) toolClasses.set(name, classes);
+        }
+        kept.set(serverId, names.length);
+      } else if (listedServers.has(serverId)) {
+        tools.push(...staged.tools);
+        for (const [name, featureSet] of staged.featureSets) toolFeatureSets.set(name, featureSet);
+        for (const [name, classes] of staged.classes) toolClasses.set(name, classes);
+        for (const [name, owner] of staged.servers) toolServers.set(name, owner);
+      }
+    }
+    if (!this.stopHasBegun()) {
+      for (const { serverId, error } of results) {
+        if (error === undefined) continue;
+        const count = kept.get(serverId) ?? 0;
+        console.error(`[mcpl] server "${serverId}": tools/list failed (${error}); ${count > 0 ? `keeping its ${count} known tool(s)` : 'none of its tools are offered'}`);
+      }
+    }
+    tools.push(...(over.size > 0 ? modernTools.filter((tool) => toolServers.has(tool.name)) : modernTools));
     this.mcplToolsRefreshPublished = generation;
-    this.mcplTools = over.size > 0 ? tools.filter((tool) => toolServers.has(tool.name)) : tools;
+    this.mcplTools = tools;
+    this.mcplPublishedConnections = publishedConnections;
     this.mcplToolFeatureSets = toolFeatureSets;
     this.mcplToolClasses = toolClasses;
     this.mcplToolServers = toolServers;
@@ -37526,6 +37532,107 @@ export class AgentFramework {
       + (listed ? ' channel_list shows the channel ids.' : '');
   }
 
+  /** Whether any tune-out is on record: a channel's, or the all-except scope. */
+  private tuneOutOnRecord(): boolean {
+    try {
+      return (this.channelRegistry?.tuneOutsOnRecord().length ?? 0) > 0 || this.tuneOutCoordinator?.getAllExcept() != null;
+    } catch {
+      return true;
+    }
+  }
+
+  /** The tune-out coordinator over this framework's channels, with the hooks it acts through. */
+  private makeTuneOutCoordinator(options: { announce?: boolean } = {}): TuneOutCoordinator {
+    const channelRegistry = this.channelRegistry;
+    if (!channelRegistry) throw new Error('a tune-out coordinator needs the channel registry');
+    return new TuneOutCoordinator(
+      channelRegistry,
+      this.mcplServerRegistry!,
+      {
+        addMessage: (participant, content, metadata, forAgent) =>
+          this.addMessage(participant, content, metadata as MessageMetadata,
+            forAgent ? { forAgent } : undefined),
+        requestInference: (agentName, reason, source, callerTurnId) => {
+          this.requestForTurn(agentName, reason, source, callerTurnId);
+        },
+        subconsciousName: () => this.subconsciousAgentName,
+        ...(this.readerForks
+          ? {
+              invokeReader: (invocation: ReaderInvocation) => this.invokeReaderFork(invocation),
+              deliverFromReader: (reader: string, content: ContentBlock[], metadata: Record<string, unknown>) =>
+                this.deliverFromReader(reader, content, metadata),
+            }
+          : {}),
+        primaryName: () => this.primaryAgentName,
+        getStoredMessages: () => {
+          const primary = this.primaryAgentName
+            ? this.agents.get(this.primaryAgentName) : undefined;
+          return primary ? primary.getContextManager().getAllMessages() : [];
+        },
+        commitDeliveries: () => this.commitDeliveries(),
+        historyTool: () => this.residentHistoryTool(),
+        getDeferredMessages: () => {
+          const forPrimary = (m: DeferredWrite): boolean => (m.forAgent ?? this.primaryAgentName) === this.primaryAgentName;
+          // Settled first, so a write that landed is in the stored rows
+          // alone (settleUnknownLandings).
+          this.settleUnknownLandings(forPrimary);
+          return this.deferredMessages.filter(forPrimary)
+            .sort(bySeq)
+            .map((m) => ({ participant: m.participant, content: m.content, metadata: m.metadata as Record<string, unknown> | undefined, writeId: m.id, heldAt: m.heldAt }));
+        },
+        // Every reader of the shared slot compiles the dump with its own
+        // strategy, so the dump fits the smallest of their bounds.
+        residentMessageChars: () => {
+          let chars: number | undefined;
+          for (const reader of this.sharedSlotAgents) {
+            const bound = this.strategyDerivedToolResultChars(reader);
+            if (bound !== undefined && (chars === undefined || bound < chars)) chars = bound;
+          }
+          return chars;
+        },
+        currentSequence: () => this.store.currentSequence(),
+        setSubconsciousAnchor: (sequence) =>
+          this.subconsciousStrategy?.setAnchor(sequence),
+        isForkBound: (channel) =>
+          this.registry.list().some((record) => sameChannel(this.homeOf(record.name), channel)),
+        isPrivilegedAuthor: (authorId) =>
+          this.eventGate?.isPrivilegedUser(authorId) ?? false,
+        allowChannelSpeech: () => this.subconsciousConfig?.allowChannelSpeech === true,
+        ...(this.tuneOutAnnounce && options.announce !== false
+          ? {
+              // The excepted channel on its server: a bare id two servers
+              // register is refused (publishForAgent).
+              announce: async (serverId: string, channelId: string, text: string) => {
+                const r = await this.channelRegistry!.publishForAgent(
+                  { serverId, channelId }, text, this.primaryAgentName ?? 'resident');
+                return { success: r.success, ...(r.error ? { error: r.error } : {}) };
+              },
+            }
+          : {}),
+        emitTrace: (e) => this.emitTrace(e),
+      },
+    );
+  }
+
+  /**
+   * No reader is configured, so nothing can watch or end a hold: each hold
+   * on record (one 0.32's `tuneOut.enabled` left, or one whose reader the
+   * recipe no longer has) ends now, and its backlog goes to the resident,
+   * the per-channel holds and the all-except scope alike, through a
+   * coordinator made for that alone: at a start, or, where no MCPL server
+   * was configured, when the first one connects. One whose release fails
+   * stays on record for the next start.
+   */
+  private releaseTuneOutsWithoutReader(): void {
+    if (!this.channelRegistry || this.tuneOutCoordinator) return;
+    // Nothing is posted in an excepted channel: this is the host's own
+    // housekeeping, at a start or when the channel subsystem comes up after
+    // one. A hold whose release fails stays on record (releaseAll logs it),
+    // so the next start releases it, backlog and all, rather than ending it
+    // with none.
+    this.makeTuneOutCoordinator({ announce: false }).releaseAll('start', 'no reader is configured');
+  }
+
   /**
    * A tune-out on record where this host has no tune-out coordinator: a
    * start with no subconscious makes none, and neither does a channel
@@ -37538,7 +37645,10 @@ export class AgentFramework {
    * agent's tune-out keeps the agent's provenance (the housekeeping guard
    * reads it). A log line names the channel and says how many of the
    * messages it diverted are held here, stored or still queued to be
-   * written, which nothing will now deliver as its backlog.
+   * written, which nothing will now deliver as its backlog. Where no reader
+   * is configured, releaseTuneOutsWithoutReader ends them instead, backlog
+   * delivered; this is only the late-connect path of a host that has a
+   * reader.
    */
   private endTuneOutsWithoutCoordinator(): void {
     const registry = this.channelRegistry;
@@ -38376,9 +38486,7 @@ export class AgentFramework {
           cadenceSeconds: r.params.cadenceSeconds,
           backlogCap: r.params.backlogCap,
           maxWakes: r.params.maxWakes,
-          note: coordinator.hasReader()
-            ? `${speech} Reader wakes pause, not cancel, when the budget is spent.`
-            : `No subconscious is configured: this is a silent hold. ${speech} The backlog is delivered per channel when you cancel or the duration ends.`,
+          note: `${speech} Reader wakes pause, not cancel, when the budget is spent.`,
         },
       };
     }
@@ -38426,9 +38534,6 @@ export class AgentFramework {
         backlogCap: r.params.backlogCap,
         maxWakes: r.params.maxWakes,
         ...(openError ? { openError } : {}),
-        ...(coordinator.hasReader()
-          ? {}
-          : { note: 'No subconscious is configured: this is a silent hold. Nothing summarizes or wakes you; the backlog is delivered when you cancel.' }),
       },
     };
   }

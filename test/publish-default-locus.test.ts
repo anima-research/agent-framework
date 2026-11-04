@@ -9,7 +9,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { fixture, eventually } from './helpers/coalescing-fixture.js';
 import { createMockResponse, HeldStream } from './helpers/mock-membrane.js';
-import { registerOpen, incoming, MENTION } from './helpers/admission.js';
+import { registerOpen, incoming, MENTION, SUB } from './helpers/admission.js';
 
 const until = async (cond: () => boolean, what: string) => {
   for (let i = 0; i < 100 && !cond(); i++) await new Promise((r) => setTimeout(r, 20));
@@ -38,7 +38,7 @@ describe('channel_publish without channelId', () => {
   });
 
   it("a call made outside the turn takes none of the turn's channels: after a turn woken in work it's refused, and under a focus it goes to the excepted channel", async () => {
-    const f = await fixture({ framework: { tuneOut: { enabled: true } } as never });
+    const f = await fixture({ framework: { subconscious: SUB } as never });
     try {
       await registerOpen(f, 'work', 'other');
       const before = await f.framework.executeToolCall({ id: 'p0', name: 'channel_publish', input: { content: 'zz-script-0' }, callerAgentName: 'agent' } as never);
@@ -62,7 +62,7 @@ describe('channel_publish without channelId', () => {
   });
 
   it("a host's call carrying an open channelless turn's id meets the turn's rule: refused, though a focus holds another channel", async () => {
-    const f = await fixture({ framework: { tuneOut: { enabled: true } } as never });
+    const f = await fixture({ framework: { subconscious: SUB } as never });
     try {
       await registerOpen(f, 'work');
       const coordinator = (f.framework as unknown as { tuneOutCoordinator: { enterAllExcept(ref: unknown, opts: unknown, source: string): { ok: boolean } } }).tuneOutCoordinator;
