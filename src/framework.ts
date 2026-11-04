@@ -14227,11 +14227,13 @@ export class AgentFramework {
         channelId: params.channelId ?? '',
       });
       this.refusalRewinds.set(agentName, 0);
+      const opening = this.turnRouting?.get(agentName)?.openingMessages;
       this.pendingRequests.push({
         agentName,
         reason: 'unstick',
         source: 'framework',
         timestamp: Date.now(),
+        ...(opening ? { openingMessages: [...opening] } : {}),
       });
       console.error(
         `[unstick] agent=${agentName} started cap=${cap} ` +
@@ -20719,12 +20721,15 @@ export class AgentFramework {
    * presents mid-turn injections. Otherwise the turn-end receipt names them
    * (or, after a crash, the next turn's catch-up). Drafts the journal cannot
    * hold are reported in the receipt: their words remain in history only.
+   * Unless `opts.ask` is false, the modules are asked about each held text
+   * but a `deliberate` one (Module.onSpeechRouted), and the receipt names
+   * the places they answer.
    */
   private holdProseDrafts(
     agent: Agent,
-    texts: Array<string | { text: string; note?: string; inheritedRisk?: InheritedRisk }>,
+    texts: Array<string | { text: string; note?: string; inheritedRisk?: InheritedRisk; deliberate?: boolean }>,
     reason: DraftReason,
-    opts: { routing: TurnRouting; note?: string; notice: 'now' | 'later'; because?: string; target?: ChannelRef },
+    opts: { routing: TurnRouting; note?: string; notice: 'now' | 'later'; because?: string; target?: ChannelRef; final?: true; ask?: false },
   ): Draft[] {
     const segments = texts
       .map((t) => (typeof t === 'string'
@@ -20732,6 +20737,13 @@ export class AgentFramework {
         : { text: t.text, note: t.note ?? opts.note, inheritedRisk: t.inheritedRisk }))
       .filter((t) => t.text.trim().length > 0);
     if (segments.length === 0) return [];
+    if (opts.ask !== false) {
+      const round: ProseRound = { routing: opts.routing, notice: opts.notice, ...(opts.final ? { final: true } : {}) };
+      for (const t of texts) {
+        const plain = typeof t === 'string' ? t : t.deliberate ? '' : t.text;
+        if (plain.trim()) (opts.routing.asking ??= []).push(this.askSpeechRouted(agent, round, plain));
+      }
+    }
     const { held, notHeld } = this.proseDrafts.hold(
       agent.name,
       segments.map(({ text, note, inheritedRisk }) => ({
@@ -21433,8 +21445,8 @@ export class AgentFramework {
     'and is kept for you to send where you choose';
 
   /**
-   * The delivery of plain speech to the turn's frozen locus, in locus mode
-   * and for hybrid's plain envelopes. A heartbeat's turn with no locus of its
+   * The delivery of plain speech to the turn's frozen locus, in locus and
+   * locked mode and for hybrid's plain envelopes. A heartbeat's turn with no locus of its
    * own (TurnRouting.heartbeat) holds the words as a draft instead of failing
    * the delivery: nobody was waiting for them, and the agent may send them
    * where it chooses.
@@ -21450,7 +21462,7 @@ export class AgentFramework {
       // before the move can't be told, so the rest of the turn's plain speech,
       // on any stream or path of it, is held (TurnRouting.heldForMove).
       console.error(`[prose] ${agent.name}: plain speech held as a draft (the lock moved during a turn routed at its end)`);
-      this.holdProseDrafts(agent, [text], 'no-destination', { routing: round.routing, notice: 'later' });
+      this.holdProseDrafts(agent, [text], 'no-destination', { routing: round.routing, notice: 'later', ...(round.final ? { final: true } : {}) });
       return null;
     }
     if (locus === null && round.routing.locked) {
@@ -21497,16 +21509,16 @@ export class AgentFramework {
   }
 
   /**
-   * Hold a locked turn's plain speech as drafts ('no-destination'): the agent
-   * pointed its speech at drafts, or has no lock yet. Named in the turn's
-   * receipt rather than a notice per round, since holding is what the agent
-   * asked for.
+   * Hold a locked turn's plain speech as drafts ('no-destination'), when its
+   * lock points at drafts or is unset or doesn't resolve. The turn's receipt
+   * names them, rather than a notice per round.
    */
   private holdLockedProse(agent: Agent, texts: string[], round: ProseRound): Draft[] {
     console.error(`[prose] ${agent.name}: locked to drafts — ${texts.length} plain-speech segment(s) held as drafts`);
     return this.holdProseDrafts(agent, texts, 'no-destination', {
       routing: round.routing,
       notice: 'later',
+      ...(round.final ? { final: true } : {}),
     });
   }
 
@@ -21525,6 +21537,7 @@ export class AgentFramework {
       routing: round.routing,
       notice: round.draftsRound ? 'later' : round.notice,
       because: AgentFramework.HEARTBEAT_HOLD_BECAUSE,
+      ...(round.final ? { final: true } : {}),
     });
   }
 
@@ -23392,7 +23405,8 @@ export class AgentFramework {
         agent,
         [{ text: words.text, ...(words.inheritedRisk ? { inheritedRisk: words.inheritedRisk } : {}) }],
         'bounced',
-        { routing: round.routing, note: `{{unsent}} was draft ${draft.id}, which could not be sent`, notice: 'later' },
+        // An explicit envelope's words, as explicit sends are never asked about.
+        { routing: round.routing, note: `{{unsent}} was draft ${draft.id}, which could not be sent`, notice: 'later', ask: false },
       )[0];
     // A bare {{unsent}} holds nothing new; otherwise say whether the
     // envelope's own words were held, since explicit mode writes no receipt
@@ -23711,7 +23725,8 @@ export class AgentFramework {
               agent,
               [{ text: words.text, ...(words.inheritedRisk ? { inheritedRisk: words.inheritedRisk } : {}) }],
               'no-destination',
-              { ...round, notice: 'later' },
+              // Explicit mode writes no receipt to name a module's place.
+              { ...round, notice: 'later', ask: false },
             );
             if (held.length === 0 && words.text.trim().length > 0) {
               this.bounceProse(agent, rawText, 'no destination prefix, and this turn has no destination now', undefined, '>>', round, { unprefixed: true });
@@ -23881,7 +23896,9 @@ export class AgentFramework {
         agent,
         [{ text: words.text, ...(inherited ? { inheritedRisk: inherited } : {}) }],
         'bounced',
-        { routing: round.routing, note: reason, notice: 'later' },
+        // An explicit envelope's words, or explicit mode's, which writes no
+        // receipt: neither is asked about.
+        { routing: round.routing, note: reason, notice: 'later', ask: false },
       )[0];
     }
     // A heartbeat's turn came from no channel: its bounce is noticed, and
@@ -26868,7 +26885,9 @@ export class AgentFramework {
                   }
                 } else {
                   // Route to the TURN-FROZEN locus, like every other speech
-                  // path.
+                  // path: a locus resolved at post time would read the global
+                  // fallback, the all-except hold or the latest inbound
+                  // channel, which arrivals move while a dispatch runs.
                   const locus = resolveTurnLocus();
                   console.error(
                     `[routing] ${agent.name}: text-only turn -> routing speech -> ${locus ? qualifiedChannelName(locus) : '(none)'}`,

@@ -8,8 +8,8 @@
   whose speech went to a channel also has its receipt name where a module
   showed the speech, beside the channel; one whose channel post failed names
   that place in its receipt, and the failed post keeps its own notice. This
-  holds under prose routing by locus and hybrid, for each tool round's prose
-  as it routes and for the final reply.
+  holds under prose routing by locus, hybrid and locked, for each tool round's
+  prose as it routes and for the final reply.
 - **Residents:** speech with no channel that no module says it showed still
   gets `[send-undeliverable]`, which now names the piece by its opening words,
   quoted: `Your plain speech "<opening>" (<n> chars) had no channel to go to

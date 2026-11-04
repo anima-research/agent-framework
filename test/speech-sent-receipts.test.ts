@@ -256,26 +256,29 @@ describe('plain speech a module says it showed', () => {
     assert.equal(receipt(f), `[delivered] plain speech → sent to ${SENT_TO} · this turn's routing posted it to no channel`);
   });
 
-  for (const [lock, asked] of [['#room', true], ['drafts', false]] as const) {
-    it(asked
-      ? "a locked turn with a lock asks the modules where its speech went, and its receipt names what they said"
-      : "a turn locked to drafts asks no module, since its speech is held", async () => {
+  for (const [lock, what] of [
+    ['#room', 'a locked turn with a lock'],
+    ['drafts', 'a turn locked to drafts'],
+    [undefined, 'a locked turn whose lock is unset'],
+    ['#nowhere', "a locked turn whose lock doesn't resolve"],
+  ] as const) {
+    it(`${what} asks the modules where its speech went, and its receipt names what they said`, async () => {
       const surface = new Surface();
       const membrane = new MockMembrane();
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi there.' }]));
-      const f = await host([surface], membrane, { proseRouting: 'locked', proseLock: lock });
+      const f = await host([surface], membrane, { proseRouting: 'locked', ...(lock ? { proseLock: lock } : {}) });
       const { server, published } = channelServer(true);
       const registry = internals(f).channelRegistry;
       registry.serverRegistry = { getServer: () => server };
       registry.ensureChannelRegistered('srv', 'room', 'room');
       await turn(f);
-      if (asked) {
+      assert.deepEqual(askedTexts(surface), [{ text: 'Hi there.', final: true }]);
+      assert.ok(receipt(f)?.includes(`sent to ${SENT_TO}`), receipt(f));
+      if (lock === '#room') {
         assert.deepEqual(published.map((p) => p.text), ['Hi there.'], 'premise: the speech went to the lock');
-        assert.deepEqual(askedTexts(surface), [{ text: 'Hi there.', final: true }]);
-        assert.ok(receipt(f)?.includes(`sent to ${SENT_TO}`), receipt(f));
       } else {
         assert.deepEqual(published, [], 'premise: nothing posted');
-        assert.deepEqual(surface.asked, []);
+        assert.match(receipt(f) ?? '', /held as draft d-/, 'its drafts note stands beside the place');
       }
     });
   }
@@ -846,7 +849,18 @@ describe('plain speech a module says it showed', () => {
     assert.deepEqual(notices(f), []);
   });
 
-  it("a heartbeat's held prose is never asked about and stays a draft", async () => {
+  /** A bounce's wake takes a turn of its own: answer it with a private envelope. */
+  const keepWakeQuiet = (f: AgentFramework, membrane: MockMembrane, envelope: string) => {
+    let starts = 0;
+    f.onTrace((event) => {
+      if (event.type === 'inference:started' && ++starts > 1) membrane.pushResponse(createMockResponse([{ type: 'text', text: envelope }]));
+    });
+  };
+
+  const openDrafts = (f: AgentFramework) =>
+    (f as unknown as { proseDrafts: { open(agent: string): Array<{ id: string; text: string; reason: string }> } }).proseDrafts.open('resident');
+
+  it("a heartbeat's held prose asks the modules, stays a draft, and its receipt names what they said", async () => {
     const surface = new Surface();
     const membrane = new MockMembrane();
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'A quiet thought.' }]));
@@ -854,10 +868,153 @@ describe('plain speech a module says it showed', () => {
     internals(f).pendingRequests.push({ agentName: 'resident', reason: 'heartbeat', source: 'heartbeat', timestamp: Date.now() });
     await f.runUntilIdle();
     assert.equal(membrane.calls.length, 1, 'premise: the heartbeat took a turn');
-    assert.deepEqual(surface.asked, []);
+    assert.deepEqual(askedTexts(surface), [{ text: 'A quiet thought.', final: true }]);
     assert.deepEqual(notices(f), []);
-    const drafts = (f as unknown as { proseDrafts: { open(agent: string): Array<{ text: string }> } }).proseDrafts.open('resident');
-    assert.deepEqual(drafts.map((d) => d.text), ['A quiet thought.']);
+    assert.deepEqual(openDrafts(f).map((d) => d.text), ['A quiet thought.']);
+    assert.ok(receipt(f)?.includes(`sent to ${SENT_TO}`), receipt(f));
+    assert.match(receipt(f) ?? '', /held as draft d-/);
+  });
+
+  it('a locked turn whose lock moved while its words waited for its end asks about the speech it holds', async () => {
+    const surface = new Surface();
+    const membrane = new WithoutRoundContent();
+    membrane.supportsInjectedMessages = false;
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Before the move.' },
+      { type: 'tool_use', id: 'pl1', name: 'prose_locus', input: { to: '#ops' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Before the move.' },
+      { type: 'text', text: 'After the move.' },
+    ] as ContentBlock[]));
+    const f = await host([surface], membrane, { proseRouting: 'locked', proseLock: '#room' });
+    const { server, published } = channelServer(true);
+    const registry = internals(f).channelRegistry;
+    registry.serverRegistry = { getServer: () => server };
+    registry.ensureChannelRegistered('srv', 'room', 'room');
+    registry.ensureChannelRegistered('srv', 'ops', 'ops');
+    await turn(f);
+    assert.deepEqual(published, [], 'premise: the move held the whole stream');
+    const asked = surface.asked.map((a) => a.text).join(' ');
+    assert.ok(asked.includes('Before the move.') && asked.includes('After the move.'), JSON.stringify(askedTexts(surface)));
+    assert.ok(receipt(f)?.includes(`sent to ${SENT_TO}`), receipt(f));
+    assert.match(receipt(f) ?? '', /held as drafts? d-/);
+  });
+
+  it("a hybrid reply held after a refused target asks about the held speech, and not about the refused envelope", async (t) => {
+    t.mock.method(console, 'error', () => {});
+    const surface = new Surface();
+    const membrane = new MockMembrane();
+    membrane.pushResponse(lookRound('>>>nowhere First.'));
+    membrane.pushResponse(afterLook('>>>nowhere First.', 'Second.'));
+    const f = await host([surface], membrane, { proseRouting: 'hybrid' });
+    keepWakeQuiet(f, membrane, '>>>skip_reply');
+    await turn(f);
+    const drafts = openDrafts(f);
+    assert.ok(drafts.some((d) => d.text === 'First.' && d.reason === 'bounced'), `premise: the refused envelope bounced: ${JSON.stringify(drafts)}`);
+    assert.ok(drafts.some((d) => d.text === 'Second.' && d.reason === 'no-destination'), `premise: the reply was held: ${JSON.stringify(drafts)}`);
+    assert.deepEqual(askedTexts(surface), [{ text: 'Second.', final: true }]);
+    const turnReceipt = texts(f).find((x) => x.startsWith('[delivered]') && x.includes('held as draft'));
+    assert.ok(turnReceipt?.includes(`sent to ${SENT_TO}`), turnReceipt);
+  });
+
+  it("speech a send in its round held, with a turn's channel, asks the modules about it", async (t) => {
+    t.mock.method(console, 'error', () => {});
+    const surface = new Surface();
+    const membrane = new MockMembrane();
+    const send = { type: 'tool_use', id: 'p1', name: 'channel_publish', input: { channelId: 'room', content: 'A note.' } } as ContentBlock;
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Looking around.' }, send], 'tool_use'));
+    membrane.pushResponse({
+      ...createMockResponse([
+        { type: 'text', text: 'Looking around.' },
+        send,
+        { type: 'tool_result', toolUseId: 'p1', content: 'posted' },
+        { type: 'text', text: 'Nothing here.' },
+      ] as ContentBlock[]),
+      toolCalls: [],
+      rawAssistantText: 'Nothing here.',
+    } as NormalizedResponse);
+    const f = await host([surface], membrane);
+    const published = await channelTurn(f, true);
+    await f.runUntilIdle();
+    assert.ok(!published.some((p) => p.text === 'Looking around.'), `premise: the send held the round's speech: ${JSON.stringify(published)}`);
+    assert.ok(openDrafts(f).some((d) => d.text === 'Looking around.' && d.reason === 'explicit-send'), JSON.stringify(openDrafts(f)));
+    assert.ok(askedTexts(surface).some((a) => a.text === 'Looking around.' && a.final === false), JSON.stringify(askedTexts(surface)));
+    assert.ok(receipt(f)?.includes(`sent to ${SENT_TO}`), receipt(f));
+  });
+
+  it("a hybrid round a send held asks about its plain envelope, and not about its >>> envelope", async (t) => {
+    t.mock.method(console, 'error', () => {});
+    const surface = new Surface();
+    const membrane = new MockMembrane();
+    const send = { type: 'tool_use', id: 'p1', name: 'channel_publish', input: { channelId: 'room', content: 'A note.' } } as ContentBlock;
+    const said = 'And plain.\n>>>room More for the room.';
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: said }, send], 'tool_use'));
+    membrane.pushResponse({
+      ...createMockResponse([
+        { type: 'text', text: said },
+        send,
+        { type: 'tool_result', toolUseId: 'p1', content: 'posted' },
+        { type: 'text', text: 'Done.' },
+      ] as ContentBlock[]),
+      toolCalls: [],
+      rawAssistantText: 'Done.',
+    } as NormalizedResponse);
+    const f = await host([surface], membrane, { proseRouting: 'hybrid' });
+    const published = await channelTurn(f, true);
+    await f.runUntilIdle();
+    const drafts = openDrafts(f);
+    assert.ok(drafts.some((d) => d.text.includes('And plain.')) && drafts.some((d) => d.text.includes('More for the room.')),
+      `premise: the send held both envelopes: ${JSON.stringify(drafts)} ${JSON.stringify(published)}`);
+    assert.ok(askedTexts(surface).some((a) => a.text.includes('And plain.') && a.final === false), JSON.stringify(askedTexts(surface)));
+    assert.ok(!surface.asked.some((a) => a.text.includes('More for the room.')), 'the >>> envelope is an explicit send');
+  });
+
+  it("explicit routing asks no module about speech it holds or bounces, since it writes no receipt", async (t) => {
+    t.mock.method(console, 'error', () => {});
+    const surface = new Surface();
+    const membrane = new MockMembrane();
+    const list = { type: 'tool_use', id: 'd1', name: 'drafts', input: { action: 'list' } } as ContentBlock;
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Unrouted words.' }, list], 'tool_use'));
+    membrane.pushResponse({
+      ...createMockResponse([
+        { type: 'text', text: 'Unrouted words.' },
+        list,
+        { type: 'tool_result', toolUseId: 'd1', content: 'no drafts' },
+        { type: 'text', text: 'Bounced words.' },
+      ] as ContentBlock[]),
+      toolCalls: [],
+      rawAssistantText: 'Bounced words.',
+    } as NormalizedResponse);
+    const f = await host([surface], membrane, { proseRouting: 'explicit' });
+    keepWakeQuiet(f, membrane, '>>skip_reply');
+    await turn(f);
+    const drafts = openDrafts(f);
+    assert.ok(drafts.some((d) => d.text === 'Unrouted words.' && d.reason === 'no-destination'), `premise: a drafts round held it: ${JSON.stringify(drafts)}`);
+    assert.ok(drafts.some((d) => d.text === 'Bounced words.' && d.reason === 'bounced'), `premise: the reply bounced: ${JSON.stringify(drafts)}`);
+    assert.deepEqual(surface.asked, []);
+    assert.equal(receipt(f), undefined);
+  });
+
+  it("an envelope whose {{unsent}} names a draft still being sent holds its words without asking, as an explicit send", async (t) => {
+    t.mock.method(console, 'error', () => {});
+    const surface = new Surface();
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>>room {{unsent}} and more' }]));
+    const f = await host([surface], membrane, { proseRouting: 'hybrid' });
+    const { server } = channelServer(true);
+    const registry = internals(f).channelRegistry;
+    registry.serverRegistry = { getServer: () => server };
+    registry.ensureChannelRegistered('srv', 'room', 'room');
+    const i = f as unknown as {
+      proseDrafts: { hold(agent: string, segments: Array<{ text: string }>, reason: string): { held: Array<{ id: string }> } };
+      draftsInFlight: Set<string>;
+    };
+    const [bounced] = i.proseDrafts.hold('resident', [{ text: 'Earlier words.' }], 'bounced').held;
+    i.draftsInFlight.add(`resident\u0000${bounced!.id}`);
+    await turn(f);
+    assert.ok(openDrafts(f).some((d) => d.text.includes('and more')), `premise: the envelope's words were held: ${JSON.stringify(openDrafts(f))}`);
+    assert.deepEqual(surface.asked, []);
   });
 
   it('a module that throws counts as having shown nothing, and the line names it', async (t) => {
@@ -1268,6 +1425,23 @@ describe('plain speech a module says it showed', () => {
     assert.ok(retried, JSON.stringify(askedTexts(surface)));
     assert.equal(retried!.context.openedBy?.reason, 'refusal-rewind-retry', 'premise: the retry opened a turn of its own');
     assert.deepEqual(openingTexts(surface, retried!), ['hello there']);
+  });
+
+  it("an operator's unstick names the messages of the turn it carries on", async () => {
+    const surface = new Surface();
+    const membrane = new MockMembrane();
+    membrane.pushResponse({ ...createMockResponse([{ type: 'text', text: 'I would rather not.' }], 'refusal'), toolCalls: [] } as NormalizedResponse);
+    const f = await host([surface], membrane);
+    await turn(f, 'hello there');
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Unstuck reply.' }]));
+    const accepted = await (f as unknown as { handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<{ ok: boolean }> })
+      .handleHostCommand('test-server', { command: 'unstick', agentName: 'resident' });
+    assert.equal(accepted.ok, true, 'premise: the unstick was accepted');
+    await f.runUntilIdle();
+    const rerun = surface.asked.find((a) => a.text === 'Unstuck reply.');
+    assert.ok(rerun, JSON.stringify(askedTexts(surface)));
+    assert.equal(rerun!.context.openedBy?.reason, 'unstick', "premise: the unstick's run opened a turn of its own");
+    assert.deepEqual(openingTexts(surface, rerun!), ['hello there']);
   });
 
   it("a retry after an inference failure's rewind names the messages of the turn it stands in for", async () => {

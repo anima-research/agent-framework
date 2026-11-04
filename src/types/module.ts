@@ -207,18 +207,22 @@ export interface Module {
    *   none of its surfaces opened. A turn with no channel's notice then
    *   still says another surface may have shown it.
    *
-   * Asked only where the turn routes plain speech (prose routing by locus,
-   * hybrid or locked, on a host with a channel registry), in the order it
-   * routes the pieces, and never about private envelopes, explicit sends, a
-   * heartbeat's held prose, a locked turn's speech held as drafts or an
-   * ephemeral run's speech with no channel, which is its caller's result. A module that throws, or hasn't answered within
-   * `SPEECH_RECEIPT_WAIT_MS`, names no place, as `{}` does. For a turn that
-   * ends with its reply or a tool, the turn's receipt and the agent's next
-   * turn wait for every answer up to that bound, so answer from what the
-   * module already holds rather than after a round trip. A turn that fails
-   * or is stopped writes no receipt and doesn't wait. A turn that had
-   * finished when `stop()` began still routes its speech, and `stop()` waits
-   * for those answers up to the bound.
+   * Asked as the turn routes each piece of its plain speech, or holds it as
+   * a draft, in the order it routes the pieces, under prose routing by
+   * locus, hybrid or locked on a host with a channel registry. Never asked
+   * about private envelopes or words kept private, explicit sends (prefixed
+   * envelopes included) or their own words held as drafts, a turn under
+   * explicit routing, which writes no receipt, or an ephemeral run's unheld
+   * speech with no channel, which is its caller's result. A module that throws, or
+   * hasn't answered within `SPEECH_RECEIPT_WAIT_MS`, names no place, as `{}`
+   * does. For a turn that ends with its reply or a tool, the turn's receipt
+   * and the agent's next turn wait for every answer, each piece's up to that
+   * bound, and a piece with no channel waits for its answers before the next
+   * piece routes, so a turn of several such pieces can wait that long for
+   * each. Answer from what the module already holds rather than after a
+   * round trip. A turn that fails or is stopped writes no receipt and
+   * doesn't wait. A turn that had finished when `stop()` began still routes
+   * its speech, and `stop()` waits for those answers in the same way.
    */
   onSpeechRouted?(
     agentName: string,
