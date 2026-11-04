@@ -16433,7 +16433,7 @@ export class AgentFramework {
       this.emitTrace({ ...event, agentName: agent.name });
       if (event.type === 'head:moved' && event.forced) {
         const why = event.forced === 'budget'
-          ? `a compile was refused over budget with ${event.changesRemoved} system changes kept, so the head took them and the compile ran again`
+          ? `a compile was refused over budget, or for dropping messages no summary covers, with ${event.changesRemoved} system changes kept, so the head took them and the compile ran again`
           : `the system changes reached ${event.changeTokens} tokens, at least a fifth of the last response's ${event.inputTokens}, and no compile had taken them into the head at no further cost, so the head took them`;
         this.opsAlert('head-consolidated', agent.name,
           `${why}: one whole write${this.thinkingSetAside(agent, 'and the thinking the request held set aside')}`,

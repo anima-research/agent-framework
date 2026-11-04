@@ -2707,7 +2707,8 @@ export class Agent {
   }
 
   private takeChangesOverBudget(error: unknown, entries: boolean, recorded: HeadDeclaration | null, current: HeadDeclaration): HeadDeclaration {
-    if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError') throw error;
+    const refusal = (error as { name?: unknown } | null)?.name;
+    if (refusal !== 'OverBudgetError' && refusal !== 'UncoveredDropError') throw error;
     const rows = this.ownChangeRows();
     if (!entries) {
       if (rows.length === 0 || !this.headDeclarations.delete(this.name)) throw error;

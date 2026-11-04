@@ -344,8 +344,9 @@ export interface AgentConfig {
      * free only where no thinking sits before the compile's `firstChanged`
      * (the first message that compile renders differently from the last
      * one; thinking from there on is set aside by the compile's own change).
-     * Past a fifth of the input, or when a compile is refused over budget
-     * with changes kept, it consolidates anyway, setting that thinking
+     * Past a fifth of the input, or when a compile is refused over budget,
+     * or for dropping messages no summary covers, with changes kept, it
+     * consolidates anyway, setting that thinking
      * aside. The host's model records carry `binds`, beside "takes entries".
      */
     binds?: boolean;

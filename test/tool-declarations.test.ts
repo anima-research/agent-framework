@@ -751,6 +751,26 @@ describe('toolDeclarations', () => {
       assert.deepEqual(events.at(-1), { type: 'head:moved', why: 'consolidated', changesRemoved: 1, forced: 'budget' });
     });
 
+    it('moves the head the same way when the compile is refused for dropping messages no summary covers', async () => {
+      const rows = [said('user', 'hello')];
+      let refuse = false;
+      const uncovered = () => (refuse && rows.some((row) => row.participant === 'system')
+        ? Object.assign(new Error('uncovered drop'), { name: 'UncoveredDropError' })
+        : undefined);
+      const context = fakeContext(rows, { fail: uncovered });
+      const heads = memoryHeadDeclarations();
+      const events: HeadEvent[] = [];
+      const agent = agentOn(context, { toolDeclarations: 'entries' }, heads, events);
+      await agent.buildActivationRequest([tool('a')]);
+      await agent.buildActivationRequest([tool('a'), tool('b')]);
+      assert.equal(changeRows(rows).length, 1, 'the premise: the change is stored');
+      refuse = true;
+      const request = await agent.buildActivationRequest([tool('a'), tool('b')]);
+      assert.deepEqual(request.tools, [tool('a'), tool('b')], 'the head took the change');
+      assert.deepEqual(changeRows(rows), []);
+      assert.deepEqual(events.at(-1), { type: 'head:moved', why: 'consolidated', changesRemoved: 1, forced: 'budget' });
+    });
+
     it("keeps its changes, and the refusal goes on, when a compile is refused over budget while its head can't be stored", async () => {
       const rows = [said('user', 'hello')];
       let refuse = false;

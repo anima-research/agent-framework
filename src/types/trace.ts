@@ -141,7 +141,8 @@ export type TraceEvent =
       changeTokens?: number;
       inputTokens?: number;
       /** A consolidation no compile made free: past a fifth of the input
-       *  ('share'), or at a compile refused over budget with changes kept
+       *  ('share'), or at a compile refused over budget, or for dropping
+       *  messages no summary covers, with changes kept
        *  ('budget'). A whole write, and on a binding model the request's
        *  thinking set aside. */
       forced?: 'share' | 'budget';

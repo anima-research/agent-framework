@@ -24,8 +24,9 @@
   compile with `binds: true` is told are the recorded head's, so a declared
   change keeps them, and a move of the head changes them wherever it changes
   what the request carries ahead of its messages. Past a fifth of the input,
-  or when a compile is refused over budget with changes kept, it happens
-  anyway, raising an operator line (`head-consolidated`). A host's own change
+  or when a compile is refused over budget, or for dropping messages no
+  summary covers, with changes kept, it happens anyway, raising an operator
+  line (`head-consolidated`). A host's own change
   rows are the host's to remove: the agent neither folds nor removes them. An
   agent built again on `'head'` clears its recorded head at its first request
   and then takes its own change rows out of its context; a record the store

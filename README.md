@@ -104,8 +104,8 @@ until it's built again, its record and then its own change rows taken out
 unrelated 400, such as one for an
 oversized image, ends its `'entries'` too. A consolidation waits for a compile that
 already rewrites the changes; past a fifth of the input, or when a compile
-is refused over budget with changes kept, it happens anyway, with an
-operator line. `thinkingBinding.binds` says whether the model binds its
+is refused over budget, or for dropping messages no summary covers, with
+changes kept, it happens anyway, with an operator line. `thinkingBinding.binds` says whether the model binds its
 thinking to everything before it. Unless it's `false`, such a compile must
 keep no thinking before the first message it renders anew (its
 `firstChanged`), and a forced move sets that thinking aside; with `true`,

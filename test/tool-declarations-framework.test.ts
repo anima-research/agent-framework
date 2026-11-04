@@ -189,7 +189,7 @@ describe('toolDeclarations in the framework', () => {
       (alpha as unknown as { onHeadEvent(e: unknown): void }).onHeadEvent({ type: 'head:moved', why: 'consolidated', changesRemoved: 2, forced: 'budget' });
       const alerts = traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-consolidated') as { message: string; data?: Record<string, unknown> }[];
       assert.equal(alerts.length, 1);
-      assert.match(alerts[0]!.message, /^a compile was refused over budget with 2 system changes kept, so the head took them and the compile ran again: one whole write/);
+      assert.match(alerts[0]!.message, /^a compile was refused over budget, or for dropping messages no summary covers, with 2 system changes kept, so the head took them and the compile ran again: one whole write/);
       assert.deepEqual(alerts[0]!.data, { forced: 'budget', changesRemoved: 2 });
     });
   });
