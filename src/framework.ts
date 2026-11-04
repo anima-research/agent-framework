@@ -5011,7 +5011,8 @@ export class AgentFramework {
               }
               const came = (provenance?.batchChannels ?? [])
                 .map((c) => framework.channelNamed(c.channelId, c.serverId))
-                .filter((c): c is ChannelRef => c !== undefined);
+                .filter((c): c is ChannelRef => c !== undefined)
+                .filter((c, i, all) => all.findIndex((d) => sameChannel(d, c)) === i);
               return came.length > 0 ? { wakeChannels: came } : {};
             })(),
           });

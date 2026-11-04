@@ -193,6 +193,28 @@ describe('Turn trigger provenance', () => {
     await framework.stop();
   });
 
+  it("a gate wake names a batch channel once, though the batch gave it both with its server and without", async () => {
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'twice.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      modules: [],
+      gate: { config: { policies: [{ name: 'batch', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 50 } }], default: 'skip' } },
+    });
+    const f = framework as unknown as {
+      eventGate: { requestInferenceFn(agent: string, reason: string, source: string, provenance?: object): void } | null;
+      channelNamed(channelId: string, serverId?: string): { serverId: string; channelId: string } | undefined;
+    };
+    assert.ok(f.eventGate, 'premise: the framework has a gate');
+    f.channelNamed = (channelId, serverId) => ({ serverId: serverId ?? 'discord', channelId });
+    f.eventGate.requestInferenceFn('scout', 'gate:debounce', 'gate', { at: Date.now(), batchChannels: [
+      { channelId: 'discord:g:room', serverId: 'discord' },
+      { channelId: 'discord:g:room' },
+    ] });
+    assert.deepEqual(internals(framework).pendingRequests.at(-1)?.wakeChannels, [{ serverId: 'discord', channelId: 'discord:g:room' }]);
+    await framework.stop();
+  });
+
   it("a coalesced render whose latest occurrence is a notice still names its channel at the gate, since it folds the batch's messages too", async () => {
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'render.chronicle'),
