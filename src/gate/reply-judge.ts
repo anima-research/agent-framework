@@ -16,19 +16,19 @@
  * Cost and latency. The budget (`maxInputTokens`, default 90,000) is set to
  * keep each request under the 100,000-token line past which Claude Haiku 5.5
  * costs five times as much, but it's met by an estimate. Tokens are estimated
- * from characters, at a ratio the judge corrects from every response's
- * reported input, so the estimate tracks the model's tokenizer and the
- * context's mix of prose and code. Until a response has corrected it, a
- * request on text denser than three characters a token (code, or Chinese,
- * Japanese or Korean text) can carry more than the budget, and so can one whose
- * newest message alone is over it, since the newest message is always shown
- * (cut to its own cap). A request the provider refuses as too long is asked
- * once more from a fresh window, with the ratio it was built at halved, to no
- * less than one character a token, or at a lower estimate another call has
- * reached meanwhile, unless it was built at one already; refused again, it
- * fails as any failed call does. The lower ratio stays for later
- * requests until responses correct it. The document is
- * sent as a run of chunks that start at an anchor, the first message shown,
+ * from characters, at a ratio that starts at three characters a token and
+ * follows every response's reported input, so the estimate tracks the model's
+ * tokenizer and the mix of text the judge has read. A request on text denser
+ * than the ratio can carry more than the budget: code, or Chinese, Japanese or
+ * Korean text, before a response has reported on such text or after the ratio
+ * has followed sparser text. So can one whose newest message alone is over it,
+ * since the newest message is always shown (cut to its own cap). A request
+ * the provider refuses as too long is asked once more from a fresh window,
+ * with the ratio it was built at halved, to no less than one character a
+ * token, or at a lower estimate another call has reached meanwhile, unless it
+ * was built at one already; refused again, it fails as any failed call does.
+ * The lower ratio stays for later requests until responses correct it. The
+ * document is sent as a run of chunks that start at an anchor, the first message shown,
  * which stays put while the window grows into its budget: the chunks before
  * the newest stay byte-identical from one request to the next, and a cache
  * breakpoint after the last full one lets every later request read them from
@@ -255,7 +255,7 @@ export function failedTurnLine(failed: FailedLastTurn, agentName: string, now: n
     case 'held':
       return `${opening} A wake for ${agentName} is held, ${failed.again.until !== undefined ? `due to be let go ${inWhile(failed.again.until, now)}` : 'and is let go when the hold on it is released'}.`;
     default:
-      return `${opening} Nothing runs it again: if you answer WAIT, what woke it stays unanswered until something wakes ${agentName}.`;
+      return `${opening} Nothing runs it again: if you answer WAIT, whatever of it is unanswered stays so until something wakes ${agentName}.`;
   }
 }
 
@@ -344,7 +344,7 @@ export function judgeQuestion(
     const where = e.channel ? ` in ${field(JSON.stringify(oneLine(e.channel)))}` : '';
     const who = e.authorId ? ` from ${field(JSON.stringify(oneLine(e.authorId)))}` : '';
     const addressed = e.addressed ? ' (addresses the agent)' : '';
-    const line = `- ${ago(e.at, now)}${addressed}${where}${who}: ${quoted(e.content)}`;
+    const line = `- ${ago(e.at, now)}${addressed}${where}${who}: ${quoted(unlabelled(e.content))}`;
     if (lines.length > 0 && used + line.length > maxEventChars) break;
     lines.unshift(line);
     used += line.length + 1;

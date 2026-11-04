@@ -341,12 +341,13 @@ export interface ReplyJudgeOptions {
    * the batch included; the context document is cut from its oldest end to
    * fit. Default 90,000, under the 100,000 input tokens past which Claude
    * Haiku 5.5 costs five times as much. Tokens are estimated from characters,
-   * at a ratio each response corrects: until one has, a request on text
-   * denser than three characters a token (code, or Chinese, Japanese or
-   * Korean text) can carry more than the budget, and so can one whose newest
-   * message alone is over it, since that is always shown. The least is 4,000, a short
-   * tail of the conversation: cheaper and quicker, with less of the room's
-   * history to weigh.
+   * at a ratio that starts at three characters a token and follows what each
+   * response reports, so a request on text denser than the ratio can carry
+   * more than the budget: code, or Chinese, Japanese or Korean text, before a
+   * response has reported on such text or after the ratio has followed sparser
+   * text. So can one whose newest message alone is over it, since that is
+   * always shown. The least is 4,000, a short tail of the conversation:
+   * cheaper and quicker, with less of the room's history to weigh.
    */
   maxInputTokens?: number;
   /** The longest (ms) a judge request may take before the batch is decided by
@@ -362,15 +363,17 @@ export interface ReplyJudgeOptions {
    * the refused call's batch wakes the agent, and while a refusal's stated
    * wait lasts each judge rule's batch wakes it without the judge being
    * asked, unless a running turn or the host's quiesce holds the batch past
-   * the wait's end, when it goes to the judge. Under `"skip"`, the batch is
-   * held in memory while the judge's calls are refused. While a refusal's
+   * the wait's end, or it waits behind a call of its rule that the judge
+   * answers WAIT when its calls are no longer refused, when it goes to the
+   * judge. Under `"skip"`, the batch is held in memory while the judge's
+   * calls are refused. While a refusal's
    * stated wait lasts, batches that arrive are held with it, a rule keeping
    * its newest 100 events as it does while a turn holds them, and they're
    * judged once the wait ends or the hold is released. A refusal that states
-   * no end keeps them held until a later batch's call, which takes in its own
-   * rule's held batch, gets a verdict, or the hold is released. A later call
-   * that fails lets its batch go, with the held events it took in, as a
-   * failed call's batch goes under `"skip"`.
+   * no end, or no time left, keeps them held until a later batch's call,
+   * which takes in its own rule's held batch, gets a verdict, or the hold ends
+   * or is released. A later call that fails lets its batch go, with the held
+   * events it took in, as a failed call's batch goes under `"skip"`.
    */
   onError?: 'wake' | 'skip';
   /** The judge's effort (`output_config.effort`). Default `"low"`: a short
