@@ -114,7 +114,7 @@ async function pollUntil(cond: () => boolean, timeoutMs = 10_000): Promise<boole
 const usageOf = (n: number) => ({ inputTokens: 10 + n, outputTokens: 5, cacheCreationTokens: 200 + n, cacheReadTokens: 3000 + n });
 const inputOf = (n: number) => { const u = usageOf(n); return u.inputTokens + u.cacheCreationTokens + u.cacheReadTokens; };
 
-async function turns(opts: { binds: boolean; refuse: (request: NormalizedRequest) => Error | undefined; second?: string[]; third?: boolean }) {
+async function turns(opts: { binds: boolean; refuse: (request: NormalizedRequest) => Error | undefined; second?: string[]; third?: boolean; providerHold?: () => { holdMs: number; reason: string } }) {
   const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-failsafe-'));
   const membrane = new MockMembrane();
   let turn = 0;
@@ -135,6 +135,7 @@ async function turns(opts: { binds: boolean; refuse: (request: NormalizedRequest
     }],
     modules: [new Input(), tools], syncIntervalMs: 0, maintenanceIntervalMs: 0,
     errorPolicy: { maxRetries: 0, onInferenceError: (_e: Error, _name: string, attempt: number) => { policyCalls.push(attempt); return { retry: false }; } },
+    ...(opts.providerHold ? { providerHold: opts.providerHold } : {}),
   });
   const traces: TraceEvent[] = [];
   framework.onTrace((event) => { traces.push(event); });
@@ -183,6 +184,13 @@ describe("toolDeclarations' fail-safe", () => {
     assert.equal(resends(run.traces), 1);
     assert.deepEqual(run.policyCalls, [], 'the refusal never reached the error policy');
     assert.equal(run.undoDepth, 2, 'one undo checkpoint for each turn: the resend continued the second');
+  });
+
+  it("resends a refused change at once, though the host's provider hold would hold a retry", async () => {
+    const run = await turns({ binds: true, refuse: (r) => (carriesChange(r) ? refusal(true) : undefined), providerHold: () => ({ holdMs: 600_000, reason: 'zz hold' }) });
+    assert.equal(run.calls.length, 3, 'the adopting turn, the refused request, its resend');
+    assert.equal(carriesChange(run.calls[2]!), false, 'the resend, on the head');
+    assert.equal(run.traces.filter((t) => t.type === 'inference:completed').length, 2, 'and the turn ended well');
   });
 
   it('counts a failure of the resend from 1, as a retry of the same turn, and never shows the policy the refusal', async () => {

@@ -298,6 +298,15 @@ describe('toolDeclarations', () => {
     assert.equal(context.rows.at(-1)!.participant, 'system');
   });
 
+  it('declares a second copy of a system block its head already holds', async () => {
+    const context = fakeContext([said('user', 'hello')]);
+    const agent = agentOn(context, { toolDeclarations: 'entries' });
+    await agent.buildActivationRequest([tool('a')], [systemInjection('x')]);
+    const request = await agent.buildActivationRequest([tool('a')], [systemInjection('x'), systemInjection('x')]);
+    const added = request.messages.flatMap((m) => m.content).filter((b) => (b as { type: string }).type === 'system_change').map((b) => (b as { addSystem?: string[] }).addSystem);
+    assert.deepEqual(added, [['x']]);
+  });
+
   it('declares after a call its own message answers, as context-manager counts it answered', async () => {
     const cycle: Row = { id: 'cycle', participant: 'agent', content: [{ type: 'tool_use', id: 't1', name: 'a', input: {} } as ContentBlock, { type: 'tool_result', toolUseId: 't1', content: 'ok' } as ContentBlock] };
     const context = fakeContext([said('user', 'hello'), cycle]);
@@ -939,6 +948,15 @@ describe('toolDeclarations', () => {
       assert.deepEqual(next.tools, [tool('a')], 'the recorded head: no free consolidation');
       assert.equal(changeRows(context.rows).length, 1);
       assert.deepEqual(events.map((e) => e.type), ['head:moved', 'head:declared']);
+    });
+
+    it('keeps the last input a response reported when a later one reports none', async () => {
+      const rows = [said('user', 'hello')];
+      const { agent } = await withOneChange(1_000_000, () => changeIndex(rows), {}, rows);
+      agent.noteResponseInput(0);
+      const request = await agent.buildActivationRequest([tool('a'), tool('b')]);
+      assert.deepEqual(request.tools, [tool('a')], 'the recorded head');
+      assert.equal(changeRows(rows).length, 1, 'the change stays');
     });
 
     it('waits for a first response before measuring', async () => {

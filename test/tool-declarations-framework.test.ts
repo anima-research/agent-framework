@@ -703,6 +703,19 @@ describe('toolDeclarations in the framework', () => {
     });
   });
 
+  it("ends a resident's request kept to its head on its own turn and `[Continue]`, though a host's change row follows the turn", async () => {
+    await withFramework([resident('alpha')], async (framework) => {
+      const alpha = framework.getAgent('alpha')!;
+      say(alpha, 'user', 'hello');
+      await alpha.buildActivationRequest([tool('a')]);
+      say(alpha, 'alpha', 'my reply');
+      alpha.getContextManager().addMessage('system', [{ type: 'system_change', defineTools: [tool('h')] } as unknown as ContentBlock]);
+      alpha.keepToHeadUntilBuiltAgain();
+      const request = await alpha.buildActivationRequest([tool('a')]);
+      assert.deepEqual(request.messages.slice(-2).map((m) => (m.content[0] as { text?: string }).text), ['my reply', '[Continue]']);
+    });
+  });
+
   it("waits to declare while the shared slot ends on another resident's call, and declares after its result", async () => {
     await withFramework([resident('alpha'), resident('beta')], async (framework) => {
       const alpha = framework.getAgent('alpha')!;
