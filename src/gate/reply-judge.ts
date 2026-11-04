@@ -53,7 +53,7 @@ export const DEFAULT_JUDGE_MAX_INPUT_TOKENS = 90_000;
  *  of the room's history to weigh) sets a budget near it. */
 export const MIN_JUDGE_INPUT_TOKENS = 4_000;
 
-/** Characters per token the judge assumes before any response has told it better. */
+/** Characters per token the judge assumes before any response has told it better. Low, so a first estimate overshoots. */
 const INITIAL_CHARS_PER_TOKEN = 3;
 /** The share of each measured ratio the running estimate takes: more when the
  *  text proved denser than estimated (more tokens a character), which is the

@@ -4346,11 +4346,14 @@ export class EventGate {
    * ends is listed so, as certain, counting only its events whose channel
    * isn't held now, unless a running turn or the host's quiesce holds it past
    * the wait's end, when it goes to the judge. Under "skip", one due before
-   * that wait ends is listed as held for the judge until the end. A batch
-   * collecting while the judge decides one of its rule's batches joins that
-   * call when it fires, so it's listed as going to the judge either way. The
-   * list is soonest first, with the wakes whose time is in words (`when`)
-   * last.
+   * that wait ends is listed as held for the judge until the end. One due
+   * before that wait ends that fires while the judge decides one of its
+   * rule's batches waits for that call: under "wake" it's delivered once the
+   * call is decided, unless the judge answers WAIT when its calls are no
+   * longer refused, which sends it to the judge, so it's listed as one that
+   * only may, and under "skip" a REPLY delivers it with the call's batch,
+   * which the entry says. The list is soonest first, with the wakes whose
+   * time is in words (`when`) last.
    */
   upcomingWakes(agentNames: string[], exceptPolicy?: string): UpcomingWake[] {
     return this.upcomingWakesBut(agentNames, { policy: exceptPolicy });
@@ -4375,15 +4378,18 @@ export class EventGate {
       const rule = `rule ${quotedValue(name)}'s`;
       if (!state.judge || !this.judgeFn) {
         wakes.push({ at: state.dueAt, certain: true, what: `${rule} debounced batch of ${count(state.events.length)}` });
-      } else if (statedEnd === undefined || state.dueAt >= statedEnd || this.judging.has(name)) {
+      } else if (statedEnd === undefined || state.dueAt >= statedEnd) {
         wakes.push({ at: state.dueAt, certain: false, what: `${rule} batch of ${count(state.events.length)} goes to the judge` });
       } else if (this.judgeOnError === 'skip') {
         const joins = this.judgeHeld.has(name) ? ', which joins its held batch when it fires,' : ',';
-        wakes.push({ at: statedEnd, certain: false, what: `${rule} batch of ${count(state.events.length)}${joins} held for the judge while its calls are refused` });
+        const reply = this.judging.has(name) ? ", unless the judge's REPLY to the rule's batch it is deciding delivers it first" : '';
+        wakes.push({ at: statedEnd, certain: false, what: `${rule} batch of ${count(state.events.length)}${joins} held for the judge while its calls are refused${reply}` });
       } else {
         const delivered = state.events.filter((e) => !this.heldNow(e)).length;
+        const deciding = this.judging.has(name);
+        const later = deciding ? ', at its due time or, if the judge is still deciding the rule\'s batch then, once it decides, unless the judge answers WAIT when its calls are no longer refused, which sends it to the judge' : '';
         if (delivered > 0) {
-          wakes.push({ at: state.dueAt, certain: true, what: `${rule} batch of ${count(delivered)}, delivered without the judge while its calls are refused` });
+          wakes.push({ at: state.dueAt, certain: !deciding, what: `${rule} batch of ${count(delivered)}, delivered without the judge while its calls are refused${later}` });
         }
       }
     }
