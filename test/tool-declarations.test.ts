@@ -663,6 +663,7 @@ describe('toolDeclarations', () => {
       const agent = agentOn(context, { toolDeclarations: 'entries', ...config }, heads, events);
       await agent.buildActivationRequest([tool('a')]);
       await agent.buildActivationRequest([tool('a'), tool('b')]);
+      assert.equal(changeRows(context.rows).length, 1, 'the premise: the change is stored');
       agent.noteResponseInput(input);
       return { agent, context, heads, events };
     }
@@ -925,6 +926,7 @@ describe('toolDeclarations', () => {
       const agent = agentOn(context, { toolDeclarations: 'entries' });
       await agent.buildActivationRequest([tool('a')]);
       await agent.buildActivationRequest([tool('a'), tool('b')]);
+      assert.equal(changeRows(context.rows).length, 1, 'the premise: the change is stored');
       await agent.buildActivationRequest([tool('a'), tool('b')]);
       assert.equal(changeRows(context.rows).length, 1);
     });

@@ -26,6 +26,8 @@ const resident = (name: string) => ({
 
 const isChange = (m: { content: readonly unknown[] }) => m.content.some((b) => (b as { type?: string }).type === 'system_change');
 const changesIn = (messages: readonly NormalizedMessage[]) => messages.filter(isChange).map((m) => m.content);
+const storedChanges = (agent: Agent, owner: string) =>
+  agent.getContextManager().queryMessages({ metadata: { kind: 'system-change', agent: owner } }).messages.length;
 
 async function withFramework<T>(
   agents: Array<Record<string, unknown>>,
@@ -214,6 +216,7 @@ describe('toolDeclarations in the framework', () => {
         say(alpha, 'user', 'hello');
         await alpha.buildActivationRequest([tool('a')]);
         await alpha.buildActivationRequest([tool('a'), tool('b')]);
+        assert.equal(storedChanges(alpha, 'alpha'), 1, 'the premise: its change row is stored');
       }, storePath);
       await withFramework([{ ...resident('alpha'), toolDeclarations: 'head', thinkingBinding: binding }], async (framework) => {
         const alpha = framework.getAgent('alpha')!;
@@ -240,6 +243,7 @@ describe('toolDeclarations in the framework', () => {
       say(alpha, 'user', 'hello');
       await alpha.buildActivationRequest([tool('a')]);
       await alpha.buildActivationRequest([tool('a'), tool('b')]);
+      assert.equal(storedChanges(alpha, 'alpha'), 1, 'the premise: its change row is stored');
       alpha.keepToHeadUntilBuiltAgain();
       const assembled = await (alpha as unknown as Assembling).assembleActivationRequest([tool('a'), tool('b')]);
       assert.deepEqual(changesIn(assembled.request.messages), []);
@@ -383,6 +387,11 @@ describe('toolDeclarations in the framework', () => {
         assert.deepEqual(heads.headDeclarations.read('alpha')!.tools.map((t) => t.name), ['a', 'b'], 'the parent moved its head');
         const again = await child.buildActivationRequest([tool('a'), tool('b'), tool('c')]);
         assert.deepEqual(again.tools, [tool('a')], "and the child's record stayed as it was copied");
+        const parentRecord = JSON.stringify(heads.headDeclarations.read('alpha'));
+        await child.buildActivationRequest([tool('a'), tool('b'), tool('c')], system('c1'));
+        const moved = await child.buildActivationRequest([tool('a'), tool('b'), tool('c')], system('c2'));
+        assert.deepEqual(moved.tools, [tool('a'), tool('b'), tool('c')], 'the child moved its head');
+        assert.equal(JSON.stringify(heads.headDeclarations.read('alpha')), parentRecord, "and the parent's record stayed as it was");
       });
     });
 
@@ -451,6 +460,20 @@ describe('toolDeclarations in the framework', () => {
       });
     });
 
+    it("declares a shared child's change though the call its parent made it from is still open on the parent's branch", async () => {
+      await withFramework([resident('alpha')], async (framework) => {
+        const alpha = framework.getAgent('alpha')!;
+        say(alpha, 'user', 'hello');
+        await alpha.buildActivationRequest([tool('a')]);
+        alpha.getContextManager().addMessage('alpha', [{ type: 'tool_use', id: 'spawn', name: 'a', input: {} } as ContentBlock]);
+        const { agent: child } = await framework.deriveAgent({ name: 'alpha-child', from: 'alpha' });
+        say(child, 'user', 'Do the task.');
+        await child.buildActivationRequest([tool('a')]);
+        await child.buildActivationRequest([tool('a'), tool('b')]);
+        assert.equal(storedChanges(child, 'alpha-child'), 1, "its parent's open call isn't one the child waits on");
+      });
+    });
+
     for (const [how, config] of [['on the head', { toolDeclarations: 'head' }], ['at a move of its head', { systemPrompt: 'You are the child.' }]] as const) {
       it(`a shared child that removes its own change rows ${how} takes its parent's from its own branch, and leaves its parent's context as it was`, async () => {
         await withFramework([resident('alpha')], async (framework) => {
@@ -461,9 +484,11 @@ describe('toolDeclarations in the framework', () => {
           const dry = (agent: Agent) => agent.getContextManager().compile(undefined, undefined, { dryRun: true }).then((c) => c.messages);
           const rowsBefore = alpha.getContextManager().getAllMessages().map((m) => m.id);
           const compiledBefore = await dry(alpha);
+          assert.equal(storedChanges(alpha, 'alpha'), 1, "the premise: the parent's change is stored");
           const { agent: child } = await framework.deriveAgent({ name: 'alpha-child', from: 'alpha', config });
           await child.buildActivationRequest([tool('a'), tool('b')]);
           assert.deepEqual(changesIn(await dry(child)), [], "the premise: the child's context holds no change row now, its parent's own taken as its own");
+          assert.deepEqual([storedChanges(child, 'alpha'), storedChanges(child, 'alpha-child')], [0, 0], "taken out of the child's branch, not only out of its compile");
           assert.deepEqual(alpha.getContextManager().getAllMessages().map((m) => m.id), rowsBefore, "the parent's stored rows as they were");
           assert.deepEqual(await dry(alpha), compiledBefore, 'and its compile');
         });
@@ -627,13 +652,17 @@ describe('toolDeclarations in the framework', () => {
     await withFramework([resident('alpha'), resident('beta')], async (framework) => {
       const alpha = framework.getAgent('alpha')!;
       const beta = framework.getAgent('beta')!;
+      const system = (text: string) => [{ namespace: 'm', position: 'system', content: [{ type: 'text', text }] }] as never;
       say(alpha, 'user', 'hello, both');
       await alpha.buildActivationRequest([tool('a')]);
-      await beta.buildActivationRequest([tool('x')], [{ namespace: 'm', position: 'system', content: [{ type: 'text', text: 'v1' }] }] as never);
+      await beta.buildActivationRequest([tool('x')], system('v1'));
+      await beta.buildActivationRequest([tool('x'), tool('y')], system('v1'));
       await alpha.buildActivationRequest([tool('a'), tool('b')]);
-      await beta.buildActivationRequest([tool('x')], [{ namespace: 'm', position: 'system', content: [{ type: 'text', text: 'v2' }] }] as never);
+      assert.deepEqual([storedChanges(alpha, 'alpha'), storedChanges(beta, 'beta')], [1, 1], 'the premise: each has a change of its own stored');
+      await beta.buildActivationRequest([tool('x'), tool('y')], system('v2'));
+      assert.deepEqual([storedChanges(alpha, 'alpha'), storedChanges(beta, 'beta')], [1, 0], "beta's move took only its own, and alpha's change stays");
       const owners = alpha.getContextManager().getAllMessages().filter(isChange).map((m) => (m.metadata as { agent?: string }).agent);
-      assert.deepEqual(owners, ['alpha'], "beta's move took only its own, and alpha's change stays");
+      assert.deepEqual(owners, ['alpha'], "alpha's view keeps its own");
     });
   });
 

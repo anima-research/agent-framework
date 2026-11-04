@@ -160,8 +160,14 @@ describe("a shared fork's view", () => {
     framework.start();
     membrane.script('fork-1', say('fork-1 done'));
     assert.equal((await framework.runEphemeralToCompletion(fork.agent, fork.contextManager)).speech, 'fork-1 done');
-    assert.deepEqual(await changeTools(await framework.inspectAgentContext('fork-1')), [],
+    const reopened = await framework.inspectAgentContext('fork-1');
+    assert.deepEqual(await changeTools(reopened), [],
       "the reopened fork: another resident's change out of its view, and its source's and its own gone from its branch at its first request, where it adopts its head and takes its own");
+    const stored = (cm: ContextManager, owner: string) => cm.queryMessages({ metadata: { kind: 'system-change', agent: owner } }).messages.length;
+    assert.deepEqual([stored(reopened, 'mira'), stored(reopened, 'fork-1'), stored(reopened, 'oren')], [0, 0, 1],
+      "its source's and its own taken out of its branch, and another resident's left there, out of its view");
+    assert.deepEqual([stored(mira.getContextManager(), 'mira'), stored(framework.getAgent('oren')!.getContextManager(), 'oren')], [1, 1],
+      "and the residents' own rows as they were");
   });
 });
 
