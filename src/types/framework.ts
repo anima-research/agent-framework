@@ -205,7 +205,9 @@ export interface FrameworkConfig {
    * Held traffic never moves the locus under either rule. Under either, a
    * turn the agent's own timer starts takes `unpromptedChannel` where it's
    * set, after an all-except hold's channel and before both rules' own
-   * fallbacks.
+   * fallbacks. Neither rule applies to an agent under locked prose routing
+   * (AgentConfig.proseRouting 'locked'): its turns speak at its lock,
+   * whatever arrives.
    */
   speech?: {
     locus?: 'delivery' | 'latest-inbound';

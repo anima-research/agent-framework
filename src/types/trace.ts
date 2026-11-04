@@ -178,7 +178,9 @@ export type TraceEvent =
        *  hybrid mode a `>>>` envelope can send the text itself elsewhere.
        *  Explicit mode: the channel its typing shows, where the start's wake
        *  came from, or, at a start whose wake names none, such as a budget
-       *  restart, the one the turn already shows. */
+       *  restart, the one the turn already shows. Disabled mode, and a silent
+       *  turn in any mode: none, though the turn may show typing, since its
+       *  text is never sent to a channel. */
       channelId?: string;
     })
   | (TraceEventBase & {
@@ -203,7 +205,9 @@ export type TraceEvent =
        *  hybrid mode a `>>>` envelope can send the text itself elsewhere.
        *  Explicit mode: the channel its typing shows, where the start's wake
        *  came from, or, at a start whose wake names none, such as a budget
-       *  restart, the one the turn already shows. */
+       *  restart, the one the turn already shows. Disabled mode, and a silent
+       *  turn in any mode: none, though the turn may show typing, since its
+       *  text is never sent to a channel. */
       channelId?: string;
     })
   | (TraceEventBase & {
@@ -624,6 +628,25 @@ export type TraceEvent =
       trigger: boolean;
       behavior: string;
       observed?: string[];
+    })
+  /** A periodic review of what suppress rules hid ran (gate/suppression-review.ts); `delivered` when the agent was told. */
+  | (TraceEventBase & {
+      type: 'gate:suppression-review';
+      agentName: string;
+      fromMs: number;
+      toMs: number;
+      total: number;
+      flagged: number;
+      delivered: boolean;
+      rules: Array<{ rule: string; suppressed: number; read: number; verdict: 'fits' | 'flagged' | 'error' | 'unjudged'; flagged: number }>;
+    })
+  /** A suppress rule took an event: its row is stored and never rendered (EventGate.noteSuppressed). */
+  | (TraceEventBase & {
+      type: 'gate:suppressed';
+      policyName: string;
+      eventType: string;
+      serverId?: string;
+      channelId?: string;
     })
   | (TraceEventBase & Fields<RecipeChanges> & {
       type: 'gate:config-reconciled';
@@ -1254,6 +1277,8 @@ export type TraceEvent =
       messageId: string;
       recipients: string[];
       held: string | null;
+      /** The suppress rule that took the event, when one did. */
+      suppressed?: string;
       wake: boolean;
       gatePass: boolean;
     })

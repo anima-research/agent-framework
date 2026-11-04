@@ -40,6 +40,7 @@ export const NOTICE_TAG = {
   system: 'system',
   toolsets: 'toolsets',
   wakeOnboarding: 'wake onboarding',
+  suppressionReview: 'suppression review',
   heartbeat: 'heartbeat',
   silentHeartbeat: 'silent heartbeat',
   heartbeatTick: 'heartbeat tick',
