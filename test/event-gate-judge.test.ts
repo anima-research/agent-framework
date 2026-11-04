@@ -645,9 +645,10 @@ describe('judge rules: timing', () => {
     await until(() => judgeState(gate).verdicts.refused === 1, 'the refusal recorded');
     gate.evaluate(chat('second'));
     gate.evaluate({ content: 'hi', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c2' });
-    assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => [w.what, w.certain]), [
-      ['rule "soon"\'s batch of 1 event, delivered without the judge while its calls are refused', true],
-      ['rule "later"\'s batch of 1 event goes to the judge', false],
+    const due = (name: string) => (gate as unknown as { debounceTimers: Map<string, { dueAt: number }> }).debounceTimers.get(name)!.dueAt;
+    assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => [w.what, w.certain, w.at]), [
+      ['rule "soon"\'s batch of 1 event, delivered without the judge while its calls are refused', true, due('soon')],
+      ['rule "later"\'s batch of 1 event goes to the judge', false, due('later')],
     ]);
     gate.dispose();
   });
@@ -689,13 +690,43 @@ describe('judge rules: timing', () => {
     await until(() => judgeState(gate).heldCount === 1, 'the refused batch held');
     gate.evaluate(chat('second'));
     gate.evaluate({ content: 'hi', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c2' });
-    const wakes = gate.upcomingWakes(['agent']);
-    const end = wakes[0]!.at;
-    assert.deepStrictEqual(wakes.map((w) => [w.what, w.certain, w.at === end]), [
-      ['rule "soon"\'s batch of 1 event, which joins its held batch when it fires, held for the judge while its calls are refused', false, true],
-      ['rule "soon"\'s batch of 1 event, held for the judge while its calls are refused', false, true],
-      ['rule "later"\'s batch of 1 event goes to the judge', false, false],
+    const end = (gate as unknown as { judgeRefusal: { until: number } }).judgeRefusal.until;
+    const later = (gate as unknown as { debounceTimers: Map<string, { dueAt: number }> }).debounceTimers.get('later')!.dueAt;
+    assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => [w.what, w.certain, w.at]), [
+      ['rule "soon"\'s batch of 1 event, which joins its held batch when it fires, held for the judge while its calls are refused', false, end],
+      ['rule "soon"\'s batch of 1 event, held for the judge while its calls are refused', false, end],
+      ['rule "later"\'s batch of 1 event goes to the judge', false, later],
     ]);
+    gate.dispose();
+  });
+
+  for (const onError of ['wake', 'skip'] as const) {
+    it(`under onError '${onError}', while a refusal's stated wait lasts, the wake list gives a batch collecting while the judge decides one of its rule's batches as going to the judge, which it joins`, async () => {
+      const judge = scriptedJudge();
+      const { gate } = makeGate(writeConfig(`refused-deciding-${onError}.json`, {
+        policies: [
+          { name: 'soon', match: { scope: ['mcpl:push-event'] }, behavior: { judge: { debounceMs: 100 } } },
+          { name: 'deciding', match: { scope: ['mcpl:channel-incoming'] }, behavior: { judge: { debounceMs: 100 } } },
+        ],
+      }), { judge: judge.fn, judgeOnError: onError, residents: ['agent'] });
+      gate.evaluate({ content: 'hi', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c2' });
+      await until(() => judge.waiting() === 1, "the deciding rule's call");
+      gate.evaluate(chat('first'));
+      await until(() => judge.waiting() === 2, "the other rule's call");
+      judge.failAt(1, refusal("scout's provider calls are held", 60_000));
+      await until(() => judgeState(gate).verdicts.refused === 1, 'the refusal recorded');
+      gate.evaluate({ content: 'again', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c2' });
+      const due = (gate as unknown as { debounceTimers: Map<string, { dueAt: number }> }).debounceTimers.get('deciding')!.dueAt;
+      const collecting = gate.upcomingWakes(['agent']).filter((w) => w.at === due);
+      assert.deepStrictEqual(collecting.map((w) => [w.what, w.certain]), [['rule "deciding"\'s batch of 1 event goes to the judge', false]]);
+      gate.dispose();
+    });
+  }
+
+  it("lists a judge rule's batch as debounced when no judge is wired, since it's delivered as a debounce's is", () => {
+    const { gate } = makeGate(writeConfig('no-judge-listed.json', JUDGED), { residents: ['agent'] });
+    gate.evaluate(chat('hello'));
+    assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => [w.what, w.certain]), [['rule "ambient"\'s debounced batch of 1 event', true]]);
     gate.dispose();
   });
 
@@ -1368,7 +1399,7 @@ describe('judge rules changed or removed while a batch waits', () => {
     gate.dispose();
   });
 
-  it("a batch whose rule's instructions are rewritten by wake_add_rule while it waits is judged by the new instructions", async () => {
+  it("a batch whose rule's instructions are rewritten through addPolicy, which wake_add_rule calls, while it waits is judged by the new instructions", async () => {
     const judge = scriptedJudge();
     const { gate } = makeGate(writeConfig('changed-write.json', waiting('Wake me for questions.')), { judge: judge.fn });
     gate.evaluate(chat('lol'));
