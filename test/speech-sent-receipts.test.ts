@@ -169,6 +169,17 @@ class HeldSecond extends MockMembrane {
   }
 }
 
+/** HeldSecond whose streams after the third end the turn with skip_reply,
+ *  so an autoContinue run comes to rest. */
+class HeldSecondThenRests extends HeldSecond {
+  override streamYielding(request: NormalizedRequest): YieldingStream {
+    if (this.primary < 3) return super.streamYielding(request);
+    this.calls.push(request);
+    this.primary++;
+    return new MockYieldingStream([createMockResponse([{ type: 'tool_use', id: `sr-${this.primary}`, name: 'skip_reply', input: {} } as ContentBlock], 'tool_use')]);
+  }
+}
+
 class RetryStartFails extends FailsAfterFirstRound {
   streams = 0;
   startsFailed = 0;
@@ -951,10 +962,24 @@ describe('plain speech a module says it showed', () => {
     const created = await f.createEphemeralAgent({ name: 'run-1', model: 'test-model', systemPrompt: 'Do the task.', proseRouting: 'locus' });
     created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
     membrane.pushResponse(lookRound('Looking around.'));
-    const run = f.runEphemeralToCompletion(created.agent, created.contextManager, { idleTimeoutMs: 300, idlePollMs: 20 });
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+    const ended = assert.rejects(f.runEphemeralToCompletion(created.agent, created.contextManager, { idleTimeoutMs: 300, idlePollMs: 20 }), /stalled/);
     f.start();
-    await assert.rejects(run, /stalled/);
-    assert.equal(surface.asked.length, 1, "premise: the round's speech was asked about");
+    const bound = performance.now() + 10_000;
+    while (surface.asked.length === 0) {
+      assert.ok(performance.now() < bound, "premise: the round's speech was asked about");
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    let settled = false;
+    void ended.finally(() => { settled = true; }).catch(() => {});
+    while (!settled) {
+      assert.ok(performance.now() < bound, 'the watchdog ends the run once the clock moves');
+      t.mock.timers.tick(1_000);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    await ended;
+    t.mock.timers.reset();
+    assert.equal(surface.asked.length, 1, "premise: the round's speech was asked about once");
     surface.release();
     await until(() => errors.some((e) => e.includes('for speech of a turn that ended without a receipt')), 'the late place logged');
     assert.ok(errors.includes('[routeSpeech] run-1: shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", for speech of a turn that ended without a receipt'), errors.join('\n'));
@@ -1090,6 +1115,37 @@ describe('plain speech a module says it showed', () => {
       assert.equal(await result, null);
       assert.deepEqual(routed, []);
       assert.ok(errors.some((e) => e.includes('[routeSpeech] resident: replaced while its modules were asked')), errors.join('\n'));
+    } finally {
+      internal.agents.set('resident', original);
+    }
+  });
+
+  it("a hybrid reply's later envelopes aren't posted once another agent has replaced its own under its name", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const surface = new Surface();
+    surface.answer = 'held';
+    const f = await host([surface], new MockMembrane(), { proseRouting: 'hybrid' });
+    const { server, published } = channelServer(true);
+    const registry = internals(f).channelRegistry;
+    registry.serverRegistry = { getServer: () => server };
+    registry.ensureChannelRegistered('srv', 'room', 'room');
+    await f.start();
+    const internal = f as unknown as {
+      agents: Map<string, unknown>;
+      routingOf(name: string): unknown;
+      deliverHybridProse(agent: unknown, rawText: string, locus: null, allowLocus: boolean, round: unknown): Promise<void>;
+    };
+    const original = internal.agents.get('resident');
+    const delivered = internal.deliverHybridProse(original, 'Said before the swap.\n>>>room Posted after it.', null, true, { routing: internal.routingOf('resident') });
+    await until(() => surface.asked.length > 0, "the plain piece's ask");
+    internal.agents.set('resident', { name: 'resident' });
+    try {
+      surface.release();
+      await delivered;
+      assert.ok(errors.some((e) => e.includes('[routeSpeech] resident: replaced while its modules were asked')), `premise: the plain piece met the replacement: ${errors.join('\n')}`);
+      assert.deepEqual(published, [], "the >>> envelope isn't posted for the replacement");
+      assert.ok(errors.some((e) => /^\[prose\] resident: replaced while its reply was routed; \d+ chars not routed for the replacement$/.test(e)), errors.join('\n'));
     } finally {
       internal.agents.set('resident', original);
     }
@@ -1833,6 +1889,30 @@ describe('plain speech a module says it showed', () => {
     assert.ok(receipt(f)?.includes('sent to the place before'), `the receipt keeps the place named before the restart: ${receipt(f)}`);
   });
 
+  it("a start that takes a module's wake into a turn already under way names the turn's opening message too", async () => {
+    const surface = new Surface();
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Both.' }]));
+    const f = await host([surface], membrane);
+    const internal = f as unknown as {
+      routingOf(name: string): { roundsRan?: true; openingMessages?: string[]; openedBy?: Record<string, unknown> };
+      openLogical: Map<string, unknown>;
+    };
+    const t0 = Date.now();
+    const routing = internal.routingOf('resident');
+    routing.openedBy = { agentName: 'resident', reason: 'external-message', source: 'console', timestamp: t0 - 10, openingMessages: ['m-opener'] };
+    routing.openingMessages = ['m-opener'];
+    routing.roundsRan = true;
+    internal.openLogical.set('resident', routing);
+    const pending = internals(f).pendingRequests;
+    pending.push({ agentName: 'resident', reason: 'tool_results_ready', source: 'framework', timestamp: t0 });
+    pending.push({ agentName: 'resident', reason: 'external-message', source: 'console', timestamp: t0 + 1, openingMessages: ['m-joined'] });
+    await f.runUntilIdle();
+    assert.deepEqual(askedTexts(surface), [{ text: 'Both.', final: true }], 'premise: one start took both');
+    assert.equal(surface.asked[0]!.context.openedBy?.reason, 'external-message', 'premise: the turn already under way opened it');
+    assert.deepEqual([...(surface.asked[0]!.context.openedBy?.messages ?? [])].sort(), ['m-joined', 'm-opener']);
+  });
+
   it("a held turn's retry that a wake is merged into names that wake's messages too", async (t) => {
     t.mock.method(console, 'error', () => {});
     const surface = new Surface();
@@ -1853,8 +1933,31 @@ describe('plain speech a module says it showed', () => {
     await f.runUntilIdle();
     assert.equal(membrane.primary, 3, 'premise: one retry, which took the wake');
     const last = surface.asked.at(-1)!;
-    assert.deepEqual(openingTexts(surface, last).slice(0, 1), ['second']);
-    assert.ok(last.context.openedBy?.messages.includes('m-merged'), JSON.stringify(last.context.openedBy));
+    assert.deepEqual([...openingTexts(surface, last)].sort(), ['(no message m-merged)', 'second'], JSON.stringify(last.context.openedBy));
+  });
+
+  it("a held autoContinue run's retry that takes a message's wake names that message, not the one that started the run", async (t) => {
+    t.mock.method(console, 'error', () => {});
+    const surface = new Surface();
+    const membrane = new HeldSecondThenRests();
+    const f = await host([surface], membrane, { autoContinue: true });
+    push(f, 'the opening message');
+    const i = internals(f);
+    const deadline = Date.now() + 5_000;
+    while (!i.providerAccelerationCooldowns.has('resident')) {
+      assert.ok(Date.now() < deadline, `premise: the run's continuation is held (calls: ${membrane.primary})`);
+      void f.runUntilIdle();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const first = surface.asked.find((a) => a.text === 'Answer 1.');
+    assert.ok(first, JSON.stringify(askedTexts(surface)));
+    assert.deepEqual(openingTexts(surface, first!), ['the opening message'], 'premise: the opening message started the run');
+    push(f, 'the second message');
+    (f as unknown as { releaseProviderWait(agent: string): void }).releaseProviderWait('resident');
+    await f.runUntilIdle();
+    const retried = surface.asked.find((a) => a.text === 'Answer 3.');
+    assert.ok(retried, `premise: the retry took the wake and spoke: ${JSON.stringify(askedTexts(surface))}`);
+    assert.deepEqual(openingTexts(surface, retried!), ['the second message']);
   });
 
   it('a console message read in a running turn still wakes a turn of its own', async () => {

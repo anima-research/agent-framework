@@ -6693,9 +6693,12 @@ export class AgentFramework {
   }
   /** Keep `request` among a hold's `held` requests, once by
    *  sameInferenceRequest. A held turn's retry (TURN_RETRY) whose equal is
-   *  already held marks that one, so the hold still keeps the turn alive. */
-  private holdRequest(held: InferenceRequest[], request: InferenceRequest): void {
-    const same = held.find((r) => this.sameInferenceRequest(r, request));
+   *  already held marks that one, so the hold still keeps the turn alive.
+   *  In a merged start's batch, a member that carries the turn on takes an
+   *  equal wake only when it has all of the wake's opening messages: a wake
+   *  with others stays a member of its own, which an abort puts back. */
+  private holdRequest(held: InferenceRequest[], request: InferenceRequest, takes: (kept: InferenceRequest) => boolean = () => true): void {
+    const same = held.find((r) => this.sameInferenceRequest(r, request) && takes(r));
     if (!same) {
       held.push(request);
       return;
@@ -6708,7 +6711,10 @@ export class AgentFramework {
     const batch = mergedBatch(request);
     if (into || batch) {
       const members = [...(into ?? [{ ...same }])];
-      for (const member of batch ?? [request]) this.holdRequest(members, member);
+      for (const member of batch ?? [request]) {
+        this.holdRequest(members, member, (kept) => continuesTurn(member) || !continuesTurn(kept) ||
+          (member.openingMessages ?? []).every((id) => kept.openingMessages?.includes(id)));
+      }
       (same as MarkedRequest)[MERGED_BATCH] = members;
     }
     const keptCarry = turnCarryOf(same);
@@ -20751,7 +20757,7 @@ export class AgentFramework {
    * the resident hears at its next tool boundary — only when the live stream
    * presents mid-turn injections. Otherwise the turn-end receipt names them
    * (or, after a crash, the next turn's catch-up). Drafts the journal cannot
-   * hold are reported in the receipt: their words remain in history only.
+   * hold are reported in the receipt: their words remain in history.
    */
   private holdProseDrafts(
     agent: Agent,
@@ -21758,7 +21764,7 @@ export class AgentFramework {
         'user',
         [{
           type: 'text',
-          text: `[${NOTICE_TAG.speechNotPosted}] The framework posted nothing you wrote before your tool calls in the rounds just above. ` +
+          text: `[${NOTICE_TAG.speechNotPosted}] The framework didn't post what you wrote before your tool calls in one or more of the rounds just above. ` +
             `If any of it should go out, send it again.`,
         }],
         { system: true, kind: 'speech-not-posted' },
@@ -23568,7 +23574,15 @@ export class AgentFramework {
     allowLocus: boolean,
     round: ProseRound,
   ): Promise<void> {
-    for (const envelope of splitHybridEnvelopes(rawText)) await this.deliverHybridEnvelope(agent, envelope, locus, allowLocus, round);
+    const envelopes = splitHybridEnvelopes(rawText);
+    for (const [i, envelope] of envelopes.entries()) {
+      const current = this.agents.get(agent.name);
+      if (current && current !== agent) {
+        console.error(`[prose] ${agent.name}: replaced while its reply was routed; ${envelopes.slice(i).join('').length} chars not routed for the replacement`);
+        return;
+      }
+      await this.deliverHybridEnvelope(agent, envelope, locus, allowLocus, round);
+    }
   }
 
   private async deliverHybridEnvelope(
@@ -24812,6 +24826,7 @@ export class AgentFramework {
       const { coalescingSubject: _subject, coalescingBatch: _batch, coalescingBatchSubjects: _subjects, readsDeferredWrite: _read, readsStoredMessage: _stored, ...retry } = trigger;
       trigger = retry;
     }
+    const ownCause = (trigger ? mergedBatch(trigger) ?? [trigger] : []).some(hasOwnCauseForRun);
     // The wakes merged into this start are the turn's now: it reads them,
     // so a later drop of its retry puts none of them back (MERGED_BATCH).
     if (trigger && mergedBatch(trigger)) {
@@ -25019,8 +25034,9 @@ export class AgentFramework {
         this.noticeAddressedArrivals(agent, routing, arrivals, when);
       }
     }
-    const opening = mergedOpeningMessages([routing, trigger]);
-    if (opening) routing.openingMessages = opening;
+    const opening = ownCause && !routing.roundsRan ? trigger?.openingMessages : mergedOpeningMessages([routing, trigger]);
+    if (opening) routing.openingMessages = [...opening];
+    else delete routing.openingMessages;
     // A silent start, or a disabled agent's, has no locus to show, whatever a
     // channel_open in a silent turn left on its object.
     const turnLocus = turnProseRouting === 'disabled' ? undefined

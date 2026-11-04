@@ -22,9 +22,10 @@
   of their wakes once at the hold's release: a wake equal to one already in
   the start's batch folds into it, as a held turn's equal wakes fold, where
   two equal members of equal merged starts were both kept and
-  `getHostModeStatus().gatedRequests` counted both; and a held wake that an
-  equal merged start folds into is released with the start's wakes, where it
-  was dropped.
+  `getHostModeStatus().gatedRequests` counted both. A wake equal to a member
+  that carries the turn on, but naming messages that member doesn't, stays a
+  member of its own: it counts on its own, and an abort of the turn puts it
+  back.
 - **Residents:** speech routed with no channel that no module says it showed
   still gets `[send-undeliverable]`, except an ephemeral run's, which gets
   none, as before; the notice now names the piece by its opening words,
@@ -61,7 +62,7 @@
   posted; it is saved in your archive.", as does an ended speaker's: "The
   framework posted nothing there. <speaker> has ended.", where it read
   "Nothing was posted. <speaker> has ended.", and the notice of a turn's
-  unposted tool-round speech reads "[speech-not-posted] The framework posted
-  nothing you wrote before your tool calls in the rounds just above. …",
-  where it read "… Nothing you wrote before your tool calls in the rounds
-  just above was posted. …".
+  unposted tool-round speech reads "[speech-not-posted] The framework didn't
+  post what you wrote before your tool calls in one or more of the rounds just
+  above. …", where it read "… Nothing you wrote before your tool calls in
+  the rounds just above was posted. …".

@@ -3510,7 +3510,7 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
           assert.equal(published(h, SPEECH).length, 0);
           assert.equal(published(h, PARTIAL).length, 0);
           assert.equal(h.drafts().length, 0);
-          assert.deepEqual(notices(h), ['[speech-not-posted] The framework posted nothing you wrote before your tool calls in the rounds just above. If any of it should go out, send it again.']);
+          assert.deepEqual(notices(h), ['[speech-not-posted] The framework didn\'t post what you wrote before your tool calls in one or more of the rounds just above. If any of it should go out, send it again.']);
           assert.equal(markers(h).length, 1);
           assert.match(markers(h)[0]!, AFTER_ROUNDS);
           assert.ok(!markers(h)[0]!.includes(CUT_OFF), markers(h)[0]);
