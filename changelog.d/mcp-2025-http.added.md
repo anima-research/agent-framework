@@ -9,9 +9,9 @@
   - **List changes** arrive on the session's standalone stream, which is kept
     open while the session lives, with a session id or without one. Its
     first open is tried again after a 408, 409, 429, a 5xx other than 501
-    and 505, or a network error, each reported as an `error`, and a relist
-    follows once it opens, also when the SDK's own retry after a credential
-    refresh opens it.
+    and 505, or a network error, each reported as an `error`, and once it
+    opens, also when the SDK's own retry after a credential refresh opens
+    it, a server that announces list changes is relisted.
     A stream that drops is reopened: the first try waits the server's `retry`
     hint when it sent one, and the base interval otherwise, and a try after a
     failed one waits the longer of the hint and the doubling backoff. A
@@ -25,15 +25,21 @@
     (modelcontextprotocol/typescript-sdk#2499). A call whose stream ends
     unanswered with nothing to resume from fails then, as `no-response`,
     not at its deadline.
-  - **A session the server ends** (HTTP 404 to a request carrying its id):
-    a call whose POST met the 404 fails as `error-response` with
-    `data.httpStatus` 404, and isn't replayed; a call whose stream was cut is
-    `no-response`. A session that had answered a request gets a new one at
-    once, whatever `reconnect` says: `close` while `willReconnect` reads
-    true, then `reconnect`, with the server and its tools kept. One that
-    hadn't is a failed connect: it emits `reconnect-failed` and `close`, then
-    follows `reconnect`, and the backoff keeps growing until a session
-    answers, with a session id or without one.
+  - **A session the server ends** (HTTP 404 to a request carrying its id,
+    but for the standalone stream's first open, whose 404 can also mean the
+    server has no GET route): a call whose POST met the 404 fails as
+    `error-response` with `data.httpStatus` 404, and isn't replayed; a call
+    whose stream was cut is `no-response`. A session that had answered a
+    request, and had lived at least the base interval
+    (`reconnectIntervalMs`), gets a new one at once, whatever `reconnect`
+    says: `close` while `willReconnect` reads true, then `reconnect`, with
+    the server and its tools kept. Any other is a failed connect: it emits
+    `reconnect-failed` and `close`, then follows `reconnect`, and the backoff
+    keeps growing, with the framework's alert at the fifth attempt, until a
+    session answers and lives the interval, with a session id or without
+    one. Answered sessions that each live longer, as behind a load balancer
+    that sends a session's later requests to another node, restart at most
+    once an interval, and each restart costs the calls in flight.
   - **A server upgraded in place** to `2026-07-28` is followed: a 400
     carrying JSON-RPC `-32022` to any request, or a 405 to a GET for one of
     the session's streams after the server had served it (the standalone
@@ -53,20 +59,15 @@
     405, gets none.
   - **Results** are final: a result that fails the tool's output schema is a
     plain error, as on `2026-07-28`, not a `no-response` outcome.
-- **On `2026-07-28` over HTTP**, a dropped stream's retries take the same
-  timing as on a 2025 revision: the server's `retry` hint first, and the
-  connection's backoff after a failed try. They stop after two failed tries,
-  the SDK's default, on every stream: a listen stream that can't be resumed
-  is reopened, with a relist, and a call whose stream can't be resumed fails
-  then, as `no-response`, rather than at its deadline.
 - **`McplProtocolVersionError` over HTTP** names the revisions each side
   speaks. Its new `offeredRevisions` lists the revisions this client
   offered: `['2024-11-05']` from the legacy engine, `['2026-07-28']` from a
   modern stdio server, and the four revisions above over HTTP. `offered`
-  stays the first of them. Besides a discovery or `-32022` error
-  naming no revision in common, it covers an `initialize` answered with a
-  revision the 2025 handshake doesn't accept (`2026-07-28` included), or
-  with none (`mismatch`), and a discovery that listed no revision in common
-  followed by an `initialize` the server refused (`rejected`). It isn't
-  retried. Over stdio, a discovery answer listing revisions without
-  `2026-07-28` is a verdict too, even one the SDK can't read.
+  stays the first of them. Besides the SDK's own refusal of a discovery or
+  a `-32022` error, after which it negotiates no further, it covers an
+  `initialize` answered with a revision the 2025 handshake doesn't accept
+  (`2026-07-28` included), or with none (`mismatch`), and a discovery that
+  listed no revision in common followed by an `initialize` the server
+  refused (`rejected`). It isn't retried. A handshake that failed any other
+  way, such as with a 503, is no verdict, and is retried as any failed
+  connect is.

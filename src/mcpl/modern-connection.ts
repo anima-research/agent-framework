@@ -46,14 +46,15 @@
  *   generation, so a superseded client never touches a newer one. `close()`
  *   owns a connect in flight too.
  * - **A 2025 session over HTTP** ends when the server answers 404 to a
- *   request that carried its id, or stops serving its revision (a 400
- *   carrying -32022) or its stream (a 405 to the stream's reopen), as a
- *   server upgraded to the SDK's 2026 handler does (`sessionEnded`). A new
- *   connect starts at once if the old session had served a request
- *   ('close', then 'reconnect'), and negotiates afresh; otherwise the end is
- *   a failed connect. A request's stream the server cut is resumed for as
- *   long as the request lives. Closing a generation DELETEs a session the
- *   server holds by its id, a failed connect's included.
+ *   request that carried its id, but for the standalone stream's first open,
+ *   or stops serving its revision (a 400 carrying -32022) or its streams (a
+ *   405 to a GET for one it had served), as a server upgraded to the SDK's
+ *   2026 handler does (`sessionEnded`). A new connect starts at once if the
+ *   old session had served a request and lived a base interval ('close',
+ *   then 'reconnect'), and negotiates afresh; otherwise the end is a failed
+ *   connect. A request's stream the server cut is resumed for as long as the
+ *   request lives. Closing a generation DELETEs a session the server holds
+ *   by its id, a failed connect's included.
  *
  * Nothing here is MCPL: a modern server has no grant, no planes and no
  * server→host requests. The framework uses this connection only through its
@@ -708,11 +709,15 @@ export class ModernMcpConnection extends EventEmitter {
   private readonly reconnectMaxIntervalMs: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   /** Consecutive failed connects. A 2025 session over HTTP counts as a
-   *  successful connect only once it has answered a request: see
-   *  {@link sessionEnded}. */
+   *  successful connect only once it has answered a request and lived a
+   *  base interval: see {@link sessionEnded}. */
   private reconnectAttempts = 0;
   /** A new session is starting in place of one the server ended. */
   private restarting = false;
+  /** When the live session was adopted, by `performance.now()`. */
+  private adoptedAt = 0;
+  /** stopReconnecting() was called: nothing dials again. */
+  private stopped = false;
   /** At most one pending reopen, and only ever for the current generation. */
   private relisten: { generation: number; timer: ReturnType<typeof setTimeout> } | null = null;
   private relistenAttempts = 0;
@@ -783,11 +788,14 @@ export class ModernMcpConnection extends EventEmitter {
   }
 
   /**
-   * Stop reconnecting, closing nothing, as the legacy engine's does.
+   * Stop reconnecting, closing nothing, as the legacy engine's does. A
+   * session the server ends from then on isn't restarted either (see
+   * {@link sessionEnded}).
    * @internal For the framework's stop(); not a host API.
    */
   stopReconnecting(): void {
     this.reconnectEnabled = false;
+    this.stopped = true;
   }
 
   /** Whether close() has been called: closed for good, or closing. A
@@ -1063,11 +1071,12 @@ export class ModernMcpConnection extends EventEmitter {
     // in both places (it would end it twice).
     if (this.opening?.session === session) this.opening = null;
     this.session = session;
+    this.adoptedAt = performance.now();
     this.protocolVersion = session.client.getNegotiatedProtocolVersion() ?? null;
     // A 2025 connection over HTTP, with a session id or without, is a
-    // successful connect only once it has answered a request: until then,
-    // its end counts as a failed attempt (see sessionEnded). Any other
-    // connect succeeded when it was adopted.
+    // successful connect only once it has answered a request and lived a
+    // base interval: until then, its end counts as a failed attempt (see
+    // sessionEnded). Any other connect succeeded when it was adopted.
     if (!session.http || era === 'modern') this.reconnectAttempts = 0;
     // On a 2025 revision list changes arrive unsolicited, on the session's
     // standalone stream: there's no subscription to keep.
@@ -1075,11 +1084,13 @@ export class ModernMcpConnection extends EventEmitter {
   }
 
   /**
-   * The server and this client share no revision: a configuration verdict,
-   * as for the legacy engine, in the same type, so every reader treats both
-   * engines alike. Retrying can't change it. What the server said decides:
-   * - the SDK's typed refusal: a discovery, or a -32022 error, naming no
-   *   revision in common, with nothing to fall back to;
+   * This client and the server couldn't negotiate a revision: a configuration
+   * verdict, as for the legacy engine, in the same type, so every reader
+   * treats both engines alike. Retrying can't change it. What the server said
+   * decides:
+   * - the SDK's typed refusal of a discovery or a -32022 error, after which
+   *   it negotiates no further, even when the server's list names a 2025
+   *   revision this client offers;
    * - over HTTP, an `initialize` answered with a revision the 2025 handshake
    *   doesn't accept, or with none (`mismatch`). 2026-07-28 isn't one: it is
    *   negotiated through `server/discover` alone;
@@ -1108,8 +1119,8 @@ export class ModernMcpConnection extends EventEmitter {
         ? ` It speaks legacy MCP: configure it without protocol: 'modern'.`
         : ` It speaks legacy MCP (${LEGACY_MCP_PROTOCOL_VERSION}), which this client reaches over stdio or WebSocket (ws://, wss://), not http(s).`;
     const rejected = (refused: readonly string[], supported: string[] | null, why: string, code?: number, data?: unknown, note = '') => new McplProtocolVersionError(
-      `MCP server "${this.id}" does not support MCP ${boundedForLog(joinVersions(refused, 'or'))}` +
-        (supported ? ` (it supports: ${boundedForLog(supported.join(', ')) || 'none listed'}).` : ` (${boundedForLog(why)}).`) +
+      `MCP server "${this.id}" does not support MCP ${boundedForLog(redact(joinVersions(refused, 'or')))}` +
+        (supported ? ` (it supports: ${boundedForLog(redact(supported.join(', '))) || 'none listed'}).` : ` (${boundedForLog(why)}).`) +
         note + legacyHint(supported),
       'rejected',
       null,
@@ -1315,7 +1326,15 @@ export class ModernMcpConnection extends EventEmitter {
       if (firstOpen) ({ response, retried } = await this.firstOpen(session, url, init));
       else response = await fetch(url, init);
       if (firstOpen && (retried || !response.ok)) http.firstOpenFailed = true;
-      const refusal = response.status === 400 ? await revisionRefusal(response) : undefined;
+      let refusal = response.status === 400 ? await revisionRefusal(response) : undefined;
+      let replayed = resuming;
+      if (!refusal && resuming && standalone && response.status === 400) {
+        await response.body?.cancel().catch(() => {});
+        headers.delete('last-event-id');
+        response = await fetch(url, { ...init, headers });
+        replayed = false;
+        refusal = response.status === 400 ? await revisionRefusal(response) : undefined;
+      }
       if (refusal) {
         const record = method === 'POST' ? wireScope.getStore() : undefined;
         if (record?.currentId !== undefined && bodyId(init?.body) === record.currentId) {
@@ -1325,13 +1344,6 @@ export class ModernMcpConnection extends EventEmitter {
         http.ended = true;
         queueMicrotask(() => this.sessionEnded(session, 'revision'));
         return response;
-      }
-      let replayed = resuming;
-      if (resuming && standalone && response.status === 400) {
-        await response.body?.cancel().catch(() => {});
-        headers.delete('last-event-id');
-        response = await fetch(url, { ...init, headers });
-        replayed = false;
       }
       if (response.status === 404 && !firstOpen && headers.has('mcp-session-id')) {
         const record = method === 'POST' ? wireScope.getStore() : undefined;
@@ -1356,12 +1368,18 @@ export class ModernMcpConnection extends EventEmitter {
    * retries. A failure that may pass (see `mayPass`, or a network error) is
    * reported as this connection's 'error' and tried again, with the
    * connection's backoff, until the stream opens, the server answers
-   * otherwise (that answer goes back to the SDK as it came), or the session
-   * ends: closing its transport aborts the request's signal, which ends the
-   * wait. `retried` says a try failed first, so changes may have gone by.
+   * otherwise (that answer goes back to the SDK as it came), or the
+   * connection no longer uses the session: a close() or a newer connect. A
+   * close() aborts the request's signal only once the session's DELETE is
+   * over, which can take its whole bound, so the generation is checked
+   * before each try again. `retried` says a try failed first, so changes may
+   * have gone by.
    */
   private async firstOpen(session: Session, url: string | URL, init: RequestInit | undefined): Promise<{ response: Response; retried: boolean }> {
     for (let failures = 1; ; failures++) {
+      if (failures > 1 && !this.isCurrent(session.generation)) {
+        throw new Error(`MCP server "${this.id}": the list-change stream's first open was not tried again, since the connection no longer uses this session`);
+      }
       let failure: string;
       try {
         const response = await fetch(url, init);
@@ -1426,18 +1444,27 @@ export class ModernMcpConnection extends EventEmitter {
    * the session's revision (a 400 carrying -32022) or its streams (a 405 to
    * a GET for one it had served). The spec's answer to the first is a new session,
    * and a new connect negotiates afresh, which follows a server that moved
-   * to 2026-07-28. A session that had answered a request since its handshake
-   * gets one at once, whatever `reconnect` says: 'close', while
-   * `willReconnect` reads true, then 'reconnect' once it's up. A server's
-   * restart then costs the calls in flight, and the server keeps its place
-   * and its tools; the framework traces it as it traces any reconnect. A
-   * session that hadn't answered is a failed connect: behind a load balancer
-   * without sticky sessions every new session would meet the same 404, and
-   * during a rolling upgrade a connect can land on an old node and its calls
-   * on a new one. It counts as a failed attempt, is reported as one
-   * (`reconnect-failed`, so the framework's alert comes at the fifth), and
-   * follows `reconnect` with its backoff. None of these sessions is
-   * DELETEd: the server has let it go (`http.ended`).
+   * to 2026-07-28. A session that had answered a request since its handshake,
+   * and had lived at least the base interval (`reconnectIntervalMs`) since
+   * it was adopted, gets one at once, whatever `reconnect` says: 'close',
+   * while `willReconnect` reads true, then 'reconnect' once it's up. A
+   * server's restart then costs the calls in flight, and the server keeps
+   * its place and its tools; the framework traces it as it traces any
+   * reconnect. That threshold's basis: restarts at once then come at most
+   * once a base interval, no more often than the backoff's shortest wait
+   * (the base interval, less its jitter) would retry a failing server. Any
+   * other session's end is a failed connect: behind a load balancer without
+   * sticky sessions every new session can meet the same 404, even after the
+   * node that issued it answered its relist, and during a rolling upgrade a
+   * connect can land on an old node and its calls on a new one. It counts as
+   * a failed attempt, is reported as one (`reconnect-failed`, so the
+   * framework's alert comes at the fifth), and follows `reconnect` with its
+   * backoff. The client can't tell such a balancer from a server that
+   * restarts, so one whose sessions each live longer than the interval
+   * restarts at most once an interval. After stopReconnecting() nothing
+   * restarts: the connection closes, as a lost one does without `reconnect`.
+   * None of these sessions is DELETEd: the server has let it go
+   * (`http.ended`).
    */
   private sessionEnded(session: Session, cause: keyof typeof SESSION_END): void {
     // Only the live session's end changes anything: a connect still running
@@ -1446,7 +1473,12 @@ export class ModernMcpConnection extends EventEmitter {
     this.session = null;
     // An HTTP session has no child to reap, so its close has no failure to keep.
     void ModernMcpConnection.closeSession(session);
-    if (session.wire.answered) {
+    if (this.stopped) {
+      this.emit('close', { reason: `the server ${SESSION_END[cause]}` });
+      return;
+    }
+    const lived = performance.now() - this.adoptedAt >= this.reconnectIntervalMs;
+    if (session.wire.answered && lived) {
       // This is where an answered session's count of failed connects resets:
       // nothing reads it while the session lives.
       this.reconnectAttempts = 0;
@@ -1458,24 +1490,25 @@ export class ModernMcpConnection extends EventEmitter {
     // Numbered as attemptReconnect numbers a failure.
     const attempt = Math.max(1, this.reconnectAttempts);
     this.reconnectAttempts = attempt + 1;
-    this.emit('reconnect-failed', {
-      error: `MCP server "${this.id}" ${SESSION_END[cause]} before the session answered a request`,
-      attempt,
-    });
-    this.emit('close', { reason: `the server ${SESSION_END[cause]} before the session answered a request` });
+    const when = session.wire.answered
+      ? `less than ${this.reconnectIntervalMs} ms after the session started`
+      : 'before the session answered a request';
+    this.emit('reconnect-failed', { error: `MCP server "${this.id}" ${SESSION_END[cause]} ${when}`, attempt });
+    this.emit('close', { reason: `the server ${SESSION_END[cause]} ${when}` });
     this.scheduleReconnect();
   }
 
   /**
    * A new session at once, in place of one the server ended after it had
-   * answered (see {@link sessionEnded}). It is attempt 1 of a reconnect, and
-   * a failure is one's. With `reconnect` set, the connection backs off and
-   * tries again, or stops for good on a revision verdict, as
-   * attemptReconnect does: the verdict's 'reconnect-failed' (`permanent`)
-   * raises the alert, and the server stays registered, as a reconnecting
-   * server does after any verdict. Without `reconnect`, nothing more is
-   * tried, so the connection closes as a lost one does: 'close' while
-   * `willReconnect` reads false, which tells its owner the server is gone.
+   * answered and lived a base interval (see {@link sessionEnded}). It is
+   * attempt 1 of a reconnect, and a failure is one's. With `reconnect` set,
+   * the connection backs off and tries again, or stops for good on a
+   * revision verdict, as attemptReconnect does: the verdict's
+   * 'reconnect-failed' (`permanent`) raises the alert, and the server stays
+   * registered, as a reconnecting server does after any verdict. Without
+   * `reconnect`, nothing more is tried, so the connection closes as a lost
+   * one does: 'close' while `willReconnect` reads false, which tells its
+   * owner the server is gone.
    */
   private async restartSession(cause: keyof typeof SESSION_END): Promise<void> {
     try {

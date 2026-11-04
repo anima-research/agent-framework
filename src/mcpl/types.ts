@@ -433,14 +433,14 @@ export interface McplServerConfig {
    * A modern server reached over HTTP at a 2025 revision can hold a session
    * for this client. When the server ends it (HTTP 404), or stops serving its
    * revision or its streams as a server upgraded to 2026-07-28 does, after it
-   * has answered a request, a new session starts at once whether or not this
-   * is set: the connection emits 'close' while its `willReconnect` reads
-   * true, then 'reconnect'. If that new session can't start, this setting
-   * decides, as for any lost connection, and a revision verdict stops it for
-   * good, as on any reconnect; without this setting, a second 'close', while
-   * `willReconnect` reads false, says the server is gone. A session that
-   * ends before it has answered counts as a failed connect, and follows this
-   * setting.
+   * has answered a request and lived at least `reconnectIntervalMs`, a new
+   * session starts at once whether or not this is set: the connection emits
+   * 'close' while its `willReconnect` reads true, then 'reconnect'. If that
+   * new session can't start, this setting decides, as for any lost
+   * connection, and a revision verdict stops it for good, as on any
+   * reconnect; without this setting, a second 'close', while
+   * `willReconnect` reads false, says the server is gone. Any other
+   * session's end counts as a failed connect, and follows this setting.
    */
   reconnect?: boolean;
 
@@ -449,11 +449,11 @@ export interface McplServerConfig {
    * The actual delay doubles with each consecutive failure (with ±25% jitter)
    * up to `reconnectMaxIntervalMs`, and resets after a successful handshake
    * (for a modern server's 2025 session over HTTP, once that session has
-   * answered a request). Over HTTP the same backoff paces a modern server's
-   * streams: a dropped stream's first try waits the server's `retry` hint
-   * when it sent one, and this interval otherwise, and a try after a failed
-   * one waits the longer of the hint and the doubling backoff. Default: 5000
-   * (5 seconds).
+   * answered a request and lived this interval). Over HTTP the same backoff
+   * paces a modern server's streams: a dropped stream's first try waits the
+   * server's `retry` hint when it sent one, and this interval otherwise, and
+   * a try after a failed one waits the longer of the hint and the doubling
+   * backoff. Default: 5000 (5 seconds).
    */
   reconnectIntervalMs?: number;
 

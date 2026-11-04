@@ -422,18 +422,18 @@ and its `family` stays `modern`. On a 2025 revision:
   open while the session lives, whether or not the server issues a session
   id. Its first open is tried again after a 408, 409, 429, a 5xx other than
   501 and 505, or a network error, each reported as the connection's
-  `error`, and a relist follows once it opens, also when it opens on the
-  SDK's own retry after a credential refresh. Any other refusal goes to the
-  SDK, which opens no stream: it takes a 405 quietly, tries a 401 once more
-  after the credential's refresh, and reports the rest as an `error`. A
-  stream that drops is reopened: the first try waits the server's `retry`
-  hint when it sent one, and the base interval otherwise, and a try after a
-  failed one waits the longer of the hint and the doubling backoff. A
-  reopen that carries `Last-Event-ID` has what it missed replayed by the
-  server. One that can't, because the server's events had no ids, the
-  stream that dropped had carried none, or the server refused the id with
-  400, opens without it and relists the tools of a server that announces
-  list changes.
+  `error`, and once it opens, also on the SDK's own retry after a
+  credential refresh, a server that announces list changes is relisted.
+  Any other refusal goes to the SDK, which opens no stream: it takes a 405
+  quietly, tries a 401 once more after the credential's refresh, and reports
+  the rest as an `error`. A stream that drops is reopened: the first try
+  waits the server's `retry` hint when it sent one, and the base interval
+  otherwise, and a try after a failed one waits the longer of the hint and
+  the doubling backoff. A reopen that carries `Last-Event-ID` has what it
+  missed replayed by the server. One that can't, because the server's events
+  had no ids, the stream that dropped had carried none, or the server
+  refused the id with 400, opens without it and relists the tools of a
+  server that announces list changes.
 - A request's stream that the server closes after a priming event is
   resumed for as long as the request lives. Its cancellation at the
   deadline stops the resume too. A stream cut again before it carried a
@@ -446,18 +446,24 @@ and its `family` stays `modern`. On a 2025 revision:
   server has no GET route). A call whose POST met the 404 fails as
   `error-response` with `data.httpStatus` 404, and isn't replayed. A call
   whose stream the server's restart cut is `no-response`, since the server
-  may have run it. A session that had answered a request gets a new one at
-  once, whatever `reconnect` says: the connection emits `close` while its
+  may have run it. A session that had answered a request, and had lived at
+  least the base interval (`reconnectIntervalMs`), gets a new one at once,
+  whatever `reconnect` says: the connection emits `close` while its
   `willReconnect` reads true, then `reconnect`, and the framework keeps the
   server and its tools and relists. If the new session can't start,
   `reconnect` decides, as for any lost connection, and a revision verdict
   stops it for good, as on any reconnect. Without `reconnect`, that failure
   emits a second `close`, while `willReconnect` reads false: the server is
-  gone. A session that ended before answering anything is a failed connect:
-  it emits `reconnect-failed` and `close`, and follows `reconnect` with a
-  growing backoff. So a load balancer without sticky sessions, or a rolling
-  upgrade that lands a connect on an old node and its requests on a new
-  one, shows up as a failing server rather than a silent loop.
+  gone. Any other session's end is a failed connect: it emits
+  `reconnect-failed` and `close`, and follows `reconnect` with a growing
+  backoff. So a load balancer without sticky sessions, or a rolling upgrade
+  that lands a connect on an old node and its requests on a new one, shows
+  up as a failing server, with the framework's alert at the fifth attempt,
+  when its sessions end within the interval. A deployment whose sessions
+  each live longer restarts at most once an interval, and each restart
+  costs the calls in flight: the client can't tell a balancer that moves a
+  session's requests from a server that restarts. Once the framework's
+  `stop()` has begun, an ended session isn't started again.
 - A server that moves to `2026-07-28` in place is followed, since the
   session's end brings a new connect, which negotiates afresh. Two more
   answers end a 2025 session, with a session id or without: a 400 carrying
