@@ -24,8 +24,9 @@
  * newest message alone is over it, since the newest message is always shown
  * (cut to its own cap). A request the provider refuses as too long is asked
  * once more from a fresh window, with the ratio it was built at halved, to no
- * less than one character a token, unless it was built at one already; refused
- * again, it fails as any failed call does. The lower ratio stays for later
+ * less than one character a token, or at a lower estimate another call has
+ * reached meanwhile, unless it was built at one already; refused again, it
+ * fails as any failed call does. The lower ratio stays for later
  * requests until responses correct it. The document is
  * sent as a run of chunks that start at an anchor, the first message shown,
  * which stays put while the window grows into its budget: the chunks before
@@ -411,7 +412,7 @@ export class ReplyJudge {
       extra = [];
     }
     const upcoming = [...(request.upcomingWakes ?? []), ...extra];
-    const ratio = atRatio ?? this.charsPerToken;
+    const ratio = atRatio === undefined ? this.charsPerToken : Math.min(atRatio, this.charsPerToken);
 
     const system = judgeSystemPrompt(agentName);
     const question = judgeQuestion(

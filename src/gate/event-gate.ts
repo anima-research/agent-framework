@@ -2370,8 +2370,8 @@ export class EventGate {
     changesJudgedContext?: (agentName: string) => boolean;
     /** How long a judge request may take (ms). Default 20,000. */
     judgeTimeoutMs?: number;
-    /** What a judge failure, or a judge call the framework refuses without
-     *  making it, does: wake (default) or skip (ReplyJudgeOptions.onError). */
+    /** What a judge failure, or a judge call whose request the framework
+     *  refuses to send, does: wake (default) or skip (ReplyJudgeOptions.onError). */
     judgeOnError?: 'wake' | 'skip';
     /** Map an event to the registered channel it arrived on (the host knows
      *  how push-event origins compose into channel ids). The gate routes a
