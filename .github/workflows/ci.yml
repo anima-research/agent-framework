@@ -83,11 +83,15 @@ jobs:
         with:
           node-version: '22.12.0'
 
-      # Root lockfiles are deliberately gitignored in this repo, so plain
-      # npm install, as publish.yml's build-and-test job does. No lock to
-      # guard here.
+      # Root lockfiles are deliberately gitignored in this repo, so npm
+      # install rather than npm ci, as publish.yml's build-and-test job does.
+      # No lock to guard here. npm picks, in each range, a release that
+      # admits the Node it runs on; where none does, it installs one anyway
+      # and only warns. --engine-strict fails the install there instead, so
+      # a range whose releases all need a newer Node than the floor in
+      # engines.node can't pass unseen.
       - name: Install dependencies
-        run: npm install
+        run: npm install --engine-strict
 
       - name: Build
         run: npm run build
@@ -137,8 +141,9 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
 
+      # --engine-strict, as in build-and-test, at each Node in the matrix.
       - name: Install dependencies
-        run: npm install
+        run: npm install --engine-strict
 
       - name: Build
         run: npm run build
