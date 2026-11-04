@@ -1,1 +1,0 @@
-- A server's listing in `toolsets--look` writes an openable toolset's options as an object of its parameters again, such as `{size?: 9|13|19 =9}`. 0.29.0 and 0.30.0 wrote a stray `"(` after the opening brace, as `{"(size?: 9|13|19 =9}`.

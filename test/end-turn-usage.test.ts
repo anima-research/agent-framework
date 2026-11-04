@@ -350,7 +350,7 @@ class RoundThenEnd implements YieldingStream {
     yield {
       type: 'tool-calls',
       calls: [{ id: call.id, name: call.name, input: {} }],
-      context: { rawText: '', preamble: '', depth: 0, previousResults: [], accumulated: '', roundContent: [call] },
+      context: { rawText: '', preamble: '', depth: 0, previousResults: [], accumulated: '', roundContent: [call], supportsInjectedMessages: true },
     } as StreamEvent;
     if (!this.resumed) await new Promise<void>((r) => { this.resume = r; });
     if (this.isCancelled) {
@@ -903,11 +903,11 @@ function loggedOnce(framework: AgentFramework, traces: TraceEvent[], error: RegE
   assert.deepEqual(logs[0].tokenUsage, expectedTokens(firstUsage), 'the entry carries what was counted');
 }
 
-/** Whether the stream's driver has ended: it releases the stream and its turn
- *  at the end of finally, after its accounting. */
+/** Whether the stream's turn has ended: the host mode lists an agent among
+ *  its active turns from the turn's dequeue to its settled teardown, which
+ *  comes after the stream's accounting. */
 function tornDown(framework: AgentFramework): boolean {
-  const internal = framework as unknown as { activeTurnTokens: Map<string, unknown>; activeStreams: Map<string, unknown> };
-  return !internal.activeTurnTokens.has('resident') && !internal.activeStreams.has('resident');
+  return !framework.getHostModeStatus().activeTurnAgents.includes('resident');
 }
 
 describe("a stop's own entry carries the rounds its stream finished, once", () => {

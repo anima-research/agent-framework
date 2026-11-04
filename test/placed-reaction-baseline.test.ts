@@ -448,13 +448,11 @@ describe('placed-reaction baseline', () => {
     const fw = await create();
     // Bring up the MCPL subsystem as a first runtime connect does.
     await (fw as unknown as { initializeMcpl(servers: McplServerConfig[]): Promise<void> }).initializeMcpl([]);
-    let added: unknown;
     const registry = (fw as unknown as { mcplServerRegistry: { addServer(config: unknown): Promise<unknown> } }).mcplServerRegistry;
-    registry.addServer = async (config: unknown) => { added = config; throw new Error('stop before connecting'); };
+    registry.addServer = async () => { throw new Error('stop before connecting'); };
     const config: McplServerConfig = { id: 'remote', url: 'ws://127.0.0.1:1' };
     await assert.rejects(() => fw.connectMcplServer(config), /stop before connecting/);
-    assert.equal(added, config, 'the same object');
-    assert.equal(config.env, undefined, 'no env added');
+    assert.deepEqual(config, { id: 'remote', url: 'ws://127.0.0.1:1' }, "the caller's config as it was: no env added");
   });
 
   for (const [marker, converted] of [

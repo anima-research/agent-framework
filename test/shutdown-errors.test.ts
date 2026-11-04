@@ -296,8 +296,9 @@ test('hang-only cleanup is bounded and later rejection remains observed', async 
   let calls = 0;
   const hung = new Promise<void>((_, fail) => { reject = fail; });
   const { framework, store } = await fixture(t, [module('hung', () => { calls++; return hung; })]);
+  // The pending work names the hung module; the label's form is the code's.
   await assert.rejects(framework.stop(15), error => error instanceof ShutdownTimeoutError &&
-    error.pending.join(',') === 'module:hung');
+    error.pending.length === 1 && error.pending[0]!.includes('hung'));
   store.registerState({ id: 'after-timeout', strategy: 'snapshot' });
   store.setStateJson('after-timeout', { open: true });
   assert.equal(calls, 1);

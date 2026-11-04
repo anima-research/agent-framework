@@ -12,20 +12,24 @@
  */
 
 import { NOTICE_TAG } from '../notice-tags.js';
-import { cutToFit, suppliedValue } from '../supplied-text.js';
+import { cutToFit, quotedJson, quotedValue, suppliedValue } from '../supplied-text.js';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
+import { SuppressScripts, type SuppressScriptEvent } from './suppress-scripts.js';
+import { firstCatchAll, namesSomething } from './rule-scope.js';
 import { canonical, duplicateName, lastRecipePath, noChanges, reconcileLine, reconcileWithRecipe, ruleName, type WrittenConfig } from './recipe-reconcile.js';
 import { closestNames, isNearMiss } from '../closest-names.js';
 import { MAX_TIMER_MS } from '../deadline-timer.js';
 import { safeSlice } from '../safe-slice.js';
 
 import type { ToolDefinition } from '../types/events.js';
+import type { TraceEventInput } from '../types/trace.js';
 import type {
   GateConfig,
   GatePolicy,
   GatePolicyMatch,
+  SuppressConfig,
   GateBehavior,
   GateDecision,
   GateEntryRef,
@@ -260,15 +264,6 @@ interface PolicyStats {
 }
 
 // ---------------------------------------------------------------------------
-// Trace event shape (subset — avoids importing the full TraceEvent union)
-// ---------------------------------------------------------------------------
-
-interface TraceEventLike {
-  type: string;
-  [key: string]: unknown;
-}
-
-// ---------------------------------------------------------------------------
 // Glob matching (simple * wildcards)
 // ---------------------------------------------------------------------------
 
@@ -447,7 +442,7 @@ function behaviorFingerprint(b: import('./types.js').GateBehavior): string {
 // default), it now loads without it.
 
 const CONFIG_FIELDS = ['default', 'policies'];
-const POLICY_FIELDS = ['name', 'match', 'behavior', 'resets', 'passthrough'];
+const POLICY_FIELDS = ['name', 'match', 'behavior', 'resets', 'passthrough', 'suppress'];
 const MATCH_FIELDS = [
   'scope', 'source', 'channel', 'mount', 'pathGlob', 'tagsAny', 'tagsAll', 'tagsNone', 'metadataTrue', 'filter',
 ];
@@ -456,6 +451,7 @@ const BEHAVIOR_KINDS = ['debounce', 'rate_limit', 'passive_sample', 'judge'] as 
 const RATE_LIMIT_FIELDS = ['tokens', 'refillIntervalMs', 'keyBy'];
 const PASSIVE_SAMPLE_FIELDS = ['every', 'keyBy'];
 const JUDGE_FIELDS = ['debounceMs', 'maxWaitMs', 'instructions'];
+const SUPPRESS_FIELDS = ['description', 'script'];
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -483,10 +479,10 @@ function beforeWriting(err: unknown): boolean {
  * "policies" that isn't a list and holds something. `runs` is what the gate
  * runs meanwhile (rulesRun).
  */
-function noListRefusal(noList: string, runs: string): string {
+function noListRefusal(noList: string, runs: string, path: string): string {
   return `${noList}, so it has no list of rules a change could edit without writing over what it holds, and nothing `
-    + `was saved. Meanwhile the gate runs ${runs}. Until gate.json is an object whose "policies" is a list holding its `
-    + 'rules, a change is refused the same way.';
+    + `was saved. Meanwhile the gate runs ${runs}. Until gate.json, at ${path}, is an object whose "policies" is a list `
+    + 'holding its rules, a change is refused the same way.';
 }
 
 /**
@@ -495,15 +491,15 @@ function noListRefusal(noList: string, runs: string): string {
  * written over it, so what it holds, often an operator's unfinished edit, stays
  * as it is. `runs` is what the gate runs meanwhile (rulesRun).
  */
-function unusableRefusal(unusable: { error: string; notJson?: true }, runs: string): string {
+function unusableRefusal(unusable: { error: string; notJson?: true }, runs: string, path: string): string {
   if (!unusable.notJson) {
-    return `gate.json couldn't be read (${unusable.error}), so a change can't edit it, and nothing was written over it. `
-      + `Meanwhile the gate runs ${runs}. Whoever runs this host can make gate.json readable; until then, a change is `
-      + 'refused the same way.';
+    return `gate.json, at ${path}, couldn't be read (${unusable.error}), so a change can't edit it, and nothing was written `
+      + `over it. Meanwhile the gate runs ${runs}. Whoever runs this host can make gate.json a file the gate can read; `
+      + 'until then, a change is refused the same way.';
   }
-  return `gate.json isn't JSON the gate can read (${unusable.error}), so a change can't edit its rules without writing `
-    + `over what it holds, and nothing was saved. Meanwhile the gate runs ${runs}. Until gate.json is JSON, a change is `
-    + 'refused the same way.';
+  return `gate.json, at ${path}, isn't JSON the gate can read (${unusable.error}), so a change can't edit its rules without `
+    + `writing over what it holds, and nothing was saved. Meanwhile the gate runs ${runs}. Until gate.json is JSON, a change `
+    + 'is refused the same way.';
 }
 
 /**
@@ -514,11 +510,17 @@ function unusableRefusal(unusable: { error: string; notJson?: true }, runs: stri
  * (notUsedClause, describeStart) say which rules keep gate.json out of use
  * and each fix.
  */
-function notUsedRefusal(runs: string): string {
-  return "gate.json isn't used at this start, which runs as one without it does, and a change would put gate.json's rules in "
+function notUsedRefusal(runs: string, path: string): string {
+  return `gate.json, at ${path}, isn't used at this start, which runs as one without it does, and a change would put gate.json's rules in `
     + `force in place of what that runs, so nothing was saved. Meanwhile the gate runs ${runs}. gate_status says what keeps `
     + 'gate.json out of use and what would put it in use, such as giving it rules under "policies", or fixing the starting '
     + 'rules, which whoever runs this host can do, for the next start; until then, a change is refused the same way.';
+}
+
+function savedOnlyInForce(path: string, remedy: string | undefined): string {
+  return remedy === undefined
+    ? ''
+    : ` gate.json, at ${path}, isn't in force, and a change is saved only if it brings it into force. ${remedy}`;
 }
 
 /**
@@ -531,7 +533,8 @@ export function shownValue(value: unknown): string {
   if (typeof value === 'number' && !Number.isFinite(value)) return String(value);
   let json: string;
   try {
-    json = JSON.stringify(value) ?? String(value);
+    const stringified = JSON.stringify(value);
+    json = stringified === undefined ? String(value) : quotedJson(stringified);
   } catch {
     json = String(value);
   }
@@ -548,9 +551,22 @@ function joinedList(items: readonly string[], joiner: 'and' | 'or' = 'and'): str
   return items.length < 2 ? items.join('') : `${items.slice(0, -1).join(', ')} ${joiner} ${items[items.length - 1]}`;
 }
 
+const asGateNames = (path: string): string => path;
+
+function namedBy(names: Readonly<Record<string, string>> | undefined): (path: string) => string {
+  if (!names) return asGateNames;
+  return (path) => {
+    for (let end = path.length; end > 0; end = path.lastIndexOf('.', end - 1)) {
+      const head = path.slice(0, end);
+      if (Object.hasOwn(names, head)) return `${names[head]}${path.slice(end)}`;
+    }
+    return path;
+  };
+}
+
 /** `"a"`, `"a" and "b"`, `"a", "b" and "c"` (or "or"). */
 function quotedList(names: readonly string[], joiner: 'and' | 'or' = 'and'): string {
-  return joinedList(names.map((n) => `"${n}"`), joiner);
+  return joinedList(names.map((n) => quotedValue(n)), joiner);
 }
 
 /** 1st, 2nd, 3rd, 4th, 11th, 21st. */
@@ -611,7 +627,7 @@ function fieldNames(
 
 /** `"tags" (did you mean "tagsAny", "tagsAll" or "tagsNone"?)` */
 function slipShown(slip: Slip): string {
-  return `"${slip.key}" (did you mean ${quotedList(slip.meant, 'or')}?)`;
+  return `${quotedValue(slip.key)} (did you mean ${quotedList(slip.meant, 'or')}?)`;
 }
 
 /** Names an object has that are fields read at another level, with where that is (`homes`). */
@@ -651,22 +667,22 @@ function misplacedShown(m: Misplaced): string {
  * The levels of a gate.json the gate reads fields at, each as a message names
  * it, `file` naming the file itself.
  */
-function fieldLevels(file: string): ReadonlyArray<{ name: string; fields: readonly string[] }> {
+function fieldLevels(file: string, named: (path: string) => string = asGateNames): ReadonlyArray<{ name: string; fields: readonly string[] }> {
   return [
     { name: file, fields: CONFIG_FIELDS },
     { name: 'a rule', fields: POLICY_FIELDS },
     { name: '"match"', fields: MATCH_FIELDS },
     { name: '"match.filter"', fields: FILTER_FIELDS },
     { name: '"behavior"', fields: BEHAVIOR_KINDS },
-    { name: '"behavior.rate_limit"', fields: RATE_LIMIT_FIELDS },
-    { name: '"behavior.passive_sample"', fields: PASSIVE_SAMPLE_FIELDS },
-    { name: '"behavior.judge"', fields: JUDGE_FIELDS },
+    { name: `"${named('behavior.rate_limit')}"`, fields: RATE_LIMIT_FIELDS },
+    { name: `"${named('behavior.passive_sample')}"`, fields: PASSIVE_SAMPLE_FIELDS },
+    { name: `"${named('behavior.judge')}"`, fields: JUDGE_FIELDS },
   ];
 }
 
 /** Where a name is a field the gate reads, at a level other than the one whose fields are `here`. */
-function homesOf(file: string, here: readonly string[]): (key: string) => string[] {
-  return (key) => fieldLevels(file)
+function homesOf(file: string, here: readonly string[], named?: (path: string) => string): (key: string) => string[] {
+  return (key) => fieldLevels(file, named)
     .filter((level) => level.fields !== here && level.fields.includes(key))
     .map((level) => level.name);
 }
@@ -798,7 +814,7 @@ interface RuleProblem {
 
 /** A rule as the gate reads it. */
 interface RuleReading {
-  /** How messages name it: `Policy "x"`, or its place when it has no name. */
+  /** How messages name it: `Rule "x"`, or its place when it has no name. */
   where: string;
   /** The rule as read, unless a problem has no reading. */
   policy?: GatePolicy;
@@ -833,6 +849,7 @@ interface Reader {
   where: string;
   /** How messages name the file the rule is in, for a field of the file's own put in the rule. */
   file: string;
+  named: (path: string) => string;
   problems: RuleProblem[];
   notes: string[];
   /** Set where its rate limit's tokens are a number not over 0, so it wakes on none of what it matches. */
@@ -859,14 +876,15 @@ function readFieldNames(
   misplacedReadOf: (m: Misplaced) => string | undefined = () => undefined,
 ): void {
   const { slips, unread } = fieldNames(obj, fields);
-  const { misplaced, rest } = placedElsewhere(unread, homesOf(r.file, fields));
-  noteUnread(level ? `${r.where}: ${level}` : r.where, rest, fields, r.notes);
+  const { misplaced, rest } = placedElsewhere(unread, homesOf(r.file, fields, r.named));
+  const shown = level === null ? null : r.named(level);
+  noteUnread(shown ? `${r.where}: ${shown}` : r.where, rest, fields, r.notes);
   for (const slip of slips) {
-    r.problems.push({ text: `${level ?? 'it'} has ${slipShown(slip)}, which the gate doesn't read`, read: readOf(slip) });
+    r.problems.push({ text: `${shown ?? 'it'} has ${slipShown(slip)}, which the gate doesn't read`, read: readOf(slip) });
   }
   for (const m of misplaced) {
     r.problems.push({
-      text: `${level ?? 'it'} has ${misplacedShown(m)}, which the gate doesn't read here`,
+      text: `${shown ?? 'it'} has ${misplacedShown(m)}, which the gate doesn't read here`,
       read: misplacedReadOf(m) ?? (m.keys.length === 1 ? SLIP_READ : 'so they do nothing'),
     });
   }
@@ -881,7 +899,7 @@ function droppedEntries(count: number): string {
  * A rule, read as written, or past each problem it has. `unnamed` names a rule
  * without a name in messages, and `file` the file it's in.
  */
-function readRule(raw: unknown, unnamed: string, file = 'gate.json'): RuleReading {
+function readRule(raw: unknown, unnamed: string, file = 'gate.json', named: (path: string) => string = asGateNames): RuleReading {
   if (!isPlainObject(raw)) {
     return {
       where: unnamed,
@@ -891,7 +909,7 @@ function readRule(raw: unknown, unnamed: string, file = 'gate.json'): RuleReadin
     };
   }
   const name = nameOf(raw);
-  const r: Reader = { where: name ? `Policy "${name}"` : unnamed, file, problems: [], notes: [] };
+  const r: Reader = { where: name ? `Rule ${quotedValue(name)}` : unnamed, file, named, problems: [], notes: [] };
   const obj = withoutEmpty(r.where, raw, r.notes, RULE_LEFT_OUT);
   // Field names first, so a slip of one is named before what its absence does.
   readFieldNames(r, null, obj, POLICY_FIELDS, (slip) => {
@@ -914,7 +932,8 @@ function readRule(raw: unknown, unnamed: string, file = 'gate.json'): RuleReadin
   const { behavior, kind } = readBehavior(r, obj.behavior);
   const match = readMatch(r, obj.match);
   const resets = readResets(r, obj.resets);
-  const passthrough = readPassthrough(r, obj.passthrough, behavior, kind);
+  const passthrough = readPassthrough(r, obj.passthrough, kind);
+  const suppress = readSuppress(r, obj.suppress, obj.behavior, match, obj.match);
   const reading: RuleReading = {
     where: r.where, problems: r.problems, notes: r.notes, quiet: kind === 'skip' || kind === 'defer' || r.noTokens === true,
   };
@@ -922,6 +941,7 @@ function readRule(raw: unknown, unnamed: string, file = 'gate.json'): RuleReadin
     const policy: GatePolicy = { name, match, behavior };
     if (resets) policy.resets = resets;
     if (passthrough) policy.passthrough = true;
+    if (suppress) policy.suppress = suppress;
     reading.policy = policy;
     if (r.matchesAll) reading.matchesAll = true;
   }
@@ -969,7 +989,7 @@ function readBehavior(r: Reader, value: unknown): { behavior?: GateBehavior | un
   }
   const behavior = READ_KIND[kind](r, b[kind]);
   for (const other of kinds.slice(1)) {
-    const unread: Reader = { where: r.where, file: r.file, problems: [], notes: [] };
+    const unread: Reader = { where: r.where, file: r.file, named: r.named, problems: [], notes: [] };
     READ_KIND[other](unread, b[other]);
     for (const p of unread.problems) r.problems.push({ text: p.text, read: `which goes unread with the rest of "${other}"` });
   }
@@ -985,18 +1005,18 @@ function readBehavior(r: Reader, value: unknown): { behavior?: GateBehavior | un
  */
 function readDebounce(r: Reader, ms: unknown): GateBehavior | undefined {
   if (typeof ms !== 'number' || !Number.isFinite(ms)) {
-    r.problems.push({ text: `behavior.debounce is ${shownValue(ms)}, where a number of milliseconds is needed, such as 60000` });
+    r.problems.push({ text: `${r.named('behavior.debounce')} is ${shownValue(ms)}, where a number of milliseconds is needed, such as 60000` });
     return undefined;
   }
   if (ms < MIN_DEBOUNCE_MS) {
     r.problems.push({
-      text: `behavior.debounce is ${ms} ms, under the ${MIN_DEBOUNCE_MS} ms minimum`, read: `so it's read as ${MIN_DEBOUNCE_MS} ms`,
+      text: `${r.named('behavior.debounce')} is ${ms} ms, under the ${MIN_DEBOUNCE_MS} ms minimum`, read: `so it's read as ${MIN_DEBOUNCE_MS} ms`,
     });
     return { debounce: MIN_DEBOUNCE_MS };
   }
   if (ms > MAX_DEBOUNCE_MS) {
     r.problems.push({
-      text: `behavior.debounce is ${ms} ms, over the ${MAX_DEBOUNCE_MS} ms maximum`, read: `so it's read as ${MAX_DEBOUNCE_MS} ms`,
+      text: `${r.named('behavior.debounce')} is ${ms} ms, over the ${MAX_DEBOUNCE_MS} ms maximum`, read: `so it's read as ${MAX_DEBOUNCE_MS} ms`,
     });
     return { debounce: MAX_DEBOUNCE_MS };
   }
@@ -1019,27 +1039,27 @@ function readDebounce(r: Reader, ms: unknown): GateBehavior | undefined {
 function readRateLimit(r: Reader, value: unknown): GateBehavior | undefined {
   if (!isPlainObject(value)) {
     r.problems.push({
-      text: `behavior.rate_limit is ${shownValue(value)}, where an object is needed, such as {"tokens": 3, "refillIntervalMs": 60000}`,
+      text: `${r.named('behavior.rate_limit')} is ${shownValue(value)}, where an object is needed, such as {"tokens": 3, "refillIntervalMs": 60000}`,
     });
     return undefined;
   }
-  const conf = withoutEmpty(`${r.where}: behavior.rate_limit`, value, r.notes, { keyBy: 'every event the rule matches shares one bucket' });
+  const conf = withoutEmpty(`${r.where}: ${r.named('behavior.rate_limit')}`, value, r.notes, { keyBy: 'every event the rule matches shares one bucket' });
   readFieldNames(r, 'behavior.rate_limit', conf, RATE_LIMIT_FIELDS);
   const tokens = conf.tokens;
   const refill = conf.refillIntervalMs;
   const tokensUsable = typeof tokens === 'number' && Number.isFinite(tokens) && tokens > 0;
   if (typeof tokens === 'number' && !(tokens > 0)) r.noTokens = true;
   if (!tokensUsable) {
-    r.problems.push({ text: `behavior.rate_limit.tokens is ${shownValue(tokens)}, where a positive number is needed` });
+    r.problems.push({ text: `${r.named('behavior.rate_limit.tokens')} is ${shownValue(tokens)}, where a positive number is needed` });
   }
   const refillUsable = typeof refill === 'number' && Number.isFinite(refill);
   if (!refillUsable) {
     r.problems.push({
-      text: `behavior.rate_limit.refillIntervalMs is ${shownValue(refill)}, where a positive number of milliseconds is needed`,
+      text: `${r.named('behavior.rate_limit.refillIntervalMs')} is ${shownValue(refill)}, where a positive number of milliseconds is needed`,
     });
   } else if (refill <= 0) {
     r.problems.push({
-      text: `behavior.rate_limit.refillIntervalMs is ${refill}, where a positive number of milliseconds is needed`,
+      text: `${r.named('behavior.rate_limit.refillIntervalMs')} is ${refill}, where a positive number of milliseconds is needed`,
       read: refill === 0
         ? 'so its tokens refill at once, and it limits nothing it matches'
         : "so its tokens never refill, and once they're spent it wakes the agent on nothing it matches",
@@ -1059,21 +1079,21 @@ function readRateLimit(r: Reader, value: unknown): GateBehavior | undefined {
  */
 function readPassiveSample(r: Reader, value: unknown): GateBehavior | undefined {
   if (!isPlainObject(value)) {
-    r.problems.push({ text: `behavior.passive_sample is ${shownValue(value)}, where an object is needed, such as {"every": 10}` });
+    r.problems.push({ text: `${r.named('behavior.passive_sample')} is ${shownValue(value)}, where an object is needed, such as {"every": 10}` });
     return undefined;
   }
-  const conf = withoutEmpty(`${r.where}: behavior.passive_sample`, value, r.notes, { keyBy: 'every event the rule matches shares one count' });
+  const conf = withoutEmpty(`${r.where}: ${r.named('behavior.passive_sample')}`, value, r.notes, { keyBy: 'every event the rule matches shares one count' });
   readFieldNames(r, 'behavior.passive_sample', conf, PASSIVE_SAMPLE_FIELDS);
   const given = conf.every;
   let every: number | undefined;
   if (typeof given !== 'number' || !Number.isFinite(given)) {
-    r.problems.push({ text: `behavior.passive_sample.every is ${shownValue(given)}, where a whole number of 1 or more is needed` });
+    r.problems.push({ text: `${r.named('behavior.passive_sample.every')} is ${shownValue(given)}, where a whole number of 1 or more is needed` });
   } else if (Number.isInteger(given) && given > 0) {
     every = given;
   } else {
     every = given <= 0 ? 1 : Math.ceil(given);
     r.problems.push({
-      text: `behavior.passive_sample.every is ${given}, ${given <= 0 ? 'under 1' : 'not a whole number'}`,
+      text: `${r.named('behavior.passive_sample.every')} is ${given}, ${given <= 0 ? 'under 1' : 'not a whole number'}`,
       read: `so it's read as ${every}`,
     });
   }
@@ -1096,11 +1116,11 @@ function readPassiveSample(r: Reader, value: unknown): GateBehavior | undefined 
 function readJudge(r: Reader, value: unknown): GateBehavior | undefined {
   if (!isPlainObject(value)) {
     r.problems.push({
-      text: `behavior.judge is ${shownValue(value)}, where an object is needed, such as {"debounceMs": 30000, "instructions": "..."}`,
+      text: `${r.named('behavior.judge')} is ${shownValue(value)}, where an object is needed, such as {"debounceMs": 30000, "instructions": "..."}`,
     });
     return undefined;
   }
-  const conf = withoutEmpty(`${r.where}: behavior.judge`, value, r.notes, {
+  const conf = withoutEmpty(`${r.where}: ${r.named('behavior.judge')}`, value, r.notes, {
     maxWaitMs: 'a batch is judged only after its quiet period',
     instructions: 'the judge decides without the agent\'s word',
   });
@@ -1109,16 +1129,16 @@ function readJudge(r: Reader, value: unknown): GateBehavior | undefined {
   const ms = conf.debounceMs;
   let debounceMs: number | undefined;
   if (typeof ms !== 'number' || !Number.isFinite(ms)) {
-    r.problems.push({ text: `behavior.judge.debounceMs is ${shownValue(ms)}, where a number of milliseconds is needed, such as 30000` });
+    r.problems.push({ text: `${r.named('behavior.judge.debounceMs')} is ${shownValue(ms)}, where a number of milliseconds is needed, such as 30000` });
     ok = false;
   } else if (ms < MIN_DEBOUNCE_MS) {
     r.problems.push({
-      text: `behavior.judge.debounceMs is ${ms} ms, under the ${MIN_DEBOUNCE_MS} ms minimum`, read: `so it's read as ${MIN_DEBOUNCE_MS} ms`,
+      text: `${r.named('behavior.judge.debounceMs')} is ${ms} ms, under the ${MIN_DEBOUNCE_MS} ms minimum`, read: `so it's read as ${MIN_DEBOUNCE_MS} ms`,
     });
     debounceMs = MIN_DEBOUNCE_MS;
   } else if (ms > MAX_DEBOUNCE_MS) {
     r.problems.push({
-      text: `behavior.judge.debounceMs is ${ms} ms, over the ${MAX_DEBOUNCE_MS} ms maximum`, read: `so it's read as ${MAX_DEBOUNCE_MS} ms`,
+      text: `${r.named('behavior.judge.debounceMs')} is ${ms} ms, over the ${MAX_DEBOUNCE_MS} ms maximum`, read: `so it's read as ${MAX_DEBOUNCE_MS} ms`,
     });
     debounceMs = MAX_DEBOUNCE_MS;
   } else {
@@ -1128,19 +1148,19 @@ function readJudge(r: Reader, value: unknown): GateBehavior | undefined {
   const wait = conf.maxWaitMs;
   if (wait !== undefined) {
     if (typeof wait !== 'number' || !Number.isFinite(wait)) {
-      r.problems.push({ text: `behavior.judge.maxWaitMs is ${shownValue(wait)}, where a number of milliseconds is needed, such as 120000` });
+      r.problems.push({ text: `${r.named('behavior.judge.maxWaitMs')} is ${shownValue(wait)}, where a number of milliseconds is needed, such as 120000` });
       ok = false;
     } else {
       const floor = debounceMs ?? MIN_DEBOUNCE_MS;
       if (wait < floor) {
         r.problems.push({
-          text: `behavior.judge.maxWaitMs is ${wait} ms, under the rule's ${floor} ms quiet period`,
+          text: `${r.named('behavior.judge.maxWaitMs')} is ${wait} ms, under the rule's ${floor} ms quiet period`,
           read: `so it's read as ${floor} ms`,
         });
         maxWaitMs = floor;
       } else if (wait > MAX_JUDGE_WAIT_MS) {
         r.problems.push({
-          text: `behavior.judge.maxWaitMs is ${wait} ms, over the ${MAX_JUDGE_WAIT_MS} ms maximum`,
+          text: `${r.named('behavior.judge.maxWaitMs')} is ${wait} ms, over the ${MAX_JUDGE_WAIT_MS} ms maximum`,
           read: `so it's read as ${MAX_JUDGE_WAIT_MS} ms`,
         });
         maxWaitMs = MAX_JUDGE_WAIT_MS;
@@ -1153,11 +1173,11 @@ function readJudge(r: Reader, value: unknown): GateBehavior | undefined {
   let instructions: string | undefined;
   if (said !== undefined) {
     if (typeof said !== 'string') {
-      r.problems.push({ text: `behavior.judge.instructions is ${shownValue(said)}, where text is needed` });
+      r.problems.push({ text: `${r.named('behavior.judge.instructions')} is ${shownValue(said)}, where text is needed` });
       ok = false;
     } else if (said.length > MAX_JUDGE_INSTRUCTIONS) {
       r.problems.push({
-        text: `behavior.judge.instructions is ${said.length} characters long, over the ${MAX_JUDGE_INSTRUCTIONS}-character maximum`,
+        text: `${r.named('behavior.judge.instructions')} is ${said.length} characters long, over the ${MAX_JUDGE_INSTRUCTIONS}-character maximum`,
       });
       ok = false;
     } else {
@@ -1184,7 +1204,7 @@ function readKeyBy(r: Reader, kind: 'rate_limit' | 'passive_sample', value: unkn
   if (value === undefined) return undefined;
   if (typeof value === 'string') return value;
   r.problems.push({
-    text: `behavior.${kind}.keyBy is ${shownValue(value)}, where a field name is needed, such as "channelId"`,
+    text: `${r.named(`behavior.${kind}.keyBy`)} is ${shownValue(value)}, where a field name is needed, such as "channelId"`,
     read: `so it does nothing, and every event the rule matches shares one ${kind === 'rate_limit' ? 'bucket' : 'count'}`,
   });
   return undefined;
@@ -1299,7 +1319,10 @@ function readMatch(r: Reader, value: unknown): GatePolicyMatch {
           new RegExp(f.pattern);
           match.filter = { type, pattern: f.pattern };
         } catch (e) {
-          r.problems.push({ text: `match.filter.pattern isn't a regular expression the gate can read (${errorText(e)})` });
+          r.problems.push({
+            text: `match.filter.pattern isn't a regular expression the gate can read (${quotedValue(errorText(e))}), so fix it, `
+              + 'or give match.filter.type "text" to look for the pattern as plain text',
+          });
         }
       }
     }
@@ -1308,8 +1331,7 @@ function readMatch(r: Reader, value: unknown): GatePolicyMatch {
   // Left with nothing that narrows it once something in it was named, it
   // matches every event. Empty lists and nulls alone always meant no
   // constraint, and name nothing.
-  const narrows = Object.entries(match).some(([field, v]) => !(field === 'scope' && Array.isArray(v) && v.length === 0));
-  if (!narrows && r.problems.length + r.notes.length > named) r.matchesAll = true;
+  if (!matchNarrows(match) && r.problems.length + r.notes.length > named) r.matchesAll = true;
   return match;
 }
 
@@ -1341,20 +1363,146 @@ function readResets(r: Reader, value: unknown): string[] | undefined {
  * always, defer, skip or a debounce it would be a no-op at best and a
  * misleading promise at worst, so it's refused rather than ignored.
  */
-function readPassthrough(
-  r: Reader, value: unknown, behavior: GateBehavior | undefined, kind: BehaviorKind | undefined,
-): boolean {
+function readPassthrough(r: Reader, value: unknown, kind: BehaviorKind | undefined): boolean {
   if (value === undefined || value === false) return false;
   if (value !== true) {
     r.problems.push({ text: `passthrough is ${shownValue(value)}, where true or false is needed` });
     return false;
   }
   if (kind === undefined || kind === 'rate_limit' || kind === 'passive_sample') return true;
+  const given = kind === 'always' || kind === 'defer' || kind === 'skip' ? `behavior "${kind}"` : r.named(`behavior.${kind}`);
   r.problems.push({
-    text: `passthrough is only valid with rate_limit or passive_sample behaviors — for "${behavior ? formatBehavior(behavior) : kind}" `
-      + 'there is no non-firing match to fall through on',
+    text: `passthrough is true, and only a ${r.named('behavior.rate_limit')} or ${r.named('behavior.passive_sample')} rule passes on `
+      + `an event it matches without waking on it; with ${given}, leave passthrough out`,
   });
   return false;
+}
+
+/** Whether a match narrows what it matches: anything but an empty scope. */
+export function matchNarrows(match: GatePolicyMatch): boolean {
+  return Object.entries(match).some(([field, v]) => !(field === 'scope' && Array.isArray(v) && v.length === 0));
+}
+
+/**
+ * Whether a suppress rule's match names what it hides: an event type, or a
+ * source, channel, mount, path or tag pattern that isn't only wildcards
+ * (namesSomething), a metadata flag, or a content filter. A pattern of
+ * wildcards alone, such as `source: "*"`, or only `tagsNone`, takes every
+ * event, which a suppress rule may not.
+ */
+function suppressMatchNarrows(match: GatePolicyMatch): boolean {
+  if ((match.scope ?? []).length > 0 || (match.metadataTrue ?? []).length > 0 || match.filter !== undefined) return true;
+  if ([match.source, match.channel, match.mount, match.pathGlob].some(namesSomething)) return true;
+  return [...(match.tagsAny ?? []), ...(match.tagsAll ?? [])].some(namesSomething);
+}
+
+/** Longest suppress description, in characters: the review sends it with every rule it judges. */
+export const MAX_SUPPRESS_DESCRIPTION = 2_000;
+/** Longest suppress script, in characters. */
+export const MAX_SUPPRESS_SCRIPT = 20_000;
+const SUPPRESS_EXAMPLE = '{"description": "the eye going on and off"}';
+
+/**
+ * A rule's `suppress`. Every problem with it is read as a rule that doesn't
+ * suppress, which is how a release without suppression reads the rule:
+ * its behavior then decides the event, and the event is rendered. The
+ * behavior has to be written out as "defer" (or "skip"), not left to
+ * default, because such a release reads a rule with no behavior as
+ * "always" and would wake the agent on every event the rule was meant to
+ * hide.
+ */
+function readSuppress(r: Reader, value: unknown, behavior: unknown, match: GatePolicyMatch, rawMatch: unknown): SuppressConfig | undefined {
+  if (value === undefined || value === false) return undefined;
+  const without = "so the rule doesn't suppress, and its behavior decides its events as for any other rule";
+  if (!isPlainObject(value)) {
+    r.problems.push({ text: `suppress is ${shownValue(value)}, where an object such as ${SUPPRESS_EXAMPLE} is needed`, read: without });
+    return undefined;
+  }
+  const before = r.problems.length;
+  // A script given as null or "" is a script that's missing, not one left
+  // out: read as left out, the rule would hide every event its match takes.
+  const { script: _givenScript, ...rest } = value;
+  const emptyScript = Object.hasOwn(value, 'script') && (value.script === null || value.script === '');
+  if (emptyScript) {
+    r.problems.push({ text: `suppress.script is ${shownValue(value.script)}, where the source of a function such as "(event, state) => false" is needed`, read: without });
+  }
+  const given = withoutEmpty(`${r.where}: suppress`, emptyScript ? rest : value, r.notes);
+  const reported = r.problems.length;
+  readFieldNames(r, 'suppress', given, SUPPRESS_FIELDS);
+  // A field it doesn't read can't be left aside here, as elsewhere in a
+  // rule: one meant as a condition, left out, would hide every event the
+  // match takes.
+  const unread = Object.keys(given).filter((key) => !SUPPRESS_FIELDS.includes(key));
+  if (unread.length > 0 && r.problems.length === reported) {
+    r.problems.push({ text: `suppress has ${quotedList(unread)}, and a suppress rule reads only "description" and "script"`, read: without });
+  }
+  const config: SuppressConfig = { description: '' };
+  if (typeof given.description !== 'string' || given.description.trim() === '') {
+    r.problems.push({
+      text: `suppress.description is ${given.description === undefined ? 'missing' : shownValue(given.description)}, where the rule's `
+        + 'purpose in a few words is needed: the review checks what the rule hides against it',
+      read: without,
+    });
+  } else if ([...given.description].length > MAX_SUPPRESS_DESCRIPTION) {
+    r.problems.push({
+      text: `suppress.description is ${[...given.description].length.toLocaleString('en-US')} characters, over the `
+        + `${MAX_SUPPRESS_DESCRIPTION.toLocaleString('en-US')} allowed`,
+      read: without,
+    });
+  } else {
+    config.description = given.description.trim();
+  }
+  if (given.script !== undefined) {
+    if (typeof given.script !== 'string' || given.script.trim() === '') {
+      r.problems.push({ text: `suppress.script is ${shownValue(given.script)}, where the source of a function such as "(event, state) => false" is needed`, read: without });
+    } else if ([...given.script].length > MAX_SUPPRESS_SCRIPT) {
+      r.problems.push({
+        text: `suppress.script is ${[...given.script].length.toLocaleString('en-US')} characters, over the ${MAX_SUPPRESS_SCRIPT.toLocaleString('en-US')} allowed`,
+        read: without,
+      });
+    } else {
+      // Parsed only, never run here: the script runs on its worker.
+      try {
+        new Function(`"use strict";\nreturn (${given.script}\n);`);
+        config.script = given.script;
+      } catch (e) {
+        r.problems.push({ text: `suppress.script doesn't parse (${quotedValue(errorText(e))})`, read: without });
+      }
+    }
+  }
+  if (behavior !== 'defer' && behavior !== 'skip') {
+    r.problems.push({
+      text: `suppress is given, and a rule that suppresses needs "behavior": "defer" written out, so a release that `
+        + `doesn't know "suppress" defers its events instead of waking you on them; it has `
+        + (behavior === undefined ? 'no behavior' : `behavior ${shownValue(behavior)}`),
+      read: without,
+    });
+  }
+  // A match field the gate doesn't read would, left aside, hide more than was
+  // written: the condition it was meant to add is gone.
+  if (isPlainObject(rawMatch)) {
+    const rawFilter = isPlainObject(rawMatch.filter) ? Object.keys(rawMatch.filter).filter((key) => !FILTER_FIELDS.includes(key)).map((key) => `filter.${key}`) : [];
+    const unreadMatch = [...Object.keys(rawMatch).filter((key) => !MATCH_FIELDS.includes(key)), ...rawFilter];
+    if (unreadMatch.length > 0) {
+      r.problems.push({ text: `suppress is given, and match has ${quotedList(unreadMatch)}, which the gate doesn't read, so the rule would hide more than was written`, read: without });
+    }
+  }
+  if (!suppressMatchNarrows(match)) {
+    r.problems.push({
+      text: 'suppress is given, and the rule\'s match names nothing it hides: a suppress rule needs a match that names '
+        + 'a scope, a source, a channel, tags, a mount or path, metadata or a filter (not a pattern of wildcards alone, or tagsNone alone), '
+        + 'so it can\'t hide everything',
+      read: without,
+    });
+  }
+  // Only a rule read without any problem suppresses: one read past a problem
+  // (a slip of a field, a match read without a part of it) matches more, or
+  // decides otherwise, than its author wrote, and hiding is what can't be
+  // seen to go wrong. Its behavior decides its events instead.
+  if (before > 0) {
+    r.problems.push({ text: 'suppress is given on a rule with problems, and a rule suppresses only when it has none', read: without });
+  }
+  return r.problems.length === 0 ? config : undefined;
 }
 
 /** What a load or a start does with a rule. */
@@ -1518,7 +1666,7 @@ function readConfig(
   }
 
   const rules = policies.map((rule, i) => {
-    const reading = readRule(rule, `The ${ordinal(i + 1)} policy`, file);
+    const reading = readRule(rule, `The ${ordinal(i + 1)} rule`, file);
     return { raw: rule, reading, outcome: ruleOutcome(reading) };
   });
   if (defaultBehavior !== 'always') {
@@ -1604,7 +1752,7 @@ function readLastRecipe(path: string): { recipe: WrittenConfig | null; problem?:
   if (read.refusedWhole !== undefined) return { recipe: null, problem: "it isn't read as the starting rules are" };
   const rules = read.rules.map((rule) => rule.raw);
   const twice = duplicateName(rules);
-  if (twice !== undefined) return { recipe: null, problem: `it names the rule "${twice}" twice` };
+  if (twice !== undefined) return { recipe: null, problem: `it names the rule ${quotedValue(twice)} twice` };
   return { recipe: { rules, default: isPlainObject(raw) ? raw.default : undefined } };
 }
 
@@ -1614,7 +1762,7 @@ function readLastRecipe(path: string): { recipe: WrittenConfig | null; problem?:
  * wrote as read agrees with the same rule written more briefly.
  */
 function ruleMeaning(rule: unknown): string {
-  const reading = readRule(rule, 'A policy');
+  const reading = readRule(rule, 'A rule');
   return reading.policy ? `read ${canonical(reading.policy)}` : `written ${canonical(rule)}`;
 }
 
@@ -1725,7 +1873,7 @@ function notUsedClause(write: Extract<StartWrite, { kind: 'start-without' }>, st
  */
 function outOfForce(write: Extract<StartWrite, { kind: 'start-without' }>): { said: string; fix: string; nextStart: boolean } | null {
   const nameless = write.nameless ?? 0;
-  const left = [...(write.leftOut ?? []).map((name) => `"${name}"`), ...(nameless === 0 ? [] : [nameless === 1 ? 'one with no name' : `${nameless} with no name`])];
+  const left = [...(write.leftOut ?? []).map((name) => quotedValue(name)), ...(nameless === 0 ? [] : [nameless === 1 ? 'one with no name' : `${nameless} with no name`])];
   const held = write.heldOut ?? [];
   const said: string[] = [];
   const fix: string[] = [];
@@ -1938,7 +2086,9 @@ export function findShadowedPolicies(policies: GatePolicy[], eventTypesFrom?: Ev
   const out: ShadowWarning[] = [];
   for (let i = 0; i < policies.length; i++) {
     const earlier = policies[i];
-    if (earlier.passthrough) continue;
+    // A suppress rule lets addressed events and the heartbeat's by, so it
+    // can't be said to take every event of a later rule.
+    if (earlier.passthrough || earlier.suppress) continue;
     for (let j = i + 1; j < policies.length; j++) {
       const found = subsumedEventTypes(earlier, policies[j], eventTypesFrom);
       if (found) {
@@ -1954,14 +2104,14 @@ export function findShadowedPolicies(policies: GatePolicy[], eventTypesFrom?: Ev
  *  three it is (the rule never applies; it misses some of its events; it
  *  may not be meant for those events at all) and what to do. */
 export function formatShadowWarning(w: ShadowWarning): string {
-  const later = `"${w.later}"`;
-  const earlier = `"${w.earlier}"`;
-  const move = `move ${later} above ${earlier} (wake_add_rule with the whole rule and insertBefore: "${w.earlier}")`;
+  const later = quotedValue(w.later);
+  const earlier = quotedValue(w.earlier);
+  const move = `move ${later} above ${earlier} (wake_add_rule with the whole rule and insertBefore: ${quotedValue(w.earlier)})`;
   if (w.whole) {
     return `${later} never applies: ${earlier} comes first and matches every event ${later} would. `
       + `If ${later} should apply, ${move}, or narrow ${earlier}.`;
   }
-  const types = w.eventTypes === 'all' ? 'all' : w.eventTypes.join(', ');
+  const types = w.eventTypes === 'all' ? 'all' : w.eventTypes.map((type) => quotedValue(type).slice(1, -1)).join(', ');
   if (w.known) {
     return `${earlier} comes first and takes ${later}'s ${types} events, so ${later} applies only to its others. `
       + `If it should apply to those too, ${move}.`;
@@ -1994,20 +2144,23 @@ function afterChange(name: string, callback: () => void): void {
 }
 
 /** The privileged-users file's error when some entries of its list aren't user ids. */
-function skippedPrivilegedIds(skipped: unknown[], loaded: number): string {
+function skippedPrivilegedIds(skipped: unknown[], loaded: number, path: string): string {
   const one = skipped.length === 1;
   const shown = skipped.slice(0, 5).map((x) => {
     if (typeof x === 'number' && Number.isInteger(x)) {
       return `${x} (a number this large can't be read exactly: write the id as a string, in quotes)`;
     }
-    const json = JSON.stringify(x) ?? String(x);
+    const json = quotedValue(x);
     return json.length > 40 ? `${safeSlice(json, 0, 39)}…` : json;
   });
   const more = skipped.length > shown.length ? `, and ${skipped.length - shown.length} more` : '';
-  const rest = loaded === 0 ? 'no id loaded, so no one is privileged' : `${loaded} ${loaded === 1 ? 'id' : 'ids'} did load`;
-  return `${skipped.length} ${one ? 'entry' : 'entries'} in the privileged-users file ${one ? "isn't a user id" : "aren't user ids"}, `
+  const rest = loaded === 0
+    ? 'no id loaded, so no one is privileged'
+    : `the ${loaded === 1 ? 'one id that did load is' : `${loaded} ids that did load are`} privileged`;
+  return `${skipped.length} ${one ? 'entry' : 'entries'} in the privileged-users file, at ${path}, ${one ? "isn't a user id" : "aren't user ids"}, `
     + `so ${one ? 'it was' : 'they were'} skipped: ${shown.join(', ')}${more}. A user id is a non-empty string, or a safe integer `
-    + `(a whole number within 2^53 - 1 of zero); ${rest}.`;
+    + `(a whole number within 2^53 - 1 of zero); ${rest}. Once ${one ? 'that entry is a user id' : 'those entries are user ids'}, the gate `
+    + 'reads the file again at its next check for changes.';
 }
 
 // ---------------------------------------------------------------------------
@@ -2039,6 +2192,7 @@ export class EventGate {
   /** Whether gate.json's error is one that keeps what it holds out of force
    *  (configUnreadable), so gate_status says what's in force instead. */
   private configUnused = false;
+  private configFix: string | null = null;
   private privilegedError: string | null = null;
   /** What the start did with the host's starting rules that it couldn't use
    *  or add (describeStart), kept apart from gate.json's own error, until the
@@ -2095,6 +2249,8 @@ export class EventGate {
 
   // Per-policy stats
   private stats = new Map<string, PolicyStats>();
+  /** Suppress rules' scripts and their state (suppress-scripts.ts), kept beside gate.json. */
+  private readonly suppressScripts: SuppressScripts;
 
   // The shadow lint's last findings (see refreshShadowWarnings), recomputed
   // on every config change and fingerprinted so an unchanged set doesn't
@@ -2144,7 +2300,7 @@ export class EventGate {
   private lastPrivilegedCheck = 0;
 
   // Dependency-injected callbacks
-  private emitTrace: (event: TraceEventLike) => void;
+  private emitTrace: (event: TraceEventInput) => void;
   private addMessageFn: (
     participant: string,
     content: Array<{ type: 'text'; text: string }>,
@@ -2169,7 +2325,7 @@ export class EventGate {
     configPath: string;
     initialConfig?: GateConfig;
     privilegedUsersPath?: string;
-    emitTrace: (event: TraceEventLike) => void;
+    emitTrace: (event: TraceEventInput) => void;
     addMessage: (
       participant: string,
       content: Array<{ type: 'text'; text: string }>,
@@ -2193,6 +2349,8 @@ export class EventGate {
     now?: () => number;
     /** Per-event timeout (ms) for the optional gate.js script. Default 50. */
     scriptTimeoutMs?: number;
+    /** How long a suppress rule's script may take for one event before the event is shown (ms). Default 50. */
+    suppressScriptTimeoutMs?: number;
     /** The reply judge `judge` rules ask (JudgeConfig). Absent: a judge
      *  rule's batch is delivered as a debounce's, and gate_status says so. */
     judge?: JudgeFn;
@@ -2232,6 +2390,11 @@ export class EventGate {
     eventTypesFrom?: EventTypesFrom;
   }) {
     this.configPath = opts.configPath;
+    // Before the rules are read: a start's merge can clear a rule's state, its script's included.
+    this.suppressScripts = new SuppressScripts({
+      statePath: join(dirname(opts.configPath), 'suppress-state.json'),
+      ...(opts.suppressScriptTimeoutMs !== undefined ? { timeoutMs: opts.suppressScriptTimeoutMs } : {}),
+    });
     this.privilegedUsersPath = opts.privilegedUsersPath;
     this.emitTrace = opts.emitTrace;
     this.addMessageFn = opts.addMessage;
@@ -2366,7 +2529,7 @@ export class EventGate {
       }
       const twice = duplicateName(starting.rules.map((rule) => rule.raw));
       if (twice !== undefined) {
-        this.startMergeNote = `At start, the recipe names the rule "${twice}" twice, so gate.json was seeded with it as given and it `
+        this.startMergeNote = `At start, the recipe names the rule ${quotedValue(twice)} twice, so gate.json was seeded with it as given and it `
           + "wasn't recorded as the recipe last applied: a later start merges the recipe by name, once gate.json and the recipe "
           + 'name each rule once.';
       } else {
@@ -2513,7 +2676,6 @@ export class EventGate {
         ...changes,
         // Every name the start added to gate.json, as an append's trace gave.
         addedPolicies: names,
-        timestamp: Date.now(),
       });
     }
     if (!appended && (!last.recipe || canonical({ rules: last.recipe.rules, default: last.recipe.default }) !== canonical({ rules: starting.rules.map((rule) => rule.raw), default: given.default }))) {
@@ -2560,7 +2722,13 @@ export class EventGate {
     try {
       raw = readFileSync(this.configPath, 'utf-8');
     } catch (err) {
-      if (!isMissing(err)) return this.configUnreadable(err);
+      if (!isMissing(err)) {
+        const why = quotedValue(errorText(err));
+        return this.configUnreadable(
+          why, `gate.json, at ${this.configPath}, can't be read: ${why}`,
+          'Whoever runs this host can make it a file the gate can read, and the gate reads it again at its next check for changes.',
+        );
+      }
       // No file is no problem with it: the rules in force stay.
       this.configError = null;
       this.configUnused = false;
@@ -2579,12 +2747,25 @@ export class EventGate {
     try {
       parsed = parseGateJson(raw);
     } catch (err) {
-      return { ...this.configUnreadable(err), notJson: true };
+      const why = quotedValue(errorText(err));
+      return {
+        ...this.configUnreadable(
+          why, `gate.json, at ${this.configPath}, isn't JSON: ${why}`,
+          "Once it's JSON, the gate reads it again at its next check for changes.",
+        ),
+        notJson: true,
+      };
     }
     const read = readConfig(parsed, 'gate.json');
     // JSON the gate doesn't use is still the operator's file, edited as written.
     if ('refused' in read) {
-      return { ...this.configUnreadable(new Error(read.refused)), state: 'refused', listed: read.listed, silenced: read.silenced };
+      const problem = read.refused.startsWith('gate.json ')
+        ? `gate.json, at ${this.configPath},${read.refused.slice('gate.json'.length)}`
+        : read.refused;
+      return {
+        ...this.configUnreadable(read.refused, problem, 'Once gate.json is mended, the gate reads it again at its next check for changes.'),
+        state: 'refused', listed: read.listed, silenced: read.silenced,
+      };
     }
     // A field the gate doesn't read does nothing, and a rule is read past a
     // problem or left out, so the file loads, and each is named.
@@ -2598,20 +2779,19 @@ export class EventGate {
    * gate.json's current error, replacing the last one, and traced and logged
    * when it's new, so an edit that doesn't load is in the log once.
    */
-  private configUnreadable(err: unknown): { state: 'unreadable'; error: string } {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg !== this.configError) {
-      console.error(`[gate] ${this.configPath} couldn't be used (${msg}), so what it holds isn't in force`);
+  private configUnreadable(why: string, problem: string, fix: string | null = null): { state: 'unreadable'; error: string } {
+    if (problem !== this.configError) {
+      console.error(`[gate] ${this.configPath} couldn't be used (${why}), so what it holds isn't in force${fix ? `. ${fix}` : ''}`);
       this.emitTrace({
         type: 'gate:config-error',
-        error: msg,
+        error: why,
         configPath: this.configPath,
-        timestamp: Date.now(),
       });
     }
-    this.configError = msg;
+    this.configError = problem;
+    this.configFix = fix;
     this.configUnused = true;
-    return { state: 'unreadable', error: msg };
+    return { state: 'unreadable', error: why };
   }
 
   /**
@@ -2620,7 +2800,8 @@ export class EventGate {
    */
   private configErrorShown(): string | null {
     if (this.configError === null || !this.configUnused) return this.configError;
-    return `${sentence(this.configError)} So what gate.json holds isn't in force, and the gate runs ${this.rulesRun()}.`;
+    return `${sentence(this.configError)} So what gate.json holds isn't in force, and the gate runs ${this.rulesRun()}.`
+      + (this.configFix ? ` ${this.configFix}` : '');
   }
 
   /** What the gate runs, by where its rules came from, for a text that says so: "the host's starting rules". */
@@ -2665,13 +2846,13 @@ export class EventGate {
     | { top: Record<string, unknown>; rules: unknown[]; remedy?: string }
     | { refused: string } {
     const read = this.readConfigFile();
-    if (read.state === 'unreadable') return { refused: unusableRefusal(read, this.rulesRun()) };
+    if (read.state === 'unreadable') return { refused: unusableRefusal(read, this.rulesRun(), this.configPath) };
     if (read.state === 'loaded' || read.state === 'refused') {
-      if ('noList' in read.listed) return { refused: noListRefusal(read.listed.noList, this.rulesRun()) };
+      if ('noList' in read.listed) return { refused: noListRefusal(read.listed.noList, this.rulesRun(), this.configPath) };
       // Rules not gate.json's in force while it holds the text in force: what a
       // start ran in place of one with no rules of its own, until it changes.
       if (read.state === 'loaded' && read.text === this.configText && this.configSource !== 'file') {
-        return { refused: notUsedRefusal(this.rulesRun()) };
+        return { refused: notUsedRefusal(this.rulesRun(), this.configPath) };
       }
       const edit = { top: read.listed.top, rules: [...read.listed.rules] };
       if (read.state === 'loaded') return edit;
@@ -2688,9 +2869,9 @@ export class EventGate {
       return {
         ...edit,
         remedy: sharing === 1
-          ? `${removes ? 'Replacing or removing' : 'Replacing'} "${only}" by name would bring gate.json into force.`
+          ? `${removes ? 'Replacing or removing' : 'Replacing'} ${quotedValue(only)} by name would bring gate.json into force.`
           : sharing > 1
-            ? `gate.json has ${sharing} rules named "${only}", and a change by that name replaces the first of them`
+            ? `gate.json has ${sharing} rules named ${quotedValue(only)}, and a change by that name replaces the first of them`
               + `${removes ? ' or removes them all' : ''}.`
             : 'No change through the gate can bring it into force, so gate.json has to be fixed by an edit of its own; '
               + 'until then, a change is refused the same way.',
@@ -2750,7 +2931,11 @@ export class EventGate {
   private clearStateFor(was: GateConfig, next: GateConfig): { removed: string[]; cleared: string[] } {
     const behaviorsByName = (config: GateConfig): Map<string, string> => {
       const byName = new Map<string, string[]>();
-      for (const p of config.policies) byName.set(p.name, [...(byName.get(p.name) ?? []), behaviorFingerprint(p.behavior)]);
+      for (const p of config.policies) {
+        // A suppress rule's script is part of what it is: a changed script starts from a fresh state.
+        const fingerprint = behaviorFingerprint(p.behavior) + (p.suppress ? ` suppress:${p.suppress.script ?? ''}` : '');
+        byName.set(p.name, [...(byName.get(p.name) ?? []), fingerprint]);
+      }
       return new Map([...byName].map(([name, behaviors]) => [name, JSON.stringify(behaviors)]));
     };
     const before = behaviorsByName(was);
@@ -2803,7 +2988,6 @@ export class EventGate {
         removedPolicies: removedPolicies.length > 0 ? removedPolicies : undefined,
         stateClearedPolicies:
           stateClearedPolicies.length > 0 ? stateClearedPolicies : undefined,
-        timestamp: now,
       });
     } catch {
       // The rules in force stay, and the next check tries again.
@@ -2864,9 +3048,18 @@ export class EventGate {
     options?: {
       position?: 'append' | 'prepend' | { before: string } | { after: string };
       onIgnoredFields?: (notes: string[]) => void;
+      /** The caller's own name for a field a refusal names, keyed by gate.json's name for it: one of
+       *  `behavior.debounce`, `behavior.rate_limit`, `behavior.passive_sample` and `behavior.judge`, or
+       *  `position.before` and `position.after` for a placement. A key names the fields under it too:
+       *  `behavior.rate_limit` gives `behavior.rate_limit.tokens` its name, and a longer key wins.
+       *  Other fields keep gate.json's names.
+       *
+       *  @internal For `wake_add_rule`'s refusals; not a host API. */
+      fieldNames?: Readonly<Record<string, string>>;
     },
   ): GatePolicy {
-    const reading = readRule(rawPolicy, 'A policy');
+    const named = namedBy(options?.fieldNames);
+    const reading = readRule(rawPolicy, 'A rule', 'gate.json', named);
     if (reading.problems.length > 0 || !reading.policy) throw new Error(refusalOf(reading));
     const policy = reading.policy;
     const ignored = notesOf(reading);
@@ -2886,9 +3079,26 @@ export class EventGate {
         const anchorName = 'before' in position ? position.before : position.after;
         const anchorIdx = rules.findIndex((rule) => nameOf(rule) === anchorName);
         if (anchorIdx < 0) {
+          const field = named('before' in position ? 'position.before' : 'position.after');
+          const others = [...new Set(rules.map(nameOf).filter((name): name is string => name !== undefined))];
+          if (idx >= 0 && anchorName === policy.name) {
+            throw new Error(
+              `${reading.where} wasn't saved: ${field} is ${quotedValue(anchorName)}, the rule being saved, and a rule can't be `
+              + 'placed beside itself. '
+              + (others.length > 0
+                ? `The other rules are ${quotedList(others)}. Give ${field} one of those to place the rule beside it, or leave it out`
+                : `There are no other rules, so leave ${field} out`)
+              + ' to replace the rule where it is.'
+              + savedOnlyInForce(this.configPath, remedy),
+            );
+          }
           throw new Error(
-            `addPolicy: no policy named "${anchorName}" to anchor on — `
-            + `have: [${rules.map(nameOf).filter((name) => name !== undefined).join(', ')}]`,
+            `${reading.where} wasn't saved: ${field} is ${quotedValue(anchorName)}, and no rule has that name. `
+            + (others.length > 0
+              ? `The other rules are ${quotedList(others)}. Give ${field} one of those to place the rule beside it, or leave it out`
+              : `There are no other rules, so leave ${field} out`)
+            + ' to add the rule at the end, or, where a rule already has its name, to replace that rule where it is.'
+            + savedOnlyInForce(this.configPath, remedy),
           );
         }
         rules.splice('before' in position ? anchorIdx : anchorIdx + 1, 0, policy);
@@ -2903,7 +3113,6 @@ export class EventGate {
       configPath: this.configPath,
       policyName: policy.name,
       replaced: idx >= 0,
-      timestamp: Date.now(),
     });
     if (ignored.length > 0) {
       // A caller that doesn't take the notes still gets them said, in the log.
@@ -2946,7 +3155,6 @@ export class EventGate {
       type: 'gate:policy-removed',
       configPath: this.configPath,
       policyName: name,
-      timestamp: Date.now(),
     });
     return true;
   }
@@ -2961,6 +3169,27 @@ export class EventGate {
     const read = this.readConfigFile({ unlessUnchanged: true });
     const current = read.state === 'loaded' ? read.config : this.config;
     return current.policies.map((p) => p.name);
+  }
+
+  /** The rules in force, in order (copies): what the last decision was made by. */
+  policiesInForce(): GatePolicy[] {
+    return this.config.policies.map((p) => structuredClone(p));
+  }
+
+  /** The rule in force by this name (a copy), or undefined. */
+  policyInForce(name: string): GatePolicy | undefined {
+    const p = this.config.policies.find((x) => x.name === name);
+    return p ? structuredClone(p) : undefined;
+  }
+
+  /** @internal For `wake_add_rule`'s and `wake_remove_rule`'s refusals; not a host API. */
+  ruleNamesForChange(): { names: string[]; note: string } | { refused: string } {
+    const edit = this.rulesForChange();
+    if ('refused' in edit) return { refused: edit.refused };
+    return {
+      names: [...new Set(edit.rules.map(nameOf).filter((name): name is string => name !== undefined))],
+      note: savedOnlyInForce(this.configPath, edit.remedy),
+    };
   }
 
   /**
@@ -2989,15 +3218,16 @@ export class EventGate {
     const read = readConfig(JSON.parse(text), 'gate.json');
     if ('refused' in read) {
       throw new Error(
-        `Nothing was saved: with this change, gate.json wouldn't be used. ${sentence(read.refused)}${remedy ? ` ${remedy}` : ''}`,
+        `Nothing was saved: with this change, gate.json, at ${this.configPath}, wouldn't be used. ${sentence(read.refused)}`
+          + (remedy ? ` ${remedy}` : ''),
       );
     }
     // One the gate doesn't use, and that a change can mend, holds back what a
     // rule it leaves out would wake on, so its default holds events back.
     if (remedy !== undefined && read.config.policies.length === 0) {
       throw new Error(
-        'Nothing was saved: with this change, gate.json would have no rules the gate reads, and its default would hold back every '
-        + `event. Meanwhile the gate runs ${this.rulesRun()}. ${remedy}`,
+        `Nothing was saved: with this change, gate.json, at ${this.configPath}, would have no rules the gate reads, and its default `
+        + `would hold back every event. Meanwhile the gate runs ${this.rulesRun()}. ${remedy}`,
       );
     }
     try {
@@ -3138,7 +3368,6 @@ export class EventGate {
           matchedPolicy: 'asleep',
           trigger: false,
           behavior: 'skip',
-          timestamp: this.now(),
         });
         return { trigger: false, policyName: 'asleep', behavior: 'skip' };
       }
@@ -3161,6 +3390,11 @@ export class EventGate {
       decision = this.computeDecision({ name: 'gate.js', match: {}, behavior: scripted }, info);
     } else {
       for (const compiled of this.compiledPolicies) {
+        // A suppress rule doesn't decide a wake for an event suppression was
+        // asked about: one it takes was suppressed before the gate was asked,
+        // and one that reaches here is one it let by. Where suppression wasn't
+        // asked (no view to hide it from), it defers, as its behavior says.
+        if (compiled.policy.suppress && this.passesOverSuppress(info)) continue;
         if (!this.compiledMatches(compiled, info)) continue;
         const candidate = this.computeDecision(compiled.policy, info);
         if (candidate.trigger || !compiled.policy.passthrough) {
@@ -3196,7 +3430,6 @@ export class EventGate {
       trigger: decision.trigger,
       behavior: formatBehavior(decision.behavior),
       ...(observed.length > 0 ? { observed } : {}),
-      timestamp: this.now(),
     });
 
     return decision;
@@ -3221,7 +3454,6 @@ export class EventGate {
       behavior: formatBehavior(policy.behavior),
       eventType: info.eventType,
       source: info.serverId || undefined,
-      timestamp: this.now(),
     });
 
     if (policy.behavior === 'defer' || policy.behavior === 'skip') {
@@ -3367,6 +3599,7 @@ export class EventGate {
   private clearPolicyState(name: string): void {
     const debounce = this.debounceTimers.get(name);
     if (debounce) clearTimeout(debounce.timer);
+    this.suppressScripts.forget(name);
     this.rateLimitBuckets.delete(name);
     this.passiveSampleCounters.delete(name);
     this.rateLimitDenied.delete(name);
@@ -3422,6 +3655,7 @@ export class EventGate {
    */
   probe(info: GateEventInfo): GateDecision {
     for (const compiled of this.compiledPolicies) {
+      if (compiled.policy.suppress && this.passesOverSuppress(info)) continue; // as evaluate does
       if (!this.compiledMatches(compiled, info)) continue;
       const trigger = this.wouldTrigger(compiled.policy, info);
       if (trigger || !compiled.policy.passthrough) {
@@ -3430,6 +3664,135 @@ export class EventGate {
     }
     const trigger = (this.config.default ?? 'always') === 'always';
     return { trigger, policyName: null, behavior: this.config.default ?? 'always' };
+  }
+
+  /**
+   * The suppress rule that takes this event, or null when none does.
+   * Side-effect-free, like probe: no counter moves, no batch forms, nothing
+   * is traced, and a rule's script runs on a copy of its state, which is
+   * then dropped. (A closure a script builds for itself is its own, and a
+   * dry run's timeout counts toward setting a script aside, as it costs the same.) The probe table and other dry runs ask this; the
+   * framework asks decideSuppression instead, once per event.
+   *
+   * It reads the rules as evaluate does, first match deciding: a rule ahead
+   * of the suppress rule that matches the event decides it instead (it isn't
+   * suppressed), unless it's a passthrough rule that wouldn't fire. A rule
+   * with a script (`suppress.script`) takes an event its match takes only
+   * when the script says to hide it; otherwise the event goes on to the rules
+   * after it, as one the rule doesn't match does. Sleep and gate.js aren't
+   * consulted: they decide wakes, and suppression decides what's rendered.
+   *
+   * Never suppressed, whatever the rules say: an event addressed to the
+   * agent (tagged `chat:addressed`: a mention, a reply, a DM) and the
+   * heartbeat's (the agent's own clock). A suppress rule lets them by to the
+   * rules after it, and its script isn't asked. The framework itself never
+   * asks about console or API input.
+   */
+  suppressionFor(info: GateEventInfo): string | null {
+    return this.walkSuppression(info, false);
+  }
+
+  /**
+   * suppressionFor, for an event that is arriving now: each script asked
+   * keeps the state it leaves, whatever later rules do with the event, and a
+   * suppressed event counts in the passthrough rules ahead of its rule. Ask
+   * once per event.
+   */
+  decideSuppression(info: GateEventInfo): string | null {
+    return this.walkSuppression(info, true);
+  }
+
+  private walkSuppression(info: GateEventInfo, commit: boolean): string | null {
+    this.reloadIfChanged();
+    this.syncSuppressScripts();
+    if (info.serverId === 'heartbeat') return null;
+    const addressed = Array.isArray(info.tags) && info.tags.includes('chat:addressed');
+    let event: SuppressScriptEvent | undefined;
+    const observers: GatePolicy[] = [];
+    for (const compiled of this.compiledPolicies) {
+      if (!this.compiledMatches(compiled, info)) continue;
+      const suppress = compiled.policy.suppress;
+      if (suppress) {
+        if (addressed) continue;
+        if (suppress.script !== undefined) {
+          event ??= this.suppressScriptEvent(info);
+          const ran = this.suppressScripts.run(compiled.policy.name, event, commit);
+          // A script that failed shows the event: it goes on to the rules after.
+          if (!ran || !('hide' in ran) || !ran.hide) continue;
+        }
+        // A suppressed event never reaches evaluate, so the passthrough rules
+        // ahead of this one count it here, as evaluate would have: none of
+        // them fires for it, and each fires on its schedule. A dry run counts
+        // nothing.
+        if (commit) for (const observer of observers) this.computeDecision(observer, info);
+        return compiled.policy.name;
+      }
+      if (compiled.policy.passthrough && !this.wouldTrigger(compiled.policy, info)) { observers.push(compiled.policy); continue; }
+      return null;
+    }
+    return null;
+  }
+
+  /** Whether evaluate and probe pass over a suppress rule for this event: suppression was asked about it, or it's one suppression always lets by. */
+  private passesOverSuppress(info: GateEventInfo): boolean {
+    return info.suppressionAsked === true || info.serverId === 'heartbeat'
+      || (Array.isArray(info.tags) && info.tags.includes('chat:addressed'));
+  }
+
+  /** The scripts in step with the rules in force (SuppressScripts.sync: only changed ones are compiled). */
+  private syncSuppressScripts(): void {
+    this.suppressScripts.sync(this.config.policies.map((p) => ({ name: p.name, ...(p.suppress?.script !== undefined ? { script: p.suppress.script } : {}) })));
+  }
+
+  /** What a suppress script is given for an event: plain JSON, its metadata included where it can be. */
+  private suppressScriptEvent(info: GateEventInfo): SuppressScriptEvent {
+    let metadata: Record<string, unknown> = {};
+    try { metadata = JSON.parse(JSON.stringify(info.metadata ?? {})) as Record<string, unknown>; } catch { metadata = {}; }
+    const channel = this.routeChannelFor(info) ?? (info.channelId || undefined);
+    const author = this.extractAuthorId(info.metadata);
+    return {
+      eventType: info.eventType,
+      source: info.serverId,
+      ...(channel ? { channel } : {}),
+      ...(author ? { author } : {}),
+      tags: [...(info.tags ?? [])],
+      text: info.content,
+      at: this.now(),
+      metadata,
+    };
+  }
+
+  /**
+   * Whether a suppress script compiles to a function, on the scripts' worker:
+   * an error's text, or null. wake_add_rule asks before it saves a rule.
+   */
+  checkSuppressScript(script: string): string | null {
+    return this.suppressScripts.check(script);
+  }
+
+  /** A suppress rule's script state as it stands (a copy), for a host or a test. */
+  suppressScriptState(name: string): Record<string, unknown> | undefined {
+    this.syncSuppressScripts();
+    return this.suppressScripts.stateOf(name);
+  }
+
+  /**
+   * Count a row the framework suppressed by `name` (suppressionFor's
+   * answer) once it's written. The rule's stats count it as a match, so
+   * gate_status shows how many events each suppress rule took since start.
+   */
+  noteSuppressed(name: string, info: Pick<GateEventInfo, 'eventType' | 'serverId' | 'channelId'>): void {
+    const policyStats = this.stats.get(name) ?? { matchCount: 0, lastMatchTimestamp: null };
+    policyStats.matchCount++;
+    policyStats.lastMatchTimestamp = this.now();
+    this.stats.set(name, policyStats);
+    this.emitTrace({
+      type: 'gate:suppressed',
+      policyName: name,
+      eventType: info.eventType,
+      ...(info.serverId ? { serverId: info.serverId } : {}),
+      ...(info.channelId ? { channelId: info.channelId } : {}),
+    });
   }
 
   /** The canonical synthetic events the probe table runs: chat shapes as MCPL delivers them, and a heartbeat. */
@@ -3507,7 +3870,12 @@ export class EventGate {
    */
   probeTable(): GateProbeRow[] {
     return this.probeEvents().map(({ label, info }) => {
-      const d = this.probe(info);
+      const suppressedBy = this.suppressionFor(info);
+      if (suppressedBy !== null) {
+        return { probe: label, eventType: info.eventType, policy: suppressedBy, behavior: 'suppress', wouldWake: false };
+      }
+      // As admission asks: suppression first, so a script that says show lets the probe on.
+      const d = this.probe({ ...info, suppressionAsked: true });
       return {
         probe: label,
         eventType: info.eventType,
@@ -3557,7 +3925,6 @@ export class EventGate {
         type: 'gate:shadow-warnings',
         reason,
         warnings: warnings.map(formatShadowWarning),
-        timestamp: this.now(),
       });
     }
   }
@@ -3679,7 +4046,7 @@ export class EventGate {
     } catch (err) {
       const one = events.length === 1;
       console.error(
-        `[gate] Policy "${policyName}": its pending batch of ${events.length} ${one ? 'event' : 'events'} couldn't be delivered `
+        `[gate] Rule ${quotedValue(policyName)}: its pending batch of ${events.length} ${one ? 'event' : 'events'} couldn't be delivered `
         + `(${errorText(err)}), so the batch is dropped`,
       );
       return;
@@ -3689,7 +4056,6 @@ export class EventGate {
       type: 'gate:debounce-delivered',
       policyName,
       eventCount: events.length,
-      timestamp: Date.now(),
     });
   }
 
@@ -3711,7 +4077,6 @@ export class EventGate {
         type: 'gate:held-dropped',
         dropped: batched.length - events.length,
         channels: [...new Set(batched.filter((e) => !events.includes(e)).map(heldAt))],
-        timestamp: this.now(),
       });
     }
     if (events.length === 0) return;
@@ -3877,7 +4242,7 @@ export class EventGate {
     ).finally(() => {
       if (state.timer) clearTimeout(state.timer);
     }).catch((err: unknown) => {
-      console.error(`[gate] Policy "${policyName}": the judge's verdict couldn't be applied (${errorText(err)})`);
+      console.error(`[gate] Rule ${quotedValue(policyName)}: the judge's verdict couldn't be applied (${errorText(err)})`);
     });
   }
 
@@ -3948,8 +4313,8 @@ export class EventGate {
       const n = state.events.length;
       const batch = `${n} ${n === 1 ? 'event' : 'events'}`;
       wakes.push(state.judge
-        ? { at: state.dueAt, certain: false, what: `rule "${name}"'s batch of ${batch} goes to the judge` }
-        : { at: state.dueAt, certain: true, what: `rule "${name}"'s debounced batch of ${batch}` });
+        ? { at: state.dueAt, certain: false, what: `rule ${quotedValue(name)}'s batch of ${batch} goes to the judge` }
+        : { at: state.dueAt, certain: true, what: `rule ${quotedValue(name)}'s debounced batch of ${batch}` });
     }
     return wakes.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
   }
@@ -3999,7 +4364,7 @@ export class EventGate {
     if (failed && (err as { providerAdmission?: unknown } | undefined)?.providerAdmission === 'deferred') {
       const wakes = this.judgeOnError === 'wake';
       console.error(
-        `[gate] Policy "${policyName}": the reply judge made no call (${errorText(err)}), so its batch of ${state.events.length} `
+        `[gate] Rule ${quotedValue(policyName)}: the reply judge made no call (${errorText(err)}), so its batch of ${state.events.length} `
         + `${state.events.length === 1 ? 'event' : 'events'} ${wakes ? 'wakes the agent' : "doesn't wake the agent"} (judge onError "${this.judgeOnError}")`,
       );
       if (this.disposed) return;
@@ -4031,7 +4396,7 @@ export class EventGate {
     const wake = outcome === 'reply' || (outcome === 'error' && this.judgeOnError === 'wake');
     if (failed) {
       console.error(
-        `[gate] Policy "${policyName}": the reply judge failed (${reason}), so its batch of ${state.events.length} `
+        `[gate] Rule ${quotedValue(policyName)}: the reply judge failed (${reason}), so its batch of ${state.events.length} `
         + `${state.events.length === 1 ? 'event' : 'events'} ${wake ? 'wakes the agent' : "doesn't wake the agent"} (judge onError "${this.judgeOnError}")`,
       );
     }
@@ -4046,7 +4411,6 @@ export class EventGate {
       ...(!failed && typeof verdict.inputTokens === 'number' ? { inputTokens: verdict.inputTokens } : {}),
       ...(!failed && typeof verdict.cacheReadTokens === 'number' ? { cacheReadTokens: verdict.cacheReadTokens } : {}),
       ...(!failed && typeof verdict.outputTokens === 'number' ? { outputTokens: verdict.outputTokens } : {}),
-      timestamp: Date.now(),
     });
     if (this.disposed) return;
     const judge = this.currentJudge(policyName, state.judge);
@@ -4262,7 +4626,6 @@ export class EventGate {
       matchedPolicy: 'asleep',
       trigger: false,
       behavior: 'skip',
-      timestamp: this.now(),
     });
     return { until: this.sleepUntil };
   }
@@ -4320,7 +4683,6 @@ export class EventGate {
         matchedPolicy: 'self-wake',
         trigger: true,
         behavior: 'always',
-        timestamp: this.now(),
       });
       // Compact in-window notice: without it the wake turn contains nothing
       // new, so the agent can't tell WHAT woke it (its own timer vs. a
@@ -4355,7 +4717,6 @@ export class EventGate {
       matchedPolicy: 'self-wake',
       trigger: false,
       behavior: 'skip',
-      timestamp: this.now(),
     });
     return { inMs: ms, armed: true };
   }
@@ -4398,7 +4759,6 @@ export class EventGate {
       matchedPolicy: 'asleep',
       trigger: true,
       behavior: 'always',
-      timestamp: this.now(),
     });
     const detail = note ? `${reason}: ${note}` : reason;
     const targets = agent ? [agent] : this.getAgentNamesFn();
@@ -4437,14 +4797,20 @@ export class EventGate {
    * each a non-empty string or a safe integer (a whole number within 2^53 - 1 of zero). An absent file
    * means no one is privileged. A file that can't be read, isn't JSON, or
    * holds no list leaves the list that last loaded in this process in effect
-   * (none, at startup), with its error in gate_status until the file is read
-   * again. In a list, an entry that isn't a user id is skipped, and named in
-   * the file's error, and the rest load. With `unlessUnchanged`, a file whose
+   * (none, at startup), with its error in gate_status until a later read
+   * loads it, finds it gone, or fails another way. In a list, an entry that isn't a user id is skipped, and named
+   * in the file's error, and the rest load. With `unlessUnchanged`, a file whose
    * text is the text last read isn't parsed again.
    */
   private loadPrivileged(opts?: { unlessUnchanged?: boolean }): void {
     if (!this.privilegedUsersPath) return;
-    const failed = (why: string): string => `Failed to load privileged-users file: ${why}`;
+    const file = `The privileged-users file, at ${this.privilegedUsersPath},`;
+    const held = this.privilegedUserIds.size;
+    const meanwhile = held === 0
+      ? 'no one is privileged'
+      : `${held === 1 ? 'the one id of the list that last loaded stays' : `the ${held} ids of the list that last loaded stay`} privileged`;
+    const revoke = 'Replacing it with a file holding [], or removing it, makes no one privileged at the gate\'s next check for changes.';
+    const failed = (problem: string, fix: string): string => `${file} ${problem}, so ${meanwhile}. ${fix} ${revoke}`;
     let raw: string;
     try {
       raw = readFileSync(this.privilegedUsersPath, 'utf8');
@@ -4456,24 +4822,28 @@ export class EventGate {
         this.privilegedUserIds = new Set();
         this.privilegedError = null;
       } else {
-        this.privilegedError = failed(err instanceof Error ? err.message : String(err));
+        this.privilegedError = failed(
+          `can't be read: ${quotedValue(errorText(err))}`,
+          'Whoever runs this host can make it a file the gate can read, and the gate reads it again at its next check for changes.',
+        );
       }
       return;
     }
     if (opts?.unlessUnchanged && raw === this.privilegedText) return;
     this.privilegedText = raw;
+    const fixed = 'Once it holds a list of user ids, the gate loads it at its next check for changes.';
     let ids: unknown;
     try {
       const parsed: unknown = parseGateJson(raw);
       ids = Array.isArray(parsed) ? parsed : (parsed as { userIds?: unknown } | null)?.userIds;
     } catch (err) {
-      this.privilegedError = failed(err instanceof Error ? err.message : String(err));
+      this.privilegedError = failed(`isn't JSON: ${quotedValue(errorText(err))}`, fixed);
       return;
     }
     // A file that parses but holds no list hasn't loaded either: it used to
     // mean no one is privileged, without a word.
     if (!Array.isArray(ids)) {
-      this.privilegedError = failed('expected a list of user ids, or {"userIds": [...]}');
+      this.privilegedError = failed('holds no list of user ids, where one is needed, such as ["123"] or {"userIds": ["123"]}', fixed);
       return;
     }
     const loaded = new Set<string>();
@@ -4486,7 +4856,7 @@ export class EventGate {
       else skipped.push(id);
     }
     this.privilegedUserIds = loaded;
-    this.privilegedError = skipped.length > 0 ? skippedPrivilegedIds(skipped, loaded.size) : null;
+    this.privilegedError = skipped.length > 0 ? skippedPrivilegedIds(skipped, loaded.size, this.privilegedUsersPath) : null;
   }
 
   /** At most once a second, the privileged-users file read again, and loaded when its text has changed. */
@@ -4518,6 +4888,7 @@ export class EventGate {
   }
 
   getStatus(): GateStatus {
+    this.syncSuppressScripts();
     const policies: GatePolicyStats[] = this.config.policies.map(p => {
       const stats = this.stats.get(p.name);
       const debounce = this.debounceTimers.get(p.name);
@@ -4526,6 +4897,9 @@ export class EventGate {
         behavior: p.behavior,
         matchCount: stats?.matchCount ?? 0,
         lastMatchTimestamp: stats?.lastMatchTimestamp ?? null,
+        ...(p.suppress
+          ? { suppress: { ...p.suppress, ...(p.suppress.script !== undefined && this.suppressScripts.status(p.name) ? { scriptStatus: this.suppressScripts.status(p.name)! } : {}) } }
+          : {}),
       };
       if (typeof p.behavior === 'object' && 'debounce' in p.behavior) {
         result.debounceState = {
@@ -4589,6 +4963,13 @@ export class EventGate {
       // Fresh, not the cache: the sources the host knows (eventTypesFrom)
       // change as servers connect, with no change to the rules.
       shadowWarnings: this.lintShadows().map(formatShadowWarning),
+      ...((): Pick<GateStatus, 'catchAll'> => {
+        const rule = firstCatchAll(this.config.policies, { lettingBy: true });
+        return rule ? { catchAll: {
+          rule,
+          note: `${JSON.stringify(rule)} lets MCPL events by without waking you and without naming a server, a channel or a tag, so a server connected later is handled by it until a rule for that server goes ahead of it.`,
+        } } : {};
+      })(),
       totalEvaluations: this.totalEvaluations,
       defaultDecisions: {
         triggered: this.defaultTriggered,
@@ -4625,6 +5006,7 @@ export class EventGate {
 
   dispose(): void {
     this.gateScript.dispose();
+    this.suppressScripts.dispose();
     for (const state of this.debounceTimers.values()) {
       clearTimeout(state.timer);
     }

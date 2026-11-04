@@ -109,7 +109,7 @@ for (const [event, component, method] of [
   });
 }
 
-test('notification rejection is traced without inventing a response', async () => {
+test('a notification\'s rejection is traced, with no request id', async () => {
   const { framework, connection, traces } = harness();
   framework.channelRegistry = { async handleChanged() { throw new Error('notification failed'); } };
   connection.emit('channels-changed', {});
@@ -484,8 +484,9 @@ test('a throwing orphaned-response listener is contained, and later messages sti
   assert.equal(traces.filter((e) => e.type === 'mcpl:server-error').length, 1);
 });
 
-test('a method that is not a string is not dispatched, even if it stringifies to a known method', () => {
+test('a method that is not a string is not dispatched, even if it stringifies to a known method', (t) => {
   const { connection, transport } = wireHarness();
+  t.mock.method(console, 'error', () => {});
   let received = false;
   connection.removeAllListeners('tools-list-changed');
   connection.on('tools-list-changed', () => { received = true; });
@@ -632,20 +633,19 @@ test('a request for a method nothing handles is answered -32601; such a notifica
   const logged: string[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
   transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 31, method: 'no/such-method' }));
-  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 32, method: ['host/command'] }));
-  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 33, method: 7 }));
+  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: null, method: 'no/such-method' }));
   transport.emit('line', JSON.stringify({ jsonrpc: '2.0', method: 'no/such-notification' }));
   const replies = transport.lines.map((line) => JSON.parse(line));
+  // A method that isn't a string is an invalid request, answered -32600
+  // (test/mcpl-request-envelope.test.ts).
   assert.deepEqual(replies.map((r) => [r.id, r.error?.code, r.error?.message]), [
     [31, -32601, 'Method not found'],
-    [32, -32601, 'Method not found'],
-    [33, -32601, 'Method not found'],
+    [null, -32601, 'Method not found'],
   ]);
   // One line per answered request, naming the method; none for the notification.
   assert.deepEqual(logged, [
     "[mcpl] srv: answered -32601 to a request for method no/such-method, which this host doesn't handle",
-    "[mcpl] srv: answered -32601 to a request for a method of type object, which this host doesn't handle",
-    "[mcpl] srv: answered -32601 to a request for a method of type number, which this host doesn't handle",
+    "[mcpl] srv: answered -32601 to a request for method no/such-method, which this host doesn't handle",
   ]);
 });
 
@@ -959,13 +959,15 @@ test('a failed request is answered -32603 with its own id, while its trace bound
   const { framework, traces, transport } = wireHarness();
   t.mock.method(console, 'error', () => {});
   framework.channelRegistry = { async handleRegister() { throw new Error('register failed'); } };
-  for (const id of ['a\u0000b\nc\u202e', true]) {
+  // null is the one id a request can carry that is neither a string nor a
+  // number; any other is refused before dispatch (mcpl-request-envelope).
+  for (const id of ['a\u0000b\nc\u202e', null]) {
     transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id, method: 'channels/register', params: { channels: [] } }));
   }
   await settle();
   assert.deepEqual(
     transport.lines.map((line) => JSON.parse(line)).map((reply) => [reply.id, reply.error?.code]),
-    [['a\u0000b\nc\u202e', -32603], [true, -32603]],
+    [['a\u0000b\nc\u202e', -32603], [null, -32603]],
   );
   assert.deepEqual(failureTraces(traces).map((trace) => trace.requestId), ['a?b?c?', undefined]);
 });
@@ -1108,7 +1110,8 @@ test("a trace listener that throws a value no printer can inspect is logged as t
     assert.deepEqual(reply.errors, [{ code: -32603, message: 'Internal error', data: undefined }]);
     assert.equal(failureTraces(traces).length, 1, 'the listener before the throwing one has the trace');
     assert.equal(failureTraces(after).length, 1, 'the listener after the throwing one has it too');
-    assert.deepEqual(logged, [
+    // Both lines, in whichever order they're written.
+    assert.deepEqual([...logged].sort(), [
       'Trace listener error: "[object Object]"',
       '[mcpl] srv channels-register handler failed: "register failed"',
     ]);
