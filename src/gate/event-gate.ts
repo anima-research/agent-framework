@@ -183,8 +183,9 @@ export interface WakeProvenance {
   counterparty?: string;
   /** True when the chosen event was `chat:addressed`. */
   addressed?: boolean;
-  /** The batch held `chat:system` notices alone: `counterparty` and `at`
-   *  are its newest authored notice's, and the wake is a notice's. */
+  /** No event of the batch but its `chat:system` notices names a channel or
+   *  an author: `counterparty` and `at` are its newest authored notice's,
+   *  and the wake is a notice's. */
   systemNotice?: true;
   /** Speech locus for the wake: the routable channel of the chosen event,
    *  set ONLY when that event addressed the agent (mention / reply / DM) and
