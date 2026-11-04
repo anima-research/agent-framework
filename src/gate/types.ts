@@ -179,6 +179,81 @@ export interface GatePolicy {
    * fire" has no meaning distinct from the behavior itself.
    */
   passthrough?: boolean;
+  /**
+   * Suppression: an event this rule takes is stored in the chronicle and
+   * never rendered into the residents' context. It isn't compiled, injected
+   * at a tool boundary, folded into memory, woken for, or counted as the
+   * latest inbound. The framework decides this once, as the event arrives
+   * (`EventGate.decideSuppression`), and stamps the row
+   * (`metadata.suppressed = { rule, eventType }`). The view filters read only
+   * that stamp, so changing the rule later never changes what was already
+   * rendered or hidden: a removed rule stops suppressing from then on, and
+   * the rows it hid stay hidden.
+   *
+   * The rule needs `behavior: "defer"` (or the legacy `"skip"`), so a release
+   * that doesn't know `suppress` defers its events instead of waking the
+   * agent on them, and a match that narrows something. Rules stay
+   * first-match, with three exceptions: an event addressed to the agent
+   * (`chat:addressed`), a heartbeat, and console or API input are never
+   * suppressed. The rule lets them by, and the rules after it decide them.
+   * A suppress rule decides no wake for an event suppression was asked about
+   * (`evaluate` and `probe` pass over it there, `GateEventInfo.suppressionAsked`);
+   * where suppression wasn't asked, it defers, as its behavior says.
+   */
+  suppress?: SuppressConfig;
+}
+
+/** A suppress rule's own settings (GatePolicy.suppress). */
+export interface SuppressConfig {
+  /**
+   * What the rule is for, in the agent's words ("the eye going on and off").
+   * Required: the periodic review (SuppressionReviewOptions), where the host
+   * runs it, checks a sample of the events the rule hid against it.
+   */
+  description: string;
+  /**
+   * The agent's own logic for the rule, when matching isn't enough: the
+   * source of a function `(event, state) => boolean`, called for each event
+   * the rule's match takes that reaches it (one an earlier rule decides, an
+   * addressed one, or the heartbeat's never does), only `true` hiding it. `event` is the event's type,
+   * source, channel, author, tags, text, arrival time (`at`, ms) and
+   * metadata. `state` is the rule's own JSON object, which the script reads
+   * and changes as it likes, kept between events and across restarts
+   * (suppress-scripts.ts), and started afresh when the script changes or the
+   * rule is removed. So a rule can hide repeats, count, or keep a window of
+   * its own. A script that throws or runs past its time counts as saying
+   * show: the event goes on to the rules after it. Left out, every event the
+   * rule matches is hidden.
+   */
+  script?: string;
+}
+
+/**
+ * The periodic review of what suppress rules hid (src/gate/suppression-review.ts):
+ * every `intervalMs`, for each rule that hid events since the last review, a
+ * small model reads the rule's description and the events it hid (a sample,
+ * past `maxEventsPerRule`) and flags any that don't fit the description or
+ * that the agent would plausibly need to see. The agent is told what each
+ * rule hid and what was flagged, in a `[suppression review]` notice; a
+ * flagged event wakes it.
+ */
+export interface SuppressionReviewOptions {
+  /** False turns the review off. Default true. */
+  enabled?: boolean;
+  /** How often, in ms. Default 2 hours; at least 10 minutes. */
+  intervalMs?: number;
+  /** The reviewer's model, as the host's membrane names it. Default `claude-haiku-5-5`. */
+  model?: string;
+  /** When the agent is told: after every review in which a rule hid something (`"always"`, the default), or only when an event was flagged (`"flagged"`). */
+  notify?: 'always' | 'flagged';
+  /** Whether a flagged event wakes the agent, which is a full turn of its own model, so a false flag costs that turn. Default true. */
+  wakeOnFlag?: boolean;
+  /** The most events of one rule the reviewer reads in one review, spread across the period. Default 60. */
+  maxEventsPerRule?: number;
+  /** How long one rule's review may take, in ms. Default 60,000. */
+  timeoutMs?: number;
+  /** The reviewer's effort (`output_config.effort`); `"none"` sends none. Default `"low"`. */
+  effort?: 'low' | 'medium' | 'high' | 'none';
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +298,13 @@ export interface GateOptions {
    *  null), the judge is wired with its defaults; it runs only for `judge`
    *  rules, so a gate with none makes no judge calls. */
   judge?: ReplyJudgeOptions | null;
+  /**
+   * The periodic review of what suppress rules hid (SuppressionReviewOptions).
+   * On by default wherever a gate is; false turns it off.
+   */
+  suppressionReview?: SuppressionReviewOptions | false;
+  /** How long a suppress rule's script may take for one event before the event is shown (ms). Default 50. */
+  suppressScriptTimeoutMs?: number;
   /**
    * Wake onboarding (gate/wake-onboarding.ts): the first event from an MCPL
    * server that the agent's rules let go by without deciding about it brings
@@ -414,6 +496,14 @@ export interface GateEventInfo {
   paths?: string[];
   /** Event tags (MCPL RFC-001), already implication-expanded by the host. */
   tags?: string[];
+  /**
+   * Set when the framework asked whether the event is suppressed before it
+   * asked about its wake (decideSuppression), so a suppress rule that
+   * matches it let it by. Left out, a suppress rule defers the events it
+   * matches, as its behavior says: suppression wasn't asked, as for an event
+   * that lands where no view hides suppressed rows.
+   */
+  suppressionAsked?: boolean;
 }
 
 /** An MCPL event whose content the framework stored at arrival, as a
@@ -463,6 +553,15 @@ export interface GatePolicyStats {
   behavior: GateBehavior;
   matchCount: number;
   lastMatchTimestamp: number | null;
+  /**
+   * Present on a suppress rule: its settings, and with a script, how the
+   * script has run since this process started. Its `matchCount` and
+   * `lastMatchTimestamp` count the events it took since then: those it
+   * suppressed, and those it only deferred where suppression wasn't asked
+   * (a channel under conversation routing). `suppression_stats` reads the
+   * stamped rows themselves, so its counts cover every start.
+   */
+  suppress?: SuppressConfig & { scriptStatus?: import('./suppress-scripts.js').SuppressScriptStatus };
   debounceState?: {
     pendingCount: number;
     nextDeliveryMs: number | null;

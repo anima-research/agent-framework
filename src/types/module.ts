@@ -51,7 +51,8 @@ export type ModuleContextInjection = ContextInjection & { placedEachCompile?: tr
 /**
  * A message as a module context's reads answer it: a stored row, or a row
  * for a write the framework holds (`held`). Either is marked
- * `heldFromResidents` when a tune-out holds it from the residents.
+ * `heldFromResidents` when a tune-out or a suppress rule holds it from the
+ * residents.
  */
 export type ModuleMessage = StoredMessage & {
   /**
@@ -456,8 +457,8 @@ export interface ModuleContext {
 
   /**
    * Get a message by its id or a held write's handle, marked
-   * `heldFromResidents` when a tune-out holds it from the residents
-   * (ModuleMessage).
+   * `heldFromResidents` when a tune-out or a suppress rule holds it from the
+   * residents (ModuleMessage).
    */
   getMessage(id: MessageId): ModuleMessage | null;
 
@@ -468,8 +469,8 @@ export interface ModuleContext {
    * the newest, or before them in a reversed query, marked `held`
    * (ModuleMessage). Those the last process held show once create() has
    * restored them, after every module's start() (addMessage). A message a
-   * tune-out holds from the residents is among the rows, marked
-   * `heldFromResidents` (ModuleMessage).
+   * tune-out or a suppress rule holds from the residents is among the rows,
+   * marked `heldFromResidents` (ModuleMessage).
    *
    * It reads the primary's window (the first registered agent's when none
    * is primary), or with `opts.forAgent`, the named agent's: a conversation

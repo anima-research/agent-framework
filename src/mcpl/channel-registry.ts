@@ -2304,8 +2304,9 @@ export class ChannelRegistry {
   }
 
   /** The explicit 'stop' for a channel whose typing ended, while its
-   *  server still registers it. */
+   *  server still registers it and holds the grant its start needed. */
   private sendTypingStop(ref: ChannelRef): void {
+    if (!this.typingGranted(ref)) return;
     if (this.sendTypingFn && this.entryAt(ref)) {
       this.sendTypingFn(ref.serverId, ref.channelId, this.typingMetadata.get(destinationKey(ref)), 'stop');
     }
@@ -3958,15 +3959,19 @@ export class ChannelRegistry {
    * (typing timer lifecycle is still managed for when the callback is wired).
    */
   private sendTypingNotification(ref: ChannelRef): void {
-    // §14.1: channels/typing requires channels.typing in the grant. Silent
-    // skip — a typing indicator is cosmetic and per-7s, so a diagnostic per
-    // tick would be noise.
-    if (!CapabilityGrant.of(this.serverRegistry.getServer(ref.serverId)).has('channels.typing')) return;
+    // Silent skip — a typing indicator is cosmetic and per-7s, so a
+    // diagnostic per tick would be noise.
+    if (!this.typingGranted(ref)) return;
     if (this.sendTypingFn) {
       this.sendTypingFn(ref.serverId, ref.channelId, this.typingMetadata.get(destinationKey(ref)));
     }
     // TODO: When server-connection exposes a public sendNotification or
     // sendTyping method, wire it here directly instead of using a callback.
+  }
+
+  /** §14.1: channels/typing, start and stop alike, requires channels.typing in the grant. */
+  private typingGranted(ref: ChannelRef): boolean {
+    return CapabilityGrant.of(this.serverRegistry.getServer(ref.serverId)).has('channels.typing');
   }
 
   // ==========================================================================
