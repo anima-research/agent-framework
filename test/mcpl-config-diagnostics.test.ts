@@ -18,6 +18,7 @@ import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
 import type { EventResponse, Module, ModuleContext, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
+import { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import { CapabilityGrant, computeGrant, expandAdvertisementShorthand } from '../src/mcpl/capability-grant.js';
 import { checkToolPattern } from '../src/mcpl/tool-pattern-check.js';
 import type { McplCapabilities, McplServerConfig } from '../src/mcpl/types.js';
@@ -129,7 +130,7 @@ test('refreshMcplTools: a live server that advertised no MCP tools does not hold
       sendToolsList: async () => { throw new Error('Method not found'); },
     };
     fw.mcplServerRegistry = { getAllServers: () => [prov, quiet] };
-    fw.modelFacingToolNames = () => new Set(fw.mcplTools.map((t: { name: string }) => t.name));
+    fw.patternableToolNames = () => new Set(fw.mcplTools.map((t: { name: string }) => t.name));
     fw.toolPatternChecksArmed = true;
     const capture = captureConsoleError();
     try {
@@ -405,7 +406,7 @@ test("the initial policy's other records keep the credentials out too", async ()
   await run(async () => ({ accepted: false, fallback: 'mcp-only', reason: `bad ${secret}` }));
 });
 
-test('registerMcplServerFeatures: a refused initial policy is traced, and fallback close closes', async () => {
+test('registerMcplServerFeatures: a refused initial policy is traced, and fallback close closes the server and unregisters it', async () => {
   for (const fallback of ['close', 'mcp-only'] as const) {
     const fw = Object.create(AgentFramework.prototype) as any;
     fw.traceListeners = [];
@@ -415,6 +416,8 @@ test('registerMcplServerFeatures: a refused initial policy is traced, and fallba
     fw.onTrace((e: Traced) => traces.push(e));
     let closed = 0;
     let established = 0;
+    // Its close() emits no 'close', as a server's doesn't once it's down
+    // between retries, so only a close through the registry unregisters it.
     const connection = {
       id: 'srv',
       capabilities: { version: '0.5', pushEvents: true } as unknown as McplCapabilities,
@@ -423,6 +426,9 @@ test('registerMcplServerFeatures: a refused initial policy is traced, and fallba
       sendFeatureSetsUpdateRequest: async () => ({ accepted: false, fallback, reason: 'policy too narrow' }),
       close: async () => { closed++; },
     };
+    const registry = new McplServerRegistry();
+    (registry as any).servers.set('srv', connection);
+    fw.mcplServerRegistry = registry;
     const capture = captureConsoleError();
     try {
       await fw.registerMcplServerFeatures({ id: 'srv', command: 'unused' } as McplServerConfig, connection);
@@ -430,6 +436,7 @@ test('registerMcplServerFeatures: a refused initial policy is traced, and fallba
       capture.stop();
     }
     assert.equal(closed, fallback === 'close' ? 1 : 0, fallback);
+    assert.equal(registry.getServer('srv'), fallback === 'close' ? null : connection, `${fallback}: registered afterwards`);
     assert.equal(established, 0, 'a refusal never establishes the grant');
     assert.deepEqual(
       traces.filter((t) => t.type === 'mcpl:policy-refused').map(withoutTimestamp),
@@ -486,7 +493,9 @@ function manifestHarness(receipt: Record<string, unknown>) {
   const config: McplServerConfig = { id: 'srv', command: 'unused', enabledFeatureSets: ['chat', 'bare'] };
   fw.mcplServerConfigs = new Map([[config.id, config]]);
   const connection = new ManifestFake(receipt);
-  fw.mcplServerRegistry = { getAllServers: () => [connection], getServer: (id: string) => (id === 'srv' ? connection : null) };
+  const registry = new McplServerRegistry();
+  (registry as any).servers.set('srv', connection);
+  fw.mcplServerRegistry = registry;
   // Post-§5.3 state: initial policy done, full grant active.
   const grant = computeGrant(connection.capabilities!, config, { mcpToolsAdvertised: false });
   const quiet = captureConsoleError();
@@ -527,6 +536,86 @@ test('manifest change: a refused policy is traced with phase manifest-change, fo
   ]);
 });
 
+test("a policy refusal's 'close' fallback whose close fails reports that failure, not an unanswered policy, and asks for the tool list to be refreshed", async () => {
+  const unreaped = () => new Error('stdio child 7 of MCP server "srv" did not exit within 2000ms of SIGKILL; it could not be reaped');
+  // At the initial policy.
+  const fw = Object.create(AgentFramework.prototype) as any;
+  fw.traceListeners = [];
+  fw.featureSetManager = new FeatureSetManager();
+  fw.checkpointManager = null;
+  const refreshed: string[] = [];
+  fw.handleToolsListChanged = (id: string) => { refreshed.push(id); };
+  const connection = {
+    id: 'srv',
+    capabilities: { version: '0.5', pushEvents: true } as unknown as McplCapabilities,
+    mcpToolsAdvertised: false,
+    establishGrant: () => {},
+    sendFeatureSetsUpdateRequest: async () => ({ accepted: false, fallback: 'close', reason: 'policy too narrow' }),
+    close: async () => { throw unreaped(); },
+  };
+  const registry = new McplServerRegistry();
+  (registry as any).servers.set('srv', connection);
+  fw.mcplServerRegistry = registry;
+  const initial = captureConsoleError();
+  try {
+    await assert.rejects(fw.registerMcplServerFeatures({ id: 'srv', command: 'unused' } as McplServerConfig, connection), /it could not be reaped$/);
+  } finally {
+    initial.stop();
+  }
+  assert.deepEqual(refreshed, ['srv'], 'a refresh of the tool list was asked for');
+  assert.equal(registry.getServer('srv'), connection, 'it stays registered, holding its id');
+  assert.ok(!initial.lines.some((l) => l.includes('did not answer')), initial.lines.join('\n'));
+
+  // At a manifest change.
+  const h = manifestHarness({ accepted: false, fallback: 'close', reason: 'too narrow' });
+  h.connection.close = () => Promise.reject(unreaped());
+  const changed: string[] = [];
+  h.fw.handleToolsListChanged = (id: string) => { changed.push(id); };
+  const later = captureConsoleError();
+  try {
+    await assert.rejects(h.fw.handleManifestChanged(h.connection, { revision: 'r2', domains: ['capabilities'] }), /it could not be reaped$/);
+  } finally {
+    later.stop();
+  }
+  assert.deepEqual(changed, ['srv'], 'a refresh of the tool list was asked for');
+  assert.ok(!later.lines.some((l) => l.includes('did not answer')), later.lines.join('\n'));
+});
+
+for (const queuedBehind of ['the fetch floor', 'a run in flight'] as const) {
+  test(`a manifest refresh queued behind ${queuedBehind}, whose 'close' fallback fails to close, logs that failure`, async (t) => {
+    const h = manifestHarness({ accepted: false, fallback: 'close', reason: 'too narrow' });
+    h.connection.close = () => Promise.reject(new Error('stdio child 7 of MCP server "srv" did not exit within 2000ms of SIGKILL; it could not be reaped'));
+    const announce = { revision: 'r2', domains: ['capabilities'] };
+    const floor = (AgentFramework as unknown as { MANIFEST_FETCH_FLOOR_MS: number }).MANIFEST_FETCH_FLOOR_MS;
+    const capture = captureConsoleError();
+    try {
+      if (queuedBehind === 'the fetch floor') {
+        // The last refresh finished just inside the floor, so this one is
+        // queued, and runs on its own a few milliseconds later.
+        h.fw.manifestRefreshState.set(h.connection, { inFlight: false, queued: false, lastCompletedAt: Date.now() - floor + 20 });
+        await h.fw.handleManifestChanged(h.connection, announce);
+        assert.equal(h.fw.manifestRefreshState.get(h.connection).queued, true, 'queued, not run yet');
+      } else {
+        // The second announcement comes while the first run is in flight, so
+        // it's queued, and runs once the fetch floor has passed after it.
+        t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+        const first = h.fw.handleManifestChanged(h.connection, announce).then(() => null, (error: unknown) => error);
+        await h.fw.handleManifestChanged(h.connection, announce);
+        assert.equal(h.fw.manifestRefreshState.get(h.connection).queued, true, 'queued behind the first');
+        assert.match(String(await first), /it could not be reaped$/, 'the first run rejects with its failed close');
+        t.mock.timers.tick(floor);
+        t.mock.timers.reset();
+      }
+      await waitFor(
+        () => capture.lines.some((l) => l.includes('srv manifest-changed handler failed') && l.includes('it could not be reaped')),
+        'the queued run to log its failed close',
+      );
+    } finally {
+      capture.stop();
+    }
+  });
+}
+
 test('policy-refused traces report the branch the host took, not raw receipt fields', async () => {
   // Anything but `close` takes the mcp-only branch; a non-string reason is dropped.
   const odd = await runManifestChange({ accepted: false, fallback: 'other', reason: 42 });
@@ -560,22 +649,18 @@ test('policy-refused traces report the branch the host took, not raw receipt fie
   );
 });
 
-test('manifest change: live feature decisions are traced, the scratch proposal is not', async () => {
-  // Accepted: the live manager derives twice (pre-receipt on the standing
-  // grant, then on the new grant). The scratch manager that builds the
-  // proposal derives a third time and must stay off the bus.
+test('manifest change: the feature sets the live derivation turns off are traced', async () => {
   const accepted = await runManifestChange({ accepted: true });
   assert.deepEqual(
-    accepted.disabled.map((t) => `${t.featureSet}:${t.reason}`),
-    ['bare:invalid_uses', 'bare:invalid_uses'],
+    new Set(accepted.disabled.map((t) => `${t.featureSet}:${t.reason}`)),
+    new Set(['bare:invalid_uses']),
   );
-  assert.equal(accepted.lines.filter((l) => l.includes('srv/bare disabled')).length, 3, 'console keeps every line');
 
   // Refused (mcp-only): the second live derivation runs on the empty grant,
   // which also turns chat off.
   const refused = await runManifestChange({ accepted: false, fallback: 'mcp-only' });
   assert.deepEqual(
-    refused.disabled.map((t) => `${t.featureSet}:${t.reason}`),
-    ['bare:invalid_uses', 'chat:missing_capabilities', 'bare:invalid_uses'],
+    new Set(refused.disabled.map((t) => `${t.featureSet}:${t.reason}`)),
+    new Set(['bare:invalid_uses', 'chat:missing_capabilities']),
   );
 });

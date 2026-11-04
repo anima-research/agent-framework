@@ -2,18 +2,23 @@
 //
 // Every tools/call is appended to CALLS_PATH. While HOLD_PATH is set and that
 // file does not exist, replies are withheld, standing in for Discord pacing a
-// long reaction drain. ANSWER_LIMIT_PATH, when that file exists, caps how many
-// calls are answered in all: later calls wait until the number in it grows.
-// When PROBE_PATH appears, the server sends one inference-bearing
-// channels/incoming request and appends to EVENTS_PATH when the host answers
-// it, so a test can see whether the MCPL data plane was held.
-import { appendFileSync, existsSync, readFileSync } from 'node:fs';
+// long reaction drain. When PROBE_PATH appears, the server sends one
+// inference-bearing channels/incoming request and appends to EVENTS_PATH when
+// the host answers it, so a test can see whether the MCPL data plane was held.
+// It sends that request only once the host has sent notifications/initialized:
+// the host's handshake reads nothing but the answer to its initialize, so a
+// request sent before then would never be answered.
+// When CRASH_PATH appears, the server consumes it and exits, and a server that
+// starts while DOWN_PATH exists exits at once, so a test can take the route
+// down and bring it back while the host reconnects.
+import { appendFileSync, existsSync, rmSync } from 'node:fs';
+
+if (process.env.DOWN_PATH && existsSync(process.env.DOWN_PATH)) process.exit(1);
 
 const callsPath = process.env.CALLS_PATH;
 const eventsPath = process.env.EVENTS_PATH;
 const holdPath = process.env.HOLD_PATH;
 const probePath = process.env.PROBE_PATH;
-const answerLimitPath = process.env.ANSWER_LIMIT_PATH;
 const channelId = process.env.CHANNEL_ID ?? 'discord:g1:c1';
 
 const send = (message) => process.stdout.write(JSON.stringify(message) + '\n');
@@ -24,23 +29,12 @@ const event = (name, extra = {}) => {
 };
 
 const held = [];
-let answered = 0;
 let probed = false;
+let initialized = false;
 let buf = '';
 
-function answerLimit() {
-  if (!answerLimitPath || !existsSync(answerLimitPath)) return Infinity;
-  const limit = Number(readFileSync(answerLimitPath, 'utf8').trim());
-  return Number.isFinite(limit) ? limit : Infinity;
-}
-
-function mayAnswer() {
-  return (!holdPath || existsSync(holdPath)) && answered < answerLimit();
-}
-
 function answer(message) {
-  answered++;
-  event('reaction-answered', { messageId: message.params?.arguments?.messageId, name: message.params?.name });
+  event('reaction-answered', { messageId: message.params?.arguments?.messageId });
   reply(message.id, { content: [{ type: 'text', text: 'Reaction applied' }] });
 }
 
@@ -66,6 +60,7 @@ function handle(message) {
     return;
   }
   if (message.method === 'notifications/initialized') {
+    initialized = true;
     request(100, 'channels/register', {
       channels: [{ id: channelId, type: 'discord', label: 'busy', direction: 'bidirectional' }],
     });
@@ -84,7 +79,7 @@ function handle(message) {
     if (callsPath) {
       appendFileSync(callsPath, JSON.stringify({ at: Date.now(), name: message.params?.name, args: message.params?.arguments }) + '\n');
     }
-    if (held.length > 0 || !mayAnswer()) held.push(message);
+    if (holdPath && !existsSync(holdPath)) held.push(message);
     else answer(message);
     return;
   }
@@ -109,8 +104,14 @@ process.stdin.on('data', (chunk) => {
 });
 
 const timer = setInterval(() => {
-  while (held.length > 0 && mayAnswer()) answer(held.shift());
-  if (!probed && probePath && existsSync(probePath)) {
+  if (process.env.CRASH_PATH && existsSync(process.env.CRASH_PATH)) {
+    rmSync(process.env.CRASH_PATH, { force: true });
+    process.exit(1);
+  }
+  if (held.length > 0 && holdPath && existsSync(holdPath)) {
+    for (const message of held.splice(0)) answer(message);
+  }
+  if (!probed && initialized && probePath && existsSync(probePath)) {
     probed = true;
     event('probe-sent');
     request(900, 'channels/incoming', {

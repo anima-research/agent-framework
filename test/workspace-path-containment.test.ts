@@ -102,9 +102,9 @@ test('traversal outside the mount is still rejected', async (t) => {
 
   const read = await call(workspace, 'read', { path: 'work/../escape.txt' });
   assert.equal(read.success, false, 'escaping read must be rejected');
-  assert.match(read.error ?? '', /traversal/i);
+  assert.match(read.error ?? '', /^The read did nothing: "work\/\.\.\/escape\.txt" climbs above the root of mount "work"/);
 
   const write = await call(workspace, 'write', { path: 'work/../../evil.txt', content: 'nope' });
   assert.equal(write.success, false, 'escaping write must be rejected');
-  assert.match(write.error ?? '', /traversal/i);
+  assert.match(write.error ?? '', /^The write did nothing: "work\/\.\.\/\.\.\/evil\.txt" climbs above the root of mount "work"/);
 });

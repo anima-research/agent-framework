@@ -385,7 +385,9 @@ test('a dual server that also serves 2025 traffic connects at 2026-07-28, and se
   assert.ok(!rpcs.includes('initialize'), rpcs.join());
 });
 
-test('a 2025 result is final: one that fails its output schema is a plain error, not an unknown outcome', async () => {
+test('a 2025 result is final: one that fails its output schema is a plain error, not a no-response outcome', async (t) => {
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
   const obj = (properties = {}) => fromJsonSchema({ type: 'object', properties });
   const fixture = await start2025({
     versions: ['2025-06-18'],
@@ -402,9 +404,10 @@ test('a 2025 result is final: one that fails its output schema is a plain error,
   await connection.listTools();
   await assert.rejects(connection.callTool('typed', {}), (err: unknown) => {
     assert.ok(!(err instanceof McplRequestError), `no request outcome is claimed: ${String(err)}`);
-    assert.match((err as Error).message, /answered tools\/call "typed", but the result can't be used: .*output schema/);
+    assert.equal((err as Error).message, 'The "remote" server answered, but not in a form this host can read, so whether the request took effect is unknown. Check its effect before trying again.');
     return true;
   });
+  assert.ok(logged.some((line) => /^MCP server "remote" answered tools\/call typed with a result this host can't use: .*output schema/.test(line)), logged.join('\n'));
 });
 
 test('a list change on a 2025 session is announced, and the next listing has the new tool', async () => {
@@ -746,7 +749,7 @@ for (const held of [false, true]) {
     await assert.rejects(calling, (err: unknown) => {
       assert.ok(err instanceof McplRequestError, String(err));
       assert.equal(err.outcome, 'no-response');
-      assert.match(err.message, /Cancellation was requested; the outcome is unknown/);
+      assert.match(err.message, /^The "remote" server didn't answer within [\d.]+ seconds?, so whether the request took effect is unknown: this host asked it to cancel/);
       return true;
     });
     const resumes = () => count(fixture, (s) => s.method === 'GET' && s.resumed);
@@ -801,6 +804,8 @@ test('on 2026-07-28 a listen stream whose resume keeps failing is given up after
 });
 
 test('on 2026-07-28 a call whose stream the transport gives up on fails then, not at its deadline', async (t) => {
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
   t.mock.method(Math, 'random', () => 0.5); // no jitter
   // The call's stream carries a priming event and ends before the answer,
   // as a server that closes it does; every resume then fails.
@@ -819,9 +824,10 @@ test('on 2026-07-28 a call whose stream the transport gives up on fails then, no
   await assert.rejects(connection.callTool('echo', { text: 'lost' }), (err: unknown) => {
     assert.ok(err instanceof McplRequestError, String(err));
     assert.equal(err.outcome, 'no-response', err.message);
-    assert.match(err.message, /the stream that would carry its answer ended, and could not be resumed\. The outcome is unknown/);
+    assert.equal(err.message, 'The request to the "remote" server failed before an answer came back, so whether it took effect is unknown. Check its effect before trying again.');
     return true;
   });
+  assert.ok(logged.some((line) => line.startsWith('MCP server "remote" tools/call echo failed: ') && line.includes('the stream that would carry its answer ended, and could not be resumed')), logged.join('\n'));
   assert.ok(Date.now() - began < 3000, `the call failed after ${Date.now() - began} ms, as at its deadline`);
   assert.equal(count(fixture, (s) => s.method === 'GET' && s.resumed), 2, 'the transport\'s two retries, then the call failed');
   assert.ok(connection.isConnected);
@@ -858,7 +864,9 @@ test('on 2026-07-28 an earlier round whose stream ends after the next round went
   assert.equal(count(fixture, (s) => s.rpc === 'tools/call'), 2, 'two rounds');
 });
 
-test('on a 2025 revision a call whose stream ends with neither its answer nor an event id fails then, not at its deadline', async () => {
+test('on a 2025 revision a call whose stream ends with neither its answer nor an event id fails then, not at its deadline', async (t) => {
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
   const fixture = await start2025({
     versions: ['2025-06-18'],
     answer: (message, res) => {
@@ -874,9 +882,10 @@ test('on a 2025 revision a call whose stream ends with neither its answer nor an
   await assert.rejects(connection.callTool('echo', { text: 'lost' }), (err: unknown) => {
     assert.ok(err instanceof McplRequestError, String(err));
     assert.equal(err.outcome, 'no-response', err.message);
-    assert.match(err.message, /the stream that would carry its answer ended, and could not be resumed\. The outcome is unknown/);
+    assert.equal(err.message, 'The request to the "remote" server failed before an answer came back, so whether it took effect is unknown. Check its effect before trying again.');
     return true;
   });
+  assert.ok(logged.some((line) => line.startsWith('MCP server "remote" tools/call echo failed: ') && line.includes('the stream that would carry its answer ended, and could not be resumed')), logged.join('\n'));
   assert.ok(Date.now() - began < 3000, `the call failed after ${Date.now() - began} ms, as at its deadline`);
   await until(() => count(fixture, (s) => s.rpc === 'notifications/cancelled') === 1, 'the call cancelled');
   assert.ok(connection.isConnected, 'the session stays');
@@ -927,9 +936,8 @@ test('a session the server ended under a call: the call is refused with 404, and
   await assert.rejects(connection.callTool('echo', { text: 'x' }), (err: unknown) => {
     assert.ok(err instanceof McplRequestError, String(err));
     assert.equal(err.outcome, 'error-response', err.message);
-    assert.equal(err.code, undefined);
     assert.deepEqual(err.data, { httpStatus: 404 });
-    assert.match(err.message, /refused tools\/call "echo": HTTP 404\. The server had ended this connection's session, so the request was not run\./);
+    assert.equal(err.message, 'The "remote" server had ended this connection\'s session, so the request didn\'t run. This host is reconnecting to it; try again later.');
     return true;
   });
   // The new session is still starting: down, and coming back.
@@ -977,7 +985,9 @@ test('a session the server ended while idle: the stream\'s reopen meets 404, and
   assert.deepEqual((await connection.callTool('echo', { text: 'x' })).content, [{ type: 'text', text: 'echo:x' }]);
 });
 
-test('a server upgraded in place to refuse 2025: the call it refused with -32022 is refused, not replayed, and a new connect settles on 2026-07-28', async () => {
+test('a server upgraded in place to refuse 2025: the call it refused with -32022 is refused, not replayed, and a new connect settles on 2026-07-28', async (t) => {
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
   const fixture = await start2025({ versions: ['2025-06-18'], get: 405 }); // no stream to reopen
   const connection = await connect(fixture);
   await connection.listTools();
@@ -987,7 +997,8 @@ test('a server upgraded in place to refuse 2025: the call it refused with -32022
   await assert.rejects(connection.callTool('echo', { text: 'refused' }), (err: unknown) => {
     assert.ok(err instanceof McplRequestError, String(err));
     assert.equal(err.outcome, 'error-response', err.message);
-    assert.equal(err.code, -32022);
+    // The JSON-RPC code is the operator's: it's in the log line, not the error.
+    assert.ok(logged.some((line) => line.startsWith('MCP server "remote" answered tools/call echo with error -32022: ')), logged.join('\n'));
     assert.deepEqual((err.data as { supported?: unknown } | undefined)?.supported, ['2026-07-28']);
     return true;
   });
@@ -1017,7 +1028,9 @@ test('a server upgraded in place to serve 2025 statelessly: the stream\'s reopen
   assert.equal(count(fixture, (s) => s.method === 'DELETE'), 0, 'a session the server let go gets no DELETE');
 });
 
-test('a 2025 server without session ids, upgraded in place to refuse 2025: the refused call is refused, and a new connect settles on 2026-07-28', async () => {
+test('a 2025 server without session ids, upgraded in place to refuse 2025: the refused call is refused, and a new connect settles on 2026-07-28', async (t) => {
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
   const fixture = await start2025({ versions: ['2025-06-18'], stateless: true });
   const connection = await connect(fixture);
   await connection.listTools();
@@ -1028,7 +1041,8 @@ test('a 2025 server without session ids, upgraded in place to refuse 2025: the r
   await assert.rejects(connection.callTool('echo', { text: 'refused' }), (err: unknown) => {
     assert.ok(err instanceof McplRequestError, String(err));
     assert.equal(err.outcome, 'error-response', err.message);
-    assert.equal(err.code, -32022);
+    // The JSON-RPC code is the operator's: it's in the log line, not the error.
+    assert.ok(logged.some((line) => line.startsWith('MCP server "remote" answered tools/call echo with error -32022: ')), logged.join('\n'));
     return true;
   });
   await until(() => events.includes('reconnect'), 'the new connect');
@@ -1075,7 +1089,7 @@ test('a cut request stream whose resume meets 404 ends the session, though no st
     assert.ok(err instanceof McplRequestError, String(err));
     // Its POST was answered: the server may have run it.
     assert.equal(err.outcome, 'no-response', err.message);
-    assert.match(err.message, /The outcome is unknown: the server may already have acted on the call\./);
+    assert.equal(err.message, 'The connection to the "remote" server closed before it answered, so whether the request took effect is unknown. Check its effect before trying again; this host is reconnecting to it.');
     return true;
   });
   // The session's end, within a bound: a resume whose 404 ended nothing
@@ -1379,7 +1393,7 @@ test('a deadline on a 2025 call: cancellation is POSTed, and the server sees the
   await assert.rejects(connection.callTool('slow', { ms: 1500 }), (err: unknown) => {
     assert.ok(err instanceof McplRequestError);
     assert.equal(err.outcome, 'no-response');
-    assert.match(err.message, /Cancellation was requested/);
+    assert.match(err.message, /^The "remote" server didn't answer within 0\.3 seconds, so whether the request took effect is unknown: this host asked it to cancel/);
     return true;
   });
   await until(() => fixture.events.includes('slow-aborted'), 'the server seeing the cancellation');
@@ -1481,7 +1495,7 @@ test('a connect that fails after its initialize was answered DELETEs the session
   const connection = ModernMcpConnection.create({ id: 'failed-start', url: fixture.url });
   connection.on('error', () => {});
   cleanups.push(() => connection.close());
-  await assert.rejects(connection.start(), (error: unknown) => (error as { status?: number }).status === 503);
+  await assert.rejects(connection.start(), (error: unknown) => (error as Error).name === 'SdkHttpError' && /temporarily unavailable/.test((error as Error).message));
   assert.equal(initializes(fixture).length, 1);
   assert.equal(count(fixture, (s) => s.method === 'DELETE'), 1, 'the session the server allocated is DELETEd');
   assert.equal(fixture.sessions.size, 0);
@@ -1660,7 +1674,7 @@ test('in the framework: status shows the negotiated revision, and an ended sessi
   await fixture.forget(false);
   const failed = await framework.executeToolCall({ id: 'after-end', name: 'mcpl--remote--echo', input: { text: 'x' } });
   assert.equal(failed.success, false);
-  assert.match(failed.error!, /HTTP 404\. The server had ended this connection's session, so the request was not run\./);
+  assert.match(failed.error!, /The "remote" server had ended this connection's session, so the request didn't run\. This host is reconnecting to it; try again later\./);
   // While the new session starts, the server stays registered, retrying.
   const [during] = framework.listMcplServers();
   assert.ok(during!.connected || during!.retrying, JSON.stringify(during));

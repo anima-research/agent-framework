@@ -25,6 +25,8 @@ import type { ToolDefinition, ToolCall, ToolResult, ProcessEvent } from '../../t
 import type { EventResponse, ProcessState } from '../../types/module.js';
 import type { AgentFramework } from '../../framework.js';
 import { formatZonedDateTime, resolveTimeZone } from '../../timezone.js';
+import { safeSlice } from '../../safe-slice.js';
+import { unknownToolMessage } from '../unknown-tool.js';
 
 export interface HealthModuleConfig {
   /** IANA zone for timestamps returned by the snapshot tool. */
@@ -126,7 +128,7 @@ export class HealthModule implements Module {
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
     if (call.name !== 'snapshot') {
-      return { success: false, isError: true, error: `Unknown tool: ${call.name}` };
+      return { success: false, isError: true, error: unknownToolMessage(this.name, call.name, this.getTools()) };
     }
     const input = (call.input ?? {}) as SnapshotInput;
     const lookback = input.lookback ?? this.config.defaultLookback;
@@ -155,8 +157,11 @@ export class HealthModule implements Module {
     includeSubagents: boolean,
   ): Record<string, unknown> {
     if (!this.framework || !this.store) {
+      // The host's mistake, named for whoever runs it; the agent reads what
+      // it can do about it, which is nothing.
+      console.error('[health] snapshot asked for before the host bound the module: call bind(framework, store) before tool dispatch');
       throw new Error(
-        'HealthModule not bound — host must call bind(framework, store) before tool dispatch.',
+        "The health snapshot isn't available: this host hasn't finished setting up the health module, so nothing was read. Calling it again won't change that; ask whoever runs this host.",
       );
     }
 
@@ -196,7 +201,7 @@ export class HealthModule implements Module {
       .map((s) => ({
         timestamp: s.timestamp,
         agentName: s.agentName,
-        error: typeof s.error === 'string' ? s.error.slice(0, 400) : s.error,
+        error: typeof s.error === 'string' ? safeSlice(s.error, 0, 400) : s.error,
         requestId: s.requestId,
       }));
 

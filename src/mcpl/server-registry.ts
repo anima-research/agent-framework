@@ -40,11 +40,19 @@ export class McplServerRegistry {
    * confirmed exited stays registered all the same, as the closed connection
    * that owns it ({@link McplUnreapedLaunchError}), so the id stays held
    * and removeServer can retry the reap.
+   *
+   * `onRegister` runs with the connection the connect resolved with, a
+   * reconnecting stub's included, synchronously just before it is
+   * registered, so what it records about the connection is in place before
+   * anything that reads the registry can see it. A failed launch registered
+   * as its child's owner doesn't run it. It must not throw: it runs before
+   * the registry owns the connection, so nothing would close it.
    */
   async addServer(
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
     signal?: AbortSignal,
+    onRegister?: (connection: McplServerConnection) => void,
   ): Promise<McplServerConnection> {
     if (this.servers.has(config.id) || this.adding.has(config.id)) {
       throw new Error(`MCPL server "${config.id}" is already registered`);
@@ -53,7 +61,7 @@ export class McplServerRegistry {
     this.adding.add(config.id);
     let connection: McplServerConnection;
     try {
-      connection = config.reconnect
+      connection = config.reconnect === true
         ? await McplServerConnection.connectWithReconnect(config, hostCapabilities, signal)
         : await McplServerConnection.connect(config, hostCapabilities, signal);
     } catch (error) {
@@ -62,6 +70,7 @@ export class McplServerRegistry {
     } finally {
       this.adding.delete(config.id);
     }
+    onRegister?.(connection);
     this.register(config, connection);
     return connection;
   }
@@ -69,11 +78,13 @@ export class McplServerRegistry {
   private register(config: McplServerConfig, connection: McplServerConnection): void {
     this.servers.set(config.id, connection);
 
-    // Auto-remove on unexpected close (unless reconnect will re-add). A
-    // connection that still owns a child it couldn't reap keeps its id, so
+    // Auto-remove on close unless the connection will reconnect. That was
+    // decided once, from `reconnect === true` at connect, and a close() the
+    // host asks for disarms it first, so a server closed for good goes too.
+    // A connection that still owns a child it couldn't reap keeps its id, so
     // nothing launches beside that child; removeServer retries the reap.
     connection.on('close', () => {
-      if (!config.reconnect && this.servers.get(config.id) === connection && !connection.holdsUnreapedChild) {
+      if (!connection.willReconnect && this.servers.get(config.id) === connection && !connection.holdsUnreapedChild) {
         this.servers.delete(config.id);
       }
     });
@@ -175,7 +186,16 @@ export class McplServerRegistry {
     })), timeoutMs);
   }
 
-  private closeServer(id: string, connection: McplServerConnection): Promise<void> {
+  /**
+   * Close a server for good and drop its entry, if this connection is still
+   * the one registered under `id`. The entry goes when close() resolves,
+   * whatever the connection reports: close() emits no 'close' for a
+   * connection that's down between retries, such as a reconnect stub waiting
+   * for its next retry, so the 'close' listener alone would leave it
+   * registered. A close that fails keeps the entry and rejects; a close
+   * already under way is shared.
+   */
+  closeServer(id: string, connection: McplServerConnection): Promise<void> {
     const existing = this.closing.get(connection);
     if (existing) return existing;
     const attempt = Promise.resolve().then(() => connection.close()).then(() => {

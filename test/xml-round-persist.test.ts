@@ -11,9 +11,7 @@
  * scaffold-in-its-own-voice.
  *
  * With membrane ≥0.5.79 the context carries `roundPreamble` (this round's
- * delta only) and the framework must prefer it. With an older membrane
- * (no `roundPreamble`) the cumulative fallback remains — pinned here so the
- * compat shape stays visible and deliberate.
+ * delta only), and the framework persists it alone.
  */
 
 import { describe, it, beforeEach } from 'node:test';
@@ -58,8 +56,8 @@ interface XmlRound {
 /**
  * Mock yielding stream simulating membrane's XML tool mode: tool-calls
  * events carry NO roundContent; `preamble` is cumulative (with injected
- * results XML between rounds), `roundPreamble` optionally carries the
- * per-round delta.
+ * results XML between rounds), `roundPreamble` carries the per-round
+ * delta.
  */
 class XmlMockStream implements YieldingStream {
   private events: StreamEvent[] = [];
@@ -71,7 +69,6 @@ class XmlMockStream implements YieldingStream {
   constructor(
     private rounds: XmlRound[],
     private finalText: string,
-    private withRoundPreamble: boolean,
   ) {
     this.emitRound();
   }
@@ -115,7 +112,8 @@ class XmlMockStream implements YieldingStream {
         depth: this._round,
         previousResults: [],
         accumulated: this.cumulativePreamble(this._round) + round.rawText,
-        ...(this.withRoundPreamble ? { roundPreamble: round.text + '\n' } : {}),
+        roundPreamble: round.text + '\n',
+        supportsInjectedMessages: false,
       },
     } as StreamEvent);
   }
@@ -165,7 +163,6 @@ class XmlMockStream implements YieldingStream {
 }
 
 class XmlMockMembrane {
-  constructor(private withRoundPreamble: boolean) {}
   calls: NormalizedRequest[] = [];
 
   async complete(request: NormalizedRequest): Promise<NormalizedResponse> {
@@ -181,7 +178,6 @@ class XmlMockMembrane {
         { text: R2, rawText: RAW2, callId: 'call_2', callInput: { message: 'round2' } },
       ],
       FINAL,
-      this.withRoundPreamble,
     );
   }
 
@@ -220,9 +216,9 @@ class EchoModule implements Module {
   }
 }
 
-async function runTurn(withRoundPreamble: boolean): Promise<string> {
+async function runTurn(): Promise<string> {
   const tempDir = mkdtempSync(join(tmpdir(), 'xml-round-persist-'));
-  const membrane = new XmlMockMembrane(withRoundPreamble);
+  const membrane = new XmlMockMembrane();
   const framework = await AgentFramework.create({
     storePath: join(tempDir, 'test.chronicle'),
     membrane: membrane.asMembrane(),
@@ -259,7 +255,7 @@ function count(haystack: string, needle: string): number {
 
 describe('XML-mode per-round persist (scaffold-leak pyramid regression)', () => {
   it('stores each round exactly once when membrane provides roundPreamble', async () => {
-    const storedText = await runTurn(true);
+    const storedText = await runTurn();
     assert.strictEqual(count(storedText, R1), 1, `round-1 text stored once, got: ${count(storedText, R1)}`);
     assert.strictEqual(count(storedText, R2), 1, 'round-2 text stored once');
     assert.strictEqual(count(storedText, FINAL), 1, 'final text stored once');
@@ -267,15 +263,5 @@ describe('XML-mode per-round persist (scaffold-leak pyramid regression)', () => 
       count(storedText, INJECTED), 0,
       'injected <function_results> XML must never persist as agent text',
     );
-  });
-
-  it('legacy membrane without roundPreamble keeps the cumulative fallback (pinned)', async () => {
-    const storedText = await runTurn(false);
-    // The old shape, deliberately pinned: round-1 in rounds 1+2 = 2 copies,
-    // injected results re-persisted once. When the fleet's membrane floor
-    // reaches 0.5.79 this contract can be dropped along with the fallback.
-    assert.strictEqual(count(storedText, R1), 2, 'cumulative fallback: round-1 text twice');
-    assert.strictEqual(count(storedText, R2), 1, 'round-2 text once');
-    assert.strictEqual(count(storedText, INJECTED), 1, 'injected XML persisted once by fallback');
   });
 });

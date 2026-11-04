@@ -17,7 +17,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { fixture, TS } from './helpers/coalescing-fixture.js';
 import { logDetail, logValue } from '../src/mcpl/log-value.js';
-import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, destinationKey } from '../src/mcpl/channel-registry.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import { parseDeclaredClasses } from '../src/mcpl/tool-classes.js';
 import { RefusalLines } from '../src/mcpl/refusal-lines.js';
@@ -247,10 +247,10 @@ test('speech routed into a closed channel names the channel as one field on each
   const registry = new ChannelRegistry(
     { getServer: () => server } as unknown as McplServerRegistry, {} as FeatureSetManager, () => {}, () => {}, {},
   );
-  (registry as unknown as { channels: Map<string, unknown> }).channels.set(`editor:${FORGED_CHANNEL}`, {
+  (registry as unknown as { channels: Map<string, unknown> }).channels.set(destinationKey({ serverId: 'editor', channelId: FORGED_CHANNEL }), {
     serverId: 'editor', descriptor: { id: FORGED_CHANNEL, type: 'discord', label: 'chat' }, open: false,
   });
-  const routed = await registry.routeSpeech('agent', 'hello', FORGED_CHANNEL);
+  const routed = await registry.routeSpeech('agent', 'hello', { serverId: 'editor', channelId: FORGED_CHANNEL });
   assert.equal(routed?.delivered, true);
   assert.deepEqual(lines.filter((l) => l.startsWith('[routeSpeech]')), [
     `[routeSpeech] agent: locus ${field(FORGED_CHANNEL)} was closed — opened by delivery (speech implies engagement)`,
@@ -262,13 +262,21 @@ test('a refusal reaction with no server for its locus names the locus as one fie
   const lines = captureConsoleError(t);
   const locus = `discord:g1:${FORGED_CHANNEL}`;
   const fakeThis = {
-    channelRegistry: { buildChannelContext: () => ({ incoming: { channelId: locus, messageId: 'm1' } }), getChannelServerId: () => undefined },
+    channelRegistry: { incomingFor: () => ({ channel: { serverId: 'gone', channelId: locus }, messageId: 'm1' }) },
     mcplServerRegistry: { getServer: () => undefined },
   };
   const react = (AgentFramework.prototype as unknown as { reactToRefusal: (agent: string, category: string) => Promise<void> }).reactToRefusal;
   await react.call(fakeThis, 'agent', 'harmful');
-  assert.deepEqual(lines, [`[inference-refusal] reaction skipped: no MCPL server for locus ${field(locus)} (agent=agent)`]);
+  // A plain token, as a server id is, prints unquoted (logValue).
+  assert.deepEqual(lines, [`[inference-refusal] reaction skipped: no MCPL server for locus ${field(locus)} on server gone (agent=agent)`]);
 });
+
+/** The framework's own spawn step, which both spawn paths decide through,
+ *  for a stub framework: it calls the stub's createConversationAgent. */
+function spawnStep() {
+  const proto = AgentFramework.prototype as unknown as Record<'routeConversation' | 'spawnConversationAgent', unknown>;
+  return { conversationSpawns: new Map(), routeConversation: proto.routeConversation, spawnConversationAgent: proto.spawnConversationAgent };
+}
 
 test('a conversation agent that fails to spawn names its channel as one field', async (t) => {
   const lines = captureConsoleError(t);
@@ -276,6 +284,8 @@ test('a conversation agent that fails to spawn names its channel as one field', 
   const fakeThis = {
     conversationRouter: { route: () => ({ kind: 'spawn', agentName: 'conversation-chat-g1', generation: 1, trigger: true }), templateAgent: 'agent' },
     channelRegistry: { getDescriptor: () => undefined },
+    storeConversationGeneration: () => {},
+    ...spawnStep(),
     createConversationAgent: async () => { throw new Error('no room'); },
     emitTrace: (e: { type: string }) => { traces.push(e); },
   };
@@ -294,6 +304,8 @@ test('a coalesced batch whose conversation agent fails to spawn names its channe
       route: () => ({ kind: 'spawn', agentName: 'conversation-chat-g1', generation: 1, trigger: true }),
     },
     channelRegistry: { getDescriptor: () => undefined },
+    storeConversationGeneration: () => {},
+    ...spawnStep(),
     createConversationAgent: async () => { throw new Error('no room'); },
   };
   const audience = (AgentFramework.prototype as unknown as { coalescedAudience: (occ: unknown) => Promise<string[]> }).coalescedAudience;

@@ -7,6 +7,8 @@
  * - a failed launch that can't be reaped is held, never orphaned: connect()
  *   hands its owner to the caller, connectWithReconnect() and the reconnect
  *   loop halt, and close() retries the reap;
+ * - a handshake whose stdio pipe failed fails, even when it's answered, so
+ *   no connection is adopted that can't write to its child;
  * - close() during a reconnect handshake ends that launch before resolving;
  * - no reconnect launches while the previous child may still be running.
  */
@@ -14,14 +16,15 @@ import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
+import type { ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 
-import { McplServerConnection, McplUnreapedLaunchError } from '../src/mcpl/server-connection.js';
+import { McplServerConnection, McplUnreapedLaunchError, stderrTailOf } from '../src/mcpl/server-connection.js';
 import { McplServerRegistry } from '../src/mcpl/server-registry.js';
-import { StdioTransport, openTransport } from '../src/mcpl/transport.js';
+import { StdioTransport, openTransport, setStdioExitGraceForTests } from '../src/mcpl/transport.js';
 import { createServer, type Socket } from 'node:net';
 import { createServer as createHttpServer } from 'node:http';
 import { EventEmitter } from 'node:events';
@@ -30,6 +33,7 @@ import type { McplHostCapabilities, McplServerConfig } from '../src/mcpl/types.j
 const here = dirname(fileURLToPath(import.meta.url));
 const SERVER = join(here, 'fixtures', 'legacy-version-server.mjs');
 const HOST_CAPS: McplHostCapabilities = { version: '0.5', pushEvents: true };
+const LONGER_THAN_ANY_START_MS = 60_000;
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => {
@@ -47,33 +51,37 @@ const starts = (log: string): number[] =>
   existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean).map((l) => Number(l.split(' ')[1])) : [];
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
-async function until(cond: () => boolean, what: string, ms = 10_000): Promise<void> {
-  const deadline = Date.now() + ms;
+async function until(cond: () => boolean, what: string): Promise<void> {
+  const deadline = Date.now() + LONGER_THAN_ANY_START_MS;
   while (!cond() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
-  assert.ok(cond(), `in time: ${what}`);
+  assert.ok(cond(), `${what}, within ${LONGER_THAN_ANY_START_MS} ms`);
 }
 
 function config(mode: string, log: string, extra: Partial<McplServerConfig> = {}): McplServerConfig {
   return { id: 'legacy', command: process.execPath, args: [SERVER, mode, log], ...extra };
 }
 const RECONNECT = { reconnect: true, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 } as const;
+const SHORT_GRACE_MS = 50;
 
 /**
  * Launches from the `from`-th on can't be signalled, so their cleanup can't
  * reap them (Olive-1804's pattern in mcp-modern-outcomes). `kill` really ends
- * one; cleanup restores spawning and ends any left.
+ * one, and `unreaped` settles when its transport reports it unreaped; cleanup
+ * restores spawning and ends any left.
  */
-function unreapableFrom(from: number): Array<{ pid: number; kill: () => void }> {
+function unreapableFrom(from: number, graceMs?: number): Array<{ pid: number; kill: () => void; unreaped: Promise<void> }> {
   const realSpawn = StdioTransport.spawn;
-  const stuck: Array<{ pid: number; kill: () => void }> = [];
+  const stuck: Array<{ pid: number; kill: () => void; unreaped: Promise<void> }> = [];
   let launches = 0;
-  (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = (c) => {
-    const transport = realSpawn.call(StdioTransport, c);
+  (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = async (c) => {
+    const transport = await realSpawn.call(StdioTransport, c);
     if (++launches >= from) {
-      const child = (transport as unknown as { child: { pid: number; kill: (signal?: string) => boolean } }).child;
+      const child = (transport as unknown as { child: ChildProcess & { pid: number } }).child;
       const realKill = child.kill.bind(child);
       child.kill = () => true;
-      stuck.push({ pid: child.pid, kill: () => { realKill('SIGKILL'); } });
+      if (graceMs !== undefined) setStdioExitGraceForTests(child, graceMs);
+      const unreaped = new Promise<void>((resolve) => { transport.once('unreaped', () => resolve()); });
+      stuck.push({ pid: child.pid, kill: () => { realKill('SIGKILL'); }, unreaped });
     }
     return transport;
   };
@@ -82,6 +90,35 @@ function unreapableFrom(from: number): Array<{ pid: number; kill: () => void }> 
     for (const s of stuck) s.kill();
   });
   return stuck;
+}
+
+/**
+ * The first launch from here on, as the transport its spawn yields, and for
+ * each line that transport hands over, whether it came in the same callback
+ * as the line before it.
+ */
+function firstLaunch(): { transport: () => StdioTransport | undefined; sameCallback: boolean[] } {
+  const realSpawn = StdioTransport.spawn;
+  let first: StdioTransport | undefined;
+  const sameCallback: boolean[] = [];
+  (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = async (c) => {
+    const transport = await realSpawn.call(StdioTransport, c);
+    if (first) return transport;
+    first = transport;
+    // A callback's lines are handed over with no microtask between them.
+    let inCallback = false;
+    transport.on('line', () => {
+      sameCallback.push(inCallback);
+      inCallback = true;
+      queueMicrotask(() => { inCallback = false; });
+    });
+    return transport;
+  };
+  cleanups.push(() => { (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = realSpawn; });
+  // The launch is ended once its test is over too, so a test that fails
+  // before its handshake ends doesn't leave the child running.
+  cleanups.push(() => first?.close().catch(() => {}));
+  return { transport: () => first, sameCallback };
 }
 
 async function killAndWait(stuck: { pid: number; kill: () => void }): Promise<void> {
@@ -121,21 +158,21 @@ test('concurrent close() calls share the teardown: none resolves while the child
   const first = connection.close().then(() => order.push(`first:${alive(pid!) ? 'alive' : 'gone'}`));
   const second = connection.close().then(() => order.push(`second:${alive(pid!) ? 'alive' : 'gone'}`));
   await Promise.all([first, second]);
-  assert.deepEqual(order, ['first:gone', 'second:gone']);
+  assert.deepEqual(order.sort(), ['first:gone', 'second:gone']);
 });
 
 test('a close that cannot reap fails, and so do concurrent ones; a later close re-checks and settles', async () => {
   const log = scratchLog();
-  const stuck = unreapableFrom(1);
+  const stuck = unreapableFrom(1, SHORT_GRACE_MS);
   const connection = await McplServerConnection.connect(config('ok', log), HOST_CAPS);
   connection.ready();
   const settled: string[] = [];
   const outcome = (name: string) => [() => settled.push(`${name}:ok`), (e: Error) => settled.push(`${name}:${e.message}`)] as const;
   const first = connection.close().then(...outcome('first'));
   const second = connection.close().then(...outcome('second'));
-  // The teardown sends SIGTERM, waits 2 s, sends SIGKILL and waits 2 s more
-  // before it gives up, so at 1 s it is still pending.
-  await new Promise((r) => setTimeout(r, 1000));
+  // The teardown sends SIGTERM, waits the grace, sends SIGKILL and waits the
+  // grace again before it gives up, so at half the grace it is still pending.
+  await new Promise((r) => setTimeout(r, SHORT_GRACE_MS / 2));
   assert.deepEqual(settled, [], 'neither resolves while the teardown is pending');
   await Promise.all([first, second]);
   assert.equal(settled.length, 2);
@@ -147,7 +184,7 @@ test('a close that cannot reap fails, and so do concurrent ones; a later close r
 
 test('a failed connect that cannot be reaped hands its owner to the caller, who can retry the reap', async () => {
   const log = scratchLog();
-  const stuck = unreapableFrom(1);
+  const stuck = unreapableFrom(1, SHORT_GRACE_MS);
   const error = await McplServerConnection.connect(config('error', log), HOST_CAPS).then(() => null, (e: unknown) => e);
   assert.ok(error instanceof McplUnreapedLaunchError, String(error));
   assert.match(error.message, /initialize failed on purpose; its cleanup also failed: .*could not be reaped/);
@@ -160,28 +197,65 @@ test('a failed connect that cannot be reaped hands its owner to the caller, who 
   await owner.close();
 });
 
-test('with reconnect, a failed first launch that cannot be reaped halts instead of retrying', async () => {
+test("a handshake answered after its stdio pipe failed fails, holding a child that outlived SIGKILL, rather than adopting a connection that can't write to it", async () => {
   const log = scratchLog();
-  const stuck = unreapableFrom(1);
-  const connection = await McplServerConnection.connectWithReconnect(config('error', log, RECONNECT), HOST_CAPS);
-  cleanups.push(() => connection.close().catch(() => {}));
-  const failures: Array<{ error: string; attempt: number; permanent?: boolean }> = [];
-  connection.on('connect-failed', (f) => failures.push(f));
-  connection.ready();
-  await until(() => failures.length > 0, 'the connect-failed event');
-  assert.equal(failures[0]!.permanent, true);
-  assert.match(failures[0]!.error, /initialize failed on purpose; the previous launch could not be reaped .*reconnecting is halted/);
-  assert.equal(connection.willReconnect, false);
-  // 300 ms is several reconnect intervals (20–40 ms): a retry would have launched.
-  await new Promise((r) => setTimeout(r, 300));
-  assert.equal(starts(log).length, 1, 'no launch beside the unreaped one');
+  const stuck = unreapableFrom(1, SHORT_GRACE_MS);
+  const connecting = McplServerConnection.connect(config('deaf-ping', log), HOST_CAPS).then(() => null, (e: unknown) => e);
+  // The server closed its stdin and pinged this host, whose answer met EPIPE.
+  // The reap gives up on the child while the handshake still waits, with
+  // nothing listening for that yet; only then does the server answer.
+  await until(() => stuck.length === 1, 'the launch');
+  await stuck[0]!.unreaped;
+  process.kill(stuck[0]!.pid, 'SIGUSR2');
+  const error = await connecting;
+  assert.ok(error instanceof McplUnreapedLaunchError, String(error));
+  assert.match(error.message, /^MCPL server "legacy": this host stopped using the server's stdio during the handshake \(write EPIPE\); its cleanup also failed: stdio child \d+ of MCP server "legacy" did not exit within \d+ms of SIGKILL; it could not be reaped$/);
+  const owner = error.connection;
+  assert.equal(owner.isConnected, false);
+  assert.equal(owner.willReconnect, false);
+  await assert.rejects(owner.close(), /could not be reaped/, 'still running: the reap fails again');
   await killAndWait(stuck[0]!);
-  await connection.close();
+  await owner.close();
+});
+
+test('a handshake fails when its answer is read in the same callback as a ping whose answer met EPIPE, and its cleanup reaps the child', async () => {
+  const log = scratchLog();
+  const launch = firstLaunch();
+  const connecting = McplServerConnection.connect(config('deaf-ping-answered', log), HOST_CAPS).then(() => null, (e: unknown) => e);
+  // The server has closed its stdin and said so on stderr, and that line is
+  // in this host's stderr tail. Only then does it write a ping and its answer
+  // together, so this host reads both in one callback: its answer to the ping
+  // meets EPIPE, which is reported only once that callback has returned.
+  await until(() => /deaf-ping: stdin closed/.test(launch.transport()?.stderrTail ?? ''), "the server's stderr line");
+  const [pid] = starts(log);
+  process.kill(pid!, 'SIGUSR2');
+  const error = await connecting;
+  assert.deepEqual(launch.sameCallback, [false, true], 'the ping and the answer were read in one callback');
+  assert.ok(error instanceof Error && !(error instanceof McplUnreapedLaunchError), String(error));
+  assert.match(String(error), /^Error: MCPL server "legacy": this host stopped using the server's stdio during the handshake \(write EPIPE\)$/);
+  assert.match(stderrTailOf(error) ?? '', /deaf-ping: stdin closed/, "the server's stderr goes with it, as with the handshake's other failures");
+  assert.equal(alive(pid!), false, "gone once the connect failed: the handshake's cleanup reaped it");
+});
+
+test('with reconnect too, a failed first launch that cannot be reaped throws, handing over its owner, as without', async () => {
+  const log = scratchLog();
+  const stuck = unreapableFrom(1, SHORT_GRACE_MS);
+  const error = await McplServerConnection.connectWithReconnect(config('error', log, RECONNECT), HOST_CAPS).then(() => null, (e: unknown) => e);
+  // No stub: no retry starts beside a child that may still be running.
+  assert.ok(error instanceof McplUnreapedLaunchError, String(error));
+  assert.match(error.message, /initialize failed on purpose; its cleanup also failed: .*could not be reaped/);
+  const owner = error.connection;
+  cleanups.push(() => owner.close().catch(() => {}));
+  assert.equal(owner.willReconnect, false);
+  await assert.rejects(owner.close(), /could not be reaped/, 'still running: the reap fails again');
+  await killAndWait(stuck[0]!);
+  await owner.close();
+  assert.equal(starts(log).length, 1, 'no launch beside the unreaped one');
 });
 
 test('a reconnect launch that cannot be reaped halts reconnecting; close() settles it once it has exited', async () => {
   const log = scratchLog();
-  const stuck = unreapableFrom(2);
+  const stuck = unreapableFrom(2, SHORT_GRACE_MS);
   const connection = await McplServerConnection.connectWithReconnect(config('ok-then-error', log, RECONNECT), HOST_CAPS);
   cleanups.push(() => connection.close().catch(() => {}));
   connection.ready();
@@ -194,6 +268,29 @@ test('a reconnect launch that cannot be reaped halts reconnecting; close() settl
   // 300 ms is several reconnect intervals (20–40 ms): a retry would have launched.
   await new Promise((r) => setTimeout(r, 300));
   assert.equal(starts(log).length, 2, 'no third launch while the second is unreaped');
+  await assert.rejects(connection.close(), /could not be reaped/);
+  await killAndWait(stuck[0]!);
+  await connection.close();
+});
+
+test("a reconnect stub held as unreaped before its first ready() still delivers its connect-failed and its permanent failure there", async () => {
+  const log = scratchLog();
+  // The first launch fails its handshake and is reaped, so a stub reconnects;
+  // the second fails too, and its cleanup can't reap it.
+  const stuck = unreapableFrom(2, SHORT_GRACE_MS);
+  const connection = await McplServerConnection.connectWithReconnect(config('error', log, RECONNECT), HOST_CAPS);
+  cleanups.push(() => connection.close().catch(() => {}));
+  const reports: Array<{ event: string; attempt: number; permanent?: boolean }> = [];
+  connection.on('connect-failed', (f: { attempt: number }) => reports.push({ event: 'connect-failed', ...f }));
+  connection.on('reconnect-failed', (f: { attempt: number; permanent?: boolean }) => reports.push({ event: 'reconnect-failed', ...f }));
+  await until(() => connection.holdsUnreapedChild, 'the reconnect launch held');
+  assert.equal(connection.willReconnect, false);
+  assert.equal(reports.length, 0, 'held until the first release');
+  connection.ready();
+  assert.deepEqual(
+    reports.map((r) => [r.event, r.event === 'connect-failed' ? r.attempt : r.permanent === true]),
+    [['connect-failed', 0], ['reconnect-failed', true]],
+  );
   await assert.rejects(connection.close(), /could not be reaped/);
   await killAndWait(stuck[0]!);
   await connection.close();
@@ -268,7 +365,7 @@ test('registry: an id stays held through its reap, and a second add is refused w
   })();
   await until(() => registry.getServer('legacy') !== null, 'registered');
   await until(() => starts(log).length === 1, 'launched');
-  await new Promise((r) => setTimeout(r, 100));
+  await until(() => existsSync(`${log}.sigterm`), 'the reap to begin');
   await assert.rejects(registry.addServer(config('ok', log), HOST_CAPS), /already registered/, 'held while its reap runs');
   await removing;
   assert.equal(registry.getServer('legacy'), null, 'freed once the exit is confirmed');
@@ -284,7 +381,7 @@ test('registry: an id stays held through its reap, and a second add is refused w
 test('registry: a connection whose reap fails stays registered, through close() and closeAll(), until a retry confirms the exit', async () => {
   const log = scratchLog();
   const registry = new McplServerRegistry();
-  const stuck = unreapableFrom(1);
+  const stuck = unreapableFrom(1, SHORT_GRACE_MS);
   const connection = await registry.addServer(config('ok', log), HOST_CAPS);
   // Its own close() can't reap: the registry keeps it, holding the id.
   await assert.rejects(connection.close(), /could not be reaped/);
@@ -304,7 +401,7 @@ test('registry: a connection whose reap fails stays registered, through close() 
 test('registry: closeAll closes every connection, removes the ones it reaped, and keeps and reports the one it could not', async () => {
   const log = scratchLog();
   const registry = new McplServerRegistry();
-  const stuck = unreapableFrom(2);
+  const stuck = unreapableFrom(2, SHORT_GRACE_MS);
   const fine = await registry.addServer({ ...config('ok', log), id: 'fine' }, HOST_CAPS);
   const held = await registry.addServer({ ...config('ok', log), id: 'held' }, HOST_CAPS);
   await assert.rejects(registry.closeAll(), /could not be reaped/);
@@ -317,7 +414,7 @@ test('registry: closeAll closes every connection, removes the ones it reaped, an
 
 test('a reconnect whose previous child cannot be reaped holds it and halts reconnecting', async () => {
   const log = scratchLog();
-  const stuck = unreapableFrom(1);
+  const stuck = unreapableFrom(1, SHORT_GRACE_MS);
   const connection = await McplServerConnection.connectWithReconnect(config('ok', log, RECONNECT), HOST_CAPS);
   cleanups.push(() => connection.close().catch(() => {}));
   connection.ready();
@@ -352,10 +449,10 @@ test('a WebSocket dial whose connection is closed meanwhile ends at once, not at
   assert.ok(Date.now() - began < 5_000, 'well before the 15 s open timeout');
 });
 
-test("a write to a stdio child that has just exited is reported, never thrown", (t) => {
+test("a write to a stdio child that has just exited is never thrown, and isn't reported as an error: the exit's close names it", (t) => {
   const child = Object.assign(new EventEmitter(), { stdin: new EventEmitter(), stderr: new EventEmitter(), killed: false, exitCode: null });
   const rl = new EventEmitter();
-  const transport = new (StdioTransport as unknown as new (id: string, c: unknown, r: unknown) => StdioTransport)('legacy', child, rl);
+  const transport = new (StdioTransport as unknown as new (c: unknown, r: unknown, id: string) => StdioTransport)(child, rl, 'legacy');
   const logged: unknown[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args); });
   const epipe = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
@@ -363,7 +460,11 @@ test("a write to a stdio child that has just exited is reported, never thrown", 
   const reported: unknown[] = [];
   transport.on('error', (error) => reported.push(error));
   child.stdin.emit('error', epipe);
-  assert.deepEqual(reported, [epipe], "it's the transport's error once someone listens");
+  assert.deepEqual(reported, [], "the stdin carries the protocol, so the exit's close reports it");
+  const closed: Array<{ reason?: string }> = [];
+  transport.on('close', (info: { reason?: string }) => closed.push(info));
+  child.emit('exit', 0, null);
+  assert.match(closed[0]?.reason ?? '', /this host had stopped using the server's stdio \(write EPIPE\)/);
 });
 
 test('close() during a WebSocket reconnect dial returns promptly, ending the dial', async () => {

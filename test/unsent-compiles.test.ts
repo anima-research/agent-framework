@@ -3,10 +3,10 @@
  *
  * A committing compile commits fold resolutions and queues compression work.
  * Agent-framework also moves the agent's consumed watermark (RFC-006) and
- * settles a prepared budget change at a full compile. With context-manager's
- * thinking binding (context-manager#160), a committing compile also commits
- * stamps and joins the branch's compiles awaiting acceptance, where one never
- * sent can fence the replies of a live stream. Previews and the API's message
+ * settles a prepared budget change at a full compile. With the thinking
+ * binding (`thinkingBinding.binds`), a committing compile also writes the
+ * context manager's binding record, which a compile never sent would leave
+ * vouching for a request nobody made. Previews and the API's message
  * list and context are never sent, so each compiles as a dry run.
  */
 import { describe, it } from 'node:test';

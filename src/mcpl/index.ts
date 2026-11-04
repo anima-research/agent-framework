@@ -88,6 +88,11 @@ export type {
 } from './types.js';
 
 export { McplMethod } from './types.js';
+// RFC-014 tool presence and toolsets (host side).
+export { ToolsetHub, ToolsetController, TOOLSETS_MODULE, META_TOOL_NAMES } from './toolset-host.js';
+export { ToolsetsModule, TOOLSETS_REMINDER_NAMESPACE } from './toolsets-module.js';
+export { ToolPresence } from './tool-presence.js';
+export type { ChangeSet, MetaToolNames, ToolsetDecl } from './tool-presence.js';
 
 // Error codes and factories
 export {
@@ -115,7 +120,7 @@ export {
   LEGACY_MCP_PROTOCOL_VERSION,
   MODERN_MCP_PROTOCOL_VERSION,
   MAX_TIMER_MS,
-  MCPL_ONLY_POLICY_FIELDS,
+  mcplPolicyGrants,
   resolveServerBinding,
   serverConfigProblems,
   serverConfigWarnings,
@@ -171,6 +176,17 @@ export { InferenceRouter } from './inference-router.js';
 
 // Channel registry (channel lifecycle, incoming messages, synthesized tools)
 export { ChannelRegistry } from './channel-registry.js';
+export type { ChannelRef, PublishRefusalReason } from './channel-registry.js';
+
+// Inbound source envelope: where each accepted item came from, stamped once;
+// and the digest of a delivered or stored body
+export { INBOUND_SOURCE_KEY, readInboundSource, conversationKey, sourceBodyDigest } from './inbound-source.js';
+export type {
+  InboundSource,
+  InboundChannelSource,
+  InboundUnscopedSource,
+  InboundSurfaceSource,
+} from './inbound-source.js';
 
 // Per-channel conversation routing (fork-per-channel agents)
 /** @deprecated Per-channel conversation routing is deprecated and will be removed (anima-research/agent-framework#235). */

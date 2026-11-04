@@ -7,6 +7,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { toolResultDataToHistoryString } from '../src/tool-result-history.js';
+import { NON_STRING_TEXT_PLACEHOLDER } from '../src/mcpl/visible-content.js';
 
 test('text-only MCP content array: blocks join with newlines', () => {
   const data = [
@@ -44,20 +45,67 @@ test('unknown block shape falls back to JSON', () => {
   assert.equal(toolResultDataToHistoryString(data), JSON.stringify(data));
 });
 
-test('mixed known + unknown block shape falls back to JSON (all-or-nothing)', () => {
+test('blocks of MCP types the lane cannot show are markers, block by block, never the JSON with their data', () => {
   const data = [
     { type: 'text', text: 'fine' },
     { type: 'audio', data: 'XX', mimeType: 'audio/mpeg' },
   ];
+  assert.equal(toolResultDataToHistoryString(data), "fine\n[Audio not shown: this host's tool results carry only text and images (audio/mpeg, 1B).]");
+});
+
+test('a block of a type MCP does not define makes the array data, written as JSON (all-or-nothing)', () => {
+  const data = [
+    { type: 'text', text: 'fine' },
+    { type: 'mystery', payload: 42 },
+  ];
   assert.equal(toolResultDataToHistoryString(data), JSON.stringify(data));
+});
+
+test('a text block whose text is not a string shows the placeholder, so a reference beside it is still a stub', () => {
+  // It used to send the whole array to the JSON fallback, the reference's
+  // uri included.
+  const data = [
+    { type: 'text', text: null },
+    { type: 'resource', uri: 'https://signed.example/f?token=RAW_TOKEN', mimeType: 'text/plain', sizeBytes: 10, name: 'f.txt', disposition: 'never' },
+  ];
+  const out = toolResultDataToHistoryString(data);
+  assert.ok(out.startsWith(`${NON_STRING_TEXT_PLACEHOLDER}\n[ref_`), out);
+  assert.ok(!out.includes('RAW_TOKEN'), out);
 });
 
 test('non-array data: JSON stringify', () => {
   assert.equal(toolResultDataToHistoryString({ ok: true }), '{"ok":true}');
-  assert.equal(toolResultDataToHistoryString('hello'), '"hello"');
   assert.equal(toolResultDataToHistoryString(42), '42');
+  assert.equal(toolResultDataToHistoryString(true), 'true');
   // JSON leaves undefined out (JSON.stringify gives undefined): no data is no text.
   assert.equal(toolResultDataToHistoryString(undefined), '');
+});
+
+test('string data: kept as it is, not JSON-quoted', () => {
+  // A module tool that answers in prose or a line-per-item listing returns
+  // a string. JSON would quote it and turn every newline into `\n`, so the
+  // model (and the spill file, and a script) got one escaped line.
+  const listing = 'As of 10:00. 3 open.\n[review] a/b#1 "Fix it"\n[merge] a/b#2 tab\there';
+  assert.equal(toolResultDataToHistoryString(listing), listing);
+  assert.equal(toolResultDataToHistoryString('hello'), 'hello');
+  assert.equal(toolResultDataToHistoryString(''), '');
+  // A string that happens to hold JSON is the tool's text too: not re-encoded.
+  assert.equal(toolResultDataToHistoryString('{"ok":true}'), '{"ok":true}');
+});
+
+test('string data: a lone surrogate reads as U+FFFD, and a pair is kept', () => {
+  // JSON escaped a lone surrogate as six characters of text. Kept as it is,
+  // it would reach the provider's request, which can be refused for it, and
+  // a spill file, which UTF-8 can't hold it in.
+  assert.equal(toolResultDataToHistoryString('cut \ud83d here'), 'cut \ufffd here');
+  assert.equal(toolResultDataToHistoryString('end \udc00'), 'end \ufffd');
+  assert.equal(toolResultDataToHistoryString('a pair \ud83d\ude00 stays'), 'a pair \ud83d\ude00 stays');
+});
+
+test('string data: maxChars truncates the text itself with a marker', () => {
+  const out = toolResultDataToHistoryString('line\n'.repeat(100), 50);
+  assert.ok(out.startsWith('line\nline\n'), 'truncation keeps real newlines');
+  assert.match(out, /\[truncated — original was 500 chars\]/);
 });
 
 test('maxChars truncates the resulting string with a marker', () => {
@@ -173,5 +221,5 @@ test('RFC-005: dispatch pre-registration and stub share ONE record (reviewer pro
   const stubId = out.match(/\[(ref_[a-z0-9_]+)\]/)?.[1];
   assert.equal(stubId, dispatchRecord.refId, 'stub id must equal dispatch id');
   assert.ok(out.includes('saved: scratch/refs/'), 'eager-fetched path must surface in the stub');
-  assert.equal(referenceRegistry.get(stubId!)?.serverId, 'srv', 'visible id must be server-bound');
+  assert.deepEqual(referenceRegistry.get(stubId!)?.serverIds, ['srv'], 'visible id must be server-bound');
 });
