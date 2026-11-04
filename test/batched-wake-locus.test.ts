@@ -146,7 +146,7 @@ function batchedWakeRig(opts: {
   };
 }
 
-function assertNamesBatchChannels(notice: string, channels: string[], chars = Number(/\((\d+) chars\)/.exec(notice)?.[1])): void {
+function assertNamesBatchChannels(notice: string, channels: string[], chars: number): void {
   const shown = channels.map((c) => `#${c} (discord:g1:${c})`);
   const where = shown.length === 1 ? shown[0] : `${shown.slice(0, -1).join(', ')} and ${shown.at(-1)}`;
   assert.equal(notice,
@@ -279,7 +279,7 @@ describe('batched wake routing', () => {
       .flatMap((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text));
     const notices = texts.filter((t) => t.startsWith('[send-undeliverable]'));
     assert.equal(notices.length, 1, "the announcement's, since a sleep ends the turn: " + JSON.stringify(texts));
-    assertNamesBatchChannels(notices[0]!, ['room', 'general']);
+    assertNamesBatchChannels(notices[0]!, ['room', 'general'], "💤 Going quiet for 1m. I'll still see messages, but won't respond until I wake.".length);
   });
 });
 
