@@ -29,11 +29,18 @@
   the persistent subconscious a turn to read it. No notice is written while writes are held: it waits for their
   release. A notice of a lost note that can't be written was only logged; it is now kept, traced as
   `tune-out:note-loss-untold` (`write-failed`, with the author and the error) at its first failure, and tried again
-  whenever held writes are stored and every 60 s while none are, until it is written or the host stops. A notice
-  written after the drop says whether the later hold it names is still in force then.
+  whenever held writes are stored and every 60 s while none are, until it is written. A notice for the persistent
+  subconscious, whose context outlives the process, is also kept in the store (`tune-out/<primary>/loss-notices`), so
+  it survives a stop: the next boot writes it into the subconscious's context, with the reason, and asks for its turn,
+  and one that boot can't write stays kept and is tried again as before. Before, a stop dropped it, and that caller
+  was left with neither its note nor a loss result. A reader fork's notice, whose run doesn't outlast a stop, is still
+  dropped at a stop. A notice written after the drop says whether the later hold it names is still in force then.
 - A reader's `cancel_tuneout` that waits for held writes, with a note, now says what becomes of the note: it is
   delivered when the hold ends; if it can't be, the reader is told so and why; if that notice can't be written
-  either, the failure is traced and the notice is tried again until the host stops; and a stop before the hold ends
-  loses the note with the cancel, untold. A reader fork is told that its note goes out as its mail even after its
-  run has ended, but that a loss reaches it only while it runs: after its end the loss reaches no one and is only
-  traced. The answer said only that the cancel waits.
+  either, the failure is traced and the notice is tried again until it is written. The persistent subconscious is
+  told that such a notice is also kept in the store, unless the store refuses that too, so a stop before it is
+  written leaves it for the next boot to write; and that the waiting cancel and its note aren't kept in the store, so
+  a stop before the hold ends loses both, untold. A reader fork is told that its note goes out as its mail even after
+  its run has ended, but that a loss reaches it only while it runs: after its end the loss reaches no one and is only
+  traced, and a stop before the hold ends loses the note with the cancel, untold. The answer said only that the
+  cancel waits.
