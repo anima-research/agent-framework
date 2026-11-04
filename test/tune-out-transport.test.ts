@@ -1483,6 +1483,16 @@ test('a tune-out whose release fails at a start with no subconscious stays recor
   assert.equal(registry.getDesiredState('disc', CHANNEL), 'tuned-out', 'still recorded: the next start releases it');
   assert.ok(store.logged.some((l) => l.includes('could not be released (no reader is configured), so it stays on record')
     && l.includes('the store refused the write')), store.logged.join('\n'));
+  // The next start, whose writes go through, releases it.
+  await second!.stop();
+  const third = await store.start(false, true);
+  const thirdRegistry = (third as unknown as RestartInternals).channelRegistry;
+  assert.equal(thirdRegistry.getTuneOutState('disc', CHANNEL), null, 'released at the next start');
+  assert.equal(thirdRegistry.getDesiredState('disc', CHANNEL), 'open');
+  const released = third.getAgent('scout')!.getContextManager().getAllMessages()
+    .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'tune-out-cancel');
+  assert.equal(released.length, 1, 'released once, at the next start');
+  assert.match(JSON.stringify(released[0]!.content), /no reader is configured/);
 });
 
 test('a decline of a tuned-out channel whose transport isn\'t open is refused, and the backlog survives to the cancel', async (t) => {

@@ -43,7 +43,8 @@ test('once the reader is gone, a hold is refused for one channel and for all-exc
   await f.register('other');
   const coordinator = internals(f).tuneOutCoordinator!;
   internals(f).subconsciousAgentName = null; // the reader ended
-  const one = coordinator.enter('editor', 'chat', { durationSeconds: 600 }, 'agent-tool');
+  // Refused before its options are read, as all-except is below.
+  const one = coordinator.enter('editor', 'chat', { durationSeconds: 'soon' }, 'agent-tool');
   assert.equal(one.ok, false);
   assert.match((one as { error: string }).error, /no subconscious resident to watch a channel/);
   assert.equal(internals(f).channelRegistry.getTuneOutState('editor', 'chat'), null);
@@ -98,6 +99,8 @@ test('an all-except hold on record at a start with no reader ends there, its bac
   // Any attempt counts: at a start the channel isn't registered yet, so a
   // post tried then is traced as tune-out:announce-failed, not announced.
   f.framework.onTrace((e) => { if (e.type.startsWith('tune-out:announce')) announced.push(e.type); }, { replay: true });
+  // A post is asynchronous: give one tried at create time the time to settle into its trace.
+  await new Promise((resolve) => setTimeout(resolve, 500));
   const scoped = releases(f).filter((m) => m.metadata?.scope === 'all-except');
   assert.equal(scoped.length, 1, 'the all-except hold was released');
   assert.match(JSON.stringify(scoped[0]!.content), /document_diff/);

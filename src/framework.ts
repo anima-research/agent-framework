@@ -36334,8 +36334,9 @@ export class AgentFramework {
    * on record (one 0.32's `tuneOut.enabled` left, or one whose reader the
    * recipe no longer has) ends now, and its backlog goes to the resident,
    * the per-channel holds and the all-except scope alike, through a
-   * coordinator made for that alone. One whose end fails is left to
-   * endTuneOutsWithoutCoordinator.
+   * coordinator made for that alone: at a start, or, where no MCPL server
+   * was configured, when the first one connects. One whose release fails
+   * stays on record for the next start.
    */
   private releaseTuneOutsWithoutReader(): void {
     if (!this.channelRegistry || this.tuneOutCoordinator) return;
