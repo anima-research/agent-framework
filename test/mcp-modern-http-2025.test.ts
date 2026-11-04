@@ -1552,7 +1552,8 @@ async function refused(fixture: Fixture, extra: Partial<McplServerConfig> = {}):
   assert.equal((connection as unknown as { reconnectTimer: unknown }).reconnectTimer, null);
   await sleep(100);
   assert.equal(fixture.seen.length, asked, 'no reconnect loop');
-  assert.deepEqual(verdict!.offered, HTTP_OFFER);
+  assert.equal(verdict!.offered, '2026-07-28');
+  assert.deepEqual(verdict!.offeredRevisions, HTTP_OFFER);
   return verdict!;
 }
 

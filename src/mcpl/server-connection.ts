@@ -164,10 +164,10 @@ const MAX_TOOL_LIST_PAGES = 100;
  * negotiates no further, even when the list also names a 2025 revision both
  * speak. This is a protocol-negotiation fact, not a request outcome.
  * Retrying cannot change it: each engine offers the same revisions every
- * time (`offered`), and only configuration, or the server's operator, can
- * fix the mismatch. A connection that gets this error does not schedule
- * reconnects. The legacy engine and the modern one (ModernMcpConnection)
- * both throw it, so its readers treat them alike.
+ * time (`offeredRevisions`), and only configuration, or the server's
+ * operator, can fix the mismatch. A connection that gets this error does not
+ * schedule reconnects. The legacy engine and the modern one
+ * (ModernMcpConnection) both throw it, so its readers treat them alike.
  *
  * - `rejected`: the server refused the revision offered. The legacy
  *   engine's `initialize` was answered with error -32022. A modern server's
@@ -192,10 +192,15 @@ export class McplProtocolVersionError extends Error {
      *  redacted (`rejected`). */
     readonly code?: number,
     readonly data?: unknown,
-    /** The revisions this client offered, in its order of preference: the
+    /** The revision this client offered first, in its order of preference:
+     *  the legacy engine's (2024-11-05), a modern connection's over stdio
+     *  (2026-07-28), or over HTTP 2026-07-28, the first of
+     *  `offeredRevisions`. */
+    readonly offered: string = MCP_PROTOCOL_VERSION,
+    /** Every revision this client offered, in its order of preference: the
      *  legacy engine's one, a modern connection's one over stdio, or its
      *  list over HTTP. */
-    readonly offered: readonly string[] = [MCP_PROTOCOL_VERSION],
+    readonly offeredRevisions: readonly string[] = [offered],
   ) {
     super(message);
     this.name = 'McplProtocolVersionError';
