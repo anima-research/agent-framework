@@ -7,8 +7,10 @@
 - A `channel_close` of the excepted channel whose hold's release failed after it had ended the focus (a step
   after the end, such as the resident's wake, threw) answered "The close wasn't recorded: <reason>" and said
   nothing of the focus. It now answers "The close wasn't recorded: <reason>. The focus on it ended before
-  that failure, and what the other channels held was delivered." A release that fails before the end still
-  answers "The close wasn't recorded: <reason>", the reason saying the hold stays in force. The release's
+  that failure, and what the other channels held was delivered." A release that fails before the end
+  answers "The close wasn't recorded: <reason>. The focus on it is still in force: what the other channels
+  hold stays held until it ends. A resident ends it with tune_out { mode: 'cancel', scope: 'all-except' },
+  or asks this close again." — the answer says the hold stays, not only the reason. The release's
   failure is now the close's answer, as the registry's other failures are, where `executeToolCall` rejected
   with it before.
 - A `channel_close` naming the channel an all-except hold excepts, after its server stopped registering it
@@ -20,7 +22,8 @@
   was recorded or sent. The focus on it ended, and what the other channels held was delivered." The release
   notice gives its reason as "a close of the excepted channel, which its server no longer registers". While
   the store's writes are held the answer says "This call cancels the all-except hold that excepts it." and
-  the wait's note; a release that fails before the end adds "The focus on it wasn't ended: <reason>", and
+  the wait's note; a release that fails before the end adds "The focus on it wasn't ended: <reason>. The focus on it is
+  still in force: …" (the same sentence as above), and
   one that fails after it "A step of the focus's release failed: <reason>. The focus on it ended before
   that failure, and what the other channels held was delivered." A module's close of such a name is
   refused as before, the focus left in force.
