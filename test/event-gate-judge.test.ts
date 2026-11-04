@@ -426,6 +426,7 @@ describe('judge rules: timing', () => {
     await advance(10);
     assert.strictEqual(wakes.length, 1);
     assert.strictEqual(judge.requests.length, 2);
+    assert.deepStrictEqual(gate.getStatus().policies[0]!.judgeState!.verdicts, { reply: 1, wait: 0, error: 0, refused: 0 }, "only the later call's REPLY counts");
     gate.dispose();
   });
 
@@ -1522,7 +1523,7 @@ describe('judge rules: timing', () => {
 
   it('a batch that fires while the judge decides waits for the verdict: delivered with it on reply', async () => {
     const judge = scriptedJudge();
-    const { gate, wakes } = makeGate(writeConfig('queued-reply.json', JUDGED), { judge: judge.fn });
+    const { gate, wakes, messages } = makeGate(writeConfig('queued-reply.json', JUDGED), { judge: judge.fn });
     gate.evaluate(chat('one'));
     await advance(160);
     await until(() => judge.waiting() === 1, 'the judge is asked');
@@ -1534,6 +1535,8 @@ describe('judge rules: timing', () => {
     await advance(10);
     await until(() => wakes.length === 1, 'the wake');
     assert.strictEqual(judge.requests.length, 1);
+    assert.strictEqual(messages.length, 1);
+    assert.match(JSON.stringify(messages[0]!.content), /Gate: 2 events matched/, 'the queued batch is delivered with the judged one');
     gate.dispose();
   });
 
@@ -2987,6 +2990,44 @@ describe('the framework wires the reply judge', () => {
     assembled();
     await pass;
     await until(() => !internal.assembling.has('scout'), 'the assembly to end');
+  });
+
+  it('a start whose name binds another agent by the time it throws before its stream marks no failed last turn for that agent', async (t) => {
+    const { framework } = await frameworkWith(t, { config: JUDGED, judge: {} });
+    const internal = framework as unknown as {
+      pushCoalescer: unknown;
+      pendingRequests: Array<Record<string, unknown>>;
+      processInferenceRequests(): Promise<void>;
+      assembling: Set<string>;
+      agents: Map<string, object>;
+      lastStartFailed: Map<string, number>;
+      recordTurnCheckpoint(agentName: string): void;
+    };
+    let assembled!: () => void;
+    const assembly = new Promise<undefined>((resolve) => { assembled = () => resolve(undefined); });
+    internal.pushCoalescer = { pendingBatches: () => 1, assemble: () => assembly, isRendering: () => false, identity: () => undefined, suspend: () => {} };
+    const record = internal.recordTurnCheckpoint.bind(framework);
+    internal.recordTurnCheckpoint = () => {
+      internal.recordTurnCheckpoint = record;
+      throw new Error('zz checkpoint refused');
+    };
+    internal.pendingRequests.push({ agentName: 'scout', reason: 'a test wake', source: 'test', timestamp: Date.now() });
+    const pass = internal.processInferenceRequests();
+    await until(() => internal.assembling.has('scout'), 'the start to wait on its assembly');
+    const original = internal.agents.get('scout')!;
+    internal.agents.set('scout', { ...original });
+    const errors = console.error;
+    console.error = () => {};
+    try {
+      assembled();
+      await assert.rejects(pass, /zz checkpoint refused/, "premise: the start's own throw reaches its pass");
+      await until(() => !internal.assembling.has('scout'), 'the assembly to end');
+    } finally {
+      console.error = errors;
+      internal.agents.set('scout', original);
+    }
+    assert.strictEqual(internal.recordTurnCheckpoint, record, 'premise: the checkpoint threw');
+    assert.strictEqual(internal.lastStartFailed.has('scout'), false);
   });
 
   it("lists another agent's wake that a scheduler pass holds while it awaits an earlier agent's start", async (t) => {

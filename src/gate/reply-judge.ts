@@ -424,7 +424,7 @@ export class ReplyJudge {
   }
 
   private async build(
-    request: JudgeRequest, now: number, atRatio?: number,
+    request: JudgeRequest, now: number, atRatio?: number, fresh = false,
   ): Promise<{ request: NormalizedRequest; agentName: string; chars: number; ratio: number }> {
     const agentName = this.chooseAgent(request.agentNames);
     if (!agentName) throw new Error('no agent to judge for');
@@ -484,7 +484,7 @@ export class ReplyJudge {
     }
 
     const windowChars = Math.max(0, docChars - header.length - about.length);
-    const start = this.windowStart(agentName, entries, windowChars);
+    const start = this.windowStart(agentName, entries, windowChars, fresh);
     const shown = entries.slice(start);
     if (shown.length > 0) {
       this.anchors.set(agentName, { keys: shown.slice(0, 3).map((e) => e.key) });
@@ -537,7 +537,7 @@ export class ReplyJudge {
    * there fits; otherwise where the newest messages fill FRESH_WINDOW_SHARE
    * of the budget, leaving room to grow before it moves again.
    */
-  private windowStart(agentName: string, entries: Entry[], windowChars: number): number {
+  private windowStart(agentName: string, entries: Entry[], windowChars: number, fresh: boolean): number {
     const tailFrom = (budget: number): number => {
       let used = 0;
       let i = entries.length;
@@ -548,7 +548,7 @@ export class ReplyJudge {
       // The newest message is shown even when it alone is over budget (it's cut to MAX_MESSAGE_CHARS already).
       return Math.min(i, Math.max(0, entries.length - 1));
     };
-    const anchor = this.anchors.get(agentName);
+    const anchor = fresh ? undefined : this.anchors.get(agentName);
     if (anchor && anchor.keys.length > 0) {
       const at = this.findAnchor(entries, anchor.keys);
       if (at !== undefined) {
@@ -602,7 +602,7 @@ export class ReplyJudge {
       this.anchors.delete(built.agentName);
       const refused = built;
       if (request.signal.aborted) throw new Error('the judge was stopped before its request');
-      built = await this.build(request, Date.now(), MIN_CHARS_PER_TOKEN);
+      built = await this.build(request, Date.now(), MIN_CHARS_PER_TOKEN, true);
       if (request.signal.aborted) throw new Error('the judge was stopped before its request');
       console.error(
         `[gate] the reply judge's request on rule ${JSON.stringify(request.policyName)}'s batch, for ${built.agentName}, of ${refused.chars} characters, built at ${refused.ratio.toFixed(2)} characters a token, `
