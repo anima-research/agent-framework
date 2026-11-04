@@ -60,9 +60,10 @@
   is reopened, with a relist, and a call whose stream can't be resumed fails
   then, as `no-response`, rather than at its deadline.
 - **`McplProtocolVersionError` over HTTP** names the revisions each side
-  speaks, and `offered` is the list this client offered: `['2024-11-05']`
-  from the legacy engine, `['2026-07-28']` from a modern stdio server, and
-  the four revisions above over HTTP. Besides a discovery or `-32022` error
+  speaks. Its new `offeredRevisions` lists the revisions this client
+  offered: `['2024-11-05']` from the legacy engine, `['2026-07-28']` from a
+  modern stdio server, and the four revisions above over HTTP. `offered`
+  stays the first of them. Besides a discovery or `-32022` error
   naming no revision in common, it covers an `initialize` answered with a
   revision the 2025 handshake doesn't accept (`2026-07-28` included), or
   with none (`mismatch`), and a discovery that listed no revision in common

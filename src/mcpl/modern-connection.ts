@@ -1116,6 +1116,7 @@ export class ModernMcpConnection extends EventEmitter {
       supported,
       code,
       data,
+      offered[0],
       offered,
     );
     if (error instanceof UnsupportedProtocolVersionError) {
@@ -1152,6 +1153,7 @@ export class ModernMcpConnection extends EventEmitter {
         null,
         undefined,
         undefined,
+        offered[0],
         offered,
       );
     }
