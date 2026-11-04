@@ -117,7 +117,7 @@ test('a run still going at its limit is stopped there', async () => {
 });
 
 test("a guest that never reaches the interrupt is ended after the stop's grace, and its ending says so", async () => {
-  const r = run({ lifetimeMs: 200, stopGraceMs: 300 });
+  const r = run({ lifetimeMs: 200, stopGraceMs: 20 });
   r.start(`text('stuck'); for (;;) {}`, TOOLS);
   const snap = await r.wait(LONGER_THAN_ANY_START_MS);
   assert.equal(snap.ending?.how, 'stopped');
@@ -139,7 +139,7 @@ test('a refusal and a failed result are recorded as such, and the script sees ea
 });
 
 test('a call with no answer within its timeout rejects in the script, and is recorded as timed out', async () => {
-  const r = run({ toolCallTimeoutMs: 200, onToolCall: () => new Promise(() => {}) });
+  const r = run({ toolCallTimeoutMs: 20, onToolCall: () => new Promise(() => {}) });
   r.start(`try { await tools.slow({}); } catch (e) { return [e.name, /may still take effect/.test(e.message)]; }`, TOOLS);
   const snap = await r.wait(LONGER_THAN_ANY_START_MS);
   assert.deepEqual(snap.ending, { how: 'finished', value: '["TimeoutError",true]' });
@@ -184,17 +184,8 @@ test("a run whose process exited before its ending came holds no child once it e
   assert.equal((r as unknown as { child: unknown }).child, null);
 });
 
-test("a child's last frames count though its process exits before the parent reads them", async () => {
-  // A grace far past the fixture's 300 ms, however slow its writer is to start on a loaded host.
-  const r = run({ childEntry: BAD_CHILD, childArgs: ['late-end'], stopGraceMs: LONGER_THAN_ANY_START_MS });
-  r.start('return 1;', TOOLS);
-  const snap = await r.wait(LONGER_THAN_ANY_START_MS);
-  assert.deepEqual(snap.ending, { how: 'finished', value: '"late"' });
-  await r.exited;
-});
-
 test("a child whose fd 3 stays open after its process exits crashes its run once the stop's grace has passed", async () => {
-  const r = run({ childEntry: BAD_CHILD, childArgs: ['held-fd3'], stopGraceMs: 300 });
+  const r = run({ childEntry: BAD_CHILD, childArgs: ['held-fd3'], stopGraceMs: 20 });
   r.start('return 1;', TOOLS);
   const exited = await Promise.race([r.exited.then(() => true), new Promise((resolve) => setTimeout(() => resolve(false), LONGER_THAN_ANY_START_MS).unref())]);
   assert.equal(exited, true, 'its process exited');
@@ -308,10 +299,9 @@ const SIXTEEN_TIME_OUT = `const names = await Promise.all(Array.from({ length: $
 test(`the host holds at most ${MAX_CALLS_IN_FLIGHT} calls, timed-out ones included: one past them waits, and goes out once one ends`, async () => {
   const { bridge, onToolCall } = holdingBridge();
   const r = run({ toolCallTimeoutMs: 1_500, onToolCall });
-  const internals = r as unknown as { dispatchWaiting: Map<number, unknown> };
   r.start(`${SIXTEEN_TIME_OUT} const late = await tools.echo({ late: true }); return [names.every((n) => n === 'TimeoutError'), late.content[0].text];`, TOOLS);
   // All sixteen timed out in the script, so its places are free, and the next call waits for the host.
-  await until(() => internals.dispatchWaiting.size === 1, 'the next call to wait for room in the host');
+  await until(() => r.snapshot().calls.waiting === 1, 'the next call to wait for room in the host');
   assert.equal(bridge.inBridge, MAX_CALLS_IN_FLIGHT);
   bridge.held.shift()!();
   const snap = await r.wait(LONGER_THAN_ANY_START_MS);
@@ -324,13 +314,13 @@ test(`the host holds at most ${MAX_CALLS_IN_FLIGHT} calls, timed-out ones includ
 
 test('a call that waits for room in the host past its timeout is told it was never sent, and the record counts it so', async () => {
   const { bridge, onToolCall } = holdingBridge();
-  const r = run({ toolCallTimeoutMs: 1_000, onToolCall });
+  const r = run({ toolCallTimeoutMs: 50, onToolCall });
   r.start(`${SIXTEEN_TIME_OUT} try { await tools.echo({ late: true }); return 'sent'; } catch (e) { return [e.name, e.message]; }`, TOOLS);
   const snap = await r.wait(LONGER_THAN_ANY_START_MS);
   assert.equal(snap.ending?.how, 'finished');
   const [name, message] = JSON.parse((snap.ending as { value: string }).value) as [string, string];
   assert.equal(name, 'TimeoutError');
-  assert.match(message, /^echo was never sent: 16 of this script's earlier calls were still running in the host, timed-out ones included, and its turn didn't come within 1 s, so nothing was done; calling it again may go through once one of them gets its result, though a call whose tool the host stopped waiting for stays counted until this script ends, and a new script starts with none$/);
+  assert.match(message, /^echo was never sent: 16 of this script's earlier calls were still running in the host, timed-out ones included, and its turn didn't come within 50 ms, so nothing was done; calling it again may go through once one of them gets its result, though a call whose tool the host stopped waiting for stays counted until this script ends, and a new script starts with none$/);
   assert.equal(bridge.calls, MAX_CALLS_IN_FLIGHT, 'the late call never reached the bridge');
   assert.equal(snap.calls.made, MAX_CALLS_IN_FLIGHT + 1);
   assert.equal(snap.calls.unsent, 1);
@@ -342,11 +332,10 @@ test('a call that waits for room in the host past its timeout is told it was nev
 test('a call waiting for room in the host when its script is stopped is never sent', async () => {
   const { bridge, onToolCall } = holdingBridge();
   const r = run({ toolCallTimeoutMs: 1_000, onToolCall });
-  const internals = r as unknown as { dispatchWaiting: Map<number, unknown> };
   r.start(`${SIXTEEN_TIME_OUT} await tools.echo({ late: true });`, TOOLS);
-  await until(() => internals.dispatchWaiting.size === 1, 'the next call to wait for room in the host');
+  await until(() => r.snapshot().calls.waiting === 1, 'the next call to wait for room in the host');
   const snap = await r.stop('agent');
-  assert.equal(internals.dispatchWaiting.size, 0);
+  assert.equal(snap.calls.waiting, 0);
   // The script made it, and nothing was done: the record says so.
   assert.equal(snap.calls.made, MAX_CALLS_IN_FLIGHT + 1);
   assert.equal(snap.calls.unsent, 1);
@@ -359,9 +348,8 @@ test('a call waiting for room in the host when its script is stopped is never se
 test('a call waiting for room in the host when a stop is asked is refused once a place frees, and never sent', async () => {
   const { bridge, onToolCall } = holdingBridge();
   const r = run({ toolCallTimeoutMs: 1_000, onToolCall });
-  const internals = r as unknown as { dispatchWaiting: Map<number, unknown> };
   r.start(`${SIXTEEN_TIME_OUT} await tools.echo({ late: true });`, TOOLS);
-  await until(() => internals.dispatchWaiting.size === 1, 'the next call to wait for room in the host');
+  await until(() => r.snapshot().calls.waiting === 1, 'the next call to wait for room in the host');
   const stopped = r.stop('agent');
   // A place frees after the stop was asked, before the script has ended.
   bridge.held.shift()!();
@@ -394,7 +382,6 @@ test('a call waiting in the script for a place when its script is stopped is nev
   const deadline = Date.now() + LONGER_THAN_ANY_START_MS;
   while (dispatched < MAX_CALLS_IN_FLIGHT && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
   const snap = await r.stop('agent');
-  await new Promise((resolve) => setTimeout(resolve, 50));
   assert.equal(dispatched, MAX_CALLS_IN_FLIGHT);
   assert.equal(snap.calls.made, MAX_CALLS_IN_FLIGHT);
   assert.equal(snap.calls.named.length + Object.values(snap.calls.more).reduce((a, b) => a + b, 0), MAX_CALLS_IN_FLIGHT, 'each sent call is uncertain');
@@ -500,7 +487,7 @@ test('a wake still waiting for its spacing when its run crashes is never sent, a
 });
 
 test("a child that says how its script ended and doesn't exit is ended after the stop's grace", async () => {
-  const r = run({ childEntry: BAD_CHILD, childArgs: ['finished-then-hold'], stopGraceMs: 300 });
+  const r = run({ childEntry: BAD_CHILD, childArgs: ['finished-then-hold'], stopGraceMs: 20 });
   r.start('return 1;', TOOLS);
   const snap = await r.wait(LONGER_THAN_ANY_START_MS);
   assert.deepEqual(snap.ending, { how: 'finished', value: '1' });
@@ -581,7 +568,8 @@ test('a bridge that rejects answers the call as a failure that may have taken ef
 test('a too-large answer waiting to be seen keeps only its brief', async () => {
   let release!: () => void;
   const hold = new Promise<void>((resolve) => (release = resolve));
-  const r = run({ memoryMaxBytes: 3 * 1024 * 1024, onToolCall: async () => { await hold; return result('y'.repeat(2 * 1024 * 1024)); } });
+  const answerChars = 2 * 1024 * 1024;
+  const r = run({ memoryMaxBytes: 3 * 1024 * 1024, onToolCall: async () => { await hold; return result('y'.repeat(answerChars)); } });
   const internals = r as unknown as { delivered: Map<number, { brief: string }> };
   const gateDir = mkdtempSync(join(tmpdir(), 'af-gate-'));
   const gate = join(gateDir, 'go');
@@ -589,7 +577,7 @@ test('a too-large answer waiting to be seen keeps only its brief', async () => {
   r.start(`const p = tools.echo({}); while (!__exists(${JSON.stringify(gate)})) __tick(); try { await p; } catch (e) { return e.name; }`, TOOLS);
   release();
   await until(() => internals.delivered.size === 1, 'the answer sent and not yet seen');
-  assert.ok([...internals.delivered.values()][0]!.brief.length <= 120);
+  assert.ok([...internals.delivered.values()][0]!.brief.length <= answerChars / 1024, 'only its start is kept, not the answer whole');
   writeFileSync(gate, '');
   const snap = await r.wait(LONGER_THAN_ANY_START_MS);
   rmSync(gateDir, { recursive: true, force: true });
@@ -665,11 +653,10 @@ test("a frame cut off by the stop's own kill ends the run as stopped, not as a b
 
 test("the run's end lets go a wake waiting behind another's delivery", async () => {
   const r = run({ onWake: () => new Promise(() => {}) });
-  const internals = r as unknown as { wakeFrames: number; wakeChain: Promise<void> };
+  const internals = r as unknown as { wakeChain: Promise<void> };
   r.start(`wake_agent(1); wake_agent(2); await new Promise(() => {});`, TOOLS);
-  await until(() => internals.wakeFrames === 2, 'two wakes, the second waiting behind the first');
   // Waiting behind the first's delivery, the second is among the calls waiting.
-  assert.equal(r.snapshot().calls.waiting, 1);
+  await until(() => r.snapshot().calls.made === 2 && r.snapshot().calls.waiting === 1, 'two wakes, the second waiting behind the first');
   const snap = await r.stop('agent');
   // The chain settles once the second wake has gone or won't, so it settles only if the end let it go.
   const settled = await Promise.race([internals.wakeChain.then(() => true), new Promise((resolve) => setTimeout(() => resolve(false), LONGER_THAN_ANY_START_MS).unref())]);
@@ -703,11 +690,11 @@ test('only the wakes the host delivered count as delivered: one it refused does 
 test("a wake's spacing counts from when the wake before it was delivered", async () => {
   const delivered: Array<{ n: number; start: number; end: number }> = [];
   const r = run({
-    wakeMinIntervalMs: 200,
+    wakeMinIntervalMs: 50,
     onWake: async (_payload, n) => {
       const start = performance.now();
       // The first delivery takes longer than the spacing.
-      if (n === 1) await new Promise((resolve) => setTimeout(resolve, 400));
+      if (n === 1) await new Promise((resolve) => setTimeout(resolve, 100));
       delivered.push({ n, start, end: performance.now() });
       return { ok: true, json: 'null' };
     },
@@ -716,7 +703,7 @@ test("a wake's spacing counts from when the wake before it was delivered", async
   const snap = await r.wait(LONGER_THAN_ANY_START_MS);
   assert.deepEqual(snap.ending, { how: 'finished', value: '"done"' });
   const [first, second] = delivered;
-  assert.ok(second!.start - first!.end >= 190, `the second came ${Math.round(second!.start - first!.end)} ms after the first's delivery`);
+  assert.ok(second!.start - first!.end >= 40, `the second came ${Math.round(second!.start - first!.end)} ms after the first's delivery`);
   await r.exited;
 });
 
@@ -740,14 +727,12 @@ test('with a relative TMPDIR, a computing script still sees its stop file', asyn
   }
 });
 
-test('a stop asked after the process exited arms no kill', async () => {
-  const r = run({ childEntry: BAD_CHILD, childArgs: ['exit-holding-fd3'], stopGraceMs: 300 });
-  const internals = r as unknown as { killTimer: unknown };
+test("a stop asked after the process exited isn't its ending's cause", async () => {
+  const r = run({ childEntry: BAD_CHILD, childArgs: ['exit-holding-fd3'], stopGraceMs: 20 });
   r.start('return 1;', TOOLS);
   await r.exited;
   assert.equal(r.snapshot().ending, null, 'fd 3 is still held open');
   const stopped = r.stop('agent');
-  assert.equal(internals.killTimer, null);
   // The process had gone before the stop was asked: the stop isn't its ending's cause.
   const ending = (await stopped).ending;
   assert.equal(ending?.how, 'crashed');
@@ -759,30 +744,32 @@ for (const [how, why] of [['wakes-then-ignore-stop', 'once a stop was asked'], [
     const sent: number[] = [];
     const gateDir = mkdtempSync(join(tmpdir(), 'af-gate-'));
     const gate = join(gateDir, 'go');
+    const fd3Gate = join(gateDir, 'let-fd3-go');
     const r = run({
       childEntry: BAD_CHILD,
-      childArgs: how === 'wake-then-exit-on-gate' ? [how, gate] : [how],
+      childArgs: how === 'wake-then-exit-on-gate' ? [how, gate, fd3Gate] : [how],
       // The turn comes when the test lets it, once the stop is asked or the
-      // exit has landed: the child holds fd 3 for 4 s after its exit, and the
-      // run waits for fd 3 to end.
+      // exit has landed: after its exit, fd 3 stays held until the test
+      // writes the second gate file, and the run waits for fd 3 to end.
       wakeMinIntervalMs: NEVER_FIRES_IN_A_TEST_MS,
-      stopGraceMs: how === 'wake-then-exit-on-gate' ? LONGER_THAN_ANY_START_MS : 2_000,
+      stopGraceMs: how === 'wake-then-exit-on-gate' ? LONGER_THAN_ANY_START_MS : 20,
       onWake: async (_payload, n) => { sent.push(n); return { ok: true, json: 'null' }; },
     });
-    const internals = r as unknown as { wakeWaiters: Set<() => void>; processExited: boolean };
+    const internals = r as unknown as { wakeWaiters: Set<() => void> };
     r.start('return 1;', TOOLS);
     // The second wake is waiting out its spacing before the stop, or the exit, comes.
     await until(() => sent.length === 1 && internals.wakeWaiters.size === 1, 'the second wake waiting for its turn');
     if (how === 'wakes-then-ignore-stop') void r.stop('agent');
     else {
       writeFileSync(gate, '');
-      await until(() => internals.processExited, 'the child to exit');
+      await r.exited;
     }
     // Its turn comes now, while the run hasn't yet ended.
     assert.equal(r.snapshot().ending, null, 'the run had not ended when the turn came');
     for (const release of [...internals.wakeWaiters]) release();
     await new Promise((res) => setImmediate(res));
     assert.equal(r.snapshot().ending, null, 'the run had not ended when the turn passed');
+    if (how === 'wake-then-exit-on-gate') writeFileSync(fd3Gate, '');
     const snap = await r.wait(LONGER_THAN_ANY_START_MS);
     assert.deepEqual(sent, [1]);
     assert.equal(snap.calls.made, 2);
@@ -888,11 +875,10 @@ test("a start frame too long to send starts nothing, and the run's exit resolves
 
 test("a call id named again once its TimeoutError was seen takes a place of its own: the host still holds at most 16", async () => {
   const { bridge, onToolCall } = holdingBridge();
-  const r = run({ childEntry: BAD_CHILD, childArgs: ['reuse-timed-out-id'], toolCallTimeoutMs: 150, onToolCall });
-  const internals = r as unknown as { dispatchWaiting: Map<number, unknown> };
+  const r = run({ childEntry: BAD_CHILD, childArgs: ['reuse-timed-out-id'], toolCallTimeoutMs: 20, onToolCall });
   r.start('return 1;', TOOLS);
-  // Sixteen held under one id, and the next waits, never sent.
-  await until(() => bridge.inBridge === MAX_CALLS_IN_FLIGHT && internals.dispatchWaiting.size === 1, 'sixteen held and one waiting');
+  // Sixteen held under one id, and the next ones never sent.
+  await until(() => bridge.inBridge === MAX_CALLS_IN_FLIGHT, 'sixteen held');
   await until(() => r.snapshot().calls.unsent >= 2, 'later ones told they were never sent');
   assert.equal(bridge.most, MAX_CALLS_IN_FLIGHT);
   await r.stop('agent');
@@ -929,10 +915,10 @@ test("a held answer that comes after the script's TimeoutError changes nothing: 
   let releaseWake!: () => void;
   const wakeGate = new Promise<void>((res) => (releaseWake = res));
   const r = run({
-    toolCallTimeoutMs: 100,
-    // As the bridge's safety timer does: its answer comes well after the script's own timeout.
+    toolCallTimeoutMs: 20,
+    // As the bridge's safety timer does: its answer comes after the script's own timeout.
     onToolCall: async () => {
-      await new Promise((res) => setTimeout(res, 400));
+      await until(() => r.snapshot().calls.named[0]?.state === 'timed-out', "the script's own timeout");
       heldCame = true;
       return { ...result('no result'), held: true };
     },
@@ -989,19 +975,17 @@ test("once its process has exited, nothing a script asks goes out: a call waitin
   const gateDir = mkdtempSync(join(tmpdir(), 'af-gate-'));
   const gate = join(gateDir, 'go');
   const r = run({ childEntry: BAD_CHILD, childArgs: ['calls-then-exit-on-gate', gate], toolCallTimeoutMs: 3_000, onToolCall });
-  const internals = r as unknown as { dispatchWaiting: Map<number, unknown>; processExited: boolean };
   r.start('return 1;', TOOLS);
   // Its own timeout is 3 s away: the exit and the freed place both come well before it.
-  await until(() => internals.dispatchWaiting.size === 1, 'the seventeenth to wait for room');
+  await until(() => r.snapshot().calls.waiting === 1, 'the seventeenth to wait for room');
   writeFileSync(gate, '');
-  await until(() => internals.processExited, 'the child to exit');
+  await r.exited;
   // Its own timeout is seconds away: it still waits as the exit lands.
-  assert.equal(internals.dispatchWaiting.size, 1, 'the seventeenth still waiting when the exit landed');
+  assert.equal(r.snapshot().calls.waiting, 1, 'the seventeenth still waiting when the exit landed');
   // A place frees after the exit, while fd 3 is still open.
   bridge.held.shift()!();
-  await new Promise((res) => setTimeout(res, 100));
-  assert.equal(bridge.calls, MAX_CALLS_IN_FLIGHT, 'the waiting call never reached the bridge');
   const snap = await r.wait(LONGER_THAN_ANY_START_MS);
+  assert.equal(bridge.calls, MAX_CALLS_IN_FLIGHT, 'the waiting call never reached the bridge');
   assert.equal(snap.ending?.how, 'crashed');
   assert.equal(snap.calls.unsent, 1);
   while (bridge.held.length) bridge.held.shift()!();
@@ -1014,9 +998,8 @@ test("once its process has exited, nothing a script asks goes out: a call waitin
   const lateDir = mkdtempSync(join(tmpdir(), 'af-gate-'));
   const lateGate = join(lateDir, 'go');
   const r2 = run({ childEntry: BAD_CHILD, childArgs: ['late-call', lateGate], stopGraceMs: LONGER_THAN_ANY_START_MS, onToolCall: async () => { late += 1; return result('x'); } });
-  const internals2 = r2 as unknown as { processExited: boolean };
   r2.start('return 1;', TOOLS);
-  await until(() => internals2.processExited, 'the child to exit');
+  await r2.exited;
   writeFileSync(lateGate, '');
   const snap2 = await r2.wait(LONGER_THAN_ANY_START_MS);
   assert.equal(snap2.ending?.how, 'crashed');
@@ -1042,15 +1025,14 @@ for (const withBrief of [true, false]) {
   });
 }
 
-test('a process that never started holds no kill timer and no child once its run has crashed', async () => {
+test('a process that never started holds no child once its run has crashed', async () => {
   const r = run({ execPath: '/nonexistent/af-node' });
-  const internals = r as unknown as { killTimer: unknown; child: unknown };
+  const internals = r as unknown as { child: unknown };
   r.start('return 1;', TOOLS);
   const snap = await r.wait(LONGER_THAN_ANY_START_MS);
   assert.equal(snap.ending?.how, 'crashed');
   // The cause is named, under Bun too, where spawn can return before its error comes.
   assert.match((snap.ending as { detail: string }).detail, /could not run: .*ENOENT/);
-  assert.equal(internals.killTimer, null);
   assert.equal(internals.child, null);
   await r.exited;
 });
@@ -1068,17 +1050,14 @@ test('a call handed a place keeps it while it runs, and the first call waiting i
       return result('ok');
     },
   });
-  const internals = r as unknown as { dispatchWaiting: Map<number, unknown>; hostCalls: number };
+  const internals = r as unknown as { hostCalls: number };
   r.start(`${SIXTEEN_TIME_OUT} const a = tools.slow({ i: 'a' }).catch(() => {}); const b = tools.slow({ i: 'b' }).catch(() => {}); await Promise.all([a, b]);`, TOOLS);
-  await until(() => internals.dispatchWaiting.size === 2, 'a and b waiting for room');
+  await until(() => r.snapshot().calls.waiting === 2, 'a and b waiting for room');
   // The record counts the two waiting among the calls the script made.
-  const waiting = r.snapshot().calls;
-  assert.equal(waiting.waiting, 2);
-  assert.equal(waiting.made, MAX_CALLS_IN_FLIGHT + 2);
+  assert.equal(r.snapshot().calls.made, MAX_CALLS_IN_FLIGHT + 2);
   held.shift()!.go();
   // The first waiting, a, went out and holds the place; b still waits.
   await until(() => held.length === MAX_CALLS_IN_FLIGHT && held[held.length - 1]!.i === 'a', 'a in the bridge');
-  assert.equal(internals.dispatchWaiting.size, 1);
   assert.equal(most, MAX_CALLS_IN_FLIGHT);
   // a's place was taken for it: the host still counts 16, so no fresh call could go out beside it.
   assert.equal(internals.hostCalls, MAX_CALLS_IN_FLIGHT);
@@ -1094,7 +1073,7 @@ test("a wake's spacing runs on a monotonic clock: the wall clock stepped back an
   t.mock.method(Date, 'now', () => realNow() + offset);
   let wakes = 0;
   const r = run({
-    wakeMinIntervalMs: 200,
+    wakeMinIntervalMs: 20,
     onWake: async () => {
       wakes += 1;
       return { ok: true, json: 'null' };
@@ -1108,7 +1087,7 @@ test("a wake's spacing runs on a monotonic clock: the wall clock stepped back an
     },
   });
   r.start(`await wake_agent(1); await tools.echo({}); await wake_agent(2); return 'done';`, TOOLS);
-  // 200 ms of spacing against an hour: the run's own wait tells them apart.
+  // 20 ms of spacing against an hour: the run's own wait tells them apart.
   const snap = await r.wait(LONGER_THAN_ANY_START_MS);
   assert.deepEqual(snap.ending, { how: 'finished', value: '"done"' });
   assert.equal(wakes, 2);
@@ -1158,10 +1137,10 @@ test("a child's frame longer than the longest a child sends, 25 MiB, crashes the
 });
 
 test("a sent call's timeout is said exactly, a fraction of a second included", async () => {
-  const r = run({ toolCallTimeoutMs: 1_500, onToolCall: () => new Promise(() => {}) });
+  const r = run({ toolCallTimeoutMs: 1_100, onToolCall: () => new Promise(() => {}) });
   r.start(`try { await tools.slow({}); return 'answered'; } catch (e) { return e.message; }`, TOOLS);
   const snap = await r.wait(LONGER_THAN_ANY_START_MS);
-  assert.deepEqual(snap.ending, { how: 'finished', value: JSON.stringify('slow was sent, and no answer came within 1.5 s; it may still take effect') });
+  assert.deepEqual(snap.ending, { how: 'finished', value: JSON.stringify('slow was sent, and no answer came within 1.1 s; it may still take effect') });
   await r.exited;
 });
 

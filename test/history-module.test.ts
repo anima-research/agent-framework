@@ -251,14 +251,17 @@ describe('HistoryModule', () => {
     });
 
     it('caps limit at the hard maximum before it reaches context-manager', async () => {
-      const { cm, calls } = buildStub(FIXTURE);
+      // More messages than the hard cap of 200, which the tool's schema states.
+      const many = Array.from({ length: 250 }, (_, i) => msg(`n${i}`, 1000 + i, 'User', [textBlock(`line ${i}`)], 'c1'));
+      const { cm } = buildStub(many);
       const h = new HistoryModule();
       h.bind(cm);
 
-      await h.handleToolCall(call('extract', { limit: 999999 }));
-      const queryCall = calls.find((c) => c.method === 'queryMessagesByTimeAndChannel');
-      // 200 = the hard cap; +1 is extract's own "is there another page" probe row.
-      assert.equal((queryCall?.args as { limit?: number }).limit, 201);
+      const result = await h.handleToolCall(call('extract', { limit: 999999 }));
+      const data = result.data as { returned: number; hasMore: boolean; messages: unknown[] };
+      assert.equal(data.messages.length, 200, 'a page holds at most the hard cap');
+      assert.equal(data.returned, 200);
+      assert.equal(data.hasMore, true, 'and says there are more');
     });
 
     it('clamps an out-of-u32-range offset to the native ceiling instead of passing it through to wrap (reviewer repro)', async () => {

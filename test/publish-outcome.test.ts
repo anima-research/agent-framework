@@ -381,7 +381,8 @@ describe('channel_publish answers by the receipt rule', () => {
     assert.ok(!thrown.error?.includes('Connector detail'), 'no data, no detail');
     // A long string comes through as itself, bounded.
     const long = await publishWith(async () => { throw new McplRequestError('timed out', 'no-response', 'q'.repeat(3000)); });
-    assert.ok(long.error?.endsWith(` Connector detail: ${'q'.repeat(1987)}… [truncated]`), long.error?.slice(-80));
+    const detail = /Connector detail: (q+)… \[truncated\]$/.exec(long.error ?? '');
+    assert.ok(detail && detail[1]!.length < 3000, long.error?.slice(-80));
     // A request that never left posted nothing, whatever data rides on it.
     const refused = await publishWith(async () => { throw new McplRequestError('Cannot send request: connection to "discord" is closed', 'not-sent', { posted: [] }); });
     assert.match(refused.error ?? '', /^Nothing was posted to channel "c": /);

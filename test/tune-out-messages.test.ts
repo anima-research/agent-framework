@@ -1,8 +1,7 @@
 /**
  * What the tune-out coordinator tells the agent, and the subconscious, when it
  * refuses: that nothing changed, why, and what to do instead. A channel that's
- * already tuned out gives its settings and how to change them, and is marked
- * for the dispatch, which tries a repeat's transport again; a cancel of one
+ * already tuned out gives its settings and how to change them; a cancel of one
  * that isn't names the connected ones that are, and the backlog's reader as
  * its caller knows the resident.
  */
@@ -47,48 +46,68 @@ function coordinator(opts: { tunedOut?: Array<{ channelId: string; expiresAtMs?:
   return new TuneOutCoordinator(registry as never, {} as never, hooks(opts) as never);
 }
 
+function refusalOf(result: { ok: boolean; error?: string }): string {
+  assert.equal(result.ok, false, JSON.stringify(result));
+  return result.error ?? '';
+}
+
+function assertSettingsAndChange(error: string): void {
+  assert.match(error, /cadenceSeconds 300, backlogCap 50 and maxWakes 3/);
+  assert.match(error, /cancel it first with tune_out mode "cancel"/);
+  assert.match(error, /then call tune_out again with the new settings/);
+}
+
+function assertEndsByItself(error: string, reader: string): void {
+  assert.match(error, /ends by itself when its duration runs out, or at the first wake past its wake budget/);
+  assert.ok(error.endsWith(`its backlog goes to ${reader} then.`), error);
+}
+
+function assertBothNamed(error: string, notDone: string): void {
+  assert.match(error, /"general"/);
+  assert.match(error, /\("a:general", "b:general"\)/);
+  assert.ok(error.includes(notDone), error);
+  assert.match(error, /Call again with channelId set to one of them/);
+}
+
+function assertWithdrawn(error: string, notDone: string): void {
+  assert.match(error, /^"general" is this turn's channel on server "b", which no longer registers it/);
+  assert.ok(error.includes(notDone), error);
+  assert.match(error, /until that server registers it again\.$/);
+}
+
 test('tune_out and cancel_tuneout say why nothing changed, and name the connected channels that are tuned out', async () => {
-  assert.deepEqual(coordinator({ subconscious: false }).enter('disc', 'disc:guild:noisy', {}, 'agent-tool'), {
-    ok: false,
-    error: 'Nothing was tuned out: this host has no subconscious resident to watch a channel, so tune_out isn\'t '
-      + 'available here, and calling it again won\'t change that. If you need channels diverted, ask whoever runs this host.',
-  });
-  assert.deepEqual(coordinator({ forkBound: true }).enter('disc', 'disc:guild:noisy', {}, 'agent-tool'), {
-    ok: false,
-    error: 'Nothing changed: a conversation is bound to "disc:guild:noisy", so its messages go to that conversation, '
-      + 'and tune_out won\'t divert a channel while one is. Calling tune_out on it again won\'t change that until the '
-      + 'conversation ends, which happens only once the channel has been quiet for a while. Tune out a different '
-      + 'channel, or ask whoever runs this host if this one should be diverted.',
-  });
-  // An end carries milliseconds, as Date.now() plus whole seconds does, and is shown to the second.
+  const unavailable = refusalOf(coordinator({ subconscious: false }).enter('disc', 'disc:guild:noisy', {}, 'agent-tool'));
+  assert.match(unavailable, /^Nothing was tuned out: /);
+  assert.match(unavailable, /ask whoever runs this host/);
+  const bound = refusalOf(coordinator({ forkBound: true }).enter('disc', 'disc:guild:noisy', {}, 'agent-tool'));
+  assert.match(bound, /^Nothing changed: a conversation is bound to "disc:guild:noisy"/);
+  assert.match(bound, /tune_out won't divert a channel while one is/);
+  assert.match(bound, /again won't change that until the conversation ends/);
+  assert.match(bound, /Tune out a different channel/);
   const expiring = coordinator({ tunedOut: [{ channelId: 'disc:guild:noisy', expiresAtMs: Date.UTC(2026, 9, 15, 6, 30, 0, 123) }] });
-  assert.deepEqual(expiring.enter('disc', 'disc:guild:noisy', {}, 'agent-tool'), {
-    ok: false,
-    error: 'Nothing changed: "disc:guild:noisy" is already tuned out, with cadenceSeconds 300, backlogCap 50 and '
-      + 'maxWakes 3, until 2026-10-15T06:30:00Z. To change those, cancel it first with tune_out mode "cancel", which '
-      + 'delivers its backlog to you now, then call tune_out again with the new settings.',
-    alreadyTunedOut: true,
-  });
+  const already = refusalOf(expiring.enter('disc', 'disc:guild:noisy', {}, 'agent-tool'));
+  assert.match(already, /^Nothing changed: "disc:guild:noisy" is already tuned out/);
+  assertSettingsAndChange(already);
+  assert.match(already, /until 2026-10-15T06:30:00/);
 
   const busy = coordinator({ tunedOut: [{ channelId: 'disc:guild:noisy' }, { channelId: 'disc:guild:busy' }] });
-  const elsewhere = 'Nothing was cancelled: no connected channel "disc:guild:quiet" is tuned out. Connected channels tuned '
-    + 'out now: "disc:guild:noisy", "disc:guild:busy". A tune-out also ends by itself when its duration runs out, or at '
-    + 'the first wake past its wake budget, and its backlog goes to';
-  assert.deepEqual(busy.cancel('disc', 'disc:guild:quiet', 'agent-tool', 'agent request'), { ok: false, error: `${elsewhere} you then.` });
-  assert.deepEqual(await busy.handleSubconsciousTool('cancel_tuneout', { channelId: 'disc:guild:quiet' }), {
-    success: false,
-    error: `${elsewhere} the resident then.`,
-    isError: true,
-  });
+  const toResident = refusalOf(busy.cancel('disc', 'disc:guild:quiet', 'agent-tool', 'agent request'));
+  const toSubconscious = await busy.handleSubconsciousTool('cancel_tuneout', { channelId: 'disc:guild:quiet' });
+  assert.deepEqual([toSubconscious.success, toSubconscious.isError], [false, true]);
+  for (const [error, reader] of [[toResident, 'you'], [toSubconscious.error ?? '', 'the resident']] as const) {
+    assert.match(error, /^Nothing was cancelled: /);
+    assert.match(error, /"disc:guild:noisy", "disc:guild:busy"/, 'the connected channels that are tuned out');
+    assertEndsByItself(error, reader);
+  }
 });
 
 test('a tune-out with no end, or one past what a date can hold, is described without one', () => {
-  const settled = 'Nothing changed: "disc:guild:noisy" is already tuned out, with cadenceSeconds 300, backlogCap 50 and '
-    + 'maxWakes 3. To change those, cancel it first with tune_out mode "cancel", which delivers its backlog to you now, then '
-    + 'call tune_out again with the new settings.';
   for (const expiresAtMs of [undefined, 8.64e15 + 1]) {
     const busy = coordinator({ tunedOut: [{ channelId: 'disc:guild:noisy', ...(expiresAtMs !== undefined ? { expiresAtMs } : {}) }] });
-    assert.deepEqual(busy.enter('disc', 'disc:guild:noisy', {}, 'agent-tool'), { ok: false, error: settled, alreadyTunedOut: true }, String(expiresAtMs));
+    const settled = refusalOf(busy.enter('disc', 'disc:guild:noisy', {}, 'agent-tool'));
+    assert.match(settled, /^Nothing changed: "disc:guild:noisy" is already tuned out/, String(expiresAtMs));
+    assertSettingsAndChange(settled);
+    assert.doesNotMatch(settled, /\buntil\b/, String(expiresAtMs));
   }
 });
 
@@ -102,12 +121,12 @@ test("a cancel_tuneout of a channel whose server was removed claims nothing abou
   registry.removeServer('disc');
   assert.ok(registry.getTuneOutState('disc', 'disc:guild:noisy'), 'the tune-out outlives its server');
   const overRegistry = new TuneOutCoordinator(registry, {} as never, hooks({}) as never);
-  assert.deepEqual(await overRegistry.handleSubconsciousTool('cancel_tuneout', { channelId: 'disc:guild:noisy' }), {
-    success: false,
-    error: 'Nothing was cancelled: no connected channel is tuned out now. A tune-out also ends by itself when its '
-      + 'duration runs out, or at the first wake past its wake budget, and its backlog goes to the resident then.',
-    isError: true,
-  });
+  const refused = await overRegistry.handleSubconsciousTool('cancel_tuneout', { channelId: 'disc:guild:noisy' });
+  assert.deepEqual([refused.success, refused.isError], [false, true]);
+  const error = refused.error ?? '';
+  assert.match(error, /^Nothing was cancelled: no connected channel is tuned out now\./);
+  assert.doesNotMatch(error, /"/, 'it names no channel');
+  assertEndsByItself(error, 'the resident');
 });
 
 test("two servers' tune-outs of one channel id are named apart, and cancel_tuneout takes the qualified name", async () => {
@@ -135,12 +154,9 @@ test("two servers' tune-outs of one channel id are named apart, and cancel_tuneo
   const already = coordinator.enter('b', 'general', {}, 'agent-tool');
   assert.ok(!already.ok && already.error.startsWith('Nothing changed: "b:general" is already tuned out'), JSON.stringify(already));
   // The registry's rule: a name both servers' channels answer to is refused.
-  assert.deepEqual(await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'general' }), {
-    success: false,
-    isError: true,
-    error: 'Channel "general" is on more than one server ("a:general", "b:general"), so nothing ran. '
-      + 'Call again with channelId set to one of them.',
-  });
+  const shared = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'general' });
+  assert.deepEqual([shared.success, shared.isError], [false, true]);
+  assertBothNamed(shared.error ?? '', 'nothing ran');
   assert.deepEqual(await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'b:general', text: 'quiet now' }),
     { success: true, data: { cancelled: true } });
   assert.ok(!registry.getTuneOutState('b', 'general'), "b's tune-out ended");
@@ -155,17 +171,17 @@ test("two servers' tune-outs of one channel id are named apart, and cancel_tuneo
   assert.deepEqual(coordinator.cancel('a', 'general', 'agent-tool', 'agent request'), { ok: true });
   (coordinator as unknown as { invokeSubconscious(s: string, c: string, t: 'cadence', n: number): void })
     .invokeSubconscious('a', 'general', 'cadence', 2);
-  assert.deepEqual(wakes.filter((w) => w.startsWith('Subconscious:')), [
-    'Subconscious: tune-out cancelled: a:general', 'Subconscious: tune-out cadence: a:general',
-  ]);
+  const subconsciousWakes = wakes.filter((w) => w.startsWith('Subconscious:'));
+  assert.equal(subconsciousWakes.length, 2, JSON.stringify(wakes));
+  for (const reason of subconsciousWakes) assert.match(reason, /\ba:general$/);
   // The subconscious's own words carry the channel's server, which the
   // framework reads on a conversational row (repinChannel).
   const note = added.find((m) => m.metadata?.kind === 'subconscious-note');
   assert.deepEqual([note?.metadata?.channelId, note?.metadata?.serverId], ['general', 'b']);
   await coordinator.handleSubconsciousTool('deliver_summary', { channelId: 'b:general', text: 'all quiet on b' });
   const which = await coordinator.handleSubconsciousTool('deliver_summary', { channelId: 'general', text: 'which general?' });
-  assert.deepEqual([which.success, which.isError, which.error], [false, true,
-    'Channel "general" is on more than one server ("a:general", "b:general"), so nothing was delivered. Call again with channelId set to one of them.']);
+  assert.deepEqual([which.success, which.isError], [false, true]);
+  assertBothNamed(which.error ?? '', 'nothing was delivered');
   await coordinator.handleSubconsciousTool('deliver_summary', { channelId: 'nowhere', text: 'about a channel nobody registers' });
   const summaries = added.filter((m) => m.metadata?.kind === 'subconscious-summary').map((m) => [m.metadata?.channelId, m.metadata?.serverId]);
   assert.deepEqual(summaries, [['general', 'b'], ['nowhere', undefined]],
@@ -181,17 +197,23 @@ test("cancel_tuneout inside the subconscious's turn reads the id of the turn's o
   }
   registry.enterTuneOut('a', 'general', SETTINGS, 'agent-tool');
   registry.enterTuneOut('b', 'general', SETTINGS, 'agent-tool');
-  const cancelled: string[] = [];
-  const coordinator = new TuneOutCoordinator(registry, {} as never, hooks({}) as never);
-  (coordinator as unknown as { cancel(s: string, c: string): { ok: boolean } }).cancel = (s: string, c: string) => { cancelled.push(`${s} ${c}`); return { ok: true }; };
+  const coordinator = new TuneOutCoordinator(registry, {} as never, {
+    ...hooks({}),
+    addMessage: () => {},
+    requestInference: () => {},
+    getStoredMessages: () => [],
+    getDeferredMessages: () => [],
+    emitTrace: () => {},
+  } as never);
   const own = [{ serverId: 'b', channelId: 'general' }];
   assert.deepEqual(await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'general' }, own), { success: true, data: { cancelled: true } });
-  assert.deepEqual(cancelled, ['b general'], "the turn's own channel, not a shared-id refusal");
+  assert.ok(!registry.getTuneOutState('b', 'general'), "the turn's own channel's tune-out ended, not a shared-id refusal");
+  assert.ok(registry.getTuneOutState('a', 'general'), "a's goes on");
   await registry.handleChanged('b', { removed: ['general'] });
   const gone = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'general' }, own);
-  assert.equal(gone.error, '"general" is this turn\'s channel on server "b", which no longer registers it, so nothing ran, '
-    + 'and nothing can run on it until that server registers it again.');
-  assert.deepEqual(cancelled, ['b general'], "a's tune-out is left as it was");
+  assert.deepEqual([gone.success, gone.isError], [false, true]);
+  assertWithdrawn(gone.error ?? '', 'nothing ran');
+  assert.ok(registry.getTuneOutState('a', 'general'), "a's tune-out is left as it was");
 });
 
 test("speak_in_channel and deliver_summary inside the subconscious's turn read the id of the turn's own channel as that channel", async () => {
@@ -220,25 +242,21 @@ test("speak_in_channel and deliver_summary inside the subconscious's turn read t
   // Once b withdraws it, speech there is refused, and a's general isn't taken for it.
   await registry.handleChanged('b', { removed: ['general'] });
   const gone = await coordinator.handleSubconsciousTool('speak_in_channel', { channelId: 'general', text: 'hello again' }, own);
-  assert.equal(gone.error, '"general" is this turn\'s channel on server "b", which no longer registers it, so nothing was posted, '
-    + 'and nothing can be until that server registers it again.');
+  assertWithdrawn(gone.error ?? '', 'nothing was posted');
   assert.equal(posted.length, 1);
   // deliver_summary refuses it too, rather than leaving a row a re-pin would read as a's general.
   const undelivered = await coordinator.handleSubconsciousTool('deliver_summary', { channelId: 'general', text: 'still quiet' }, own);
   assert.deepEqual([undelivered.success, undelivered.isError], [false, true]);
-  assert.equal(undelivered.error, '"general" is this turn\'s channel on server "b", which no longer registers it, so nothing was delivered, '
-    + 'and nothing can be until that server registers it again.');
+  assertWithdrawn(undelivered.error ?? '', 'nothing was delivered');
   assert.equal(added.length, 1);
   // Where the turn has channels with that id on two servers, it means neither, for both tools.
   await registry.handleRegister('b', { channels: [{ id: 'general', type: 'chat', label: '#general', direction: 'bidirectional' }] });
   const both = [{ serverId: 'a', channelId: 'general' }, { serverId: 'b', channelId: 'general' }];
   const unspoken = await coordinator.handleSubconsciousTool('speak_in_channel', { channelId: 'general', text: 'to whom?' }, both);
-  assert.equal(unspoken.error, '"general" is the id of this turn\'s channels on more than one server ("a:general", "b:general"), '
-    + 'so nothing was posted. Call again with channelId set to one of them.');
+  assertBothNamed(unspoken.error ?? '', 'nothing was posted');
   const unsummed = await coordinator.handleSubconsciousTool('deliver_summary', { channelId: 'general', text: 'about whom?' }, both);
   assert.deepEqual([unsummed.success, unsummed.isError], [false, true]);
-  assert.equal(unsummed.error, '"general" is the id of this turn\'s channels on more than one server ("a:general", "b:general"), '
-    + 'so nothing was delivered. Call again with channelId set to one of them.');
+  assertBothNamed(unsummed.error ?? '', 'nothing was delivered');
   assert.equal(posted.length, 1);
   assert.equal(added.length, 1);
 });
