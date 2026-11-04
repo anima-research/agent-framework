@@ -11173,8 +11173,15 @@ export class AgentFramework {
               // on the fork's own branch — not in a namespace of its own.
               namespace: inherit?.mode === 'shared' ? namespace : spec.namespace ?? namespace,
               ...(inherit ? { inherit } : {}),
+              ...(config.selfParticipants?.length ? { selfParticipants: config.selfParticipants } : {}),
+              ...(config.presentAs && config.presentAs !== config.name ? { presentAs: config.presentAs } : {}),
             }
-          : { ...workerSpec(config.name, { namespace }), model: config.model },
+          : {
+              ...workerSpec(config.name, { namespace }),
+              model: config.model,
+              ...(config.selfParticipants?.length ? { selfParticipants: config.selfParticipants } : {}),
+              ...(config.presentAs && config.presentAs !== config.name ? { presentAs: config.presentAs } : {}),
+            },
       });
       this.ephemeralAgents.add(agent);
       this.managerReleases.set(agent, release);

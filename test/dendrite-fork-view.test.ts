@@ -316,6 +316,23 @@ describe("a shared child of a resident with former names", () => {
     resumed.cleanup();
   });
 
+  it("records the mapping a job's requests use when its config names it and its spec doesn't", async () => {
+    framework.getAgent('mira')!.getContextManager().addMessage('user', [text('Please look into the open issues.')]);
+    const { name: _name, ...spec } = taskForkSpec('job-4', { parent: 'mira', inherit: { mode: 'shared' } });
+    const config = (name: string) => ({ name, model: 'test-model', systemPrompt: 'Do the task.', toolDeclarations: 'entries', selfParticipants: ['zed'], presentAs: `${name}-shown` });
+    const withSpec = await framework.createEphemeralAgent(config('job-4') as never, spec);
+    const bare = await framework.createEphemeralAgent(config('job-5') as never);
+    for (const job of [withSpec, bare]) job.contextManager.addMessage('user', [text('Run once.')]);
+    framework.start();
+    membrane.script('job-4-shown', say('job-4 done'));
+    membrane.script('job-5-shown', say('job-5 done'));
+    for (const job of [withSpec, bare]) await framework.runEphemeralToCompletion(job.agent, job.contextManager);
+    for (const name of ['job-4', 'job-5']) {
+      const record = framework.getAgentRecord(name)!;
+      assert.deepEqual([record.selfParticipants, record.presentAs], [['zed'], `${name}-shown`], name);
+    }
+  });
+
   it("gives a child resumed with no mapping of its own the view of its record's", async () => {
     const changeTools = async (cm: ContextManager): Promise<string[]> =>
       (await cm.compile(undefined, undefined, { dryRun: true })).messages.flatMap((m) =>
