@@ -26,6 +26,8 @@
     `^0.24.0`, membrane `^0.8.0` and chronicle `^0.5.1`, as 0.32.0 does.
   - When the persistent reader ends while a hold's release fails (its
     backlog can't be made durable), the release is tried again, backing off
-    from a minute, up to five times; `tune_out` / `focus` stay listed only
-    while a reader is there or a hold is still on record to check or
+    from a minute, five tries in all; after the last, the hold stays until
+    the resident cancels it, or the next start releases it (with no reader)
+    or resumes it (with one). `tune_out` / `focus` stay listed while a
+    reader is there, or while such a hold is still on record to check or
     cancel.

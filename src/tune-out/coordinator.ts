@@ -1006,11 +1006,12 @@ export class TuneOutCoordinator {
     // open-ended one has no end time to release it: try again, backing off,
     // a few times (a try that fails after its dump is durable writes a new
     // one only for messages held since). After the last, the hold stays
-    // until the resident cancels it or the next start releases it.
+    // until the resident cancels it, or the next start releases it (with no
+    // reader configured) or resumes it (with one).
     const attempt = options.attempt ?? 1;
     if (failed && options.retry && !this.stopped) {
       if (attempt >= RELEASE_RETRY_ATTEMPTS) {
-        console.error(`[tune-out] releasing the holds (${reason}) failed ${attempt} times, so what failed stays held until it is cancelled or the next start releases it`);
+        console.error(`[tune-out] releasing the holds (${reason}) failed ${attempt} times, so what failed stays held until it is cancelled, or the next start releases it (with no reader configured) or resumes it (with one)`);
       } else {
         this.releaseRetry = setTimeout(() => {
           this.releaseRetry = null;
