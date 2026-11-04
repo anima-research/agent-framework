@@ -32054,7 +32054,7 @@ export class AgentFramework {
       branch: this.store.currentBranch().name,
     };
     const abort = new AbortController();
-    const settled = this.auxiliaryMembraneFor(name).complete(withoutHistory(request), { retry: false, signal: abort.signal }).then(
+    const settled = this.ownAuxiliaryMembraneFor(agent).complete(withoutHistory(request), { retry: false, signal: abort.signal }).then(
       (response): Error | null => (isAbortedResponse(response)
         ? new Error(`the probe was aborted (${String((response as { reason?: unknown }).reason ?? 'no reason given')})`)
         : null),
@@ -32091,6 +32091,13 @@ export class AgentFramework {
     });
     const probe = { abort, settled };
     this.breakerProbes.add(probe);
+  }
+  private ownAuxiliaryMembraneFor(agent: Agent): Membrane {
+    const release = this.managerReleases.get(agent);
+    if (!release) return this.auxiliaryMembraneFor(agent.name);
+    return this.ephemeralAgents.has(agent)
+      ? this.ephemeralAuxiliaryMembraneFor(agent.name, release)
+      : this.withdrawnOnceReleased(this.conversationAuxiliaryMembraneFor(agent.name), agent.name, release);
   }
 
   /**

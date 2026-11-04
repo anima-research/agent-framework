@@ -81,6 +81,8 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   fw.failedRequests = { get: () => onTheWire, delete: () => true };
   fw.activeTurnTokens = new Map();
   fw.breakerProbes = new Set();
+  fw.managerReleases = new WeakMap();
+  fw.ephemeralAgents = new WeakSet();
   fw.store = { currentBranch: () => ({ name: 'main' }) };
   const probes: NormalizedRequest[] = [];
   fw.auxiliaryMembraneFor = () => ({

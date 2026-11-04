@@ -384,8 +384,81 @@ test('a probe opens no kv submission: only the turns that went on the wire do', 
     r.say(text);
     await r.until(() => r.count('inference:exhausted') === i + 1, `${text}'s turn to fail`);
   }
+  await r.until(() => membrane.probes.length === 1, 'the probe to go out');
   await r.quiet(60_000);
-  assert.equal(membrane.probes.length, 1, 'the probe went out');
+  assert.equal(membrane.probes.length, 1, 'the probe went out, and only one');
   assert.equal(membrane.sends.length, 5);
   assert.deepEqual(strategy.begun, ['zz-send-1', 'zz-send-2', 'zz-send-3', 'zz-send-4', 'zz-send-5']);
+});
+
+async function started(t: TestContext, membrane: StandIn, more: Record<string, unknown>) {
+  const dir = mkdtempSync(join(tmpdir(), 'breaker-probe-'));
+  const fw = await AgentFramework.create({
+    storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
+    modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0, ...more,
+  } as never);
+  const traces: Trace[] = [];
+  fw.onTrace((e) => { traces.push(e as unknown as Trace); });
+  t.after(async () => {
+    await fw.stop().catch(() => {});
+    rmSync(dir, { recursive: true, force: true });
+  });
+  fw.start();
+  const soon = async (done: () => boolean, what: string) => {
+    for (const end = Date.now() + 30_000; !done(); await settle()) {
+      if (Date.now() > end) throw new Error(`zz-timeout: ${what} did not happen within 30 s`);
+    }
+  };
+  const failed = (name: string) => traces.filter((tr) => tr.type === 'inference:exhausted' && tr.agentName === name).length;
+  const gates = () => (fw as unknown as { providerGates: Map<string, unknown> }).providerGates;
+  return { fw, traces, soon, failed, gates };
+}
+
+test("a conversation fork reaching the breaker is probed as its own calls are, so it gets no provider gate and its disposal withdraws the probe", async (t) => {
+  const membrane = new StandIn(() => walk4(), () => new Promise<never>(() => {}));
+  const r = await started(t, membrane, {
+    agents: [{ name: 'trunk', model: 'zz-model', systemPrompt: 'system' }],
+    conversations: { templateAgent: 'trunk', bind: { channel: 'mention' } },
+  });
+  const internals = r.fw as unknown as {
+    createConversationAgent(name: string, home: { serverId: string; channelId: string }): Promise<unknown>;
+    disposeConversationAgent(name: string): void;
+    pendingRequests: unknown[];
+  };
+  await internals.createConversationAgent('trunk-chan-g1', { serverId: 'world', channelId: 'world:chan' });
+  const fork = r.fw.getAgent('trunk-chan-g1')!;
+  for (let i = 1; i <= 3; i++) {
+    fork.getContextManager().addMessage('User', [{ type: 'text', text: `zz-fork-${i}` }]);
+    internals.pendingRequests.push({ agentName: 'trunk-chan-g1', source: 'test', reason: 'zz-wake', timestamp: Date.now() });
+    await r.soon(() => r.failed('trunk-chan-g1') === i, `the fork's turn ${i} to fail`);
+  }
+  await r.soon(() => membrane.probes.length === 1, 'the breaker to probe the fork');
+  assert.equal(r.gates().has('trunk-chan-g1'), false, 'the fork has no provider gate, as its own calls take none');
+  internals.disposeConversationAgent('trunk-chan-g1');
+  assert.equal(membrane.probeOptions[0].signal?.aborted, true, "the fork's disposal withdrew its probe");
+  await r.soon(() => stderr.some((line) => line.includes("agent=trunk-chan-g1: its probe's answer is set aside")), "the probe's end to be set aside");
+  assert.equal(r.gates().has('trunk-chan-g1'), false, 'and left no gate');
+});
+
+test("a run released while its probe is out has the probe withdrawn, as the run's own calls are, and the probe's end touches nothing of it", async (t) => {
+  const membrane = new StandIn(() => walk4(), () => new Promise<never>(() => {}));
+  const r = await started(t, membrane, { agents: [] });
+  let last: { getAllMessages(): Array<{ metadata?: unknown }> } | undefined;
+  const config = { model: 'zz-model', systemPrompt: 'Do the task.' };
+  for (let i = 1; i <= 3; i++) {
+    const { agent, contextManager } = i === 1
+      ? await r.fw.createEphemeralAgent({ name: 'job', ...config } as never)
+      : await r.fw.resumeAgent('job', config as never);
+    contextManager.addMessage('User', [{ type: 'text', text: `zz-task-${i}` }]);
+    await assert.rejects(r.fw.runEphemeralToCompletion(agent, contextManager));
+    last = contextManager as never;
+  }
+  const setAside = () => stderr.some((line) => line.includes("agent=job: its probe's answer is set aside"));
+  await r.soon(() => membrane.probes.length === 1 || setAside(), 'the breaker to probe the run');
+  assert.ok(membrane.probeOptions.every((o) => o.signal?.aborted === true), 'a probe that went out for the run was withdrawn with it');
+  await r.soon(setAside, "the probe's end to be set aside");
+  assert.equal(r.gates().has('job'), false, 'the run has no provider gate, as its own calls take none');
+  assert.equal(stderr.filter((line) => line.includes('agent=job') && /kept its history|shed/.test(line)).length, 0, 'nothing was shed or kept for it');
+  assert.equal(last!.getAllMessages().filter((m) => (m.metadata as { kind?: unknown } | undefined)?.kind === 'refusal-rewind').length, 0,
+    'and no marker went into its history');
 });
