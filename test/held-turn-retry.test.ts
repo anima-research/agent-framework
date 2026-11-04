@@ -1278,7 +1278,7 @@ test("a wake folded into a held merged start that equals one of its wakes counts
     const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
     const { fw, internal } = await framework(path, membrane);
     try {
-      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again');
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again', 'wake');
       const before = fw.getHostModeStatus().gatedRequests;
       const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
       const start = held[0] as unknown as Record<string, unknown>;
@@ -1287,6 +1287,9 @@ test("a wake folded into a held merged start that equals one of its wakes counts
       (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, wake);
       assert.equal(held.length, 1, 'premise: the hold folds the equal wake into the merged start');
       assert.equal(fw.getHostModeStatus().gatedRequests, before, 'the wake it equals already counts');
+      const batchKey = Object.getOwnPropertySymbols(start).find((key) => key.description === 'merged-batch')!;
+      const members = (start as unknown as Record<symbol, Array<{ wakeChannels?: Array<{ channelId: string }> }>>)[batchKey];
+      assert.ok(members.some((member) => member.wakeChannels?.some((channel) => channel.channelId === 'discord:g:again')), "the wake's channels are kept by the member it equals");
       go();
     } finally { await fw.stop(); log.restore(); }
   });
