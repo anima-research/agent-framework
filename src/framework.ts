@@ -16323,7 +16323,7 @@ export class AgentFramework {
     console.error(`[head-declarations] ${agent.name}: a request carrying a system change was refused, so it declares on its head until it's built again: ${error.message}`);
     if (!recognised) {
       this.opsAlert('head-resend', agent.name,
-        `a 400 membrane doesn't recognise as a refused system change ended a request that carried one, so it goes again on the agent's head${this.thinkingSetAside(agent, 'which sets aside the thinking the request held')}. The 400 may not be about the change. The agent keeps to its head until it's built again, so until then each change to its tools or system text rewrites its cache: ${error.message}`,
+        `a 400 membrane doesn't recognise as a refused system change ended a request that carried one, so it goes again on the agent's head${this.thinkingSetAside(agent, 'which can set aside the thinking the request held')}. The 400 may not be about the change. The agent keeps to its head until it's built again, so until then each change to its tools or system text rewrites its cache: ${error.message}`,
         { data: { httpStatus: 400 } });
     }
     this.emitTrace({ type: 'head:resend', agentName: agent.name, error: error.message });

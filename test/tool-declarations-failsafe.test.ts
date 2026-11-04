@@ -211,7 +211,7 @@ describe("toolDeclarations' fail-safe", () => {
       const alert = alerts[0] as { message: string; data?: { httpStatus?: number } };
       assert.match(alert.message, /role system not accepted here/, 'quoting the 400');
       assert.match(alert.message, /keeps to its head until it's built again/);
-      assert.equal(/sets aside the thinking/.test(alert.message), binds, `binds ${binds}: the thinking's cost said only where it's paid`);
+      assert.equal(/can set aside the thinking/.test(alert.message), binds, `binds ${binds}: the thinking's cost said only where it can be paid`);
       assert.equal(alert.data?.httpStatus, 400);
     }
     const recognised = await turns({ binds: true, refuse: (r) => (carriesChange(r) ? refusal(true) : undefined) });
