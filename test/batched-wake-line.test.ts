@@ -3,8 +3,8 @@
  * child. The line says which messages a wake is for; for one message that is
  * still the newest entry in the agent's window it says nothing the message
  * right above doesn't, so the delivery agent's wake runs without it. The
- * gate hands such a line to the wake, and a fresh start of the wake's turn
- * decides it (placeWakeLines).
+ * gate hands such a line to the wake, and a start decides it as WakeLine
+ * says (placeWakeLines).
  *
  * Seen live: a resident whose addressed messages wake through a 5 s debounce
  * had a third of its window made of these lines, four in five of them right

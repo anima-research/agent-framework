@@ -1293,8 +1293,7 @@ describe('EventGate: channel patterns and channelId keys through the route resol
  * one message still the newest entry in the window the line would go to, it
  * says nothing the message right above doesn't when the batch fires (the
  * framework answers isNewestEntry), so the gate hands the line to the wake
- * instead of writing it, for a fresh start of the wake's turn to decide
- * (WakeLine).
+ * instead of writing it, for a start to decide as WakeLine says.
  */
 describe('a batched wake writes its line only when it says something', () => {
   const fire = (gate: EventGate, policyName: string): void => {

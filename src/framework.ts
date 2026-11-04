@@ -4954,8 +4954,10 @@ export class AgentFramework {
         // back, with its server where another server shares its id.
         channelShown: (channel) => framework.channelRegistry?.nameShown(channel) ?? suppliedValue(channel.channelId),
         // A batched wake for one message still newest in the window hands its
-        // `[Gate: …]` line to the wake, for the first start after it in the
-        // window to decide (placeWakeLines).
+        // `[Gate: …]` line to the wake, for the first start after it of any
+        // reader of the window to decide where its write went to the delivery
+        // agent, and otherwise the delivery agent's starts of the wake
+        // (placeWakeLines).
         isNewestEntry: (entry) => framework.isNewestContextEntry(entry),
         isAnswered: (after) => {
           const agent = after.agent !== undefined ? framework.agents.get(after.agent) : undefined;
@@ -37863,7 +37865,7 @@ export class AgentFramework {
     const b = r.behavior;
     const does = b === 'always' ? 'wake you'
       : b === 'defer' || b === 'skip' ? 'don\'t wake you (they still enter your context)'
-      : typeof b === 'object' && 'debounce' in b ? `wake you once, ${spanOf(b.debounce)} after a burst goes quiet`
+      : typeof b === 'object' && 'debounce' in b ? `wake you once, ${spanOf(b.debounce)} after a burst goes quiet, unless by the time it would start your turn every event in the burst was written for you and you've read and answered it`
       : typeof b === 'object' && 'rate_limit' in b ? `wake you at most once every ${spanOf(b.rate_limit.refillIntervalMs)}`
       : typeof b === 'object' && 'passive_sample' in b ? (b.passive_sample.every === 1 ? 'wake you' : `wake you for one in every ${b.passive_sample.every}`)
       : 'wake you as the server says';

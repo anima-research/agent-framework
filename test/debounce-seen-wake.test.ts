@@ -424,7 +424,7 @@ describe('debounced writes already read and answered', () => {
 
   for (const kind of ['addressed', 'ambient', 'system'] as const) {
     it(`a channel event read without replying there ${kind === 'addressed' ? 'keeps its addressed wake' : kind === 'ambient' ? 'drops its ambient wake' : 'drops a chat:system notice\'s wake'}`, async () => {
-      const { f, module, start } = await setup(60_000);
+      const { f, module, streams, start } = await setup(60_000);
       const wakes = recordWakes(f);
       try {
         await registerOpen(f, 'elsewhere');
@@ -433,6 +433,7 @@ describe('debounced writes already read and answered', () => {
         await eventually(() => deferred(f, 'new event'), 'event deferred');
         module.release('first');
         await loop;
+        assert.ok(heard(streams[0]!).includes('new event'), 'premise: the first turn read the event');
         assert.ok(!f.published.some((p) => p.channelId === 'work'), 'the first turn did not reply there');
         fire(f);
         assert.deepEqual(wakes, [{ agentName: 'agent', lines: 1 }], 'the batch requested its wake, handing on its line');
