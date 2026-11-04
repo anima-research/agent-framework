@@ -231,7 +231,9 @@ export interface McplServerConfig {
   /** AgentFramework-only opt-in, fail-closed admission for inbound data lanes.
    * Direct McplServerConnection factories reject this option. Required coalesced
    * content may be acknowledged before module onProcess completes; module
-   * dispatch remains FIFO per channel, independent of content acknowledgements. */
+   * dispatch remains FIFO per channel. The 64-slot queued+running module
+   * backlog refuses overflow before content acceptance; connection/host
+   * lifecycle boundaries drop queued work, with diagnostics. */
   inboundAdmission?: InboundAdmissionConfig;
   /** Unique server identifier */
   id: string;

@@ -135,8 +135,23 @@ stream drains deferred work immediately for the next compile.
 
 For required coalesced traffic, built-in storage and the durable acknowledgement
 do not await module `onProcess`. Module dispatch starts after acceptance and is
-FIFO per channel (feature-set scope for plain pushes). A hanging module delays
-later module dispatch for that scope, not later content acceptance or replies.
+FIFO per channel (feature-set scope for plain pushes). The named ceiling
+`MAX_PENDING_REQUIRED_MODULE_WORK = 64` (the admission ticket ceiling) bounds
+queued **plus running** work, including capacity reserved before storage. At
+capacity, new required coalesced deliveries refuse with `admission_denied` before
+any replacement, removal, storage or acceptance receipt. Refusals use the normal
+lane diagnostic/trace. Receipt retries do not create work and still replay.
+There is no wait for module space under the coalescer lock, and no silent module
+skip for accepted work outside the following lifecycle drop policy.
+
+Stop, disconnect, transport close and reconnect discard not-yet-started module
+work for that connection, release queued event references, and emit a bounded
+`mcpl:module-work-dropped` diagnostic/trace with count and fixed reason. Accepted
+content remains stored. A running call is not cancelled: it remains counted
+across epochs until it settles, and its completion cannot resurrect dropped work.
+After reconnect, new work for that scope waits behind that running call. A hanging
+module therefore delays module dispatch and, at the ceiling, refuses further
+content, rather than accumulating an unbounded backlog.
 Module errors are contained; they never retract an acknowledgement. Unconfigured
 coalesced delivery retains its existing completion timing.
 

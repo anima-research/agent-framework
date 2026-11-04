@@ -38,3 +38,8 @@
   stop answers once and a closed transport gets no answer. Stamp support arrives
   with context-only delivery, not this profile. No SPEC change is required;
   a full MCPL pin follows separately. See `docs/required-inbound-admission.md`.
+
+  Required coalesced module work has a 64-slot queued+running bound per channel
+  (feature-set scope for plain pushes). Overflow refuses before content
+  acceptance. Stop/connection boundaries drop queued work with diagnostics,
+  while a running call remains counted until it finishes.

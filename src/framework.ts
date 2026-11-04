@@ -1,4 +1,4 @@
-import { MAX_PENDING_ADMISSIONS, admissionConnectErrorOf, admittedEnvelope, attachAdmission, wakeForbidden, type RequiredIngress } from './mcpl/inbound-admission.js';
+import { MAX_PENDING_ADMISSIONS, admissionOf, admissionConnectErrorOf, admittedEnvelope, attachAdmission, wakeForbidden, type ConnectionKey, type RequiredIngress } from './mcpl/inbound-admission.js';
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { presentAuthor } from './author-presentation.js';
 import { constants as bufferConstants } from 'node:buffer';
@@ -1078,6 +1078,22 @@ interface CoalescedChannelEvent {
 type CoalescedDelivery =
   | { lane: 'channel'; event: CoalescedChannelEvent }
   | { lane: 'push'; event: McplPushEvent };
+/** Required coalesced module work per channel/feature-set scope, including
+ * the running call and reservations before built-in acceptance. */
+export const MAX_PENDING_REQUIRED_MODULE_WORK = MAX_PENDING_ADMISSIONS;
+type RequiredModuleSlot = {
+  connection: ConnectionKey;
+  queue: RequiredModuleQueue;
+  event?: ProcessEvent;
+  ready: boolean;
+  dropped: boolean;
+};
+type RequiredModuleQueue = {
+  key: string;
+  pending: RequiredModuleSlot[];
+  running?: RequiredModuleSlot;
+  scheduled?: boolean;
+};
 /** RFC-006 coalescing bookkeeping: receipts (retry window) + subject history. */
 const COALESCING_STATE_ID = 'mcpl/coalescing';
 /** Receipts written since the last snapshot flush (bridges the throttle window). */
@@ -4280,7 +4296,8 @@ export class AgentFramework {
   /** Both lanes are admitted in arrival order: a create, edit and delete of
    *  one subject must not overtake one another while routing awaits. */
   private coalescingAdmission: Promise<unknown> = Promise.resolve();
-  private readonly requiredCoalescedModuleTails = new Map<string, Promise<void>>();
+  private readonly requiredModuleQueues = new Map<string, RequiredModuleQueue>();
+  private readonly requiredModuleReservations = new WeakMap<object, RequiredModuleSlot>();
   private readonly coalescingTicketCounts = new Map<string, number>();
   private readonly coalescingTickets = new Map<string, Promise<void>>();
   private coalescingSaveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -5643,6 +5660,7 @@ export class AgentFramework {
       for (const connection of this.mcplServerRegistry?.getAllServers() ?? []) connection.stopReconnecting();
       for (const connection of this.modernServers().values()) connection.stopReconnecting();
     });
+    step(() => this.dropRequiredModuleWork('host_stopped'));
     step(() => this.pushCoalescer?.suspend());
     step(() => this.flushCoalescingSnapshot());
     this.running = false;
@@ -19016,7 +19034,7 @@ export class AgentFramework {
         acceptedAt: event.acceptedAt,
         sourceTimestamp: message.timestamp,
       });
-      const result = await this.pushCoalescer.accept({
+      const result = await this.acceptCoalescedWithModuleCapacity({
         serverId,
         binding: this.coalescingBinding(serverId),
         scope: { kind: 'channel', id: message.channelId },
@@ -19119,7 +19137,7 @@ export class AgentFramework {
             deferred: !!c.deferred,
           })
         : this.pushSource(event, { deferred: !!c.deferred });
-      return this.pushCoalescer.accept({
+      return this.acceptCoalescedWithModuleCapacity({
         serverId,
         binding: this.coalescingBinding(serverId),
         featureSet: params.featureSet,
@@ -19305,18 +19323,107 @@ export class AgentFramework {
     return placement;
   }
 
-  /** Required content acceptance does not await arbitrary module work. Keep
-   * module dispatch FIFO per channel (or feature-set subject), after the
-   * acceptance's lock/commit; a hung module delays only later module dispatch. */
+  /** Reserve under the coalescer's final check, before subject mutation,
+   * replacement/removal or built-in storage. Receipt replay creates no work. */
+  private acceptCoalescedWithModuleCapacity(occ: CoalescedOccurrence<CoalescedDelivery>, check?: RequiredIngress['check']): Promise<PushEventResult> {
+    if (!check) return this.pushCoalescer!.accept(occ);
+    return (async () => {
+      let slot: RequiredModuleSlot | undefined;
+      try {
+        return await this.pushCoalescer!.accept(occ, () => {
+          const reason = check();
+          if (reason) return reason;
+          if (!slot) {
+            const key = JSON.stringify([occ.serverId, occ.binding, occ.scope]);
+            let queue = this.requiredModuleQueues.get(key);
+            if (queue && queue.pending.length + (queue.running ? 1 : 0) >= MAX_PENDING_REQUIRED_MODULE_WORK) return 'admission_denied';
+            if (!queue) {
+              queue = { key, pending: [] };
+              this.requiredModuleQueues.set(key, queue);
+            }
+            slot = { connection: admissionOf(occ.event.event)!.connection, queue, ready: false, dropped: false };
+            queue.pending.push(slot);
+            this.requiredModuleReservations.set(occ.event.event, slot);
+          }
+        });
+      } finally {
+        this.requiredModuleReservations.delete(occ.event.event);
+        if (slot && !slot.dropped) {
+          if (slot.event) {
+            slot.ready = true;
+            this.pumpRequiredModuleQueue(slot.queue);
+          } else {
+            // No delivery (e.g. pure withdrawal) or a pre-storage failure.
+            slot.queue.pending.splice(slot.queue.pending.indexOf(slot), 1);
+            this.pumpRequiredModuleQueue(slot.queue);
+            this.pruneRequiredModuleQueue(slot.queue);
+          }
+        }
+      }
+    })();
+  }
+
+  /** No promise chains per event: pending payloads live only in this bounded,
+   * explicitly clearable array. Starting modules is deferred past acceptance. */
   private scheduleRequiredCoalescedModules(event: ProcessEvent, occ: CoalescedOccurrence<CoalescedDelivery>): void {
-    const key = JSON.stringify([occ.serverId, occ.binding, occ.scope]);
-    const prior = this.requiredCoalescedModuleTails.get(key) ?? Promise.resolve();
-    const accepted = this.coalescingAdmission;
-    const run = Promise.all([prior, accepted]).then(() => this.dispatchProcessEventToModules(event)).catch(error => {
-      console.error('[mcpl] required coalesced module dispatch failed:', error);
+    const slot = this.requiredModuleReservations.get(occ.event.event);
+    if (!slot) throw new Error('Required coalesced delivery has no module reservation');
+    if (!slot.dropped) slot.event = event;
+  }
+
+  private pruneRequiredModuleQueue(queue: RequiredModuleQueue): void {
+    if (queue.pending.length || queue.running) return;
+    queue.scheduled = undefined;
+    if (this.requiredModuleQueues.get(queue.key) === queue) this.requiredModuleQueues.delete(queue.key);
+  }
+
+  private pumpRequiredModuleQueue(queue: RequiredModuleQueue): void {
+    if (queue.running || queue.scheduled || !queue.pending[0]?.ready) return;
+    queue.scheduled = true;
+    queueMicrotask(() => {
+      queue.scheduled = undefined;
+      if (this.requiredModuleQueues.get(queue.key) !== queue || queue.running) return;
+      const slot = queue.pending[0];
+      if (!slot?.ready) return;
+      const connection = this.mcplServerRegistry?.getServer(slot.connection.connectionId);
+      if (this.stopHasBegun() || !connection?.requiredAdmission?.isCurrent(slot.connection)) {
+        this.dropRequiredModuleWork(this.stopHasBegun() ? 'host_stopped' : 'connection_closed', slot.connection.instance);
+        return;
+      }
+      queue.pending.shift();
+      queue.running = slot;
+      const event = slot.event!;
+      slot.event = undefined;
+      void this.dispatchProcessEventToModules(event).catch(error => {
+        console.error('[mcpl] required coalesced module dispatch failed:', error);
+      }).finally(() => {
+        queue.running = undefined;
+        this.pumpRequiredModuleQueue(queue);
+        this.pruneRequiredModuleQueue(queue);
+      });
     });
-    this.requiredCoalescedModuleTails.set(key, run);
-    void run.then(() => { if (this.requiredCoalescedModuleTails.get(key) === run) this.requiredCoalescedModuleTails.delete(key); });
+  }
+
+  /** Drop only not-yet-started work. Keep the running slot counted across
+   * epochs, so reconnects cannot accumulate new hanging calls for this scope.
+   * Its completion sees the cleared array, never a retained promise chain. */
+  private dropRequiredModuleWork(reason: 'host_stopped' | 'connection_closed' | 'reconnected' | 'disconnected', instance?: symbol): void {
+    const dropped = new Map<string, number>();
+    for (const queue of this.requiredModuleQueues.values()) {
+      queue.pending = queue.pending.filter(slot => {
+        if (instance !== undefined && slot.connection.instance !== instance) return true;
+        slot.dropped = true;
+        slot.event = undefined;
+        const id = slot.connection.connectionId;
+        dropped.set(id, (dropped.get(id) ?? 0) + 1);
+        return false;
+      });
+      this.pruneRequiredModuleQueue(queue);
+    }
+    for (const [serverId, count] of dropped) {
+      console.error(`[mcpl:module-work-dropped] server=${logValue(serverId)} count=${count} reason=${reason}`);
+      this.emitTrace({ type: 'mcpl:module-work-dropped', serverId, count, reason });
+    }
   }
 
   private async wakeForCoalescedBatch(occ: CoalescedOccurrence<CoalescedDelivery>): Promise<void> {
@@ -35078,6 +35185,8 @@ export class AgentFramework {
       throw new Error('MCPL subsystem is not initialized');
     }
     const registry = this.mcplServerRegistry;
+    const instance = this.requiredModuleQueues?.size ? registry.getServer(id)?.requiredAdmission?.instance : undefined;
+    if (instance) this.dropRequiredModuleWork('disconnected', instance);
     const hold = this.holdMcpServerId(id, 'disconnect');
     try {
       // Channel entries go first: removing them cancels the server's queued
@@ -35998,6 +36107,7 @@ export class AgentFramework {
     // preserved across the transient close are resumed by idempotent
     // registration. Then refresh tools (server may have different tools).
     connection.on('reconnect', (info?: { attempts?: number }) => {
+      if (connection.requiredAdmission) this.dropRequiredModuleWork('reconnected', connection.requiredAdmission.instance);
       // The connection closed both planes before wiring the fresh transport.
       // Re-establish the grant first: the §5.3 policy Request must be
       // answered before either plane opens — otherwise the first
@@ -36168,6 +36278,7 @@ export class AgentFramework {
     // a SIGKILL preserves them. Permanent removal is owned solely by
     // disconnectMcplServer, which deletes the trees explicitly.
     connection.on('close', (code?: number | null, signal?: string | null, info?: McplConnectionCloseInfo) => {
+      if (connection.requiredAdmission) this.dropRequiredModuleWork('connection_closed', connection.requiredAdmission.instance);
       // First here, and synchronously: the closed transport's channel
       // confirmations go with it before anything else this handler does, so
       // a registration on the next transport can't come first and lose its
