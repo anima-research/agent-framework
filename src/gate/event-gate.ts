@@ -2218,7 +2218,8 @@ export class EventGate {
   private judging = new Map<string, JudgingState>();
   /** Per rule, a batch that fired while a turn changing the judged context ran or the host was
    *  quiesced, held to be judged once both are clear: the judge reads the
-   *  context the turn leaves, which may already answer it. */
+   *  context the turn leaves, which may already answer it. Under onError
+   *  "skip", a batch is also held while the judge's calls are refused. */
   private judgeHeld = new Map<string, { events: PendingEvent[]; judge: JudgeConfig }>();
   private judgeRecords = new Map<string, JudgeRecord>();
   private changesJudgedContextFn: ((agentName: string) => boolean) | undefined;
@@ -4032,9 +4033,14 @@ export class EventGate {
 
     // A judge rule's batch goes to the reply judge, which delivers it, or
     // doesn't, once it has decided (judgeBatch). Without a judge wired it's
-    // delivered below, as a debounce's batch is.
+    // delivered below, as a debounce's batch is. One whose send to the judge
+    // throws is dropped, named in the log, as a delivery that throws is.
     if (state.judge && this.judgeFn) {
-      this.judgeBatch(policyName, events, state.judge);
+      try {
+        this.judgeBatch(policyName, events, state.judge);
+      } catch (err) {
+        this.logUnsent(policyName, events, 'sent to the judge', err);
+      }
       return;
     }
 
@@ -4054,11 +4060,7 @@ export class EventGate {
     try {
       this.deliverEvents(events);
     } catch (err) {
-      const one = events.length === 1;
-      console.error(
-        `[gate] Rule ${quotedValue(policyName)}: its pending batch of ${events.length} ${one ? 'event' : 'events'} couldn't be delivered `
-        + `(${errorText(err)}), so the batch is dropped`,
-      );
+      this.logUnsent(policyName, events, 'delivered', err);
       return;
     }
 
@@ -4067,6 +4069,14 @@ export class EventGate {
       policyName,
       eventCount: events.length,
     });
+  }
+
+  private logUnsent(policyName: string, events: PendingEvent[], as: string, err: unknown): void {
+    const one = events.length === 1;
+    console.error(
+      `[gate] Rule ${quotedValue(policyName)}: its pending batch of ${events.length} ${one ? 'event' : 'events'} couldn't be ${as} `
+      + `(${errorText(err)}), so the batch is dropped`,
+    );
   }
 
   // =========================================================================
@@ -4236,7 +4246,13 @@ export class EventGate {
       return;
     }
     const abort = new AbortController();
-    const agentNames = this.getAgentNamesFn();
+    let agentNames: string[];
+    try {
+      agentNames = this.getAgentNamesFn();
+    } catch (err) {
+      this.logUnsent(policyName, events, 'sent to the judge', err);
+      return;
+    }
     const state: JudgingState = { events, judge, started: Date.now(), abort, queued: [], ask: ++this.judgeAsks };
     this.judging.set(policyName, state);
     const timedOut = new Promise<never>((_, reject) => {
@@ -4326,8 +4342,11 @@ export class EventGate {
    * it) or held, so it only may, except that under onError "wake", while a
    * refusal's stated wait lasts, it wakes the agent without the judge being
    * asked, and one due before that wait ends is listed so, as certain,
-   * unless a running turn or the host's quiesce holds it past the wait's
-   * end, when it goes to the judge.
+   * counting only its events whose channel isn't held now, unless a running
+   * turn or the host's quiesce holds it past the wait's end, when it goes to
+   * the judge. Under "skip", one due before that wait ends is listed as held
+   * for the judge until the end. The list is soonest first, with the wakes
+   * whose time is in words (`when`) last.
    */
   upcomingWakes(agentNames: string[], exceptPolicy?: string): UpcomingWake[] {
     return this.upcomingWakesBut(agentNames, { policy: exceptPolicy });
@@ -4346,15 +4365,23 @@ export class EventGate {
       wakes.push({ at: this.sleepUntil, certain: true, what: 'the end of its sleep' });
     }
     const count = (n: number): string => `${n} ${n === 1 ? 'event' : 'events'}`;
-    const unjudgedUntil = this.judgeOnError === 'wake' && this.judgeRefusing() ? this.judgeRefusal?.until : undefined;
+    const statedEnd = this.judgeRefusing() ? this.judgeRefusal?.until : undefined;
     for (const [name, state] of this.debounceTimers) {
       if (name === leftOut.policy || state.events.length === 0) continue;
-      const batch = count(state.events.length);
-      wakes.push(!state.judge
-        ? { at: state.dueAt, certain: true, what: `rule ${quotedValue(name)}'s debounced batch of ${batch}` }
-        : unjudgedUntil !== undefined && state.dueAt < unjudgedUntil
-          ? { at: state.dueAt, certain: true, what: `rule ${quotedValue(name)}'s batch of ${batch}, delivered without the judge while its calls are refused` }
-          : { at: state.dueAt, certain: false, what: `rule ${quotedValue(name)}'s batch of ${batch} goes to the judge` });
+      const rule = `rule ${quotedValue(name)}'s`;
+      if (!state.judge) {
+        wakes.push({ at: state.dueAt, certain: true, what: `${rule} debounced batch of ${count(state.events.length)}` });
+      } else if (statedEnd === undefined || state.dueAt >= statedEnd) {
+        wakes.push({ at: state.dueAt, certain: false, what: `${rule} batch of ${count(state.events.length)} goes to the judge` });
+      } else if (this.judgeOnError === 'skip') {
+        const joins = this.judgeHeld.has(name) ? ', which joins its held batch when it fires,' : ',';
+        wakes.push({ at: statedEnd, certain: false, what: `${rule} batch of ${count(state.events.length)}${joins} held for the judge while its calls are refused` });
+      } else {
+        const delivered = state.events.filter((e) => !this.heldNow(e)).length;
+        if (delivered > 0) {
+          wakes.push({ at: state.dueAt, certain: true, what: `${rule} batch of ${count(delivered)}, delivered without the judge while its calls are refused` });
+        }
+      }
     }
     for (const [name, state] of this.judging) {
       if (name === leftOut.policy || state === leftOut.batch) continue;
@@ -4375,7 +4402,8 @@ export class EventGate {
     if (buffered > 0) {
       wakes.push({ certain: true, when: "once no turn runs and the host isn't quiesced", what: `${count(buffered)} buffered for delivery` });
     }
-    return wakes.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
+    const due = (w: UpcomingWake): number => (w.when !== undefined ? Infinity : w.at ?? now);
+    return wakes.sort((a, b) => (due(a) === due(b) ? 0 : due(a) - due(b)));
   }
 
   /** A batch's event as the judge is shown it. */
@@ -4705,7 +4733,7 @@ export class EventGate {
     bufferedEvents: number;
     droppedBufferedEvents: number;
     sleepUntil: number;
-    /** Events held for the reply judge until the turn or quiesce ends, and the judge's own drops at the cap. */
+    /** Events held for the reply judge until the turn or quiesce ends, or a refusal of the judge's calls does, and the judge's own drops at the cap. */
     judgeHeldEvents: number;
     droppedJudgeEvents: number;
   } {
