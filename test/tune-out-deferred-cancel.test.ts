@@ -154,7 +154,8 @@ describe('a later cancel of a tune-out whose cancel already waits', () => {
       const answer = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', text: 'Someone asked for you.' });
       assert.equal(answer.success, true, answer.error);
       assert.equal(waiting(answer).waiting, true);
-      assert.doesNotMatch(waiting(answer).note ?? '', /note/, `nothing said of its note: ${waiting(answer).note}`);
+      assert.match(waiting(answer).note ?? '', /Your note waits with the cancel and is delivered when the tune-out ends\./,
+        `told what becomes of its note: ${waiting(answer).note}`);
       release();
       assert.equal(registry.getTuneOutState('editor', 'noisy'), null, 'ended at the release');
       assert.ok(has(f, 'Someone asked for you.'), "the subconscious's note is delivered with the release");
@@ -166,11 +167,13 @@ describe('a later cancel of a tune-out whose cancel already waits', () => {
     try {
       const first = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', text: 'The first note.' });
       assert.equal(first.success, true, first.error);
-      assert.doesNotMatch(waiting(first).note ?? '', /note/, 'the first caller is told nothing of a note');
+      assert.match(waiting(first).note ?? '', /Your note waits with the cancel and is delivered when the tune-out ends\./,
+        'the first caller is told its note waits with the cancel');
       const second = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', text: 'The second note.' });
       assert.equal(second.success, true, second.error);
       assert.equal(waiting(second).waiting, true);
       assert.match(waiting(second).note ?? '', /Your note isn't delivered/, `the second caller is told: ${waiting(second).note}`);
+      assert.doesNotMatch(waiting(second).note ?? '', /Your note waits/, 'and not that it waits');
       release();
       assert.equal(registry.getTuneOutState('editor', 'noisy'), null, 'ended at the release');
       assert.ok(has(f, 'The first note.'), "the waiting cancel's note is delivered");
@@ -189,11 +192,13 @@ describe('a later cancel of a tune-out whose cancel already waits', () => {
       const first = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', scope: 'all-except', text: 'The first note.' });
       assert.equal(first.success, true, first.error);
       assert.equal(waiting(first).waiting, true);
-      assert.doesNotMatch(waiting(first).note ?? '', /note/, 'the first caller is told nothing of a note');
+      assert.match(waiting(first).note ?? '', /Your note waits with the cancel and is delivered when the all-except hold ends\./,
+        'the first caller is told its note waits with the cancel');
       const second = await coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', scope: 'all-except', text: 'The second note.' });
       assert.equal(second.success, true, second.error);
       assert.equal(waiting(second).waiting, true);
       assert.match(waiting(second).note ?? '', /Your note isn't delivered/, `the second caller is told: ${waiting(second).note}`);
+      assert.doesNotMatch(waiting(second).note ?? '', /Your note waits/, 'and not that it waits');
       again();
       assert.equal(coordinator.getAllExcept(), null, 'ended at the release');
       assert.ok(has(f, 'The first note.'), "the waiting cancel's note is delivered");
