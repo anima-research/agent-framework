@@ -38,7 +38,7 @@ export function endsOnUnansweredCalls(
     if (turn.participant !== agentName || isSystemChangeMessage(turn)) continue;
     const calls = turn.content.flatMap((block) => (block.type === 'tool_use' ? [block.id] : []));
     if (calls.length === 0) return false;
-    const answered = new Set(messages.slice(i + 1).flatMap((m) => m.content.flatMap((block) => (block.type === 'tool_result' ? [block.toolUseId] : []))));
+    const answered = new Set(messages.slice(i).flatMap((m) => m.content.flatMap((block) => (block.type === 'tool_result' ? [block.toolUseId] : []))));
     return calls.some((id) => !answered.has(id));
   }
   return false;

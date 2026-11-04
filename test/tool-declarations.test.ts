@@ -298,6 +298,15 @@ describe('toolDeclarations', () => {
     assert.equal(context.rows.at(-1)!.participant, 'system');
   });
 
+  it('declares after a call its own message answers, as context-manager counts it answered', async () => {
+    const cycle: Row = { id: 'cycle', participant: 'agent', content: [{ type: 'tool_use', id: 't1', name: 'a', input: {} } as ContentBlock, { type: 'tool_result', toolUseId: 't1', content: 'ok' } as ContentBlock] };
+    const context = fakeContext([said('user', 'hello'), cycle]);
+    const agent = agentOn(context, { toolDeclarations: 'entries' });
+    await agent.buildActivationRequest([tool('a')]);
+    await agent.buildActivationRequest([tool('a'), tool('b')]);
+    assert.equal(changeRows(context.rows).length, 1);
+  });
+
   it("hashes a head for kv-unified as the wire carries it, so a tool field left undefined hashes the same after adoption", async () => {
     const context = fakeContext([said('user', 'hello')], { kvUnified: true });
     const agent = agentOn(context, { toolDeclarations: 'entries' });
