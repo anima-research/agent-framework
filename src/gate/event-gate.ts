@@ -4359,7 +4359,7 @@ export class EventGate {
     for (const [name, state] of this.judging) {
       if (name === leftOut.policy || state === leftOut.batch) continue;
       const queued = state.queued.length > 0 ? `, with ${count(state.queued.length)} queued behind it` : '';
-      wakes.push({ certain: false, what: `rule ${quotedValue(name)}'s batch of ${count(state.events.length)}${queued}, which the judge is deciding` });
+      wakes.push({ certain: false, when: 'once the judge decides it', what: `rule ${quotedValue(name)}'s batch of ${count(state.events.length)}${queued}, which the judge is deciding` });
     }
     const refusal = this.judgeHeldForRefusal() ? this.judgeRefusal : null;
     for (const [name, held] of this.judgeHeld) {
@@ -5158,13 +5158,13 @@ export class EventGate {
     if (refusal.until !== undefined) {
       return `The reply judge's calls are refused until ${new Date(refusal.until).toISOString()}: ${refusal.hold}. `
         + (wakes
-          ? "Until then, each judge rule's batch wakes the agent without being judged."
+          ? "Until then, each judge rule's batch wakes the agent without being judged, unless a turn or the host's quiesce holds it until after then, when it's judged."
           : `Until then, judge rules' batches are held (${events} now), and they're judged after that, or sooner if the hold is released.`);
     }
     return `A reply judge call was refused, and the hold stated no end: ${refusal.hold}. `
       + (wakes
         ? "Each judge rule's batch is still asked about, and wakes the agent if the call is refused."
-        : `Nothing asks the judge again on its own: judge rules' held batches (${events} now) are judged once a new batch gets a verdict, or when the hold is released. A new batch whose call fails lets the held events it took in go with it, unjudged.`);
+        : `Nothing asks the judge again on its own: judge rules' held batches (${events} now) are judged once a new batch gets a verdict, or when whoever runs the host releases the hold. A new batch whose call fails lets the held events it took in go with it, unjudged.`);
   }
 
   // =========================================================================

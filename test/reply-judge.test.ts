@@ -455,6 +455,19 @@ describe('reply judge: the document', () => {
     assert.strictEqual(requests.length, 0);
   });
 
+  it('compiles no preview when the gate gave up before the judge was asked', async () => {
+    const { membrane, requests } = fakeMembrane();
+    let previews = 0;
+    const judge = new ReplyJudge({
+      membraneFor: () => membrane,
+      chooseAgent: (n) => n[0],
+      preview: async () => { previews++; return { messages: conversation(2), config: { model: 'x', maxTokens: 1 } }; },
+    });
+    await assert.rejects(judge.judge(judgeRequest({ signal: AbortSignal.abort() })), /stopped/);
+    assert.strictEqual(previews, 0);
+    assert.strictEqual(requests.length, 0);
+  });
+
   it('reads a budget under the minimum at the minimum, saying so, rather than at the default', async () => {
     const { membrane } = fakeMembrane('WAIT: x', 3);
     const errors: string[] = [];
@@ -639,6 +652,23 @@ describe('reply judge: the document', () => {
       assert.ok(!text.replace(/&(amp|lt|gt);/g, '').includes('&'), 'no entity is split');
       assert.doesNotMatch(text, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/, 'no character is split');
       assert.ok(text.split('\n').slice(1).every((line) => line.startsWith('  ')), 'every line after the first is quoted');
+    }
+  });
+
+  it("keeps a message within its bound whatever its participant's name, cutting a name too long to leave room", () => {
+    const render = (participant: string, blocks: string[]) => renderMessage({
+      participant,
+      content: blocks.map((text) => ({ type: 'text', text })),
+    } as unknown as NormalizedMessage);
+    for (const name of ['&'.repeat(3_000), '\u{1F600}'.repeat(7_000)]) {
+      const short = render(name, ['hi']);
+      const long = render(name, ['b'.repeat(5_000), 'c'.repeat(5_000), 'd'.repeat(5_000)]);
+      for (const text of [short, long]) {
+        assert.ok(text.length <= 12_000, String(text.length));
+        assert.ok(!text.replace(/&(amp|lt|gt|#91|#93);/g, '').includes('&'), 'no entity is split');
+        assert.doesNotMatch(text, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/, 'no character is split');
+      }
+      assert.ok(short.endsWith('] hi'), short.slice(-20));
     }
   });
 

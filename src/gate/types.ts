@@ -361,15 +361,16 @@ export interface ReplyJudgeOptions {
    * stopping framework), which isn't counted as a failure. Under `"wake"`,
    * the refused call's batch wakes the agent, and while a refusal's stated
    * wait lasts each judge rule's batch wakes it without the judge being
-   * asked. Under `"skip"`, the batch is held in memory while the judge's
-   * calls are refused. While a refusal's stated wait lasts, batches that
-   * arrive are held with it, a rule keeping its newest 100 events as it does
-   * while a turn holds them, and they're judged once the wait ends or the
-   * hold is released. A refusal that states no end keeps them held until a
-   * later batch's call, which takes in its own rule's held batch, gets a
-   * verdict, or the hold is released. A later call that fails lets its batch
-   * go, with the held events it took in, as a failed call's batch goes under
-   * `"skip"`.
+   * asked, unless a running turn or the host's quiesce holds the batch past
+   * the wait's end, when it goes to the judge. Under `"skip"`, the batch is
+   * held in memory while the judge's calls are refused. While a refusal's
+   * stated wait lasts, batches that arrive are held with it, a rule keeping
+   * its newest 100 events as it does while a turn holds them, and they're
+   * judged once the wait ends or the hold is released. A refusal that states
+   * no end keeps them held until a later batch's call, which takes in its own
+   * rule's held batch, gets a verdict, or the hold is released. A later call
+   * that fails lets its batch go, with the held events it took in, as a
+   * failed call's batch goes under `"skip"`.
    */
   onError?: 'wake' | 'skip';
   /** The judge's effort (`output_config.effort`). Default `"low"`: a short
@@ -418,15 +419,15 @@ export interface FailedLastTurn {
 export interface UpcomingWake {
   /**
    * When (ms), when known. Absent for one that has no time of its own: a
-   * wake already queued, due as soon as the agent is free; a batch the judge
-   * is deciding; and one `when` describes, such as a batch held for the judge
-   * until no turn or quiesce holds it, or events buffered until no turn runs
-   * and the host isn't quiesced.
+   * wake already queued, due as soon as the agent is free, and one `when`
+   * describes, such as a batch the judge is deciding, a batch held for the
+   * judge until no turn or quiesce holds it, or events buffered until no turn
+   * runs and the host isn't quiesced.
    */
   at?: number;
-  /** When, in words, for one due at no time anyone can name (a hold only a
-   *  release or another call ends); given without `at`, and shown in its
-   *  place. */
+  /** When, in words, for one due at no time anyone can name (a verdict, or a
+   *  hold only a release or another call ends); given without `at`, and
+   *  shown in its place. */
   when?: string;
   /** False when it only may wake the agent (a judge rule's batch goes to the judge then). */
   certain: boolean;
