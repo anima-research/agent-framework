@@ -50,11 +50,12 @@
  *   or stops serving its revision (a 400 carrying -32022) or its streams (a
  *   405 to a GET for one it had served), as a server upgraded to the SDK's
  *   2026 handler does (`sessionEnded`). A new connect starts at once if the
- *   old session had served a request and lived a base interval ('close',
- *   then 'reconnect'), and negotiates afresh; otherwise the end is a failed
- *   connect. A request's stream the server cut is resumed for as long as the
- *   request lives. Closing a generation DELETEs a session the server holds
- *   by its id, a failed connect's included.
+ *   old session had served a request ('close', then 'reconnect'), and
+ *   negotiates afresh, unless it lived less than a base interval, as did the
+ *   last one restarted that way; otherwise the end is a failed connect. A
+ *   request's stream the server cut is resumed for as long as the request
+ *   lives. Closing a generation DELETEs a session the server holds by its
+ *   id, a failed connect's included.
  *
  * Nothing here is MCPL: a modern server has no grant, no planes and no
  * server→host requests. The framework uses this connection only through its
@@ -709,13 +710,17 @@ export class ModernMcpConnection extends EventEmitter {
   private readonly reconnectMaxIntervalMs: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   /** Consecutive failed connects. A 2025 session over HTTP counts as a
-   *  successful connect only once it has answered a request and lived a
-   *  base interval: see {@link sessionEnded}. */
+   *  successful connect once its end starts a new one at once: see
+   *  {@link sessionEnded}. */
   private reconnectAttempts = 0;
   /** A new session is starting in place of one the server ended. */
   private restarting = false;
   /** When the live session was adopted, by `performance.now()`. */
   private adoptedAt = 0;
+  /** No young session's end has started a new one at once since the last
+   *  session that lived a base interval, or since this connection began
+   *  (see {@link sessionEnded}). */
+  private youngRestartFree = true;
   /** stopReconnecting() was called: nothing dials again. */
   private stopped = false;
   /** At most one pending reopen, and only ever for the current generation. */
@@ -1074,9 +1079,9 @@ export class ModernMcpConnection extends EventEmitter {
     this.adoptedAt = performance.now();
     this.protocolVersion = session.client.getNegotiatedProtocolVersion() ?? null;
     // A 2025 connection over HTTP, with a session id or without, is a
-    // successful connect only once it has answered a request and lived a
-    // base interval: until then, its end counts as a failed attempt (see
-    // sessionEnded). Any other connect succeeded when it was adopted.
+    // successful connect only once its end starts a new one at once: until
+    // then, its end counts as a failed attempt (see sessionEnded). Any other
+    // connect succeeded when it was adopted.
     if (!session.http || era === 'modern') this.reconnectAttempts = 0;
     // On a 2025 revision list changes arrive unsolicited, on the session's
     // standalone stream: there's no subscription to keep.
@@ -1450,10 +1455,16 @@ export class ModernMcpConnection extends EventEmitter {
    * while `willReconnect` reads true, then 'reconnect' once it's up. A
    * server's restart then costs the calls in flight, and the server keeps
    * its place and its tools; the framework traces it as it traces any
-   * reconnect. That threshold's basis: restarts at once then come at most
-   * once a base interval, no more often than the backoff's shortest wait
-   * (the base interval, less its jitter) would retry a failing server. Any
-   * other session's end is a failed connect: behind a load balancer without
+   * reconnect. That threshold's basis: a session that lived a whole base
+   * interval and then restarts at once restarts no sooner after its connect
+   * than the backoff's shortest wait (the base interval, less its jitter)
+   * would retry a failing server. A session that answered but ends sooner
+   * gets one at once too, once after each session that lived the interval
+   * and once before any did: a server restarted once soon after a connect,
+   * as in a rolling deploy, costs a restart, not the server. So restarts at
+   * once come at most twice a base interval, and a second young end in a
+   * row is the loop the threshold is there to catch. It, and any other
+   * session's end, is a failed connect: behind a load balancer without
    * sticky sessions every new session can meet the same 404, even after the
    * node that issued it answered its relist, and during a rolling upgrade a
    * connect can land on an old node and its calls on a new one. It counts as
@@ -1478,7 +1489,8 @@ export class ModernMcpConnection extends EventEmitter {
       return;
     }
     const lived = performance.now() - this.adoptedAt >= this.reconnectIntervalMs;
-    if (session.wire.answered && lived) {
+    if (session.wire.answered && (lived || this.youngRestartFree)) {
+      this.youngRestartFree = lived;
       // This is where an answered session's count of failed connects resets:
       // nothing reads it while the session lives.
       this.reconnectAttempts = 0;
@@ -1500,10 +1512,10 @@ export class ModernMcpConnection extends EventEmitter {
 
   /**
    * A new session at once, in place of one the server ended after it had
-   * answered and lived a base interval (see {@link sessionEnded}). It is
-   * attempt 1 of a reconnect, and a failure is one's. With `reconnect` set,
-   * the connection backs off and tries again, or stops for good on a
-   * revision verdict, as attemptReconnect does: the verdict's
+   * answered (see {@link sessionEnded}). It is attempt 1 of a reconnect, and
+   * a failure is one's. With `reconnect` set, the connection backs off and
+   * tries again, or stops for good on a revision verdict, as
+   * attemptReconnect does: the verdict's
    * 'reconnect-failed' (`permanent`) raises the alert, and the server stays
    * registered, as a reconnecting server does after any verdict. Without
    * `reconnect`, nothing more is tried, so the connection closes as a lost

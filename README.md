@@ -446,24 +446,28 @@ and its `family` stays `modern`. On a 2025 revision:
   server has no GET route). A call whose POST met the 404 fails as
   `error-response` with `data.httpStatus` 404, and isn't replayed. A call
   whose stream the server's restart cut is `no-response`, since the server
-  may have run it. A session that had answered a request, and had lived at
-  least the base interval (`reconnectIntervalMs`), gets a new one at once,
-  whatever `reconnect` says: the connection emits `close` while its
+  may have run it. A session that had answered a request gets a new one at
+  once, whatever `reconnect` says: the connection emits `close` while its
   `willReconnect` reads true, then `reconnect`, and the framework keeps the
   server and its tools and relists. If the new session can't start,
   `reconnect` decides, as for any lost connection, and a revision verdict
   stops it for good, as on any reconnect. Without `reconnect`, that failure
   emits a second `close`, while `willReconnect` reads false: the server is
-  gone. Any other session's end is a failed connect: it emits
-  `reconnect-failed` and `close`, and follows `reconnect` with a growing
-  backoff. So a load balancer without sticky sessions, or a rolling upgrade
-  that lands a connect on an old node and its requests on a new one, shows
-  up as a failing server, with the framework's alert at the fifth attempt,
-  when its sessions end within the interval. A deployment whose sessions
-  each live longer restarts at most once an interval, and each restart
-  costs the calls in flight: the client can't tell a balancer that moves a
-  session's requests from a server that restarts. Once the framework's
-  `stop()` has begun, an ended session isn't started again.
+  gone. A session that ended less than the base interval
+  (`reconnectIntervalMs`) after it started gets a new one at once only if
+  the last session restarted that way had lived the interval, or there was
+  none: a server restarted once soon after a connect costs a restart, not
+  the server. A second such young end in a row is a failed connect, as is
+  a session's end before it answered anything: it emits `reconnect-failed`
+  and `close`, and follows `reconnect` with a growing backoff. So a load
+  balancer without sticky sessions, or a rolling upgrade that lands a
+  connect on an old node and its requests on a new one, shows up as a
+  failing server, with the framework's alert at the fifth attempt, when its
+  sessions end within the interval. A deployment whose sessions each live
+  longer restarts at most once an interval, and each restart costs the
+  calls in flight: the client can't tell a balancer that moves a session's
+  requests from a server that restarts. Once the framework's `stop()` has
+  begun, an ended session isn't started again.
 - A server that moves to `2026-07-28` in place is followed, since the
   session's end brings a new connect, which negotiates afresh. Two more
   answers end a 2025 session, with a session id or without: a 400 carrying
