@@ -178,14 +178,17 @@ export function systemTextOf(blocks: readonly string[]): string {
 }
 
 function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  return canonicalOf(JSON.parse(JSON.stringify(value) ?? 'null'));
+}
+
+function canonicalOf(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalOf).join(',')}]`;
   if (value && typeof value === 'object') {
     const entries = Object.entries(value as Record<string, unknown>)
-      .filter(([, v]) => v !== undefined)
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(',')}}`;
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalOf(v)}`).join(',')}}`;
   }
-  return JSON.stringify(value) ?? 'null';
+  return JSON.stringify(value);
 }
 
 export function effectiveDeclaration(

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import type { SystemChangeContent, ToolDefinition } from '@animalabs/membrane';
 
 import {
+  copyHead,
   declarationDifference,
   effectiveDeclaration,
   changeWriteCheck,
@@ -29,6 +30,11 @@ describe('system changes', () => {
     assert.equal(isSystemChangeMessage({ content: [{ type: 'system_change', removeTools: ['a'] }] }), true);
     assert.equal(isSystemChangeMessage({ content: [{ type: 'text', text: 'system_change' }] }), false);
     assert.equal(isSystemChangeMessage({ content: [] }), false);
+  });
+
+  it('compares a tool as the wire carries it, so a Date in its schema matches the text its recorded head holds', () => {
+    const dated = { ...tool('a'), inputSchema: { type: 'object', properties: { when: { type: 'string', default: new Date('2026-01-01T00:00:00Z') } } } } as unknown as ToolDefinition;
+    assert.deepEqual(differenceFrom(copyHead(head([dated])), [], head([dated])), { kind: 'none' });
   });
 
   it("finds an agent's own changes in a compile by the metadata of the rows it names as their sources", () => {
