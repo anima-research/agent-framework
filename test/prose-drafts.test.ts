@@ -3960,7 +3960,7 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
   });
 
   describe('native tool mode: the failure and stop notes', () => {
-    const HANDED_ON = 'Plain speech its rounds routed live was handed on for delivery as written, and no [delivered] line was written for it.';
+    const HANDED_ON = 'Plain speech of its rounds was handed on for delivery or shown as written, and no [delivered] line was written for it.';
     const STILL_ROUTING = 'Some of its plain speech was still being routed when it ended, so it may yet be posted; check the channel before sending it again.';
     for (const [how, shown] of [['error', 'an error'], ['throw', 'a throw'], ['abort', "an abort that isn't a stop"]] as const) {
       it(`a failure after a live-routed round, reported as ${shown}, says the rounds ran and the speech was handed on, and writes no receipt`, async () => {

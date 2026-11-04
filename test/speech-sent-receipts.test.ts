@@ -14,7 +14,7 @@ const SENT_TO = 'the console that sent this turn';
 const HEDGE = 'This route delivered it nowhere; if another surface showed it (a reply thread, the console), that copy stands. It is saved in your archive.';
 const UNDELIVERABLE = '[send-undeliverable]';
 
-type Answer = 'sent' | 'none' | 'throw' | 'hang' | 'late' | 'late-throw' | { sentTo?: unknown };
+type Answer = 'sent' | 'per-text' | 'none' | 'throw' | 'hang' | 'late' | 'late-throw' | { sentTo?: unknown };
 type Asked = { agent: string; text: string; context: SpeechRoutedContext };
 
 class Surface {
@@ -52,6 +52,7 @@ class Surface {
     if (answer === 'late') return new Promise((resolve) => setTimeout(() => resolve({ sentTo: SENT_TO }), SPEECH_RECEIPT_WAIT_MS + 1_000));
     if (answer === 'late-throw') return new Promise((_, reject) => setTimeout(() => reject(new Error(`${this.name} broke late`)), SPEECH_RECEIPT_WAIT_MS + 1_000));
     if (typeof answer === 'object') return answer;
+    if (answer === 'per-text') return { sentTo: `${SENT_TO}, for ${text}` };
     return answer === 'sent' ? { sentTo: SENT_TO } : {};
   }
 }
@@ -250,7 +251,10 @@ describe('plain speech a module says it showed', () => {
     const membrane = new MockMembrane();
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi there.' }]));
     const f = await host([surface], membrane);
+    const traces: Array<{ type: string }> = [];
+    f.onTrace((event) => { traces.push(event as { type: string }); });
     await turn(f);
+    assert.deepEqual(traces.filter((e) => e.type === 'mcpl:speech-route-failed'), [], 'a shown piece emits no route-failure trace');
     assert.deepEqual(askedTexts(surface), [{ text: 'Hi there.', final: true }]);
     assert.deepEqual(notices(f), []);
     assert.equal(receipt(f), `[delivered] plain speech → sent to ${SENT_TO} · this turn's routing posted it to no channel`);
@@ -289,11 +293,22 @@ describe('plain speech a module says it showed', () => {
     const membrane = new MockMembrane();
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi there.' }]));
     const f = await host([surface], membrane);
+    const traces: Array<{ type: string }> = [];
+    f.onTrace((event) => { traces.push(event as { type: string }); });
     await turn(f);
     assert.equal(surface.asked.length, 1, 'premise: it was asked');
+    assert.equal(traces.filter((e) => e.type === 'mcpl:speech-route-failed').length, 1, 'an unshown piece emits its route-failure trace');
     assert.equal(notices(f).length, 1, notices(f).join('\n'));
     assert.ok(notices(f)[0]!.startsWith('[send-undeliverable] Your plain speech "Hi there." (9 chars) had no channel to go to'), notices(f)[0]);
     assert.ok(notices(f)[0]!.endsWith(HEDGE), notices(f)[0]);
+  });
+
+  it("a no-channel notice whose words its host didn't pass names the speech by its length alone", async () => {
+    const f = await host([], new MockMembrane());
+    const registry = internals(f).channelRegistry as unknown as { onRouteFailure(info: Record<string, unknown>): void };
+    registry.onRouteFailure({ conversationId: 'resident', channelId: null, reason: 'no channel was chosen for it', textLen: 50, outcome: 'failed' });
+    assert.equal(notices(f).length, 1, notices(f).join('\n'));
+    assert.ok(notices(f)[0]!.startsWith('[send-undeliverable] Your plain speech (50 chars) had no channel to go to'), notices(f)[0]);
   });
 
   it("the line for a reply a module showed names where, and never says 'no locus', which connectome-doctor reads as not delivered", async (t) => {
@@ -369,6 +384,10 @@ describe('plain speech a module says it showed', () => {
       const f = await host([surface], membrane);
       const routed: string[] = [];
       const routing: Promise<unknown>[] = [];
+      const receiptSteps: string[] = [];
+      const internal = f as unknown as { appendProseDeliveryReceipt(agent: { name: string }, routing: unknown): void };
+      const append = internal.appendProseDeliveryReceipt.bind(f);
+      internal.appendProseDeliveryReceipt = (agent, turnRouting) => { append(agent, turnRouting); receiptSteps.push(agent.name); };
       const registry = (f as unknown as { channelRegistry: { routeSpeech(...args: unknown[]): unknown } }).channelRegistry;
       const routeSpeech = registry.routeSpeech.bind(registry);
       registry.routeSpeech = (...args: unknown[]) => { routed.push(String(args[0])); const outcome = routeSpeech(...args); routing.push(Promise.resolve(outcome)); return outcome; };
@@ -382,7 +401,7 @@ describe('plain speech a module says it showed', () => {
       await until(() => routed.includes('run-1') || surface.asked.length > 0, "the run's speech reaching the registry, or a module being asked");
       assert.deepEqual(surface.asked, []);
       await Promise.allSettled(routing);
-      await new Promise((resolve) => setImmediate(resolve));
+      await until(() => receiptSteps.includes('run-1'), "the run's turn-end receipt step");
       const runTexts = created.contextManager.getAllMessages().map((m) => textOf(m.content));
       assert.deepEqual(runTexts.filter((text) => text.startsWith('[delivered]')), []);
     });
@@ -666,7 +685,7 @@ describe('plain speech a module says it showed', () => {
     assert.deepEqual(askedTexts(surface), [{ text: 'Looking around.', final: false }], 'premise: the round was asked about');
     const failed = texts(f).filter((t) => t.startsWith('[inference-failed]'));
     assert.equal(failed.length, 1, texts(f).join('\n'));
-    assert.ok(failed[0]!.includes('Plain speech its rounds routed live was handed on for delivery as written'), failed[0]);
+    assert.ok(failed[0]!.includes('Plain speech of its rounds was handed on for delivery or shown as written'), failed[0]);
     assert.deepEqual(notices(f), []);
   });
 
@@ -681,7 +700,7 @@ describe('plain speech a module says it showed', () => {
     assert.deepEqual(openDrafts(f).map((d) => d.text), ['Looking around.'], 'premise: the round was held as a draft');
     const failed = texts(f).filter((t) => t.startsWith('[inference-failed]'));
     assert.equal(failed.length, 1, texts(f).join('\n'));
-    assert.ok(failed[0]!.includes('Plain speech its rounds routed live was handed on for delivery as written'), failed[0]);
+    assert.ok(failed[0]!.includes('Plain speech of its rounds was handed on for delivery or shown as written'), failed[0]);
   });
 
   it("a ' !' continuation names the messages of the turn that asked for it", async () => {
@@ -888,6 +907,7 @@ describe('plain speech a module says it showed', () => {
 
   it('a locked turn whose lock moved while its words waited for its end asks about the speech it holds', async () => {
     const surface = new Surface();
+    surface.answer = 'per-text';
     const membrane = new WithoutRoundContent();
     membrane.supportsInjectedMessages = false;
     membrane.pushResponse(createMockResponse([
@@ -908,7 +928,10 @@ describe('plain speech a module says it showed', () => {
     assert.deepEqual(published, [], 'premise: the move held the whole stream');
     const asked = surface.asked.map((a) => a.text).join(' ');
     assert.ok(asked.includes('Before the move.') && asked.includes('After the move.'), JSON.stringify(askedTexts(surface)));
-    assert.ok(receipt(f)?.includes(`sent to ${SENT_TO}`), receipt(f));
+    for (const piece of surface.asked) {
+      const place = `sent to ${SENT_TO}, for ${piece.text.replace(/\s+/g, ' ').trim()}`;
+      assert.ok(receipt(f)?.includes(place), `${place} in ${receipt(f)}`);
+    }
     assert.match(receipt(f) ?? '', /held as drafts? d-/);
   });
 
@@ -932,6 +955,7 @@ describe('plain speech a module says it showed', () => {
   it("speech a send in its round held, with a turn's channel, asks the modules about it", async (t) => {
     t.mock.method(console, 'error', () => {});
     const surface = new Surface();
+    surface.answer = 'per-text';
     const membrane = new MockMembrane();
     const send = { type: 'tool_use', id: 'p1', name: 'channel_publish', input: { channelId: 'room', content: 'A note.' } } as ContentBlock;
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Looking around.' }, send], 'tool_use'));
@@ -951,7 +975,7 @@ describe('plain speech a module says it showed', () => {
     assert.ok(!published.some((p) => p.text === 'Looking around.'), `premise: the send held the round's speech: ${JSON.stringify(published)}`);
     assert.ok(openDrafts(f).some((d) => d.text === 'Looking around.' && d.reason === 'explicit-send'), JSON.stringify(openDrafts(f)));
     assert.ok(askedTexts(surface).some((a) => a.text === 'Looking around.' && a.final === false), JSON.stringify(askedTexts(surface)));
-    assert.ok(receipt(f)?.includes(`sent to ${SENT_TO}`), receipt(f));
+    assert.ok(receipt(f)?.includes(`sent to ${SENT_TO}, for Looking around.`), receipt(f));
   });
 
   it("a hybrid round a send held asks about its plain envelope, and not about its >>> envelope", async (t) => {
@@ -1199,7 +1223,8 @@ describe('plain speech a module says it showed', () => {
     let settled = false;
     const run = f.runUntilIdle().finally(() => { settled = true; });
     try {
-      await until(() => published.length > 0 || settled, 'the post', 4_000);
+      const hooksBoundAndAMargin = SPEECH_RECEIPT_WAIT_MS + 1_000;
+      await until(() => published.length > 0 || settled, 'the post', hooksBoundAndAMargin);
       assert.equal(receipt(f), undefined, 'no receipt while the answer is due');
     } finally {
       release();

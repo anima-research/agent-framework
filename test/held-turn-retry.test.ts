@@ -1071,7 +1071,6 @@ async function mergedStartWaiting(fw: AgentFramework, internal: Internal, membra
   fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-during the hold', metadata: {} });
   await fw.runUntilIdle();
   assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 2, 'the hold keeps the retry and the wake');
-  // A hold that took the wake before the retry: the merge then leads with the wake.
   if (leads === 'wake') internal.providerAccelerationCooldowns.get('resident')!.heldRequests.reverse();
   const gate = internal.providerGate('resident');
   gate.auxiliaryInFlight = 1;
@@ -1143,6 +1142,56 @@ test("a held turn's retry the hold folds into an equal held wake gives that wake
       assert.equal(held.length, 1, 'premise: the hold folds the retry into the held wake');
       assert.equal(held[0], wake, 'premise: the held wake is the one kept');
       assert.deepEqual((held[0] as unknown as Record<symbol, unknown>)[carry!], retry[carry!]);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a held turn's retry the hold folds into an equal held wake gives it the turn's carry, over one the wake kept from an exhausted retry", async (t) => {
+  await withStoreDir(async (path) => {
+    holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      await heldTurn(fw, internal, membrane);
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
+      const retry = held.splice(0, 1)[0] as unknown as Record<string | symbol, unknown>;
+      const carry = Object.getOwnPropertySymbols(retry).find((key) => key.description === 'turn-carry');
+      assert.ok(carry && retry[carry], 'premise: the retry carries its turn');
+      const kept = { silence: null, sends: null };
+      const wake: Record<string | symbol, unknown> = { [carry!]: kept };
+      for (const key of identityKeys) if (retry[key] !== undefined) wake[key] = retry[key];
+      held.push(wake as unknown as Request);
+      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, retry);
+      assert.equal(held.length, 1, 'premise: the hold folds the retry into the held wake');
+      assert.equal(held[0], wake, 'premise: the held wake is the one kept');
+      assert.equal((held[0] as unknown as Record<symbol, unknown>)[carry!], retry[carry!]);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a held turn's retry with no carry the hold folds into an equal held wake leaves it none, though the wake kept one from an exhausted retry", async (t) => {
+  await withStoreDir(async (path) => {
+    holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      await heldTurn(fw, internal, membrane);
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
+      const retry = held.splice(0, 1)[0] as unknown as Record<string | symbol, unknown>;
+      const carry = Object.getOwnPropertySymbols(retry).find((key) => key.description === 'turn-carry');
+      assert.ok(carry && retry[carry], 'premise: the retry carries its turn');
+      delete retry[carry!];
+      const wake: Record<string | symbol, unknown> = { [carry!]: { silence: null, sends: null } };
+      for (const key of identityKeys) if (retry[key] !== undefined) wake[key] = retry[key];
+      held.push(wake as unknown as Request);
+      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, retry);
+      assert.equal(held.length, 1, 'premise: the hold folds the retry into the held wake');
+      assert.equal(held[0], wake, 'premise: the held wake is the one kept');
+      assert.equal((held[0] as unknown as Record<symbol, unknown>)[carry!], undefined);
     } finally { await fw.stop(); log.restore(); }
   });
 });

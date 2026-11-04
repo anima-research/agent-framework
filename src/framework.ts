@@ -1906,7 +1906,7 @@ function ephemeralRunStopped(name: string, observed?: string): Error {
 
 const CALLS_CUT_OFF = "A round's tool calls were started, but its stream ended before their results came back, so that round isn't in your context; those calls may have taken effect.";
 const SPEECH_STILL_ROUTING = 'Some of its plain speech was still being routed when it ended, so it may yet be posted; check the channel before sending it again.';
-const LIVE_SPEECH_UNRECEIPTED = `Plain speech its rounds routed live was handed on for delivery as written, and no [${NOTICE_TAG.delivered}] line was written for it.`;
+const LIVE_SPEECH_UNRECEIPTED = `Plain speech of its rounds was handed on for delivery or shown as written, and no [${NOTICE_TAG.delivered}] line was written for it.`;
 
 /** The reason on the inference:aborted that ends a turn whose retry stop()
  *  cancelled, whichever frame was waiting to retry: beginAgentTurn's, when
@@ -6689,11 +6689,9 @@ export class AgentFramework {
       return;
     }
     // A merged start's batch (MERGED_BATCH) stays recorded on the request
-    // kept in its place, which then stands for it, as the start did. What
-    // folds into a merged start, or a held wake that a merged start folds
-    // into, goes into the batch by this same fold, so the release expands
-    // to each wake once. The copy of a held wake is taken before any mark
-    // below, so it carries only what that wake itself was.
+    // kept in its place, which then stands for it, as the start did.
+    // Copy the held wake and read the kept request's carry before marking
+    // it, and reconcile each mark as the scheduler's merge does.
     const into = mergedBatch(same);
     const batch = mergedBatch(request);
     if (into || batch) {
@@ -6701,11 +6699,11 @@ export class AgentFramework {
       for (const member of batch ?? [request]) this.holdRequest(members, member);
       (same as MarkedRequest)[MERGED_BATCH] = members;
     }
+    const keptCarry = turnCarryOf(same);
     if (isTurnRetry(request)) (same as MarkedRequest)[TURN_RETRY] = true;
-    // As the scheduler's merge does: the kept request takes the turn's carry
-    // when it has none, and stays re-armed only if both were.
-    const carry = turnCarryOf(request);
-    if (carry && !turnCarryOf(same)) (same as MarkedRequest)[TURN_CARRY] = carry;
+    const carry = keptCarry ?? turnCarryOf(request);
+    if (carry) (same as MarkedRequest)[TURN_CARRY] = carry;
+    else delete (same as MarkedRequest)[TURN_CARRY];
     if (!isRearmed(request)) delete (same as MarkedRequest)[REARMED];
     const opening = mergedOpeningMessages([same, request]);
     if (opening) same.openingMessages = opening;
@@ -23420,7 +23418,6 @@ export class AgentFramework {
         agent,
         [{ text: words.text, ...(words.inheritedRisk ? { inheritedRisk: words.inheritedRisk } : {}) }],
         'bounced',
-        // An explicit envelope's words, as explicit sends are never asked about.
         { routing: round.routing, note: `{{unsent}} was draft ${draft.id}, which could not be sent`, notice: 'later', ask: false },
       )[0];
     // A bare {{unsent}} holds nothing new; otherwise say whether the
@@ -23740,7 +23737,6 @@ export class AgentFramework {
               agent,
               [{ text: words.text, ...(words.inheritedRisk ? { inheritedRisk: words.inheritedRisk } : {}) }],
               'no-destination',
-              // Explicit mode writes no receipt to name a module's place.
               { ...round, notice: 'later', ask: false },
             );
             if (held.length === 0 && words.text.trim().length > 0) {
@@ -23911,8 +23907,6 @@ export class AgentFramework {
         agent,
         [{ text: words.text, ...(inherited ? { inheritedRisk: inherited } : {}) }],
         'bounced',
-        // An explicit envelope's words, or explicit mode's, which writes no
-        // receipt: neither is asked about.
         { routing: round.routing, note: reason, notice: 'later', ask: false },
       )[0];
     }
@@ -33201,7 +33195,7 @@ export class AgentFramework {
                 // have been posted (in part or whole). Never claim it wasn't.
                 ? `[${NOTICE_TAG.discordSendFailed}] Delivery of your previous reply (${textLen} chars) to ${where} was not confirmed (${suppliedValue(reason)}). It may or may not have been posted, so sending it again could post it twice. It is saved in your archive.`
                 : `[${NOTICE_TAG.discordSendFailed}] Your previous reply (${textLen} chars) could not be delivered to ${where} (${suppliedValue(reason)}). Nothing was posted; it is saved in your archive.`)
-              : `[${NOTICE_TAG.sendUndeliverable}] Your plain speech ${quotedValue(speechOpening(words ?? ''))} (${textLen} chars) had no channel to go to — ${suppliedValue(reason)}. This is a routing/configuration situation, not a channel failure. This route delivered it nowhere; if another surface showed it (a reply thread, the console), that copy stands. It is saved in your archive.`;
+              : `[${NOTICE_TAG.sendUndeliverable}] Your plain speech${words === undefined ? '' : ` ${quotedValue(speechOpening(words))}`} (${textLen} chars) had no channel to go to — ${suppliedValue(reason)}. This is a routing/configuration situation, not a channel failure. This route delivered it nowhere; if another surface showed it (a reply thread, the console), that copy stands. It is saved in your archive.`;
             // A registered speaker's notice is addressed to it (noticeTargetFor).
             this.addMessage(
               'user',
