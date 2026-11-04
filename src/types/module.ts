@@ -207,11 +207,11 @@ export interface Module {
    *   none of its surfaces opened. A turn with no channel's notice then
    *   still says another surface may have shown it.
    *
-   * Asked only where the turn routes plain speech (prose routing by locus or
-   * hybrid, on a host with a channel registry), in the order it routes the
-   * pieces, and never about private envelopes, explicit sends, a heartbeat's
-   * held prose or an ephemeral run's speech with no channel, which is its
-   * caller's result. A module that throws, or hasn't answered within
+   * Asked only where the turn routes plain speech (prose routing by locus,
+   * hybrid or locked, on a host with a channel registry), in the order it
+   * routes the pieces, and never about private envelopes, explicit sends, a
+   * heartbeat's held prose, a locked turn's speech held as drafts or an
+   * ephemeral run's speech with no channel, which is its caller's result. A module that throws, or hasn't answered within
    * `SPEECH_RECEIPT_WAIT_MS`, names no place, as `{}` does. For a turn that
    * ends with its reply or a tool, the turn's receipt and the agent's next
    * turn wait for every answer up to that bound, so answer from what the

@@ -256,6 +256,30 @@ describe('plain speech a module says it showed', () => {
     assert.equal(receipt(f), `[delivered] plain speech → sent to ${SENT_TO} · this turn's routing posted it to no channel`);
   });
 
+  for (const [lock, asked] of [['#room', true], ['drafts', false]] as const) {
+    it(asked
+      ? "a locked turn with a lock asks the modules where its speech went, and its receipt names what they said"
+      : "a turn locked to drafts asks no module, since its speech is held", async () => {
+      const surface = new Surface();
+      const membrane = new MockMembrane();
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi there.' }]));
+      const f = await host([surface], membrane, { proseRouting: 'locked', proseLock: lock });
+      const { server, published } = channelServer(true);
+      const registry = internals(f).channelRegistry;
+      registry.serverRegistry = { getServer: () => server };
+      registry.ensureChannelRegistered('srv', 'room', 'room');
+      await turn(f);
+      if (asked) {
+        assert.deepEqual(published.map((p) => p.text), ['Hi there.'], 'premise: the speech went to the lock');
+        assert.deepEqual(askedTexts(surface), [{ text: 'Hi there.', final: true }]);
+        assert.ok(receipt(f)?.includes(`sent to ${SENT_TO}`), receipt(f));
+      } else {
+        assert.deepEqual(published, [], 'premise: nothing posted');
+        assert.deepEqual(surface.asked, []);
+      }
+    });
+  }
+
   it("a reply no module named a place for is told it went nowhere, named by its words, and that another surface may have shown it", async () => {
     const surface = new Surface();
     surface.answer = 'none';
