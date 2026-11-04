@@ -181,6 +181,28 @@ describe('reply judge: a request refused as too long', () => {
     assert.ok(size(requests[2]!) < size(requests[1]!), `${size(requests[2]!)} < ${size(requests[1]!)}`);
   });
 
+  it("starts the retry's fresh window though another call anchors one while the retry's preview is read", async () => {
+    const { membrane, requests, size } = refusingMembrane((n) => n === 2);
+    let previews = 0;
+    let kept: unknown;
+    const judge: ReplyJudge = new ReplyJudge({
+      membraneFor: () => membrane, chooseAgent: (n) => n[0],
+      preview: async () => {
+        const anchors = (judge as unknown as { anchors: Map<string, unknown> }).anchors;
+        if (++previews === 2) kept = anchors.get('Scout');
+        if (previews === 3) anchors.set('Scout', kept);
+        return { messages: conversation(50), config: { model: 'x', maxTokens: 1 } };
+      },
+      options: { maxInputTokens: 35_000 },
+    });
+    await quietly(() => judge.judge(judgeRequest()));
+    await quietly(() => judge.judge(judgeRequest()));
+    assert.strictEqual(requests.length, 3);
+    assert.ok(kept !== undefined, 'premise: an anchor to set again');
+    assert.strictEqual(size(requests[1]!), size(requests[0]!), 'premise: the refused request is the answered one again');
+    assert.ok(size(requests[2]!) < size(requests[1]!), `${size(requests[2]!)} < ${size(requests[1]!)}`);
+  });
+
   it('asks a refused request once more at one character a token and leaves the estimate as it was, and asks one built at one character a token only once', async () => {
     const { membrane, requests, size } = refusingMembrane(() => true);
     const judge = judgeOver(membrane);
