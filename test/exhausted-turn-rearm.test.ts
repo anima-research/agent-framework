@@ -303,6 +303,9 @@ for (const failsAt of ['event', 'setup', 'throw'] as const) {
         .addMessage('user', content, metadata);
       queue(r, { reason: 'zz-wake' });
       await waitFor(() => r.count('inference:exhausted') === 5 + i, `a wake's turn after ${what} to end exhausted`);
+      const marker = metadata === undefined ? `zz_tool_${i}` : `zz-unsaid-${i}`;
+      assert.ok(r.fw.getAgent('resident')!.getContextManager().getAllMessages().some((m) => JSON.stringify(m.content).includes(marker)),
+        `the premise: ${what} is stored`);
       assert.equal(r.admission().providerAdmission.heldRequests, 0, `${what} doesn't start the count again`);
     }
     assert.deepEqual(rearmLines('count', 'message'), [], 'nor says it did');
@@ -717,6 +720,8 @@ test("a host's system change written for the subconscious, which its view leaves
     undefined, { forAgent: 'Subconscious' });
   queue(r, { agentName: 'Subconscious', reason: 'zz-wake' });
   await waitFor(() => r.count('inference:exhausted') === 3, "the subconscious's next turn to end exhausted");
+  assert.ok(r.fw.getAgent('Subconscious')!.getContextManager().getAllMessages().some((m) => JSON.stringify(m.content).includes('zz_tool')),
+    'the premise: the change is stored for it');
   assert.equal(held(), 0, "its view never holds the change, so its count doesn't start again");
   assert.ok(!stderr.some((line) => line.includes('re-send count started again')), 'nor says it did');
 });

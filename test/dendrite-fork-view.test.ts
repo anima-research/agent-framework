@@ -228,6 +228,7 @@ describe("a shared fork of an isolated-slot reader's view", () => {
     mira.getContextManager().addMessage('user', [text('MIRA-SAID')]);
     mira.getContextManager().addMessage('Antra', [text('HELD-ROW')], { tuneOut: { epochId: 'e1' } } as never);
     mira.getContextManager().addMessage('Antra', [text('SUPPRESSED-ROW')], suppressed as never);
+    assert.ok(mira.getContextManager().getAllMessages().some((m) => textOf(m) === 'SUPPRESSED-ROW'), 'the premise: the suppressed row is stored');
     const own = await compiled(sub.getContextManager());
     assert.ok(own.includes('MIRA-SAID') && own.includes('HELD-ROW'), "the premise: the subconscious reads the residents' slot, held rows included");
     assert.ok(!own.includes('SUPPRESSED-ROW'), "the subconscious's compile leaves out the suppressed row");

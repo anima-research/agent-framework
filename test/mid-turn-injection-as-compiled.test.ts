@@ -237,6 +237,8 @@ describe('a message injected at a tool boundary', () => {
       module.framework = framework;
       const change: ContentBlock = { type: 'system_change', defineTools: [{ name: 'zz_tool', description: 'ZZCHANGE', inputSchema: { type: 'object', properties: {} } }] } as unknown as ContentBlock;
       const injected = await turnWith([[change], [text('HEARD')]]);
+      assert.ok(framework.getAgent('assistant')!.getContextManager().getAllMessages().some((m) => JSON.stringify(m.content).includes('ZZCHANGE')),
+        'the premise: the boundary stored the change');
       assert.notEqual(holding(injected, 'HEARD'), '', 'the message beside it goes in');
       const next = await nextRequest();
       assert.notEqual(next('HEARD'), '', 'the premise: the next request is the resident\'s');

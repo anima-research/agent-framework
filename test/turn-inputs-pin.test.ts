@@ -282,7 +282,9 @@ test("a turn's pin starts at its first input past a change row a host stored bef
     await waitUntil('the second turn to end', () => storedText(framework).includes(FINAL));
     assert.equal(pins?.length, 1, 'one pin while the turn runs');
     const [from, to] = span(framework, pins![0]);
-    assert.ok(from > rowWith(framework, 'zz-pin-tool'), "the pin starts past the host's change row");
+    const change = rowWith(framework, 'zz-pin-tool');
+    assert.ok(change >= 0, "the premise: the host's change row is stored");
+    assert.ok(from > change, "the pin starts past the host's change row");
     assert.ok(from <= rowWith(framework, OPENING) && to >= rowWith(framework, OPENING), 'and covers the request');
   });
 });
