@@ -1018,11 +1018,14 @@ describe('a turn whose continuation is dropped ends there', () => {
       let asked = 0;
       internal.providerHoldHook = () => (asked++ === 0 ? { holdMs: 1_000, reason: 'the host says wait' } : undefined);
       internal.holdProviderAcceleration(h.framework.getAgent('prime'), new Error('compression failed'), undefined, true);
-      assert.equal(internal.providerGate('prime').primaryPending, true, 'the rebuilt hold left a primary pending');
-      await waitFor('the rebuilt hold to release', () => !internal.providerAccelerationCooldowns.has('prime'), 5_000);
+      // Prime's provider admission, as healthSnapshot() reports it.
+      const admission = () => (h.framework.healthSnapshot() as { agents: Array<{ name: string; providerAdmission: { primaryPending: boolean; cooldownReason: string | null } }> })
+        .agents.find((agent) => agent.name === 'prime')!.providerAdmission;
+      assert.equal(admission().primaryPending, true, 'the rebuilt hold left a primary pending');
+      await waitFor('the rebuilt hold to release', () => admission().cooldownReason === null, 5_000);
       await aPass(h, 'a pass after the release');
       assert.equal(h.membrane.calls.length, 1, "no retry turn took the dropped continuation's place");
-      assert.equal(internal.providerGate('prime').primaryPending, false, 'its pending primary ended');
+      assert.equal(admission().primaryPending, false, 'its pending primary ended');
     } finally {
       await h.cleanup();
     }

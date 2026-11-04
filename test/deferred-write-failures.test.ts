@@ -15,6 +15,7 @@ import { JsStore } from '@animalabs/chronicle';
 
 import * as indexExports from '../src/index.js';
 import { AgentFramework, ApiServer } from '../src/index.js';
+import { setAbandonGraceForTests } from '../src/framework.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 /** A stream that ends only when cancelled: a turn that stays alive. */
@@ -393,6 +394,9 @@ test('a turn the abandon can\'t cancel, a token with no stream, is listed as una
     // A turn between dequeue and stream registration: its token is held, and there's no stream to cancel.
     const tokens = (h.framework as unknown as { activeTurnTokens: Map<string, object> }).activeTurnTokens;
     tokens.set('agent', {});
+    // The token is held until the quiesce has returned, so no turn can end
+    // within the abandon's grace, and a short one only brings its report sooner.
+    setAbandonGraceForTests(h.framework, 50);
     try {
       h.add(OVER_CAP);
       const status = await h.framework.quiesce({ reason: 'surgery', timeoutMs: 1_000, abandon: true });

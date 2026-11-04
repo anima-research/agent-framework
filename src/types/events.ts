@@ -349,6 +349,8 @@ export interface ToolCall {
  * Converted from wire-format McplContentBlock to membrane ContentBlock.
  */
 export interface McplPushEvent {
+  /** The occurrence's suppression, when a coalesced push's wake decided it (CoalescedOccurrence.suppressionDecision). */
+  suppressionDecision?: string | null;
   type: 'mcpl:push-event';
   serverId: string;
   featureSet: string;

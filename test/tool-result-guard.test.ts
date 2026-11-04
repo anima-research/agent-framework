@@ -48,7 +48,11 @@ const contentById = (blocks: Array<{ toolUseId?: string; content?: unknown }>) =
   Object.fromEntries(blocks.map((block) => [block.toolUseId, block.content]));
 
 const dirs: string[] = [];
-afterEach(() => { while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true }); });
+const unscripted: string[] = [];
+afterEach(() => {
+  while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
+  assert.deepEqual(unscripted.splice(0), [], 'every stream the framework opened was one the test scripted');
+});
 const answer = () => createMockResponse([{ type: 'text', text: 'continued' }]);
 const refused = () => ({
   ...createMockResponse([{ type: 'text', text: 'discard-this-partial-output' }], 'refusal'),
@@ -70,7 +74,11 @@ class ScriptMembrane {
   streamYielding(request: NormalizedRequest, options: YieldingStreamOptions = {}) {
     this.requests.push(structuredClone({ ...request, onCacheWireReceipt: undefined }));
     const script = this.scripts.shift();
-    assert.ok(script, 'unexpected extra inference');
+    if (!script) {
+      const last = request.messages.at(-1)?.content.map((b) => (b as { text?: string }).text ?? `[${b.type}]`).join(' ') ?? '';
+      unscripted.push(`stream ${this.requests.length}, after: ${last.slice(0, 120)}`);
+      throw new Error('unexpected extra inference');
+    }
     const stream = new MockYieldingStream(script);
     const provide = stream.provideToolResults.bind(stream);
     stream.provideToolResults = (...args) => {
@@ -1061,15 +1069,6 @@ test("explicit: a restarted turn whose last response is empty checks for its ' !
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
     getDescriptor: () => undefined, getChannelTools: () => [],
   }), { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
-  const internals = h.framework as unknown as {
-    requestProseContinuation(agent: unknown, routing: { continuation: boolean }): void;
-  };
-  const check = internals.requestProseContinuation.bind(h.framework);
-  const seen: boolean[] = [];
-  internals.requestProseContinuation = (agent, routing) => {
-    seen.push(routing.continuation);
-    check(agent, routing);
-  };
   try {
     const run = h.run();
     for (const end = Date.now() + 5000; h.membrane.requests.length < 2 && Date.now() < end;) {
@@ -1077,7 +1076,7 @@ test("explicit: a restarted turn whose last response is empty checks for its ' !
     }
     assert.equal(h.membrane.requests.length, 2, 'the turn restarted for its budget');
     await new Promise<void>((resolve) => setTimeout(resolve, 100));
-    assert.deepEqual(seen, [], 'no continuation check while the earlier post is held');
+    assert.equal(h.membrane.requests.length, 2, 'no continuation while the earlier post is held');
     release();
     await run;
     for (const end = Date.now() + 5000; h.membrane.requests.length < 3 && Date.now() < end;) {
@@ -1085,8 +1084,7 @@ test("explicit: a restarted turn whose last response is empty checks for its ' !
       await h.framework.runUntilIdle();
     }
     assert.deepEqual(routed.map((text) => text.trim()), ['first', 'second']);
-    assert.equal(seen[0], true, "the completion's check saw the ' !' the queued envelope set");
-    assert.equal(h.membrane.requests.length, 3, 'and the continuation ran');
+    assert.equal(h.membrane.requests.length, 3, "the continuation the queued envelope's ' !' asked for ran");
   } finally {
     release();
     await h.framework.stop();
@@ -3481,11 +3479,15 @@ test('#277: a withheld batch keeps what each marked result listed; an unmarked o
     const [marked, plain] = toolResults(h.framework).map((block) => String(block.content));
     assert.deepEqual(keptLists(marked), { written: ['LOG.md'] });
     assert.doesNotMatch(marked, /payload-marked/, 'only the marked field is kept');
-    assert.match(marked, /^Tool result withheld by the guard\. The tool has already executed\. Its result is in workspace file work\/tool-results\/\S+-0-marked\.txt\. Kept from its result: /);
+    assert.match(marked, /^Tool result withheld by the guard\. The tool has already executed\. Its result is in workspace file work\/tool-results\/\S+-withheld-\S+-0-marked\.txt\. Kept from its result: /);
     assert.equal(keptLists(plain), undefined);
-    assert.match(plain, /Its result is in workspace file work\/tool-results\/\S+-1-plain\.txt\.$/);
-    const file = await h.workspace.readBinary(/workspace file (\S+\.txt)\./.exec(marked)![1]);
+    assert.match(plain, /Its result is in workspace file work\/tool-results\/\S+-withheld-\S+-1-plain\.txt\.$/);
+    const fileOf = (stub: string) => /workspace file (\S+\.txt)\./.exec(stub)![1]!;
+    assert.notEqual(fileOf(marked), fileOf(plain), 'a file of its own for each result');
+    const file = await h.workspace.readBinary(fileOf(marked));
     assert.match((file as { data: Buffer }).data.toString('utf8'), /payload-marked/, 'the file holds the whole result');
+    const plainFile = await h.workspace.readBinary(fileOf(plain));
+    assert.match((plainFile as { data: Buffer }).data.toString('utf8'), /payload-plain/, "the unmarked one's file holds its whole result");
     const retried = h.membrane.requests[1].messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_result');
     assert.deepEqual(retried.map((b) => b.content), [marked, plain], 'the retry already carries the lists');
     assert.doesNotMatch(marked, /refus|test-category/, "#159's line: no refusal or category in the context");
@@ -3600,12 +3602,20 @@ test("#277: a withheld round whose results fit the bound still cuts its stubs' f
     await h.run();
     const stubs = toolResults(h.framework).map((block) => String(block.content));
     const whole = JSON.stringify({ written });
-    assert.ok(whole.length > 1360 && whole.length < 3800, `${whole.length} characters of fields`);
-    assert.equal(stubs[0], `${AUDIT_STUB}${LISTS}${whole.slice(0, 1360)} [cut: 1360 of these fields' ` +
-      `${whole.length} characters; the whole result is where this note says]`);
+    assert.ok(whole.length < 3800, `${whole.length} characters of fields: the results fit the reader's bound`);
+    // The first stub's fields are cut within the share, where the share's
+    // arithmetic puts the cut, and say so.
+    const head = `${AUDIT_STUB}${LISTS}`;
+    assert.ok(stubs[0]!.startsWith(head), stubs[0]);
+    const cut = / \[cut: (\d+) of these fields' (\d+) characters; the whole result is where this note says\]$/.exec(stubs[0]!);
+    assert.ok(cut, stubs[0]);
+    const kept = Number(cut[1]);
+    assert.ok(kept > 0 && kept < whole.length && Number(cut[2]) === whole.length, cut[0]);
+    assert.equal(stubs[0]!.slice(head.length, stubs[0]!.length - cut[0].length), whole.slice(0, kept), 'the fields kept, up to the cut');
     assert.equal(stubs[1], `${AUDIT_STUB}${LISTS}${JSON.stringify({ written: ['one.txt'] })}`);
     const total = stubs.reduce((sum, stub) => sum + stub.length, 0);
     assert.ok(total <= 4000, `the stubs are ${total} characters together`);
+    assert.ok(stubs.every((stub) => stub.length <= 2000), `each stub within its share of the bound: ${stubs.map((stub) => stub.length).join(', ')}`);
   } finally { await h.framework.stop(); }
 });
 

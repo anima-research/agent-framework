@@ -66,7 +66,7 @@ import {
   type TransportSendOptions,
 } from '@modelcontextprotocol/client';
 
-import { STDERR_END_WAIT_MS, StdioTransport, type McplTransport, type TransportCloseInfo } from './transport.js';
+import { HeldStderr, STDERR_END_WAIT_MS, StdioTransport, type McplTransport, type TransportCloseInfo } from './transport.js';
 import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError, stderrTailOf, withStderr } from './server-connection.js';
 import { LEGACY_MCP_PROTOCOL_VERSION, MAX_TIMER_MS, MODERN_MCP_PROTOCOL_VERSION, checkServerConfig, describeCredentialError, logDroppedLine, maskedError, noteDialSent, redactServerText, redactedData, serverTextRedactor, type ServerTextRedactor } from './protocol-family.js';
 import type { McplServerConfig, McpToolDefinition } from './types.js';
@@ -79,8 +79,6 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 const CONNECT_TIMEOUT_MS = 30_000;
 /** Inventory listing has its own bound: it is host work, not a resident's call. */
 const LIST_TIMEOUT_MS = 30_000;
-/** Startup stderr kept for the first listener. */
-const STDERR_BACKLOG_LINES = 200;
 
 /** A modern tool result as the framework consumes it. `structuredContent` is
  *  kept by presence: `false`, `0` and `null` are values, not absence. */
@@ -113,18 +111,12 @@ interface WireRecord {
   continued: boolean;
 }
 
-/**
- * A send that Connectome's own transport refused before writing anything (its
- * stdio line is closed): nothing of that request reached the server. `pipe`:
- * the child's stdin or stdout had failed, so this host can no longer write to
- * that server at all.
- */
 class NotWrittenError extends Error {
-  readonly pipe: boolean;
-  constructor(message: string, pipe = false) {
+  readonly stdioStopped: boolean;
+  constructor(message: string, stdioStopped = false) {
     super(message);
     this.name = 'NotWrittenError';
-    this.pipe = pipe;
+    this.stdioStopped = stdioStopped;
   }
 }
 
@@ -321,9 +313,6 @@ class SpawnerStdioTransport implements Transport {
   constructor(
     private readonly config: McplServerConfig,
     private readonly onStderr: (line: string) => void,
-    /** The child's pipe failed and it outlived SIGKILL too, so the line
-     *  stays open, owning it (the line's 'unreaped'): `reason` names the
-     *  pipe's error, and `failure` is the reap's. */
     private readonly onUnreaped: (reason: string, failure: Error) => void,
   ) {
     this.recorded = serverTextRedactor(config);
@@ -364,13 +353,11 @@ class SpawnerStdioTransport implements Transport {
       this.closeInfo = info;
       this.onclose?.();
     });
-    line.on('unreaped', (failure: Error) => this.onUnreaped(`its stdio pipe failed with ${line.pipeFailure?.message ?? 'an error'}`, failure));
+    line.on('unreaped', (failure: Error) => this.onUnreaped(`this host stopped using the server's stdio (${line.stdioStopCause?.message ?? 'an error'})`, failure));
   }
 
-  /** The first error on the child's stdin or stdout, once there is one: the
-   *  line is ending the child then, and writes nothing more to it. */
-  get pipeFailure(): Error | undefined {
-    return this.line?.pipeFailure;
+  get stdioStopCause(): Error | undefined {
+    return this.line?.stdioStopCause;
   }
 
   /** The last of the child's stderr, redacted, once the stream has ended or
@@ -385,10 +372,8 @@ class SpawnerStdioTransport implements Transport {
 
   async send(message: JSONRPCMessage): Promise<void> {
     if (!this.line || this.line.closed) throw new NotWrittenError(`MCP server "${this.config.id}" stdio transport is closed`);
-    // Once the child's stdin or stdout has failed, the line is ending it and
-    // writes nothing more to it, so a message is refused here as not sent.
-    const failed = this.pipeFailure;
-    if (failed) throw new NotWrittenError(`MCP server "${this.config.id}" stdio pipe failed with ${failed.message}`, true);
+    const stopped = this.stdioStopCause;
+    if (stopped) throw new NotWrittenError(`MCP server "${this.config.id}": this host stopped using the server's stdio (${stopped.message})`, true);
     this.line.writeLine(JSON.stringify(message));
   }
 
@@ -476,10 +461,7 @@ export class ModernMcpConnection extends EventEmitter {
   /** A lost session's reap in flight: the reconnect follows it, and
    *  close() waits for it. */
   private losing: { session: Session; done: Promise<void> } | null = null;
-  /** Child stderr from before anyone listens (the caller attaches only once
-   *  connect() returns), delivered to the first listener. Bounded: the
-   *  newest lines are kept. */
-  private stderrBacklog: string[] = [];
+  private readonly heldStderr = new HeldStderr();
   private redactor?: ServerTextRedactor;
 
   /** The server's text with its configuration's credentials replaced, for
@@ -505,9 +487,8 @@ export class ModernMcpConnection extends EventEmitter {
       if (this.listenerCount('error') === 1) console.error(`[mcp] ${this.id}: ${redactServerText(error.message, this.config)}`);
     });
     this.on('newListener', (event: string | symbol) => {
-      if (event !== 'stderr' || this.stderrBacklog.length === 0) return;
-      const pending = this.stderrBacklog;
-      this.stderrBacklog = [];
+      if (event !== 'stderr' || this.heldStderr.empty) return;
+      const pending = this.heldStderr.take();
       // After the listener is added (newListener fires just before).
       queueMicrotask(() => { for (const line of pending) this.emit('stderr', { line }); });
     });
@@ -518,8 +499,7 @@ export class ModernMcpConnection extends EventEmitter {
       this.emit('stderr', { line });
       return;
     }
-    this.stderrBacklog.push(line);
-    if (this.stderrBacklog.length > STDERR_BACKLOG_LINES) this.stderrBacklog.shift();
+    this.heldStderr.hold(line);
   }
 
   /** The per-call deadline: `requestTimeoutMs`, validated positive. */
@@ -682,11 +662,6 @@ export class ModernMcpConnection extends EventEmitter {
       ? new SpawnerStdioTransport(
         this.config,
         (line) => { if (this.isCurrent(generation)) this.deliverStderr(line); },
-        // A child whose pipe failed and that outlived SIGKILL: a loss whose
-        // launch is already known unreaped, so it's held as the loss is
-        // handled (handleLost). During a connect there is no session to lose
-        // yet: a connect whose pipe has failed fails, whether or not the SDK
-        // resolves it (establish), and its cleanup holds the launch.
         (reason, failure) => { if (this.isCurrent(generation)) this.handleLost(generation, reason, failure); },
       )
       : null;
@@ -764,21 +739,21 @@ export class ModernMcpConnection extends EventEmitter {
       return;
     }
     // The transport closed while the client connected, such as a child that
-    // exited at the connect-time list-change subscribe, or the child's stdio
-    // pipe failed, such as that subscribe's write meeting EPIPE: the SDK
-    // reports the subscribe's failure only as an error, and resolves the
-    // connect anyway (R1-2). Adopted, the session would read as connected
-    // with nothing it can write to behind it, and from a child that outlived
-    // SIGKILL, whose 'unreaped' came while there was no session to lose, no
-    // later close would come to reconnect it. So the connect failed: its
-    // close reaps the child, and a child it can't reap is held. A failed
-    // pipe is named whether or not the child has exited by now.
-    const pipe = session.stdio?.pipeFailure;
-    if (session.lost || pipe) {
+    // exited at the connect-time list-change subscribe, or this host stopped
+    // using the child's stdio, such as after that subscribe's write met
+    // EPIPE: the SDK reports the subscribe's failure only as an error, and
+    // resolves the connect anyway (R1-2). Adopted, the session would read as
+    // connected with nothing it can write to behind it, and from a child that
+    // outlived SIGKILL, whose 'unreaped' came while there was no session to
+    // lose, no later close would come to reconnect it. So the connect failed:
+    // its close reaps the child, and a child it can't reap is held. The
+    // stop's cause is named whether or not the child has exited by now.
+    const stopped = session.stdio?.stdioStopCause;
+    if (session.lost || stopped) {
       const failure = await ModernMcpConnection.closeSession(session);
       if (failure) this.holdUnreaped(session, failure);
-      throw await ModernMcpConnection.withStderrTail(session, new Error(pipe
-        ? `MCP server "${this.id}" stdio pipe failed with ${pipe.message} while connecting`
+      throw await ModernMcpConnection.withStderrTail(session, new Error(stopped
+        ? `MCP server "${this.id}": this host stopped using the server's stdio while connecting (${stopped.message})`
         : `MCP server "${this.id}" closed its connection while connecting`));
     }
     this.session = session;
@@ -882,9 +857,7 @@ export class ModernMcpConnection extends EventEmitter {
     }
   }
 
-  /** The transport went away (child exit, or a closed HTTP client).
-   *  `unreaped`: the child's pipe failed and it outlived SIGKILL, so its
-   *  launch is already known unreaped. */
+  /** The transport went away (child exit, or a closed HTTP client). */
   private handleLost(generation: number, reason: string, unreaped?: Error, ended?: TransportCloseInfo): void {
     const session = this.session;
     if (session?.generation !== generation) return;
@@ -1210,9 +1183,9 @@ export class ModernMcpConnection extends EventEmitter {
       : `${said}, so whether the request took effect is unknown. Check its effect before trying again.`;
     if (!record.handedOff) {
       log(`${what} not sent: ${logDetail(message)}`);
-      const pipe = error instanceof NotWrittenError && error.pipe;
+      const stdioStopped = error instanceof NotWrittenError && error.stdioStopped;
       return new McplRequestError(
-        pipe
+        stdioStopped
           ? `The request wasn't sent: this host can no longer write to ${server}, so nothing ran. ${this.retryText()}`
           // Before the wire, the cause can pass (the stdio line closing as
           // the connection is lost) or stay (a tool's outputSchema the SDK

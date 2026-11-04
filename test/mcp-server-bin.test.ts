@@ -20,7 +20,6 @@ import { WebSocketServer } from 'ws';
 // The compiled test sits in dist/test/, beside dist/src/.
 const BIN = fileURLToPath(new URL('../src/api/mcp-server.js', import.meta.url));
 const CORE = fileURLToPath(new URL('../src/api/mcp-server-core.js', import.meta.url));
-const LINE_READER = fileURLToPath(new URL('../src/line-reader.js', import.meta.url));
 const ROOT_MODULE = fileURLToPath(new URL('../src/index.js', import.meta.url));
 // The repository root, from which mcp-wrapper.sh runs the built file.
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
@@ -57,7 +56,8 @@ function start(file: string, args: string[], env: Record<string, string>, cwd?: 
   const exited = new Promise<{ code: number | null; stderr: string }>((resolve) => {
     child.on('close', (code) => resolve({ code, stderr }));
   });
-  return { endStdin: () => child.stdin.end(), kill: () => child.kill(), exited };
+  child.stdin.on('error', () => {});
+  return { endStdin: () => child.stdin.end(), writeStdin: (chunk: Buffer) => child.stdin.write(chunk), kill: () => child.kill(), exited };
 }
 
 function within<T>(promise: Promise<T>, what: string): Promise<T> {
@@ -111,16 +111,15 @@ test('importing the package, or running its server module under the command\'s n
   const entry = join(dir, 'entry.mjs');
   writeFileSync(entry, `const { McpServer } = await import(${rootUrl});\nif (typeof McpServer !== 'function') process.exit(2);\n`);
   // An application bundling the package carries the server's module, never
-  // the command: this copy, under the command's file name, with the module it
-  // imports at the path it imports it from, and inside the package so it
-  // resolves 'ws' as the module does, is that bundle run as the entry point.
-  // It used to start the server.
-  const bundleDir = join(dirname(CORE), '..', `bundle-${process.pid}`);
-  mkdirSync(join(bundleDir, 'api'), { recursive: true });
+  // the command: this copy, under the command's file name and as deep in
+  // dist/src/ as the original, so it resolves 'ws' and its own relative
+  // imports as the module does, is that bundle run as the entry point. It
+  // used to start the server.
+  const bundleDir = join(dirname(dirname(CORE)), `bundle-${process.pid}`);
+  mkdirSync(bundleDir);
   made.push(bundleDir);
-  const bundle = join(bundleDir, 'api', 'mcp-server.js');
+  const bundle = join(bundleDir, 'mcp-server.js');
   copyFileSync(CORE, bundle);
-  copyFileSync(LINE_READER, join(bundleDir, 'line-reader.js'));
   const cases: Array<[string, string[], string | undefined]> = [
     ['a host that imports the package root, from an entry script of its own', [entry], undefined],
     ['the package root imported under `node -e`', ['--input-type=module', '-e', `await import(${rootUrl});`], undefined],
@@ -189,6 +188,20 @@ test("the command's answers on stdout carry U+2028 and U+2029 escaped, and parse
     assert.equal(answer.error.message, 'Method not found: no\u2028such\u2029method');
   } finally {
     child.kill();
+    await api.close();
+  }
+});
+
+test('a line on stdin longer than 104,857,600 UTF-16 code units ends the server with code 1 and one stderr line naming the bound', async () => {
+  const api = await standInApi();
+  const run = start(process.execPath, [BIN], { AGENT_FRAMEWORK_WS_URL: api.url });
+  try {
+    await within(api.connected, 'the server connected to the stand-in API');
+    run.writeStdin(Buffer.alloc(104_857_601, 0x78));
+    const { code, stderr } = await within(run.exited, 'the server exited after the long line');
+    assert.deepEqual({ code, stderr }, { code: 1, stderr: 'MCP server stopped: a line on stdin was longer than 104,857,600 UTF-16 code units\n' });
+  } finally {
+    run.kill();
     await api.close();
   }
 });

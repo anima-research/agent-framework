@@ -314,7 +314,9 @@ export class Agent {
   readonly refusalHandling: AgentConfig['refusalHandling'];
   readonly toolResultGuard: ToolResultGuard;
   /** Prose delivery mode (see AgentConfig.proseRouting). Default 'locus'. */
-  readonly proseRouting: 'locus' | 'explicit' | 'hybrid' | 'disabled';
+  readonly proseRouting: 'locus' | 'explicit' | 'hybrid' | 'disabled' | 'locked';
+  /** Locked mode's destination until the agent chooses one (see AgentConfig.proseLock). */
+  readonly proseLock: string | undefined;
   /** Exact whole-response known-tool wrapper containment (default off). */
   readonly toolWrapperProseGuard: boolean;
   /** Continuation after a turn the model ends itself (see
@@ -459,6 +461,7 @@ export class Agent {
     this.refusalHandling = config.refusalHandling;
     this.toolResultGuard = new ToolResultGuard(config.name, contextManager, config.toolResultGuard === true);
     this.proseRouting = config.proseRouting ?? 'locus';
+    this.proseLock = typeof config.proseLock === 'string' && config.proseLock.trim() ? config.proseLock.trim() : undefined;
     this.toolWrapperProseGuard = config.toolWrapperProseGuard === true;
     this.autoContinue = resolveAutoContinue(config);
     this.clock = resolveClockConfig(config.name, config.clock);
@@ -1154,11 +1157,7 @@ export class Agent {
    * A message above it may still be replaced or withdrawn in place by its
    * sender, though it may already have been in one of the agent's requests.
    * A live stream carries each round's own content and results, which it
-   * stores at its tool boundaries, into its next request. It can also carry
-   * the messages injected at a boundary whose stream didn't say whether it
-   * carries injections, as no membrane 0.5.x stream does: its native path
-   * carries them and its XML path drops them, and either way they stay
-   * above it.
+   * stores at its tool boundaries, into its next request.
    */
   private consumedWatermark: { branch: string; sequence: number } | null = null;
   /** Counts marks (markContextConsumed's and applyCompileWatermark's), so a
@@ -1168,8 +1167,7 @@ export class Agent {
    * The newest stored message a compile or a tool boundary may have put in
    * front of the agent, per branch. It moves where the consumed watermark
    * does, and sooner: when a committing compile takes its value, before it
-   * awaits, and at every tool boundary that injects, whether or not the
-   * stream says it carries injected messages. A message above it may still
+   * awaits, and at every tool boundary that injects into its stream. A message above it may still
    * have been shown, though: for one, a live stream carries each round's own
    * content and results, stored at a boundary that injected nothing, into its
    * next request. A compile that throws assembled nothing, and gives its move
@@ -1311,7 +1309,7 @@ export class Agent {
   }
 
   /** Mark everything currently stored as possibly shown (a tool boundary
-   *  that injected messages, whatever its stream says it carries). Without
+   *  that injected messages into its stream). Without
    *  a watermark the coalescer counts a message as shown, as it counts one
    *  read without a consumed watermark. */
   markContextShown(): void {

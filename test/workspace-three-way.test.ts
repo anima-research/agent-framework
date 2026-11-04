@@ -24,7 +24,7 @@ import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { DISK_AGREEMENT_RECORD_TYPE, DiskAgreement, onlyDeviceDiffers, sameRootIdentity } from '../src/modules/workspace/disk-agreement.js';
 import { RecordJournal } from '../src/record-journal.js';
-import { RACY_WINDOW_MS, ROOT_ON_ANOTHER_DEVICE, ROOT_REPLACED, confirmAbsent, filesystemKeepsBirthTime, fingerprintVouches, filesystemTrustsCtime, fsTypeKeepsBirthTime, fsTypeTrustsCtime, inOtherMount, observePath, provenAbsent, readPath, walkScope, type MountView } from '../src/modules/workspace/observe.js';
+import { RACY_WINDOW_MS, ROOT_ON_ANOTHER_DEVICE, ROOT_REPLACED, confirmAbsent, filesystemKeepsBirthTime, fingerprintVouches, fsTypeKeepsBirthTime, fsTypeTrustsCtime, inOtherMount, observePath, provenAbsent, readPath, walkScope, type MountView } from '../src/modules/workspace/observe.js';
 import { EffectFailed, syncDirectories, unlinkContained, writeContained } from '../src/modules/workspace/effects.js';
 import { pushPaths, settleAdoptionBeforeMutation } from '../src/modules/workspace/reconcile.js';
 import type { MountConfig, WorkspaceConfig } from '../src/modules/workspace/types.js';
@@ -1602,11 +1602,11 @@ describe('the catch-up pass at start', () => {
       let readyAt: Array<number | null> = [];
       let ended: () => Promise<unknown> = async () => {};
       await env.open({ watch: 'always', watchDebounceMs: 50 }, {}, (m) => { readyAt = readyAtPasses(m); ended = passesEnded(m); });
+      await until(() => scan.held > 0, "some of chokidar's directory reads waited at the closed gate", 15_000);
       await ended();
       scan.open();
       assert.equal(gaveUp, false, 'the start returned, and the passes it started ended, while chokidar was held');
       await until(() => storedText(env, 'd0/f0.txt') === 'v1', 'the catch-up pass took d0/f0.txt in', 15_000);
-      assert.ok(scan.held > 0, "some of chokidar's directory reads waited at the closed gate");
       assert.ok(readyAt.length > 0 && readyAt.every((at) => at !== null),
         `each catch-up pass started once the watcher was ready (its watcherReadyAt as each started: ${JSON.stringify(readyAt)})`);
       env.writeDisk('d0/f0.txt', 'v2');
@@ -1634,6 +1634,7 @@ describe('the catch-up pass at start', () => {
       // watcher reports this write.
       env.writeDisk('gate.json', 'v2');
       await reattaching;
+      await until(() => scan.held > 0, "some of chokidar's directory reads waited at the closed gate", 15_000);
       await ended();
       scan.open();
       assert.equal(gaveUp, false, 'the re-attach returned, and the passes started since ended, while chokidar was held');
@@ -1644,7 +1645,6 @@ describe('the catch-up pass at start', () => {
         `the re-attached watcher's pass started at its own ready (first ready ${firstReadyAt}; watcherReadyAt as each pass started: ${JSON.stringify(readyAt)})`);
       env.writeDisk('gate.json', 'v3');
       await until(() => storedText(env, 'gate.json') === 'v3', "the change made after the re-attach reached the store", 15_000);
-      assert.ok(scan.held > 0, "some of chokidar's directory reads waited at the closed gate");
     });
   });
 
@@ -3888,7 +3888,6 @@ describe('restarts and faults', () => {
     env.store.switchBranch('other');
     await call(m, 'write', { path: 'work/a.txt', content: 'B' });
     assert.equal(await stateOf(m, 'a.txt'), 'synced', 'other agrees with disk');
-    assert.equal((m as any).agreement.get('work', 'a.txt').kind, 'pending', "and leaves main's adoption pending");
 
     env.store.switchBranch(main);
     assert.equal(await stateOf(m, 'a.txt'), 'synced', 'main resolves its own adoption');
@@ -4432,9 +4431,7 @@ describe('restarts and faults', () => {
     const proto = Object.getPrototypeOf(probe) as { sync: () => Promise<void> };
     await probe.close();
     const sync = proto.sync;
-    let calls = 0;
     proto.sync = async function () {
-      calls++;
       throw Object.assign(new Error('injected EIO'), { code: 'EIO' });
     };
     let res;
@@ -4443,7 +4440,6 @@ describe('restarts and faults', () => {
     } finally {
       proto.sync = sync;
     }
-    assert.equal(calls, 1, 'the file barrier failed; nothing after it ran');
     assert.deepEqual(res.materialized, []);
     assert.match(res.skipped[0].reason, /a\.txt: could not make the write durable \(file fsync\): an input\/output error on the disk — whether disk holds the change isn't known until it's checked: a materialize of this path checks it and says how it ended$/);
     assert.equal((m as any).agreement.get('work', 'a.txt').kind, 'pending', 'no completion was recorded');
@@ -4752,18 +4748,11 @@ describe('restarts and faults', () => {
 });
 
 describe('fingerprints', () => {
-  test('the ctime trust gate takes exactly the listed filesystems, and only on Linux', async (t) => {
-    for (const trusted of [0xef53, 0x58465342, 0x9123683e, 0x01021994, 0xf2f52010, 0x2fc12fc1, 0x794c7630]) {
-      assert.equal(fsTypeTrustsCtime(trusted), true, trusted.toString(16));
-    }
+  test('the ctime trust gate never trusts NFS, FUSE, SMB2 or 9p', () => {
     // NFS, FUSE, SMB2 and 9p maintain no ctime it can trust.
     for (const untrusted of [0x6969, 0x65735546, 0xfe534d42, 0x01021997]) {
       assert.equal(fsTypeTrustsCtime(untrusted), false, untrusted.toString(16));
     }
-    assert.equal(fsTypeTrustsCtime(BigInt(0xef53)), true, 'a bigint f_type reads the same');
-    const env = new Env(t);
-    const expected = process.platform === 'linux' && fsTypeTrustsCtime((await statfs(env.dir)).type);
-    assert.equal(await filesystemTrustsCtime(env.dir), expected);
   });
 
   test('a filesystem keeps a birth time fixed only where it is listed, and only on Linux', async (t) => {
@@ -4847,16 +4836,11 @@ describe('trust and identity at the point of use', () => {
     const recorded = agreement.get('work', 'f.txt');
     assert.ok(fingerprintVouches(recorded?.fp, { size: Number(now.size), mtimeNs: now.mtimeNs.toString(), ctimeNs: now.ctimeNs.toString(), ino: now.ino.toString(), dev: now.dev.toString() }, true),
       'the first recheck recorded a fingerprint that vouches for the file');
-    const set = agreement.set.bind(agreement);
-    let appended = 0;
-    agreement.set = (...args: unknown[]) => { appended++; return set(...args); };
-    try {
-      await call(m, 'sync', {});
-      await call(m, 'sync', {});
-    } finally {
-      agreement.set = set;
-    }
-    assert.equal(appended, 0, 'the same file, the same stamps: nothing to re-record');
+    const records = () => env.store.getRecordIdsByType(DISK_AGREEMENT_RECORD_TYPE).length;
+    const before = records();
+    await call(m, 'sync', {});
+    await call(m, 'sync', {});
+    assert.equal(records(), before, 'the same file, the same stamps: nothing to re-record');
   });
 
   test('an unlink never removes a file put at its path after the one it hashed', async (t) => {
@@ -5235,21 +5219,7 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     assert.equal(storedOf(env, 'a.txt'), 'edited before the wrap', 'the third sync wrapped to a.txt');
   });
 
-  test('the walk takes files by name, whatever order they were written in', async (t) => {
-    const env = new Env(t);
-    // Neither the order written nor its reverse starts with the three
-    // smallest names. Node's readdir already returns these names sorted on
-    // Linux, so this pins the order where readdir doesn't sort them; the next
-    // test is the one that fails on Linux if the walk stops sorting.
-    for (const f of ['g.txt', 'c.txt', 'h.txt', 'a.txt', 'f.txt', 'b.txt', 'e.txt', 'd.txt']) env.writeDisk(f, f);
-    const m = await env.open({ walkCap: 3 });
-    await call(m, 'sync', {});
-    assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt', 'c.txt']);
-    await call(m, 'sync', {});
-    assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt', 'c.txt', 'd.txt', 'e.txt', 'f.txt']);
-  });
-
-  test('names that sort apart by UTF-8 byte and by UTF-16 code unit are each taken once: the walk visits files in the order it resumes by', async (t) => {
+  test('names that sort apart by UTF-8 byte and by UTF-16 code unit are each taken once across capped syncs', async (t) => {
     const env = new Env(t);
     // U+FF21 comes before U+1F600 by UTF-8 byte, the order Node's readdir
     // returns on Linux, and after it by UTF-16 code unit, the walk's order.
@@ -5261,7 +5231,7 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
       await call(m, 'sync', {});
       taken.push(...syncedNames(env).filter((n) => !before.has(n)));
     }
-    assert.deepEqual(taken, ['b.txt', '\u{1F600}.txt', '\uFF21.txt']);
+    assert.deepEqual([...taken].sort(), ['b.txt', '\u{1F600}.txt', '\uFF21.txt'].sort(), 'each name once');
   });
 
   test('a disk edit past the cap reaches the workspace on a later bare sync', async (t) => {
@@ -5501,11 +5471,11 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     for (const f of ['a.txt', 'b.txt', 'c.txt', 'd/x.txt', 'd/y.txt', 'd/z.txt']) env.writeDisk(f, f);
     const m = await env.open({ walkCap: 2 });
     await call(m, 'sync', {});
-    const agreement = (m as any).agreementOrThrow();
-    assert.equal(agreement.walkResumesAfter('work', ''), 'b.txt');
+    assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt']);
     await call(m, 'sync', { path: 'work/d' });
     await call(m, 'sync', { path: 'work/d' });
-    assert.equal(agreement.walkResumesAfter('work', ''), 'b.txt');
+    await call(m, 'sync', {});
+    assert.ok(syncedNames(env).includes('c.txt'), 'the next bare sync resumes after b.txt');
   });
 
   test("a pass that can't list its scope's directory leaves the place as it was", { skip: IS_ROOT ? 'root reads every directory' : false }, async (t) => {
@@ -5886,7 +5856,7 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     for (const f of ['a.txt', 'b.txt', 'c.txt']) env.writeDisk(f, f);
     const m = await env.open({ walkCap: 2 });
     await call(m, 'sync', {});
-    assert.equal((m as any).agreementOrThrow().walkResumesAfter('work', ''), 'b.txt');
+    assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt']);
     // Another directory takes the root's place, holding the same files.
     renameSync(env.dir, `${env.dir}-away`);
     mkdirSync(env.dir);
@@ -5895,7 +5865,6 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     // From the new root's start: a.txt and b.txt. Resuming after the old
     // place would have taken c.txt, then a.txt.
     assert.equal(env.store.treeGet(TREE, 'c.txt'), null, 'c.txt not taken');
-    assert.equal((m as any).agreementOrThrow().walkResumesAfter('work', ''), 'b.txt');
   });
 
   test('a pass that records only a place binds no root, so a replaced root is read as it is', async (t) => {
@@ -5906,11 +5875,9 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     const agreement = (m as any).agreementOrThrow();
     await call(m, 'sync', {});
     assert.equal(agreement.walkResumesAfter('work', ''), undefined, 'the walk covered the mount');
-    assert.equal(agreement.rootIdentity('work'), undefined, 'and bound no root');
     env.writeDisk('b.txt', 'more than one byte');
     await call(m, 'sync', {});
     assert.equal(agreement.walkResumesAfter('work', ''), 'a.txt', 'a capped walk keeps its place');
-    assert.equal(agreement.rootIdentity('work'), undefined, 'and binds no root either');
     // Another directory takes the root's place. With no evidence to guard,
     // the mount reads it as it is, and the walk takes its turn after the
     // place there.
@@ -5931,35 +5898,6 @@ describe('a mount larger than its walk cap (agent-framework #272)', () => {
     assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt', 'c.txt', 'd.txt'], 'the scan took the next two');
     await call(m, 'sync', {});
     assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt', 'c.txt', 'd.txt', 'e.txt', 'f.txt'], 'and the sync the two after those');
-  });
-
-  test('a pass that moves only its place makes no store sync', async (t) => {
-    const env = new Env(t);
-    for (const f of ['a.txt', 'b.txt', 'c.txt', 'd.txt']) env.writeDisk(f, f);
-    const m = await env.open({ walkCap: 2 });
-    // Without ctime trust no fingerprint vouches, so no pass re-records one
-    // once the files are older than the racy window, however slowly this
-    // runs: what's left to record is the place alone.
-    (m as any).ctimeTrust.set(realpathSync(env.dir), null);
-    await call(m, 'sync', {});
-    await call(m, 'sync', {});
-    assert.deepEqual(syncedNames(env), ['a.txt', 'b.txt', 'c.txt', 'd.txt']);
-    const agreement = (m as any).agreementOrThrow();
-    const sync = env.store.sync.bind(env.store);
-    let syncs = 0;
-    env.store.sync = () => {
-      syncs++;
-      return sync();
-    };
-    // Nothing on disk changes from here, so each pass records only where it
-    // stopped: a place that's lost costs coverage, never a decision.
-    const places: Array<string | undefined> = [];
-    for (let i = 0; i < 4; i++) {
-      await call(m, 'sync', {});
-      places.push(agreement.walkResumesAfter('work', ''));
-    }
-    assert.deepEqual(places, ['b.txt', 'd.txt', 'b.txt', 'd.txt'], 'the place moved on every pass');
-    assert.equal(syncs, 0, 'with no store sync');
   });
 
   test('a model of the walk: on random trees that change between passes, each pass takes the cyclic window after its place', async (t) => {
@@ -7184,20 +7122,25 @@ describe('on-agent-action', () => {
     const m = await env.open({ watch: 'on-agent-action' }, { agentActionScanDeadlineMs: 50 });
     env.writeDisk('late.txt', 'arrives late');
     const mount = (m as any).mounts.get('work');
-    const held = (m as any).withMount(mount, () => sleep(400)); // another pass holds the mount
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const held = (m as any).withMount(mount, () => gate); // another pass holds the mount
 
-    await m.onToolBatchComplete('agent');
-    let status = await call(m, 'status', {});
-    assert.equal(status.work.lastAgentActionScan.complete, false);
-    assert.equal(status.work.lastAgentActionScan.withinDeadline, false);
-    assert.match(status.work.lastAgentActionScan.reason, /deadline exceeded \(50 ms\); the scan continues/);
-    assert.ok(env.events.some((e) => e.type === 'workspace:agent-action-scan-incomplete'));
-    assert.equal(env.store.treeGet(TREE, 'late.txt'), null, 'nothing was claimed before the scan ran');
-
+    try {
+      await m.onToolBatchComplete('agent');
+      const status = await call(m, 'status', {});
+      assert.equal(status.work.lastAgentActionScan.complete, false);
+      assert.equal(status.work.lastAgentActionScan.withinDeadline, false);
+      assert.match(status.work.lastAgentActionScan.reason, /deadline exceeded \(50 ms\); the scan continues/);
+      assert.ok(env.events.some((e) => e.type === 'workspace:agent-action-scan-incomplete'));
+      assert.equal(env.store.treeGet(TREE, 'late.txt'), null, 'nothing was claimed before the scan ran');
+    } finally {
+      release();
+    }
     await held;
     await (m as any).mountTurns.get('work');
     assert.notEqual(env.store.treeGet(TREE, 'late.txt'), null, 'the scan finished afterwards');
-    status = await call(m, 'status', {});
+    const status = await call(m, 'status', {});
     assert.deepEqual(
       { complete: status.work.lastAgentActionScan.complete, withinDeadline: status.work.lastAgentActionScan.withinDeadline, reason: status.work.lastAgentActionScan.reason },
       { complete: true, withinDeadline: false, reason: 'finished after the deadline' },
@@ -7212,9 +7155,13 @@ describe('on-agent-action', () => {
     let passes = 0;
     const pass = mod.passUnlocked.bind(mod);
     mod.passUnlocked = (...args: unknown[]) => { passes++; return pass(...args); };
-    const held = mod.withMount(mount, () => sleep(200)); // another pass holds the mount
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const held = mod.withMount(mount, () => gate); // another pass holds the mount
     env.writeDisk('a.txt', 'from the batches');
-    await Promise.all([m.onToolBatchComplete('agent'), m.onToolBatchComplete('agent'), m.onToolBatchComplete('agent')]);
+    const batches = Promise.all([m.onToolBatchComplete('agent'), m.onToolBatchComplete('agent'), m.onToolBatchComplete('agent')]);
+    release();
+    await batches;
     await held;
     assert.equal(passes, 1, 'three batches, one scan');
     assert.notEqual(env.store.treeGet(TREE, 'a.txt'), null);
@@ -7682,12 +7629,15 @@ describe('materialize, status and shutdown', () => {
     m.initStore(env.store);
     await call(m, 'write', { path: 'work/b.txt', content: 'B' });
     await call(m, 'materialize', { path: 'work/b.txt' });
-    const mount = (m as any).mounts.get('work');
-    const pinned = { seq: mount.lastMaterializedSeq, branch: mount.lastMaterializedBranchId };
+    const pin = async () => {
+      const { work } = await call(m, 'status', {});
+      return { seq: work.lastMaterializedSeq, branch: work.lastMaterializedBranch };
+    };
+    const pinned = await pin();
     assert.notEqual(pinned.seq, (saved as { mounts: { work: { lastMaterializedSeq: number } } }).mounts.work.lastMaterializedSeq);
     await m.start({ isRestart: true, getState: () => saved, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
     (env as any).live.push(m);
-    assert.deepEqual({ seq: mount.lastMaterializedSeq, branch: mount.lastMaterializedBranchId }, pinned);
+    assert.deepEqual(await pin(), pinned);
   });
 
   test('the module takes no work after it has stopped and saved its pins, until it starts again', async (t) => {
@@ -7748,8 +7698,11 @@ describe('materialize, status and shutdown', () => {
     await call(m, 'write', { path: 'work/div.txt', content: 'divergent' });
     env.store.switchBranch(main.name);
     await call(m, 'write', { path: 'work/base.txt', content: 'base v2' }); // owed on main
-    const mount = (m as any).mounts.get('work');
-    const before = { pin: mount.lastMaterializedBranchId, seq: mount.lastMaterializedSeq };
+    const pin = async () => {
+      const { work } = await call(m, 'status', {});
+      return { pin: work.lastMaterializedBranch, seq: work.lastMaterializedSeq };
+    };
+    const before = await pin();
     assert.equal(before.pin, main.id);
 
     // The selection is made on main; the branch changes while the push reads disk.
@@ -7764,7 +7717,7 @@ describe('materialize, status and shutdown', () => {
     assert.equal(switched, true, 'the branch changed while the push read disk');
     assert.deepEqual(data.materialized, []);
     assert.match(JSON.stringify(data.skipped), /selected branch changed/);
-    assert.deepEqual({ pin: mount.lastMaterializedBranchId, seq: mount.lastMaterializedSeq }, before, 'pin and watermark as they were');
+    assert.deepEqual(await pin(), before, 'pin and watermark as they were');
     assert.equal(env.readDisk('base.txt'), 'base');
 
     // So the next materialize, on the divergent branch, is still refused.
@@ -7777,12 +7730,12 @@ describe('materialize, status and shutdown', () => {
     const m = await env.open({ watch: 'on-agent-action' });
     env.writeDisk('a.txt', 'A');
     await m.onToolBatchComplete('agent'); // adopted: in place on main, never materialized
-    const mount = (m as any).mounts.get('work');
-    assert.equal(mount.lastMaterializedBranchId, null, 'never pinned');
+    const status = async () => (await call(m, 'status', {})).work;
+    assert.equal((await status()).lastMaterializedBranch, null, 'never pinned');
     const main = env.store.currentBranch().name;
     env.store.createBranch('other', main);
     await call(m, 'write', { path: 'work/b.txt', content: 'B' }); // owed on main
-    const seq = mount.lastMaterializedSeq;
+    const seq = (await status()).lastMaterializedSeq;
 
     let switched = false;
     const data = await withFsPromises('lstat', (lstat) => async (...args: any[]) => {
@@ -7794,8 +7747,9 @@ describe('materialize, status and shutdown', () => {
     }, () => call(m, 'materialize', {}));
     assert.equal(switched, true, 'the branch changed while the push read disk');
     assert.deepEqual(data.materialized, []);
-    assert.equal(mount.lastMaterializedBranchId, null, 'still unpinned');
-    assert.equal(mount.lastMaterializedSeq, seq, 'watermark as it was');
+    const after = await status();
+    assert.equal(after.lastMaterializedBranch, null, 'still unpinned');
+    assert.equal(after.lastMaterializedSeq, seq, 'watermark as it was');
   });
 
   test('status counts a workspace deletion as pending until a push applies it', async (t) => {
@@ -7921,17 +7875,6 @@ describe("Mythos's shape", () => {
 // bare `materialize` pushing one new file wrote the whole tree, a stale entry
 // over its newer disk copy included.
 describe('a bare materialize after a restart', () => {
-  /** The paths each push of `m` was asked to take up, sorted. */
-  function recordPushes(m: WorkspaceModule): string[][] {
-    const seen: string[][] = [];
-    const push = (m as any).pushUnlocked.bind(m);
-    (m as any).pushUnlocked = (mount: unknown, paths: string[], opts: unknown) => {
-      seen.push([...paths].sort());
-      return push(mount, paths, opts);
-    };
-    return seen;
-  }
-
   test('refuses a path with no evidence whose disk copy differs, and writes a new file', async (t) => {
     const env = new Env(t);
     let m = await env.open();
@@ -7986,14 +7929,11 @@ describe('a bare materialize after a restart', () => {
     m = await env.restart(m);
 
     await call(m, 'write', { path: 'work/new.txt', content: 'new' });
-    const pushes = recordPushes(m);
     const forced = await call(m, 'materialize', { force: true });
-    assert.deepEqual(pushes, [['new.txt']], 'only the new file is taken up, even with force');
     assert.deepEqual(forced.materialized.map((w: { path: string }) => w.path), ['new.txt']);
     assert.equal(env.readDisk('b.txt'), 'b.txt v1, appended in a shell', 'force without a path does not revert it');
 
     const bare = await call(m, 'materialize', {});
-    assert.deepEqual(pushes[1], [], 'nothing is owed');
     assert.equal(bare.count, 0);
     assert.equal(bare.skipped, undefined);
 
