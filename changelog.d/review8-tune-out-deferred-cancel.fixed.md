@@ -25,4 +25,11 @@
   logged and traced as `tune-out:deferred-cancel-dropped` (`note-undelivered`, with the reason and the author); the
   cancel still ends the tune-out. Each notice of a lost note gives the persistent subconscious a turn to read it.
   A reader fork that has ended by then is not told: the framework writes nothing for an agent that has ended, and
-  logs the notice it drops.
+  logs the notice it drops. A notice of a lost note that can't be written was only logged; it is now kept, traced
+  as `tune-out:note-loss-untold` (`write-failed`, with the author and the error) at its first failure, and tried
+  again whenever held writes are stored and every 60 s while none are, until it is written or the host stops. A
+  notice written after the drop says whether the later hold it names is still in force then.
+- A reader's `cancel_tuneout` that waits for held writes, with a note, now says what becomes of the note: it is
+  delivered when the hold ends; if it can't be, the reader is told so and why; if that notice can't be written
+  either, the failure is traced and the notice is tried again until the host stops; and a stop before the hold ends
+  loses the note with the cancel, untold. The answer said only that the cancel waits.

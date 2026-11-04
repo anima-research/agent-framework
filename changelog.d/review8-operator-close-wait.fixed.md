@@ -14,6 +14,7 @@
     resident's, the reader's, its end time's, or another close) can end it
     first, and delivers the note the queued cancel carries. If writing that
     note fails, the note's author is told so and why (unless it is a reader
-    fork that has ended), and the loss is traced.
+    fork that has ended), and the loss is traced. A notice that can't be
+    written is traced, kept, and tried again until the host stops.
   - A stop before the retry succeeds loses the queued cancel, and the hold
     is still in force after the restart unless its end time has passed.

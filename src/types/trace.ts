@@ -1162,6 +1162,25 @@ export type TraceEvent =
       noteAuthor?: string;
       error?: string;
     })
+  /**
+   * The notice telling a lost note's author (`noteAuthor`) of the loss (a
+   * `tune-out:deferred-cancel-dropped` with `noteLost`) was not written.
+   * `write-failed`: writing it threw (`error`). It is kept, and tried again
+   * whenever held writes are stored and every 60 s while none are, until it
+   * is written or the host stops; this traces its first failure only, and
+   * each later one is logged. For the all-except hold (`scope`), the
+   * channel is its excepted one.
+   */
+  | (TraceEventBase & {
+      type: 'tune-out:note-loss-untold';
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      scope?: 'all-except';
+      noteAuthor: string;
+      reason: 'write-failed';
+      error?: string;
+    })
 
   /** A reader fork ended in prose without `deliver_summary`; its final prose was delivered as its report. */
   | (TraceEventBase & {
