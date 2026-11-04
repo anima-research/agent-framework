@@ -773,18 +773,27 @@ describe('debounce', () => {
     assert.strictEqual(inferenceRequests[1].addressed, undefined);
     assert.deepStrictEqual(inferenceRequests[1].batchChannels, [{ channelId: 'discord:g:room', serverId: 'discord' }]);
 
-    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room',
-      content: 'pat joined', tags: ['chat:system'], metadata: { authorId: '6' } }));
-    pin();
-    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room',
-      content: 'the weather turned', tags: ['chat:system'] }));
+    const arriving = (at: number, evaluate: () => void) => {
+      const realNow = Date.now;
+      Date.now = () => at;
+      try {
+        evaluate();
+      } finally {
+        Date.now = realNow;
+      }
+    };
+    arriving(1_000, () => gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room',
+      content: 'pat joined', tags: ['chat:system'], metadata: { authorId: '6' } })));
+    arriving(2_000, pin);
+    arriving(3_000, () => gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room',
+      content: 'the weather turned', tags: ['chat:system'] })));
     t.mock.timers.tick(150);
     assert.strictEqual(inferenceRequests.length, 3);
     const alone = inferenceRequests[2];
     assert.deepStrictEqual(
-      [alone.channelId, alone.routeChannelId, alone.addressed, alone.batchChannels, alone.counterparty],
-      [undefined, undefined, undefined, undefined, 'discord:user:5'],
-      'notices alone give the newest author among them, and nothing else',
+      [alone.channelId, alone.routeChannelId, alone.addressed, alone.batchChannels, alone.counterparty, alone.at],
+      [undefined, undefined, undefined, undefined, 'discord:user:5', 2_000],
+      "notices alone give the newest author among them, and that notice's arrival time, and nothing else",
     );
   });
 

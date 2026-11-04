@@ -133,7 +133,9 @@ interface PendingEvent {
    *  composite channel id. */
   channelLabel?: string;
   /** Author id of the event (discord snowflake etc.), when the metadata carries
-   *  one — a debounced wake names the newest such author as its counterparty. */
+   *  one — a debounced wake's counterparty is the author of the event
+   *  wakeProvenance picks; when it picks none and gives no
+   *  `batchChannels`, the author of the batch's newest notice that has one. */
   authorId?: string;
   /** MCPL server id the event came from — the namespace for the counterparty
    *  (`<serverId>:user:<id>`), same as the direct channel-incoming path. */
@@ -313,10 +315,12 @@ function isMetadataTruthy(value: unknown): boolean {
 }
 
 /**
- * Provenance of a batched wake: the newest ADDRESSED channel-bearing event
- * wins (mention / reply / DM outranks newer ambient chatter — the framework's
- * own locus rule); else the newest channel-bearing event. Channel, author and
- * addressed all come from that one event, so they can never disagree. A
+ * Provenance of a batched wake: the newest ADDRESSED event that names a
+ * channel or an author wins (mention / reply / DM outranks newer ambient
+ * chatter — the framework's own locus rule); else the newest event that
+ * names either. An addressed event's resolved route counts as its channel;
+ * an ambient one's doesn't. Channel, author and addressed all come from
+ * that one event, so they can never disagree. A
  * `chat:system` notice is never that event, even one addressed by its place
  * (a pin in a DM), since a notice never decides where the agent's speech
  * goes. A coalesced render whose latest occurrence is a notice isn't taken
