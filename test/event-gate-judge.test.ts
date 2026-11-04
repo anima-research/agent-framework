@@ -730,6 +730,28 @@ describe('judge rules: timing', () => {
     });
   }
 
+  it("under onError 'wake', a batch delivered without the judge while its calls are refused, whose delivery throws, is logged as a judge rule's batch", async () => {
+    const judge = scriptedJudge();
+    let failing = false;
+    const { gate } = makeGate(writeConfig('refused-wake-throws.json', JUDGED), {
+      judge: judge.fn, residents: ['agent'],
+      isHeld: () => {
+        if (failing) throw new Error('zz isHeld failed');
+        return false;
+      },
+    });
+    gate.evaluate(chat('first'));
+    await until(() => judge.waiting() === 1, 'the judge call');
+    judge.fail(refusal("scout's provider calls are held", 60_000));
+    await until(() => judgeState(gate).verdicts.refused === 1, 'the refusal recorded');
+    gate.evaluate(chat('second'));
+    failing = true;
+    const logged = await logDuring(async () => { await advance(200); });
+    assert.ok(logged.some((l) => l.includes("[gate] a judge rule's batch of 1 event couldn't be delivered") && l.includes('zz isHeld failed')), JSON.stringify(logged));
+    assert.strictEqual(judge.requests.length, 1, 'premise: delivered without the judge');
+    gate.dispose();
+  });
+
   it("under onError 'wake', while a refusal's stated wait lasts, the wake list counts only a batch's events whose channel isn't held now, and leaves out a batch with none", async () => {
     const judge = scriptedJudge();
     let tunedOut = false;
@@ -1392,7 +1414,45 @@ describe('judge rules: timing', () => {
       judge.fail(step);
       await advance(20);
     }
-    assert.ok(gate.getStatus().errors.some((e) => e.includes('reply judge has failed its last 3 requests')), JSON.stringify(gate.getStatus().errors));
+    assert.ok(gate.getStatus().errors.some((e) => e.includes('reply judge has failed its last 3 requests, refusals aside (the newest: ')), JSON.stringify(gate.getStatus().errors));
+    gate.dispose();
+  });
+
+  it('a failing streak with no refusal in it keeps the plain words, and one with a refusal after its failures says refusals aside', async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('refused-streak-end.json', JUDGED), { judge: judge.fn });
+    const failing = () => gate.getStatus().errors.find((e) => e.includes('reply judge has failed its last'));
+    const steps: unknown[] = [new Error('provider down'), new Error('provider down'), new Error('provider down'), refusal('a live surgery for scout holds the store')];
+    for (const [i, step] of steps.entries()) {
+      gate.evaluate(chat(`hello ${i}`));
+      await until(() => judge.waiting() === 1, `judge call ${i}`);
+      judge.fail(step);
+      await advance(20);
+      if (i === 2) assert.ok(failing()?.includes('failed its last 3 requests (the newest: '), String(failing()));
+    }
+    assert.ok(failing()?.includes('failed its last 3 requests, refusals aside (the newest: '), String(failing()));
+    gate.dispose();
+  });
+
+  it('a refusal before a failing streak, or inside one a success has ended since, leaves the streak its plain words', async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('refused-streak-outside.json', JUDGED), { judge: judge.fn });
+    const failing = () => gate.getStatus().errors.find((e) => e.includes('reply judge has failed its last'));
+    const fail = new Error('provider down');
+    const steps: Array<unknown | JudgeVerdict> = [
+      refusal('a live surgery for scout holds the store'), fail, fail, fail,
+      fail, refusal('a live surgery for scout holds the store'), { reply: false, reason: 'chatter' }, fail, fail, fail,
+    ];
+    for (const [i, step] of steps.entries()) {
+      gate.evaluate(chat(`hello ${i}`));
+      await until(() => judge.waiting() === 1, `judge call ${i}`);
+      if (step && typeof step === 'object' && 'reply' in step) judge.answer(step as JudgeVerdict);
+      else judge.fail(step);
+      await advance(20);
+      if (i === 3) assert.ok(failing()?.includes('failed its last 3 requests (the newest: '), `a refusal before the streak: ${String(failing())}`);
+      if (i === 5) assert.ok(failing()?.includes('failed its last 4 requests, refusals aside (the newest: '), `premise: a refusal inside it: ${String(failing())}`);
+    }
+    assert.ok(failing()?.includes('failed its last 3 requests (the newest: '), `a fresh streak after a success: ${String(failing())}`);
     gate.dispose();
   });
 

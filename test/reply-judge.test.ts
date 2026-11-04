@@ -148,6 +148,7 @@ describe('reply judge: a request refused as too long', () => {
       assert.strictEqual(previews, 2, second);
       assert.strictEqual(requests.length, second === 'built' ? 2 : 1, second);
       assert.strictEqual(logged.filter((line) => line.includes('asked once more')).length, second === 'built' ? 1 : 0, `${second}: ${JSON.stringify(logged)}`);
+      if (second === 'built') assert.ok(logged.some((line) => line.includes("the reply judge's request on rule \"ambient\"'s batch, for Scout, of ")), JSON.stringify(logged));
     }
   });
 
@@ -181,7 +182,7 @@ describe('reply judge: a request refused as too long', () => {
   });
 
   it('asks a refused request once more at one character a token and leaves the estimate as it was, and asks one built at one character a token only once', async () => {
-    const { membrane, requests } = refusingMembrane(() => true);
+    const { membrane, requests, size } = refusingMembrane(() => true);
     const judge = judgeOver(membrane);
     const asked: number[] = [];
     const ask = async () => {
@@ -190,6 +191,11 @@ describe('reply judge: a request refused as too long', () => {
       asked.push(requests.length - before);
     };
     await ask();
+    const floor = refusingMembrane(0);
+    const atFloor = judgeOver(floor.membrane);
+    (atFloor as unknown as { charsPerToken: number }).charsPerToken = 1;
+    await atFloor.judge(judgeRequest());
+    assert.strictEqual(size(requests[1]!), size(floor.requests[0]!), 'the retry is the request a judge at one character a token builds');
     await ask();
     assert.strictEqual(judge.estimateRatio(), 3);
     (judge as unknown as { charsPerToken: number }).charsPerToken = 1;
