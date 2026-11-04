@@ -80,6 +80,7 @@ test('the puppet\'s gate tools answer as the agent\'s own calls do', { timeout: 
   const h = await setup(t);
   await answersAsTheAgent(h, [
     ['gate_status', {}],
+    ['suppression_stats', {}],
     ['event_tags', {}],
     ['wake_add_rule', {}],
     ['wake_remove_rule', { name: 'zz-none' }],

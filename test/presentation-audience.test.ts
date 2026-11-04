@@ -18,8 +18,8 @@ import { join } from 'node:path';
 import type { MessageId, MessageMetadata } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import {
-  AgentFramework, AgentRegistry, RESIDENTS_SLOT, asOwnRow, audienceOf, observedRowFor, residentSpec, subconsciousSpec, taskForkSpec,
-  withAudience, workerSpec,
+  AgentFramework, AgentRegistry, RESIDENTS_SLOT, asOwnRow, audienceOf, observedRowFor, residentSpec, residentViewFilter, subconsciousSpec,
+  subconsciousViewFilter, taskForkSpec, withAudience, workerSpec,
 } from '../src/index.js';
 import type { EventResponse, Module, ProcessEvent, ToolCall, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { audienceFault, bearingOf, readerFacts, recordedReaderFacts } from '../src/presentation.js';
@@ -107,6 +107,20 @@ describe("the presentation index's audience rule", () => {
     assert.equal(bearingOf(heldRow, oren, 'own'), 'elsewhere');
     assert.equal(bearingOf(heldRow, sub, RESIDENTS_SLOT), 'arrival');
     assert.equal(bearingOf(heldRow, watcher, RESIDENTS_SLOT), 'elsewhere', "through an edge that doesn't show held traffic");
+  });
+
+  it("a row a suppress rule hid is every reader's elsewhere, the subconscious's included, and out of both views", () => {
+    const suppressed = { suppressed: { rule: 'hide-noisy', eventType: 'mcpl:channel-incoming' } } as unknown as MessageMetadata;
+    // As addMessage stamps it (for nobody), and as a release without the stamp stored it.
+    for (const metadata of [withAudience(suppressed, []), suppressed, withAudience(suppressed, ['mira', 'oren'])]) {
+      for (const reader of [mira, oren, kid]) assert.equal(bearingOf(row(metadata), reader, 'own'), 'elsewhere', reader.name);
+      assert.equal(bearingOf(row(metadata), sub, RESIDENTS_SLOT), 'elsewhere', 'not through the edge that shows held traffic');
+      assert.equal(bearingOf(row(metadata), watcher, RESIDENTS_SLOT), 'elsewhere');
+      assert.equal(observedRowFor({ includeHeld: true }, row(metadata), { observer: 'Subconscious', owners: ['mira', 'oren'] }), false);
+      const stored = { metadata } as Parameters<ReturnType<typeof residentViewFilter>>[0];
+      assert.equal(residentViewFilter('mira')(stored), false, "the residents' view leaves it out");
+      assert.equal(subconsciousViewFilter('Subconscious')(stored), false, "and so does the subconscious's");
+    }
   });
 
   it("a resident's own round is an arrival for the subconscious (the observe edge's default)", () => {

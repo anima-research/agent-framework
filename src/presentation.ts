@@ -60,7 +60,7 @@
  */
 import type { ContentBlock } from '@animalabs/membrane';
 import { continuesBody, MessageStore, type ContextManager, type MessageId, type MessageMetadata, type StoredMessage } from '@animalabs/context-manager';
-import { audienceOf, heldFromResidents, observedRowFor } from './dendrite/audience.js';
+import { audienceOf, heldFromResidents, observedRowFor, suppressedRow } from './dendrite/audience.js';
 import { sameSlot, type AgentRegistry } from './dendrite/registry.js';
 import type { AgentName, AgentRecord, MessageSlotRef, ObserveEdge } from './dendrite/types.js';
 import type { WindowOrdinal } from './read-marks.js';
@@ -68,7 +68,7 @@ import { isAnotherAgentsInjection } from './stored-injections.js';
 import { nameAsStored } from './text-as-stored.js';
 import type { PresentationRetractReason, TraceEventInput } from './types/trace.js';
 
-export { heldFromResidents } from './dendrite/audience.js';
+export { heldFromResidents, suppressedRow } from './dendrite/audience.js';
 
 // ============================================================================
 // Pure pieces the tool boundary and the drain share
@@ -138,7 +138,7 @@ export function windowMarkOf(cm: Pick<ContextManager, 'windowMode' | 'indexLengt
  * What a row in one agent's merged record is to that agent: its own row,
  * an arrival (a row meant for it that another writer stored), or elsewhere
  * (a row it is never presented: another agent's own round, mail for a
- * co-resident, a held row for a resident).
+ * co-resident, a held row for a resident, a row a suppress rule hid).
  */
 export type Bearing = 'own' | 'arrival' | 'elsewhere';
 
@@ -225,6 +225,9 @@ export type RowSlot = 'own' | MessageSlotRef;
  * a ref sameSlot as its `ownSlot`), else a slot it may observe. undefined,
  * a slot its caller couldn't name, is elsewhere.
  *
+ * A row a suppress rule hid (suppressedRow) is elsewhere to every reader,
+ * in any slot: no view the framework sets renders it.
+ *
  * In its own slot, with `stamp = audienceOf(metadata)`:
  * - its own row (`ownRowOf` names it): own;
  * - another agent's own row: an arrival when one of the reader's edges
@@ -257,6 +260,7 @@ export function bearingOf(
 ): Bearing {
   const metadata = row.metadata as Record<string, unknown> | undefined;
   if (slot === undefined) return 'elsewhere';
+  if (suppressedRow(metadata)) return 'elsewhere';
   if (slot !== 'own' && !sameSlot(slot, reader.ownSlot)) {
     const shown = reader.observed.some((seen) => sameSlot(seen.slot, slot)
       && observedRowFor(seen.edge, row, { observer: reader.name, owners: seen.owners }));
@@ -1066,7 +1070,8 @@ export class AgentPresentation {
    * Every live agent holding a row: each whose window has it at a place,
    * leaving out one whose window leaves held rows out when the row is held
    * (a window written down from the record took in those an earlier release
-   * stored, before the audience stamp; retractForeign takes out the rest);
+   * stored, before the audience stamp; retractForeign takes out the rest),
+   * and every one when a suppress rule hid the row, which no view renders;
    * each whose window
    * is still the whole record and whose record holds it; and each reader fork
    * handed it as framing.
@@ -1085,8 +1090,9 @@ export class AgentPresentation {
       }
       const position = positionIn(cm, rowId);
       if (position === undefined) continue;
-      if (readerFacts(this.host.registry, agent.name).hidesHeld
-        && heldFromResidents(cm.getMessage(rowId)?.metadata as Record<string, unknown> | undefined)) continue;
+      const metadata = cm.getMessage(rowId)?.metadata as Record<string, unknown> | undefined;
+      if (suppressedRow(metadata)) continue;
+      if (readerFacts(this.host.registry, agent.name).hidesHeld && heldFromResidents(metadata)) continue;
       holders.push({ agent: agent.name, via: 'window', position });
       inWindow.add(agent.name);
     }

@@ -14,38 +14,42 @@
  *
  * - A resident reads the residents' shared slot (no `isolate`), its context
  *   state under `agents/<name>`. Its view leaves out what a tune-out holds
- *   (heldFromResidents) and the other residents' stored context injections
- *   (isAnotherAgentsInjection): their context, which they share the slot
- *   with it but never its conversation.
+ *   (heldFromResidents), what a suppress rule hid (suppressedRow), and the
+ *   other residents' stored context injections (isAnotherAgentsInjection):
+ *   their context, which they share the slot with it but never its
+ *   conversation.
  * - The subconscious keeps its rows in a slot of its own,
  *   `subconscious/<serves>`, and reads the residents' slot beside it
  *   (`auxiliaryMessageViews: [{}]`), held traffic included, which is what it
  *   reads for. With the presentation index the residents' rows enter its
  *   window by its observe edge's rule, and the merged slot is still the
  *   record its window is presented from. Its view leaves out only the
- *   residents' stored context injections. Its strategy is a windowed
+ *   residents' stored context injections and what a suppress rule hid,
+ *   which renders for no reader, this one included. Its strategy is a windowed
  *   passthrough, anchored at the oldest active tune-out's start.
  *
  * Each call returns a new object and, for the subconscious, a new strategy:
  * a strategy keeps state for the manager it is opened with.
  */
 import { WindowedPassthroughStrategy, type ContextManagerConfig, type StoredMessage } from '@animalabs/context-manager';
-import { heldFromResidents } from './dendrite/audience.js';
+import { heldFromResidents, suppressedRow } from './dendrite/audience.js';
 import { persistentReaderName } from './tune-out/tools.js';
 import { isAnotherAgentsInjection } from './stored-injections.js';
 
 /** ContextManager.open's options over a store the caller gives: everything but the store. */
 export type ContextManagerOpenOptions = Omit<Extract<ContextManagerConfig, { store: unknown }>, 'store'>;
 
-/** What a resident's view leaves out: held traffic, and another agent's stored context injections. */
+/** What a resident's view leaves out: held traffic, suppressed rows, and another agent's stored context injections. */
 export function residentViewFilter(name: string): (message: StoredMessage) => boolean {
   return (message) => !heldFromResidents(message.metadata as Record<string, unknown> | undefined)
+    && !suppressedRow(message.metadata as Record<string, unknown> | undefined)
     && !isAnotherAgentsInjection(message.metadata, name);
 }
 
-/** What the subconscious's view leaves out: the residents' stored context injections, and nothing it reads for. */
+/** What the subconscious's view leaves out: the residents' stored context injections and suppressed rows, and nothing it reads for. */
 export function subconsciousViewFilter(name: string): (message: StoredMessage) => boolean {
-  return (message) => !isAnotherAgentsInjection(message.metadata, name);
+  return (message) => !suppressedRow(message.metadata as Record<string, unknown> | undefined)
+    && !isAnotherAgentsInjection(message.metadata, name);
 }
 
 /** The options a resident named `agentName` is opened with: the residents' slot, through its view. The caller gives its strategy. */
