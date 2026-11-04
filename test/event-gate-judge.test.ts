@@ -228,7 +228,7 @@ describe('judge rules: verdicts', () => {
     gate.dispose();
   });
 
-  it('a wait on an event outside MCPL writes nothing either, as defer doesn\'t: its module stores its own message', async () => {
+  it('a wait on an event outside MCPL writes nothing either, as defer doesn\'t', async () => {
     const judge = scriptedJudge();
     const { gate, wakes, messages } = makeGate(writeConfig('wait-module-event.json', {
       policies: [{ name: 'files', match: { scope: ['workspace:modified'] }, behavior: { judge: { debounceMs: 30 } } }],
@@ -607,7 +607,7 @@ describe('judge rules: timing', () => {
     const errors = gate.getStatus().errors;
     assert.strictEqual(errors.some((e) => e.includes('reply judge has failed')), false, 'gate_status names no failing judge');
     assert.ok(errors.some((e) => e.startsWith("The reply judge's calls are refused until") && e.includes('provider calls are held')
-      && e.includes("each judge rule's batch wakes the agent without being judged")), JSON.stringify(errors));
+      && e.includes("Until then, each judge rule's batch wakes the agent without being judged, unless a turn or the host's quiesce holds it until after then, when it's judged.")), JSON.stringify(errors));
     gate.dispose();
   });
 
@@ -709,18 +709,22 @@ describe('judge rules: timing', () => {
     gate.dispose();
   });
 
-  it("states a refusal's end on the gate's own clock, as the rest of the wake list is", async () => {
+  it("states a refusal's end on the gate's own clock, as the rest of the wake list is, and asks the judge again at that end", async () => {
     const offset = 86_400_000;
     const judge = scriptedJudge();
     const { gate } = makeGate(writeConfig('refused-clock.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip', now: () => Date.now() + offset });
     gate.evaluate(chat('first'));
     await until(() => judge.waiting() === 1, 'the judge call');
-    judge.fail(refusal("scout's provider calls are held", 60_000));
+    const refusedAt = Date.now();
+    judge.fail(refusal("scout's provider calls are held", 1_200));
     await until(() => judgeState(gate).heldCount === 1, 'the refused batch held');
     const gateNow = Date.now() + offset;
     const held = gate.upcomingWakes(['agent']).find((w) => w.what.includes('held for the judge while its calls are refused'));
     assert.ok(held?.at !== undefined, JSON.stringify(gate.upcomingWakes(['agent'])));
-    assert.ok(held.at > gateNow + 50_000 && held.at <= gateNow + 60_000, `due ${held.at - gateNow} ms after the gate's now`);
+    assert.ok(held.at > gateNow + 1_000 && held.at <= gateNow + 1_200, `due ${held.at - gateNow} ms after the gate's now`);
+    await until(() => judge.waiting() === 1, "the held batch to be judged at the refusal's end", 4_000);
+    assert.ok(judge.askedAt[1]! - refusedAt >= 1_200, `asked again ${judge.askedAt[1]! - refusedAt} ms on, not before the stated wait ends`);
+    judge.answer({ reply: false, reason: 'chatter' });
     gate.dispose();
   });
 
@@ -813,7 +817,7 @@ describe('judge rules: timing', () => {
     judge.fail(refusal('a live surgery for scout holds the store'));
     await until(() => judgeState(gate).heldCount === 1, 'the batch held');
     assert.ok(gate.getStatus().errors.some((e) => e.includes('stated no end')
-      && e.includes("Nothing asks the judge again on its own: judge rules' held batches (1 event now) are judged once a new batch gets a verdict, or when the hold is released. A new batch whose call fails lets the held events it took in go with it, unjudged.")), JSON.stringify(gate.getStatus().errors));
+      && e.includes("Nothing asks the judge again on its own: judge rules' held batches (1 event now) are judged once a new batch gets a verdict, or when whoever runs the host releases the hold. A new batch whose call fails lets the held events it took in go with it, unjudged.")), JSON.stringify(gate.getStatus().errors));
     gate.onInferenceStarted('agent');
     gate.evaluate(chat('during'));
     await until(() => judgeState(gate).heldCount === 2, 'the batch that fired during the turn held with it');
@@ -1382,8 +1386,8 @@ describe('judge rules: what waiting leaves the agent with', () => {
     ]);
     gate.evaluate(chat('and again'));
     await until(() => judge.requests.length === 2, "second's batch to go to the judge while first's is decided");
-    assert.deepStrictEqual(judge.requests[1]!.upcomingWakes!.map((w) => [w.what, w.certain]), [
-      ['rule "first"\'s batch of 1 event, with 1 event queued behind it, which the judge is deciding', false],
+    assert.deepStrictEqual(judge.requests[1]!.upcomingWakes!.map((w) => [w.when, w.what, w.certain]), [
+      ['once the judge decides it', 'rule "first"\'s batch of 1 event, with 1 event queued behind it, which the judge is deciding', false],
     ]);
     judge.answer({ reply: false, reason: 'chatter' });
     judge.answer({ reply: false, reason: 'chatter' });
@@ -1429,8 +1433,8 @@ describe('judge rules: what waiting leaves the agent with', () => {
     assert.deepStrictEqual(judge.requests[0]!.upcomingWakes!.map((w) => [w.what, w.certain]), [
       ['rule "second"\'s batch of 1 event, held for the judge', false],
     ]);
-    assert.deepStrictEqual(judge.requests[1]!.upcomingWakes!.map((w) => [w.what, w.certain]), [
-      ['rule "first"\'s batch of 1 event, which the judge is deciding', false],
+    assert.deepStrictEqual(judge.requests[1]!.upcomingWakes!.map((w) => [w.when, w.what, w.certain]), [
+      ['once the judge decides it', 'rule "first"\'s batch of 1 event, which the judge is deciding', false],
     ]);
     judge.answer({ reply: false, reason: 'chatter' });
     judge.answer({ reply: false, reason: 'chatter' });
@@ -2210,9 +2214,8 @@ describe('the framework wires the reply judge', () => {
       const asked = membrane.calls.filter((c) => c.assistantParticipant === 'reply-judge').at(-1)!;
       return (asked.messages.at(-1)!.content[0] as { text: string }).text;
     };
-    const stillUntil = async (done: () => boolean, what: string): Promise<void> => {
-      for (let i = 0; i < 2_000 && !done(); i++) await new Promise((resolve) => setImmediate(resolve));
-      assert.ok(done(), `timed out waiting for ${what}, the clock still`);
+    const stillUntil = async (done: () => boolean): Promise<void> => {
+      while (!done()) await new Promise((resolve) => setImmediate(resolve));
     };
     const run = () => {
       const state = { ended: false, failure: undefined as unknown };
@@ -2231,7 +2234,7 @@ describe('the framework wires the reply judge', () => {
     try {
       wake('a first wake');
       const first = run();
-      await stillUntil(() => failures() === 1, 'the first turn to fail');
+      await stillUntil(() => failures() === 1);
       assert.ok(sameMillisecond(), 'premise: the turn started and failed in one millisecond');
       await ended(first, 'the failed turn to end');
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
@@ -2247,7 +2250,7 @@ describe('the framework wires the reply judge', () => {
       wake('a third wake');
       mock.timers.setTime(failedAt);
       const third = run();
-      await stillUntil(() => membrane.hung === 1, 'the next turn to start');
+      await stillUntil(() => membrane.hung === 1);
       assert.ok(sameMillisecond(), 'premise: the next turn started in the millisecond the last one failed');
       assert.strictEqual(framework.abortInference('scout'), true, 'premise: the turn is stopped');
       await ended(third, 'the stopped turn to end');

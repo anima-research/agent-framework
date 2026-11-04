@@ -70,8 +70,9 @@ const CHUNK_TOKENS = 6_000;
 const FIXED_TOKENS_RESERVE = 3_000;
 /** Longest text block (characters) a message renders whole; a longer one keeps its head and tail. */
 const MAX_TEXT_CHARS = 6_000;
-/** Longest message (characters) rendered, all its blocks together. */
+/** Longest message (characters) rendered, its participant's name and all its blocks together. */
 const MAX_MESSAGE_CHARS = 12_000;
+const CUT_MARKER_ROOM = 40;
 /** Longest tool call input / tool result (characters) rendered. */
 const MAX_TOOL_CHARS = 600;
 /** Output tokens a verdict may take, adaptive thinking included: room enough
@@ -131,7 +132,8 @@ function field(text: string): string {
 }
 
 /** A message as the document shows it: its participant, and each block as
- *  text, quoted (see `quoted`). Thinking is the agent's own, and isn't shown. */
+ *  text, quoted (see `quoted`). Thinking is the agent's own, and isn't shown.
+ *  A name too long to leave room for the text's cut is cut at its end. */
 export function renderMessage(message: NormalizedMessage): string {
   const parts: string[] = [];
   for (const block of message.content as ContentBlock[]) {
@@ -139,8 +141,17 @@ export function renderMessage(message: NormalizedMessage): string {
     if (line) parts.push(line);
   }
   if (parts.length === 0) return '';
-  const opener = `[${field(message.participant)}] `;
+  const opener = `[${fieldWithin(message.participant, MAX_MESSAGE_CHARS - CUT_MARKER_ROOM - '[] '.length)}] `;
   return opener + quotedCut(parts.join('\n'), MAX_MESSAGE_CHARS - opener.length);
+}
+
+function fieldWithin(text: string, max: number): string {
+  const whole = field(text);
+  if (whole.length <= max) return whole;
+  const plain = oneLine(text);
+  let end = 0;
+  for (let used = 0; end < plain.length && used + field(plain[end]!).length <= max; end++) used += field(plain[end]!).length;
+  return field(safeSlice(plain, 0, end));
 }
 
 function quotedCut(text: string, max: number): string {
@@ -148,7 +159,7 @@ function quotedCut(text: string, max: number): string {
   if (whole.length <= max) return whole;
   const plain = normalizeLineBreaks(text);
   const width = (at: number): number => quoted(plain[at]!).length;
-  const keep = Math.floor((max - 40) / 2);
+  const keep = Math.floor((max - CUT_MARKER_ROOM) / 2);
   let head = 0;
   for (let used = 0; head < plain.length && used + width(head) <= keep; head++) used += width(head);
   let tail = plain.length;
@@ -407,6 +418,7 @@ export class ReplyJudge {
   ): Promise<{ request: NormalizedRequest; agentName: string; chars: number; ratio: number }> {
     const agentName = this.chooseAgent(request.agentNames);
     if (!agentName) throw new Error('no agent to judge for');
+    if (request.signal.aborted) throw new Error('the judge was stopped before its request');
     const preview = await this.preview(agentName);
     if (request.signal.aborted) throw new Error('the judge was stopped before its request');
 
