@@ -10,10 +10,16 @@
   `presentAs`, as a derived agent's does, so `inspect` shows them and a
   context reopened from records reads the mapping that ran.
 - kv-unified's immutable-prefix hash takes an agent's tools as the wire
-  carries them, leaving out a field whose value is undefined, as membrane's
-  request does, where it wrote such a field as null. A host whose tool
-  definitions carry one, built as objects rather than parsed from JSON, gets
-  one fresh layout at the upgrade, on `'head'` too.
+  carries them, as JSON writes them: a field whose value is undefined is left
+  out, as membrane's request does, where it was hashed as null, and a value
+  JSON writes as text, such as a Date, is hashed as that text, where it was
+  hashed as an empty object. A host whose tool definitions carry either,
+  built as objects rather than parsed from JSON, gets one fresh layout at the
+  upgrade, on `'head'` too.
+- A message-count undo (`/undo` with `messages`) counts every message but
+  system change rows: the change rows among the last N go with them
+  uncounted, and a refusal's count of the messages the history holds leaves
+  them out.
 - A system change row is never a message said to an agent: it restarts no
   re-send count, clears no earlier deadline cut of a re-armed turn
   (agent-framework#871), counts as nothing heard, moves no turn to a channel,

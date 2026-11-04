@@ -2766,7 +2766,8 @@ interface HostCommandParams {
   agentName?: string;
   turns?: number;
   /** Message-granular undo: branch the chronicle so the last N messages
-   *  (regardless of participant) are no longer on the active branch.
+   *  (regardless of participant; system change rows among them go too,
+   *  uncounted) are no longer on the active branch.
    *  Mutually exclusive with `turns`. */
   messages?: number;
   /** Message-granular undo: awareness marks on the removed Discord

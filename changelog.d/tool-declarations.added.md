@@ -42,13 +42,16 @@
   `createEphemeralAgent` returns, stamps them with `systemChangeMetadata`
   (exported beside `isSystemChangeMessage`), so they are the new agent's
   own, which a move of its head takes out of its context. That pays for a
-  fork with its parent's system text; a subagent with its own system prompt
-  moves to its own head at its first request, as without it.
+  fork with its parent's system text that declares entries itself; a new
+  agent on `'head'` sends its current head whatever it was started on, and a
+  subagent with its own system prompt moves to its own head at its first
+  request, as without it.
 - An agent's own system changes are those stored with the change metadata
   (`systemChangeMetadata`) of its name or one of its `selfParticipants`: its
-  compile under `'entries'` keeps them where it leaves out another's, and in
-  either mode they're the rows a move of its head takes out of its context (on
-  `'head'`, once its recorded head is cleared).
+  compile under `'entries'` keeps them where it leaves out another's (a
+  derived agent's view is its source's too, so it keeps its source's as
+  well), and in either mode they're the rows a move of its head takes out of
+  its context (on `'head'`, once its recorded head is cleared).
 - A subconscious on another model than its resident, as the persistent
   reader or as a reader fork, declares its tools and system text on its
   head, whatever the resident's `toolDeclarations`. A reader fork on the
