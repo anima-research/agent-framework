@@ -1336,7 +1336,7 @@ test("with no locus, a batch's inbound-only channel is named as one, and only th
     'direction "inbound", so the host publishes nothing into it; to speak there, use that server\'s own tools');
 });
 
-test("with no locus, a batch's channel the host no longer has registered is named as one nothing sent there can reach", async () => {
+test("with no locus, a batch's channel the host no longer has registered is named as one this host has no channel for", async () => {
   const { registry, failures } = makeRegistry({ delivered: true });
   await registerRoom(registry);
   const room = { channel: discord('discord:g1:room'), shown: '#room (discord:g1:room)' };
@@ -1345,11 +1345,11 @@ test("with no locus, a batch's channel the host no longer has registered is name
   assert.equal(await registry.routeSpeech('linn', 'hi', null, { cameFrom: [room, gone] }), null);
   assert.equal(failures.at(-1)!.reason, 'this turn came from #room (discord:g1:room) and #gone (discord:g1:gone), and no channel ' +
     'was chosen for its reply; to reply in #room (discord:g1:room), send your reply to that channel explicitly; ' +
-    "#gone (discord:g1:gone) isn't registered with this host now, so nothing sent there can reach it");
+    "#gone (discord:g1:gone) isn't registered with this host now, so this host has no channel there to send to");
 
   assert.equal(await registry.routeSpeech('linn', 'hi', null, { cameFrom: [gone] }), null);
   assert.equal(failures.at(-1)!.reason, 'this turn came from #gone (discord:g1:gone), and no channel was chosen for its reply; ' +
-    "#gone (discord:g1:gone) isn't registered with this host now, so nothing sent there can reach it");
+    "#gone (discord:g1:gone) isn't registered with this host now, so this host has no channel there to send to");
 });
 
 test("with no locus, a batch's channel whose server can't take a send is named with why, and while its server is connecting, told to send there once it's back", async () => {

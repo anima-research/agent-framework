@@ -6204,7 +6204,7 @@ export class ChannelRegistry {
         const open: Array<{ channel: ChannelRef; shown: string }> = [];
         for (const came of from) {
           const entry = this.entryAt(came.channel);
-          if (!entry) closed.push(`${came.shown} isn't registered with this host now, so nothing sent there can reach it`);
+          if (!entry) closed.push(`${came.shown} isn't registered with this host now, so this host has no channel there to send to`);
           else if (isInboundOnly(entry)) closed.push(`${came.shown} is ${inboundOnlyReason(entry)}`);
           else if (!this.publishingServer(entry.serverId)) {
             const reach = this.serverReach(entry.serverId);

@@ -838,6 +838,21 @@ describe('debounce', () => {
     assert.deepStrictEqual(provenance?.batchChannels, [{ channelId: 'general', serverId: 'discord' }, { channelId: 'general', serverId: 'surface' }]);
   });
 
+  it("a batch lists a channel once with its server and once without, since only the host can tell they're one", async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const path = writeConfig('debounce-server-and-none.json', {
+      policies: [{ name: 'push', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 100 } }],
+      default: 'skip',
+    });
+    const { gate, inferenceRequests } = makeGate(path, { resolveRouteChannel: () => 'discord:g:room' });
+    for (const serverId of ['discord', '', 'discord', '']) {
+      gate.evaluate(event({ eventType: 'mcpl:push-event', serverId, content: 'status' }));
+    }
+    t.mock.timers.tick(150);
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.deepStrictEqual(inferenceRequests[0].batchChannels, [{ channelId: 'discord:g:room', serverId: 'discord' }, { channelId: 'discord:g:room' }]);
+  });
+
   it('a batch too large to spread into one call still names its channels', () => {
     // 200,000 arguments overflow a spread call on Node 24 (130,000 already
     // throw RangeError); a batch keeps whatever arrived in its window.
