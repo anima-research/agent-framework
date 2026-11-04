@@ -760,6 +760,22 @@ describe('toolDeclarations', () => {
       assert.deepEqual(events.at(-1), { type: 'head:moved', why: 'consolidated', changesRemoved: 1, forced: 'budget' });
     });
 
+    it("moves a derived agent's head when the compile is refused over budget with only its source's change rows kept, and takes them off its branch", async () => {
+      const rows = [said('user', 'hello')];
+      const context = fakeContext(rows, { overBudget: (r) => r.some((row) => row.participant === 'system') });
+      const heads = memoryHeadDeclarations();
+      const events: HeadEvent[] = [];
+      const agent = agentOn(context, { toolDeclarations: 'entries' }, heads, events);
+      await agent.buildActivationRequest([tool('a')]);
+      agent.setSourceChangeOwners(['source']);
+      context.cm.addMessage('system', [{ type: 'system_change', defineTools: [tool('s')] } as unknown as ContentBlock], { kind: 'system-change', agent: 'source' });
+      assert.equal(changeRows(rows).length, 1, "the premise: its source's change is stored, and none of its own");
+      const request = await agent.buildActivationRequest([tool('a')]);
+      assert.deepEqual(request.tools, [tool('a')], 'its own head');
+      assert.deepEqual(changeRows(rows), [], "its source's change taken off its branch");
+      assert.deepEqual(events.at(-1), { type: 'head:moved', why: 'consolidated', changesRemoved: 1, forced: 'budget' });
+    });
+
     it('moves the head the same way when the compile is refused for dropping messages no summary covers', async () => {
       const rows = [said('user', 'hello')];
       let refuse = false;

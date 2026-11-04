@@ -2709,15 +2709,16 @@ export class Agent {
   private takeChangesOverBudget(error: unknown, entries: boolean, recorded: HeadDeclaration | null, current: HeadDeclaration): HeadDeclaration {
     const refusal = (error as { name?: unknown } | null)?.name;
     if (refusal !== 'OverBudgetError' && refusal !== 'UncoveredDropError') throw error;
-    const rows = this.ownChangeRows();
     if (!entries) {
+      const rows = this.ownChangeRows();
       if (rows.length === 0 || !this.headDeclarations.delete(this.name)) throw error;
       const removed = this.removeOwnChanges(rows);
       this.onHeadEvent?.({ type: 'head:moved', why: 'on-head', changesRemoved: removed });
       return current;
     }
+    const rows = this.movedChangeRows();
     if (rows.length === 0 || !this.headDeclarations.write(this.name, copyHead(current))) throw error;
-    const removed = this.removeOwnChanges(this.movedChangeRows());
+    const removed = this.removeOwnChanges(rows);
     this.onHeadEvent?.(recorded
       ? { type: 'head:moved', why: 'consolidated', changesRemoved: removed, forced: 'budget' }
       : { type: 'head:moved', why: 'adopted', changesRemoved: removed });
