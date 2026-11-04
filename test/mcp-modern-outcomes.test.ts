@@ -1310,6 +1310,21 @@ test('a discovery the SDK can\'t read, listing no 2026-07-28, is a verdict on st
   assert.equal(wire(log).filter((e) => e.event === 'start').length, 1, 'one launch');
 });
 
+test('a discovery the SDK can\'t read that lists 2026-07-28 is no verdict on stdio: the connect is retried', async () => {
+  const log = scratchLog();
+  const connection = ModernMcpConnection.create({
+    id: 'raw', command: process.execPath, args: [SERVER, 'unreadable-current-revision', log], protocol: 'modern',
+    reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60,
+  });
+  cleanups.push(() => connection.close());
+  const failed: unknown[] = [];
+  connection.on('connect-failed', (f) => failed.push(f));
+  await connection.start();
+  assert.equal(failed.length, 1, 'the first connect failed, and will be retried');
+  assert.equal(connection.willReconnect, true);
+  await until(() => wire(log).filter((e) => e.event === 'start').length >= 2, 'a second launch');
+});
+
 test('a legacy-only server is pointed to what reaches it: its configuration over stdio, stdio or WebSocket for an http url', () => {
   const refusal = new UnsupportedProtocolVersionError({ supported: ['2024-11-05'], requested: '2026-07-28' });
   const verdictFor = (config: Parameters<typeof ModernMcpConnection.create>[0]) =>

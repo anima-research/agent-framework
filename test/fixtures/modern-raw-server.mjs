@@ -19,6 +19,7 @@
 //   other-revision-later  launches after the first do
 //   unreadable-older-revision  server/discover's result isn't a DiscoverResult the SDK
 //                        can read (its capabilities aren't an object), and lists only 2025-11-25
+//   unreadable-current-revision  the same, listing 2026-07-28
 // Tools: op (outputSchema {value: integer}, answers with a string: invalid
 // structured content), plain (text), separators (text holding U+2028 and
 // U+2029), err (a JSON-RPC error), touch (announces
@@ -89,6 +90,9 @@ lines.on('line', (line) => {
     case 'server/discover':
       if (flags.has('unreadable-older-revision')) {
         return result(m.id, { supportedVersions: ['2025-11-25'], capabilities: 'none' });
+      }
+      if (flags.has('unreadable-current-revision')) {
+        return result(m.id, { supportedVersions: ['2026-07-28'], capabilities: 'none' });
       }
       if (flags.has('other-revision') || (flags.has('other-revision-later') && launch > 1)) {
         return result(m.id, {
