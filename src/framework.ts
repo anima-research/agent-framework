@@ -1566,6 +1566,8 @@ interface TurnRouting {
   deliveries: ChannelRef[];
   sentTo?: string[];
   asking?: Promise<string[]>[];
+  /** Set once the turn's receipt has settled its asks, until a start uses this routing again. */
+  asksSettled?: true;
   postTried?: true;
   openedBy?: InferenceRequest;
   openingMessages?: string[];
@@ -1661,6 +1663,7 @@ function notFinal(round: ProseRound): ProseRound {
 }
 
 async function settleSpeechAsks(routing: TurnRouting): Promise<void> {
+  routing.asksSettled = true;
   const asking = routing.asking;
   if (!asking) return;
   delete routing.asking;
@@ -20752,7 +20755,7 @@ export class AgentFramework {
         const plain = typeof t === 'string' ? t : t.deliberate ? '' : t.text;
         const final = typeof t === 'string' ? opts.final : t.final ?? opts.final;
         const round: ProseRound = { routing: opts.routing, notice: opts.notice, ...(final ? { final: true } : {}) };
-        if (plain.trim()) (opts.routing.asking ??= []).push(this.askSpeechRouted(agent, round, plain));
+        if (plain.trim()) this.trackSpeechAsk(agent, opts.routing, this.askSpeechRouted(agent, round, plain));
       }
     }
     const { held, notHeld } = this.proseDrafts.hold(
@@ -21488,9 +21491,11 @@ export class AgentFramework {
       return this.channelRegistry!.routeSpeech(agent.name, text, locus);
     }
     const asked = this.askSpeechRouted(agent, round, text);
-    (round.routing.asking ??= []).push(asked);
+    this.trackSpeechAsk(agent, round.routing, asked);
     if (locus === null) {
       const places = await asked;
+      const current = this.agents.get(agent.name);
+      if (current && current !== agent) return null;
       if (places.length > 0) {
         console.error(`[routeSpeech] ${agent.name}: turn has no channel; ${text.length} chars shown by ${places.map(logValue).join(' · ')}, routing posted it to no channel`);
         return null;
@@ -21507,17 +21512,30 @@ export class AgentFramework {
 
   private async askSpeechRouted(agent: Agent, round: ProseRound, text: string): Promise<string[]> {
     try {
-      const places = await this.moduleRegistry.askSpeechRouted(agent.name, text, {
+      return await this.moduleRegistry.askSpeechRouted(agent.name, text, {
         final: round.final === true,
         turnId: round.routing.turnId,
         ...speechOpenedBy(round.routing),
+      }, () => {
+        if (!round.final) round.routing.liveSpeech = true;
       });
-      if (places.length > 0 && !round.final) round.routing.liveSpeech = true;
-      return places;
     } catch (err) {
       console.error(`[routeSpeech] ${agent.name}: asking the modules where speech went failed:`, err);
       return [];
     }
+  }
+
+  /** Keep an ask for the turn's receipt, or log what it names when the receipt is already written. */
+  private trackSpeechAsk(agent: Agent, routing: TurnRouting, asked: Promise<string[]>): void {
+    if (!routing.asksSettled) {
+      (routing.asking ??= []).push(asked);
+      return;
+    }
+    void asked.then((places) => {
+      if (places.length > 0) {
+        console.error(`[routeSpeech] ${agent.name}: shown by ${places.map(logValue).join(' · ')} after the turn's receipt took its asks, which doesn't name it`);
+      }
+    });
   }
 
   /**
@@ -21625,7 +21643,7 @@ export class AgentFramework {
     if (held.length > 0) {
       notes.push(
         `${held.length} plain-speech segment(s) held as draft${held.length === 1 ? '' : 's'} ${idList(held)} ` +
-        '(not sent — drafts can resend them unchanged, or dismiss them)',
+        "(the framework didn't send them — drafts can resend them unchanged, or dismiss them)",
       );
     }
     if (letGo.length > 0) {
@@ -21661,7 +21679,7 @@ export class AgentFramework {
     if (notHeld) {
       notes.push(
         `${notHeld.count} plain-speech segment(s) suppressed and NOT held as drafts (${notHeld.error}) — ` +
-        'the words remain only in your history',
+        'the words remain in your history',
       );
     }
     if (kept > 0) notes.push(`${kept} plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)`);
@@ -24830,6 +24848,7 @@ export class AgentFramework {
         opensTurn = true;
       }
     }
+    delete routing.asksSettled;
     if (opensTurn) {
       const head = agent.branchHead();
       if (head) routing.start = head;

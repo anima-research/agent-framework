@@ -1455,8 +1455,18 @@ test("a provider hold that folds a wake into an equal re-arm keeps it re-armed o
   const key = rearmedKey(rearm)!;
   const wake: Record<string | symbol, unknown> = { ...rearm };
   delete wake[key];
+  const marked = (): Record<string | symbol, unknown> => ({ ...rearm, [key]: true });
+  const unmarked = (): Record<string | symbol, unknown> => ({ ...wake });
   const before = held().length;
   internal.holdRequest(held(), wake);
   assert.equal(held().length, before, 'premise: the hold folds the equal wake into the re-arm');
   assert.equal(rearm[key], undefined, "not re-armed, since the wake folded into it wasn't");
+  const both = [marked()];
+  internal.holdRequest(both, marked());
+  assert.equal(both.length, 1, 'premise: the hold folds the equal re-arm into the re-arm');
+  assert.equal(both[0]![key], true, 'still re-armed, since both were');
+  const second = [unmarked()];
+  internal.holdRequest(second, marked());
+  assert.equal(second.length, 1, 'premise: the hold folds the equal re-arm into the wake');
+  assert.equal(second[0]![key], undefined, "not re-armed, since the wake it folded into wasn't");
 });

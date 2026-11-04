@@ -126,6 +126,13 @@ interface SpeechHandler {
 }
 
 
+/** A module's `sentTo` as its receipt shows it, or undefined where it names no place. */
+function speechPlace(named: unknown): string | undefined {
+  const flat = typeof named === 'string' ? oneLine(named).replace(/\s+/g, ' ').trim() : '';
+  if (!flat) return undefined;
+  return markedTexts([flat.length > SPEECH_PLACE_MAX ? `${safeSlice(flat, 0, SPEECH_PLACE_MAX)}…` : flat])[0]!;
+}
+
 /**
  * Registry for managing modules.
  */
@@ -743,50 +750,61 @@ export class ModuleRegistry {
   /**
    * Ask every module with onSpeechRouted, all at once, whether it showed
    * `text` to someone. Resolves, once every module has answered or
-   * SPEECH_RECEIPT_WAIT_MS has passed, to the places they named, in module
-   * registration order. A module that throws, answers after the wait, is
-   * removed or replaced before it answers, or names no place (`{}`, "can't
-   * tell") names none.
+   * SPEECH_RECEIPT_WAIT_MS has passed since it was asked, to the places they
+   * named, in module registration order; `onPlace` is called as each one
+   * that names a place answers. A module that throws, answers after the
+   * wait, is removed or replaced before it answers, or names no place (`{}`,
+   * "can't tell") names none.
    */
-  async askSpeechRouted(agentName: string, text: string, context: SpeechRoutedContext): Promise<string[]> {
-    const asked = [...this.modules.values()].filter((module) => module.onSpeechRouted)
-      .map((module) => ({ module, registration: this.moduleContexts.get(module.name) }));
-    const answers = await Promise.all(asked.map(({ module, registration }) => new Promise<unknown>((resolve) => {
-      let settled = false;
-      let call: Promise<unknown>;
+  async askSpeechRouted(agentName: string, text: string, context: SpeechRoutedContext, onPlace?: () => void): Promise<string[]> {
+    const asked = [...this.modules.values()].filter((module) => {
       try {
-        call = Promise.resolve(module.onSpeechRouted!(agentName, text, context)).then((answer) => (answer as { sentTo?: unknown } | null | undefined)?.sentTo);
+        return typeof module.onSpeechRouted === 'function';
       } catch (error) {
-        call = Promise.reject(error);
+        console.error(`Speech-routed module ${module.name} (agent ${agentName}) error reading its onSpeechRouted:`, error);
+        return false;
       }
+    }).map((module) => ({ module, registration: this.moduleContexts.get(module.name) }));
+    const answers = await Promise.all(asked.map(({ module, registration }) => new Promise<string | undefined>((resolve) => {
+      let settled = false;
       const timer = setTimeout(() => {
         settled = true;
         console.error(`Speech-routed module ${module.name} (agent ${agentName}) hadn't answered within ${SPEECH_RECEIPT_WAIT_MS / 1000} s: counted as having sent nothing`);
         resolve(undefined);
       }, SPEECH_RECEIPT_WAIT_MS);
-      call.then((answer) => {
-        if (settled) {
-          console.error(`Speech-routed module ${module.name} (agent ${agentName}) answered after the ${SPEECH_RECEIPT_WAIT_MS / 1000} s wait: its answer counts for nothing`);
-          return;
-        }
-        settled = true;
-        clearTimeout(timer);
-        resolve(this.moduleContexts.get(module.name) === registration ? answer : undefined);
-      }, (error: unknown) => {
+      let call: Promise<unknown>;
+      try {
+        call = Promise.resolve(module.onSpeechRouted!(agentName, text, context));
+      } catch (error) {
+        call = Promise.reject(error);
+      }
+      const fail = (error: unknown): void => {
         console.error(`Speech-routed module ${module.name} (agent ${agentName}) error${settled ? ' after the wait' : ''}:`, error);
         if (settled) return;
         settled = true;
         clearTimeout(timer);
         resolve(undefined);
-      });
+      };
+      call.then((answer) => {
+        if (settled) {
+          console.error(`Speech-routed module ${module.name} (agent ${agentName}) answered after the ${SPEECH_RECEIPT_WAIT_MS / 1000} s wait: its answer counts for nothing`);
+          return;
+        }
+        let named: unknown;
+        try {
+          named = (answer as { sentTo?: unknown } | null | undefined)?.sentTo;
+        } catch (error) {
+          fail(error);
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        const place = this.moduleContexts.get(module.name) === registration ? speechPlace(named) : undefined;
+        if (place !== undefined) onPlace?.();
+        resolve(place);
+      }, fail);
     })));
-    const places: string[] = [];
-    answers.forEach((named) => {
-      const flat = typeof named === 'string' ? oneLine(named).replace(/\s+/g, ' ').trim() : '';
-      if (!flat) return;
-      places.push(markedTexts([flat.length > SPEECH_PLACE_MAX ? `${safeSlice(flat, 0, SPEECH_PLACE_MAX)}…` : flat])[0]!);
-    });
-    return places;
+    return answers.filter((place): place is string => place !== undefined);
   }
 
   private getStateId(moduleName: string): string {

@@ -815,13 +815,14 @@ export interface SpeechRoutedContext {
    * the messages that opened that turn, each as its stored id or a held
    * write's handle, either of which a module context's `getMessage` takes.
    * A message a rewind removed is still named, and `getMessage` returns
-   * `null` for it.
+   * `null` for it. A wake an event gate debounced carries none, so the
+   * messages of the module answers it stands for aren't named.
    */
   openedBy?: {
     reason: string;
     source: string;
     timestamp: number;
-    messages: string[];
+    messages: readonly string[];
   };
 }
 
