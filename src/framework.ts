@@ -32025,8 +32025,9 @@ export class AgentFramework {
 
     // Retry immediately on the repaired history (bounded by the cap above).
     // The failed turn's routing is still the agent's latest: this runs in
-    // its inference:exhausted trace.
-    const opening = this.turnRouting.get(agent.name)?.openingMessages;
+    // its inference:exhausted trace. Optional, since a framework built from
+    // its prototype, as some suites build one, has no map of routings.
+    const opening = this.turnRouting?.get(agent.name)?.openingMessages;
     this.pendingRequests.push({
       agentName: agent.name,
       reason: 'inference-failure-rewind-retry',
