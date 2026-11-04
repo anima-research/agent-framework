@@ -83,7 +83,8 @@
       drops the held turn.
     - **Work nothing bounds:** compression whose pending work isn't a call,
       such as a quarantine clean-up under the compression-state lock that
-      never ends, keeps the turn held with no signal of its own, and so does
+      never ends, keeps the turn held with no signal beyond the hold's own
+      `context-hold` alert (under Added), and so does
       a compression call that doesn't return where the host sets
       `inferenceBounds: false`. Otherwise the framework gives each
       compression call a time limit (`progressTimeoutMs`) from its inference
