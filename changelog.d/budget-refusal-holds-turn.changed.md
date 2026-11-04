@@ -13,14 +13,6 @@
     and a conversation agent's disposal, each with one `inference:aborted`.
     After an abandon or `abortInference()`, the wakes that joined it go back
     to the queue and run as a turn of their own.
-  - A surgery, a branch switch, and an undo or redo that would move the store
-    are refused (`agent-busy`) while a turn is held, for every agent sharing
-    the store, not only the held one, as the store-wide surgery gate refuses
-    them while a provider hold keeps a turn's retry; and so is
-    `puppetToolCall` for the held agent. The refusal names the hold and its
-    reason, and says that a quiesce with `abandon: true` ends the turn. A host
-    that ran surgery on a resident whose turn had ended on such a refusal now
-    waits for the hold, however long it lasts, or ends the turn.
   - The turn's terminal event comes when the held turn ends, however long it
     was held, rather than as an exhaustion within seconds. Wakes that arrive
     while it waits join it: the held list has no bound, and how large a long
@@ -29,13 +21,16 @@
     new trace `inference:held`; `inference:hold_ended` follows when the hold
     ends, and the turn's next start emits `inference:started` again.
     `healthSnapshot()` gives each agent's `budgetHold` (or null): since when
-    it holds, when it last saw something it watches change (`changedAt`, its
-    start until then), context-manager's description of its pending work now
-    (`pending`, bounded to 2,000 characters, or null), the held count, and
-    the refusal's type and figures.
-  - A held turn raises no ops alert, since it goes on. Before, the refused
-    compile's exhaustion raised `context-refusal`; a hold that ends without a
-    fit and whose turn's compile is refused again still does. The hold's start
+    it holds, when compression's own state last changed
+    (`compressionChangedAt`: its progress snapshot, whether work is pending,
+    or its description of that work; the hold's start until then; messages,
+    settings and pins arriving don't move it), context-manager's description
+    of its pending work now (`pending`, bounded to 2,000 characters, or null),
+    the held count, and the refusal's type and figures.
+  - A held turn raises `context-hold` (under Added) rather than
+    `context-refusal`, since it goes on. Before, the refused compile's
+    exhaustion raised `context-refusal`; a hold that ends without a fit and
+    whose turn's compile is refused again still does. The hold's start
     logs a `[budget-hold]` line, unless an `inference:held` listener has
     already ended it, saying the turn runs once a check finds its context fits
     its budget, followed by context-manager's own description of its pending

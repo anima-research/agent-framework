@@ -836,6 +836,50 @@ describe('a compile refused for budget holds its turn (#304)', () => {
   });
   }
 
+  it('tells an agent addressed while a provider hold kept the start its budget hold released that the turn waited on a provider hold', async () => {
+    await withBacklog({ stalled: true }, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      const registry: Record<string, unknown> = {
+        resolveLocus: () => ({ serverId: 'stub', channelId: 'discord:guild:chanA' }),
+        routeSpeech: async (_agent: string, _text: string, locus?: { serverId: string; channelId: string } | null) =>
+          (locus ? { delivered: true, serverId: locus.serverId, channelId: locus.channelId } : null),
+        getDefaultPublishChannel: () => null,
+        isChannelOpen: () => true,
+        getDescriptor: () => undefined,
+        getChannelTools: () => [],
+        channelsNamed: (name: string) => [{ serverId: 'stub', channelId: name }],
+        nameShown: (channel: { channelId: string }) => channel.channelId,
+      };
+      (t.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(registry, {
+        get: (target, prop: string) => (prop in target ? target[prop] : () => undefined),
+      });
+      const recordWait = () => (t.framework as unknown as { recordProviderWait(agent: string, model: string, error: Error): unknown })
+        .recordProviderWait('prime', t.framework.getAgent('prime')!.model, new MembraneError({
+          type: 'rate_limit', retryable: true, retryAfterMs: Infinity, message: 'zz quota held until further notice', rawError: undefined,
+        }));
+      try {
+        t.send('Are you there?', { channelId: 'discord:guild:chanA' });
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        recordWait();
+        backlog.fit = true;
+        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1, 5_000), 'the budget hold releases the turn');
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        assert.equal(turnCalls(t.membrane).length, 0, 'premise: the provider wait keeps the released start');
+        t.send('hey, over here?', { channelId: 'discord:dm:antra', tags: ['chat:addressed'] });
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        t.framework.releaseProviderWait('prime');
+        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000), 'the turn runs once the wait is released');
+        const notices = stored(t.framework).filter((m) => m.metadata.kind === 'routing-notice').map((m) => m.text);
+        const notice = notices.find((text) => text.includes('addressed you from discord:dm:antra'));
+        assert.ok(notice, `the start announces the arrival: ${JSON.stringify(notices)}`);
+        assert.ok(notice!.includes('provider hold'), `and says what the turn waited on last: ${notice}`);
+        assert.ok(!notice!.includes('waited for compression'), notice);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
   it("gives a held turn's pending work and its last change in healthSnapshot()", async () => {
     await withBacklog({ stalled: true, pendingDescription: 'zz 3 chunks pending' }, async (backlog) => {
       const t = await residentTurn({ maintenanceIntervalMs: 50 });
@@ -847,12 +891,12 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         await new Promise((resolve) => setTimeout(resolve, 200));
         const first = hold();
         assert.equal(first.pending, 'zz 3 chunks pending', "context-manager's description of its pending work, read now");
-        assert.equal(first.changedAt, first.since, 'nothing it watches has changed since it started');
+        assert.equal(first.compressionChangedAt, first.since, 'nothing it watches has changed since it started');
         await new Promise((resolve) => setTimeout(resolve, 200));
-        assert.equal(hold().changedAt, first.since, 'a pass that changes nothing moves nothing');
+        assert.equal(hold().compressionChangedAt, first.since, 'a pass that changes nothing moves nothing');
         backlog.pendingDescription = 'zz 2 chunks pending';
         backlog.progress = 1;
-        assert.ok(await pollUntil(() => (hold().changedAt as number) > (first.since as number), 2_000), 'compression moving is a change it saw');
+        assert.ok(await pollUntil(() => (hold().compressionChangedAt as number) > (first.since as number), 2_000), 'compression moving is a change it saw');
         assert.equal(hold().pending, 'zz 2 chunks pending');
         backlog.fit = true;
         assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000));
@@ -862,11 +906,11 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
-  it("keeps a held turn's changedAt at the change while a slow dry compile looks at it", async () => {
+  it("keeps a held turn's compressionChangedAt at the change while a slow dry compile looks at it", async () => {
     await withBacklog({ previewless: true, stalled: true, dryRunMs: 300 }, async (backlog) => {
       const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      const changedAt = () => (t.framework.healthSnapshot() as { agents: Array<{ name: string; budgetHold: { changedAt: number } | null }> })
-        .agents.find((a) => a.name === 'prime')!.budgetHold!.changedAt;
+      const changedAt = () => (t.framework.healthSnapshot() as { agents: Array<{ name: string; budgetHold: { compressionChangedAt: number } | null }> })
+        .agents.find((a) => a.name === 'prime')!.budgetHold!.compressionChangedAt;
       try {
         t.send('Are you there?');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.dryRuns >= 1 && backlog.dryRunsRunning === 0, 5_000));
@@ -887,11 +931,11 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
-  it("stamps a held turn's changedAt for a change back to the state its last verdict saw, and not for a pass with no change", async () => {
+  it("stamps a held turn's compressionChangedAt for a change back to the state its last verdict saw, and not for a pass with no change", async () => {
     await withBacklog({ previewless: true, stalled: true, dryRunMs: 300 }, async (backlog) => {
       const t = await residentTurn({ maintenanceIntervalMs: 50 });
-      const changedAt = () => (t.framework.healthSnapshot() as { agents: Array<{ name: string; budgetHold: { changedAt: number } | null }> })
-        .agents.find((a) => a.name === 'prime')!.budgetHold!.changedAt;
+      const changedAt = () => (t.framework.healthSnapshot() as { agents: Array<{ name: string; budgetHold: { compressionChangedAt: number } | null }> })
+        .agents.find((a) => a.name === 'prime')!.budgetHold!.compressionChangedAt;
       try {
         t.send('Are you there?');
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1 && backlog.dryRuns >= 1 && backlog.dryRunsRunning === 0, 5_000));
@@ -909,6 +953,62 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.ok(await pollUntil(() => backlog.dryRunsRunning === 0, 2_000));
         await new Promise((resolve) => setTimeout(resolve, 200));
         assert.equal(changedAt(), second, 'and passes with no change stamp nothing');
+        backlog.fit = true;
+        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000));
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("keeps a held turn's compressionChangedAt where compression left it while messages keep arriving", async () => {
+    await withBacklog({ stalled: true }, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      const changedAt = () => (t.framework.healthSnapshot() as { agents: Array<{ name: string; budgetHold: { since: number; compressionChangedAt: number } | null }> })
+        .agents.find((a) => a.name === 'prime')!.budgetHold!;
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        const looks = backlog.previews;
+        for (let i = 0; i < 3; i++) {
+          t.send(`zz more traffic ${i}`);
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        assert.ok(backlog.previews > looks, 'premise: the hold saw the traffic and looked again');
+        assert.equal(changedAt().compressionChangedAt, changedAt().since, 'traffic moves nothing compression did');
+        const changed = Date.now();
+        backlog.progress = 1;
+        assert.ok(await pollUntil(() => changedAt().compressionChangedAt >= changed, 2_000), 'compression moving does');
+        backlog.fit = true;
+        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000));
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('takes no new look for a suppressed row stored while a turn is held, and does for a row that shows', async () => {
+    await withBacklog({ stalled: true }, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      const add = (text: string, suppressed: boolean) => (t.framework as unknown as {
+        addMessage(participant: string, content: unknown[], metadata?: unknown, opts?: unknown): unknown;
+      }).addMessage('user', [{ type: 'text', text }], {}, suppressed ? { suppressedBy: { rule: 'zz-rule', eventType: 'zz-event' } } : {});
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        const looks = backlog.previews;
+        const added: Array<Record<string, unknown> | undefined> = [];
+        t.framework.getAgent('prime')!.getContextManager().onMessage((event) => {
+          if (event.type === 'add') added.push(event.message.metadata as Record<string, unknown> | undefined);
+        });
+        add('zz a suppressed arrival', true);
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        assert.ok(added.some((metadata) => metadata?.suppressed !== undefined), 'premise: the suppressed row reached the store');
+        assert.equal(backlog.previews, looks, 'a row no compile renders brings no new look');
+        add('zz an arrival that shows', false);
+        assert.ok(await pollUntil(() => backlog.previews > looks, 2_000), 'a row that shows does');
         backlog.fit = true;
         assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000));
       } finally {
@@ -1018,7 +1118,8 @@ describe('a compile refused for budget holds its turn (#304)', () => {
           assert.equal(holdOf(t)?.state, 'holding', 'still held three hours on');
           assert.equal(alerts('provider-wait').length, 1, 'alerted once, by the wait');
           assert.match(String(alerts('provider-wait')[0]!.message), /holds until an operator releases it/);
-          assert.deepEqual(alerts('context-refusal'), [], 'the hold raises no alert of its own');
+          assert.deepEqual(alerts('context-refusal'), [], 'the hold raises no refusal alert');
+          assert.equal(alerts('context-hold').length, 1, 'and its own alert once, at its start');
           assert.equal(compressionCalls, 1, 'no compression call while the wait holds');
           assert.equal(turnCalls(t.membrane).length, 0);
           t.framework.releaseProviderWait('prime');
@@ -1624,7 +1725,8 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000), 'compression lands, and the turn runs');
         assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
         assert.equal(failures().length, 2);
-        assert.deepEqual(t.of('ops:alert').filter((e) => e.kind !== 'context-maintenance-failed'), [], 'no other alert');
+        assert.deepEqual(t.of('ops:alert').filter((e) => !['context-maintenance-failed', 'context-hold', 'context-hold-clear'].includes(String(e.kind))), [], 'no other alert');
+        assert.deepEqual(t.of('ops:alert').filter((e) => String(e.kind).startsWith('context-hold')).map((e) => e.kind), ['context-hold', 'context-hold-clear'], "and the hold's own, once each");
       } finally {
         await t.close();
       }
@@ -2164,6 +2266,80 @@ describe('a compile refused for budget holds its turn (#304)', () => {
           await t.close();
         }
       });
+    });
+  });
+
+  it("raises context-hold at a hold's start, naming the refusal and the way on, and its clear at the hold's end; a request that joins the held turn raises neither", async () => {
+    await withBacklog({ stalled: true }, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      const holdAlerts = () => t.of('ops:alert').filter((e) => String(e.kind).startsWith('context-hold'));
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => holdAlerts().length === 1, 5_000));
+        const [start] = holdAlerts();
+        assert.equal(start!.kind, 'context-hold');
+        assert.equal(start!.agentName, 'prime');
+        assert.match(String(start!.message), /^turn held until compression makes room, since its compile was refused for budget: .+; a quiesce lets a held turn start when its hold ends and finish, so to go on sooner, end it with quiesce with abandon: true/);
+        assert.equal((start!.data as Record<string, unknown>).errorType, 'over_budget');
+        t.send('and another thing');
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        assert.equal(holdOf(t)?.heldRequests.length, 2, 'premise: the second request joined the held turn');
+        assert.equal(holdAlerts().length, 1, 'a join raises nothing');
+        backlog.fit = true;
+        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000));
+        assert.deepEqual(holdAlerts().map((e) => e.kind), ['context-hold', 'context-hold-clear']);
+        assert.equal((holdAlerts()[1]!.data as Record<string, unknown>).outcome, 'fit');
+        assert.deepEqual(t.of('ops:alert').filter((e) => e.kind === 'context-refusal'), []);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('raises context-hold again for a released turn held again, after the first clear, so starts and clears pair one to one', async () => {
+    await withBacklog({ fit: true, alwaysPending: true, refuseCompiles: 2 }, async () => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 5_000));
+        assert.equal(t.of('inference:held').length, 2, 'premise: held, then held again');
+        assert.deepEqual(t.of('ops:alert').filter((e) => String(e.kind).startsWith('context-hold')).map((e) => e.kind),
+          ['context-hold', 'context-hold-clear', 'context-hold', 'context-hold-clear']);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('clears context-hold when compression has nothing left to do, and then raises context-refusal as an exhausted turn does', async () => {
+    await withBacklog({ readyAt: 20 }, async () => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:exhausted').length === 1, 5_000));
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['nothing_pending']);
+        assert.deepEqual(t.of('ops:alert').filter((e) => ['context-hold', 'context-hold-clear', 'context-refusal'].includes(String(e.kind))).map((e) => e.kind),
+          ['context-hold', 'context-hold-clear', 'context-refusal']);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('clears context-hold when the held turn is ended', async () => {
+    await withBacklog({ stalled: true }, async () => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        assert.equal(t.framework.abortInference('prime'), true);
+        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1, 2_000));
+        const holdAlerts = t.of('ops:alert').filter((e) => String(e.kind).startsWith('context-hold'));
+        assert.deepEqual(holdAlerts.map((e) => e.kind), ['context-hold', 'context-hold-clear']);
+        assert.equal((holdAlerts[1]!.data as Record<string, unknown>).outcome, 'stopped');
+      } finally {
+        await t.close();
+      }
     });
   });
 

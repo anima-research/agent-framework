@@ -1093,7 +1093,10 @@ export type TraceEvent =
   // this stream, not a separate system. See connectome docs/observability.md.
   | (TraceEventBase & {
       type: 'ops:alert';
-      /** Alert kind — open set: 'refusal' | 'hard-down' | 'mcpl-down' | … */
+      /** Alert kind — open set: 'refusal' | 'hard-down' | 'mcpl-down' |
+       *  'context-hold' | … A kind ending in `-clear` ends the alert of the
+       *  kind before it: 'context-hold-clear' is raised at every end of a
+       *  budget hold, each start of which raised 'context-hold'. */
       kind: string;
       /** Agent name, or a server/component id for non-agent alerts (e.g. mcpl-down). */
       agentName: string;
