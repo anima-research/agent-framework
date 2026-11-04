@@ -19,6 +19,8 @@ import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
 import type { InferenceRequest } from '../src/types/agent.js';
 import { OneResponsePerTurnMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { fixture, TS } from './helpers/coalescing-fixture.js';
+import type { FrameworkConfig } from '../src/types/framework.js';
 import { jsonLines } from './helpers/json-lines.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/wake-locus-mcpl-server.mjs');
@@ -180,4 +182,51 @@ describe('messageQuietPeriod through MCPL ingress', () => {
     assert.equal(publishes()[0], DM);
     assert.ok(publishes().slice(1).every((c) => c === ROOM), `later replies, if any, went to the room: ${publishes().join(', ')}`);
   });
+});
+
+/**
+ * A deferred coalesced batch (RFC-006) scoped to a channel, held beside
+ * another channel's burst (#856 R3-1): the turn the other burst starts
+ * leaves the batch for the batch's own turn, so the channel it was asked in
+ * is the channel it is answered in. The loopback fixture renders the batch
+ * as `document_diff`; `ok` answers every turn.
+ */
+describe('messageQuietPeriod and a deferred coalesced batch', () => {
+  const batch = (id: string, text: string, channel: string) => ({
+    featureSet: 'doc', eventId: id, timestamp: TS, tags: ['chat:mention', 'chat:addressed'],
+    coalesce: { channelId: channel, key: 'doc', deferred: true, initial: true },
+    payload: { content: [{ type: 'text', text }] },
+  });
+
+  for (const on of [false, true]) {
+    it(`an addressed deferred batch held beside another channel's burst keeps its turn, in its channel (option ${on ? 'on' : 'off'})`, async () => {
+      const f = await fixture({
+        framework: {
+          ...(on ? { messageQuietPeriod: { quietMs: 600 } } : {}),
+          gate: { config: { policies: [], default: 'always' } },
+        } as Partial<FrameworkConfig>,
+        mcpl: {},
+      });
+      try {
+        f.alwaysRespond();
+        await f.register('room');
+        await f.register('general');
+        await f.framework.start();
+        await f.send('channels/incoming', { messages: [{
+          channelId: 'room', messageId: 'r1', eventId: 'r1', timestamp: TS, author: { id: 'u', name: 'U' },
+          tags: ['chat:mention', 'chat:addressed'], content: [{ type: 'text', text: 'ROOMQ scout?' }],
+        }] });
+        await sleep(150);
+        await f.send('push/event', batch('b1', 'GENQ batch question', 'general'));
+        await waitFor(() => f.published.length >= 2, 'both answers', 6_000);
+        await sleep(300);
+        assert.deepEqual(f.published.map((p) => p.channelId), ['room', 'general'], 'general was asked, so general is answered');
+        assert.equal(f.membrane.calls.length, 2, 'one turn per burst');
+        const carries = f.membrane.calls.map((c) => JSON.stringify((c as { messages?: unknown }).messages).includes('document_diff'));
+        assert.deepEqual(carries, [false, true], "the room's turn left the batch; general's turn assembled it");
+      } finally {
+        await f.close();
+      }
+    });
+  }
 });

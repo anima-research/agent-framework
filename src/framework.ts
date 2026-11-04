@@ -959,7 +959,10 @@ function carryQuietSince(r: InferenceRequest, since: number): void {
  *   now, with the wakes that name no channel and at most one channel's burst:
  *   the channel the other wake itself names, else the ready burst that has
  *   waited longest, else none. The other channels' bursts keep waiting, so
- *   the turn never speaks for a channel it didn't start for.
+ *   the turn carries at most one channel's held messages. (Which channel the
+ *   merged turn speaks in is the start's merge's choice, as on `main`: a wake
+ *   naming a channel no burst holds, beside a ready burst, may speak in its
+ *   own channel.)
  */
 export function quietSplit(
   requests: readonly InferenceRequest[],
@@ -2652,18 +2655,18 @@ const ABANDON_GRACE_MS = 10_000;
 
 const testAbandonGraces = new WeakMap<AgentFramework, number>();
 
-/**
- * For tests only: `framework`'s abandon takes `ms` as its grace in place of
- * {@link ABANDON_GRACE_MS}. Set it only where the test holds every turn the
- * abandon reaches past the grace, so no turn can end within it and a short
- * grace only brings the abandon's report sooner.
- */
 /** Test-only: marks a wake as standing for a burst whose oldest wake was at
  *  `since`, as a coalesced batch's replacement or a quiesce's coalescing does. */
 export function carryQuietSinceForTests(request: InferenceRequest, since: number): void {
   carryQuietSince(request, since);
 }
 
+/**
+ * For tests only: `framework`'s abandon takes `ms` as its grace in place of
+ * {@link ABANDON_GRACE_MS}. Set it only where the test holds every turn the
+ * abandon reaches past the grace, so no turn can end within it and a short
+ * grace only brings the abandon's report sooner.
+ */
 export function setAbandonGraceForTests(framework: AgentFramework, ms: number): void {
   testAbandonGraces.set(framework, ms);
 }
@@ -4655,7 +4658,13 @@ export class AgentFramework {
     // Before anything opens or starts: a refused config must leave nothing behind.
     if (config.codeExecution != null) validateCodeExecutionConfig(config.codeExecution);
     resolveInferenceBounds(config.inferenceBounds);
-    quietPeriodOf(config.messageQuietPeriod);
+    if (quietPeriodOf(config.messageQuietPeriod) && config.speech?.locus === 'latest-inbound') {
+      // Under latest-inbound, a held message is the latest delivered inbound,
+      // so a turn with no channel of its own would speak in a held channel
+      // and read-drop that channel's burst: the one-turn-per-burst promise
+      // can't hold there, so the pair is refused rather than half-kept.
+      throw new Error("FrameworkConfig.messageQuietPeriod can't be used with speech.locus 'latest-inbound': a held message would become a turn's fallback locus. Use the default 'delivery' locus.");
+    }
     assertFrameworkSwitches(config);
     for (const agentConfig of config.agents) assertAgentSwitches(agentConfig);
     assertAgentNamesUnique(config.agents);
@@ -19187,8 +19196,6 @@ export class AgentFramework {
     }
   }
 
-  /** Withdraw unstarted wakes whose sole cause is this subject (§4.2), and
-   *  a merged start whose every request is withdrawn. */
   /** Ends the quiet-period holds of `agentName`'s bursts that are no longer
    *  queued (quietHolds): each gets a `quiet-period:released` trace with the
    *  cause `gone`. `queuedKeys` are the bursts still in its queue. Called
@@ -19206,13 +19213,32 @@ export class AgentFramework {
     if (held.size === 0) this.quietHolds.delete(agentName);
   }
 
-  /** The burst keys of an agent's queued message wakes, for pruneQuietHolds. */
+  /** The burst keys of an agent's queued message wakes, for pruneQuietHolds:
+   *  in the queue, in a pass's hands, or held by a provider's cooldown. */
   private queuedQuietKeys(agentName: string): Set<string> {
     const keys = new Set<string>();
-    for (const r of this.pendingRequests) if (r.agentName === agentName && isMessageWake(r)) keys.add(quietBurstKey(r));
+    const add = (r: InferenceRequest): void => { if (r.agentName === agentName && isMessageWake(r)) keys.add(quietBurstKey(r)); };
+    this.pendingRequests.forEach(add);
+    for (const pass of this.passRequests ?? []) for (const requests of pass.values()) requests.forEach(add);
+    for (const cooldown of this.providerAccelerationCooldowns?.values() ?? []) cooldown.heldRequests.forEach(add);
     return keys;
   }
 
+  /** The coalescing subjects of `agentName`'s wakes a message quiet period
+   *  holds now (quietHolds): a turn another burst starts leaves their batches
+   *  for the turn they wait for (PushCoalescer.assemble's `leave`). */
+  private quietHeldSubjects(agentName: string): Set<string> | undefined {
+    const held = this.quietHolds?.get(agentName);
+    if (!held?.size) return undefined;
+    const subjects = new Set<string>();
+    for (const r of this.pendingRequests) {
+      if (r.agentName === agentName && r.coalescingSubject !== undefined && isMessageWake(r) && held.has(quietBurstKey(r))) subjects.add(r.coalescingSubject);
+    }
+    return subjects.size > 0 ? subjects : undefined;
+  }
+
+  /** Withdraw unstarted wakes whose sole cause is this subject (§4.2), and
+   *  a merged start whose every request is withdrawn. */
   private cancelCoalescedWakes(subject: string): void {
     // A wake of the subject's merged into a start
     // (MERGED_BATCH) is withdrawn from the start's batch, so no stop puts
@@ -24075,7 +24101,10 @@ export class AgentFramework {
       // the turn (addMessage's bypassDeferralFor counts only within it).
       this.assembling.add(agent.name);
       try {
-        assembly = await this.pushCoalescer.assemble(agent.name, batchSubjects);
+        // A batch whose wake a message quiet period holds for a turn of its
+        // own is left for that turn (quietHeldSubjects): taken here, its
+        // channel's question could only be answered in this turn's channel.
+        assembly = await this.pushCoalescer.assemble(agent.name, batchSubjects, this.quietHeldSubjects(agent.name));
       } catch (err) {
         console.error(`[coalescing] assembly for ${agent.name} failed:`, err);
       } finally {

@@ -186,6 +186,17 @@ describe('quietSplit', () => {
     assert.deepEqual(split.hold, [room]);
     assert.deepEqual([...split.started], [[key('dm:42'), 'other-wake']]);
   });
+
+  it('an other wake takes the ready channel burst, not an older ready channel-less one (channelsOnly)', () => {
+    // slimepriestess's Q8 (#856 R3-5).
+    const timer = message(T0 + 5_000, { reason: 'self-wake', source: 'gate' });
+    const source = message(T0, { reason: 'mcpl:push-event', source: 'tsm' });
+    const room = inChannel(T0 + 100, 'g:room');
+    const split = quietSplit([timer, source, room], T0 + 5_000, QUIET);
+    assert.ok(split.start.includes(room), 'the ready channel starts');
+    assert.ok(split.start.includes(source), 'and the channel-less burst rides along');
+    assert.deepEqual([...split.started.keys()].sort(), [quietBurstKey(source), key('g:room')].sort());
+  });
 });
 
 describe('messageQuietPeriod in the scheduler', () => {
@@ -285,8 +296,10 @@ describe('messageQuietPeriod in the scheduler', () => {
     try {
       const t0 = Date.now();
       wake(internals, { channelId: 'discord:dm:42', channelServerId: 'discord', addressed: true });
-      // The salon chatters every 150 ms until the DM's turn: its burst is never quiet.
-      const chatter = setInterval(() => wake(internals, { channelId: 'discord:g:salon', channelServerId: 'discord', ambient: true }), 150);
+      // The salon asks every 150 ms until the DM's turn: its burst is never
+      // quiet. Addressed, as a question is; an ambient message the DM's turn
+      // read would be dropped as read through real ingress (the e2e DM test).
+      const chatter = setInterval(() => wake(internals, { channelId: 'discord:g:salon', channelServerId: 'discord', addressed: true }), 150);
       try {
         await waitFor(() => membrane.calls.length >= 1, 'the DM\'s turn', 3_000);
         const dmAt = Date.now() - t0;
@@ -432,6 +445,101 @@ describe('messageQuietPeriod in the scheduler', () => {
     } finally {
       await framework.stop();
     }
+  });
+
+  it('a withdrawal that empties the queue ends the hold, so the next burst on that key is held anew (R3-5)', async () => {
+    const { framework, membrane, internals, traces } = await start({ quietMs: 5_000 });
+    reply(membrane, 'ok');
+    const x = framework as unknown as { cancelCoalescedWakes(subject: string): void };
+    try {
+      wake(internals, { reason: 'mcpl:push-event', source: 'tsm', coalescingSubject: 'tsm:s', coalescingBatch: true });
+      await waitFor(() => heldKeys(traces).length >= 1, 'the hold', 2_000);
+      // The batch is withdrawn with nothing else queued: no pass runs, so the
+      // prune at the withdrawal is what ends the hold.
+      x.cancelCoalescedWakes('tsm:s');
+      await sleep(100);
+      assert.deepEqual(released(traces), [[quietBurstKey(message(0, { source: 'tsm' })), 'gone']]);
+      wake(internals, { reason: 'mcpl:push-event', source: 'tsm', coalescingSubject: 'tsm:s2', coalescingBatch: true });
+      await waitFor(() => heldKeys(traces).length >= 2, 'held anew', 2_000);
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it("a coalesced notice's new wake carries the age of the one it replaced (R3-5, Q15)", async () => {
+    const { framework, internals } = await start({ quietMs: 10_000, maxWaitMs: 10_000 });
+    const x = internals as unknown as {
+      pendingRequests: InferenceRequest[];
+      cancelCoalescedWakes(subject: string): void;
+      queueCoalescedWakes(occ: unknown): Promise<void>;
+      wakeForCoalescedBatch(occ: unknown): Promise<void>;
+    };
+    try {
+      await (framework as unknown as { quiesce(o?: unknown): Promise<unknown> }).quiesce();
+      let subject = '';
+      const cancel = x.cancelCoalescedWakes.bind(framework);
+      x.cancelCoalescedWakes = (s: string) => { subject = s; cancel(s); };
+      x.queueCoalescedWakes = async () => {
+        x.pendingRequests.push(message(Date.now(), { reason: 'mcpl:push-event', source: 'tsm', coalescingSubject: subject }));
+      };
+      const occ = { serverId: 'x', binding: 'b', scope: 's', key: 'k' };
+      await x.wakeForCoalescedBatch(occ);
+      x.pendingRequests.length = 0;
+      x.pendingRequests.push(message(Date.now() - 9_000, { reason: 'mcpl:push-event', source: 'tsm', coalescingSubject: subject }));
+      await x.wakeForCoalescedBatch(occ);
+      const mine = x.pendingRequests.filter((r) => r.coalescingSubject === subject);
+      assert.equal(mine.length, 1);
+      const left = [...quietSplit(mine, Date.now(), { quietMs: 10_000, maxWaitMs: 10_000 }).waiting.values()][0];
+      assert.ok(left === undefined || left < 2_000, `the cap counts from the first wake: ${left} ms left`);
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it("the wake a quiesce keeps carries its burst's age (R3-5, Q16)", async () => {
+    const { framework, internals } = await start({ quietMs: 10_000, maxWaitMs: 10_000 });
+    try {
+      await (framework as unknown as { quiesce(o?: unknown): Promise<unknown> }).quiesce();
+      const now = Date.now();
+      internals.pendingRequests.push(message(now - 9_000, { channelId: 'discord:g:room', channelServerId: 'discord' }));
+      internals.pendingRequests.push(message(now, { channelId: 'discord:g:room', channelServerId: 'discord' }));
+      await sleep(400);
+      assert.equal(internals.pendingRequests.length, 1, 'one kept');
+      const left = [...quietSplit(internals.pendingRequests, Date.now(), { quietMs: 10_000, maxWaitMs: 10_000 }).waiting.values()][0];
+      assert.ok(left === undefined || left < 2_000, `the cap counts from the first wake: ${left} ms left`);
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('a quiesce parks two channels apart (R3-5, Q17)', async () => {
+    const { framework, internals } = await start({ quietMs: 2_000 });
+    try {
+      await (framework as unknown as { quiesce(o?: unknown): Promise<unknown> }).quiesce();
+      wake(internals, { channelId: 'discord:g:room', channelServerId: 'discord', addressed: true });
+      wake(internals, { channelId: 'discord:g:general', channelServerId: 'discord', addressed: true });
+      await sleep(400);
+      assert.deepEqual(internals.pendingRequests.map((r) => r.channelId).sort(), ['discord:g:general', 'discord:g:room']);
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it("refuses the option with speech.locus 'latest-inbound', before the store opens (R3-2)", async () => {
+    mkdirSync(TMP, { recursive: true });
+    const storePath = join(TMP, `store-li-${Math.random().toString(36).slice(2)}`);
+    await assert.rejects(
+      AgentFramework.create({
+        storePath,
+        membrane: new MockMembrane().asMembrane(),
+        agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+        modules: [],
+        messageQuietPeriod: { quietMs: 500 },
+        speech: { locus: 'latest-inbound' },
+      }),
+      /latest-inbound/,
+    );
+    assert.ok(!existsSync(storePath) || readdirSync(storePath).length === 0, 'a refused config leaves no store behind');
   });
 
   it('refuses a quiet period that is not finite numbers of ms, before the store opens (R1-5)', async () => {

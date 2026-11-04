@@ -970,13 +970,19 @@ export class PushCoalescer<E = unknown> {
    * by now settles and gives the turn nothing, and an assembly that joins
    * another's render waits for it, so its compile shows the content, without
    * taking it as its own.
+   *
+   * `leave` are subjects this assembly must not take: those whose wakes the
+   * host holds for a turn of their own (a message quiet period's held
+   * bursts), so that turn, not this one, consumes them. A cause is never
+   * left. With nothing held, every pending batch is taken, as before.
    */
-  async assemble(agentName: string, causes: readonly string[] = []): Promise<AssemblyResult> {
+  async assemble(agentName: string, causes: readonly string[] = [], leave?: ReadonlySet<string>): Promise<AssemblyResult> {
     const result: AssemblyResult = { settled: new Set(), materialized: new Set() };
     if (this.suspended) return result;
     const work: Promise<void>[] = [];
     const wanted = new Set(causes);
     for (const subject of new Set([...this.subjects.keys(), ...causes])) {
+      if (leave?.has(subject) && !wanted.has(subject)) continue;
       // The handle is wrapped: a bare promise returned through `locked` would
       // be flattened by `then`, holding the lock until the render settled —
       // and the settlement itself needs the lock.
