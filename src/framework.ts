@@ -20998,7 +20998,7 @@ export class AgentFramework {
       const places = await asked;
       if (places.length > 0) {
         if (!round.final) round.routing.liveSpeech = true;
-        console.error(`[routeSpeech] ${agent.name}: turn has no channel; ${text.length} chars shown by ${places.map(logValue).join(' · ')}, none posted to a channel`);
+        console.error(`[routeSpeech] ${agent.name}: turn has no channel; ${text.length} chars shown by ${places.map(logValue).join(' · ')}, routing posted it to no channel`);
         return null;
       }
       return this.channelRegistry!.routeSpeech(agent.name, text, locus);
@@ -21177,7 +21177,7 @@ export class AgentFramework {
     const places = [...shown, ...sentTo.map((place) => `sent to ${place}`)];
     const text =
       places.length > 0
-        ? `[${NOTICE_TAG.delivered}] plain speech → ${places.join(' · ')}${shown.length === 0 && !postTried ? ' · no channel posted it' : ''}${suppressedNote ? ` · ${suppressedNote}` : ''}${closedNote}`
+        ? `[${NOTICE_TAG.delivered}] plain speech → ${places.join(' · ')}${shown.length === 0 && !postTried ? " · this turn's routing posted it to no channel" : ''}${suppressedNote ? ` · ${suppressedNote}` : ''}${closedNote}`
         : agent.proseRouting === 'disabled'
           ? `[${NOTICE_TAG.delivered}] plain speech → no channel — ${suppressedNote}`
           : `[${NOTICE_TAG.delivered}] nothing${uncertain ? ' confirmed' : ''} — ${suppressedNote}`;
@@ -21343,7 +21343,7 @@ export class AgentFramework {
     let text: string;
     if (locus === null) {
       text =
-        `[${NOTICE_TAG.routing}] Your plain speech currently has no channel, so no channel posts it. ` +
+        `[${NOTICE_TAG.routing}] Your plain speech currently has no channel, so routing posts it to no channel. ` +
         'Use an explicit send tool to reach a channel.';
     } else {
       const shown = this.channelShown(locus);
@@ -25950,6 +25950,7 @@ export class AgentFramework {
                   reason: forced ? 'unstick-retry' : 'refusal-rewind-retry',
                   source: 'framework',
                   timestamp: Date.now(),
+                  ...(streamRouting.openingMessages ? { openingMessages: [...streamRouting.openingMessages] } : {}),
                 });
                 handledByRewind = true;
               };
@@ -32023,11 +32024,15 @@ export class AgentFramework {
     );
 
     // Retry immediately on the repaired history (bounded by the cap above).
+    // The failed turn's routing is still the agent's latest: this runs in
+    // its inference:exhausted trace.
+    const opening = this.turnRouting.get(agent.name)?.openingMessages;
     this.pendingRequests.push({
       agentName: agent.name,
       reason: 'inference-failure-rewind-retry',
       source: 'framework',
       timestamp: Date.now(),
+      ...(opening ? { openingMessages: [...opening] } : {}),
     });
   }
 

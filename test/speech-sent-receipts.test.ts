@@ -253,7 +253,7 @@ describe('plain speech a module says it showed', () => {
     await turn(f);
     assert.deepEqual(askedTexts(surface), [{ text: 'Hi there.', final: true }]);
     assert.deepEqual(notices(f), []);
-    assert.equal(receipt(f), `[delivered] plain speech → sent to ${SENT_TO} · no channel posted it`);
+    assert.equal(receipt(f), `[delivered] plain speech → sent to ${SENT_TO} · this turn's routing posted it to no channel`);
   });
 
   it("a reply no module named a place for is told it went nowhere, named by its words, and that another surface may have shown it", async () => {
@@ -278,7 +278,7 @@ describe('plain speech a module says it showed', () => {
     const f = await host([surface], membrane);
     await turn(f);
     const lines = errors.filter((e) => e.startsWith('[routeSpeech]'));
-    assert.deepEqual(lines, ['[routeSpeech] resident: turn has no channel; 9 chars shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", none posted to a channel']);
+    assert.deepEqual(lines, ['[routeSpeech] resident: turn has no channel; 9 chars shown by "the\\u0020console\\u0020that\\u0020sent\\u0020this\\u0020turn", routing posted it to no channel']);
   });
 
   it("a place a module names is logged as a field, its invisible characters escaped, and kept readable in the receipt", async (t) => {
@@ -291,8 +291,8 @@ describe('plain speech a module says it showed', () => {
     const f = await host([surface], membrane);
     await turn(f);
     const lines = errors.filter((e) => e.startsWith('[routeSpeech]'));
-    assert.deepEqual(lines, ['[routeSpeech] resident: turn has no channel; 9 chars shown by "the\\u0020terminal\\u202e(page)", none posted to a channel']);
-    assert.equal(receipt(f), '[delivered] plain speech → sent to the terminal\u202e(page) · no channel posted it');
+    assert.deepEqual(lines, ['[routeSpeech] resident: turn has no channel; 9 chars shown by "the\\u0020terminal\\u202e(page)", routing posted it to no channel']);
+    assert.equal(receipt(f), "[delivered] plain speech → sent to the terminal\u202e(page) · this turn's routing posted it to no channel");
   });
 
   it("the line for a reply no module showed still says 'no locus', as connectome-doctor reads it", async (t) => {
@@ -316,7 +316,7 @@ describe('plain speech a module says it showed', () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi there.' }]));
     const f = await host([surface], membrane);
     await turn(f);
-    assert.equal(receipt(f), '[delivered] plain speech → sent to the terminal \\[routing] says so · no channel posted it');
+    assert.equal(receipt(f), "[delivered] plain speech → sent to the terminal \\[routing] says so · this turn's routing posted it to no channel");
   });
 
   it("a place cut at its cap is marked after the cut, so the cut can't leave a notice's opening unmarked", async () => {
@@ -326,7 +326,7 @@ describe('plain speech a module says it showed', () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi there.' }]));
     const f = await host([surface], membrane);
     await turn(f);
-    assert.equal(receipt(f), `[delivered] plain speech → sent to ${'x'.repeat(192)}\\[routing… · no channel posted it`);
+    assert.equal(receipt(f), `[delivered] plain speech → sent to ${'x'.repeat(192)}\\[routing… · this turn's routing posted it to no channel`);
   });
 
   for (const [what, answer, proseRouting] of [
@@ -341,9 +341,10 @@ describe('plain speech a module says it showed', () => {
       const membrane = new MockMembrane();
       const f = await host([surface], membrane);
       const routed: string[] = [];
+      const routing: Promise<unknown>[] = [];
       const registry = (f as unknown as { channelRegistry: { routeSpeech(...args: unknown[]): unknown } }).channelRegistry;
       const routeSpeech = registry.routeSpeech.bind(registry);
-      registry.routeSpeech = (...args: unknown[]) => { routed.push(String(args[0])); return routeSpeech(...args); };
+      registry.routeSpeech = (...args: unknown[]) => { routed.push(String(args[0])); const outcome = routeSpeech(...args); routing.push(Promise.resolve(outcome)); return outcome; };
       const created = await f.createEphemeralAgent({ name: 'run-1', model: 'test-model', systemPrompt: 'Do the task.', proseRouting });
       created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
@@ -353,6 +354,9 @@ describe('plain speech a module says it showed', () => {
       assert.equal(result.speech, 'Done.');
       await until(() => routed.includes('run-1') || surface.asked.length > 0, "the run's speech reaching the registry, or a module being asked");
       assert.deepEqual(surface.asked, []);
+      // The receipt would be written once the run's routing is done, so it's looked for after that.
+      await Promise.allSettled(routing);
+      await new Promise((resolve) => setImmediate(resolve));
       const runTexts = created.contextManager.getAllMessages().map((m) => textOf(m.content));
       assert.deepEqual(runTexts.filter((text) => text.startsWith('[delivered]')), []);
     });
@@ -420,7 +424,7 @@ describe('plain speech a module says it showed', () => {
     assert.equal(typeof turnIds[0], 'number');
     assert.equal(turnIds[1], turnIds[0], "one turn's pieces name one turn");
     assert.deepEqual(notices(f), []);
-    assert.equal(receipt(f), `[delivered] plain speech → sent to ${SENT_TO} · no channel posted it`);
+    assert.equal(receipt(f), `[delivered] plain speech → sent to ${SENT_TO} · this turn's routing posted it to no channel`);
   });
 
   it("where tool rounds aren't routed live, a round's prose routed at the turn's end is asked about as a round's, and only the reply as the final speech", async () => {
@@ -672,7 +676,7 @@ describe('plain speech a module says it showed', () => {
     assert.deepEqual(surface.asked, []);
   });
 
-  it("a hybrid reply's >>> post whose outcome is unknown counts as a post tried, so the receipt doesn't say no channel posted it", async (t) => {
+  it("a hybrid reply's >>> post whose outcome is unknown counts as a post tried, so the receipt doesn't say its routing posted it to no channel", async (t) => {
     t.mock.method(console, 'error', () => {});
     const surface = new Surface();
     const membrane = new MockMembrane();
@@ -686,7 +690,7 @@ describe('plain speech a module says it showed', () => {
     assert.deepEqual(published.map((p) => p.text), ['Hello room.'], 'premise: the post was tried');
     assert.deepEqual(surface.asked.map((a) => a.text), ['Hi there.'], 'premise: the plain piece was asked about');
     assert.ok(receipt(f)?.includes(`sent to ${SENT_TO}`), receipt(f));
-    assert.ok(!receipt(f)?.includes('no channel posted it'), receipt(f));
+    assert.ok(!receipt(f)?.includes('posted it to no channel'), receipt(f));
   });
 
   it("a hybrid reply's >>> post that follows a piece with no channel waits for that piece's answer, then posts", async () => {
@@ -756,6 +760,30 @@ describe('plain speech a module says it showed', () => {
     assert.equal(receipt(f), undefined);
   });
 
+  it("a module that answered and is then removed while another is still being asked names its place", async () => {
+    const surface = new Surface();
+    const other = new Surface('other');
+    other.answer = 'none';
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    const ask = other.onSpeechRouted.bind(other);
+    other.onSpeechRouted = async (agent, text, context) => {
+      const answer = ask(agent, text, context);
+      await released;
+      return answer;
+    };
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi there.' }]));
+    const f = await host([surface, other], membrane);
+    // The console answers at once; after its answer is in, it's removed, and only then does the other module answer.
+    other.onAsked = () => { setTimeout(() => { void f.removeModule('console').then(release); }, 0); };
+    await turn(f);
+    assert.equal(surface.asked.length, 1, 'premise: the console was asked');
+    assert.equal(other.asked.length, 1, 'premise: so was the other module');
+    assert.deepEqual(notices(f), []);
+    assert.equal(receipt(f), `[delivered] plain speech → sent to ${SENT_TO} · this turn's routing posted it to no channel`);
+  });
+
   it("a round no module says it showed keeps its notice when the trailing reply's place clears its own", async () => {
     const surface = new Surface();
     let asks = 0;
@@ -778,7 +806,7 @@ describe('plain speech a module says it showed', () => {
       const f = await host([surface], membrane, { proseRouting: 'hybrid' });
       await turn(f);
       assert.equal(notices(f).length, answer === 'sent' ? 0 : 1, notices(f).join('\n'));
-      if (answer === 'sent') assert.equal(receipt(f), `[delivered] plain speech → sent to ${SENT_TO} · no channel posted it`);
+      if (answer === 'sent') assert.equal(receipt(f), `[delivered] plain speech → sent to ${SENT_TO} · this turn's routing posted it to no channel`);
     });
   }
 
@@ -903,7 +931,7 @@ describe('plain speech a module says it showed', () => {
     push(f, 'hello', 'first');
     await f.runUntilIdle();
     const long = `a page ${'x'.repeat(300)}`.slice(0, 200);
-    assert.equal(receipt(f), `[delivered] plain speech → sent to the terminal that sent this turn · sent to ${long}… · no channel posted it`);
+    assert.equal(receipt(f), `[delivered] plain speech → sent to the terminal that sent this turn · sent to ${long}… · this turn's routing posted it to no channel`);
     assert.deepEqual(notices(f), []);
   });
 
@@ -948,7 +976,7 @@ describe('plain speech a module says it showed', () => {
     assert.equal(receipt(f), `[delivered] plain speech → room · sent to ${SENT_TO}`);
   });
 
-  it("a turn whose channel post has an unknown outcome names the place in its receipt without saying no channel posted it", async (t) => {
+  it("a turn whose channel post has an unknown outcome names the place in its receipt without saying its routing posted it to no channel", async (t) => {
     t.mock.method(console, 'error', () => {});
     const surface = new Surface();
     const membrane = new MockMembrane();
@@ -1004,7 +1032,7 @@ describe('plain speech a module says it showed', () => {
     assert.match(receipt(f) ?? '(no receipt)', new RegExp(`sent to ${SENT_TO}`));
   });
 
-  it('the turn-start notice for a turn with no channel says no channel posts its speech, in its own words', async () => {
+  it('the turn-start notice for a turn with no channel says routing posts its speech to no channel, in its own words', async () => {
     const surface = new Surface();
     const membrane = new MockMembrane();
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi there.' }]));
@@ -1012,7 +1040,7 @@ describe('plain speech a module says it showed', () => {
     internals(f).lastAnnouncedLocus.set('resident', { serverId: 'srv', channelId: 'room' });
     await turn(f);
     assert.deepEqual(texts(f).filter((t) => t.startsWith('[routing]')), [
-      '[routing] Your plain speech currently has no channel, so no channel posts it. Use an explicit send tool to reach a channel.',
+      '[routing] Your plain speech currently has no channel, so routing posts it to no channel. Use an explicit send tool to reach a channel.',
     ]);
   });
 
@@ -1193,6 +1221,44 @@ describe('plain speech a module says it showed', () => {
     routing.openingMessages = ['m-opening'];
     i.bounceProse(agent, 'Unrouted prose', 'no destination', undefined, '>>', { routing, notice: 'later' });
     const woke = i.pendingRequests.filter((r) => r.reason === 'prose-bounce');
+    assert.deepEqual(woke.map((r) => r.openingMessages), [['m-opening']]);
+  });
+
+  it("a retry after a refused round's rewind names the messages of the turn it stands in for", async () => {
+    const surface = new Surface();
+    const membrane = new MockMembrane();
+    const call = { type: 'tool_use', id: 'c1', name: 'console--look', input: {} } as ContentBlock;
+    membrane.pushResponse(lookRound('Let me look.'));
+    membrane.pushResponse({
+      ...createMockResponse([{ type: 'text', text: 'Let me look.' }, call, { type: 'tool_result', toolUseId: 'c1', content: 'nothing here' }] as ContentBlock[], 'refusal'),
+      toolCalls: [],
+    } as NormalizedResponse);
+    const f = await host([surface], membrane, { refusalHandling: { autoRewind: true, maxRewinds: 3 } });
+    let starts = 0;
+    f.onTrace((event) => {
+      if (event.type === 'inference:started' && ++starts === 2) membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi there.' }]));
+    });
+    await turn(f, 'hello there');
+    await f.runUntilIdle();
+    const retried = surface.asked.find((a) => a.text === 'Hi there.');
+    assert.ok(retried, JSON.stringify(askedTexts(surface)));
+    assert.equal(retried!.context.openedBy?.reason, 'refusal-rewind-retry', 'premise: the retry opened a turn of its own');
+    assert.deepEqual(openingTexts(surface, retried!), ['hello there']);
+  });
+
+  it("a retry after an inference failure's rewind names the messages of the turn it stands in for", async () => {
+    const surface = new Surface();
+    const f = await host([surface], new MockMembrane());
+    const agent = f.getAgent('resident')!;
+    agent.getContextManager().addMessage('user', [{ type: 'text', text: 'the newest exchange' }]);
+    const i = f as unknown as {
+      pendingRequests: Array<{ reason?: string; openingMessages?: string[] }>;
+      routingOf(name: string): { openingMessages?: string[] };
+      quarantinePoisonedHistory(agent: unknown, reason: string): void;
+    };
+    i.routingOf('resident').openingMessages = ['m-opening'];
+    i.quarantinePoisonedHistory(agent, 'the provider refused the request');
+    const woke = i.pendingRequests.filter((r) => r.reason === 'inference-failure-rewind-retry');
     assert.deepEqual(woke.map((r) => r.openingMessages), [['m-opening']]);
   });
 

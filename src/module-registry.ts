@@ -727,12 +727,13 @@ export class ModuleRegistry {
    * `text` to someone. Resolves, once every module has answered or
    * SPEECH_RECEIPT_WAIT_MS has passed, to the places they named, in module
    * registration order. A module that throws, answers after the wait, is
-   * replaced while asked, or names no place (`{}`, "can't tell") names none.
+   * removed or replaced before it answers, or names no place (`{}`, "can't
+   * tell") names none.
    */
   async askSpeechRouted(agentName: string, text: string, context: SpeechRoutedContext): Promise<string[]> {
     const asked = [...this.modules.values()].filter((module) => module.onSpeechRouted)
       .map((module) => ({ module, registration: this.moduleContexts.get(module.name) }));
-    const answers = await Promise.all(asked.map(({ module }) => new Promise<unknown>((resolve) => {
+    const answers = await Promise.all(asked.map(({ module, registration }) => new Promise<unknown>((resolve) => {
       let settled = false;
       let call: Promise<unknown>;
       try {
@@ -752,7 +753,9 @@ export class ModuleRegistry {
         }
         settled = true;
         clearTimeout(timer);
-        resolve(answer);
+        // Judged as it arrives: a module still registered when it answers
+        // names its place, even if it's removed while others are asked.
+        resolve(this.moduleContexts.get(module.name) === registration ? answer : undefined);
       }, (error: unknown) => {
         console.error(`Speech-routed module ${module.name} error${settled ? ' after the wait' : ''}:`, error);
         if (settled) return;
@@ -762,9 +765,7 @@ export class ModuleRegistry {
       });
     })));
     const places: string[] = [];
-    answers.forEach((answer, i) => {
-      const { module, registration } = asked[i]!;
-      if (this.moduleContexts.get(module.name) !== registration) return;
+    answers.forEach((answer) => {
       const named = (answer as { sentTo?: unknown } | null | undefined)?.sentTo;
       const flat = typeof named === 'string' ? oneLine(named).replace(/\s+/g, ' ').trim() : '';
       if (!flat) return;

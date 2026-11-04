@@ -210,7 +210,9 @@ export interface Module {
    * ends with its reply or a tool, the turn's receipt and the agent's next
    * turn wait for every answer up to that bound, so answer from what the
    * module already holds rather than after a round trip. A turn that fails
-   * or is stopped writes no receipt and doesn't wait.
+   * or is stopped writes no receipt and doesn't wait. A turn that had
+   * finished when `stop()` began still routes its speech, and `stop()` waits
+   * for those answers up to the bound.
    */
   onSpeechRouted?(
     agentName: string,
@@ -794,9 +796,10 @@ export interface SpeechRoutedContext {
    * continuation, and this is still the one that started it. `messages`
    * are the messages added by the module answers whose wakes the turn took,
    * and, for a turn the framework queued to carry another on (a `!`
-   * continuation, an autoContinue run, a bounce's wake), the messages that
-   * opened that turn, each as its stored id or a held write's handle, either
-   * of which a module context's `getMessage` takes.
+   * continuation, an autoContinue run, a bounce's wake, or a retry on a
+   * history rewound after a refusal, an unstick or an inference failure),
+   * the messages that opened that turn, each as its stored id or a held
+   * write's handle, either of which a module context's `getMessage` takes.
    */
   openedBy?: {
     reason: string;

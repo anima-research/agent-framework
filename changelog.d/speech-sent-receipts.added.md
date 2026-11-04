@@ -15,7 +15,9 @@
   never asked about. Answer from what the module already holds: for a turn
   that ends with its reply or a tool, the turn's receipt and the agent's next
   turn wait for every answer up to the bound. A turn that fails or is
-  stopped writes no receipt and doesn't wait.
+  stopped writes no receipt and doesn't wait. A turn that had finished when
+  `stop()` began still routes its speech, and `stop()` waits for those
+  answers up to the bound.
 - `SpeechRoutedContext`: `final` (the turn's final reply: its speech after
   its last tool call, a refused XML attempt or a call cut off unrun being
   none), `turnId`, and
@@ -23,5 +25,6 @@
   context-budget restart, with `messages`: the messages added by the module
   answers whose wakes the turn took, and, for a turn the framework queued to
   carry another on (a `!` continuation, an autoContinue run, a bounce's
-  wake), the messages that opened that turn, as stored ids or held-write
-  handles that a module context's `getMessage` reads.
+  wake, or a retry on a history rewound after a refusal, an unstick or an
+  inference failure), the messages that opened that turn, as stored ids or
+  held-write handles that a module context's `getMessage` reads.
