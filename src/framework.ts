@@ -6225,12 +6225,12 @@ export class AgentFramework {
   }
   /**
    * Wakes the framework holds for `agentName` that need no new event: a
-   * request already queued for it (it runs as soon as the agent is free, or
-   * only may, when each queued request names messages written to the agent's
-   * window and nothing else, since the scheduler drops one whose messages the
-   * agent has answered by then) and
-   * turns a provider cooldown holds until its end. The reply judge is told of
-   * them beside the gate's own timers, so it can weigh what waiting costs.
+   * request already queued for it, which runs as soon as the agent is free,
+   * and turns a provider cooldown holds until its end. Either only may wake
+   * the agent when each request names messages written to the agent's window
+   * and nothing else, since the scheduler drops one whose messages the agent
+   * has answered by then. The reply judge is told of them beside the gate's
+   * own timers, so it can weigh what waiting costs.
    */
   private upcomingWakesFor(agentName: string): import('./gate/types.js').UpcomingWake[] {
     const wakes: import('./gate/types.js').UpcomingWake[] = [];
@@ -6244,7 +6244,7 @@ export class AgentFramework {
     }
     const cooldown = this.providerAccelerationCooldowns.get(agentName);
     if (cooldown && cooldown.heldRequests.length > 0 && Number.isFinite(cooldown.until)) {
-      wakes.push({ at: cooldown.until, certain: true, what: cooldown.rearm
+      wakes.push({ at: cooldown.until, certain: cooldown.heldRequests.some((r) => !this.mayDropAnswered(r)), what: cooldown.rearm
         ? `a turn whose retries ran out, sent again (${cooldown.rearm.number} of ${cooldown.rearm.of})`
         : 'a turn held by a provider cooldown, when it ends' });
     }

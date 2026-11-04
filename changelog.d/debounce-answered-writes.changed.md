@@ -1,8 +1,9 @@
-- A batched wake's `[Gate: …]` line, for a batch whose every event the host
-  wrote to the delivery agent's window (`after`, with its message's id), is
-  written at the first fresh start after the batch fires of any agent that
-  reads that window, whatever woke that agent, not when the batch fires, and
-  it names only the events not yet answered then. A batch answered by then
+- A batched wake's `[Gate: …]` line, for a batch that wakes an agent and
+  whose every event the host wrote to the delivery agent's window (`after`,
+  with its message's id), is written at the first fresh start after the
+  batch fires of any agent that reads that window, whatever woke that agent,
+  not when the batch fires, and it names only the events not yet answered
+  then. A batch answered by then
   leaves no line, and residents who share the window still wake for it and
   find none, where a line was written when the batch fired before. The lines
   owed to one start are written as one `[Gate: N events matched]` line: its

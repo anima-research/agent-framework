@@ -15,11 +15,12 @@
   round read; an event the host gave no message of its own keeps the wake.
   This covers MCPL channel messages and pushes, those routed to a
   conversation fork included, heartbeat ticks and reminders, and module
-  events whose response adds exactly one message, where neither the event
-  nor the message names a channel and the event isn't an `external-message`
-  or `api:message`; any other module response keeps the wake. A judge rule's
-  batch is judged so too where no judge decided it (none wired, or one that
-  failed, timed out or made no call, with `onError: "wake"`), and on a reply
+  events whose response adds exactly one message, where neither the event's
+  metadata nor the message's names a channel and the event isn't an
+  `external-message` or `api:message`; any other module response keeps the
+  wake. A judge rule's batch is judged so too where no judge decided it (none
+  wired, or one that failed, timed out or made no call, with
+  `onError: "wake"`), and on a reply
   verdict, except for an event the gate's `isAnswered` counts as answered
   when the judge answers. AgentFramework's counts one in a request the agent
   had already answered, whether or not it had published there, and one whose

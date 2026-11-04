@@ -699,8 +699,10 @@ export interface InferenceRequest {
   wakeAt?: number;
   /** Batched-wake lines the gate handed to this wake rather than wrote
    *  (WakeLine), decided by fresh starts as WakeLine says, each written once
-   *  into the window it names. A retry, or a start that resumes a logical
-   *  turn, decides none. */
+   *  into the window it names. A later attempt of a start, or a start that
+   *  resumes a logical turn, decides none. A retry the scheduler starts
+   *  again, such as a provider hold's release, is a fresh start and decides
+   *  them as one. */
   wakeLines?: WakeLine[];
   /** Suppress every automatic plain-prose delivery for this logical turn.
    * Explicit tool calls remain available. Used by authenticated silent wakes. */

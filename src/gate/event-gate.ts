@@ -4194,11 +4194,12 @@ export class EventGate {
     // nothing the message right above doesn't. But the turn compiles later,
     // and what lands in between puts the message above other entries, so the
     // gate hands the line to the wake (WakeProvenance.lines) and a turn's start
-    // decides it (WakeLine), as it does for a batch whose every event has a
-    // write (isWrite).
+    // decides it (WakeLine), as it does for a batch that wakes an agent and
+    // whose every event has a write (isWrite).
+    const recipients = this.getAgentNamesFn();
     const only = events.length === 1 && events[0].inContext ? events[0] : undefined;
     const handed = this.isNewestEntryFn !== undefined
-      && (events.every((e) => isWrite(e.after)) || (only !== undefined && this.newestEntry(only)));
+      && ((recipients.length > 0 && events.every((e) => isWrite(e.after))) || (only !== undefined && this.newestEntry(only)));
     if (!handed) {
       this.addMessageFn('user', [{ type: 'text', text: wakeLineText(lines, Date.now()) }], {
         source: 'gate:debounce',
@@ -4215,7 +4216,7 @@ export class EventGate {
     // any traffic. Ambient-only batches set no locus.
     const chosen = wakeProvenance(events);
     const provenance = handed ? { ...chosen, lines } : chosen;
-    for (const agentName of this.getAgentNamesFn()) {
+    for (const agentName of recipients) {
       this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
     }
   }

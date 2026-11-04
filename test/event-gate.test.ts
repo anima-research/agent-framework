@@ -1458,6 +1458,18 @@ describe('a batched wake writes its line only when it says something', () => {
     }
   });
 
+  it('a batch whose every event has a write but that wakes no agent gets its line written when it fires', () => {
+    const { gate, messages, inferenceRequests } = makeGate(config('written-no-recipient.json'), { isNewestEntry: () => false, agentNames: [] });
+    for (const [content, messageId, row] of [['a', 'm1', 'row-1'], ['b', 'm2', 'row-2']]) {
+      gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content,
+        metadata: { messageId } }), { agent: 'agent', messageId: row });
+    }
+    fire(gate, 'chat');
+    assert.strictEqual(inferenceRequests.length, 0, 'premise: nobody is woken');
+    assert.strictEqual(messages.length, 1, 'the line is written, with no start to owe it to');
+    assert.match((messages[0]!.content as Array<{ text: string }>)[0]!.text, /^\[Gate: 2 events matched\]/);
+  });
+
   it('a batch with an event the host gave no filled write is mixed: its whole line is written when it fires', () => {
     const { gate, messages, inferenceRequests } = makeGate(config('mixed-unfilled.json'), { isNewestEntry: () => false });
     gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'a',

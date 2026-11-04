@@ -7,7 +7,7 @@ import type { EventGate } from '../src/gate/event-gate.js';
 import { fixture, eventually } from './helpers/coalescing-fixture.js';
 import { incoming, registerOpen, MENTION } from './helpers/admission.js';
 import { GateModule, waitCall, say } from './helpers/dendrite.js';
-import { MockYieldingStream } from './helpers/mock-membrane.js';
+import { MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 
 class ReminderModule extends GateModule {
   override async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
@@ -16,6 +16,22 @@ class ReminderModule extends GateModule {
       addMessages: [{ participant: 'user', content: [{ type: 'text', text: String((event as unknown as { content: string }).content) }] }],
       requestInference: true,
     };
+  }
+}
+
+class EndingModule extends ReminderModule {
+  ended = false;
+
+  override getTools() {
+    return [...super.getTools(), { name: 'end', description: 'End the turn', inputSchema: { type: 'object' as const, properties: {} } }];
+  }
+
+  override async handleToolCall(call: Parameters<ReminderModule['handleToolCall']>[0]) {
+    if (call.name === 'end' || call.name.endsWith('--end')) {
+      this.ended = true;
+      return { success: true, data: { ended: true }, endTurn: true };
+    }
+    return super.handleToolCall(call);
   }
 }
 
@@ -75,8 +91,7 @@ function fire(f: Fixture) {
     gate.fireDebounce(name);
   }
 }
-async function setup(debounce = 200, failing = false, beforeComplete?: (f: Fixture) => Promise<void>, agents?: unknown[]) {
-  const module = new ReminderModule();
+async function setup(debounce = 200, failing = false, beforeComplete?: (f: Fixture) => Promise<void>, agents?: unknown[], module: ReminderModule = new ReminderModule()) {
   const f = await fixture({ agents, framework: {
     modules: [module],
     errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
@@ -503,6 +518,7 @@ describe('debounced writes already read and answered', () => {
         await send(f, 'channel');
         await eventually(() => deferred(f, 'new event'), 'event deferred');
         fire(f);
+        assert.equal(gateOf(f).inferenceDiagnostics().bufferedEvents, 1, 'premise: the batch fired during the turn is held for it');
         module.release('first');
         await eventually(() => publishing, 'final publication started');
         if (outcome === 'disposes') {
@@ -523,6 +539,49 @@ describe('debounced writes already read and answered', () => {
           assert.equal(f.membrane.calls.length, 2, 'failed publication leaves a chance to reply');
         }
         assert.equal(gateOf(f).inferenceDiagnostics().bufferedEvents, 0, 'no batch stays wedged');
+      } finally { release(); await f.close(); }
+    });
+  }
+
+  for (const proseRouting of ['locus', 'hybrid'] as const) {
+    it(`${proseRouting}: a turn a tool ends is judged after its final publication, so its answered channel batch starts no second call`, async () => {
+      const module = new EndingModule();
+      const { f, start } = await setup(60_000, false, undefined, [{ name: 'agent', model: 'test', systemPrompt: 'test', proseRouting }], module);
+      const wakes = recordWakes(f);
+      const ending = createMockResponse([{ type: 'text', text: 'answered' }, { type: 'tool_use', id: 'call-end', name: 'test--end', input: {} }], 'tool_use');
+      let calls = 0;
+      (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
+        f.membrane.calls.push(request);
+        return new MockYieldingStream(calls++ === 0 ? [waitCall('first'), ending] : [say('fresh turn')], true);
+      };
+      const registry = (f.framework as unknown as {
+        channelRegistry: { routeSpeech: (...args: unknown[]) => Promise<unknown> };
+      }).channelRegistry;
+      const original = registry.routeSpeech.bind(registry);
+      let publishing = false;
+      let release!: () => void;
+      const wait = new Promise<void>((resolve) => { release = resolve; });
+      registry.routeSpeech = async (...args) => {
+        if (!publishing) {
+          publishing = true;
+          await wait;
+        }
+        return original(...args);
+      };
+      try {
+        const { loop } = await start();
+        await send(f, 'channel');
+        await eventually(() => deferred(f, 'new event'), 'event deferred');
+        fire(f);
+        assert.equal(gateOf(f).inferenceDiagnostics().bufferedEvents, 1, 'premise: the batch fired during the turn is held for it');
+        module.release('first');
+        await eventually(() => module.ended && publishing, 'the tool ended the turn with its reply still publishing');
+        release();
+        await loop;
+        await f.framework.runUntilIdle();
+        assert.deepEqual(wakes, [{ agentName: 'agent', lines: 1 }], 'the batch requested its wake, handing on its line');
+        assert.ok(f.published.some((p) => p.channelId === 'work'), 'premise: the held publication reached the channel');
+        assert.equal(f.membrane.calls.length, 1, 'judged after the publication, the wake is dropped');
       } finally { release(); await f.close(); }
     });
   }
@@ -921,6 +980,27 @@ describe("what the judge is told of the framework's queued wakes", () => {
         [{}],
         [maybe, {}],
       ]) assert.deepEqual(told(internal, queued), [true], JSON.stringify(queued));
+    } finally { await f.close(); }
+  });
+
+  it('a turn a provider cooldown holds is a maybe when the scheduler could drop each held request, and certain otherwise', async () => {
+    const { f } = await judged(true);
+    try {
+      const internal = f.framework as unknown as Internal & {
+        recordProviderWait(agentName: string, model: string, error: Error): unknown;
+        holdForProviderWait(agent: unknown, wait: unknown, requests: unknown[]): boolean;
+        providerAccelerationCooldowns: Map<string, { heldRequests: unknown[] }>;
+        getAgent(name: string): unknown;
+      };
+      const wait = internal.recordProviderWait('agent', 'test-model', new MembraneError({
+        type: 'rate_limit', retryable: true, retryAfterMs: 60_000, message: 'slow down', rawError: { status: 429 },
+      }));
+      const droppable = { agentName: 'agent', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), readsWakeLines: true, wakeLines: [line({ agent: 'agent', messageId: 'row-1' })] };
+      assert.ok(internal.holdForProviderWait(internal.getAgent('agent'), wait, [droppable]), 'premise: the cooldown holds the wake');
+      const cooldownTold = () => internal.upcomingWakesFor('agent').filter((w) => w.what.includes('provider cooldown')).map((w) => w.certain);
+      assert.deepEqual(cooldownTold(), [false], 'a held wake the scheduler could drop on release');
+      internal.providerAccelerationCooldowns.get('agent')!.heldRequests.push({ agentName: 'agent', reason: 'test', source: 'test', timestamp: Date.now() });
+      assert.deepEqual(cooldownTold(), [true], 'beside a held request it can never drop');
     } finally { await f.close(); }
   });
 });
