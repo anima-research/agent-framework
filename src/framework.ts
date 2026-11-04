@@ -20548,6 +20548,7 @@ export class AgentFramework {
     privateThink: boolean,
     round: ProseRound,
     at: { target: ChannelRef | null; when: number | 'end' | 'turn' },
+    finalFrom = 0,
   ): boolean {
     if (segments.length === 0) return false;
     const routing = round.routing;
@@ -20566,7 +20567,7 @@ export class AgentFramework {
       return false;
     }
     const note = at.target ? `written for ${this.channelShown(at.target)}` : undefined;
-    return this.holdProseDrafts(agent, segments.map((text) => ({ text, ...(note ? { note } : {}) })), 'explicit-send', {
+    return this.holdProseDrafts(agent, segments.map((text, index) => ({ text, ...(note ? { note } : {}), ...(index < finalFrom ? { final: false } : {}) })), 'explicit-send', {
       ...round,
       because: this.sendHoldText(cause, at.target, at.when),
       ...(at.target ? { target: at.target } : {}),
@@ -20596,7 +20597,7 @@ export class AgentFramework {
     // (`{{unsent}}` under the re-bounce rule, unsentWords), not its routing
     // syntax, and where it was going stays with it as a note.
     let privateCount = 0;
-    type Part = { text: string; note?: string; inheritedRisk?: InheritedRisk; deliberate?: boolean };
+    type Part = { text: string; note?: string; inheritedRisk?: InheritedRisk; deliberate?: boolean; final?: boolean };
     const runs: Array<{ hold: SendHold; target: ChannelRef | null; parts: Part[] }> = [];
     const hold = (sendHold: SendHold, target: ChannelRef | null, part: Part): void => {
       const last = runs.at(-1);
@@ -20665,7 +20666,7 @@ export class AgentFramework {
             await this.deliverHybridEnvelope(agent, routed[index]!, locus, true, segmentRound);
             continue;
           }
-          hold(sendHold, target, { text: envelope, ...(target ? { note: `written for ${this.channelShown(target)}` } : {}) });
+          hold(sendHold, target, { text: envelope, ...(target ? { note: `written for ${this.channelShown(target)}` } : {}), ...(segmentIndex < finalFrom ? { final: false } : {}) });
         }
       }
     }
@@ -20721,13 +20722,10 @@ export class AgentFramework {
    * presents mid-turn injections. Otherwise the turn-end receipt names them
    * (or, after a crash, the next turn's catch-up). Drafts the journal cannot
    * hold are reported in the receipt: their words remain in history only.
-   * Unless `opts.ask` is false, the modules are asked about each held text
-   * but a `deliberate` one (Module.onSpeechRouted), and the receipt names
-   * the places they answer.
    */
   private holdProseDrafts(
     agent: Agent,
-    texts: Array<string | { text: string; note?: string; inheritedRisk?: InheritedRisk; deliberate?: boolean }>,
+    texts: Array<string | { text: string; note?: string; inheritedRisk?: InheritedRisk; deliberate?: boolean; final?: boolean }>,
     reason: DraftReason,
     opts: { routing: TurnRouting; note?: string; notice: 'now' | 'later'; because?: string; target?: ChannelRef; final?: true; ask?: false },
   ): Draft[] {
@@ -20738,9 +20736,10 @@ export class AgentFramework {
       .filter((t) => t.text.trim().length > 0);
     if (segments.length === 0) return [];
     if (opts.ask !== false) {
-      const round: ProseRound = { routing: opts.routing, notice: opts.notice, ...(opts.final ? { final: true } : {}) };
       for (const t of texts) {
         const plain = typeof t === 'string' ? t : t.deliberate ? '' : t.text;
+        const final = typeof t === 'string' ? opts.final : t.final ?? opts.final;
+        const round: ProseRound = { routing: opts.routing, notice: opts.notice, ...(final ? { final: true } : {}) };
         if (plain.trim()) (opts.routing.asking ??= []).push(this.askSpeechRouted(agent, round, plain));
       }
     }
@@ -26999,7 +26998,7 @@ export class AgentFramework {
                 );
                 if (segments.length > 0) {
                   const cause = trailingSilence === 'private' ? 'private' : thinkPrivate ? 'kept' : sendHold ?? 'private';
-                  closingHeld = this.holdSilencedProse(agent, runs, cause, thinkPrivate, trailingHold, { target: resolveTurnLocus(), when: trailingWhen });
+                  closingHeld = this.holdSilencedProse(agent, runs, cause, thinkPrivate, trailingHold, { target: resolveTurnLocus(), when: trailingWhen }, finalFrom);
                 }
               } else if (thinkPrivate) {
                 thinkHeld();
@@ -32966,9 +32965,6 @@ export class AgentFramework {
     );
 
     // Retry immediately on the repaired history (bounded by the cap above).
-    // The failed turn's routing is still the agent's latest: this runs in
-    // its inference:exhausted trace. Optional, since a framework built from
-    // its prototype, as some suites build one, has no map of routings.
     const opening = this.turnRouting?.get(agent.name)?.openingMessages;
     this.pendingRequests.push({
       agentName: agent.name,

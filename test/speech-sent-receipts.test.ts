@@ -970,6 +970,35 @@ describe('plain speech a module says it showed', () => {
     assert.ok(!surface.asked.some((a) => a.text.includes('More for the room.')), 'the >>> envelope is an explicit send');
   });
 
+  for (const hybrid of [false, true]) {
+    it(`where tool rounds aren't routed live, a send that held the turn's speech asks about a round's prose as a round's and only the reply as the final speech${hybrid ? ', under hybrid routing' : ''}`, async (t) => {
+      t.mock.method(console, 'error', () => {});
+      const surface = new Surface();
+      const membrane = new WithoutRoundContent();
+      const send = { type: 'tool_use', id: 'p1', name: 'channel_publish', input: { channelId: 'room', content: 'A note.' } } as ContentBlock;
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Looking around.' }, send], 'tool_use'));
+      membrane.pushResponse({
+        ...createMockResponse([
+          { type: 'text', text: 'Looking around.' },
+          send,
+          { type: 'tool_result', toolUseId: 'p1', content: 'posted' },
+          { type: 'text', text: 'Nothing here.' },
+        ] as ContentBlock[]),
+        toolCalls: [],
+        rawAssistantText: 'Nothing here.',
+      } as NormalizedResponse);
+      const f = await host([surface], membrane, hybrid ? { proseRouting: 'hybrid' } : {});
+      await channelTurn(f, true);
+      await f.runUntilIdle();
+      const held = openDrafts(f).map((d) => d.text);
+      assert.ok(held.some((d) => d.includes('Looking around.')) && held.some((d) => d.includes('Nothing here.')), `premise: the send held both: ${JSON.stringify(held)}`);
+      assert.deepEqual(askedTexts(surface), [
+        { text: 'Looking around.', final: false },
+        { text: 'Nothing here.', final: true },
+      ]);
+    });
+  }
+
   it("explicit routing asks no module about speech it holds or bounces, since it writes no receipt", async (t) => {
     t.mock.method(console, 'error', () => {});
     const surface = new Surface();
@@ -1028,6 +1057,21 @@ describe('plain speech a module says it showed', () => {
     await turn(f);
     assert.equal(notices(f).length, 1);
     assert.ok(notices(f)[0]!.includes('if another surface showed it'), 'a module that failed may have shown it');
+    assert.ok(errors.some((e) => e.startsWith('Speech-routed module console error:') && e.includes('console broke')), errors.join('\n'));
+  });
+
+  it("a module whose answer throws when its place is read counts as having shown nothing, and another module's place still counts", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const surface = new Surface();
+    surface.answer = { get sentTo(): unknown { throw new Error('console broke'); } };
+    const other = new Surface('other');
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi there.' }]));
+    const f = await host([surface, other], membrane);
+    await turn(f);
+    assert.deepEqual(notices(f), []);
+    assert.equal(receipt(f), `[delivered] plain speech → sent to ${SENT_TO} · this turn's routing posted it to no channel`);
     assert.ok(errors.some((e) => e.startsWith('Speech-routed module console error:') && e.includes('console broke')), errors.join('\n'));
   });
 

@@ -205,11 +205,13 @@ export interface Module {
    *   with no channel writes no `[send-undeliverable]` notice for it;
    * - `{}` otherwise: it can't say the text reached someone, as for a turn
    *   none of its surfaces opened. A turn with no channel's notice then
-   *   still says another surface may have shown it.
+   *   still says another surface may have shown it. A piece held as a draft
+   *   gets no such notice, since it's named as a draft.
    *
-   * Asked as the turn routes each piece of its plain speech, or holds it as
-   * a draft, in the order it routes the pieces, under prose routing by
-   * locus, hybrid or locked on a host with a channel registry. Never asked
+   * Asked as the turn routes each piece of its plain speech, in the order it
+   * routes them, or holds one as a draft, which can be after later pieces
+   * have routed, under prose routing by locus, hybrid or locked on a host
+   * with a channel registry. Never asked
    * about private envelopes or words kept private, explicit sends (prefixed
    * envelopes included) or their own words held as drafts, a turn under
    * explicit routing, which writes no receipt, or an ephemeral run's unheld
@@ -217,9 +219,9 @@ export interface Module {
    * hasn't answered within `SPEECH_RECEIPT_WAIT_MS`, names no place, as `{}`
    * does. For a turn that ends with its reply or a tool, the turn's receipt
    * and the agent's next turn wait for every answer, each piece's up to that
-   * bound, and a piece with no channel waits for its answers before the next
-   * piece routes, so a turn of several such pieces can wait that long for
-   * each. Answer from what the module already holds rather than after a
+   * bound, and a routed piece with no channel waits for its answers before
+   * the next piece routes, so a turn of several such pieces can wait that
+   * long for each; only the turn's receipt waits for a held piece's answers. Answer from what the module already holds rather than after a
    * round trip. A turn that fails or is stopped writes no receipt and
    * doesn't wait. A turn that had finished when `stop()` began still routes
    * its speech, and `stop()` waits for those answers in the same way.

@@ -106,10 +106,11 @@ export const TOOL_BATCH_HOOK_TIMEOUT_MS = 30_000;
 /**
  * How long the modules' answers about one piece of plain speech a turn
  * routes (Module.onSpeechRouted), all asked at once, are waited for: by the
- * piece itself when it has no channel, and by the turn's receipt. A piece's
- * own channel post never waits for its answers; pieces route in order, so a
- * post that follows a piece with no channel waits behind that piece's
- * answers, only while a module hasn't answered.
+ * piece itself when it routes with no channel, and by the turn's receipt. A
+ * piece's own channel post never waits for its answers; pieces route in
+ * order, so a post that follows a routed piece with no channel waits behind
+ * that piece's answers, only while a module hasn't answered. A piece held as
+ * a draft is waited for only by the receipt.
  */
 export const SPEECH_RECEIPT_WAIT_MS = 5_000;
 
@@ -754,7 +755,7 @@ export class ModuleRegistry {
       let settled = false;
       let call: Promise<unknown>;
       try {
-        call = Promise.resolve(module.onSpeechRouted!(agentName, text, context));
+        call = Promise.resolve(module.onSpeechRouted!(agentName, text, context)).then((answer) => (answer as { sentTo?: unknown } | null | undefined)?.sentTo);
       } catch (error) {
         call = Promise.reject(error);
       }
@@ -770,8 +771,6 @@ export class ModuleRegistry {
         }
         settled = true;
         clearTimeout(timer);
-        // Judged as it arrives: a module still registered when it answers
-        // names its place, even if it's removed while others are asked.
         resolve(this.moduleContexts.get(module.name) === registration ? answer : undefined);
       }, (error: unknown) => {
         console.error(`Speech-routed module ${module.name} error${settled ? ' after the wait' : ''}:`, error);
@@ -782,8 +781,7 @@ export class ModuleRegistry {
       });
     })));
     const places: string[] = [];
-    answers.forEach((answer) => {
-      const named = (answer as { sentTo?: unknown } | null | undefined)?.sentTo;
+    answers.forEach((named) => {
       const flat = typeof named === 'string' ? oneLine(named).replace(/\s+/g, ' ').trim() : '';
       if (!flat) return;
       places.push(markedTexts([flat.length > SPEECH_PLACE_MAX ? `${safeSlice(flat, 0, SPEECH_PLACE_MAX)}…` : flat])[0]!);

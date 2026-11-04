@@ -10,8 +10,8 @@
   that place in its receipt, and the failed post keeps its own notice. This
   holds under prose routing by locus, hybrid and locked, for each tool round's
   prose as it routes and for the final reply.
-- **Residents:** speech with no channel that no module says it showed still
-  gets `[send-undeliverable]`, which now names the piece by its opening words,
+- **Residents:** speech routed with no channel that no module says it showed
+  still gets `[send-undeliverable]`, which now names the piece by its opening words,
   quoted: `Your plain speech "<opening>" (<n> chars) had no channel to go to
   …`, where it said "Your previous reply (<n> chars)". A long piece's opening
   is cut at the last word within 40 characters, or inside a first word longer
