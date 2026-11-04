@@ -172,6 +172,39 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     });
   });
 
+  it("a dropped connection's channel is named with why in a no-locus notice, where it was advised a send while up", async () => {
+    // A drop empties the connection's grant until the next transport's, so
+    // the registry refuses a send there before anything goes out, and the
+    // notice names the server's state in place of advising one.
+    writeFileSync(FLAG_FILE, '');
+    connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);
+    connection.establishGrant(new CapabilityGrant(new Set(['channels.publish']), []));
+    const failures: Array<{ reason: string }> = [];
+    const registry = new ChannelRegistry(
+      { getServer: () => connection } as never,
+      {} as never,
+      () => {},
+      () => {},
+      { onRouteFailure: (info: { reason: string }) => { failures.push(info); } },
+    );
+    await registry.handleChanged('flaky', {
+      added: [{ id: 'room', type: 'text', label: '#room', direction: 'bidirectional' }],
+    } as never);
+    const room = { channel: { serverId: 'flaky', channelId: 'room' }, shown: '#room' };
+    const came = 'this turn came from #room, and no channel was chosen for its reply; ';
+    assert.equal(await registry.routeSpeech('linn', 'hi', null, { cameFrom: [room] }), null);
+    assert.equal(failures.at(-1)?.reason, came + 'to reply there, send your reply to that channel explicitly', 'premise: up, it is advised a send');
+    // The server stays down after this crash, so the connection keeps retrying.
+    rmSync(FLAG_FILE);
+    connection.sendToolsList().catch(() => {});
+    await waitFor(() => !connection!.isConnected, 5000, 'transport drop');
+    assert.strictEqual(connection.willReconnect, true);
+    assert.deepStrictEqual(connection.grant.effectiveList(), [], 'the drop emptied the grant');
+    assert.equal(await registry.routeSpeech('linn', 'hi', null, { cameFrom: [room] }), null);
+    assert.equal(failures.at(-1)?.reason, came +
+      '#room can\'t take a send: the "flaky" server isn\'t connected, and this host is reconnecting to it, so try again later');
+  });
+
   it('holds a reconnected transport\'s control traffic, not only its data, until the host opens the planes', async () => {
     writeFileSync(FLAG_FILE, '');
     connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);
