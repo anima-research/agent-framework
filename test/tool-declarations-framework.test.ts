@@ -358,6 +358,47 @@ describe('toolDeclarations in the framework', () => {
       });
     });
 
+    it("declares to a host's shared child on its parent's head what its parent's change rows say that it doesn't hold, in both directions", async () => {
+      const readTools = (request: { tools?: ToolDefinition[]; messages: readonly NormalizedMessage[] }) => {
+        const names = new Set((request.tools ?? []).map((t) => t.name));
+        for (const block of request.messages.flatMap((m) => m.content) as Array<{ type: string; removeTools?: string[]; defineTools?: ToolDefinition[] }>) {
+          if (block.type !== 'system_change') continue;
+          for (const name of block.removeTools ?? []) names.delete(name);
+          for (const t of block.defineTools ?? []) names.add(t.name);
+        }
+        return [...names].sort();
+      };
+      for (const [parentTools, childTools] of [[[tool('a'), tool('b')], [tool('a')]], [[tool('a')], [tool('a'), tool('b')]]] as const) {
+        await withFramework([resident('alpha')], async (framework) => {
+          const alpha = framework.getAgent('alpha')!;
+          say(alpha, 'user', 'hello');
+          await alpha.buildActivationRequest([...childTools]);
+          await alpha.buildActivationRequest([...parentTools]);
+          assert.equal(storedChanges(alpha, 'alpha'), 1, "the premise: the parent's change is stored");
+          const { name: _name, ...spec } = taskForkSpec('host-child', { parent: 'alpha', inherit: { mode: 'shared' } });
+          const { agent: child } = await framework.createEphemeralAgent({ ...resident('host-child'), systemPrompt: 'You are alpha.' } as never, spec);
+          const request = await child.buildActivationRequest([...childTools]);
+          assert.deepEqual(readTools(request), childTools.map((t) => t.name).sort(), `with ${parentTools.length} tools on its parent's branch, the model reads the child's own`);
+        });
+      }
+    });
+
+    it("shows none of its parent's change rows in a dry move of a host's shared child to a head of its own", async () => {
+      await withFramework([{ ...resident('alpha'), selfParticipants: ['alpha-old'] }], async (framework) => {
+        const alpha = framework.getAgent('alpha')!;
+        say(alpha, 'user', 'hello');
+        await alpha.buildActivationRequest([tool('a')]);
+        await alpha.buildActivationRequest([tool('a'), tool('b')]);
+        alpha.getContextManager().addMessage('system', [{ type: 'system_change', defineTools: [tool('o')] }] as never, systemChangeMetadata('alpha-old') as never);
+        const { name: _name, ...spec } = taskForkSpec('host-child', { parent: 'alpha', inherit: { mode: 'shared' } });
+        const { agent: child } = await framework.createEphemeralAgent({ ...resident('host-child'), systemPrompt: 'You are the child.' } as never, spec);
+        assert.equal(storedChanges(child, 'alpha') + storedChanges(child, 'alpha-old'), 2, "the premise: the child's branch holds both of its parent's rows");
+        const request = await child.buildActivationRequest([tool('c')], undefined, undefined, undefined, { dryRun: true });
+        assert.deepEqual(changesIn(request.messages), [], "none of its parent's rows, under either of its names");
+        assert.equal(storedChanges(child, 'alpha') + storedChanges(child, 'alpha-old'), 2, 'and a dry run stores nothing');
+      });
+    });
+
     it("sends its parent's added block once to a host's shared child at a checkpoint (atSequence) with its parent's prompt, tools and block", async () => {
       await withFramework([resident('alpha')], async (framework) => {
         const alpha = framework.getAgent('alpha')!;

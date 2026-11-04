@@ -411,3 +411,96 @@ describe("a resumed 'head' job", () => {
     });
   }
 });
+
+describe("a derived agent's change rows, its source's among them", () => {
+  let tempDir: string;
+  let membrane: RoutedMembrane;
+  let gates: GateModule;
+  let framework: AgentFramework;
+  const tool = (name: string) => ({ name, description: name, inputSchema: { type: 'object' as const, properties: {} } });
+  const change = (name: string) => [{ type: 'system_change', defineTools: [tool(name)] }] as never;
+  /** The tools a request's change rows define. */
+  const defined = (messages: ReadonlyArray<{ content: unknown }>): string[] =>
+    messages.flatMap((m) => (m.content as Array<{ type: string; defineTools?: Array<{ name: string }> }>)
+      .filter((b) => b.type === 'system_change').flatMap((b) => (b.defineTools ?? []).map((t) => t.name)));
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'dendrite-fork-view-owners-'));
+    membrane = new RoutedMembrane();
+    membrane.identify = (request) => {
+      const sent = JSON.stringify(request.messages);
+      if (sent.includes('[GRANDCHILD-FRAMING]')) return 'g';
+      if (sent.includes('[FORK-FRAMING]')) return 'c';
+      return request.assistantParticipant ?? '';
+    };
+    gates = new GateModule();
+    framework = await AgentFramework.create({
+      storePath: join(tempDir, 'store.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'mira', model: 'test-model', systemPrompt: 'You are mira.', selfParticipants: ['mira-old'], toolDeclarations: 'entries' }],
+      modules: [gates],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    });
+    const mira = framework.getAgent('mira')!;
+    mira.getContextManager().addMessage('user', [text('Please look into the open issues.')]);
+    await mira.buildActivationRequest([]);
+    mira.getContextManager().addMessage('system', change('b'), systemChangeMetadata('mira') as never);
+    mira.getContextManager().addMessage('system', change('o'), systemChangeMetadata('mira-old') as never);
+  });
+  const holdsBoth = (names: string[]) => names.includes('b') && names.includes('o');
+  const holdsNeither = (names: string[]) => !names.includes('b') && !names.includes('o');
+
+  afterEach(async () => {
+    try { await framework.stop(); } catch { /* already stopped */ }
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  /** A host's shared child `c` of mira, and `g` of `c` made while `c` runs: `g` shared too, or a copy `deriveAgent` makes. */
+  async function childAndGrandchild(copy = false) {
+    const { name: _c, ...cSpec } = taskForkSpec('c', { parent: 'mira', inherit: { mode: 'shared' } });
+    const c = await framework.createEphemeralAgent({ name: 'c', model: 'test-model', systemPrompt: 'You are mira.', toolDeclarations: 'entries' }, cSpec);
+    c.contextManager.addMessage('user', [text(FRAMING)]);
+    framework.start();
+    membrane.script('c', waitCall('g-c'), say('c done'));
+    const run = framework.runEphemeralToCompletion(c.agent, c.contextManager);
+    await until(() => gates.entered.has('g-c'), 'c to block mid-turn');
+    let g: { agent: Agent; contextManager: ContextManager };
+    if (copy) {
+      g = await framework.deriveAgent({ name: 'g', from: 'c', mode: 'copy', config: { systemPrompt: 'You are g.' }, framing: [{ participant: 'user', content: [text(GRANDCHILD)] }] });
+    } else {
+      const { name: _g, ...gSpec } = taskForkSpec('g', { parent: 'c', inherit: { mode: 'shared' } });
+      g = await framework.createEphemeralAgent({ name: 'g', model: 'test-model', systemPrompt: 'You are mira.', toolDeclarations: 'entries' }, gSpec);
+      g.contextManager.addMessage('user', [text(GRANDCHILD)]);
+    }
+    return { c, g, run };
+  }
+
+  it("takes, resumed with a prompt of its own, every change row a host's shared child's sources count as their own, its source's former name's and its source's source's included", async () => {
+    const { g, run } = await childAndGrandchild();
+    membrane.script('g', say('g done'));
+    assert.equal((await framework.runEphemeralToCompletion(g.agent, g.contextManager)).speech, 'g done');
+    gates.release('g-c');
+    assert.equal((await run).speech, 'c done');
+    for (const name of ['c', 'g']) {
+      const resumed = await framework.resumeAgent(name, { model: 'test-model', systemPrompt: `You are ${name}, resumed.`, toolDeclarations: 'entries' } as never);
+      const before = defined((await resumed.contextManager.compile(undefined, undefined, { dryRun: true })).messages);
+      assert.ok(holdsBoth(before), `the premise: resumed ${name}'s view keeps mira's rows under both its names: ${before}`);
+      const request = await resumed.agent.buildActivationRequest([]);
+      const sent = defined(request.messages);
+      assert.ok(holdsNeither(sent), `resumed ${name}'s request, on a head of its own, defines neither: ${sent}`);
+      resumed.cleanup();
+    }
+  });
+
+  it("stamps a copy-mode fork of a host's running shared child with every change row the child counts as its own, so the fork's move takes them", async () => {
+    const { g, run } = await childAndGrandchild(true);
+    const copied = defined((await g.contextManager.compile(undefined, undefined, { dryRun: true })).messages);
+    assert.ok(holdsBoth(copied), `the premise: the fork's copy holds both of mira's rows: ${copied}`);
+    const request = await g.agent.buildActivationRequest([]);
+    const sent = defined(request.messages);
+    assert.ok(holdsNeither(sent), `the fork's request, on a head of its own, defines neither: ${sent}`);
+    gates.release('g-c');
+    await run;
+  });
+});

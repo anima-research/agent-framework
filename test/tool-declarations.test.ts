@@ -760,6 +760,21 @@ describe('toolDeclarations', () => {
       assert.deepEqual(events.at(-1), { type: 'head:moved', why: 'consolidated', changesRemoved: 1, forced: 'budget' });
     });
 
+    it("takes a derived agent's source's change rows out when it's kept to its head, and when such a compile is refused over budget", async () => {
+      for (const refused of [false, true]) {
+        const rows = [said('user', 'hello')];
+        const context = fakeContext(rows, refused ? { overBudget: (r) => r.some((row) => row.participant === 'system') } : {});
+        const agent = agentOn(context, { toolDeclarations: 'entries' });
+        await agent.buildActivationRequest([tool('a')]);
+        agent.setSourceChangeOwners(['source']);
+        context.cm.addMessage('system', [{ type: 'system_change', defineTools: [tool('s')] } as unknown as ContentBlock], { kind: 'system-change', agent: 'source' });
+        agent.keepToHeadUntilBuiltAgain();
+        const request = await agent.buildActivationRequest([tool('a')]);
+        assert.deepEqual(request.messages.filter((m) => m.content.some((b) => (b as { type: string }).type === 'system_change')), [], `refused ${refused}: its request carries none`);
+        assert.deepEqual(changeRows(rows), [], `refused ${refused}: its branch holds none`);
+      }
+    });
+
     it("moves a derived agent's head when the compile is refused over budget with only its source's change rows kept, and takes them off its branch", async () => {
       const rows = [said('user', 'hello')];
       const context = fakeContext(rows, { overBudget: (r) => r.some((row) => row.participant === 'system') });
@@ -973,6 +988,42 @@ describe('toolDeclarations', () => {
       const request = await agent.buildActivationRequest([tool('a'), tool('b')]);
       assert.deepEqual(request.tools, [tool('a')], 'the recorded head');
       assert.equal(changeRows(rows).length, 1, 'the change stays');
+    });
+
+    it("counts a consolidation free only at a compile that re-renders from the first change row a move takes, its source's included", async () => {
+      const rows = [said('user', 'hello')];
+      let at: number | null = null;
+      const context = fakeContext(rows, { firstChanged: () => at });
+      const events: HeadEvent[] = [];
+      const agent = agentOn(context, { toolDeclarations: 'entries' }, memoryHeadDeclarations(), events);
+      await agent.buildActivationRequest([tool('a')]);
+      agent.setSourceChangeOwners(['source']);
+      context.cm.addMessage('system', [{ type: 'system_change', removeTools: ['z'] } as unknown as ContentBlock], { kind: 'system-change', agent: 'source' });
+      for (const n of [1, 2, 3]) rows.push(said('user', `more ${n}`));
+      await agent.buildActivationRequest([tool('a'), tool('b')]);
+      assert.equal(changeRows(rows).length, 2, "the premise: its source's change and its own are stored");
+      agent.noteResponseInput(tenth);
+      at = rows.findIndex((r) => r.metadata?.agent === 'agent');
+      assert.ok(at > rows.findIndex((r) => r.metadata?.agent === 'source'), "the premise: its own change comes after its source's");
+      const moves = events.filter((e) => e.type === 'head:moved').length;
+      await agent.buildActivationRequest([tool('a'), tool('b')]);
+      assert.equal(events.filter((e) => e.type === 'head:moved').length, moves, "no move: that compile re-renders only from its own change");
+      assert.equal(changeRows(rows).length, 2, 'both changes stay');
+    });
+
+    it("consolidates by share a derived agent that holds only its source's change rows", async () => {
+      const rows = [said('user', 'hello')];
+      const context = fakeContext(rows, { firstChanged: () => null });
+      const events: HeadEvent[] = [];
+      const agent = agentOn(context, { toolDeclarations: 'entries' }, memoryHeadDeclarations(), events);
+      await agent.buildActivationRequest([tool('a')]);
+      agent.setSourceChangeOwners(['source']);
+      context.cm.addMessage('system', [{ type: 'system_change', defineTools: [tool('b')] } as unknown as ContentBlock], { kind: 'system-change', agent: 'source' });
+      agent.noteResponseInput(price * 5);
+      const request = await agent.buildActivationRequest([tool('a'), tool('b')]);
+      assert.deepEqual(request.tools, [tool('a'), tool('b')], 'its own head');
+      assert.deepEqual(changeRows(rows), [], "its source's change taken off its branch");
+      assert.deepEqual(events.at(-1), { type: 'head:moved', why: 'consolidated', changesRemoved: 1, changeTokens: price, inputTokens: price * 5, forced: 'share' });
     });
 
     it('waits for a first response before measuring', async () => {
