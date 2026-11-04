@@ -952,6 +952,23 @@ test('a session the server ended under a call: the call is refused with 404, and
   assert.equal(count(fixture, (s) => s.rpc === 'tools/call' && s.status === 404), 1, 'the refused call was not replayed');
 });
 
+test('a session the server ended before it answered anything: the call is refused with 404, and without `reconnect` the agent is told nothing reconnects', async () => {
+  const fixture = await start2025({ versions: ['2025-11-25'] });
+  // No `reconnect`, and no request answered since the handshake: a failed connect.
+  const connection = await connect(fixture);
+  await fixture.forget(false);
+  await assert.rejects(connection.callTool('echo', { text: 'x' }), (err: unknown) => {
+    assert.ok(err instanceof McplRequestError, String(err));
+    assert.equal(err.outcome, 'error-response', err.message);
+    assert.deepEqual(err.data, { httpStatus: 404 });
+    assert.equal(err.message, 'The "remote" server had ended this connection\'s session, so the request didn\'t run. ' +
+      "This host won't reconnect to it on its own. If you need it, ask whoever runs this host.");
+    return true;
+  });
+  assert.equal(connection.willReconnect, false);
+  assert.equal(count(fixture, (s) => s.rpc === 'tools/call' && s.status === 404), 1, 'the refused call was not replayed');
+});
+
 test('close() while the new session starts stops it: nothing reconnects, and no second close', async () => {
   const fixture = await start2025({ versions: ['2025-11-25'] });
   const connection = await connect(fixture);
@@ -1520,8 +1537,8 @@ for (const [what, get] of [['405', 405], ['404', 404]] as const) {
 }
 
 /** A connect expected to meet a permanent verdict, with `reconnect` set to show nothing retries it. */
-async function refused(fixture: Fixture): Promise<McplProtocolVersionError> {
-  const connection = ModernMcpConnection.create({ id: 'remote', url: fixture.url, reconnect: true, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
+async function refused(fixture: Fixture, extra: Partial<McplServerConfig> = {}): Promise<McplProtocolVersionError> {
+  const connection = ModernMcpConnection.create({ id: 'remote', url: fixture.url, reconnect: true, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40, ...extra });
   connection.on('error', () => {});
   cleanups.push(() => connection.close());
   let verdict: McplProtocolVersionError | undefined;
@@ -1591,6 +1608,47 @@ test('an initialize answered with 2026-07-28 is a mismatch: that revision is neg
   assert.equal(verdict.kind, 'mismatch');
   assert.equal(verdict.returned, '2026-07-28');
   assert.match(verdict.message, /answered initialize with MCP 2026-07-28, which this client negotiates through server\/discover, not initialize\./);
+});
+
+test('a verdict read from the wire carries none of a credential the server\'s initialize or discovery quotes', async () => {
+  const token = 'tok-0123456789abcdef';
+  // An initialize answered with a revision that quotes the configured token.
+  const mismatched = await start2025({
+    answer: (message, res) => {
+      if (message.method !== 'initialize') return false;
+      json(res, 200, { jsonrpc: '2.0', id: message.id, result: { protocolVersion: `v-${token}`, capabilities: {}, serverInfo: { name: 'echoing', version: '1' } } });
+      return true;
+    },
+  });
+  const mismatch = await refused(mismatched, { token });
+  assert.equal(mismatch.kind, 'mismatch');
+  assert.equal(mismatch.returned, 'v-redacted');
+  assert.match(mismatch.message, /^MCP server "remote" answered initialize with MCP v-redacted\. /);
+  // A -32022 discovery error whose list (an older revision, so the SDK goes on
+  // to the 2025 handshake) and data quote it, then a refused initialize.
+  const listing = await start2025({
+    answer: (message, res) => {
+      if (message.method === 'server/discover') {
+        json(res, 200, { jsonrpc: '2.0', id: message.id, error: { code: -32022, message: 'Unsupported protocol version', data: { supported: [`2024-10-07-${token}`], echoed: token } } });
+        return true;
+      }
+      if (message.method === 'initialize') {
+        json(res, 200, { jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'Method not found' } });
+        return true;
+      }
+      return false;
+    },
+  });
+  const listed = await refused(listing, { token });
+  assert.equal(listed.kind, 'rejected');
+  assert.deepEqual(listed.supported, ['2024-10-07-redacted']);
+  assert.equal(initializes(listing).length, 1, 'the 2025 handshake was tried');
+  assert.match(listed.message, /\(it supports: 2024-10-07-redacted\)\.$/);
+  for (const verdict of [mismatch, listed]) {
+    assert.ok(!verdict.message.includes(token), verdict.message);
+    assert.ok(!JSON.stringify(verdict).includes(token), JSON.stringify(verdict));
+    assert.ok(!JSON.stringify(verdict.data ?? null).includes(token), JSON.stringify(verdict.data));
+  }
 });
 
 test('a failed initialize that refused nothing, after a discovery with no revision in common, is no verdict: it is retried', async () => {
