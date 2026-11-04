@@ -3784,7 +3784,7 @@ export class AgentFramework {
   private staleWarnAt = new Map<string, number>();
   /** Per-agent last inference activity (epoch ms), for /healthz + doctor tooling. */
   private lastInferenceAt = new Map<string, { startedAt?: number; endedAt?: number; failedAt?: number; lastError?: string }>();
-  private lastStartFailed = new Map<string, number>();
+  private lastStartFailed = new WeakMap<Agent, number>();
   private processLoggingPersist: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
   /** Told once per inbound acceptance (mcpl/inbound-source.ts). An internal
@@ -6237,11 +6237,12 @@ export class AgentFramework {
   }
 
   private wakesOnTheirWay(agentName: string): { queued: string[]; held?: { until?: number; rearm?: { number: number; of: number } } } {
-    const mine = (r: InferenceRequest): boolean => r.agentName === agentName;
+    const agent = this.agents.get(agentName);
+    const mine = (r: InferenceRequest): boolean => r.agentName === agentName
+      && !(agent && (mergedBatch(r) ?? [r]).every((m) => this.alreadyRead(agent, m)));
     const requests = [...this.pendingRequests.filter(mine), ...[...this.parkedContinuations].filter(mine)];
     for (const pass of this.passRequests) for (const taken of pass.values()) requests.push(...taken.filter(mine));
     const queued = requests.map((r) => String(r.reason));
-    const agent = this.agents.get(agentName);
     for (const parked of this.parkedStarts) if (parked.agent === agent) queued.push('a start waiting for an auxiliary call to finish');
     if (this.assembling.has(agentName)) queued.push('a start assembling its deferred pushes');
     const ends = (until: number | null | undefined): { until?: number } =>
@@ -6263,7 +6264,8 @@ export class AgentFramework {
   }
 
   private failedLastTurnFor(agentName: string): import('./gate/types.js').FailedLastTurn | undefined {
-    const at = this.lastStartFailed.get(agentName);
+    const agent = this.agents.get(agentName);
+    const at = agent && this.lastStartFailed.get(agent);
     if (at === undefined) return undefined;
     const { queued, held } = this.wakesOnTheirWay(agentName);
     if (queued.length > 0) return { at, again: { kind: 'queued' } };
@@ -12059,7 +12061,6 @@ export class AgentFramework {
 
   private forgetFailureAccounting(name: string): void {
     this.consecutiveInferenceFailures.delete(name);
-    this.lastStartFailed.delete(name);
     this.exhaustionRewinds.delete(name);
     this.refusalStreak.delete(name);
     this.refusalRewinds.delete(name);
@@ -20108,15 +20109,7 @@ export class AgentFramework {
       // such a message asked nothing of the agent, so reading it was all its
       // wake was for, as for a chat:system notice. One with neither tag is
       // judged as addressed.
-      const read = requests.filter((r) => {
-        // A chat:system notice asks nothing either, ambient or not, and no
-        // speech is routed by it, so waiting for one in its channel would
-        // keep its wake forever.
-        const to = r.channelId === undefined || r.ambient === true || r.systemNotice === true
-          ? undefined : { serverId: r.source, channelId: r.channelId };
-        return r.readsDeferredWrite !== undefined ? this.deferredWriteDone(agent, r.readsDeferredWrite, to)
-          : r.readsStoredMessage !== undefined && this.storedMessageDone(agent, r.readsStoredMessage, to);
-      });
+      const read = requests.filter((r) => this.alreadyRead(agent, r));
       if (read.length > 0) {
         const left = requests.filter((r) => !read.includes(r));
         requests.length = 0;
@@ -23737,7 +23730,7 @@ export class AgentFramework {
       // one's routing, and an ephemeral run fails with the error rather than
       // waiting out its watchdog. A silent start has no part in an open turn.
       if (!trigger?.suppressProse) {
-        if (this.agents.get(agent.name) === agent) this.lastStartFailed.set(agent.name, Date.now());
+        this.lastStartFailed.set(agent, Date.now());
         this.settleAgent(agent.name, {
           stopReason: 'exhausted', speech: '', error: error instanceof Error ? error.message : String(error),
         }, this.openLogical.get(agent.name));
@@ -24496,7 +24489,7 @@ export class AgentFramework {
       this.eventGate?.onInferenceResumed(agent.name);
     }
     this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), startedAt: turnStartedAt });
-    this.lastStartFailed.delete(agent.name);
+    this.lastStartFailed.delete(agent);
 
     // Typing indicator, started at TURN START. It says "attending", which is
     // true from the moment the turn is accepted — but it used to start inside
@@ -24876,7 +24869,7 @@ export class AgentFramework {
           ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
         }, routing);
         if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
-        if (this.agents.get(agent.name) === agent) this.lastStartFailed.set(agent.name, Date.now());
+        this.lastStartFailed.set(agent, Date.now());
         this.emitTrace({
           type: 'inference:exhausted',
           agentName: agent.name,
@@ -26718,7 +26711,7 @@ export class AgentFramework {
                 ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
               }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined, streamRouting);
               if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
-              this.lastStartFailed.set(agent.name, Date.now());
+              this.lastStartFailed.set(agent, Date.now());
               this.emitTrace({
                 type: 'inference:exhausted',
                 agentName: agent.name,
@@ -26806,7 +26799,7 @@ export class AgentFramework {
                   speech: '',
                   error: terminal,
                 }, streamRouting);
-                this.lastStartFailed.set(agent.name, Date.now());
+                this.lastStartFailed.set(agent, Date.now());
                 this.emitTrace({
                   type: 'inference:exhausted',
                   agentName: agent.name,
@@ -27103,7 +27096,7 @@ export class AgentFramework {
         ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
       }, streamRouting);
       if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
-      this.lastStartFailed.set(agent.name, Date.now());
+      this.lastStartFailed.set(agent, Date.now());
       this.emitTrace({
         type: 'inference:exhausted',
         agentName: agent.name,
@@ -31520,6 +31513,16 @@ export class AgentFramework {
       `nothing was changed. It's refused the same way while the store can't be searched; the host log names ` +
       `the store's error`,
     );
+  }
+
+  private alreadyRead(agent: Agent, r: InferenceRequest): boolean {
+    // A chat:system notice asks nothing either, ambient or not, and no
+    // speech is routed by it, so waiting for one in its channel would
+    // keep its wake forever.
+    const to = r.channelId === undefined || r.ambient === true || r.systemNotice === true
+      ? undefined : { serverId: r.source, channelId: r.channelId };
+    return r.readsDeferredWrite !== undefined ? this.deferredWriteDone(agent, r.readsDeferredWrite, to)
+      : r.readsStoredMessage !== undefined && this.storedMessageDone(agent, r.readsStoredMessage, to);
   }
 
   /** Whether a wake for a deferred write has nothing left for the agent to
