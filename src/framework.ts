@@ -6643,9 +6643,12 @@ export class AgentFramework {
   }
   /** Keep `request` among a hold's `held` requests, once by
    *  sameInferenceRequest. A held turn's retry (TURN_RETRY) whose equal is
-   *  already held marks that one, so the hold still keeps the turn alive. */
-  private holdRequest(held: InferenceRequest[], request: InferenceRequest): void {
-    const same = held.find((r) => this.sameInferenceRequest(r, request));
+   *  already held marks that one, so the hold still keeps the turn alive.
+   *  In a merged start's batch, a member that carries the turn on takes an
+   *  equal wake only when it has all of the wake's channels: a wake with
+   *  others stays a member of its own, which an abort puts back. */
+  private holdRequest(held: InferenceRequest[], request: InferenceRequest, takes: (kept: InferenceRequest) => boolean = () => true): void {
+    const same = held.find((r) => this.sameInferenceRequest(r, request) && takes(r));
     if (!same) {
       held.push(request);
       return;
@@ -6658,7 +6661,10 @@ export class AgentFramework {
     const batch = mergedBatch(request);
     if (into || batch) {
       const members = [...(into ?? [{ ...same }])];
-      for (const member of batch ?? [request]) this.holdRequest(members, member);
+      for (const member of batch ?? [request]) {
+        this.holdRequest(members, member, (kept) => continuesTurn(member) || !continuesTurn(kept) ||
+          (member.wakeChannels ?? []).every((channel) => kept.wakeChannels?.some((c) => sameChannel(c, channel))));
+      }
       (same as MarkedRequest)[MERGED_BATCH] = members;
     }
     const keptCarry = turnCarryOf(same);
