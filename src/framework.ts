@@ -23736,8 +23736,8 @@ export class AgentFramework {
       // the next start opens a turn of its own rather than continuing this
       // one's routing, and an ephemeral run fails with the error rather than
       // waiting out its watchdog. A silent start has no part in an open turn.
-      if (this.agents.get(agent.name) === agent) this.lastStartFailed.set(agent.name, Date.now());
       if (!trigger?.suppressProse) {
+        if (this.agents.get(agent.name) === agent) this.lastStartFailed.set(agent.name, Date.now());
         this.settleAgent(agent.name, {
           stopReason: 'exhausted', speech: '', error: error instanceof Error ? error.message : String(error),
         }, this.openLogical.get(agent.name));
@@ -26718,7 +26718,7 @@ export class AgentFramework {
                 ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
               }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined, streamRouting);
               if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
-              if (this.agents.get(agent.name) === agent) this.lastStartFailed.set(agent.name, Date.now());
+              this.lastStartFailed.set(agent.name, Date.now());
               this.emitTrace({
                 type: 'inference:exhausted',
                 agentName: agent.name,
@@ -26806,7 +26806,7 @@ export class AgentFramework {
                   speech: '',
                   error: terminal,
                 }, streamRouting);
-                if (this.agents.get(agent.name) === agent) this.lastStartFailed.set(agent.name, Date.now());
+                this.lastStartFailed.set(agent.name, Date.now());
                 this.emitTrace({
                   type: 'inference:exhausted',
                   agentName: agent.name,
@@ -27103,7 +27103,7 @@ export class AgentFramework {
         ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
       }, streamRouting);
       if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
-      if (this.agents.get(agent.name) === agent) this.lastStartFailed.set(agent.name, Date.now());
+      this.lastStartFailed.set(agent.name, Date.now());
       this.emitTrace({
         type: 'inference:exhausted',
         agentName: agent.name,
