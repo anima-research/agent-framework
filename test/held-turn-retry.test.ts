@@ -1295,6 +1295,31 @@ test("a wake folded into a held merged start that equals one of its wakes counts
   });
 });
 
+test("a merged start the hold folds into an equal held merged start folds its members into their equals, so its wakes count once", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again', 'wake');
+      const before = fw.getHostModeStatus().gatedRequests;
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
+      const start = held[0] as unknown as Record<string | symbol, unknown>;
+      const batchKey = Object.getOwnPropertySymbols(start).find((key) => key.description === 'merged-batch')!;
+      const members = start[batchKey] as Array<Record<string | symbol, unknown>>;
+      assert.equal(members.length, 2, 'premise: the merged start stands for the retry and the wake');
+      const again: Record<string | symbol, unknown> = { ...start, [batchKey]: members.map((member) => ({ ...member })) };
+      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, again);
+      assert.equal(held.length, 1, 'premise: the hold folds the equal merged start into the held one');
+      assert.equal((start[batchKey] as unknown[]).length, 2, 'each member folds into its equal');
+      assert.equal(fw.getHostModeStatus().gatedRequests, before, 'its wakes already count');
+      go();
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
 test("a merged start its released wait puts back in the queue counts as the wakes merged into it there, until the next pass takes it", async (t) => {
   await withStoreDir(async (path) => {
     const clock = holdClock(t);
