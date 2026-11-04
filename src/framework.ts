@@ -21321,8 +21321,8 @@ export class AgentFramework {
     return routing.heartbeat && !routing.locus ? { heartbeatTurn: true } : {};
   }
 
-  private wakeChannelsMark(routing: TurnRouting): { wakeChannels?: ChannelRef[] } {
-    return !routing.locus && routing.wakeChannels ? { wakeChannels: routing.wakeChannels } : {};
+  private wakeChannelsMark(routing: TurnRouting | undefined): { wakeChannels?: ChannelRef[] } {
+    return routing && !routing.locus && routing.wakeChannels ? { wakeChannels: routing.wakeChannels } : {};
   }
 
   /** Hold a heartbeat turn's plain speech as drafts ('no-destination'), named by `round`'s notice. */
@@ -26215,6 +26215,7 @@ export class AgentFramework {
                   reason: forced ? 'unstick-retry' : 'refusal-rewind-retry',
                   source: 'framework',
                   timestamp: Date.now(),
+                  ...this.wakeChannelsMark(streamRouting),
                 });
                 handledByRewind = true;
               };
@@ -32411,6 +32412,7 @@ export class AgentFramework {
       reason: 'inference-failure-rewind-retry',
       source: 'framework',
       timestamp: Date.now(),
+      ...this.wakeChannelsMark(this.turnRouting?.get(agent.name)),
     });
   }
 

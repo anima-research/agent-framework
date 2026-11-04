@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { ContentBlock, NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
 import { AgentFramework } from '../src/framework.js';
-import type { Module, ProcessEvent, ProcessState, EventResponse, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
+import type { InferenceRequest, Module, ProcessEvent, ProcessState, EventResponse, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { AutobiographicalStrategy } from '@animalabs/context-manager';
 
@@ -268,6 +268,25 @@ for (const partial of [undefined, 'Here is the start of an answer']) {
     } finally { await rig.close(); }
   });
 }
+
+test("a refused turn its batch gave no channel is retried with the batch's channels", async () => {
+  const channels = [{ serverId: 'discord', channelId: 'discord:g:room' }];
+  let retried: InferenceRequest | undefined;
+  const rig = await rewindRig([[], [refused()]], { autoRewind: true, maxRewinds: 3 }, {
+    onRequest: (count, framework) => { if (count === 3) retried = framework.getActiveTurnTrigger('scout'); },
+  });
+  try {
+    await rig.say('first question', 1);
+    rig.framework.pushEvent({ type: 'external-message', source: 'tui', content: 'second question', metadata: {}, triggerInference: false } as never);
+    await rig.framework.runUntilIdle();
+    (rig.framework as unknown as { pendingRequests: InferenceRequest[] }).pendingRequests.push(
+      { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), wakeChannels: channels });
+    for (let i = 0; i < 200 && rig.requests.length < 3; i++) { await rig.framework.runUntilIdle(); await new Promise((r) => setTimeout(r, 10)); }
+    assert.equal(rig.requests.length, 3, 'the turn, the refused request and the retry');
+    assert.equal(retried?.reason, 'refusal-rewind-retry');
+    assert.deepEqual(retried?.wakeChannels, channels);
+  } finally { await rig.close(); }
+});
 
 test('a message injected into the refused round is the newest turn it carried, and is shed first', async () => {
   const call = { type: 'tool_use', id: 'look-1', name: 'surface--look', input: {} } as ContentBlock;
