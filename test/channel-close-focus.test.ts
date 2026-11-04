@@ -112,7 +112,7 @@ describe('a close that fails after the focus ended says the focus ended', () => 
     } finally { await f.close(); }
   });
 
-  it("a release that fails before the end: the error says the close wasn't recorded, and nothing of an end", async () => {
+  it("a release that fails before the end: the error says the close wasn't recorded, and that the focus is still in force", async () => {
     const f = await focused();
     try {
       const hooks = (coordinatorOf(f) as unknown as { hooks: { commitDeliveries?: () => boolean } }).hooks;
@@ -120,7 +120,7 @@ describe('a close that fails after the focus ended says the focus ended', () => 
       const result = await close(f, { channelId: 'work' });
       assert.equal(result.success, false);
       assert.ok(coordinatorOf(f).getAllExcept(), 'premise: the focus is in force');
-      assert.equal(result.error, "The close wasn't recorded: the all-except release could not be made durable, so the hold stays in force");
+      assert.equal(result.error, "The close wasn't recorded: the all-except release could not be made durable, so the hold stays in force. The focus on it is still in force: what the other channels hold stays held until it ends. A resident ends it with tune_out { mode: 'cancel', scope: 'all-except' }, or asks this close again.");
     } finally { await f.close(); }
   });
 });
@@ -163,7 +163,7 @@ describe('a close naming the excepted channel after its server no longer registe
     } finally { await f.close(); }
   });
 
-  it("a release that fails before the end: the answer says the focus wasn't ended, and why", async () => {
+  it("a release that fails before the end: the answer says the focus wasn't ended, why, and that it is still in force", async () => {
     const f = await focused();
     try {
       await f.send('channels/changed', { removed: ['work'] });
@@ -172,7 +172,7 @@ describe('a close naming the excepted channel after its server no longer registe
       assert.equal(result.success, false);
       assert.ok(coordinatorOf(f).getAllExcept(), 'premise: the focus is in force');
       assert.equal(result.error, 'Server "editor" no longer registers channel "work", so no close was recorded or sent. '
-        + "The focus on it wasn't ended: the all-except release could not be made durable, so the hold stays in force");
+        + "The focus on it wasn't ended: the all-except release could not be made durable, so the hold stays in force. The focus on it is still in force: what the other channels hold stays held until it ends. A resident ends it with tune_out { mode: 'cancel', scope: 'all-except' }, or asks this close again.");
     } finally { await f.close(); }
   });
 

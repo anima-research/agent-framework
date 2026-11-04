@@ -34812,6 +34812,9 @@ export class AgentFramework {
             }
           };
           const endedText = 'The focus on it ended, and what the other channels held was delivered.';
+          // A failure before the end leaves the hold in force, which the reason
+          // needn't say: the answer does.
+          const stillText = (why: string): string => `${/[.!?]$/.test(why) ? why : `${why}.`} The focus on it is still in force: what the other channels hold stays held until it ends. A resident ends it with tune_out { mode: 'cancel', scope: 'all-except' }, or asks this close again.`;
           let released: ReturnType<typeof coordinator.cancelAllExcept>;
           try {
             released = coordinator.cancelAllExcept('channel-close', unregistered
@@ -34826,9 +34829,9 @@ export class AgentFramework {
               throw new Error(`${unregistered ? "A step of the focus's release failed" : "The close wasn't recorded"}: `
                 + `${/[.!?]$/.test(why) ? why : `${why}.`} The focus on it ended before that failure, and what the other channels held was delivered.`);
             }
-            throw new Error(unregistered ? `The focus on it wasn't ended: ${why}` : `The close wasn't recorded: ${why}`);
+            throw new Error(unregistered ? `The focus on it wasn't ended: ${stillText(why)}` : `The close wasn't recorded: ${stillText(why)}`);
           }
-          if (!released.ok) throw new Error(unregistered ? `The focus on it wasn't ended: ${released.error}` : `The close wasn't recorded: ${released.error}`);
+          if (!released.ok) throw new Error(unregistered ? `The focus on it wasn't ended: ${stillText(released.error)}` : `The close wasn't recorded: ${stillText(released.error)}`);
           if (!released.deferred) return () => endedText;
           // A cancel that waits is told as the tune-out tools tell one
           // (cancelWaitsNote): what it waits for, that asking again doesn't
