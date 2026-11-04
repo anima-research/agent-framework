@@ -4049,7 +4049,7 @@ export class EventGate {
 
     // A delivery that throws drops the batch, named in the log: thrown from
     // its timer, it would be uncaught, and stop the process, and thrown to a
-    // write or reload that sends it (clearStateFor), it would report a change
+    // write or reload that sends it (fireCleared), it would report a change
     // that was made as failed.
     try {
       this.deliverEvents(events);
@@ -4271,7 +4271,8 @@ export class EventGate {
   }
 
   /** Hold a batch for the judge until no turn changing the context it reads
-   *  runs and the host isn't quiesced, merged with what the rule already holds. */
+   *  runs, the host isn't quiesced and no refusal of the judge's calls holds
+   *  it, merged with what the rule already holds. */
   private holdForJudge(policyName: string, events: PendingEvent[], judge: JudgeConfig): void {
     const held = this.judgeHeld.get(policyName);
     if (held) {
@@ -4322,7 +4323,11 @@ export class EventGate {
    * wakes the agent when it's delivered: when it fires, or, buffered, once no
    * turn runs and the host isn't quiesced. A judge rule's batch goes to the
    * judge, whether it's collecting, being decided (with what queued behind
-   * it) or held, so it only may.
+   * it) or held, so it only may, except that under onError "wake", while a
+   * refusal's stated wait lasts, it wakes the agent without the judge being
+   * asked, and one due before that wait ends is listed so, as certain,
+   * unless a running turn or the host's quiesce holds it past the wait's
+   * end, when it goes to the judge.
    */
   upcomingWakes(agentNames: string[], exceptPolicy?: string): UpcomingWake[] {
     return this.upcomingWakesBut(agentNames, { policy: exceptPolicy });
@@ -4341,12 +4346,15 @@ export class EventGate {
       wakes.push({ at: this.sleepUntil, certain: true, what: 'the end of its sleep' });
     }
     const count = (n: number): string => `${n} ${n === 1 ? 'event' : 'events'}`;
+    const unjudgedUntil = this.judgeOnError === 'wake' && this.judgeRefusing() ? this.judgeRefusal?.until : undefined;
     for (const [name, state] of this.debounceTimers) {
       if (name === leftOut.policy || state.events.length === 0) continue;
       const batch = count(state.events.length);
-      wakes.push(state.judge
-        ? { at: state.dueAt, certain: false, what: `rule ${quotedValue(name)}'s batch of ${batch} goes to the judge` }
-        : { at: state.dueAt, certain: true, what: `rule ${quotedValue(name)}'s debounced batch of ${batch}` });
+      wakes.push(!state.judge
+        ? { at: state.dueAt, certain: true, what: `rule ${quotedValue(name)}'s debounced batch of ${batch}` }
+        : unjudgedUntil !== undefined && state.dueAt < unjudgedUntil
+          ? { at: state.dueAt, certain: true, what: `rule ${quotedValue(name)}'s batch of ${batch}, delivered without the judge while its calls are refused` }
+          : { at: state.dueAt, certain: false, what: `rule ${quotedValue(name)}'s batch of ${batch} goes to the judge` });
     }
     for (const [name, state] of this.judging) {
       if (name === leftOut.policy || state === leftOut.batch) continue;
@@ -4594,7 +4602,7 @@ export class EventGate {
     }
   }
 
-  /** Send the batches held for the judge once no turn changing the context it reads runs and the host isn't quiesced. */
+  /** Send the batches held for the judge once no turn changing the context it reads runs, the host isn't quiesced and no refusal of the judge's calls holds them. */
   private flushJudgeHeldIfClear(): void {
     if (this.quiesced || this.judgedTurnRunning() || this.judgeHeld.size === 0) return;
     // Deferred, as the inference buffer's flush is, to stay out of the
@@ -5156,7 +5164,7 @@ export class EventGate {
     return `A reply judge call was refused, and the hold stated no end: ${refusal.hold}. `
       + (wakes
         ? "Each judge rule's batch is still asked about, and wakes the agent if the call is refused."
-        : `Nothing asks the judge again on its own: judge rules' held batches (${events} now) are judged once a new batch gets a verdict, or when the hold is released.`);
+        : `Nothing asks the judge again on its own: judge rules' held batches (${events} now) are judged once a new batch gets a verdict, or when the hold is released. A new batch whose call fails lets the held events it took in go with it, unjudged.`);
   }
 
   // =========================================================================

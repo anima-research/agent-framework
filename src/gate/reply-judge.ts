@@ -40,6 +40,7 @@
 
 import { NativeFormatter } from '@animalabs/membrane';
 import type { ContentBlock, DetailedUsage, Membrane, NormalizedMessage, NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
+import { safeSlice } from '../safe-slice.js';
 import { normalizeLineBreaks, oneLine } from '../supplied-text.js';
 import type { FailedLastTurn, JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudgeOptions, UpcomingWake } from './types.js';
 
@@ -138,7 +139,23 @@ export function renderMessage(message: NormalizedMessage): string {
     if (line) parts.push(line);
   }
   if (parts.length === 0) return '';
-  return cut(`[${field(message.participant)}] ${quoted(parts.join('\n'))}`, MAX_MESSAGE_CHARS);
+  const opener = `[${field(message.participant)}] `;
+  return opener + quotedCut(parts.join('\n'), MAX_MESSAGE_CHARS - opener.length);
+}
+
+function quotedCut(text: string, max: number): string {
+  const whole = quoted(text);
+  if (whole.length <= max) return whole;
+  const plain = normalizeLineBreaks(text);
+  const width = (at: number): number => quoted(plain[at]!).length;
+  const keep = Math.floor((max - 40) / 2);
+  let head = 0;
+  for (let used = 0; head < plain.length && used + width(head) <= keep; head++) used += width(head);
+  let tail = plain.length;
+  for (let used = 0; tail > head && used + width(tail - 1) <= keep; tail--) used += width(tail - 1);
+  const before = safeSlice(plain, 0, head);
+  const after = safeSlice(plain, tail, plain.length);
+  return quoted(`${before} […${plain.length - before.length - after.length} characters cut…] ${after}`);
 }
 
 function renderBlock(block: ContentBlock): string {

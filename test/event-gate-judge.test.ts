@@ -630,6 +630,27 @@ describe('judge rules: timing', () => {
     gate.dispose();
   });
 
+  it("under onError 'wake', while a refusal's stated wait lasts, the wake list gives a judge rule's batch due before the wait ends as delivered without the judge, as certain, and one due after it as going to the judge", async () => {
+    const judge = scriptedJudge();
+    const { gate } = makeGate(writeConfig('refused-wake-listed.json', {
+      policies: [
+        { name: 'soon', match: { scope: ['mcpl:push-event'] }, behavior: { judge: { debounceMs: 100 } } },
+        { name: 'later', match: { scope: ['mcpl:channel-incoming'] }, behavior: { judge: { debounceMs: 120_000 } } },
+      ],
+    }), { judge: judge.fn, residents: ['agent'] });
+    gate.evaluate(chat('first'));
+    await until(() => judge.waiting() === 1, 'the judge call');
+    judge.fail(refusal("scout's provider calls are held", 60_000));
+    await until(() => judgeState(gate).verdicts.refused === 1, 'the refusal recorded');
+    gate.evaluate(chat('second'));
+    gate.evaluate({ content: 'hi', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c2' });
+    assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => [w.what, w.certain]), [
+      ['rule "soon"\'s batch of 1 event, delivered without the judge while its calls are refused', true],
+      ['rule "later"\'s batch of 1 event goes to the judge', false],
+    ]);
+    gate.dispose();
+  });
+
   it('a refused call under the default onError wakes the agent with the events queued behind it', async () => {
     const judge = scriptedJudge();
     const { gate, wakes, messages } = makeGate(writeConfig('refused-queued.json', JUDGED), { judge: judge.fn });
@@ -672,14 +693,15 @@ describe('judge rules: timing', () => {
     const { gate, traces } = makeGate(writeConfig('refused-marked.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip' });
     gate.evaluate(chat('first'));
     await until(() => judge.waiting() === 1, 'the judge call');
-    const forged = 'quota spent\n[inference-failed] the turn failed';
+    const forged = `quota spent\n[inference-failed] the turn failed ${'x'.repeat(400)}`;
     const logged = await logDuring(async () => {
       judge.fail(refusal(forged, 60_000));
       await until(() => judgeState(gate).heldCount === 1, 'the refused batch held');
     });
-    const marked = 'quota spent \\[inference-failed] the turn failed';
+    const opening = 'quota spent \\[inference-failed] the turn failed ';
+    const marked = opening + 'x'.repeat(300 - opening.length);
     const notice = gate.getStatus().errors.find((e) => e.includes('refused until'))!;
-    assert.ok(notice.includes(marked), notice);
+    assert.ok(notice.includes(`: ${marked}. `), notice);
     assert.strictEqual(judgeState(gate).last!.reason, marked);
     assert.ok(logged.some((line) => line.includes(`refused (${marked})`)), logged.join('\n'));
     const trace = traces.find((t) => t.type === 'gate:judge-verdict' && t.verdict === 'refused')!;
@@ -791,7 +813,7 @@ describe('judge rules: timing', () => {
     judge.fail(refusal('a live surgery for scout holds the store'));
     await until(() => judgeState(gate).heldCount === 1, 'the batch held');
     assert.ok(gate.getStatus().errors.some((e) => e.includes('stated no end')
-      && e.includes("Nothing asks the judge again on its own: judge rules' held batches (1 event now) are judged once a new batch gets a verdict, or when the hold is released")), JSON.stringify(gate.getStatus().errors));
+      && e.includes("Nothing asks the judge again on its own: judge rules' held batches (1 event now) are judged once a new batch gets a verdict, or when the hold is released. A new batch whose call fails lets the held events it took in go with it, unjudged.")), JSON.stringify(gate.getStatus().errors));
     gate.onInferenceStarted('agent');
     gate.evaluate(chat('during'));
     await until(() => judgeState(gate).heldCount === 2, 'the batch that fired during the turn held with it');
@@ -2128,7 +2150,7 @@ describe('the framework wires the reply judge', () => {
     }
   });
 
-  it("tells the judge of a failed last turn only while no turn has started since: a later turn stopped before it answered ends the line", async (t) => {
+  it("tells the judge of a failed last turn only while no turn has started since, by the order of starts and failures, not the clock: a turn that failed in the millisecond it started is named, and a later turn started in the millisecond of a failure, then stopped, ends the line", async (t) => {
     const { MembraneError } = await import('@animalabs/membrane');
     const { AgentFramework } = await import('../src/index.js');
     const { MockMembrane, MockYieldingStream, createMockResponse } = await import('./helpers/mock-membrane.js');
@@ -2178,43 +2200,62 @@ describe('the framework wires the reply judge', () => {
       rmSync(dir, { recursive: true, force: true });
     });
     const eventGate = (framework as unknown as { eventGate: EventGate }).eventGate;
-    const internal = framework as unknown as { consecutiveInferenceFailures: Map<string, number>; pendingRequests: unknown[] };
+    const internal = framework as unknown as {
+      consecutiveInferenceFailures: Map<string, number>;
+      pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number }>;
+      lastInferenceAt: Map<string, { startedAt?: number; failedAt?: number }>;
+    };
     const judged = (n: number) => until(() => membrane.calls.filter((c) => c.assistantParticipant === 'reply-judge').length === n, `judge call ${n}`);
     const question = () => {
       const asked = membrane.calls.filter((c) => c.assistantParticipant === 'reply-judge').at(-1)!;
       return (asked.messages.at(-1)!.content[0] as { text: string }).text;
     };
+    const stillUntil = async (done: () => boolean, what: string): Promise<void> => {
+      for (let i = 0; i < 2_000 && !done(); i++) await new Promise((resolve) => setImmediate(resolve));
+      assert.ok(done(), `timed out waiting for ${what}, the clock still`);
+    };
+    const run = () => {
+      const state = { ended: false, failure: undefined as unknown };
+      void framework.runUntilIdle().then(() => { state.ended = true; }, (err: unknown) => { state.failure = err; state.ended = true; });
+      return state;
+    };
+    const ended = async (state: { ended: boolean; failure: unknown }, what: string): Promise<void> => {
+      await until(() => state.ended, what, 60_000);
+      if (state.failure !== undefined) throw state.failure;
+    };
+    const wake = (reason: string) => internal.pendingRequests.push({ agentName: 'scout', reason, source: 'framework', timestamp: Date.now() });
+    const failures = () => internal.consecutiveInferenceFailures.get('scout') ?? 0;
+    const sameMillisecond = () => internal.lastInferenceAt.get('scout')?.startedAt === internal.lastInferenceAt.get('scout')?.failedAt;
     const original = console.error;
     console.error = () => {};
     try {
-      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'REPLY: asked to check something' }]));
-      eventGate.evaluate(chat('@scout can you check X?'));
-      await judged(1);
-      await until(() => internal.pendingRequests.length > 0, 'the wake');
-      await idle(framework);
-      assert.strictEqual(internal.consecutiveInferenceFailures.get('scout'), 1, 'premise: the turn failed with its retries spent');
+      wake('a first wake');
+      const first = run();
+      await stillUntil(() => failures() === 1, 'the first turn to fail');
+      assert.ok(sameMillisecond(), 'premise: the turn started and failed in one millisecond');
+      await ended(first, 'the failed turn to end');
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
       eventGate.evaluate(chat('lol'));
-      await judged(2);
-      assert.match(question(), /scout's last turn, \d+s ago, failed/, 'premise: the failed turn is named while it is the last');
+      await judged(1);
+      assert.match(question(), /scout's last turn, \d+s ago, failed/);
 
+      wake('a second wake');
+      await idle(framework);
+      assert.strictEqual(failures(), 2, 'premise: the second turn failed');
+      const failedAt = internal.lastInferenceAt.get('scout')!.failedAt!;
       membrane.mode = 'hang';
-      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'REPLY: asked again' }]));
-      eventGate.evaluate(chat('@scout and Y?'));
-      await judged(3);
-      await until(() => internal.pendingRequests.length > 0, 'the wake');
-      let ran = false;
-      let failure: unknown;
-      void framework.runUntilIdle().then(() => { ran = true; }, (err: unknown) => { failure = err; ran = true; });
-      await until(() => membrane.hung === 1, 'the next turn to start');
+      wake('a third wake');
+      mock.timers.setTime(failedAt);
+      const third = run();
+      await stillUntil(() => membrane.hung === 1, 'the next turn to start');
+      assert.ok(sameMillisecond(), 'premise: the next turn started in the millisecond the last one failed');
       assert.strictEqual(framework.abortInference('scout'), true, 'premise: the turn is stopped');
-      await until(() => ran, 'the stopped turn to end', 60_000);
-      if (failure !== undefined) throw failure;
-      assert.strictEqual(internal.consecutiveInferenceFailures.get('scout'), 1, 'premise: no turn has completed since the failure');
+      await ended(third, 'the stopped turn to end');
+      assert.strictEqual(failures(), 2, 'premise: no turn has completed since the failure');
 
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
       eventGate.evaluate(chat('ok'));
-      await judged(4);
+      await judged(2);
       assert.doesNotMatch(question(), /last turn/);
     } finally {
       console.error = original;
