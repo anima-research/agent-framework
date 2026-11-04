@@ -145,10 +145,12 @@ export interface AgentConfig {
    *   host's model records say which. Membrane refuses a system change any
    *   other way. The agent's own change rows are those stored with its
    *   `systemChangeMetadata(name)`, or with one of its `selfParticipants`'
-   *   (see `selfParticipants`). A change row a host writes without such
-   *   metadata goes out as written, and the agent neither folds it onto its
-   *   head, consolidates it nor removes it, but declares nothing such a row
-   *   already carries: it's the host's to remove. System text is compared
+   *   (see `selfParticipants`), and for an agent that continues another's
+   *   context, those its source counts as its own. A change row a host
+   *   writes without such metadata goes out as written, and the agent
+   *   neither folds it onto its head, consolidates it nor removes it, but
+   *   declares nothing such a row already carries: it's the host's to
+   *   remove. System text is compared
    *   block by block, in any order: an added block is declared as a change,
    *   and a block already declared that's dropped or edited is a
    *   replacement. So this saves writes only while the blocks already
