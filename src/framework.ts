@@ -30329,7 +30329,7 @@ export class AgentFramework {
     // message, and the line says which message the wake is for.
     if (this.turnAlive(agent)) return false;
     // A queued write the agent won't see (a suppressed one) isn't a message after it.
-    if (this.deferredMessages.some((m) => (m.forAgent ?? this.primaryAgentName) === agent.name && this.agentSees(agent, m.metadata))) return false;
+    if (this.deferredMessages.some((m) => (m.forAgent ?? this.primaryAgentName) === agent.name && this.agentSees(agent, m.metadata) && !isSystemChangeMessage(m))) return false;
     return this.isNewestIn(agent, entry);
   }
 

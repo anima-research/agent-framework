@@ -296,7 +296,7 @@ describe('isNewestContextEntry', () => {
     isNewestContextEntry(entry: { eventType: string; serverId?: string; channelId?: string; messageId?: string; eventId?: string }): boolean;
     activeTurnTokens: Map<string, number>;
     activeStreams: Map<string, unknown>;
-    deferredMessages: Array<{ forAgent?: string }>;
+    deferredMessages: Array<{ forAgent?: string; participant: string; content: unknown[] }>;
     addMessage(participant: string, content: Array<{ type: 'text'; text: string }>, metadata?: Record<string, unknown>): string;
     agents: Map<string, { getContextManager(): { getAllMessages(): Array<{ metadata?: Record<string, unknown>; content: Array<{ type: string; text?: string }> }> } }>;
   };
@@ -509,10 +509,22 @@ describe('isNewestContextEntry', () => {
     internals().activeStreams.set('scout', {});
     assert.equal(ask(), false, 'a turn streaming');
     internals().activeStreams.delete('scout');
-    internals().deferredMessages.push({ forAgent: 'scout' });
+    internals().deferredMessages.push({ forAgent: 'scout', participant: 'someone', content: [{ type: 'text', text: 'deferred after it' }] });
     assert.equal(ask(), false, 'a write deferred');
     internals().deferredMessages.pop();
     assert.equal(ask(), true);
+  });
+
+  it("still newest with a system change deferred for the agent, as with one stored after it", async () => {
+    command(`dm ev-${++n} 134 1548000000000000001 a DM`);
+    const md = await stored('a DM');
+    const ask = () => internals().isNewestContextEntry({ eventType: 'mcpl:push-event', serverId: 'discord', eventId: md.eventId as string });
+    assert.equal(ask(), true, 'premise');
+    internals().deferredMessages.push({ forAgent: 'scout', participant: 'system', content: [{ type: 'system_change', defineTools: [{ name: 'zz', description: 'zz', inputSchema: { type: 'object', properties: {} } }] }] });
+    assert.equal(ask(), true, "a deferred system change isn't a message a reply could be meant for");
+    internals().deferredMessages.push({ forAgent: 'scout', participant: 'someone', content: [{ type: 'text', text: 'deferred after it' }] });
+    assert.equal(ask(), false, 'a deferred message is');
+    internals().deferredMessages.splice(0);
   });
 
   it('false for an entry a tune-out holds from the residents', async () => {
