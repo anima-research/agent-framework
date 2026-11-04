@@ -30,6 +30,7 @@ describe('system changes', () => {
     assert.equal(isSystemChangeMessage({ content: [{ type: 'system_change', removeTools: ['a'] }] }), true);
     assert.equal(isSystemChangeMessage({ content: [{ type: 'text', text: 'system_change' }] }), false);
     assert.equal(isSystemChangeMessage({ content: [] }), false);
+    assert.equal(isSystemChangeMessage({ content: undefined } as never), false, 'a damaged row with no content array');
   });
 
   it('compares a tool as the wire carries it, so a Date in its schema matches the text its recorded head holds', () => {

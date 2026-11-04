@@ -148,7 +148,7 @@ export type DeclarationDifference =
  *  conversation's tail look past, are every change row. Folding onto the head
  *  and consolidating read only the agent's own (ownSystemChanges). */
 export function isSystemChangeMessage(message: { content: readonly ContentBlock[] }): boolean {
-  return message.content.some(isSystemChangeContent);
+  return Array.isArray(message.content) && message.content.some(isSystemChangeContent);
 }
 
 function isOwnChangeRow(row: { metadata?: unknown }, isOwn: (agentName: string) => boolean): boolean {
