@@ -27,3 +27,7 @@
   one that fails after it "A step of the focus's release failed: <reason>. The focus on it ended before
   that failure, and what the other channels held was delivered." A module's close of such a name is
   refused as before, the focus left in force.
+- A `channel_close` answer built after its focus ended names a replacement all-except focus in force by
+  then: "… A new all-except focus is in force now, excepting <server>/<channel>: not this close's, and what
+  the other channels hold stays held until it ends." — so an agent whose close waited on held writes or a
+  transport round-trip is told the focus it accounts for next, not only that its own ended.

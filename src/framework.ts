@@ -35480,14 +35480,25 @@ export class AgentFramework {
             throw new Error(unregistered ? `The focus on it wasn't ended: ${stillText(why)}` : `The close wasn't recorded: ${stillText(why)}`);
           }
           if (!released.ok) throw new Error(unregistered ? `The focus on it wasn't ended: ${stillText(released.error)}` : `The close wasn't recorded: ${stillText(released.error)}`);
-          if (!released.deferred) return () => endedText;
+          // What holds the channel set when the answer is built: this close's
+          // focus ended, and a replacement in force by then is named with its
+          // channel, since the agent accounts for that one next.
+          const status = (): string => {
+            let now: ReturnType<typeof coordinator.getAllExcept> = null;
+            try { now = coordinator.getAllExcept(); } catch { now = null; }
+            if (now && now.params.epochId !== epochId) {
+              return `${endedText} A new all-except focus is in force now, excepting ${now.params.except.serverId}/${now.params.except.channelId}: not this close's, and what the other channels hold stays held until it ends.`;
+            }
+            return endedText;
+          };
+          if (!released.deferred) return status;
           // A cancel that waits is told as the tune-out tools tell one
           // (cancelWaitsNote): what it waits for, that asking again doesn't
           // end the wait sooner, that its length isn't known, and that a stop
           // before it runs loses it. Until the answer is built: a release
           // that ran by then ended the focus, and the answer says so.
           const waits = `${unregistered ? 'This call' : 'The close'} cancels the all-except hold that excepts it. ${cancelWaitsNote('The all-except hold')}`;
-          return () => (over() ? endedText : waits);
+          return () => (over() ? status() : waits);
         },
         focusChannelResolver: () => this.tuneOutCoordinator?.focusChannel() ?? null,
         // Who reads a tuned-out channel's traffic, for the registry's texts
