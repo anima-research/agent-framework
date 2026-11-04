@@ -1,0 +1,89 @@
+/**
+ * What a channel_close result says of the all-except hold (the focus) that
+ * excepts the channel it names (AF #844 review follow-up, Isaac-3593,
+ * round 3): the focus status true when the result arrives.
+ */
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { fixture, eventually } from './helpers/coalescing-fixture.js';
+import type { FrameworkConfig } from '../src/types/framework.js';
+import { SUB, internals, textOf, find, incoming, registerOpen, settle, type Fixture } from './helpers/admission.js';
+
+type Answer = { success: boolean; data?: unknown; error?: string };
+type Framework = {
+  reserveStoreForSurgery(verb: string, agentName: string): () => void;
+  mcplServerRegistry: { getServer(id: string): { sendChannelsClose(params: { channelId: string }): Promise<unknown> } | null };
+};
+
+const ENDED = 'The focus on it ended, and what the other channels held was delivered.';
+const WAITS = /^The close cancels the all-except hold that excepts it\. Not cancelled yet: /;
+
+const framework = (f: Fixture) => f.framework as unknown as Framework;
+const coordinatorOf = (f: Fixture) => internals(f).tuneOutCoordinator!;
+const close = (f: Fixture, input: Record<string, unknown>, id = 'c1'): Promise<Answer> =>
+  f.framework.executeToolCall({ id, name: 'channel_close', input, callerAgentName: 'agent' } as never) as Promise<Answer>;
+
+/** `work` the excepted channel, a message held in `noisy`. */
+async function focused(): Promise<Fixture> {
+  const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+  await registerOpen(f, 'work', 'noisy');
+  const r = coordinatorOf(f).enterAllExcept({ serverId: 'editor', channelId: 'work' }, { durationSeconds: 120, backlogCap: 10 }, 'agent-tool');
+  assert.ok(r.ok, (r as { error?: string }).error);
+  await incoming(f, 'noisy', 'n1', 'held');
+  await settle(f);
+  return f;
+}
+
+describe("a channel_close result says what became of the focus when the result arrives", () => {
+  it('control: a close of the registered excepted channel ends the focus and says so', async () => {
+    const f = await focused();
+    try {
+      const result = await close(f, { channelId: 'work' });
+      assert.equal(result.success, true, result.error);
+      assert.equal(coordinatorOf(f).getAllExcept(), null, 'the focus ended');
+      assert.equal((result.data as { note?: string }).note, ENDED);
+      assert.match(textOf(find(f, 'all channels except')), /antra: held/, 'its backlog released');
+    } finally { await f.close(); }
+  });
+
+  it("control: a deferred close whose transport answers before the release says the focus's end waits, the focus in force", async () => {
+    const f = await focused();
+    const release = framework(f).reserveStoreForSurgery('roll back', 'agent');
+    try {
+      const result = await close(f, { channelId: 'work' });
+      assert.equal(result.success, true, result.error);
+      const data = result.data as { status?: string; note?: string };
+      assert.equal(data.status, 'closed');
+      assert.ok(coordinatorOf(f).getAllExcept(), 'premise: the focus is in force at the answer');
+      assert.match(data.note ?? '', WAITS, JSON.stringify(data));
+      release();
+      assert.equal(coordinatorOf(f).getAllExcept(), null, 'ended at the release');
+    } finally { release(); await f.close(); }
+  });
+
+  it("a deferred close whose focus release finishes while its transport is awaited says the focus ended", async () => {
+    const f = await focused();
+    const release = framework(f).reserveStoreForSurgery('roll back', 'agent');
+    const server = framework(f).mcplServerRegistry.getServer('editor')!;
+    let answer!: () => void;
+    const sent = server.sendChannelsClose.bind(server);
+    server.sendChannelsClose = async (params) => {
+      await new Promise<void>((resolve) => { answer = resolve; });
+      return sent(params);
+    };
+    try {
+      const closing = close(f, { channelId: 'work' });
+      await eventually(() => answer !== undefined, 'the close is out at the transport');
+      assert.ok(coordinatorOf(f).getAllExcept(), 'premise: the focus is in force while the transport is awaited');
+      release();
+      assert.equal(coordinatorOf(f).getAllExcept(), null, 'premise: the release ended the focus while the transport is awaited');
+      answer();
+      const result = await closing;
+      assert.equal(result.success, true, result.error);
+      const data = result.data as { status?: string; note?: string };
+      assert.equal(data.status, 'closed');
+      assert.equal(coordinatorOf(f).getAllExcept(), null, 'no focus at the answer');
+      assert.equal(data.note, ENDED, `the note is the focus's status at the answer: ${JSON.stringify(data)}`);
+    } finally { release(); answer?.(); await f.close(); }
+  });
+});

@@ -1013,11 +1013,14 @@ interface ChannelRegistryOptions {
    * this is ends through the cancel flow (release the backlog, record the
    * end) before the lifecycle state flips to closed. A
    * tuned-out channel's close is refused before this (its cancel ends it).
-   * Returns what it ended, or that the end waits, in a sentence the close's
-   * answer carries whatever became of the close: as `note` on a success,
+   * Returns, where a hold excepts the channel, what became of that hold:
+   * a function that says it in a sentence, read when the close's answer is
+   * built, after its transport's round-trip, so the answer says what holds
+   * when it arrives (a release that waited may have run by then). The
+   * answer carries it whatever became of the close: as `note` on a success,
    * after the error on a failure.
    */
-  onToolClose?: (serverId: string, channelId: string) => string | undefined;
+  onToolClose?: ToolCloseHook;
   /**
    * The channel unprefixed speech lands in while an all-except hold is
    * active (its exception), else null. Consulted after a fork's home and
@@ -1146,6 +1149,9 @@ interface ChannelRegistryOptions {
 // ChannelRegistry
 // ============================================================================
 
+/** ChannelRegistryOptions.onToolClose: a tool close's end of the all-except hold that excepts its channel. */
+export type ToolCloseHook = (serverId: string, channelId: string) => (() => string) | undefined;
+
 /**
  * Who is actually making a channel tool call, as established by the
  * framework's own dispatch — model-origin calls come through
@@ -1205,7 +1211,7 @@ export class ChannelRegistry {
   ) => void;
   private shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean;
   private readonly latestInboundLocus: boolean;
-  private onToolClose?: (serverId: string, channelId: string) => string | undefined;
+  private onToolClose?: ToolCloseHook;
   private focusChannelResolver?: () => ChannelRef | null;
   private readonly tuneOutReaderFn?: () => TuneOutReader;
   private onRouteFailure?: ChannelRegistryOptions['onRouteFailure'];
@@ -5284,13 +5290,13 @@ export class ChannelRegistry {
       } catch (err) {
         return {
           success: false,
-          error: `Channel ${shown} is already closed, but recording the decision to close it failed: ${(err as Error).message}${ended ? ` ${ended}` : ''}`,
+          error: `Channel ${shown} is already closed, but recording the decision to close it failed: ${(err as Error).message}${ended ? ` ${ended()}` : ''}`,
           isError: true,
         };
       }
       return {
         success: true,
-        data: { channelId: input.channelId, serverId: entry.serverId, status: 'already closed', ...(ended ? { note: ended } : {}) },
+        data: { channelId: input.channelId, serverId: entry.serverId, status: 'already closed', ...(ended ? { note: ended() } : {}) },
       };
     }
 
@@ -5336,8 +5342,10 @@ export class ChannelRegistry {
     // answer says so, and what the hook ended all the same. Every answer
     // carries the hook's sentence, a success's as `note`: whether the close
     // went through says nothing of the focus, whose end may wait (an
-    // operator's change to the store in progress).
-    const withEnded = (text: string): string => (ended ? `${text} ${ended}` : text);
+    // operator's change to the store in progress). The sentence is read as
+    // the answer is built, after the transport's round-trip, during which a
+    // release that waited may have run.
+    const withEnded = (text: string): string => (ended ? `${text} ${ended()}` : text);
     try {
       this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
     } catch (err) {
@@ -5359,7 +5367,7 @@ export class ChannelRegistry {
       if (applied.open || now !== 'closed') throw new ChannelLifecycleError(supersededClause('close', now), 'superseded');
       return {
         success: true,
-        data: { channelId: input.channelId, serverId: entry.serverId, status: 'closed', ...(ended ? { note: ended } : {}) },
+        data: { channelId: input.channelId, serverId: entry.serverId, status: 'closed', ...(ended ? { note: ended() } : {}) },
       };
     } catch (err) {
       return { success: false, error: withEnded(this.lifecycleFailureText('close', entry, err)), isError: true };

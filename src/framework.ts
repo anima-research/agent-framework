@@ -34795,6 +34795,19 @@ export class AgentFramework {
           if (!coordinator) return undefined;
           const scope = coordinator.getAllExcept();
           if (!scope || scope.params.except.serverId !== serverId || scope.params.except.channelId !== channelId) return undefined;
+          const { epochId } = scope.params;
+          // Whether this hold has ended, read when an answer is built: after
+          // the close's transport round-trip, during which a release that
+          // waited may have run. A record that can't be read is taken for
+          // the hold in force, as the deferred cancels take it.
+          const over = (): boolean => {
+            try {
+              return coordinator.getAllExcept()?.params.epochId !== epochId;
+            } catch {
+              return false;
+            }
+          };
+          const endedText = 'The focus on it ended, and what the other channels held was delivered.';
           let released: ReturnType<typeof coordinator.cancelAllExcept>;
           try {
             released = coordinator.cancelAllExcept('channel-close', 'the excepted channel was closed');
@@ -34802,13 +34815,14 @@ export class AgentFramework {
             throw new Error(`The close wasn't recorded: ${err instanceof Error ? err.message : String(err)}`);
           }
           if (!released.ok) throw new Error(`The close wasn't recorded: ${released.error}`);
+          if (!released.deferred) return () => endedText;
           // A cancel that waits is told as the tune-out tools tell one
           // (cancelWaitsNote): what it waits for, that asking again doesn't
           // end the wait sooner, that its length isn't known, and that a stop
-          // before it runs loses it.
-          return released.deferred
-            ? `The close cancels the all-except hold that excepts it. ${cancelWaitsNote('The all-except hold')}`
-            : 'The focus on it ended, and what the other channels held was delivered.';
+          // before it runs loses it. Until the answer is built: a release
+          // that ran by then ended the focus, and the answer says so.
+          const waits = `The close cancels the all-except hold that excepts it. ${cancelWaitsNote('The all-except hold')}`;
+          return () => (over() ? endedText : waits);
         },
         focusChannelResolver: () => this.tuneOutCoordinator?.focusChannel() ?? null,
         // Who reads a tuned-out channel's traffic, for the registry's texts
