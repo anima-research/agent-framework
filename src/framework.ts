@@ -7806,9 +7806,10 @@ export class AgentFramework {
     if (this.channelRegistry) {
       channelTools.push(AgentFramework.DRAFTS_TOOL);
     }
-    // Offered while a reader is there to watch a hold: not once the
-    // persistent reader has ended (enter would refuse anyway).
-    if (this.tuneOutCoordinator && this.tuneOutOffered && (this.subconsciousAgentName !== null || this.readerForks)) {
+    // Offered while a reader is there to watch a hold, or a hold is still on
+    // record for the resident to check or cancel: not once the persistent
+    // reader has ended and its holds are released (enter would refuse).
+    if (this.tuneOutCoordinator && this.tuneOutOffered && (this.subconsciousAgentName !== null || this.readerForks || this.tuneOutOnRecord())) {
       channelTools.push(AgentFramework.TUNE_OUT_TOOL, AgentFramework.FOCUS_TOOL);
     }
     const gateTools = this.eventGate
@@ -36256,6 +36257,15 @@ export class AgentFramework {
       isError: result.isError ?? false,
       ...structured,
     };
+  }
+
+  /** Whether any tune-out is on record: a channel's, or the all-except scope. */
+  private tuneOutOnRecord(): boolean {
+    try {
+      return (this.channelRegistry?.tuneOutsOnRecord().length ?? 0) > 0 || this.tuneOutCoordinator?.getAllExcept() != null;
+    } catch {
+      return true;
+    }
   }
 
   /** The tune-out coordinator over this framework's channels, with the hooks it acts through. */

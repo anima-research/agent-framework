@@ -25,6 +25,7 @@
   - **Sibling versions:** none raised; this needs context-manager
     `^0.24.0`, membrane `^0.8.0` and chronicle `^0.5.1`, as 0.32.0 does.
   - When the persistent reader ends while a hold's release fails (its
-    backlog can't be made durable), the release is tried again every
-    minute until it goes, and `tune_out` / `focus` are no longer listed
-    once the reader has ended.
+    backlog can't be made durable), the release is tried again, backing off
+    from a minute, up to five times; `tune_out` / `focus` stay listed only
+    while a reader is there or a hold is still on record to check or
+    cancel.

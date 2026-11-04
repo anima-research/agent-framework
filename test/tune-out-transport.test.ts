@@ -1491,11 +1491,12 @@ test('a tune-out whose release fails at a start with no subconscious stays recor
   assert.equal(thirdRegistry.getDesiredState('disc', CHANNEL), 'open');
   const released = third.getAgent('scout')!.getContextManager().getAllMessages()
     .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'tune-out-cancel');
-  assert.ok(released.length >= 1, 'released at the next start');
-  const text = JSON.stringify(released.map((m) => m.content));
-  assert.match(text, /no reader is configured/);
-  assert.match(text, /backlog 1/, 'the held message is in the release');
-  assert.equal(released.filter((m) => /backlog 1/.test(JSON.stringify(m.content))).length, 1, 'delivered once');
+  // The failed start's dump was made durable before its record write failed;
+  // the next start ends the hold and writes no second notice (nothing new
+  // was held), so there is one release in all, with the held message in it.
+  assert.equal(released.length, 1, 'one release across both starts, no empty second notice');
+  assert.match(JSON.stringify(released[0]!.content), /no reader is configured/);
+  assert.match(JSON.stringify(released[0]!.content), /backlog 1/, 'the held message is in it');
 });
 
 test('a tune-out on record when a start with no subconscious and no servers connects one later is released then, backlog delivered', async (t) => {

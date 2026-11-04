@@ -216,6 +216,8 @@ export interface TuneOutCheck {
 
 /** How long after an end time's or a wake budget's cancel threw the cancel is tried again. */
 const EXPIRY_RETRY_MS = 60_000;
+/** How many times releaseAll tries a release that keeps failing, backing off from EXPIRY_RETRY_MS. */
+const RELEASE_RETRY_ATTEMPTS = 5;
 
 /** Ends a backlog line cut to fit in one of the residents' messages. */
 const CUT_MARK = ` [${NOTICE_TAG.cutToFit}; the whole message is in the channel's history]`;
@@ -329,6 +331,8 @@ export class TuneOutCoordinator {
   private expiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** A releaseAll asked to retry its failures (a reader that ended): the next try. */
   private releaseRetry: ReturnType<typeof setTimeout> | null = null;
+  /** stop() has run: no timer is armed after it. */
+  private stopped = false;
   /** Channels with a wake invocation pending inside the coalescing window. */
   private pendingWakes = new Map<string, { count: number; timer: ReturnType<typeof setTimeout> }>();
   /**
@@ -959,7 +963,7 @@ export class TuneOutCoordinator {
    * the agent's provenance (the housekeeping guard reads it); `source` is the
    * all-except scope's.
    */
-  releaseAll(source: string, reason: string, options: { retry?: boolean } = {}): void {
+  releaseAll(source: string, reason: string, options: { retry?: boolean; attempt?: number } = {}): void {
     if (this.releaseRetry) {
       clearTimeout(this.releaseRetry);
       this.releaseRetry = null;
@@ -999,13 +1003,20 @@ export class TuneOutCoordinator {
       failed = true;
     }
     // With a reader gone mid-run the hold still diverts traffic, and an
-    // open-ended one has no end time to release it: try again until it goes
-    // (stop() clears the try).
-    if (failed && options.retry) {
-      this.releaseRetry = setTimeout(() => {
-        this.releaseRetry = null;
-        this.releaseAll(source, reason, options);
-      }, EXPIRY_RETRY_MS);
+    // open-ended one has no end time to release it: try again, backing off,
+    // a few times (a try that fails after its dump is durable writes a new
+    // one only for messages held since). After the last, the hold stays
+    // until the resident cancels it or the next start releases it.
+    const attempt = options.attempt ?? 1;
+    if (failed && options.retry && !this.stopped) {
+      if (attempt >= RELEASE_RETRY_ATTEMPTS) {
+        console.error(`[tune-out] releasing the holds (${reason}) failed ${attempt} times, so what failed stays held until it is cancelled or the next start releases it`);
+      } else {
+        this.releaseRetry = setTimeout(() => {
+          this.releaseRetry = null;
+          this.releaseAll(source, reason, { ...options, attempt: attempt + 1 });
+        }, EXPIRY_RETRY_MS * 2 ** (attempt - 1));
+      }
     }
   }
 
@@ -2180,6 +2191,7 @@ export class TuneOutCoordinator {
 
   /** Stop all timers (framework shutdown). */
   stop(): void {
+    this.stopped = true;
     if (this.releaseRetry) {
       clearTimeout(this.releaseRetry);
       this.releaseRetry = null;

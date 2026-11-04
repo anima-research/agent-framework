@@ -154,6 +154,8 @@ test('a release that fails when the reader is stopped is tried again until it go
   await f.register('chat');
   const coordinator = internals(f).tuneOutCoordinator!;
   assert.ok(coordinator.enter('editor', 'chat', {}, 'agent-tool').ok, 'an open-ended hold');
+  await f.send('push/event', f.params('e1', 'notice_fallback', { channelId: 'chat', key: 'doc1', deferred: true }));
+  await eventually(() => residentRows(f).some((m) => m.metadata?.tuneOut && JSON.stringify(m.content).includes('document_diff')), 'the batch held');
   const registry = internals(f).channelRegistry as unknown as { cancelTuneOut: (...args: unknown[]) => unknown };
   const cancel = registry.cancelTuneOut;
   registry.cancelTuneOut = () => { throw new Error('the store refused the write'); };
@@ -167,4 +169,7 @@ test('a release that fails when the reader is stopped is tried again until it go
   t.mock.timers.tick(60_000);
   t.mock.timers.reset();
   assert.equal(internals(f).channelRegistry.getTuneOutState('editor', 'chat'), null, 'the retry released it');
+  const withBatch = releases(f).filter((m) => JSON.stringify(m.content).includes('document_diff'));
+  assert.equal(withBatch.length, 1, 'the held batch is delivered once');
+  assert.equal(releases(f).length, 1, 'and the retry wrote no second notice');
 });
