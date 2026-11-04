@@ -41,17 +41,18 @@
     404 does, and the new connect negotiates afresh. These are how the SDK's
     2026 handler answers 2025 traffic it refuses (`legacy: 'reject'`) or
     serves statelessly (its default). A call refused with `-32022` fails as
-    `error-response` with the server's code and data, and isn't replayed. A
-    connection that never had a standalone stream, to a server that serves
-    2025 statelessly, stays on 2025 until its next connect, unless the
-    upgrade cut a call's stream, whose resume then meets the 405.
+    `error-response` with the server's data, its code in the host's log,
+    and isn't replayed. A connection that never had a standalone stream, to
+    a server that serves 2025 statelessly, stays on 2025 until its next
+    connect, unless the upgrade cut a call's stream, whose resume then meets
+    the 405.
   - **A `DELETE`** ends each session the server holds by its id when the
     connection lets it go, waiting at most 3 s: at `close()`, a connect in
     flight included, and when a connect fails after its `initialize` was
     answered. A session the server let go, with a 404, a `-32022` or such a
     405, gets none.
   - **Results** are final: a result that fails the tool's output schema is a
-    plain error, as on `2026-07-28`, not an unknown outcome.
+    plain error, as on `2026-07-28`, not a `no-response` outcome.
 - **On `2026-07-28` over HTTP**, a dropped stream's retries take the same
   timing as on a 2025 revision: the server's `retry` hint first, and the
   connection's backoff after a failed try. They stop after two failed tries,
