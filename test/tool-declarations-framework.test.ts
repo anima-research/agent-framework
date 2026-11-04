@@ -486,6 +486,7 @@ describe('toolDeclarations in the framework', () => {
           const compiledBefore = await dry(alpha);
           assert.equal(storedChanges(alpha, 'alpha'), 1, "the premise: the parent's change is stored");
           const { agent: child } = await framework.deriveAgent({ name: 'alpha-child', from: 'alpha', config });
+          assert.equal(storedChanges(child, 'alpha'), 1, "the premise: the child's branch holds its parent's change");
           await child.buildActivationRequest([tool('a'), tool('b')]);
           assert.deepEqual(changesIn(await dry(child)), [], "the premise: the child's context holds no change row now, its parent's own taken as its own");
           assert.deepEqual([storedChanges(child, 'alpha'), storedChanges(child, 'alpha-child')], [0, 0], "taken out of the child's branch, not only out of its compile");
