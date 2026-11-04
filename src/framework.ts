@@ -21321,6 +21321,10 @@ export class AgentFramework {
     return routing.heartbeat && !routing.locus ? { heartbeatTurn: true } : {};
   }
 
+  private wakeChannelsMark(routing: TurnRouting): { wakeChannels?: ChannelRef[] } {
+    return !routing.locus && routing.wakeChannels ? { wakeChannels: routing.wakeChannels } : {};
+  }
+
   /** Hold a heartbeat turn's plain speech as drafts ('no-destination'), named by `round`'s notice. */
   private holdHeartbeatProse(agent: Agent, texts: string[], round: ProseRound): Draft[] {
     console.error(`[prose] ${agent.name}: heartbeat turn — ${texts.length} plain-speech segment(s) held as drafts (no destination)`);
@@ -22552,6 +22556,7 @@ export class AgentFramework {
       source: 'framework',
       timestamp: Date.now(),
       ...this.heartbeatTurnMark(routing),
+      ...this.wakeChannelsMark(routing),
     });
   }
 
@@ -22644,6 +22649,7 @@ export class AgentFramework {
       ...channel,
       autoContinueRun: { stop, ...(opts.heldAfterSend ? { heldAfterSend: true } : {}) },
       ...this.heartbeatTurnMark(routing),
+      ...this.wakeChannelsMark(routing),
     });
   }
 
@@ -23494,6 +23500,7 @@ export class AgentFramework {
         source: 'framework',
         timestamp: Date.now(),
         ...this.heartbeatTurnMark(round.routing),
+        ...this.wakeChannelsMark(round.routing),
       });
     }
   }

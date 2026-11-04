@@ -1049,9 +1049,8 @@ interface ChannelRegistryOptions {
     outcome?: 'failed' | 'unknown';
     /** Bounded display of the connector's structured error data, when present. */
     detail?: string;
-    /** The turn had no channel by design: its batch named the channels it
-     *  came from, the reason names them, and none was chosen for its
-     *  reply. */
+    /** Set when the turn had no channel and the reason names the channels
+     *  its batch came from. */
     byDesign?: true;
   }) => void;
   /**

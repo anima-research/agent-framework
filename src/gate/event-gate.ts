@@ -203,8 +203,11 @@ export interface WakeProvenance {
    *  neither as addressing the agent nor as a channel. The wake has no
    *  route, and the turn's no-locus notice names them. */
   batchChannels?: Array<{ channelId: string; serverId?: string }>;
-  /** Timestamp (ms) of the chosen event, so a consumer coalescing several
-   *  requests can order by event recency, not by flush order. */
+  /** Timestamp (ms) of the chosen event. With none chosen, of the batch's
+   *  newest event that isn't a `chat:system` notice when `batchChannels` is
+   *  set, or else of the notice `counterparty` names: so a consumer
+   *  coalescing several requests can order by event recency, not by flush
+   *  order. */
   at?: number;
   /** The batch's `[Gate: …]` line, when the gate handed it to the wake rather
    *  than wrote it: a WakeLine, the parts its text is rendered from when it's

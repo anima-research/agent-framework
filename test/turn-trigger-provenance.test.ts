@@ -135,11 +135,9 @@ describe('Turn trigger provenance', () => {
       const i = internals(framework);
       const captured = spy(framework);
       const t = Date.now();
-      // The batch comes second, so the merged trigger, the first request, doesn't carry its channels.
-      i.pendingRequests.push(
-        { agentName: 'scout', timestamp: t, ...other },
-        { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: t + 1, wakeChannels: [{ serverId: 'discord', channelId: 'discord:g:room' }] },
-      );
+      const batch: InferenceRequest = { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: t + 1, wakeChannels: [{ serverId: 'discord', channelId: 'discord:g:room' }] };
+      const wake: InferenceRequest = { agentName: 'scout', timestamp: t, ...other };
+      i.pendingRequests.push(...(keeps ? [wake, batch] : [batch, wake]));
       await i.processInferenceRequests();
       await framework.runUntilIdle();
       assert.ok(captured.exposed, 'the merged turn started');

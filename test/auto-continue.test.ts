@@ -834,6 +834,65 @@ describe('autoContinue', () => {
   });
 });
 
+describe("a continuation of a turn its batch gave no channel", () => {
+  let tempDir: string;
+  let membrane: MockMembrane;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'batch-continuation-test-'));
+    membrane = new MockMembrane();
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  const batchChannels = [{ serverId: 'stub', channelId: 'world:commons' }];
+
+  async function run(proseRouting: AgentConfig['proseRouting'], autoContinue: AgentConfig['autoContinue'], first: NormalizedResponse): Promise<InferenceRequest[]> {
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'You are a test agent.', proseRouting, autoContinue }],
+      modules: [],
+    });
+    stubRegistry(framework);
+    (framework as unknown as { channelRegistry: { resolveLocus: () => null } }).channelRegistry.resolveLocus = () => null;
+    const triggers: InferenceRequest[] = [];
+    const internals = framework as unknown as { activeTurnTriggers: Map<string, InferenceRequest>; pendingRequests: InferenceRequest[] };
+    framework.onTrace((e) => {
+      if ((e as { type: string }).type !== 'inference:started') return;
+      triggers.push(internals.activeTurnTriggers.get('assistant') ?? ({ reason: 'unknown' } as InferenceRequest));
+      membrane.pushResponse(triggers.length === 1 ? first : skipReply(`stray-${triggers.length}`));
+    });
+    try {
+      internals.pendingRequests.push({ agentName: 'assistant', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), wakeChannels: batchChannels });
+      await within(framework.runUntilIdle(), 'the run');
+    } finally {
+      await framework.stop();
+    }
+    return triggers;
+  }
+
+  it("an autoContinue continuation keeps the batch's channels", async () => {
+    const triggers = await run('locus', true, prose('First thought.'));
+    assert.equal(triggers[1]?.reason, 'auto-continue');
+    assert.deepEqual(triggers[1]?.wakeChannels, batchChannels);
+  });
+
+  it("a ' !' continuation keeps the batch's channels", async () => {
+    const triggers = await run('explicit', false, prose('>>#alpha ! step one'));
+    assert.equal(triggers[1]?.reason, 'prose-continuation');
+    assert.deepEqual(triggers[1]?.wakeChannels, batchChannels);
+  });
+
+  it("a bounce's wake keeps the batch's channels", async () => {
+    const triggers = await run('explicit', false, prose('>>#nowhere words'));
+    assert.equal(triggers[1]?.reason, 'prose-bounce');
+    assert.deepEqual(triggers[1]?.wakeChannels, batchChannels);
+  });
+});
+
 describe('autoContinue config', () => {
   const at = (autoContinue: unknown) => ({ name: 'a', model: 'm', systemPrompt: '', autoContinue } as AgentConfig);
 
