@@ -1782,8 +1782,9 @@ export class McplServerConnection extends EventEmitter {
    * following `nextCursor` across pages (2024-11-05 pagination). Cursors are
    * opaque strings, `''` included: only an absent or null `nextCursor` ends
    * the inventory (a null one is how some servers say "no more", and main
-   * read it as a complete page). A page that isn't well formed (no `tools` array, a cursor
-   * that isn't a string), or cursors that don't terminate (a repeat, or more
+   * read it as a complete page). A page that isn't well formed (no `tools` array, an entry
+   * that isn't an object with a string `name`, a cursor that isn't a string), or cursors
+   * that don't terminate (a repeat, or more
    * than {@link MAX_TOOL_LIST_PAGES} pages), are errors, never a partial or
    * empty inventory published as complete. The read tap (RFC-014) is handed
    * the complete inventory once, with the last page's `_meta`, as the last
@@ -1798,9 +1799,12 @@ export class McplServerConnection extends EventEmitter {
     let first: Record<string, unknown> | undefined;
     const read: McpToolDefinition[] = [];
     const revs = new Set<unknown>();
+    const isTool = (entry: unknown): boolean =>
+      !!entry && typeof entry === 'object' && typeof (entry as { name?: unknown }).name === 'string';
     const onRead = (result: unknown) => {
       if (!result || typeof result !== 'object' || !Array.isArray((result as { tools?: unknown }).tools)) return;
       const r = result as { tools: McpToolDefinition[]; nextCursor?: unknown; _meta?: unknown };
+      if (!r.tools.every(isTool)) return;
       for (const t of r.tools) read.push(t);
       const rev = (r._meta as Record<string, unknown> | undefined)?.['mcpl/rev'];
       if (typeof rev === 'number') revs.add(rev);
@@ -1817,6 +1821,8 @@ export class McplServerConnection extends EventEmitter {
       if (!result || typeof result !== 'object' || !Array.isArray(result.tools)) {
         throw malformed('no tools array');
       }
+      const unreadable = (result.tools as unknown[]).findIndex((entry) => !isTool(entry));
+      if (unreadable !== -1) throw malformed(`entry ${unreadable + 1} isn't an object with a string name`);
       first ??= result;
       for (const t of result.tools as McpToolDefinition[]) tools.push(t);
       if (result.nextCursor === undefined || result.nextCursor === null) {
