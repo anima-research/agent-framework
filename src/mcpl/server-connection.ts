@@ -401,8 +401,12 @@ function unmatchedResponse(
  * Not exported from the package entry point; this is not a direct-consumer API. */
 const frameworkAdmissionConfigs = new WeakSet<McplServerConfig>();
 export function frameworkAdmissionConfig<T extends McplServerConfig>(config: T): T {
-  frameworkAdmissionConfigs.add(config);
-  return config;
+  if (config.inboundAdmission === undefined) return config;
+  // Do not mark the host's original config: reusing it through a direct
+  // factory must still fail. Inherit fields/getters without a lossy spread.
+  const internal = Object.create(config) as T;
+  frameworkAdmissionConfigs.add(internal);
+  return internal;
 }
 function requireFrameworkAdmission(config: McplServerConfig): void {
   if (config.inboundAdmission !== undefined && !frameworkAdmissionConfigs.has(config)) {
@@ -2812,7 +2816,7 @@ export class McplServerConnection extends EventEmitter {
     const event = Object.hasOwn(McplServerConnection.METHOD_TO_EVENT, request.method)
       ? McplServerConnection.METHOD_TO_EVENT[request.method] : undefined;
     if (this.requiredAdmission && event && ['channels-incoming', 'push-event', 'inference-request'].includes(event)) {
-      this.refuseAdmission(event, request.params, request.id != null ? this.responderFor(request.id, epoch) : undefined, 'admission_stale');
+      this.refuseAdmission(event, request.params, requestId !== undefined ? this.responderFor(requestId, epoch) : undefined, 'admission_stale');
       return;
     }
     if (this.closedForGood || event === undefined || !McplServerConnection.WORLD_EVENTS.has(event)) {
