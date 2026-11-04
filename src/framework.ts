@@ -3784,7 +3784,7 @@ export class AgentFramework {
   private staleWarnAt = new Map<string, number>();
   /** Per-agent last inference activity (epoch ms), for /healthz + doctor tooling. */
   private lastInferenceAt = new Map<string, { startedAt?: number; endedAt?: number; failedAt?: number; lastError?: string }>();
-  private lastStartFailed = new Set<string>();
+  private lastStartFailed = new Map<string, number>();
   private processLoggingPersist: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
   /** Told once per inbound acceptance (mcpl/inbound-source.ts). An internal
@@ -6263,9 +6263,8 @@ export class AgentFramework {
   }
 
   private failedLastTurnFor(agentName: string): import('./gate/types.js').FailedLastTurn | undefined {
-    if (!(this.consecutiveInferenceFailures.get(agentName) ?? 0)) return undefined;
-    const at = this.lastInferenceAt.get(agentName)?.failedAt;
-    if (at === undefined || !this.lastStartFailed.has(agentName)) return undefined;
+    const at = this.lastStartFailed.get(agentName);
+    if (at === undefined) return undefined;
     const { queued, held } = this.wakesOnTheirWay(agentName);
     if (queued.length > 0) return { at, again: { kind: 'queued' } };
     return { at, again: held ? { kind: 'held', ...(held.until !== undefined ? { until: held.until } : {}) } : { kind: 'none' } };
@@ -23737,6 +23736,7 @@ export class AgentFramework {
       // the next start opens a turn of its own rather than continuing this
       // one's routing, and an ephemeral run fails with the error rather than
       // waiting out its watchdog. A silent start has no part in an open turn.
+      this.lastStartFailed.set(agent.name, Date.now());
       if (!trigger?.suppressProse) {
         this.settleAgent(agent.name, {
           stopReason: 'exhausted', speech: '', error: error instanceof Error ? error.message : String(error),
@@ -32205,7 +32205,7 @@ export class AgentFramework {
     const streak = (this.consecutiveInferenceFailures.get(agentName) ?? 0) + 1;
     this.consecutiveInferenceFailures.set(agentName, streak);
     this.lastInferenceAt.set(agentName, { ...this.lastInferenceAt.get(agentName), failedAt: Date.now(), lastError: boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS) });
-    this.lastStartFailed.add(agentName);
+    this.lastStartFailed.set(agentName, Date.now());
 
     // (1) Durable stderr line — works in headless/daemon mode with no client.
     const labels = [

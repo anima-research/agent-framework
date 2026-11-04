@@ -19,7 +19,7 @@ function makeHarness() {
   fw.inferenceFailureEscalationThreshold = 3;
   fw.exhaustionRewinds = new Map<string, number>();
   fw.lastInferenceAt = new Map<string, object>();
-  fw.lastStartFailed = new Set<string>();
+  fw.lastStartFailed = new Map<string, number>();
   fw.pendingRequests = [];
   fw.activeStreams = new Map();   // healthSnapshot reads its keys
   fw.agents = new Map([['cairn', {
