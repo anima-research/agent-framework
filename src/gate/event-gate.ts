@@ -319,7 +319,9 @@ function isMetadataTruthy(value: unknown): boolean {
  * `chat:system` notice is never that event, even one addressed by its place
  * (a pin in a DM), since a notice never decides where the agent's speech
  * goes. A coalesced render whose latest occurrence is a notice isn't taken
- * as one (GateEventInfo.folds).
+ * as one (GateEventInfo.folds). A batch with no such event and no
+ * `batchChannels` takes only the author and time of its newest notice that
+ * has an author.
  */
 export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefined {
   const said = events.filter((e) => !e.systemNotice);

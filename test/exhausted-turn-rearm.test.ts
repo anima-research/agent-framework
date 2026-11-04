@@ -1427,3 +1427,25 @@ test("a job's turn aborted from outside ends its run without clearing its failur
   const failed = stderr.filter((line) => line.startsWith('[inference-failed] agent=job consecutive='));
   assert.deepEqual(failed.map((line) => line.match(/consecutive=(\d+)/)![1]), ['1', '2'], 'the abort is neither an end from outside nor a failure');
 });
+
+test("a provider hold that folds a wake into an equal re-arm keeps it re-armed only if both were, as the scheduler's merge does", async (t) => {
+  const membrane = new ScriptedMembrane(() => serverError, 'event');
+  const r = await resident(t, membrane);
+  const internal = r.fw as unknown as {
+    providerAccelerationCooldowns: Map<string, { heldRequests: Array<Record<string | symbol, unknown>> }>;
+    holdRequest(held: unknown[], request: unknown): void;
+  };
+  const rearmedKey = (request: Record<string | symbol, unknown>) =>
+    Object.getOwnPropertySymbols(request).find((key) => key.description === 'rearmed' && request[key] === true);
+  const held = () => internal.providerAccelerationCooldowns.get('resident')?.heldRequests ?? [];
+  r.say('zz-question');
+  await waitFor(() => held().some((request) => rearmedKey(request) !== undefined), 'a re-arm to be held');
+  const rearm = held().find((request) => rearmedKey(request) !== undefined)!;
+  const key = rearmedKey(rearm)!;
+  const wake: Record<string | symbol, unknown> = { ...rearm };
+  delete wake[key];
+  const before = held().length;
+  internal.holdRequest(held(), wake);
+  assert.equal(held().length, before, 'premise: the hold folds the equal wake into the re-arm');
+  assert.equal(rearm[key], undefined, "not re-armed, since the wake folded into it wasn't");
+});
