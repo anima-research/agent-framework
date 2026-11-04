@@ -335,17 +335,14 @@ test('a tune-out of a channel that isn\'t registered here says so', async () => 
 // The texts that say where a tuned-out channel's messages go name the reader
 // the host has, as tune_out's own text does (tuneOutTool): a persistent
 // reader by the name it runs under, reader forks as forks of the resident's
-// context ("the reader" where its messages reach it), or, with none, that
-// they are held, and received, with no reader to read them. None says
+// context ("the reader" where its messages reach it). None says
 // "subconscious".
-test('the texts about where a tuned-out channel\'s messages go name the reader the host has, or say there is none', async () => {
+test('the texts about where a tuned-out channel\'s messages go name the reader the host has', async () => {
   const cases: Array<[TuneOutReader, { held: string; mayNot: string; dont: string; reach: string }]> = [
     [{ kind: 'persistent', name: 'Muse' },
       { held: 'are held from you and read by Muse', mayNot: 'may not reach Muse', dont: 'don\'t reach Muse', reach: 'reach Muse' }],
     [{ kind: 'forks' },
       { held: 'are held from you and read by forks of your context', mayNot: 'may not reach the reader', dont: 'don\'t reach the reader', reach: 'reach the reader' }],
-    [{ kind: 'none' },
-      { held: 'are held from you, with no reader configured here to read them', mayNot: 'may not be received', dont: 'aren\'t received', reach: 'are received and held' }],
   ];
   for (const [reader, words] of cases) {
     const texts: string[] = [];

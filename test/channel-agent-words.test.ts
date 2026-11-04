@@ -289,13 +289,14 @@ test('a channel_open or channel_close that a later decision overtook says which 
 
   // A tune-out entered while the open is out keeps the transport for its
   // reader, and channel_open refuses a tuned-out channel. With no reader
-  // given to the registry, the text says none is configured.
+  // given to the registry, the text names the persistent reader by its
+  // default name.
   server.sendChannelsOpen = held({ channel: descriptor('y') });
   const openingY = f.call('channel_open', { channelId: 'y' });
   await tick();
   f.registry.enterTuneOut('a', 'y', { epochId: 'e1', cadenceSeconds: 60, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
   await answer();
-  assert.equal((await openingY).error, 'Channel "y" was tuned out meanwhile: its messages are held from you, with no reader configured here to read them, and channel_open ' +
+  assert.equal((await openingY).error, 'Channel "y" was tuned out meanwhile: its messages are held from you and read by Subconscious, and channel_open ' +
     'doesn\'t change that. Call tune_out with channelId "y" and mode "cancel" for it to resume normal attention; ' +
     'cancelling delivers the diverted backlog.');
 
@@ -308,7 +309,7 @@ test('a channel_open or channel_close that a later decision overtook says which 
   f.registry.enterTuneOut('a', 'x', { epochId: 'e2', cadenceSeconds: 60, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
   await answer();
   assert.equal((await closingX).error,
-    'Channel "x" was tuned out meanwhile: its messages are held from you, with no reader configured here to read them, and channel_close doesn\'t change that. ' +
+    'Channel "x" was tuned out meanwhile: its messages are held from you and read by Subconscious, and channel_close doesn\'t change that. ' +
     'Call tune_out with channelId "x" and mode "cancel" for it to resume normal attention; cancelling delivers the diverted ' +
     'backlog, and channel_close closes it after that.');
 });
@@ -650,7 +651,7 @@ test('a decline that a later decision replaced while its acknowledgment was out 
     ['a tune-out', async (f) => {
       f.registry.enterTuneOut('a', 'x', { epochId: 'e1', cadenceSeconds: 60, backlogCap: 10, maxWakes: 3, startedAtSequence: 0 }, 'agent-tool');
     }, 'The decline is recorded, but the channel was tuned out meanwhile, and that decision stands: its messages ' +
-      'are held from you, with no reader configured here to read them. If you still want it closed, cancel the tune-out with tune_out mode "cancel", which delivers what it ' +
+      'are held from you and read by Subconscious. If you still want it closed, cancel the tune-out with tune_out mode "cancel", which delivers what it ' +
       'diverted, and then call channel_close.'],
   ];
   const declineHeld = async () => {
@@ -1108,7 +1109,7 @@ test('a decline that a tune-out replaced sends nothing for that decision', async
   assert.equal(declined.data?.status, 'replaced');
   assert.equal(declined.data?.closeError,
     'The decline is recorded, but the channel was tuned out meanwhile, and that decision stands: its messages ' +
-    'are held from you, with no reader configured here to read them. If you still want it closed, cancel the tune-out with tune_out mode "cancel", which delivers what it ' +
+    'are held from you and read by Subconscious. If you still want it closed, cancel the tune-out with tune_out mode "cancel", which delivers what it ' +
     'diverted, and then call channel_close.');
 });
 

@@ -537,25 +537,6 @@ describe('admission: the hold is decided once, before any side effect', () => {
     } finally { await f.close(); }
   });
 
-  it("gap 10 / §3.3 — without a reader, tune_out's answers say no reader is configured here, and none says subconscious", async () => {
-    const f = await fixture({ framework: { tuneOut: { enabled: true } } as Partial<FrameworkConfig> });
-    try {
-      await registerOpen(f, 'noisy', 'work');
-      const i = internals(f);
-      const channel = await i.handleTuneOutTool('agent', { channelId: 'noisy' });
-      assert.ok(channel.success, channel.error);
-      assert.equal((channel.data as { note?: string }).note,
-        'No reader is configured here: this is a silent hold. Nothing summarizes or wakes you; the backlog is delivered when you cancel.');
-      assert.ok((await i.handleTuneOutTool('agent', { channelId: 'noisy', mode: 'cancel' })).success);
-      const scope = await i.handleTuneOutTool('agent', { channelId: 'work', scope: 'all-except', durationSeconds: 120 });
-      assert.ok(scope.success, scope.error);
-      const note = (scope.data as { note?: string }).note ?? '';
-      assert.ok(note.startsWith('No reader is configured here: this is a silent hold. '), note);
-      assert.ok(note.endsWith(' The backlog is delivered per channel when you cancel or the duration ends.'), note);
-      for (const answer of [channel, scope]) assert.ok(!/subconscious/i.test(JSON.stringify(answer)), JSON.stringify(answer));
-    } finally { await f.close(); }
-  });
-
   it('gap 8 — the tune_out tool refuses an ambiguous channel id and takes serverId', async () => {
     const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
     try {

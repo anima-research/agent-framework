@@ -49,7 +49,7 @@ import type { InboundSource } from './inbound-source.js';
 import { McplRequestError, type McplServerConnection } from './server-connection.js';
 import { readSkipReplyWake, skipReplyNote, type SkipReplyEarlierWake } from './skip-reply-wake.js';
 import { isProseTargetToken } from './prose-grammar.js';
-import { tuneOutHeldWords, tuneOutReachWords, type TuneOutReader } from '../tune-out/tools.js';
+import { persistentReaderName, tuneOutHeldWords, tuneOutReachWords, type TuneOutReader } from '../tune-out/tools.js';
 import type { TraceEventInput } from '../types/trace.js';
 
 // ============================================================================
@@ -1055,9 +1055,10 @@ interface ChannelRegistryOptions {
   focusChannelResolver?: () => ChannelRef | null;
   /**
    * Who reads a tuned-out channel's traffic (the framework's reader: the
-   * persistent subconscious by its name, reader forks, or none), for the
-   * texts that tell an agent where a tuned-out channel's messages go.
-   * Left out, the texts say no reader is configured.
+   * persistent subconscious by its name, or reader forks), for the texts
+   * that tell an agent where a tuned-out channel's messages go. Left out,
+   * the texts name the persistent reader by its default name
+   * (persistentReaderName): there is no hold without a reader (0.33.0).
    */
   tuneOutReader?: () => TuneOutReader;
   /**
@@ -4126,9 +4127,9 @@ export class ChannelRegistry {
     return channelOnServer(ref);
   }
 
-  /** The reader of a tuned-out channel's traffic, as the host says (tuneOutReader), or none. */
+  /** The reader of a tuned-out channel's traffic, as the host says (tuneOutReader), or the default persistent reader. */
   private tuneOutReaderNow(): TuneOutReader {
-    return this.tuneOutReaderFn?.() ?? { kind: 'none' };
+    return this.tuneOutReaderFn?.() ?? { kind: 'persistent', name: persistentReaderName({}) };
   }
 
   /** What a tuned-out channel's messages are, after "its messages" (tuneOutHeldWords). */

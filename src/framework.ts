@@ -2167,25 +2167,19 @@ export type { TuneOutReader };
 /**
  * The `tune_out` tool for a host with `reader`. The text says what happens
  * to the channel's traffic and what the reader there can do, by the name
- * the host gave it, and where there is none, that the traffic is held for
- * the resident until it cancels or the duration runs out. It says nothing
- * of what a reader decides or why: the voice doctrine's standard
- * (coordinator.ts), which puts no words in a model's mouth, holds for what
- * the resident is told about its reader too.
+ * the host gave it. It says nothing of what a reader decides or why: the
+ * voice doctrine's standard (coordinator.ts), which puts no words in a
+ * model's mouth, holds for what the resident is told about its reader too.
  */
 export function tuneOutTool(reader: TuneOutReader): import('./types/index.js').ToolDefinition {
-  const has = reader.kind !== 'none';
   const who = reader.kind === 'persistent' ? reader.name : 'the reader';
   const reads = reader.kind === 'persistent'
     ? `${reader.name}, the reader configured here, reads it instead. It runs on a cadence and when a message there ` +
       'that your wake rules let through mentions you or is from an author they privilege, and can report to you in ' +
       'its own words and cancel the tune-out. '
-    : reader.kind === 'forks'
-      ? 'A reader reads it instead: a fork of your context, run on a cadence and when a message there that your wake ' +
-        'rules let through mentions you or is from an author they privilege. It can report to you in its own words ' +
-        'and cancel the tune-out. '
-      : 'No reader is configured here, so none reads it meanwhile: it is held for you, and delivered when you cancel ' +
-        'the tune-out or durationSeconds runs out. ';
+    : 'A reader reads it instead: a fork of your context, run on a cadence and when a message there that your wake ' +
+      'rules let through mentions you or is from an author they privilege. It can report to you in its own words ' +
+      'and cancel the tune-out. ';
   return {
     name: 'tune_out',
     description:
@@ -2193,16 +2187,16 @@ export function tuneOutTool(reader: TuneOutReader): import('./types/index.js').T
       reads +
       'People who mention you get an automatic reaction so they know you saw nothing. ' +
       'Cancelling (mode "cancel") delivers the held backlog. ' +
-      (has ? 'The tune-out auto-cancels after maxWakes mention-bursts. ' : '') +
-      `A tuned-out channel is kept open, so its traffic ${has ? `reaches ${who}` : 'is still received and held'}: ` +
+      'The tune-out auto-cancels after maxWakes mention-bursts. ' +
+      `A tuned-out channel is kept open, so its traffic reaches ${who}: ` +
       'where this host opens and closes the server\'s channels, this opens a channel you closed, and answers once ' +
       'that open is done. Where the channel isn\'t open then, the answer\'s openError says why, and when its ' +
-      `messages will ${has ? `reach ${who}` : 'be received'} where that's known. ` +
+      `messages will reach ${who} where that's known. ` +
       'Calling tune_out again for a channel already tuned out keeps its settings, and, where this host can open the ' +
       'channel, tries the open again if it isn\'t open. ' +
       'scope "all-except" holds EVERY channel (DMs and new channels included) except channelId, for ' +
-      'durationSeconds (required); your plain speech lands in that channel meanwhile' +
-      (has ? `; ${who} pauses rather than cancels when its wake budget is spent` : '') + '. ' +
+      `durationSeconds (required); your plain speech lands in that channel meanwhile; ${who} pauses rather than ` +
+      'cancels when its wake budget is spent. ' +
       'mode "check" reports what is held without releasing it (`peek` shows one channel\'s newest held lines).',
     inputSchema: {
       type: 'object',
@@ -2221,9 +2215,7 @@ export function tuneOutTool(reader: TuneOutReader): import('./types/index.js').T
           type: 'number',
           description:
             `Max raw messages delivered at cancel (default ${TUNE_OUT_DEFAULTS.backlogCap}). ` +
-            (has
-              ? `0 = deliver no raw backlog at all: ${reader.kind === 'persistent' ? `${reader.name}'s` : 'the reader\'s'} report is the whole delivery.`
-              : '0 = deliver no raw backlog at all: the cancel counts what was held and shows none of it.'),
+            `0 = deliver no raw backlog at all: ${reader.kind === 'persistent' ? `${reader.name}'s` : 'the reader\'s'} report is the whole delivery.`,
         },
         maxWakes: {
           type: 'number',
@@ -8792,8 +8784,8 @@ export class AgentFramework {
    *  out, or undefined where nothing needs saying. A send keeps the tune-out
    *  (ChannelRegistry.openChannelNow), so the agent that sent there expecting
    *  answers learns they are still held from it, and who reads them
-   *  meanwhile: the reader by the name it runs under, forks of its context,
-   *  or none (tuneOutReader). A send tool's answer
+   *  meanwhile: the reader by the name it runs under, or forks of its
+   *  context (tuneOutReader). A send tool's answer
    *  carries this, send_dm's included, or for a code_execution script's send
    *  a notice in the agent's window: a tune-out diverts a DM too. The same setting
    *  turns it off, a conversation agent gets none, and a failure while
@@ -8812,9 +8804,7 @@ export class AgentFramework {
       const reader = this.tuneOutReader();
       const held = reader.kind === 'persistent'
         ? `is still held from you, and read by ${reader.name}, until the tune-out ends.`
-        : reader.kind === 'forks'
-          ? 'is still held from you, and read by forks of your context, until the tune-out ends.'
-          : 'is still held until the tune-out ends, and delivered to you then; no reader is configured here to read it meanwhile.';
+        : 'is still held from you, and read by forks of your context, until the tune-out ends.';
       return `${this.channelShown(channel)} stays tuned out: your words there don't end the tune-out, so its ` +
         `traffic ${held}${end ? ` ${end}` : ''}`;
     } catch (err) {
@@ -13515,8 +13505,7 @@ export class AgentFramework {
    * Returns entries with summary info (doesn't resolve blobs).
    */
   /** Tune-out (issue #77): hold a channel. Offered when a reader is
-   *  configured or `tuneOut.enabled` is set (tuneOutOffered), its text
-   *  naming the reader there is, or saying there is none (tuneOutTool). */
+   *  configured (tuneOutOffered), its text naming the reader (tuneOutTool). */
   private tuneOutToolDefinition(): import('./types/index.js').ToolDefinition {
     return tuneOutTool(this.tuneOutReader());
   }
@@ -13525,13 +13514,18 @@ export class AgentFramework {
    * The reader of a tuned-out channel's traffic, as the text a resident
    * reads describes it (tuneOutTool, tunedOutSendNote, tune_out's answers
    * and the channel registry's refusals of a tuned-out channel): the persistent
-   * subconscious by the name it runs under, which the host gives it, reader
-   * forks as forks of the resident's context, or none.
+   * subconscious by the name it runs under, which the host gives it, or
+   * reader forks as forks of the resident's context. There is no hold
+   * without a reader (0.33.0): a tune-out is on record with none running
+   * only where its release failed, after the persistent reader ended or at
+   * a start with none configured. The text names the persistent reader as
+   * configured then, or by its default name (persistentReaderName).
    */
   private tuneOutReader(): TuneOutReader {
     if (this.subconsciousAgentName) return { kind: 'persistent', name: suppliedValue(this.subconsciousAgentName) };
     if (this.readerForks) return { kind: 'forks' };
-    return { kind: 'none' };
+    const configured = this.subconsciousConfig;
+    return { kind: 'persistent', name: suppliedValue(persistentReaderName(configured && configured.reader !== 'forks' ? configured : {})) };
   }
 
   /** `focus`: the resident-facing alias for `tune_out` with scope "all-except" (#232 decision 2). */
