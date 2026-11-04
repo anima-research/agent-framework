@@ -4384,7 +4384,8 @@ export class EventGate {
       if (!state.judge || !this.judgeFn) {
         wakes.push({ at: state.dueAt, certain: true, what: `${rule} debounced batch of ${count(state.events.length)}` });
       } else if (statedEnd === undefined || state.dueAt >= statedEnd) {
-        wakes.push({ at: state.dueAt, certain: false, what: `${rule} batch of ${count(state.events.length)} goes to the judge` });
+        const joins = this.judgeHeld.has(name) ? ', which joins its held batch when it fires,' : '';
+        wakes.push({ at: state.dueAt, certain: false, what: `${rule} batch of ${count(state.events.length)}${joins} goes to the judge` });
       } else if (this.judgeOnError === 'skip') {
         const joins = this.judgeHeld.has(name) ? ', which joins its held batch when it fires,' : ',';
         const reply = this.judging.has(name) ? ", unless the judge's REPLY to the rule's batch it is deciding delivers it first" : '';
@@ -4544,7 +4545,7 @@ export class EventGate {
       else this.flushJudgeHeldIfClear();
     }
     const n = state.events.length;
-    const went = wakes ? 'wakes the agent' : this.judgeHeldForRefusal() ? "is held while the judge's calls are refused" : 'goes back to the judge';
+    const went = wakes ? 'goes to delivery without the judge' : this.judgeHeldForRefusal() ? "is held while the judge's calls are refused" : 'goes back to the judge';
     console.error(
       `[gate] Rule ${quotedValue(policyName)}: the reply judge's call was refused (${hold}), so its batch of ${n} `
       + `${n === 1 ? 'event' : 'events'} ${went} (judge onError "${this.judgeOnError}")`,
@@ -5208,19 +5209,19 @@ export class EventGate {
     if (refusal.until !== undefined) {
       return `The reply judge's calls are refused until ${new Date(refusal.until).toISOString()}: ${refusal.hold}. `
         + (wakes
-          ? "Until then, each judge rule's batch wakes the agent without being judged, unless a turn or the host's quiesce holds it until after then, when it's judged."
-          : `Until then, judge rules' batches are held (${events} now), and they're judged after that, or sooner if the hold is released.`);
+          ? "Until then, each judge rule's batch wakes the agent without being judged, unless a turn or the host's quiesce holds it until after then, or it waits behind a call of its rule that the judge answers WAIT once its calls are no longer refused, when it's judged."
+          : `Until then, judge rules' batches are held (${events} now), and they're judged after that, or sooner if the hold is released or a judge call asked after the refused one gets a verdict. A batch waiting behind a call of its rule that the judge answers REPLY is delivered with that call's batch.`);
     }
     if (refusal.noTimeLeft) {
       return `A reply judge call was refused by a hold with no time left on it: ${refusal.hold}. `
         + (wakes
           ? "Each judge rule's batch is still asked about, and wakes the agent if the call is refused."
-          : `Nothing asks the judge again on its own: judge rules' held batches (${events} now) are judged once a new batch gets a verdict, or when the framework lets the agent's calls go again. A new batch whose call fails lets the held events it took in go with it, unjudged.`);
+          : `The refusal sets no time to ask again: judge rules' held batches (${events} now) are judged once a judge call made after this gets a verdict, or when the hold on the agent's calls ends. A new batch whose call fails lets the held events it took in go with it, unjudged.`);
     }
     return `A reply judge call was refused, and the hold stated no end: ${refusal.hold}. `
       + (wakes
         ? "Each judge rule's batch is still asked about, and wakes the agent if the call is refused."
-        : `Nothing asks the judge again on its own: judge rules' held batches (${events} now) are judged once a new batch gets a verdict, or when whoever runs the host releases the hold. A new batch whose call fails lets the held events it took in go with it, unjudged.`);
+        : `The refusal sets no time to ask again: judge rules' held batches (${events} now) are judged once a judge call made after this gets a verdict, or when the hold is released, as an operator's release of a provider wait or a surgery's end does. A new batch whose call fails lets the held events it took in go with it, unjudged.`);
   }
 
   // =========================================================================

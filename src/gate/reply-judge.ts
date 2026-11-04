@@ -24,10 +24,9 @@
  * has followed sparser text. So can one whose newest message alone is over it,
  * since the newest message is always shown (cut to its own cap). A request
  * the provider refuses as too long is asked once more from a fresh window,
- * with the ratio it was built at halved, to no less than one character a
- * token, or at a lower estimate another call has reached meanwhile, unless it
- * was built at one already; refused again, it fails as any failed call does.
- * The lower ratio stays for later requests until responses correct it. The
+ * at one character a token, the lowest ratio the estimate takes, unless it
+ * was built at that already; refused again, it fails as any failed call does.
+ * The estimate is left to follow responses, the retry's among them. The
  * document is sent as a run of chunks that start at an anchor, the first message shown,
  * which stays put while the window grows into its budget: the chunks before
  * the newest stay byte-identical from one request to the next, and a cache
@@ -60,6 +59,7 @@ const INITIAL_CHARS_PER_TOKEN = 3;
  *  side that overruns the budget, less when sparser. */
 const CALIBRATION_WEIGHT_DENSER = 0.6;
 const CALIBRATION_WEIGHT_SPARSER = 0.2;
+const MIN_CHARS_PER_TOKEN = 1;
 /** The share of the budget the system prompt (the agent's, abridged) may fill. */
 const SYSTEM_SHARE = 0.08;
 /** The share of the document budget a fresh window starts at, leaving the rest to grow into before the anchor moves. */
@@ -72,7 +72,6 @@ const FIXED_TOKENS_RESERVE = 3_000;
 const MAX_TEXT_CHARS = 6_000;
 /** Longest message (characters) rendered, its participant's name and all its blocks together. */
 const MAX_MESSAGE_CHARS = 12_000;
-const CUT_MARKER_ROOM = 40;
 /** Longest tool call input / tool result (characters) rendered. */
 const MAX_TOOL_CHARS = 600;
 /** Output tokens a verdict may take, adaptive thinking included: room enough
@@ -141,8 +140,13 @@ export function renderMessage(message: NormalizedMessage): string {
     if (line) parts.push(line);
   }
   if (parts.length === 0) return '';
-  const opener = `[${fieldWithin(message.participant, MAX_MESSAGE_CHARS - CUT_MARKER_ROOM - '[] '.length)}] `;
-  return opener + quotedCut(parts.join('\n'), MAX_MESSAGE_CHARS - opener.length);
+  const text = parts.join('\n');
+  const opener = `[${fieldWithin(message.participant, MAX_MESSAGE_CHARS - cutMarker(text.length).length - '[] '.length)}] `;
+  return opener + quotedCut(text, MAX_MESSAGE_CHARS - opener.length);
+}
+
+function cutMarker(count: number): string {
+  return ` […${count} characters cut…] `;
 }
 
 function fieldWithin(text: string, max: number): string {
@@ -159,14 +163,14 @@ function quotedCut(text: string, max: number): string {
   if (whole.length <= max) return whole;
   const plain = normalizeLineBreaks(text);
   const width = (at: number): number => quoted(plain[at]!).length;
-  const keep = Math.floor((max - CUT_MARKER_ROOM) / 2);
+  const keep = Math.floor((max - cutMarker(plain.length).length) / 2);
   let head = 0;
   for (let used = 0; head < plain.length && used + width(head) <= keep; head++) used += width(head);
   let tail = plain.length;
   for (let used = 0; tail > head && used + width(tail - 1) <= keep; tail--) used += width(tail - 1);
   const before = safeSlice(plain, 0, head);
   const after = safeSlice(plain, tail, plain.length);
-  return quoted(`${before} […${plain.length - before.length - after.length} characters cut…] ${after}`);
+  return quoted(`${before}${cutMarker(plain.length - before.length - after.length)}${after}`);
 }
 
 function renderBlock(block: ContentBlock): string {
@@ -310,7 +314,7 @@ export function judgeSystemPrompt(agentName: string): string {
     `You are the reply judge for an AI agent named ${agentName}. The agent isn't woken for every message: when new`,
     'events arrive, you decide whether now is a good time to wake it so it can respond. Waking it costs it a turn;',
     "letting the events go by means it won't act on them until something else wakes it (what was stored as it",
-    'arrived, it will see then).',
+    'arrived stays stored for then).',
     '',
     "You're given the agent's context as a document: its conversation, oldest first, cut from the oldest end to",
     "fit, then its system prompt (abridged). The agent's own messages are those from the participant named",
@@ -448,7 +452,7 @@ export class ReplyJudge {
     }
     if (request.signal.aborted) throw new Error('the judge was stopped before its request');
     const upcoming = [...(request.upcomingWakes ?? []), ...extra];
-    const ratio = atRatio === undefined ? this.charsPerToken : Math.min(atRatio, this.charsPerToken);
+    const ratio = atRatio ?? this.charsPerToken;
 
     const system = judgeSystemPrompt(agentName);
     const question = judgeQuestion(
@@ -575,7 +579,7 @@ export class ReplyJudge {
     const next = this.charsPerToken * (1 - weight) + measured * weight;
     // Over budget: take the measured ratio at once, with a margin, rather than drift toward it.
     this.charsPerToken = inputTokens > this.maxInputTokens ? Math.min(next, measured * 0.9) : next;
-    this.charsPerToken = Math.min(6, Math.max(1, this.charsPerToken));
+    this.charsPerToken = Math.min(6, Math.max(MIN_CHARS_PER_TOKEN, this.charsPerToken));
   }
 
   private ask(built: { agentName: string; request: NormalizedRequest }, signal: AbortSignal): Promise<NormalizedResponse> {
@@ -594,16 +598,14 @@ export class ReplyJudge {
     try {
       response = await this.ask(built, request.signal);
     } catch (err) {
-      if ((err as { type?: unknown } | null)?.type !== 'context_length' || built.ratio <= 1) throw err;
-      const halved = Math.max(1, built.ratio / 2);
-      this.charsPerToken = Math.min(this.charsPerToken, halved);
+      if ((err as { type?: unknown } | null)?.type !== 'context_length' || built.ratio <= MIN_CHARS_PER_TOKEN) throw err;
       this.anchors.delete(built.agentName);
       if (request.signal.aborted) throw new Error('the judge was stopped before its request');
       console.error(
         `[gate] the reply judge's request of ${built.chars} characters, built at ${built.ratio.toFixed(2)} characters a token, `
-        + `was refused as too long; the estimate is now ${this.charsPerToken.toFixed(2)}, and the batch is asked once more`,
+        + `was refused as too long, so the batch is asked once more at ${MIN_CHARS_PER_TOKEN} character a token`,
       );
-      built = await this.build(request, Date.now(), halved);
+      built = await this.build(request, Date.now(), MIN_CHARS_PER_TOKEN);
       response = await this.ask(built, request.signal);
     }
     const usage = (response as NormalizedResponse).details?.usage;

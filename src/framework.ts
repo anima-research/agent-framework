@@ -3620,8 +3620,8 @@ const JUDGE_PARAMETER: ToolParameter = {
   description:
     'Ask the reply judge first: batch matching events like debounceMs, then a small, cheap model reads your ' +
     'context (its newest part) with your instructions and decides whether to wake you now. When it says wait, ' +
-    'you aren\'t woken, and as for "defer", nothing more is added to your context: what was stored as it arrived is ' +
-    'there when you\'re next woken. The next batch is judged afresh. ' +
+    'you aren\'t woken, and as for "defer", nothing more is added to your context: what was stored as it arrived ' +
+    'stays stored for when you\'re next woken. The next batch is judged afresh. ' +
     'If the judge fails or times out you are woken, unless your host set it to stay quiet then. ' +
     'Its verdicts and reasons are in gate_status.',
   properties: {
@@ -4108,6 +4108,7 @@ export class AgentFramework {
    *  auxiliary call, in no queue meanwhile. A drop takes one out and gives
    *  its admission back; the park, woken, then finds it gone. */
   private parkedContinuations: Set<InferenceRequest> = new Set();
+  private parkedStarts: Set<{ agentName: string }> = new Set();
   /** Each turn whose settle has ended it (settleAgent, endDroppedTurn), for
    *  its agent's scripts: its start's teardown can still hold the agent's
    *  token, and a turn that has ended isn't live (liveTurns). A later start
@@ -6240,10 +6241,7 @@ export class AgentFramework {
     const requests = [...this.pendingRequests.filter(mine), ...[...this.parkedContinuations].filter(mine)];
     for (const pass of this.passRequests) for (const taken of pass.values()) requests.push(...taken.filter(mine));
     const queued = requests.map((r) => String(r.reason));
-    const gate = this.providerGates.get(agentName);
-    if (gate && gate.primaryDepth > 0 && !this.activeTurnTokens.has(agentName) && queued.length === 0) {
-      queued.push('a start waiting for an auxiliary call to finish');
-    }
+    for (const parked of this.parkedStarts) if (parked.agentName === agentName) queued.push('a start waiting for an auxiliary call to finish');
     const ends = (until: number | null | undefined): { until?: number } =>
       (typeof until === 'number' && Number.isFinite(until) ? { until } : {});
     const model = this.agents.get(agentName)?.model;
@@ -23592,7 +23590,10 @@ export class AgentFramework {
         // owned and the continuation receives it after the in-flight call settles.
         const parkedContinuation = trigger !== undefined && continuesTurn(trigger);
         if (parkedContinuation) this.parkedContinuations.add(trigger);
+        const parkedStart = parkedContinuation ? undefined : { agentName: agent.name };
+        if (parkedStart) this.parkedStarts.add(parkedStart);
         void this.waitForAuxiliaryIdle(agent.name).then(async () => {
+          if (parkedStart) this.parkedStarts.delete(parkedStart);
           // A continuation dropped while it was parked left the set then, with
           // its admission given back.
           if (parkedContinuation && !this.parkedContinuations.delete(trigger)) return;
@@ -23653,6 +23654,7 @@ export class AgentFramework {
           }
           await this.startAgentStream(agent, trigger, attempt, true);
         }).catch((error) => {
+          if (parkedStart) this.parkedStarts.delete(parkedStart);
           this.releasePrimaryProviderGate(agent.name);
           console.error(`[provider-cooldown] failed to resume primary for ${agent.name}: ${describeFailureWithFrames(error)}`);
         });
