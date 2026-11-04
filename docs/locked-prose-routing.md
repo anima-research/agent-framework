@@ -64,20 +64,33 @@ A turn locked to drafts, or with no destination yet, holds its plain speech
 as drafts (`no-destination`). Holding is what the resident asked for, so
 there's no draft notice for each round. The turn's `[delivered]` receipt
 names the drafts, and they resend or dismiss like any others. Such a turn has
-no channel: a send tool called with no channel has no default to fall back
-to, and a `sleep` posts no announcement.
+no outgoing channel: a send tool called with no channel has no default to
+fall back to, and a `sleep` posts no announcement. It can still answer an
+incoming message: servers are told which message woke it, and a refusal
+reaction marks that one.
 
 ## The starting destination
 
 A resident that hasn't chosen yet speaks where its recipe's `proseLock`
 points: `"#channel"`, `"@person"`, a channel id or `"drafts"`, resolved at
-each turn's start the way a `>>` target is. A channel its server hasn't
+each turn's start the way a `>>` target is, except that no turn's own channels
+take precedence: an id two servers register is ambiguous here, and holds
+speech as drafts until the recipe names one. A channel its server hasn't
 registered yet resolves once it has; until then that turn's plain speech is
 held as drafts, and the operator log says why. With no `proseLock`, plain
 speech is held as drafts until the resident chooses. Once the resident has
 chosen, its choice outranks the recipe's. A stored choice that can't be
 read, or whose stored entry names no destination, holds speech as drafts
 rather than fall back to the recipe's.
+
+## Module speech handlers
+
+Locked routing governs plain speech routed through the channel registry
+(MCPL channels). A module that handles a turn's final speech itself
+(`onAgentSpeech`), such as the in-process Discord module in
+`src/modules/discord`, receives it in locked mode as it does in every other
+mode, `disabled` and `explicit` included. Hosts that rely on locked routing
+should reach channels through MCPL servers rather than such a module.
 
 ## Unchanged from locus mode
 

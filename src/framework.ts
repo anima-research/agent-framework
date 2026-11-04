@@ -832,6 +832,15 @@ const PROSE_LOCUS_TOOL: import('./types/index.js').ToolDefinition = {
 /** The word that points locked prose routing at drafts (prose_locus, AgentConfig.proseLock). */
 const PROSE_LOCK_DRAFTS = 'drafts';
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** What a damaged stored value is, for a diagnostic that doesn't repeat its contents (other agents' choices). */
+function shapeOf(value: unknown): string {
+  return value === null ? 'null' : Array.isArray(value) ? `an array of ${value.length}` : typeof value;
+}
+
 /** What a call of the removed `utils` tool is answered: where its utilities went. */
 const UTILS_REMOVED = `utils was removed: module utilities are in the host's built-in toolset now. ` +
   `${META_TOOL_NAMES.look} {toolset:"${BUILTIN_TOOLSET}"} lists them, ${META_TOOL_NAMES.open} {toolset:"${BUILTIN_TOOLSET}"} opens it, ` +
@@ -21145,7 +21154,8 @@ export class AgentFramework {
    *  of its own (InferenceRequest.heartbeatTurn), so the turn it opens is a
    *  heartbeat's too; nothing for any other turn. */
   private heartbeatTurnMark(routing: TurnRouting): { heartbeatTurn?: true } {
-    return routing.heartbeat && !routing.locus ? { heartbeatTurn: true } : {};
+    // A locked turn's locus is its lock, not a channel the heartbeat answered.
+    return routing.heartbeat && (!routing.locus || routing.locked) ? { heartbeatTurn: true } : {};
   }
 
   /** Hold a heartbeat turn's plain speech as drafts ('no-destination'), named by `round`'s notice. */
@@ -21458,14 +21468,15 @@ export class AgentFramework {
    * hasn't chosen. Throws when the state can't be read.
    */
   private readProseLock(agentName: string): ChannelRef | 'drafts' | undefined {
-    const data = this.store.getStateJson(FRAMEWORK_STATE_ID) as { proseLocks?: unknown } | null;
-    const locks = data?.proseLocks;
+    const data = this.store.getStateJson(FRAMEWORK_STATE_ID) as unknown;
+    if (data !== null && data !== undefined && !isPlainRecord(data)) {
+      throw new Error(`${FRAMEWORK_STATE_ID} isn't a record (${shapeOf(data)})`);
+    }
+    const locks = (data as { proseLocks?: unknown } | null | undefined)?.proseLocks;
     if (locks === undefined) return undefined;
     // A container that isn't a record holds choices that can't be read; it
     // isn't taken as none, which would fall back to the recipe's destination.
-    if (!locks || typeof locks !== 'object' || Array.isArray(locks)) {
-      throw new Error(`the stored prose locks ${JSON.stringify(locks)} aren't a record`);
-    }
+    if (!isPlainRecord(locks)) throw new Error(`its prose-lock record isn't a record (${shapeOf(locks)})`);
     // Own keys only: an agent named after an Object.prototype member has no inherited choice.
     if (!Object.hasOwn(locks, agentName)) return undefined;
     const value = (locks as Record<string, unknown>)[agentName];
@@ -21476,19 +21487,23 @@ export class AgentFramework {
     }
     // A stored entry is a choice, even one that can't be read: it isn't
     // taken as no choice, which would fall back to the recipe's destination.
-    throw new Error(`its stored entry ${JSON.stringify(value)} names no destination`);
+    throw new Error(`its stored entry names no destination (${shapeOf(value)})`);
   }
 
   /** Record a locked agent's choice of destination. Throws when it isn't recorded. */
   private writeProseLock(agentName: string, lock: ChannelRef | 'drafts'): void {
     const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
-    const state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
+    // Damaged state keeps every agent's speech held as drafts
+    // (readProseLock); replacing it would drop the others' choices back to
+    // their recipes' destinations, so it's left for the host's operator.
+    const repair = 'the host\'s operator has to repair it, and until then no move can be recorded';
+    if (data !== null && data !== undefined && !isPlainRecord(data)) {
+      throw new Error(`the framework's stored state is damaged, so ${repair}`);
+    }
+    const state = (data ?? {}) as Record<string, unknown>;
     const stored = state.proseLocks;
-    // A container that can't be read keeps every agent's speech held as
-    // drafts (readProseLock); replacing it would drop the others' choices
-    // back to their recipes' destinations, so it's left for the operator.
-    if (stored !== undefined && (!stored || typeof stored !== 'object' || Array.isArray(stored))) {
-      throw new Error(`the stored prose locks ${JSON.stringify(stored)} aren't a record, so no lock can be written`);
+    if (stored !== undefined && !isPlainRecord(stored)) {
+      throw new Error(`the stored prose-lock record is damaged, so ${repair}`);
     }
     const locks: Record<string, unknown> = { ...((stored as Record<string, unknown> | undefined) ?? {}) };
     Object.defineProperty(locks, agentName, {
@@ -21575,7 +21590,7 @@ export class AgentFramework {
     // after "your plain speech": under heldForMove, nowhere for the rest of
     // the turn, and the lock from the next.
     const nowShown = (): string => (inTurn && callingTurn!.heldForMove
-      ? `is held as drafts for the rest of this turn, since the lock moved while its words waited for its end, and from your next turn it ${this.proseLockShown(current(), agentName)}`
+      ? `is held as drafts for the rest of this turn, since the lock moved while its words waited for its end, and from your next turn it ${this.proseLockShown(this.proseLockLocus(agent), agentName)}`
       : this.proseLockShown(current(), agentName));
     if (input.to === undefined || input.to === null) {
       return { success: true, data: { proseLocus: `Your plain speech ${nowShown()}.` } };
@@ -21601,13 +21616,32 @@ export class AgentFramework {
       }
       lock = { serverId: resolved.serverId, channelId: resolved.channelId };
     }
+    const locus = lock === 'drafts' ? null : lock;
+    // Pointed where the turn already speaks and the stored choice already
+    // is: nothing to move, write or hold.
+    let chosen: ChannelRef | 'drafts' | undefined;
+    try {
+      chosen = this.readProseLock(agentName);
+    } catch {
+      chosen = undefined;
+    }
+    const alreadyChosen = chosen !== undefined && sameChannel(chosen === 'drafts' ? null : chosen, locus);
+    if (inTurn && sameChannel(callingTurn!.locus ?? null, locus) && alreadyChosen) {
+      return {
+        success: true,
+        data: {
+          proseLocus: callingTurn!.heldForMove
+            ? `Your plain speech already ${this.proseLockShown(locus, agentName)} from your next turn. The rest of this turn's is held as drafts.`
+            : `Your plain speech already ${this.proseLockShown(locus, agentName)}.`,
+        },
+      };
+    }
     try {
       this.writeProseLock(agentName, lock);
     } catch (err) {
       return refuse(`The change wasn't recorded (${thrownText(err)}), so your plain speech still ${nowShown()}.`);
     }
-    const locus = lock === 'drafts' ? null : lock;
-    const movesTurn = !!callingTurn?.locked && this.openLogical.get(agentName) === callingTurn;
+    const movesTurn = inTurn;
     console.error(`[routing] ${agentName}: prose_locus -> ${locus ? qualifiedChannelName(locus) : 'drafts'}${movesTurn ? '' : ' (from its next turn)'}`);
     if (!movesTurn) {
       // A call from outside the agent's turn (a host's, or one answered
@@ -21620,28 +21654,21 @@ export class AgentFramework {
       };
     }
     const turn = callingTurn!;
-    if (sameChannel(turn.locus ?? null, locus)) {
-      // Pointed where it already goes: nothing moves, and nothing more is held.
-      return {
-        success: true,
-        data: {
-          proseLocus: turn.heldForMove
-            ? `Your plain speech already ${this.proseLockShown(locus, agentName)} from your next turn. The rest of this turn's is held as drafts.`
-            : `Your plain speech already ${this.proseLockShown(locus, agentName)}.`,
-        },
-      };
-    }
-    if (turn.endRouted) turn.heldForMove = true;
+    // The stored choice moved back to where this turn already speaks (a
+    // move from outside had moved it on): the turn goes on as it was.
+    const turnMoves = !sameChannel(turn.locus ?? null, locus);
+    if (turnMoves && turn.endRouted) turn.heldForMove = true;
     if (locus) {
       turn.locus = locus;
       noteTurnChannel(turn, locus);
     } else {
       delete turn.locus;
-      // Nothing this turn writes will be posted where it showed typing.
-      if (turn.typing) {
-        this.channelRegistry?.stopTyping(turn.typing);
-        delete turn.typing;
-      }
+    }
+    // Nothing more this turn writes is posted where it showed typing when it
+    // now speaks nowhere (drafts, or held after the move).
+    if (!this.turnSpeaksAt(turn) && turn.typing) {
+      this.channelRegistry?.stopTyping(turn.typing);
+      delete turn.typing;
     }
     // The announce baseline stays where it was: the next turn's
     // announce-on-change confirms where its speech lands, which also holds
@@ -22697,8 +22724,12 @@ export class AgentFramework {
     // turn that had no channel (noChannel: its wake named one that resolves
     // to none) passes its wake's channel on, so the next has none either,
     // rather than taking the global fallback this one refused.
-    const channel = routing.locus
-      ? { channelId: routing.locus.channelId, channelServerId: routing.locus.serverId }
+    // A locked turn's next takes the lock when it opens, so the wake names
+    // the channel this one came from (none for a heartbeat's), never the lock,
+    // which would read as the channel the next turn answers.
+    const named = routing.locked ? routing.triggerChannel : routing.locus;
+    const channel = named
+      ? { channelId: named.channelId, channelServerId: named.serverId }
       : routing.noChannel && trigger?.channelId
         ? { channelId: trigger.channelId, ...(trigger.channelServerId ? { channelServerId: trigger.channelServerId } : {}) }
         : {};
@@ -24467,11 +24498,11 @@ export class AgentFramework {
       // stability).
       if (turnProseRouting === 'locked') {
         // Locked mode: the agent's lock, whatever woke the turn, a heartbeat
-        // included; none (drafts) until it has one. prose_locus says where
-        // it moves the lock in its result and records that as announced, as
-        // the primer does, so announce-on-change speaks only when the lock
-        // changed some other way: a recipe proseLock whose channel has
-        // registered since, or a stored lock that couldn't be read.
+        // included; none (drafts) until it has one. Announce-on-change speaks
+        // when the lock differs from what the agent was last told: after any
+        // prose_locus move (its result told the turn that made it; this
+        // confirms it, even where a rewind dropped that exchange), and after
+        // a recipe proseLock's channel registers. The primer counts as told.
         routing.locked = true;
         const locus = this.proseLockLocus(agent);
         if (locus !== null) {
@@ -25332,8 +25363,9 @@ export class AgentFramework {
     // prose_locus). Once a locus or hybrid turn has a locus it always has one.
     const followTurnLocus = (): void => {
       if (turnProseRouting !== 'locus' && turnProseRouting !== 'hybrid' && turnProseRouting !== 'locked') return;
-      const locus = resolveTurnLocus();
-      if (!locus || sameChannel(locus, typingChannel)) return;
+      const locus = turnProseRouting === 'locked' ? this.turnSpeaksAt(streamRouting) : resolveTurnLocus();
+      // Against the turn's own record, which a locked move to drafts clears.
+      if (!locus || sameChannel(locus, streamRouting.typing ?? null)) return;
       this.showTurnTyping(streamRouting, locus);
       typingChannel = locus;
     };
@@ -32634,7 +32666,7 @@ export class AgentFramework {
           const routing = this.turnRouting.get(agentName);
           // A locked turn's channel is its lock, or none: the channel that
           // woke it isn't where its speech goes.
-          if (routing?.locked) return routing.locus ?? null;
+          if (routing?.locked) return this.turnSpeaksAt(routing);
           return routing?.locus ?? routing?.triggerChannel ?? (routing?.noChannel || routing?.heartbeat ? null : undefined);
         },
         // An ephemeral run (a subagent) never takes the process-global

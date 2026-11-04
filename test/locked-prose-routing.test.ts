@@ -593,7 +593,10 @@ describe('locked prose routing', () => {
     trigger(framework);
     await framework.runUntilIdle();
 
-    assert.ok(toolResultTexts().some((t) => t.includes('Your plain speech already goes to discord:g:main.')));
+    // Recorded as the agent's own choice (the recipe's was only a default),
+    // and nothing is held, since the turn's speech didn't move.
+    assert.ok(toolResultTexts().some((t) => t.includes('Your plain speech now goes to discord:g:main, on this turn')));
+    assert.ok(!toolResultTexts().some((t) => t.includes('held as drafts')));
     assert.deepEqual(routed, [{ text: 'Still main.', locus: 'discord:g:main' }]);
     await framework.stop();
   });
@@ -637,6 +640,8 @@ describe('locked prose routing', () => {
 
     assert.deepEqual(module.ran, ['send_message'], 'the send ran');
     assert.deepEqual(routed, [], 'neither the narration nor the postscript is posted beside the send');
+    const listed = JSON.stringify(await framework.executeToolCall({ id: 'l', name: 'drafts', input: { action: 'list' }, callerAgentName: 'assistant' } as ToolCall));
+    for (const words of ['Sending it now.', 'Sent it.']) assert.ok(listed.includes(words), `"${words}" is held as a draft`);
     await framework.stop();
   });
 
@@ -779,7 +784,8 @@ describe('locked prose routing', () => {
     trigger(framework);
     await framework.runUntilIdle();
 
-    assert.ok(toolResultTexts().some((t) => t.includes("The change wasn't recorded") && t.includes("aren't a record")));
+    assert.ok(toolResultTexts().some((t) => t.includes("The change wasn't recorded (the stored prose-lock record is damaged, so the host's operator has to repair it")));
+    assert.ok(!toolResultTexts().some((t) => t.includes('damaged\\"]') || t.includes('["damaged')), "the record's contents aren't repeated");
     assert.deepEqual((store.getStateJson('framework/state') as { proseLocks: unknown }).proseLocks, ['damaged'], 'left for the operator');
     assert.deepEqual(routed, [], 'still held as drafts');
     await framework.stop();
@@ -855,7 +861,11 @@ describe('locked prose routing', () => {
       internals.openLogical.set('assistant', turn);
       internals.turnRouting.set('assistant', turn);
       internals.activeTurnTriggers.set('assistant', {});
-      internals.dispatchSleepToolCall('assistant', { id: `s-${turn.turnId}`, name: 'sleep', input: { seconds: 60 }, callerTurnId: turn.turnId } as ToolCall, () => {});
+      const answered = new Promise<ToolResult>((resolve) => {
+        internals.dispatchSleepToolCall('assistant', { id: `s-${turn.turnId}`, name: 'sleep', input: { seconds: 60 }, callerTurnId: turn.turnId } as ToolCall, resolve);
+      });
+      const result = await Promise.race([answered, new Promise<never>((_, reject) => setTimeout(() => reject(new Error('sleep never answered')), 2000))]);
+      assert.equal(result.success, true, JSON.stringify(result));
       await settle();
       assert.deepEqual(announced, expected, `turn ${turn.turnId}`);
     }
@@ -863,6 +873,31 @@ describe('locked prose routing', () => {
     internals.turnRouting.delete('assistant');
     internals.activeTurnTriggers.delete('assistant');
     Object.assign(internals, { eventGate, channelRegistry });
+    await framework.stop();
+  });
+
+  it("a locked heartbeat's continuation stays a heartbeat's, and names no channel it didn't come from", async () => {
+    const framework = await createFramework({ proseLock: '#main', autoContinue: true });
+    stubChannelRegistry(framework);
+    const internals = framework as unknown as {
+      pendingRequests: Array<Record<string, unknown>>;
+      autoContinueAfterTurn(agent: unknown, routing: unknown, trigger: unknown, stopReason: string): void;
+    };
+    const main = { serverId: 'stub', channelId: 'discord:g:main' };
+    const lounge = { serverId: 'stub', channelId: 'discord:g:lounge' };
+    const continueFrom = (routing: Record<string, unknown>, trigger: Record<string, unknown>): Record<string, unknown> | undefined => {
+      internals.pendingRequests.length = 0;
+      internals.autoContinueAfterTurn(framework.getAgent('assistant'), { turnId: 1, wasIn: [], engaged: new Set(), ...routing }, trigger, 'end_turn');
+      return internals.pendingRequests.find((r) => r.reason === 'auto-continue');
+    };
+    const beat = continueFrom({ heartbeat: true, locked: true, locus: main }, { reason: 'heartbeat', source: 'heartbeat' });
+    assert.ok(beat, 'continued');
+    assert.equal(beat!.heartbeatTurn, true, 'still a heartbeat turn');
+    assert.equal(beat!.channelId, undefined, 'the lock is not named as the channel it answers');
+    const woken = continueFrom({ locked: true, locus: main, triggerChannel: lounge }, { reason: 'message', source: 'test', channelId: 'discord:g:lounge' });
+    assert.equal(woken?.channelId, 'discord:g:lounge', 'a turn from a channel names that channel');
+    assert.equal(woken?.heartbeatTurn, undefined);
+    internals.pendingRequests.length = 0;
     await framework.stop();
   });
 

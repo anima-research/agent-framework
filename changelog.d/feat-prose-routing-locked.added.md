@@ -6,4 +6,8 @@
   `"@person"`, an id) or to `"drafts"`, which holds plain speech as drafts.
   A move is stored in `framework/state` and survives restarts. The optional
   `AgentConfig.proseLock` sets the destination until the agent first chooses.
-  See docs/locked-prose-routing.md.
+  An earlier agent-framework doesn't know the mode and routes it as `locus`,
+  so upgrade agent-framework before any recipe sets it; connectome-host needs
+  its companion release (anima-research/connectome-host#603) to accept it in
+  a recipe. Agents that don't set the mode route as before. See
+  docs/locked-prose-routing.md.
