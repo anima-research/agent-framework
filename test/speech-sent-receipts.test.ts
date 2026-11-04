@@ -381,7 +381,6 @@ describe('plain speech a module says it showed', () => {
       assert.equal(result.speech, 'Done.');
       await until(() => routed.includes('run-1') || surface.asked.length > 0, "the run's speech reaching the registry, or a module being asked");
       assert.deepEqual(surface.asked, []);
-      // The receipt would be written once the run's routing is done, so it's looked for after that.
       await Promise.allSettled(routing);
       await new Promise((resolve) => setImmediate(resolve));
       const runTexts = created.contextManager.getAllMessages().map((m) => textOf(m.content));
@@ -802,7 +801,6 @@ describe('plain speech a module says it showed', () => {
     const membrane = new MockMembrane();
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi there.' }]));
     const f = await host([surface, other], membrane);
-    // The console answers at once; after its answer is in, it's removed, and only then does the other module answer.
     other.onAsked = () => { setTimeout(() => { void f.removeModule('console').then(release); }, 0); };
     await turn(f);
     assert.equal(surface.asked.length, 1, 'premise: the console was asked');
@@ -849,7 +847,6 @@ describe('plain speech a module says it showed', () => {
     assert.deepEqual(notices(f), []);
   });
 
-  /** A bounce's wake takes a turn of its own: answer it with a private envelope. */
   const keepWakeQuiet = (f: AgentFramework, membrane: MockMembrane, envelope: string) => {
     let starts = 0;
     f.onTrace((event) => {
