@@ -3,11 +3,16 @@
  * excepts the channel it names (AF #844 review follow-up, Isaac-3593,
  * round 3): the focus status true when the result arrives, a focus end that
  * happened before a failure, and a repeat close that names the excepted
- * channel after its server no longer registers it.
+ * channel after its server no longer registers it; and (Simon-2700, round
+ * 7) a bare id the focus's channel answers to means that channel, not
+ * another server's channel with the id.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { fixture, eventually } from './helpers/coalescing-fixture.js';
+import { once } from 'node:events';
+import type { AddressInfo } from 'node:net';
+import { WebSocketServer, type WebSocket } from 'ws';
+import { fixture, eventually, REPLY_DEADLINE_MS } from './helpers/coalescing-fixture.js';
 import type { FrameworkConfig } from '../src/types/framework.js';
 import { SUB, internals, textOf, find, has, incoming, registerOpen, settle, type Fixture } from './helpers/admission.js';
 
@@ -15,6 +20,7 @@ type Answer = { success: boolean; data?: unknown; error?: string };
 type Framework = {
   reserveStoreForSurgery(verb: string, agentName: string): () => void;
   disconnectMcplServer(id: string): Promise<void>;
+  connectMcplServer(config: { id: string; url: string }): Promise<void>;
   mcplServerRegistry: { getServer(id: string): { sendChannelsClose(params: { channelId: string }): Promise<unknown> } | null };
   channelRegistry: { handleChannelToolCall(name: string, input: unknown, origin?: unknown): Promise<Answer> };
 };
@@ -260,4 +266,142 @@ describe('a close naming the excepted channel after its server no longer registe
       assert.ok(has(f, 'antra: held'), 'its backlog released');
     } finally { release(); await f.close(); }
   });
+});
+
+/**
+ * A second MCPL server, `other`, on its own loopback socket, connected to the
+ * fixture's host. It records the channels/close requests it is sent, and
+ * registers channels as the fixture's server does (registerOpen).
+ */
+async function otherServer(f: Fixture) {
+  const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+  await once(wss, 'listening');
+  const closes: string[] = [];
+  const replies = new Map<number, (value: unknown) => void>();
+  let socket: WebSocket | undefined;
+  let next = 1;
+  wss.on('connection', (ws) => {
+    socket = ws;
+    ws.on('message', (bytes) => {
+      const m = JSON.parse(String(bytes));
+      if (!m.method) { replies.get(m.id)?.(m); replies.delete(m.id); return; }
+      const reply = (result: unknown) => ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }));
+      if (m.method === 'initialize') {
+        reply({ protocolVersion: '2024-11-05', capabilities: { tools: {}, experimental: { mcpl: {
+          version: '0.5', channels: { incoming: true, register: true, lifecycle: true, publish: true },
+        } } }, serverInfo: { name: 'other', version: '1' } });
+      } else if (m.method === 'tools/list') reply({ tools: [] });
+      else if (m.method === 'channels/close') { closes.push(m.params.channelId); reply({ closed: true }); }
+      else if (m.method === 'channels/open') reply({ channel: { id: m.params.channelId, type: 'discord', label: m.params.channelId } });
+      else if (m.id !== undefined) reply({});
+    });
+  });
+  await framework(f).connectMcplServer({ id: 'other', url: `ws://127.0.0.1:${(wss.address() as AddressInfo).port}` });
+  // Sends a request and waits for its reply, for up to REPLY_DEADLINE_MS, as the fixture's send() does.
+  const send = (method: string, params: unknown): Promise<unknown> => new Promise((resolve, reject) => {
+    const id = next++;
+    const timer = setTimeout(() => reject(new Error(`no reply to ${method} within ${REPLY_DEADLINE_MS / 1000} s`)), REPLY_DEADLINE_MS);
+    replies.set(id, (value) => { clearTimeout(timer); resolve(value); });
+    socket!.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }));
+  });
+  return {
+    closes,
+    registerOpen: async (id: string) => {
+      await send('channels/register', { channels: [{ id, type: 'discord', label: id, initiallyOpen: true, metadata: { channelType: 'guild_text' } }] });
+      await eventually(() => internals(f).channelRegistry.getDesiredState('other', id) === 'open', `other's ${id} open`);
+    },
+    stop: async () => {
+      for (const client of wss.clients) client.terminate();
+      await new Promise<void>((r) => wss.close(() => r()));
+    },
+  };
+}
+
+/** A first close of `work` whose release fails before the focus ends, which leaves the focus in force. */
+async function firstCloseFails(f: Fixture): Promise<void> {
+  const hooks = (coordinatorOf(f) as unknown as { hooks: { commitDeliveries?: () => boolean } }).hooks;
+  const commit = hooks.commitDeliveries;
+  hooks.commitDeliveries = () => false;
+  try {
+    const first = await close(f, { channelId: 'work' }, 'c0');
+    assert.equal(first.success, false, 'premise: the first close failed');
+  } finally { hooks.commitDeliveries = commit; }
+  assert.ok(coordinatorOf(f).getAllExcept(), 'premise: the focus outlived the first close');
+}
+
+const OTHER_NOT_CLOSED = 'Channel "work" on server "other" was not closed: name its server to close it.';
+
+describe("a bare channel_close id the focus's channel answers to means that channel, not another server's with the id", () => {
+  it("the focus's channel gone and another server's `work` registered: the repeat ends the focus, and leaves other's `work` open", async () => {
+    const f = await focused();
+    const other = await otherServer(f);
+    try {
+      await firstCloseFails(f);
+      await f.send('channels/changed', { removed: ['work'] });
+      await other.registerOpen('work');
+      const result = await close(f, { channelId: 'work' });
+      assert.equal(result.success, false, `no close ran: ${JSON.stringify(result)}`);
+      assert.equal(result.error,
+        `Server "editor" no longer registers channel "work", so no close was recorded or sent. ${ENDED} ${OTHER_NOT_CLOSED}`);
+      assert.equal(coordinatorOf(f).getAllExcept(), null, 'the focus ended');
+      assert.match(textOf(find(f, 'all channels except')), /antra: held/, 'its backlog released');
+      assert.equal(internals(f).channelRegistry.getDesiredState('other', 'work'), 'open', "other's work stays open");
+      // The focus's end wakes the resident: its turn answered, the host is
+      // idle, and nothing it did sent other's server a close.
+      f.alwaysRespond();
+      await f.framework.runUntilIdle();
+      assert.deepEqual(other.closes, [], "other's server was sent no close");
+    } finally { await f.close(); await other.stop(); }
+  });
+
+  it("the focus's channel still registered beside another server's `work`: the close goes to the focus's channel, and says other's `work` was not closed", async () => {
+    const f = await focused();
+    const other = await otherServer(f);
+    try {
+      await other.registerOpen('work');
+      const result = await close(f, { channelId: 'work' });
+      assert.equal(result.success, true, result.error);
+      assert.deepEqual(result.data, { channelId: 'work', serverId: 'editor', status: 'closed', note: `${ENDED} ${OTHER_NOT_CLOSED}` });
+      assert.equal(coordinatorOf(f).getAllExcept(), null, 'the focus ended');
+      assert.equal(internals(f).channelRegistry.getDesiredState('editor', 'work'), 'closed');
+      assert.equal(internals(f).channelRegistry.getDesiredState('other', 'work'), 'open', "other's work stays open");
+      // The focus's end wakes the resident: its turn answered, the host is
+      // idle, and nothing it did sent other's server a close.
+      f.alwaysRespond();
+      await f.framework.runUntilIdle();
+      assert.deepEqual(other.closes, [], "other's server was sent no close");
+    } finally { await f.close(); await other.stop(); }
+  });
+
+  it('control: with no second `work`, the repeat ends the old focus and says no close was sent', async () => {
+    const f = await focused();
+    try {
+      await firstCloseFails(f);
+      await f.send('channels/changed', { removed: ['work'] });
+      const result = await close(f, { channelId: 'work' });
+      assert.equal(result.success, false);
+      assert.equal(result.error, `Server "editor" no longer registers channel "work", so no close was recorded or sent. ${ENDED}`);
+      assert.equal(coordinatorOf(f).getAllExcept(), null, 'the focus ended');
+    } finally { await f.close(); }
+  });
+
+  for (const input of [{ channelId: 'work', serverId: 'other' }, { channelId: 'other:work' }]) {
+    it(`control: a close naming other's server (${JSON.stringify(input)}) closes other's \`work\` and leaves the focus alone`, async () => {
+      const f = await focused();
+      const other = await otherServer(f);
+      try {
+        await firstCloseFails(f);
+        await f.send('channels/changed', { removed: ['work'] });
+        await other.registerOpen('work');
+        const result = await close(f, input);
+        assert.equal(result.success, true, result.error);
+        assert.deepEqual(result.data, { channelId: 'work', serverId: 'other', status: 'closed' });
+        assert.ok(coordinatorOf(f).getAllExcept(), 'the focus is in force');
+        assert.equal(internals(f).channelRegistry.getDesiredState('other', 'work'), 'closed');
+        // A tool close's lifecycle sends channels/close once per queued
+        // operation, here more than once (as for the fixture's own server).
+        assert.ok(other.closes.length > 0 && other.closes.every((id) => id === 'work'), `other's server was sent the close: ${JSON.stringify(other.closes)}`);
+      } finally { await f.close(); await other.stop(); }
+    });
+  }
 });

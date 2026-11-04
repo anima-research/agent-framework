@@ -31,3 +31,14 @@
   then: "… A new all-except focus is in force now, excepting <server>/<channel>: not this close's, and what
   the other channels hold stays held until it ends." — so an agent whose close waited on held writes or a
   transport round-trip is told the focus it accounts for next, not only that its own ended.
+- An agent's `channel_close` given a bare id (no `serverId`) that the channel an all-except hold excepts answers
+  to now acts on that channel, not on another server's channel with the same id. After the hold's channel
+  (`editor`'s `work`) stopped being registered and another server registered `work`, a repeat
+  `channel_close({ channelId: "work" })` outside a turn of that channel closed `other`'s `work`, answered
+  `{ channelId: "work", serverId: "other", status: "closed" }`, and left the focus in force. It now ends the
+  focus as the vanished-channel close above does, sends `other` no close, and adds "Channel "work" on server
+  "other" was not closed: name its server to close it." With the hold's channel still registered beside
+  another server's `work`, the bare id, refused before as on more than one server, now closes the hold's
+  channel and adds the same sentence to the answer's `note`. A close that names `other` (`serverId: "other"`
+  or `"other:work"`) closes `other`'s `work` and leaves the focus alone. A name the calling turn's own channel
+  answers to, a module's close, and any close while no focus is in force resolve as before.
