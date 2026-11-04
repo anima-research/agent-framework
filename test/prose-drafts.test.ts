@@ -881,7 +881,7 @@ describe('held prose drafts, end to end', () => {
       assert.equal(h.publishes().filter((p) => p.text === 'scout words').length, 0);
       // Residents of one framework share a message slot (#197), so the
       // notice is visible there too; it names whose drafts it means.
-      const held = h.texts('scout').find((t) => t.startsWith(`[drafts] scout: not sent — a plain-speech segment held as draft ${mine.id}`));
+      const held = h.texts('scout').find((t) => t.startsWith(`[drafts] scout: not sent by the framework — a plain-speech segment held as draft ${mine.id}`));
       assert.ok(held);
       assert.ok(!held!.includes('scout words'), `the held-draft notice quotes none of the draft's words: ${held}`);
     } finally {

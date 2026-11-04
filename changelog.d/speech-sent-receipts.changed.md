@@ -39,8 +39,8 @@
   has no channel this turn", where each said it "stays in your archive". The
   note for a channel its server declared inbound-only, in the `[routing]`
   notices and in `channel_open`'s result, reads "plain speech there is
-  refused, so no channel there posts it", where it said it "stays in your
-  archive".
+  refused, so routing posts it to no channel there", where it said it "stays
+  in your archive".
 - **Residents:** a failed turn's `[inference-failed]` note, and a stopped
   turn's `[turn-interrupted]` note, also say a round's plain speech was handed
   on when a module had said by the time the turn ended that it showed it,
@@ -51,4 +51,9 @@
   reads "(the framework didn't send them — drafts can resend them unchanged,
   or dismiss them)", where it read "(not sent — …)", and for speech it
   couldn't hold, "the words remain in your history", where it read "remain
-  only in your history": a module may have shown either.
+  only in your history": a module may have shown either. For the same
+  reason, the `[drafts]` notice for speech held as a draft reads "not sent by
+  the framework — …", where it read "not sent — …", and autoContinue's
+  `[continue]` row reads "Some or all of your closing words last turn were
+  held, and the framework didn't send them: …", where it read "were held, not
+  sent: …".

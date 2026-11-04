@@ -715,7 +715,9 @@ describe('plain speech a module says it showed', () => {
     assert.ok(failed[0]!.includes('Plain speech of its rounds was handed on for delivery or shown as written'), failed[0]);
   });
 
-  it("a turn that fails after a round one module showed, while another hadn't answered, says that round's speech was handed on", async () => {
+  it("a turn that fails after a round one module showed, while another hadn't answered, says that round's speech was handed on", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
     const surface = new Surface();
     const slow = new Surface('terminal');
     slow.answer = 'hang';
@@ -724,8 +726,10 @@ describe('plain speech a module says it showed', () => {
     const f = await host([surface, slow], membrane);
     await turn(f);
     assert.deepEqual(askedTexts(slow), [{ text: 'Looking around.', final: false }], 'premise: the other module was asked too');
+    assert.deepEqual(askedTexts(surface), [{ text: 'Looking around.', final: false }], 'premise: the module that answered at once was asked');
     const failed = texts(f).filter((t) => t.startsWith('[inference-failed]'));
     assert.equal(failed.length, 1, texts(f).join('\n'));
+    assert.ok(!errors.some((e) => e.includes("Speech-routed module terminal (agent resident) hadn't answered")), 'the other module was still due when the turn failed');
     assert.ok(failed[0]!.includes('Plain speech of its rounds was handed on for delivery or shown as written'), failed[0]);
   });
 
@@ -750,7 +754,41 @@ describe('plain speech a module says it showed', () => {
     assert.ok(errors.some((e) => e.includes("after the turn's receipt took its asks")), errors.join('\n'));
   });
 
-  it("a piece with no channel whose agent was replaced while its modules were asked isn't routed for the replacement", async () => {
+  it("a context-budget restart that takes a routing whose receipt took its asks keeps its own asks for its receipt", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const surface = new Surface();
+    surface.answer = 'per-text';
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi there.' }]));
+    const f = await host([surface], membrane);
+    await turn(f);
+    assert.equal(receipt(f), `[delivered] plain speech → sent to ${SENT_TO}, for Hi there. · this turn's routing posted it to no channel`, 'premise: the turn wrote its receipt');
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Again.' }]));
+    internals(f).pendingRequests.push({ agentName: 'resident', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now() });
+    await f.runUntilIdle();
+    assert.deepEqual(askedTexts(surface).map((a) => a.text), ['Hi there.', 'Again.'], 'premise: the restart routed its speech');
+    assert.equal(receipt(f), `[delivered] plain speech → sent to ${SENT_TO}, for Again. · this turn's routing posted it to no channel`);
+    assert.ok(!errors.some((e) => e.includes("after the turn's receipt took its asks")), errors.join('\n'));
+  });
+
+  it("a turn that takes a module's wake beside a continuation names that wake's messages, not those the continuation carried", async () => {
+    const surface = new Surface();
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Both.' }]));
+    const f = await host([surface], membrane);
+    const pending = internals(f).pendingRequests;
+    const t0 = Date.now();
+    pending.push({ agentName: 'resident', reason: 'auto-continue', source: 'framework', timestamp: t0, openingMessages: ['m-carried'], autoContinueRun: { stop: 'end_turn' } });
+    pending.push({ agentName: 'resident', reason: 'external-message', source: 'console', timestamp: t0 + 1, openingMessages: ['m-new'] });
+    await f.runUntilIdle();
+    assert.deepEqual(askedTexts(surface), [{ text: 'Both.', final: true }], 'premise: one turn took both');
+    assert.deepEqual(surface.asked[0]!.context.openedBy?.messages, ['m-new']);
+  });
+
+  it("a piece with no channel whose agent was replaced while its modules were asked isn't routed for the replacement", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
     const surface = new Surface();
     surface.answer = 'held';
     const f = await host([surface], new MockMembrane());
@@ -771,6 +809,7 @@ describe('plain speech a module says it showed', () => {
       surface.release();
       assert.equal(await result, null);
       assert.deepEqual(routed, []);
+      assert.ok(errors.some((e) => e.includes('[routeSpeech] resident: replaced while its modules were asked')), errors.join('\n'));
     } finally {
       internal.agents.set('resident', original);
     }
@@ -802,7 +841,9 @@ describe('plain speech a module says it showed', () => {
     }
   });
 
-  it("a module whose onSpeechRouted can't be read isn't asked, and the others are", async () => {
+  it("a module whose onSpeechRouted can't be read isn't asked, and the others are", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
     const surface = new Surface();
     const broken = new Surface('broken');
     Object.defineProperty(broken, 'onSpeechRouted', { get() { throw new Error('broken accessor'); } });
@@ -812,6 +853,19 @@ describe('plain speech a module says it showed', () => {
     await turn(f);
     assert.deepEqual(notices(f), []);
     assert.equal(receipt(f), `[delivered] plain speech → sent to ${SENT_TO} · this turn's routing posted it to no channel`);
+    assert.ok(errors.some((e) => e.includes('Speech-routed module broken (agent resident) error reading its onSpeechRouted')), errors.join('\n'));
+  });
+
+  it("a place's callback that throws is logged, and the ask still settles with the place", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const surface = new Surface();
+    const f = await host([surface], new MockMembrane());
+    const registry = (f as unknown as { moduleRegistry: { askSpeechRouted(agent: string, text: string, context: SpeechRoutedContext, onPlace?: () => void): Promise<string[]> } }).moduleRegistry;
+    const asked = registry.askSpeechRouted('resident', 'Hi.', { final: true }, () => { throw new Error('zz-callback broke'); });
+    const settled = await Promise.race([asked, new Promise((resolve) => setTimeout(() => resolve('unsettled'), 1_000))]);
+    assert.deepEqual(settled, [SENT_TO]);
+    assert.ok(errors.some((e) => e.includes("Speech-routed module console (agent resident) place's callback error")), errors.join('\n'));
   });
 
   it("a ' !' continuation names the messages of the turn that asked for it", async () => {

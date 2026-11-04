@@ -2599,10 +2599,10 @@ describe('present while acting', () => {
     assert.ok(text, `${what} was written`);
     assert.ok(
       text!.includes(
-        'pocket-body declared this channel inbound-only, and plain speech there is refused, so no channel there posts it. ' +
+        'pocket-body declared this channel inbound-only, and plain speech there is refused, so routing posts it to no channel there. ' +
           "To speak there, use pocket-body's own tools.",
       ),
-      `${what} says plain speech there is refused, that no channel there posts it, and what to use instead: ${text}`,
+      `${what} says plain speech there is refused, that routing posts it to no channel there, and what to use instead: ${text}`,
     );
     assert.ok(!text!.includes('lands'), `${what} doesn't say the speech lands there: ${text}`);
   }

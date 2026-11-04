@@ -50,8 +50,8 @@ A turn continues when the model ended it (stop reason `end_turn` or
   (`allowedTools`). Explicit and hybrid agents can always end with a skip
   envelope.
 
-A turn that sent with a send tool and then closed in prose (held, not sent,
-some or all of it, because a send that turn may already have posted where it
+A turn that sent with a send tool and then closed in prose (held, and not
+sent by the framework, some or all of it, because a send that turn may already have posted where it
 was going) still continues: its closing words can't be told from unfinished
 work. The row tells the agent those words were held.
 
@@ -71,8 +71,8 @@ same reason it is never written while another resident's turn is alive: the
 continuation waits for that turn to end, as a clock row does. When some or
 all of the last turn's closing words were held because a send that turn may
 already have posted where they were going, it adds `Some or all of your
-closing words last turn were held, not sent: a send that turn may already have
-posted where they were going.` The last continuation of a run adds `This is the last
+closing words last turn were held, and the framework didn't send them: a send
+that turn may already have posted where they were going.` The last continuation of a run adds `This is the last
 continuation in a row: after this turn you wait for the next event either
 way.` An agent that can't call `skip_reply` is told to end with a
 `>>skip_reply` (explicit) or `>>>skip_reply` (hybrid) envelope instead.

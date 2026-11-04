@@ -1212,6 +1212,7 @@ test("a held wake that a held turn's merged retry, led by an equal wake, folds i
       held.push(wake as unknown as Request);
       (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, start);
       assert.equal(held.length, 1, 'premise: the hold folds the merged retry into the held wake');
+      assert.equal(held[0], wake as unknown as Request, 'the held wake is the one kept');
       assert.equal(fw.abortInference('resident', 'zz-operator stop'), true);
       go();
       await waitFor(fw, () => membrane.primary >= 3, 'the held wake, as a turn of its own');

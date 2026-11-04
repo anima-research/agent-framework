@@ -8,7 +8,8 @@
   surface may have shown it. A piece held as a draft gets no such notice,
   since it's named as a draft. Modules are asked together, and their answers
   about each piece are waited for at most `SPEECH_RECEIPT_WAIT_MS` (5 s,
-  exported). A piece with a channel posts without waiting for its own answers;
+  exported) from each hook's call; a hook that blocks synchronously past it
+  and returns its answer still has it taken. A piece with a channel posts without waiting for its own answers;
   since a turn's pieces route in order, a post after a routed piece with no
   channel waits behind that piece's answers, only while a module hasn't answered. The
   turn's `[delivered]` receipt waits up to the same bound for answers still
@@ -36,5 +37,7 @@
   carry another on (a `!` continuation, an autoContinue run, a bounce's
   wake, or a retry on a history rewound after a refusal, an unstick or an
   inference failure), the messages that opened that turn, as stored ids or
-  held-write handles that a module context's `getMessage` reads. A message a
+  held-write handles that a module context's `getMessage` reads; a turn that
+  took a cause of its own beside such a continuation names that cause's
+  messages instead. A message a
   rewind removed is still named, and `getMessage` returns `null` for it.

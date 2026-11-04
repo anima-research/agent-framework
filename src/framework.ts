@@ -574,7 +574,7 @@ function injectedBlockTokens(block: ContentBlock): number {
 function inboundOnlySpeechNote(serverId: string): string {
   return (
     `${serverId} declared this channel inbound-only, and plain speech there is refused, ` +
-    `so no channel there posts it. To speak there, use ${serverId}'s own tools.`
+    `so routing posts it to no channel there. To speak there, use ${serverId}'s own tools.`
   );
 }
 
@@ -20412,7 +20412,7 @@ export class AgentFramework {
           ? trigger?.readsDeferredWrite : undefined,
         readsStoredMessage: requests.every((r) => r.readsStoredMessage === trigger?.readsStoredMessage)
           ? trigger?.readsStoredMessage : undefined,
-        openingMessages: mergedOpeningMessages(requests),
+        openingMessages: mergedOpeningMessages(requests.some(hasOwnCauseForRun) ? requests.filter(hasOwnCauseForRun) : requests),
         // Every merged wake's handed line, each event's once: the turn's start
         // decides each (beginAgentTurn).
         wakeLines: mergeWakeLines(requests),
@@ -20840,7 +20840,7 @@ export class AgentFramework {
     // Named: residents that share one message slot (#197) share this window.
     // "Not sent" only when no copied words may already have been posted.
     return (
-      `[${NOTICE_TAG.drafts}] ${agentName}: ${risky.length > 0 ? '' : 'not sent — '}` +
+      `[${NOTICE_TAG.drafts}] ${agentName}: ${risky.length > 0 ? '' : 'not sent by the framework — '}` +
       `${many ? `${held.length} plain-speech segments` : 'a plain-speech segment'} ` +
       `held as draft${many ? 's' : ''} ${ids.join(', ')} — ${because ? `because ${because}` : AgentFramework.DRAFT_REASON_TEXT[reason]}. ` +
       `${resend.join('; ')}; drafts(action: "dismiss", draftIds: [${quoted(held)}]) sets ${many ? 'them' : 'it'} aside.`
@@ -21495,7 +21495,10 @@ export class AgentFramework {
     if (locus === null) {
       const places = await asked;
       const current = this.agents.get(agent.name);
-      if (current && current !== agent) return null;
+      if (current && current !== agent) {
+        console.error(`[routeSpeech] ${agent.name}: replaced while its modules were asked; ${text.length} chars not routed for the replacement`);
+        return null;
+      }
       if (places.length > 0) {
         console.error(`[routeSpeech] ${agent.name}: turn has no channel; ${text.length} chars shown by ${places.map(logValue).join(' · ')}, routing posted it to no channel`);
         return null;

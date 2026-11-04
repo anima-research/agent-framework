@@ -216,8 +216,10 @@ export interface Module {
    * envelopes included) or their own words held as drafts, a turn under
    * explicit routing, which writes no receipt, or an ephemeral run's unheld
    * speech with no channel, which is its caller's result. A module that throws, or
-   * hasn't answered within `SPEECH_RECEIPT_WAIT_MS`, names no place, as `{}`
-   * does. For a turn that ends with its reply or a tool, the turn's receipt
+   * hasn't answered within `SPEECH_RECEIPT_WAIT_MS` of its call, names no
+   * place, as `{}` does; a hook that blocks synchronously past that bound
+   * and returns its answer still has it taken, since no timer runs while it
+   * blocks. For a turn that ends with its reply or a tool, the turn's receipt
    * and the agent's next turn wait for every answer, each piece's up to that
    * bound, and a routed piece with no channel waits for its answers before
    * the next piece routes, so a turn of several such pieces can wait that
@@ -814,9 +816,12 @@ export interface SpeechRoutedContext {
    * history rewound after a refusal, an unstick or an inference failure),
    * the messages that opened that turn, each as its stored id or a held
    * write's handle, either of which a module context's `getMessage` takes.
-   * A message a rewind removed is still named, and `getMessage` returns
-   * `null` for it. A wake an event gate debounced carries none, so the
-   * messages of the module answers it stands for aren't named.
+   * A turn that took a cause of its own beside such a continuation, such as
+   * a module answer's wake, names that cause's messages, not those the
+   * continuation carried. A message a rewind removed is still named, and
+   * `getMessage` returns `null` for it. A wake an event gate debounced
+   * carries none, so the messages of the module answers it stands for
+   * aren't named.
    */
   openedBy?: {
     reason: string;

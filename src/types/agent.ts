@@ -618,7 +618,8 @@ export interface InferenceRequest {
   /** @internal The messages added by the module answers whose wakes this
    *  request stands for, and, for a request the framework queued to carry a
    *  turn on, the messages that opened that turn, each as its stored id or a
-   *  held write's handle. */
+   *  held write's handle. A start merged from such a request and a cause of
+   *  its own takes only the cause's. */
   openingMessages?: string[];
   agentName: string;
   reason: string;
