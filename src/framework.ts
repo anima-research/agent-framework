@@ -4915,6 +4915,7 @@ export class AgentFramework {
             ...(provenance?.channelId ? { wakeChannelId: provenance.channelId } : {}),
             ...(provenance?.counterparty ? { counterparty: provenance.counterparty } : {}),
             ...(provenance?.at ? { wakeAt: provenance.at } : {}),
+            ...(provenance?.systemNotice ? { systemNotice: true as const } : {}),
             // The batch's line, when the gate left it to the turn's start
             // (beginAgentTurn decides it: placeWakeLines).
             ...(provenance?.line ? { wakeLines: [provenance.line] } : {}),
@@ -4939,6 +4940,7 @@ export class AgentFramework {
               if (route && framework.mayTakeGateRoute(agentName, route)) {
                 return { channelId: route.channelId, channelServerId: route.serverId, addressed: true };
               }
+              if (provenance?.addressed) return { addressed: true };
               const came = (provenance?.batchChannels ?? [])
                 .map((c) => framework.channelNamed(c.channelId, c.serverId))
                 .filter((c): c is ChannelRef => c !== undefined);
@@ -19266,7 +19268,7 @@ export class AgentFramework {
         eventType: 'mcpl:push-event',
         ...(occ.tags ? { tags: occ.tags } : {}),
       },
-    }, { suppressible, ...remembered });
+    }, { suppressible, ...remembered, folds: true });
     // Its batch's row, written later, reads this decision, since a rule's
     // script answers once per event. (A copy of the occurrence, as a wake to
     // read a row has, was decided before it was copied.)
@@ -20225,9 +20227,10 @@ export class AgentFramework {
       let provReq: InferenceRequest | undefined = addressedReq
         ?? (channelReq?.counterparty || channelReq?.wakeChannelId ? channelReq : undefined);
       if (!provReq) {
-        for (const r of requests) {
-          if (!r.counterparty && !r.wakeChannelId) continue;
-          if (!provReq || (r.wakeAt ?? r.timestamp) >= (provReq.wakeAt ?? provReq.timestamp)) provReq = r;
+        const naming = requests.filter((r) => r.counterparty || r.wakeChannelId);
+        const said = naming.filter((r) => !r.systemNotice);
+        for (const r of said.length > 0 ? said : naming) {
+          if (!provReq || eventAt(r) >= eventAt(provReq)) provReq = r;
         }
       }
       // A silent tick never suppresses a genuine coalesced wake. If any
@@ -20268,7 +20271,7 @@ export class AgentFramework {
         // channel is that message's, never one server's id with another's.
         channelId: channelReq?.channelId,
         channelServerId: channelReq?.channelServerId,
-        wakeChannels: channelReq ? undefined : wakeChannelsOf(requests),
+        wakeChannels: channelReq || requests.some((r) => r.addressed && !r.systemNotice) ? undefined : wakeChannelsOf(requests),
         // Only the mark this batch decided, never one requests[0] carried.
         autoContinueRun: continuationMark,
         addressed: addressedReq !== undefined,
@@ -21306,9 +21309,9 @@ export class AgentFramework {
     return this.channelRegistry!.routeSpeech(agent.name, text, locus, this.cameFrom(round.routing, locus));
   }
 
-  private cameFrom(routing: TurnRouting, locus: ChannelRef | null): { cameFrom: string[] } | undefined {
+  private cameFrom(routing: TurnRouting, locus: ChannelRef | null): { cameFrom: Array<{ channel: ChannelRef; shown: string }> } | undefined {
     return locus === null && routing.wakeChannels
-      ? { cameFrom: routing.wakeChannels.map((c) => this.channelShown(c)) }
+      ? { cameFrom: routing.wakeChannels.map((c) => ({ channel: c, shown: this.channelShown(c) })) }
       : undefined;
   }
 
@@ -37633,7 +37636,7 @@ export class AgentFramework {
      * this occurrence earlier (a coalesced push's, at its wake), used instead
      * of asking again, since a rule's script answers once per event.
      */
-    opts: { suppressible?: boolean; decided?: string | null } = {},
+    opts: { suppressible?: boolean; decided?: string | null; folds?: boolean } = {},
   ): AdmissionDecision & { gateDecision?: GateDecision } {
     // The gate's whole decision, for wake onboarding (which rule let the event
     // go by); admission itself reads only whether it wakes.
@@ -37650,6 +37653,7 @@ export class AgentFramework {
       metadata: e.gateMetadata,
       tags: Array.isArray(e.gateMetadata.tags) ? (e.gateMetadata.tags as string[]) : undefined,
       ...(asked ? { suppressionAsked: true } : {}),
+      ...(opts.folds ? { folds: true as const } : {}),
     });
     const decision = admit(env, {
       untargetedRecipients: () => this.registry.untargetedRecipients(),

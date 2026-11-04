@@ -183,6 +183,9 @@ export interface WakeProvenance {
   counterparty?: string;
   /** True when the chosen event was `chat:addressed`. */
   addressed?: boolean;
+  /** The batch held `chat:system` notices alone: `counterparty` and `at`
+   *  are its newest authored notice's, and the wake is a notice's. */
+  systemNotice?: true;
   /** Speech locus for the wake: the routable channel of the chosen event,
    *  set ONLY when that event addressed the agent (mention / reply / DM) and
    *  the host resolved its registered channel. A batched wake used to carry
@@ -331,7 +334,7 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
   if (!pick && channels.length === 0) {
     const notice = events.reduce<PendingEvent | undefined>(
       (n, e) => (e.systemNotice && e.authorId && (!n || e.timestamp >= n.timestamp) ? e : n), undefined);
-    return notice ? { counterparty: counterpartyOf(notice) } : undefined;
+    return notice ? { counterparty: counterpartyOf(notice), systemNotice: true, at: notice.timestamp } : undefined;
   }
   // push-event channel ids are the adapter's raw ids (a Discord snowflake):
   // not a composite channel id, so not reported as one
@@ -4019,7 +4022,7 @@ export class EventGate {
       authorId: this.extractAuthorId(info.metadata) ?? undefined,
       serverId: info.serverId || undefined,
       addressed: Array.isArray(info.tags) && info.tags.includes('chat:addressed'),
-      ...(isSystemNotice(info.tags) ? { systemNotice: true as const } : {}),
+      ...(isSystemNotice(info.tags) && !info.folds ? { systemNotice: true as const } : {}),
       routeChannelId: this.routeChannelFor(info),
       ...(typeof info.metadata?.messageId === 'string' ? { messageId: info.metadata.messageId } : {}),
       ...(typeof info.metadata?.eventId === 'string' ? { eventId: info.metadata.eventId } : {}),

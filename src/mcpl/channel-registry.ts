@@ -6120,9 +6120,10 @@ export class ChannelRegistry {
      *  draft with its own notice, so no failure marker is written for it.
      *  An `unknown` outcome still gets its marker. `cameFrom`: with no
      *  locus, the channels the turn's batch of messages came from when none
-     *  of them addressed the agent, as the agent is shown them; the failure's
-     *  reason names them. */
-    opts?: { heldOnFailure?: boolean; cameFrom?: readonly string[] },
+     *  of them addressed the agent, each with how the agent is shown it; the
+     *  failure's reason names them, and how to reply in those that take
+     *  speech. */
+    opts?: { heldOnFailure?: boolean; cameFrom?: ReadonlyArray<{ channel: ChannelRef; shown: string }> },
   ): Promise<PublishOutcome> {
     // `logged` is what the log line and the trace say, where it isn't the
     // agent's reason (the three no-locus reasons below).
@@ -6180,10 +6181,19 @@ export class ChannelRegistry {
       // The locus froze at the turn's start, so this says what the turn had.
       const from = opts?.cameFrom ?? [];
       if (from.length > 0) {
-        const where = from.length === 1 ? from[0] : `${from.slice(0, -1).join(', ')} and ${from.at(-1)}`;
-        const reason = `this turn came from ${where}, and what came from ${from.length === 1 ? 'there' : 'those'} didn't ` +
-          `address you, and no channel was chosen for its reply; to reply ${from.length === 1 ? 'there' : 'in one of them'}, ` +
-          'send your reply to that channel explicitly';
+        const list = (names: readonly string[]) =>
+          names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names.at(-1)}`;
+        const closed = from.flatMap(({ channel, shown }) => {
+          const entry = this.entryAt(channel);
+          return entry && isInboundOnly(entry) ? [`${shown} is ${inboundOnlyReason(entry)}`] : [];
+        });
+        const open = from.filter(({ channel }) => { const entry = this.entryAt(channel); return !(entry && isInboundOnly(entry)); });
+        const reply = open.length === 0 ? ''
+          : open.length === from.length
+            ? `; to reply ${from.length === 1 ? 'there' : 'in one of them'}, send your reply to that channel explicitly`
+            : `; to reply in ${open.length === 1 ? open[0].shown : `one of ${list(open.map((c) => c.shown))}`}, send your reply to that channel explicitly`;
+        const reason = `this turn came from ${list(from.map((c) => c.shown))}, and what came from ${from.length === 1 ? 'there' : 'those'} didn't ` +
+          `address you, and no channel was chosen for its reply${reply}${closed.map((c) => `; ${c}`).join('')}`;
         return fail(null, reason, { status: 'failed', reason, at: Date.now() },
           'turn has no locus (its batch addressed the agent from none of its channels)', true);
       }
@@ -6221,7 +6231,7 @@ export class ChannelRegistry {
     conversationId: string,
     text: string,
     locus: ChannelRef | null,
-    opts?: { cameFrom?: readonly string[] },
+    opts?: { cameFrom?: ReadonlyArray<{ channel: ChannelRef; shown: string }> },
   ): Promise<{ delivered: boolean; serverId: string; channelId: string; messageId?: string } | null> {
     const outcome = await this.deliverSpeech(conversationId, text, locus, opts);
     if (outcome.status !== 'delivered') return null;

@@ -318,7 +318,7 @@ test("routeSpeech names a batch's channels when it has no locus, and its log lin
   console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
   let res;
   try {
-    res = await registry.routeSpeech('cairn', 'joining in', registry.resolveLocus('cairn'), { cameFrom: ['#room (discord:g1:room)'] });
+    res = await registry.routeSpeech('cairn', 'joining in', registry.resolveLocus('cairn'), { cameFrom: [{ channel: discord('discord:g1:room'), shown: '#room (discord:g1:room)' }] });
   } finally {
     console.error = original;
   }
@@ -1308,6 +1308,24 @@ test('plain speech into a channel its server declared inbound-only is refused be
   assert.match(failures[0]!.reason, /^inbound-only: server "body" declared this channel's direction "inbound"/);
   assert.match(failures[0]!.reason, /use that server's own tools$/);
   assert.ok(traces.some((t) => t.type === 'mcpl:speech-route-failed' && t.channelId === 'body:ears'));
+});
+
+test("with no locus, a batch's inbound-only channel is named as one, and only the channels that take speech get the advice to send there", async () => {
+  const { registry, failures } = makeRegistry({ delivered: true });
+  await registerInboundOnly(registry);
+  const ears = { channel: body('body:ears'), shown: '#Body · ears (body:ears)' };
+  const room = { channel: discord('discord:g1:room'), shown: '#room (discord:g1:room)' };
+
+  assert.equal(await registry.routeSpeech('linn', 'hi', null, { cameFrom: [ears] }), null);
+  assert.equal(failures.at(-1)!.reason, "this turn came from #Body · ears (body:ears), and what came from there didn't address you, " +
+    'and no channel was chosen for its reply; #Body · ears (body:ears) is inbound-only: server "body" declared this channel\'s ' +
+    'direction "inbound", so the host publishes nothing into it; to speak there, use that server\'s own tools');
+
+  assert.equal(await registry.routeSpeech('linn', 'hi', null, { cameFrom: [room, ears] }), null);
+  assert.equal(failures.at(-1)!.reason, "this turn came from #room (discord:g1:room) and #Body · ears (body:ears), and what came " +
+    "from those didn't address you, and no channel was chosen for its reply; to reply in #room (discord:g1:room), send your " +
+    'reply to that channel explicitly; #Body · ears (body:ears) is inbound-only: server "body" declared this channel\'s ' +
+    'direction "inbound", so the host publishes nothing into it; to speak there, use that server\'s own tools');
 });
 
 test('publish() itself refuses an inbound-only channel, so a drafts resend, which names the server, is refused before anything opens', async () => {
