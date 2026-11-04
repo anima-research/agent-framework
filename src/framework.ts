@@ -3620,7 +3620,7 @@ const JUDGE_PARAMETER: ToolParameter = {
   description:
     'Ask the reply judge first: batch matching events like debounceMs, then a small, cheap model reads your ' +
     'context (its newest part) with your instructions and decides whether to wake you now. When it says wait, ' +
-    'you aren\'t woken (the events stay in your context, as for "defer"); the next batch is judged afresh. ' +
+    'you aren\'t woken; you see the events when you\'re next woken, as for "defer"; the next batch is judged afresh. ' +
     'If the judge fails or times out you are woken, unless your host set it to stay quiet then. ' +
     'Its verdicts and reasons are in gate_status.',
   properties: {

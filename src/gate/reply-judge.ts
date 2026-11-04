@@ -280,8 +280,7 @@ export function judgeSystemPrompt(agentName: string): string {
   return [
     `You are the reply judge for an AI agent named ${agentName}. The agent isn't woken for every message: when new`,
     'events arrive, you decide whether now is a good time to wake it so it can respond. Waking it costs it a turn;',
-    "letting the events go by means it won't act on them until something else wakes it (they stay in its context,",
-    'so it will see them then).',
+    "letting the events go by means it won't act on them until something else wakes it (it will see them then).",
     '',
     "You're given the agent's context as a document: its conversation, oldest first, cut from the oldest end to",
     "fit, then its system prompt (abridged). The agent's own messages are those from the participant named",

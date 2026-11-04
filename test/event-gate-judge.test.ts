@@ -1600,6 +1600,13 @@ describe('wake_add_rule with judge', () => {
     assert.match(removal, /A judge rule's batch is pending while it waits out its quiet period, is held or is being judged\./);
   });
 
+  it("tells an agent with the judge that it sees a waited batch's events when it's next woken, not that they stay in its context", async (t) => {
+    const { wakeAddRule } = await judgeFramework(t, {});
+    const judge = (wakeAddRule().inputSchema.properties as Record<string, { description: string }>).judge!;
+    assert.ok(judge.description.includes('When it says wait, you aren\'t woken; you see the events when you\'re next woken, as for "defer"'), judge.description);
+    assert.ok(!judge.description.includes('stay in your context'), judge.description);
+  });
+
   it("refuses a judge out of range in the agent's own terms: judge, not gate.json's behavior.judge", async (t) => {
     const { call } = await judgeFramework(t, {});
     const early = await call({ name: 'quick', judge: { debounceMs: 50 } });
