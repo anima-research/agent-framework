@@ -901,6 +901,36 @@ describe('locked prose routing', () => {
     await framework.stop();
   });
 
+  it("a silent start of a locked agent gives a send with no channel its lock, or nothing, never the registry's default", async () => {
+    for (const [proseLock, expected] of [['#main', 'discord:g:main'], ['drafts', undefined]] as const) {
+      rmSync(tempDir, { recursive: true, force: true });
+      tempDir = mkdtempSync(join(tmpdir(), 'locked-prose-'));
+      membrane = new MockMembrane();
+      membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'p1', name: 'channel_publish', input: { content: 'quietly' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([] as ContentBlock[]));
+      const framework = await createFramework({ proseLock });
+      const { state } = stubChannelRegistry(framework);
+      const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+      const asked: Array<{ channelId?: unknown }> = [];
+      registry.handleChannelToolCall = async (_name: string, input: { channelId?: unknown }) => {
+        asked.push(input);
+        return { success: true, data: {} };
+      };
+      // A silent tick: its prose is suppressed, and the stub registry would
+      // resolve #lounge as a default for any turn that asked it.
+      (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+        agentName: 'assistant', reason: 'heartbeat', source: 'heartbeat', timestamp: Date.now(), suppressProse: true,
+      });
+      await framework.runUntilIdle();
+      assert.equal(asked.length, 1, proseLock);
+      assert.equal(asked[0]!.channelId, expected, proseLock);
+      assert.equal(state.locusCalls, 0, `${proseLock}: the registry's default wasn't asked for`);
+      await framework.stop();
+    }
+  });
+
   it('prose_locus is offered only to a locked agent, and refuses any other', async () => {
     const locked = await createFramework({ proseLock: '#main' });
     stubChannelRegistry(locked);

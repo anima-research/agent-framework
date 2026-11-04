@@ -35,7 +35,7 @@ Offered only to a locked agent (and only where its `allowedTools` permit it).
 | Call | Effect |
 | --- | --- |
 | `prose_locus {}` (or `to: null`) | Reports where plain speech goes now. |
-| `prose_locus { to: "#channel" }`, `"@person"`, a channel id | Points plain speech there. The target resolves the way a `>>` target does: inside a turn, an id one of the turn's own channels has means that channel; a name that is ambiguous or matches nothing is refused, naming its candidates where there are any, and moves nothing. Pointing it where it already goes changes nothing. |
+| `prose_locus { to: "#channel" }`, `"@person"`, a channel id | Points plain speech there. The target resolves the way a `>>` target does: inside a turn, an id one of the turn's own channels has means that channel; a name that is ambiguous or matches nothing is refused, naming its candidates where there are any, and moves nothing. Pointing it where the turn already speaks moves and holds nothing; if that destination was only the recipe's default, it's recorded as the resident's own choice, so a later change to the recipe's `proseLock` no longer moves it. |
 | `prose_locus { to: "drafts" }` | Holds plain speech as drafts: posted nowhere unless the resident resends them with the `drafts` tool. |
 
 A move is recorded in `framework/state` (`proseLocks`) before it applies, so a
@@ -64,8 +64,10 @@ A turn locked to drafts, or with no destination yet, holds its plain speech
 as drafts (`no-destination`). Holding is what the resident asked for, so
 there's no draft notice for each round. The turn's `[delivered]` receipt
 names the drafts, and they resend or dismiss like any others. Such a turn has
-no outgoing channel: a send tool called with no channel has no default to
-fall back to, and a `sleep` posts no announcement. It can still answer an
+no outgoing channel: `channel_publish` called with no channel has no default
+to fall back to, and a `sleep` posts no announcement. A module's own send
+tool that keeps a reply context of its own, such as the in-process Discord
+module's `discord--reply`, isn't governed by the lock (see below). It can still answer an
 incoming message: servers are told which message woke it, and a refusal
 reaction marks that one.
 

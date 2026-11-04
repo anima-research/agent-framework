@@ -24496,7 +24496,14 @@ export class AgentFramework {
       // this turn compiles, so the agent always knows where its voice goes
       // (announce-on-change only — no per-turn chatter, append-only for KV
       // stability).
-      if (turnProseRouting === 'locked') {
+      if (trigger?.suppressProse && this.proseRoutingOf(agent) === 'locked') {
+        // A silent start of a locked agent publishes no prose, but what it
+        // tells servers and gives a send with no channel is its lock or
+        // nothing, never the channel that woke it or a fallback.
+        routing.locked = true;
+        const locus = this.proseLockLocus(agent);
+        if (locus !== null) routing.locus = locus;
+      } else if (turnProseRouting === 'locked') {
         // Locked mode: the agent's lock, whatever woke the turn, a heartbeat
         // included; none (drafts) until it has one. Announce-on-change speaks
         // when the lock differs from what the agent was last told: after any
@@ -24560,7 +24567,9 @@ export class AgentFramework {
     }
     // A silent start, or a disabled agent's, has no locus to show, whatever a
     // channel_open in a silent turn left on its object.
-    const turnLocus = turnProseRouting === 'disabled' ? undefined : routing.locus;
+    const turnLocus = turnProseRouting === 'disabled' ? undefined
+      : turnProseRouting === 'locked' ? this.turnSpeaksAt(routing) ?? undefined
+        : routing.locus;
 
     this.touchEphemeralRun(agent.name, true);
     const turnStartedAt = Date.now();
@@ -25356,7 +25365,9 @@ export class AgentFramework {
         ? null
         : turnProseRouting === 'explicit'
           ? streamRouting.typing ?? null
-          : resolveTurnLocus();
+          : turnProseRouting === 'locked'
+            ? this.turnSpeaksAt(streamRouting)
+            : resolveTurnLocus();
     if (typingChannel) this.showTurnTyping(streamRouting, typingChannel);
     // Locus, hybrid and locked mode: move the indicator to the turn's locus
     // when it has moved since the indicator last showed (locked: by
