@@ -118,7 +118,7 @@ describe('the built-in toolset', () => {
     try {
       const names = await headerNames(h.framework);
       const all = h.framework.getAllTools().map((t) => t.name);
-      for (const folded of ['agent_settings', 'wake_add_rule', 'wake_remove_rule', 'gate_status', 'event_tags', 'workspace--status']) {
+      for (const folded of ['agent_settings', 'wake_add_rule', 'wake_remove_rule', 'gate_status', 'suppression_stats', 'dump_suppressed', 'event_tags', 'workspace--status']) {
         if (all.includes(folded)) assert.ok(!names.includes(folded), `${folded} folded`);
       }
       assert.ok(all.includes('workspace--status') && all.includes('agent_settings'), 'the folded tools exist');
