@@ -24785,8 +24785,6 @@ export class AgentFramework {
     // no longer holds are still on disk goes in before this start's compile.
     this.noticeHeadMoves(agent);
 
-    // At every start: a wake that joins a held turn's retry adds its batch's
-    // channels to the turn's, though the turn's locus stays as it opened.
     const wakeChannels = wakeChannelsOf([routing, trigger]);
     if (wakeChannels) routing.wakeChannels = wakeChannels;
 
