@@ -27,4 +27,5 @@
   carry another on (a `!` continuation, an autoContinue run, a bounce's
   wake, or a retry on a history rewound after a refusal, an unstick or an
   inference failure), the messages that opened that turn, as stored ids or
-  held-write handles that a module context's `getMessage` reads.
+  held-write handles that a module context's `getMessage` reads. A message a
+  rewind removed is still named, and `getMessage` returns `null` for it.

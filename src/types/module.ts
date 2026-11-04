@@ -800,6 +800,8 @@ export interface SpeechRoutedContext {
    * history rewound after a refusal, an unstick or an inference failure),
    * the messages that opened that turn, each as its stored id or a held
    * write's handle, either of which a module context's `getMessage` takes.
+   * A message a rewind removed is still named, and `getMessage` returns
+   * `null` for it.
    */
   openedBy?: {
     reason: string;
