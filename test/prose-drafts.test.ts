@@ -967,7 +967,7 @@ describe('held prose drafts, end to end', () => {
       await h.turn([createMockResponse([text('words a refusing connector drops')])]);
       await h.until(() => h.texts().some((t) => t.startsWith('[discord-send-failed]')), 'the marker');
       const marker = h.texts().find((t) => t.startsWith('[discord-send-failed]'))!;
-      assert.match(marker, /could not be delivered to .* Nothing was posted/);
+      assert.match(marker, /could not be delivered to .* The framework posted nothing there/);
       assert.deepEqual(h.drafts(), [], 'locus speech is not held');
     } finally {
       await h.close();

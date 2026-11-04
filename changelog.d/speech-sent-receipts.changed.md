@@ -56,4 +56,6 @@
   the framework — …", where it read "not sent — …", and autoContinue's
   `[continue]` row reads "Some or all of your closing words last turn were
   held, and the framework didn't send them: …", where it read "were held, not
-  sent: …".
+  sent: …", and a failed channel post's notice reads "The framework posted
+  nothing there; it is saved in your archive.", where it read "Nothing was
+  posted; it is saved in your archive.".

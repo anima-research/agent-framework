@@ -1566,8 +1566,9 @@ interface TurnRouting {
   deliveries: ChannelRef[];
   sentTo?: string[];
   asking?: Promise<string[]>[];
-  /** Set once the turn's receipt has settled its asks, until a start uses this routing again. */
-  asksSettled?: true;
+  /** Set once the turn's asks are settled, until a start uses this routing
+   *  again: by its receipt, or with none when the turn failed or was stopped. */
+  asksSettled?: 'receipt' | 'no receipt';
   postTried?: true;
   openedBy?: InferenceRequest;
   openingMessages?: string[];
@@ -1662,8 +1663,16 @@ function notFinal(round: ProseRound): ProseRound {
   return rest;
 }
 
+function logLateAsk(agentName: string, settled: 'receipt' | 'no receipt', asked: Promise<string[]>): void {
+  void asked.then((places) => {
+    if (places.length === 0) return;
+    console.error(`[routeSpeech] ${agentName}: shown by ${places.map(logValue).join(' · ')} ` +
+      (settled === 'receipt' ? "after the turn's receipt took its asks, which doesn't name it" : 'after its turn ended without a receipt'));
+  });
+}
+
 async function settleSpeechAsks(routing: TurnRouting): Promise<void> {
-  routing.asksSettled = true;
+  routing.asksSettled = 'receipt';
   const asking = routing.asking;
   if (!asking) return;
   delete routing.asking;
@@ -12673,6 +12682,7 @@ export class AgentFramework {
     // Its scripts take it as a settle's end of the turn: the start sent
     // nothing, so none of its own calls is waiting on a script.
     this.settledTurns.add(routing);
+    this.abandonSpeechAsks(agentName, routing);
     this.releaseTurnInputs(routing);
     this.codeExecution?.scripts.turnEnded(agentName, { id: routing.turnId, live: this.liveTurns(agentName, routing) }, false);
   }
@@ -12742,6 +12752,7 @@ export class AgentFramework {
       // Ended, unless it's the logical turn this settle left open.
       if (this.openLogical.get(agentName) !== stream) {
         this.settledTurns.add(stream);
+        if (outcome.stopReason === 'exhausted') this.abandonSpeechAsks(agentName, stream);
         this.releaseTurnInputs(stream);
       }
       this.codeExecution?.scripts.turnEnded(
@@ -21528,17 +21539,22 @@ export class AgentFramework {
     }
   }
 
-  /** Keep an ask for the turn's receipt, or log what it names when the receipt is already written. */
+  /** Keep an ask for the turn's receipt, or log what it names when the turn's asks are already settled. */
   private trackSpeechAsk(agent: Agent, routing: TurnRouting, asked: Promise<string[]>): void {
     if (!routing.asksSettled) {
       (routing.asking ??= []).push(asked);
       return;
     }
-    void asked.then((places) => {
-      if (places.length > 0) {
-        console.error(`[routeSpeech] ${agent.name}: shown by ${places.map(logValue).join(' · ')} after the turn's receipt took its asks, which doesn't name it`);
-      }
-    });
+    logLateAsk(agent.name, routing.asksSettled, asked);
+  }
+
+  /** A turn that failed or was stopped writes no receipt: what its asks name is logged as each answers. */
+  private abandonSpeechAsks(agentName: string, routing: TurnRouting): void {
+    if (routing.asksSettled) return;
+    routing.asksSettled = 'no receipt';
+    const asking = routing.asking;
+    delete routing.asking;
+    for (const asked of asking ?? []) logLateAsk(agentName, 'no receipt', asked);
   }
 
   /**
@@ -33216,7 +33232,7 @@ export class AgentFramework {
                 // A request went out and no valid receipt came back: it may
                 // have been posted (in part or whole). Never claim it wasn't.
                 ? `[${NOTICE_TAG.discordSendFailed}] Delivery of your previous reply (${textLen} chars) to ${where} was not confirmed (${suppliedValue(reason)}). It may or may not have been posted, so sending it again could post it twice. It is saved in your archive.`
-                : `[${NOTICE_TAG.discordSendFailed}] Your previous reply (${textLen} chars) could not be delivered to ${where} (${suppliedValue(reason)}). Nothing was posted; it is saved in your archive.`)
+                : `[${NOTICE_TAG.discordSendFailed}] Your previous reply (${textLen} chars) could not be delivered to ${where} (${suppliedValue(reason)}). The framework posted nothing there; it is saved in your archive.`)
               : `[${NOTICE_TAG.sendUndeliverable}] Your plain speech${words === undefined ? '' : ` ${quotedValue(speechOpening(words))}`} (${textLen} chars) had no channel to go to — ${suppliedValue(reason)}. This is a routing/configuration situation, not a channel failure. This route delivered it nowhere; if another surface showed it (a reply thread, the console), that copy stands. It is saved in your archive.`;
             // A registered speaker's notice is addressed to it (noticeTargetFor).
             this.addMessage(

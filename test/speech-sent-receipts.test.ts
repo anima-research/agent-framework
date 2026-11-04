@@ -23,6 +23,7 @@ class Surface {
   messagesPerEvent = 1;
   onAsked: () => void = () => {};
   release: () => void = () => {};
+  heldAnswer: unknown = {};
   ctx: ModuleContext | null = null;
   constructor(readonly name = 'console') {}
   async start(ctx: ModuleContext): Promise<void> { this.ctx = ctx; }
@@ -50,7 +51,7 @@ class Surface {
     const answer = this.answer;
     if (answer === 'throw') throw new Error(`${this.name} broke`);
     if (answer === 'hang') return new Promise(() => {});
-    if (answer === 'held') return new Promise((resolve) => { this.release = () => resolve({}); });
+    if (answer === 'held') return new Promise((resolve) => { this.release = () => resolve(this.heldAnswer); });
     if (answer === 'late') return new Promise((resolve) => setTimeout(() => resolve({ sentTo: SENT_TO }), SPEECH_RECEIPT_WAIT_MS + 1_000));
     if (answer === 'late-throw') return new Promise((_, reject) => setTimeout(() => reject(new Error(`${this.name} broke late`)), SPEECH_RECEIPT_WAIT_MS + 1_000));
     if (typeof answer === 'object') return answer;
@@ -713,6 +714,69 @@ describe('plain speech a module says it showed', () => {
     const failed = texts(f).filter((t) => t.startsWith('[inference-failed]'));
     assert.equal(failed.length, 1, texts(f).join('\n'));
     assert.ok(failed[0]!.includes('Plain speech of its rounds was handed on for delivery or shown as written'), failed[0]);
+  });
+
+  it("a turn that fails while a module's answer is due logs the place it names when it answers", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const surface = new Surface();
+    surface.answer = 'held';
+    surface.heldAnswer = { sentTo: SENT_TO };
+    const membrane = new FailsAfterFirstRound();
+    membrane.pushResponse(lookRound('Looking around.'));
+    const f = await host([surface], membrane);
+    await turn(f);
+    assert.equal(texts(f).filter((text) => text.startsWith('[inference-failed]')).length, 1, 'premise: the turn failed');
+    assert.equal(surface.asked.length, 1, "premise: the round's speech was asked about");
+    surface.release();
+    await until(() => errors.some((e) => e.includes('after its turn ended without a receipt')), 'the late place logged');
+    assert.ok(errors.some((e) => e.startsWith('[routeSpeech] resident: shown by') && e.includes('after its turn ended without a receipt')), errors.join('\n'));
+  });
+
+  it("a turn stopped while a module's answer is due logs the place it names when it answers", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const surface = new Surface();
+    surface.answer = 'held';
+    surface.heldAnswer = { sentTo: SENT_TO };
+    const membrane = new MockMembrane();
+    membrane.pushResponse(lookRound('Looking around.'));
+    membrane.pushResponse(afterLook('Looking around.', 'Seen it.'));
+    const f = await host([surface], membrane);
+    surface.toolCall = () => { f.abortInference('resident', 'zz-operator stop'); };
+    await turn(f);
+    assert.equal(texts(f).filter((text) => text.startsWith('[turn-interrupted]')).length, 1, 'premise: the turn was stopped');
+    assert.equal(surface.asked.length, 1, "premise: the round's speech was asked about");
+    surface.release();
+    await until(() => errors.some((e) => e.includes('after its turn ended without a receipt')), 'the late place logged');
+    assert.ok(errors.some((e) => e.startsWith('[routeSpeech] resident: shown by') && e.includes('after its turn ended without a receipt')), errors.join('\n'));
+  });
+
+  it("a turn whose continuation is dropped while a module's answer is due logs the place it names when it answers", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const surface = new Surface();
+    surface.answer = 'held';
+    surface.heldAnswer = { sentTo: SENT_TO };
+    const f = await host([surface], new MockMembrane());
+    const internal = f as unknown as {
+      pendingRequests: Array<Record<string, unknown>>;
+      openLogical: Map<string, unknown>;
+      routingOf(name: string): unknown;
+      routeLocusSpeech(agent: unknown, round: unknown, text: string, locus: null): Promise<unknown>;
+      dropContinuations(agentName: string, drop: { kind: 'dropped'; why: string }): void;
+    };
+    const routing = internal.routingOf('resident');
+    internal.openLogical.set('resident', routing);
+    const routed = internal.routeLocusSpeech(f.getAgent('resident'), { routing }, 'Said before the drop.', null);
+    await until(() => surface.asked.length > 0, 'the ask');
+    internal.pendingRequests.push({ agentName: 'resident', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now() });
+    internal.dropContinuations('resident', { kind: 'dropped', why: 'its agent was disposed' });
+    assert.equal(internal.pendingRequests.some((r) => r.reason === 'context_budget_restart'), false, 'premise: the continuation was dropped');
+    surface.release();
+    await routed;
+    await until(() => errors.some((e) => e.includes('after its turn ended without a receipt')), 'the late place logged');
+    assert.ok(errors.some((e) => e.startsWith('[routeSpeech] resident: shown by') && e.includes('after its turn ended without a receipt')), errors.join('\n'));
   });
 
   it("a turn that fails after a round one module showed, while another hadn't answered, says that round's speech was handed on", async (t) => {
@@ -1689,7 +1753,7 @@ describe('plain speech a module says it showed', () => {
     assert.deepEqual(openingTexts(surface, rerun!), ['hello there']);
   });
 
-  it("a retry after an inference failure's rewind names the messages of the turn it stands in for", async () => {
+  it("an inference failure's rewind queues its retry with the messages of the turn it stands in for", async () => {
     const surface = new Surface();
     const f = await host([surface], new MockMembrane());
     const agent = f.getAgent('resident')!;
