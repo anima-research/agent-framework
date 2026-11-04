@@ -202,7 +202,7 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     assert.deepStrictEqual(connection.grant.effectiveList(), [], 'the drop emptied the grant');
     assert.equal(await registry.routeSpeech('linn', 'hi', null, { cameFrom: [room] }), null);
     assert.equal(failures.at(-1)?.reason, came +
-      '#room can\'t take a send: the "flaky" server isn\'t connected, and this host is reconnecting to it, so try again later');
+      '#room can\'t take a send: the "flaky" server isn\'t connected, and this host is reconnecting to it, so to reply there, send your reply to that channel explicitly once it\'s back');
   });
 
   it('holds a reconnected transport\'s control traffic, not only its data, until the host opens the planes', async () => {

@@ -1336,7 +1336,7 @@ test("with no locus, a batch's inbound-only channel is named as one, and only th
     'direction "inbound", so the host publishes nothing into it; to speak there, use that server\'s own tools');
 });
 
-test("with no locus, a batch's channel the host no longer has registered is named without the advice to send there", async () => {
+test("with no locus, a batch's channel the host no longer has registered is named as one nothing sent there can reach", async () => {
   const { registry, failures } = makeRegistry({ delivered: true });
   await registerRoom(registry);
   const room = { channel: discord('discord:g1:room'), shown: '#room (discord:g1:room)' };
@@ -1344,17 +1344,19 @@ test("with no locus, a batch's channel the host no longer has registered is name
 
   assert.equal(await registry.routeSpeech('linn', 'hi', null, { cameFrom: [room, gone] }), null);
   assert.equal(failures.at(-1)!.reason, 'this turn came from #room (discord:g1:room) and #gone (discord:g1:gone), and no channel ' +
-    'was chosen for its reply; to reply in #room (discord:g1:room), send your reply to that channel explicitly');
+    'was chosen for its reply; to reply in #room (discord:g1:room), send your reply to that channel explicitly; ' +
+    "#gone (discord:g1:gone) isn't registered with this host now, so nothing sent there can reach it");
 
   assert.equal(await registry.routeSpeech('linn', 'hi', null, { cameFrom: [gone] }), null);
-  assert.equal(failures.at(-1)!.reason, 'this turn came from #gone (discord:g1:gone), and no channel was chosen for its reply');
+  assert.equal(failures.at(-1)!.reason, 'this turn came from #gone (discord:g1:gone), and no channel was chosen for its reply; ' +
+    "#gone (discord:g1:gone) isn't registered with this host now, so nothing sent there can reach it");
 });
 
-test("with no locus, a batch's channel whose server can't take a send is named with why, in place of the advice to send there", async () => {
+test("with no locus, a batch's channel whose server can't take a send is named with why, and while its server is connecting, told to send there once it's back", async () => {
   for (const [server, connecting, why] of [
     [{ grant: new CapabilityGrant(new Set(), []) }, false,
       'this host isn\'t permitted to post to the "discord" server\'s channels, and trying again won\'t change that; if you need it, ask whoever runs this host'],
-    [undefined, true, 'this host is connecting to the "discord" server, so try again in a moment'],
+    [undefined, true, 'this host is connecting to the "discord" server, so to reply there, send your reply to that channel explicitly once it\'s back'],
   ] as const) {
     const { registry, failures } = makeRegistry({ delivered: true });
     await registerRoom(registry);

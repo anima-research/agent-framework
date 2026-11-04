@@ -177,10 +177,11 @@ export interface WakeProvenance {
   channelId?: string;
   /** Server-namespaced author id: `<serverId>:user:<id>` (falls back to the
    *  channel id's first segment only when the event carried no server id).
-   *  A `chat:system` notice is never the chosen event; a batch in which no
-   *  other event names a channel or an author names the author of its
-   *  newest notice that has one, with that notice's time (`at`), and
-   *  nothing else of it. */
+   *  A `chat:system` notice is never the chosen event, unless it's a
+   *  coalesced render's latest occurrence (GateEventInfo.folds); a batch in
+   *  which no other event names a channel or an author, and which has no
+   *  `batchChannels`, names the author of its newest notice that has one,
+   *  with that notice's time (`at`), and nothing else of it. */
   counterparty?: string;
   /** True when the chosen event was `chat:addressed`. */
   addressed?: boolean;
@@ -200,8 +201,10 @@ export interface WakeProvenance {
   /** The channels a batch came from, each its registered id and server, in
    *  the order they first appear, when no event of it addressed the agent:
    *  those the host resolved, one or more. A `chat:system` notice counts
-   *  neither as addressing the agent nor as a channel. The wake has no
-   *  route, and the turn's no-locus notice names them. */
+   *  neither as addressing the agent nor as a channel, except as a
+   *  coalesced render's latest occurrence, which the gate takes as a
+   *  message (GateEventInfo.folds). The wake has no route, and the turn's
+   *  no-locus notice names them. */
   batchChannels?: Array<{ channelId: string; serverId?: string }>;
   /** Timestamp (ms) of the chosen event. With none chosen, of the batch's
    *  newest event that isn't a `chat:system` notice when `batchChannels` is
@@ -312,7 +315,8 @@ function isMetadataTruthy(value: unknown): boolean {
  * addressed all come from that one event, so they can never disagree. A
  * `chat:system` notice is never that event, even one addressed by its place
  * (a pin in a DM), since a notice never decides where the agent's speech
- * goes.
+ * goes. A coalesced render whose latest occurrence is a notice isn't taken
+ * as one (GateEventInfo.folds).
  */
 export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefined {
   const said = events.filter((e) => !e.systemNotice);

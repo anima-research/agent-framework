@@ -6204,10 +6204,14 @@ export class ChannelRegistry {
         const open: Array<{ channel: ChannelRef; shown: string }> = [];
         for (const came of from) {
           const entry = this.entryAt(came.channel);
-          if (!entry) continue;
-          if (isInboundOnly(entry)) closed.push(`${came.shown} is ${inboundOnlyReason(entry)}`);
-          else if (!this.publishingServer(entry.serverId)) closed.push(`${came.shown} can't take a send: ${this.sendRefusal(entry.serverId)}`);
-          else open.push(came);
+          if (!entry) closed.push(`${came.shown} isn't registered with this host now, so nothing sent there can reach it`);
+          else if (isInboundOnly(entry)) closed.push(`${came.shown} is ${inboundOnlyReason(entry)}`);
+          else if (!this.publishingServer(entry.serverId)) {
+            const reach = this.serverReach(entry.serverId);
+            closed.push(reach === 'connecting' || reach === 'down'
+              ? `${came.shown} can't take a send: ${unreachableClause(entry.serverId, reach)}, so to reply there, send your reply to that channel explicitly once it's back`
+              : `${came.shown} can't take a send: ${this.sendRefusal(entry.serverId)}`);
+          } else open.push(came);
         }
         const reply = open.length === 0 ? ''
           : open.length === from.length
