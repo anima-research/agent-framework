@@ -400,7 +400,7 @@ export interface JudgeEventSummary {
 
 /**
  * The agent's last turn, when it failed (its retries spent) and no turn has
- * completed since, as the reply judge is told it: when it failed, and whether
+ * started since, as the reply judge is told it: when it failed, and whether
  * a wake of the agent's is on its way with no new event, already queued or
  * held until a provider hold ends (`until`, absent when it states no end). Neither says the wake starts a turn: the host's inference
  * policy can still decline it.

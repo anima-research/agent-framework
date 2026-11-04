@@ -604,7 +604,7 @@ export type TraceEvent =
       inputTokens?: number;
       cacheReadTokens?: number;
       outputTokens?: number;
-      /** For a refusal: the hold that refused the call, in the framework's words. */
+      /** For a refusal: the hold that refused the call, as the framework words it, with any provider's reason in it marked as supplied text. */
       hold?: string;
       /** For a refusal: when its hold said it ends (ms), when it said. */
       until?: number;

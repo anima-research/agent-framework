@@ -6260,8 +6260,9 @@ export class AgentFramework {
 
   private failedLastTurnFor(agentName: string): import('./gate/types.js').FailedLastTurn | undefined {
     if (!(this.consecutiveInferenceFailures.get(agentName) ?? 0)) return undefined;
-    const at = this.lastInferenceAt.get(agentName)?.failedAt;
-    if (at === undefined) return undefined;
+    const last = this.lastInferenceAt.get(agentName);
+    const at = last?.failedAt;
+    if (at === undefined || (last?.startedAt ?? 0) > at) return undefined;
     const { queued, held } = this.wakesOnTheirWay(agentName);
     if (queued.length > 0) return { at, again: { kind: 'queued' } };
     return { at, again: held ? { kind: 'held', ...(held.until !== undefined ? { until: held.until } : {}) } : { kind: 'none' } };
