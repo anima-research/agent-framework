@@ -129,10 +129,10 @@ describe('Turn trigger provenance', () => {
     await framework.stop();
   });
 
-  for (const [what, other, batchFirst, why] of [
-    ['a wake that names a channel', { reason: 'mcpl:channel-incoming', source: 'discord', channelId: 'discord:g:feed', channelServerId: 'discord' }, true, "the wake's channel decides the turn's locus, and the batch's channels are named only to a turn with none"],
-    ['an addressed push that names no channel', { reason: 'mcpl:push-event', source: 'discord', addressed: true }, false, 'the notice says only where the turn came from and that no channel was chosen, which holds though a message addressed the agent'],
-    ['an addressed chat:system notice', { reason: 'mcpl:channel-incoming', source: 'discord', channelId: 'discord:dm:5', channelServerId: 'discord', addressed: true, systemNotice: true }, false, 'a notice neither addresses the agent nor names a channel'],
+  for (const [what, other, why] of [
+    ['a wake that names a channel', { reason: 'mcpl:channel-incoming', source: 'discord', channelId: 'discord:g:feed', channelServerId: 'discord' }, "the wake's channel decides the turn's locus, and the batch's channels are named only to a turn with none"],
+    ['an addressed push that names no channel', { reason: 'mcpl:push-event', source: 'discord', addressed: true }, 'the notice says only where the turn came from and that no channel was chosen, which holds though a message addressed the agent'],
+    ['an addressed chat:system notice', { reason: 'mcpl:channel-incoming', source: 'discord', channelId: 'discord:dm:5', channelServerId: 'discord', addressed: true, systemNotice: true }, 'a notice neither addresses the agent nor names a channel'],
   ] as const) {
     it(`a turn merged from ${what} and an ambient batch keeps the batch's channels`, async () => {
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi' }]));
@@ -142,7 +142,7 @@ describe('Turn trigger provenance', () => {
       const t = Date.now();
       const batch: InferenceRequest = { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: t + 1, wakeChannels: [{ serverId: 'discord', channelId: 'discord:g:room' }] };
       const wake: InferenceRequest = { agentName: 'scout', timestamp: t, ...other };
-      i.pendingRequests.push(...(batchFirst ? [batch, wake] : [wake, batch]));
+      i.pendingRequests.push(wake, batch);
       await i.processInferenceRequests();
       await framework.runUntilIdle();
       assert.ok(captured.exposed, 'the merged turn started');

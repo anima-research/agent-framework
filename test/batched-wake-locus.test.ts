@@ -146,15 +146,15 @@ function batchedWakeRig(opts: {
   };
 }
 
-function assertNamesBatchChannels(notice: string, channels: string[]): void {
+function assertNamesBatchChannels(notice: string, channels: string[], chars = Number(/\((\d+) chars\)/.exec(notice)?.[1])): void {
   const shown = channels.map((c) => `#${c} (discord:g1:${c})`);
   const where = shown.length === 1 ? shown[0] : `${shown.slice(0, -1).join(', ')} and ${shown.at(-1)}`;
-  assert.ok(notice.includes(
-    `had no channel to go to — this turn came from ${where}, and no channel was chosen for its reply; ` +
-    `to reply ${channels.length === 1 ? 'there' : 'in one of them'}, ` +
-    'send your reply to that channel explicitly. This is a routing situation, not a channel failure.'), notice);
-  assert.ok(!notice.includes('came from no channel'), notice);
-  assert.ok(!notice.includes('configuration'), 'nothing is misconfigured when no message of a batch addressed the agent');
+  assert.equal(notice,
+    `[send-undeliverable] Your previous reply (${chars} chars) had no channel to go to — this turn came from ${where}, ` +
+    `and no channel was chosen for its reply; to reply ${channels.length === 1 ? 'there' : 'in one of them'}, ` +
+    'send your reply to that channel explicitly. This is a routing situation, not a channel failure. ' +
+    'This route delivered it nowhere; if another surface showed it (a reply thread, the console), that copy stands. ' +
+    'It is saved in your archive.');
 }
 
 async function ambientBatchHasNoLocus(rig: ReturnType<typeof batchedWakeRig>, channels: string[], named: string[]): Promise<void> {
@@ -174,7 +174,7 @@ async function ambientBatchHasNoLocus(rig: ReturnType<typeof batchedWakeRig>, ch
   assert.ok(texts.includes('joining in'), 'the prose stays in the window');
   const notices = texts.filter((t) => t.startsWith('[send-undeliverable]'));
   assert.equal(notices.length, 1, JSON.stringify(texts));
-  assertNamesBatchChannels(notices[0]!, named);
+  assertNamesBatchChannels(notices[0]!, named, 'joining in'.length);
 }
 
 describe('batched wake routing', () => {

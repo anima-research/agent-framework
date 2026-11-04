@@ -1357,6 +1357,7 @@ test("with no locus, a batch's channel whose server can't take a send is named w
     [{ grant: new CapabilityGrant(new Set(), []) }, false,
       'this host isn\'t permitted to post to the "discord" server\'s channels, and trying again won\'t change that; if you need it, ask whoever runs this host'],
     [undefined, true, 'this host is connecting to the "discord" server, so to reply there, send your reply to that channel explicitly once it\'s back'],
+    [undefined, false, 'the "discord" server isn\'t connected, and this host won\'t reconnect to it on its own; if you need it, ask whoever runs this host'],
   ] as const) {
     const { registry, failures } = makeRegistry({ delivered: true });
     await registerRoom(registry);
