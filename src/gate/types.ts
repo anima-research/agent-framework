@@ -65,10 +65,11 @@ export interface PassiveSampleConfig {
  * batch is delivered as a debounce's is; on wait (or a failure under
  * `"skip"`) the agent isn't woken, and the next batch is judged afresh. The
  * events are in its context either way when they're stored as they arrive, as
- * MCPL's channel and push events are, and as the framework's own modules store
- * the message an event of theirs carries; a wait, like `defer`, adds nothing
- * more. Rules are read in order, as ever: a mention rule placed ahead
- * of a judge rule wakes the agent without the judge. A judge that fails or
+ * MCPL's channel and push events are (apart from a coalesced push its server
+ * sends deferred, which waits outside the context until the server renders it
+ * for a turn), and as the framework's own modules store the message an event
+ * of theirs carries; a wait, like `defer`, adds nothing more. Rules are read
+ * in order, as ever: a mention rule placed ahead of a judge rule wakes the agent without the judge. A judge that fails or
  * times out wakes the agent (fail open),
  * unless the host set its `onError` to `"skip"`. A call whose request the
  * framework refuses to send isn't a failure, and `onError` decides it as well: under
