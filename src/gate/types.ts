@@ -360,8 +360,8 @@ export interface ReplyJudgeOptions {
    * request the framework refuses to send too (a hold on the agent's provider
    * calls or on the judge's model, a surgery's hold on the store, or a
    * stopping framework), which isn't counted as a failure. Under `"wake"`,
-   * the refused call's batch wakes the agent, and while a refusal's stated
-   * wait lasts each judge rule's batch wakes it without the judge being
+   * the refused call's batch is delivered, and while a refusal's stated
+   * wait lasts each judge rule's batch is delivered without the judge being
    * asked, unless a running turn or the host's quiesce holds the batch past
    * the wait's end, or it waits behind a call of its rule that the judge
    * answers WAIT when its calls are no longer refused, when it goes to the
@@ -371,9 +371,10 @@ export interface ReplyJudgeOptions {
    * its newest 100 events as it does while a turn holds them, and they're
    * judged once the wait ends or the hold is released. A refusal that states
    * no end, or no time left, keeps them held until a later batch's call,
-   * which takes in its own rule's held batch, gets a verdict, or the hold ends
-   * or is released. A later call that fails lets its batch go, with the held
-   * events it took in, as a failed call's batch goes under `"skip"`.
+   * which takes in its own rule's held batch, gets a verdict, or the gate is
+   * told the hold ended or was released (`EventGate.providerCallsReleased`).
+   * A later call that fails lets its batch go, with the held events it took
+   * in, as a failed call's batch goes under `"skip"`.
    */
   onError?: 'wake' | 'skip';
   /** The judge's effort (`output_config.effort`). Default `"low"`: a short
@@ -473,7 +474,11 @@ export interface JudgeVerdict {
   outputTokens?: number;
 }
 
-/** The judge's function, as the framework wires it into the gate. */
+/** The judge's function, as the framework wires it into the gate. A call whose
+ *  request a hold refuses rejects with an error whose `providerAdmission` is
+ *  `'deferred'`, and whose `retryAfterMs` is the hold's time left when it
+ *  states one, as the framework's own judge does: the gate counts that as a
+ *  refusal, and any other rejection as a failed call. */
 export type JudgeFn = (request: JudgeRequest) => Promise<JudgeVerdict>;
 
 // ---------------------------------------------------------------------------

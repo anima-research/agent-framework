@@ -5209,18 +5209,18 @@ export class EventGate {
     if (refusal.until !== undefined) {
       return `The reply judge's calls are refused until ${new Date(refusal.until).toISOString()}: ${refusal.hold}. `
         + (wakes
-          ? "Until then, each judge rule's batch wakes the agent without being judged, unless a turn or the host's quiesce holds it until after then, or it waits behind a call of its rule that the judge answers WAIT once its calls are no longer refused, when it's judged."
+          ? "Until then, each judge rule's batch is delivered without being judged, unless a turn or the host's quiesce holds it until after then, or it waits behind a call of its rule that the judge answers WAIT once its calls are no longer refused, when it's judged."
           : `Until then, judge rules' batches are held (${events} now), and they're judged after that, or sooner if the hold is released or a judge call asked after the refused one gets a verdict. A batch waiting behind a call of its rule that the judge answers REPLY is delivered with that call's batch.`);
     }
     if (refusal.noTimeLeft) {
       return `A reply judge call was refused by a hold with no time left on it: ${refusal.hold}. `
         + (wakes
-          ? "Each judge rule's batch is still asked about, and wakes the agent if the call is refused."
+          ? "Each judge rule's batch is still asked about, and is delivered without being judged if the call is refused."
           : `The refusal sets no time to ask again: judge rules' held batches (${events} now) are judged once a judge call made after this gets a verdict, or when the hold on the agent's calls ends. A new batch whose call fails lets the held events it took in go with it, unjudged.`);
     }
     return `A reply judge call was refused, and the hold stated no end: ${refusal.hold}. `
       + (wakes
-        ? "Each judge rule's batch is still asked about, and wakes the agent if the call is refused."
+        ? "Each judge rule's batch is still asked about, and is delivered without being judged if the call is refused."
         : `The refusal sets no time to ask again: judge rules' held batches (${events} now) are judged once a judge call made after this gets a verdict, or when the hold is released, as an operator's release of a provider wait or a surgery's end does. A new batch whose call fails lets the held events it took in go with it, unjudged.`);
   }
 
