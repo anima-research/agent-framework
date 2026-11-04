@@ -200,7 +200,7 @@ describe('present while acting', () => {
 
   // LEGACY (the re-pin rule the re-pin tests run under) is declared below.
   async function createFramework(
-    options: { speech?: { locus: 'delivery' | 'latest-inbound' }; maxStreamTokens?: number; physicalWindowTokens?: number; proseRouting?: 'locus' | 'hybrid' } = {},
+    options: { speech?: { locus: 'delivery' | 'latest-inbound' }; maxStreamTokens?: number; physicalWindowTokens?: number; proseRouting?: 'locus' | 'hybrid' | 'locked' } = {},
   ): Promise<AgentFramework> {
     const { speech, ...agentOptions } = options;
     const frameworkOptions = speech ? { speech } : {};
@@ -1570,6 +1570,73 @@ describe('present while acting', () => {
         assert.ok(told[0]!.startsWith('[routing] Someone addressed you from discord:dm:antra'), told[0]);
         assert.equal(wired.filter((t) => t.startsWith('[routing] Someone addressed you from discord:dm:antra')).length, 1, `the stream it went on was told: ${JSON.stringify(wired)}`);
       }
+
+      await framework.stop();
+    });
+  }
+
+  for (const speech of ['delivery', 'latest-inbound'] as const) {
+    it(`a locked turn whose boundary declines its budget restart is told there of a message addressed elsewhere, under the ${speech} rule`, async () => {
+      const overBudget = createMockResponse([
+        { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+      ] as ContentBlock[], 'tool_use');
+      overBudget.usage = { inputTokens: 100, outputTokens: 5 };
+      membrane.pushResponse(overBudget);
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'On the same stream.' }] as ContentBlock[]));
+
+      const framework = await createFramework({ speech: { locus: speech }, maxStreamTokens: 20, proseRouting: 'locked' });
+      stubChannelRegistry(framework);
+      const cm = framework.getAgent('assistant')!.getContextManager();
+      cm.previewContext = (() => ({ fits: false, clearedBy: ['compression'], finalTokens: 9_000, budgetTokens: 8_000 })) as unknown as typeof cm.previewContext;
+      module.interjection = 'quick question for you';
+      module.interjectionMetadata = addressed('discord:dm:antra');
+      const declines: string[] = [];
+      framework.onTrace((event) => { if (event.type === 'inference:restart_declined') declines.push(event.type); });
+      trigger(framework);
+      await framework.runUntilIdle();
+
+      assert.equal(declines.length, 1, 'the boundary declined the restart');
+      assert.equal(membrane.calls.length, 1, 'the turn went on on its one stream');
+      const told = addressedFrom(framework);
+      assert.equal(told.length, 1, 'the boundary told the agent once');
+      assert.ok(told[0]!.startsWith('[routing] Someone addressed you from discord:dm:antra while you were busy.'), told[0]);
+      const wired = membrane.lastStream!.receivedToolResultOptions
+        .flatMap((o) => o?.injectedMessages ?? [])
+        .flatMap((m) => (m.content as Array<{ text?: string }>).map((b) => b.text ?? ''))
+        .filter((t) => t.startsWith('[routing] Someone addressed you from discord:dm:antra'));
+      assert.equal(wired.length, 1, `the stream it went on was told: ${JSON.stringify(wired)}`);
+
+      await framework.stop();
+    });
+
+    it(`a locked turn whose budget restart the window projection forces as well is told of a message addressed elsewhere at the restart, not at its boundary, under the ${speech} rule`, async () => {
+      const overBudget = createMockResponse([
+        { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+      ] as ContentBlock[], 'tool_use');
+      overBudget.usage = { inputTokens: 100, outputTokens: 5 };
+      membrane.pushResponse(overBudget);
+
+      const framework = await createFramework({ speech: { locus: speech }, maxStreamTokens: 20, physicalWindowTokens: 50, proseRouting: 'locked' });
+      stubChannelRegistry(framework);
+      module.interjection = 'quick question for you';
+      module.interjectionMetadata = addressed('discord:dm:antra');
+      feedStart(framework, 2, [{ type: 'text', text: 'After the restart.' }] as ContentBlock[]);
+      const reasons: string[] = [];
+      let atBoundary: string[] | undefined;
+      framework.onTrace((event) => {
+        if (event.type !== 'inference:stream_restarted') return;
+        reasons.push((event as { reason: string }).reason);
+        atBoundary = addressedFrom(framework);
+      });
+      trigger(framework);
+      await framework.runUntilIdle();
+
+      assert.equal(membrane.calls.length, 2, 'the turn restarted');
+      assert.deepEqual(reasons, ['physical_window'], "the restart is the window projection's");
+      assert.deepEqual(atBoundary, [], 'the restarting boundary stored no addressed-elsewhere notice');
+      const told = addressedFrom(framework);
+      assert.equal(told.length, 1, 'the agent is told once');
+      assert.ok(told[0]!.startsWith('[routing] Someone addressed you from discord:dm:antra at your budget restart.'), "by the restart's start");
 
       await framework.stop();
     });
