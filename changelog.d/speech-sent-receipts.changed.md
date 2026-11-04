@@ -10,6 +10,11 @@
   that place in its receipt, and the failed post keeps its own notice. This
   holds under prose routing by locus, hybrid and locked, for each tool round's
   prose as it routes and for the final reply.
+- **Hosts:** a piece of speech with no channel that a module says it showed
+  logs `[routeSpeech] <agent>: turn has no channel; <n> chars shown by
+  <places>, routing posted it to no channel` and emits no
+  `mcpl:speech-route-failed` trace, where it emitted one; a piece no module
+  showed still emits it.
 - **Residents:** speech routed with no channel that no module says it showed
   still gets `[send-undeliverable]`, which now names the piece by its opening words,
   quoted: `Your plain speech "<opening>" (<n> chars) had no channel to go to
