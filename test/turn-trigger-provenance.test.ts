@@ -193,6 +193,33 @@ describe('Turn trigger provenance', () => {
     await framework.stop();
   });
 
+  it("a provider hold that keeps one of two equal gate wakes keeps both batches' channels", async () => {
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'held.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      modules: [],
+    });
+    const i = framework as unknown as {
+      pendingRequests: Array<Record<string, unknown>>;
+      providerAccelerationCooldowns: Map<string, { startedAt: number; until: number; timer: ReturnType<typeof setTimeout>; heldRequests: Array<{ wakeChannels?: unknown }>; reason: string; failures: number }>;
+    };
+    const now = Date.now();
+    const timer = setTimeout(() => {}, 60_000);
+    try {
+      i.providerAccelerationCooldowns.set('scout', { startedAt: now, until: now + 60_000, timer, heldRequests: [], reason: 'test hold', failures: 1 });
+      const wake = (channelId: string) => ({ agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: now, wakeChannels: [{ serverId: 'discord', channelId }] });
+      i.pendingRequests.push(wake('discord:g:a'), wake('discord:g:b'));
+      await framework.runUntilIdle();
+      const held = i.providerAccelerationCooldowns.get('scout')!.heldRequests;
+      assert.equal(held.length, 1, 'premise: the hold keeps one of the two equal wakes');
+      assert.deepEqual(held[0]!.wakeChannels, [{ serverId: 'discord', channelId: 'discord:g:a' }, { serverId: 'discord', channelId: 'discord:g:b' }]);
+    } finally {
+      clearTimeout(timer);
+      await framework.stop();
+    }
+  });
+
   it("a gate wake names a batch channel once, though the batch gave it both with its server and without", async () => {
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'twice.chronicle'),

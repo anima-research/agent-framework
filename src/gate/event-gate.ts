@@ -209,7 +209,8 @@ export interface WakeProvenance {
    *  no-locus notice names them. */
   batchChannels?: Array<{ channelId: string; serverId?: string }>;
   /** Timestamp (ms) of the chosen event. With none chosen, of the batch's
-   *  newest event that isn't a `chat:system` notice when `batchChannels` is
+   *  newest event that isn't a `chat:system` notice (a coalesced render's
+   *  latest occurrence counts as a message) when `batchChannels` is
    *  set, or else of the notice `counterparty` names: so a consumer
    *  coalescing several requests can order by event recency, not by flush
    *  order. */
