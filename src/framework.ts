@@ -4915,7 +4915,6 @@ export class AgentFramework {
             ...(provenance?.channelId ? { wakeChannelId: provenance.channelId } : {}),
             ...(provenance?.counterparty ? { counterparty: provenance.counterparty } : {}),
             ...(provenance?.at ? { wakeAt: provenance.at } : {}),
-            ...(provenance?.systemNotice ? { systemNotice: true as const } : {}),
             // The batch's line, when the gate left it to the turn's start
             // (beginAgentTurn decides it: placeWakeLines).
             ...(provenance?.line ? { wakeLines: [provenance.line] } : {}),
@@ -4940,7 +4939,6 @@ export class AgentFramework {
               if (route && framework.mayTakeGateRoute(agentName, route)) {
                 return { channelId: route.channelId, channelServerId: route.serverId, addressed: true };
               }
-              if (provenance?.addressed) return { addressed: true };
               const came = (provenance?.batchChannels ?? [])
                 .map((c) => framework.channelNamed(c.channelId, c.serverId))
                 .filter((c): c is ChannelRef => c !== undefined);
@@ -19978,6 +19976,8 @@ export class AgentFramework {
           // line stays to be decided when the host resumes.
           const lines = prev ? mergeWakeLines([prev, request]) : undefined;
           if (lines) kept.wakeLines = lines;
+          const channels = prev ? wakeChannelsOf([prev, request]) : undefined;
+          if (channels) kept.wakeChannels = channels;
           newestByKey.set(key, kept);
         }
         this.pendingRequests.push(...newestByKey.values());
@@ -20227,10 +20227,9 @@ export class AgentFramework {
       let provReq: InferenceRequest | undefined = addressedReq
         ?? (channelReq?.counterparty || channelReq?.wakeChannelId ? channelReq : undefined);
       if (!provReq) {
-        const naming = requests.filter((r) => r.counterparty || r.wakeChannelId);
-        const said = naming.filter((r) => !r.systemNotice);
-        for (const r of said.length > 0 ? said : naming) {
-          if (!provReq || eventAt(r) >= eventAt(provReq)) provReq = r;
+        for (const r of requests) {
+          if (!r.counterparty && !r.wakeChannelId) continue;
+          if (!provReq || (r.wakeAt ?? r.timestamp) >= (provReq.wakeAt ?? provReq.timestamp)) provReq = r;
         }
       }
       // A silent tick never suppresses a genuine coalesced wake. If any
@@ -20271,7 +20270,7 @@ export class AgentFramework {
         // channel is that message's, never one server's id with another's.
         channelId: channelReq?.channelId,
         channelServerId: channelReq?.channelServerId,
-        wakeChannels: channelReq || requests.some((r) => r.addressed && !r.systemNotice) ? undefined : wakeChannelsOf(requests),
+        wakeChannels: channelReq ? undefined : wakeChannelsOf(requests),
         // Only the mark this batch decided, never one requests[0] carried.
         autoContinueRun: continuationMark,
         addressed: addressedReq !== undefined,

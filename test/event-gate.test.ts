@@ -809,12 +809,12 @@ describe('debounce', () => {
     assert.deepStrictEqual(inferenceRequests[0].batchChannels, [{ channelId: 'discord:g:room', serverId: 'discord' }]);
   });
 
-  it("a batch of notices alone gives its newest authored notice's author and time, and marks itself a notice's", () => {
+  it("a batch of notices alone gives its newest authored notice's author and time", () => {
     const notice = (timestamp: number, authorId?: string) => ({ policyName: 'chat', content: 'x', eventType: 'mcpl:channel-incoming',
       timestamp, addressed: false, systemNotice: true, serverId: 'discord', channelId: 'discord:g:room', routeChannelId: 'discord:g:room',
       ...(authorId ? { authorId } : {}) });
     const provenance = wakeProvenance([notice(10, '5'), notice(20)] as Parameters<typeof wakeProvenance>[0]);
-    assert.deepStrictEqual(provenance, { counterparty: 'discord:user:5', systemNotice: true, at: 10 });
+    assert.deepStrictEqual(provenance, { counterparty: 'discord:user:5', at: 10 });
   });
 
   it('a render that folds a batch is never taken as a notice, so it names its channel when a notice came last', async (t) => {
@@ -829,7 +829,6 @@ describe('debounce', () => {
     t.mock.timers.tick(150);
     assert.strictEqual(inferenceRequests.length, 1);
     assert.deepStrictEqual(inferenceRequests[0].batchChannels, [{ channelId: 'editor:chat', serverId: 'editor' }]);
-    assert.strictEqual((inferenceRequests[0] as { systemNotice?: true }).systemNotice, undefined);
   });
 
   it("a batch names the same channel id on two servers as two channels", () => {

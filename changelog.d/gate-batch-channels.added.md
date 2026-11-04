@@ -1,4 +1,4 @@
 - `WakeProvenance.batchChannels`: the registered channels of a debounced batch in which no message addressed the agent, those the host resolved; before, nothing named them.
 - `InferenceRequest.wakeChannels`: those channels on the gate wake for such a batch, those the framework names, set by the framework for hosts to read rather than set; before, no request carried them.
-- `WakeProvenance.systemNotice`: set on the provenance of a debounced batch in which no event but its `chat:system` notices names a channel or an author, whose `counterparty` and `at` are its newest authored notice's; the framework marks the batch's wake `systemNotice` from it.
 - `GateEventInfo.folds`: set by the framework on a coalesced render it admits, which folds its batch's every occurrence while its `tags` are the latest's; the gate then never takes it as a `chat:system` notice.
+- `byDesign` on the failure passed to `ChannelRegistry`'s `onRouteFailure` option: set when a turn's plain speech had no channel and its batch named the channels it came from, which the failure's reason names; before, no failure was marked so.

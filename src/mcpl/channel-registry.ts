@@ -1049,8 +1049,9 @@ interface ChannelRegistryOptions {
     outcome?: 'failed' | 'unknown';
     /** Bounded display of the connector's structured error data, when present. */
     detail?: string;
-    /** The turn had no channel by design, as for a batch of messages none
-     *  of which addressed the agent: nothing is misconfigured. */
+    /** The turn had no channel by design: its batch named the channels it
+     *  came from, the reason names them, and none was chosen for its
+     *  reply. */
     byDesign?: true;
   }) => void;
   /**
@@ -6119,10 +6120,9 @@ export class ChannelRegistry {
     /** `heldOnFailure`: the caller holds a `failed` delivery's words as a
      *  draft with its own notice, so no failure marker is written for it.
      *  An `unknown` outcome still gets its marker. `cameFrom`: with no
-     *  locus, the channels the turn's batch of messages came from when none
-     *  of them addressed the agent, each with how the agent is shown it; the
-     *  failure's reason names them, and how to reply in those that take
-     *  speech. */
+     *  locus, the channels the turn's batch came from, each with how the
+     *  agent is shown it; the failure's reason names them, and how to reply
+     *  in those registered that take speech. */
     opts?: { heldOnFailure?: boolean; cameFrom?: ReadonlyArray<{ channel: ChannelRef; shown: string }> },
   ): Promise<PublishOutcome> {
     // `logged` is what the log line and the trace say, where it isn't the
@@ -6158,8 +6158,8 @@ export class ChannelRegistry {
     // connectome-doctor reads the last [routeSpeech] line for "no locus". Keep
     // "no locus" in each logged text. Each names no tool: whether one the
     // agent may call could post the words isn't known here, and the notice
-    // calls it a routing or configuration situation, or for a batch none of
-    // whose messages addressed the agent a routing one (byDesign).
+    // calls it a routing or configuration situation, or for a turn whose
+    // batch named the channels it came from a routing one (byDesign).
     // Runtime backstop for JS callers the compiler can't see: an omitted
     // locus is a routing bug at the call site, never something to paper over
     // with a live re-resolution.
@@ -6187,15 +6187,15 @@ export class ChannelRegistry {
           const entry = this.entryAt(channel);
           return entry && isInboundOnly(entry) ? [`${shown} is ${inboundOnlyReason(entry)}`] : [];
         });
-        const open = from.filter(({ channel }) => { const entry = this.entryAt(channel); return !(entry && isInboundOnly(entry)); });
+        const open = from.filter(({ channel }) => { const entry = this.entryAt(channel); return entry !== undefined && !isInboundOnly(entry); });
         const reply = open.length === 0 ? ''
           : open.length === from.length
             ? `; to reply ${from.length === 1 ? 'there' : 'in one of them'}, send your reply to that channel explicitly`
             : `; to reply in ${open.length === 1 ? open[0].shown : `one of ${list(open.map((c) => c.shown))}`}, send your reply to that channel explicitly`;
-        const reason = `this turn came from ${list(from.map((c) => c.shown))}, and what came from ${from.length === 1 ? 'there' : 'those'} didn't ` +
-          `address you, and no channel was chosen for its reply${reply}${closed.map((c) => `; ${c}`).join('')}`;
+        const reason = `this turn came from ${list(from.map((c) => c.shown))}, and no channel was chosen for its reply` +
+          `${reply}${closed.map((c) => `; ${c}`).join('')}`;
         return fail(null, reason, { status: 'failed', reason, at: Date.now() },
-          'turn has no locus (its batch addressed the agent from none of its channels)', true);
+          "turn has no locus (no channel was chosen for its batch's reply)", true);
       }
       const reason = 'this turn came from no channel, and it had no home or recent channel to reply in; if it should have ' +
         'had one, ask whoever runs this host';

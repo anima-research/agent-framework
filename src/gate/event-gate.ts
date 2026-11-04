@@ -179,14 +179,11 @@ export interface WakeProvenance {
    *  channel id's first segment only when the event carried no server id).
    *  A `chat:system` notice is never the chosen event; a batch in which no
    *  other event names a channel or an author names the author of its
-   *  newest notice that has one, and nothing else of it. */
+   *  newest notice that has one, with that notice's time (`at`), and
+   *  nothing else of it. */
   counterparty?: string;
   /** True when the chosen event was `chat:addressed`. */
   addressed?: boolean;
-  /** No event of the batch but its `chat:system` notices names a channel or
-   *  an author: `counterparty` and `at` are its newest authored notice's,
-   *  and the wake is a notice's. */
-  systemNotice?: true;
   /** Speech locus for the wake: the routable channel of the chosen event,
    *  set ONLY when that event addressed the agent (mention / reply / DM) and
    *  the host resolved its registered channel. A batched wake used to carry
@@ -335,7 +332,7 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
   if (!pick && channels.length === 0) {
     const notice = events.reduce<PendingEvent | undefined>(
       (n, e) => (e.systemNotice && e.authorId && (!n || e.timestamp >= n.timestamp) ? e : n), undefined);
-    return notice ? { counterparty: counterpartyOf(notice), systemNotice: true, at: notice.timestamp } : undefined;
+    return notice ? { counterparty: counterpartyOf(notice), at: notice.timestamp } : undefined;
   }
   // push-event channel ids are the adapter's raw ids (a Discord snowflake):
   // not a composite channel id, so not reported as one

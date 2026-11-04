@@ -150,8 +150,8 @@ function assertNamesBatchChannels(notice: string, channels: string[]): void {
   const shown = channels.map((c) => `#${c} (discord:g1:${c})`);
   const where = shown.length === 1 ? shown[0] : `${shown.slice(0, -1).join(', ')} and ${shown.at(-1)}`;
   assert.ok(notice.includes(
-    `had no channel to go to — this turn came from ${where}, and what came from ${channels.length === 1 ? 'there' : 'those'} ` +
-    `didn't address you, and no channel was chosen for its reply; to reply ${channels.length === 1 ? 'there' : 'in one of them'}, ` +
+    `had no channel to go to — this turn came from ${where}, and no channel was chosen for its reply; ` +
+    `to reply ${channels.length === 1 ? 'there' : 'in one of them'}, ` +
     'send your reply to that channel explicitly. This is a routing situation, not a channel failure.'), notice);
   assert.ok(!notice.includes('came from no channel'), notice);
   assert.ok(!notice.includes('configuration'), 'nothing is misconfigured when no message of a batch addressed the agent');
