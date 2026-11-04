@@ -6688,12 +6688,12 @@ export class AgentFramework {
       held.push(request);
       return;
     }
-    if (isTurnRetry(request)) (same as MarkedRequest)[TURN_RETRY] = true;
     // A merged start's batch (MERGED_BATCH) stays recorded on the request
     // kept in its place, which then stands for it, as the start did. What
     // folds into a merged start, or a held wake that a merged start folds
     // into, goes into the batch by this same fold, so the release expands
-    // to each wake once.
+    // to each wake once. The copy of a held wake is taken before any mark
+    // below, so it carries only what that wake itself was.
     const into = mergedBatch(same);
     const batch = mergedBatch(request);
     if (into || batch) {
@@ -6701,6 +6701,12 @@ export class AgentFramework {
       for (const member of batch ?? [request]) this.holdRequest(members, member);
       (same as MarkedRequest)[MERGED_BATCH] = members;
     }
+    if (isTurnRetry(request)) (same as MarkedRequest)[TURN_RETRY] = true;
+    // As the scheduler's merge does: the kept request takes the turn's carry
+    // when it has none, and stays re-armed only if both were.
+    const carry = turnCarryOf(request);
+    if (carry && !turnCarryOf(same)) (same as MarkedRequest)[TURN_CARRY] = carry;
+    if (!isRearmed(request)) delete (same as MarkedRequest)[REARMED];
     const opening = mergedOpeningMessages([same, request]);
     if (opening) same.openingMessages = opening;
   }
@@ -21488,7 +21494,6 @@ export class AgentFramework {
     if (locus === null) {
       const places = await asked;
       if (places.length > 0) {
-        if (!round.final) round.routing.liveSpeech = true;
         console.error(`[routeSpeech] ${agent.name}: turn has no channel; ${text.length} chars shown by ${places.map(logValue).join(' · ')}, routing posted it to no channel`);
         return null;
       }
@@ -21504,11 +21509,13 @@ export class AgentFramework {
 
   private async askSpeechRouted(agent: Agent, round: ProseRound, text: string): Promise<string[]> {
     try {
-      return await this.moduleRegistry.askSpeechRouted(agent.name, text, {
+      const places = await this.moduleRegistry.askSpeechRouted(agent.name, text, {
         final: round.final === true,
         turnId: round.routing.turnId,
         ...speechOpenedBy(round.routing),
       });
+      if (places.length > 0 && !round.final) round.routing.liveSpeech = true;
+      return places;
     } catch (err) {
       console.error(`[routeSpeech] ${agent.name}: asking the modules where speech went failed:`, err);
       return [];

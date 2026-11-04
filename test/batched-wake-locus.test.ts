@@ -10,8 +10,8 @@
  *   - ambient BEFORE the DM: the DM never displaced it.
  * Now a batch containing an addressed message routes to that message's
  * registered channel. An ambient-only batch names no channel: under the
- * default `speech.locus: 'delivery'` the turn has no locus and its prose
- * stays private; under `'latest-inbound'` it keeps the legacy fallback.
+ * default `speech.locus: 'delivery'` the turn has no locus and routing posts
+ * its prose to no channel; under `'latest-inbound'` it keeps the legacy fallback.
  *
  * The tests hold the gate's batch until both events are in it (holdBatches),
  * so they don't depend on the second reaching the gate inside the window.

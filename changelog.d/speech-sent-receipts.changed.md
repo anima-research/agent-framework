@@ -10,11 +10,11 @@
   that place in its receipt, and the failed post keeps its own notice. This
   holds under prose routing by locus, hybrid and locked, for each tool round's
   prose as it routes and for the final reply.
-- **Hosts:** a piece of speech with no channel that a module says it showed
-  logs `[routeSpeech] <agent>: turn has no channel; <n> chars shown by
+- **Hosts:** a routed piece of speech with no channel that a module says it
+  showed logs `[routeSpeech] <agent>: turn has no channel; <n> chars shown by
   <places>, routing posted it to no channel` and emits no
   `mcpl:speech-route-failed` trace, where it emitted one; a routed piece no
-  module showed still emits it. `ChannelRegistry`'s `onRouteFailure` info now
+  module showed emits it as before. `ChannelRegistry`'s `onRouteFailure` info now
   carries `text`, the words routed, so a host that logs that info logs the
   agent's speech.
 - **Hosts:** under a provider hold, a merged start and an equal wake keep each
@@ -30,7 +30,8 @@
   …`, where it said "Your previous reply (<n> chars)". A long piece's opening
   is cut at the last word within 40 characters, or inside a first word longer
   than that, and marked "…".
-- **Residents:** the `[routing]` notice for a turn with no channel reads "Your
+- **Residents:** the `[routing]` notice for a turn with no channel that isn't
+  locked reads "Your
   plain speech currently has no channel, so routing posts it to no channel.",
   and an addressed-elsewhere notice on such a turn reads "Your plain speech
   has no channel this turn", where each said it "stays in your archive". The

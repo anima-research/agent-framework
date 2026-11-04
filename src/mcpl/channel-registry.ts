@@ -5806,8 +5806,8 @@ export class ChannelRegistry {
    * What every conversation that takes the global fallback falls back to when
    * neither a home channel nor its own delivery names one: the all-except
    * hold's channel while one is open, else the latest delivered inbound
-   * channel under the legacy locus rule, else none, and no channel posts the
-   * prose (architecture channel §3 carve-out, 2026-10-06).
+   * channel under the legacy locus rule, else none, and routing posts the
+   * prose to no channel (architecture channel §3 carve-out, 2026-10-06).
    */
   private sharedFallback(): ChannelRef | null {
     return this.focusChannelResolver?.() ?? this.fallbackLocus();
@@ -6181,8 +6181,8 @@ export class ChannelRegistry {
         return { status: 'failed', reason: "an ephemeral run's plain speech with no channel of its own is its caller's result", at: Date.now() };
       }
       // The turn froze with no locus (no home, no triggering channel, no
-      // global inbound ever seen) — the agent was told no channel posts
-      // its prose; honor that.
+      // global inbound ever seen) — the agent was told routing posts its
+      // prose to no channel; honor that.
       // The locus froze at the turn's start, so this says what the turn had.
       const reason = 'this turn came from no channel, and it had no home or recent channel to reply in; if it should have ' +
         'had one, ask whoever runs this host';

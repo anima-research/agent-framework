@@ -670,6 +670,20 @@ describe('plain speech a module says it showed', () => {
     assert.deepEqual(notices(f), []);
   });
 
+  it("a heartbeat that fails after a round a module showed says that round's held speech was handed on", async () => {
+    const surface = new Surface();
+    const membrane = new FailsAfterFirstRound();
+    membrane.pushResponse(lookRound('Looking around.'));
+    const f = await host([surface], membrane);
+    internals(f).pendingRequests.push({ agentName: 'resident', reason: 'heartbeat', source: 'heartbeat', timestamp: Date.now() });
+    await f.runUntilIdle();
+    assert.deepEqual(askedTexts(surface), [{ text: 'Looking around.', final: false }], 'premise: the held round was asked about');
+    assert.deepEqual(openDrafts(f).map((d) => d.text), ['Looking around.'], 'premise: the round was held as a draft');
+    const failed = texts(f).filter((t) => t.startsWith('[inference-failed]'));
+    assert.equal(failed.length, 1, texts(f).join('\n'));
+    assert.ok(failed[0]!.includes('Plain speech its rounds routed live was handed on for delivery as written'), failed[0]);
+  });
+
   it("a ' !' continuation names the messages of the turn that asked for it", async () => {
     const surface = new Surface();
     const membrane = new MockMembrane();
@@ -1054,7 +1068,7 @@ describe('plain speech a module says it showed', () => {
     await turn(f);
     assert.equal(notices(f).length, 1);
     assert.ok(notices(f)[0]!.includes('if another surface showed it'), 'a module that failed may have shown it');
-    assert.ok(errors.some((e) => e.startsWith('Speech-routed module console error:') && e.includes('console broke')), errors.join('\n'));
+    assert.ok(errors.some((e) => e.startsWith('Speech-routed module console (agent resident) error:') && e.includes('console broke')), errors.join('\n'));
   });
 
   it("a module whose answer throws when its place is read counts as having shown nothing, and another module's place still counts", async (t) => {
@@ -1069,7 +1083,7 @@ describe('plain speech a module says it showed', () => {
     await turn(f);
     assert.deepEqual(notices(f), []);
     assert.equal(receipt(f), `[delivered] plain speech → sent to ${SENT_TO} · this turn's routing posted it to no channel`);
-    assert.ok(errors.some((e) => e.startsWith('Speech-routed module console error:') && e.includes('console broke')), errors.join('\n'));
+    assert.ok(errors.some((e) => e.startsWith('Speech-routed module console (agent resident) error:') && e.includes('console broke')), errors.join('\n'));
   });
 
   it("modules that haven't answered are waited for together until the bound and no longer, and count as having shown nothing", async (t) => {
@@ -1095,7 +1109,7 @@ describe('plain speech a module says it showed', () => {
       assert.ok(!errors.some((e) => e.includes("hadn't answered")), 'and not given up');
       t.mock.timers.tick(1);
       for (const name of ['console', 'other']) {
-        assert.ok(errors.includes(`Speech-routed module ${name} hadn't answered within 5 s: counted as having sent nothing`), errors.join('\n'));
+        assert.ok(errors.includes(`Speech-routed module ${name} (agent resident) hadn't answered within 5 s: counted as having sent nothing`), errors.join('\n'));
       }
       await tickUntil(t, () => settled);
     } finally {
@@ -1132,8 +1146,8 @@ describe('plain speech a module says it showed', () => {
       assert.equal(notices(f).length, 1, 'the late answer counts for nothing');
       assert.equal(receipt(f), undefined, 'and no receipt names its place');
       const line = late === 'late'
-        ? 'Speech-routed module console answered after the 5 s wait: its answer counts for nothing'
-        : 'Speech-routed module console error after the wait:';
+        ? 'Speech-routed module console (agent resident) answered after the 5 s wait: its answer counts for nothing'
+        : 'Speech-routed module console (agent resident) error after the wait:';
       assert.ok(errors.some((e) => e.startsWith(line)), errors.join('\n'));
     });
   }

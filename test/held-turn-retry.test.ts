@@ -1065,12 +1065,14 @@ test("a wait released by a listener of the inference:failed a conversation agent
 /** A held turn with a wake beside its retry, released so the two merge into
  *  one start, which parks behind an auxiliary call or is held again at the
  *  last admission boundary by a wait recorded meanwhile. */
-async function mergedStartWaiting(fw: AgentFramework, internal: Internal, membrane: ScriptedMembrane, clock: { advance(ms: number): void; pass(ms: number): void }, wait: number, how: 'parked' | 'held again') {
+async function mergedStartWaiting(fw: AgentFramework, internal: Internal, membrane: ScriptedMembrane, clock: { advance(ms: number): void; pass(ms: number): void }, wait: number, how: 'parked' | 'held again', leads: 'retry' | 'wake' = 'retry') {
   await heldTurn(fw, internal, membrane);
   clock.advance(1);
   fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-during the hold', metadata: {} });
   await fw.runUntilIdle();
   assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 2, 'the hold keeps the retry and the wake');
+  // A hold that took the wake before the retry: the merge then leads with the wake.
+  if (leads === 'wake') internal.providerAccelerationCooldowns.get('resident')!.heldRequests.reverse();
   const gate = internal.providerGate('resident');
   gate.auxiliaryInFlight = 1;
   clock.pass(wait);
@@ -1118,6 +1120,57 @@ for (const how of ['parked', 'held again'] as const) test(`a wake merged into a 
   });
 });
 
+const identityKeys = ['agentName', 'reason', 'source', 'timestamp', 'channelId', 'channelServerId', 'coalescingSubject',
+  'coalescingBatchSubjects', 'readsDeferredWrite', 'readsStoredMessage', 'wakeLines'];
+
+test("a held turn's retry the hold folds into an equal held wake gives that wake the turn's carry", async (t) => {
+  await withStoreDir(async (path) => {
+    holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      await heldTurn(fw, internal, membrane);
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
+      const retry = held.splice(0, 1)[0] as unknown as Record<string | symbol, unknown>;
+      const carry = Object.getOwnPropertySymbols(retry).find((key) => key.description === 'turn-carry');
+      assert.ok(carry && retry[carry], 'premise: the retry carries its turn');
+      const wake: Record<string, unknown> = {};
+      for (const key of identityKeys) if (retry[key] !== undefined) wake[key] = retry[key];
+      held.push(wake as unknown as Request);
+      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, retry);
+      assert.equal(held.length, 1, 'premise: the hold folds the retry into the held wake');
+      assert.equal(held[0], wake, 'premise: the held wake is the one kept');
+      assert.deepEqual((held[0] as unknown as Record<symbol, unknown>)[carry!], retry[carry!]);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a held wake that a held turn's merged retry, led by an equal wake, folds into still runs after abortInference() ends the turn", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again', 'wake');
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
+      const start = held.splice(0, 1)[0] as unknown as Record<string, unknown>;
+      const wake: Record<string, unknown> = {};
+      for (const key of identityKeys) if (start[key] !== undefined) wake[key] = start[key];
+      held.push(wake as unknown as Request);
+      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, start);
+      assert.equal(held.length, 1, 'premise: the hold folds the merged retry into the held wake');
+      assert.equal(fw.abortInference('resident', 'zz-operator stop'), true);
+      go();
+      await waitFor(fw, () => membrane.primary >= 3, 'the held wake, as a turn of its own');
+      assert.match(texts(membrane.calls[2]), /zz-during the hold/);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
 test("a wake the hold folds into a held merged start keeps its opening messages when the start is released", async (t) => {
   await withStoreDir(async (path) => {
     const clock = holdClock(t);
@@ -1143,9 +1196,6 @@ test("a wake the hold folds into a held merged start keeps its opening messages 
     } finally { await fw.stop(); log.restore(); }
   });
 });
-
-const identityKeys = ['agentName', 'reason', 'source', 'timestamp', 'channelId', 'channelServerId', 'coalescingSubject',
-  'coalescingBatchSubjects', 'readsDeferredWrite', 'readsStoredMessage', 'wakeLines'];
 
 test("a held wake that an equal merged start folds into keeps its opening messages when the start is released", async (t) => {
   await withStoreDir(async (path) => {

@@ -761,19 +761,19 @@ export class ModuleRegistry {
       }
       const timer = setTimeout(() => {
         settled = true;
-        console.error(`Speech-routed module ${module.name} hadn't answered within ${SPEECH_RECEIPT_WAIT_MS / 1000} s: counted as having sent nothing`);
+        console.error(`Speech-routed module ${module.name} (agent ${agentName}) hadn't answered within ${SPEECH_RECEIPT_WAIT_MS / 1000} s: counted as having sent nothing`);
         resolve(undefined);
       }, SPEECH_RECEIPT_WAIT_MS);
       call.then((answer) => {
         if (settled) {
-          console.error(`Speech-routed module ${module.name} answered after the ${SPEECH_RECEIPT_WAIT_MS / 1000} s wait: its answer counts for nothing`);
+          console.error(`Speech-routed module ${module.name} (agent ${agentName}) answered after the ${SPEECH_RECEIPT_WAIT_MS / 1000} s wait: its answer counts for nothing`);
           return;
         }
         settled = true;
         clearTimeout(timer);
         resolve(this.moduleContexts.get(module.name) === registration ? answer : undefined);
       }, (error: unknown) => {
-        console.error(`Speech-routed module ${module.name} error${settled ? ' after the wait' : ''}:`, error);
+        console.error(`Speech-routed module ${module.name} (agent ${agentName}) error${settled ? ' after the wait' : ''}:`, error);
         if (settled) return;
         settled = true;
         clearTimeout(timer);
