@@ -19,9 +19,10 @@
  *   only while its request lives;
  * - a 404 to a request carrying the session's id ends the session, except
  *   the stream's first open. The call whose POST met it is refused (404). A
- *   session that had answered and lived a base interval gets a new one at
- *   once ('close', then 'reconnect'); any other is a failed connect, backing
- *   off, and after stopReconnecting() nothing starts again;
+ *   session that had answered gets a new one at once ('close', then
+ *   'reconnect'), unless it lived less than a base interval, as did the last
+ *   one restarted that way; any other end is a failed connect, backing off,
+ *   and after stopReconnecting() nothing starts again;
  * - a 400 carrying -32022, or a 405 to a GET for one of the session's
  *   streams that the server had served, ends the session too, and the
  *   connection follows the server to 2026-07-28;
@@ -1402,43 +1403,88 @@ test('behind a load balancer without sticky sessions, each new session ends unan
   assert.ok(fourth! - third! >= 155, `the fourth session waited ${fourth! - third!} ms`);
 });
 
+/** A balancer's two nodes: the one that issued a session answers its relist,
+ *  and every call reaches one that doesn't hold the session. */
+const splitNodes = () => start2025({
+  versions: ['2025-06-18'],
+  get: 405,
+  answer: (message, res) => {
+    if (message.method !== 'tools/call') return false;
+    sessionNotFound(res);
+    return true;
+  },
+});
+
+/** The connection's lifecycle events, in order, with each close's
+ *  `willReconnect`, each failed attempt's number and words, and each
+ *  reconnect's attempt count. */
+function lifecycle(connection: ModernMcpConnection): string[] {
+  const events: string[] = [];
+  connection.on('close', () => events.push(`close willReconnect=${connection.willReconnect}`));
+  connection.on('reconnect-failed', (f: { attempt: number; error: string }) => events.push(`reconnect-failed ${f.attempt}: ${f.error}`));
+  connection.on('reconnect', (r: { attempts: number }) => events.push(`reconnect ${r.attempts}`));
+  return events;
+}
+
 for (const lived of [false, true]) {
-  test(`behind a load balancer whose node that issued a session answers its relist, the session's end on another node ${lived ? 'after the base interval starts a new one at once' : 'within the base interval is a failed connect, to the fifth attempt, where the framework alerts'}`, async (t) => {
+  test(`behind a load balancer whose node that issued a session answers its relist, sessions the server ends on another node ${lived ? 'after the base interval each start a new one at once' : 'within the base interval are failed connects after the first, to the fifth attempt, where the framework alerts'}`, async (t) => {
     t.mock.method(Math, 'random', () => 0.5); // no jitter
-    // Each session's relist reaches the node that issued it, and every call
-    // a node that doesn't hold the session.
-    const fixture = await start2025({
-      versions: ['2025-06-18'],
-      get: 405,
-      answer: (message, res) => {
-        if (message.method !== 'tools/call') return false;
-        sessionNotFound(res);
-        return true;
-      },
-    });
-    const connection = await connect(fixture, { reconnect: true, reconnectIntervalMs: 200, reconnectMaxIntervalMs: 200 });
-    const events: string[] = [];
-    connection.on('close', () => events.push(`close willReconnect=${connection.willReconnect}`));
-    connection.on('reconnect-failed', (f: { attempt: number; error: string }) => events.push(`reconnect-failed ${f.attempt}: ${f.error}`));
-    connection.on('reconnect', (r: { attempts: number }) => events.push(`reconnect ${r.attempts}`));
+    const fixture = await splitNodes();
+    // Not lived: a 5 s base, so no session's few milliseconds can count as
+    // lived on a loaded host, and a 100 ms cap on the backoff.
+    const interval = lived ? 200 : 5000;
+    const connection = await connect(fixture, { reconnect: true, reconnectIntervalMs: interval, reconnectMaxIntervalMs: lived ? 200 : 100 });
+    const events = lifecycle(connection);
     // As the framework does, list after every (re)connect; then a call.
     const cycle = async () => {
       await connection.listTools();
-      if (lived) await outlive(200);
+      if (lived) await outlive(interval);
       await connection.callTool('echo', {}).catch(() => {});
     };
     if (lived) {
       await cycle();
-      await until(() => events.includes('reconnect 1'), 'the new session');
-      assert.deepEqual(events, ['close willReconnect=true', 'reconnect 1'], 'restarted at once, no failed connect');
+      await until(() => events.length === 2, 'the first new session');
+      await cycle();
+      await until(() => events.length === 4, 'the second new session');
+      assert.deepEqual(events, ['close willReconnect=true', 'reconnect 1', 'close willReconnect=true', 'reconnect 1'], 'each restarted at once, no failed connect');
       return;
     }
     connection.on('reconnect', () => { void cycle().catch(() => {}); });
     await cycle();
-    await until(() => events.filter((e) => e.startsWith('reconnect-failed')).length >= 5, 'the fifth attempt');
+    await until(() => events.filter((e) => e.startsWith('reconnect-failed')).length >= 5, 'the fifth attempt', 10_000);
+    // The first young end starts a new session at once; each after it is a failed connect.
+    assert.deepEqual(events.slice(0, 2), ['close willReconnect=true', 'reconnect 1']);
     const failed = events.filter((e) => e.startsWith('reconnect-failed')).slice(0, 5);
     assert.deepEqual(failed.map((e) => e.split(':')[0]), [1, 2, 3, 4, 5].map((n) => `reconnect-failed ${n}`));
-    for (const line of failed) assert.match(line, /ended its session \(HTTP 404\) less than 200 ms after the session started$/);
+    for (const line of failed) assert.match(line, /ended its session \(HTTP 404\) less than 5000 ms after the session started$/);
+  });
+}
+
+for (const before of ['as the first', 'after a session that lived the base interval'] as const) {
+  test(`without \`reconnect\`, an answered session the server ends young ${before} starts a new one at once, and a second young end in a row leaves the server gone`, async () => {
+    const fixture = await splitNodes();
+    const interval = 500;
+    const connection = await connect(fixture, { reconnectIntervalMs: interval, reconnectMaxIntervalMs: 100 });
+    const events = lifecycle(connection);
+    const end = async (live: boolean) => {
+      await connection.listTools();
+      if (live) await outlive(interval);
+      await connection.callTool('echo', {}).catch(() => {});
+    };
+    const expected: string[] = [];
+    if (before !== 'as the first') {
+      await end(true);
+      expected.push('close willReconnect=true', 'reconnect 1');
+      await until(() => events.length === expected.length, 'the lived session\'s new one');
+    }
+    await end(false);
+    expected.push('close willReconnect=true', 'reconnect 1');
+    await until(() => events.length === expected.length, 'the young session\'s new one');
+    await end(false);
+    expected.push(`reconnect-failed 1: MCP server "remote" ended its session (HTTP 404) less than ${interval} ms after the session started`, 'close willReconnect=false');
+    await until(() => events.length === expected.length, 'the second young end');
+    assert.deepEqual(events, expected);
+    assert.equal(connection.willReconnect, false);
   });
 }
 

@@ -30,16 +30,19 @@
     server has no GET route): a call whose POST met the 404 fails as
     `error-response` with `data.httpStatus` 404, and isn't replayed; a call
     whose stream was cut is `no-response`. A session that had answered a
-    request, and had lived at least the base interval
-    (`reconnectIntervalMs`), gets a new one at once, whatever `reconnect`
-    says: `close` while `willReconnect` reads true, then `reconnect`, with
-    the server and its tools kept. Any other is a failed connect: it emits
-    `reconnect-failed` and `close`, then follows `reconnect`, and the backoff
-    keeps growing, with the framework's alert at the fifth attempt, until a
-    session answers and lives the interval, with a session id or without
-    one. Answered sessions that each live longer, as behind a load balancer
-    that sends a session's later requests to another node, restart at most
-    once an interval, and each restart costs the calls in flight.
+    request gets a new one at once, whatever `reconnect` says: `close` while
+    `willReconnect` reads true, then `reconnect`, with the server and its
+    tools kept. One that ended less than the base interval
+    (`reconnectIntervalMs`) after it started does only if the last session
+    restarted that way had lived the interval, or there was none. A second
+    such young end in a row, or an end before the session answered, is a
+    failed connect: it emits `reconnect-failed` and `close`, then follows
+    `reconnect`, and the backoff keeps growing, with the framework's alert
+    at the fifth attempt, until a session's end starts a new one at once,
+    with a session id or without one. Answered sessions that each live
+    longer, as behind a load balancer that sends a session's later requests
+    to another node, restart at most once an interval, and each restart
+    costs the calls in flight.
   - **A server upgraded in place** to `2026-07-28` is followed: a 400
     carrying JSON-RPC `-32022` to any request, or a 405 to a GET for one of
     the session's streams after the server had served it (the standalone
