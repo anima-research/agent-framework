@@ -65,7 +65,7 @@ const permissionsHold = process.platform !== 'win32' && process.getuid?.() !== 0
 const BEHAVIORS = '"always", "defer" or "skip", or an object holding one of "debounce", "rate_limit", "passive_sample" and "judge"';
 /** A character outside the Basic Multilingual Plane: one code point, two UTF-16 units. */
 const GRIN = '\u{1F600}';
-const POLICY_FIELDS = '"name", "match", "behavior", "resets" and "passthrough"';
+const POLICY_FIELDS = '"name", "match", "behavior", "resets", "passthrough" and "suppress"';
 const MATCH_FIELDS = '"scope", "source", "channel", "mount", "pathGlob", "tagsAny", "tagsAll", "tagsNone", "metadataTrue" and "filter"';
 const MENTIONS = { name: 'mentions', match: { tagsAny: ['chat:mention'] }, behavior: 'always' };
 const event = (tags: string[], eventType = 'mcpl:channel-incoming'): GateEventInfo =>
@@ -1131,7 +1131,7 @@ test('a change refuses, writing nothing, where gate.json has no rule list it cou
 test("the host's starting rules are read rule by rule: a first start writes them as given and runs each as read, leaving out only what it must", (t) => {
   const usable: GateConfig = { default: 'skip', policies: [{ name: 'user-input', match: { scope: ['user:message'] }, behavior: 'always' }] };
   const clean = makeGate(tempDir(t), { initialConfig: usable });
-  assert.equal(readFileSync(clean.configPath, 'utf-8'), JSON.stringify(usable, null, 2) + '\n', 'verbatim');
+  assert.deepEqual(onDisk(clean.configPath), usable, 'as given');
   assert.deepEqual(clean.gate.getStatus().errors, []);
   assert.equal(clean.gate.getStatus().configSource, 'file');
 
@@ -1940,12 +1940,13 @@ test('a gate.json saved with a BOM reads as the same file without one: at a late
     'tool_use',
   ));
   membrane.pushResponse(createMockResponse([]));
+  const before = readdirSync(dir).sort();
   assert.equal(framework.nudgeAgent('scout').ok, true);
   await framework.runUntilIdle();
   const [round] = membrane.lastStream!.receivedToolResults as Array<Array<{ content: string; isError: boolean }>>;
   assert.equal(round![0]!.isError, false, round![0]!.content);
   assert.deepEqual(onDisk(configPath).policies.map((p) => p.name), ['mentions', 'by-hand', 'watch']);
-  assert.deepEqual(readdirSync(dir).filter((f) => f.startsWith('gate.json.unreadable-')), []);
+  assert.deepEqual(readdirSync(dir).sort(), before, 'the file is written in place; nothing is moved aside');
 });
 
 test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its own terms, names fields it left out, and keeps the rules it didn\'t change', async (t) => {
@@ -1997,7 +1998,7 @@ test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its
   // Its own parameters are checked as a rule's fields are: a slip is refused.
   const before = readFileSync(configPath, 'utf-8');
   const parameters = '"name", "match", "behavior", "debounceMs", "rateLimit", "passiveSample", "judge", "position", "insertBefore", '
-    + '"insertAfter", "passthrough" and "resets"';
+    + '"insertAfter", "passthrough", "resets" and "suppress"';
   const slip = await call({ name: 'watch', passiveSample: { every: 10 }, pasthrough: true });
   assert.equal(slip.isError, true);
   assert.ok(
@@ -2149,15 +2150,17 @@ test('wake_add_rule refuses a behavior, or a placement, of the wrong kind in its
   // Each of the description's examples, made as the call it shows, is saved as it reads.
   const examples = [...description.matchAll(/`(\{ name: "[^`]+\})`/g)]
     .map((m) => new Function(`return (${m[1]});`)() as Record<string, unknown>);
-  assert.deepEqual(examples.map((e) => e.name), ['watch-notes', 'watch-cairn', 'ambient-judged']);
+  assert.deepEqual(examples.map((e) => e.name), ['watch-notes', 'watch-cairn', 'hide-tool-flaps', 'ambient-judged']);
   for (const example of examples) {
     const result = await call(example);
     assert.equal(result.isError, false, result.content);
     assert.equal(JSON.parse(result.content).ignoredFields, undefined, 'every field it gives is read');
   }
-  assert.deepEqual(onDisk(configPath).policies.slice(-3), [
+  assert.deepEqual(onDisk(configPath).policies.slice(-4), [
     { name: 'watch-notes', match: { scope: ['workspace:modified'], mount: 'project', pathGlob: 'notes/*.md' }, behavior: 'always' },
     { name: 'watch-cairn', match: { source: 'discord', channel: 'discord:*:12345', tagsAny: ['chat:ambient'] }, behavior: { debounce: 60000 } },
+    // A suppress rule given no behavior is saved with "defer" written out.
+    { name: 'hide-tool-flaps', match: { source: 'body', scope: ['mcpl:tool-changes'] }, behavior: 'defer', suppress: { description: "the body's tools coming and going" } },
     {
       name: 'ambient-judged',
       match: { tagsAny: ['chat:ambient'] },

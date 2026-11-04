@@ -4,11 +4,25 @@ import { StringDecoder } from 'node:string_decoder';
 const LF = 0x0a;
 const CR = 0x0d;
 
-export function readLines(input: Readable, onLine: (line: string) => void, onEnd?: () => void): () => void {
+export const MAX_LINE_CHARS = 100 * 1024 * 1024;
+
+export interface LineHandlers {
+  line: (line: string) => void;
+  end?: () => void;
+  tooLong: (maxChars: number) => void;
+}
+
+export function readLines(input: Readable, on: LineHandlers, maxChars = MAX_LINE_CHARS): () => void {
   const decoder = new StringDecoder('utf8');
   let partial = '';
   let lineEndedAtCr = false;
   let stopped = false;
+
+  const refuse = () => {
+    stop();
+    partial = '';
+    on.tooLong(maxChars);
+  };
 
   const take = (text: string) => {
     let from = 0;
@@ -19,6 +33,7 @@ export function readLines(input: Readable, onLine: (line: string) => void, onEnd
     for (let i = from; i < text.length && !stopped; i++) {
       const code = text.charCodeAt(i);
       if (code !== LF && code !== CR) continue;
+      if (partial.length + (i - from) > maxChars) return refuse();
       const line = partial + text.slice(from, i);
       partial = '';
       if (code === CR) {
@@ -26,9 +41,11 @@ export function readLines(input: Readable, onLine: (line: string) => void, onEnd
         else if (text.charCodeAt(i + 1) === LF) i++;
       }
       from = i + 1;
-      onLine(line);
+      on.line(line);
     }
-    if (!stopped) partial += text.slice(from);
+    if (stopped) return;
+    if (partial.length + (text.length - from) > maxChars) return refuse();
+    partial += text.slice(from);
   };
 
   const onData = (chunk: Buffer | string) => take(decoder.write(chunk));
@@ -37,11 +54,11 @@ export function readLines(input: Readable, onLine: (line: string) => void, onEnd
     if (!stopped && partial.length > 0) {
       const last = partial;
       partial = '';
-      onLine(last);
+      on.line(last);
     }
     if (stopped) return;
     stop();
-    onEnd?.();
+    on.end?.();
   };
   const stop = () => {
     stopped = true;

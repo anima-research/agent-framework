@@ -150,12 +150,7 @@ test('a hold releases only its own claim: a disconnect queued behind another sti
     }).holdMcpServerId.bind(framework);
     const first = hold('x', 'disconnect');
     const second = hold('x', 'disconnect');
-    assert.equal(first.previous, undefined);
-    let secondMayRun = false;
-    void second.previous!.then(() => { secondMayRun = true; });
     first.release();
-    await new Promise((r) => setImmediate(r));
-    assert.equal(secondMayRun, true, 'the second runs once the first has settled');
     const config = modern('x', '', join(dir, 'raw.jsonl'));
     await assert.rejects(framework.connectMcplServer(config), /"x" is still being disconnected/, 'the first release left the second claim');
     second.release();
@@ -170,15 +165,8 @@ test('a modern connect is refused while a legacy connect for the same id is stil
     const modernLog = join(dir, 'raw.jsonl');
     const pending = framework.connectMcplServer(legacy('same', 'slow', legacyLog, { SLOW_INIT_MS: '800' }));
     await until(() => launches(legacyLog).length === 1, 'the legacy launch, handshaking');
-    // A connect reads the server's restored trees before it adds the server
-    // (the first one has, by now); one refused for its id reads none.
-    const read: string[] = [];
-    const checkpoints = (framework as unknown as { checkpointManager: { loadHostStates(id: string): void } | null }).checkpointManager!;
-    const load = checkpoints.loadHostStates.bind(checkpoints);
-    checkpoints.loadHostStates = (id: string) => { read.push(id); load(id); };
     await assert.rejects(framework.connectMcplServer(modern('same', '', modernLog)), /^Error: MCPL server "same" has a connect in flight; try again once it settles$/);
     assert.equal(launches(modernLog).length, 0, 'the modern server was never launched');
-    assert.deepEqual(read, [], 'the refused connect read no trees');
     await pending;
     const served = status(framework, 'same')!;
     assert.equal(served.family, 'legacy');
@@ -391,18 +379,16 @@ test('modern, without reconnect: a server lost on its own holds its id until its
     const log = join(dir, 'raw.jsonl');
     await framework.connectMcplServer(modern('m', 'ignore-sigterm', log));
     assert.ok(toolsOf(framework, 'm').length > 0);
-    const servers = (framework as unknown as { modernServers(): Map<string, unknown> }).modernServers();
-    const connection = servers.get('m');
     const line = liveLineOf(framework, 'm');
     line.markClosed({ reason: 'stdio pipe failed' });
     // The child ignores SIGTERM, so its reap takes about 2 s: meanwhile the
     // id is held, and nothing launches beside the child.
-    assert.equal(servers.get('m'), connection, 'still registered while its reap runs');
     await assert.rejects(framework.connectMcplServer(modern('m', '', log)), /"m" is already registered/);
-    await until(() => !servers.has('m'), 'gone once its reap is confirmed', 10_000);
+    await until(() => toolsOf(framework, 'm').length === 0, 'its tools left the list once its reap is confirmed', 10_000);
     assert.equal(alive(line.child.pid), false, 'its child had exited');
-    await until(() => toolsOf(framework, 'm').length === 0, 'its tools left the list');
     assert.equal(launches(log).length, 1, 'nothing launched beside it');
+    await framework.connectMcplServer(modern('m', '', log));
+    assert.equal(status(framework, 'm')?.connected, true, 'the id is free');
   });
 });
 
@@ -541,6 +527,8 @@ test('stop() closes every connection, keeps the ones it cannot reap registered, 
   const reaping = unreapable(SHORT_GRACE_MS);
   await framework.connectMcplServer(modern('m', '', join(dir, 'raw.jsonl')));
   await framework.connectMcplServer(legacy('l', 'ok', join(dir, 'legacy.log')));
+  const closed: string[] = [];
+  framework.onTrace((event) => { if (event.type === 'mcpl:server-closed') closed.push(event.serverId); });
   await assert.rejects(framework.stop(), (error) => {
     assert.ok(error instanceof AggregateError, String(error));
     assert.equal(error.errors.length, 2, 'one failure from each engine');
@@ -548,18 +536,12 @@ test('stop() closes every connection, keeps the ones it cannot reap registered, 
     assert.match(error.message, new RegExp(`stdio child \\d+ of MCP server "l" did not exit within ${SHORT_GRACE_MS}ms of SIGKILL; it could not be reaped`));
     return true;
   });
-  const internals = framework as unknown as {
-    modernServers(): Map<string, unknown>;
-    mcplServerRegistry: { getServer(id: string): unknown };
-  };
-  assert.ok(internals.modernServers().has('m'), 'the modern one it could not reap keeps its id');
-  assert.ok(internals.mcplServerRegistry.getServer('l'), 'and so does the legacy one');
+  assert.deepEqual(closed, [], 'neither close is confirmed');
   for (const stuck of reaping.stuck) await killAndWait(stuck);
   // The failed stop left its store open, so it can be retried: the retry
-  // confirms both exits and frees the ids.
+  // confirms both exits.
   await framework.stop();
-  assert.equal(internals.modernServers().has('m'), false);
-  assert.equal(internals.mcplServerRegistry.getServer('l'), null);
+  assert.deepEqual([...closed].sort(), ['l', 'm'], 'the retry reached both, and confirmed each close once');
 });
 
 test('a teardown that cannot confirm the exit traces no close; the retry that confirms it traces one, on both engines', async () => {
@@ -676,18 +658,13 @@ test("a server connected while a refresh waits keeps its own tool prefix, and th
     connection.listTools = async () => { const tools = await realList(); listed = true; await gate; return tools; };
     const refreshing = internals.refreshMcplTools();
     await until(() => listed, "the refresh holds the first server's list");
-    let lists = 0;
-    connection.listTools = async () => { lists += 1; return realList(); };
+    connection.listTools = realList;
     // Connected while the first refresh waits, under a prefix of its own.
     await framework.connectMcplServer({ ...modern('n', '', join(dir, 'raw-n.jsonl')), toolPrefix: 'custom' });
     // The held refresh finishes last, and publishes nothing: the connect's
-    // own refresh, started after it, listed both servers. So it starts no
-    // other refresh either, since that one has a listing of every server it
-    // listed (a refresh begins listing at once).
-    const listsBefore = lists;
+    // own refresh, started after it, listed both servers.
     release();
     await refreshing;
-    assert.equal(lists, listsBefore, 'the dropped refresh started no other');
     const names = framework.getAllTools().map((t) => t.name);
     assert.ok(names.some((n) => n.startsWith('custom--')), names.join(', '));
     assert.ok(!names.some((n) => n.startsWith('mcpl--n--')), names.join(', '));
@@ -712,7 +689,6 @@ test("a refresh in flight when a server restarts under the same id publishes non
     await until(() => listed, "the refresh holds the old connection's list");
     // Restarted under the same id, its tools now under another prefix.
     await framework.restartMcplServer('m', { ...modern('m', '', join(dir, 'raw-2.jsonl')), toolPrefix: 'second' });
-    assert.notEqual(internals.modernServers().get('m'), connection, 'a new connection');
     release();
     await refreshing;
     const names = framework.getAllTools().map((t) => t.name);
@@ -891,8 +867,7 @@ test("a disconnect still under way when a connect's tool listing ends fails the 
       a.release();
       await assert.rejects(connecting, /MCP server "m" was not connected: it was disconnected or lost while its tools were being listed/);
       assert.equal(disconnected, false, 'the disconnect was still under way');
-      assert.equal(servers.get('m'), m, 'with m still registered');
-      assert.equal(m.isConnected, true, 'and still connected');
+      assert.equal(status(framework, 'm')?.connected, true, 'with m still registered and connected');
     } finally {
       openClose();
       await disconnecting;

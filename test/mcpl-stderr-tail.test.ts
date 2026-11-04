@@ -38,9 +38,9 @@ function within<T, F>(promise: Promise<T>, fallback: F, ms = 15_000): Promise<T 
 /** A server script's last step: it exits once the host's initialize line
  *  arrives, before answering it. A server that exits at once races the host's
  *  initialize write instead: a write that meets the closed pipe fails with
- *  EPIPE, and the close's reason names that failure ("…, and its pipe failed
- *  with write EPIPE") whenever it is handled before the exit, which only
- *  scheduling decides. Exiting after the line arrives leaves the host nothing
+ *  EPIPE, and the close's reason names that failure ("…, and this host had
+ *  stopped using the server's stdio (write EPIPE)") whenever it is handled
+ *  before the exit, which only scheduling decides. Exiting after the line arrives leaves the host nothing
  *  to write once the server is gone. */
 const EXIT_ON_INITIALIZE = "process.stdin.once('data', () => process.exit(1))";
 

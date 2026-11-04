@@ -257,8 +257,9 @@ describe('Greptile review on 62b57f0 (real store)', () => {
   it('G8: limit:0 author extract resume advances; maxScan:0 is rejected', async () => {
     const now = Date.now();
     const { mod } = build([1, 2, 3].map((i) => ({ text: `a${i}`, channel: 'd', author: 'antra', ms: now - (10 - i) * MIN })));
-    const d = await call(mod, 'extract', { author: 'antra', channelId: 'd', limit: 0 });
-    assert.ok(!d.truncated || d.resume.windowOffset > 0, JSON.stringify(d));
+    const d = await call(mod, 'extract', { author: 'antra', channelId: 'd', limit: 0, maxScan: 2 });
+    assert.equal(d.truncated, true, JSON.stringify(d));
+    assert.equal(d.resume.windowOffset, 2, JSON.stringify(d));
     const r = await mod.handleToolCall({ id: 't', name: 'extract', input: { author: 'antra', maxScan: 0 } } as ToolCall);
     assert.equal(r.success, false);
   });

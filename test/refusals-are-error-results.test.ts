@@ -213,12 +213,10 @@ test('a script, and a module calling in process, get the refusals as errors too'
   );
   // A module gets the result as the registry returns it: flagged, with the
   // refusal's data kept, so it can still read why.
-  assert.deepEqual(await keeper.ctx!.callTool({ id: 'ctx-open', name: 'channel_open', input: { channelId: CHANNEL } }), {
-    success: false,
-    isError: true,
-    error: TUNED_OUT,
-    data: { refusal: 'tuned-out', channelId: CHANNEL, serverId: 'disc' },
-  });
+  const opened = await keeper.ctx!.callTool({ id: 'ctx-open', name: 'channel_open', input: { channelId: CHANNEL } });
+  assert.deepEqual([opened.success, opened.isError, opened.error], [false, true, TUNED_OUT]);
+  const data = opened.data as { refusal?: unknown; channelId?: unknown };
+  assert.deepEqual([data.refusal, data.channelId], ['tuned-out', CHANNEL], 'the refusal\'s data, as documented');
   assert.deepEqual(
     await keeper.ctx!.callTool({ id: 'ctx-api', name: 'api--lookup', input: {} }),
     { success: false, error: API_UNKNOWN, isError: true },

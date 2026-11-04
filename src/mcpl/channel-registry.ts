@@ -49,6 +49,7 @@ import type { InboundSource } from './inbound-source.js';
 import { McplRequestError, type McplServerConnection } from './server-connection.js';
 import { readSkipReplyWake, skipReplyNote, type SkipReplyEarlierWake } from './skip-reply-wake.js';
 import { isProseTargetToken } from './prose-grammar.js';
+import type { TraceEventInput } from '../types/trace.js';
 
 // ============================================================================
 // Typing indicator interval (Discord typing lasts ~10s, so 7s keeps it alive)
@@ -200,7 +201,7 @@ function substitutedChannel(
  */
 const CHANNEL_LABEL_HISTORY_LOG_ID = 'mcpl/channel-label-history';
 
-type DesiredChannelState = 'open' | 'closed' | 'tuned-out';
+export type DesiredChannelState = 'open' | 'closed' | 'tuned-out';
 
 /**
  * Parameters of an active tune-out (issue #77), carried on the
@@ -1100,6 +1101,15 @@ interface ChannelRegistryOptions {
    */
   activeChannelResolver?: (agentName: string) => ChannelRef | null | undefined;
   /**
+   * Whether the agent's current turn has no channel of its own — a
+   * heartbeat's, or one woken for a channel that names none — so it replies
+   * to no incoming message (incomingFor). Left out, a null from
+   * activeChannelResolver means that, as it always did; given, it separates
+   * a turn with nowhere to speak (a locked turn pointed at drafts) from one
+   * with nothing to answer.
+   */
+  channellessTurn?: (agentName: string) => boolean;
+  /**
    * Whether a conversation takes the process-global fallback, the channel of
    * the most recent delivered inbound message: as where its plain speech lands
    * when it has no home and no channel of its own this turn, as its channel
@@ -1177,7 +1187,7 @@ export class ChannelRegistry {
   private serverRegistry: McplServerRegistry;
   private featureSetManager: FeatureSetManager;
   private pushEventFn: (event: ProcessEvent) => void;
-  private emitTraceFn: (event: { type: string; [key: string]: unknown }) => void;
+  private emitTraceFn: (event: TraceEventInput) => void;
   private sendTypingFn?: (
     serverId: string,
     channelId: string,
@@ -1197,6 +1207,7 @@ export class ChannelRegistry {
   }) => void;
   private homeChannelResolver?: (agentName: string) => ChannelRef | undefined;
   private activeChannelResolver?: (agentName: string) => ChannelRef | null | undefined;
+  private channellessTurn?: (agentName: string) => boolean;
   private takesGlobalFallback?: (conversationId: string) => boolean;
   private serverConnecting?: (serverId: string) => boolean;
   private store?: JsStore;
@@ -1581,7 +1592,7 @@ export class ChannelRegistry {
     serverRegistry: McplServerRegistry,
     featureSetManager: FeatureSetManager,
     pushEventFn: (event: ProcessEvent) => void,
-    emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
+    emitTraceFn: (event: TraceEventInput) => void,
     options?: ChannelRegistryOptions & {
       sendTypingFn?: (
         serverId: string,
@@ -1623,6 +1634,7 @@ export class ChannelRegistry {
     this.onChannelAutoOpened = options?.onChannelAutoOpened;
     this.homeChannelResolver = options?.homeChannelResolver;
     this.activeChannelResolver = options?.activeChannelResolver;
+    this.channellessTurn = options?.channellessTurn;
     this.takesGlobalFallback = options?.takesGlobalFallback;
     this.serverConnecting = options?.serverConnecting;
     this.store = options?.store;
@@ -2303,8 +2315,9 @@ export class ChannelRegistry {
   }
 
   /** The explicit 'stop' for a channel whose typing ended, while its
-   *  server still registers it. */
+   *  server still registers it and holds the grant its start needed. */
   private sendTypingStop(ref: ChannelRef): void {
+    if (!this.typingGranted(ref)) return;
     if (this.sendTypingFn && this.entryAt(ref)) {
       this.sendTypingFn(ref.serverId, ref.channelId, this.typingMetadata.get(destinationKey(ref)), 'stop');
     }
@@ -2520,7 +2533,9 @@ export class ChannelRegistry {
    * its home.
    */
   incomingFor(agentName?: string): { channel: ChannelRef; messageId: string; threadId?: string } | undefined {
-    if (agentName !== undefined && this.activeChannelResolver?.(agentName) === null && !this.homeChannelResolver?.(agentName)) {
+    const channelless = agentName === undefined ? false
+      : this.channellessTurn ? this.channellessTurn(agentName) : this.activeChannelResolver?.(agentName) === null;
+    if (channelless && !this.homeChannelResolver?.(agentName!)) {
       return undefined;
     }
     // The latest delivered inbound itself, not the speech fallback
@@ -3957,15 +3972,19 @@ export class ChannelRegistry {
    * (typing timer lifecycle is still managed for when the callback is wired).
    */
   private sendTypingNotification(ref: ChannelRef): void {
-    // §14.1: channels/typing requires channels.typing in the grant. Silent
-    // skip — a typing indicator is cosmetic and per-7s, so a diagnostic per
-    // tick would be noise.
-    if (!CapabilityGrant.of(this.serverRegistry.getServer(ref.serverId)).has('channels.typing')) return;
+    // Silent skip — a typing indicator is cosmetic and per-7s, so a
+    // diagnostic per tick would be noise.
+    if (!this.typingGranted(ref)) return;
     if (this.sendTypingFn) {
       this.sendTypingFn(ref.serverId, ref.channelId, this.typingMetadata.get(destinationKey(ref)));
     }
     // TODO: When server-connection exposes a public sendNotification or
     // sendTyping method, wire it here directly instead of using a callback.
+  }
+
+  /** §14.1: channels/typing, start and stop alike, requires channels.typing in the grant. */
+  private typingGranted(ref: ChannelRef): boolean {
+    return CapabilityGrant.of(this.serverRegistry.getServer(ref.serverId)).has('channels.typing');
   }
 
   // ==========================================================================
@@ -6267,8 +6286,13 @@ export class ChannelRegistry {
             ? 'Nothing was posted: name the channel with channelId. A subagent has no default channel, since its plain '
               + 'speech is returned to whoever called it, so channel_publish sends only to a channel it names.'
             : caller !== undefined && inTurn && this.activeChannelResolver?.(caller) === null
-              ? `Nothing was posted: name the channel with channelId. This turn has no channel of its own, so its plain speech `
-                + `goes to none and channel_publish sends only to a channel it names. ${findIds}`
+              ? (this.channellessTurn && !this.channellessTurn(caller)
+                // The turn came from a channel, but its speech goes to none
+                // (a locked turn held as drafts).
+                ? `Nothing was posted: name the channel with channelId. Your plain speech goes to no channel now, so `
+                  + `channel_publish sends only to a channel it names. ${findIds}`
+                : `Nothing was posted: name the channel with channelId. This turn has no channel of its own, so its plain speech `
+                  + `goes to none and channel_publish sends only to a channel it names. ${findIds}`)
               : `Nothing was posted: channel_publish needs a \`channelId\`, and there's no channel to default to yet. ${findIds}`,
         isError: true,
       };

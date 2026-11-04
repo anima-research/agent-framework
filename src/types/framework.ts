@@ -131,12 +131,12 @@ export interface FrameworkConfig {
      */
     announceOrphans?: boolean;
     /**
-     * By default every derivation tells the agent it was made from, in one
-     * host-framed line. After this many derivations of one kind from one
-     * agent, that agent hears a count line every so many instead of a line
-     * per fork, so a reader loop that forks a hundred times a session doesn't
-     * fill its source's context with stamps; every derivation still emits its
-     * `dendrite:agent-created` trace. Default 10; 0 never collapses.
+     * With a `derivationNotice`, after this many derivations of one kind from
+     * one agent, the line it's given is a count line every so many instead of
+     * a line per fork, so a reader loop that forks a hundred times a session
+     * doesn't fill its source's context with stamps; every derivation still
+     * emits its `dendrite:agent-created` trace. Default 10; 0 never collapses.
+     * Without a `derivationNotice` the source is told nothing.
      */
     collapseDerivationNoticesAfter?: number;
     /**
@@ -152,9 +152,11 @@ export interface FrameworkConfig {
     beforeDerive?: (spec: import('../dendrite/types.js').AgentSpec) => void | { refuse: string };
     /**
      * What an agent is told when something is derived from it. Given the
-     * record, the agent it was derived from and the framework's default line,
-     * return the text to add, or null to add nothing. Absent, the default
-     * line is used. The `dendrite:agent-created` trace is emitted either way.
+     * record, the agent it was derived from and the framework's own line,
+     * return the text to add (that line, or the host's own), or null to add
+     * nothing. Absent, nothing is added: an agent isn't told of derivations
+     * unless the host asks for it. The `dendrite:agent-created` trace is
+     * emitted either way.
      */
     derivationNotice?: (record: import('../dendrite/types.js').AgentRecord, from: string, defaultText: string) => string | null;
   };
@@ -200,7 +202,9 @@ export interface FrameworkConfig {
    *   inbound message is a global fallback locus for turns without one, and
    *   an addressed message injected mid-turn re-pins the turn's locus.
    *
-   * Held traffic never moves the locus under either rule.
+   * Held traffic never moves the locus under either rule. Neither rule
+   * applies to an agent under locked prose routing (AgentConfig.proseRouting
+   * 'locked'): its turns speak at its lock, whatever arrives.
    */
   speech?: {
     locus?: 'delivery' | 'latest-inbound';

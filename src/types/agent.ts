@@ -258,17 +258,10 @@ export interface AgentConfig {
      *   `thinking-binding-loss` ops alert, once per incident and again if a
      *   call drops more. The provider reports drops only on a request that
      *   carries the drop control; without it, such a block is refused;
-     * - the agent is told, in a `[reasoning] <agent>:` system notice of kind
-     *   `reasoning-loss` stored for it as the framework's other notices are,
-     *   when a committing compile leaves out a stored reply's reasoning at a
-     *   change of the request's head, at a branch's first compile, or in a
-     *   fold or other change to an earlier message that takes a reply of the
-     *   current turn, and, with `dropBlock` set too, when the provider drops
-     *   blocks it can place as the agent's stored replies or the stream's
-     *   rounds, once per incident and again when a call drops more. The
-     *   framework hears compiles through `Agent.onThinkingStrip` from the
-     *   agent's first stream on, unless a host has set its own, so an agent
-     *   driven only through the direct API is never told.
+     * - the agent is told nothing of reasoning left out or dropped: no line
+     *   about the mechanics of its own memory or reasoning is put in its
+     *   context. Hosts can observe compiles' strips through
+     *   `Agent.onThinkingStrip`;
      * The record and the notes
      * vouch for requests as agent-framework hands them to membrane, so a
      * membrane `beforeRequest` hook that changes a request must change every
@@ -337,8 +330,29 @@ export interface AgentConfig {
    * - 'disabled': generated prose is never published. Only explicit tools may
    *   send externally; prose remains in Chronicle, and a turn that wrote plain
    *   speech ends with a private `[delivered] plain speech → no channel` receipt.
+   * - 'locked': unprefixed prose goes to one destination the agent chose, on
+   *   every turn, and nothing moves it automatically: not the channel that
+   *   woke the turn, not an addressed message, a heartbeat or channel_open.
+   *   Only the `prose_locus` tool moves it, to a channel or to drafts (held,
+   *   never posted unless the agent resends them). The choice persists
+   *   across turns and restarts. Until the agent first makes one,
+   *   `proseLock` is the destination. It governs routing through the channel
+   *   registry: a module that handles final speech itself (`onAgentSpeech`,
+   *   such as the in-process Discord module) receives it in every mode, this
+   *   one included. See docs/locked-prose-routing.md.
    */
-  proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled';
+  proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled' | 'locked';
+
+  /**
+   * Locked mode's destination until the agent chooses one with `prose_locus`:
+   * `"#channel"`, `"@person"`, a channel id, or `"drafts"`. Resolved as a
+   * `>>` target is, at each turn's start, so a channel its server hasn't
+   * registered yet resolves once it has; until it resolves, plain speech is
+   * held as drafts. Left out, plain speech is held as drafts until the agent
+   * chooses. The agent's own choice, once made, takes its place. Ignored in
+   * the other modes.
+   */
+  proseLock?: string;
 
   /**
    * Stored participants that are this agent's own voice, in addition to its
@@ -539,7 +553,8 @@ export interface InferenceOptions {
  * `supportsInjectedMessages` is what the stream declared with the round's
  * tool calls (membrane's `ToolContext.supportsInjectedMessages`): whether it
  * can carry messages injected with that round's results. It's absent when
- * the stream doesn't say, as on membrane 0.5.87 and earlier.
+ * the stream doesn't say, which reads as a stream that can't, and when there
+ * is no stream, as for the direct API.
  */
 export type AgentState =
   | { status: 'idle' }

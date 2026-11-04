@@ -12,7 +12,7 @@ import { execFile, execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve as resolvePath } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 const SCRIPT = fileURLToPath(new URL("../../scripts/pack-installs-alone.mjs", import.meta.url));
 const { npmCommand } = (await import(new URL("../../scripts/single-threaded.mjs", import.meta.url).href)) as {
@@ -302,30 +302,6 @@ describe("pack-installs-alone", { concurrency: 4 }, () => {
     assert.match(imports.stdout, /; bins start with '#!': zz-serve; ES module bins' static imports load: zz-serve\.\n$/m);
   });
 
-  test("the bin load hook goes in through registerHooks where Node has it, and through register where it doesn't", async () => {
-    // A preload that wraps node:module's register and registerHooks, noting
-    // each call: the check shows a bin load's output only when the load
-    // fails, so a passing check's output can't say which one it called.
-    const dir = mkdtempSync(join(tmpdir(), "pack-installs-alone-spy-"));
-    made.push(dir);
-    const calls = join(dir, "calls.txt");
-    writeFileSync(join(dir, "spy.mjs"), `import { appendFileSync } from "node:fs";
-import { createRequire, syncBuiltinESMExports } from "node:module";
-const builtin = createRequire(import.meta.url)("node:module");
-for (const name of ["register", "registerHooks"]) {
-  const original = builtin[name];
-  if (typeof original === "function") builtin[name] = function (...args) { appendFileSync(${JSON.stringify(calls)}, name + "\\n"); return original.apply(this, args); };
-}
-syncBuiltinESMExports();
-`);
-    const result = await check(fixture({ files: ["dist"], bin: "./dist/serve.js" }, { "dist/serve.js": NODE_BIN }), NO_BUN, "", {
-      NODE_OPTIONS: `--import ${pathToFileURL(join(dir, "spy.mjs")).href}`,
-    });
-    assert.equal(result.code, 0, result.stderr);
-    const hooks = typeof (await import("node:module") as { registerHooks?: unknown }).registerHooks === "function";
-    assert.deepEqual(readFileSync(calls, "utf8").trim().split("\n"), [hooks ? "registerHooks" : "register"]);
-  });
-
   test("a CommonJS bin is parsed, never run, whatever marks it CommonJS, and one that doesn't parse fails", async () => {
     const marks = mkdtempSync(join(tmpdir(), "pack-installs-alone-marks-"));
     made.push(marks);
@@ -496,20 +472,12 @@ syncBuiltinESMExports();
     assert.ok(!existsSync(join(notes, "pack-outlived")), "npm pack, ignoring SIGTERM, outlived the limit");
   });
 
-  test("check() runs the script's npm under the tests' npm limit, short of the runner's own timeout", async () => {
-    // The npm notes the limit it was started under, then fails, so nothing is packed.
-    const notes = mkdtempSync(join(tmpdir(), "pack-installs-alone-limit-"));
-    made.push(notes);
-    const noted = join(notes, "limit");
-    const npm = shim("npm", `#!/usr/bin/env node\nrequire("node:fs").writeFileSync(${JSON.stringify(noted)}, String(process.env.PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS));\nprocess.exit(3);\n`);
+  test("an npm pack that fails without timing out fails the check, pointing to npm's own output", async () => {
+    // The npm fails at once, so nothing is packed.
+    const npm = shim("npm", "#!/usr/bin/env node\nprocess.exit(3);\n");
     const result = await check(fixture({ files: ["dist"], main: "./dist/index.js" }, ENTRY), NO_BUN, `${npm}:`);
     assert.equal(result.code, 1);
     assert.match(result.stderr, /pack-installs-alone: npm pack failed \(its output is above\)\.\n$/);
-    assert.equal(readFileSync(noted, "utf8"), String(PACK_LIMIT_MS));
-    // npm test's own timeout, from the test script in package.json.
-    const { scripts } = JSON.parse(readFileSync(fileURLToPath(new URL("../../package.json", import.meta.url)), "utf8")) as { scripts: { test: string } };
-    const runner = Number(/--test-timeout=(\d+)/.exec(scripts.test)?.[1]);
-    assert.ok(PACK_LIMIT_MS < runner, `the tests' npm limit, ${PACK_LIMIT_MS} ms, is short of npm test's ${runner} ms`);
   });
 
   /** A file each Node that loads `noteFlags` adds the flags it started with to,

@@ -1,3 +1,4 @@
+import { suppressionRecordOf } from './gate/suppression-stats.js';
 import type { MessageId, MessageQuery, StoredMessage } from '@animalabs/context-manager';
 
 /**
@@ -66,8 +67,10 @@ function valueAt(value: unknown, path: string): unknown {
  * boundary stores a stamped write without injecting it into the live turn, so
  * a marked row is one the store keeps and no resident is shown
  * (ModuleMessage.heldFromResidents says where its text can still reach
- * one). Any other row comes back as it is.
+ * one). So is a row a suppress rule hid (`metadata.suppressed`), which no view
+ * shows either. Any other row comes back as it is.
  */
 export function asModuleRow<T extends Pick<StoredMessage, 'metadata'>>(row: T): T & { heldFromResidents?: true } {
-  return (row.metadata as { tuneOut?: unknown } | undefined)?.tuneOut ? { ...row, heldFromResidents: true } : row;
+  const metadata = row.metadata as Record<string, unknown> | undefined;
+  return metadata?.tuneOut || suppressionRecordOf(metadata) ? { ...row, heldFromResidents: true } : row;
 }

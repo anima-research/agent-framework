@@ -68,7 +68,8 @@ test('precedence: override > host > server; first pattern wins within a source',
 
 test('config tables drop unknown classes and empty entries', () => {
   const t = quiet(() => normalizeClassTable({ 'a--*': ['files', 'nope'], 'b--*': ['nope'] }, 'cfg'));
-  assert.deepEqual(t, [['a--*', ['files']]]);
+  assert.deepEqual(resolveToolClass('a--x', ['shell'], { overrides: t, host: [] }), { classes: ['files'], source: 'override' });
+  assert.deepEqual(resolveToolClass('b--x', ['shell'], { overrides: t, host: [] }), { classes: ['shell'], source: 'server' });
 });
 
 test('glob: * is any run, whole-string, case-sensitive, nothing else is special', () => {
