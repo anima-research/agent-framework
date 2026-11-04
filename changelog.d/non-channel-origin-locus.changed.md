@@ -95,22 +95,32 @@
   before: that turn reads the channel messages the hold kept, not an
   operator's words.
 
-  In locus and hybrid mode, a private turn that holds a channel's message
+  In locus, hybrid and locked mode, a private turn that holds a channel's message
   tells its resident which channels' messages it holds and that its plain
   speech reaches none of them, in a `[routing]` notice before it replies,
   naming each channel once in the turn. That covers a channel wake its start
   takes in, a gate debounce window's channel messages, and a message one of
   its tool boundaries takes in that addressed the agent or follows up where
   the turn sent, whether the boundary injects it or leaves it to the turn's
-  next start. Under `'delivery'`, 0.30.0's own notice that someone addressed
-  the agent from another channel may name a channel first, and the turn
-  names it once either way. In
+  next start. Under `'delivery'`, and in locked mode under either rule, the
+  notice that someone addressed the agent from another channel may name a
+  channel first, and the turn names it once either way. In
   explicit and disabled mode no channel's message moves where plain speech
   goes, in any turn, so no channel is named.
 
-  A private turn's plain speech is kept private in every mode. In locus and
-  hybrid modes its `[delivered]` receipt counts it and says the plain speech
-  went to no channel, rather than reporting a failed send. In explicit mode, a
+  A private turn's plain speech is kept private in every mode. In locus,
+  hybrid and locked modes its `[delivered]` receipt counts it and says the
+  plain speech went to no channel, rather than reporting a failed send.
+  Under locked prose routing (`proseRouting: 'locked'`), a private turn
+  isn't locked while it's private: the agent's lock stays stored for its
+  turns that hold no private input. In a private turn, `prose_locus` with
+  no destination says the turn's plain speech stays private and where it
+  goes on a turn that holds none, and a move is recorded for those turns,
+  leaving the private turn as it is. In every mode, an MCPL server's
+  `context/beforeInference` channels for a private turn name no default
+  outgoing channel and no incoming message: the server isn't told the turn
+  speaks in a channel or answers the latest inbound message, as it was on
+  0.30.0, where the turn took the fallback channel. In explicit mode, a
   private turn's unprefixed speech is no longer bounced and held as a draft to
   resend: a notice says it was kept private and how to publish. An envelope
   that bounces in a private turn, because it names no destination, names one
@@ -147,7 +157,7 @@
   it opens, as the dispatcher's other refusals are, so its result carries
   `refused` (`ToolResult.refused`); a script's reaches the script as an
   Error, and a host's is a failed result. A private turn's `channel_open`
-  doesn't move the locus, and in locus and hybrid mode its answer says so.
+  doesn't move the locus, and in locus, hybrid and locked mode its answer says so.
   Neither does its entering an all-except hold (`focus`, or `tune_out` with
   `scope: 'all-except'`), whose answer says the turn's plain speech stays
   private, a conversation fork's included. The `focus` and `tune_out`

@@ -1,8 +1,8 @@
 # Locked prose routing (`proseRouting: "locked"`)
 
 Locked routing sends a resident's plain speech (text written without a send
-tool) to one destination the resident chose, on every turn, and lets nothing
-move it automatically.
+tool) to one destination the resident chose, on every turn that isn't
+private, and lets nothing move it automatically.
 
 ```jsonc
 "agent": { "proseRouting": "locked", "proseLock": "#lounge" }  // proseLock is optional
@@ -111,6 +111,18 @@ speech, as a `disabled` resident's run doesn't, since in locus mode its
 narration between tool calls would post to the channel inferred for its turn.
 connectome-host launches a locked resident's subagents as `disabled` for the
 same reason.
+
+A private turn isn't locked while it's private either. A turn is private
+once it takes in private input, such as an operator's message from a
+private surface (a WebUI or TUI message). Its plain speech is kept private,
+as in every mode: it goes to no channel and isn't held as a draft. A turn
+private from its start shows no typing indicator. The lock stays stored, and
+governs the resident's turns that hold no private input. In a private turn,
+`prose_locus` with no destination says that the turn's plain speech stays
+private and where it goes on a turn that holds none. A move is recorded for
+those turns and leaves the private turn as it is. `channel_open` and an
+all-except hold (`focus`, or `tune_out` with `scope: "all-except"`) answer
+that the turn's plain speech stays private.
 
 ## What the resident is told
 

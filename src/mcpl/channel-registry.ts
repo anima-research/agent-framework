@@ -1094,8 +1094,9 @@ interface ChannelRegistryOptions {
    * here. For a heartbeat / no-trigger turn it resolves to undefined until the
    * turn's locus is resolved, so that
    * resolution takes the global fallback, which the turn then keeps.
-   * Consulted AFTER `homeChannelResolver` (a fork's home always wins), BEFORE
-   * `defaultPublishChannel`. Null where the turn deliberately has no channel,
+   * Consulted AFTER `homeChannelResolver` (a fork's home always wins, except
+   * in a private turn's channel context, which names neither: `privateTurn`),
+   * BEFORE `defaultPublishChannel`. Null where the turn deliberately has no channel,
    * as one woken for a channel id two servers register, given without its
    * server: that takes no fallback either.
    */
@@ -1109,6 +1110,12 @@ interface ChannelRegistryOptions {
    * with nothing to answer.
    */
   channellessTurn?: (agentName: string) => boolean;
+  /**
+   * Whether the agent's current turn is private: it holds private input, so
+   * it names no channel to anyone. Its channel context names no outgoing
+   * channel, a conversation fork's home included, and no incoming message.
+   */
+  privateTurn?: (agentName: string) => boolean;
   /**
    * Whether a conversation takes the process-global fallback, the channel of
    * the most recent delivered inbound message: as where its plain speech lands
@@ -1208,6 +1215,7 @@ export class ChannelRegistry {
   private homeChannelResolver?: (agentName: string) => ChannelRef | undefined;
   private activeChannelResolver?: (agentName: string) => ChannelRef | null | undefined;
   private channellessTurn?: (agentName: string) => boolean;
+  private privateTurn?: (agentName: string) => boolean;
   private takesGlobalFallback?: (conversationId: string) => boolean;
   private serverConnecting?: (serverId: string) => boolean;
   private store?: JsStore;
@@ -1635,6 +1643,7 @@ export class ChannelRegistry {
     this.homeChannelResolver = options?.homeChannelResolver;
     this.activeChannelResolver = options?.activeChannelResolver;
     this.channellessTurn = options?.channellessTurn;
+    this.privateTurn = options?.privateTurn;
     this.takesGlobalFallback = options?.takesGlobalFallback;
     this.serverConnecting = options?.serverConnecting;
     this.store = options?.store;
@@ -2533,6 +2542,7 @@ export class ChannelRegistry {
    * its home.
    */
   incomingFor(agentName?: string): { channel: ChannelRef; messageId: string; threadId?: string } | undefined {
+    if (agentName !== undefined && this.privateTurn?.(agentName)) return undefined;
     const channelless = agentName === undefined ? false
       : this.channellessTurn ? this.channellessTurn(agentName) : this.activeChannelResolver?.(agentName) === null;
     if (channelless && !this.homeChannelResolver?.(agentName!)) {
@@ -2575,7 +2585,7 @@ export class ChannelRegistry {
     // its outgoing one, nor that message as the one it is replying to.
     const fallback = agentName !== undefined ? this.globalFallbackFor(agentName) : this.sharedFallback();
     // A turn that deliberately has no channel (null) takes no fallback.
-    const outgoing = home ?? (active !== undefined ? active : fallback);
+    const outgoing = agentName !== undefined && this.privateTurn?.(agentName) ? null : home ?? (active !== undefined ? active : fallback);
 
     const context: ChannelContext = {};
 

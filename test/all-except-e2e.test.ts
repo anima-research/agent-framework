@@ -657,6 +657,109 @@ describe('a private turn and the focus', () => {
     } finally { await f.close(); }
   });
 
+  it("a locked agent's private turn that enters a focus is told its plain speech stays private, and that a turn that holds none speaks at the lock", async () => {
+    const f = await fixture({
+      framework: { modules: [new SurfaceModule()], tuneOut: { enabled: true } } as Partial<FrameworkConfig>,
+      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', proseRouting: 'locked', proseLock: 'home' }],
+    });
+    try {
+      await registerOpen(f, 'work', 'home');
+      clear(f);
+      f.membrane.pushResponse(focusCall({ channelId: 'work', durationSeconds: 120 }));
+      f.membrane.pushResponse(say('zz-the code is 4417'));
+      f.framework.pushEvent(tuiMessage('for your eyes only: what is the door code?'));
+      await f.framework.runUntilIdle();
+      assert.equal(internals(f).tuneOutCoordinator!.getAllExcept()?.params.except.channelId, 'work', 'control: the focus holds');
+      const results = stored(f).map((m) => JSON.stringify(m.content));
+      assert.ok(results.some((text) => text.includes('This turn holds private input, so its plain speech stays private; on a turn that holds none, it still ')),
+        `the focus result says this turn's speech stays private, and where the lock sends later speech: ${results.slice(-4).join('\n')}`);
+      assert.ok(!results.some((text) => text.includes('excepted channel')), "it doesn't promise the excepted channel, which the lock overrides");
+      assert.ok(has(f, 'zz-the code is 4417'), 'premise: the private turn spoke');
+      assert.deepEqual(sent(f, 'zz-the code is 4417'), [], 'the private words reached no channel');
+    } finally { await f.close(); }
+  });
+
+  type ServerContext = { defaultOutgoing?: { channelId: string }; incoming?: { channelId: string } } | undefined;
+  /** A module whose `look` tool records what a server is told for the agent while its turn is open (context/beforeInference's channels). */
+  const contextProbe = () => {
+    const seen: ServerContext[] = [];
+    let bound: Awaited<ReturnType<typeof fixture>> | undefined;
+    const module = {
+      name: 'probe', async start() {}, async stop() {},
+      getTools: () => [{ name: 'look', description: 'Look', inputSchema: { type: 'object', properties: {} } }],
+      async handleToolCall() {
+        seen.push((internals(bound!).channelRegistry as unknown as { buildChannelContext(agent: string, server: string): ServerContext })
+          .buildChannelContext('agent', 'editor'));
+        return { success: true, data: 'looked' };
+      },
+      async onProcess() { return {}; },
+    } as unknown as Module;
+    return { seen, module, bind: (f: Awaited<ReturnType<typeof fixture>>) => { bound = f; } };
+  };
+  const look = (id: string) => createMockResponse([{ type: 'tool_use', id, name: 'probe--look', input: {} }] as ContentBlock[], 'tool_use');
+
+  for (const mode of ['locus', 'hybrid', 'locked'] as const) for (const rule of ['delivery', 'latest-inbound'] as const) {
+    it(`${mode}, ${rule}: a private turn tells a server no channel it speaks in and no message it answers`, async () => {
+      const probe = contextProbe();
+      const f = await fixture({
+        framework: { modules: [new SurfaceModule(), probe.module], speech: { locus: rule } } as Partial<FrameworkConfig>,
+        agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', proseRouting: mode, ...(mode === 'locked' ? { proseLock: 'work' } : {}) }],
+      });
+      probe.bind(f);
+      try {
+        await registerOpen(f, 'work');
+        clear(f);
+        f.membrane.pushResponse(look('l1'));
+        f.membrane.pushResponse(say('zz-room'));
+        await incoming(f, 'work', 'w1', 'agent, hello', MENTION);
+        await f.framework.runUntilIdle();
+        await eventually(() => probe.seen.length === 1, 'the room turn looked');
+        f.membrane.pushResponse(look('l2'));
+        f.membrane.pushResponse(say('zz-private'));
+        f.framework.pushEvent(tuiMessage('for your eyes only'));
+        await f.framework.runUntilIdle();
+        await eventually(() => probe.seen.length === 2, 'the private turn looked');
+        const [room, privateTurn] = probe.seen;
+        assert.equal(room?.defaultOutgoing?.channelId, 'work', `control: a room's turn names where it speaks: ${JSON.stringify(probe.seen)}`);
+        assert.equal(room?.incoming?.channelId, 'work', 'control: and the message it answers');
+        assert.equal(privateTurn?.defaultOutgoing, undefined, JSON.stringify(privateTurn));
+        assert.equal(privateTurn?.incoming, undefined, JSON.stringify(privateTurn));
+      } finally { await f.close(); }
+    });
+  }
+
+  it("a conversation fork's private turn tells a server no channel, its home included, and no message it answers", async () => {
+    const probe = contextProbe();
+    const f = await fixture({ framework: { modules: [new SurfaceModule(), probe.module] } as Partial<FrameworkConfig> });
+    probe.bind(f);
+    const wake = (request: Record<string, unknown>) =>
+      (f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({ agentName: 'agent', timestamp: Date.now(), ...request });
+    try {
+      await registerOpen(f, 'work', 'home');
+      clear(f);
+      f.membrane.pushResponse(say('zz-first'));
+      await incoming(f, 'work', 'w1', 'agent, hello', MENTION);
+      await f.framework.runUntilIdle();
+      await eventually(() => f.published.some((p) => JSON.stringify(p).includes('zz-first')), 'premise: a room turn answered, so the latest inbound message is in work');
+      bindAsConversationFork(f.framework, 'agent', { serverId: 'editor', channelId: 'home' });
+      f.membrane.pushResponse(look('l1'));
+      f.membrane.pushResponse(say('zz-home'));
+      wake({ reason: 'mcpl:channel-incoming', source: 'editor', channelId: 'home', channelServerId: 'editor', addressed: true });
+      await f.framework.runUntilIdle();
+      await eventually(() => probe.seen.length === 1, "the fork's home turn looked");
+      f.membrane.pushResponse(look('l2'));
+      f.membrane.pushResponse(say('zz-private'));
+      wake({ reason: 'external-message', source: 'tui', nonChannelOrigin: true });
+      await f.framework.runUntilIdle();
+      await eventually(() => probe.seen.length === 2, 'the private turn looked');
+      const [home, privateTurn] = probe.seen;
+      assert.equal(home?.defaultOutgoing?.channelId, 'home', `control: the fork's turn names its home: ${JSON.stringify(probe.seen)}`);
+      assert.equal(home?.incoming?.channelId, 'work', "control: and the latest inbound message as the one it answers");
+      assert.equal(privateTurn?.defaultOutgoing, undefined, JSON.stringify(privateTurn));
+      assert.equal(privateTurn?.incoming, undefined, JSON.stringify(privateTurn));
+    } finally { await f.close(); }
+  });
+
   for (const fromPrivate of [true, false]) {
     it(`under 'latest-inbound', the turn a focus cancel wakes speaks ${fromPrivate ? 'in no channel when a private turn cancelled' : 'in the latest inbound when a room turn cancelled'}`, async () => {
       const f = await fixture({ framework: { modules: [new SurfaceModule()], tuneOut: { enabled: true }, speech: { locus: 'latest-inbound' } } as Partial<FrameworkConfig> });

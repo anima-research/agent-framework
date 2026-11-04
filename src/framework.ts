@@ -781,7 +781,7 @@ function proseModePrimer(mode: 'explicit' | 'hybrid' | 'locus' | 'disabled', hel
  * it, and teaches no grammar. `where` reads after "your plain speech".
  */
 function lockedModePrimer(where: string, canMove: boolean): string {
-  return `[${NOTICE_TAG.proseRouting}] Locked routing: your plain speech ${where}, on every turn` +
+  return `[${NOTICE_TAG.proseRouting}] Locked routing: your plain speech ${where}, on every turn that holds no private input` +
     (canMove ? ', until you move it with prose_locus. ' : '. ') +
     'The channel a message comes from no longer moves it; other channels need an explicit send tool.';
 }
@@ -18736,6 +18736,9 @@ export class AgentFramework {
             // move from outside the turn leaves the turn where it was): no
             // open or reply moves it.
             const open = this.openLogical.get(reader!.name);
+            if (open?.nonChannelOrigin) {
+              return `1. Reply — ${plainSpeechRule} ${tunedOut ? 'it will be delivered there.' : delivered} If that is another channel, or you see none, to reply here, ${sendTool}.\n`;
+            }
             const lock = open?.locked ? this.turnSpeaksAt(open) : this.proseLockLocus(reader!);
             // A move made while a turn is held reaches only the next turn, so
             // it's no way to reply here now.
@@ -22053,13 +22056,17 @@ export class AgentFramework {
     }
     const input = (rawInput && typeof rawInput === 'object' ? rawInput : {}) as { to?: unknown };
     const inTurn = !!callingTurn?.locked && this.openLogical.get(agentName) === callingTurn;
+    const privateTurn = !!callingTurn?.nonChannelOrigin && this.openLogical.get(agentName) === callingTurn;
     const current = (): ChannelRef | null => (inTurn ? callingTurn!.locus ?? null : this.proseLockLocus(agent));
     // Where the agent's plain speech goes as of this call, a verb phrase
-    // after "your plain speech": under heldForMove, nowhere for the rest of
-    // the turn, and the lock from the next.
-    const nowShown = (): string => (inTurn && callingTurn!.heldForMove
-      ? `is held as drafts for the rest of this turn, since the lock moved while its words waited for its end, and from your next turn it ${this.proseLockShown(this.proseLockLocus(agent), agentName)}`
-      : this.proseLockShown(current(), agentName));
+    // after "your plain speech": in a private turn, private for the turn and
+    // the lock on turns that hold no private input; under heldForMove,
+    // nowhere for the rest of the turn, and the lock from the next.
+    const nowShown = (): string => (privateTurn
+      ? `stays private on this turn, which holds private input, and on a turn that holds none it ${this.proseLockShown(this.proseLockLocus(agent), agentName)}`
+      : inTurn && callingTurn!.heldForMove
+        ? `is held as drafts for the rest of this turn, since the lock moved while its words waited for its end, and from your next turn it ${this.proseLockShown(this.proseLockLocus(agent), agentName)}`
+        : this.proseLockShown(current(), agentName));
     if (input.to === undefined || input.to === null) {
       return { success: true, data: { proseLocus: `Your plain speech ${nowShown()}.` } };
     }
@@ -22118,7 +22125,11 @@ export class AgentFramework {
       // and the next turn's announce-on-change tells it where it speaks.
       return {
         success: true,
-        data: { proseLocus: `Your plain speech ${this.proseLockShown(locus, agentName, true)} from your next turn, until you change it. A turn under way keeps where it was.` },
+        data: {
+          proseLocus: privateTurn
+            ? `Your plain speech ${this.proseLockShown(locus, agentName, true)} from your next turn that holds no private input, until you change it. This turn holds private input, so its plain speech stays private.`
+            : `Your plain speech ${this.proseLockShown(locus, agentName, true)} from your next turn, until you change it. A turn under way keeps where it was.`,
+        },
       };
     }
     const turn = callingTurn!;
@@ -22664,6 +22675,7 @@ export class AgentFramework {
     delete routing.locus;
     delete routing.pin;
     delete routing.triggerChannel;
+    delete routing.locked;
     if (wasPrivate || silent) return undefined;
     const notice = this.storePrivateTurnNotice(agent);
     if (notice) console.error(`[routing] ${agent.name}: private input made the turn private (${had ? qualifiedChannelName(had) : 'no destination'} -> none)`);
@@ -25200,7 +25212,7 @@ export class AgentFramework {
       }
     }
     const wakeChannels = (trigger as MarkedRequest | undefined)?.[WAKE_CHANNELS];
-    if (routing.nonChannelOrigin && wakeChannels && (turnProseRouting === 'locus' || turnProseRouting === 'hybrid')) {
+    if (routing.nonChannelOrigin && wakeChannels && (turnProseRouting === 'locus' || turnProseRouting === 'hybrid' || turnProseRouting === 'locked')) {
       this.noticeChannelMessages(agent, routing, wakeChannels);
     }
     if (trigger && routing.nonChannelOrigin && (trigger.channelId !== undefined || trigger.addressed || trigger.nonChannelOrigin !== true)) {
@@ -33396,6 +33408,7 @@ export class AgentFramework {
         // channel that names none) is replying to no message. A locked
         // turn's null locus (drafts) is where it speaks, not what it answers.
         channellessTurn: (agentName) => this.channellessTurn(agentName),
+        privateTurn: (agentName) => this.turnRouting.get(agentName)?.nonChannelOrigin === true,
         activeChannelResolver: (agentName) => {
           const routing = this.turnRouting.get(agentName);
           // A locked turn's channel is its lock, or none: the channel that
@@ -37722,7 +37735,7 @@ export class AgentFramework {
                 },
               };
             } else if (openerAgent
-              && (openerMode === 'locus' || openerMode === 'hybrid')
+              && (openerMode === 'locus' || openerMode === 'hybrid' || (openerMode === 'locked' && privateTurn))
               && this.openLogical.get(agentName) === callingTurn) {
               if (!privateTurn) {
                 callingTurn.locus = opened;

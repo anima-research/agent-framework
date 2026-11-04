@@ -4,8 +4,8 @@
   gets no inferred reply in its channel. That covers one batch, one gate
   debounce window, a private surface's message stored before the start,
   and a private turn that a channel's wake continues or that one of its
-  tool boundaries brings the message into. The turn is private. In locus
-  and hybrid mode, a `[routing]` notice tells its resident which channels'
+  tool boundaries brings the message into. The turn is private. In locus,
+  hybrid and locked mode, a `[routing]` notice tells its resident which channels'
   messages the turn holds, and that its plain speech reaches none of them,
   so the resident can answer there with an explicit send, or in hybrid
   mode with a `>>>` envelope. A message whose wake is dropped once the

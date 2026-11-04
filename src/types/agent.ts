@@ -333,7 +333,9 @@ export interface AgentConfig {
    *   send externally; prose remains in Chronicle, and a turn that wrote plain
    *   speech ends with a private `[delivered] plain speech → no channel` receipt.
    * - 'locked': unprefixed prose goes to one destination the agent chose, on
-   *   every turn, and nothing moves it automatically: not the channel that
+   *   every turn that isn't private (a private turn keeps its plain speech
+   *   private, as in every mode, and the choice applies again after it), and
+   *   nothing moves it automatically: not the channel that
    *   woke the turn, not an addressed message, a heartbeat or channel_open.
    *   Only the `prose_locus` tool moves it, to a channel or to drafts (held,
    *   never posted unless the agent resends them). The choice persists

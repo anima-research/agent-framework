@@ -2701,6 +2701,41 @@ describe('private wins, one way', () => {
     });
   }
 
+  it("a locked agent's private start that takes in a room's message names the room before the reply, and shows typing nowhere", async () => {
+    const rig = await surfaceRig({ agent: { proseRouting: 'locked', proseLock: '#main' } });
+    try {
+      rig.i.pendingRequests.push(roomWake(), tuiWake());
+      await rig.until(() => rig.starts.length >= 1 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the turn');
+      assert.deepEqual(named(rig), [[ROOM]]);
+      assert.ok(noticeBeforeReply(rig), JSON.stringify(rig.texts()));
+      assert.deepEqual(rig.routed, []);
+      assert.deepEqual(rig.typing, [], 'no typing in the room or at the lock');
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it("a locked agent's private turn whose boundary is over budget names an addressed message it took in, for the restart to read", async () => {
+    const OTHER = 'discord:g:other';
+    let framework: AgentFramework | undefined;
+    const tool = robot(() => {
+      (framework as unknown as { addMessage(participant: string, content: unknown, metadata: unknown): unknown }).addMessage(
+        'someone', [{ type: 'text', text: 'over here' }], { channelId: OTHER, serverId: 'discord', tags: ['chat:addressed'] });
+    });
+    const rig = await surfaceRig({ maxStreamTokens: 5, modules: [tool], agent: { proseRouting: 'locked', proseLock: '#main' } });
+    framework = rig.framework;
+    try {
+      rig.membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'm1', name: 'robot--move', input: {} }] as never, 'tool_use'));
+      rig.framework.pushEvent(tuiMessage());
+      await rig.until(() => rig.starts.length >= 2 && rig.framework.getAgent('scout')!.state.status === 'idle', 'the turn and its restart');
+      assert.deepEqual(rig.starts.map((r) => r.reason)[1], 'context_budget_restart', JSON.stringify(rig.starts));
+      assert.deepEqual(named(rig), [[OTHER]]);
+      assert.deepEqual(rig.routed, []);
+    } finally {
+      await rig.close();
+    }
+  });
+
   it("a gate wake names its window's channel messages, and a private turn that takes it names them", async () => {
     const gate = { config: { policies: [{ name: 'both', match: { scope: ['external-message', 'mcpl:channel-incoming'] }, behavior: { debounce: 100 } }], default: 'skip' } };
     const rig = await surfaceRig({ gate });
