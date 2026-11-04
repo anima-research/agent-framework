@@ -2271,7 +2271,8 @@ export class EventGate {
 
   // Inference buffering
   private inferring = new Set<string>();
-  private inferenceBuffer: PendingEvent[] = [];
+  private inferenceBuffer: Array<{ event: PendingEvent; batch: number }> = [];
+  private bufferedBatches = 0;
   /** Host quiesce suppression — see setQuiesced. */
   private quiesced = false;
   /** Lifetime count of buffer-cap evictions (see bufferForInference). */
@@ -4598,19 +4599,25 @@ export class EventGate {
   private flushInferenceBufferIfClear(): void {
     if (this.quiesced) return;
     if (this.inferring.size === 0 && this.inferenceBuffer.length > 0) {
-      const events = this.inferenceBuffer.splice(0);
+      const held = this.inferenceBuffer.splice(0);
+      const unwritten = new Set(held.filter(({ event }) => !isWrite(event.after)).map(({ batch }) => batch));
+      const deliveries = [false, true]
+        .map((part) => held.filter(({ batch }) => unwritten.has(batch) === part).map(({ event }) => event))
+        .filter((events) => events.length > 0);
       // Defer to avoid re-entrancy inside trace callbacks. A delivery that
-      // throws drops what was held, named in the log, as fireDebounce drops a
+      // throws drops what it held, named in the log, as fireDebounce drops a
       // batch: thrown in the microtask, it would be uncaught.
       queueMicrotask(() => {
-        try {
-          this.deliverEvents(events);
-        } catch (err) {
-          const one = events.length === 1;
-          console.error(
-            `[gate] ${events.length} ${one ? 'event' : 'events'} held for an agent's turn or the host's quiesce couldn't be `
-            + `delivered (${errorText(err)}), so ${one ? "it's" : "they're"} dropped`,
-          );
+        for (const events of deliveries) {
+          try {
+            this.deliverEvents(events);
+          } catch (err) {
+            const one = events.length === 1;
+            console.error(
+              `[gate] ${events.length} ${one ? 'event' : 'events'} held for an agent's turn or the host's quiesce couldn't be `
+              + `delivered (${errorText(err)}), so ${one ? "it's" : "they're"} dropped`,
+            );
+          }
         }
       });
     }
@@ -4647,6 +4654,7 @@ export class EventGate {
 
   /** Called internally when debounce fires during inference. */
   private bufferForInference(events: PendingEvent[]): void {
+    const batch = ++this.bufferedBatches;
     for (const event of events) {
       if (this.inferenceBuffer.length >= MAX_INFERENCE_BUFFER) {
         this.inferenceBuffer.shift(); // Drop oldest
@@ -4663,7 +4671,7 @@ export class EventGate {
           );
         }
       }
-      this.inferenceBuffer.push(event);
+      this.inferenceBuffer.push({ event, batch });
     }
   }
 

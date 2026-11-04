@@ -375,6 +375,57 @@ describe('debounced writes already read and answered', () => {
     } finally { await f.close(); }
   });
 
+  for (const held of ['a mention', 'a module event without a write', 'both'] as const) {
+    it(`batches held for one turn are delivered apart by whether every event has a write: ${held}`, async () => {
+      const module = new class extends ReminderModule {
+        override async onProcess(event: ProcessEvent, state: ProcessState): Promise<EventResponse> {
+          if (event.type !== 'test:double') return super.onProcess(event, state);
+          return {
+            addMessages: ['double one', 'double two'].map((text) => ({ participant: 'user', content: [{ type: 'text' as const, text }] })),
+            requestInference: true,
+          };
+        }
+      }();
+      const f = await fixture({ framework: {
+        modules: [module],
+        errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
+        gate: { config: { policies: [
+          { name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 200 } },
+          { name: 'double', match: { scope: ['test:double'] }, behavior: { debounce: 200 } },
+        ], default: 'always' } },
+      } });
+      let calls = 0;
+      (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
+        f.membrane.calls.push(request);
+        return new MockYieldingStream(calls++ === 0 ? [waitCall('first'), say('answered')] : [say('fresh turn')], true);
+      };
+      try {
+        await registerOpen(f, 'work');
+        (f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+          agentName: 'agent', reason: 'test', source: 'editor', channelId: 'work', channelServerId: 'editor', timestamp: Date.now(),
+        });
+        const loop = f.framework.runUntilIdle();
+        await eventually(() => module.entered.has('first'), 'turn reached tool');
+        if (held !== 'a module event without a write') await send(f, 'channel');
+        if (held !== 'a mention') f.framework.pushEvent({ type: 'test:double', source: 'test', content: 'no write' } as unknown as ProcessEvent);
+        await eventually(() => gateOf(f).inferenceDiagnostics().bufferedEvents === (held === 'both' ? 2 : 1), 'the batches held for the turn');
+        module.release('first');
+        await loop;
+        await f.framework.runUntilIdle();
+        const lines = f.framework.getAgent('agent')!.getContextManager().getAllMessages()
+          .filter((row) => row.metadata?.source === 'gate:debounce').map((row) => JSON.stringify(row.content));
+        assert.equal(f.membrane.calls.length, held === 'a mention' ? 1 : 2, 'a second turn only where the module event was held');
+        assert.equal(f.published.filter((p) => p.channelId === 'work').length, 1, "only the first turn's answer reached the mention's channel");
+        if (held === 'a mention') assert.deepEqual(lines, [], 'no line for the answered mention');
+        else {
+          assert.equal(lines.length, 1, 'one line, written when the batches were delivered');
+          assert.match(lines[0]!, /1 event matched/);
+          assert.doesNotMatch(lines[0]!, /in work/, 'naming the module event, not the answered mention');
+        }
+      } finally { await f.close(); }
+    });
+  }
+
   it('two batches owed to one start are written as one line, in the order they fired', async () => {
     const module = new class extends ReminderModule {
       override async onProcess(event: ProcessEvent, state: ProcessState): Promise<EventResponse> {
