@@ -133,22 +133,34 @@ interface WindowStartsState {
  * author (tellNoteLost), a notice that can't be written being traced and
  * tried again (writeLossNotices) until the host stops, and lost untold at a
  * stop before the hold ends. The cancel can't wait for the delivery, which
- * comes only when the hold ends.
+ * comes only when the hold ends. A reader fork's (`fork`) goes out as its
+ * mail even after its run has ended (deliverReaderNote), but a notice of
+ * its loss reaches it only while it runs: an ended fork is no agent the
+ * framework writes to, and the loss is then traced only (writeLossNotice).
  */
-export function cancelWaitsNote(what: string, noteDropped = false, noteKept = false): string {
+export function cancelWaitsNote(what: string, noteDropped = false, noteKept?: 'persistent' | 'fork'): string {
   const hold = what.charAt(0).toLowerCase() + what.slice(1);
+  const retry = 'tried again every 60 s, except while such a change or refusal lasts, and as soon as one ends, until it is ';
   return 'Not cancelled yet: an operator\'s change to the store is in progress, or a context the cancel writes to '
     + 'refuses writes until the host re-initializes it, so the cancel waits until that is over. Cancelling again '
     + 'doesn\'t end the wait sooner, and how long it lasts isn\'t known here. '
     + `${what} stays in force until then, and what it held is delivered when it ends. If the host stops before then, `
     + 'the cancel is lost and it is still in force after the restart, unless its end time has passed by then.'
     + (noteDropped ? ' Your note isn\'t delivered with it: the cancel already waiting carries a note of its own.' : '')
-    + (noteKept && !noteDropped
+    + (noteKept === 'persistent' && !noteDropped
       ? ` Your note waits with the cancel and is delivered when ${hold} ends. If it can't be delivered then, you are `
         + 'told so in your context, and why. If writing that notice fails too, the failure is traced for the host, and '
-        + 'the notice is tried again every 60 s, except while such a change or refusal lasts, and as soon as one ends, '
-        + `until it is written or the host stops. If the host stops before ${hold} ends, your note is lost with the `
-        + 'cancel, and you are not told.'
+        + `the notice is ${retry}written or the host stops.`
+      : '')
+    + (noteKept === 'fork' && !noteDropped
+      ? ` Your note waits with the cancel and goes to the resident as your mail when ${hold} ends, even if your run `
+        + 'has ended by then. If it can\'t be delivered then, you are told so in your context, and why, but only while '
+        + 'your run lasts: once it has ended, nothing can be written to you, so the loss reaches no one and is only '
+        + 'traced for the host. If writing that notice fails while you still run, the failure is traced for the host, '
+        + `and the notice is ${retry}written, your run ends, or the host stops.`
+      : '')
+    + (noteKept && !noteDropped
+      ? ` If the host stops before ${hold} ends, your note is lost with the cancel, and you are not told.`
       : '');
 }
 
@@ -323,7 +335,7 @@ interface DeferredCancel {
   run: (queued: DeferredCancel) => void;
   note?: string;
   noteAuthor?: string;
-  /** Its note was delivered, or told lost to its author (deliverQueuedNote, dropDeferred). */
+  /** Its note was delivered, or its loss told (deliverQueuedNote, dropDeferred). */
   noteSettled?: true;
 }
 
@@ -1239,7 +1251,8 @@ export class TuneOutCoordinator {
    * done (`drop`, DeferredDrop), told on stderr and as a trace
    * (`tune-out:deferred-cancel-dropped`) with the epoch it was asked for. A
    * note it carried is lost: the trace names its author (noteAuthorOf), and
-   * the author is told so in its own context (tellNoteLost).
+   * the author is told so in its own context where it still exists, a
+   * reader fork whose run has ended being written nothing (tellNoteLost).
    */
   private dropDeferred(entry: DeferredCancel, drop: DeferredDrop): void {
     const { epochId, serverId, channelId, scope } = entry.for;
@@ -1291,9 +1304,10 @@ export class TuneOutCoordinator {
    * whose write fails stays kept, its first failure traced, and is tried
    * again at the next release and at the retry, which this arms, until it
    * is written or the host stops; what dropped the cancel goes on either
-   * way. A fork that has ended is no agent the framework writes to any
-   * more: the framework drops the notice with its log line, as it does any
-   * write for an agent that has ended, and the trace (dropDeferred) still
+   * way. While writes are held it waits for their release, as the cancels
+   * do. A reader fork that has ended is no agent the framework writes to
+   * any more: it is written nothing, the loss reaching no one, which is
+   * traced (writeLossNotice), and the trace of the drop (dropDeferred) still
    * names the fork. An author not known is logged.
    */
   private tellNoteLost(entry: DeferredCancel, author: string | undefined, drop: DeferredDrop): void {
@@ -1312,9 +1326,12 @@ export class TuneOutCoordinator {
 
   /**
    * Write the loss notices kept (lossNotices), `author`'s or every
-   * author's, each author's in the order its losses came: one written
-   * leaves the queue, one whose write fails stays for the next try
-   * (writeLossNotice). Never throws.
+   * author's, each author's in the order its losses came: one written, or
+   * whose author has ended, leaves the queue; one whose write fails stays
+   * for the next try (writeLossNotice). None is written while writes are
+   * held (writesHeld): the framework would keep it in memory and answer an
+   * empty id, which then couldn't tell a kept write from an ended author's
+   * dropped one. The release or the retry writes them. Never throws.
    */
   private writeLossNotices(author?: string): void {
     for (const name of author !== undefined ? [author] : [...this.lossNotices.keys()]) {
@@ -1323,7 +1340,7 @@ export class TuneOutCoordinator {
       // Off the map while they are written: a loss told meanwhile is kept
       // after them, not written over.
       this.lossNotices.delete(name);
-      const left = kept.filter((notice) => !this.writeLossNotice(name, notice));
+      const left = kept.filter((notice) => this.writesHeldNow() || this.writeLossNotice(name, notice) === 'failed');
       const since = this.lossNotices.get(name) ?? [];
       if (left.length + since.length > 0) this.lossNotices.set(name, [...left, ...since]);
     }
@@ -1336,15 +1353,26 @@ export class TuneOutCoordinator {
    * loss can come with no turn of its (a release, a retry, a cancel it
    * didn't make), and one asked for with a cancel's own notice is the same
    * turn. A reader fork still alive is in its run, which takes the notice
-   * at its next point. Answers whether it was written. One whose write
-   * throws, or whose words can't be put together, is logged, traced at its
-   * first failure (`tune-out:note-loss-untold`), and kept; a turn that
-   * can't be asked for is logged. Never throws.
+   * at its next point. Answers what became of it. `failed`: its write
+   * threw, or its words couldn't be put together; it is logged, traced at
+   * its first failure (`tune-out:note-loss-untold`, `write-failed`), and
+   * kept. `gone`: the framework wrote nothing, answering an empty id, as it
+   * does for a write for an agent it has no registration of, a reader fork
+   * whose run has ended among them: the loss reaches no one, which is
+   * logged and traced (`author-gone`). It is written only while writes
+   * aren't held (writeLossNotices), so an empty id is no write kept in
+   * memory, unless this write began such a hold (a context manager that
+   * refuses its work from it on), which writesHeld then says, and which
+   * stores the write at its release. A reader fork's own context manager
+   * refusing its work isn't told apart from its end here: the framework
+   * answers an empty id for both. A turn that can't be asked for is
+   * logged. Never throws.
    */
-  private writeLossNotice(author: string, notice: LossNotice): boolean {
+  private writeLossNotice(author: string, notice: LossNotice): 'written' | 'failed' | 'gone' {
     const { serverId, channelId, epochId, scope } = notice.for;
     const { drop } = notice;
     let shown: string;
+    let id: string;
     try {
       shown = this.shown(serverId, channelId);
       const hold = scope === 'all-except' ? `the all-except hold (all channels except ${shown})` : shown;
@@ -1377,7 +1405,7 @@ export class TuneOutCoordinator {
       }
       const text = `[${NOTICE_TAG.tuneOut}: the note you left with your cancel of ${hold} was not delivered to `
         + `${resident ? suppliedValue(resident) : 'the resident'}. ${why}]`;
-      this.hooks.addMessage(
+      id = this.hooks.addMessage(
         'user',
         [{ type: 'text', text }],
         { system: true, kind: 'tune-out-note-undelivered', channelId, epochId, ...(scope ? { scope } : {}) },
@@ -1398,7 +1426,20 @@ export class TuneOutCoordinator {
           console.error(`[tune-out] the failure to tell ${author} of its lost note could not be traced: ${thrownReason(traceErr)}`);
         }
       }
-      return false;
+      return 'failed';
+    }
+    if (id === '' && !this.writesHeldNow()) {
+      console.error(`[tune-out] ${author} is no agent the framework writes to any more, so the loss of the note it left with `
+        + `the cancel of ${notice.what} reaches no one`);
+      try {
+        this.hooks.emitTrace({
+          type: 'tune-out:note-loss-untold', serverId, channelId, epochId, ...(scope ? { scope } : {}),
+          noteAuthor: author, reason: 'author-gone',
+        });
+      } catch (traceErr) {
+        console.error(`[tune-out] that the loss of ${author}'s note reaches no one could not be traced: ${thrownReason(traceErr)}`);
+      }
+      return 'gone';
     }
     if (notice.traced) {
       console.error(`[tune-out] ${author} is told, at a later try, that the note it left with the cancel of ${notice.what} was not delivered`);
@@ -1409,13 +1450,13 @@ export class TuneOutCoordinator {
     } catch {
       subName = null;
     }
-    if (subName === null || subName !== author) return true;
+    if (subName === null || subName !== author) return 'written';
     try {
       this.hooks.requestInference(author, `tune-out note not delivered: ${scope ? 'all-except' : shown}`, 'tune-out');
     } catch (err) {
       console.error(`[tune-out] ${author} was told that the note it left with the cancel of ${notice.what} was not delivered, but a turn to read it could not be asked for: ${thrownReason(err)}`);
     }
-    return true;
+    return 'written';
   }
 
   /**
@@ -1469,8 +1510,9 @@ export class TuneOutCoordinator {
    * another cancel that ended the hold first (takeDeferred, `by` another),
    * or by the queued cancel's own run (`by` itself). One that can't be is
    * told lost, with the reason, on stderr, as a trace and to its author
-   * (dropDeferred), and the cancel that ended the hold goes on: no caller
-   * waits on it to be told. Answers whether it was delivered.
+   * where it still exists (dropDeferred), and the cancel that ended the
+   * hold goes on: no caller waits on it to be told. Answers whether it was
+   * delivered.
    */
   private deliverQueuedNote(
     entry: DeferredCancel,
@@ -1551,7 +1593,7 @@ export class TuneOutCoordinator {
   /**
    * cancel's work. `asQueued`: the queued cancel this call runs
    * (runDeferredCancels), whose note (`subconsciousNote`) is delivered as a
-   * queued one is (deliverQueuedNote), told lost to its author where it
+   * queued one is (deliverQueuedNote), told lost (dropDeferred) where it
    * can't be, the cancel going on.
    */
   private endTuneOut(
@@ -2812,7 +2854,7 @@ export class TuneOutCoordinator {
           const result = this.cancelAllExcept('subconscious', cancelledBy(caller), note, caller);
           if (!result.ok) return { success: false, error: result.error, isError: true };
           return result.deferred
-            ? { success: true, data: { waiting: true, scope: 'all-except', note: cancelWaitsNote('The all-except hold', result.noteDropped === true, note !== undefined) } }
+            ? { success: true, data: { waiting: true, scope: 'all-except', note: cancelWaitsNote('The all-except hold', result.noteDropped === true, note === undefined ? undefined : fork ? 'fork' : 'persistent') } }
             : { success: true, data: { cancelled: true, scope: 'all-except' } };
         };
         // A call naming the all-except scope ends that hold outright, as the
@@ -2865,7 +2907,7 @@ export class TuneOutCoordinator {
         const result = this.cancel(channel.serverId, channel.channelId, 'subconscious', cancelledBy(caller), note, caller);
         if (!result.ok) return { success: false, error: result.error, isError: true };
         return result.deferred
-          ? { success: true, data: { waiting: true, note: cancelWaitsNote('The tune-out', result.noteDropped === true, note !== undefined) } }
+          ? { success: true, data: { waiting: true, note: cancelWaitsNote('The tune-out', result.noteDropped === true, note === undefined ? undefined : fork ? 'fork' : 'persistent') } }
           : { success: true, data: { cancelled: true } };
       }
       case 'note_disposition': {

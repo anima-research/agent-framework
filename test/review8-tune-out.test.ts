@@ -13,7 +13,9 @@
  *     context, and the trace names the author. Round 3: a notice of the
  *     loss that can't be written is kept, traced at its first failure, and
  *     tried again at the next release and the retry; the cancel_tuneout
- *     that waits with a note says so.
+ *     that waits with a note says so. A reader fork that has ended is not
+ *     written to: the loss is traced as reaching no one, and the fork's
+ *     cancel_tuneout says so when it waits with a note.
  * 66: a kept start is recorded in force once it is set, not before, and
  *     one whose set fails is tried again at the next presentation.
  * 67: a kept start clamped to a shorter window is kept clamped.
@@ -149,7 +151,11 @@ type Trace = Record<string, unknown> & { type: string };
 
 /** `forks`: reader forks read, with no persistent subconscious; a fork's note goes out as its mail (`mail`). */
 function epochSetup(options: { forks?: boolean } = {}) {
-  const state = { held: false, durable: true, noteFails: false, noticeFails: false, wakeFails: false, subNameFailsAfterEnd: false };
+  const state = {
+    held: false, durable: true, noteFails: false, noticeFails: false, wakeFails: false, subNameFailsAfterEnd: false,
+    /** Agents that have ended: the framework drops a write for one, answering an empty id. */
+    gone: [] as string[],
+  };
   let channel: { params: { epochId: string }; wakeCount: number } | null = null;
   const states = new Map<string, unknown>();
   const rows: Array<{ participant: string; content: ContentBlock[]; metadata: Record<string, unknown>; sequence: number }> = [];
@@ -171,6 +177,7 @@ function epochSetup(options: { forks?: boolean } = {}) {
   };
   const hooks = {
     addMessage: (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, forAgent?: string) => {
+      if (forAgent !== undefined && state.gone.includes(forAgent)) return '';
       if (state.noteFails && metadata?.kind === 'subconscious-note') throw new Error('the store refused the row (test)');
       if (state.noticeFails && metadata?.kind === 'tune-out-note-undelivered') throw new Error('the store refused the notice too (test)');
       added.push({ participant, content, metadata, forAgent });
@@ -871,6 +878,127 @@ test('65 follow-up, control: a deferred cancel whose release succeeds delivers i
   } finally {
     h.coordinator.stop();
     mock.timers.reset();
+  }
+});
+
+test("65 follow-up (Isaac-3593, round 3): a reader fork that has ended before its queued note is lost is written nothing; the loss is traced as reaching no one, and nothing is kept", () => {
+  mock.timers.enable({ apis: ['setTimeout'] });
+  const errors = mock.method(console, 'error', () => {});
+  const h = epochSetup({ forks: true });
+  try {
+    const a = h.enter();
+    h.state.held = true;
+    h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by reader-1', 'Someone asked for you.', 'reader-1');
+    failFirstRelease(h);
+    h.state.noteFails = true;
+    h.state.gone.push('reader-1');
+    assert.deepEqual(h.coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'agent request'), { ok: true });
+    assert.equal(h.inForce(), null);
+    assert.deepEqual(h.lossNotices(), [], 'nothing is written');
+    assert.deepEqual(h.dropped().map((t) => [t.reason, t.noteAuthor]), [['note-undelivered', 'reader-1']]);
+    assert.deepEqual(h.untold(), [{
+      type: 'tune-out:note-loss-untold', serverId: 'disc', channelId: 'disc:guild:a', epochId: a,
+      noteAuthor: 'reader-1', reason: 'author-gone',
+    }], 'the loss is traced as reaching no one, naming the fork');
+    const line = errors.mock.calls.map((c) => String(c.arguments[0])).find((l) => l.includes('reaches no one'));
+    assert.ok(line?.includes('reader-1') && line.includes('disc:guild:a'), `logged, naming the fork and the hold: ${line}`);
+    mock.timers.tick(120_000);
+    h.coordinator.runDeferredCancels();
+    assert.equal(h.untold().length, 1, 'not kept for a retry');
+    assert.deepEqual(h.lossNotices(), []);
+  } finally {
+    h.coordinator.stop();
+    errors.mock.restore();
+    mock.timers.reset();
+  }
+});
+
+test("65 follow-up (Isaac-3593, round 3): a kept notice to a reader fork that ends before the retry is traced at the retry as reaching no one, and dropped", () => {
+  mock.timers.enable({ apis: ['setTimeout'] });
+  const errors = mock.method(console, 'error', () => {});
+  const h = epochSetup({ forks: true });
+  try {
+    h.enter();
+    h.state.held = true;
+    h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by reader-1', 'Someone asked for you.', 'reader-1');
+    failFirstRelease(h);
+    h.state.noteFails = true;
+    h.state.noticeFails = true;
+    h.coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'agent request');
+    assert.deepEqual(h.untold().map((t) => t.reason), ['write-failed'], 'premise: kept');
+    h.state.gone.push('reader-1');
+    h.state.noticeFails = false;
+    mock.timers.tick(60_000);
+    assert.deepEqual(h.untold().map((t) => [t.reason, t.noteAuthor]), [['write-failed', 'reader-1'], ['author-gone', 'reader-1']]);
+    assert.deepEqual(h.lossNotices(), []);
+    mock.timers.tick(120_000);
+    assert.equal(h.untold().length, 2, 'dropped, not tried again');
+  } finally {
+    h.coordinator.stop();
+    errors.mock.restore();
+    mock.timers.reset();
+  }
+});
+
+test("65 follow-up (Isaac-3593, round 3): a loss told while writes are held is written at their release, not into the hold, so an ended fork's is traced as reaching no one", () => {
+  const errors = mock.method(console, 'error', () => {});
+  for (const forks of [false, true]) {
+    const author = forks ? 'reader-1' : 'Subconscious';
+    const h = epochSetup({ forks });
+    try {
+      const a = h.enter();
+      h.state.held = true;
+      h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', `by ${author}`, 'For A.', author);
+      failFirstRelease(h);
+      h.endOtherwise();
+      h.enter();
+      h.state.held = true;
+      if (forks) h.state.gone.push(author);
+      h.coordinator.cancel('disc', 'disc:guild:a', 'subconscious', 'by Subconscious', 'For B.', forks ? 'reader-2' : 'Subconscious');
+      assert.deepEqual(h.dropped().map((t) => [t.epochId, t.reason, t.noteAuthor]), [[a, 'hold-ended', author]],
+        "premise: B's cancel, waiting, dropped A's");
+      assert.deepEqual(h.lossNotices(), [], `${author}: nothing is written while the writes are held`);
+      assert.deepEqual(h.untold(), [], `${author}: nor traced as untold`);
+      h.state.held = false;
+      h.coordinator.runDeferredCancels();
+      if (forks) {
+        assert.deepEqual(h.lossNotices(), [], 'the ended fork is written nothing at the release');
+        assert.deepEqual(h.untold().map((t) => [t.epochId, t.reason, t.noteAuthor]), [[a, 'author-gone', 'reader-1']]);
+      } else {
+        assert.deepEqual(h.lossNotices().map((m) => [m.forAgent, m.metadata?.epochId]), [['Subconscious', a]], 'written at the release');
+        assert.deepEqual(h.untold(), []);
+      }
+    } finally {
+      h.coordinator.stop();
+    }
+  }
+  errors.mock.restore();
+});
+
+test("65 follow-up (Isaac-3593, round 3): a reader fork's cancel_tuneout that waits with its note says the note goes out even after the fork ends, and that a loss reaches it only while it runs", async () => {
+  const errors = mock.method(console, 'error', () => {});
+  const h = epochSetup({ forks: true });
+  try {
+    const a = h.enter();
+    h.state.held = true;
+    const answer = await h.coordinator.handleSubconsciousTool('cancel_tuneout',
+      { channelId: 'disc:guild:a', serverId: 'disc', text: 'Someone asked for you.' }, [], 'reader-1', { epochId: a });
+    assert.deepEqual(answer, { success: true, data: { waiting: true, note:
+      'Not cancelled yet: an operator\'s change to the store is in progress, or a context the cancel writes to '
+      + 'refuses writes until the host re-initializes it, so the cancel waits until that is over. Cancelling again '
+      + 'doesn\'t end the wait sooner, and how long it lasts isn\'t known here. The tune-out stays in force until '
+      + 'then, and what it held is delivered when it ends. If the host stops before then, the cancel is lost and it is '
+      + 'still in force after the restart, unless its end time has passed by then. Your note waits with the cancel and '
+      + 'goes to the resident as your mail when the tune-out ends, even if your run has ended by then. If it can\'t be '
+      + 'delivered then, you are told so in your context, and why, but only while your run lasts: once it has ended, '
+      + 'nothing can be written to you, so the loss reaches no one and is only traced for the host. If writing that '
+      + 'notice fails while you still run, the failure is traced for the host, and the notice is tried again every '
+      + '60 s, except while such a change or refusal lasts, and as soon as one ends, until it is written, your run '
+      + 'ends, or the host stops. If the host stops before the tune-out ends, your note is lost with the cancel, and '
+      + 'you are not told.' } });
+  } finally {
+    h.coordinator.stop();
+    errors.mock.restore();
   }
 });
 

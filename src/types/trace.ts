@@ -1144,9 +1144,11 @@ export type TraceEvent =
    * there (`currentEpochId`, the one in force when it was dropped, if one
    * was). `note-undelivered`: its hold ended, by another cancel or by its
    * own run, and delivering the note it carried failed (`error`).
-   * `noteLost`: it carried a reader's note, which is not delivered, and
-   * whose author is told so in its own context; `noteAuthor`, whose note it
-   * was, the name it would have been delivered under (the persistent
+   * `noteLost`: it carried a reader's note, which is not delivered; its
+   * author is told so in its own context where the author still exists,
+   * and a reader fork that has ended is not, the loss reaching no one
+   * (`tune-out:note-loss-untold`, `author-gone`). `noteAuthor`, whose note
+   * it was, the name it would have been delivered under (the persistent
    * subconscious's, or the reader fork's that left it), where one is known.
    * For the all-except hold (`scope`), the channel is its excepted one.
    */
@@ -1168,8 +1170,10 @@ export type TraceEvent =
    * `write-failed`: writing it threw (`error`). It is kept, and tried again
    * whenever held writes are stored and every 60 s while none are, until it
    * is written or the host stops; this traces its first failure only, and
-   * each later one is logged. For the all-except hold (`scope`), the
-   * channel is its excepted one.
+   * each later one is logged. `author-gone`: the framework wrote nothing,
+   * as no agent of that name is registered (a reader fork whose run has
+   * ended): the loss reaches no one, and the notice is not kept. For the
+   * all-except hold (`scope`), the channel is its excepted one.
    */
   | (TraceEventBase & {
       type: 'tune-out:note-loss-untold';
@@ -1178,7 +1182,7 @@ export type TraceEvent =
       epochId: string;
       scope?: 'all-except';
       noteAuthor: string;
-      reason: 'write-failed';
+      reason: 'write-failed' | 'author-gone';
       error?: string;
     })
 
