@@ -631,14 +631,6 @@ test('a send into a tuned-out channel leaves the tune-out in place, and its answ
   framework.subconsciousAgentName = null;
   framework.readerForks = true;
   assert.ok((await reply()).data.includes('so its traffic is still held from you, and read by forks of your context, until the tune-out ends. '));
-  // No reader: the traffic is held for the agent, and nothing is said to read it.
-  framework.readerForks = false;
-  const silent = (await reply()).data;
-  assert.ok(silent.includes(
-    "your words there don't end the tune-out, so its traffic is still held until the tune-out ends, and delivered to you " +
-    'then; no reader is configured here to read it meanwhile. Call tune_out',
-  ), silent);
-  assert.ok(!/subconscious/i.test(silent), silent);
   // A conversation agent gets none.
   framework.registry.homes.set('sol', { serverId: 'discord', channelId });
   assert.ok(!(await reply()).data.includes('[tuned out]'));

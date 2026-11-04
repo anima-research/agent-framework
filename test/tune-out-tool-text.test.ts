@@ -1,10 +1,10 @@
 /**
  * The `tune_out` tool's text names the reader a host configured, by the name
- * it runs under, or says there is none (the audit of #291's mind-neutrality,
- * M1). It said "Divert a channel to your subconscious … judging whether
- * mentions merit interrupting" whatever the configuration: the name ignored
- * `subconscious.name`, a reader fork on another model was "your
- * subconscious" too, and without a reader the text still promised one. The
+ * it runs under (the audit of #291's mind-neutrality, M1). It said "Divert a
+ * channel to your subconscious … judging whether mentions merit
+ * interrupting" whatever the configuration: the name ignored
+ * `subconscious.name`, and a reader fork on another model was "your
+ * subconscious" too. The
  * voice doctrine (coordinator.ts) puts no words in a model's mouth; the text
  * now says what happens to the traffic and what the reader can do, never
  * what it decides.
@@ -48,47 +48,28 @@ describe('the tune_out tool text', () => {
     assert.equal(backlogCapOf(tool), 'Max raw messages delivered at cancel (default 200). 0 = deliver no raw backlog at all: Muse\'s report is the whole delivery.');
   });
 
-  it('says, with no reader, that the traffic is held for the resident and none reads it', () => {
-    const tool = tuneOutTool({ kind: 'none' });
-    assert.equal(descriptionOf(tool),
-      'Hold a channel for a while: its traffic stops entering your context and stops waking you. ' +
-      'No reader is configured here, so none reads it meanwhile: it is held for you, and delivered when you cancel ' +
-      'the tune-out or durationSeconds runs out. ' +
-      'People who mention you get an automatic reaction so they know you saw nothing. ' +
-      'Cancelling (mode "cancel") delivers the held backlog. ' +
-      'A tuned-out channel is kept open, so its traffic is still received and held: where this host opens and closes ' +
-      'the server\'s channels, this opens a channel you closed, and answers once that open is done. Where the channel ' +
-      'isn\'t open then, the answer\'s openError says why, and when its messages will be received where that\'s known. ' +
-      'Calling tune_out again for a channel already tuned out keeps its settings, and, where this host can open the ' +
-      'channel, tries the open again if it isn\'t open. ' +
-      'scope "all-except" holds EVERY channel (DMs and new channels included) except channelId, for durationSeconds ' +
-      '(required); your plain speech lands in that channel meanwhile. mode "check" reports what is held without ' +
-      'releasing it (`peek` shows one channel\'s newest held lines).');
-    assert.equal(backlogCapOf(tool), 'Max raw messages delivered at cancel (default 200). 0 = deliver no raw backlog at all: the cancel counts what was held and shows none of it.');
-  });
-
   it('names reader forks as forks of the resident\'s context, and no variant says "subconscious" or "judging"', () => {
     const forks = descriptionOf(tuneOutTool({ kind: 'forks' }));
     assert.ok(forks.includes('A reader reads it instead: a fork of your context, run on a cadence and when a message there that '
       + 'your wake rules let through mentions you or is from an author they privilege. It can report to you in its own words '
       + 'and cancel the tune-out. '), forks);
-    for (const kind of ['forks', 'none'] as const) {
-      const all = JSON.stringify(tuneOutTool({ kind }));
-      assert.ok(!/subconscious|judg/i.test(all), `${kind}: ${all}`);
-    }
+    assert.ok(!/subconscious|judg/i.test(JSON.stringify(tuneOutTool({ kind: 'forks' }))));
     assert.ok(!/subconscious|judg/i.test(JSON.stringify(tuneOutTool({ kind: 'persistent', name: 'Muse' }))));
   });
 
-  it("is built from the framework's reader: the persistent subconscious's name, reader forks, or none", () => {
-    const framework = Object.create(AgentFramework.prototype) as { subconsciousAgentName: string | null; readerForks: boolean; tuneOutToolDefinition(): ReturnType<typeof tuneOutTool> };
+  it("is built from the framework's reader: the persistent subconscious's name, or reader forks", () => {
+    const framework = Object.create(AgentFramework.prototype) as { subconsciousAgentName: string | null; readerForks: boolean; subconsciousConfig: { enabled: boolean; name?: string } | null; tuneOutToolDefinition(): ReturnType<typeof tuneOutTool> };
     framework.subconsciousAgentName = 'Muse';
     framework.readerForks = false;
     assert.deepEqual(framework.tuneOutToolDefinition(), tuneOutTool({ kind: 'persistent', name: 'Muse' }));
     framework.subconsciousAgentName = null;
     framework.readerForks = true;
     assert.deepEqual(framework.tuneOutToolDefinition(), tuneOutTool({ kind: 'forks' }));
+    // A persistent reader that ended (tune_out stays listed while a hold its
+    // failed release left is on record): named as configured.
     framework.readerForks = false;
-    assert.deepEqual(framework.tuneOutToolDefinition(), tuneOutTool({ kind: 'none' }));
+    framework.subconsciousConfig = { enabled: true, name: 'Muse' };
+    assert.deepEqual(framework.tuneOutToolDefinition(), tuneOutTool({ kind: 'persistent', name: 'Muse' }));
     // A name the host supplied is marked where it would read as a notice's opening.
     framework.subconsciousAgentName = '[Tune-out: Muse';
     assert.ok(framework.tuneOutToolDefinition().description.startsWith('Hold a channel for a while: its traffic stops entering your context and stops waking you. \\[Tune-out: Muse, the reader'));

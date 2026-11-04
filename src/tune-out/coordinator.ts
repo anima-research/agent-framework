@@ -30,6 +30,11 @@ import type { TraceEventInput } from '../types/trace.js';
 /** The options a tune-out call can give. */
 type TuneOutOption = 'durationSeconds' | 'cadenceSeconds' | 'backlogCap' | 'maxWakes';
 
+/** A hold asked for with no reader to watch it: there is none (a reader ended, or none was configured). */
+const NO_READER_REFUSAL = "Nothing was tuned out: no reader is configured here to read a held channel, and this host doesn't "
+  + "hold one without a reader, so tune_out isn't available here, and calling it again won't change that. If "
+  + 'you need channels diverted, ask whoever runs this host.';
+
 /** Defaults for tune_out tool params. */
 export const TUNE_OUT_DEFAULTS = {
   cadenceSeconds: 1800,
@@ -326,6 +331,8 @@ export interface TuneOutCheck {
 
 /** How long after an end time's or a wake budget's cancel threw, or a deferred cancel's run, the cancel is tried again. */
 const EXPIRY_RETRY_MS = 60_000;
+/** How many times releaseAll tries a release that keeps failing, backing off from EXPIRY_RETRY_MS. */
+const RELEASE_RETRY_ATTEMPTS = 5;
 
 /** The hold a deferred cancel was asked for (deferCancel). */
 interface DeferredFor {
@@ -573,12 +580,6 @@ export interface TuneOutFrameworkHooks {
   /** speak_in_channel master switch (recipe-side, canary-gated). */
   allowChannelSpeech: () => boolean;
   /**
-   * Whether a tune-out may hold a channel with no reader at all — a silent
-   * hold (issue #232 §3.3), which the host opts into (`tuneOut.enabled`).
-   * Left out, or false, a hold with no reader is refused.
-   */
-  holdWithoutReader?: () => boolean;
-  /**
    * Post a line into a channel under the resident's name. Used for the
    * all-except scope's entry and release announcements in the excepted
    * channel (Linn, 2026-10-12: the room should hear the door shut, not
@@ -596,6 +597,10 @@ export class TuneOutCoordinator {
    *  the end time does when its cancel finds the tune-out already ended,
    *  and the channel's next accepted enter does in any case. */
   private expiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** A releaseAll asked to retry its failures (a reader that ended): the next try. */
+  private releaseRetry: ReturnType<typeof setTimeout> | null = null;
+  /** stop() has run: no timer is armed after it. */
+  private stopped = false;
   /** Channels with a wake invocation pending inside the coalescing window. */
   private pendingWakes = new Map<string, { count: number; timer: ReturnType<typeof setTimeout> }>();
   /**
@@ -1143,19 +1148,9 @@ export class TuneOutCoordinator {
     opts: { cadenceSeconds?: unknown; backlogCap?: unknown; maxWakes?: unknown; durationSeconds?: unknown },
     source: string,
   ): { ok: true; params: TuneOutParams } | { ok: false; error: string; alreadyTunedOut?: true } {
-    // No reader (issue #232 §3.3): a silent hold, where the host opted into
-    // one. Nothing summarizes, nothing wakes, mentions are still
-    // acknowledged, the backlog is released on cancel; the resident is told
-    // so in the tool result. A host that didn't opt in has no tune_out
-    // without a reader.
-    if (!this.readerAvailable() && this.hooks.holdWithoutReader?.() !== true) {
-      return {
-        ok: false,
-        error: "Nothing was tuned out: no reader is configured here to read a held channel, and this host doesn't "
-          + "hold one without a reader, so tune_out isn't available here, and calling it again won't change that. If "
-          + 'you need channels diverted, ask whoever runs this host.',
-      };
-    }
+    // No reader: no hold. One nothing summarizes would hand the resident an
+    // undated backlog all at once when it ends.
+    if (!this.readerAvailable()) return { ok: false, error: NO_READER_REFUSAL };
     if (this.hooks.isForkBound({ serverId, channelId })) {
       return {
         ok: false,
@@ -2134,6 +2129,73 @@ export class TuneOutCoordinator {
     return `tune-out/${this.hooks.primaryName() ?? 'default'}/all-except`;
   }
 
+  /**
+   * End every hold on record and deliver each backlog to the resident: the
+   * per-channel holds, then the all-except scope. For a host with no reader
+   * (AgentFramework.releaseTuneOutsWithoutReader) and a reader that ended; a
+   * hold whose end fails stays on record, and says so in the log. A
+   * per-channel hold ends under its own source, so an agent's tune-out keeps
+   * the agent's provenance (the housekeeping guard reads it); `source` is the
+   * all-except scope's.
+   */
+  releaseAll(source: string, reason: string, options: { retry?: boolean; attempt?: number } = {}): void {
+    if (this.releaseRetry) {
+      clearTimeout(this.releaseRetry);
+      this.releaseRetry = null;
+    }
+    let failed = false;
+    // What the registry has on record, registered or not: at a start the
+    // channels aren't registered yet, so listActive() would find none.
+    let onRecord: ReturnType<ChannelRegistry['tuneOutsOnRecord']> = [];
+    try {
+      onRecord = this.channelRegistry.tuneOutsOnRecord();
+    } catch (err) {
+      console.error(`[tune-out] the tune-outs on record could not be read to release them (${reason}), so they stay on record:`, err);
+      failed = true;
+    }
+    for (const { serverId, channelId, source: recorded } of onRecord) {
+      try {
+        const r = this.cancel(serverId, channelId, recorded, reason);
+        if (!r.ok) {
+          console.error(`[tune-out] ${this.shown(serverId, channelId)} could not be released (${reason}), so it stays on record: ${r.error}`);
+          failed = true;
+        }
+      } catch (err) {
+        console.error(`[tune-out] ${this.shown(serverId, channelId)} could not be released (${reason}), so it stays on record:`, err);
+        failed = true;
+      }
+    }
+    try {
+      if (this.getAllExcept()) {
+        const r = this.cancelAllExcept(source, reason);
+        if (!r.ok) {
+          console.error(`[tune-out] the all-except hold could not be released (${reason}), so it stays on record: ${r.error}`);
+          failed = true;
+        }
+      }
+    } catch (err) {
+      console.error(`[tune-out] the all-except hold could not be released (${reason}), so it stays on record:`, err);
+      failed = true;
+    }
+    // With a reader gone mid-run the hold still diverts traffic, and an
+    // open-ended one has no end time to release it: try again, backing off,
+    // a few times (a try that fails after its dump is durable writes a new
+    // one only for messages held since). After the last, the hold stays
+    // until the resident cancels it, or the next start releases it (with no
+    // reader configured) or resumes it (with one).
+    const attempt = options.attempt ?? 1;
+    if (failed && options.retry && !this.stopped) {
+      if (attempt >= RELEASE_RETRY_ATTEMPTS) {
+        console.error(`[tune-out] releasing the holds (${reason}) failed ${attempt} times, so what failed stays held until it is cancelled, or the next start releases it (with no reader configured) or resumes it (with one)`);
+      } else {
+        this.releaseRetry = setTimeout(() => {
+          this.releaseRetry = null;
+          this.releaseAll(source, reason, { ...options, attempt: attempt + 1 });
+        }, EXPIRY_RETRY_MS * 2 ** (attempt - 1));
+      }
+    }
+  }
+
   getAllExcept(): AllExceptState | null {
     if (this.scopeCache !== undefined) return this.scopeCache;
     // A record that can't be read, or isn't a hold's, is not taken for no
@@ -2159,6 +2221,7 @@ export class TuneOutCoordinator {
     opts: { cadenceSeconds?: unknown; backlogCap?: unknown; maxWakes?: unknown; durationSeconds?: unknown },
     source: string,
   ): { ok: true; params: AllExceptParams } | { ok: false; error: string } {
+    if (!this.readerAvailable()) return { ok: false, error: NO_READER_REFUSAL };
     const read = this.readOptions(opts, {
       durationSeconds: null,
       cadenceSeconds: `for the default, ${TUNE_OUT_DEFAULTS.cadenceSeconds}`,
@@ -3287,8 +3350,9 @@ export class TuneOutCoordinator {
 
   /**
    * The reader ended, not the framework: its turns stop (cadence and
-   * coalescing wakes), and every hold keeps its end time, which releases it
-   * to the resident with no reader.
+   * coalescing wakes). The framework then releases every hold with
+   * releaseAll ("its reader ended"); a hold whose release fails keeps its end
+   * time, which releases it to the resident with no reader.
    */
   stopReader(): void {
     for (const timer of this.cadenceTimers.values()) clearTimeout(timer);
@@ -3299,6 +3363,11 @@ export class TuneOutCoordinator {
 
   /** Stop all timers (framework shutdown). */
   stop(): void {
+    this.stopped = true;
+    if (this.releaseRetry) {
+      clearTimeout(this.releaseRetry);
+      this.releaseRetry = null;
+    }
     // A cancel still waiting for held writes ends nothing: the tune-out stays
     // in force on disk, for the next boot, and a note it carries is lost with
     // it. A loss notice not written yet for the persistent subconscious stays

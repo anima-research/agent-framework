@@ -113,10 +113,9 @@ export const SUBCONSCIOUS_TOOLS: ToolDefinition[] = [
 
 /**
  * Who reads a tuned-out channel's traffic, as the text a resident reads
- * says it: the persistent subconscious by the name it runs under, reader
- * forks, or no reader (a silent hold, where `tuneOut.enabled` offers
- * tune_out without one). A persistent reader's name is a value the host
- * supplied, marked as such (suppliedValue).
+ * says it: the persistent subconscious by the name it runs under, or reader
+ * forks. There is no hold without a reader (0.33.0). A persistent reader's
+ * name is a value the host supplied, marked as such (suppliedValue).
  */
 export type TuneOutReader =
   | { readonly kind: 'persistent'; readonly name: string }
@@ -126,33 +125,25 @@ export type TuneOutReader =
       readonly persist?: 'epoch' | 'resident';
       /** `subconscious.resync`, read with `persist`. */
       readonly resync?: 'window' | 'none';
-    }
-  | { readonly kind: 'none' };
-
+    };
 /**
  * What a tuned-out channel's messages are, as the words after "its
  * messages" in a refusal a resident reads (a channel tool's on a tuned-out
  * channel): held from it and read by `reader`, by the name it runs under or
- * as forks of the resident's context, or, with no reader, held with none to
- * read them.
+ * as forks of the resident's context.
  */
 export function tuneOutHeldWords(reader: TuneOutReader): string {
   return reader.kind === 'persistent' ? `are held from you and read by ${reader.name}`
-    : reader.kind === 'forks' ? 'are held from you and read by forks of your context'
-      : 'are held from you, with no reader configured here to read them';
+    : 'are held from you and read by forks of your context';
 }
 
 /**
  * Whether a tuned-out channel's messages get to its reader, as the words
  * after "its messages" in tune_out's answers about the channel's transport,
  * in the sentence's `form`: they reach `reader`, by the name it runs under
- * or as "the reader" (forks, as tuneOutTool says it), or, with no reader,
- * they are received and held.
+ * or as "the reader" (forks, as tuneOutTool says it).
  */
 export function tuneOutReachWords(reader: TuneOutReader, form: 'reach' | 'may not reach' | "don't reach"): string {
-  if (reader.kind === 'none') {
-    return form === 'reach' ? 'are received and held' : form === 'may not reach' ? 'may not be received' : "aren't received";
-  }
   return `${form} ${reader.kind === 'persistent' ? reader.name : 'the reader'}`;
 }
 

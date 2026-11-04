@@ -2061,6 +2061,13 @@ function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
  * unchecked, since nothing reads them then.
  */
 function assertFrameworkSwitches(config: FrameworkConfig): void {
+  if ((config.tuneOut as { enabled?: unknown } | null | undefined)?.enabled === true) {
+    throw new Error(
+      'tuneOut.enabled was removed in agent-framework 0.33.0: residents are offered tune_out only with a reader ' +
+        '(subconscious), since a hold nothing summarizes hands the resident an undated backlog all at once. ' +
+        'Remove tuneOut.enabled; to keep tune-out, configure a subconscious as well.',
+    );
+  }
   if (holdsSettings('subconscious', config.subconscious, '{ enabled: true }')) {
     assertBooleanSetting(
       'subconscious.enabled',
@@ -2200,30 +2207,24 @@ export type { TuneOutReader };
 /**
  * The `tune_out` tool for a host with `reader`. The text says what happens
  * to the channel's traffic and what the reader there can do, by the name
- * the host gave it, and where there is none, that the traffic is held for
- * the resident until it cancels or the duration runs out. It says nothing
- * of what a reader decides or why: the voice doctrine's standard
- * (coordinator.ts), which puts no words in a model's mouth, holds for what
- * the resident is told about its reader too.
+ * the host gave it. It says nothing of what a reader decides or why: the
+ * voice doctrine's standard (coordinator.ts), which puts no words in a
+ * model's mouth, holds for what the resident is told about its reader too.
  */
 export function tuneOutTool(reader: TuneOutReader): import('./types/index.js').ToolDefinition {
-  const has = reader.kind !== 'none';
   const who = reader.kind === 'persistent' ? reader.name : 'the reader';
   const reads = reader.kind === 'persistent'
     ? `${reader.name}, the reader configured here, reads it instead. It runs on a cadence and when a message there ` +
       'that your wake rules let through mentions you or is from an author they privilege, and can report to you in ' +
       'its own words and cancel the tune-out. '
-    : reader.kind === 'forks'
-      ? 'A reader reads it instead: a fork of your context, run on a cadence and when a message there that your wake ' +
+    : 'A reader reads it instead: a fork of your context, run on a cadence and when a message there that your wake ' +
         'rules let through mentions you or is from an author they privilege. It can report to you in its own words ' +
         'and cancel the tune-out. ' +
         (reader.persist === undefined
           ? ''
           : `${reader.persist === 'epoch' ? 'Within one tune-out, later runs resume that fork' : 'Later runs resume that fork, across tune-outs'}` +
             `${reader.resync === 'none' ? '' : ', each handed an account of the messages your context took since the run before (not your stored context injections)'}` +
-            `; a new fork is made when it can't be resumed${reader.persist === 'epoch' ? ', or for a run after the tune-out ended' : ''}. `)
-      : 'No reader is configured here, so none reads it meanwhile: it is held for you, and delivered when you cancel ' +
-        'the tune-out or durationSeconds runs out. ';
+            `; a new fork is made when it can't be resumed${reader.persist === 'epoch' ? ', or for a run after the tune-out ended' : ''}. `);
   return {
     name: 'tune_out',
     description:
@@ -2231,16 +2232,16 @@ export function tuneOutTool(reader: TuneOutReader): import('./types/index.js').T
       reads +
       'People who mention you get an automatic reaction so they know you saw nothing. ' +
       'Cancelling (mode "cancel") delivers the held backlog. ' +
-      (has ? 'The tune-out auto-cancels after maxWakes mention-bursts. ' : '') +
-      `A tuned-out channel is kept open, so its traffic ${has ? `reaches ${who}` : 'is still received and held'}: ` +
+      'The tune-out auto-cancels after maxWakes mention-bursts. ' +
+      `A tuned-out channel is kept open, so its traffic reaches ${who}: ` +
       'where this host opens and closes the server\'s channels, this opens a channel you closed, and answers once ' +
       'that open is done. Where the channel isn\'t open then, the answer\'s openError says why, and when its ' +
-      `messages will ${has ? `reach ${who}` : 'be received'} where that's known. ` +
+      `messages will reach ${who} where that's known. ` +
       'Calling tune_out again for a channel already tuned out keeps its settings, and, where this host can open the ' +
       'channel, tries the open again if it isn\'t open. ' +
       'scope "all-except" holds EVERY channel (DMs and new channels included) except channelId, for ' +
-      'durationSeconds (required); your plain speech lands in that channel meanwhile' +
-      (has ? `; ${who} pauses rather than cancels when its wake budget is spent` : '') + '. ' +
+      `durationSeconds (required); your plain speech lands in that channel meanwhile; ${who} pauses rather than ` +
+      'cancels when its wake budget is spent. ' +
       'mode "check" reports what is held without releasing it (`peek` shows one channel\'s newest held lines).',
     inputSchema: {
       type: 'object',
@@ -2259,9 +2260,7 @@ export function tuneOutTool(reader: TuneOutReader): import('./types/index.js').T
           type: 'number',
           description:
             `Max raw messages delivered at cancel (default ${TUNE_OUT_DEFAULTS.backlogCap}). ` +
-            (has
-              ? `0 = deliver no raw backlog at all: ${reader.kind === 'persistent' ? `${reader.name}'s` : 'the reader\'s'} report is the whole delivery.`
-              : '0 = deliver no raw backlog at all: the cancel counts what was held and shows none of it.'),
+            `0 = deliver no raw backlog at all: ${reader.kind === 'persistent' ? `${reader.name}'s` : 'the reader\'s'} report is the whole delivery.`,
         },
         maxWakes: {
           type: 'number',
@@ -4607,7 +4606,7 @@ export class AgentFramework {
   private subconsciousConfig: SubconsciousConfig | null = null;
   /** Tune-out coordinator (issue #77); non-null iff a reader is configured + channels. */
   private tuneOutCoordinator: TuneOutCoordinator | null = null;
-  /** Residents are offered `tune_out` (a reader is configured, or `tuneOut.enabled`). */
+  /** Residents are offered `tune_out` (a reader is configured). */
   private tuneOutOffered = false;
   /**
    * The reply anchor a coalesced delivery would set, parked until the
@@ -5471,7 +5470,7 @@ export class AgentFramework {
     framework.beforeDerive = config.dendrite?.beforeDerive;
     framework.derivationNoticeHook = config.dendrite?.derivationNotice;
     framework.speechLocus = config.speech?.locus ?? 'delivery';
-    framework.tuneOutOffered = !!config.subconscious?.enabled || config.tuneOut?.enabled === true;
+    framework.tuneOutOffered = !!config.subconscious?.enabled;
     framework.tuneOutAnnounce = config.tuneOut?.announce !== false;
 
     // What the previous process left in the agent registry. Read before any
@@ -5944,105 +5943,18 @@ export class AgentFramework {
       await framework.ensureToolsetsModule();
     }
 
-    // Tune-out coordinator (issue #77, #232 §3.3): the hold machinery exists
-    // wherever tune_out is offered — with a reader (persistent subconscious
-    // or reader forks) it summarizes and wakes; with `tuneOut.enabled` alone
-    // it is a silent hold, and a persisted epoch is resumed and released
-    // (#232 gap 10). Where neither is configured nothing could ever cancel a
-    // tune-out on record, so each one ends at the start instead
-    // (endTuneOutsWithoutCoordinator), as main has it.
+    // Tune-out coordinator (issue #77): the hold machinery exists wherever
+    // tune_out is offered, which is only with a reader (persistent
+    // subconscious or reader forks): it summarizes and wakes, and a persisted
+    // epoch is resumed and released (#232 gap 10). Without a reader each
+    // tune-out on record is released at the start instead, backlog delivered
+    // (releaseTuneOutsWithoutReader), a hold that 0.32's `tuneOut.enabled`
+    // left included.
     if (framework.channelRegistry && framework.tuneOutOffered) {
-      framework.tuneOutCoordinator = new TuneOutCoordinator(
-        framework.channelRegistry,
-        framework.mcplServerRegistry!,
-        {
-          addMessage: (participant, content, metadata, forAgent) =>
-            framework.addMessage(participant, content, metadata as MessageMetadata,
-              forAgent ? { forAgent } : undefined),
-          requestInference: (agentName, reason, source) => {
-            framework.pendingRequests.push({ agentName, reason, source, timestamp: Date.now() });
-          },
-          subconsciousName: () => framework.subconsciousAgentName,
-          ...(framework.readerForks
-            ? {
-                invokeReader: (invocation: ReaderInvocation) => framework.invokeReaderFork(invocation),
-                deliverFromReader: (reader: string, content: ContentBlock[], metadata: Record<string, unknown>) =>
-                  framework.deliverFromReader(reader, content, metadata),
-              }
-            : {}),
-          primaryName: () => framework.primaryAgentName,
-          getStoredMessages: () => {
-            const primary = framework.primaryAgentName
-              ? framework.agents.get(framework.primaryAgentName) : undefined;
-            return primary ? primary.getContextManager().getAllMessages() : [];
-          },
-          // What a surgery's hold keeps for the primary's store until its
-          // release, as addMessage was given it, after the writes kept for
-          // the primary while its context manager refuses its work
-          // (heldForRecovery), which came first: a check during the hold
-          // counts and peeks a tune-out's held messages among them
-          // (#232 gap 7). A cancel waits for the release (writesHeld, below),
-          // so a dump lists them only where asking that throws and the
-          // cancel goes on.
-          // A write straight into a fork's store isn't the primary's. Read
-          // defensively, as releaseSurgeryHeldWrites is.
-          getSurgeryHeldMessages: () => {
-            const primary = framework.primaryAgentName;
-            const forPrimary = (write: SurgeryHeldWrite) => !write.direct && (write.opts?.forAgent ?? primary) === primary;
-            return [...(primary ? framework.heldForRecovery?.get(primary) ?? [] : []), ...(framework.surgeryHeldWrites ?? [])]
-              .filter(forPrimary)
-              .map((write) => ({ participant: write.participant, content: write.content, metadata: write.metadata }));
-          },
-          commitDeliveries: () => framework.commitDeliveries(),
-          // A release made while a surgery's hold keeps writes in memory, or
-          // while the primary's or the subconscious's manager refuses its
-          // work, would be kept there too, and lost to a crash before it is
-          // stored, while the epoch's end is on disk at once: the cancel
-          // waits (releaseSurgeryHeldWrites runs it).
-          writesHeld: () => framework.surgeryHold !== null || framework.replayingHeld
-            || [framework.primaryAgentName, framework.subconsciousAgentName]
-              .some((name) => name != null && (framework.waitsForRecovery(name) || framework.refusesItsWork(name))),
-          historyTool: () => framework.residentHistoryTool(),
-          // Every reader of the shared slot compiles the dump with its own
-          // strategy, so the dump fits the smallest of their bounds.
-          residentMessageChars: () => {
-            let chars: number | undefined;
-            for (const reader of framework.sharedSlotAgents) {
-              const bound = framework.strategyDerivedToolResultChars(reader);
-              if (bound !== undefined && (chars === undefined || bound < chars)) chars = bound;
-            }
-            return chars;
-          },
-          currentSequence: () => framework.store.currentSequence(),
-          // By sequence while its window is the record; by a fixed ordinal
-          // once the presentation index presents for it (window-anchor.ts).
-          setSubconsciousAnchor: (start, others) => framework.subconsciousAnchor?.set(start, others),
-          subconsciousWindowOrdinals: () => framework.presents(
-            framework.subconsciousAgentName ? framework.agents.get(framework.subconsciousAgentName) : undefined),
-          unseenBySubconscious: (keep) => framework.unseenBySubconscious(keep),
-          isForkBound: (channel) =>
-            framework.registry.list().some((record) => sameChannel(framework.homeOf(record.name), channel)),
-          isPrivilegedAuthor: (authorId) =>
-            framework.eventGate?.isPrivilegedUser(authorId) ?? false,
-          allowChannelSpeech: () => framework.subconsciousConfig?.allowChannelSpeech === true,
-          holdWithoutReader: () => framework.tuneOutOffered,
-          ...(framework.tuneOutAnnounce
-            ? {
-                // The excepted channel on its server: a bare id two servers
-                // register is refused (publishForAgent).
-                announce: async (serverId: string, channelId: string, text: string) => {
-                  const r = await framework.channelRegistry!.publishForAgent(
-                    { serverId, channelId }, text, framework.primaryAgentName ?? 'resident');
-                  return { success: r.success, ...(r.error ? { error: r.error } : {}) };
-                },
-              }
-            : {}),
-          emitTrace: (e) => framework.emitTrace(e),
-        },
-      );
+      framework.tuneOutCoordinator = framework.makeTuneOutCoordinator();
       framework.tuneOutCoordinator.resumeActiveEpochs();
     } else {
-      framework.endTuneOutsWithoutCoordinator();
+      framework.releaseTuneOutsWithoutReader();
     }
 
     // Modules, agents, MCPL servers and the tune-out tool are all in place:
@@ -8598,7 +8510,10 @@ export class AgentFramework {
     if (this.channelRegistry) {
       channelTools.push(AgentFramework.DRAFTS_TOOL);
     }
-    if (this.tuneOutCoordinator && this.tuneOutOffered) {
+    // Offered while a reader is there to watch a hold, or a hold is still on
+    // record for the resident to check or cancel: not once the persistent
+    // reader has ended and its holds are released (enter would refuse).
+    if (this.tuneOutCoordinator && this.tuneOutOffered && (this.subconsciousAgentName !== null || this.readerForks || this.tuneOutOnRecord())) {
       channelTools.push(this.tuneOutToolDefinition(), AgentFramework.FOCUS_TOOL);
     }
     const gateTools = this.eventGate
@@ -8989,8 +8904,8 @@ export class AgentFramework {
    *  out, or undefined where nothing needs saying. A send keeps the tune-out
    *  (ChannelRegistry.openChannelNow), so the agent that sent there expecting
    *  answers learns they are still held from it, and who reads them
-   *  meanwhile: the reader by the name it runs under, forks of its context,
-   *  or none (tuneOutReader). A send tool's answer
+   *  meanwhile: the reader by the name it runs under, or forks of its
+   *  context (tuneOutReader). A send tool's answer
    *  carries this, send_dm's included, or for a code_execution script's send
    *  a notice in the agent's window: a tune-out diverts a DM too. The same setting
    *  turns it off, a conversation agent gets none, and a failure while
@@ -9009,9 +8924,7 @@ export class AgentFramework {
       const reader = this.tuneOutReader();
       const held = reader.kind === 'persistent'
         ? `is still held from you, and read by ${reader.name}, until the tune-out ends.`
-        : reader.kind === 'forks'
-          ? 'is still held from you, and read by forks of your context, until the tune-out ends.'
-          : 'is still held until the tune-out ends, and delivered to you then; no reader is configured here to read it meanwhile.';
+        : 'is still held from you, and read by forks of your context, until the tune-out ends.';
       return `${this.channelShown(channel)} stays tuned out: your words there don't end the tune-out, so its ` +
         `traffic ${held}${end ? ` ${end}` : ''}`;
     } catch (err) {
@@ -12826,6 +12739,9 @@ export class AgentFramework {
     if (name === this.subconsciousAgentName) {
       this.tuneOutCoordinator?.stopReader();
       this.subconsciousAgentName = null;
+      // No reader is left, and a hold nothing summarizes isn't kept: each
+      // ends now, its backlog to the resident.
+      if (!this.readerForks) this.tuneOutCoordinator?.releaseAll('reader-ended', 'its reader ended', { retry: true });
     }
   }
 
@@ -13730,8 +13646,7 @@ export class AgentFramework {
    * Returns entries with summary info (doesn't resolve blobs).
    */
   /** Tune-out (issue #77): hold a channel. Offered when a reader is
-   *  configured or `tuneOut.enabled` is set (tuneOutOffered), its text
-   *  naming the reader there is, or saying there is none (tuneOutTool). */
+   *  configured (tuneOutOffered), its text naming the reader (tuneOutTool). */
   private tuneOutToolDefinition(): import('./types/index.js').ToolDefinition {
     return tuneOutTool(this.tuneOutReader());
   }
@@ -13740,8 +13655,12 @@ export class AgentFramework {
    * The reader of a tuned-out channel's traffic, as the text a resident
    * reads describes it (tuneOutTool, tunedOutSendNote, tune_out's answers
    * and the channel registry's refusals of a tuned-out channel): the persistent
-   * subconscious by the name it runs under, which the host gives it, reader
-   * forks as forks of the resident's context, or none.
+   * subconscious by the name it runs under, which the host gives it, or
+   * reader forks as forks of the resident's context. There is no hold
+   * without a reader (0.33.0): a tune-out is on record with none running
+   * only where its release failed, after the persistent reader ended or at
+   * a start with none configured. The text names the persistent reader as
+   * configured then, or by its default name (persistentReaderName).
    */
   private tuneOutReader(): TuneOutReader {
     if (this.subconsciousAgentName) return { kind: 'persistent', name: suppliedValue(this.subconsciousAgentName) };
@@ -13752,7 +13671,8 @@ export class AgentFramework {
         ? { kind: 'forks', persist, resync: (cfg as ForkReaderConfig).resync ?? 'window' }
         : { kind: 'forks' };
     }
-    return { kind: 'none' };
+    const configured = this.subconsciousConfig;
+    return { kind: 'persistent', name: suppliedValue(persistentReaderName(configured && configured.reader !== 'forks' ? configured : {})) };
   }
 
   /** `focus`: the resident-facing alias for `tune_out` with scope "all-except" (#232 decision 2). */
@@ -37464,8 +37384,11 @@ export class AgentFramework {
     if (!this.mcplServerRegistry || !this.mcplHostCapabilities) {
       await this.initializeMcpl([], this.mcplInferenceRoutingConfig ?? undefined);
       // The lifecycle log's replay restored any tune-out on record, and no
-      // coordinator is made here to carry one.
-      this.endTuneOutsWithoutCoordinator();
+      // coordinator is made here to carry one. With no reader configured,
+      // each ends with its backlog; with one, it ends as before (its backlog
+      // isn't delivered: a coordinator made at this connect would carry it).
+      if (this.tuneOutOffered) this.endTuneOutsWithoutCoordinator();
+      else this.releaseTuneOutsWithoutReader();
     }
 
     const collision = this.mcplPrefixCollision(config, undefined, claim);
@@ -39700,6 +39623,127 @@ export class AgentFramework {
     };
   }
 
+  /** Whether any tune-out is on record: a channel's, or the all-except scope. */
+  private tuneOutOnRecord(): boolean {
+    try {
+      return (this.channelRegistry?.tuneOutsOnRecord().length ?? 0) > 0 || this.tuneOutCoordinator?.getAllExcept() != null;
+    } catch {
+      return true;
+    }
+  }
+
+  /** The tune-out coordinator over this framework's channels, with the hooks it acts through. */
+  private makeTuneOutCoordinator(options: { announce?: boolean } = {}): TuneOutCoordinator {
+    const channelRegistry = this.channelRegistry;
+    if (!channelRegistry) throw new Error('a tune-out coordinator needs the channel registry');
+    return new TuneOutCoordinator(
+      channelRegistry,
+      this.mcplServerRegistry!,
+      {
+        addMessage: (participant, content, metadata, forAgent) =>
+          this.addMessage(participant, content, metadata as MessageMetadata,
+            forAgent ? { forAgent } : undefined),
+        requestInference: (agentName, reason, source) => {
+          this.pendingRequests.push({ agentName, reason, source, timestamp: Date.now() });
+        },
+        subconsciousName: () => this.subconsciousAgentName,
+        ...(this.readerForks
+          ? {
+              invokeReader: (invocation: ReaderInvocation) => this.invokeReaderFork(invocation),
+              deliverFromReader: (reader: string, content: ContentBlock[], metadata: Record<string, unknown>) =>
+                this.deliverFromReader(reader, content, metadata),
+            }
+          : {}),
+        primaryName: () => this.primaryAgentName,
+        getStoredMessages: () => {
+          const primary = this.primaryAgentName
+            ? this.agents.get(this.primaryAgentName) : undefined;
+          return primary ? primary.getContextManager().getAllMessages() : [];
+        },
+        // What a surgery's hold keeps for the primary's store until its
+        // release, as addMessage was given it, after the writes kept for
+        // the primary while its context manager refuses its work
+        // (heldForRecovery), which came first: a check during the hold
+        // counts and peeks a tune-out's held messages among them
+        // (#232 gap 7). A cancel waits for the release (writesHeld, below),
+        // so a dump lists them only where asking that throws and the
+        // cancel goes on.
+        // A write straight into a fork's store isn't the primary's. Read
+        // defensively, as releaseSurgeryHeldWrites is.
+        getSurgeryHeldMessages: () => {
+          const primary = this.primaryAgentName;
+          const forPrimary = (write: SurgeryHeldWrite) => !write.direct && (write.opts?.forAgent ?? primary) === primary;
+          return [...(primary ? this.heldForRecovery?.get(primary) ?? [] : []), ...(this.surgeryHeldWrites ?? [])]
+            .filter(forPrimary)
+            .map((write) => ({ participant: write.participant, content: write.content, metadata: write.metadata }));
+        },
+        commitDeliveries: () => this.commitDeliveries(),
+        // A release made while a surgery's hold keeps writes in memory, or
+        // while the primary's or the subconscious's manager refuses its
+        // work, would be kept there too, and lost to a crash before it is
+        // stored, while the epoch's end is on disk at once: the cancel
+        // waits (releaseSurgeryHeldWrites runs it).
+        writesHeld: () => this.surgeryHold !== null || this.replayingHeld
+          || [this.primaryAgentName, this.subconsciousAgentName]
+            .some((name) => name != null && (this.waitsForRecovery(name) || this.refusesItsWork(name))),
+        historyTool: () => this.residentHistoryTool(),
+        // Every reader of the shared slot compiles the dump with its own
+        // strategy, so the dump fits the smallest of their bounds.
+        residentMessageChars: () => {
+          let chars: number | undefined;
+          for (const reader of this.sharedSlotAgents) {
+            const bound = this.strategyDerivedToolResultChars(reader);
+            if (bound !== undefined && (chars === undefined || bound < chars)) chars = bound;
+          }
+          return chars;
+        },
+        currentSequence: () => this.store.currentSequence(),
+        // By sequence while its window is the record; by a fixed ordinal
+        // once the presentation index presents for it (window-anchor.ts).
+        setSubconsciousAnchor: (start, others) => this.subconsciousAnchor?.set(start, others),
+        subconsciousWindowOrdinals: () => this.presents(
+          this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName) : undefined),
+        unseenBySubconscious: (keep) => this.unseenBySubconscious(keep),
+        isForkBound: (channel) =>
+          this.registry.list().some((record) => sameChannel(this.homeOf(record.name), channel)),
+        isPrivilegedAuthor: (authorId) =>
+          this.eventGate?.isPrivilegedUser(authorId) ?? false,
+        allowChannelSpeech: () => this.subconsciousConfig?.allowChannelSpeech === true,
+        ...(this.tuneOutAnnounce && options.announce !== false
+          ? {
+              // The excepted channel on its server: a bare id two servers
+              // register is refused (publishForAgent).
+              announce: async (serverId: string, channelId: string, text: string) => {
+                const r = await this.channelRegistry!.publishForAgent(
+                  { serverId, channelId }, text, this.primaryAgentName ?? 'resident');
+                return { success: r.success, ...(r.error ? { error: r.error } : {}) };
+              },
+            }
+          : {}),
+        emitTrace: (e) => this.emitTrace(e),
+      },
+    );
+  }
+
+  /**
+   * No reader is configured, so nothing can watch or end a hold: each hold
+   * on record (one 0.32's `tuneOut.enabled` left, or one whose reader the
+   * recipe no longer has) ends now, and its backlog goes to the resident,
+   * the per-channel holds and the all-except scope alike, through a
+   * coordinator made for that alone: at a start, or, where no MCPL server
+   * was configured, when the first one connects. One whose release fails
+   * stays on record for the next start.
+   */
+  private releaseTuneOutsWithoutReader(): void {
+    if (!this.channelRegistry || this.tuneOutCoordinator) return;
+    // Nothing is posted in an excepted channel: this is the host's own
+    // housekeeping, at a start or when the channel subsystem comes up after
+    // one. A hold whose release fails stays on record (releaseAll logs it),
+    // so the next start releases it, backlog and all, rather than ending it
+    // with none.
+    this.makeTuneOutCoordinator({ announce: false }).releaseAll('start', 'no reader is configured');
+  }
+
   /**
    * A tune-out on record where this host has no tune-out coordinator: a
    * start with no subconscious makes none, and neither does a channel
@@ -39712,7 +39756,9 @@ export class AgentFramework {
    * agent's tune-out keeps the agent's provenance (the housekeeping guard
    * reads it). A log line names the channel and says how many of the
    * messages it diverted are stored here, which nothing will now deliver as
-   * its backlog.
+   * its backlog. Where no reader is configured, releaseTuneOutsWithoutReader
+   * ends them instead, backlog delivered; this is only the late-connect path
+   * of a host that has a reader.
    */
   private endTuneOutsWithoutCoordinator(): void {
     const registry = this.channelRegistry;
@@ -40539,9 +40585,7 @@ export class AgentFramework {
           cadenceSeconds: r.params.cadenceSeconds,
           backlogCap: r.params.backlogCap,
           maxWakes: r.params.maxWakes,
-          note: coordinator.hasReader()
-            ? `${speech} Reader wakes pause, not cancel, when the budget is spent.`
-            : `No reader is configured here: this is a silent hold. ${speech} The backlog is delivered per channel when you cancel or the duration ends.`,
+          note: `${speech} Reader wakes pause, not cancel, when the budget is spent.`,
         },
       };
     }
@@ -40589,9 +40633,6 @@ export class AgentFramework {
         backlogCap: r.params.backlogCap,
         maxWakes: r.params.maxWakes,
         ...(openError ? { openError } : {}),
-        ...(coordinator.hasReader()
-          ? {}
-          : { note: 'No reader is configured here: this is a silent hold. Nothing summarizes or wakes you; the backlog is delivered when you cancel.' }),
       },
     };
   }

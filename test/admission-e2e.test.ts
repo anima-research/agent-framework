@@ -526,37 +526,14 @@ describe('admission: the hold is decided once, before any side effect', () => {
     } finally { await f.close(); }
   });
 
-  it('gap 10 / §3.3 — without a reader, tune-out is a silent hold that still releases', async () => {
-    const f = await fixture({ framework: { tuneOut: { enabled: true } } as Partial<FrameworkConfig> });
+  it('without a reader there is no tune-out: no coordinator, no tune_out tool', async () => {
+    const f = await fixture({ framework: { tuneOut: { enabled: false } } as Partial<FrameworkConfig> });
     try {
       await registerOpen(f, 'noisy');
-      const coordinator = internals(f).tuneOutCoordinator;
-      assert.ok(coordinator, 'the coordinator exists without a subconscious');
-      enter(f, 'noisy', { backlogCap: 10 });
-      await incoming(f, 'noisy', 'n1', 'agent?', MENTION);
-      await settle(f);
-      assert.equal(stored(f).filter(held).length, 1, 'held');
-      assert.ok(coordinator!.cancel('editor', 'noisy', 'agent-tool', 'test').ok);
-      assert.match(textOf(find(f, '<tuned-out-backlog')), /antra: agent\?/, 'the release reaches the resident');
-    } finally { await f.close(); }
-  });
-
-  it("gap 10 / §3.3 — without a reader, tune_out's answers say no reader is configured here, and none says subconscious", async () => {
-    const f = await fixture({ framework: { tuneOut: { enabled: true } } as Partial<FrameworkConfig> });
-    try {
-      await registerOpen(f, 'noisy', 'work');
-      const i = internals(f);
-      const channel = await i.handleTuneOutTool('agent', { channelId: 'noisy' });
-      assert.ok(channel.success, channel.error);
-      assert.equal((channel.data as { note?: string }).note,
-        'No reader is configured here: this is a silent hold. Nothing summarizes or wakes you; the backlog is delivered when you cancel.');
-      assert.ok((await i.handleTuneOutTool('agent', { channelId: 'noisy', mode: 'cancel' })).success);
-      const scope = await i.handleTuneOutTool('agent', { channelId: 'work', scope: 'all-except', durationSeconds: 120 });
-      assert.ok(scope.success, scope.error);
-      const note = (scope.data as { note?: string }).note ?? '';
-      assert.ok(note.startsWith('No reader is configured here: this is a silent hold. '), note);
-      assert.ok(note.endsWith(' The backlog is delivered per channel when you cancel or the duration ends.'), note);
-      for (const answer of [channel, scope]) assert.ok(!/subconscious/i.test(JSON.stringify(answer)), JSON.stringify(answer));
+      assert.equal(internals(f).tuneOutCoordinator, null, 'no reader, no hold machinery');
+      const names = f.framework.getAllTools().map((t) => t.name);
+      assert.ok(names.length > 0, 'premise: the framework lists its tools');
+      assert.ok(!names.includes('tune_out'), 'tune_out is not offered');
     } finally { await f.close(); }
   });
 
