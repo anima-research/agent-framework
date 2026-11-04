@@ -5,7 +5,9 @@
  * happened before a failure, and a repeat close that names the excepted
  * channel after its server no longer registers it; and (Simon-2700, round
  * 7) a bare id the focus's channel answers to means that channel, not
- * another server's channel with the id.
+ * another server's channel with the id; and (Mabel-3575, round 8) a bare
+ * id that both the focus's channel and the calling turn's own channel on
+ * another server answer to is refused, naming both.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -404,4 +406,85 @@ describe("a bare channel_close id the focus's channel answers to means that chan
       } finally { await f.close(); await other.stop(); }
     });
   }
+});
+
+/** The calling turn's origin, the turn owning other's `work`, as a channel_open naming it makes it the turn's. */
+const OTHERS_TURN = { kind: 'agent', agentName: 'agent', own: [{ serverId: 'other', channelId: 'work' }] };
+const inTurn = (f: Fixture, name: string, input: Record<string, unknown>): Promise<Answer> =>
+  framework(f).channelRegistry.handleChannelToolCall(name, input, OTHERS_TURN);
+
+const FOCUS_OR_OWN = 'Channel "work" names both the channel the all-except focus excepts ("editor:work") and this turn\'s channel ("other:work"), ' +
+  'so nothing ran. Call again with channelId set to one of them, or with serverId set to "editor" or "other".';
+
+describe("a bare channel_close id that both the focus's channel and the calling turn's own channel on another server answer to is refused", () => {
+  const states: Array<[string, (f: Fixture) => Promise<void>]> = [
+    ["the focus's channel still registered", async () => {}],
+    ["the focus's channel no longer registered", async (f) => { await f.send('channels/changed', { removed: ['work'] }); }],
+  ];
+  for (const [how, then] of states) {
+    it(`${how}: the repeat after a failed close, in a turn that opened other's \`work\`, closes neither, the focus in force`, async () => {
+      const f = await focused();
+      const other = await otherServer(f);
+      try {
+        await other.registerOpen('work');
+        await firstCloseFails(f);
+        await then(f);
+        const opened = await inTurn(f, 'channel_open', { channelId: 'work', serverId: 'other' });
+        assert.equal(opened.success, true, opened.error);
+        const result = await inTurn(f, 'channel_close', { channelId: 'work' });
+        assert.equal(result.success, false, `nothing ran: ${JSON.stringify(result)}`);
+        assert.equal(result.error, FOCUS_OR_OWN);
+        assert.ok(coordinatorOf(f).getAllExcept(), 'the focus is in force');
+        assert.equal(internals(f).channelRegistry.getDesiredState('other', 'work'), 'open', "other's work stays open");
+        assert.deepEqual(other.closes, [], "other's server was sent no close");
+      } finally { await f.close(); await other.stop(); }
+    });
+  }
+
+  for (const input of [{ channelId: 'work', serverId: 'other' }, { channelId: 'other:work' }]) {
+    it(`control: in that turn, a close naming other's server (${JSON.stringify(input)}) closes other's \`work\` and leaves the focus alone`, async () => {
+      const f = await focused();
+      const other = await otherServer(f);
+      try {
+        await other.registerOpen('work');
+        await firstCloseFails(f);
+        const result = await inTurn(f, 'channel_close', input);
+        assert.equal(result.success, true, result.error);
+        assert.deepEqual(result.data, { channelId: 'work', serverId: 'other', status: 'closed' });
+        assert.ok(coordinatorOf(f).getAllExcept(), 'the focus is in force');
+        assert.equal(internals(f).channelRegistry.getDesiredState('other', 'work'), 'closed');
+      } finally { await f.close(); await other.stop(); }
+    });
+  }
+
+  for (const input of [{ channelId: 'work', serverId: 'editor' }, { channelId: 'editor:work' }]) {
+    it(`control: in that turn, a close naming the focus's server (${JSON.stringify(input)}) closes the focus's channel and ends the focus`, async () => {
+      const f = await focused();
+      const other = await otherServer(f);
+      try {
+        await other.registerOpen('work');
+        await firstCloseFails(f);
+        const result = await inTurn(f, 'channel_close', input);
+        assert.equal(result.success, true, result.error);
+        assert.equal((result.data as { serverId?: string }).serverId, 'editor');
+        assert.equal(coordinatorOf(f).getAllExcept(), null, 'the focus ended');
+        assert.equal(internals(f).channelRegistry.getDesiredState('editor', 'work'), 'closed');
+        assert.equal(internals(f).channelRegistry.getDesiredState('other', 'work'), 'open', "other's work stays open");
+      } finally { await f.close(); await other.stop(); }
+    });
+  }
+
+  it("control: a turn whose own channel is the focus's: the bare id closes it and ends the focus", async () => {
+    const f = await focused();
+    const other = await otherServer(f);
+    try {
+      await other.registerOpen('work');
+      const result = await framework(f).channelRegistry.handleChannelToolCall('channel_close', { channelId: 'work' },
+        { kind: 'agent', agentName: 'agent', own: [{ serverId: 'editor', channelId: 'work' }] });
+      assert.equal(result.success, true, result.error);
+      assert.equal((result.data as { serverId?: string }).serverId, 'editor');
+      assert.equal(coordinatorOf(f).getAllExcept(), null, 'the focus ended');
+      assert.equal(internals(f).channelRegistry.getDesiredState('other', 'work'), 'open', "other's work stays open");
+    } finally { await f.close(); await other.stop(); }
+  });
 });

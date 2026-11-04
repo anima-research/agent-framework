@@ -1144,10 +1144,15 @@ export type TraceEvent =
    * there (`currentEpochId`, the one in force when it was dropped, if one
    * was). `note-undelivered`: its hold ended, by another cancel or by its
    * own run, and delivering the note it carried failed (`error`).
+   * `stopped`: the host stopped while it waited, its hold still in force,
+   * which the next boot resumes without running it.
    * `noteLost`: it carried a reader's note, which is not delivered; its
    * author is told so in its own context where the author still exists,
    * and a reader fork that has ended is not, the loss reaching no one
-   * (`tune-out:note-loss-untold`, `author-gone`). `noteAuthor`, whose note
+   * (`tune-out:note-loss-untold`, `author-gone`). The persistent
+   * subconscious is told by the next boot where the host stopped, and,
+   * where another cancel ended the hold, in that cancel's release, which
+   * its window holds, rather than in a notice of its own. `noteAuthor`, whose note
    * it was, the name it would have been delivered under (the persistent
    * subconscious's, or the reader fork's that left it), where one is known.
    * For the all-except hold (`scope`), the channel is its excepted one.
@@ -1158,7 +1163,7 @@ export type TraceEvent =
       channelId: string;
       epochId: string;
       scope?: 'all-except';
-      reason: 'hold-ended' | 'note-undelivered';
+      reason: 'hold-ended' | 'note-undelivered' | 'stopped';
       currentEpochId?: string;
       noteLost: boolean;
       noteAuthor?: string;
