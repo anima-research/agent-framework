@@ -341,6 +341,42 @@ describe('toolDeclarations in the framework', () => {
       });
     });
 
+    it("takes its parent's change off a host's shared child's branch once the child moves to a head of its own", async () => {
+      await withFramework([resident('alpha')], async (framework) => {
+        const alpha = framework.getAgent('alpha')!;
+        say(alpha, 'user', 'hello');
+        await alpha.buildActivationRequest([tool('a')]);
+        await alpha.buildActivationRequest([tool('a'), tool('b')]);
+        const { name: _name, ...spec } = taskForkSpec('host-child', { parent: 'alpha', inherit: { mode: 'shared' } });
+        const { agent: child } = await framework.createEphemeralAgent({ ...resident('host-child'), systemPrompt: 'You are the child.' } as never, spec);
+        assert.equal(storedChanges(child, 'alpha'), 1, "the premise: the child's branch holds its parent's change");
+        const request = await child.buildActivationRequest([tool('c')]);
+        assert.deepEqual(request.tools, [tool('c')], 'its own head');
+        assert.deepEqual(changesIn(request.messages), [], "and none of its parent's declarations");
+        assert.equal(storedChanges(child, 'alpha'), 0, "taken off the child's branch");
+        assert.equal(storedChanges(alpha, 'alpha'), 1, "and the parent's own context as it was");
+      });
+    });
+
+    it("sends its parent's added block once to a host's shared child at a checkpoint (atSequence) with its parent's prompt, tools and block", async () => {
+      await withFramework([resident('alpha')], async (framework) => {
+        const alpha = framework.getAgent('alpha')!;
+        say(alpha, 'user', 'hello');
+        const block = { namespace: 'module', position: 'system' as const, content: [{ type: 'text' as const, text: 'ALPHA ADDED BLOCK' }] };
+        await alpha.buildActivationRequest([tool('a')]);
+        await alpha.buildActivationRequest([tool('a')], [block]);
+        const [row] = alpha.getContextManager().queryMessages({ metadata: { kind: 'system-change', agent: 'alpha' } }).messages;
+        assert.ok(row, "the premise: alpha's added block is a change row");
+        const atSequence = alpha.getContextManager().getMessage(row!.id)!.sequence;
+        const { name: _name, ...spec } = taskForkSpec('checkpoint-child', { parent: 'alpha', inherit: { mode: 'shared', atSequence } });
+        const { agent: child } = await framework.createEphemeralAgent({ ...resident('checkpoint-child'), systemPrompt: 'You are alpha.' } as never, spec);
+        assert.equal(storedChanges(child, 'alpha'), 1, "the premise: the child's branch holds its parent's change");
+        const request = await child.buildActivationRequest([tool('a')], [block]);
+        assert.equal(JSON.stringify({ system: request.system, messages: request.messages }).split('ALPHA ADDED BLOCK').length - 1, 1, 'the block goes out once');
+        assert.equal(storedChanges(child, 'alpha'), 0, "its adoption took its parent's change off its branch");
+      });
+    });
+
     it("carries its parent's change once in a host's shared child, whose own participants don't include its parent", async () => {
       await withFramework([resident('alpha')], async (framework) => {
         const traces: TraceEvent[] = [];

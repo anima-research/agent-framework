@@ -11116,6 +11116,7 @@ export class AgentFramework {
         }
       }
       let inherit = spec?.inherit;
+      let sourceChangeOwners: string[] = [];
 
       if (inherit?.mode === 'shared') {
         // Shared reads, separate writes: the child's context is the parent's
@@ -11124,6 +11125,7 @@ export class AgentFramework {
         contextManager = derived.contextManager;
         inherit = derived.inherit;
         namespace = derived.namespace;
+        sourceChangeOwners = derived.sourceChangeOwners;
       } else {
         // A namespace belongs to the agent that opened it: another agent's
         // turns there would be read as its own by inspection and by its
@@ -11156,6 +11158,7 @@ export class AgentFramework {
       release.manager = contextManager;
 
       const agent = new Agent(config, contextManager, this.membrane);
+      agent.setSourceChangeOwners(sourceChangeOwners);
       const heads = memoryHeadDeclarations();
       if (seedHead) heads.write(config.name, seedHead);
       this.attachHeads(agent, heads);
@@ -11511,6 +11514,7 @@ export class AgentFramework {
         throw new Error(`resumeAgent: "${name}" was registered while it was being resumed`);
       }
       agent = new Agent(fullConfig, contextManager, this.membrane);
+      agent.setSourceChangeOwners(this.sourceChangeOwnersOf(record));
       this.attachHeads(agent, memoryHeadDeclarations());
       this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
@@ -11642,12 +11646,24 @@ export class AgentFramework {
     return view ? seen(opened, view) : opened;
   }
 
+  private sourceChangeOwnersOf(record: AgentRecord): string[] {
+    const owners: string[] = [];
+    const walked = new Set<string>();
+    for (let from: AgentRecord | undefined = record; from?.inherit?.mode === 'shared' && !walked.has(from.name);) {
+      walked.add(from.name);
+      const source: AgentRecord | undefined = this.registry.inspect(from.inherit.from);
+      owners.push(from.inherit.from, ...(source?.selfParticipants ?? []));
+      from = source;
+    }
+    return owners;
+  }
+
   /** Open a derived agent's context on a branch of its own (see deriveAgent). */
   private async deriveSharedContext(
     config: AgentConfig,
     inherit: NonNullable<AgentSpec['inherit']>,
     release: ManagerRelease,
-  ): Promise<{ contextManager: ContextManager; inherit: NonNullable<AgentSpec['inherit']>; namespace: string }> {
+  ): Promise<{ contextManager: ContextManager; inherit: NonNullable<AgentSpec['inherit']>; namespace: string; sourceChangeOwners: string[] }> {
     const parent = this.agents.get(inherit.from);
     if (!parent) {
       throw new Error(`Agent "${config.name}": context source "${inherit.from}" is not a registered agent`);
@@ -11711,6 +11727,7 @@ export class AgentFramework {
           : {}),
       },
       namespace: this.registry.get(inherit.from)?.namespace ?? `subagent/${config.name}`,
+      sourceChangeOwners: parent.changeOwners(),
     };
   }
 

@@ -277,7 +277,7 @@ describe("a shared child of a resident with former names", () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  it("keeps, reopened after it ends, a change its source counts as its own under a former name, as it did live", async () => {
+  it("keeps a change its source counts as its own under a former name until its own head takes its place, reopened as live", async () => {
     const changeTools = async (cm: ContextManager): Promise<string[]> =>
       (await cm.compile(undefined, undefined, { dryRun: true })).messages.flatMap((m) =>
         (m.content as Array<{ type: string; defineTools?: Array<{ name: string }> }>)
@@ -294,8 +294,10 @@ describe("a shared child of a resident with former names", () => {
     framework.start();
     membrane.script('job-1', say('job-1 done'));
     assert.equal((await framework.runEphemeralToCompletion(job.agent, job.contextManager)).speech, 'job-1 done');
-    assert.deepEqual(await changeTools(job.contextManager), ['old-tool'], 'and still at its end');
-    assert.deepEqual(await changeTools(await framework.inspectAgentContext('job-1')), ['old-tool'], 'reopened, as at its end');
+    assert.deepEqual(await changeTools(job.contextManager), [], 'and none at its end, its adoption having taken it off its branch');
+    assert.deepEqual(await changeTools(await framework.inspectAgentContext('job-1')), [], 'reopened, as at its end');
+    assert.equal(mira.getContextManager().queryMessages({ metadata: { kind: 'system-change', agent: 'mira-old' } }).messages.length, 1,
+      "while its source's own branch keeps it");
     const record = framework.getAgentRecord('mira')!;
     assert.deepEqual([record.selfParticipants, record.presentAs], [['mira-old'], 'mira-shown'], "the resident's record states its mapping");
   });

@@ -51,7 +51,10 @@
   compile under `'entries'` keeps them where it leaves out another's (a
   derived agent's view is its source's too, so it keeps its source's as
   well), and in either mode they're the rows a move of its head takes out of
-  its context (on `'head'`, once its recorded head is cleared).
+  its context (on `'head'`, once its recorded head is cleared). A move of a
+  derived agent's head under `'entries'` takes its source's out of its own
+  branch too, since from then on they declare another agent's tools and
+  system text.
 - A subconscious on another model than its resident, as the persistent
   reader or as a reader fork, declares its tools and system text on its
   head, whatever the resident's `toolDeclarations`. A reader fork on the

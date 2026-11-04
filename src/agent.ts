@@ -387,6 +387,7 @@ export class Agent {
   readonly presentAs: string;
   /** Stored participants presented as this agent's own turns: its name plus AgentConfig.selfParticipants. */
   private readonly ownParticipants: ReadonlySet<string>;
+  private sourceChangeOwners: ReadonlySet<string> = new Set();
   private readonly deniedAtDispatch: ReadonlySet<string>;
 
   private _state: AgentState = { status: 'idle' };
@@ -593,6 +594,22 @@ export class Agent {
   /** Whether a stored participant is this agent's own voice. */
   isOwnParticipant(participant: string): boolean {
     return this.ownParticipants.has(participant);
+  }
+
+  /**
+   * For an agent that continues another's context on a branch of its own:
+   * the participants whose change rows its source's view keeps as its
+   * source's own. A move of this agent's head takes those out of its context
+   * as well as its own, since from then on they declare another agent's
+   * tools and system text.
+   */
+  setSourceChangeOwners(owners: Iterable<string>): void {
+    this.sourceChangeOwners = new Set([...owners].filter((owner) => !this.ownParticipants.has(owner)));
+  }
+
+  /** The participants whose change rows this agent's view keeps as its own or its source's. */
+  changeOwners(): string[] {
+    return [...this.ownParticipants, ...this.sourceChangeOwners];
   }
 
   /**
@@ -2699,7 +2716,7 @@ export class Agent {
       return current;
     }
     if (rows.length === 0 || !this.headDeclarations.write(this.name, copyHead(current))) throw error;
-    const removed = this.removeOwnChanges(rows);
+    const removed = this.removeOwnChanges(this.movedChangeRows());
     this.onHeadEvent?.(recorded
       ? { type: 'head:moved', why: 'consolidated', changesRemoved: removed, forced: 'budget' }
       : { type: 'head:moved', why: 'adopted', changesRemoved: removed });
@@ -2718,13 +2735,13 @@ export class Agent {
   ): Promise<{ compiled: CompileResult; head: HeadDeclaration }> {
     if (dryRun) {
       const shown = compiledWith !== null && headHash(compiledWith) !== headHash(current) ? await compile(current) : compiled;
-      const own = ownSystemChanges(shown, (name) => this.ownParticipants.has(name));
+      const own = ownSystemChanges(shown, (name) => this.ownParticipants.has(name) || this.sourceChangeOwners.has(name));
       const kept = (_: unknown, index: number) => !own.has(index);
       const provenance = shown.provenance && { ...shown.provenance, messages: shown.provenance.messages.filter(kept) };
       return { compiled: { ...shown, messages: shown.messages.filter(kept), ...(provenance ? { provenance } : {}) }, head: current };
     }
     if (!this.headDeclarations.write(this.name, copyHead(current))) return { compiled, head: recorded ?? current };
-    const removed = this.removeOwnChanges();
+    const removed = this.removeOwnChanges(this.movedChangeRows());
     this.onHeadEvent?.({ type: 'head:moved', why, changesRemoved: removed, ...sizes });
     const again = removed > 0 || (compiledWith !== null && headHash(compiledWith) !== headHash(current));
     return { compiled: again ? await compile(current) : compiled, head: current };
@@ -2750,10 +2767,14 @@ export class Agent {
     return changeTokens * 5 >= inputTokens ? { changeTokens, inputTokens, forced: 'share' } : undefined;
   }
 
-  private ownChangeRows() {
-    return [...this.ownParticipants]
+  private ownChangeRows(owners: Iterable<string> = this.ownParticipants) {
+    return [...owners]
       .flatMap((agent) => this.contextManager.queryMessages({ metadata: { kind: 'system-change', agent } }).messages)
       .filter((row) => isSystemChangeMessage(row as { content: readonly ContentBlock[] }));
+  }
+
+  private movedChangeRows() {
+    return this.ownChangeRows(this.changeOwners());
   }
 
   private removeOwnChanges(rows = this.ownChangeRows()): number {
