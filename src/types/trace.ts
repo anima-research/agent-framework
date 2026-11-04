@@ -1143,9 +1143,12 @@ export type TraceEvent =
    * (`epochId`) ended without it, so it ends nothing, and no later hold
    * there (`currentEpochId`, the one in force when it was dropped, if one
    * was). `note-undelivered`: another cancel ended its hold, and delivering
-   * the note it carried failed (`error`). `noteLost`: it carried a reader's
-   * note, which is not delivered. For the all-except hold (`scope`), the
-   * channel is its excepted one.
+   * the note it carried failed (`error`), and the note's author is told so
+   * in its own context. `noteLost`: it carried a reader's note, which is not
+   * delivered; `noteAuthor`, whose note it was, the name it would have been
+   * delivered under (the persistent subconscious's, or the reader fork's
+   * that left it), where one is known. For the all-except hold (`scope`),
+   * the channel is its excepted one.
    */
   | (TraceEventBase & {
       type: 'tune-out:deferred-cancel-dropped';
@@ -1156,6 +1159,7 @@ export type TraceEvent =
       reason: 'hold-ended' | 'note-undelivered';
       currentEpochId?: string;
       noteLost: boolean;
+      noteAuthor?: string;
       error?: string;
     })
 

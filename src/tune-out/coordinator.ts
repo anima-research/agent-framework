@@ -1176,17 +1176,19 @@ export class TuneOutCoordinator {
    * with the epoch it was asked for: `hold-ended`, that epoch's hold ended
    * without it (`current`, the epoch holding there now, if one does), so it
    * ends nothing; `note-undelivered`, another cancel ended its hold and the
-   * note it carried couldn't be delivered (`error`).
+   * note it carried couldn't be delivered (`error`). A lost note's author
+   * (noteAuthorOf) is named in both.
    */
   private dropDeferred(entry: DeferredCancel, reason: 'hold-ended' | 'note-undelivered', current?: string, error?: string): void {
     const { epochId, serverId, channelId, scope } = entry.for;
     const noteLost = entry.note !== undefined;
+    const author = noteLost ? this.noteAuthorOf(entry) : undefined;
     if (reason === 'hold-ended') {
       console.error(`[tune-out] the cancel of ${entry.what}, asked for while writes were held in memory for epoch ${epochId}, is dropped: `
         + `that epoch's hold ended without it${current !== undefined ? `, and epoch ${current} holds there now, which it was not asked for` : ''}, `
         + `so it ends nothing${noteLost ? ', and the note it carried is not delivered' : ''}`);
     } else {
-      console.error(`[tune-out] the note carried by the cancel of ${entry.what}, asked for while writes were held in memory for epoch ${epochId}, `
+      console.error(`[tune-out] the note${author !== undefined ? ` ${author} left with` : ' carried by'} the cancel of ${entry.what}, asked for while writes were held in memory for epoch ${epochId}, `
         + `is lost: another cancel ended that hold, and the note could not be delivered: ${error}`);
     }
     this.hooks.emitTrace({
@@ -1195,8 +1197,62 @@ export class TuneOutCoordinator {
       reason,
       ...(current !== undefined ? { currentEpochId: current } : {}),
       noteLost,
+      ...(author !== undefined ? { noteAuthor: author } : {}),
       ...(error !== undefined ? { error } : {}),
     });
+  }
+
+  /**
+   * Whose a queued cancel's note is: the name deliverReaderNote would
+   * deliver it under, the persistent subconscious's, else the reader fork's
+   * that left it (`noteAuthor`). Undefined where neither is known.
+   */
+  private noteAuthorOf(entry: DeferredCancel): string | undefined {
+    return this.hooks.subconsciousName() ?? entry.noteAuthor;
+  }
+
+  /**
+   * The author of a queued cancel's note (noteAuthorOf), told in its own
+   * context that the note was not delivered and why (`why`): its cancel was
+   * answered as waiting, so nothing else tells it. A host-framed notice, as
+   * the coordinator's other notices to a reader are. It asks for no turn of
+   * its own: where the cancel that ended the hold isn't the subconscious's,
+   * the subconscious is given one after this (its cancel notice); its own
+   * cancel is made in a turn of its, which takes the notice at its next
+   * point; and a reader fork still alive is in its run, which takes it so
+   * too. A fork that has ended is no agent the framework writes to any
+   * more: the framework drops the notice with its log line, as it does any
+   * write for an agent that has ended, and the trace (dropDeferred) still
+   * names the fork. A notice that can't be written, or an author not known,
+   * is logged, and the cancel that ended the hold goes on.
+   */
+  private tellNoteLost(entry: DeferredCancel, why: string): void {
+    let author: string | undefined;
+    try {
+      author = this.noteAuthorOf(entry);
+      if (author === undefined) {
+        console.error(`[tune-out] the note carried by the cancel of ${entry.what} is lost, and no author of it is known here, so none is told`);
+        return;
+      }
+      const { serverId, channelId, epochId, scope } = entry.for;
+      const hold = scope === 'all-except'
+        ? `the all-except hold (all channels except ${this.shown(serverId, channelId)})`
+        : this.shown(serverId, channelId);
+      const resident = this.hooks.primaryName();
+      const reason = suppliedValue(why);
+      // A thrown error's words may end without a stop.
+      const text = `[${NOTICE_TAG.tuneOut}: the note you left with your cancel of ${hold} was not delivered to `
+        + `${resident ? suppliedValue(resident) : 'the resident'}. Another cancel ended that ${scope ? 'hold' : 'tune-out'} `
+        + `while yours waited, and delivering the note then failed: ${reason}${/[.!?]$/.test(reason) ? '' : '.'}]`;
+      this.hooks.addMessage(
+        'user',
+        [{ type: 'text', text }],
+        { system: true, kind: 'tune-out-note-undelivered', channelId, epochId, ...(scope ? { scope } : {}) },
+        author,
+      );
+    } catch (err) {
+      console.error(`[tune-out] ${author ?? 'the author'} could not be told that the note it left with the cancel of ${entry.what} was not delivered: ${thrownReason(err)}`);
+    }
   }
 
   /**
@@ -1247,8 +1303,9 @@ export class TuneOutCoordinator {
   /**
    * The note a queued cancel carries (takeDeferred), delivered when another
    * cancel ends its hold, as that cancel's own release would have delivered
-   * it (deliverReaderNote); one that can't be is told lost (dropDeferred),
-   * with the reason, and the cancel that ended the hold goes on. Answers
+   * it (deliverReaderNote); one that can't be is told lost, with the reason,
+   * on stderr and as a trace (dropDeferred) and to its author
+   * (tellNoteLost), and the cancel that ended the hold goes on. Answers
    * whether it was delivered.
    */
   private deliverQueuedNote(
@@ -1260,11 +1317,15 @@ export class TuneOutCoordinator {
     try {
       delivered = this.deliverReaderNote(entry.note, entry.noteAuthor, metadata);
     } catch (err) {
-      this.dropDeferred(entry, 'note-undelivered', undefined, thrownReason(err));
+      const why = thrownReason(err);
+      this.dropDeferred(entry, 'note-undelivered', undefined, why);
+      this.tellNoteLost(entry, why);
       return false;
     }
     if (!delivered) {
-      this.dropDeferred(entry, 'note-undelivered', undefined, 'there is no subconscious here, and no delivery of a reader fork\'s note for its author');
+      const why = 'there is no subconscious here, and no delivery of a reader fork\'s note for its author';
+      this.dropDeferred(entry, 'note-undelivered', undefined, why);
+      this.tellNoteLost(entry, why);
     }
     return delivered;
   }
