@@ -380,8 +380,29 @@ export interface AgentConfig {
    * - 'disabled': generated prose is never published. Only explicit tools may
    *   send externally; prose remains in Chronicle, and a turn that wrote plain
    *   speech ends with a private `[delivered] plain speech → no channel` receipt.
+   * - 'locked': unprefixed prose goes to one destination the agent chose, on
+   *   every turn, and nothing moves it automatically: not the channel that
+   *   woke the turn, not an addressed message, a heartbeat or channel_open.
+   *   Only the `prose_locus` tool moves it, to a channel or to drafts (held,
+   *   never posted unless the agent resends them). The choice persists
+   *   across turns and restarts. Until the agent first makes one,
+   *   `proseLock` is the destination. It governs routing through the channel
+   *   registry: a module that handles final speech itself (`onAgentSpeech`,
+   *   such as the in-process Discord module) receives it in every mode, this
+   *   one included. See docs/locked-prose-routing.md.
    */
-  proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled';
+  proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled' | 'locked';
+
+  /**
+   * Locked mode's destination until the agent chooses one with `prose_locus`:
+   * `"#channel"`, `"@person"`, a channel id, or `"drafts"`. Resolved as a
+   * `>>` target is, at each turn's start, so a channel its server hasn't
+   * registered yet resolves once it has; until it resolves, plain speech is
+   * held as drafts. Left out, plain speech is held as drafts until the agent
+   * chooses. The agent's own choice, once made, takes its place. Ignored in
+   * the other modes.
+   */
+  proseLock?: string;
 
   /**
    * Stored participants that are this agent's own voice, in addition to its

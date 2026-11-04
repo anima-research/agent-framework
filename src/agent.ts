@@ -312,7 +312,9 @@ export class Agent {
   readonly refusalHandling: AgentConfig['refusalHandling'];
   readonly toolResultGuard: ToolResultGuard;
   /** Prose delivery mode (see AgentConfig.proseRouting). Default 'locus'. */
-  readonly proseRouting: 'locus' | 'explicit' | 'hybrid' | 'disabled';
+  readonly proseRouting: 'locus' | 'explicit' | 'hybrid' | 'disabled' | 'locked';
+  /** Locked mode's destination until the agent chooses one (see AgentConfig.proseLock). */
+  readonly proseLock: string | undefined;
   /** Exact whole-response known-tool wrapper containment (default off). */
   readonly toolWrapperProseGuard: boolean;
   /** Continuation after a turn the model ends itself (see
@@ -460,6 +462,7 @@ export class Agent {
     this.refusalHandling = config.refusalHandling;
     this.toolResultGuard = new ToolResultGuard(config.name, contextManager, config.toolResultGuard === true);
     this.proseRouting = config.proseRouting ?? 'locus';
+    this.proseLock = typeof config.proseLock === 'string' && config.proseLock.trim() ? config.proseLock.trim() : undefined;
     this.toolWrapperProseGuard = config.toolWrapperProseGuard === true;
     this.autoContinue = resolveAutoContinue(config);
     this.clock = resolveClockConfig(config.name, config.clock);

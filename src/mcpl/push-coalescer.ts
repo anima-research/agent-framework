@@ -98,6 +98,20 @@ export interface CoalescedOccurrence<E = unknown> {
   identity?: { messageId?: string; author?: { id: string; name: string }; threadId?: string };
   /** The event the ordinary path would have queued — the host delivers it. */
   event: E;
+  /**
+   * The suppress rule that took this occurrence, or null when none did, once
+   * the host has decided (its wake, or its row, whichever came first). Decided
+   * once for the occurrence, since a rule's script answers once per event:
+   * its row and any later wake read this. Snapshots carry it.
+   */
+  suppressionDecision?: string | null;
+  /**
+   * Set on a batch's latest occurrence when the batch holds an occurrence
+   * addressed to the agent (`chat:addressed`), this one or an earlier one. An
+   * addressed event is never suppressed, so such a batch is shown, whatever its
+   * latest occurrence would be decided. Snapshots carry it.
+   */
+  batchAddressed?: true;
   /** Set by the coalescer: deliver into this agent only (§3.2 audience may
    *  narrow, never widen — a replacement or notice follows the prior delivery). */
   deliverTo?: string;
@@ -293,6 +307,21 @@ export interface CoalescingReceiptRecord {
   batch: { latest: CoalescedOccurrence<unknown>; notices: DeferredNotice[]; dropped: number } | null;
 }
 
+export type CoalescingAudit = { subject: string; eventId: string } & (
+  | { kind: 'received'; retract: boolean; deferred: boolean }
+  | { kind: 'removed' }
+  | { kind: 'remove-failed' }
+  | { kind: 'revoked' }
+  | { kind: 'displaced'; batch?: true }
+  | { kind: 'render-cancelled'; reason?: 'suspend' }
+  | { kind: 'recovery-wake'; attempt: number; delayMs: number }
+  | { kind: 'rendered'; source: 'render' | 'fallback'; empty: boolean }
+  | { kind: 'render-failed'; serverId: string; field?: string; error: string }
+  | { kind: 'late-render'; discarded: true }
+  | { kind: 'persist-failed'; error: string }
+  | { kind: 'accepted-observer-failed'; error: string }
+);
+
 export interface CoalescerHost<E> {
   /** True iff the placement still exists and, as far as the host can tell,
    *  no model request has included it. */
@@ -326,7 +355,7 @@ export interface CoalescerHost<E> {
   /** Agents that read this occurrence's delivery target (may spawn a fork). */
   audience(occurrence: CoalescedOccurrence<E>): Promise<string[]>;
   render(occurrence: CoalescedOccurrence<E>, params: PushRenderParams): Promise<PushRenderResult>;
-  audit(record: Record<string, unknown>): void;
+  audit(record: CoalescingAudit): void;
   /** Persist (throttled by the host); the thunk builds the snapshot lazily. */
   save(snapshot: () => CoalescingSnapshot): void;
   /** Persist the snapshot NOW (a render is about to start: that boundary must
@@ -937,6 +966,7 @@ export class PushCoalescer<E = unknown> {
       // Later notices stay in the batch's audience.
       occurrence = { ...occurrence, deliverTo: state.batch.latest.deliverTo };
     }
+    if (occurrence.tags?.includes('chat:addressed') || state.batch?.latest.batchAddressed) occurrence = { ...occurrence, batchAddressed: true };
     const notice: DeferredNotice = { eventId: occurrence.eventId, timestamp: occurrence.timestamp, ...(occurrence.data !== undefined ? { data: structuredClone(occurrence.data) } : {}) };
     if (state.batch) {
       state.batch.notices.push(notice);
@@ -1003,10 +1033,15 @@ export class PushCoalescer<E = unknown> {
    * A batch that opened while another render ran is rendered once that
    * render settles. Resolves whether it materialized.
    */
-  async materializeNow(agentName: string, subject: string): Promise<boolean> {
+  async materializeNow(agentName: string, subject: string, onlyIfLatest?: string): Promise<boolean> {
     for (;;) {
       if (this.suspended) return false;
-      const started = await this.locked(() => this.freeze(subject, agentName));
+      // `onlyIfLatest`: a newer occurrence took the batch over while this
+      // waited for the lock, and its own decision and wake are the batch's.
+      const started = await this.locked(() => {
+        if (onlyIfLatest !== undefined && this.subjects.get(subject)?.batch?.latest.eventId !== onlyIfLatest) return Promise.resolve(undefined);
+        return this.freeze(subject, agentName);
+      });
       if (!started || started === 'declined') return false;
       await started.done;
       this.persist();
