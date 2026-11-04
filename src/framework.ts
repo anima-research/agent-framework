@@ -20581,6 +20581,9 @@ export class AgentFramework {
         }
         const recovery = this.providerAccelerationRecoveries.get(agentName);
         if (recovery) recovery.releasedAt = now;
+        // A start a budget hold released and this hold kept waited on the
+        // provider, as at the hold's own release (noteProviderTookRelease).
+        this.noteProviderTookRelease(agentName, providerCooldown.heldRequests);
         requests = [...providerCooldown.heldRequests, ...requests];
       }
       // A start that came back before it took its

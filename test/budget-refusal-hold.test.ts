@@ -880,6 +880,59 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
+  it("tells it the same where the scheduler lets a provider hold's kept start go itself, the hold's time having passed before its timer fired", async () => {
+    await withBacklog({ stalled: true }, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      const registry: Record<string, unknown> = {
+        resolveLocus: () => ({ serverId: 'stub', channelId: 'discord:guild:chanA' }),
+        routeSpeech: async (_agent: string, _text: string, locus?: { serverId: string; channelId: string } | null) =>
+          (locus ? { delivered: true, serverId: locus.serverId, channelId: locus.channelId } : null),
+        getDefaultPublishChannel: () => null,
+        isChannelOpen: () => true,
+        getDescriptor: () => undefined,
+        getChannelTools: () => [],
+        channelsNamed: (name: string) => [{ serverId: 'stub', channelId: name }],
+        nameShown: (channel: { channelId: string }) => channel.channelId,
+      };
+      (t.framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(registry, {
+        get: (target, prop: string) => (prop in target ? target[prop] : () => undefined),
+      });
+      const i = t.framework as unknown as {
+        pendingRequests: Array<Record<string | symbol, unknown>>;
+        providerAccelerationCooldowns: Map<string, { until: number; heldRequests: unknown[] }>;
+      };
+      // A provider hold whose timer will not fire in the test, as one delivered late.
+      const timer = setTimeout(() => {}, 60_000);
+      timer.unref?.();
+      try {
+        t.send('Are you there?', { channelId: 'discord:guild:chanA' });
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        i.providerAccelerationCooldowns.set('prime', {
+          startedAt: Date.now(), until: Date.now() + 60_000, timer, heldRequests: [], reason: 'zz-provider', failures: 0,
+        } as never);
+        backlog.fit = true;
+        assert.ok(await pollUntil(() => t.of('inference:hold_ended').length === 1, 5_000), 'the budget hold releases the turn');
+        assert.ok(await pollUntil(() => (i.providerAccelerationCooldowns.get('prime')?.heldRequests.length ?? 0) >= 1, 2_000),
+          'premise: the provider hold keeps the released start');
+        t.send('hey, over here?', { channelId: 'discord:dm:antra', tags: ['chat:addressed'] });
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        assert.equal(turnCalls(t.membrane).length, 0, 'premise: nothing ran while the provider hold kept the start');
+        i.providerAccelerationCooldowns.get('prime')!.until = Date.now() - 1;
+        i.pendingRequests.push({ agentName: 'prime', reason: 'zz-wake', source: 'zz-server', timestamp: Date.now() });
+        assert.ok(await pollUntil(() => turnCalls(t.membrane).length === 1, 5_000), 'the scheduler lets the start go, and it runs');
+        assert.equal(i.providerAccelerationCooldowns.has('prime'), false, 'premise: the scheduler dropped the provider hold itself');
+        const notices = stored(t.framework).filter((m) => m.metadata.kind === 'routing-notice').map((m) => m.text);
+        const notice = notices.find((text) => text.includes('addressed you from discord:dm:antra'));
+        assert.ok(notice, `the start announces the arrival: ${JSON.stringify(notices)}`);
+        assert.ok(notice!.includes('provider hold'), `and says what the turn waited on last: ${notice}`);
+        assert.ok(!notice!.includes('waited for compression'), notice);
+      } finally {
+        clearTimeout(timer);
+        await t.close();
+      }
+    });
+  });
+
   it('marks a budget release taken by a provider hold only where that hold lets go a start the release pushed', async () => {
     await withBacklog({ stalled: true }, async () => {
       const t = await residentTurn({ maintenanceIntervalMs: 50 });
