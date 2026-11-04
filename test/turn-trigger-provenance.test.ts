@@ -13,7 +13,9 @@ import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
 import type { InferenceRequest } from '../src/index.js';
 import { MembraneError } from '@animalabs/membrane';
-import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+import type { NormalizedRequest, YieldingStream } from '@animalabs/membrane';
+import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 
 function internals(framework: AgentFramework) {
   return framework as unknown as {
@@ -166,6 +168,57 @@ describe('Turn trigger provenance', () => {
     await framework.runUntilIdle();
     assert.ok(captured.exposed, 'the turn started at resume');
     assert.deepEqual(captured.exposed.wakeChannels, [room, general]);
+    await framework.stop();
+  });
+
+  it("a context-budget restart of a batch's turn carries the batch's channels", async () => {
+    // One queued response per stream: the restart opens a second stream.
+    class SequentialStreamMembrane extends MockMembrane {
+      private streamIdx = 0;
+      streamYielding(request: NormalizedRequest, _options?: unknown): YieldingStream {
+        this.calls.push(request);
+        const stream = new MockYieldingStream(this.responses.slice(this.streamIdx, ++this.streamIdx));
+        this.lastStream = stream;
+        return stream;
+      }
+    }
+    class EchoModule implements Module {
+      readonly name = 'test';
+      async start(_ctx: ModuleContext): Promise<void> {}
+      async stop(): Promise<void> {}
+      getTools(): ToolDefinition[] {
+        return [{ name: 'echo', description: 'Echo input', inputSchema: { type: 'object', properties: {} } }];
+      }
+      async handleToolCall(_call: ToolCall): Promise<ToolResult> { return { success: true, data: 'ok' }; }
+      async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> { return {}; }
+    }
+    const sequential = new SequentialStreamMembrane();
+    // The tool round's usage (10 input tokens) is over the budget below.
+    sequential.pushResponse(createMockResponse([
+      { type: 'text', text: 'Working.' },
+      { type: 'tool_use', id: 'call_1', name: 'test--echo', input: {} },
+    ], 'tool_use'));
+    sequential.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'budget.chronicle'),
+      membrane: sequential.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', maxStreamTokens: 5 }],
+      modules: [new EchoModule()],
+    });
+    const i = internals(framework);
+    const triggers: InferenceRequest[] = [];
+    const orig = i.startAgentStream.bind(framework);
+    i.startAgentStream = async (agent: unknown, trigger?: InferenceRequest) => {
+      if (trigger) triggers.push(trigger);
+      return orig(agent, trigger);
+    };
+    const room = { serverId: 'discord', channelId: 'discord:g:room' };
+    i.pendingRequests.push({ agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), wakeChannels: [room] });
+    await i.processInferenceRequests();
+    await framework.runUntilIdle();
+    const restart = triggers.find((r) => r.reason === 'context_budget_restart');
+    assert.ok(restart, `premise: the turn restarts on its budget: ${JSON.stringify(triggers.map((r) => r.reason))}`);
+    assert.deepEqual(restart.wakeChannels, [room]);
     await framework.stop();
   });
 

@@ -1118,7 +1118,14 @@ for (const how of ['parked', 'held again'] as const) test(`a wake merged into a 
   });
 });
 
-test("a gate wake the hold folds into a held merged start keeps its batch's channels when the start is released", async (t) => {
+const identityKeys = ['agentName', 'reason', 'source', 'timestamp', 'channelId', 'channelServerId', 'coalescingSubject',
+  'coalescingBatchSubjects', 'readsDeferredWrite', 'readsStoredMessage', 'wakeLines'];
+
+function routingChannels(internal: unknown): string {
+  return JSON.stringify((internal as { turnRouting: Map<string, { wakeChannels?: unknown }> }).turnRouting.get('resident')?.wakeChannels ?? []);
+}
+
+test("a gate wake the hold folds into a held turn's merged retry names its batch's channels to the turn when the retry is released", async (t) => {
   await withStoreDir(async (path) => {
     const clock = holdClock(t);
     const wait = 400;
@@ -1130,19 +1137,58 @@ test("a gate wake the hold folds into a held merged start keeps its batch's chan
       const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
       const start = held[0] as unknown as Record<string, unknown>;
       const wake: Record<string, unknown> = { wakeChannels: [{ serverId: 'discord', channelId: 'discord:g:folded' }] };
-      for (const key of ['agentName', 'reason', 'source', 'timestamp', 'channelId', 'channelServerId', 'coalescingSubject',
-        'coalescingBatchSubjects', 'readsDeferredWrite', 'readsStoredMessage', 'wakeLines']) {
-        if (start[key] !== undefined) wake[key] = start[key];
-      }
+      for (const key of identityKeys) if (start[key] !== undefined) wake[key] = start[key];
       (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, wake);
       assert.equal(held.length, 1, 'premise: the hold folds the equal wake into the merged start');
-      const started: Array<{ wakeChannels?: unknown }> = [];
-      const startStream = internal.startAgentStream.bind(internal);
-      internal.startAgentStream = (agent, trigger) => { started.push(trigger as { wakeChannels?: unknown }); return startStream(agent, trigger); };
       go();
       await waitFor(fw, () => membrane.primary >= 3, 'the released start, sent');
-      assert.ok(started.some((s) => JSON.stringify(s.wakeChannels ?? []).includes('discord:g:folded')),
-        `the folded wake's channel: ${JSON.stringify(started.map((s) => s.wakeChannels))}`);
+      assert.ok(routingChannels(internal).includes('discord:g:folded'), `the folded wake's channel: ${routingChannels(internal)}`);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a held gate wake that an equal merged start folds into names its batch's channels to the turn when the start is released", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again');
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
+      const start = held.splice(0, 1)[0] as unknown as Record<string, unknown>;
+      const wake: Record<string, unknown> = { wakeChannels: [{ serverId: 'discord', channelId: 'discord:g:held-first' }] };
+      for (const key of identityKeys) if (start[key] !== undefined) wake[key] = start[key];
+      held.push(wake as unknown as Request);
+      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, start);
+      assert.equal(held.length, 1, 'premise: the hold folds the merged start into the held wake');
+      assert.equal(held[0], wake, 'premise: the held wake is the one kept');
+      go();
+      await waitFor(fw, () => membrane.primary >= 3, 'the released start, sent');
+      assert.ok(routingChannels(internal).includes('discord:g:held-first'), `the held wake's channel: ${routingChannels(internal)}`);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a wake folded into a held merged start that equals one of its wakes counts once", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set([2]), (request) => rateLimited(wait, request));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const go = await mergedStartWaiting(fw, internal, membrane, clock, wait, 'held again');
+      const before = fw.getHostModeStatus().gatedRequests;
+      const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
+      const start = held[0] as unknown as Record<string, unknown>;
+      const wake: Record<string, unknown> = { wakeChannels: [{ serverId: 'discord', channelId: 'discord:g:again' }] };
+      for (const key of identityKeys) if (start[key] !== undefined) wake[key] = start[key];
+      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, wake);
+      assert.equal(held.length, 1, 'premise: the hold folds the equal wake into the merged start');
+      assert.equal(fw.getHostModeStatus().gatedRequests, before, 'the wake it equals already counts');
+      go();
     } finally { await fw.stop(); log.restore(); }
   });
 });

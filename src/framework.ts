@@ -3663,9 +3663,9 @@ function mergeWakeLines(requests: readonly InferenceRequest[]): WakeLine[] | und
   return byEntry.size > 0 ? [...byEntry.values()] : undefined;
 }
 
-function wakeChannelsOf(requests: readonly InferenceRequest[]): ChannelRef[] | undefined {
+function wakeChannelsOf(requests: readonly ({ wakeChannels?: ChannelRef[] } | undefined)[]): ChannelRef[] | undefined {
   const channels: ChannelRef[] = [];
-  for (const channel of requests.flatMap((r) => r.wakeChannels ?? [])) {
+  for (const channel of requests.flatMap((r) => r?.wakeChannels ?? [])) {
     if (!channels.some((c) => sameChannel(c, channel))) channels.push(channel);
   }
   return channels.length > 0 ? channels : undefined;
@@ -6653,11 +6653,17 @@ export class AgentFramework {
     }
     if (isTurnRetry(request)) (same as MarkedRequest)[TURN_RETRY] = true;
     // A merged start's batch (MERGED_BATCH) stays recorded on the request
-    // kept in its place, which then stands for it, as the start did; a wake
-    // folded into a merged start joins its batch, which its release expands.
-    const batch = mergedBatch(request);
+    // kept in its place, which then stands for it, as the start did. What
+    // folds into a merged start, or a held wake that a merged start folds
+    // into, goes into the batch by this same fold, so the release expands
+    // to each wake once.
     const into = mergedBatch(same);
-    if (batch || into) (same as MarkedRequest)[MERGED_BATCH] = [...new Set([...(into ?? []), ...(batch ?? [request])])];
+    const batch = mergedBatch(request);
+    if (into || batch) {
+      const members = [...(into ?? [{ ...same }])];
+      for (const member of batch ?? [request]) this.holdRequest(members, member);
+      (same as MarkedRequest)[MERGED_BATCH] = members;
+    }
     const channels = wakeChannelsOf([same, request]);
     if (channels) same.wakeChannels = channels;
   }
@@ -17205,6 +17211,7 @@ export class AgentFramework {
               timestamp: Date.now(),
               suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
               silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
+              ...this.wakeChannelsMark(this.turnRouting.get(agent.name)),
             }, currentState.stream ? this.streamCarries.get(currentState.stream)?.() : undefined);
             this.pendingRequests.push(continuation);
             // Context budget exceeded: break the stream, let compile() compress.
@@ -17315,6 +17322,7 @@ export class AgentFramework {
               timestamp: Date.now(),
               suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
               silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
+              ...this.wakeChannelsMark(this.turnRouting.get(agent.name)),
             });
           }
         }
@@ -24771,6 +24779,11 @@ export class AgentFramework {
     // no longer holds are still on disk goes in before this start's compile.
     this.noticeHeadMoves(agent);
 
+    // At every start: a wake that joins a held turn's retry adds its batch's
+    // channels to the turn's, though the turn's locus stays as it opened.
+    const wakeChannels = wakeChannelsOf([routing, trigger]);
+    if (wakeChannels) routing.wakeChannels = wakeChannels;
+
     if (opensTurn) {
       // The turn's trigger channel (item-3 redux): the channel of a
       // channel/DM-triggered turn, with its server, and none for a
@@ -24795,8 +24808,6 @@ export class AgentFramework {
       // speech is held as a draft (TurnRouting.heartbeat).
       if (isHeartbeatWake(trigger)) routing.heartbeat = true;
       else delete routing.heartbeat;
-      if (trigger?.wakeChannels) routing.wakeChannels = trigger.wakeChannels;
-      else delete routing.wakeChannels;
       // Resolve the turn's outbound locus now: the home channel for forks,
       // else the trigger channel, else the global default, which an
       // ephemeral run never takes (takesGlobalFallback). Ambient mid-turn
