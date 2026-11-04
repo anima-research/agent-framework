@@ -605,7 +605,7 @@ export class ReplyJudge {
       built = await this.build(request, Date.now(), MIN_CHARS_PER_TOKEN);
       if (request.signal.aborted) throw new Error('the judge was stopped before its request');
       console.error(
-        `[gate] the reply judge's request of ${refused.chars} characters, built at ${refused.ratio.toFixed(2)} characters a token, `
+        `[gate] the reply judge's request on rule ${JSON.stringify(request.policyName)}'s batch, for ${built.agentName}, of ${refused.chars} characters, built at ${refused.ratio.toFixed(2)} characters a token, `
         + `was refused as too long, so the batch is asked once more at ${MIN_CHARS_PER_TOKEN} character a token`,
       );
       response = await this.ask(built, request.signal);

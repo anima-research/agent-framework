@@ -2229,6 +2229,7 @@ export class EventGate {
    *  whose provider can't serve the judge's model fails every time, which
    *  gate_status says once it's a streak (judgeFailingNotice). */
   private judgeFailStreak = 0;
+  private judgeStreakRefused = false;
   private judgeLastFailure = '';
   private judgeRefusal: { hold: string; until?: number; noTimeLeft?: true } | null = null;
   private judgeRefusalTimer: ReturnType<typeof setTimeout> | null = null;
@@ -4504,6 +4505,7 @@ export class EventGate {
       this.judgeLastFailure = cutToFit(suppliedValue(reason), 200);
     } else {
       this.judgeFailStreak = 0;
+      this.judgeStreakRefused = false;
     }
     const newest = !failed && state.ask > this.judgeNewestOutcome;
     if (newest) this.judgeNewestOutcome = state.ask;
@@ -4539,6 +4541,7 @@ export class EventGate {
   }
 
   private refusedJudging(policyName: string, state: JudgingState, err: unknown, durationMs: number): void {
+    if (this.judgeFailStreak > 0) this.judgeStreakRefused = true;
     const hold = cutToFit(suppliedValue(errorText(err)), 300);
     const stated = (err as { retryAfterMs?: unknown }).retryAfterMs;
     const now = this.now();
@@ -4640,7 +4643,7 @@ export class EventGate {
     } catch (err) {
       const one = events.length === 1;
       console.error(
-        `[gate] a judged batch of ${events.length} ${one ? 'event' : 'events'} couldn't be delivered `
+        `[gate] a judge rule's batch of ${events.length} ${one ? 'event' : 'events'} couldn't be delivered `
         + `(${errorText(err)}), so the batch is dropped`,
       );
     }
@@ -5202,7 +5205,7 @@ export class EventGate {
   /** gate_status's word on a judge that keeps failing (JUDGE_FAILING_STREAK in a row). */
   private judgeFailingNotice(): string | null {
     if (this.judgeFailStreak < JUDGE_FAILING_STREAK) return null;
-    return `the reply judge has failed its last ${this.judgeFailStreak} requests (the newest: ${this.judgeLastFailure}), `
+    return `the reply judge has failed its last ${this.judgeFailStreak} requests${this.judgeStreakRefused ? ', refusals aside' : ''} (the newest: ${this.judgeLastFailure}), `
       + (this.judgeOnError === 'wake'
         ? 'so judge rules wake the agent as debounces of the same quiet period would'
         : "so judge rules' batches don't wake the agent")
