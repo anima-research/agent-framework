@@ -22,7 +22,7 @@ function internals(framework: AgentFramework) {
     pendingRequests: InferenceRequest[];
     processInferenceRequests(): Promise<void>;
     startAgentStream(agent: unknown, trigger?: InferenceRequest): Promise<void>;
-    routingOf(agentName: string): { wakeChannels?: Array<{ serverId: string; channelId: string }>; triggerChannel?: unknown };
+    routingOf(agentName: string): { wakeChannels?: Array<{ serverId: string; channelId: string }>; triggerChannel?: unknown; noChannel?: true };
     openLogical: Map<string, unknown>;
     cameFrom(routing: unknown, locus: null): { cameFrom: Array<{ channel: unknown }> } | undefined;
   };
@@ -172,6 +172,23 @@ describe('Turn trigger provenance', () => {
     assert.equal(routing.triggerChannel, undefined, 'premise: the start continued the open turn, which takes no channel from it');
     assert.deepEqual(routing.wakeChannels, [general, room]);
     assert.deepEqual(i.cameFrom(routing, null)?.cameFrom.map((c) => c.channel), [general, room]);
+    await framework.stop();
+  });
+
+  it("a start that continues a turn whose wake named a channel this host couldn't resolve names no channel it came from, though a batch's wake joined it", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi' }]));
+    const framework = await makeFramework();
+    const i = internals(framework);
+    const room = { serverId: 'discord', channelId: 'discord:g:room' };
+    const routing = i.routingOf('scout');
+    routing.noChannel = true;
+    i.openLogical.set('scout', routing);
+    i.pendingRequests.push({ agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), wakeChannels: [room] });
+    await i.processInferenceRequests();
+    await framework.runUntilIdle();
+    assert.deepEqual(routing.wakeChannels, [room], "premise: the batch's wake joined the turn's start");
+    assert.equal(routing.noChannel, true, 'premise: the turn still has no channel');
+    assert.equal(i.cameFrom(routing, null), undefined);
     await framework.stop();
   });
 
