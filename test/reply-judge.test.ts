@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { MembraneError } from '@animalabs/membrane';
 import type { Membrane, NormalizedMessage, NormalizedRequest } from '@animalabs/membrane';
-import { ReplyJudge, cut, failedTurnLine, ifYouWait, judgeQuestion, parseVerdict, renderMessage } from '../src/gate/reply-judge.js';
+import { ReplyJudge, cut, failedTurnLine, ifYouWait, judgeQuestion, judgeSystemPrompt, parseVerdict, renderMessage } from '../src/gate/reply-judge.js';
 import type { JudgeRequest } from '../src/gate/types.js';
 import { oneLine } from '../src/supplied-text.js';
 
@@ -517,6 +517,12 @@ describe('reply judge: the document', () => {
       assert.ok(!text.includes("isn't woken until a new event arrives"), text);
       assert.ok(text.includes('Beside that wake, nothing the host knows of is scheduled to wake Scout'), text);
     }
+  });
+
+  it("tells the judge the agent sees events it lets go by when something next wakes it, not that they stay in its context", () => {
+    const prompt = judgeSystemPrompt('Scout');
+    assert.ok(prompt.includes("letting the events go by means it won't act on them until something else wakes it (it will see them then)."), prompt);
+    assert.ok(!prompt.includes('stay in its context'), prompt);
   });
 
   it("says a wake of the agent's is queued, or held until its hold ends or an operator releases it, when one is", () => {
