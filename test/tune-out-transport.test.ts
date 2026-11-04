@@ -1474,14 +1474,18 @@ async function tunedOutStore(t: { after(fn: () => Promise<void>): void }, divert
 const endedLine = `"${CHANNEL}" on the "disc" server was tuned out, and nothing on this host watches or cancels tune-outs, so ` +
   'the tune-out ends here and the channel is decided open again.';
 
-test('a tune-out on record at a start with no subconscious ends there, its channel decided open again, and the log names it and the messages it diverted', async (t) => {
+test('a tune-out on record at a start with no subconscious ends there, its channel decided open again, and its backlog goes to the resident', async (t) => {
   const store = await tunedOutStore(t, 2);
   const second = await store.start(false, true);
   const registry = (second as unknown as RestartInternals).channelRegistry;
   assert.equal(registry.getDesiredState('disc', CHANNEL), 'open', 'decided open again, as a cancel leaves it');
   assert.equal(registry.getTuneOutState('disc', CHANNEL), null);
-  assert.ok(store.logged.includes(`[tune-out] ${endedLine} The 2 messages it diverted stay here, and nothing will deliver them ` +
-    'as its backlog.'), store.logged.join('\n'));
+  const released = second.getAgent('scout')!.getContextManager().getAllMessages()
+    .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'tune-out-cancel');
+  assert.equal(released.length, 1, 'one release');
+  assert.match(JSON.stringify(released[0]!.content), /messages=2/, 'both diverted messages in its backlog');
+  assert.match(JSON.stringify(released[0]!.content), /no reader is configured/);
+  assert.ok(!store.logged.some((l) => l.includes('nothing will deliver')), store.logged.join('\n'));
 });
 
 // Ported for #291: the diverted write is stored at once, where this test
@@ -1523,8 +1527,8 @@ test('a tune-out on record when a start without servers connects one later ends 
   assert.deepEqual(unleased.data, { refusal: 'explicit-open', channelId: CHANNEL, serverId: 'disc' });
 });
 
-test('a tune-out whose ending fails at a start with no subconscious stays recorded, and the log says so', async (t) => {
-  const store = await tunedOutStore(t, 0);
+test('a tune-out whose release fails at a start with no subconscious stays recorded for the next start, and the log says so', async (t) => {
+  const store = await tunedOutStore(t, 1);
   const cancel = ChannelRegistry.prototype.cancelTuneOut;
   ChannelRegistry.prototype.cancelTuneOut = () => { throw new Error('the store refused the write'); };
   let second: AgentFramework;
@@ -1534,10 +1538,37 @@ test('a tune-out whose ending fails at a start with no subconscious stays record
     ChannelRegistry.prototype.cancelTuneOut = cancel;
   }
   const registry = (second as unknown as RestartInternals).channelRegistry;
-  assert.equal(registry.getDesiredState('disc', CHANNEL), 'tuned-out');
-  assert.ok(store.logged.includes(`[tune-out] "${CHANNEL}" on the "disc" server is tuned out, and nothing on this host ` +
-    'watches or cancels tune-outs, but ending this one failed, so it stays recorded until a start that can end it: the ' +
-    'store refused the write.'), store.logged.join('\n'));
+  assert.equal(registry.getDesiredState('disc', CHANNEL), 'tuned-out', 'still recorded: the next start releases it');
+  assert.ok(store.logged.some((l) => l.includes('could not be released (no reader is configured), so it stays on record')
+    && l.includes('the store refused the write')), store.logged.join('\n'));
+  // The next start, whose writes go through, releases it.
+  await second!.stop();
+  const third = await store.start(false, true);
+  const thirdRegistry = (third as unknown as RestartInternals).channelRegistry;
+  assert.equal(thirdRegistry.getTuneOutState('disc', CHANNEL), null, 'released at the next start');
+  assert.equal(thirdRegistry.getDesiredState('disc', CHANNEL), 'open');
+  const released = third.getAgent('scout')!.getContextManager().getAllMessages()
+    .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'tune-out-cancel');
+  // The failed start's dump was made durable before its record write failed;
+  // the next start ends the hold and writes no second notice (nothing new
+  // was held), so there is one release in all, with the held message in it.
+  assert.equal(released.length, 1, 'one release across both starts, no empty second notice');
+  assert.match(JSON.stringify(released[0]!.content), /no reader is configured/);
+  assert.match(JSON.stringify(released[0]!.content), /backlog 1/, 'the held message is in it');
+});
+
+test('a tune-out on record when a start with no subconscious and no servers connects one later is released then, backlog delivered', async (t) => {
+  const store = await tunedOutStore(t, 2);
+  const second = await store.start(false, false);
+  await store.capture(() => second.connectMcplServer(store.server));
+  const registry = (second as unknown as RestartInternals).channelRegistry;
+  assert.equal(registry.getTuneOutState('disc', CHANNEL), null, 'released at the connect');
+  assert.equal(registry.getDesiredState('disc', CHANNEL), 'open');
+  const released = second.getAgent('scout')!.getContextManager().getAllMessages()
+    .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'tune-out-cancel');
+  assert.equal(released.length, 1);
+  assert.match(JSON.stringify(released[0]!.content), /messages=2/);
+  assert.match(JSON.stringify(released[0]!.content), /no reader is configured/);
 });
 
 test('a decline of a tuned-out channel whose transport isn\'t open is refused, and the backlog survives to the cancel', async (t) => {
