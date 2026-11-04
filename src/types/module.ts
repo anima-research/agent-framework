@@ -224,7 +224,10 @@ export interface Module {
    * long for each; only the turn's receipt waits for a held piece's answers. Answer from what the module already holds rather than after a
    * round trip. A turn that fails or is stopped writes no receipt and
    * doesn't wait. A turn that had finished when `stop()` began still routes
-   * its speech, and `stop()` waits for those answers in the same way.
+   * its speech, and `stop()` waits for those answers in the same way, except
+   * an ephemeral run's, whose stream its run's end leaves to finish on its
+   * own: its receipt can come after the run returns, and a `stop()` before it
+   * comes loses it.
    */
   onSpeechRouted?(
     agentName: string,
