@@ -1414,6 +1414,11 @@ export class ChannelRegistry {
     return new ChannelLifecycleError(`this host isn't permitted to open or close the "${serverId}" server's channels`, 'not-permitted');
   }
 
+  private publishingServer(serverId: string): McplServerConnection | undefined {
+    const server = this.serverRegistry.getServer(serverId);
+    return server && CapabilityGrant.of(server).has('channels.publish') ? server : undefined;
+  }
+
   /**
    * Why a send to this server's channels is refused before anything goes
    * out, as one clause with what works from there, for a caller that found
@@ -5963,12 +5968,12 @@ export class ChannelRegistry {
     if (isInboundOnly(entry)) {
       return { status: 'failed', destination, reason: inboundOnlyReason(entry), at: at() };
     }
-    const server = this.serverRegistry.getServer(entry.serverId);
+    const server = this.publishingServer(entry.serverId);
     // §14.1: channels/publish requires channels.publish in the grant. The
     // host not sending is the enforcement, here and at the last check, and
     // the server's state words the refusal (sendRefusal).
     const ungranted = (): PublishOutcome => ({ status: 'failed', destination, reason: this.sendRefusal(entry.serverId), at: at() });
-    if (!server || !CapabilityGrant.of(server).has('channels.publish')) return ungranted();
+    if (!server) return ungranted();
 
     const prevented = (err: unknown): PublishOutcome => ({
       status: 'failed', destination, reason: lifecycleClause(err) + refusalRemedy(err), at: at(),
@@ -6195,11 +6200,15 @@ export class ChannelRegistry {
       if (from.length > 0) {
         const list = (names: readonly string[]) =>
           names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names.at(-1)}`;
-        const closed = from.flatMap(({ channel, shown }) => {
-          const entry = this.entryAt(channel);
-          return entry && isInboundOnly(entry) ? [`${shown} is ${inboundOnlyReason(entry)}`] : [];
-        });
-        const open = from.filter(({ channel }) => { const entry = this.entryAt(channel); return entry !== undefined && !isInboundOnly(entry); });
+        const closed: string[] = [];
+        const open: Array<{ channel: ChannelRef; shown: string }> = [];
+        for (const came of from) {
+          const entry = this.entryAt(came.channel);
+          if (!entry) continue;
+          if (isInboundOnly(entry)) closed.push(`${came.shown} is ${inboundOnlyReason(entry)}`);
+          else if (!this.publishingServer(entry.serverId)) closed.push(`${came.shown} can't take a send: ${this.sendRefusal(entry.serverId)}`);
+          else open.push(came);
+        }
         const reply = open.length === 0 ? ''
           : open.length === from.length
             ? `; to reply ${from.length === 1 ? 'there' : 'in one of them'}, send your reply to that channel explicitly`
@@ -6404,8 +6413,8 @@ export class ChannelRegistry {
 
     // The same refusal, in the same words, as plain speech's (sendRefusal),
     // whose server state is the reason's: nothing awaits between the two.
-    const server = this.serverRegistry.getServer(entry.serverId);
-    if (!server || !CapabilityGrant.of(server).has('channels.publish')) {
+    const server = this.publishingServer(entry.serverId);
+    if (!server) {
       if (seen) {
         const reach = this.serverReach(entry.serverId);
         seen.refusal = reach === 'up' ? 'not-permitted' : `server-${reach}`;

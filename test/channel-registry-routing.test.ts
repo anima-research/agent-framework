@@ -1350,6 +1350,24 @@ test("with no locus, a batch's channel the host no longer has registered is name
   assert.equal(failures.at(-1)!.reason, 'this turn came from #gone (discord:g1:gone), and no channel was chosen for its reply');
 });
 
+test("with no locus, a batch's channel whose server can't take a send is named with why, in place of the advice to send there", async () => {
+  for (const [server, connecting, why] of [
+    [{ grant: new CapabilityGrant(new Set(), []) }, false,
+      'this host isn\'t permitted to post to the "discord" server\'s channels, and trying again won\'t change that; if you need it, ask whoever runs this host'],
+    [undefined, true, 'this host is connecting to the "discord" server, so try again in a moment'],
+  ] as const) {
+    const { registry, failures } = makeRegistry({ delivered: true });
+    await registerRoom(registry);
+    const internals = registry as unknown as { serverRegistry: { getServer: (id: string) => unknown }; serverConnecting?: (id: string) => boolean };
+    internals.serverRegistry.getServer = () => server;
+    internals.serverConnecting = () => connecting;
+    const room = { channel: discord('discord:g1:room'), shown: '#room (discord:g1:room)' };
+    assert.equal(await registry.routeSpeech('linn', 'hi', null, { cameFrom: [room] }), null);
+    assert.equal(failures.at(-1)!.reason, 'this turn came from #room (discord:g1:room), and no channel was chosen for its reply; ' +
+      `#room (discord:g1:room) can't take a send: ${why}`);
+  }
+});
+
 test('publish() itself refuses an inbound-only channel, so a drafts resend, which names the server, is refused before anything opens', async () => {
   const { registry, failures, publishCalls, openCalls } = makeRegistry({ delivered: true });
   await registerInboundOnly(registry);

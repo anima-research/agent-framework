@@ -193,6 +193,32 @@ describe('Turn trigger provenance', () => {
     await framework.stop();
   });
 
+  it("a coalesced render whose latest occurrence is a notice still names its channel at the gate, since it folds the batch's messages too", async () => {
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'render.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      modules: [],
+      gate: { config: { policies: [{ name: 'batch', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 30 } }], default: 'skip' } },
+    });
+    const f = framework as unknown as {
+      eventGate: { requestInferenceFn(agent: string, reason: string, source: string, provenance?: { batchChannels?: unknown }): void } | null;
+      queueCoalescedWakes(occ: unknown): Promise<void>;
+    };
+    assert.ok(f.eventGate, 'premise: the framework has a gate');
+    const provenances: Array<{ batchChannels?: unknown } | undefined> = [];
+    f.eventGate.requestInferenceFn = (_agent, _reason, _source, provenance) => { provenances.push(provenance); };
+    const text = [{ type: 'text', text: 'pat joined' }];
+    await f.queueCoalescedWakes({
+      serverId: 'discord', binding: 'b1', scope: { kind: 'channel', id: 'discord:g:room' }, key: 'k1', eventId: 'ev-1',
+      timestamp: new Date().toISOString(), retract: false, deferred: true, initial: false, tags: ['chat:system'], content: text,
+      event: { lane: 'push', event: { triggerInference: true, origin: { mcplChannelId: 'discord:g:room' }, content: text, featureSet: 'chat' } },
+    });
+    for (let i = 0; i < 100 && provenances.length === 0; i++) await new Promise((r) => setTimeout(r, 20));
+    assert.deepEqual(provenances.map((p) => p?.batchChannels), [[{ channelId: 'discord:g:room', serverId: 'discord' }]]);
+    await framework.stop();
+  });
+
   it('a gate wake queued after a NEWER addressed direct wake does not take the turn', async () => {
     // The agent was busy: Alice's DM sat in the gate's buffer while Bob's
     // newer mention queued a direct wake. The gate flushed at turn end, so its
