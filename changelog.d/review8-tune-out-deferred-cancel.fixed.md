@@ -12,9 +12,12 @@
   waits in its place. Each drop is logged and traced as `tune-out:deferred-cancel-dropped`, with the epoch it was
   for and why. A run that recorded its tune-out's end and failed after it is logged and no longer queued again.
 - A reader's note queued with a tune-out cancel that waits for held writes now reaches the resident when another
-  cancel ends that tune-out first. After the waiting cancel's first release failed, a resident's cancel, an end
-  time or a close of the excepted channel could end the tune-out before the retry, and it delivered only its own
-  caller's note: the queued one was never delivered. That cancel now takes the waiting one off the queue and
-  delivers its note once, after the release, under the subconscious's name (a reader fork's as its mail), before
-  the caller's own. A note that can't be delivered then is logged and traced as `tune-out:deferred-cancel-dropped`
-  (`note-undelivered`), with the reason.
+  cancel ends that tune-out first, unless writing it then fails; its author is then told so, and why. After the
+  waiting cancel's first release failed, a resident's cancel, an end time or a close of the excepted channel could
+  end the tune-out before the retry, and it delivered only its own caller's note: the queued one was never
+  delivered. That cancel now takes the waiting one off the queue and delivers its note once, after the release,
+  under the subconscious's name (a reader fork's as its mail), before the caller's own. If that write fails, the
+  note's author is told so in its own context, with the hold, the resident and the error's text, and the loss is
+  logged and traced as `tune-out:deferred-cancel-dropped` (`note-undelivered`, with the reason and the author); the
+  cancel still ends the tune-out. A reader fork that has ended by then is not told: the framework writes nothing
+  for an agent that has ended, and logs the notice it drops.

@@ -3,4 +3,5 @@
   hold, with `scope`), the epoch the cancel was asked for (`epochId`), and why (`reason`): `hold-ended`, that
   epoch's hold ended without it, so it ends nothing, with the epoch in force there then (`currentEpochId`, if one
   was); or `note-undelivered`, another cancel ended the hold and the note it carried could not be delivered
-  (`error`). `noteLost` says whether a reader's note it carried is lost with it.
+  (`error`). `noteLost` says whether a reader's note it carried is lost with it, and `noteAuthor` whose note it was:
+  the name it would have been delivered under, the persistent subconscious's or the reader fork's.

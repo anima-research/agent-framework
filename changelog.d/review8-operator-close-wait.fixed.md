@@ -12,6 +12,8 @@
     next release or 60 s later.
   - Until that retry succeeds, another cancel of the same hold (the
     resident's, the reader's, its end time's, or another close) can end it
-    first, and delivers the note the queued cancel carries.
+    first, and delivers the note the queued cancel carries. If writing that
+    note fails, the note's author is told so and why (unless it is a reader
+    fork that has ended), and the loss is traced.
   - A stop before the retry succeeds loses the queued cancel, and the hold
     is still in force after the restart unless its end time has passed.
