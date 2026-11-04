@@ -46,6 +46,25 @@ export function logValue(value: unknown): string {
 }
 
 /**
+ * `logValue` of a value a server chose whose text may hold a credential:
+ * its text, as logValue reads it (a JSON value as its JSON text), with
+ * `redact` applied, then printed as logValue prints a field. A value whose
+ * text holds nothing `redact` replaces prints exactly as logValue prints it.
+ */
+export function logValueRedacted(value: unknown, redact: (text: string) => string): string {
+  return printed(redact(textOf(value)), FIELD);
+}
+
+/**
+ * A JSON-RPC error answer's code as a log line prints it: a number, as
+ * JSON-RPC says a code is, as logValue prints it; any other JSON value a
+ * server sends there redacted (logValueRedacted), since the server wrote it.
+ */
+export function loggedCode(code: unknown, redact: (text: string) => string): string {
+  return typeof code === 'number' ? logValue(code) : logValueRedacted(code, redact);
+}
+
+/**
  * The host's own message, as the free text that ends a log line after its
  * fields: `reason=coalesce-invalid field=payload.content: "content must be an
  * array"`. It prints as `logValue` prints a field, cut the same way, except

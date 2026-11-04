@@ -7,6 +7,7 @@ import { JsStore } from '@animalabs/chronicle';
 
 import { AutobiographicalStrategy, ContextManager } from '@animalabs/context-manager';
 import { Agent, AgentFramework, BudgetPreflightError, type AgentRuntimeSettingsPatch } from '../src/index.js';
+import { rejectsBuild } from './helpers/failed-create.js';
 
 const membrane = {} as any;
 
@@ -853,7 +854,7 @@ describe('a reached budget across a restart', () => {
     });
   });
 
-  it("a record the boot can't read is logged, and the agent boots at the recipe's", async () => {
+  it("a record the boot can't read fails create(), naming it, and the next boot restores it", async () => {
     await run(async ({ framework, restart }) => {
       framework().updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000, immediate: true });
       // Only the boot's read of the record fails.
@@ -863,19 +864,37 @@ describe('a reached budget across a restart', () => {
         if (new Error().stack?.includes('readAgentRuntimeSettings')) throw new Error('store unreadable');
         return original.apply(this, args);
       };
-      const log = quietErrors();
-      let restarted: AgentFramework;
       try {
-        restarted = await restart();
+        // Booted at the recipe's, its next settings change would store over the record.
+        await rejectsBuild(restart, /^the persisted settings of agent "agent" \(framework\/state, agentRuntimeSettings\) can't be restored: store unreadable\. The framework doesn't start without them, since the agent would boot at its recipe's settings and the next settings change would store over them\. They're unchanged, and the framework starts once they can be read\.$/);
       } finally {
         proto.getStateJson = original;
-        log.restore();
       }
-      assert.deepEqual(budgets(restarted), { target: 100_000, effective: 100_000, transition: 'stable' });
-      assert.ok(
-        log.lines.some((l) => l.includes("agent: its persisted settings can't be read (store unreadable); it boots at the recipe's")),
-        log.lines.join('\n'),
-      );
+      const restarted = await restart();
+      assert.equal(budgets(restarted).target, 60_000);
+      assert.deepEqual(persisted(restarted), { contextBudgetTokens: 60_000 });
+    });
+  });
+
+  it("what's stored for an agent that isn't a settings record fails create(), naming what it is", async () => {
+    await run(async ({ framework, restart, config }) => {
+      writeRecord(framework(), ['contextBudgetTokens', 60_000] as never);
+      await rejectsBuild(restart, /^the persisted settings of agent "agent" \(framework\/state, agentRuntimeSettings\) can't be restored: what's stored for the agent is an array, not a settings record\. The framework doesn't start without them, since the agent would boot at its recipe's settings and the next settings change would store over them\. They're unchanged, and starting again won't help until they're repaired\.$/);
+      // The refused boots closed their stores, so write the next form through one of the test's own.
+      const store = JsStore.openOrCreate({ path: config().storePath });
+      try {
+        const state = store.getStateJson('framework/state') as { agentRuntimeSettings?: object };
+        store.setStateJson('framework/state', { ...state, agentRuntimeSettings: { ...state.agentRuntimeSettings, agent: null } });
+      } finally { store.close(); }
+      await rejectsBuild(restart, /can't be restored: what's stored for the agent is null, not a settings record\./);
+    });
+  });
+
+  it("a map of agents' settings that isn't an object fails create(), naming what it is", async () => {
+    await run(async ({ framework, restart }) => {
+      const store = framework().getStore();
+      store.setStateJson('framework/state', { ...(store.getStateJson('framework/state') as object), agentRuntimeSettings: 'agent' });
+      await rejectsBuild(restart, /^the persisted settings of agent "agent" \(framework\/state, agentRuntimeSettings\) can't be restored: the map that holds every agent's settings is a string, not an object\. /);
     });
   });
 
@@ -1495,6 +1514,7 @@ const infeasibleAt = (floor: number) => (budget: { maxTokens: number }) => ({
 
 async function withPreflightFramework(
   fn: (framework: AgentFramework) => Promise<void> | void,
+  agentStrategy: AutobiographicalStrategy = strategy(),
 ): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'agent-settings-preflight-'));
   const framework = await AgentFramework.create({
@@ -1504,7 +1524,7 @@ async function withPreflightFramework(
       name: 'agent',
       model: 'test-model',
       systemPrompt: 'test',
-      strategy: strategy(),
+      strategy: agentStrategy,
       contextBudgetTokens: 550_000,
       maxTokens: 10_000,
     }],
@@ -1606,6 +1626,24 @@ it('previewAgentRuntimeSettings: structured reasons for the strategy throw paths
       assert.equal(preview.reason, reason);
     }
   });
+});
+
+it('previewAgentRuntimeSettings: a hierarchical agent within its budget has no fold plan to preview, so it gets no verdict, as no_preview_support, and resume() warns nothing for it', async (t) => {
+  await withPreflightFramework(async (framework) => {
+    assert.equal(framework.previewContextSettings('agent', 550_000), null);
+    const preview = framework.previewAgentRuntimeSettings('agent');
+    assert.equal(preview.available, false);
+    assert.equal(preview.reason, 'no_preview_support');
+
+    await framework.quiesce();
+    const warn = t.mock.method(console, 'warn', () => {});
+    try {
+      assert.equal((await framework.resume()).quiesced, false);
+    } finally {
+      warn.mock.restore();
+    }
+    assert.deepEqual(warn.mock.calls.map((call) => String(call.arguments[0])).filter((line) => line.includes('feasibility preview unavailable')), []);
+  }, new AutobiographicalStrategy({ adaptiveResolution: false }));
 });
 
 it('previewAgentRuntimeSettings: paced patches report effective=live plus an advisory target', async () => {

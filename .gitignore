@@ -5,3 +5,6 @@ data/
 package-lock.json
 bun.lock
 logs/
+
+# Node diagnostic reports (written on SIGUSR2 when report-on-signal is armed; see test/diagnostics-signal.test.ts)
+report.*.json

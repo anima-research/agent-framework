@@ -5,7 +5,9 @@ import { existsSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { EventGate } from '../src/gate/event-gate.js';
-import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, destinationKey } from '../src/mcpl/channel-registry.js';
+import { PushHandler } from '../src/mcpl/push-handler.js';
+import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 import type { GateConfig } from '../src/gate/types.js';
 import type { ChannelsIncomingParams } from '../src/mcpl/types.js';
 import type { ProcessEvent } from '../src/types/index.js';
@@ -35,7 +37,9 @@ function makeGate(config: GateConfig) {
 function makeRegistry(shouldTriggerInference?: (c: string, m: Record<string, unknown>) => boolean) {
   const pushed: ProcessEvent[] = [];
   const registry = new ChannelRegistry(
-    {} as never,
+    // No server connection: the host directs no channel lifecycle here, so
+    // traffic is what marks a channel open.
+    { getServer: () => undefined } as never,
     {} as never,
     (ev) => pushed.push(ev),
     () => {},
@@ -44,7 +48,7 @@ function makeRegistry(shouldTriggerInference?: (c: string, m: Record<string, unk
   // §14.5: incoming no longer mints unknown channels — seed what a
   // conforming server's channels/register would have created.
   for (const id of ['zulip:tracker-miner-f', 'zulip:other-channel']) {
-    (registry as unknown as { channels: Map<string, unknown> }).channels.set(`zulip:${id}`, {
+    (registry as unknown as { channels: Map<string, unknown> }).channels.set(destinationKey({ serverId: 'zulip', channelId: id }), {
       serverId: 'zulip', descriptor: { id, type: 'zulip', label: id }, open: false,
     });
   }
@@ -82,6 +86,57 @@ describe('ChannelRegistry → shouldTriggerInference contract', () => {
     assert.strictEqual(seen[0].eventType, 'mcpl:channel-incoming');
     assert.strictEqual(seen[0].serverId, 'zulip');
     assert.strictEqual(seen[0].channelId, 'zulip:tracker-miner-f');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PushHandler: the host's own fields, whatever the server's origin says
+// ---------------------------------------------------------------------------
+
+function pushVia(shouldTriggerInference: (c: string, m: Record<string, unknown>) => boolean) {
+  const pushed: Array<{ triggerInference?: boolean }> = [];
+  const handler = new PushHandler({ validateInbound() {} } as unknown as FeatureSetManager, (event) => { pushed.push(event); }, () => {}, shouldTriggerInference);
+  let n = 0;
+  const push = async (serverId: string, origin: Record<string, unknown>) => {
+    await handler.handlePushEvent(serverId, {
+      featureSet: 'fs', eventId: `push-${++n}`, timestamp: '2026-10-20T00:00:00Z',
+      payload: { content: [{ type: 'text', text: 'hello' }] }, origin,
+    } as never, { respond: () => {}, respondError: () => {} } as never);
+    return pushed[pushed.length - 1]?.triggerInference;
+  };
+  return { push };
+}
+
+describe('PushHandler → shouldTriggerInference contract', () => {
+  it("gives the host's server id, feature set, event id and event type over the origin's, and the origin's other fields as they are", async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    const { push } = pushVia((_content, metadata) => { seen.push(metadata); return true; });
+    await push('discord', {
+      source: 'discord', channelId: 'c1',
+      serverId: 'heartbeat', featureSet: 'other', eventId: 'other', eventType: 'mcpl:channel-incoming',
+    });
+    assert.strictEqual(seen.length, 1);
+    assert.strictEqual(seen[0].serverId, 'discord');
+    assert.strictEqual(seen[0].featureSet, 'fs');
+    assert.strictEqual(seen[0].eventId, 'push-1');
+    assert.strictEqual(seen[0].eventType, 'mcpl:push-event');
+    assert.strictEqual(seen[0].source, 'discord');
+    assert.strictEqual(seen[0].channelId, 'c1');
+  });
+
+  it('wakes a sleeping agent only for the server the host names heartbeat, whatever the origin says', async () => {
+    const gate = makeGate({ policies: [], default: 'always' });
+    gate.setSleep(3600, 'resting', 'agent');
+    try {
+      const { push } = pushVia(gate.asShouldTriggerCallback());
+      assert.strictEqual(await push('discord', {}), false, 'an ordinary push');
+      assert.strictEqual(await push('discord', { source: 'heartbeat' }), false, "an origin saying it's the heartbeat");
+      assert.strictEqual(await push('discord', { serverId: 'heartbeat' }), false, "an origin giving the heartbeat's server id");
+      assert.strictEqual(await push('heartbeat', { source: 'heartbeat', reason: 'schedule' }), true, 'the heartbeat');
+    } finally {
+      gate.clearSleep();
+      gate.dispose();
+    }
   });
 });
 
@@ -282,7 +337,7 @@ describe('ChannelRegistry durable lifecycle', () => {
     assert.deepStrictEqual(server.acks, [{
       channelId: 'discord:g1:c1', messageId: 'm1', intent: 'seen-not-opening', value: '👀',
     }]);
-    assert.strictEqual(registry.isChannelOpen('discord:g1:c1'), false);
+    assert.strictEqual(registry.isChannelOpen({ serverId: 'discord', channelId: 'discord:g1:c1' }), false);
   });
 
   it('requires serverId only when two MCPLs expose the same channel id', async () => {
@@ -309,7 +364,8 @@ describe('ChannelRegistry durable lifecycle', () => {
 
     const ambiguous = await registry.handleChannelToolCall('channel_open', { channelId: 'shared' });
     assert.strictEqual(ambiguous.success, false);
-    assert.match(ambiguous.error ?? '', /ambiguous/);
+    assert.equal(ambiguous.error, 'Channel "shared" is on more than one server ("alpha:shared", "beta:shared"), so nothing ran. ' +
+      'Call again with channelId set to one of them, or with serverId set to "alpha" or "beta".');
 
     const exact = await registry.handleChannelToolCall('channel_open', {
       channelId: 'shared', serverId: 'beta',

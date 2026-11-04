@@ -7,13 +7,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { WebSocketServer } from 'ws';
 import type { AddressInfo } from 'node:net';
 
 import { AgentFramework } from '../src/index.js';
+import { referenceRegistry } from '../src/mcpl/references.js';
 import type { EventResponse, Module, ModuleContext, ToolDefinition, ToolResult } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
@@ -61,6 +62,16 @@ process.stdin.on('data', (c) => {
 /** The framework's inner disconnect, which a restart's own teardown calls
  *  (the public disconnectMcplServer is an operator operation around it). */
 type Inner = { runDisconnectMcplServer(id: string): Promise<void> };
+type Internals = {
+  legacyConnectAborts(): Map<string, AbortController>;
+  mcplServerRegistry: { getServer(id: string): { sendToolsList(): Promise<unknown> } | null } | null;
+};
+
+async function until(cond: () => boolean, what: string, ms = 10_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!cond() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.ok(cond(), `in time: ${what}`);
+}
 
 function serverConfig(id: string, extra?: Record<string, unknown>) {
   return { id, command: process.execPath, args: ['-e', STDIO_SERVER], ...extra };
@@ -92,6 +103,9 @@ test('connectMcplServer lazily initializes MCPL on a zero-server framework and e
     assert.deepEqual(framework.listMcplServers(), [], 'no servers configured at start');
 
     await framework.connectMcplServer(serverConfig('dyn'));
+    // Its address is recorded where a reference's stub reads it: none, for a
+    // server the host spawns.
+    assert.equal(referenceRegistry.serverAddress('dyn'), 'no-address');
 
     const servers = framework.listMcplServers();
     assert.equal(servers.length, 1);
@@ -211,15 +225,15 @@ test('restartMcplServer of an id whose disconnect is in flight is refused before
 
 test("a disconnect removes its server's prefix claim, and leaves one another server holds", async () => {
   await withFramework(true, async (framework) => {
-    const internals = framework as unknown as { mcplPrefixMap: Map<string, string> };
-    assert.equal(internals.mcplPrefixMap.get('mcpl--first'), 'first');
+    await framework.connectMcplServer(serverConfig('second', { toolPrefix: 'held' }) as never);
     await framework.disconnectMcplServer('first');
-    assert.equal(internals.mcplPrefixMap.has('mcpl--first'), false, 'its own claim is released');
-    // As after a restart under a new id: `second` holds the prefix `first` had.
-    await framework.connectMcplServer(serverConfig('first') as never);
-    internals.mcplPrefixMap.set('mcpl--first', 'second');
-    await framework.disconnectMcplServer('first');
-    assert.equal(internals.mcplPrefixMap.get('mcpl--first'), 'second', "the other server's claim stands");
+    // Its own claim is released: another server may take the prefix.
+    await framework.connectMcplServer(serverConfig('third', { toolPrefix: 'mcpl--first' }) as never);
+    // The other server's claim stands.
+    await assert.rejects(
+      framework.connectMcplServer(serverConfig('fourth', { toolPrefix: 'held' }) as never),
+      /toolPrefix "held" collides with server "second"/,
+    );
   });
 });
 
@@ -434,6 +448,10 @@ for (const when of ['teardown', 'gap', 'connect'] as const) {
       if (when !== 'connect') {
         // Its connect is refused at once, naming the disconnect.
         assert.match(refused!.message, /: MCP server "first" is being disconnected, which ends the restart of "first"$/);
+      } else {
+        // Its connect, under way, is ended by the disconnect, in whichever
+        // phase the disconnect finds it.
+        assert.match(refused!.message, /: MCP server "first" (was not connected: it was disconnected (while connecting|or lost while its tools were being listed)|is being disconnected, which ends the restart of "first")$/);
       }
       assert.equal(await host, 'disconnected', 'the disconnect completed');
       assert.deepEqual(framework.listMcplServers(), [], 'nothing is left of the server');
@@ -489,8 +507,8 @@ for (const ending of ['stop()', 'a disconnect'] as const) {
   test(`${ending} ends a legacy connect stuck in its handshake at once`, async () => {
     await withFramework(true, async (framework) => {
       const connecting = framework.connectMcplServer(SILENT as never).then(() => null, (error: unknown) => error as Error);
-      // The child is up and its initialize sent.
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      // The connect is in its handshake, which never finishes.
+      await until(() => (framework as unknown as Internals).legacyConnectAborts().has('silent'), 'the connect in its handshake');
       const started = Date.now();
       if (ending === 'stop()') await framework.stop();
       else await framework.disconnectMcplServer('silent');
@@ -510,8 +528,8 @@ for (const silentOn of ['featureSets/update', 'tools/list'] as const) {
     await withFramework(true, async (framework) => {
       const config = serverConfig('late', { env: { SILENT_ON: silentOn }, requestTimeoutMs: 0 });
       const connecting = framework.connectMcplServer(config as never).then(() => null, (error: unknown) => error as Error);
-      // Past the handshake, waiting for the answer that never comes.
-      await new Promise((resolve) => setTimeout(resolve, 600));
+      // Past the handshake, registered, waiting for the answer that never comes.
+      await until(() => !!(framework as unknown as Internals).mcplServerRegistry?.getServer('late'), 'the connect past its handshake');
       const started = Date.now();
       await framework.stop();
       const took = Date.now() - started;
@@ -526,9 +544,13 @@ test("stop() ends a connect whose tool listing waits on another server that stop
   await withFramework(false, async (framework) => {
     // Lists its tools once, at its own connect, and never again.
     await framework.connectMcplServer(serverConfig('quiet', { env: { SILENT_AFTER: 'tools/list:1' }, requestTimeoutMs: 0 }) as never);
+    const quiet = (framework as unknown as Internals).mcplServerRegistry!.getServer('quiet')!;
+    const realList = quiet.sendToolsList.bind(quiet);
+    let asked = false;
+    quiet.sendToolsList = () => { asked = true; return realList(); };
     const connecting = framework.connectMcplServer(serverConfig('late') as never).then(() => null, (error: unknown) => error as Error);
     // The new connect is listing every server's tools, and waits on "quiet".
-    await new Promise((resolve) => setTimeout(resolve, 600));
+    await until(() => asked, "the new connect's listing asked quiet");
     const started = Date.now();
     await framework.stop();
     const took = Date.now() - started;
@@ -572,6 +594,87 @@ test('connectMcplServer rejects a duplicate id and a colliding prefix', async ()
   });
 });
 
+test('create() refuses a boolean setting that holds anything but true or false, before it spawns any server', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'mcpl-lifecycle-'));
+  const marker = join(tempDir, 'spawned');
+  // A valid server listed first writes a marker when it starts, so a refusal
+  // that came after anything was spawned leaves the marker. Both servers
+  // exit as soon as they start, so a spawn that shouldn't have happened
+  // leaves no child holding the test open.
+  const early = { id: 'early', command: process.execPath, args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, '')`] };
+  const refused = (extra: Record<string, unknown>) => ({ id: 'quoted', command: process.execPath, args: ['-e', ''], ...extra });
+  const cases: Array<[string, Record<string, unknown>, string]> = [
+    ['inheritEnv', { inheritEnv: 'false' }, 'true or false, unquoted, not a string'],
+    ['reconnect', { reconnect: 'true' }, 'true or false, unquoted, not a string'],
+    ['allowHostCommands', { allowHostCommands: 1 }, 'true or false, not a number'],
+  ];
+  try {
+    for (const [setting, extra, wanted] of cases) {
+      const created = AgentFramework.create({
+        storePath: join(tempDir, `test-${setting}.chronicle`),
+        membrane: new MockMembrane().asMembrane(),
+        agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'test' }],
+        modules: [],
+        mcplServers: [early, refused(extra)] as never,
+      });
+      // A framework created anyway is stopped, so the failure is this
+      // assertion rather than a file held open by its server.
+      await assert.rejects(
+        created.then(async (framework) => { await framework.stop(); return framework; }),
+        new RegExp(`MCPL server "quoted" ${setting} must be ${wanted}: `),
+      );
+      assert.equal(existsSync(marker), false, `no server was spawned before ${setting} was refused`);
+    }
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('connectMcplServer refuses a boolean setting that holds anything but true or false, and registers nothing', async () => {
+  await withFramework(true, async (framework) => {
+    for (const [setting, value] of [['inheritEnv', 'false'], ['reconnect', 'false'], ['allowHostCommands', 'true']]) {
+      await assert.rejects(
+        framework.connectMcplServer(serverConfig('second', { [setting]: value }) as never),
+        new RegExp(`MCPL server "second" ${setting} must be true or false, unquoted, not a string: `),
+      );
+    }
+    assert.deepEqual(framework.listMcplServers().map(s => s.id), ['first']);
+  });
+});
+
+test('restartMcplServer refuses such a setting before it disconnects the running server, which stays up', async () => {
+  await withFramework(true, async (framework) => {
+    for (const [setting, value] of [['inheritEnv', 'true'], ['reconnect', 'true'], ['allowHostCommands', 'false']]) {
+      await assert.rejects(
+        framework.restartMcplServer('first', serverConfig('first', { [setting]: value }) as never),
+        new RegExp(`MCPL server "first" ${setting} must be true or false, unquoted, not a string: `),
+      );
+      const servers = framework.listMcplServers();
+      assert.equal(servers.length, 1);
+      assert.equal(servers[0].connected, true, `the running server stays connected after ${setting} was refused`);
+    }
+  });
+});
+
+test('restartMcplServer given no config checks the stored one, before it disconnects the running server', async () => {
+  await withFramework(false, async (framework) => {
+    const config: Record<string, unknown> = serverConfig('stored');
+    await framework.connectMcplServer(config as never);
+    // The framework keeps the caller's own config object, so a host that
+    // changes it in place changes what a restart with no new config uses.
+    config.reconnect = 'true';
+    await assert.rejects(
+      framework.restartMcplServer('stored'),
+      /MCPL server "stored" reconnect must be true or false, unquoted, not a string: /,
+    );
+    assert.deepEqual(
+      framework.listMcplServers().map((s) => [s.id, s.connected]),
+      [['stored', true]],
+      'the running server stays connected',
+    );
+  });
+});
+
 test('connectMcplServer hot-connects a network-only (WebSocket) MCPL server', async () => {
   // Minimal in-process MCPL server over WebSocket (same shape as
   // mcpl-ws-transport.test.ts) — no child process involved.
@@ -581,8 +684,9 @@ test('connectMcplServer hot-connects a network-only (WebSocket) MCPL server', as
       let msg: { id?: unknown; method?: string; params?: { arguments?: Record<string, unknown> } };
       try { msg = JSON.parse(String(data)); } catch { return; }
       const reply = (result: unknown) => ws.send(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }));
-      if (msg.method === 'initialize') reply({ protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.4', pushEvents: true } } } });
+      if (msg.method === 'initialize') reply({ protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.5', pushEvents: true } } } });
       else if (msg.method === 'tools/list') reply({ tools: [{ name: 'echo', description: 'e', inputSchema: { type: 'object' } }] });
+      else if (msg.method === 'featureSets/update') reply({ accepted: true });
     });
   });
   await new Promise<void>((resolve) => (wss.address() ? resolve() : wss.once('listening', () => resolve())));

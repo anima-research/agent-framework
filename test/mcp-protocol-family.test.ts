@@ -16,12 +16,18 @@ import {
   redactServerText,
   credentialRedactor,
   serverCredentialPatterns,
+  serverTextRedactor,
+  noteDialSent,
   describeCredentialError,
-  MCPL_ONLY_POLICY_FIELDS,
+  mcplPolicyGrants,
   MAX_TIMER_MS,
 } from '../src/mcpl/protocol-family.js';
+import { logValueRedacted } from '../src/mcpl/log-value.js';
+import { getEventListeners } from 'node:events';
+import { DEFAULT_EAGER_FETCH_MAX_BYTES, DEFAULT_MAX_TOTAL_BYTES } from '../src/mcpl/reference-fetcher.js';
+import { DEFAULT_MAX_INPUT_BYTES } from '../src/mcpl/tool-lifecycle.js';
 import { ModernMcpConnection } from '../src/mcpl/modern-connection.js';
-import { WebSocketTransport } from '../src/mcpl/transport.js';
+import { WebSocketTransport, buildWebSocketUrl } from '../src/mcpl/transport.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 
 const cfg = (c: Partial<McplServerConfig>): McplServerConfig => ({ id: 's', ...c });
@@ -130,6 +136,18 @@ test('a modern server needs a real deadline', () => {
   }
 });
 
+test("a deadline that can't be printed is refused with a placeholder for it, not thrown", () => {
+  // JSON can hold it, and String() throws on it: its toString isn't callable.
+  const unprintable = JSON.parse('{"toString": 1}') as unknown as number;
+  assert.throws(() => String(unprintable), TypeError);
+  for (const c of [cfg({ url: 'https://x/mcp', requestTimeoutMs: unprintable }), cfg({ command: 'srv', protocol: 'modern', requestTimeoutMs: unprintable })]) {
+    assert.match(
+      serverConfigProblems(c).join(),
+      /requestTimeoutMs must be an integer from 1 to 2147483647 for a modern server \(got \[a value that cannot be printed\]\)/,
+    );
+  }
+});
+
 test('a legacy deadline above the timer limit is refused; every value that worked passes', () => {
   for (const bad of [MAX_TIMER_MS + 1, Number.POSITIVE_INFINITY]) {
     for (const c of [cfg({ command: 'srv', requestTimeoutMs: bad }), cfg({ url: 'wss://x/mcpl', requestTimeoutMs: bad })]) {
@@ -141,24 +159,71 @@ test('a legacy deadline above the timer limit is refused; every value that worke
   }
 });
 
-test('MCPL policy on a modern server is rejected, empty values are not', () => {
-  const effective: Partial<McplServerConfig> = {
-    enabledFeatureSets: ['a'],
-    disabledFeatureSets: ['b'],
-    enabledCapabilities: ['pushEvents'],
-    disabledCapabilities: ['channels'],
-    scopes: { a: {} as never },
-    channelSubscription: 'manual',
-    allowHostCommands: true,
-    toolLifecycle: { observe: {} } as never,
-    autofetch: { maxBytes: 10 },
-    shouldTriggerInference: () => true,
-  };
-  for (const field of MCPL_ONLY_POLICY_FIELDS) {
-    const problems = serverConfigProblems(cfg({ url: 'https://x/mcp', [field]: effective[field] }));
-    assert.equal(problems.length, 1, field);
-    assert.match(problems[0]!, new RegExp(`"${field}" is MCPL policy`));
+test('MCPL policy on a modern server is refused where its value grants, and accepted where it only narrows or repeats a default (R1-3)', () => {
+  const modern = (c: Partial<McplServerConfig>) => cfg({ url: 'https://x/mcp', ...c });
+  // Each value that asks for MCPL behaviour is refused, naming the part that grants.
+  const granting: Array<[Partial<McplServerConfig>, string]> = [
+    [{ enabledCapabilities: ['toolLifecycle.observe'] }, 'enabledCapabilities: toolLifecycle.observe'],
+    [{ enabledCapabilities: ['contextHooks.beforeInference.inject.*'] }, 'enabledCapabilities: contextHooks.beforeInference.inject.system'],
+    [{ allowHostCommands: true }, 'allowHostCommands'],
+    [{ channelSubscription: 'auto' }, 'channelSubscription'],
+    [{ channelSubscription: ['general'] }, 'channelSubscription'],
+    [{ scopes: { files: { whitelist: ['read:*'], blacklist: ['write:*'] } } }, 'scopes.files.whitelist'],
+    [{ toolLifecycle: { observe: {} } }, 'toolLifecycle.observe'],
+    [{ toolLifecycle: { inputs: { tools: ['x--*'] } } }, 'toolLifecycle.inputs'],
+    [{ autofetch: { maxBytes: DEFAULT_EAGER_FETCH_MAX_BYTES + 1 } }, 'autofetch.maxBytes'],
+    [{ autofetch: { maxTotalBytes: DEFAULT_MAX_TOTAL_BYTES + 1 } }, 'autofetch.maxTotalBytes'],
+    [{ toolLifecycle: { maxInputBytes: DEFAULT_MAX_INPUT_BYTES + 1 } }, 'toolLifecycle.maxInputBytes'],
+  ];
+  // Patterns reaching every path denied by default name each. A `*` matches
+  // one segment, and counts must agree (capabilityPatternMatches).
+  assert.deepEqual(mcplPolicyGrants(modern({ enabledCapabilities: ['*.*', '*.*.*.*'] })), [
+    'enabledCapabilities: contextHooks.beforeInference.inject.system',
+    'enabledCapabilities: toolLifecycle.observe',
+    'enabledCapabilities: toolLifecycle.inputs',
+  ]);
+  // An entry that isn't a string can't be matched, so it's read as asking
+  // for every path denied by default.
+  assert.deepEqual(mcplPolicyGrants(modern({ enabledCapabilities: [42 as never] })), [
+    'enabledCapabilities: contextHooks.beforeInference.inject.system',
+    'enabledCapabilities: toolLifecycle.observe',
+    'enabledCapabilities: toolLifecycle.inputs',
+  ]);
+  for (const [config, path] of granting) {
+    assert.deepEqual(mcplPolicyGrants(modern(config)), [path], path);
+    const problems = serverConfigProblems(modern(config));
+    assert.equal(problems.length, 1, path);
+    assert.ok(problems[0]!.includes(`"${path}" asks for MCPL behaviour, which a modern MCP server cannot negotiate`), problems[0]);
   }
+  // What only takes something away, or repeats a default, is already
+  // satisfied: a modern server has no MCPL surface.
+  const narrowing: Partial<McplServerConfig>[] = [
+    // connectome-host's overlay route stamps this on every server it deploys.
+    { disabledCapabilities: ['contextHooks', 'inferenceLifecycle', 'inferenceRequest', 'toolLifecycle'] },
+    { disabledFeatureSets: ['b'] },
+    // Allow-lists: absent, every declared set or advertised capability is a
+    // candidate, so a list can only narrow, except where it names a path
+    // denied by default.
+    { enabledFeatureSets: ['a'] },
+    { enabledCapabilities: ['pushEvents', 'contextHooks.afterInference'] },
+    // A one-segment `*` reaches no path denied by default.
+    { enabledCapabilities: ['*'] },
+    { scopes: { files: { blacklist: ['write:*'] } } },
+    { scopes: { files: { whitelist: [] } } },
+    { channelSubscription: 'manual' },
+    { toolLifecycle: { maxInputBytes: 1024 } },
+    { toolLifecycle: { maxInputBytes: DEFAULT_MAX_INPUT_BYTES } },
+    { toolLifecycle: { observe: false } as never },
+    { autofetch: { maxBytes: DEFAULT_EAGER_FETCH_MAX_BYTES, maxTotalBytes: 1 } },
+    { shouldTriggerInference: () => false },
+  ];
+  for (const config of narrowing) {
+    assert.deepEqual(serverConfigProblems(modern(config)), [], JSON.stringify(config));
+    // Nor a warning: a host that stamps its deny-list on every server would
+    // hear it at every start, with nothing to do about it.
+    assert.deepEqual(serverConfigWarnings(modern(config)), [], JSON.stringify(config));
+  }
+  // Empty values grant nothing, on a modern stdio server too.
   const empty = cfg({
     command: 'srv',
     protocol: 'modern',
@@ -167,6 +232,7 @@ test('MCPL policy on a modern server is rejected, empty values are not', () => {
     scopes: {},
     allowHostCommands: false,
     toolLifecycle: {} as never,
+    channelSubscription: [],
   });
   assert.deepEqual(serverConfigProblems(empty), []);
 });
@@ -296,6 +362,75 @@ test('both engines admit a configuration through checkServerConfig, which logs i
   } finally {
     console.warn = realWarn;
   }
+});
+
+test("a query credential is removed as the WebSocket dial sends it, the query re-encoded once the token is set", () => {
+  const config = cfg({ url: 'wss://host.example/mcp?password=secret%20key123&q=a~b', token: 'tok-abcdefgh' });
+  const sent = buildWebSocketUrl(config);
+  // The form the server receives, and can echo, as URLSearchParams writes it.
+  assert.ok(sent.includes('password=secret+key123') && sent.includes('q=a%7Eb'), sent);
+  const shown = redactServerText(`closed by the server: ${sent}`, config);
+  assert.ok(!shown.includes('key123'), shown);
+  assert.ok(!shown.includes('tok-abcdefgh'), shown);
+  assert.ok(!shown.includes('q=a%7Eb'), shown);
+});
+
+test("an access provider's token is removed once a dial has sent it, in a WebSocket url or an HTTP header", async () => {
+  const ws = cfg({ id: 'ws', url: 'ws://127.0.0.1:1/mcpl?password=secret%20key123', accessProvider: async () => 'prov/ws-0123456789' });
+  const http = cfg({ id: 'http', url: 'http://127.0.0.1:1/mcp', accessProvider: async () => 'prov-http-0123456789' });
+  // Made before the dial, as the framework makes a connection's.
+  const recorded = serverTextRedactor(ws);
+  assert.ok(recorded('token=prov%2Fws-0123456789').includes('ws-0123456789'), 'no dial has sent it yet');
+  // Nothing listens on port 1: each dial notes its credential before it fails.
+  await assert.rejects(WebSocketTransport.open(ws));
+  await assert.rejects(ModernMcpConnection.connect(http));
+  const shown = recorded('closed: ws://127.0.0.1:1/mcpl?password=secret+key123&token=prov%2Fws-0123456789');
+  assert.ok(!shown.includes('ws-0123456789') && !shown.includes('key123'), shown);
+  // The token in the forms a token takes, as JSON with its slash escaped.
+  const json = recorded('{"token":"prov\\/ws-0123456789"}');
+  assert.ok(!json.includes('ws-0123456789'), json);
+  const header = redactServerText('refused: Authorization: Bearer prov-http-0123456789', http);
+  assert.ok(!header.includes('prov-http'), header);
+});
+
+test("a dial with an access provider takes its abort listener off the signal once the provider has answered", async () => {
+  // A reconnect loop's signal lives across many dials.
+  const controller = new AbortController();
+  for (let n = 1; n <= 3; n++) {
+    await assert.rejects(WebSocketTransport.open(cfg({ id: 'ws', url: 'ws://127.0.0.1:1/mcpl', accessProvider: async () => `prov-loop-${n}-0123456789` }), controller.signal));
+    assert.equal(getEventListeners(controller.signal, 'abort').length, 0, `after dial ${n}`);
+  }
+});
+
+test("a dial whose signal aborts while its access provider is called ends then, not when the provider answers", { timeout: 10_000 }, async () => {
+  const controller = new AbortController();
+  await assert.rejects(
+    WebSocketTransport.open(cfg({
+      id: 'ws',
+      url: 'ws://127.0.0.1:1/mcpl',
+      // The connection is closed while the provider runs, and the provider
+      // never answers.
+      accessProvider: () => { controller.abort(); return new Promise<string>(() => {}); },
+    }), controller.signal),
+    /WebSocket connect abandoned: the connection was closed/,
+  );
+});
+
+test("a token a dial sends again is the newest, so the oldest of the others goes first", () => {
+  const config = cfg({ id: 'r', url: 'http://127.0.0.1:1/mcp' });
+  noteDialSent(config, { token: 'prov-again-0000' });
+  for (let n = 1; n <= 15; n++) noteDialSent(config, { token: `prov-other-${String(n).padStart(4, '0')}` });
+  noteDialSent(config, { token: 'prov-again-0000' });
+  noteDialSent(config, { token: 'prov-other-0016' });
+  assert.equal(redactServerText('prov-again-0000', config), 'redacted');
+  assert.equal(redactServerText('prov-other-0001', config), 'prov-other-0001', 'the oldest of the others is let go');
+});
+
+test("a configuration keeps only its dials' newest provider tokens", () => {
+  const config = cfg({ id: 'p', url: 'http://127.0.0.1:1/mcp' });
+  for (let n = 0; n <= 16; n++) noteDialSent(config, { token: `prov-token-${String(n).padStart(4, '0')}` });
+  assert.ok(redactServerText('prov-token-0000', config).includes('prov-token-0000'), 'the oldest of 17 is let go');
+  assert.equal(redactServerText('prov-token-0001 prov-token-0016', config), 'redacted redacted');
 });
 
 test('recorded server text removes encoded and decoded URL credentials as exact strings', () => {
@@ -430,6 +565,47 @@ test('recorded server text: a credential as JSON.stringify writes it, its quotes
       assert.equal(redactServerText(`config {"secret":"${form}"} refused`, config), 'config {"secret":"redacted"} refused', form);
     }
   }
+});
+
+test("recorded server text: a url's credentials, pairs and userinfo as JSON.stringify writes them, as a token's are", () => {
+  // Decoded, each holds a quote and a backslash, or a slash: a path segment,
+  // a credential-named query value, a pair whose value is too short to go on
+  // its own, a ws:// password, and a userinfo unit too short to go on its own.
+  const config = cfg({ url: 'wss://bot:pa%22ss%5Cw0rd@h/mcpl/s3cr%22et%5C0123456789?password=sec%2Fret%22key123&region=e%22u' });
+  for (const decoded of ['s3cr"et\\0123456789', 'sec/ret"key123', 'pa"ss\\w0rd']) {
+    const json = JSON.stringify(decoded).slice(1, -1);
+    for (const form of [decoded, json, json.replace(/\//g, '\\/')]) {
+      assert.equal(redactServerText(`config {"secret":"${form}"} refused`, config), 'config {"secret":"redacted"} refused', form);
+    }
+  }
+  assert.equal(redactServerText('config {"q":"region=e\\"u"} refused', config), 'config {"q":"redacted"} refused');
+  const short = cfg({ url: 'wss://b%22t:p%22w@h/mcp' });
+  assert.equal(redactServerText('dial {"url":"wss://b\\"t:p\\"w@h/mcp"} failed', short), 'dial {"url":"wss://redacted@h/mcp"} failed');
+});
+
+test('recorded server text: a pair or userinfo unit after a JSON escape goes, as after the control character it stands for', () => {
+  const config = cfg({ url: 'wss://bot:pw@h/mcpl?key=abc' });
+  for (const escape of ['\\n', '\\t', '\\r', '\\b', '\\f', '\\u000b']) {
+    assert.equal(redactServerText(`{"said":"bad${escape}key=abc"}`, config), `{"said":"bad${escape}redacted"}`, escape);
+    assert.equal(redactServerText(`{"said":"dial${escape}bot:pw@h"}`, config), `{"said":"dial${escape}redacted@h"}`, escape);
+  }
+  // A letter or digit that's text, not an escape's end, still adjoins it.
+  assert.equal(redactServerText('monkey=abc', config), 'monkey=abc');
+  assert.equal(redactServerText('robot:pw@h', config), 'robot:pw@h');
+  // The case a JSON value's text makes: a string with a newline before the pair.
+  assert.equal(logValueRedacted({ said: 'bad\nkey=abc' }, (text) => redactServerText(text, config)), '"{\\"said\\":\\"bad\\\\nredacted\\"}"');
+});
+
+test('recorded server text: the floor applies to each form, so a seven-character token goes in its eight-character JSON form', () => {
+  const config = cfg({ token: 'ab"cdef' });
+  assert.equal(redactServerText('refused: ab"cdef', config), 'refused: ab"cdef');
+  assert.equal(redactServerText('refused: ab\\"cdef', config), 'refused: redacted');
+});
+
+test("a JSON value logged through logValueRedacted keeps no url credential, though its JSON text escapes the credential's quote", () => {
+  const config = cfg({ url: 'wss://h/mcpl?password=secret%22key123' });
+  const line = logValueRedacted({ said: 'secret"key123' }, (text) => redactServerText(text, config));
+  assert.equal(line, '"{\\"said\\":\\"redacted\\"}"');
 });
 
 test("one redactor over several configurations' strings takes the longest secret among them all", () => {
