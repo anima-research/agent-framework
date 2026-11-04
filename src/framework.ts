@@ -6653,9 +6653,11 @@ export class AgentFramework {
     }
     if (isTurnRetry(request)) (same as MarkedRequest)[TURN_RETRY] = true;
     // A merged start's batch (MERGED_BATCH) stays recorded on the request
-    // kept in its place, which then stands for it, as the start did.
+    // kept in its place, which then stands for it, as the start did; a wake
+    // folded into a merged start joins its batch, which its release expands.
     const batch = mergedBatch(request);
-    if (batch) (same as MarkedRequest)[MERGED_BATCH] = [...new Set([...(mergedBatch(same) ?? []), ...batch])];
+    const into = mergedBatch(same);
+    if (batch || into) (same as MarkedRequest)[MERGED_BATCH] = [...new Set([...(into ?? []), ...(batch ?? [request])])];
     const channels = wakeChannelsOf([same, request]);
     if (channels) same.wakeChannels = channels;
   }
