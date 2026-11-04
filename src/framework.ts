@@ -5140,10 +5140,10 @@ export class AgentFramework {
     // Tune-out coordinator (issue #77): the hold machinery exists wherever
     // tune_out is offered, which is only with a reader (persistent
     // subconscious or reader forks): it summarizes and wakes, and a persisted
-    // epoch is resumed and released (#232 gap 10). Without a reader nothing
-    // could ever cancel a tune-out on record, so each one ends at the start
-    // instead (endTuneOutsWithoutCoordinator), a hold that 0.32's
-    // `tuneOut.enabled` left included.
+    // epoch is resumed and released (#232 gap 10). Without a reader each
+    // tune-out on record is released at the start instead, backlog delivered
+    // (releaseTuneOutsWithoutReader), a hold that 0.32's `tuneOut.enabled`
+    // left included.
     if (framework.channelRegistry && framework.tuneOutOffered) {
       framework.tuneOutCoordinator = framework.makeTuneOutCoordinator();
       framework.tuneOutCoordinator.resumeActiveEpochs();
@@ -7806,7 +7806,9 @@ export class AgentFramework {
     if (this.channelRegistry) {
       channelTools.push(AgentFramework.DRAFTS_TOOL);
     }
-    if (this.tuneOutCoordinator && this.tuneOutOffered) {
+    // Offered while a reader is there to watch a hold: not once the
+    // persistent reader has ended (enter would refuse anyway).
+    if (this.tuneOutCoordinator && this.tuneOutOffered && (this.subconsciousAgentName !== null || this.readerForks)) {
       channelTools.push(AgentFramework.TUNE_OUT_TOOL, AgentFramework.FOCUS_TOOL);
     }
     const gateTools = this.eventGate
@@ -11994,7 +11996,7 @@ export class AgentFramework {
       this.subconsciousAgentName = null;
       // No reader is left, and a hold nothing summarizes isn't kept: each
       // ends now, its backlog to the resident.
-      if (!this.readerForks) this.tuneOutCoordinator?.releaseAll('reader-ended', 'its reader ended');
+      if (!this.readerForks) this.tuneOutCoordinator?.releaseAll('reader-ended', 'its reader ended', { retry: true });
     }
   }
 

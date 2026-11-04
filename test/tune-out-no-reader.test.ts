@@ -121,7 +121,9 @@ test('when the persistent reader is stopped, its holds end with it and each back
   assert.equal(releases(f).length, 1);
   assert.match(JSON.stringify(releases(f)[0]!.content), /its reader ended/);
   assert.match(JSON.stringify(releases(f)[0]!.content), /document_diff/);
-  // With the reader gone, no new hold, for one channel or all-except.
+  // With the reader gone, tune_out and focus are no longer offered, and no new hold is made.
+  const names = f.framework.getAllTools().map((tool) => tool.name);
+  assert.ok(names.length > 0 && !names.includes('tune_out') && !names.includes('focus'), names.join(', '));
   const again = coordinator.enter('editor', 'chat', {}, 'agent-tool');
   assert.equal(again.ok, false);
   assert.match((again as { error: string }).error, /no subconscious resident to watch a channel/);
@@ -144,4 +146,25 @@ test('when the persistent reader is stopped during an all-except hold, the hold 
   assert.equal(scoped.length, 1);
   assert.match(JSON.stringify(scoped[0]!.content), /its reader ended/);
   assert.match(JSON.stringify(scoped[0]!.content), /document_diff/);
+});
+
+test('a release that fails when the reader is stopped is tried again until it goes', async (t) => {
+  const f = await fixture({ framework: { subconscious: READER, tuneOut: { announce: false } } as Partial<FrameworkConfig> });
+  t.after(f.close);
+  await f.register('chat');
+  const coordinator = internals(f).tuneOutCoordinator!;
+  assert.ok(coordinator.enter('editor', 'chat', {}, 'agent-tool').ok, 'an open-ended hold');
+  const registry = internals(f).channelRegistry as unknown as { cancelTuneOut: (...args: unknown[]) => unknown };
+  const cancel = registry.cancelTuneOut;
+  registry.cancelTuneOut = () => { throw new Error('the store refused the write'); };
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    f.framework.stopAgent(internals(f).subconsciousAgentName!);
+    assert.notEqual(internals(f).channelRegistry.getTuneOutState('editor', 'chat'), null, 'the first try failed: still held');
+  } finally {
+    registry.cancelTuneOut = cancel;
+  }
+  t.mock.timers.tick(60_000);
+  t.mock.timers.reset();
+  assert.equal(internals(f).channelRegistry.getTuneOutState('editor', 'chat'), null, 'the retry released it');
 });

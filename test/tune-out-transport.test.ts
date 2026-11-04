@@ -1470,7 +1470,7 @@ test('a tune-out on record when a start without servers connects one later ends 
 });
 
 test('a tune-out whose release fails at a start with no subconscious stays recorded for the next start, and the log says so', async (t) => {
-  const store = await tunedOutStore(t, 0);
+  const store = await tunedOutStore(t, 1);
   const cancel = ChannelRegistry.prototype.cancelTuneOut;
   ChannelRegistry.prototype.cancelTuneOut = () => { throw new Error('the store refused the write'); };
   let second: AgentFramework;
@@ -1491,7 +1491,24 @@ test('a tune-out whose release fails at a start with no subconscious stays recor
   assert.equal(thirdRegistry.getDesiredState('disc', CHANNEL), 'open');
   const released = third.getAgent('scout')!.getContextManager().getAllMessages()
     .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'tune-out-cancel');
-  assert.equal(released.length, 1, 'released once, at the next start');
+  assert.ok(released.length >= 1, 'released at the next start');
+  const text = JSON.stringify(released.map((m) => m.content));
+  assert.match(text, /no reader is configured/);
+  assert.match(text, /backlog 1/, 'the held message is in the release');
+  assert.equal(released.filter((m) => /backlog 1/.test(JSON.stringify(m.content))).length, 1, 'delivered once');
+});
+
+test('a tune-out on record when a start with no subconscious and no servers connects one later is released then, backlog delivered', async (t) => {
+  const store = await tunedOutStore(t, 2);
+  const second = await store.start(false, false);
+  await store.capture(() => second.connectMcplServer(store.server));
+  const registry = (second as unknown as RestartInternals).channelRegistry;
+  assert.equal(registry.getTuneOutState('disc', CHANNEL), null, 'released at the connect');
+  assert.equal(registry.getDesiredState('disc', CHANNEL), 'open');
+  const released = second.getAgent('scout')!.getContextManager().getAllMessages()
+    .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'tune-out-cancel');
+  assert.equal(released.length, 1);
+  assert.match(JSON.stringify(released[0]!.content), /messages=2/);
   assert.match(JSON.stringify(released[0]!.content), /no reader is configured/);
 });
 

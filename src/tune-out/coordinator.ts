@@ -327,6 +327,8 @@ export class TuneOutCoordinator {
    *  the end time does when its cancel finds the tune-out already ended,
    *  and the channel's next accepted enter does in any case. */
   private expiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** A releaseAll asked to retry its failures (a reader that ended): the next try. */
+  private releaseRetry: ReturnType<typeof setTimeout> | null = null;
   /** Channels with a wake invocation pending inside the coalescing window. */
   private pendingWakes = new Map<string, { count: number; timer: ReturnType<typeof setTimeout> }>();
   /**
@@ -957,7 +959,12 @@ export class TuneOutCoordinator {
    * the agent's provenance (the housekeeping guard reads it); `source` is the
    * all-except scope's.
    */
-  releaseAll(source: string, reason: string): void {
+  releaseAll(source: string, reason: string, options: { retry?: boolean } = {}): void {
+    if (this.releaseRetry) {
+      clearTimeout(this.releaseRetry);
+      this.releaseRetry = null;
+    }
+    let failed = false;
     // What the registry has on record, registered or not: at a start the
     // channels aren't registered yet, so listActive() would find none.
     let onRecord: ReturnType<ChannelRegistry['tuneOutsOnRecord']> = [];
@@ -965,22 +972,40 @@ export class TuneOutCoordinator {
       onRecord = this.channelRegistry.tuneOutsOnRecord();
     } catch (err) {
       console.error(`[tune-out] the tune-outs on record could not be read to release them (${reason}), so they stay on record:`, err);
+      failed = true;
     }
     for (const { serverId, channelId, source: recorded } of onRecord) {
       try {
         const r = this.cancel(serverId, channelId, recorded, reason);
-        if (!r.ok) console.error(`[tune-out] ${this.shown(serverId, channelId)} could not be released (${reason}), so it stays on record: ${r.error}`);
+        if (!r.ok) {
+          console.error(`[tune-out] ${this.shown(serverId, channelId)} could not be released (${reason}), so it stays on record: ${r.error}`);
+          failed = true;
+        }
       } catch (err) {
         console.error(`[tune-out] ${this.shown(serverId, channelId)} could not be released (${reason}), so it stays on record:`, err);
+        failed = true;
       }
     }
     try {
       if (this.getAllExcept()) {
         const r = this.cancelAllExcept(source, reason);
-        if (!r.ok) console.error(`[tune-out] the all-except hold could not be released (${reason}), so it stays on record: ${r.error}`);
+        if (!r.ok) {
+          console.error(`[tune-out] the all-except hold could not be released (${reason}), so it stays on record: ${r.error}`);
+          failed = true;
+        }
       }
     } catch (err) {
       console.error(`[tune-out] the all-except hold could not be released (${reason}), so it stays on record:`, err);
+      failed = true;
+    }
+    // With a reader gone mid-run the hold still diverts traffic, and an
+    // open-ended one has no end time to release it: try again until it goes
+    // (stop() clears the try).
+    if (failed && options.retry) {
+      this.releaseRetry = setTimeout(() => {
+        this.releaseRetry = null;
+        this.releaseAll(source, reason, options);
+      }, EXPIRY_RETRY_MS);
     }
   }
 
@@ -2155,6 +2180,10 @@ export class TuneOutCoordinator {
 
   /** Stop all timers (framework shutdown). */
   stop(): void {
+    if (this.releaseRetry) {
+      clearTimeout(this.releaseRetry);
+      this.releaseRetry = null;
+    }
     for (const timer of this.cadenceTimers.values()) clearTimeout(timer);
     this.cadenceTimers.clear();
     for (const timer of this.expiryTimers.values()) clearTimeout(timer);

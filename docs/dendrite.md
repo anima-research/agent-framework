@@ -275,11 +275,11 @@ Under both rules a held message is never "the latest inbound".
 
 ### Tune-out without a reader
 
-The tune-out coordinator exists wherever residents are offered `tune_out`, which is only with a reader (the persistent subconscious or reader forks): it summarizes on a cadence and wakes the reader on addressed traffic, and a persisted epoch is resumed and released (gap 10). Without a reader there is no hold: a hold nothing summarizes would hand the resident an undated backlog all at once when it ends, so `tuneOut.enabled`, which offered one, was removed in 0.33.0 and is refused, and a tune-out still on record from it ends at the next start (with no MCPL server configured, when the first one connects). A hold asked for after its reader ended is refused the same way, and the holds a persistent reader had end with it, their backlogs to the resident.
+The tune-out coordinator exists wherever residents are offered `tune_out`, which is only with a reader (the persistent subconscious or reader forks): it summarizes on a cadence and wakes the reader on addressed traffic, and a persisted epoch is resumed and released (gap 10). Without a reader there is no hold: a hold nothing summarizes would hand the resident an undated backlog all at once when it ends, so `tuneOut.enabled`, which offered one, was removed in 0.33.0 (`enabled: true` is refused at `create`; `false` is still accepted and does nothing), and a tune-out still on record from it ends at the next start (with no MCPL server configured, when the first one connects). A hold asked for after its reader ended is refused the same way, and the holds a persistent reader had end with it, their backlogs to the resident.
 
 ### What a release is
 
-A release is a system-framed notice with the count, the channel and the epoch, then the held messages up to `backlogCap` as `author: text [image] …` lines in block order, then the reader's report under the reader's own name. Messages still in the deferred queue (held while a turn was alive) are included. Above the cap the note names the history tool the resident actually has, or says the rest was not delivered. The release is made durable before the cancel returns.
+A release is a system-framed notice with the count, the channel and the epoch, then the held messages up to `backlogCap` as `author: text [image] …` lines in block order, then, where a reader is configured, the reader's report under the reader's own name (a release made because there is no reader has none). Messages still in the deferred queue (held while a turn was alive) are included. Above the cap the note names the history tool the resident actually has, or says the rest was not delivered. The release is made durable before the cancel returns.
 
 ### The all-except scope
 

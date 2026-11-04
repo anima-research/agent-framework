@@ -22,3 +22,9 @@
   - The `tune_out` description drops its sentence about a silent hold, and
     the tool results their silent-hold notes. `tuneOut.announce` is
     unchanged.
+  - **Sibling versions:** none raised; this needs context-manager
+    `^0.24.0`, membrane `^0.8.0` and chronicle `^0.5.1`, as 0.32.0 does.
+  - When the persistent reader ends while a hold's release fails (its
+    backlog can't be made durable), the release is tried again every
+    minute until it goes, and `tune_out` / `focus` are no longer listed
+    once the reader has ended.
