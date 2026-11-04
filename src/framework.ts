@@ -34788,27 +34788,55 @@ export class AgentFramework {
         latestInboundLocus: this.speechLocus === 'latest-inbound',
         // A tool close of the channel an all-except hold excepts ends that
         // hold through the cancel flow, since there is nothing left to speak
-        // into. A tool close of a tuned-out channel is refused
-        // before this hook is called (ChannelRegistry.tunedOutRefusal).
-        onToolClose: (serverId, channelId) => {
+        // into, and so does a close naming that channel once its server no
+        // longer registers it (`unregistered`). A tool close of a tuned-out
+        // channel is refused before this hook is called
+        // (ChannelRegistry.tunedOutRefusal).
+        onToolClose: (serverId, channelId, opts) => {
           const coordinator = this.tuneOutCoordinator;
           if (!coordinator) return undefined;
           const scope = coordinator.getAllExcept();
           if (!scope || scope.params.except.serverId !== serverId || scope.params.except.channelId !== channelId) return undefined;
+          const unregistered = opts?.unregistered === true;
+          const { epochId } = scope.params;
+          // Whether this hold has ended, read when an answer is built: after
+          // the close's transport round-trip, during which a release that
+          // waited may have run, or after a release that failed part-way. A
+          // record that can't be read is taken for the hold in force, as the
+          // deferred cancels take it.
+          const over = (): boolean => {
+            try {
+              return coordinator.getAllExcept()?.params.epochId !== epochId;
+            } catch {
+              return false;
+            }
+          };
+          const endedText = 'The focus on it ended, and what the other channels held was delivered.';
           let released: ReturnType<typeof coordinator.cancelAllExcept>;
           try {
-            released = coordinator.cancelAllExcept('channel-close', 'the excepted channel was closed');
+            released = coordinator.cancelAllExcept('channel-close', unregistered
+              ? 'a close of the excepted channel, which its server no longer registers'
+              : 'the excepted channel was closed');
           } catch (err) {
-            throw new Error(`The close wasn't recorded: ${err instanceof Error ? err.message : String(err)}`);
+            const why = err instanceof Error ? err.message : String(err);
+            // The release records the hold's end once its notice is stored,
+            // and steps follow it (a note's delivery, the resident's wake): a
+            // failure there comes after the end, which the answer says.
+            if (over()) {
+              throw new Error(`${unregistered ? "A step of the focus's release failed" : "The close wasn't recorded"}: `
+                + `${/[.!?]$/.test(why) ? why : `${why}.`} The focus on it ended before that failure, and what the other channels held was delivered.`);
+            }
+            throw new Error(unregistered ? `The focus on it wasn't ended: ${why}` : `The close wasn't recorded: ${why}`);
           }
-          if (!released.ok) throw new Error(`The close wasn't recorded: ${released.error}`);
+          if (!released.ok) throw new Error(unregistered ? `The focus on it wasn't ended: ${released.error}` : `The close wasn't recorded: ${released.error}`);
+          if (!released.deferred) return () => endedText;
           // A cancel that waits is told as the tune-out tools tell one
           // (cancelWaitsNote): what it waits for, that asking again doesn't
           // end the wait sooner, that its length isn't known, and that a stop
-          // before it runs loses it.
-          return released.deferred
-            ? `The close cancels the all-except hold that excepts it. ${cancelWaitsNote('The all-except hold')}`
-            : 'The focus on it ended, and what the other channels held was delivered.';
+          // before it runs loses it. Until the answer is built: a release
+          // that ran by then ended the focus, and the answer says so.
+          const waits = `${unregistered ? 'This call' : 'The close'} cancels the all-except hold that excepts it. ${cancelWaitsNote('The all-except hold')}`;
+          return () => (over() ? endedText : waits);
         },
         focusChannelResolver: () => this.tuneOutCoordinator?.focusChannel() ?? null,
         // Who reads a tuned-out channel's traffic, for the registry's texts
