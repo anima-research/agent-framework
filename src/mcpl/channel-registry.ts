@@ -5273,6 +5273,7 @@ export class ChannelRegistry {
     // close resolves its name as any other: housekeeping doesn't end the
     // resident's focus.
     const focused = origin?.kind === 'module' ? undefined : this.focusNamedBare(input.channelId, input.serverId, own);
+    if (focused && 'refusal' in focused) return { success: false, error: focused.refusal, isError: true };
     if (focused) {
       const entry = this.entryAt(focused.focus);
       const result = entry
@@ -5461,6 +5462,17 @@ export class ChannelRegistry {
    * and another server registered the id: that one is closed only by a close
    * that names its server. With it, where other registered channels answer
    * to the name, the sentence saying they weren't closed (`notClosed`).
+   *
+   * Where the name is the hold channel's and a channel of the calling turn's
+   * own, another channel, answers to it too, the name means neither: a
+   * resident repeating a close that failed before its focus ended, in a turn
+   * that has since opened another server's channel with the id, would
+   * otherwise close that channel and leave the focus in force. That close is
+   * refused, naming both (`refusal`, focusOrOwnRefusal), and a close naming
+   * either's server reaches it. A turn's name for the hold's channel itself,
+   * and a name the turn's channels on more than one server answer to
+   * (ownNeitherRefusal), resolve as any other.
+   *
    * Undefined where no hold is in force, where the name isn't the hold
    * channel's, and where the hold's record can't be read, which leaves the
    * name to resolve as any other (resolveToolChannelEntry).
@@ -5469,8 +5481,10 @@ export class ChannelRegistry {
     name: string,
     serverId: string | undefined,
     own: readonly ChannelRef[] | undefined,
-  ): { focus: ChannelRef; notClosed?: string } | undefined {
-    if (serverId || this.ownChannelNamed(name, own)) return undefined;
+  ): { focus: ChannelRef; notClosed?: string } | { refusal: string } | undefined {
+    if (serverId) return undefined;
+    const mine = this.ownChannelNamed(name, own);
+    if (mine && 'neither' in mine) return undefined;
     let focus: ChannelRef | null | undefined;
     try {
       focus = this.focusChannelResolver?.();
@@ -5478,9 +5492,45 @@ export class ChannelRegistry {
       return undefined;
     }
     if (!focus || (name !== focus.channelId && name !== qualifiedChannelName(focus))) return undefined;
+    if (mine) return sameChannel(mine.channel, focus) ? undefined : { refusal: this.focusOrOwnRefusal(name, focus, mine.channel, own) };
     const held = focus;
     const others = this.entriesNamed(name).map(refOf).filter((ref) => !sameChannel(ref, held));
     return { focus: held, ...(others.length > 0 ? { notClosed: notClosedText(others) } : {}) };
+  }
+
+  /**
+   * The refusal of a channel_close's bare name (focusNamedBare) that both the
+   * channel the all-except hold excepts (`focus`) and another channel of the
+   * calling turn's own (`mine`, ownChannelNamed) answer to, each named by
+   * what reaches it alone. The hold's channel is reached by its
+   * server-qualified name, registered or not (focusNamedBare), unless a
+   * channel of the turn's answers to that too; the turn's channel as a
+   * refusal of the turn's names shows it (ownCandidates). A serverId goes
+   * with the channel's own id, so it's offered only where the name is the id
+   * of both, for the hold's server (registered or not, the close reaches its
+   * channel: unregisteredFocusNamed) and for the turn's channel's where that
+   * server still registers it. Where the name is the hold channel's
+   * server-qualified name, which another of the turn's channels has for its
+   * id, the hold's channel is reached by its id and server.
+   */
+  private focusOrOwnRefusal(name: string, focus: ChannelRef, mine: ChannelRef, own: readonly ChannelRef[] | undefined): string {
+    const qualified = qualifiedChannelName(focus);
+    const focusReaches = this.ownChannelNamed(qualified, own) === undefined;
+    const [theirs] = this.ownCandidates([mine]);
+    const parts = [
+      { text: focusReaches ? quotedValue(qualified) : channelOnServer(focus), reaches: focusReaches },
+      { text: theirs!.reaches ? quotedValue(theirs!.text) : theirs!.text, reaches: theirs!.reaches },
+    ];
+    const named = parts.filter((p) => p.reaches).map((p) => p.text);
+    const byName = named.length === 2 ? 'channelId set to one of them' : named.length === 1 ? `channelId ${named[0]}` : '';
+    const servers = name === focus.channelId ? [focus.serverId, ...(this.entryAt(mine) ? [mine.serverId] : [])] : [];
+    const byServer = servers.length > 0 ? `serverId set to ${servers.map((id) => JSON.stringify(id)).join(' or ')}` : '';
+    const how = [byName, byServer].filter((h) => h !== '').join(', or with ');
+    const focusRoute = name !== focus.channelId && !focusReaches
+      ? ` For the channel the focus excepts, call again with channelId ${quotedValue(focus.channelId)} and serverId ${JSON.stringify(focus.serverId)}.`
+      : '';
+    return `Channel ${JSON.stringify(name)} names both the channel the all-except focus excepts (${parts[0]!.text}) ` +
+      `and this turn's channel (${parts[1]!.text}), so nothing ran.${how ? ` Call again with ${how}.` : ''}${focusRoute}`;
   }
 
   /**
