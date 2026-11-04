@@ -712,10 +712,9 @@ export interface InferenceRequest {
    * Framework-set on a gate wake whose batch held no message that addressed
    * the agent, and which so took no route: the channels its messages came
    * from (a `chat:system` notice names none, unless it's a coalesced
-   * render's latest occurrence), each once. A turn merged with
-   * a wake that names a channel (a `chat:system` notice's doesn't count)
-   * carries none. When such a turn's plain speech, or a sleep's
-   * announcement, is routed with no locus, the agent is told these channels.
+   * render's latest occurrence), each once. When such a turn's plain
+   * speech, or a sleep's announcement, is routed with no locus, the agent is
+   * told these channels.
    */
   wakeChannels?: Array<{ serverId: string; channelId: string }>;
   /** Timestamp of the event the wake provenance was taken from (ms). */

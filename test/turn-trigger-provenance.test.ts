@@ -22,6 +22,9 @@ function internals(framework: AgentFramework) {
     pendingRequests: InferenceRequest[];
     processInferenceRequests(): Promise<void>;
     startAgentStream(agent: unknown, trigger?: InferenceRequest): Promise<void>;
+    routingOf(agentName: string): { wakeChannels?: Array<{ serverId: string; channelId: string }>; triggerChannel?: unknown };
+    openLogical: Map<string, unknown>;
+    cameFrom(routing: unknown, locus: null): { cameFrom: Array<{ channel: unknown }> } | undefined;
   };
 }
 
@@ -126,12 +129,12 @@ describe('Turn trigger provenance', () => {
     await framework.stop();
   });
 
-  for (const [what, other, keeps, why] of [
-    ['a wake that names a channel', { reason: 'mcpl:channel-incoming', source: 'discord', channelId: 'discord:g:feed', channelServerId: 'discord' }, false, 'the turn has a channel'],
-    ['an addressed push that names no channel', { reason: 'mcpl:push-event', source: 'discord', addressed: true }, true, 'the notice says only where the turn came from and that no channel was chosen, which holds though a message addressed the agent'],
-    ['an addressed chat:system notice', { reason: 'mcpl:channel-incoming', source: 'discord', channelId: 'discord:dm:5', channelServerId: 'discord', addressed: true, systemNotice: true }, true, 'a notice neither addresses the agent nor names a channel'],
+  for (const [what, other, batchFirst, why] of [
+    ['a wake that names a channel', { reason: 'mcpl:channel-incoming', source: 'discord', channelId: 'discord:g:feed', channelServerId: 'discord' }, true, "the wake's channel decides the turn's locus, and the batch's channels are named only to a turn with none"],
+    ['an addressed push that names no channel', { reason: 'mcpl:push-event', source: 'discord', addressed: true }, false, 'the notice says only where the turn came from and that no channel was chosen, which holds though a message addressed the agent'],
+    ['an addressed chat:system notice', { reason: 'mcpl:channel-incoming', source: 'discord', channelId: 'discord:dm:5', channelServerId: 'discord', addressed: true, systemNotice: true }, false, 'a notice neither addresses the agent nor names a channel'],
   ] as const) {
-    it(`a turn merged from ${what} and an ambient batch ${keeps ? 'keeps' : 'names no'} batch channels`, async () => {
+    it(`a turn merged from ${what} and an ambient batch keeps the batch's channels`, async () => {
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi' }]));
       const framework = await makeFramework();
       const i = internals(framework);
@@ -139,14 +142,38 @@ describe('Turn trigger provenance', () => {
       const t = Date.now();
       const batch: InferenceRequest = { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: t + 1, wakeChannels: [{ serverId: 'discord', channelId: 'discord:g:room' }] };
       const wake: InferenceRequest = { agentName: 'scout', timestamp: t, ...other };
-      i.pendingRequests.push(...(keeps ? [wake, batch] : [batch, wake]));
+      i.pendingRequests.push(...(batchFirst ? [batch, wake] : [wake, batch]));
       await i.processInferenceRequests();
       await framework.runUntilIdle();
       assert.ok(captured.exposed, 'the merged turn started');
-      assert.deepEqual(captured.exposed.wakeChannels, keeps ? [{ serverId: 'discord', channelId: 'discord:g:room' }] : undefined, why);
+      assert.deepEqual(captured.exposed.wakeChannels, [{ serverId: 'discord', channelId: 'discord:g:room' }], why);
       await framework.stop();
     });
   }
+
+  it("a start that continues a turn with no locus names a joining batch's channels to it, though a wake that names a channel joined too", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi' }]));
+    const framework = await makeFramework();
+    const i = internals(framework);
+    const captured = spy(framework);
+    const general = { serverId: 'discord', channelId: 'discord:g:general' };
+    const room = { serverId: 'discord', channelId: 'discord:g:room' };
+    const routing = i.routingOf('scout');
+    routing.wakeChannels = [general];
+    i.openLogical.set('scout', routing);
+    const t = Date.now();
+    i.pendingRequests.push(
+      { agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: t, channelId: 'discord:g:feed', channelServerId: 'discord' },
+      { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: t + 1, wakeChannels: [room] },
+    );
+    await i.processInferenceRequests();
+    await framework.runUntilIdle();
+    assert.equal(captured.exposed?.channelId, 'discord:g:feed', 'premise: the merged start names the wake\'s channel');
+    assert.equal(routing.triggerChannel, undefined, 'premise: the start continued the open turn, which takes no channel from it');
+    assert.deepEqual(routing.wakeChannels, [general, room]);
+    assert.deepEqual(i.cameFrom(routing, null)?.cameFrom.map((c) => c.channel), [general, room]);
+    await framework.stop();
+  });
 
   it("two ambient batches parked while the host is quiesced, coalesced into one, name both batches' channels at resume", async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi' }]));

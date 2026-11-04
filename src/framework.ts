@@ -20377,7 +20377,7 @@ export class AgentFramework {
         // channel is that message's, never one server's id with another's.
         channelId: channelReq?.channelId,
         channelServerId: channelReq?.channelServerId,
-        wakeChannels: channelReq ? undefined : wakeChannelsOf(requests),
+        wakeChannels: wakeChannelsOf(requests),
         // Only the mark this batch decided, never one requests[0] carried.
         autoContinueRun: continuationMark,
         addressed: addressedReq !== undefined,
