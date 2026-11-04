@@ -4994,8 +4994,7 @@ export class AgentFramework {
             // process-global most-recent-inbound channel, which an ambient
             // message elsewhere could retarget between the DM's arrival and
             // the debounce firing (2026-09-30). Ambient-only batches set no
-            // locus and keep the legacy fallback; the channels they came
-            // from travel as `wakeChannels`, for the no-locus notice.
+            // locus and keep the legacy fallback.
             //
             // The wake is broadcast to every agent, conversation forks
             // included, and a fork speaks only in its home channel: the
@@ -6652,11 +6651,9 @@ export class AgentFramework {
       return;
     }
     // A merged start's batch (MERGED_BATCH) stays recorded on the request
-    // kept in its place, which then stands for it, as the start did. What
-    // folds into a merged start, or a held wake that a merged start folds
-    // into, goes into the batch by this same fold, so the release expands
-    // to each wake once. The copy of a held wake is taken before any mark
-    // below, so it carries only what that wake itself was.
+    // kept in its place, which then stands for it, as the start did.
+    // Copy the held wake and read the kept request's carry before marking
+    // it, and reconcile each mark as the scheduler's merge does.
     const into = mergedBatch(same);
     const batch = mergedBatch(request);
     if (into || batch) {
@@ -6664,11 +6661,11 @@ export class AgentFramework {
       for (const member of batch ?? [request]) this.holdRequest(members, member);
       (same as MarkedRequest)[MERGED_BATCH] = members;
     }
+    const keptCarry = turnCarryOf(same);
     if (isTurnRetry(request)) (same as MarkedRequest)[TURN_RETRY] = true;
-    // As the scheduler's merge does: the kept request takes the turn's carry
-    // when it has none, and stays re-armed only if both were.
-    const carry = turnCarryOf(request);
-    if (carry && !turnCarryOf(same)) (same as MarkedRequest)[TURN_CARRY] = carry;
+    const carry = keptCarry ?? turnCarryOf(request);
+    if (carry) (same as MarkedRequest)[TURN_CARRY] = carry;
+    else delete (same as MarkedRequest)[TURN_CARRY];
     if (!isRearmed(request)) delete (same as MarkedRequest)[REARMED];
     const channels = wakeChannelsOf([same, request]);
     if (channels) same.wakeChannels = channels;
@@ -21435,7 +21432,7 @@ export class AgentFramework {
   }
 
   private cameFrom(routing: TurnRouting, locus: ChannelRef | null): { cameFrom: Array<{ channel: ChannelRef; shown: string }> } | undefined {
-    return locus === null && routing.wakeChannels
+    return locus === null && !routing.noChannel && routing.wakeChannels
       ? { cameFrom: routing.wakeChannels.map((c) => ({ channel: c, shown: this.channelShown(c) })) }
       : undefined;
   }

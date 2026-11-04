@@ -249,6 +249,16 @@ describe('batched wake routing', () => {
     assert.ok(!routing.some((t) => t.includes('room')), JSON.stringify(routing));
   });
 
+  it("a turn whose wake named a channel this host can't resolve names no channel it came from, though a batch's channels joined it", async () => {
+    const internal = rig.framework() as unknown as {
+      cameFrom(routing: Record<string, unknown>, locus: null): { cameFrom: Array<{ shown: string }> } | undefined;
+    };
+    const room = { serverId: 'discord', channelId: ROOM };
+    assert.deepEqual(internal.cameFrom({ wakeChannels: [room] }, null)?.cameFrom.map((c) => c.shown), ['#room (discord:g1:room)'],
+      "premise: a batch's turn with no locus names the channels it came from");
+    assert.equal(internal.cameFrom({ noChannel: true, wakeChannels: [room] }, null), undefined);
+  });
+
   it('an ambient batch of one message has no locus: its prose stays private, and the resident is told the channel it came from', async () => {
     await ambientBatchHasNoLocus(rig, [ROOM], ['room']);
   });

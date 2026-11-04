@@ -172,7 +172,6 @@ describe('Turn trigger provenance', () => {
   });
 
   it("a context-budget restart of a batch's turn carries the batch's channels", async () => {
-    // One queued response per stream: the restart opens a second stream.
     class SequentialStreamMembrane extends MockMembrane {
       private streamIdx = 0;
       streamYielding(request: NormalizedRequest, _options?: unknown): YieldingStream {
@@ -193,7 +192,6 @@ describe('Turn trigger provenance', () => {
       async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> { return {}; }
     }
     const sequential = new SequentialStreamMembrane();
-    // The tool round's usage (10 input tokens) is over the budget below.
     sequential.pushResponse(createMockResponse([
       { type: 'text', text: 'Working.' },
       { type: 'tool_use', id: 'call_1', name: 'test--echo', input: {} },

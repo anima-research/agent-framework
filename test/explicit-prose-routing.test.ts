@@ -1498,7 +1498,6 @@ describe('explicit prose routing', () => {
     origin.continuation = true;
     const room = { serverId: 'discord', channelId: 'discord:g:room' };
     (origin as unknown as { wakeChannels?: unknown }).wakeChannels = [room];
-    // The turn that ran the tools is open, as its fresh start left it.
     internals.openLogical.set('assistant', origin);
     const response = createMockResponse([
       { type: 'tool_use', id: 'unstreamed-one', name: 'robot--move', input: { dir: 'north' } },
