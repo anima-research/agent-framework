@@ -3030,6 +3030,31 @@ describe('the framework wires the reply judge', () => {
     assert.strictEqual(internal.lastStartFailed.has('scout'), false);
   });
 
+  it('a silent start that throws before its stream marks no failed last turn, since it settles none', async (t) => {
+    const { framework } = await frameworkWith(t, { config: JUDGED, judge: {} });
+    const internal = framework as unknown as {
+      pendingRequests: Array<Record<string, unknown>>;
+      processInferenceRequests(): Promise<void>;
+      lastStartFailed: Map<string, number>;
+      recordTurnCheckpoint(agentName: string): void;
+    };
+    const record = internal.recordTurnCheckpoint.bind(framework);
+    internal.recordTurnCheckpoint = () => {
+      internal.recordTurnCheckpoint = record;
+      throw new Error('zz checkpoint refused');
+    };
+    internal.pendingRequests.push({ agentName: 'scout', reason: 'a silent test wake', source: 'test', timestamp: Date.now(), suppressProse: true });
+    const errors = console.error;
+    console.error = () => {};
+    try {
+      await assert.rejects(internal.processInferenceRequests(), /zz checkpoint refused/, "premise: the start's own throw reaches its pass");
+    } finally {
+      console.error = errors;
+    }
+    assert.strictEqual(internal.recordTurnCheckpoint, record, 'premise: the checkpoint threw');
+    assert.strictEqual(internal.lastStartFailed.has('scout'), false);
+  });
+
   it("lists another agent's wake that a scheduler pass holds while it awaits an earlier agent's start", async (t) => {
     const { AgentFramework } = await import('../src/index.js');
     const { MockMembrane, createMockResponse } = await import('./helpers/mock-membrane.js');
