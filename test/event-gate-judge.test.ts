@@ -16,9 +16,6 @@ function writeConfig(name: string, config: unknown): string {
   return path;
 }
 
-// node:test's mock timers leave setImmediate real, so promise chains, and I/O
-// callbacks already due, run between the mocked clock's steps; slower I/O
-// isn't waited for.
 async function settle(): Promise<void> {
   for (let i = 0; i < 4; i++) await new Promise((resolve) => setImmediate(resolve));
 }
@@ -63,7 +60,6 @@ async function idle(framework: { runUntilIdle(): Promise<unknown> }, what = 'the
 /** A judge whose verdicts the test hands out, one per request, in order. */
 function scriptedJudge() {
   const requests: JudgeRequest[] = [];
-  /** When each request was asked (ms), in order. */
   const askedAt: number[] = [];
   const pending: Array<{ resolve: (v: JudgeVerdict) => void; reject: (e: unknown) => void }> = [];
   const fn: JudgeFn = (request) => {
@@ -85,13 +81,11 @@ function scriptedJudge() {
       assert.ok(next, 'a judge request is waiting');
       next.reject(err);
     },
-    /** Answer the waiting request at `index` in asking order, leaving the others waiting. */
     answerAt(index: number, verdict: JudgeVerdict) {
       const [next] = pending.splice(index, 1);
       assert.ok(next, `a judge request is waiting at ${index}`);
       next.resolve(verdict);
     },
-    /** Fail the waiting request at `index` in asking order, leaving the others waiting. */
     failAt(index: number, err: unknown) {
       const [next] = pending.splice(index, 1);
       assert.ok(next, `a judge request is waiting at ${index}`);
@@ -104,7 +98,6 @@ function scriptedJudge() {
 function makeGate(configPath: string, opts: {
   judge?: JudgeFn; judgeTimeoutMs?: number; judgeOnError?: 'wake' | 'skip'; now?: () => number; residents?: string[];
   isHeld?: (serverId: string | undefined, channelId: string | undefined) => boolean;
-  /** Called with each trace as it's emitted, after it's recorded. */
   onTrace?: (trace: { type: string; [k: string]: unknown }) => void;
 } = {}) {
   const traces: Array<{ type: string; [k: string]: unknown }> = [];
@@ -578,11 +571,9 @@ describe('judge rules: timing', () => {
     gate.dispose();
   });
 
-  /** A call the framework refused without making it, as judgeMembraneFor refuses one under the agent's holds. */
   const refusal = (text: string, retryAfterMs?: number) =>
     Object.assign(new Error(text), { providerAdmission: 'deferred' as const, ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) });
   const judgeState = (gate: EventGate) => gate.getStatus().policies[0]!.judgeState!;
-  /** What the gate logs while `step` runs. */
   const logDuring = async (step: () => Promise<void>): Promise<string[]> => {
     const logged: string[] = [];
     const original = console.error;
@@ -760,11 +751,13 @@ describe('judge rules: timing', () => {
     const { gate } = makeGate(writeConfig('refused-joins.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip' });
     gate.evaluate(chat('first'));
     await until(() => judge.waiting() === 1, 'the judge call');
+    const refusedAt = Date.now();
     judge.fail(refusal("scout's provider calls are held", 1_500));
     await until(() => judgeState(gate).heldCount === 1, 'the batch held');
     gate.evaluate(chat('second'));
     await until(() => judgeState(gate).heldCount === 2, 'the new batch to join the held one');
     await until(() => judge.waiting() === 1, 'both judged once the wait ends', 4_000);
+    assert.ok(judge.askedAt[1]! - refusedAt >= 1_500, `asked again ${judge.askedAt[1]! - refusedAt} ms after the refusal`);
     assert.strictEqual(judge.requests.length, 2, 'the judge was not asked between');
     assert.deepStrictEqual(judge.requests.at(-1)!.events.map((e) => e.content), ['first', 'second']);
     judge.answer({ reply: false, reason: 'chatter' });
@@ -885,7 +878,6 @@ describe('judge rules: timing', () => {
     await until(() => judge.waiting() === 1, "first's call");
     gate.evaluate({ content: 'hi', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'c2' });
     await until(() => judge.waiting() === 2, "second's call, asked after first's");
-    // second's call is refused; first's, asked before, then answers.
     judge.failAt(1, refusal("scout's provider calls are held", 60_000));
     await until(() => gate.getStatus().policies[1]!.judgeState!.heldCount === 1, "second's batch held");
     judge.answer({ reply: false, reason: 'chatter' });
@@ -1949,8 +1941,6 @@ describe('the framework wires the reply judge', () => {
     const { tmpdir } = await import('node:os');
     const dir = mkdtempSync(join(tmpdir(), 'gate-judge-hold-'));
     const membrane = new MockMembrane();
-    // The host holds the agent's calls once, for longer than the gate's
-    // one-second floor, and not again when asked at the hold's end.
     let consulted = 0;
     const framework = await AgentFramework.create({
       storePath: join(dir, 'store'),
@@ -1967,14 +1957,12 @@ describe('the framework wires the reply judge', () => {
     });
     const eventGate = (framework as unknown as { eventGate: EventGate }).eventGate;
     const internal = framework as unknown as { holdProviderAcceleration(agent: unknown, error: Error, trigger?: unknown, auxiliary?: boolean): boolean };
-    // When the judge's call was made: MockMembrane is called only for calls admitted.
     let calledAt: number | undefined;
     const complete = membrane.complete.bind(membrane);
     membrane.complete = async (request) => { calledAt ??= Date.now(); return complete(request); };
     const original = console.error;
     console.error = () => {};
     try {
-      // As an auxiliary call's quota failure holds it: no turn of the agent's waits on the hold.
       const quota = new MembraneError({ type: 'rate_limit', retryable: true, httpStatus: 429, message: 'quota', rawError: { status: 429 } });
       assert.strictEqual(internal.holdProviderAcceleration(framework.getAgent('scout'), quota, undefined, true), true, 'premise: the agent is held');
       const heldAt = Date.now();
@@ -2019,7 +2007,6 @@ describe('the framework wires the reply judge', () => {
     const { MockMembrane, createMockResponse } = await import('./helpers/mock-membrane.js');
     const { mkdtempSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
-    /** Turns fail with a server error while `failTurns`; the judge's calls (complete) answer as scripted. */
     class FailingTurns extends MockMembrane {
       failTurns = true;
       override streamYielding(request: import('@animalabs/membrane').NormalizedRequest): import('@animalabs/membrane').YieldingStream {
@@ -2067,7 +2054,6 @@ describe('the framework wires the reply judge', () => {
     const original = console.error;
     console.error = () => {};
     try {
-      // A REPLY wakes scout, and its turn fails with no retry left.
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'REPLY: asked to check something' }]));
       eventGate.evaluate(chat('@scout can you check X?'));
       await judged(1);
@@ -2082,7 +2068,6 @@ describe('the framework wires the reply judge', () => {
       assert.match(question(), opening);
       assert.ok(question().includes('Nothing runs it again: if you answer WAIT, what woke it stays unanswered until something wakes scout.'), question());
 
-      // A provider wait on scout's model holds nothing, but its release queues a retry.
       const later = new MembraneError({ type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 180_000, message: 'slow down', rawError: { status: 429 } });
       assert.strictEqual(internal.holdProviderAcceleration(framework.getAgent('scout'), later), true, 'premise: scout is held, with no turn held');
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
@@ -2090,14 +2075,12 @@ describe('the framework wires the reply judge', () => {
       await judged(3);
       assert.ok(question().includes('A wake for scout is held, due to be let go in 3 min.'), question());
       assert.ok(question().includes(': a wake held by a provider hold, when it ends'), question());
-      // Released, the retry it queues runs and fails as the turn did.
       const failures = internal.consecutiveInferenceFailures.get('scout') ?? 0;
       framework.releaseProviderWait('scout', 'test-model');
       await idle(framework);
       assert.ok((internal.consecutiveInferenceFailures.get('scout') ?? 0) > failures, 'the release queued a retry, which ran and failed');
       assert.strictEqual(internal.pendingRequests.length, 0, 'premise: nothing re-arms it');
 
-      // A wake already queued for scout.
       internal.pendingRequests.push({ agentName: 'scout', reason: 'a queued wake', source: 'framework', timestamp: Date.now() });
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
       eventGate.evaluate(chat('and?'));
@@ -2105,7 +2088,6 @@ describe('the framework wires the reply judge', () => {
       assert.ok(question().includes('A wake for scout is already queued.'), question());
       assert.ok(question().includes(': a wake already queued (a queued wake)'), question());
 
-      // The same request parked as a continuation is still on its way.
       const request = internal.pendingRequests.shift()!;
       internal.parkedContinuations.add(request);
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
@@ -2116,7 +2098,6 @@ describe('the framework wires the reply judge', () => {
       internal.parkedContinuations.delete(request);
       internal.pendingRequests.push(request);
 
-      // A provider wait on scout's model, under which the scheduler holds the queued request; the judge's model is another.
       const wait = new MembraneError({ type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 180_000, message: 'slow down', rawError: { status: 429 } });
       internal.recordProviderWait('scout', 'test-model', wait);
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
@@ -2126,7 +2107,6 @@ describe('the framework wires the reply judge', () => {
       assert.ok(question().includes(': a wake held by a provider hold, when it ends'), question());
       assert.ok(!question().includes('already queued'), question());
 
-      // The wait holds the turn itself.
       assert.strictEqual(internal.holdProviderAcceleration(framework.getAgent('scout'), wait, internal.pendingRequests.shift()), true, 'premise: the turn is held');
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
       eventGate.evaluate(chat('hm'));
@@ -2134,7 +2114,6 @@ describe('the framework wires the reply judge', () => {
       assert.ok(question().includes('A wake for scout is held, due to be let go in 3 min.'), question());
       assert.ok(question().includes(': a wake held by a provider hold, when it ends'), question());
 
-      // Released, the held turn runs and completes: the failure is over.
       membrane.failTurns = false;
       framework.releaseProviderWait('scout', 'test-model');
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Checked: X is fine.' }]));
@@ -2143,6 +2122,99 @@ describe('the framework wires the reply judge', () => {
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
       eventGate.evaluate(chat('thanks'));
       await judged(8);
+      assert.doesNotMatch(question(), /last turn/);
+    } finally {
+      console.error = original;
+    }
+  });
+
+  it("tells the judge of a failed last turn only while no turn has started since: a later turn stopped before it answered ends the line", async (t) => {
+    const { MembraneError } = await import('@animalabs/membrane');
+    const { AgentFramework } = await import('../src/index.js');
+    const { MockMembrane, MockYieldingStream, createMockResponse } = await import('./helpers/mock-membrane.js');
+    const { mkdtempSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    class StoppableStream extends MockYieldingStream {
+      private stop!: () => void;
+      private readonly stopped = new Promise<void>((resolve) => { this.stop = resolve; });
+      override cancel(): void { this.stop(); }
+      override async *[Symbol.asyncIterator](): AsyncGenerator<import('@animalabs/membrane').StreamEvent> {
+        await this.stopped;
+        yield { type: 'aborted', reason: 'user' } as import('@animalabs/membrane').StreamEvent;
+      }
+    }
+    class Turns extends MockMembrane {
+      mode: 'fail' | 'hang' = 'fail';
+      hung = 0;
+      override streamYielding(request: import('@animalabs/membrane').NormalizedRequest): import('@animalabs/membrane').YieldingStream {
+        this.calls.push(request);
+        if (this.mode === 'hang') {
+          this.hung++;
+          return new StoppableStream([]);
+        }
+        const error = new MembraneError({ type: 'server', retryable: true, httpStatus: 500, message: 'Internal server error', rawError: { status: 500 } });
+        return {
+          isWaitingForTools: false, pendingToolCallIds: [], toolDepth: 0, isCancelled: false,
+          provideToolResults() { throw new Error('not waiting'); },
+          cancel() {},
+          async *[Symbol.asyncIterator]() { yield { type: 'error', error }; },
+        } as unknown as import('@animalabs/membrane').YieldingStream;
+      }
+    }
+    const dir = mkdtempSync(join(tmpdir(), 'gate-judge-stopped-'));
+    const membrane = new Turns();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', proseRouting: 'disabled' }],
+      modules: [],
+      gate: { configPath: join(dir, 'gate.json'), config: JUDGED },
+      errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false as const }) },
+      exhaustedTurnRearmMs: false,
+    });
+    t.after(async () => {
+      useRealClock();
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    });
+    const eventGate = (framework as unknown as { eventGate: EventGate }).eventGate;
+    const internal = framework as unknown as { consecutiveInferenceFailures: Map<string, number>; pendingRequests: unknown[] };
+    const judged = (n: number) => until(() => membrane.calls.filter((c) => c.assistantParticipant === 'reply-judge').length === n, `judge call ${n}`);
+    const question = () => {
+      const asked = membrane.calls.filter((c) => c.assistantParticipant === 'reply-judge').at(-1)!;
+      return (asked.messages.at(-1)!.content[0] as { text: string }).text;
+    };
+    const original = console.error;
+    console.error = () => {};
+    try {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'REPLY: asked to check something' }]));
+      eventGate.evaluate(chat('@scout can you check X?'));
+      await judged(1);
+      await until(() => internal.pendingRequests.length > 0, 'the wake');
+      await idle(framework);
+      assert.strictEqual(internal.consecutiveInferenceFailures.get('scout'), 1, 'premise: the turn failed with its retries spent');
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
+      eventGate.evaluate(chat('lol'));
+      await judged(2);
+      assert.match(question(), /scout's last turn, \d+s ago, failed/, 'premise: the failed turn is named while it is the last');
+
+      membrane.mode = 'hang';
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'REPLY: asked again' }]));
+      eventGate.evaluate(chat('@scout and Y?'));
+      await judged(3);
+      await until(() => internal.pendingRequests.length > 0, 'the wake');
+      let ran = false;
+      let failure: unknown;
+      void framework.runUntilIdle().then(() => { ran = true; }, (err: unknown) => { failure = err; ran = true; });
+      await until(() => membrane.hung === 1, 'the next turn to start');
+      assert.strictEqual(framework.abortInference('scout'), true, 'premise: the turn is stopped');
+      await until(() => ran, 'the stopped turn to end', 60_000);
+      if (failure !== undefined) throw failure;
+      assert.strictEqual(internal.consecutiveInferenceFailures.get('scout'), 1, 'premise: no turn has completed since the failure');
+
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
+      eventGate.evaluate(chat('ok'));
+      await judged(4);
       assert.doesNotMatch(question(), /last turn/);
     } finally {
       console.error = original;
@@ -2181,7 +2253,6 @@ describe('the framework wires the reply judge', () => {
       internal.surgeryHold = { verb: 'undo', agentName: 'scout' };
       eventGate.evaluate(chat('is scout around?'));
       await until(() => eventGate.getStatus().policies[0]!.judgeState!.heldCount === 1, 'the refused batch to be held');
-      // The hold lifts unannounced; an operator then releases scout's waits, of which none is recorded.
       internal.surgeryHold = null;
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'WAIT: chatter' }]));
       assert.deepStrictEqual(framework.releaseProviderWait('scout'), [], 'premise: no wait was recorded');
@@ -2360,8 +2431,6 @@ describe('a mention rule ahead of a judge rule, end to end over an MCPL server',
   const GENERAL = 'discord:g1:general';
 
   it("wakes the agent without the judge once its message is stored; its turn stops the judge deciding the judge rule's earlier batch, which is judged after the turn, and one turn runs", async (t) => {
-    // The MCPL server is a child process whose replies arrive in real time;
-    // stepping a mocked clock while waiting for them would spend its bound first.
     useRealClock();
     const { mkdtempSync, appendFileSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');

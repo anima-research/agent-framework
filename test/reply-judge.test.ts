@@ -46,7 +46,6 @@ function conversation(n: number, size = 400): NormalizedMessage[] {
   return out;
 }
 
-/** A provider that refuses, with `error` (a context-length error by default), the requests `refuses` picks by their 1-based number, or the first `refuses` of them. */
 function refusingMembrane(refuses: number | ((n: number) => boolean), error?: Error) {
   const refused = typeof refuses === 'number' ? (n: number) => n <= refuses : refuses;
   const requests: NormalizedRequest[] = [];
@@ -101,8 +100,40 @@ describe('reply judge: a request refused as too long', () => {
     assert.strictEqual(requests.length, 2);
   });
 
+  it('is not built or asked again once the gate has stopped the judge, as when its call timed out before the refusal came back', async () => {
+    const stop = new AbortController();
+    const requests: NormalizedRequest[] = [];
+    const membrane = {
+      complete: async (request: NormalizedRequest) => {
+        requests.push(request);
+        stop.abort();
+        throw new MembraneError({ type: 'context_length', retryable: false, message: 'prompt is too long: 1200000 tokens > 1000000 maximum', rawError: { status: 400 } });
+      },
+    } as unknown as Membrane;
+    let previews = 0;
+    const judge = new ReplyJudge({
+      membraneFor: () => membrane, chooseAgent: (n) => n[0],
+      preview: async () => { previews++; return { messages: conversation(60), config: { model: 'x', maxTokens: 1 } }; },
+      options: { maxInputTokens: 4_000 },
+    });
+    await quietly(() => assert.rejects(judge.judge(judgeRequest({ signal: stop.signal })), /stopped/));
+    assert.strictEqual(requests.length, 1);
+    assert.strictEqual(previews, 1);
+  });
+
+  it('sends nothing when the gate stops the judge while an asynchronous wake provider answers', async () => {
+    const stop = new AbortController();
+    const { membrane, requests } = refusingMembrane(0);
+    const judge = new ReplyJudge({
+      membraneFor: () => membrane, chooseAgent: (n) => n[0],
+      preview: async () => ({ messages: conversation(5), config: { model: 'x', maxTokens: 1 } }),
+      upcomingWakes: async () => { stop.abort(); return []; },
+    });
+    await quietly(() => assert.rejects(judge.judge(judgeRequest({ signal: stop.signal })), /stopped/));
+    assert.strictEqual(requests.length, 0);
+  });
+
   it('is asked smaller though the window from the last request still fits, by starting a fresh window', async () => {
-    // The first batch is answered, and its window holds the whole conversation; the second is refused.
     const { membrane, requests, size } = refusingMembrane((n) => n === 2);
     const judge = judgeOver(membrane, 50, 20_000);
     await quietly(() => judge.judge(judgeRequest()));

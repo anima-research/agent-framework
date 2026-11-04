@@ -99,7 +99,7 @@ export interface ReplyJudgeDeps {
    *  timers the request carries: wakes the framework has queued or holds. A
    *  provider that throws counts as knowing of none. */
   upcomingWakes?: (agentName: string) => UpcomingWake[] | Promise<UpcomingWake[]>;
-  /** The agent's last turn, when it failed and no turn has completed since:
+  /** The agent's last turn, when it failed and no turn has started since:
    *  the judge then says what woke it may be unanswered. A provider that
    *  throws counts as no failed turn. */
   failedLastTurn?: (agentName: string) => FailedLastTurn | undefined;
@@ -213,11 +213,6 @@ function inWhile(at: number | undefined, now: number): string {
   return `in ${h} h${m % 60 ? ` ${m % 60} min` : ''}`;
 }
 
-/**
- * The agent's last turn, when it failed: what woke it may be unanswered,
- * whether or not the turn sent part of an answer, and whether a wake of the
- * agent's is on its way without a new event.
- */
 export function failedTurnLine(failed: FailedLastTurn, agentName: string, now: number): string {
   const opening = `${agentName}'s last turn, ${ago(failed.at, now)}, failed and may not have answered all of what woke it.`;
   switch (failed.again.kind) {
@@ -416,6 +411,7 @@ export class ReplyJudge {
     } catch {
       extra = [];
     }
+    if (request.signal.aborted) throw new Error('the judge was stopped before its request');
     const upcoming = [...(request.upcomingWakes ?? []), ...extra];
     const ratio = atRatio === undefined ? this.charsPerToken : Math.min(atRatio, this.charsPerToken);
 
@@ -550,9 +546,7 @@ export class ReplyJudge {
   private ask(built: { agentName: string; request: NormalizedRequest }, signal: AbortSignal): Promise<NormalizedResponse> {
     // The native formatter whatever the host's agents use: an XML or
     // completions formatter would end the judge's request in a prefill, which
-    // current Claude models refuse. (A membrane whose own formatter is OpenAI
-    // Responses', on that adapter outside its subscription mode, keeps it
-    // whatever a request asks: membrane's resolveActiveFormatter.)
+    // current Claude models refuse.
     return this.membraneFor(built.agentName).complete(built.request, {
       signal,
       formatter: new NativeFormatter(),
@@ -569,6 +563,7 @@ export class ReplyJudge {
       const halved = Math.max(1, built.ratio / 2);
       this.charsPerToken = Math.min(this.charsPerToken, halved);
       this.anchors.delete(built.agentName);
+      if (request.signal.aborted) throw new Error('the judge was stopped before its request');
       console.error(
         `[gate] the reply judge's request of ${built.chars} characters, built at ${built.ratio.toFixed(2)} characters a token, `
         + `was refused as too long; the estimate is now ${this.charsPerToken.toFixed(2)}, and the batch is asked once more`,

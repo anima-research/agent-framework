@@ -86,7 +86,6 @@ const MAX_JUDGE_INSTRUCTIONS = 4_000;
 const DEFAULT_JUDGE_TIMEOUT_MS = 20_000;
 /** Judge failures in a row after which gate_status names the judge as failing. */
 const JUDGE_FAILING_STREAK = 3;
-/** The latest instant a Date can name (ms): a later stated end can't be shown. */
 const MAX_DATE_MS = 8.64e15;
 const JUDGE_REFUSAL_MIN_RETRY_MS = 1_000;
 
@@ -213,10 +212,6 @@ interface DebounceState {
   firstAt: number;
   /** When its timer fires (ms), as of its last re-arm (upcomingWakes). */
   dueAt: number;
-  /** The judge rule the batch began under. When the judge is asked, the
-   *  rule as it is then decides it, while it's still a judge rule; a batch
-   *  whose rule was removed or is no longer a judge rule is judged by this
-   *  one. Absent for a debounce. */
   judge?: JudgeConfig;
 }
 
@@ -4333,8 +4328,6 @@ export class EventGate {
     return this.upcomingWakesBut(agentNames, { policy: exceptPolicy });
   }
 
-  /** upcomingWakes without rule `policy`'s batches, or without `batch`, the
-   *  one the judge is being asked about, its rule's others still listed. */
   private upcomingWakesBut(agentNames: string[], leftOut: { policy?: string; batch?: JudgingState }): UpcomingWake[] {
     const wakes: UpcomingWake[] = [];
     const now = this.now();
@@ -4480,8 +4473,6 @@ export class EventGate {
   private refusedJudging(policyName: string, state: JudgingState, err: unknown, durationMs: number): void {
     const hold = cutToFit(suppliedValue(errorText(err)), 300);
     const stated = (err as { retryAfterMs?: unknown }).retryAfterMs;
-    // A wait that isn't a number of ms a Date can end at states no end (a
-    // hold until released): a timer given one would fire at once.
     const now = this.now();
     const end = typeof stated === 'number' ? now + Math.max(0, stated) : undefined;
     const until = end !== undefined && end <= MAX_DATE_MS ? end : undefined;
@@ -4527,7 +4518,6 @@ export class EventGate {
     const delay = Math.max(0, until - this.now());
     this.judgeRefusalTimer = setTimeout(() => {
       this.judgeRefusalTimer = null;
-      // A wait longer than one timer is waited out in steps.
       if (this.judgeRefusing()) this.armJudgeRefusalTimer();
       else this.flushJudgeHeldIfClear();
     }, Math.min(delay, MAX_TIMER_MS));
