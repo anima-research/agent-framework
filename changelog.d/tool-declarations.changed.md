@@ -30,6 +30,11 @@
   hashed as an empty object. A host whose tool definitions carry either,
   built as objects rather than parsed from JSON, gets one fresh layout at the
   upgrade, on `'head'` too.
+- A request's tools are a copy of the agent's tools as JSON writes them, on
+  `'head'` too: a value JSON can't write, such as a BigInt, fails as the
+  request is built, where it failed once the request was serialised to be
+  sent, and a field JSON leaves out, such as a function, is left out of the
+  request as it was of what was sent.
 - A message-count undo (`/undo` with `messages`) counts every message but
   system change rows: the change rows among the last N go with them
   uncounted, and a refusal's count of the messages the history holds leaves
