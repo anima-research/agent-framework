@@ -196,7 +196,7 @@ describe('unpromptedChannel on a real MCPL server', () => {
 
   async function setup(
     unpromptedChannel?: string,
-    opts: { speech?: 'delivery' | 'latest-inbound'; proseRouting?: 'locus' | 'explicit'; autoContinue?: true } = {},
+    opts: { speech?: 'delivery' | 'latest-inbound'; proseRouting?: 'locus' | 'explicit' | 'locked'; proseLock?: string; autoContinue?: true } = {},
   ) {
     framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
@@ -204,6 +204,7 @@ describe('unpromptedChannel on a real MCPL server', () => {
       agents: [{
         name: 'scout', model: 'test-model', systemPrompt: 'You are scout.',
         ...(opts.proseRouting ? { proseRouting: opts.proseRouting } : {}),
+        ...(opts.proseLock ? { proseLock: opts.proseLock } : {}),
         ...(opts.autoContinue ? { autoContinue: { maxConsecutive: 1 } } : {}),
       }],
       modules: [new InputModule()],
@@ -381,6 +382,21 @@ describe('unpromptedChannel on a real MCPL server', () => {
   });
 
   describe("the turns that don't: they keep what they do without it", () => {
+    it("a locked agent's: its timer's turn speaks at its lock, and servers are told the lock", async () => {
+      const t = await setup(OPS, { proseRouting: 'locked', proseLock: BUSY });
+      await t.skipReplyWake([say('back')]);
+      assert.deepEqual(t.published(), [BUSY]);
+      assert.equal(t.toldInTurns.at(-1), BUSY);
+    });
+
+    it("a locked agent's pointed at drafts: its timer's turn holds its speech, and servers are told no default", async () => {
+      const t = await setup(OPS, { proseRouting: 'locked', proseLock: 'drafts' });
+      await t.skipReplyWake([say('back')]);
+      assert.deepEqual(t.published(), []);
+      assert.equal(t.toldInTurns.at(-1), undefined);
+      assert.ok(t.held.length > 0, 'its speech was held as drafts');
+    });
+
     it("a start merged from a timer's wake and an ambient batch's", async () => {
       const t = await setup(OPS);
       const before = await t.gateWakes([

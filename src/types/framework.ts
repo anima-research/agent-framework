@@ -491,28 +491,28 @@ export interface FrameworkConfig {
    * The channel for a turn the agent's own timer starts, which no message
    * prompted: the wake `skip_reply` schedules, or the end of a `sleep`. Plain
    * speech in locus or hybrid prose routing goes there, and so does
-   * `channel_publish` naming no channel in any prose routing mode, which
-   * servers are told as the turn's default outgoing channel. An all-except
-   * hold's channel still comes first while one is open, and without the
-   * setting such a turn follows `speech.locus`. A turn the framework opens to
-   * continue such a turn that had no locus of its own, as in explicit or
+   * `channel_publish` naming no channel in any prose routing mode but locked,
+   * which servers are told as the turn's default outgoing channel. An
+   * all-except hold's channel still comes first while one is open, and without
+   * the setting such a turn follows `speech.locus`. A turn the framework opens
+   * to continue such a turn that had no locus of its own, as in explicit or
    * disabled routing, takes it too: a `!` continuation, autoContinue's next
-   * turn, or a bounced reply's wake. No other turn takes it: not
-   * one a message prompted, from a channel, a module, a person at a console
-   * or another agent; not a heartbeat's or a reminder's (its plain speech is
-   * held as drafts); not a conversation fork's or an ephemeral run's; and not
-   * a start merged from a timer's wake and any other cause. One value, for
-   * every agent on the framework. A registered channel's id, e.g.
-   * `discord:{guildId}:{channelId}`, or, to pick one server's where two
-   * register that id, `{serverId}:{channelId}`. `create()` refuses a value
-   * that is neither a string nor null, or is blank; null reads as not set. A
-   * value that names no registered channel, several, or one its server
-   * declared inbound-only, when a turn would take it, is logged, and logged
-   * again only after a turn has used it since; the turn takes what it would
-   * without the setting. `channel_publish`'s
-   * description names it among the defaults only on a framework with an
-   * event gate, the only one with such turns; on any other the description
-   * is as it is without the setting.
+   * turn, or a bounced reply's wake. No other turn takes it: not one a message
+   * prompted, from a channel, a module, a person at a console or another agent;
+   * not a heartbeat's or a reminder's (its plain speech is held as drafts); not
+   * a conversation fork's or an ephemeral run's; not a locked agent's, which
+   * speaks at its lock or holds its speech as drafts; and not a start merged
+   * from a timer's wake and any other cause. One value, for every agent on the
+   * framework. A registered channel's id, e.g. `discord:{guildId}:{channelId}`,
+   * or, to pick one server's where two register that id,
+   * `{serverId}:{channelId}`. `create()` refuses a value that is neither a
+   * string nor null, or is blank; null reads as not set. A value that names no
+   * registered channel, several, or one its server declared inbound-only, when
+   * a turn would take it, is logged, and logged again only after a turn has
+   * used it since; the turn takes what it would without the setting.
+   * `channel_publish`'s description names it among the defaults only on a
+   * framework with an event gate, the only one with such turns; on any other
+   * the description is as it is without the setting.
    */
   unpromptedChannel?: string;
 
