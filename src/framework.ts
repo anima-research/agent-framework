@@ -4108,7 +4108,7 @@ export class AgentFramework {
    *  auxiliary call, in no queue meanwhile. A drop takes one out and gives
    *  its admission back; the park, woken, then finds it gone. */
   private parkedContinuations: Set<InferenceRequest> = new Set();
-  private parkedStarts: Set<{ agentName: string }> = new Set();
+  private parkedStarts: Set<{ agent: Agent }> = new Set();
   /** Each turn whose settle has ended it (settleAgent, endDroppedTurn), for
    *  its agent's scripts: its start's teardown can still hold the agent's
    *  token, and a turn that has ended isn't live (liveTurns). A later start
@@ -6241,7 +6241,9 @@ export class AgentFramework {
     const requests = [...this.pendingRequests.filter(mine), ...[...this.parkedContinuations].filter(mine)];
     for (const pass of this.passRequests) for (const taken of pass.values()) requests.push(...taken.filter(mine));
     const queued = requests.map((r) => String(r.reason));
-    for (const parked of this.parkedStarts) if (parked.agentName === agentName) queued.push('a start waiting for an auxiliary call to finish');
+    const agent = this.agents.get(agentName);
+    for (const parked of this.parkedStarts) if (parked.agent === agent) queued.push('a start waiting for an auxiliary call to finish');
+    if (this.assembling.has(agentName)) queued.push('a start assembling its deferred pushes');
     const ends = (until: number | null | undefined): { until?: number } =>
       (typeof until === 'number' && Number.isFinite(until) ? { until } : {});
     const model = this.agents.get(agentName)?.model;
@@ -23590,7 +23592,7 @@ export class AgentFramework {
         // owned and the continuation receives it after the in-flight call settles.
         const parkedContinuation = trigger !== undefined && continuesTurn(trigger);
         if (parkedContinuation) this.parkedContinuations.add(trigger);
-        const parkedStart = parkedContinuation ? undefined : { agentName: agent.name };
+        const parkedStart = parkedContinuation ? undefined : { agent };
         if (parkedStart) this.parkedStarts.add(parkedStart);
         void this.waitForAuxiliaryIdle(agent.name).then(async () => {
           if (parkedStart) this.parkedStarts.delete(parkedStart);
