@@ -31873,7 +31873,7 @@ export class AgentFramework {
       ? `[${NOTICE_TAG.discordSendFailed}] Delivery of a reply by ${speaker}${size} to ${where} was not confirmed${why}. ` +
         `It may or may not have been posted, so sending it again could post it twice. ${speaker} has ended.`
       : `[${NOTICE_TAG.discordSendFailed}] A reply by ${speaker}${size} could not be delivered to ${where}${why}. ` +
-        `Nothing was posted. ${speaker} has ended.`;
+        `The framework posted nothing there. ${speaker} has ended.`;
     return {
       content: [{ type: 'text', text: text + (detail !== undefined ? ` Connector detail: ${suppliedValue(detail)}` : '') }],
       metadata: {

@@ -58,4 +58,6 @@
   held, and the framework didn't send them: …", where it read "were held, not
   sent: …", and a failed channel post's notice reads "The framework posted
   nothing there; it is saved in your archive.", where it read "Nothing was
-  posted; it is saved in your archive.".
+  posted; it is saved in your archive.", as does an ended speaker's: "The
+  framework posted nothing there. <speaker> has ended.", where it read
+  "Nothing was posted. <speaker> has ended.".

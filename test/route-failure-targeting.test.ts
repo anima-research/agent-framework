@@ -288,7 +288,7 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(primary.mock.callCount(), 1);
       const [, content, metadata] = primary.mock.calls[0]!.arguments;
       assert.match(JSON.stringify(content),
-        /\[discord-send-failed\] A reply by released-conversation \(5 chars\) could not be delivered to missing-channel \(the \\"srv\\" server has no channel \\"missing-channel\\" registered here\)\. Nothing was posted\. released-conversation has ended\./);
+        /\[discord-send-failed\] A reply by released-conversation \(5 chars\) could not be delivered to missing-channel \(the \\"srv\\" server has no channel \\"missing-channel\\" registered here\)\. The framework posted nothing there\. released-conversation has ended\./);
       assert.equal(metadata?.speaker, 'released-conversation');
       assert.equal(metadata?.textLen, 5);
       assert.equal(internals(framework).pendingRequests.length, 0, 'context only: the primary is not woken');
@@ -625,7 +625,7 @@ describe('notices about an agent\'s own action', () => {
       const told = messages.filter((m) => JSON.stringify(m.content).includes(SEND_FAILED));
       assert.equal(told.length, 1);
       assert.match(JSON.stringify(told[0]!.content),
-        new RegExp(`A reply by ${fork.name} \\(${reply.length} chars\\) could not be delivered to missing-channel \\(the \\\\"srv\\\\" server has no channel \\\\"missing-channel\\\\" registered here\\)\\. Nothing was posted\\. ${fork.name} has ended\\.`));
+        new RegExp(`A reply by ${fork.name} \\(${reply.length} chars\\) could not be delivered to missing-channel \\(the \\\\"srv\\\\" server has no channel \\\\"missing-channel\\\\" registered here\\)\\. The framework posted nothing there\\. ${fork.name} has ended\\.`));
       // The marker passed on names the channel's server, as the fork's did.
       const markers = framework.getAgent('primary')!.getContextManager().queryMessages({}).messages
         .map((m) => m.metadata as { kind?: string; channelId?: string; serverId?: string } | undefined)
@@ -1340,8 +1340,8 @@ describe('notices about an agent\'s own action', () => {
       const { messages } = await framework.getAgent('primary')!.getContextManager().compile();
       const told = messages.filter((m) => JSON.stringify(m.content).includes('has ended')).map((m) => JSON.stringify(m.content));
       assert.equal(told.length, 2);
-      assert.match(told[0]!, /A reply by conversation-gone \(12 chars\) could not be delivered to missing-channel \(no registered channel\)\. Nothing was posted\. conversation-gone has ended\./);
-      assert.match(told[1]!, /A reply by conversation-older could not be delivered to missing-channel\. Nothing was posted\. conversation-older has ended\./);
+      assert.match(told[0]!, /A reply by conversation-gone \(12 chars\) could not be delivered to missing-channel \(no registered channel\)\. The framework posted nothing there\. conversation-gone has ended\./);
+      assert.match(told[1]!, /A reply by conversation-older could not be delivered to missing-channel\. The framework posted nothing there\. conversation-older has ended\./);
       assert.ok(!told.some((t) => t.includes('undefined')));
       // Each is the entry itself, under its own id: boot's landed scan finds
       // it, so a crash before the ack replays neither.
@@ -1798,7 +1798,7 @@ describe('notices about an agent\'s own action', () => {
         const told = primary.messages.filter((m) => JSON.stringify(m.content).includes(SEND_FAILED));
         assert.equal(told.length, 1);
         assert.match(JSON.stringify(told[0]!.content),
-          new RegExp(`A reply by ${fork.name} \\(${finalReply.length} chars\\) could not be delivered to #closure test \\(closure-channel\\) \\(.*server said it didn't post the message\\)\\. Nothing was posted\\. ${fork.name} has ended\\.`));
+          new RegExp(`A reply by ${fork.name} \\(${finalReply.length} chars\\) could not be delivered to #closure test \\(closure-channel\\) \\(.*server said it didn't post the message\\)\\. The framework posted nothing there\\. ${fork.name} has ended\\.`));
         assert.equal(membrane.calls.length, 2, 'only the initial and closure turns ran');
         assert.equal(state.pendingRequests.length, 0, 'a failed closure reply does not wake another turn');
       });
