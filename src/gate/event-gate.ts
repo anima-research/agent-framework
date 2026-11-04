@@ -4340,12 +4340,15 @@ export class EventGate {
    * rule's batch is delivered as a debounce's is, and listed so. With one, a
    * judge rule's batch goes to the judge, whether it's collecting, being
    * decided (with what queued behind it) or held, so it only may, except
-   * that under onError "wake", while a refusal's stated wait lasts, it wakes
-   * the agent without the judge being asked, and one due before that wait
+   * that under onError "wake", while a refusal's stated wait lasts, it's
+   * delivered without the judge being asked, and one due before that wait
    * ends is listed so, counting only its events whose channel isn't held now.
    * A running turn or the host's quiesce can hold it past the wait's end, when
    * it goes to the judge, so while a judged turn runs or the host is quiesced
-   * the entry says so and only may; otherwise it's certain. One a turn holds
+   * the entry says so and only may; otherwise it's certain. Each entry names
+   * the holds in force when it's listed: while a turn runs or the host is
+   * quiesced, the batch comes at its due time or, if that still holds then,
+   * once it doesn't. One a turn holds
    * now is listed as going to the judge, or delivered without it if the
    * judge's calls are still refused when the turn ends. Under "skip", one due
    * before that wait ends is listed as held for the judge until the end, and
@@ -4376,8 +4379,9 @@ export class EventGate {
     }
     const count = (n: number): string => `${n} ${n === 1 ? 'event' : 'events'}`;
     const statedEnd = this.judgeRefusing() ? this.judgeRefusal?.until : undefined;
-    const turnHolds = this.judgedTurnRunning() || this.quiesced;
-    const pastEnd = turnHolds ? " and, past the refusal's end, while a turn or the host's quiesce holds it" : '';
+    const holders = [...(this.judgedTurnRunning() ? ['a turn'] : []), ...(this.quiesced ? ["the host's quiesce"] : [])].join(' or ');
+    const turnHolds = holders !== '';
+    const pastEnd = turnHolds ? ` and, past the refusal's end, while ${holders} holds it` : '';
     for (const [name, state] of this.debounceTimers) {
       if (name === leftOut.policy || state.events.length === 0) continue;
       const rule = `rule ${quotedValue(name)}'s`;
@@ -4395,9 +4399,15 @@ export class EventGate {
         const deciding = this.judging.has(name);
         const toJudge = [
           ...(deciding ? ['the judge answers WAIT when its calls are no longer refused'] : []),
-          ...(turnHolds ? ["a turn or the host's quiesce holds it past the refusal's end"] : []),
+          ...(turnHolds ? [`${holders} holds it past the refusal's end`] : []),
         ];
-        const later = `, at its due time${deciding ? ' or, if the judge is still deciding the rule\'s batch then, once it decides' : ''}, or, if a turn is running then, once none is`;
+        const holdingNow = [...(this.quiesced ? ['the host is still quiesced'] : []), ...(this.inferring.size > 0 ? ['a turn is still running'] : [])];
+        const once = holdingNow.length > 1 ? 'neither is' : this.quiesced ? "it isn't" : 'none is';
+        const alternatives = [
+          ...(deciding ? ["if the judge is still deciding the rule's batch then, once it decides"] : []),
+          ...(holdingNow.length > 0 ? [`if ${holdingNow.join(' or ')} then, once ${once}`] : []),
+        ];
+        const later = alternatives.length > 0 ? `, at its due time or, ${alternatives.join(', or, ')}` : '';
         const unless = toJudge.length > 0 ? `, unless ${toJudge.join(' or ')}, which sends it to the judge` : '';
         if (delivered > 0) {
           wakes.push({ at: state.dueAt, certain: toJudge.length === 0, what: `${rule} batch of ${count(delivered)}, delivered without the judge while its calls are refused${later}${unless}` });
