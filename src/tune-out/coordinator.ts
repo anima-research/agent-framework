@@ -1175,21 +1175,98 @@ export class TuneOutCoordinator {
    * done, told on stderr and as a trace (`tune-out:deferred-cancel-dropped`)
    * with the epoch it was asked for: `hold-ended`, that epoch's hold ended
    * without it (`current`, the epoch holding there now, if one does), so it
-   * ends nothing.
+   * ends nothing; `note-undelivered`, another cancel ended its hold and the
+   * note it carried couldn't be delivered (`error`).
    */
-  private dropDeferred(entry: DeferredCancel, reason: 'hold-ended', current?: string): void {
+  private dropDeferred(entry: DeferredCancel, reason: 'hold-ended' | 'note-undelivered', current?: string, error?: string): void {
     const { epochId, serverId, channelId, scope } = entry.for;
     const noteLost = entry.note !== undefined;
-    console.error(`[tune-out] the cancel of ${entry.what}, asked for while writes were held in memory for epoch ${epochId}, is dropped: `
-      + `that epoch's hold ended without it${current !== undefined ? `, and epoch ${current} holds there now, which it was not asked for` : ''}, `
-      + `so it ends nothing${noteLost ? ', and the note it carried is not delivered' : ''}`);
+    if (reason === 'hold-ended') {
+      console.error(`[tune-out] the cancel of ${entry.what}, asked for while writes were held in memory for epoch ${epochId}, is dropped: `
+        + `that epoch's hold ended without it${current !== undefined ? `, and epoch ${current} holds there now, which it was not asked for` : ''}, `
+        + `so it ends nothing${noteLost ? ', and the note it carried is not delivered' : ''}`);
+    } else {
+      console.error(`[tune-out] the note carried by the cancel of ${entry.what}, asked for while writes were held in memory for epoch ${epochId}, `
+        + `is lost: another cancel ended that hold, and the note could not be delivered: ${error}`);
+    }
     this.hooks.emitTrace({
       type: 'tune-out:deferred-cancel-dropped', serverId, channelId, epochId,
       ...(scope ? { scope } : {}),
       reason,
       ...(current !== undefined ? { currentEpochId: current } : {}),
       noteLost,
+      ...(error !== undefined ? { error } : {}),
     });
+  }
+
+  /**
+   * The queued cancel of this hold (`epochId`, deferCancel), off the queue:
+   * a cancel that ends the hold first leaves it nothing to end, and
+   * delivers its note (deliverQueuedNote). One queued for an earlier epoch
+   * there is dropped, told (dropDeferred). The retry timer goes with the
+   * last one.
+   */
+  private takeDeferred(key: string, epochId: string): DeferredCancel | undefined {
+    const entry = this.deferredCancels.get(key);
+    if (!entry) return undefined;
+    this.deferredCancels.delete(key);
+    if (this.deferredCancels.size === 0 && this.deferredRetry !== undefined) {
+      clearTimeout(this.deferredRetry);
+      this.deferredRetry = undefined;
+    }
+    if (entry.for.epochId === epochId) return entry;
+    this.dropDeferred(entry, 'hold-ended');
+    return undefined;
+  }
+
+  /**
+   * A reader's note to the resident, verbatim: the persistent subconscious's
+   * under its own name, a reader fork's (`author`) as attributed mail under
+   * the fork's name and incarnation, never the resident's voice. `metadata`
+   * is the subconscious's row's; a fork's mail has it without the server.
+   * Answers false where neither is configured to deliver it.
+   */
+  private deliverReaderNote(
+    note: string,
+    author: string | undefined,
+    metadata: { kind: 'subconscious-note'; epochId: string; channelId?: string; serverId?: string },
+  ): boolean {
+    const subName = this.hooks.subconsciousName();
+    if (subName) {
+      this.hooks.addMessage(subName, [{ type: 'text', text: note }], { ...metadata });
+      return true;
+    }
+    if (author && this.hooks.deliverFromReader) {
+      const { serverId: _server, ...mail } = metadata;
+      this.hooks.deliverFromReader(author, [{ type: 'text', text: note }], mail);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * The note a queued cancel carries (takeDeferred), delivered when another
+   * cancel ends its hold, as that cancel's own release would have delivered
+   * it (deliverReaderNote); one that can't be is told lost (dropDeferred),
+   * with the reason, and the cancel that ended the hold goes on. Answers
+   * whether it was delivered.
+   */
+  private deliverQueuedNote(
+    entry: DeferredCancel,
+    metadata: { kind: 'subconscious-note'; epochId: string; channelId?: string; serverId?: string },
+  ): boolean {
+    if (entry.note === undefined) return false;
+    let delivered: boolean;
+    try {
+      delivered = this.deliverReaderNote(entry.note, entry.noteAuthor, metadata);
+    } catch (err) {
+      this.dropDeferred(entry, 'note-undelivered', undefined, thrownReason(err));
+      return false;
+    }
+    if (!delivered) {
+      this.dropDeferred(entry, 'note-undelivered', undefined, 'there is no subconscious here, and no delivery of a reader fork\'s note for its author');
+    }
+    return delivered;
   }
 
   /** Arm the one retry of the deferred cancels, unless it is armed; it arms itself again while one still waits. */
@@ -1366,25 +1443,18 @@ export class TuneOutCoordinator {
     this.channelRegistry.cancelTuneOut(serverId, channelId, nextState, source);
     this.clearTimers(serverId, channelId);
     this.divertedSinceInvocation.delete(this.key(serverId, channelId));
-    // The subconscious's own words, under its own name, verbatim.
+    // The subconscious's own words, under its own name, verbatim; a reader
+    // fork's as its attributed mail. With its server: a conversational row
+    // whose channel the framework reads (repinChannel), where another
+    // server's channel can share the id. A cancel of this hold still queued
+    // (asked for while writes were held, its release failing since) has
+    // nothing left to end: it leaves the queue, and the note it carries
+    // goes out first, since it was asked for first, then this caller's.
     const subName = this.hooks.subconsciousName();
-    if (subconsciousNote && subName) {
-      this.hooks.addMessage(
-        subName,
-        [{ type: 'text', text: subconsciousNote }],
-        // With its server: a conversational row whose channel the framework
-        // reads (repinChannel), where another server's channel can share the id.
-        { kind: 'subconscious-note', channelId, serverId, epochId },
-      );
-    } else if (subconsciousNote && noteAuthor && this.hooks.deliverFromReader) {
-      // A reader fork's note: attributed mail, under the fork's name and
-      // incarnation, never the resident's voice.
-      this.hooks.deliverFromReader(
-        noteAuthor,
-        [{ type: 'text', text: subconsciousNote }],
-        { kind: 'subconscious-note', channelId, epochId },
-      );
-    }
+    const noteMetadata = { kind: 'subconscious-note' as const, channelId, serverId, epochId };
+    const queued = this.takeDeferred(this.key(serverId, channelId), epochId);
+    const queuedNote = queued !== undefined && this.deliverQueuedNote(queued, noteMetadata);
+    if (subconsciousNote) this.deliverReaderNote(subconsciousNote, noteAuthor, noteMetadata);
     const primary = this.hooks.primaryName();
     if (primary) {
       this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out');
@@ -1397,13 +1467,13 @@ export class TuneOutCoordinator {
     // when some of the epoch's messages are ones it hasn't been shown yet
     // (unseenBySubconscious: those that came in during its own turn, say),
     // since it wrote its note before it could see them, and the notice says
-    // how many; and when it wrote no note and the dump left any message out,
-    // since nothing else then covers it. Otherwise its note speaks for what
-    // it saw.
+    // how many; and when no note of its went out (its own, or a queued
+    // cancel's) and the dump left any message out, since nothing else then
+    // covers it. Otherwise its note speaks for what it saw.
     const selfCancel = source === 'subconscious';
     const unseen = subName && selfCancel ? this.unseenBySubconscious(ofEpoch) : 0;
     const truncatedInAll = records.reduce((n, r) => n + r.truncated, 0);
-    if (subName && (!selfCancel || unseen > 0 || (!subconsciousNote && truncatedInAll > 0))) {
+    if (subName && (!selfCancel || unseen > 0 || (!subconsciousNote && !queuedNote && truncatedInAll > 0))) {
       const truncNote = truncationNote(records);
       const unseenNote = unseen > 0
         ? ` ${unseen === 1 ? 'One of its held messages' : `${unseen} of its held messages`} came in after you last looked; your view has ${unseen === 1 ? 'it' : 'them'} now.`
@@ -1758,12 +1828,12 @@ export class TuneOutCoordinator {
       clearTimeout(pending.timer);
       this.pendingWakes.delete(key);
     }
+    // A cancel of this hold still queued has nothing left to end, and its
+    // note goes out first, as a channel's cancel delivers one.
     const subName = this.hooks.subconsciousName();
-    if (note && subName) {
-      this.hooks.addMessage(subName, [{ type: 'text', text: note }], { kind: 'subconscious-note', epochId });
-    } else if (note && noteAuthor && this.hooks.deliverFromReader) {
-      this.hooks.deliverFromReader(noteAuthor, [{ type: 'text', text: note }], { kind: 'subconscious-note', epochId });
-    }
+    const queued = this.takeDeferred(TuneOutCoordinator.SCOPE_KEY, epochId);
+    if (queued) this.deliverQueuedNote(queued, { kind: 'subconscious-note', epochId });
+    if (note) this.deliverReaderNote(note, noteAuthor, { kind: 'subconscious-note', epochId });
     const primary = this.hooks.primaryName();
     if (primary) this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out');
     const notice = `[${NOTICE_TAG.tuneOutCancelled}: all channels except ${this.shown(except.serverId, except.channelId)} — ${reason}.]`;
