@@ -11318,7 +11318,7 @@ export class AgentFramework {
         // The historical copy: the parent's compiled view, its turns renamed
         // so the child reads its inheritance as its own history.
         const compiled = await parent.getContextManager().compile();
-        const parentsOwnChanges = ownSystemChanges(compiled, (name) => parent.isOwnParticipant(name));
+        const parentsOwnChanges = ownSystemChanges(compiled, (name) => parent.ownsChange(name));
         compiled.messages.forEach((message, index) => {
           const participant = parent.isOwnParticipant(message.participant) ? options.name : message.participant;
           if (parentsOwnChanges.has(index)) {
@@ -18360,7 +18360,7 @@ export class AgentFramework {
         const templateCompile = await template.toolResultGuard.afterAnnotations(
           () => template.getContextManager().compile(undefined, undefined, { dryRun: true }));
         const { messages: compiledWhole, provenance } = templateCompile;
-        const templatesOwnChanges = new Set([...ownSystemChanges(templateCompile, (name) => template.isOwnParticipant(name))].flatMap((i) => compiledWhole[i]!.content));
+        const templatesOwnChanges = new Set([...ownSystemChanges(templateCompile, (name) => template.ownsChange(name))].flatMap((i) => compiledWhole[i]!.content));
         const templateRows = template.getContextManager().getAllMessages();
         // The template's stored context injections (stored-injections.ts) are
         // its context, not the conversation, so the seed leaves them out, as

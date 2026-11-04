@@ -599,15 +599,19 @@ export class Agent {
   /**
    * For an agent that continues another's context on a branch of its own:
    * the participants whose change rows its source's view keeps as its
-   * source's own. A move of this agent's head takes those out of its context
-   * as well as its own, since from then on they declare another agent's
-   * tools and system text.
+   * source's own. They're in this agent's every request, so it reads them as
+   * its own change rows: what it declares, consolidates and takes out.
    */
   setSourceChangeOwners(owners: Iterable<string>): void {
     this.sourceChangeOwners = new Set([...owners].filter((owner) => !this.ownParticipants.has(owner)));
   }
 
-  /** The participants whose change rows this agent's view keeps as its own or its source's. */
+  /** Whether a change row stamped with this participant is one of this agent's own. */
+  ownsChange(participant: string): boolean {
+    return this.ownParticipants.has(participant) || this.sourceChangeOwners.has(participant);
+  }
+
+  /** The participants whose change rows are this agent's own. */
   changeOwners(): string[] {
     return [...this.ownParticipants, ...this.sourceChangeOwners];
   }
@@ -2663,7 +2667,7 @@ export class Agent {
     compile: (head: HeadDeclaration) => Promise<CompileResult>,
   ): Promise<{ compiled: CompileResult; head: HeadDeclaration; declared?: NormalizedMessage }> {
     const current = this.currentHead(availableTools, compiled.systemInjections);
-    const own = ownSystemChanges(compiled, (name) => this.ownParticipants.has(name));
+    const own = ownSystemChanges(compiled, (name) => this.ownsChange(name));
     if (!entries) {
       // context-manager's comparison baseline for `firstChanged`, and with
       // `binds: true` its thinking-binding record, are the last committing compile's.
@@ -2716,7 +2720,7 @@ export class Agent {
       this.onHeadEvent?.({ type: 'head:moved', why: 'on-head', changesRemoved: removed });
       return current;
     }
-    const rows = this.movedChangeRows();
+    const rows = this.ownChangeRows();
     if (rows.length === 0 || !this.headDeclarations.write(this.name, copyHead(current))) throw error;
     const removed = this.removeOwnChanges(rows);
     this.onHeadEvent?.(recorded
@@ -2737,13 +2741,13 @@ export class Agent {
   ): Promise<{ compiled: CompileResult; head: HeadDeclaration }> {
     if (dryRun) {
       const shown = compiledWith !== null && headHash(compiledWith) !== headHash(current) ? await compile(current) : compiled;
-      const own = ownSystemChanges(shown, (name) => this.ownParticipants.has(name) || this.sourceChangeOwners.has(name));
+      const own = ownSystemChanges(shown, (name) => this.ownsChange(name));
       const kept = (_: unknown, index: number) => !own.has(index);
       const provenance = shown.provenance && { ...shown.provenance, messages: shown.provenance.messages.filter(kept) };
       return { compiled: { ...shown, messages: shown.messages.filter(kept), ...(provenance ? { provenance } : {}) }, head: current };
     }
     if (!this.headDeclarations.write(this.name, copyHead(current))) return { compiled, head: recorded ?? current };
-    const removed = this.removeOwnChanges(this.movedChangeRows());
+    const removed = this.removeOwnChanges();
     this.onHeadEvent?.({ type: 'head:moved', why, changesRemoved: removed, ...sizes });
     const again = removed > 0 || (compiledWith !== null && headHash(compiledWith) !== headHash(current));
     return { compiled: again ? await compile(current) : compiled, head: current };
@@ -2769,14 +2773,10 @@ export class Agent {
     return changeTokens * 5 >= inputTokens ? { changeTokens, inputTokens, forced: 'share' } : undefined;
   }
 
-  private ownChangeRows(owners: Iterable<string> = this.ownParticipants) {
-    return [...owners]
+  private ownChangeRows() {
+    return this.changeOwners()
       .flatMap((agent) => this.contextManager.queryMessages({ metadata: { kind: 'system-change', agent } }).messages)
       .filter((row) => isSystemChangeMessage(row as { content: readonly ContentBlock[] }));
-  }
-
-  private movedChangeRows() {
-    return this.ownChangeRows(this.changeOwners());
   }
 
   private removeOwnChanges(rows = this.ownChangeRows()): number {
