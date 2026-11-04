@@ -5,18 +5,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
 import { AnthropicAdapter, Membrane, MembraneError, NativeFormatter } from '@animalabs/membrane';
-import { CompressionWithdrawn, ContextManager } from '@animalabs/context-manager';
+import { CompressionWithdrawn } from '@animalabs/context-manager';
 import { JsStore } from '@animalabs/chronicle';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolDefinition, ToolResult } from '../src/index.js';
 import { Agent, AgentFramework, AutobiographicalStrategy, PassthroughStrategy, taskForkSpec } from '../src/index.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
-
-const supported =
-  typeof (JsStore.prototype as unknown as { view?: unknown }).view === 'function' &&
-  typeof (ContextManager.prototype as unknown as { derive?: unknown }).derive === 'function';
-const skip = supported
-  ? false
-  : 'installed @animalabs/chronicle / context-manager lack branch-bound handles or ContextManager.derive';
 
 class CompressionMembrane extends MockMembrane {
   readonly compressions: number[] = [];
@@ -243,7 +236,7 @@ describe('a context manager the framework is done with makes no further provider
     }
   });
 
-  it('a shared-inheritance run that has ended, with compression still queued (the derived manager is on the run\'s membrane)', { timeout: 60_000, skip }, async () => {
+  it('a shared-inheritance run that has ended, with compression still queued (the derived manager is on the run\'s membrane)', { timeout: 60_000 }, async () => {
     const membrane = new CompressionMembrane(200);
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
     const { dir, framework } = await setup('af-done-shared-', membrane, { agents: true });

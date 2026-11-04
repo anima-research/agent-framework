@@ -848,6 +848,9 @@ describe('replies to a [Continue] turn', () => {
     };
     internal.providerAccelerationDefaultCooldownMs = 10 * 60_000;
     internal.providerAccelerationJitterMs = 0;
+    // The agents a provider hold holds, as healthSnapshot() reports them.
+    const held = () => (x.framework.healthSnapshot() as { agents: Array<{ name: string; providerAdmission: { cooldownReason: string | null } }> })
+      .agents.filter((agent) => agent.providerAdmission.cooldownReason !== null).map((agent) => agent.name);
     try {
       membrane.queues.push([createMockResponse(signed('sig-1', 'first reply'))]);
       await wake(x, ordinaryEvent('hello'));
@@ -855,10 +858,10 @@ describe('replies to a [Continue] turn', () => {
         [createMockResponse(signed('sig-w', 'wake reply'))]);
       internal.pendingRequests.push({ agentName: 'assistant', reason: 'timer', source: 'framework', timestamp: Date.now() });
       await x.framework.runUntilIdle();
-      assert.equal(internal.providerAccelerationCooldowns.size, 1, 'the restart is held');
+      assert.deepEqual(held(), ['assistant'], 'the restart is held');
       await wake(x, opts.event);
       opts.whileHeld?.(x);
-      assert.equal(internal.providerAccelerationCooldowns.size, 1, 'the restart is still held');
+      assert.deepEqual(held(), ['assistant'], 'the restart is still held');
       internal.providerAccelerationCooldowns.get('assistant')!.until = Date.now();
       internal.releaseProviderAccelerationCooldown('assistant');
       await x.framework.runUntilIdle();

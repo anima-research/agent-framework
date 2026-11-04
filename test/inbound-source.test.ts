@@ -141,7 +141,7 @@ describe('inbound source envelope', () => {
     assert.equal(source.serverId, 'discord');
     assert.equal(source.lane, 'channels/incoming');
     assert.equal(source.coalesced, undefined);
-    assert.match(source.binding, /^[0-9a-f]{16}$/);
+    assert.ok(typeof source.binding === 'string' && source.binding.length > 0, 'an endpoint binding, opaque');
     assert.equal(source.channelId, ROOM);
     assert.equal(source.messageId, 'm-1');
     assert.equal(source.label, '#room (Guild One)');

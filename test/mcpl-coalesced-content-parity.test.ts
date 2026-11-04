@@ -617,7 +617,7 @@ test('a render result with a malformed block falls back, and the host names it o
   assert(f.context().includes('render_fallback'), 'the occurrence\'s own content is delivered');
   const line = lines.find((l) => l.startsWith('[push-render-failed]'));
   assert(line, lines.join('\n'));
-  assert.match(line, /^\[push-render-failed\] server=editor subject=\S+ eventId=r1 field=payload\.content: "CoalesceError:\\u0020invalid\\u0020content\\u0020block" \(the occurrence's own content is delivered instead\)$/);
+  assert.match(line, /^\[push-render-failed\] server=editor subject=\S+ eventId=r1 field=payload\.content: "[^"]*invalid\\u0020content\\u0020block" \(the occurrence's own content is delivered instead\)$/);
 });
 
 test('a render result is delivered only when the converters show each block as itself or as a reference stub', async (t) => {

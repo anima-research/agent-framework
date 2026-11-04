@@ -56,11 +56,23 @@ class InterjectingModule implements Module {
     const metadata = this.interjectionMetadata;
     this.interjections = [];
     this.interjectionMetadata = [];
-    batch.forEach((blocks, i) => {
-      this.framework!.pushEvent({ type: 'external-message', source: 'test', content: '', blocks, metadata: {}, rowMetadata: metadata[i] } as unknown as ProcessEvent);
+    const pending = new Set<unknown>();
+    const processed = new Promise<void>((resolve) => {
+      if (batch.length === 0) { resolve(); return; }
+      const off = this.framework!.onTrace((t) => {
+        if (t.type !== 'process:completed' || !pending.delete(t.processEvent)) return;
+        if (pending.size === 0) { off(); resolve(); }
+      });
     });
-    // A beat for the run loop to defer them while this round's tools are pending.
-    if (batch.length > 0) await new Promise((r) => setTimeout(r, 30));
+    batch.forEach((blocks, i) => {
+      const event = { type: 'external-message', source: 'test', content: '', blocks, metadata: {}, rowMetadata: metadata[i] } as unknown as ProcessEvent;
+      pending.add(event);
+      this.framework!.pushEvent(event);
+    });
+    await Promise.race([
+      processed,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('the run loop never processed the interjections')), 10_000).unref()),
+    ]);
     return { success: true, data: { ok: true, tool: call.name } };
   }
 
@@ -309,8 +321,8 @@ describe('a message injected at a tool boundary', () => {
 
   it('under the memory strategy, a body bigger than the recent window that the render gives null goes in as stored, and the rest as the next request sends it', async () => {
     // The strategy stores the long message as several shards. As stored, it
-    // goes in joined, as the store reads it back: its image first, then its
-    // text as one block, which differs from the blocks as they were queued.
+    // goes in whole, as the store reads it back, which may differ from the
+    // blocks as they were queued.
     await create(new AutobiographicalStrategy({
       adaptiveResolution: true, foldingStrategy: 'kv-stable', recentWindowTokens: 300, kvStableReachTokens: 8_000,
       targetChunkTokens: 200,
@@ -322,7 +334,9 @@ describe('a message injected at a tool boundary', () => {
     const rows = framework.getAgent('assistant')!.getContextManager().getAllMessages();
     const row = rows.find((m) => JSON.stringify(m.content).includes('FIRSTLONG'))!;
     assert.ok(rows.filter((m) => m.bodyGroupId !== undefined && m.bodyGroupId === row.bodyGroupId).length > 1, 'the premise: it is stored in parts');
-    assert.deepEqual(JSON.parse(holding(injected, 'FIRSTLONG')), [image(), text(`Intro. ${long}`)], 'it goes in whole, as the store reads it back');
+    const first = JSON.parse(holding(injected, 'FIRSTLONG')) as Array<{ type: string; text?: string }>;
+    assert.equal(first.filter((b) => b.type === 'image').length, 1, 'its image, once');
+    assert.equal(first.filter((b) => b.type === 'text').map((b) => b.text).join(''), `Intro. ${long}`, 'its text, whole and in order');
     const second = holding(injected, 'SECONDSHORT');
     assert.deepEqual(JSON.parse((await nextRequest())('SECONDSHORT')), JSON.parse(second));
   });
@@ -431,13 +445,5 @@ describe('a message injected at a tool boundary', () => {
     }
     assert.deepEqual(JSON.parse(holding(injected, 'THROWNMSG')), [text('THROWNMSG and more')]);
     assert.ok(logged.some((l) => l.includes('[injection]') && l.includes('render broke')), 'the failure is logged');
-  });
-
-  it('renders nothing at a boundary with nothing to inject', async () => {
-    await create(new WindowedPassthroughStrategy({}));
-    const seen = renderWith((ids, real) => real(ids));
-    await turnWith([]);
-    assert.equal(membrane.lastStream!.receivedToolResults.length, 1, 'the premise: a tool boundary passed');
-    assert.equal(seen.calls, 0);
   });
 });

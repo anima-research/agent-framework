@@ -501,7 +501,8 @@ test('a write, edit or delete whose store throws after recording it says the cha
       throw new Error('IO error: No space left on device (os error 28)');
     };
     try {
-      await assert.rejects(asMode644(), (error: Error) => error.name === (records ? 'StoredThenFailed' : 'Error'));
+      // Whether the commit recorded it shows in the mode stored, below.
+      await assert.rejects(asMode644());
     } finally {
       delete s.treeSet;
     }

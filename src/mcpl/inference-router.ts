@@ -29,6 +29,7 @@ import { hostStoppedWhileHandling } from './errors.js';
 import type { HookOrchestrator } from './hook-orchestrator.js';
 import { logValue } from './log-value.js';
 import { streamBounds, wholeCallMs, withHostSetting, type InferenceBounds } from '../inference-bounds.js';
+import type { TraceEventInput } from '../types/trace.js';
 
 // ============================================================================
 // Responder interface
@@ -38,8 +39,10 @@ import { streamBounds, wholeCallMs, withHostSetting, type InferenceBounds } from
 interface Responder {
   respond(result: McplInferenceRequestResult): void;
   respondError(code: number, message: string, data?: unknown): void;
-  /** The JSON-RPC request ID, used for streaming chunk correlation. */
-  requestId?: string | number;
+  /** The JSON-RPC request ID, used for streaming chunk correlation: a
+   *  request sent with id null is answered whole, since its chunks couldn't
+   *  name it. */
+  requestId?: string | number | null;
   /** Sends a streamed chunk on the transport the request came on, as its
    *  answer is sent. */
   sendChunk?(params: InferenceChunkParams): void;
@@ -184,7 +187,7 @@ export class InferenceRouter {
   private hookOrchestrator: HookOrchestrator;
   private featureSetManager: FeatureSetManager;
   private routingPolicy: InferenceRoutingPolicy | null;
-  private emitTraceFn: (event: { type: string; [key: string]: unknown }) => void;
+  private emitTraceFn: (event: TraceEventInput) => void;
   /** The refusals for want of a model that have been logged: one line per
    *  server with no policy, and per server and feature set with one, so a
    *  server that keeps asking doesn't flood the operator's log. */
@@ -196,7 +199,7 @@ export class InferenceRouter {
     hookOrchestrator: HookOrchestrator,
     featureSetManager: FeatureSetManager,
     routingPolicy: InferenceRoutingPolicy | null,
-    emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
+    emitTraceFn: (event: TraceEventInput) => void,
     private readonly inferenceBounds: () => InferenceBounds | null = () => null,
   ) {
     this.membrane = membrane;

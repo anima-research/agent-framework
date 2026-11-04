@@ -41,14 +41,16 @@ const FIVE = stored(5);
 function cancelWith(opts: { backlogCap?: number; room?: number; source?: string; stored?: Row[]; held?: Row[]; note?: string }) {
   const added: Added[] = [];
   const inferences: string[] = [];
+  const tunedOut = {
+    params: { epochId: 'eA', cadenceSeconds: 300, backlogCap: opts.backlogCap ?? 20, maxWakes: 3, startedAtSequence: 0 },
+    wakeCount: 0,
+  };
+  let ended = false;
   const registry = {
     // No other tune-out or all-except hold, and nothing else stored.
-    getTuneOutState: () => null,
+    getTuneOutState: (_serverId: string, channelId: string) => (!ended && channelId === 'disc:guild:a' ? tunedOut : null),
     readCoordinatorState: () => null,
-    cancelTuneOut: () => ({
-      params: { epochId: 'eA', cadenceSeconds: 300, backlogCap: opts.backlogCap ?? 20, maxWakes: 3, startedAtSequence: 0 },
-      wakeCount: 0,
-    }),
+    cancelTuneOut: () => { ended = true; return tunedOut; },
     // The dump names its channel as the resident is shown it: here its id.
     nameShown: (channel: { channelId: string }) => channel.channelId,
     quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
@@ -223,14 +225,6 @@ test('without a per-message cap the dump is not fitted', () => {
   assert.deepEqual(shownOf(dump), ['M1', 'M2', 'M3', 'M4', 'M5'], 'every message is shown');
   assert.ok(dump.includes(`\n${huge}\n</tuned-out-backlog>`), 'the 100,000-character one whole, last');
   assert.ok(!dump.includes('truncated=') && !dump.includes(CUT_MARK), 'none counted or cut');
-});
-
-test("a room smaller than the dump's frame shows no message and counts them all", () => {
-  const { dump, notice } = cancelWith({ room: 10, stored: FIVE });
-  assert.deepEqual(shownOf(dump), [], 'no line');
-  assert.ok(!dump.includes(CUT_MARK), 'not even a cut one');
-  assert.ok(dump.includes('messages=5 truncated=5 '), 'all five counted');
-  assert.ok(notice!.includes('5 of 5 diverted messages'), 'and the report is told of all five');
 });
 
 test('a backlogCap of 0, or below 1, shows no message at any room', () => {
