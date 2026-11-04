@@ -247,7 +247,9 @@ export function ifYouWait(wakes: readonly UpcomingWake[], agentName: string, now
     ...(failed ? [failedTurnLine(failed, agentName, now)] : []),
     ...(listed.length > 0
       ? [`If you answer WAIT and nothing new arrives, ${agentName} is next woken by:`, ...listed, ...more]
-      : [`Nothing the host knows of is scheduled to wake ${agentName}: if you answer WAIT, it isn't woken until a new event arrives (a server's own timers, such as a heartbeat, may not be listed).`]),
+      : failed && failed.again.kind !== 'none'
+        ? [`Beside that wake, nothing the host knows of is scheduled to wake ${agentName} (a server's own timers, such as a heartbeat, may not be listed).`]
+        : [`Nothing the host knows of is scheduled to wake ${agentName}: if you answer WAIT, it isn't woken until a new event arrives (a server's own timers, such as a heartbeat, may not be listed).`]),
     '</if_you_wait>',
   ].join('\n');
 }
@@ -309,8 +311,8 @@ export function judgeQuestion(
   let i = request.events.length;
   while (i > 0) {
     const e: JudgeEventSummary = request.events[i - 1]!;
-    const where = e.channel ? ` in ${field(e.channel)}` : '';
-    const who = e.authorId ? ` from ${field(e.authorId)}` : '';
+    const where = e.channel ? ` in ${field(JSON.stringify(oneLine(e.channel)))}` : '';
+    const who = e.authorId ? ` from ${field(JSON.stringify(oneLine(e.authorId)))}` : '';
     const addressed = e.addressed ? ' (addresses the agent)' : '';
     const line = `- ${ago(e.at, now)}${addressed}${where}${who}: ${quoted(e.content)}`;
     if (lines.length > 0 && used + line.length > maxEventChars) break;
@@ -381,40 +383,45 @@ export class ReplyJudge {
     return this.charsPerToken;
   }
 
-  private tokens(chars: number): number {
-    return Math.ceil(chars / this.charsPerToken);
-  }
-
   /** Build the judge's request for one batch: the system prompt, the document in chunks, the question. */
-  async buildRequest(request: JudgeRequest, now = Date.now()): Promise<{ request: NormalizedRequest; agentName: string; chars: number; ratio: number }> {
+  async buildRequest(
+    request: JudgeRequest, now = Date.now(), atRatio?: number,
+  ): Promise<{ request: NormalizedRequest; agentName: string; chars: number; ratio: number }> {
     const agentName = this.chooseAgent(request.agentNames);
     if (!agentName) throw new Error('no agent to judge for');
     const preview = await this.preview(agentName);
     if (request.signal.aborted) throw new Error('the judge was stopped before its request');
 
-    let extra: UpcomingWake[] = [];
+    let pending: UpcomingWake[] | Promise<UpcomingWake[]> | undefined;
     try {
-      extra = (await this.extraWakes?.(agentName)) ?? [];
+      pending = this.extraWakes?.(agentName);
     } catch {
-      extra = [];
+      pending = undefined;
     }
-    const upcoming = [...(request.upcomingWakes ?? []), ...extra];
     let failed: FailedLastTurn | undefined;
     try {
       failed = this.failedLastTurn?.(agentName);
     } catch {
       failed = undefined;
     }
+    let extra: UpcomingWake[] = [];
+    try {
+      extra = (await pending) ?? [];
+    } catch {
+      extra = [];
+    }
+    const upcoming = [...(request.upcomingWakes ?? []), ...extra];
+    const ratio = atRatio ?? this.charsPerToken;
 
     const system = judgeSystemPrompt(agentName);
     const question = judgeQuestion(
-      { ...request, upcomingWakes: upcoming }, agentName, now, Math.floor(this.maxInputTokens * EVENTS_SHARE * this.charsPerToken), failed,
+      { ...request, upcomingWakes: upcoming }, agentName, now, Math.floor(this.maxInputTokens * EVENTS_SHARE * ratio), failed,
     );
     const fixedChars = system.length + question.length;
 
-    // The budget the document may fill, in characters at the current ratio.
-    const docTokens = Math.max(1_000, this.maxInputTokens - FIXED_TOKENS_RESERVE - this.tokens(fixedChars));
-    const docChars = Math.floor(docTokens * this.charsPerToken);
+    // The budget the document may fill, in characters at the ratio it's built at.
+    const docTokens = Math.max(1_000, this.maxInputTokens - FIXED_TOKENS_RESERVE - Math.ceil(fixedChars / ratio));
+    const docChars = Math.floor(docTokens * ratio);
 
     // The agent's system prompt comes after the conversation, just before the
     // question: a system prompt that changes between requests (a host that
@@ -471,7 +478,7 @@ export class ReplyJudge {
     return {
       agentName,
       chars,
-      ratio: this.charsPerToken,
+      ratio,
       request: {
         system,
         messages,
@@ -553,13 +560,14 @@ export class ReplyJudge {
       response = await this.ask(built, request.signal);
     } catch (err) {
       if ((err as { type?: unknown } | null)?.type !== 'context_length' || built.ratio <= 1) throw err;
-      this.charsPerToken = Math.min(this.charsPerToken, Math.max(1, built.ratio / 2));
+      const halved = Math.max(1, built.ratio / 2);
+      this.charsPerToken = Math.min(this.charsPerToken, halved);
       this.anchors.delete(built.agentName);
       console.error(
         `[gate] the reply judge's request of ${built.chars} characters, built at ${built.ratio.toFixed(2)} characters a token, `
         + `was refused as too long; the estimate is now ${this.charsPerToken.toFixed(2)}, and the batch is asked once more`,
       );
-      built = await this.buildRequest(request);
+      built = await this.buildRequest(request, Date.now(), halved);
       response = await this.ask(built, request.signal);
     }
     const usage = (response as NormalizedResponse).details?.usage;

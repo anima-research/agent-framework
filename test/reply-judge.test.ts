@@ -132,6 +132,23 @@ describe('reply judge: a request refused as too long', () => {
     assert.strictEqual(judge.estimateRatio(), 1.5);
   });
 
+  it('builds its second request at the halved ratio, though another call moves the estimate while its preview is read', async () => {
+    const { membrane, requests, size } = refusingMembrane(1);
+    let previews = 0;
+    const judge: ReplyJudge = new ReplyJudge({
+      membraneFor: () => membrane, chooseAgent: (n) => n[0],
+      preview: async () => {
+        if (++previews === 2) (judge as unknown as { charsPerToken: number }).charsPerToken = 6;
+        return { messages: conversation(60), config: { model: 'x', maxTokens: 1 } };
+      },
+      options: { maxInputTokens: 4_000 },
+    });
+    await quietly(() => judge.judge(judgeRequest()));
+    assert.strictEqual(requests.length, 2);
+    assert.strictEqual(previews, 2, 'premise: the estimate moved during the second request\'s preview');
+    assert.ok(size(requests[1]!) < size(requests[0]!), `${size(requests[1]!)} < ${size(requests[0]!)}`);
+  });
+
   it("isn't asked again for any other failure", async () => {
     const { membrane, requests } = refusingMembrane(1, new MembraneError({ type: 'server', retryable: true, message: 'upstream 500', rawError: { status: 500 } }));
     await assert.rejects(judgeOver(membrane).judge(judgeRequest()), /upstream 500/);
@@ -437,6 +454,34 @@ describe('reply judge: the document', () => {
     ].join('\n')), last);
   });
 
+  it('reads the failed-turn line in the same step as the wake list, so the two describe one moment', async () => {
+    const { membrane, requests } = fakeMembrane();
+    const now = Date.now();
+    let queued = false;
+    const judge = new ReplyJudge({
+      membraneFor: () => membrane, chooseAgent: (n) => n[0],
+      preview: async () => ({ messages: conversation(2), config: { model: 'x', maxTokens: 1 } }),
+      upcomingWakes: () => {
+        queueMicrotask(() => { queued = true; });
+        return [];
+      },
+      failedLastTurn: () => ({ at: now - 30_000, again: queued ? { kind: 'queued' as const } : { kind: 'none' as const } }),
+    });
+    await judge.judge(judgeRequest());
+    const last = (requests[0]!.messages.at(-1)!.content[0] as { text: string }).text;
+    assert.ok(last.includes('Nothing runs it again'), last);
+    assert.ok(!last.includes('already queued'), last);
+  });
+
+  it("says beside a queued or held wake that nothing else is scheduled, not that nothing wakes the agent", () => {
+    const now = 1_000_000;
+    for (const again of [{ kind: 'queued' as const }, { kind: 'held' as const, until: now + 60_000 }, { kind: 'held' as const }]) {
+      const text = ifYouWait([], 'Scout', now, { at: now - 30_000, again });
+      assert.ok(!text.includes("isn't woken until a new event arrives"), text);
+      assert.ok(text.includes('Beside that wake, nothing the host knows of is scheduled to wake Scout'), text);
+    }
+  });
+
   it("says a wake of the agent's is queued, or held until its hold ends or an operator releases it, when one is", () => {
     const now = 1_000_000;
     const opening = "Scout's last turn, 30s ago, failed and may not have answered all of what woke it.";
@@ -497,14 +542,21 @@ describe('reply judge: the document', () => {
     const question = judgeQuestion({
       events: [{ eventType: 'mcpl:channel-incoming', channel: '#r&d <beds> [b]', authorId: 'u<1>\n[x]', addressed: false, content: 'hi', at: 1_000_000 }],
     }, 'Scout', 1_000_000);
-    assert.ok(question.includes('- 0s ago in #r&amp;d &lt;beds&gt; &#91;b&#93; from u&lt;1&gt; &#91;x&#93;: hi'), question);
+    assert.ok(question.includes('- 0s ago in "#r&amp;d &lt;beds&gt; &#91;b&#93;" from "u&lt;1&gt; &#91;x&#93;": hi'), question);
   });
 
   it("puts the gate's addressed marker right after the time, ahead of the channel and the author", () => {
     const question = judgeQuestion({
       events: [{ eventType: 'mcpl:channel-incoming', channel: '#garden', authorId: 'u1', addressed: true, content: 'hi', at: 1_000_000 }],
     }, 'Scout', 1_000_000);
-    assert.ok(question.includes('- 0s ago (addresses the agent) in #garden from u1: hi'), question);
+    assert.ok(question.includes('- 0s ago (addresses the agent) in "#garden" from "u1": hi'), question);
+  });
+
+  it("quotes an event's channel and its author each as its own value, so an author can't read as a channel", () => {
+    const question = judgeQuestion({
+      events: [{ eventType: 'mcpl:channel-incoming', channel: '#garden', authorId: 'u1 in #admin', addressed: false, content: 'hi', at: 1_000_000 }],
+    }, 'Scout', 1_000_000);
+    assert.ok(question.includes('- 0s ago in "#garden" from "u1 in #admin": hi'), question);
   });
 
   it('keeps a value to one line whatever form its line breaks take', () => {
@@ -515,7 +567,7 @@ describe('reply judge: the document', () => {
     const question = judgeQuestion({
       events: [{ eventType: 'mcpl:channel-incoming', channel: '#garden\nbeds', authorId: 'u1', addressed: false, content: 'the beds need:\n- compost\n- a < b', at: 1_000_000 }],
     }, 'Scout', 1_000_000);
-    assert.ok(question.includes('<new_events count="1">\n- 0s ago in #garden beds from u1: the beds need:\n  - compost\n  - a &lt; b\n</new_events>'), question);
+    assert.ok(question.includes('<new_events count="1">\n- 0s ago in "#garden beds" from "u1": the beds need:\n  - compost\n  - a &lt; b\n</new_events>'), question);
   });
 
   it('reads the primary agent its chooser names', async () => {
