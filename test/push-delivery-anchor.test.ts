@@ -36,7 +36,7 @@ async function rig(t: TestContext, framework: Partial<FrameworkConfig>) {
   return { f, fw, origin };
 }
 
-const NO_WAKES = { gate: { config: { policies: [], default: 'defer' } } } as unknown as Partial<FrameworkConfig>;
+const NO_WAKES = { gate: { config: { policies: [], default: 'defer' }, onboarding: false } } as unknown as Partial<FrameworkConfig>;
 
 describe('a push that delivers a new message becomes the latest delivered inbound', () => {
   it('under \'latest-inbound\', a mention pushed from a closed channel moves the fallback locus and the reply anchor, thread included, and an edit pushed after it doesn\'t', async (t) => {
