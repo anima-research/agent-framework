@@ -4478,7 +4478,7 @@ export class EventGate {
   }
 
   private refusedJudging(policyName: string, state: JudgingState, err: unknown, durationMs: number): void {
-    const hold = safeSlice(errorText(err), 0, 300);
+    const hold = suppliedValue(safeSlice(errorText(err), 0, 300));
     const stated = (err as { retryAfterMs?: unknown }).retryAfterMs;
     // A wait that isn't a number of ms a Date can end at states no end (a
     // hold until released): a timer given one would fire at once.
