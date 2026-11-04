@@ -90,6 +90,34 @@ describe("a channel_close result says what became of the focus when the result a
       assert.equal(data.note, ENDED, `the note is the focus's status at the answer: ${JSON.stringify(data)}`);
     } finally { release(); answer?.(); await f.close(); }
   });
+  it("a deferred close whose focus ended, with a replacement focus begun on another channel before the answer, names the replacement", async () => {
+    const f = await focused();
+    const release = framework(f).reserveStoreForSurgery('roll back', 'agent');
+    const server = framework(f).mcplServerRegistry.getServer('editor')!;
+    let answer!: () => void;
+    const sent = server.sendChannelsClose.bind(server);
+    server.sendChannelsClose = async (params) => {
+      await new Promise<void>((resolve) => { answer = resolve; });
+      return sent(params);
+    };
+    try {
+      const closing = close(f, { channelId: 'work' });
+      await eventually(() => answer !== undefined, 'the close is out at the transport');
+      release();
+      assert.equal(coordinatorOf(f).getAllExcept(), null, 'premise: the release ended the focus while the transport is awaited');
+      const again = coordinatorOf(f).enterAllExcept({ serverId: 'editor', channelId: 'noisy' }, { durationSeconds: 120, backlogCap: 10 }, 'agent-tool');
+      assert.ok(again.ok, (again as { error?: string }).error);
+      answer();
+      const result = await closing;
+      assert.equal(result.success, true, result.error);
+      const data = result.data as { status?: string; note?: string };
+      assert.equal(data.status, 'closed');
+      assert.ok(coordinatorOf(f).getAllExcept(), 'premise: the replacement focus is in force at the answer');
+      assert.equal(data.note, `${ENDED} A new all-except focus is in force now, excepting editor/noisy: not this close's, and what the other channels hold stays held until it ends.`,
+        `the note names the replacement: ${JSON.stringify(data)}`);
+    } finally { release(); answer?.(); await f.close(); }
+  });
+
 });
 
 describe('a close that fails after the focus ended says the focus ended', () => {
