@@ -417,14 +417,18 @@ export class ReplyJudge {
     return this.charsPerToken;
   }
 
-  /** Build the judge's request for one batch: the system prompt, the document in chunks, the question. */
-  async buildRequest(request: JudgeRequest, now = Date.now()): Promise<{ request: NormalizedRequest; agentName: string; chars: number }> {
+  /**
+   * Build the judge's request for one batch: the system prompt, the document in chunks, the question.
+   * The question's times are told against `now`, or, when it's left out, the clock read once the
+   * agent's preview and the wakes waiting for it have been read.
+   */
+  async buildRequest(request: JudgeRequest, now?: number): Promise<{ request: NormalizedRequest; agentName: string; chars: number }> {
     const { request: built, agentName, chars } = await this.build(request, now);
     return { request: built, agentName, chars };
   }
 
   private async build(
-    request: JudgeRequest, now: number, atRatio?: number, fresh = false,
+    request: JudgeRequest, now: number | undefined, atRatio?: number, fresh = false,
   ): Promise<{ request: NormalizedRequest; agentName: string; chars: number; ratio: number }> {
     const agentName = this.chooseAgent(request.agentNames);
     if (!agentName) throw new Error('no agent to judge for');
@@ -456,7 +460,7 @@ export class ReplyJudge {
 
     const system = judgeSystemPrompt(agentName);
     const question = judgeQuestion(
-      { ...request, upcomingWakes: upcoming }, agentName, now, Math.floor(this.maxInputTokens * EVENTS_SHARE * ratio), failed,
+      { ...request, upcomingWakes: upcoming }, agentName, now ?? Date.now(), Math.floor(this.maxInputTokens * EVENTS_SHARE * ratio), failed,
     );
     const fixedChars = system.length + question.length;
 
@@ -593,7 +597,7 @@ export class ReplyJudge {
   }
 
   private async decide(request: JudgeRequest): Promise<JudgeVerdict> {
-    let built = await this.build(request, Date.now());
+    let built = await this.build(request, undefined);
     let response: NormalizedResponse;
     try {
       response = await this.ask(built, request.signal);
@@ -602,7 +606,7 @@ export class ReplyJudge {
       this.anchors.delete(built.agentName);
       const refused = built;
       if (request.signal.aborted) throw new Error('the judge was stopped before its request');
-      built = await this.build(request, Date.now(), MIN_CHARS_PER_TOKEN, true);
+      built = await this.build(request, undefined, MIN_CHARS_PER_TOKEN, true);
       if (request.signal.aborted) throw new Error('the judge was stopped before its request');
       console.error(
         `[gate] the reply judge's request on rule ${JSON.stringify(request.policyName)}'s batch, for ${built.agentName}, of ${refused.chars} characters, built at ${refused.ratio.toFixed(2)} characters a token, `

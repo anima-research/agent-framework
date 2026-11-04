@@ -641,7 +641,7 @@ test("a turn that fails for good as its stream is set up, after its agent's name
     return make(request);
   };
   const r = await resident(t, membrane, { exhaustedTurnRearmMs: false });
-  const internal = r.fw as unknown as { agents: Map<string, object>; lastStartFailed: Map<string, number> };
+  const internal = r.fw as unknown as { agents: Map<string, object>; failedLastTurnFor(agentName: string): unknown };
   const original = internal.agents.get('resident')!;
   rebind = () => {
     rebind = () => {};
@@ -649,20 +649,54 @@ test("a turn that fails for good as its stream is set up, after its agent's name
   };
   let marked: boolean | undefined;
   r.fw.onTrace((e) => {
-    if ((e as { type: string }).type === 'inference:exhausted' && marked === undefined) marked = internal.lastStartFailed.has('resident');
+    if ((e as { type: string }).type === 'inference:exhausted' && marked === undefined) marked = internal.failedLastTurnFor('resident') !== undefined;
   });
   const errors = console.error;
   console.error = () => {};
   try {
     r.say('zz-question');
     await waitFor(() => r.count('inference:exhausted') === 1, 'the turn to fail for good');
+    assert.strictEqual(marked, false, 'not marked as the turn failed');
+    assert.strictEqual(internal.failedLastTurnFor('resident'), undefined);
   } finally {
     console.error = errors;
     internal.agents.set('resident', original);
   }
-  assert.strictEqual(marked, false, 'not marked as the turn failed');
-  assert.strictEqual(internal.lastStartFailed.has('resident'), false);
 });
+
+for (const [how, failsAt] of [['reported by its stream', 'event'], ['thrown by its stream', 'throw']] as const) {
+  test(`a turn that fails for good after a listener of its failure ended its agent marks no failed last turn for the agent bound to the name next (failure ${how})`, async (t) => {
+    const membrane = new ScriptedMembrane((n) => (n === 1 ? invalidRequest : undefined), failsAt);
+    const r = await resident(t, membrane, { exhaustedTurnRearmMs: false });
+    const internal = r.fw as unknown as {
+      agents: Map<string, object>;
+      failedLastTurnFor(agentName: string): unknown;
+      releaseAgentRuntime(agent: object): void;
+    };
+    const original = internal.agents.get('resident')!;
+    let ended = false;
+    r.fw.onTrace((e) => {
+      if ((e as { type: string }).type !== 'inference:failed' || ended) return;
+      ended = true;
+      internal.releaseAgentRuntime(original);
+    });
+    const errors = console.error;
+    console.error = () => {};
+    try {
+      r.say('zz-question');
+      await waitFor(() => r.count('inference:exhausted') === 1, 'the turn to fail for good');
+    } finally {
+      console.error = errors;
+    }
+    assert.ok(ended, "premise: a listener of the turn's failure ended its agent");
+    internal.agents.set('resident', Object.assign(Object.create(Object.getPrototypeOf(original)), original));
+    try {
+      assert.strictEqual(internal.failedLastTurnFor('resident'), undefined);
+    } finally {
+      internal.agents.set('resident', original);
+    }
+  });
+}
 
 test("a wake queued while the agent waits for a re-arm is what the judge is told of, not the re-arm's end, since the wake starts the turn at once", async (t) => {
   const membrane = new ScriptedMembrane((n) => (n <= 3 ? serverError : undefined));

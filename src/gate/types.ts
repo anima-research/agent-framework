@@ -371,7 +371,7 @@ export interface ReplyJudgeOptions {
    * its newest 100 events as it does while a turn holds them, and they're
    * judged once the wait ends or the hold is released. A refusal that states
    * no end, or no time left, keeps them held until a later batch's call,
-   * which takes in its own rule's held batch, gets a verdict, or the gate is
+   * which takes in its own rule's held batch, gets a REPLY or WAIT, or the gate is
    * told the hold ended or was released (`EventGate.providerCallsReleased`).
    * A later call that fails lets its batch go, with the held events it took
    * in, as a failed call's batch goes under `"skip"`.

@@ -87,6 +87,22 @@ describe('ProviderWaits', () => {
     } finally { store.close(); }
   }));
 
+  it('reads its own clock after it retries the recorded waits, so a wait that ends while the retry runs is over', () => withStoreDir((path) => {
+    const store = JsStore.openOrCreate({ path });
+    try {
+      const time = clock();
+      const waits = new ProviderWaits(store, { now: time.now, ...quiet });
+      waits.set('ada', 'zz-model', 100, 'zz 429');
+      const internal = waits as unknown as { retry(): void };
+      const retry = internal.retry.bind(waits);
+      internal.retry = () => {
+        retry();
+        time.advance(200);
+      };
+      assert.equal(waits.active('ada', 'zz-model'), undefined);
+    } finally { store.close(); }
+  }));
+
   it('never lets a later, shorter wait shorten an outstanding one; indefinite stays indefinite', () => withStoreDir((path) => {
     const store = JsStore.openOrCreate({ path });
     try {

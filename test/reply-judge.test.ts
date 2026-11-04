@@ -514,6 +514,24 @@ describe('reply judge: the document', () => {
     assert.ok(verdict!.inputTokens! <= 4_000, String(verdict!.inputTokens));
   });
 
+  it("tells the judge when a wake comes against the clock read after the agent's preview, which can take a while", async (t) => {
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+    const { membrane, requests } = fakeMembrane();
+    const start = Date.now();
+    const judge = new ReplyJudge({
+      membraneFor: () => membrane, chooseAgent: (n) => n[0],
+      preview: async () => {
+        t.mock.timers.tick(30_000);
+        return { messages: conversation(2), config: { model: 'x', maxTokens: 1 } };
+      },
+      upcomingWakes: () => [{ at: start + 40_000, certain: true, what: 'zz a wake held by a provider hold, when it ends' }],
+    });
+    await judge.judge(judgeRequest());
+    assert.strictEqual(Date.now(), start + 30_000, 'premise: the preview took 30 s');
+    const last = (requests[0]!.messages.at(-1)!.content[0] as { text: string }).text;
+    assert.ok(last.includes('- in 10 s: zz a wake held by a provider hold, when it ends'), last);
+  });
+
   it('tells the judge what wakes the agent if it waits, soonest first, the framework\'s beside the gate\'s', async () => {
     const { membrane, requests } = fakeMembrane();
     const now = Date.now();
