@@ -6251,7 +6251,10 @@ export class AgentFramework {
     if (cooldown && !(cooldown.rearm && queued.length > 0)) {
       const releaseWakes = cooldown.heldRequests.length > 0 || !(cooldown.auxiliaryOrigin || cooldown.emptiedBy);
       if (releaseWakes || queued.length > 0) {
-        return { queued: [], held: { ...ends(cooldown.until), ...(cooldown.rearm ? { rearm: cooldown.rearm } : {}) } };
+        const bound = cooldown.waitModel !== undefined && model === cooldown.waitModel
+          ? this.providerWaits?.active(agentName, cooldown.waitModel)
+          : undefined;
+        return { queued: [], held: { ...ends(bound ? bound.until : cooldown.until), ...(cooldown.rearm ? { rearm: cooldown.rearm } : {}) } };
       }
     }
     const wait = queued.length > 0 && model !== undefined ? this.providerWaits?.active(agentName, model) : undefined;

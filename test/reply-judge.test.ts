@@ -124,12 +124,19 @@ describe('reply judge: a request refused as too long', () => {
   it('sends nothing when the gate stops the judge while an asynchronous wake provider answers', async () => {
     const stop = new AbortController();
     const { membrane, requests } = refusingMembrane(0);
+    let entered!: () => void;
+    const inProvider = new Promise<void>((resolve) => { entered = resolve; });
+    let answer!: (wakes: []) => void;
     const judge = new ReplyJudge({
       membraneFor: () => membrane, chooseAgent: (n) => n[0],
       preview: async () => ({ messages: conversation(5), config: { model: 'x', maxTokens: 1 } }),
-      upcomingWakes: async () => { stop.abort(); return []; },
+      upcomingWakes: () => { entered(); return new Promise<[]>((resolve) => { answer = resolve; }); },
     });
-    await quietly(() => assert.rejects(judge.judge(judgeRequest({ signal: stop.signal })), /stopped/));
+    const asked = judge.judge(judgeRequest({ signal: stop.signal }));
+    await inProvider;
+    stop.abort();
+    answer([]);
+    await quietly(() => assert.rejects(asked, /stopped/));
     assert.strictEqual(requests.length, 0);
   });
 
@@ -157,13 +164,17 @@ describe('reply judge: a request refused as too long', () => {
   });
 
   it('halves the ratio once for two requests built at it and refused together', async () => {
-    const { membrane } = refusingMembrane(() => true);
+    const { membrane, requests } = refusingMembrane(() => true);
     const judge = judgeOver(membrane);
-    await quietly(() => Promise.allSettled([judge.judge(judgeRequest()), judge.judge(judgeRequest())]));
+    const settled = await quietly(() => Promise.allSettled([judge.judge(judgeRequest()), judge.judge(judgeRequest())]));
+    assert.deepStrictEqual(settled.map((s) => s.status), ['rejected', 'rejected']);
+    assert.ok(settled.every((s) => s.status === 'rejected' && /prompt is too long/.test(String(s.reason))), 'premise: each call was refused as too long');
+    assert.strictEqual(requests.length, 4, 'premise: each call sent its request and its retry');
     assert.strictEqual(judge.estimateRatio(), 1.5);
   });
 
-  it('builds its second request at the halved ratio, though another call moves the estimate while its preview is read', async () => {
+  it('builds its second request at the halved ratio, though another call moves the estimate while its preview is read', async (t) => {
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
     const { membrane, requests, size } = refusingMembrane(1);
     let previews = 0;
     const judge: ReplyJudge = new ReplyJudge({
