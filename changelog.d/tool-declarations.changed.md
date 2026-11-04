@@ -12,10 +12,14 @@
   declared may be another agent's tools and system text. Its tool description
   says so, so an agent with the history module has its tools written to the
   provider's cache afresh once at the upgrade.
-- Going back to an earlier release after an agent has declared changes under
-  `'entries'`: that release compiles the stored change rows as it does any
-  row, so an agent sends them as written beside its current head, and a
-  resident in the residents' shared slot sends the other residents' as well.
+- Going back to a release from 0.26.0 on, after an agent has declared changes
+  under `'entries'`: that release compiles the stored change rows as it does
+  any row. Through membrane's native formatter to an adapter that sends system
+  changes, a request carries them as written beside its current head, and a
+  resident's request in the residents' shared slot carries the other
+  residents' as well; through any other, membrane refuses a request that
+  carries one. A release before 0.26.0 depends on a membrane with no system
+  changes at all.
 - A resident's registry record now states its `selfParticipants` and
   `presentAs`, as a derived agent's does, so `inspect` shows them and a
   context reopened from records reads the mapping that ran.
