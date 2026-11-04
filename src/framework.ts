@@ -26886,8 +26886,9 @@ export class AgentFramework {
                 } else {
                   // Route to the TURN-FROZEN locus, like every other speech
                   // path: a locus resolved at post time would read the global
-                  // fallback, the all-except hold or the latest inbound
-                  // channel, which arrivals move while a dispatch runs.
+                  // fallback (the all-except hold's channel while one is open,
+                  // else the latest inbound channel), which an arrival, or the
+                  // hold opening or ending, can move while a dispatch runs.
                   const locus = resolveTurnLocus();
                   console.error(
                     `[routing] ${agent.name}: text-only turn -> routing speech -> ${locus ? qualifiedChannelName(locus) : '(none)'}`,
