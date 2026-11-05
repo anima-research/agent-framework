@@ -1187,11 +1187,14 @@ export type TraceEvent =
    * At boot, a hold on record (`epochId`; the all-except hold with `scope`,
    * its channel the excepted one) that the last stop's stamp
    * (`tune-out/<primary>/stop-stamp`) doesn't cover: the host crashed, or
-   * the store refused the stop's writes, so whether a cancel of it waited
-   * then, with a note, is not known. The persistent subconscious
-   * (`noteAuthor`) is told that any such cancel was lost, with any note
-   * left with it, by a loss notice kept and tried again as the others are
-   * (`tune-out:note-loss-untold` where its write fails).
+   * the store refused the stop's writes. `found`, from that run's residents'
+   * rows: `delivered`, a waiting cancel's note was written to the resident
+   * before the stop, the cancel's end not recorded; `unknown`, nothing says
+   * whether a cancel waited. The persistent subconscious (`noteAuthor`) is
+   * told which, by a loss notice kept and tried again as the others are
+   * (`tune-out:note-loss-untold` where its write fails). A hold whose
+   * release already told a waiting note's loss is not traced: nothing more
+   * is told.
    */
   | (TraceEventBase & {
       type: 'tune-out:stop-unrecorded';
@@ -1200,6 +1203,7 @@ export type TraceEvent =
       epochId: string;
       scope?: 'all-except';
       noteAuthor: string;
+      found: 'delivered' | 'unknown';
     })
   | (TraceEventBase & {
       type: 'tune-out:note-loss-untold';

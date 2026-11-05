@@ -1231,7 +1231,7 @@ test("65 follow-up (Ivy-3594, round 8): a stop while a reader fork's cancel wait
   }
 });
 
-test("65 follow-up (Ivy-3594, round 8, the stop stamp): a boot that finds no stamp tells the subconscious, for a channel's hold and the all-except hold on record, that any cancel then waiting was lost; a stop's stamp covers both, and the boot clears it", () => {
+test("65 follow-up (Ivy-3594, round 8, the stop stamp): a boot that finds no stamp tells the subconscious, for a channel's hold and the all-except hold on record, that a cancel it asked for then, if any, was lost; a stop's stamp covers both, and the boot stamps its own run as covering none", () => {
   mock.timers.enable({ apis: ['setTimeout'] });
   const errors = mock.method(console, 'error', () => {});
   const g = epochSetup();
@@ -1242,21 +1242,21 @@ test("65 follow-up (Ivy-3594, round 8, the stop stamp): a boot that finds no sta
     const b = g.enterScope();
     boot();
     const says = (hold: string, epochId: string, it: string) => `[Tune-out: the host stopped without recording the state of ${hold}${epochId}). `
-      + `Any cancel of it asked for before the stop that had not run yet was lost, and so was any note you left with one. That ${it} is still in force.]`;
+      + `If you asked for a cancel of it before the stop, it had not run when the host stopped: it was lost, and any note you left with it. That ${it} is still in force.]`;
     assert.deepEqual(g.lossNotices().map((m) => [m.forAgent, m.metadata?.epochId, m.metadata?.scope, textOf(m.content)]), [
       ['Subconscious', a, undefined, says('the tune-out of disc:guild:a (epoch ', a, 'tune-out')],
       ['Subconscious', b, 'all-except', says('the all-except hold (all channels except disc:guild:x; epoch ', b, 'hold')],
     ], 'no stop stamped them (a crash): each hold gets the row');
     assert.deepEqual(g.wakes.filter(([, why]) => why.startsWith('tune-out stop not recorded')),
       [['Subconscious', 'tune-out stop not recorded: disc:guild:a'], ['Subconscious', 'tune-out stop not recorded: all-except']], 'with a turn to read it');
-    assert.deepEqual(g.traces.filter((t) => t.type === 'tune-out:stop-unrecorded').map((t) => [t.epochId, t.scope, t.noteAuthor]),
-      [[a, undefined, 'Subconscious'], [b, 'all-except', 'Subconscious']], 'traced');
+    assert.deepEqual(g.traces.filter((t) => t.type === 'tune-out:stop-unrecorded').map((t) => [t.epochId, t.scope, t.noteAuthor, t.found]),
+      [[a, undefined, 'Subconscious', 'unknown'], [b, 'all-except', 'Subconscious', 'unknown']], 'traced, nothing found of a note');
     const before = g.lossNotices().length;
     booted.at(-1)!.stop();
-    assert.deepEqual(g.states.get('tune-out/scout/stop-stamp'), { v: 1, epochs: [a, b] }, 'the stop stamps both');
+    assert.deepEqual(g.states.get('tune-out/scout/stop-stamp'), { v: 1, epochs: [a, b], runStartedAt: 2 }, "the stop stamps both, with its run's start");
     boot();
     assert.equal(g.lossNotices().length, before, 'the next boot, covered by the stamp, writes none');
-    assert.equal(g.states.has('tune-out/scout/stop-stamp'), false, 'and clears the stamp');
+    assert.deepEqual(g.states.get('tune-out/scout/stop-stamp'), { v: 1, epochs: [], runStartedAt: 2 }, 'and stamps its own run as covering none');
     boot();
     assert.equal(g.lossNotices().length, before + 2, 'so a later boot with no stop of its own writes them again');
   } finally {
