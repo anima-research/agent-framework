@@ -713,14 +713,16 @@ export interface InferenceRequest {
    * the agent, and which so took no route: the channels its messages came
    * from (a `chat:system` notice names none, unless it's a coalesced
    * render's latest occurrence), each once. A start merged from several
-   * requests carries every one's channels, and the framework's own wakes
+   * requests carries every one's channels, as does a request a provider
+   * hold takes another into, and the framework's own wakes
    * that continue a turn with no locus (a restart, a re-inference, a
-   * continuation, a retry, a bounce), unless its own wake named a channel
-   * that resolves to none, carry the channels the turn's starts gathered,
-   * so a turn's trigger can name channels from several batches. When such a
-   * turn's plain speech, or a sleep's announcement, is routed with no locus,
-   * the agent is told these channels, unless the turn's own wake named a
-   * channel that resolves to none.
+   * continuation, a retry, a bounce, a re-arm), unless its own wake named
+   * a channel that resolves to none, carry the channels the turn's starts
+   * gathered, so a turn's trigger can name channels from several batches.
+   * When such a turn's plain speech, or a sleep's announcement, is routed
+   * with no locus, the agent is told these channels, unless the turn's own
+   * wake named a channel that resolves to none, or the turn is an ephemeral
+   * run's, which is told nothing.
    */
   wakeChannels?: Array<{ serverId: string; channelId: string }>;
   /** Timestamp of the event the wake provenance was taken from (ms). */

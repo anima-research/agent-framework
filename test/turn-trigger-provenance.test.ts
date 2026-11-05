@@ -291,7 +291,7 @@ describe('Turn trigger provenance', () => {
     await framework.stop();
   });
 
-  it("a gate wake names a batch channel even when another conversation fork calls it home", async () => {
+  it("a gate wake names a batch channel the gate's own route check refuses", async () => {
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'gated.chronicle'),
       membrane: membrane.asMembrane(),

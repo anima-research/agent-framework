@@ -210,7 +210,8 @@ export interface WakeProvenance {
    *  coalesced render's latest occurrence, which the gate takes as a
    *  message (GateEventInfo.folds). The wake has no route, and the turn's
    *  no-locus notice names them, unless the turn's own wake named a channel
-   *  that resolves to none. */
+   *  that resolves to none, or the turn is an ephemeral run's, which writes
+   *  none. */
   batchChannels?: Array<{ channelId: string; serverId?: string }>;
   /** Timestamp (ms) of the chosen event, so a consumer coalescing several
    *  requests can order by event recency, not by flush order. */

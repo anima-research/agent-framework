@@ -6644,30 +6644,19 @@ export class AgentFramework {
   /** Keep `request` among a hold's `held` requests, once by
    *  sameInferenceRequest. A held turn's retry (TURN_RETRY) whose equal is
    *  already held marks that one, so the hold still keeps the turn alive. */
-  private holdRequest(held: InferenceRequest[], request: InferenceRequest, takes: (kept: InferenceRequest) => boolean = () => true): void {
-    const same = held.find((r) => this.sameInferenceRequest(r, request) && takes(r));
+  private holdRequest(held: InferenceRequest[], request: InferenceRequest): void {
+    const same = held.find((r) => this.sameInferenceRequest(r, request));
     if (!same) {
       held.push(request);
       return;
     }
-    // A merged start's batch (MERGED_BATCH) stays recorded on the request
-    // kept in its place, which then stands for it, as the start did.
-    // Copy the held request and read the kept one's carry before marking it.
-    const into = mergedBatch(same);
-    const batch = mergedBatch(request);
-    if (into || batch) {
-      const copy = into ? undefined : { ...same };
-      const members = into ? [...into] : [copy!];
-      const joining = batch ?? [request];
-      // Fold the members that carry the turn on before the wakes, so a wake
-      // never joins the copy a retry then takes.
-      for (const member of [...joining.filter(continuesTurn), ...joining.filter((m) => !continuesTurn(m))]) {
-        this.holdRequest(members, member, (kept) => continuesTurn(member) ? continuesTurn(kept) || kept === copy : !continuesTurn(kept));
-      }
-      (same as MarkedRequest)[MERGED_BATCH] = members;
-    }
+    // Read the kept request's carry before marking it.
     const keptCarry = turnCarryOf(same);
     if (isTurnRetry(request)) (same as MarkedRequest)[TURN_RETRY] = true;
+    // A merged start's batch (MERGED_BATCH) stays recorded on the request
+    // kept in its place, which then stands for it, as the start did.
+    const batch = mergedBatch(request);
+    if (batch) (same as MarkedRequest)[MERGED_BATCH] = [...new Set([...(mergedBatch(same) ?? []), ...batch])];
     const carry = keptCarry ?? turnCarryOf(request);
     if (carry) (same as MarkedRequest)[TURN_CARRY] = carry;
     else delete (same as MarkedRequest)[TURN_CARRY];
@@ -6798,6 +6787,8 @@ export class AgentFramework {
     const request: MarkedRequest = { ...trigger, [REARMED]: true };
     delete request[TURN_RETRY];
     delete request[MERGED_BATCH];
+    delete request.wakeChannels;
+    Object.assign(request, this.wakeChannelsMark(routing));
     if (continuation) {
       request.reason = REARM_REASON;
       delete request.counterparty;
@@ -20011,7 +20002,12 @@ export class AgentFramework {
       // passes, and the read check and the policy decide on them all; the
       // merge below records the batch anew.
       if (requests.some((r) => mergedBatch(r) !== undefined)) {
-        requests = requests.flatMap((r) => mergedBatch(r) ?? [r]);
+        requests = requests.flatMap((r) => {
+          const batch = mergedBatch(r);
+          if (!batch?.length) return [r];
+          const channels = wakeChannelsOf([batch[0], r]);
+          return channels ? [{ ...batch[0]!, wakeChannels: channels }, ...batch.slice(1)] : batch;
+        });
       }
 
       // A provider's stated wait on this agent's primary model, including one
@@ -26363,10 +26359,12 @@ export class AgentFramework {
                 // a postscript to a message already delivered.
                 // Restart inference inside this logical turn. No tool is
                 // executed again and no settle/checkpoint/locus reset occurs.
-                await this.startAgentStream(agent, withTurnCarry({
+                const retried: InferenceRequest = {
                   ...trigger, agentName: agent.name, reason: 'tool_result_guard_retry',
                   source: trigger?.source ?? 'framework', timestamp: Date.now(),
-                }, { silence, sends: turnSends, read: carry.read }), attempt);
+                };
+                delete retried.wakeChannels;
+                await this.startAgentStream(agent, withTurnCarry({ ...retried, ...this.wakeChannelsMark(streamRouting) }, { silence, sends: turnSends, read: carry.read }), attempt);
                 return;
               }
               const lastResult = response.content.reduce((last, block, index) =>
