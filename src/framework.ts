@@ -32981,7 +32981,8 @@ export class AgentFramework {
 
   /**
    * Ops alert — the one escalation path for "a human should hear about this":
-   * (1) durable failures.log record (unless the caller already wrote one),
+   * (1) durable failures.log record (unless the caller already wrote one,
+   *     or the alert reports a state, as the budget hold's do, with none),
    * (2) an `ops:alert` trace so authorized observers get it on the wire,
    * (3) if CONNECTOME_OPS_WEBHOOK is set, a Discord post throttled to one per
    *     (agent, kind) per cooldown window — a persistent failure re-posts
