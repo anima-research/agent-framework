@@ -2612,7 +2612,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
-  it('posts every context-hold and its clear to the ops webhook, so its last post for a turn held again is the start', async () => {
+  it('posts every context-hold and its clear to the ops webhook, so the last it sends for a turn held again is the start', async () => {
     await withWebhook(async (posts) => {
       await withBacklog({ stalled: true }, async (backlog) => {
         const t = await residentTurn({ maintenanceIntervalMs: 50 });
@@ -2637,7 +2637,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
-  it("reports a hold that a listener of its context-hold alert ends at once in order, on the trace and on the webhook", async () => {
+  it("reports a hold that a listener of its context-hold alert ends at once in order, on the trace and in what it sends the webhook", async () => {
     await withWebhook(async (posts) => {
       await withBacklog({ stalled: true }, async () => {
         const t = await residentTurn({ maintenanceIntervalMs: 50 });
