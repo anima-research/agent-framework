@@ -19094,17 +19094,21 @@ export class AgentFramework {
 
   private async wakeForCoalescedBatch(occ: CoalescedOccurrence<CoalescedDelivery>): Promise<void> {
     const subject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
-    // The wake this notice replaces began the batch's burst: under a message
-    // quiet period the new wake carries its age (QUIET_SINCE), so a batch
-    // that keeps updating still starts at `maxWaitMs` from its first wake.
+    // Under a message quiet period a replacement is the same burst: the wake
+    // this notice replaces began it, so the new wake carries its age
+    // (QUIET_SINCE) and a batch that keeps updating still starts at
+    // `maxWaitMs` from its first wake; and the burst's hold isn't ended by
+    // the withdrawal (no prune inside it), only re-read once the new wake is
+    // queued, so a replacement traces no `gone`, and a start assembling in
+    // between still leaves the batch (quietLeftSubjects reads the queue).
     const since = new Map<string, number>();
     if (this.quietPeriod) {
-      for (const r of this.pendingRequests) {
-        if (r.coalescingSubject !== subject) continue;
+      this.forEachQueuedRequest((r) => {
+        if (r.coalescingSubject !== subject) return;
         since.set(r.agentName, Math.min(since.get(r.agentName) ?? Infinity, quietSince(r)));
-      }
+      });
     }
-    this.cancelCoalescedWakes(subject);
+    this.cancelCoalescedWakes(subject, !this.quietPeriod);
     await this.queueCoalescedWakes(occ);
     if (since.size > 0) {
       for (const r of this.pendingRequests) {
@@ -19112,6 +19116,7 @@ export class AgentFramework {
         if (was !== undefined) carryQuietSince(r, was);
       }
     }
+    if (this.quietPeriod) for (const agentName of [...(this.quietHolds?.keys() ?? [])]) this.pruneQuietHolds(agentName, this.queuedQuietKeys(agentName));
   }
 
   /** Queue a wake for each agent of the batch's audience, when its latest
@@ -19213,33 +19218,41 @@ export class AgentFramework {
     if (held.size === 0) this.quietHolds.delete(agentName);
   }
 
-  /** The burst keys of an agent's queued message wakes, for pruneQuietHolds:
-   *  in the queue, in a pass's hands, or held by a provider's cooldown. */
+  /** Every request queued for a start: in the queue, in a pass's hands, or
+   *  held by a provider's cooldown. */
+  private forEachQueuedRequest(fn: (r: InferenceRequest) => void): void {
+    this.pendingRequests.forEach(fn);
+    for (const pass of this.passRequests ?? []) for (const requests of pass.values()) requests.forEach(fn);
+    for (const cooldown of this.providerAccelerationCooldowns?.values() ?? []) cooldown.heldRequests.forEach(fn);
+  }
+
+  /** The burst keys of an agent's queued message wakes, for pruneQuietHolds. */
   private queuedQuietKeys(agentName: string): Set<string> {
     const keys = new Set<string>();
-    const add = (r: InferenceRequest): void => { if (r.agentName === agentName && isMessageWake(r)) keys.add(quietBurstKey(r)); };
-    this.pendingRequests.forEach(add);
-    for (const pass of this.passRequests ?? []) for (const requests of pass.values()) requests.forEach(add);
-    for (const cooldown of this.providerAccelerationCooldowns?.values() ?? []) cooldown.heldRequests.forEach(add);
+    this.forEachQueuedRequest((r) => { if (r.agentName === agentName && isMessageWake(r)) keys.add(quietBurstKey(r)); });
     return keys;
   }
 
-  /** The coalescing subjects of `agentName`'s wakes a message quiet period
-   *  holds now (quietHolds): a turn another burst starts leaves their batches
-   *  for the turn they wait for (PushCoalescer.assemble's `leave`). */
-  private quietHeldSubjects(agentName: string): Set<string> | undefined {
-    const held = this.quietHolds?.get(agentName);
-    if (!held?.size) return undefined;
+  /** Under a message quiet period, the coalescing subjects of `agentName`'s
+   *  message wakes still queued as its turn starts: each waits for a turn of
+   *  its own (held, or ready and waiting its turn), so this start's assembly
+   *  leaves their batches (PushCoalescer.assemble's `leave`). Read from the
+   *  queue, not from the hold map, so a replacement notice in flight or a
+   *  hold not yet traced can't open the door. The start's own causes are
+   *  never left: assemble keeps them whatever this says. `isMessageWake`
+   *  is defensive here: a queued coalesced wake is one by construction. */
+  private quietLeftSubjects(agentName: string): Set<string> | undefined {
+    if (!this.quietPeriod) return undefined;
     const subjects = new Set<string>();
-    for (const r of this.pendingRequests) {
-      if (r.agentName === agentName && r.coalescingSubject !== undefined && isMessageWake(r) && held.has(quietBurstKey(r))) subjects.add(r.coalescingSubject);
-    }
+    this.forEachQueuedRequest((r) => {
+      if (r.agentName === agentName && r.coalescingSubject !== undefined && isMessageWake(r)) subjects.add(r.coalescingSubject);
+    });
     return subjects.size > 0 ? subjects : undefined;
   }
 
   /** Withdraw unstarted wakes whose sole cause is this subject (§4.2), and
    *  a merged start whose every request is withdrawn. */
-  private cancelCoalescedWakes(subject: string): void {
+  private cancelCoalescedWakes(subject: string, pruneQuietHolds = true): void {
     // A wake of the subject's merged into a start
     // (MERGED_BATCH) is withdrawn from the start's batch, so no stop puts
     // it back and no pass unpacks it.
@@ -19258,12 +19271,15 @@ export class AgentFramework {
     for (const pass of this.passRequests ?? []) for (const requests of pass.values()) requests.forEach(unrecord);
     const withdrawn = (r: InferenceRequest): boolean => r.coalescingSubject === subject || emptied.has(r);
     this.pendingRequests = this.pendingRequests.filter((r) => !withdrawn(r));
-    for (const agentName of [...(this.quietHolds?.keys() ?? [])]) this.pruneQuietHolds(agentName, this.queuedQuietKeys(agentName));
     for (const cooldown of this.providerAccelerationCooldowns.values()) {
       const held = cooldown.heldRequests.length;
       cooldown.heldRequests = cooldown.heldRequests.filter((r) => !withdrawn(r));
       if (held > 0 && cooldown.heldRequests.length === 0) cooldown.emptiedBy = 'withdrawal';
     }
+    // A held burst whose wakes this withdrawal took ends its hold, read after
+    // the cooldowns too. A replacement (wakeForCoalescedBatch) prunes once
+    // its new wake is queued instead, so the burst's hold goes on.
+    if (pruneQuietHolds) for (const agentName of [...(this.quietHolds?.keys() ?? [])]) this.pruneQuietHolds(agentName, this.queuedQuietKeys(agentName));
     for (const pass of this.passRequests ?? []) {
       for (const requests of pass.values()) {
         if (!requests.some((r) => emptied.has(r))) continue;
@@ -19739,7 +19755,7 @@ export class AgentFramework {
     // A burst held for an agent with nothing queued now ended without a
     // start (quietHolds): its hold is traced as gone.
     for (const agentName of [...(this.quietHolds?.keys() ?? [])]) {
-      if (!requestsByAgent.has(agentName)) this.pruneQuietHolds(agentName, new Set(), now);
+      if (!requestsByAgent.has(agentName)) this.pruneQuietHolds(agentName, this.queuedQuietKeys(agentName), now);
     }
 
     // Check each agent
@@ -20027,8 +20043,11 @@ export class AgentFramework {
       let quietRelease: Map<string, QuietReleaseCause> | undefined;
       if (split.waiting.size > 0 || split.started.size > 0 || this.quietHolds?.get(agentName)?.size) {
         const holds = (this.quietHolds ??= new Map());
-        // A burst no longer queued ended its hold without a start.
-        const queued = new Set([...split.waiting.keys(), ...split.started.keys()]);
+        // A burst no longer queued ended its hold without a start. Counted
+        // with the split's keys: wakes this pass sent back to the queue
+        // before the split (a resuming continuation's siblings, a quiesce's
+        // parked wakes) and wakes held elsewhere.
+        const queued = new Set([...split.waiting.keys(), ...split.started.keys(), ...this.queuedQuietKeys(agentName)]);
         this.pruneQuietHolds(agentName, queued, now);
         let held = holds.get(agentName);
         for (const [key, leftMs] of split.waiting) {
@@ -24104,7 +24123,7 @@ export class AgentFramework {
         // A batch whose wake a message quiet period holds for a turn of its
         // own is left for that turn (quietHeldSubjects): taken here, its
         // channel's question could only be answered in this turn's channel.
-        assembly = await this.pushCoalescer.assemble(agent.name, batchSubjects, this.quietHeldSubjects(agent.name));
+        assembly = await this.pushCoalescer.assemble(agent.name, batchSubjects, this.quietLeftSubjects(agent.name));
       } catch (err) {
         console.error(`[coalescing] assembly for ${agent.name} failed:`, err);
       } finally {

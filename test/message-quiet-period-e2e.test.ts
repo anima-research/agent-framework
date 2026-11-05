@@ -47,7 +47,7 @@ describe('messageQuietPeriod through MCPL ingress', () => {
   let framework: AgentFramework;
   let n = 0;
 
-  async function start(quiet: { quietMs: number; maxWaitMs?: number }): Promise<void> {
+  async function start(quiet: { quietMs: number; maxWaitMs?: number }, privilegedUsersPath?: string): Promise<void> {
     tempDir = mkdtempSync(join(tmpdir(), 'quiet-period-e2e-'));
     statusPath = join(tempDir, 'status.jsonl');
     commandPath = join(tempDir, 'commands.txt');
@@ -58,7 +58,7 @@ describe('messageQuietPeriod through MCPL ingress', () => {
       membrane: membrane.asMembrane(),
       agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
       messageQuietPeriod: quiet,
-      gate: { config: { policies: [], default: 'always' } },
+      gate: { config: { policies: [], default: 'always' }, ...(privilegedUsersPath ? { privilegedUsersPath } : {}) },
       mcplServers: [{
         id: 'discord',
         command: process.execPath,
@@ -158,6 +158,30 @@ describe('messageQuietPeriod through MCPL ingress', () => {
     assert.equal(membrane.calls.length, 3, 'the timer\'s turn, then one per channel');
   });
 
+  it('while the agent sleeps, a privileged author\'s DM wakes it, held then answered in the DM; another author\'s does not (R1-6)', async () => {
+    const privileged = join(tmpdir(), `quiet-privileged-${Math.random().toString(36).slice(2)}.json`);
+    writeFileSync(privileged, JSON.stringify({ userIds: ['134'] }));
+    try {
+      await start({ quietMs: 600 }, privileged);
+      reply('answering the privileged DM');
+      const gate = (framework as unknown as { eventGate: { setSleep(s: number, note?: string, agent?: string): unknown } }).eventGate;
+      gate.setSleep(3600, 'resting', 'scout');
+      // The gate decides: the privileged author's DM wakes the sleeping
+      // agent; a stranger's (author 999) does not, hold or no hold.
+      command(`dm ev-${++n} 999 ${RAW_DM} are you there?`);
+      await sleep(900);
+      assert.equal(membrane.calls.length, 0, "a stranger's DM doesn't wake a sleeping agent");
+      const t0 = Date.now();
+      dm('scout, wake up please');
+      await waitFor(() => publishes().length >= 1, "the privileged DM's reply", 5_000);
+      assert.ok(Date.now() - t0 >= 550, 'held for the quiet period first');
+      assert.deepEqual(publishes(), [DM]);
+      assert.equal(membrane.calls.length, 1);
+    } finally {
+      rmSync(privileged, { force: true });
+    }
+  });
+
   it("a DM's turn is not delayed by chatter elsewhere, and its reply stays in the DM (R1-1)", async () => {
     await start({ quietMs: 600, maxWaitMs: 5_000 });
     reply('answering the DM');
@@ -229,4 +253,43 @@ describe('messageQuietPeriod and a deferred coalesced batch', () => {
       }
     });
   }
+
+  it("a notice to the held batch while the other burst's start is parked behind an auxiliary call: still left for its own turn (R4-1a)", async () => {
+    const f = await fixture({
+      framework: { messageQuietPeriod: { quietMs: 600 }, gate: { config: { policies: [], default: 'always' } } } as Partial<FrameworkConfig>,
+      mcpl: {},
+    });
+    try {
+      f.alwaysRespond();
+      await f.register('room');
+      await f.register('general');
+      await f.framework.start();
+      // An auxiliary call (a compression, say) is in flight from before the
+      // burst: the room's start will park on it (providerPrimaryWaiting).
+      const x = f.framework as unknown as { providerGate(agent: string): { auxiliaryInFlight: number; idleWaiters: Array<() => void> } };
+      const gate = x.providerGate('agent');
+      gate.auxiliaryInFlight++;
+      await f.send('channels/incoming', { messages: [{
+        channelId: 'room', messageId: 'r1', eventId: 'r1', timestamp: TS, author: { id: 'u', name: 'U' },
+        tags: ['chat:mention', 'chat:addressed'], content: [{ type: 'text', text: 'ROOMQ agent?' }],
+      }] });
+      await sleep(150);
+      await f.send('push/event', batch('b1', 'GENQ batch question', 'general'));
+      // The room's burst is ready at +600 and its start parks; a second
+      // notice of the batch lands while it is parked, then the call ends.
+      await sleep(900);
+      assert.equal(f.membrane.calls.length, 0, 'the start is parked');
+      await f.send('push/event', { ...batch('b2', 'GENQ more', 'general'), coalesce: { channelId: 'general', key: 'doc', deferred: true } });
+      await sleep(100);
+      gate.auxiliaryInFlight = 0;
+      for (const resolve of gate.idleWaiters.splice(0)) resolve();
+      await waitFor(() => f.published.length >= 2, 'both answers', 6_000);
+      await sleep(300);
+      assert.deepEqual(f.published.map((p) => p.channelId), ['room', 'general'], 'general was asked, so general is answered');
+      const carries = f.membrane.calls.map((c) => JSON.stringify((c as { messages?: unknown }).messages).includes('document_diff'));
+      assert.deepEqual(carries, [false, true], "the room's turn left the batch though a notice replaced its wake while the start was parked");
+    } finally {
+      await f.close();
+    }
+  });
 });

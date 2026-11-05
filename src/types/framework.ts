@@ -408,22 +408,25 @@ export interface FrameworkConfig {
    * source's; each is held on its own clock, until `quietMs` have passed
    * since its newest wake or `maxWaitMs` (default 30000) since its oldest,
    * and then starts a turn with its wakes alone, the other bursts waiting
-   * their own turns. So, under the default `speech.locus: 'delivery'` and
-   * for an agent not under locked prose routing, chatter in one channel
-   * neither delays another channel's turn nor takes its reply: each
-   * channel's turn speaks in its own channel. The option is refused with
-   * `speech.locus: 'latest-inbound'`, where a held message would become a
-   * turn's fallback locus; a locked agent speaks at its lock as always. A
+   * their own turns. So chatter in one channel neither delays another
+   * channel's turn nor takes its reply, and, for locus-routed prose
+   * (`proseRouting` `locus` or `hybrid`) under the default `speech.locus:
+   * 'delivery'`, each channel's turn speaks in its own channel. The option
+   * is refused with `speech.locus: 'latest-inbound'`, where a held message
+   * would become a turn's fallback locus; a locked agent speaks at its lock,
+   * and explicit and disabled routing deliver no unprefixed prose, as
+   * always. A
    * message wake is a channel message's or a server event's
    * (`mcpl:channel-incoming`, `mcpl:push-event`) other than the heartbeat's.
    * Each message's own decision stays what the gate gives it: who wakes a
    * sleeping agent, where a reply goes, what tune-out and conversation
    * routing see. Held messages are already in context, so another burst's
    * turn can read them: an ambient burst that turn has read is dropped as
-   * read, as on `main`, and what the agent says about it goes in that turn's
-   * channel; an addressed channel burst keeps its own turn, and so does a
-   * deferred coalesced batch, which a turn started for another burst leaves
-   * unassembled; a channel-less burst another turn has read is dropped,
+   * read, as without the option, and what the agent says about it goes in
+   * that turn's channel; an addressed channel burst keeps its own turn, and
+   * so does a deferred coalesced batch, which a turn started for another
+   * burst leaves unassembled, a notice that arrives meanwhile included; a
+   * channel-less burst another turn has read is dropped,
    * addressed or not, as its wake asks for no reply in a channel. The turn's
    * `incoming` anchor (what servers are told the agent replies to, and what a
    * refusal reacts to) stays the latest delivered inbound message, which can

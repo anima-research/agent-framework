@@ -982,6 +982,9 @@ export class PushCoalescer<E = unknown> {
     const work: Promise<void>[] = [];
     const wanted = new Set(causes);
     for (const subject of new Set([...this.subjects.keys(), ...causes])) {
+      // A cause is never left: defensive, since the host builds `leave` from
+      // wakes still queued, and a cause's wake has left the queue to start
+      // this turn.
       if (leave?.has(subject) && !wanted.has(subject)) continue;
       // The handle is wrapped: a bare promise returned through `locked` would
       // be flattened by `then`, holding the lock until the render settled —

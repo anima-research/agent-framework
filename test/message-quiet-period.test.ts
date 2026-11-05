@@ -525,6 +525,49 @@ describe('messageQuietPeriod in the scheduler', () => {
     }
   });
 
+  it('queuedQuietKeys reads the queue, a pass\'s hands and a provider cooldown (R3-6, R4-2)', () => {
+    // slimepriestess's pin: fails under each half of the lookup removed.
+    const wake = (channelId: string) => ({ agentName: 'a', reason: 'mcpl:channel-incoming', source: 'discord', channelId, timestamp: 1 });
+    const f = Object.create(AgentFramework.prototype) as {
+      pendingRequests: unknown[]; passRequests: Set<Map<string, unknown[]>>; providerAccelerationCooldowns: Map<string, { heldRequests: unknown[] }>;
+      queuedQuietKeys(agent: string): Set<string>;
+    };
+    f.pendingRequests = [wake('queued')];
+    f.passRequests = new Set([new Map([['a', [wake('in-a-pass')]]])]);
+    f.providerAccelerationCooldowns = new Map([['p', { heldRequests: [wake('cooling')] }]]);
+    assert.equal(f.queuedQuietKeys('a').size, 3);
+  });
+
+  it("a coalesced batch's later notices keep one hold: no gone between them, one released at the end (R4-1b)", async () => {
+    const { framework, internals, traces, membrane } = await start({ quietMs: 400 });
+    reply(membrane, 'ok');
+    const x = internals as unknown as {
+      pendingRequests: InferenceRequest[];
+      cancelCoalescedWakes(subject: string, prune?: boolean): void;
+      queueCoalescedWakes(occ: unknown): Promise<void>;
+      wakeForCoalescedBatch(occ: unknown): Promise<void>;
+    };
+    try {
+      let subject = '';
+      const cancel = x.cancelCoalescedWakes.bind(framework);
+      x.cancelCoalescedWakes = (s: string, prune?: boolean) => { subject = s; cancel(s, prune); };
+      x.queueCoalescedWakes = async () => {
+        x.pendingRequests.push(message(Date.now(), { reason: 'mcpl:push-event', source: 'tsm', coalescingSubject: subject, coalescingBatch: true }));
+      };
+      const occ = { serverId: 'x', binding: 'b', scope: 's', key: 'k' };
+      await x.wakeForCoalescedBatch(occ);
+      await sleep(150);
+      await x.wakeForCoalescedBatch(occ);
+      await sleep(150);
+      await x.wakeForCoalescedBatch(occ);
+      await waitFor(() => membrane.calls.length >= 1, 'the turn', 3_000);
+      assert.equal(heldKeys(traces).length, 1, 'one hold for the burst, however many notices');
+      assert.deepEqual(released(traces).map(([, cause]) => cause), ['quiet'], 'no gone between notices');
+    } finally {
+      await framework.stop();
+    }
+  });
+
   it("refuses the option with speech.locus 'latest-inbound', before the store opens (R3-2)", async () => {
     mkdirSync(TMP, { recursive: true });
     const storePath = join(TMP, `store-li-${Math.random().toString(36).slice(2)}`);
