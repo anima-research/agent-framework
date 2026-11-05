@@ -1,6 +1,7 @@
 import { describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { fixture, eventually, crash } from './helpers/coalescing-fixture.js';
+import { createMockResponse } from './helpers/mock-membrane.js';
 import type { FrameworkConfig } from '../src/types/framework.js';
 import { SUB, internals, textOf, stored, has, find, registerOpen, enter, type Fixture, type Stored } from './helpers/admission.js';
 
@@ -612,6 +613,71 @@ describe("a release that tells a waiting note's loss leaves the subconscious a t
     } finally {
       errors.mock.restore();
       release();
+      await f.close();
+    }
+  });
+});
+
+describe("a boot after an unrecorded stop names the cancel the subconscious asked for (AF #844 review, round 8, Vincent-3603)", () => {
+  /** The coordinator answers as if writes were held (a context manager refusing its work, say): its cancels wait, while the subconscious's own rows store. */
+  function holdCoordinatorWrites(f: Fixture): void {
+    (internals(f).tuneOutCoordinator as unknown as { hooks: { writesHeld?: () => boolean } }).hooks.writesHeld = () => true;
+  }
+  const NOTE = 'Antra asked for you in #noisy.\nShe needs the build log.';
+
+  it("a cancel_tuneout with a note the subconscious called in a turn of its own, answered as waiting, then a crash: the next start's row names the cancel and quotes the note", async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const { f, sub, epochId } = await heldWithPrimer();
+    try {
+      holdCoordinatorWrites(f);
+      const membrane = f.membrane as unknown as { responses: unknown[]; responseIndex: number; pushResponse(r: unknown): void };
+      membrane.responses.length = 0; // the fixture pre-scripts an `ok`
+      membrane.responseIndex = 0;
+      membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'sub-cancel', name: 'cancel_tuneout', input: { channelId: 'noisy', text: NOTE } },
+      ] as never, 'tool_use'));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Waiting for the cancel.' }] as never));
+      (f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({ agentName: sub, reason: 'test', source: 'test', timestamp: Date.now() });
+      void f.framework.runUntilIdle();
+      const result = (): string | undefined => {
+        for (const m of f.framework.getAgent(sub)!.getContextManager().getPresentedMessages() as unknown as Array<{ content: Array<{ type: string; toolUseId?: string; content?: unknown }> }>) {
+          for (const b of m.content) if (b.type === 'tool_result' && b.toolUseId === 'sub-cancel') return String(b.content);
+        }
+        return undefined;
+      };
+      await eventually(() => result() !== undefined, "the subconscious's cancel_tuneout and its result are stored");
+      assert.match(result()!, /"waiting":true/, 'premise: answered as waiting');
+      assert.equal(internals(f).channelRegistry.getTuneOutState('editor', 'noisy')?.params.epochId, epochId, 'premise: the hold stays in force');
+      await crashLosingStopWrites(f);
+      await f.create();
+      assert.equal(internals(f).channelRegistry.getTuneOutState('editor', 'noisy')?.params.epochId, epochId, 'premise: the hold is resumed');
+      const window = presentedTo(f, sub);
+      assert.ok(window.some((t) => t.includes('primer 7a2d')), 'premise: the subconscious kept its context across the restart');
+      assert.deepEqual(window.filter((t) => t.includes('without recording')), [
+        `[Tune-out: the host stopped without recording the state of the tune-out of noisy (epoch ${epochId}). The cancel of it you `
+        + 'asked for with your note "Antra asked for you in #noisy." had not run when the host stopped: it was lost, and the note you '
+        + 'left with it. That tune-out is still in force.]',
+      ], 'the row names the cancel it asked for and quotes its note');
+      assert.ok(internals(f).pendingRequests.some((r) => r.agentName === sub && r.reason === 'tune-out stop not recorded: noisy'), 'with a turn to read it');
+    } finally {
+      errors.mock.restore();
+      await f.close();
+    }
+  });
+
+  it("control: the same cancel through executeToolCall, which stores no turn's rows, then a crash: the row stays conditional", async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const { f, sub, epochId } = await heldWithPrimer();
+    try {
+      holdCoordinatorWrites(f);
+      const answer = await f.framework.executeToolCall({ id: 'c1', name: 'cancel_tuneout', input: { channelId: 'noisy', text: NOTE }, callerAgentName: sub } as never) as { success: boolean; data?: { waiting?: unknown } };
+      assert.equal(answer.data?.waiting, true, `premise: answered as waiting: ${JSON.stringify(answer)}`);
+      await crashLosingStopWrites(f);
+      await f.create();
+      assert.deepEqual(presentedTo(f, sub).filter((t) => t.includes('without recording')), [unrecorded(epochId)],
+        'with no call of its own in its window, the row is the conditional one');
+    } finally {
+      errors.mock.restore();
       await f.close();
     }
   });

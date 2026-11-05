@@ -331,6 +331,9 @@ export interface TuneOutCheck {
   peek?: string[];
 }
 
+/** The most characters of a note's first line a boot's notice of an unrecorded stop quotes (askedCancelOf). */
+const NOTE_QUOTE_CHARS = 120;
+
 /** How long after an end time's or a wake budget's cancel threw, or a deferred cancel's run, the cancel is tried again. */
 const EXPIRY_RETRY_MS = 60_000;
 /** How many times releaseAll tries a release that keeps failing, backing off from EXPIRY_RETRY_MS. */
@@ -378,12 +381,16 @@ type DeferredDrop =
  * Why a loss notice (LossNotice) is written: a deferred cancel's drop
  * (DeferredDrop), or `unstamped-stop`, the boot found a hold on record
  * that the last stop's stamp doesn't cover (noteUnstampedStop): a crash,
- * or a stop whose writes the store refused. `found`: what the residents'
- * rows of that run show of a waiting cancel's note, `delivered` (its note
- * row is there, its end not recorded) or `unknown` (nothing: none waited,
- * or one waited and was lost).
+ * or a stop whose writes the store refused. `found`: what that run's rows
+ * show of a waiting cancel, `delivered` (its note's row is the residents',
+ * its end not recorded), `asked` (the subconscious's own call of it,
+ * answered as waiting, with the start of its note, `note`, if it left one),
+ * or `unknown` (nothing: none waited, or one waited and its ask was lost
+ * with its turn).
  */
-type LossReason = DeferredDrop | { reason: 'unstamped-stop'; found: 'delivered' | 'unknown' };
+type LossReason = DeferredDrop
+  | { reason: 'unstamped-stop'; found: 'delivered' | 'unknown' }
+  | { reason: 'unstamped-stop'; found: 'asked'; note?: string };
 
 /**
  * What `tune-out/<primary>/stop-stamp` keeps (`{ v: 1, epochs,
@@ -406,6 +413,8 @@ interface HoldOnRecord {
   serverId: string;
   channelId: string;
   scope?: 'all-except';
+  /** The store's sequence when it began, where its record keeps one. */
+  startedAt?: number;
 }
 
 /** A notice to a lost note's author (tellNoteLost), kept until it is written (writeLossNotices). */
@@ -454,7 +463,8 @@ interface PersistedLossNotice {
 function lossSubject(notice: Pick<LossNotice, 'what' | 'drop'>): string {
   if (notice.drop.reason !== 'unstamped-stop') return `that the note it left with the cancel of ${notice.what} was not delivered`;
   return `that the host stopped without recording the state of ${notice.what}`
-    + (notice.drop.found === 'delivered' ? ', after the note it left with a cancel of it was delivered' : ', so that a cancel of it then waiting was lost');
+    + (notice.drop.found === 'delivered' ? ', after the note it left with a cancel of it was delivered'
+      : notice.drop.found === 'asked' ? ', so that the cancel of it it asked for was lost' : ', so that a cancel of it then waiting was lost');
 }
 
 /** A kept notice in the record's form, or undefined for an entry this version can't read. */
@@ -475,7 +485,9 @@ function readPersistedLossNotice(value: unknown): PersistedLossNotice | undefine
   } else if (drop?.reason === 'stopped') {
     why = { reason: 'stopped' };
   } else if (drop?.reason === 'unstamped-stop') {
-    why = { reason: 'unstamped-stop', found: drop.found === 'delivered' ? 'delivered' : 'unknown' };
+    why = drop.found === 'asked'
+      ? { reason: 'unstamped-stop', found: 'asked', ...(typeof drop.note === 'string' ? { note: drop.note } : {}) }
+      : { reason: 'unstamped-stop', found: drop.found === 'delivered' ? 'delivered' : 'unknown' };
   } else {
     return undefined;
   }
@@ -629,6 +641,13 @@ export interface TuneOutFrameworkHooks {
    * (askTurnsForUnreadLosses). Left out, none are.
    */
   unansweredBySubconscious?: (keep: (m: Pick<StoredMessage, 'metadata'>) => boolean) => Array<Pick<StoredMessage, 'metadata'>>;
+  /**
+   * The persistent subconscious's own `cancel_tuneout` calls its window
+   * holds: each one's input, its row's sequence, and whether its result
+   * answered it as waiting. A boot reads it for a hold the last stop didn't
+   * stamp (noteUnstampedStop). Left out, none are.
+   */
+  subconsciousCancelAsks?: () => Array<{ sequence: number; input: Record<string, unknown>; waiting: boolean }>;
   /** True when a channel is bound to a conversation-fork agent. */
   isForkBound: (channel: ChannelRef) => boolean;
   /** Gate privileged-users list (#77: privileged authors wake, like mentions). */
@@ -1562,7 +1581,7 @@ export class TuneOutCoordinator {
             : drop.reason === 'stopped'
               ? { reason: 'stopped' }
               : drop.reason === 'unstamped-stop'
-                ? { reason: 'unstamped-stop', found: drop.found }
+                ? { ...drop }
                 : { reason: 'note-undelivered', by: drop.by, error: drop.error },
           keptAtMs: notice.keptAtMs,
           ...(notice.traced ? { traced: true as const } : {}),
@@ -1696,8 +1715,14 @@ export class TuneOutCoordinator {
     const held = this.getAllExcept();
     return [
       ...channels.filter(({ params }) => typeof params.epochId === 'string')
-        .map(({ serverId, channelId, params }) => ({ epochId: params.epochId, serverId, channelId })),
-      ...(held ? [{ epochId: held.params.epochId, serverId: held.params.except.serverId, channelId: held.params.except.channelId, scope: 'all-except' as const }] : []),
+        .map(({ serverId, channelId, params }) => ({
+          epochId: params.epochId, serverId, channelId,
+          ...(typeof params.startedAtSequence === 'number' ? { startedAt: params.startedAtSequence } : {}),
+        })),
+      ...(held ? [{
+        epochId: held.params.epochId, serverId: held.params.except.serverId, channelId: held.params.except.channelId, scope: 'all-except' as const,
+        ...(typeof held.params.startedAtSequence === 'number' ? { startedAt: held.params.startedAtSequence } : {}),
+      }] : []),
     ];
   }
 
@@ -1819,9 +1844,16 @@ export class TuneOutCoordinator {
           console.error(`[tune-out] the last stop did not record the state of ${what}, but a release of it already told ${author} that its waiting note was lost`);
           continue;
         }
-        const found = delivered.has(epochId) ? 'delivered' as const : 'unknown' as const;
+        const asked = delivered.has(epochId) ? undefined : this.askedCancelOf(hold, since);
+        const drop: Extract<LossReason, { reason: 'unstamped-stop' }> = delivered.has(epochId)
+          ? { reason: 'unstamped-stop', found: 'delivered' }
+          : asked ? { reason: 'unstamped-stop', found: 'asked', ...(asked.note !== undefined ? { note: asked.note } : {}) }
+          : { reason: 'unstamped-stop', found: 'unknown' };
+        const found = drop.found;
         console.error(`[tune-out] the last stop did not record the state of ${what}, so ${author} is told `
-          + (found === 'delivered' ? 'that the note it left with a cancel of it was delivered, and its end not recorded' : 'that a cancel of it then waiting, if it asked for one, was lost, with any note'));
+          + (found === 'delivered' ? 'that the note it left with a cancel of it was delivered, and its end not recorded'
+            : found === 'asked' ? 'that the cancel of it it asked for, answered as waiting, was lost, with its note'
+            : 'that a cancel of it then waiting, if it asked for one, was lost, with any note'));
         try {
           this.hooks.emitTrace({ type: 'tune-out:stop-unrecorded', serverId, channelId, epochId, ...(scope ? { scope } : {}), noteAuthor: author, found });
         } catch (err) {
@@ -1830,7 +1862,7 @@ export class TuneOutCoordinator {
         const notice: LossNotice = {
           id: randomUUID(),
           for: { epochId, serverId, channelId, ...(scope ? { scope } : {}), current: this.epochHoldingAt(serverId, channelId, scope) },
-          what, drop: { reason: 'unstamped-stop', found }, keptAtMs: Date.now(), persistent: true,
+          what, drop, keptAtMs: Date.now(), persistent: true,
         };
         this.lossNotices.set(author, [...(this.lossNotices.get(author) ?? []), notice]);
       }
@@ -1839,6 +1871,46 @@ export class TuneOutCoordinator {
     } catch (err) {
       console.error(`[tune-out] whether the last stop recorded the holds on record could not be checked at boot: ${thrownReason(err)}`);
     }
+  }
+
+  /**
+   * For a hold the last stop didn't stamp, nothing else found
+   * (noteUnstampedStop): the persistent subconscious's own `cancel_tuneout`
+   * of it, answered as waiting, in its window since the hold began and
+   * since the last run began (`since`; subconsciousCancelAsks). The hold
+   * being still on record, no later row can show that cancel done. Its
+   * note is the first such call's that left one (a cancel waiting with
+   * none takes a later call's note; a later note is dropped, and its caller
+   * told so), cut to its first line, at most NOTE_QUOTE_CHARS characters.
+   * Undefined where none is found, or the window can't be read.
+   */
+  private askedCancelOf(hold: HoldOnRecord, since: number | undefined): { note?: string } | undefined {
+    let asks: Array<{ sequence: number; input: Record<string, unknown>; waiting: boolean }>;
+    try {
+      asks = this.hooks.subconsciousCancelAsks?.() ?? [];
+    } catch (err) {
+      console.error(`[tune-out] the subconscious's own cancels could not be read at boot, so a cancel of a hold it asked for isn't named: ${thrownReason(err)}`);
+      return undefined;
+    }
+    const after = Math.max(hold.startedAt ?? -Infinity, since ?? -Infinity);
+    let shown: string;
+    try {
+      shown = this.shown(hold.serverId, hold.channelId);
+    } catch {
+      shown = hold.channelId;
+    }
+    const names = ({ input }: { input: Record<string, unknown> }): boolean => {
+      if (hold.scope === 'all-except') return input.scope === 'all-except';
+      if (input.scope === 'all-except') return false;
+      return (input.channelId === hold.channelId || input.channelId === shown)
+        && (input.serverId === undefined || input.serverId === hold.serverId);
+    };
+    const mine = asks.filter((ask) => ask.waiting && ask.sequence > after && names(ask));
+    if (mine.length === 0) return undefined;
+    const withNote = mine.find((ask) => typeof ask.input.text === 'string' && ask.input.text.trim() !== '');
+    if (!withNote) return {};
+    const first = (withNote.input.text as string).trim().split(/\r?\n/)[0]!.trim();
+    return { note: first.length > NOTE_QUOTE_CHARS ? `${cutToFit(first, NOTE_QUOTE_CHARS - 1)}…` : first };
   }
 
   /**
@@ -1986,6 +2058,10 @@ export class TuneOutCoordinator {
           }
           text = `${unrecorded}The note you left with your cancel of it was delivered to ${to} before the stop. The cancel's end was not recorded`
             + (still === true ? `, so that ${it} is still in force.]` : still === false ? `, and that ${it} has ended since.]` : '.]');
+        } else if (drop.found === 'asked') {
+          // Its own call, answered as waiting, read from its window.
+          text = `${unrecorded}The cancel of it you asked for ${drop.note !== undefined ? `with your note ${quotedValue(drop.note)}` : 'with no note'} `
+            + `had not run when the host stopped: it was lost${drop.note !== undefined ? ', and the note you left with it' : ''}.${nowInForce()}]`;
         } else {
           text = `${unrecorded}If you asked for a cancel of it before the stop, it had not run when the host stopped: it was lost, and any `
             + `note you left with it.${nowInForce()}]`;
