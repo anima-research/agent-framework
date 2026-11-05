@@ -3978,7 +3978,7 @@ export class AgentFramework {
    *  rule (repinChannel). */
   private midTurnInputSignals: Set<string> = new Set();
   private privateInputStored: Set<string> = new Set();
-  private privateInputRecords = new Map<string, boolean | undefined>();
+  private privateInputResidents = new Set<string>();
   /** Last outbound locus announced to each agent as a durable `[routing]`
    *  window message. Announce-on-change only: steady state emits nothing
    *  (KV-safe, no per-turn chatter). Kept in the store as well
@@ -16367,7 +16367,7 @@ export class AgentFramework {
     const recorded = this.readPrivateInputRecord(config.name);
     const waiting = recorded ?? holdsUnansweredPrivateInput(contextManager, config.name, sees);
     if (waiting) this.privateInputStored.add(config.name);
-    this.privateInputRecords.set(config.name, recorded);
+    this.privateInputResidents.add(config.name);
     this.recordPrivateInput(config.name, waiting);
     this.sharedSlotAgents.add(agent);
     // The first resident declared owns default delivery.
@@ -31096,7 +31096,7 @@ export class AgentFramework {
 
   private storeTurnReply(agent: Agent, content: ContentBlock[]): MessageId | undefined {
     const id = agent.addAssistantResponse(content, this.silentTurnRowMetadata(agent.name));
-    if (id === undefined || this.activeTurnTriggers.get(agent.name)?.suppressProse || this.privateInputStored.has(agent.name)) return id;
+    if (id === undefined || this.privateInputStored.has(agent.name)) return id;
     try {
       this.recordPrivateInput(agent.name, false);
     } catch (error) {
@@ -31115,12 +31115,13 @@ export class AgentFramework {
   }
 
   private recordPrivateInput(agentName: string, waiting: boolean): void {
-    if (!this.privateInputRecords.has(agentName) || this.privateInputRecords.get(agentName) === waiting) return;
+    if (!this.privateInputResidents.has(agentName)) return;
     const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
     const state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
-    state.privateInputWaiting = { ...(state.privateInputWaiting as Record<string, boolean> | undefined), [agentName]: waiting };
+    const values = state.privateInputWaiting as Record<string, unknown> | undefined;
+    if (values?.[agentName] === waiting) return;
+    state.privateInputWaiting = { ...values, [agentName]: waiting };
     this.store.setStateJson(FRAMEWORK_STATE_ID, state);
-    this.privateInputRecords.set(agentName, waiting);
   }
 
   private isPrivateInput(metadata: MessageMetadata | undefined): boolean {

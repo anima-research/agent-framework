@@ -2149,9 +2149,10 @@ describe('private wins, one way', () => {
       });
     }
 
-    for (const variant of ['its turn turned private after it was queued', "its queue entry doesn't say whether its turn was private, as damage or a hand edit can leave one"] as const) {
+    for (const variant of ['its turn turned private after it was queued, and the host crashed', "its queue entry doesn't say whether its turn was private, as damage or a hand edit can leave one"] as const) {
       it(`a channel turn's script report deferred across an update's restart, where ${variant}, keeps the next run's start out of every channel`, async () => {
         const storeDir = mkdtempSync(join(tmpdir(), 'deferred-report-privacy-'));
+        const crashed = mkdtempSync(join(tmpdir(), 'deferred-report-privacy-crash-'));
         try {
           const first = await surfaceRig({ storeDir });
           try {
@@ -2164,14 +2165,15 @@ describe('private wins, one way', () => {
             }).scriptWake('scout', 's1', '[script s1] the build finished', 's1-ended', turn.turnId as number);
             first.i.pendingRequests.length = 0;
             assert.ok(first.framework.getHostModeStatus().deferredWrites >= 1, 'control: the report is deferred, and kept');
-            if (variant === 'its turn turned private after it was queued') {
+            if (variant === 'its turn turned private after it was queued, and the host crashed') {
               (first.framework as unknown as { makeTurnPrivate(agent: unknown, routing: unknown): unknown })
                 .makeTurnPrivate(first.framework.getAgent('scout'), turn);
+              cpSync(join(storeDir, 'store'), join(crashed, 'store'), { recursive: true });
             }
           } finally {
             await first.close();
           }
-          if (variant !== 'its turn turned private after it was queued') {
+          if (variant !== 'its turn turned private after it was queued, and the host crashed') {
             const queuePath = join(storeDir, 'store', 'recovery', 'deferred-writes.json');
             const queue = JSON.parse(readFileSync(queuePath, 'utf8')) as { pending: Array<Record<string, unknown>> };
             const report = queue.pending.find((m) => JSON.stringify(m.content).includes('the build finished'))!;
@@ -2179,7 +2181,7 @@ describe('private wins, one way', () => {
             delete report.callerTurnPrivate;
             writeFileSync(queuePath, JSON.stringify(queue));
           }
-          const next = await surfaceRig({ storeDir });
+          const next = await surfaceRig({ storeDir: variant === 'its turn turned private after it was queued, and the host crashed' ? crashed : storeDir });
           try {
             if (next.framework.getHostModeStatus().quiesced) await next.framework.resume();
             assert.ok(stored(next).includes('the build finished'), 'control: the next run stored the report');
@@ -2191,6 +2193,7 @@ describe('private wins, one way', () => {
           }
         } finally {
           rmSync(storeDir, { recursive: true, force: true });
+          rmSync(crashed, { recursive: true, force: true });
         }
       });
     }
@@ -2215,6 +2218,38 @@ describe('private wins, one way', () => {
         }
         const next = await surfaceRig({ storeDir, quietSources: ['console'], modules: [robot()] });
         try {
+          const { channelTurn } = restarted(next);
+          assert.deepEqual(await channelTurn(), [], 'the start that reads it speaks in no channel');
+          assert.deepEqual(await channelTurn(), [ROOM], 'control: a later channel turn speaks in its channel');
+        } finally {
+          await next.close();
+        }
+      } finally {
+        rmSync(storeDir, { recursive: true, force: true });
+      }
+    });
+
+    it("a private surface's message stored after the host moves its branch back past an earlier unread one keeps the next run's first start out of every channel", async () => {
+      const storeDir = mkdtempSync(join(tmpdir(), 'branch-move-private-restart-'));
+      try {
+        const first = await surfaceRig({ storeDir, quietSources: ['console'] });
+        try {
+          await firstTurn(first, false);
+          const cm = first.framework.getAgent('scout')!.getContextManager();
+          const answer = cm.queryMessages({}).messages.filter((m) => m.participant === 'scout').at(-1)!;
+          first.framework.pushEvent({ type: 'external-message', source: 'console', content: 'an earlier question', metadata: {} } as never);
+          await first.until(() => stored(first).includes('an earlier question'), 'the first private message stored');
+          await cm.switchBranch(cm.branchAt(answer.id, `undo-${Date.now()}`));
+          assert.ok(!stored(first).includes('an earlier question'), 'control: the move took the first message off the branch');
+          first.framework.pushEvent({ type: 'external-message', source: 'console', content: 'for your eyes only', metadata: {} } as never);
+          await first.until(() => stored(first).includes('for your eyes only'), 'the second private message stored');
+          await first.framework.runUntilIdle();
+        } finally {
+          await first.close();
+        }
+        const next = await surfaceRig({ storeDir, quietSources: ['console'] });
+        try {
+          assert.ok(stored(next).includes('for your eyes only'), 'control: the next run opened on the branch that holds it');
           const { channelTurn } = restarted(next);
           assert.deepEqual(await channelTurn(), [], 'the start that reads it speaks in no channel');
           assert.deepEqual(await channelTurn(), [ROOM], 'control: a later channel turn speaks in its channel');
@@ -2310,10 +2345,13 @@ describe('private wins, one way', () => {
         for (const [n, image] of images.entries()) {
           const next = await surfaceRig({ storeDir: image, quietSources: ['console'] });
           try {
-            await next.framework.runUntilIdle();
+            const ownRows = () => next.framework.getAgent('scout')!.getContextManager().getAllMessages().filter((m) => m.participant === 'scout').length;
             const rows = next.framework.getAgent('scout')!.getContextManager().getAllMessages();
             const asked = rows.findIndex((m) => JSON.stringify(m.content).includes('for your eyes only'));
             const answered = asked >= 0 && rows.slice(asked + 1).some((m) => m.participant === 'scout');
+            const opened = ownRows();
+            await next.framework.runUntilIdle();
+            assert.equal(ownRows(), opened, `control: image ${n}'s boot stored no row of the resident's own`);
             const routed = await restarted(next).channelTurn();
             if (asked >= 0 && !answered) {
               unanswered++;
