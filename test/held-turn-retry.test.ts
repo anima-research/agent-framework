@@ -1877,25 +1877,39 @@ for (const routing of ["holds a later batch's channels in its routing", 'has no 
   });
 });
 
-for (const kind of ["a provider hold's", "an error's"] as const) for (const routing of ["holds a later batch's channels in its routing", 'has no channel'] as const) test(`${kind} retry of a turn with no locus that ${routing} carries ${routing === 'has no channel' ? 'no channel' : "every channel its routing holds, not only its start's"}`, async (t) => {
+const serverError = (request: NormalizedRequest) => new MembraneError({
+  type: 'server', retryable: true, httpStatus: 500, message: 'zz internal error', rawError: { status: 500 }, rawRequest: request,
+});
+const retrySites = [
+  { site: "a stated wait's hold", failure: (request: NormalizedRequest) => rateLimited(60_000, request), held: true },
+  { site: "an acceleration hold", failure: (request: NormalizedRequest) => new MembraneError({
+    type: 'rate_limit', retryable: true, httpStatus: 429,
+    message: "zz this organization's acceleration limit was reached", rawError: { status: 429 }, rawRequest: request,
+  }), held: true },
+  { site: "its stream's error retry", failure: serverError, held: false },
+  { site: "its start's error retry", failure: serverError, failsAt: 'setup', held: false },
+  { site: "a conversation agent's stated-wait hold", failure: (request: NormalizedRequest) => rateLimited(60_000, request), held: true, fork: true },
+  { site: "a conversation agent's hold for a wait recorded during its compile", held: true, fork: true, compileWait: true },
+] as const;
+
+for (const at of retrySites) for (const routing of ["holds a later batch's channels in its routing", 'has no channel'] as const) test(`${at.site}: the retry of a turn with no locus that ${routing} carries ${routing === 'has no channel' ? 'no channel' : "every channel its routing holds, not only its start's"}`, async (t) => {
   await withStoreDir(async (path) => {
     holdClock(t);
     const log = silence();
     const first = { serverId: 'discord', channelId: 'discord:g:first' };
     const later = { serverId: 'discord', channelId: 'discord:g:later' };
-    let turnRouting: Map<string, { wakeChannels?: unknown; noChannel?: true }> | undefined;
+    let turnRouting: Map<string, { wakeChannels?: unknown; noChannel?: true; locus?: unknown }> | undefined;
     let written = false;
-    const membrane = new ScriptedMembrane(new Set([1]), (request) => {
+    const write = (): void => {
       const turn = turnRouting?.get('resident');
-      if (turn) {
-        if (routing === 'has no channel') turn.noChannel = true;
-        else turn.wakeChannels = [first, later];
-        written = true;
-      }
-      return kind === "a provider hold's" ? rateLimited(60_000, request) : new MembraneError({
-        type: 'server', retryable: true, httpStatus: 500, message: 'zz internal error', rawError: { status: 500 }, rawRequest: request,
-      });
-    });
+      if (!turn || turn.locus !== undefined) return;
+      if (routing === 'has no channel') turn.noChannel = true;
+      else turn.wakeChannels = [first, later];
+      written = true;
+    };
+    const membrane = 'failure' in at
+      ? new ScriptedMembrane(new Set([1]), (request) => { write(); return at.failure(request); }, 'failsAt' in at ? at.failsAt : 'event')
+      : new ScriptedMembrane(new Set(), () => new Error('unused'));
     const { fw, internal } = await framework(path, membrane);
     turnRouting = (internal as unknown as { turnRouting: typeof turnRouting }).turnRouting;
     const triggers: Array<Record<string | symbol, unknown> | undefined> = [];
@@ -1905,11 +1919,27 @@ for (const kind of ["a provider hold's", "an error's"] as const) for (const rout
       return (start as (...args: unknown[]) => Promise<void>)(agent, trigger, ...rest);
     });
     try {
-      fw.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-message' }]);
-      internal.pendingRequests.push({ agentName: 'resident', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), wakeChannels: [later] } as unknown as Request);
+      const agent = fw.getAgent('resident')!;
+      agent.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-message' }]);
+      const wake = { agentName: 'resident', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), wakeChannels: [later] };
+      if ('fork' in at) {
+        bindAsConversationFork(fw, 'resident', { serverId: 'stub', channelId: 'world:zz' });
+        if ('compileWait' in at) {
+          const compile = agent.startStreamWithInjections.bind(agent);
+          agent.startStreamWithInjections = (async (...args: Parameters<typeof compile>) => {
+            const made = await compile(...args);
+            write();
+            internal.providerWaits.set('resident', 'zz-model', 60_000, 'zz wait during the compile');
+            return made;
+          }) as typeof compile;
+        }
+        void internal.startAgentStream(agent, wake);
+      } else {
+        internal.pendingRequests.push(wake as unknown as Request);
+      }
       const isRetry = (r: Record<string | symbol, unknown> | undefined) => !!r && Object.getOwnPropertySymbols(r).some((key) => key.description === 'turn-retry' && r[key] === true);
       let retry: Record<string | symbol, unknown> | undefined;
-      if (kind === "a provider hold's") {
+      if (at.held) {
         await waitFor(fw, () => internal.providerAccelerationCooldowns.has('resident'), 'the turn held');
         retry = (internal.providerAccelerationCooldowns.get('resident')!.heldRequests as unknown as Array<Record<string | symbol, unknown>>).find(isRetry);
       } else {
@@ -1917,7 +1947,7 @@ for (const kind of ["a provider hold's", "an error's"] as const) for (const rout
         retry = triggers.find(isRetry);
       }
       assert.ok(retry, `premise: the turn's retry: ${log.lines.join('\n')}`);
-      assert.ok(written, "premise: the turn's routing was there at its call");
+      assert.ok(written, "premise: the turn's routing was there, with no locus, at its call");
       assert.deepEqual(retry.wakeChannels, routing === 'has no channel' ? undefined : [first, later]);
     } finally { await fw.stop(); log.restore(); }
   });

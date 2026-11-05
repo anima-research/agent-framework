@@ -129,6 +129,25 @@ describe('Turn trigger provenance', () => {
     await framework.stop();
   });
 
+  it("a turn merged from an autoContinue wake and a batch from another channel names only the batch's channels, since the batch is its cause", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi' }]));
+    const framework = await makeFramework();
+    const i = internals(framework);
+    const captured = spy(framework);
+    const t = Date.now();
+    const earlier = { serverId: 'discord', channelId: 'discord:g:earlier' };
+    const room = { serverId: 'discord', channelId: 'discord:g:room' };
+    i.pendingRequests.push(
+      { agentName: 'scout', reason: 'auto-continue', source: 'framework', timestamp: t, wakeChannels: [earlier] },
+      { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: t + 1, wakeChannels: [room] },
+    );
+    await i.processInferenceRequests();
+    await framework.runUntilIdle();
+    assert.ok(captured.exposed, 'premise: the merged turn started');
+    assert.deepEqual(captured.exposed.wakeChannels, [room]);
+    await framework.stop();
+  });
+
   for (const [what, other, why] of [
     ['a wake that names a channel', { reason: 'mcpl:channel-incoming', source: 'discord', channelId: 'discord:g:feed', channelServerId: 'discord' }, "the wake's channel decides the turn's locus, and the batch's channels are named only to a turn with none"],
     ['an addressed push that names no channel', { reason: 'mcpl:push-event', source: 'discord', addressed: true }, 'the notice says only where the turn came from and that no channel was chosen, which holds though a message addressed the agent'],
