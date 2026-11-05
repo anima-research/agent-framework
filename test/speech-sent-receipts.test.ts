@@ -1284,6 +1284,23 @@ describe('plain speech a module says it showed', () => {
     }
   });
 
+  it("a module removed once its ask outlasts the bound doesn't hold back the next module of that name", async (t) => {
+    const surface = new Surface();
+    surface.answer = 'held';
+    const f = await host([surface], new MockMembrane());
+    const registry = (f as unknown as { moduleRegistry: { askSpeechRouted(agent: string, text: string, context: SpeechRoutedContext): Promise<string[]> } }).moduleRegistry;
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    void registry.askSpeechRouted('resident', 'First.', { final: false });
+    t.mock.timers.tick(SPEECH_RECEIPT_WAIT_MS);
+    await new Promise((resolve) => setImmediate(resolve));
+    t.mock.timers.reset();
+    await f.removeModule('console');
+    const next = new Surface();
+    await f.addModule(next as unknown as Module);
+    assert.deepEqual(await registry.askSpeechRouted('resident', 'Second.', { final: true }), [SENT_TO]);
+    assert.equal(next.asked.length, 1, 'the next module of that name is asked');
+  });
+
   it("a module's place counts when it was registered as it answered, though its removal completes before the next reaction", async () => {
     const surface = new Surface();
     const f = await host([surface], new MockMembrane());
@@ -1525,6 +1542,7 @@ describe('plain speech a module says it showed', () => {
     assert.deepEqual(published, [], 'premise: the move held the whole stream');
     const asked = surface.asked.map((a) => a.text).join(' ');
     assert.ok(asked.includes('Before the move.') && asked.includes('After the move.'), JSON.stringify(askedTexts(surface)));
+    assert.deepEqual(askedTexts(surface).map((a) => a.final), [true], "the reply's held piece is asked about as final");
     for (const piece of surface.asked) {
       const place = `sent to ${SENT_TO}, for ${piece.text.replace(/\s+/g, ' ').trim()}`;
       assert.ok(receipt(f)?.includes(place), `${place} in ${receipt(f)}`);
@@ -1678,17 +1696,18 @@ describe('plain speech a module says it showed', () => {
     assert.deepEqual(surface.asked, []);
   });
 
-  it('a module that throws counts as having shown nothing, and the line names it', async (t) => {
+  it("a module whose hook throws as it's called counts as having shown nothing, the line names it, and another module's place still counts", async (t) => {
     const errors: string[] = [];
     t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
     const surface = new Surface();
-    surface.answer = 'throw';
+    (surface as unknown as { onSpeechRouted(): never }).onSpeechRouted = () => { throw new Error('console broke'); };
+    const other = new Surface('other');
     const membrane = new MockMembrane();
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi there.' }]));
-    const f = await host([surface], membrane);
+    const f = await host([surface, other], membrane);
     await turn(f);
-    assert.equal(notices(f).length, 1);
-    assert.ok(notices(f)[0]!.includes('if another surface showed it'), 'a module that failed may have shown it');
+    assert.deepEqual(notices(f), []);
+    assert.equal(receipt(f), `[delivered] plain speech → sent to ${SENT_TO} · this turn's routing posted it to no channel`);
     assert.ok(errors.includes('Speech-routed module console (agent resident) error: Error: console broke'), errors.join('\n'));
   });
 
