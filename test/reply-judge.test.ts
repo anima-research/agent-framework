@@ -218,7 +218,7 @@ describe('reply judge: a request refused as too long', () => {
     const atFloor = judgeOver(floor.membrane);
     (atFloor as unknown as { charsPerToken: number }).charsPerToken = 1;
     await atFloor.judge(judgeRequest());
-    assert.strictEqual(size(requests[1]!), size(floor.requests[0]!), 'the retry is the request a judge at one character a token builds');
+    assert.deepStrictEqual(requests[1]!.messages, floor.requests[0]!.messages, 'the retry is the request a judge at one character a token builds');
     await ask();
     assert.strictEqual(judge.estimateRatio(), 3);
     (judge as unknown as { charsPerToken: number }).charsPerToken = 1;
@@ -250,7 +250,7 @@ describe('reply judge: a request refused as too long', () => {
     const atFloor = judgeOver(floor.membrane);
     (atFloor as unknown as { charsPerToken: number }).charsPerToken = 1;
     await atFloor.judge(judgeRequest({ events }));
-    assert.strictEqual(size(requests[1]!), size(floor.requests[0]!), 'the retry is the request a judge at one character a token builds');
+    assert.deepStrictEqual(requests[1]!.messages, floor.requests[0]!.messages, 'the retry is the request a judge at one character a token builds');
   });
 
   it("isn't asked again for any other failure", async () => {

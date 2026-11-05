@@ -6253,22 +6253,28 @@ export class AgentFramework {
     for (const pass of this.passRequests) for (const taken of pass.values()) arriving.push(...taken.filter(mine));
     const queued = arriving.filter(unread).map((r) => String(r.reason));
     const batchOnly: string[] = [];
+    let parkedCount = 0;
     for (const parked of this.parkedStarts) {
       if (parked.agent !== agent) continue;
+      parkedCount++;
       if (parked.batchOnly) batchOnly.push('a start waiting for an auxiliary call to finish, which starts no turn if its deferred pushes give it nothing to read');
       else queued.push('a start waiting for an auxiliary call to finish');
     }
+    const passed: string[] = [];
+    const passedMaybe: string[] = [];
+    const model = this.agents.get(agentName)?.model;
     if (this.assembling.has(agentName)) {
-      if (this.activeTurnTriggers.get(agentName)?.coalescingBatchSubjects?.length) batchOnly.push('a start assembling its deferred pushes, which starts no turn if they give it nothing to read');
-      else queued.push('a start assembling its deferred pushes');
+      const heldAfterCompile = this.registry.homeChannel(agentName) !== undefined && model !== undefined && this.providerWaits?.active(agentName, model) !== undefined;
+      if (this.activeTurnTriggers.get(agentName)?.coalescingBatchSubjects?.length) passedMaybe.push('a start assembling its deferred pushes, which starts no turn if they give it nothing to read');
+      else if (heldAfterCompile) passedMaybe.push('a start assembling its deferred pushes, which a provider wait on its model holds after its compile if the wait still stands then');
+      else passed.push('a start assembling its deferred pushes');
     }
     const ends = (until: number | null | undefined): { until?: number } =>
       (typeof until === 'number' && Number.isFinite(until) ? { until } : {});
-    const model = this.agents.get(agentName)?.model;
     const cooldown = this.providerAccelerationCooldowns.get(agentName);
     const otherModel = cooldown?.waitModel !== undefined && cooldown.waitModel !== model;
-    const meeting = arriving.length + (queued.length - arriving.filter(unread).length) + batchOnly.length;
-    const letGo = cooldown !== undefined && (cooldown.rearm !== undefined || otherModel) && meeting > 0;
+    const expired = cooldown !== undefined && !cooldown.hostHoldError && cooldown.until <= Date.now();
+    const letGo = cooldown !== undefined && (cooldown.rearm !== undefined || otherModel || expired) && arriving.length + parkedCount > 0;
     if (letGo) queued.unshift(...cooldown.heldRequests.filter(unread).map((r) => String(r.reason)));
     const waiting = queued.length + batchOnly.length;
     if (cooldown && !letGo) {
@@ -6279,12 +6285,12 @@ export class AgentFramework {
         const waitHold = cooldown.waitModel !== undefined && model === cooldown.waitModel;
         const until = cooldown.hostHoldError ? undefined
           : wait && (waitHold || wait.until === null || wait.until > cooldown.until) ? wait.until : cooldown.until;
-        return { queued: [], held: { ...ends(until), ...(cooldown.rearm ? { rearm: cooldown.rearm } : {}), ...(!releaseWakes && queued.length === 0 ? { maybe: true as const } : {}) } };
+        return { queued: passed, batchOnly: passedMaybe, held: { ...ends(until), ...(cooldown.rearm ? { rearm: cooldown.rearm } : {}), ...(!releaseWakes && queued.length === 0 ? { maybe: true as const } : {}) } };
       }
     }
     const wait = waiting > 0 && model !== undefined ? this.providerWaits?.active(agentName, model) : undefined;
-    if (wait) return { queued: [], held: { ...ends(wait.until), ...(queued.length === 0 ? { maybe: true as const } : {}) } };
-    return { queued, batchOnly };
+    if (wait) return { queued: passed, batchOnly: passedMaybe, held: { ...ends(wait.until), ...(queued.length === 0 ? { maybe: true as const } : {}) } };
+    return { queued: [...queued, ...passed], batchOnly: [...batchOnly, ...passedMaybe] };
   }
 
   private failedLastTurnFor(agentName: string, onTheirWay?: WakesOnTheirWay): import('./gate/types.js').FailedLastTurn | undefined {
@@ -23753,8 +23759,8 @@ export class AgentFramework {
       // the next start opens a turn of its own rather than continuing this
       // one's routing, and an ephemeral run fails with the error rather than
       // waiting out its watchdog. A silent start has no part in an open turn.
+      this.lastStartFailed.set(agent, Date.now());
       if (!trigger?.suppressProse) {
-        this.lastStartFailed.set(agent, Date.now());
         this.settleAgent(agent.name, {
           stopReason: 'exhausted', speech: '', error: error instanceof Error ? error.message : String(error),
         }, this.openLogical.get(agent.name));

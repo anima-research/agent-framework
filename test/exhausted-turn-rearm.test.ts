@@ -738,6 +738,25 @@ test("a start that throws before its stream, at the turn's checkpoint, is a fail
   assert.equal(r.count('inference:exhausted'), 0, 'premise: no inference failed');
 });
 
+test("a silent start that throws before its stream, at the turn's checkpoint, is a failed last turn the judge is told of, as one that fails in its setup is", async (t) => {
+  const membrane = new ScriptedMembrane(() => undefined);
+  const r = await resident(t, membrane);
+  const internal = r.fw as unknown as {
+    recordTurnCheckpoint(agentName: string): void;
+    failedLastTurnFor(agentName: string): { at: number; again: { kind: string } } | undefined;
+  };
+  const record = internal.recordTurnCheckpoint.bind(r.fw);
+  internal.recordTurnCheckpoint = () => {
+    internal.recordTurnCheckpoint = record;
+    throw new Error('zz checkpoint refused');
+  };
+  const before = Date.now();
+  queue(r, { reason: 'zz-silent-tick', suppressProse: true });
+  await waitFor(() => internal.failedLastTurnFor('resident') !== undefined, 'the judge to be told the silent start failed');
+  assert.ok(internal.failedLastTurnFor('resident')!.at >= before);
+  assert.equal(membrane.sends.length, 0, 'premise: the start threw before sending anything');
+});
+
 for (const said of [false, true]) {
   test(`the turn a wake starts while the agent waits is the wake's own, with the error policy's retries; the next re-arm ${said ? 'starts the count again, since a message was said' : 'follows it'}`, async (t) => {
     const membrane = new ScriptedMembrane((n) => (n <= 6 ? serverError : undefined));

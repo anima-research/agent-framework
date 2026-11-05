@@ -4333,7 +4333,8 @@ export class EventGate {
   }
 
   /**
-   * The gate's own timers that will wake `agentNames` with no new event, for
+   * The gate's own timers that will wake `agentNames` with no new event, or
+   * may (`certain` false), for
    * the judge to weigh what waiting costs: each agent's pending self-wake
    * (skip_reply's wake_in_seconds), the end of a sleep, and the pending
    * batches of rules other than `exceptPolicy`, with those rules' events
@@ -4345,7 +4346,8 @@ export class EventGate {
    * decided (with what queued behind it) or held, so it only may, except
    * that under onError "wake", while a refusal's stated wait lasts, it's
    * delivered without the judge being asked, and one due before that wait
-   * ends is listed so, counting only its events whose channel isn't held now.
+   * ends is listed so, counting only its events whose channel isn't held now,
+   * and left out when none is.
    * A running turn or the host's quiesce can hold it past the wait's end, when
    * it goes to the judge, so while a judged turn runs or the host is quiesced
    * the entry says so and only may; otherwise it's certain. Each entry names
@@ -4556,6 +4558,7 @@ export class EventGate {
       now = this.now();
     } catch (clockErr) {
       this.logUnsent(policyName, [...state.events, ...state.queued], this.judgeOnError === 'wake' ? 'delivered' : 'held for the judge', clockErr);
+      this.recordRefusal(policyName, state.events.length, hold, durationMs, false);
       return;
     }
     const end = typeof stated === 'number' ? now + Math.max(0, stated) : undefined;
@@ -4577,6 +4580,12 @@ export class EventGate {
       `[gate] Rule ${quotedValue(policyName)}: the reply judge's call was refused (${hold}), so its batch of ${n} `
       + `${n === 1 ? 'event' : 'events'}${behind > 0 ? `, with ${behind} more queued behind the call,` : ''} ${went} (judge onError "${this.judgeOnError}")`,
     );
+    this.recordRefusal(policyName, n, hold, durationMs, wakes, until);
+    if (this.disposed) return;
+    if (wakes) this.deliverOrBuffer([...state.events, ...state.queued]);
+  }
+
+  private recordRefusal(policyName: string, n: number, hold: string, durationMs: number, woke: boolean, until?: number): void {
     const record = this.judgeRecords.get(policyName) ?? { verdicts: { reply: 0, wait: 0, error: 0, refused: 0 } };
     record.verdicts.refused++;
     record.last = { at: Date.now(), verdict: 'refused', reason: hold, eventCount: n, durationMs };
@@ -4585,14 +4594,12 @@ export class EventGate {
       type: 'gate:judge-verdict',
       policyName,
       verdict: 'refused',
-      woke: wakes,
+      woke,
       eventCount: n,
       durationMs,
       hold,
       ...(until !== undefined ? { until } : {}),
     });
-    if (this.disposed) return;
-    if (wakes) this.deliverOrBuffer([...state.events, ...state.queued]);
   }
 
   private armJudgeRefusalTimer(now: number): void {
@@ -4623,8 +4630,10 @@ export class EventGate {
   }
 
   private judgeRefusing(now?: number): boolean {
+    if (this.judgeRefusal?.until === undefined) return false;
+    const at = now ?? this.now();
     const until = this.judgeRefusal?.until;
-    return until !== undefined && until > (now ?? this.now());
+    return until !== undefined && until > at;
   }
 
   private judgeHeldForRefusal(now?: number): boolean {
@@ -5249,8 +5258,9 @@ export class EventGate {
   }
 
   private judgeRefusalNotice(): string | null {
+    const now = this.judgeRefusal?.until !== undefined ? this.now() : undefined;
     const refusal = this.judgeRefusal;
-    if (refusal === null || (refusal.until !== undefined && refusal.until <= this.now())) return null;
+    if (refusal === null || (refusal.until !== undefined && (now === undefined || refusal.until <= now))) return null;
     let held = 0;
     for (const batch of this.judgeHeld.values()) held += batch.events.length;
     const wakes = this.judgeOnError === 'wake';
@@ -5258,8 +5268,8 @@ export class EventGate {
     if (refusal.until !== undefined) {
       return `The reply judge's calls are refused until ${new Date(refusal.until).toISOString()}: ${refusal.hold}. `
         + (wakes
-          ? "Until then, each judge rule's batch is delivered without being judged, unless a turn that changes what the judge reads, or the host's quiesce, holds it until after then, or it waits behind a call of its rule that the judge answers WAIT once its calls are no longer refused, when it's judged."
-          : `Until then, judge rules' batches are held (${events} now), and they're judged after that, or sooner if the hold is released or a judge call asked after the refused one gets a REPLY or WAIT, once no turn that changes what the judge reads runs and the host isn't quiesced. A batch waiting behind a call of its rule that the judge answers REPLY is delivered with that call's batch.`);
+          ? "Until then, each judge rule's batch is delivered without being judged, unless a turn that changes what the judge reads, or the host's quiesce, holds it until after then, or it waits behind a call of its rule that the judge answers WAIT once its calls are no longer refused, when it goes back to the judge."
+          : `Until then, judge rules' batches are held (${events} now), and they go back to the judge after that, or sooner if the hold is released or a judge call asked after the refused one gets a REPLY or WAIT, once no turn that changes what the judge reads runs and the host isn't quiesced. A batch waiting behind a call of its rule that the judge answers REPLY is delivered with that call's batch.`);
     }
     if (refusal.noTimeLeft) {
       return `A reply judge call was refused by a hold with no time left on it: ${refusal.hold}. `
