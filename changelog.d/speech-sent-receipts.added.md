@@ -9,7 +9,8 @@
   since it's named as a draft. Modules are asked together, and their answers
   about each piece are waited for at most `SPEECH_RECEIPT_WAIT_MS` (5 s,
   exported) from each hook's call; a hook that blocks synchronously past it
-  and returns its answer still has it taken. A piece with a channel posts without waiting for its own answers;
+  and returns its answer still has it taken, and a module still answering an
+  earlier ask past it isn't asked again until that answer comes. A piece with a channel posts without waiting for its own answers;
   since a turn's pieces route in order, a post after a routed piece with no
   channel waits behind that piece's answers, only while a module hasn't answered. The
   turn's `[delivered]` receipt waits up to the same bound for answers still
@@ -25,7 +26,9 @@
   can wait that long for each; only the turn's receipt waits for a held
   piece's answers. A turn that fails or is stopped writes no receipt
   and doesn't wait. A turn that had finished when `stop()` began still routes
-  its speech, and `stop()` waits for those answers in the same way, except
+  its speech, and `stop()` waits for those answers in the same way, within its
+  own timeout, after which it stops the modules and a later answer names no
+  place. That holds except for
   an ephemeral run's, whose stream its run's end leaves to finish on its own:
   when its reply ends the run, its receipt can come after the run returns, and
   a `stop()` before it comes loses it; when a tool ends it, it writes no

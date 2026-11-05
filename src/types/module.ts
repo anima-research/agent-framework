@@ -218,7 +218,10 @@ export interface Module {
    * speech with no channel, which is its caller's result. A module that throws, or
    * hasn't answered within `SPEECH_RECEIPT_WAIT_MS` of its call, names no
    * place, as `{}` does, and so does a module removed or replaced before it
-   * answers; a hook that blocks synchronously past that bound
+   * answers. A module still answering an earlier ask past that bound isn't
+   * asked again until that answer comes, and names no place meanwhile, as a
+   * wedged `onToolBatchComplete` isn't called again. A hook that blocks
+   * synchronously past that bound
    * and returns its answer still has it taken, since no timer runs while it
    * blocks. For a turn that ends with its reply or a tool, the turn's receipt
    * and the agent's next turn wait for every answer, each piece's up to that
@@ -227,7 +230,9 @@ export interface Module {
    * long for each; only the turn's receipt waits for a held piece's answers. Answer from what the module already holds rather than after a
    * round trip. A turn that fails or is stopped writes no receipt and
    * doesn't wait. A turn that had finished when `stop()` began still routes
-   * its speech, and `stop()` waits for those answers in the same way, except
+   * its speech, and `stop()` waits for those answers in the same way, within
+   * its own timeout: once that runs out it stops the modules, and an answer
+   * that comes after its module has stopped names no place. That holds except for
    * an ephemeral run's, whose stream its run's end leaves to finish on its
    * own: when its reply ends the run, its receipt can come after the run
    * returns, and a `stop()` before it comes loses it; when a tool ends it, it

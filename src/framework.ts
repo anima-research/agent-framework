@@ -6713,7 +6713,8 @@ export class AgentFramework {
     if (carry) (same as MarkedRequest)[TURN_CARRY] = carry;
     else delete (same as MarkedRequest)[TURN_CARRY];
     if (!isRearmed(request)) delete (same as MarkedRequest)[REARMED];
-    const opening = mergedOpeningMessages([same, request]);
+    const pair = [same, request];
+    const opening = mergedOpeningMessages(pair.some(bringsOwnMessages) ? pair.filter(hasOwnCauseForRun) : pair);
     if (opening) same.openingMessages = opening;
   }
   private consultProviderHold(error: Error, agentName: string): { holdMs: number; reason: string } | undefined {
@@ -21641,12 +21642,14 @@ export class AgentFramework {
     routing.suppressed = 0;
     const seen = new Set<string>();
     const shown: string[] = [];
+    const logged: string[] = [];
     const landed: ChannelRef[] = [];
     for (const channel of list ?? []) {
       const key = destinationKey(channel);
       if (seen.has(key)) continue;
       seen.add(key);
       shown.push(this.channelShown(channel));
+      logged.push(logValue(channel.channelId));
       landed.push(channel);
     }
     const notes: string[] = [];
@@ -21703,6 +21706,7 @@ export class AgentFramework {
         notes.push(`draft ${d.id} delivered ${how}`);
       } else {
         shown.push(`${this.destinationText(attempt.destination)} (draft ${d.id}, ${how})`);
+        logged.push(logValue(`${attempt.destination.channelId} (draft ${d.id}, ${how})`));
       }
     }
     if (notHeld) {
@@ -21753,7 +21757,8 @@ export class AgentFramework {
       );
       this.emitTrace({ type: 'message:added', messageId: mid, source: 'delivery-receipt' });
     } catch (err) {
-      console.error(`[delivered] ${agent.name}: its receipt couldn't be recorded; it named ${places.length > 0 ? places.map(logValue).join(' · ') : 'no place'}:`, err);
+      const named = [...logged, ...sentTo.map((place) => logValue(`sent to ${place}`))];
+      console.error(`[delivered] ${agent.name}: its receipt couldn't be recorded; it named ${named.length > 0 ? named.join(' · ') : 'no place'}:`, err);
     }
   }
 

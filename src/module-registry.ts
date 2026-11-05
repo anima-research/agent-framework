@@ -32,7 +32,6 @@ import type { Agent } from './agent.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from './shutdown.js';
 import { logValue } from './mcpl/log-value.js';
 import { asCalled, markedInputRefusal, toolArgsProblems } from './tool-args.js';
-import { safeSlice } from './safe-slice.js';
 import { markedTexts, oneLine } from './supplied-text.js';
 
 /** How the registry queues a module's event: its push names the module. A
@@ -114,8 +113,6 @@ export const TOOL_BATCH_HOOK_TIMEOUT_MS = 30_000;
  */
 export const SPEECH_RECEIPT_WAIT_MS = 5_000;
 
-const SPEECH_PLACE_MAX = 200;
-
 /**
  * Registered speech handler.
  */
@@ -129,7 +126,7 @@ interface SpeechHandler {
 function speechPlace(named: unknown): string | undefined {
   const flat = typeof named === 'string' ? oneLine(named).replace(/\s+/g, ' ').trim() : '';
   if (!flat) return undefined;
-  return markedTexts([flat.length > SPEECH_PLACE_MAX ? `${safeSlice(flat, 0, SPEECH_PLACE_MAX)}…` : flat])[0]!;
+  return markedTexts([flat])[0]!;
 }
 
 /**
@@ -138,6 +135,8 @@ function speechPlace(named: unknown): string | undefined {
 export class ModuleRegistry {
   /** Each module's tool-batch hook still running, past its bound or not. */
   private batchHooksRunning = new Map<string, Promise<unknown>>();
+  /** Each module's speech-routed ask still running past its bound. */
+  private speechAsksOverdue = new Map<string, Promise<unknown>>();
 
   private modules: Map<string, Module> = new Map();
   private stopping = new Map<Module, Promise<void>>();
@@ -479,6 +478,7 @@ export class ModuleRegistry {
         this.moduleContexts.delete(module.name);
         this.speechHandlers = this.speechHandlers.filter(handler => handler.moduleName !== module.name);
         this.batchHooksRunning.delete(module.name);
+        this.speechAsksOverdue.delete(module.name);
         this.stopping.delete(module);
         context?.retire();
         return;
@@ -755,20 +755,30 @@ export class ModuleRegistry {
         console.error(`Speech-routed module ${module.name} (agent ${agentName}) error reading its onSpeechRouted:`, error);
         return false;
       }
+    }).filter((module) => {
+      if (!this.speechAsksOverdue.has(module.name)) return true;
+      console.error(`Speech-routed module ${module.name} (agent ${agentName}) is still answering an earlier ask past the ${SPEECH_RECEIPT_WAIT_MS / 1000} s wait: not asked, counted as having sent nothing`);
+      return false;
     }).map((module) => ({ module, registration: this.moduleContexts.get(module.name) }));
     const answers = await Promise.all(asked.map(({ module, registration }) => new Promise<string | undefined>((resolve) => {
       let settled = false;
+      let call: Promise<unknown> | undefined;
       const timer = setTimeout(() => {
         settled = true;
         console.error(`Speech-routed module ${module.name} (agent ${agentName}) hadn't answered within ${SPEECH_RECEIPT_WAIT_MS / 1000} s: counted as having sent nothing`);
+        if (call) this.speechAsksOverdue.set(module.name, call);
         resolve(undefined);
       }, SPEECH_RECEIPT_WAIT_MS);
-      let call: Promise<unknown>;
       try {
         call = Promise.resolve(module.onSpeechRouted!(agentName, text, context));
       } catch (error) {
         call = Promise.reject(error);
       }
+      const asking = call;
+      const overdueEnds = (): void => {
+        if (this.speechAsksOverdue.get(module.name) === asking) this.speechAsksOverdue.delete(module.name);
+      };
+      asking.then(overdueEnds, overdueEnds);
       const fail = (error: unknown): void => {
         console.error(`Speech-routed module ${module.name} (agent ${agentName}) error${settled ? ' after the wait' : ''}:`, error);
         if (settled) return;
@@ -776,7 +786,7 @@ export class ModuleRegistry {
         clearTimeout(timer);
         resolve(undefined);
       };
-      call.then((answer) => {
+      asking.then((answer) => {
         if (settled) {
           console.error(`Speech-routed module ${module.name} (agent ${agentName}) answered after the ${SPEECH_RECEIPT_WAIT_MS / 1000} s wait: its answer counts for nothing`);
           return;

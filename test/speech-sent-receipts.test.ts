@@ -442,16 +442,6 @@ describe('plain speech a module says it showed', () => {
     assert.equal(receipt(f), "[delivered] plain speech → sent to the terminal \\[routing] says so · this turn's routing posted it to no channel");
   });
 
-  it("a place cut at its cap is marked after the cut, so the cut can't leave a notice's opening unmarked", async () => {
-    const surface = new Surface();
-    surface.answer = { sentTo: `${'x'.repeat(192)}[routingX and more after it` };
-    const membrane = new MockMembrane();
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi there.' }]));
-    const f = await host([surface], membrane);
-    await turn(f);
-    assert.equal(receipt(f), `[delivered] plain speech → sent to ${'x'.repeat(192)}\\[routing… · this turn's routing posted it to no channel`);
-  });
-
   for (const [what, answer, proseRouting] of [
     ['a module that never answers costs it nothing', 'hang', 'locus'],
     ['a module that says it showed the speech puts no receipt in it', 'sent', 'locus'],
@@ -1406,6 +1396,30 @@ describe('plain speech a module says it showed', () => {
     assert.deepEqual(places, []);
   });
 
+  it("a module still answering an ask past the bound isn't asked again until that answer comes, as a wedged onToolBatchComplete isn't called again", async (t) => {
+    const surface = new Surface();
+    surface.answer = 'held';
+    surface.heldAnswer = {};
+    const f = await host([surface], new MockMembrane());
+    const registry = (f as unknown as { moduleRegistry: { askSpeechRouted(agent: string, text: string, context: SpeechRoutedContext): Promise<string[]> } }).moduleRegistry;
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    let first: string[] | undefined;
+    void registry.askSpeechRouted('resident', 'First.', { final: false }).then((named) => { first = named; });
+    t.mock.timers.tick(SPEECH_RECEIPT_WAIT_MS);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(first, [], 'premise: the first ask ran out its bound');
+    let second: string[] | undefined;
+    void registry.askSpeechRouted('resident', 'Second.', { final: true }).then((named) => { second = named; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(surface.asked.length, 1, 'not asked again while its first answer is due');
+    assert.deepEqual(second, []);
+    surface.release();
+    await new Promise((resolve) => setImmediate(resolve));
+    surface.answer = 'sent';
+    assert.deepEqual(await registry.askSpeechRouted('resident', 'Third.', { final: true }), [SENT_TO]);
+    assert.equal(surface.asked.length, 2, 'asked again once that answer came');
+  });
+
   it("a module's place counts when it was registered as it answered, though its removal completes before the next reaction", async () => {
     const surface = new Surface();
     const f = await host([surface], new MockMembrane());
@@ -1922,7 +1936,7 @@ describe('plain speech a module says it showed', () => {
     });
   }
 
-  it("modules are asked together: each place once, in module order, a blank answer names none, and a place reads as one line, cut when long", async () => {
+  it("modules are asked together: each place once, in module order, a blank answer names none, and a place reads as one line", async () => {
     const first = new Surface('first');
     const second = new Surface('second');
     const third = new Surface('third');
@@ -1936,8 +1950,7 @@ describe('plain speech a module says it showed', () => {
     const f = await host([first, second, third, fourth], membrane);
     push(f, 'hello', 'first');
     await f.runUntilIdle();
-    const long = `a page ${'x'.repeat(300)}`.slice(0, 200);
-    assert.equal(receipt(f), `[delivered] plain speech → sent to the terminal that sent this turn · sent to ${long}… · this turn's routing posted it to no channel`);
+    assert.equal(receipt(f), `[delivered] plain speech → sent to the terminal that sent this turn · sent to a page ${'x'.repeat(300)} · this turn's routing posted it to no channel`);
     assert.deepEqual(notices(f), []);
   });
 
@@ -1949,6 +1962,30 @@ describe('plain speech a module says it showed', () => {
     internals(f).pendingRequests.push({ agentName: 'resident', reason: 'channel-message', source: 'mcpl', timestamp: Date.now(), channelId: 'room', channelServerId: 'srv' });
     return published;
   }
+
+  it("a receipt that can't be recorded is logged naming each channel by its id, however long the channel's label", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const surface = new Surface();
+    surface.answer = 'none';
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi room.' }]));
+    const f = await host([surface], membrane);
+    const registry = internals(f).channelRegistry as unknown as { ensureChannelRegistered(serverId: string, channelId: string, label?: string): void; getDescriptor(channel: { serverId: string; channelId: string }): { label?: string } | undefined };
+    registry.ensureChannelRegistered('srv', 'room', 'l'.repeat(300));
+    await channelTurn(f, true);
+    assert.equal(registry.getDescriptor({ serverId: 'srv', channelId: 'room' })?.label?.length, 300, "premise: the channel's label is longer than a log value");
+    const cm = f.getAgent('resident')!.getContextManager();
+    const add = cm.addMessage.bind(cm);
+    t.mock.method(cm, 'addMessage', (...args: Parameters<typeof cm.addMessage>) => {
+      if ((args[2] as { kind?: string } | undefined)?.kind === 'delivery-receipt') throw new Error('zz-receipt refused');
+      return add(...args);
+    });
+    await f.runUntilIdle();
+    const line = errors.find((e) => e.startsWith("[delivered] resident: its receipt couldn't be recorded; it named "));
+    assert.ok(line, `premise: the receipt couldn't be recorded: ${errors.join('\n')}`);
+    assert.ok(line.split('; it named ')[1]!.includes('room'), line);
+  });
 
   it("a turn with a channel posts there without waiting for a module, and its receipt names the channel and where the module showed the reply", async (t) => {
     const errors: string[] = [];
