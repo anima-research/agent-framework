@@ -6248,10 +6248,10 @@ export class AgentFramework {
   private wakesOnTheirWay(agentName: string): WakesOnTheirWay {
     const agent = this.agents.get(agentName);
     const unread = (r: InferenceRequest): boolean => !(agent && (mergedBatch(r) ?? [r]).every((m) => this.alreadyRead(agent, m)));
-    const mine = (r: InferenceRequest): boolean => r.agentName === agentName && unread(r);
-    const requests = [...this.pendingRequests.filter(mine), ...[...this.parkedContinuations].filter(mine)];
-    for (const pass of this.passRequests) for (const taken of pass.values()) requests.push(...taken.filter(mine));
-    const queued = requests.map((r) => String(r.reason));
+    const mine = (r: InferenceRequest): boolean => r.agentName === agentName;
+    const arriving = [...this.pendingRequests.filter(mine), ...[...this.parkedContinuations].filter(mine)];
+    for (const pass of this.passRequests) for (const taken of pass.values()) arriving.push(...taken.filter(mine));
+    const queued = arriving.filter(unread).map((r) => String(r.reason));
     const batchOnly: string[] = [];
     for (const parked of this.parkedStarts) {
       if (parked.agent !== agent) continue;
@@ -6262,18 +6262,23 @@ export class AgentFramework {
       if (this.activeTurnTriggers.get(agentName)?.coalescingBatchSubjects?.length) batchOnly.push('a start assembling its deferred pushes, which starts no turn if they give it nothing to read');
       else queued.push('a start assembling its deferred pushes');
     }
-    const waiting = queued.length + batchOnly.length;
     const ends = (until: number | null | undefined): { until?: number } =>
       (typeof until === 'number' && Number.isFinite(until) ? { until } : {});
     const model = this.agents.get(agentName)?.model;
     const cooldown = this.providerAccelerationCooldowns.get(agentName);
     const otherModel = cooldown?.waitModel !== undefined && cooldown.waitModel !== model;
-    if (cooldown && !((cooldown.rearm || otherModel) && waiting > 0)) {
-      const releaseWakes = cooldown.heldRequests.some(unread) || (cooldown.heldRequests.length === 0 && !(cooldown.auxiliaryOrigin || cooldown.emptiedBy));
+    const meeting = arriving.length + (queued.length - arriving.filter(unread).length) + batchOnly.length;
+    const letGo = cooldown !== undefined && (cooldown.rearm !== undefined || otherModel) && meeting > 0;
+    if (letGo) queued.unshift(...cooldown.heldRequests.filter(unread).map((r) => String(r.reason)));
+    const waiting = queued.length + batchOnly.length;
+    if (cooldown && !letGo) {
+      const atRelease = [...cooldown.heldRequests, ...arriving];
+      const releaseWakes = atRelease.some(unread) || (atRelease.length === 0 && !(cooldown.auxiliaryOrigin || cooldown.emptiedBy));
       if (releaseWakes || waiting > 0) {
         const wait = model !== undefined ? this.providerWaits?.active(agentName, model) : undefined;
         const waitHold = cooldown.waitModel !== undefined && model === cooldown.waitModel;
-        const until = wait && (waitHold || wait.until === null || wait.until > cooldown.until) ? wait.until : cooldown.until;
+        const until = cooldown.hostHoldError ? undefined
+          : wait && (waitHold || wait.until === null || wait.until > cooldown.until) ? wait.until : cooldown.until;
         return { queued: [], held: { ...ends(until), ...(cooldown.rearm ? { rearm: cooldown.rearm } : {}), ...(!releaseWakes && queued.length === 0 ? { maybe: true as const } : {}) } };
       }
     }
@@ -6287,8 +6292,8 @@ export class AgentFramework {
     const at = agent && this.lastStartFailed.get(agent);
     if (at === undefined) return undefined;
     const { queued, batchOnly = [], held } = onTheirWay ?? this.wakesOnTheirWay(agentName);
-    if (queued.length > 0 || batchOnly.length > 0) return { at, again: { kind: 'queued' } };
-    return { at, again: held ? { kind: 'held', ...(held.until !== undefined ? { until: held.until } : {}) } : { kind: 'none' } };
+    if (queued.length > 0 || batchOnly.length > 0) return { at, again: { kind: 'queued', ...(queued.length === 0 ? { maybe: true as const } : {}) } };
+    return { at, again: held ? { kind: 'held', ...(held.until !== undefined ? { until: held.until } : {}), ...(held.maybe ? { maybe: true as const } : {}) } : { kind: 'none' } };
   }
 
   /**

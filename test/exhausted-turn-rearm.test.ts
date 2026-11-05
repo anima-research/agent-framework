@@ -709,7 +709,7 @@ test("a wake queued while the agent waits for a re-arm is what the judge is told
   await waitFor(() => r.count('inference:exhausted') === 1, 'the window to end exhausted');
   assert.equal(r.admission().providerAdmission.heldRequests, 1, 'premise: the re-armed turn is held');
   queue(r, { reason: 'zz-wake' });
-  assert.deepEqual(internal.upcomingWakesFor('resident').map((w) => w.what), ['a wake already queued (zz-wake)']);
+  assert.deepEqual(internal.upcomingWakesFor('resident').map((w) => w.what), ['2 wakes already queued (external-message)']);
   assert.equal(internal.failedLastTurnFor('resident')?.again.kind, 'queued');
   await waitFor(() => r.count('inference:completed') === 1, 'premise: the queued wake starts the turn');
   assert.equal(membrane.sends.length, 4, 'premise: at once, with no fourth delay of 60 s');
