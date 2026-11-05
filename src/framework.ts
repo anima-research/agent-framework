@@ -31103,7 +31103,7 @@ export class AgentFramework {
     } catch (error) {
       console.error(
         `[routing] ${agent.name}: the record that its private input was answered couldn't be written (${thrownText(error)}); ` +
-          `after a restart its first start speaks in no channel`,
+          `its next start speaks in no channel, and so does each after it until the record is written`,
       );
     }
     return id;
