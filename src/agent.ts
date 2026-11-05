@@ -2705,7 +2705,11 @@ export class Agent {
     }
     const declared: NormalizedMessage = { participant: SYSTEM_CHANGE_PARTICIPANT, content: [difference.block] };
     if (dryRun) return { compiled, head: recorded, declared };
-    this.contextManager.addMessage(declared.participant, declared.content, systemChangeMetadata(this.name) as never);
+    try {
+      this.contextManager.addMessage(declared.participant, declared.content, systemChangeMetadata(this.name) as never);
+    } catch {
+      return { compiled, head: recorded };
+    }
     this.onHeadEvent?.({
       type: 'head:declared',
       removed: difference.block.removeTools ?? [],
