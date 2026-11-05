@@ -448,6 +448,37 @@ describe('toolDeclarations', () => {
     assert.equal(changeRows(context.rows).length, 1, 'and its change row stays');
   });
 
+  it("sends what's current without its own change rows while it can't store a head with none recorded", async () => {
+    const added: Row = { id: 'c-added', participant: 'system', content: [{ type: 'system_change', addSystem: ['a server joined'] } as never], metadata: { system: true, kind: 'system-change', agent: 'agent' } };
+    const context = fakeContext([said('user', 'hello'), added]);
+    const real = memoryHeadDeclarations();
+    const heads: HeadDeclarationStore = { read: (name) => real.read(name), write: () => false, delete: (name) => real.delete(name) };
+    const agent = agentOn(context, { toolDeclarations: 'entries' }, heads);
+    const request = await agent.buildActivationRequest([tool('a')], [systemInjection('a server joined')]);
+    assert.equal(request.system, 'You are an agent.\na server joined', 'what is current goes out');
+    assert.deepEqual(changeRows(request.messages as unknown as Row[]), [], 'and no row of its own adds that block again');
+    assert.equal(changeRows(context.rows).length, 1, 'while its change row stays stored');
+  });
+
+  it("goes on its recorded head, declaring nothing, when the store refuses its change row", async () => {
+    const context = fakeContext([said('user', 'hello')]);
+    const refusing = context.cm as unknown as { addMessage: (...args: unknown[]) => string };
+    const write = refusing.addMessage;
+    refusing.addMessage = (...args: unknown[]) => {
+      if ((args[1] as Array<{ type: string }>).some((block) => block.type === 'system_change')) throw new Error("Message refused: a system change can't go between a tool call and its result");
+      return write(...args);
+    };
+    const heads = memoryHeadDeclarations();
+    heads.write('agent', { tools: [tool('a')], system: ['You are an agent.'] });
+    const events: HeadEvent[] = [];
+    const agent = agentOn(context, { toolDeclarations: 'entries' }, heads, events);
+    const request = await agent.buildActivationRequest([tool('a'), tool('b')]);
+    assert.deepEqual(request.tools, [tool('a')], 'it goes on its recorded head');
+    assert.deepEqual(changeRows(context.rows), [], 'with nothing written');
+    assert.deepEqual(heads.read('agent'), { tools: [tool('a')], system: ['You are an agent.'] }, 'and its record as it was');
+    assert.deepEqual(events, [], 'and nothing declared');
+  });
+
   it("lets a refusal over budget go on, keeping its own change rows, on the head while its record can't be cleared", async () => {
     const context = fakeContext([said('user', 'hello'), changeRow([tool('b')])], { overBudget: (r) => r.some((row) => row.participant === 'system') });
     const real = memoryHeadDeclarations();
