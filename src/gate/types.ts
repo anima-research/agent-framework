@@ -412,7 +412,10 @@ export interface JudgeEventSummary {
  * when it's the host's, which the host is asked about again then). Neither says the wake starts a turn: the host's inference
  * policy can still decline it, and a start whose only causes are deferred
  * batches starts none if they give it nothing to read. `maybe` marks a wake
- * that is only such a start, or a hold that holds only such starts.
+ * that may not start a turn: a start whose only causes are deferred batches,
+ * a conversation agent's start assembling its deferred pushes under a provider
+ * wait on its model, which holds it after its compile, or a hold that holds
+ * only starts of the first kind. The wake list gives each one's reason.
  */
 export interface FailedLastTurn {
   at: number;
