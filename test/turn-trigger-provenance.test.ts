@@ -2261,6 +2261,51 @@ describe('private wins, one way', () => {
       }
     });
 
+    it("a private surface's message a start answered, after the host moves its branch back to before that answer and a silent heartbeat tick runs there, keeps the next run's first start out of every channel", async () => {
+      const storeDir = mkdtempSync(join(tmpdir(), 'branch-move-silent-tick-restart-'));
+      try {
+        const first = await surfaceRig({ storeDir, quietSources: ['console'] });
+        try {
+          await firstTurn(first, false);
+          first.framework.pushEvent({ type: 'external-message', source: 'console', content: 'for your eyes only', metadata: {} } as never);
+          await first.until(() => stored(first).includes('for your eyes only'), 'the private message stored');
+          const { channelTurn } = restarted(first);
+          assert.deepEqual(await channelTurn(), [], "control: the start that reads it speaks in no channel");
+          const cm = first.framework.getAgent('scout')!.getContextManager();
+          const asked = cm.queryMessages({}).messages.find((m) => JSON.stringify(m.content).includes('for your eyes only'))!;
+          const answers = () => {
+            const rows = cm.getAllMessages();
+            const at = rows.findIndex((m) => JSON.stringify(m.content).includes('for your eyes only'));
+            return rows.slice(at + 1).filter((m) => m.participant === 'scout');
+          };
+          assert.ok(answers().length > 0, 'control: the start stored its answer');
+          await cm.switchBranch(cm.branchAt(asked.id, `undo-${Date.now()}`));
+          assert.deepEqual(answers(), [], 'control: the move took the answer off the branch');
+          const starts = first.starts.length;
+          first.i.pendingRequests.push({
+            agentName: 'scout', reason: 'heartbeat', source: 'heartbeat', timestamp: Date.now(),
+            suppressProse: true, silentHeartbeat: { eventId: 'tick-1', serverId: 'heartbeat' },
+          });
+          await first.until(() => first.starts.length > starts && idle(first), 'the silent tick');
+          await first.framework.runUntilIdle();
+          assert.ok(answers().length > 0 && answers().every((m) => (m.metadata as { silentHeartbeat?: unknown } | undefined)?.silentHeartbeat),
+            "control: the tick stored rows of the resident's own after the message, and no other row of its own follows it");
+        } finally {
+          await first.close();
+        }
+        const next = await surfaceRig({ storeDir, quietSources: ['console'] });
+        try {
+          const { channelTurn } = restarted(next);
+          assert.deepEqual(await channelTurn(), [], 'the start that reads it speaks in no channel');
+          assert.deepEqual(await channelTurn(), [ROOM], 'control: a later channel turn speaks in its channel');
+        } finally {
+          await next.close();
+        }
+      } finally {
+        rmSync(storeDir, { recursive: true, force: true });
+      }
+    });
+
     it("a store from before this release, holding a private surface's message no start read, keeps the next run's first start out of every channel, across a further restart with a /puppet pair stored between", async () => {
       const storeDir = mkdtempSync(join(tmpdir(), 'older-store-private-restart-'));
       try {

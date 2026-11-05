@@ -31096,7 +31096,7 @@ export class AgentFramework {
 
   private storeTurnReply(agent: Agent, content: ContentBlock[]): MessageId | undefined {
     const id = agent.addAssistantResponse(content, this.silentTurnRowMetadata(agent.name));
-    if (id === undefined || this.privateInputStored.has(agent.name)) return id;
+    if (id === undefined || this.activeTurnTriggers.get(agent.name)?.suppressProse || this.privateInputStored.has(agent.name)) return id;
     try {
       this.recordPrivateInput(agent.name, false);
     } catch (error) {
