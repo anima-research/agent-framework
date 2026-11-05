@@ -1183,6 +1183,24 @@ export type TraceEvent =
    * notice is not kept. For the all-except hold (`scope`), the channel is
    * its excepted one.
    */
+  /**
+   * At boot, a hold on record (`epochId`; the all-except hold with `scope`,
+   * its channel the excepted one) that the last stop's stamp
+   * (`tune-out/<primary>/stop-stamp`) doesn't cover: the host crashed, or
+   * the store refused the stop's writes, so whether a cancel of it waited
+   * then, with a note, is not known. The persistent subconscious
+   * (`noteAuthor`) is told that any such cancel was lost, with any note
+   * left with it, by a loss notice kept and tried again as the others are
+   * (`tune-out:note-loss-untold` where its write fails).
+   */
+  | (TraceEventBase & {
+      type: 'tune-out:stop-unrecorded';
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      scope?: 'all-except';
+      noteAuthor: string;
+    })
   | (TraceEventBase & {
       type: 'tune-out:note-loss-untold';
       serverId: string;
