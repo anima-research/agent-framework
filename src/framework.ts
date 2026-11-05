@@ -1967,6 +1967,10 @@ function hasOwnCauseForRun(r: InferenceRequest): boolean {
   return !FRAMEWORK_WAKE_SOURCES.has(r.source) && r.suppressProse !== true;
 }
 
+function bringsOwnMessages(r: InferenceRequest): boolean {
+  return hasOwnCauseForRun(r) && (r.openingMessages?.length ?? 0) > 0;
+}
+
 /** Whether a wake carries an autoContinue continuation: its own wake, or a
  *  requeued turn trigger that kept the mark (InferenceRequest.autoContinueRun). */
 function carriesContinuation(r: InferenceRequest): boolean {
@@ -20141,7 +20145,7 @@ export class AgentFramework {
           if (lines) kept.wakeLines = lines;
           if (prev) {
             const pair = [prev, request];
-            const opening = mergedOpeningMessages(pair.some(hasOwnCauseForRun) ? pair.filter(hasOwnCauseForRun) : pair);
+            const opening = mergedOpeningMessages(pair.some(bringsOwnMessages) ? pair.filter(hasOwnCauseForRun) : pair);
             if (opening) kept.openingMessages = opening;
             else delete kept.openingMessages;
           }
@@ -20425,7 +20429,7 @@ export class AgentFramework {
           ? trigger?.readsDeferredWrite : undefined,
         readsStoredMessage: requests.every((r) => r.readsStoredMessage === trigger?.readsStoredMessage)
           ? trigger?.readsStoredMessage : undefined,
-        openingMessages: mergedOpeningMessages(requests.some(hasOwnCauseForRun) ? requests.filter(hasOwnCauseForRun) : requests),
+        openingMessages: mergedOpeningMessages(requests.some(bringsOwnMessages) ? requests.filter(hasOwnCauseForRun) : requests),
         // Every merged wake's handed line, each event's once: the turn's start
         // decides each (beginAgentTurn).
         wakeLines: mergeWakeLines(requests),
@@ -24823,7 +24827,7 @@ export class AgentFramework {
       const { coalescingSubject: _subject, coalescingBatch: _batch, coalescingBatchSubjects: _subjects, readsDeferredWrite: _read, readsStoredMessage: _stored, ...retry } = trigger;
       trigger = retry;
     }
-    const ownCause = (trigger ? mergedBatch(trigger) ?? [trigger] : []).some(hasOwnCauseForRun);
+    const ownCause = (trigger ? mergedBatch(trigger) ?? [trigger] : []).some(bringsOwnMessages);
     // The wakes merged into this start are the turn's now: it reads them,
     // so a later drop of its retry puts none of them back (MERGED_BATCH).
     if (trigger && mergedBatch(trigger)) {
@@ -26953,8 +26957,9 @@ export class AgentFramework {
                   // Route to the TURN-FROZEN locus, like every other speech
                   // path: a locus resolved at post time would read the global
                   // fallback (the all-except hold's channel while one is open,
-                  // else the latest inbound channel), which an arrival, or the
-                  // hold opening or ending, can move while a dispatch runs.
+                  // else, under the legacy locus rule, the latest inbound
+                  // channel), which an arrival, or the hold opening or ending,
+                  // can move while a dispatch runs.
                   const locus = resolveTurnLocus();
                   console.error(
                     `[routing] ${agent.name}: text-only turn -> routing speech -> ${locus ? qualifiedChannelName(locus) : '(none)'}`,

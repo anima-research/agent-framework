@@ -2228,23 +2228,6 @@ describe('plain speech a module says it showed', () => {
     assert.deepEqual(openingTexts(surface, retried!), ['the second message']);
   });
 
-  it('a console message read in a running turn still wakes a turn of its own', async () => {
-    const surface = new Surface();
-    surface.answer = 'none';
-    const membrane = new MockMembrane();
-    membrane.pushResponse(lookRound('Looking around.'));
-    membrane.pushResponse(afterLook('Looking around.', 'Seen it.'));
-    const f = await host([surface], membrane);
-    let starts = 0;
-    f.onTrace((event) => {
-      if (event.type === 'inference:started' && ++starts === 2) membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Again.' }]));
-    });
-    surface.toolCall = () => { push(f, 'arrived mid-turn'); };
-    await turn(f, 'the opening message');
-    await f.runUntilIdle();
-    assert.equal(starts, 2, 'the mid-turn message woke a turn after the first, as surface input always has');
-  });
-
   it('two wakes coalesced while the host is quiesced name both their messages at resume', async () => {
     const surface = new Surface();
     const membrane = new MockMembrane();

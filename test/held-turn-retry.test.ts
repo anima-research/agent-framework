@@ -1315,6 +1315,54 @@ test("a held wake that an equal merged start folds into keeps its opening messag
   });
 });
 
+test("a start merged from an autoContinue wake carrying its turn's opening message and a heartbeat names that message, since the heartbeat brought none", async (t) => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set(), () => new Error('unused'));
+    const { fw, internal } = await framework(path, membrane);
+    const triggers: Array<Record<string, unknown> | undefined> = [];
+    const start = internal.startAgentStream.bind(internal);
+    t.mock.method(internal, 'startAgentStream', (agent: unknown, trigger: Record<string, unknown> | undefined, ...rest: unknown[]) => {
+      triggers.push(trigger);
+      return (start as (...args: unknown[]) => Promise<void>)(agent, trigger, ...rest);
+    });
+    try {
+      const at = Date.now();
+      internal.pendingRequests.push(
+        { agentName: 'resident', reason: 'auto-continue', source: 'framework', timestamp: at, openingMessages: ['zz-console message'] } as unknown as Request,
+        { agentName: 'resident', reason: 'heartbeat', source: 'heartbeat', timestamp: at + 1 },
+      );
+      await fw.runUntilIdle();
+      assert.equal(triggers.length, 1, `premise: one merged start: ${log.lines.join('\n')}`);
+      assert.deepEqual(triggers[0]?.openingMessages, ['zz-console message']);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a heartbeat that continues an open turn before any of its rounds reached its tool calls keeps the turn's opening messages, since it brought none", async (t) => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new ScriptedMembrane(new Set(), () => new Error('unused'));
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const turns = internal as unknown as { routingOf(name: string): { openingMessages?: string[] }; openLogical: Map<string, unknown> };
+      const routing = turns.routingOf('resident');
+      routing.openingMessages = ['zz-console message'];
+      turns.openLogical.set('resident', routing);
+      const seen: Array<string[] | undefined> = [];
+      const stream = membrane.streamYielding.bind(membrane);
+      t.mock.method(membrane, 'streamYielding', (request: NormalizedRequest) => {
+        seen.push(routing.openingMessages && [...routing.openingMessages]);
+        return stream(request);
+      });
+      internal.pendingRequests.push({ agentName: 'resident', reason: 'heartbeat', source: 'heartbeat', timestamp: Date.now() });
+      await fw.runUntilIdle();
+      assert.equal(seen.length, 1, `premise: the heartbeat's start made one call: ${log.lines.join('\n')}`);
+      assert.deepEqual(seen[0], ['zz-console message']);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
 test("a held merged start's release gives its first member none of the other members' opening messages, so a member the read check drops leaves its message off the turn", async (t) => {
   await withStoreDir(async (path) => {
     const clock = holdClock(t);
