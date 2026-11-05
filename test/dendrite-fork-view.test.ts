@@ -504,3 +504,76 @@ describe("a derived agent's change rows, its source's among them", () => {
     await run;
   });
 });
+
+describe("a 'head' agent whose compile is refused over budget", () => {
+  let tempDir: string;
+  let membrane: RoutedMembrane;
+  let framework: AgentFramework;
+  const change = (name: string) => [{ type: 'system_change', defineTools: [{ name, description: name, inputSchema: { type: 'object' as const, properties: {} } }] }] as never;
+  const defined = (messages: ReadonlyArray<{ content: unknown }>): string[] =>
+    messages.flatMap((m) => (m.content as Array<{ type: string; defineTools?: Array<{ name: string }> }>)
+      .filter((b) => b.type === 'system_change').flatMap((b) => (b.defineTools ?? []).map((t) => t.name)));
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'dendrite-fork-view-head-budget-'));
+    membrane = new RoutedMembrane();
+    framework = await AgentFramework.create({
+      storePath: join(tempDir, 'store.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [
+        { name: 'mira', model: 'test-model', systemPrompt: 'You are mira.', selfParticipants: ['mira-old'], toolDeclarations: 'entries' },
+        { name: 'nell', model: 'test-model', systemPrompt: 'You are nell.' },
+      ],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    });
+    const mira = framework.getAgent('mira')!;
+    mira.getContextManager().addMessage('user', [text('Please look into the open issues.')]);
+    await mira.buildActivationRequest([]);
+    mira.getContextManager().addMessage('system', change('b'), systemChangeMetadata('mira') as never);
+    mira.getContextManager().addMessage('system', change('o'), systemChangeMetadata('mira-old') as never);
+  });
+
+  afterEach(async () => {
+    await framework.stop();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("leaves its branch's change rows, its own and its source's, where its compile never held them, and the refusal goes on", async () => {
+    const traces: Array<{ type: string; agentName?: string }> = [];
+    framework.onTrace((event) => { traces.push(event as never); });
+    const { name: _name, ...spec } = taskForkSpec('hc', { parent: 'mira', inherit: { mode: 'shared' } });
+    const hc = await framework.createEphemeralAgent({ name: 'hc', model: 'test-model', systemPrompt: 'You are hc.' }, spec);
+    hc.contextManager.addMessage('system', change('h'), systemChangeMetadata('hc') as never);
+    hc.contextManager.addMessage('user', [text('Run once.')]);
+    const stored = () => ['mira', 'mira-old', 'hc'].map((owner) => hc.contextManager.queryMessages({ metadata: { kind: 'system-change', agent: owner } }).messages.length);
+    assert.deepEqual(stored(), [1, 1, 1], "the premise: its branch holds its source's two rows and its own");
+    assert.deepEqual(defined((await hc.contextManager.compile(undefined, undefined, { dryRun: true })).messages), [], 'and its compile, on its head, holds none of them');
+    let refused = 0;
+    (hc.contextManager as unknown as { compile: (...args: unknown[]) => Promise<unknown> }).compile = async () => {
+      refused++;
+      throw Object.assign(new Error('over budget'), { name: 'OverBudgetError' });
+    };
+    await assert.rejects(hc.agent.buildActivationRequest([]), /over budget/, 'refused over budget');
+    assert.equal(refused, 1, 'compiled once, as nothing it could take would help');
+    assert.deepEqual(stored(), [1, 1, 1], 'every row left where it was');
+    assert.deepEqual(traces.filter((t) => t.type === 'head:moved' && t.agentName === 'hc'), [], 'and no move');
+  });
+
+  it("leaves a 'head' resident's own change rows where its compile never held them, and the refusal goes on", async () => {
+    const nell = framework.getAgent('nell')!;
+    nell.getContextManager().addMessage('user', [text('Please look into the open issues.')]);
+    nell.getContextManager().addMessage('system', change('n'), systemChangeMetadata('nell') as never);
+    const stored = () => nell.getContextManager().queryMessages({ metadata: { kind: 'system-change', agent: 'nell' } }).messages.length;
+    assert.equal(stored(), 1, 'the premise: its own row is stored');
+    let refused = 0;
+    (nell.getContextManager() as unknown as { compile: (...args: unknown[]) => Promise<unknown> }).compile = async () => {
+      refused++;
+      throw Object.assign(new Error('over budget'), { name: 'OverBudgetError' });
+    };
+    await assert.rejects(nell.buildActivationRequest([]), /over budget/, 'refused over budget');
+    assert.equal(refused, 1, 'compiled once');
+    assert.equal(stored(), 1, 'its row left where it was');
+  });
+});
