@@ -393,10 +393,10 @@ export interface FrameworkConfig {
    * schedule, the heartbeat's tick or reminder, a self-wake timer it set, or a
    * script's wake. A notice a module or an MCPL server stores as a message
    * counts. A message in the residents' shared slot counts for each resident
-   * that reads it. Any other wake leaves the count going on. A re-armed turn's
-   * transient failure writes no `[inference-failed]` marker unless a round of
-   * it ran or had its tool calls cut off; any other failure of it writes one.
-   * Each counts toward the hard-down streak. Ephemeral runs and conversation
+   * that reads it. Any other wake leaves the count going on. A failure of a
+   * re-armed turn writes an `[inference-failed]` note only when a round of it
+   * ran or had its tool calls cut off, as any turn's failure does. Each
+   * counts toward the hard-down streak. Ephemeral runs and conversation
    * forks are never re-armed. The wait and the count are kept in memory:
    * `stop()` drops them, and so does a restart. The wait isn't a turn, so
    * `abortInference()` doesn't end it.
