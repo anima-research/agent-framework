@@ -427,9 +427,12 @@ describe("a note waiting with an accepted cancel, after the host stops (AF #844 
 const unrecorded = (epochId: string): string => `[Tune-out: the host stopped without recording the state of the tune-out of noisy `
   + `(epoch ${epochId}). If you asked for a cancel of it before the stop, it had not run when the host stopped: it was lost, and `
   + 'any note you left with it. That tune-out is still in force.]';
-const deliveredBeforeStop = (epochId: string): string => `[Tune-out: the host stopped without recording the state of the tune-out of noisy `
-  + `(epoch ${epochId}). The note you left with your cancel of it was delivered to agent before the stop. The cancel's end was not `
-  + 'recorded, so that tune-out is still in force.]';
+const ranWithNote = (epochId: string): string => `[Tune-out: the host stopped without recording the state of the tune-out of noisy `
+  + `(epoch ${epochId}). A cancel of it ran: its release reached agent, with the note you left with your cancel of it. Its end was `
+  + 'not recorded, so that tune-out is still in force.]';
+const ranUnasked = (epochId: string): string => `[Tune-out: the host stopped without recording the state of the tune-out of noisy `
+  + `(epoch ${epochId}). A cancel of it ran: its release reached agent. Its end was not recorded, so that tune-out is still in force. `
+  + 'Any note you left with a cancel of it was not delivered.]';
 
 /** The process dies: nothing the stop would write to the coordinator's state reaches the store. */
 async function crashLosingStopWrites(f: Fixture): Promise<void> {
@@ -479,13 +482,13 @@ describe("a hold on record that the last stop didn't stamp (AF #844 review, roun
       assert.equal(internals(f).channelRegistry.getTuneOutState('editor', 'noisy')?.params.epochId, epochId, 'the hold is resumed');
       const window = presentedTo(f, sub);
       assert.ok(window.some((t) => t.includes('primer 7a2d')), 'premise: the subconscious kept its context across the restart');
-      assert.deepEqual(window.filter((t) => t.includes('without recording')), [unrecorded(epochId)],
-        "the subconscious's presented context has the reasoned row");
+      assert.deepEqual(window.filter((t) => t.includes('without recording')), [ranUnasked(epochId)],
+        "the subconscious's presented context has the reasoned row: the first release, its sync refused, is stored (Weft, finding 2)");
       assert.ok(internals(f).pendingRequests.some((r) => r.agentName === sub && r.reason === 'tune-out stop not recorded: noisy'),
         'and a turn to read it is queued');
       assert.deepEqual(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'agent request'), { ok: true },
         'a later note-free cancel ends the hold');
-      assert.deepEqual(presentedTo(f, sub).filter((t) => t.includes('without recording')), [unrecorded(epochId)], 'the row stays, once');
+      assert.deepEqual(presentedTo(f, sub).filter((t) => t.includes('without recording')), [ranUnasked(epochId)], 'the row stays, once');
       assert.ok(!has(f, 'Someone asked for you.'), 'premise: the note was never delivered');
     } finally {
       errors.mock.restore();
@@ -546,7 +549,8 @@ describe("what a boot after an unrecorded stop can tell of a waiting note (AF #8
       await f.create();
       assert.equal(internals(f).channelRegistry.getTuneOutState('editor', 'noisy')?.params.epochId, epochId, 'premise: the hold is resumed');
       const window = presentedTo(f, sub);
-      assert.deepEqual(window.filter((t) => t.includes('without recording')), [deliveredBeforeStop(epochId)], 'the row says the note was delivered');
+      assert.deepEqual(window.filter((t) => t.includes('without recording')), [ranWithNote(epochId)],
+        'the row says the cancel ran and the note was delivered, its release being stored too (Weft, finding 2)');
       assert.ok(!window.some((t) => t.includes('it was lost')), 'and not that it was lost');
       assert.ok(internals(f).pendingRequests.some((r) => r.agentName === sub && r.reason === 'tune-out stop not recorded: noisy'), 'with a turn to read it');
     } finally {
@@ -659,6 +663,59 @@ describe("a boot after an unrecorded stop names the cancel the subconscious aske
         + 'left with it. That tune-out is still in force.]',
       ], 'the row names the cancel it asked for and quotes its note');
       assert.ok(internals(f).pendingRequests.some((r) => r.agentName === sub && r.reason === 'tune-out stop not recorded: noisy'), 'with a turn to read it');
+    } finally {
+      errors.mock.restore();
+      await f.close();
+    }
+  });
+
+  it("the cancel the subconscious asked for ran, its release stored, and its end's record failed, then a crash: the row says it ran and that its note did not go out (Weft, finding 2)", async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const { f, sub, epochId } = await heldWithPrimer();
+    try {
+      holdCoordinatorWrites(f);
+      const membrane = f.membrane as unknown as { responses: unknown[]; responseIndex: number; pushResponse(r: unknown): void };
+      membrane.responses.length = 0;
+      membrane.responseIndex = 0;
+      membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'sub-cancel', name: 'cancel_tuneout', input: { channelId: 'noisy', text: NOTE } },
+      ] as never, 'tool_use'));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Waiting for the cancel.' }] as never));
+      (f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({ agentName: sub, reason: 'test', source: 'test', timestamp: Date.now() });
+      void f.framework.runUntilIdle();
+      await eventually(() => (f.framework.getAgent(sub)!.getContextManager().getPresentedMessages() as unknown as Array<{ content: Array<{ type: string; toolUseId?: string }> }>)
+        .some((m) => m.content.some((b) => b.type === 'tool_result' && b.toolUseId === 'sub-cancel')), "the subconscious's cancel_tuneout and its result are stored");
+      // The writes resume: its run stores its release, and the end can't be recorded.
+      (internals(f).tuneOutCoordinator as unknown as { hooks: { writesHeld?: () => boolean } }).hooks.writesHeld = () => false;
+      endNotRecorded(f);
+      internals(f).tuneOutCoordinator!.runDeferredCancels();
+      assert.equal(internals(f).channelRegistry.getTuneOutState('editor', 'noisy')?.params.epochId, epochId, 'premise: the hold stays in force');
+      assert.ok(stored(f).some((m) => (m.metadata as { kind?: unknown; epochId?: unknown } | undefined)?.kind === 'tune-out-cancel'
+        && (m.metadata as { epochId?: unknown }).epochId === epochId), 'premise: its release is stored');
+      await crashLosingStopWrites(f);
+      await f.create();
+      assert.deepEqual(presentedTo(f, sub).filter((t) => t.includes('without recording')), [
+        `[Tune-out: the host stopped without recording the state of the tune-out of noisy (epoch ${epochId}). The cancel of it you `
+        + 'asked for ran: its release reached agent, but the note you left with it, "Antra asked for you in #noisy.", did not. Its end '
+        + 'was not recorded, so that tune-out is still in force.]',
+      ]);
+    } finally {
+      errors.mock.restore();
+      await f.close();
+    }
+  });
+
+  it("three crashes with nothing asked tell the hold once, and leave one turn asked for (Weft, finding 5)", async () => {
+    const errors = mock.method(console, 'error', () => {});
+    const { f, sub } = await heldWithPrimer();
+    try {
+      for (let crashes = 0; crashes < 3; crashes++) {
+        await crashLosingStopWrites(f);
+        await f.create();
+      }
+      assert.equal(presentedTo(f, sub).filter((t) => t.includes('without recording')).length, 1, 'one row');
+      assert.deepEqual(internals(f).pendingRequests.filter((r) => r.agentName === sub && r.reason.startsWith('tune-out')).map((r) => r.reason),
+        ['tune-out stop not recorded: noisy'], 'one turn');
     } finally {
       errors.mock.restore();
       await f.close();

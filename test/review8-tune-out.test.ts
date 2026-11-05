@@ -519,6 +519,8 @@ test("65 follow-up (Isaac-3593; Ivy-3594, round 8): the subconscious whose queue
     assert.equal(release.participant, 'user', "framed by the framework, not in anyone's voice");
     assert.equal(release.forAgent, undefined, "in the residents' store, which the subconscious's window holds");
     assert.equal(release.metadata?.epochId, a);
+    assert.equal(release.metadata?.lostNote, true, 'marked as telling the loss, for a boot to read (Weft, pin)');
+    assert.ok(release.metadata?.released, 'premise: a release with rows');
     assert.ok(textOf(release.content).startsWith('[Tune-out: disc:guild:a cancelled — agent request, 0 wakes]\n\n'
       + 'The note Subconscious left with an earlier cancel of disc:guild:a was not delivered to scout. This cancel ended '
       + 'that tune-out while that one waited, and delivering the note then failed: the store refused the row (test).\n\n'
@@ -552,6 +554,8 @@ test("65 follow-up (Isaac-3593; Ivy-3594, round 8): a queued note of the all-exc
     assert.equal(release.forAgent, undefined);
     assert.equal(release.metadata?.scope, 'all-except');
     assert.equal(release.metadata?.epochId, a);
+    assert.equal(release.metadata?.lostNote, true, 'marked as telling the loss, for a boot to read (Weft, pin)');
+    assert.ok(release.metadata?.released, 'premise: a release with rows');
     assert.ok(textOf(release.content).startsWith('[Tune-out: all channels except disc:guild:x released — the excepted channel was closed, 0 wakes]\n\n'
       + 'The note Subconscious left with an earlier cancel of the all-except hold (all channels except disc:guild:x) was not '
       + 'delivered to scout. This cancel ended that hold while that one waited, and delivering the note then failed: '
@@ -846,10 +850,10 @@ test("65 follow-up (Isaac-3593, round 3; Ivy-3594, rounds 6 and 8): the subconsc
       + `when it starts again that any cancel of ${hold} then waiting was lost, with any note left with it.`;
     assert.deepEqual(
       await h.coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'disc:guild:a', serverId: 'disc', text: 'Look here.' }, [], 'Subconscious'),
-      { success: true, data: { waiting: true, note: `${waits}The tune-out stays in force until then, and what it held is delivered when it ends. ${stop}${kept('the tune-out')}` } });
+      { success: true, data: { waiting: true, serverId: 'disc', note: `${waits}The tune-out stays in force until then, and what it held is delivered when it ends. ${stop}${kept('the tune-out')}` } });
     assert.deepEqual(
       await h.coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'disc:guild:a', serverId: 'disc' }, [], 'Subconscious'),
-      { success: true, data: { waiting: true, note: `${waits}The tune-out stays in force until then, and what it held is delivered when it ends. ${stop}` } },
+      { success: true, data: { waiting: true, serverId: 'disc', note: `${waits}The tune-out stays in force until then, and what it held is delivered when it ends. ${stop}` } },
       'control: with no note of its own, nothing is said of one');
     h.state.held = false;
     h.coordinator.runDeferredCancels();
@@ -1121,7 +1125,7 @@ test("65 follow-up (Isaac-3593, round 3): a reader fork's cancel_tuneout that wa
     h.state.held = true;
     const answer = await h.coordinator.handleSubconsciousTool('cancel_tuneout',
       { channelId: 'disc:guild:a', serverId: 'disc', text: 'Someone asked for you.' }, [], 'reader-1', { epochId: a });
-    assert.deepEqual(answer, { success: true, data: { waiting: true, note:
+    assert.deepEqual(answer, { success: true, data: { waiting: true, serverId: 'disc', note:
       'Not cancelled yet: an operator\'s change to the store is in progress, or a context the cancel writes to '
       + 'refuses writes until the host re-initializes it, so the cancel waits until that is over. Cancelling again '
       + 'doesn\'t end the wait sooner, and how long it lasts isn\'t known here. The tune-out stays in force until '
@@ -1238,6 +1242,9 @@ test("65 follow-up (Ivy-3594, round 8, the stop stamp): a boot that finds no sta
   const booted: TuneOutCoordinator[] = [];
   const boot = (): void => { const next = g.reboot(); booted.push(next); next.resumeActiveEpochs(); };
   try {
+    // An earlier boot of this version stamped its run (covering no hold): a
+    // crash after it leaves that stamp, which doesn't cover the holds.
+    g.coordinator.resumeActiveEpochs();
     const a = g.enter();
     const b = g.enterScope();
     boot();
@@ -1257,8 +1264,6 @@ test("65 follow-up (Ivy-3594, round 8, the stop stamp): a boot that finds no sta
     boot();
     assert.equal(g.lossNotices().length, before, 'the next boot, covered by the stamp, writes none');
     assert.deepEqual(g.states.get('tune-out/scout/stop-stamp'), { v: 1, epochs: [], runStartedAt: 2 }, 'and stamps its own run as covering none');
-    boot();
-    assert.equal(g.lossNotices().length, before + 2, 'so a later boot with no stop of its own writes them again');
   } finally {
     g.coordinator.stop();
     for (const next of booted) next.stop();
