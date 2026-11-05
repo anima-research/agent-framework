@@ -27,8 +27,9 @@
   and doesn't wait. A turn that had finished when `stop()` began still routes
   its speech, and `stop()` waits for those answers in the same way, except
   an ephemeral run's, whose stream its run's end leaves to finish on its own:
-  its receipt can come after the run returns, and a `stop()` before it comes
-  loses it.
+  when its reply ends the run, its receipt can come after the run returns, and
+  a `stop()` before it comes loses it; when a tool ends it, it writes no
+  receipt, as before, and a place a module names for its speech is logged.
 - `SpeechRoutedContext`: `final` (the turn's final reply: its speech after
   its last tool call, a refused XML attempt or a call cut off unrun being
   none), `turnId`, and

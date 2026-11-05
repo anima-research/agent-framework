@@ -1307,6 +1307,92 @@ describe('plain speech a module says it showed', () => {
     }
   });
 
+  for (const where of ["a heartbeat's turn with no locus", 'a reply with no destination'] as const) it(`hybrid plain words of ${where} that a replaced agent writes after another agent took its name are held as a draft, as before, and no module is asked about them`, async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const surface = new Surface();
+    const f = await host([surface], new MockMembrane(), { proseRouting: 'hybrid' });
+    await f.start();
+    const internal = f as unknown as {
+      agents: Map<string, unknown>;
+      routingOf(name: string): { heartbeat?: true; drafts: Array<{ id: string }> };
+      deliverHybridProse(agent: unknown, rawText: string, locus: null, allowLocus: boolean, round: unknown): Promise<void>;
+    };
+    const original = internal.agents.get('resident');
+    const routing = internal.routingOf('resident');
+    const heartbeat = where === "a heartbeat's turn with no locus";
+    if (heartbeat) routing.heartbeat = true;
+    internal.agents.set('resident', { name: 'resident' });
+    try {
+      await internal.deliverHybridProse(original, 'Kept for later.', null, heartbeat, { routing, notice: 'later' });
+      assert.equal(routing.drafts.length, 1, `it's held as a draft: ${errors.join('\n')}`);
+      assert.deepEqual(surface.asked, [], 'no module is asked about it');
+    } finally {
+      internal.agents.set('resident', original);
+    }
+  });
+
+  it("a hybrid reply that meets the replacement still holds as a draft the later words a send in its turn silenced", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const surface = new Surface();
+    const f = await host([surface], new MockMembrane(), { proseRouting: 'hybrid' });
+    const { server, published } = channelServer(true);
+    const registry = internals(f).channelRegistry;
+    registry.serverRegistry = { getServer: () => server };
+    registry.ensureChannelRegistered('srv', 'room', 'room');
+    registry.ensureChannelRegistered('srv', 'elsewhere', 'elsewhere');
+    await f.start();
+    const internal = f as unknown as {
+      agents: Map<string, unknown>;
+      routingOf(name: string): { drafts: Array<{ id: string }> };
+      routeSilencedHybrid(agent: unknown, segments: string[], sends: unknown, draftsCause: boolean, round: unknown, locus: null, when: number): Promise<boolean>;
+    };
+    const original = internal.agents.get('resident');
+    const elsewhere = { serverId: 'srv', channelId: 'elsewhere' };
+    const sends = { places: new Map([[JSON.stringify(['srv', 'elsewhere']), { to: elsewhere, tool: 'channel_publish', delivered: true, round: 0 }]]) };
+    const routing = internal.routingOf('resident');
+    internal.agents.set('resident', { name: 'resident' });
+    try {
+      const held = await internal.routeSilencedHybrid(original, ['>>>room Meant for the room.\n>>>elsewhere Set aside for there.'], sends, false, { routing, notice: 'later' }, null, 0);
+      assert.equal(held, true, `the words for the silenced place are held: ${errors.join('\n')}`);
+      assert.equal(routing.drafts.length, 1, 'one draft');
+      assert.deepEqual(published, [], 'nothing is posted for the replacement');
+      assert.deepEqual(surface.asked, [], 'no module is asked about either');
+      assert.ok(errors.includes(`[prose] resident: replaced while its reply was routed; ${'>>>room Meant for the room.'.length} chars not routed for the replacement`), errors.join('\n'));
+    } finally {
+      internal.agents.set('resident', original);
+    }
+  });
+
+  it("explicit routing's envelopes that a replaced agent routes after another agent took its name aren't posted", async (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+    const surface = new Surface();
+    const f = await host([surface], new MockMembrane(), { proseRouting: 'explicit' });
+    const { server, published } = channelServer(true);
+    const registry = internals(f).channelRegistry;
+    registry.serverRegistry = { getServer: () => server };
+    registry.ensureChannelRegistered('srv', 'room', 'room');
+    await f.start();
+    const internal = f as unknown as {
+      agents: Map<string, unknown>;
+      deliverProse(agent: unknown, rawText: string): Promise<void>;
+    };
+    const original = internal.agents.get('resident');
+    const posted = (): Array<string | undefined> => published.map((p) => p.text);
+    internal.agents.set('resident', { name: 'resident' });
+    try {
+      await internal.deliverProse(original, '>>room First for the room.\n>>room Second for it.');
+      assert.deepEqual(posted(), [], 'neither is posted for the replacement');
+      assert.equal(errors.filter((e) => e.startsWith('[prose] resident: replaced while its reply was routed;')).length, 2, errors.join('\n'));
+    } finally {
+      internal.agents.set('resident', original);
+    }
+    await internal.deliverProse(original, '>>room Third, from the agent itself.');
+    assert.deepEqual(posted(), ['Third, from the agent itself.'], 'premise: the agent that holds its name posts there');
+  });
+
   it("a module's synchronous work before its hook returns counts toward the bound", async (t) => {
     const surface = new Surface();
     surface.answer = 'hang';

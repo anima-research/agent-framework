@@ -1368,7 +1368,8 @@ for (const joins of ['a merged start holding it'] as const) for (const own of ['
         "premise: the start is led by its batch's retry member, so a wake equal to the start equals that member");
       const wake: Record<string, unknown> = { ...(own === 'none of its own' ? {} : { openingMessages: ['zz-own message'] }), zzJoined: true };
       for (const key of identityKeys) if (start[key] !== undefined) wake[key] = start[key];
-      const joining: Record<string | symbol, unknown> = { ...wake, [batchKey]: [wake] };
+      const also: Record<string, unknown> = { ...wake, timestamp: (wake.timestamp as number) + 7, zzJoined: false, zzAlso: true };
+      const joining: Record<string | symbol, unknown> = { ...wake, [batchKey]: [wake, also] };
       (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, joining);
       assert.equal(held.length, 1, 'premise: the hold folds it into the held start');
       assert.equal((start[batchKey] as unknown[]).filter((member) => member === wake).length, 1, 'the wake is a member of its own');
@@ -1376,6 +1377,7 @@ for (const joins of ['a merged start holding it'] as const) for (const own of ['
       assert.equal(fw.abortInference('resident', 'zz-operator stop'), true);
       const back = (internal as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests;
       assert.equal(back.filter((r) => r.zzJoined === true).length, 1, 'the abort puts the wake back, once');
+      assert.equal(back.filter((r) => r.zzAlso === true).length, 1, "the joining start's other wake comes back, once");
       go();
     } finally { await fw.stop(); log.restore(); }
   });
@@ -1427,13 +1429,16 @@ test("a retry equal to the wake that leads a held merged start, joining it in a 
       wake.zzOriginal = true;
       const retry: Record<string | symbol, unknown> = { [retryKey]: true, openingMessages: ['zz-retry message'] };
       for (const key of identityKeys) if (start[key] !== undefined) retry[key] = start[key];
-      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, { ...retry, [batchKey]: [retry] });
+      const also: Record<string | symbol, unknown> = { ...retry, [retryKey]: undefined, timestamp: (retry.timestamp as number) + 7, openingMessages: undefined, zzAlso: true };
+      delete also[retryKey];
+      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, { ...retry, [batchKey]: [retry, also] });
       assert.equal(held.length, 1, 'premise: the hold folds it into the held start');
       assert.notEqual(wake[retryKey], true, "the wake doesn't become the turn's retry");
       assert.ok(!(wake.openingMessages as string[] | undefined)?.includes('zz-retry message'), 'the wake took nothing of the retry');
       assert.equal(fw.abortInference('resident', 'zz-operator stop'), true);
       const back = (internal as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests;
       assert.equal(back.filter((r) => r.zzOriginal === true).length, 1, 'the abort puts the wake back, once');
+      assert.equal(back.filter((r) => r.zzAlso === true).length, 1, "the joining start's other wake comes back, once");
       go();
     } finally { await fw.stop(); log.restore(); }
   });
@@ -1491,18 +1496,17 @@ test("a wake held on its own, that an equal start with no retry folds into, keep
       const hold = (request: unknown) => (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, request);
       const wake: Record<string | symbol, unknown> = { ...identity, zzHeld: true };
       const equal = { ...identity, zzEqual: true };
-      const restart = { ...identity, reason: 'context_budget_restart', timestamp: (identity.timestamp as number) + 3, zzRestart: true };
       const other = { ...identity, timestamp: (identity.timestamp as number) + 7, zzOther: true };
       held.length = 0;
       held.push(wake);
-      hold({ ...identity, [batchKey]: [equal, restart, other] });
+      hold({ ...identity, [batchKey]: [equal, other] });
       assert.equal(held.length, 1, 'premise: the start folds into the held wake');
       assert.equal(held[0], wake, 'premise: the held wake is the one kept');
-      assert.deepEqual(wake[batchKey], [equal, restart, other], "the start's members, each kept");
+      assert.deepEqual(wake[batchKey], [equal, other], "the start's members, each kept");
       assert.equal(fw.abortInference('resident', 'zz-operator stop'), false, 'nothing held carries the turn on');
       assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests[0], wake as unknown as Request, 'the wake stays held');
       const back = (internal as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests;
-      assert.equal(back.filter((r) => r.zzHeld === true || r.zzEqual === true || r.zzRestart === true || r.zzOther === true).length, 0, 'nothing is put back');
+      assert.equal(back.filter((r) => r.zzHeld === true || r.zzEqual === true || r.zzOther === true).length, 0, 'nothing is put back');
       go();
     } finally { await fw.stop(); log.restore(); }
   });
@@ -1530,7 +1534,8 @@ for (const start of ['a wake equal to it', 'no member equal to it'] as const) te
       const other = { ...identity, timestamp: (identity.timestamp as number) + 7, zzOther: true };
       held.length = 0;
       held.push(wake);
-      hold({ ...identity, [batchKey]: start === 'a wake equal to it' ? [equal, other] : [other] });
+      const another = { ...identity, timestamp: (identity.timestamp as number) + 9, zzAnother: true };
+      hold({ ...identity, [batchKey]: start === 'a wake equal to it' ? [equal, other] : [other, another] });
       hold({ ...identity, [retryKey]: true, zzRetry: true });
       assert.equal(held.length, 1, 'premise: both fold into the held wake');
       assert.equal(held[0], wake, 'premise: the held wake is the one kept');
@@ -1539,6 +1544,7 @@ for (const start of ['a wake equal to it', 'no member equal to it'] as const) te
       assert.equal(back.filter((r) => r.zzHeld === true).length, 0, "the held wake is the retry's event, which the abort ends");
       assert.equal(back.filter((r) => r.zzOther === true).length, 1, "the start's other wake comes back, once");
       assert.equal(back.filter((r) => r.zzEqual === true).length, start === 'a wake equal to it' ? 1 : 0, "the start's equal wake comes back, once");
+      assert.equal(back.filter((r) => r.zzAnother === true).length, start === 'a wake equal to it' ? 0 : 1, "the start's second wake comes back, once");
       go();
     } finally { await fw.stop(); log.restore(); }
   });

@@ -19,11 +19,11 @@
   carries `text`, the words routed, so a host that logs that info logs the
   agent's speech.
 - **Hosts:** once another agent holds an agent's name, plain speech the
-  replaced agent routes after that, under prose routing by locus or hybrid,
-  a piece with a channel and a `>>>` envelope's target included, is neither
-  asked about nor routed under that name, where it was routed; each stop is
-  logged with the agent's name and how many characters weren't routed for
-  the replacement.
+  replaced agent routes after that, under locus, locked, hybrid or explicit
+  prose routing, a piece with a channel and an envelope's named target
+  included, is neither asked about nor routed under that name, where it was
+  routed; each stop is logged with the agent's name and how many characters
+  weren't routed for the replacement. Its tool calls go as before.
 - **Residents:** speech routed with no channel that no module says it showed
   still gets `[send-undeliverable]`, except an ephemeral run's, which gets
   none, as before; the notice now names the piece by its opening words,

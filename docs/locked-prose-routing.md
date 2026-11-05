@@ -127,8 +127,9 @@ same reason.
 - Notices name `prose_locus`, and the `drafts` tool, only where the
   resident's `allowedTools` let it call them.
 - A turn whose plain speech was delivered or held ends with its `[delivered]`
-  receipt. A post that fails gets the failure marker, and the receipt names
-  no channel for it, only any place where a module said it showed it.
+  receipt. A post that fails gets the failure marker instead; a receipt, when
+  the turn writes one, names no channel for it, only any place where a module
+  said it showed it.
 
 Leaving locked mode keeps the stored lock, which applies again if the agent
 returns to locked mode.
