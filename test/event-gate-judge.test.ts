@@ -3007,6 +3007,45 @@ describe('the framework wires the reply judge', () => {
     }
   });
 
+  it("lists a provider hold or wait as a maybe when only a start whose only causes are deferred batches makes it hold a wake, and as certain beside an unread held request", async (t) => {
+    const { MembraneError } = await import('@animalabs/membrane');
+    const { createMockResponse } = await import('./helpers/mock-membrane.js');
+    const { framework, membrane } = await judgeFramework(t, {}, { providerHold: () => ({ holdMs: 60_000, reason: 'weekly quota spent' }) });
+    const internal = framework as unknown as {
+      withAuxiliaryAdmission<T>(agentName: string, run: () => Promise<T>, model?: string): Promise<T>;
+      pendingRequests: Array<Record<string, unknown>>;
+      processInferenceRequests(): Promise<void>;
+      providerGates: Map<string, { primaryDepth: number; auxiliaryInFlight: number }>;
+      providerAccelerationCooldowns: Map<string, { heldRequests: unknown[]; auxiliaryOrigin?: boolean }>;
+      holdProviderAcceleration(agent: unknown, error: Error, trigger?: unknown, auxiliary?: boolean): boolean;
+      recordProviderWait(agentName: string, model: string, error: Error): unknown;
+      upcomingWakesFor(agentName: string): Array<{ at?: number; when?: string; certain: boolean; what: string }>;
+    };
+    let finish!: () => void;
+    const auxiliary = internal.withAuxiliaryAdmission('scout', () => new Promise<void>((resolve) => { finish = resolve; }));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    internal.pendingRequests.push({ agentName: 'scout', reason: 'a deferred batch', source: 'test', timestamp: Date.now(), coalescingBatch: true, coalescingSubject: 'zz-batch' });
+    await internal.processInferenceRequests();
+    const gate = internal.providerGates.get('scout')!;
+    assert.deepStrictEqual([gate.auxiliaryInFlight, gate.primaryDepth, internal.pendingRequests.length], [1, 1, 0], 'premise: the start waits behind the auxiliary call');
+    internal.holdProviderAcceleration(framework.getAgent('scout'), new MembraneError({ type: 'rate_limit', retryable: true, message: 'quota spent', rawError: { status: 429 } }), undefined, true);
+    const hold = internal.providerAccelerationCooldowns.get('scout');
+    assert.deepStrictEqual([hold?.auxiliaryOrigin, hold?.heldRequests.length], [true, 0], "premise: an auxiliary call's hold, holding nothing");
+    assert.deepStrictEqual(internal.upcomingWakesFor('scout').map((w) => [w.certain, w.what]), [
+      [false, 'a start held by a provider hold, which starts no turn if its deferred pushes give it nothing to read'],
+    ]);
+    hold!.heldRequests.push({ agentName: 'scout', reason: 'zz a held wake', source: 'test', timestamp: Date.now() });
+    assert.deepStrictEqual(internal.upcomingWakesFor('scout').map((w) => [w.certain, w.what]), [[true, 'a wake held by a provider hold, when it ends']]);
+    hold!.heldRequests.length = 0;
+    internal.providerAccelerationCooldowns.delete('scout');
+    assert.ok(internal.recordProviderWait('scout', 'test-model', new MembraneError({ type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 3_600_000, message: 'slow down', rawError: { status: 429 } })), "premise: a wait on scout's model");
+    assert.deepStrictEqual(internal.upcomingWakesFor('scout').map((w) => [w.certain, w.what]), [
+      [false, 'a start held by a provider hold, which starts no turn if its deferred pushes give it nothing to read'],
+    ], 'under a recorded wait alone, too');
+    finish();
+    await auxiliary;
+  });
+
   it('lists a start that waits behind an auxiliary call, with nothing else queued, as a wake on its way', async (t) => {
     const { createMockResponse } = await import('./helpers/mock-membrane.js');
     const { framework, membrane } = await frameworkWith(t, { config: JUDGED, judge: {} });
