@@ -1746,16 +1746,17 @@ export class TuneOutCoordinator {
    * read (readLossRecord, tried again first). A write that fails is logged,
    * and the notices stay kept in memory, written or tried again as before;
    * a stop meanwhile loses them. At `stop`, written whenever one is kept,
-   * held writes or not, and answers whether the record holds them. Never
-   * throws.
+   * held writes or not, and answers whether the record holds them. At
+   * `boot`, written where they changed, held writes or not, as the boot's
+   * stamp is (noteUnstampedStop). Never throws.
    */
-  private writeLossRecord(at?: 'stop'): boolean {
+  private writeLossRecord(at?: 'stop' | 'boot'): boolean {
     try {
       const notices = this.persistedLossNotices();
       const shape = JSON.stringify(notices);
       if (at !== 'stop' && shape === this.lossRecordShape && !this.lossRecordStale) return true;
       if (at === 'stop' && notices.length === 0 && !this.lossRecordStale && !this.lossRecordUnread) return true;
-      if (at !== 'stop' && this.writesHeldNow()) {
+      if (at === undefined && this.writesHeldNow()) {
         this.lossRecordStale = true;
         return false;
       }
@@ -1985,13 +1986,13 @@ export class TuneOutCoordinator {
       // this boot's (`bootHead`), so a release this boot made isn't read as
       // the last run's.
       const notes = new Map<string, number>();
-      const releases = new Map<string, Array<{ sequence: number; source?: string; reason?: string }>>();
+      const releases = new Map<string, Array<{ sequence: number; source?: string; reason?: string; by?: string }>>();
       const toldInRelease = new Set<string>();
       try {
         for (const m of this.hooks.getStoredMessages()) {
           if (since !== undefined && typeof m.sequence === 'number' && m.sequence <= since) continue;
           if (bootHead !== undefined && typeof m.sequence === 'number' && m.sequence > bootHead) continue;
-          const meta = m.metadata as { kind?: unknown; epochId?: unknown; lostNote?: unknown; cancel?: { source?: unknown; reason?: unknown } } | undefined;
+          const meta = m.metadata as { kind?: unknown; epochId?: unknown; lostNote?: unknown; cancel?: { source?: unknown; reason?: unknown; by?: unknown } } | undefined;
           if (typeof meta?.epochId !== 'string') continue;
           if (meta.kind === 'subconscious-note') notes.set(meta.epochId, Math.max(notes.get(meta.epochId) ?? -Infinity, m.sequence));
           else if (meta.kind === 'tune-out-cancel') {
@@ -2000,6 +2001,7 @@ export class TuneOutCoordinator {
               sequence: m.sequence,
               ...(typeof meta.cancel?.source === 'string' ? { source: meta.cancel.source } : {}),
               ...(typeof meta.cancel?.reason === 'string' ? { reason: meta.cancel.reason } : {}),
+              ...(typeof meta.cancel?.by === 'string' ? { by: meta.cancel.by } : {}),
             }]);
           }
         }
@@ -2020,16 +2022,21 @@ export class TuneOutCoordinator {
         console.error(`[tune-out] the tool-result guard's audit could not be read at boot, so a result it withheld isn't read from it: ${thrownReason(err)}`);
       }
       const asks = cancelAsksIn(window, author, archived);
-      // What it was told of a hold's unrecorded stop already, and when: its
-      // rows (by their sequence), and notices kept to be written (by the
-      // store's head when kept; one kept with none counts as told now).
+      // What it was told of a hold's unrecorded stop already, and when: by
+      // the store's head when the boot that told it decided it
+      // (keptAtSequence), on its row or on a notice kept to be written; a
+      // row with none by its own sequence, a kept notice with none as told
+      // now. A notice written late, its writes held, was told then.
       const toldBefore = (epochId: string): Array<{ found: UnstampedStop['found']; note?: string; at: number }> => [
         ...window.flatMap((m) => {
-          const meta = m.metadata as { kind?: unknown; epochId?: unknown; stopUnrecorded?: { found?: unknown; note?: unknown } } | undefined;
+          const meta = m.metadata as { kind?: unknown; epochId?: unknown; stopUnrecorded?: { found?: unknown; note?: unknown; keptAtSequence?: unknown } } | undefined;
           if (meta?.kind !== 'tune-out-note-undelivered' || meta.epochId !== epochId || !meta.stopUnrecorded) return [];
           const found = meta.stopUnrecorded.found;
           return found === 'delivered' || found === 'ran' || found === 'asked' || found === 'unknown'
-            ? [{ found: found as UnstampedStop['found'], ...(typeof meta.stopUnrecorded.note === 'string' ? { note: meta.stopUnrecorded.note } : {}), at: m.sequence }] : [];
+            ? [{
+              found: found as UnstampedStop['found'], ...(typeof meta.stopUnrecorded.note === 'string' ? { note: meta.stopUnrecorded.note } : {}),
+              at: typeof meta.stopUnrecorded.keptAtSequence === 'number' ? meta.stopUnrecorded.keptAtSequence : m.sequence,
+            }] : [];
         }),
         ...(this.lossNotices.get(author) ?? []).flatMap((n) => (n.drop.reason === 'unstamped-stop' && n.for.epochId === epochId
           ? [{ found: n.drop.found, ...(n.drop.note !== undefined ? { note: n.drop.note } : {}), at: n.keptAtSequence ?? Infinity }] : [])),
@@ -2052,7 +2059,11 @@ export class TuneOutCoordinator {
         // told from none by any store; it is kept for the reading's sake.
         const after = asked ? asked.sequence : Math.max(hold.startedAt ?? -Infinity, since ?? -Infinity);
         const ranAfter = (releases.get(epochId) ?? []).filter((r) => r.sequence > after);
-        const own = ranAfter.some((r) => r.source === 'subconscious');
+        // The subconscious's own cancel: one its tool asked for (`subconscious`)
+        // under its own name, or under none; a reader fork's, under the
+        // fork's, is another's, as anyone else's is.
+        const own = ranAfter.some((r) => r.source === 'subconscious' && (r.by === undefined || r.by === author));
+        // Credited to the latest that ran.
         const by = own ? undefined : ranAfter.at(-1);
         const noteAt = notes.get(epochId);
         const drop: UnstampedStop = ranAfter.length > 0
@@ -2093,6 +2104,14 @@ export class TuneOutCoordinator {
         this.lossNotices.set(author, [...(this.lossNotices.get(author) ?? []), notice]);
       }
       this.writeLossNotices(author);
+      // Kept, not written (writes held, or the subconscious's context
+      // refusing them), each is kept in the store at once, held writes or
+      // not, as the boot's stamp is: a crash before the writes land then
+      // leaves it for the next boot's replay (restoreLossNotices), whose scan
+      // reads only the run that crashed. Where the store refuses the record
+      // too, it is tried again when writes land (writeLossNotices); a crash
+      // before then loses it, which nothing here can help.
+      this.writeLossRecord('boot');
       if (this.lossNotices.size > 0) this.armDeferredRetry();
     } catch (err) {
       console.error(`[tune-out] whether the last stop recorded the holds on record could not be checked at boot: ${thrownReason(err)}`);
@@ -2362,7 +2381,12 @@ export class TuneOutCoordinator {
         {
           system: true, kind: 'tune-out-note-undelivered', channelId, epochId, ...(scope ? { scope } : {}),
           // What an unrecorded stop's notice told, for a later boot (noteUnstampedStop).
-          ...(drop.reason === 'unstamped-stop' ? { stopUnrecorded: { found: drop.found, ...(drop.note !== undefined ? { note: drop.note } : {}) } } : {}),
+          // When the boot decided it (keptAtSequence), which a later boot
+          // reads as when it was told, though it was written later.
+          ...(drop.reason === 'unstamped-stop' ? { stopUnrecorded: {
+            found: drop.found, ...(drop.note !== undefined ? { note: drop.note } : {}),
+            ...(notice.keptAtSequence !== undefined ? { keptAtSequence: notice.keptAtSequence } : {}),
+          } } : {}),
         },
         author,
       );
@@ -2642,7 +2666,15 @@ export class TuneOutCoordinator {
     noteAuthor: string | undefined,
     nextState: 'open' | 'closed',
     asQueued?: DeferredCancel,
+    /**
+     * Who asked for the cancel, by the name it runs under, which its release
+     * records: left out, the note's author, as a direct call's is; `null`,
+     * no one named (a queued run of a cancel asked for under no name, whose
+     * entry may carry a later caller's note).
+     */
+    askedBy?: string | null,
   ): { ok: true; deferred?: true; noteDropped?: true } | { ok: false; error: string } {
+    const caller = askedBy === undefined ? noteAuthor : askedBy ?? undefined;
     const ending = this.channelRegistry.getTuneOutState(serverId, channelId);
     if (!ending) {
       // Its reader is the resident's tune_out: cancel_tuneout finds the channel first.
@@ -2655,7 +2687,7 @@ export class TuneOutCoordinator {
         current: () => this.channelRegistry.getTuneOutState(serverId, channelId)?.params.epochId,
       };
       const kept = this.deferCancel(this.key(serverId, channelId), target, `${this.shown(serverId, channelId)} (${reason})`,
-        (entry) => { this.endTuneOut(serverId, channelId, source, reason, entry.note, entry.noteAuthor, nextState, entry); },
+        (entry) => { this.endTuneOut(serverId, channelId, source, reason, entry.note, entry.noteAuthor, nextState, entry, caller ?? null); },
         subconsciousNote, noteAuthor);
       return { ok: true, deferred: true, ...(kept === 'note-dropped' ? { noteDropped: true as const } : {}) };
     }
@@ -2764,7 +2796,7 @@ export class TuneOutCoordinator {
       this.hooks.addMessage(
         'user',
         [{ type: 'text', text: render(lines, truncated) }],
-        { system: true, kind: 'tune-out-cancel', channelId, epochId, released: record, cancel: { source, reason }, ...(lost ? { lostNote: true } : {}) },
+        { system: true, kind: 'tune-out-cancel', channelId, epochId, released: record, cancel: { source, reason, ...(caller !== undefined ? { by: caller } : {}) }, ...(lost ? { lostNote: true } : {}) },
       );
       records.push(record);
     } else if (lost) {
@@ -2772,7 +2804,7 @@ export class TuneOutCoordinator {
       // loss alone, and covers none (no `released`). `lostNote` marks a
       // release that tells a queued note's loss, as a boot reads it
       // (noteUnstampedStop).
-      this.hooks.addMessage('user', [{ type: 'text', text: lifecycle }], { system: true, kind: 'tune-out-cancel', channelId, epochId, cancel: { source, reason }, lostNote: true });
+      this.hooks.addMessage('user', [{ type: 'text', text: lifecycle }], { system: true, kind: 'tune-out-cancel', channelId, epochId, cancel: { source, reason, ...(caller !== undefined ? { by: caller } : {}) }, lostNote: true });
     }
     // Told, in the release written: not delivered or told again, even if
     // the release isn't made durable below and the queued cancel runs later.
@@ -3187,7 +3219,10 @@ export class TuneOutCoordinator {
     note: string | undefined,
     noteAuthor: string | undefined,
     asQueued?: DeferredCancel,
+    /** Who asked for the cancel, as endTuneOut's. */
+    askedBy?: string | null,
   ): { ok: true; deferred?: true; noteDropped?: true } | { ok: false; error: string } {
+    const caller = askedBy === undefined ? noteAuthor : askedBy ?? undefined;
     const scope = this.getAllExcept();
     if (!scope) return { ok: false, error: 'no all-except hold is active' };
     // As a channel's cancel: while writes are kept in memory, the release
@@ -3198,7 +3233,7 @@ export class TuneOutCoordinator {
         scope: 'all-except', current: () => this.getAllExcept()?.params.epochId,
       };
       const kept = this.deferCancel(TuneOutCoordinator.SCOPE_KEY, target, `the all-except hold (${reason})`,
-        (entry) => { this.endAllExcept(source, reason, entry.note, entry.noteAuthor, entry); },
+        (entry) => { this.endAllExcept(source, reason, entry.note, entry.noteAuthor, entry, caller ?? null); },
         note, noteAuthor);
       return { ok: true, deferred: true, ...(kept === 'note-dropped' ? { noteDropped: true as const } : {}) };
     }
@@ -3258,11 +3293,11 @@ export class TuneOutCoordinator {
       this.hooks.addMessage(
         'user',
         [{ type: 'text', text: `${header}\n\n${summary}${dumps.length > 0 ? '\n\n' + dumps.join('\n\n') : ''}` }],
-        { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId, released: record, cancel: { source, reason }, ...(lost ? { lostNote: true } : {}) },
+        { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId, released: record, cancel: { source, reason, ...(caller !== undefined ? { by: caller } : {}) }, ...(lost ? { lostNote: true } : {}) },
       );
     } else if (lost) {
       this.hooks.addMessage('user', [{ type: 'text', text: header }],
-        { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId, cancel: { source, reason }, lostNote: true });
+        { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId, cancel: { source, reason, ...(caller !== undefined ? { by: caller } : {}) }, lostNote: true });
     }
     if (first?.lost) first.entry.noteSettled = true;
     if (this.hooks.commitDeliveries?.() === false) {
