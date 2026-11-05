@@ -53,14 +53,17 @@
   request, as without it.
 - An agent's own system changes are those stored with the change metadata
   (`systemChangeMetadata`) of its name or one of its `selfParticipants`, and
-  for an agent that continues another's context, those its source counts as
-  its own, since its view keeps them and its every request carries them. Its
-  compile under `'entries'` keeps them where it leaves out another's, it
-  folds them onto its head to find what it declares, prices them for
-  consolidation, and in either mode they're the rows a move of its head
-  takes out of its own branch (on `'head'`, once its recorded head is
-  cleared). A child `deriveAgent` makes already counts its parent's through
-  `selfParticipants`, and a host's shared child counts them the same way.
+  for an agent that shares another's context on a branch of its own, those
+  its source counts as its own, since its view keeps them and its requests
+  under `'entries'` carry them. Its compile under `'entries'` keeps them
+  where it leaves out another's, it folds them onto its head to find what it
+  declares, prices them for consolidation, and in either mode they're the
+  rows a move of its head takes out of its own branch (on `'head'`, once its
+  recorded head is cleared). A shared child `deriveAgent` makes already
+  counts its parent's, since its parent is among its `selfParticipants`; a
+  host's shared child, whose `selfParticipants` needn't name its parent,
+  counts them through the owners the framework gives it as it's created or
+  resumed.
 - A subconscious on another model than its resident, as the persistent
   reader or as a reader fork, declares its tools and system text on its
   head, whatever the resident's `toolDeclarations`. A reader fork on the
