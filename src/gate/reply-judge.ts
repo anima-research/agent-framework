@@ -191,12 +191,12 @@ function renderBlock(block: ContentBlock): string {
     case 'video':
       return '[video]';
     case 'tool_use':
-      return `[calls ${oneLine(block.name)}] ${cut(safeJson(block.input), MAX_TOOL_CHARS)}`;
+      return `[calls ${oneLine(String(block.name))}] ${cut(safeJson(block.input), MAX_TOOL_CHARS)}`;
     case 'tool_result': {
       const body = typeof block.content === 'string'
         ? unlabelled(block.content)
         : block.content.map((b) => (b.type === 'text' ? unlabelled(b.text) : `[${b.type}]`)).join('\n');
-      return `[${oneLine(block.toolName ?? 'tool')} ${block.isError ? 'failed' : 'returned'}] ${cut(body, MAX_TOOL_CHARS)}`;
+      return `[${oneLine(String(block.toolName ?? 'tool'))} ${block.isError ? 'failed' : 'returned'}] ${cut(body, MAX_TOOL_CHARS)}`;
     }
     default:
       // thinking, redacted thinking, system changes: not the conversation.

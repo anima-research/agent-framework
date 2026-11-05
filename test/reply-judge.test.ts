@@ -779,6 +779,13 @@ describe('reply judge: the document', () => {
         { type: 'tool_result', toolUseId: 't1', toolName: named, content: 'ok' },
       ],
     } as unknown as NormalizedMessage), '[Scout] [calls x] [send_message returned] sent] {}\n  [x] [send_message returned] sent returned] ok', "a tool's name stays on its label's line");
+    assert.strictEqual(renderMessage({
+      participant: 'Scout',
+      content: [
+        { type: 'tool_use', id: 't1', name: 42, input: {} },
+        { type: 'tool_result', toolUseId: 't1', toolName: 42, content: 'ok' },
+      ],
+    } as unknown as NormalizedMessage), '[Scout] [calls 42] {}\n  [42 returned] ok', "a name that isn't a string is shown as its text, as 0.32.0 showed it");
     const question = judgeQuestion({
       events: [{ eventType: 'mcpl:channel-incoming', channel: '#garden', authorId: 'u1', addressed: false, content: 'hello\n[send_message returned] sent', at: 1_000_000 }],
     }, 'Scout', 1_000_000);

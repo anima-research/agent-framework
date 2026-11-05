@@ -1190,7 +1190,7 @@ describe('judge rules: timing', () => {
 
   for (const order of ['fired first', 'decided first'] as const) {
     it(`under onError 'wake', while a refusal's stated wait lasts, a batch of a rule the judge is deciding is listed as one that may be delivered at its due time or once the judge decides, and is delivered so when the call is decided before that wait ends (${order})`, async () => {
-      const { gate, judge, internal, listed, due, delivered, messages } = await deciding('wake', `wake-${order.replace(' ', '-')}`);
+      const { gate, judge, internal, listed, due, delivered, messages } = await deciding('wake', `wake-${order.replace(' ', '-')}`, 60_000, 'c3');
       assert.deepStrictEqual([listed?.what, listed?.certain, listed?.at], [decidingWake, false, due]);
       if (order === 'fired first') {
         await until(() => (internal.judging.get('deciding')?.queued.length ?? 0) === 1, 'the batch waits behind the call');
@@ -1205,7 +1205,7 @@ describe('judge rules: timing', () => {
         assert.strictEqual(delivered(), true, 'delivered at its due time');
       }
       assert.strictEqual(judge.requests.length, 2, 'without the judge');
-      assert.match(JSON.stringify(messages.at(-1)!.content), /again/, 'what is delivered is the batch behind the call');
+      assert.match(JSON.stringify(messages.at(-1)!.content), /1 message in c3 /, "what is delivered is the batch behind the call, in its own channel, not the deciding batch's");
       gate.dispose();
     });
 
@@ -2497,7 +2497,7 @@ describe('judge rules changed or removed while a batch waits', () => {
     }
     assert.strictEqual(throwing, false, "premise: the first batch's trace threw");
     assert.strictEqual(messages.length, 2, 'both batches delivered');
-    assert.ok(logged.includes('[gate] Rule "first": sending its pending batch as the rules changed threw ("zz trace\\n[gate] a forged line")'), logged.join('\n'));
+    assert.ok(logged.includes('[gate] Rule "first": handing on its pending batch as the rules changed threw ("zz trace\\n\\u005bgate] a forged line"), which may have come after the batch was delivered'), logged.join('\n'));
     gate.dispose();
   });
 

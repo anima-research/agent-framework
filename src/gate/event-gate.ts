@@ -2964,7 +2964,7 @@ export class EventGate {
       try {
         this.fireDebounce(name);
       } catch (err) {
-        console.error(`[gate] Rule ${quotedValue(name)}: sending its pending batch as the rules changed threw (${quotedValue(errorText(err))})`);
+        console.error(`[gate] Rule ${quotedValue(name)}: handing on its pending batch as the rules changed threw (${quotedValue(errorText(err))}), which may have come after the batch was delivered`);
       }
     }
   }
