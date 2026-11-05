@@ -209,9 +209,10 @@ export interface WakeProvenance {
    *  neither as addressing the agent nor as a channel, except as a
    *  coalesced render's latest occurrence, which the gate takes as a
    *  message (GateEventInfo.folds). The wake has no route, and the turn's
-   *  no-locus notice names those that still name one registered channel when
-   *  its wake is admitted, unless the turn's own wake named a channel that
-   *  resolves to none, or the turn is an ephemeral run's, which writes none. */
+   *  no-locus notice names them, one given without its server only if its id
+   *  still names one registered channel when the wake is admitted, unless the
+   *  turn's own wake named a channel that resolves to none, or the turn is an
+   *  ephemeral run's, which writes none. */
   batchChannels?: Array<{ channelId: string; serverId?: string }>;
   /** Timestamp (ms) of the chosen event, so a consumer coalescing several
    *  requests can order by event recency, not by flush order. */
