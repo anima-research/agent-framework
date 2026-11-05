@@ -6108,7 +6108,8 @@ export class ChannelRegistry {
    * Plain speech for one turn segment: publish `text` to the turn's frozen
    * locus and report the PublishOutcome. A failure (or an uncertain outcome)
    * is surfaced as a trace and through onRouteFailure, so the agent learns
-   * its words did not (or may not have) reached anyone. A `failed` one whose
+   * that this route didn't deliver its words, or didn't confirm it.
+   * A `failed` one whose
    * caller holds its words with a notice of its own (`heldOnFailure`) gets
    * the trace but not onRouteFailure. An ephemeral run's speech with no locus
    * (null) is its caller's result: it returns as not delivered and surfaces
