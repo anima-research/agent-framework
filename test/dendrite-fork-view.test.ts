@@ -561,6 +561,32 @@ describe("a 'head' agent whose compile is refused over budget", () => {
     assert.deepEqual(traces.filter((t) => t.type === 'head:moved' && t.agentName === 'hc'), [], 'and no move');
   });
 
+  it("leaves a resumed 'head' child's change rows where its compile never held them, and the refusal goes on", async () => {
+    const mira = framework.getAgent('mira')!;
+    const [last] = mira.getContextManager().queryMessages({ metadata: { kind: 'system-change', agent: 'mira-old' } }).messages;
+    const atSequence = mira.getContextManager().getMessage(last!.id)!.sequence;
+    const { name: _name, ...spec } = taskForkSpec('hc', { parent: 'mira', inherit: { mode: 'shared', atSequence } });
+    const config = { model: 'test-model', systemPrompt: 'You are hc.' };
+    const hc = await framework.createEphemeralAgent({ name: 'hc', ...config }, spec);
+    hc.contextManager.addMessage('system', change('h'), systemChangeMetadata('hc') as never);
+    hc.contextManager.addMessage('user', [text('Run once.')]);
+    framework.start();
+    membrane.script('hc', say('hc done'));
+    assert.equal((await framework.runEphemeralToCompletion(hc.agent, hc.contextManager)).speech, 'hc done');
+    const resumed = await framework.resumeAgent('hc', config as never);
+    const stored = () => ['mira', 'mira-old', 'hc'].map((owner) => resumed.contextManager.queryMessages({ metadata: { kind: 'system-change', agent: owner } }).messages.length);
+    assert.deepEqual(stored(), [1, 1, 1], "the premise: its branch still holds its source's two rows and its own");
+    let refused = 0;
+    (resumed.contextManager as unknown as { compile: (...args: unknown[]) => Promise<unknown> }).compile = async () => {
+      refused++;
+      throw Object.assign(new Error('over budget'), { name: 'OverBudgetError' });
+    };
+    await assert.rejects(resumed.agent.buildActivationRequest([]), /over budget/, 'refused over budget');
+    assert.equal(refused, 1, 'compiled once');
+    assert.deepEqual(stored(), [1, 1, 1], 'every row left where it was');
+    resumed.cleanup();
+  });
+
   it("leaves a 'head' resident's own change rows where its compile never held them, and the refusal goes on", async () => {
     const nell = framework.getAgent('nell')!;
     nell.getContextManager().addMessage('user', [text('Please look into the open issues.')]);
