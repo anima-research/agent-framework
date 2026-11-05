@@ -1290,7 +1290,7 @@ function gotPartway(routing: TurnRouting): boolean {
 
 const REARM_REASON = 'exhausted-turn-rearm';
 
-type WakesOnTheirWay = { queued: string[]; batchOnly?: string[]; held?: { until?: number; rearm?: { number: number; of: number } } };
+type WakesOnTheirWay = { queued: string[]; batchOnly?: string[]; held?: { until?: number; rearm?: { number: number; of: number }; maybe?: true } };
 
 function mergedBatch(request: InferenceRequest): InferenceRequest[] | undefined {
   return (request as MarkedRequest)[MERGED_BATCH];
@@ -6231,7 +6231,10 @@ export class AgentFramework {
       });
     }
     for (const what of batchOnly) wakes.push({ certain: false, what });
-    if (held) {
+    if (held?.maybe) {
+      const what = 'a start held by a provider hold, which starts no turn if its deferred pushes give it nothing to read';
+      wakes.push(held.until === undefined ? { when: 'when the hold on it is released', certain: false, what } : { at: held.until, certain: false, what });
+    } else if (held) {
       wakes.push(held.until === undefined
         ? { when: 'when the hold on it is released', certain: true, what: 'a wake held by a provider hold' }
         : { at: held.until, certain: true, what: held.rearm
@@ -6271,11 +6274,11 @@ export class AgentFramework {
         const wait = model !== undefined ? this.providerWaits?.active(agentName, model) : undefined;
         const waitHold = cooldown.waitModel !== undefined && model === cooldown.waitModel;
         const until = wait && (waitHold || wait.until === null || wait.until > cooldown.until) ? wait.until : cooldown.until;
-        return { queued: [], held: { ...ends(until), ...(cooldown.rearm ? { rearm: cooldown.rearm } : {}) } };
+        return { queued: [], held: { ...ends(until), ...(cooldown.rearm ? { rearm: cooldown.rearm } : {}), ...(!releaseWakes && queued.length === 0 ? { maybe: true as const } : {}) } };
       }
     }
     const wait = waiting > 0 && model !== undefined ? this.providerWaits?.active(agentName, model) : undefined;
-    if (wait) return { queued: [], held: ends(wait.until) };
+    if (wait) return { queued: [], held: { ...ends(wait.until), ...(queued.length === 0 ? { maybe: true as const } : {}) } };
     return { queued, batchOnly };
   }
 
