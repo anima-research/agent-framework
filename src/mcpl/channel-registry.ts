@@ -1044,9 +1044,8 @@ interface ChannelRegistryOptions {
     serverId?: string;
     reason: string;
     textLen: number;
-    /** The words routed, whichever the outcome; the registry sets it on
-     *  every failure it reports. */
-    text?: string;
+    /** The words routed, whichever the outcome. */
+    text: string;
     /** `failed`: nothing was posted; `unknown`: the request was dispatched
      *  and no valid receipt came back, so it may or may not have been. */
     outcome?: 'failed' | 'unknown';
