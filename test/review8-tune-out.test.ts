@@ -520,6 +520,7 @@ test("65 follow-up (Isaac-3593; Ivy-3594, round 8): the subconscious whose queue
     assert.equal(release.forAgent, undefined, "in the residents' store, which the subconscious's window holds");
     assert.equal(release.metadata?.epochId, a);
     assert.equal(release.metadata?.lostNote, true, 'marked as telling the loss, for a boot to read (Weft, pin)');
+    assert.deepEqual(release.metadata?.cancel, { source: 'agent-tool', reason: 'agent request' }, 'and whose cancel made it (Weft, pin)');
     assert.ok(release.metadata?.released, 'premise: a release with rows');
     assert.ok(textOf(release.content).startsWith('[Tune-out: disc:guild:a cancelled — agent request, 0 wakes]\n\n'
       + 'The note Subconscious left with an earlier cancel of disc:guild:a was not delivered to scout. This cancel ended '
@@ -555,6 +556,7 @@ test("65 follow-up (Isaac-3593; Ivy-3594, round 8): a queued note of the all-exc
     assert.equal(release.metadata?.scope, 'all-except');
     assert.equal(release.metadata?.epochId, a);
     assert.equal(release.metadata?.lostNote, true, 'marked as telling the loss, for a boot to read (Weft, pin)');
+    assert.deepEqual(release.metadata?.cancel, { source: 'channel-close', reason: 'the excepted channel was closed' }, 'and whose cancel made it (Weft, pin)');
     assert.ok(release.metadata?.released, 'premise: a release with rows');
     assert.ok(textOf(release.content).startsWith('[Tune-out: all channels except disc:guild:x released — the excepted channel was closed, 0 wakes]\n\n'
       + 'The note Subconscious left with an earlier cancel of the all-except hold (all channels except disc:guild:x) was not '
