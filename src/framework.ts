@@ -33228,8 +33228,8 @@ export class AgentFramework {
         },
         // A text-only turn whose speech couldn't be delivered must not vanish
         // silently: record a `[discord-send-failed]` marker in chronicle so the
-        // agent sees, on her next turn, that her reply didn't reach the human,
-        // or wasn't confirmed to. addMessage() alone does not request
+        // agent sees, on her next turn, that the framework didn't deliver her
+        // reply there, or didn't confirm it. addMessage() alone does not request
         // inference, so this never wakes her (matching the
         // `discord-send-failed-skip` gate intent: context yes, wake no).
         onRouteFailure: ({ conversationId, channelId, serverId, reason, textLen, text: words, outcome, detail }) => {
