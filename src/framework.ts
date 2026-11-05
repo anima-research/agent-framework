@@ -6658,7 +6658,10 @@ export class AgentFramework {
     if (into || batch) {
       const copy = into ? undefined : { ...same };
       const members = into ? [...into] : [copy!];
-      for (const member of batch ?? [request]) {
+      const joining = batch ?? [request];
+      // Fold the members that carry the turn on before the wakes, so a wake
+      // never joins the copy a retry then takes.
+      for (const member of [...joining.filter(continuesTurn), ...joining.filter((m) => !continuesTurn(m))]) {
         this.holdRequest(members, member, (kept) => continuesTurn(member) ? continuesTurn(kept) || kept === copy : !continuesTurn(kept));
       }
       (same as MarkedRequest)[MERGED_BATCH] = members;
