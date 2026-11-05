@@ -842,7 +842,8 @@ test("65 follow-up (Isaac-3593, round 3; Ivy-3594, rounds 6 and 8): the subconsc
       + 'that too: if the host stops before the notice is written, the host writes it when it starts again, or keeps '
       + 'trying as above. The waiting cancel isn\'t kept in the store: if the host stops before '
       + `${hold} ends, the cancel and your note are lost, and you are told so by such a notice, kept in the store `
-      + 'for the host to write when it starts again, unless the store refuses that too.';
+      + 'for the host to write when it starts again; if the store refuses that too, or the host crashes, you are told '
+      + `when it starts again that any cancel of ${hold} then waiting was lost, with any note left with it.`;
     assert.deepEqual(
       await h.coordinator.handleSubconsciousTool('cancel_tuneout', { channelId: 'disc:guild:a', serverId: 'disc', text: 'Look here.' }, [], 'Subconscious'),
       { success: true, data: { waiting: true, note: `${waits}The tune-out stays in force until then, and what it held is delivered when it ends. ${stop}${kept('the tune-out')}` } });
@@ -1227,6 +1228,42 @@ test("65 follow-up (Ivy-3594, round 8): a stop while a reader fork's cancel wait
   } finally {
     g.coordinator.stop();
     errors.mock.restore();
+  }
+});
+
+test("65 follow-up (Ivy-3594, round 8, the stop stamp): a boot that finds no stamp tells the subconscious, for a channel's hold and the all-except hold on record, that a cancel it asked for then, if any, was lost; a stop's stamp covers both, and the boot stamps its own run as covering none", () => {
+  mock.timers.enable({ apis: ['setTimeout'] });
+  const errors = mock.method(console, 'error', () => {});
+  const g = epochSetup();
+  const booted: TuneOutCoordinator[] = [];
+  const boot = (): void => { const next = g.reboot(); booted.push(next); next.resumeActiveEpochs(); };
+  try {
+    const a = g.enter();
+    const b = g.enterScope();
+    boot();
+    const says = (hold: string, epochId: string, it: string) => `[Tune-out: the host stopped without recording the state of ${hold}${epochId}). `
+      + `If you asked for a cancel of it before the stop, it had not run when the host stopped: it was lost, and any note you left with it. That ${it} is still in force.]`;
+    assert.deepEqual(g.lossNotices().map((m) => [m.forAgent, m.metadata?.epochId, m.metadata?.scope, textOf(m.content)]), [
+      ['Subconscious', a, undefined, says('the tune-out of disc:guild:a (epoch ', a, 'tune-out')],
+      ['Subconscious', b, 'all-except', says('the all-except hold (all channels except disc:guild:x; epoch ', b, 'hold')],
+    ], 'no stop stamped them (a crash): each hold gets the row');
+    assert.deepEqual(g.wakes.filter(([, why]) => why.startsWith('tune-out stop not recorded')),
+      [['Subconscious', 'tune-out stop not recorded: disc:guild:a'], ['Subconscious', 'tune-out stop not recorded: all-except']], 'with a turn to read it');
+    assert.deepEqual(g.traces.filter((t) => t.type === 'tune-out:stop-unrecorded').map((t) => [t.epochId, t.scope, t.noteAuthor, t.found]),
+      [[a, undefined, 'Subconscious', 'unknown'], [b, 'all-except', 'Subconscious', 'unknown']], 'traced, nothing found of a note');
+    const before = g.lossNotices().length;
+    booted.at(-1)!.stop();
+    assert.deepEqual(g.states.get('tune-out/scout/stop-stamp'), { v: 1, epochs: [a, b], runStartedAt: 2 }, "the stop stamps both, with its run's start");
+    boot();
+    assert.equal(g.lossNotices().length, before, 'the next boot, covered by the stamp, writes none');
+    assert.deepEqual(g.states.get('tune-out/scout/stop-stamp'), { v: 1, epochs: [], runStartedAt: 2 }, 'and stamps its own run as covering none');
+    boot();
+    assert.equal(g.lossNotices().length, before + 2, 'so a later boot with no stop of its own writes them again');
+  } finally {
+    g.coordinator.stop();
+    for (const next of booted) next.stop();
+    errors.mock.restore();
+    mock.timers.reset();
   }
 });
 

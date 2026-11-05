@@ -18131,6 +18131,68 @@ export class AgentFramework {
   }
 
   /**
+   * The rows of the persistent subconscious's window that `keep` keeps and
+   * that come after its last row of its own (the coordinator's
+   * unansweredBySubconscious): shown to it, and no turn of its since, as
+   * the window, written down, says across a restart, where the turn the
+   * row asked for, in memory, doesn't. A note it left that a cancel
+   * delivered is a row under its name but no turn of it, so isn't its own
+   * here. None with no subconscious, or where its window can't be read.
+   */
+  private unansweredBySubconscious(keep: (m: Pick<StoredMessage, 'metadata'>) => boolean): Array<Pick<StoredMessage, 'metadata'>> {
+    const sub = this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName) : undefined;
+    if (!sub || !this.presents(sub)) return [];
+    const window = sub.getContextManager().getPresentedMessages();
+    let after = 0;
+    window.forEach((m, at) => {
+      if (m.participant === sub.name && (m.metadata as { kind?: unknown } | undefined)?.kind !== 'subconscious-note') after = at + 1;
+    });
+    return window.slice(after).filter((m) => (m.shardIndex ?? 0) === 0 && keep(m));
+  }
+
+  /**
+   * The persistent subconscious's own `cancel_tuneout` calls its window
+   * holds (the coordinator's subconsciousCancelAsks): each call's input, its
+   * row's sequence, and whether the call's result answered it as waiting
+   * (`waiting: true`), as a turn of its stored them. None with no
+   * subconscious, or where its window can't be read; a call whose result
+   * isn't there, or can't be read, isn't waiting.
+   */
+  private subconsciousCancelAsks(): Array<{ sequence: number; input: Record<string, unknown>; waiting: boolean }> {
+    const sub = this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName) : undefined;
+    if (!sub || !this.presents(sub)) return [];
+    const window = sub.getContextManager().getPresentedMessages();
+    const results = new Map<string, unknown>();
+    for (const m of window) {
+      for (const b of m.content as Array<{ type: string; toolUseId?: unknown; tool_use_id?: unknown; content?: unknown }>) {
+        if (b.type !== 'tool_result') continue;
+        const id = typeof b.toolUseId === 'string' ? b.toolUseId : b.tool_use_id;
+        if (typeof id === 'string') results.set(id, b.content);
+      }
+    }
+    const waiting = (content: unknown): boolean => {
+      const raw = typeof content === 'string' ? content
+        : Array.isArray(content) ? content.map((b) => (b as { type?: unknown; text?: unknown }).type === 'text' ? String((b as { text?: unknown }).text ?? '') : '').join('')
+        : '';
+      try {
+        return (JSON.parse(raw) as { waiting?: unknown }).waiting === true;
+      } catch {
+        return false;
+      }
+    };
+    const asks: Array<{ sequence: number; input: Record<string, unknown>; waiting: boolean }> = [];
+    for (const m of window) {
+      if (m.participant !== sub.name) continue;
+      for (const b of m.content as Array<{ type: string; id?: unknown; name?: unknown; input?: unknown }>) {
+        if (b.type !== 'tool_use' || b.name !== 'cancel_tuneout' || typeof b.id !== 'string') continue;
+        const input = b.input && typeof b.input === 'object' ? b.input as Record<string, unknown> : {};
+        asks.push({ sequence: m.sequence, input, waiting: waiting(results.get(b.id)) });
+      }
+    }
+    return asks;
+  }
+
+  /**
    * One reader invocation: derive a fork of the resident at its head with
    * the resident's refusals, hand it the held traffic since the last look
    * as ordinary framing, and run it. It reports through `deliver_summary`
@@ -39715,6 +39777,8 @@ export class AgentFramework {
         subconsciousWindowOrdinals: () => this.presents(
           this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName) : undefined),
         unseenBySubconscious: (keep) => this.unseenBySubconscious(keep),
+        unansweredBySubconscious: (keep) => this.unansweredBySubconscious(keep),
+        subconsciousCancelAsks: () => this.subconsciousCancelAsks(),
         isForkBound: (channel) =>
           this.registry.list().some((record) => sameChannel(this.homeOf(record.name), channel)),
         isPrivilegedAuthor: (authorId) =>
