@@ -231,9 +231,13 @@ export interface McplServerConfig {
   /** AgentFramework-only opt-in, fail-closed admission for inbound data lanes.
    * Direct McplServerConnection factories reject this option. Required coalesced
    * content may be acknowledged before module onProcess completes; module
-   * dispatch remains FIFO per channel. The 64-slot queued+running module
-   * backlog refuses overflow before content acceptance; connection/host
-   * lifecycle boundaries drop queued work, with diagnostics. */
+   * dispatch runs per channel in acceptance order (callback-completion order across subjects).
+   * The 64-slot queued+running module backlog refuses new deliveries before
+   * content acceptance, but withdrawals stand at that cap (only notice module work may
+   * be dropped at capacity). Stop/disconnect drop queued work with diagnostics;
+   * close/reconnect preserve it. Required and unconfigured coalescing servers
+   * share one host-wide chain/mutex: an unconfigured server's hung coalesced
+   * module delivery can stall required coalesced effects. */
   inboundAdmission?: InboundAdmissionConfig;
   /** Unique server identifier */
   id: string;

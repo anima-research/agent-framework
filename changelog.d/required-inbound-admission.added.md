@@ -1,7 +1,8 @@
 - **Host applications:** opt into bounded, connection/epoch-bound inbound admission
   with `McplServerConfig.inboundAdmission` through AgentFramework only (direct
   connection factories reject it). Required coalesced content acknowledgement
-  does not await module processing; per-channel module dispatch remains FIFO. Channel messages, pushes and inference
+  does not await module processing; per-channel module dispatch runs
+  in acceptance order (callback-completion order across subjects). Channel messages, pushes and inference
   requests are authorized before an asynchronous, fail-closed host callback.
   Unconfigured connections retain their existing behaviour without a preflight.
   Required traffic is held during startup staging and quiesce, then admitted at
@@ -40,6 +41,14 @@
   a full MCPL pin follows separately. See `docs/required-inbound-admission.md`.
 
   Required coalesced module work has a 64-slot queued+running bound per channel
-  (feature-set scope for plain pushes). Overflow refuses before content
-  acceptance. Stop/connection boundaries drop queued work with diagnostics,
-  while a running call remains counted until it finishes.
+  (feature-set scope for plain pushes). Overflow refuses new deliveries before
+  content acceptance; withdrawals still remove occupants, dropping only a
+  delivered notice's module work at capacity, with diagnostics. Capacity
+  diagnostics distinguish ticket/module limits from policy denials; wire
+  refusals remain `admission_denied`. Live receipts replay even at capacity,
+  subject to current authority rechecked under the coalescer mutex.
+  Stop/disconnect drop queued work with diagnostics; close/reconnect preserve
+  acknowledged work, while a running call remains counted until it finishes.
+  Required and unconfigured coalescing servers share one host-wide coalescing
+  chain/mutex: a hung module on an unconfigured server's coalesced delivery can
+  stall required coalesced effects (existing main behaviour, out of scope).

@@ -1043,7 +1043,12 @@ Requires Node.js >= 22.12. Chronicle requires a Rust toolchain for native module
 Required inbound admission is supported only through `AgentFramework`; direct
 `McplServerConnection` factories reject `inboundAdmission`. Required coalesced
 content is stored and acknowledged without awaiting module `onProcess`; module
-dispatch remains FIFO per channel but may run after acknowledgement. Its
-64-slot queued+running backlog refuses overflow before storage/acceptance;
-stop/connection boundaries discard queued work with diagnostics. See
+dispatch runs per channel in acceptance order (callback-completion order across subjects)
+and may run after acknowledgement. Its 64-slot queued+running backlog refuses
+new deliveries before storage/acceptance, but never refuses a withdrawal at that cap: at
+capacity only a delivered withdrawal notice's module work is dropped, with
+diagnostics. Stop/disconnect discard queued work; close/reconnect preserve it.
+Required and unconfigured coalescing servers share one host-wide coalescing
+chain/mutex: a hung module on an unconfigured server's coalesced delivery can
+stall required coalesced effects (existing main behaviour, outside this change). See
 [required inbound admission](docs/required-inbound-admission.md) for limits.

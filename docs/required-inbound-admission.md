@@ -69,8 +69,8 @@ channel-scoped pushes share that queue: a later verdict waits for earlier ticket
 for the subject to retire, including refusals. Channel batches reserve all their
 tickets on arrival and still admit siblings sequentially. Independent single-item subjects do not wait on one another's callbacks.
 Batch siblings remain sequential: reserving B behind a slow sibling A also delays
-later traffic for B. Outstanding coalescing tickets are capped at 64 per connection;
-excess occurrences refuse immediately without joining the subject queue. A pause or grant change during a running preflight invalidates it even if restored before the verdict.
+later traffic for B. Outstanding coalescing tickets are capped at 64 per server id (spans reconnects);
+excess fresh occurrences refuse without joining the subject queue, after live receipt lookup. A pause or grant change during a running preflight invalidates it even if restored before the verdict.
 Required connections never advertise `toolHints`, even if `toolHints: true` is
 configured. That explicit combination logs one diagnostic at connect (not on
 automatic transport retries); it is not a configuration error. Under RFC-014 §6.3 the peer must not send hints and should tailor
@@ -134,26 +134,39 @@ Admitted work goes out with the round's results only on a stream that declares
 stream drains deferred work immediately for the next compile.
 
 For required coalesced traffic, built-in storage and the durable acknowledgement
-do not await module `onProcess`. Module dispatch starts after acceptance and is
-FIFO per channel (feature-set scope for plain pushes). The named ceiling
-`MAX_PENDING_REQUIRED_MODULE_WORK = 64` (the admission ticket ceiling) bounds
-queued **plus running** work, including capacity reserved before storage. At
-capacity, new required coalesced deliveries refuse with `admission_denied` before
-any replacement, removal, storage or acceptance receipt. Refusals use the normal
-lane diagnostic/trace. Receipt retries do not create work and still replay.
-There is no wait for module space under the coalescer lock, and no silent module
-skip for accepted work outside the following lifecycle drop policy.
+do not await module `onProcess`. Module dispatch starts after acceptance and runs
+per channel (feature-set scope for plain pushes) in acceptance order (callback-completion order across subjects).
+The exported ceiling `MAX_PENDING_REQUIRED_MODULE_WORK = 64` (equal to
+`MAX_PENDING_ADMISSIONS`) bounds queued **plus running** work, including
+capacity reserved before storage. At capacity, new deliveries refuse with
+`admission_denied` before replacement, storage or acceptance receipt.
+Withdrawals are never refused at the module cap: removal stands, and if the
+withdrawal delivers a notice, only that notice's module work is dropped with
+`mcpl:module-work-dropped`, count 1, reason `admission_module_capacity`.
+No module work is queued over the cap. Pure withdrawals deliver no module work.
+The lane diagnostic/trace reasons `admission_ticket_capacity` and
+`admission_module_capacity` distinguish the two bounds from policy denials;
+both capacity refusals retain wire reason `admission_denied` (no wire schema change).
+Receipt retries create no work and still replay at capacity, after current
+authority (not the callback verdict or capacity) is checked under the mutex.
+There is no wait for module space under the coalescer lock.
 
-Stop, disconnect, transport close and reconnect discard not-yet-started module
-work for that connection, release queued event references, and emit a bounded
-`mcpl:module-work-dropped` diagnostic/trace with count and fixed reason. Accepted
-content remains stored. A running call is not cancelled: it remains counted
-across epochs until it settles, and its completion cannot resurrect dropped work.
-After reconnect, new work for that scope waits behind that running call. A hanging
-module therefore delays module dispatch and, at the ceiling, refuses further
-content, rather than accumulating an unbounded backlog.
-Module errors are contained; they never retract an acknowledgement. Unconfigured
-coalesced delivery retains its existing completion timing.
+Stop and explicit disconnect discard not-yet-started module work, release queued
+event references, and emit `mcpl:module-work-dropped` with count and fixed reason.
+Transport close/reconnect preserve queued work for already-acknowledged content.
+Accepted content remains stored. A running call is not cancelled: it stays
+counted across epochs until it settles; completion cannot resurrect dropped work.
+New work for the scope waits behind the running call and preserved queue.
+A hung required-path module occupies one slot and eventually causes new
+deliveries in its scope to refuse, rather than growing an unbounded backlog.
+Module errors are contained; they never retract an acknowledgement.
+
+**Shared coalescing limit:** required and unconfigured coalescing servers share
+one host-wide coalescing chain/mutex. Unconfigured coalesced delivery retains its
+existing completion timing and awaits module `onProcess` inside that chain.
+A hung module on an unconfigured server's coalesced delivery can therefore stall
+required coalesced effects too, eventually filling their ticket limit. Isolation
+from such modules is not promised (existing main behaviour, out of scope).
 
 Channel-scoped pushes also require the `channels.incoming` grant and a declared
 channel before either receipt replay or the admission callback.
