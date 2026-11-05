@@ -18135,13 +18135,16 @@ export class AgentFramework {
    * rows (the coordinator's subconsciousWindow): what a boot reads for the
    * losses told to it, its own cancels, and what it was told of an
    * unrecorded stop, where the turn a row asked for, in memory, doesn't
-   * outlast a stop, and its read marks, in memory too, don't either. None
-   * with no subconscious, or where its window isn't presented.
+   * outlast a stop, and its read marks, in memory too, don't either. Its
+   * stored rows where its window isn't presented. None with no
+   * subconscious.
    */
   private subconsciousWindow(): StoredMessage[] {
     const sub = this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName) : undefined;
-    if (!sub || !this.presents(sub)) return [];
-    return sub.getContextManager().getPresentedMessages();
+    if (!sub) return [];
+    // A subconscious whose window isn't presented (a legacy one) has its
+    // stored rows for its record (#844 round 8, Weft).
+    return this.presents(sub) ? sub.getContextManager().getPresentedMessages() : sub.getContextManager().getAllMessages();
   }
 
   /**

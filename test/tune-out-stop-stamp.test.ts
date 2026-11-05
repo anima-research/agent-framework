@@ -48,30 +48,42 @@ function stampSetup() {
   const added: Row[] = [];
   const wakes: Array<[string, string]> = [];
   const traces: Trace[] = [];
-  const state = { held: false, seq: 100, endFails: false };
+  const state = {
+    held: false, seq: 100, endFails: false,
+    /** The subconscious's context refuses writes. */
+    subRefuses: false,
+    /** The stamp can't be read. */
+    stampUnreadable: false,
+    /** The holds' channels are registered, as a boot after #900 may find them, with this wake count. */
+    registered: false, wakeCount: 0,
+  };
   const key = (s: string, c: string) => `${s}\0${c}`;
   const registry = {
     tuneOutsOnRecord: () => holds.map((h) => ({ serverId: h.serverId, channelId: h.channelId, params: { epochId: h.epochId, startedAtSequence: h.startedAt }, source: 'agent-tool' })),
     getTuneOutState: (s: string, c: string) => {
       const h = holds.find((x) => x.serverId === s && x.channelId === c);
-      return h ? { params: { epochId: h.epochId, startedAtSequence: h.startedAt, cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5 }, wakeCount: 0 } : null;
+      return h ? { params: { epochId: h.epochId, startedAtSequence: h.startedAt, cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5 }, wakeCount: state.wakeCount } : null;
     },
     cancelTuneOut: (s: string, c: string) => {
       if (state.endFails) throw new Error('the end could not be recorded (test)');
       const at = holds.findIndex((x) => x.serverId === s && x.channelId === c);
       return at >= 0 ? holds.splice(at, 1)[0] : null;
     },
-    readCoordinatorState: (id: string) => states.get(id) ?? null,
+    readCoordinatorState: (id: string) => {
+      if (state.stampUnreadable && id === STAMP) throw new Error('the stamp could not be read (test)');
+      return states.get(id) ?? null;
+    },
     writeCoordinatorState: (id: string, value: unknown) => {
       if (refuse.has(id)) throw new Error(`the store refused ${id} (test)`);
       if (value === null) states.delete(id); else states.set(id, structuredClone(value));
     },
     nameShown: (c: { serverId: string; channelId: string }) => shown.get(key(c.serverId, c.channelId)) ?? c.channelId,
     quotedShown: (c: { channelId: string }) => JSON.stringify(c.channelId),
-    listChannelsRaw: () => [],
+    listChannelsRaw: () => (state.registered ? holds.map((x) => ({ serverId: x.serverId, descriptor: { id: x.channelId } })) : []),
   };
   const hooks = {
     addMessage: (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, forAgent?: string) => {
+      if (forAgent === SUB && state.subRefuses) throw new Error("the subconscious's context refused the write (test)");
       const row: Row = { participant, content, ...(metadata ? { metadata } : {}), sequence: ++state.seq, ...(forAgent ? { forAgent } : {}) };
       added.push(row);
       if (forAgent === SUB) window.push(row); else rows.push(row);
@@ -101,10 +113,10 @@ function stampSetup() {
     return epochId;
   };
   /** The all-except hold on record, excepting `except`. */
-  const holdScope = (epochId = `scope-${state.seq}`): string => {
+  const holdScope = (epochId = `scope-${state.seq}`, expiresAtMs = Date.now() + 3_600_000): string => {
     states.set(SCOPE, { params: {
       epochId, except: { serverId: 'editor', channelId: 'work' }, cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5,
-      startedAtSequence: ++state.seq, startedAtMs: Date.now(), expiresAtMs: Date.now() + 3_600_000, source: 'agent-tool',
+      startedAtSequence: ++state.seq, startedAtMs: Date.now(), expiresAtMs, source: 'agent-tool',
     }, wakeCount: 0 });
     return epochId;
   };
@@ -117,11 +129,19 @@ function stampSetup() {
     window.push({ participant: 'user', content: [{ type: 'tool_result', toolUseId: id, toolName: 'cancel_tuneout', content: JSON.stringify(answer) } as unknown as ContentBlock], sequence: ++state.seq });
     return sequence;
   };
+  /** A release of `epochId` stored by a cancel from `source`, giving `reason`. */
+  const release = (epochId: string, source: string, reason: string): void => {
+    rows.push({ participant: 'user', content: [text(`[Tune-out: cancelled — ${reason}]`)], metadata: { system: true, kind: 'tune-out-cancel', epochId, cancel: { source, reason } }, sequence: ++state.seq });
+  };
+  /** The subconscious's note of `epochId`, delivered to the resident. */
+  const note = (epochId: string): void => {
+    rows.push({ participant: SUB, content: [text('Look.')], metadata: { kind: 'subconscious-note', epochId }, sequence: ++state.seq });
+  };
   /** The rows told of an unrecorded stop, in the subconscious's window. */
   const unrecorded = () => window.filter((m) => m.metadata?.kind === 'tune-out-note-undelivered' && textOf(m.content).includes('without recording'));
   const told = () => window.filter((m) => m.metadata?.kind === 'tune-out-note-undelivered');
   const stopAll = (): void => { for (const c of made) c.stop(); };
-  return { states, refuse, holds, shown, rows, window, added, wakes, traces, state, make, hold, holdScope, boot, ask, unrecorded, told, stopAll };
+  return { states, refuse, holds, shown, rows, window, added, wakes, traces, state, make, hold, holdScope, boot, ask, release, note, unrecorded, told, stopAll };
 }
 
 const conditional = (hold: string, epochId: string, it = 'tune-out') => `[Tune-out: the host stopped without recording the state of ${hold} `
@@ -171,7 +191,7 @@ test("2 (Weft): a release of the epoch stored after the subconscious's waiting a
       h.boot();
       const e = h.hold();
       h.ask({ channelId: 'noisy', ...(withNote ? { text: 'Look at the build.\nThe log is long.' } : {}) });
-      h.rows.push({ participant: 'user', content: [text('[Tune-out: noisy cancelled — by Subconscious, 0 wakes]')], metadata: { system: true, kind: 'tune-out-cancel', channelId: 'noisy', epochId: e }, sequence: ++h.state.seq });
+      h.release(e, 'subconscious', 'by Subconscious');
       h.boot();
       assert.deepEqual(h.unrecorded().map((m) => textOf(m.content)), [
         `[Tune-out: the host stopped without recording the state of the tune-out of noisy (epoch ${e}). The cancel of it you asked for ran: `
@@ -279,7 +299,7 @@ test("4 (Weft): while the boot's stamp isn't written, a waiting cancel's answer 
     const c = h.boot();
     h.state.held = true;
     const answer = await c.handleSubconsciousTool('cancel_tuneout', { channelId: 'noisy', serverId: 'editor', text: 'Look.' }, [], SUB) as { data?: { note?: string } };
-    assert.match(answer.data?.note ?? '', /This run's start couldn't be recorded in the store yet, so if the host dies before the cancel runs, you may not be told so when it starts again\.$/);
+    assert.match(answer.data?.note ?? '', /This run's start couldn't be recorded in the store yet: if the host stops or dies before the cancel runs while the store still refuses it, you may not be told so when it starts again\.$/);
     h.refuse.delete(STAMP);
     h.state.held = false;
     c.runDeferredCancels();
@@ -493,3 +513,371 @@ test("pin: cancelAsksIn reads a result's waiting, server and scope, as a string 
     [true, 'other', undefined], [true, undefined, 'all-except'], [false, undefined, undefined], [false, undefined, undefined], [false, undefined, undefined],
   ]);
 });
+
+// ---------------------------------------------------------------------------
+// Weft's reading of c55239d5.
+// ---------------------------------------------------------------------------
+
+const asked = (hold: string, epochId: string, note: string, it = 'tune-out', end = `That ${it} is still in force.`) =>
+  `[Tune-out: the host stopped without recording the state of ${hold} (epoch ${epochId}). The cancel of it you asked for with your note `
+  + `"${note}" had not run when the host stopped: it was lost, and the note you left with it. ${end}]`;
+
+test("1 (Weft, c55239d5): a loss told as asked, asked again after with the same note, answered waiting, then a crash, is told again, with a turn", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    const e = h.hold();
+    h.ask({ channelId: 'noisy', text: 'Look.' });
+    h.boot();
+    assert.equal(h.unrecorded().length, 1, 'premise: told once');
+    h.wakes.length = 0;
+    h.ask({ channelId: 'noisy', text: 'Look.' });
+    h.boot();
+    assert.deepEqual(h.unrecorded().map((m) => textOf(m.content)), [asked('the tune-out of noisy', e, 'Look.'), asked('the tune-out of noisy', e, 'Look.')]);
+    assert.ok(h.wakes.some(([, why]) => why === 'tune-out stop not recorded: noisy'), 'with a turn');
+  } finally { h.stopAll(); }
+}));
+
+test("1 (Weft, c55239d5): told that its cancel ran, a later ask with a new note that a crash lost is told, though less definite", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    const e = h.hold();
+    h.release(e, 'subconscious', 'by Subconscious');
+    h.boot();
+    assert.match(textOf(h.unrecorded()[0]!.content), /Your cancel of it ran/);
+    h.ask({ channelId: 'noisy', text: 'Again.' });
+    h.boot();
+    assert.equal(textOf(h.unrecorded().at(-1)!.content), asked('the tune-out of noisy', e, 'Again.'));
+  } finally { h.stopAll(); }
+}));
+
+test("1 (Weft, c55239d5), control: told asked with one note, then asked with another, gives a second row", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    const e = h.hold();
+    h.ask({ channelId: 'noisy', text: 'First.' });
+    h.boot();
+    h.ask({ channelId: 'noisy', text: 'Second.' });
+    h.boot();
+    assert.deepEqual(h.unrecorded().map((m) => textOf(m.content)), [asked('the tune-out of noisy', e, 'First.'), asked('the tune-out of noisy', e, 'Second.')]);
+  } finally { h.stopAll(); }
+}));
+
+test("2 (Weft, c55239d5): an all-except hold whose end time passed while the host was down, released by the boot itself, isn't told as a cancel that ran", () => quiet(() => {
+  for (const withAsk of [false, true]) {
+    const h = stampSetup();
+    try {
+      h.boot();
+      const s = h.holdScope(undefined, Date.now() + 3_600_000);
+      if (withAsk) h.ask({ channelId: 'all-except', scope: 'all-except', text: 'Back.' }, { waiting: true, scope: 'all-except' });
+      const scope = h.states.get(SCOPE) as { params: { expiresAtMs: number } };
+      scope.params.expiresAtMs = Date.now() - 1;
+      h.boot();
+      assert.equal(h.states.get(SCOPE), undefined, 'premise: the boot released it');
+      const rows = h.unrecorded().map((m) => textOf(m.content));
+      const opening = `[Tune-out: the host stopped without recording the state of the all-except hold (all channels except work; epoch ${s}). `;
+      assert.deepEqual(rows, [withAsk
+        ? `${opening}The cancel of it you asked for with your note "Back." had not run when the host stopped: it was lost, and the note you `
+          + 'left with it. That hold has ended since.]'
+        : `${opening}If you asked for a cancel of it before the stop, it had not run when the host stopped: it was lost, and any note you `
+          + 'left with it. That hold has ended since.]']);
+    } finally { h.stopAll(); }
+  }
+}));
+
+test("2 (Weft, c55239d5): a channel's hold past its wake budget, released by the boot itself, isn't told as a cancel that ran", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    const e = h.hold();
+    h.state.registered = true;
+    h.state.wakeCount = 6;
+    h.boot();
+    assert.equal(h.holds.length, 0, "premise: the boot's cancel past the budget ended it");
+    assert.deepEqual(h.unrecorded().map((m) => textOf(m.content)), [conditional('the tune-out of noisy', e).replace('That tune-out is still in force.', 'That tune-out has ended since.')]);
+  } finally { h.stopAll(); }
+}));
+
+test("3 (Weft, c55239d5): a note delivered and told in one run, a resident's release in the next, its end unrecorded, a crash: nothing is said of notes", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    const e = h.hold();
+    h.note(e);
+    h.boot();
+    assert.match(textOf(h.unrecorded()[0]!.content), /was delivered to scout before the stop/);
+    h.release(e, 'agent-tool', 'agent request');
+    h.boot();
+    assert.equal(textOf(h.unrecorded().at(-1)!.content),
+      `[Tune-out: the host stopped without recording the state of the tune-out of noisy (epoch ${e}). A cancel of it that wasn't yours `
+      + '(agent request) ran: its release reached scout. Its end was not recorded, so that tune-out is still in force.]');
+  } finally { h.stopAll(); }
+}));
+
+test("4 (Weft, c55239d5): a resident's cancel that stored the release is credited, and the subconscious's own, asked for, had not run", () => quiet(() => {
+  for (const delivered of [false, true]) {
+    const h = stampSetup();
+    try {
+      h.boot();
+      const e = h.hold();
+      h.ask({ channelId: 'noisy', text: 'Look.' });
+      if (delivered) h.note(e);
+      h.release(e, 'agent-tool', 'agent request');
+      h.boot();
+      assert.equal(textOf(h.unrecorded()[0]!.content),
+        `[Tune-out: the host stopped without recording the state of the tune-out of noisy (epoch ${e}). A cancel of it that wasn't yours `
+        + `(agent request) ran: its release reached scout${delivered ? ', with the note you left with your cancel of it' : ''}. Its end was `
+        + 'not recorded, so that tune-out is still in force. The cancel of it you asked for had not run when the host stopped: it was lost'
+        + `${delivered ? '' : ', and the note you left with it, "Look."'}.]`);
+    } finally { h.stopAll(); }
+  }
+}));
+
+test("5 (Weft, c55239d5): the floor — the first boot's stamp refused, then a stop refusing its stamp and the loss record: nothing is told; control, the boot's stamp landed: told", () => quiet(() => {
+  for (const landed of [false, true]) {
+    const h = stampSetup();
+    try {
+      if (!landed) h.refuse.add(STAMP);
+      const first = h.boot();
+      const e = h.hold();
+      h.state.held = true;
+      first.cancel('editor', 'noisy', 'subconscious', 'by Subconscious', 'Look.', SUB);
+      h.refuse.add(STAMP);
+      h.refuse.add(LOSS_RECORD);
+      first.stop();
+      h.refuse.clear();
+      h.state.held = false;
+      h.boot();
+      assert.deepEqual(h.unrecorded().map((m) => textOf(m.content)), landed ? [conditional('the tune-out of noisy', e)] : [], landed ? 'told' : 'nothing durable: the floor');
+    } finally { h.stopAll(); }
+  }
+}));
+
+// --- pins ------------------------------------------------------------------
+
+test('pin: told that its cancel ran, a boot that finds less (nothing in its run) says nothing more', () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    const e = h.hold();
+    h.release(e, 'subconscious', 'by Subconscious');
+    h.boot();
+    h.boot();
+    assert.equal(h.unrecorded().length, 1);
+  } finally { h.stopAll(); }
+}));
+
+test('pin: a row told later than the ask with another note does not silence this note', () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    const e = h.hold();
+    h.ask({ channelId: 'noisy', text: 'Second.' });
+    h.window.push({ participant: 'user', content: [text('told before')], metadata: { kind: 'tune-out-note-undelivered', epochId: e, stopUnrecorded: { found: 'asked', note: 'First.' } }, sequence: ++h.state.seq });
+    h.boot();
+    assert.deepEqual(h.unrecorded().map((m) => textOf(m.content)), [asked('the tune-out of noisy', e, 'Second.')]);
+  } finally { h.stopAll(); }
+}));
+
+test("pin: one hold's told row doesn't silence another hold's", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    h.hold('noisy');
+    h.boot();
+    const b = h.hold('quiet');
+    h.boot();
+    assert.deepEqual(h.unrecorded().map((m) => m.metadata?.epochId).filter((x) => x === b), [b]);
+  } finally { h.stopAll(); }
+}));
+
+test('pin: a notice of the stop kept to be written, its write refused, counts as told: one row once written', () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    h.hold();
+    h.state.subRefuses = true;
+    h.boot();
+    const c = h.boot();
+    h.state.subRefuses = false;
+    c.runDeferredCancels();
+    assert.equal(h.unrecorded().length, 1);
+  } finally { h.stopAll(); }
+}));
+
+test("pin: the boot arms the retry of its refused stamp itself", () => quiet(() => {
+  mock.timers.enable({ apis: ['setTimeout'] });
+  const h = stampSetup();
+  try {
+    h.refuse.add(STAMP);
+    h.boot();
+    h.refuse.delete(STAMP);
+    mock.timers.tick(60_000);
+    assert.ok(h.states.has(STAMP));
+  } finally { h.stopAll(); mock.timers.reset(); }
+}));
+
+test("pin: a release that can't write the boot's stamp arms the retry again", () => quiet(() => {
+  mock.timers.enable({ apis: ['setTimeout'] });
+  const h = stampSetup();
+  try {
+    h.refuse.add(STAMP);
+    const c = h.boot();
+    c.runDeferredCancels();
+    h.refuse.delete(STAMP);
+    mock.timers.tick(60_000);
+    assert.ok(h.states.has(STAMP));
+  } finally { h.stopAll(); mock.timers.reset(); }
+}));
+
+test("pin: a retry that finds writes held arms itself again for the boot's stamp", () => quiet(() => {
+  mock.timers.enable({ apis: ['setTimeout'] });
+  const h = stampSetup();
+  try {
+    h.refuse.add(STAMP);
+    h.boot();
+    h.state.held = true;
+    mock.timers.tick(60_000);
+    h.state.held = false;
+    h.refuse.delete(STAMP);
+    mock.timers.tick(60_000);
+    assert.ok(h.states.has(STAMP));
+  } finally { h.stopAll(); mock.timers.reset(); }
+}));
+
+test("pin: a stop's stamp isn't written over by the boot's, still pending, afterwards", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.refuse.add(STAMP);
+    const c = h.boot();
+    const e = h.hold();
+    h.refuse.delete(STAMP);
+    c.stop();
+    c.runDeferredCancels();
+    assert.deepEqual((h.states.get(STAMP) as { epochs: string[] }).epochs, [e]);
+  } finally { h.stopAll(); }
+}));
+
+test("pin: a cancel taken off the queue doesn't clear the retry the boot's refused stamp still needs", () => quiet(() => {
+  mock.timers.enable({ apis: ['setTimeout'] });
+  const h = stampSetup();
+  try {
+    h.refuse.add(STAMP);
+    const c = h.boot();
+    h.hold();
+    h.state.held = true;
+    c.cancel('editor', 'noisy', 'duration', 'duration elapsed');
+    h.state.held = false;
+    c.cancel('editor', 'noisy', 'agent-tool', 'agent request');
+    h.refuse.delete(STAMP);
+    mock.timers.tick(60_000);
+    assert.ok(h.states.has(STAMP));
+  } finally { h.stopAll(); mock.timers.reset(); }
+}));
+
+for (const [what, mark] of [
+  ['ran, asked, with its note not delivered', (h: ReturnType<typeof stampSetup>, e: string) => { h.ask({ channelId: 'noisy', text: 'Look.' }); h.release(e, 'subconscious', 'by Subconscious'); }],
+  ['ran, its note delivered', (h: ReturnType<typeof stampSetup>, e: string) => { h.note(e); h.release(e, 'subconscious', 'by Subconscious'); }],
+  ["ran by another's cancel", (h: ReturnType<typeof stampSetup>, e: string) => { h.release(e, 'agent-tool', 'agent request'); }],
+] as const) {
+  test(`pin: a notice of the stop (${what}) kept in the store, its write refused, is written by the next boot as it was`, () => quiet(() => {
+    const h = stampSetup();
+    const g = stampSetup();
+    try {
+      // The text it would have been written with, where nothing refused.
+      g.boot();
+      const ge = g.hold();
+      mark(g, ge);
+      g.boot();
+      const want = textOf(g.unrecorded()[0]!.content).replace(ge, '<epoch>');
+      h.boot();
+      const e = h.hold();
+      mark(h, e);
+      h.state.subRefuses = true;
+      h.boot();
+      h.state.subRefuses = false;
+      h.boot();
+      assert.deepEqual(h.unrecorded().map((m) => textOf(m.content).replace(e, '<epoch>')), [want]);
+    } finally { h.stopAll(); g.stopAll(); }
+  }));
+}
+
+test('pin: a notice of the stop written after its hold ended says it has ended since, for ran as for unknown', () => quiet(() => {
+  for (const ran of [false, true]) {
+    const h = stampSetup();
+    try {
+      h.boot();
+      const e = h.hold();
+      if (ran) h.release(e, 'subconscious', 'by Subconscious');
+      h.state.subRefuses = true;
+      const c = h.boot();
+      h.holds.length = 0;
+      h.state.subRefuses = false;
+      c.runDeferredCancels();
+      assert.match(textOf(h.unrecorded()[0]!.content), ran ? /Its end was not recorded, and that tune-out has ended since\.\]$/ : /That tune-out has ended since\.\]$/);
+    } finally { h.stopAll(); }
+  }
+}));
+
+test("pin: a stamp that can't be read isn't a first start: the holds are told", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    const e = h.hold();
+    h.state.stampUnreadable = true;
+    h.boot();
+    assert.deepEqual(h.unrecorded().map((m) => textOf(m.content)), [conditional('the tune-out of noisy', e)]);
+  } finally { h.stopAll(); }
+}));
+
+test("pin: the all-except hold's waiting answer says so too while the boot's stamp isn't written", async () => {
+  const errors = mock.method(console, 'error', () => {});
+  const h = stampSetup();
+  try {
+    h.holdScope();
+    h.refuse.add(STAMP);
+    const c = h.boot();
+    h.state.held = true;
+    const answer = await c.handleSubconsciousTool('cancel_tuneout', { channelId: 'all-except', scope: 'all-except', text: 'Back.' }, [], SUB) as { data?: { note?: string } };
+    assert.match(answer.data?.note ?? '', /This run's start couldn't be recorded in the store yet/);
+  } finally { h.stopAll(); errors.mock.restore(); }
+});
+
+test("pin: a loss notice the stop kept for another reason than its stop doesn't account for the hold", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    const e = h.hold();
+    h.states.set(LOSS_RECORD, { v: 1, pendingLossNotices: [{
+      id: 'n1', author: SUB, what: 'noisy (by Subconscious)', for: { epochId: e, serverId: 'editor', channelId: 'noisy' },
+      drop: { reason: 'note-undelivered', by: 'itself', error: 'refused' }, keptAtMs: 1,
+    }] });
+    h.boot();
+    assert.deepEqual(h.unrecorded().map((m) => textOf(m.content)), [conditional('the tune-out of noisy', e)]);
+  } finally { h.stopAll(); }
+}));
+
+test("pin: a call naming the all-except scope in its input, its result naming none, is that hold's", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    h.holdScope();
+    h.ask({ channelId: 'work', scope: 'all-except', text: 'Back.' }, { waiting: true });
+    h.boot();
+    assert.match(textOf(h.unrecorded()[0]!.content), /The cancel of it you asked for with your note "Back\."/);
+  } finally { h.stopAll(); }
+}));
+
+test("pin: the all-except hold excepting a channel doesn't make a bare name of that channel's own hold ambiguous", () => quiet(() => {
+  const h = stampSetup();
+  try {
+    h.boot();
+    const w = h.hold('work');
+    h.holdScope();
+    h.ask({ channelId: 'work', text: 'Look.' });
+    h.boot();
+    const byEpoch = new Map(h.unrecorded().map((m) => [m.metadata?.epochId, textOf(m.content)]));
+    assert.match(byEpoch.get(w) ?? '', /The cancel of it you asked for with your note "Look\."/);
+  } finally { h.stopAll(); }
+}));
