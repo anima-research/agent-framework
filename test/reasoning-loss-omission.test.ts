@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { NativeFormatter, type ContentBlock, type NormalizedRequest } from '@animalabs/membrane';
-import { AgentFramework } from '../src/index.js';
+import { AgentFramework, type ProcessEvent } from '../src/index.js';
 import { PassthroughStrategy } from '@animalabs/context-manager';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
@@ -18,11 +18,12 @@ class MarkedPrefix extends PassthroughStrategy {
   }
 }
 const flags = { system: true, kind: 'reasoning-loss' };
-async function fixture() {
+async function fixture(conversations = false) {
   const dir = mkdtempSync(join(tmpdir(), 'af-reasoning-loss-'));
   const membrane = new MockMembrane();
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store'), membrane: membrane.asMembrane(), syncIntervalMs: 0, modules: [],
+    ...(conversations ? { conversations: { templateAgent: 'assistant' } } : {}),
     agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'Test.', strategy: new MarkedPrefix() }],
   });
   cleanups.push(async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); });
@@ -31,7 +32,7 @@ async function fixture() {
   const cm = agent.getContextManager();
   const add = (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>) => cm.addMessage(participant, content, metadata);
   const request = () => agent.buildActivationRequest([]);
-  return { agent, cm, add, request, membrane };
+  return { framework, agent, cm, add, request, membrane };
 }
 const wire = (r: NormalizedRequest) => new NativeFormatter().buildMessages(r.messages, {
   participantMode: 'multiuser', assistantParticipant: 'assistant', promptCaching: true,
@@ -108,4 +109,55 @@ it('leaves the entire no-notice request byte-identical to the baseline shape', a
     system: 'Test.', config: { model: 'test-model', maxTokens: 4096 },
     promptCaching: true, cacheTtl: '1h', assistantParticipant: 'assistant',
   }));
+});
+
+async function inheritanceHistory(x: Awaited<ReturnType<typeof fixture>>) {
+  await x.add('user', [text('before')]);
+  await x.add('user', [text(notice)], flags);
+  await x.add('user', [text('arbitrary body')], { ...flags, deferredWriteId: 'deferred' });
+  // Identical content is not identity: only the flagged copy is omitted.
+  for (const metadata of [undefined, { system: true }, { kind: 'reasoning-loss' }]) {
+    await x.add('user', [text(notice)], metadata);
+  }
+  await x.add('user', [text('after')]);
+  return [[text('before')], [text(notice)], [text(notice)], [text(notice)], [text('after')]];
+}
+
+for (const mode of ['copy', 'shared'] as const) {
+  it(`${mode} inheritance omits only qualifying notices and leaves parent history and request unchanged`, async () => {
+    const x = await fixture();
+    const expected = await inheritanceHistory(x);
+    const stored = JSON.stringify(x.cm.getAllMessages());
+    const before = JSON.stringify(await x.request());
+    const fork = await x.framework.deriveAgent({ name: 'child', from: 'assistant', mode });
+    cleanups.push(async () => fork.cleanup());
+    const request = await fork.agent.buildActivationRequest([]);
+    assert.deepEqual(request.messages.map(m => m.content), expected);
+    assert.equal(JSON.stringify(x.cm.getAllMessages()), stored);
+    assert.equal(JSON.stringify(await x.request()), before);
+    assert.equal((await x.agent.compileContext()).messages.length, 7, 'debug compiles still show stored history');
+    if (mode === 'copy') assert.deepEqual(fork.contextManager.getAllMessages().map(m => m.content), expected);
+  });
+}
+
+it('conversation-template inheritance omits notices before metadata is lost, without changing the template', async () => {
+  const x = await fixture(true);
+  const expected = await inheritanceHistory(x);
+  const stored = JSON.stringify(x.cm.getAllMessages());
+  const before = JSON.stringify(await x.request());
+  x.membrane.pushResponse(createMockResponse([text('reply')]));
+  const channel = { serverId: 'test', channelId: 'channel' };
+  x.framework.pushEvent({
+    type: 'mcpl:channel-incoming', ...channel, messageId: 'message',
+    author: { id: 'user', name: 'user' }, content: [text('wake')],
+    timestamp: new Date().toISOString(), metadata: { channel_type: 'im' }, triggerInference: true,
+  } as unknown as ProcessEvent);
+  await x.framework.runUntilIdle();
+  const binding = x.framework.getConversationRouter()!.getBinding(channel);
+  assert.ok(binding, 'the real router spawned and bound a conversation');
+  const child = x.framework.getAgent(binding.agentName)!;
+  assert.deepEqual(child.getContextManager().getAllMessages().slice(0, expected.length).map(m => m.content), expected);
+  assert.deepEqual(x.membrane.calls[0]!.messages.slice(0, expected.length).map(m => m.content), expected);
+  assert.equal(JSON.stringify(x.cm.getAllMessages()), stored);
+  assert.equal(JSON.stringify(await x.request()), before);
 });

@@ -1,3 +1,4 @@
+import { reasoningLossRows } from './reasoning-loss.js';
 import { NOTICE_TAG } from './notice-tags.js';
 import { heartbeatToolAlias } from './heartbeat/heartbeat.js';
 import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, ThinkingBindingEntry, YieldingStream } from '@animalabs/membrane';
@@ -1598,22 +1599,6 @@ export class Agent {
       && source.bodies.every((b) => this.storedMarkOf(b.messageId)?.agent === this.name);
   }
 
-  /** Render-only compatibility for #973: #938 stopped writing these notices,
-   *  but old stores still contain them. Use raw provenance, never their text;
-   *  keep selection and cache breakpoints on every preceding row unchanged. */
-  private reasoningLossRows(result: CompileResult): Set<number> {
-    const omitted = new Set<number>();
-    if (!result.provenance || typeof this.contextManager.getAllMessages !== 'function') return omitted;
-    const notices = new Set(this.contextManager.getAllMessages()
-      .filter(({ metadata }) => metadata?.kind === 'reasoning-loss' && metadata.system === true)
-      .map(({ id }) => id));
-    result.provenance.messages.forEach((source, i) => {
-      if (source.kind === 'raw' && source.bodies.length > 0
-        && source.bodies.every(({ messageId }) => notices.has(messageId))) omitted.add(i);
-    });
-    return omitted;
-  }
-
   /** A stored row's injection mark, or undefined for any other row, and for
    *  one the store can't read just now, which is logged: a start doesn't fail
    *  on it (the row then counts as no stored injection). */
@@ -1766,7 +1751,7 @@ export class Agent {
       const { systemInjections } = compiled;
       // The framework's own pricing stamp never goes out (thinking-token-stamp.ts);
       // the agent's own turns are then presented under its name (presentOwnTurns).
-      const omitted = this.reasoningLossRows(compiled);
+      const omitted = reasoningLossRows(compiled, this.contextManager);
       const messages = this.presentOwnTurns(withoutTokenEstimates(
         compiled.messages.filter((_, i) => !omitted.has(i))));
       // Read once, after the first compile, since results may have become
@@ -1983,7 +1968,7 @@ export class Agent {
       origin = [...origin.slice(0, at), ...appended.map(() => null), ...origin.slice(at)];
       messages = [...messages.slice(0, at), ...appended, ...messages.slice(at)];
     }
-    const omitted = this.reasoningLossRows(compiledResult);
+    const omitted = reasoningLossRows(compiledResult, this.contextManager);
     const kept = origin.map((from) => from === null || !omitted.has(from));
     messages = messages.filter((_, i) => kept[i]);
     origin = origin.filter((_, i) => kept[i]);

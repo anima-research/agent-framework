@@ -1,3 +1,4 @@
+import { reasoningLossRows } from './reasoning-loss.js';
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { presentAuthor } from './author-presentation.js';
 import { constants as bufferConstants } from 'node:buffer';
@@ -11152,8 +11153,10 @@ export class AgentFramework {
       if (!shared) {
         // The historical copy: the parent's compiled view, its turns renamed
         // so the child reads its inheritance as its own history.
-        const { messages } = await parent.getContextManager().compile();
-        for (const message of messages) {
+        const compiled = await parent.getContextManager().compile();
+        const omitted = reasoningLossRows(compiled, parent.getContextManager());
+        for (const [i, message] of compiled.messages.entries()) {
+          if (omitted.has(i)) continue;
           created.contextManager.addMessage(
             parent.isOwnParticipant(message.participant) ? options.name : message.participant,
             message.content,
@@ -18062,8 +18065,10 @@ export class AgentFramework {
         // The copy is the fork's own, and the template's annotation edits only
         // the template's message: seed only once each of the template's
         // annotations has finished.
-        const { messages: compiledWhole, provenance } = await template.toolResultGuard.afterAnnotations(
+        const compiledResult = await template.toolResultGuard.afterAnnotations(
           () => template.getContextManager().compile(undefined, undefined, { dryRun: true }));
+        const { messages: compiledWhole, provenance } = compiledResult;
+        const omitted = reasoningLossRows(compiledResult, template.getContextManager());
         const templateRows = template.getContextManager().getAllMessages();
         // The template's stored context injections (stored-injections.ts) are
         // its context, not the conversation, so the seed leaves them out, as
@@ -18072,6 +18077,7 @@ export class AgentFramework {
         // account of where each message came from.
         const injectionRows = new Set(templateRows.filter((m) => storedInjectionMarkOf(m.metadata)).map((m) => m.id));
         const compiled = compiledWhole.filter((_, i) => {
+          if (omitted.has(i)) return false;
           const source = provenance?.messages[i];
           return !(source?.kind === 'raw' && source.bodies.length > 0 && source.bodies.every((b) => injectionRows.has(b.messageId)));
         });
@@ -18079,7 +18085,7 @@ export class AgentFramework {
         const withoutNotices = withoutPrimaryNotices(
           withoutReasoning, primaryNoticeTexts(templateRows));
         const seed = stripUnpairedToolBlocks(withoutNotices);
-        logSeedOmissions(name, template.name, compiledWhole.length - compiled.length, compiled, withoutReasoning, withoutNotices, seed);
+        logSeedOmissions(name, template.name, compiledWhole.length - compiled.length - omitted.size, compiled, withoutReasoning, withoutNotices, seed);
         for (const msg of seed) {
           const participant = msg.participant === template.name ? name : msg.participant;
           contextManager.addMessage(participant, msg.content);
