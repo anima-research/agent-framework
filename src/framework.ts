@@ -1566,8 +1566,6 @@ interface TurnRouting {
   deliveries: ChannelRef[];
   sentTo?: string[];
   asking?: Promise<string[]>[];
-  /** Set once the turn's asks are settled, until a start uses this routing
-   *  again: by its receipt, or with none when the turn failed or was stopped. */
   asksSettled?: 'receipt' | 'no receipt';
   postTried?: true;
   openedBy?: InferenceRequest;
@@ -6693,13 +6691,7 @@ export class AgentFramework {
   }
   /** Keep `request` among a hold's `held` requests, once by
    *  sameInferenceRequest. A held turn's retry (TURN_RETRY) whose equal is
-   *  already held marks that one, so the hold still keeps the turn alive.
-   *  In a merged start's batch, a member folds only into an equal member of
-   *  its own kind: a wake in a batch and a member that carries the turn on
-   *  never fold into each other, so the wake stays a member of its own,
-   *  which an abort puts back. The copy of a request held on its own is the
-   *  exception: a member that carries the turn on takes it, as the mark above
-   *  takes that request. */
+   *  already held marks that one, so the hold still keeps the turn alive. */
   private holdRequest(held: InferenceRequest[], request: InferenceRequest, takes: (kept: InferenceRequest) => boolean = () => true): void {
     const same = held.find((r) => this.sameInferenceRequest(r, request) && takes(r));
     if (!same) {
@@ -6708,8 +6700,7 @@ export class AgentFramework {
     }
     // A merged start's batch (MERGED_BATCH) stays recorded on the request
     // kept in its place, which then stands for it, as the start did.
-    // Copy the held wake and read the kept request's carry before marking
-    // it, and reconcile each mark as the scheduler's merge does.
+    // Copy the held request and read the kept one's carry before marking it.
     const into = mergedBatch(same);
     const batch = mergedBatch(request);
     if (into || batch) {
@@ -21560,7 +21551,6 @@ export class AgentFramework {
     }
   }
 
-  /** Keep an ask for the turn's receipt, or log what it names when the turn's asks are already settled. */
   private trackSpeechAsk(agent: Agent, routing: TurnRouting, asked: Promise<string[]>): void {
     if (!routing.asksSettled) {
       (routing.asking ??= []).push(asked);
@@ -21569,7 +21559,6 @@ export class AgentFramework {
     logLateAsk(agent.name, routing.asksSettled, asked);
   }
 
-  /** A turn that failed or was stopped writes no receipt: what its asks name is logged as each answers. */
   private abandonSpeechAsks(agentName: string, routing: TurnRouting): void {
     if (routing.asksSettled) return;
     routing.asksSettled = 'no receipt';
@@ -23577,7 +23566,6 @@ export class AgentFramework {
     return draft ? draftState(draft) : 'let go';
   }
 
-  /** Says that `chars` of a reply weren't routed, since another agent now holds its agent's name. */
   private logReplacedRouting(agent: Agent, chars: number): void {
     console.error(`[prose] ${agent.name}: replaced while its reply was routed; ${chars} chars not routed for the replacement`);
   }
@@ -23599,7 +23587,6 @@ export class AgentFramework {
     }
   }
 
-  /** Route one hybrid envelope; false, routing nothing, once another agent holds its agent's name. */
   private async deliverHybridEnvelope(
     agent: Agent,
     envelope: string,
@@ -27839,9 +27826,6 @@ export class AgentFramework {
       // with its scripts returned while its turn waited, is routed, each
       // unanswered send counting as one that may have posted anywhere.
       this.decideWaitingRound(agent, myStreamId, 'its stream ended');
-      // A stream whose agent was released or replaced writes no receipt from
-      // here, so what its turn's asks name is logged as each answers. A turn
-      // whose receipt took its asks (settleSpeechAsks) is left as it is.
       if (this.agents.get(agent.name) !== agent) this.abandonSpeechAsks(agent.name, streamRouting);
 
       // Spec 14.3: once the deliveries this stream queued have run, close

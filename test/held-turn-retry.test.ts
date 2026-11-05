@@ -1122,9 +1122,6 @@ for (const how of ['parked', 'held again'] as const) test(`a wake merged into a 
 const identityKeys = ['agentName', 'reason', 'source', 'timestamp', 'channelId', 'channelServerId', 'coalescingSubject',
   'coalescingBatchSubjects', 'readsDeferredWrite', 'readsStoredMessage', 'wakeLines'];
 
-/** The mark a re-arm of an exhausted turn sets (REARMED), read off one the
- *  framework makes for a probe trigger of its own reason, which is taken
- *  back out of the hold. */
 function rearmedMark(fw: AgentFramework, internal: Internal, trigger: Record<string | symbol, unknown>): symbol {
   const held = internal.providerAccelerationCooldowns.get('resident')!.heldRequests;
   const before = held.length;

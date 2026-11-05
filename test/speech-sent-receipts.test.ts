@@ -169,8 +169,6 @@ class HeldSecond extends MockMembrane {
   }
 }
 
-/** HeldSecond whose streams after the third end the turn with skip_reply,
- *  so an autoContinue run comes to rest. */
 class HeldSecondThenRests extends HeldSecond {
   override streamYielding(request: NormalizedRequest): YieldingStream {
     if (this.primary < 3) return super.streamYielding(request);
@@ -303,9 +301,6 @@ describe('plain speech a module says it showed', () => {
     addressedElsewhereNotice(agent: unknown, routing: unknown, channel: { serverId: string; channelId: string }, who: string): unknown;
   };
   const askedTexts = (s: Surface) => s.asked.map((a) => ({ text: a.text, final: a.context.final }));
-  /** A run whose turn speaks in `room`, as channel_open's result leaves its
-   *  routing, on a server whose posts wait for `post`: that many
-   *  milliseconds, or until it settles. */
   const runSpeaksIn = (f: AgentFramework, membrane: AtEachStream, name: string, post: number | Promise<void> = 0) => {
     const { server, published } = channelServer(true);
     const publish = server.sendChannelsPublish;

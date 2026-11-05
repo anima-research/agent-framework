@@ -615,11 +615,7 @@ export interface InferenceRequest {
    *  published into that channel having read it, or once the message isn't
    *  on its store's current branch, the wake starts no turn. */
   readsStoredMessage?: string;
-  /** @internal The messages added by the module answers whose wakes this
-   *  request stands for, and, for a request the framework queued to carry a
-   *  turn on, the messages that opened that turn, each as its stored id or a
-   *  held write's handle. A start merged from such a request and a cause of
-   *  its own takes only the cause's. */
+  /** @internal For the framework's speech receipts; not a host API. */
   openingMessages?: string[];
   agentName: string;
   reason: string;

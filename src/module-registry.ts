@@ -126,7 +126,6 @@ interface SpeechHandler {
 }
 
 
-/** A module's `sentTo` as its receipt shows it, or undefined where it names no place. */
 function speechPlace(named: unknown): string | undefined {
   const flat = typeof named === 'string' ? oneLine(named).replace(/\s+/g, ' ').trim() : '';
   if (!flat) return undefined;
@@ -747,20 +746,7 @@ export class ModuleRegistry {
     }
   }
 
-  /**
-   * @internal For the framework's speech routing; not a host API.
-   *
-   * Ask every module with onSpeechRouted, all at once, whether it showed
-   * `text` to someone. Resolves, once every module has answered or
-   * SPEECH_RECEIPT_WAIT_MS has passed since it was asked, to the places they
-   * named, in module registration order; `onPlace` is called as each one
-   * that names a place answers, and one that throws is logged. A module that
-   * throws, answers after the wait, is removed or replaced before it
-   * answers, or names no place (`{}`, "can't tell") names none. The wait
-   * counts from the hook's call, and a hook that blocks synchronously past
-   * it and returns its answer still has it taken, since no timer runs while
-   * it blocks.
-   */
+  /** @internal For the framework's speech routing; not a host API. */
   async askSpeechRouted(agentName: string, text: string, context: SpeechRoutedContext, onPlace?: () => void): Promise<string[]> {
     const asked = [...this.modules.values()].filter((module) => {
       try {
