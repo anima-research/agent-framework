@@ -54,12 +54,16 @@
 - An agent's own system changes are those stored with the change metadata
   (`systemChangeMetadata`) of its name or one of its `selfParticipants`, and
   for an agent that shares another's context on a branch of its own, those
-  its source counts as its own, since its view keeps them and its requests
-  under `'entries'` carry them. Its compile under `'entries'` keeps them
+  its source counts as its own, since under `'entries'` its view keeps them
+  and its requests carry them. Its compile under `'entries'` keeps them
   where it leaves out another's, it folds them onto its head to find what it
-  declares, prices them for consolidation, and in either mode they're the
-  rows a move of its head takes out of its own branch (on `'head'`, once its
-  recorded head is cleared). A shared child `deriveAgent` makes already
+  declares, prices them for consolidation, and they're the rows a move of
+  its head takes out of its own branch. On `'head'` they're taken out when
+  a recorded head is cleared or its compile holds them, and an agent with
+  neither, such as a derived agent started on `'head'`, leaves them in
+  place. Where its compile leaves them out, as the framework's does on
+  `'head'` for every agent but the subconscious, a compile refused over
+  budget takes none of them. A shared child `deriveAgent` makes already
   counts its parent's, since its parent is among its `selfParticipants`; a
   host's shared child, whose `selfParticipants` needn't name its parent,
   counts them through the owners the framework gives it as it's created or

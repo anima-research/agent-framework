@@ -600,8 +600,9 @@ export class Agent {
   /**
    * For an agent that continues another's context on a branch of its own:
    * the participants whose change rows its source's view keeps as its
-   * source's own. They're in this agent's every request, so it reads them as
-   * its own change rows: what it declares, consolidates and takes out.
+   * source's own. Under `'entries'` its requests carry them, so it reads
+   * them as its own change rows: what it declares, consolidates and takes
+   * out.
    */
   setSourceChangeOwners(owners: Iterable<string>): void {
     this.sourceChangeOwners = new Set([...owners].filter((owner) => !this.ownParticipants.has(owner)));
