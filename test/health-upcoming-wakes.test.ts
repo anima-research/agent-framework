@@ -28,6 +28,7 @@ async function frameworkWith(t: { after(fn: () => Promise<void> | void): void },
     heartbeat: { start(): void; handleToolCall(name: string, input: unknown): { success: boolean } };
     eventGate: {
       addPolicy(p: unknown): void;
+      evaluate(info: unknown): unknown;
       armSelfWake(agent: string, seconds: number): void;
       setSleep(seconds: number, note?: string, agent?: string): unknown;
     };
@@ -75,6 +76,17 @@ describe('healthSnapshot: upcomingWakes', () => {
     ]);
   });
 
+  it("quotes no rule name from a gate wake's description", async (t) => {
+    const rule = 'a-rule-name-the-agent-chose';
+    const { framework, internals, wakes } = await frameworkWith(t);
+    internals.eventGate.addPolicy({ name: rule, match: { scope: ['workspace:modified'] }, behavior: { debounce: 60000 } });
+    internals.eventGate.evaluate({ content: 'notes.md', eventType: 'workspace:modified', serverId: '', channelId: '' });
+    const [wake] = wakes()!;
+    assert.equal(wake!.kind, 'debounce');
+    assert.deepEqual(Object.keys(wake!).sort(), ['at', 'certain', 'kind']);
+    assert.ok(!JSON.stringify(framework.healthSnapshot()).includes(rule));
+  });
+
   it('lists a queued wake first, with no time and without its reason', async (t) => {
     const reason = 'a reason that quotes a channel';
     const { framework, internals, wakes } = await frameworkWith(t, { defaults: { intervalSeconds: 3600 } });
@@ -95,9 +107,12 @@ describe('healthSnapshot: upcomingWakes', () => {
     for (let i = 12; i >= 1; i--) {
       assert.equal(internals.heartbeat.handleToolCall('heartbeat--reminder_add', { message: `r${i}`, inMinutes: i }).success, true);
     }
+    assert.deepEqual(wakes()!.map((w) => Math.round((w.at! - before) / 60_000)), [1, 2, 3, 4, 5, 6, 7, 8]);
+    // The gate's wakes are read after the heartbeat's, and the soonest still leads.
+    internals.eventGate.armSelfWake('scout', 30);
     const listed = wakes()!;
-    assert.deepEqual(listed.map((w) => Math.round((w.at! - before) / 60_000)), [1, 2, 3, 4, 5, 6, 7, 8]);
-    assert.ok(listed.every((w) => w.kind === 'reminder'), 'the hourly tick comes after all of them');
+    assert.equal(listed[0]!.kind, 'self-wake');
+    assert.deepEqual(listed.slice(1).map((w) => Math.round((w.at! - before) / 60_000)), [1, 2, 3, 4, 5, 6, 7]);
   });
 
   it('leaves the field out when the read throws, says why, and so reads as unknown and not as nothing due', async (t) => {
