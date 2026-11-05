@@ -35196,7 +35196,7 @@ export class AgentFramework {
     }
     const registry = this.mcplServerRegistry;
     // Work can outlive a closed transport already removed from the registry.
-    this.dropRequiredModuleWork('disconnected', id);
+    if (this.requiredModuleQueues?.size) this.dropRequiredModuleWork('disconnected', id);
     const hold = this.holdMcpServerId(id, 'disconnect');
     try {
       // Channel entries go first: removing them cancels the server's queued
