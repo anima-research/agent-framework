@@ -1,0 +1,4 @@
+- **Hosts that store their own `system_change` rows:** an agent on its head (`toolDeclarations: 'head'`, the default) no longer sends them.
+  - **Who needs to act:** a host whose change rows reached its model before. They now stay out of the requests and the compile of every agent on its head, whose context manager the framework opens with a view that leaves them out: a resident's, an ephemeral agent's, isolated or derived, a resumed agent's and a conversation fork's.
+  - **Migration:** set `toolDeclarations: 'entries'` on the agents that should send them. Under `'entries'` a host's change rows go out as stored. It needs no sibling version beyond this release's own ranges (`@animalabs/membrane` `^0.8.0`, `@animalabs/context-manager` `^0.24.0`).
+  - **Unchanged:** the rows stay stored, and an inspection (`inspectAgentContext`) still shows them. The subconscious's view is as it was, since it already left out every change row not its own.

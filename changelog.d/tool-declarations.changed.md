@@ -1,12 +1,7 @@
-- An agent on its head (`toolDeclarations: 'head'`, the default) now sends no
-  system change: a host's `system_change` rows in its context, which its
-  requests carried before, stay out of them, and out of what it compiles, so
-  they no longer reach its model or count against its budget. Every
-  context manager the framework opens for such an agent leaves them out of its
-  view: a resident's, an ephemeral agent's, isolated or derived, a resumed
-  agent's and a conversation fork's. An inspection (`inspectAgentContext`)
-  still shows the change rows stored. The subconscious's view is as it was,
-  since it already left out every change row not its own.
+- A host's `system_change` rows no longer count against the budget of an
+  agent on its head (`toolDeclarations: 'head'`, the default) whose context
+  manager the framework opens, since its compile leaves them out, as its
+  request now does (see Breaking).
 - The history module's `extract` returns a system change as its type alone
   with `format: "raw"`, and as `[system change]` with `"text"`, since what it
   declared may be another agent's tools and system text. Its tool description
