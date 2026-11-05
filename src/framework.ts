@@ -6643,13 +6643,7 @@ export class AgentFramework {
   }
   /** Keep `request` among a hold's `held` requests, once by
    *  sameInferenceRequest. A held turn's retry (TURN_RETRY) whose equal is
-   *  already held marks that one, so the hold still keeps the turn alive.
-   *  In a merged start's batch, a member folds only into an equal member of
-   *  its own kind: a wake in a batch and a member that carries the turn on
-   *  never fold into each other, so the wake stays a member of its own,
-   *  which an abort puts back. The copy of a request held on its own is the
-   *  exception: a member that carries the turn on takes it, as the mark above
-   *  takes that request. */
+   *  already held marks that one, so the hold still keeps the turn alive. */
   private holdRequest(held: InferenceRequest[], request: InferenceRequest, takes: (kept: InferenceRequest) => boolean = () => true): void {
     const same = held.find((r) => this.sameInferenceRequest(r, request) && takes(r));
     if (!same) {
@@ -6658,8 +6652,7 @@ export class AgentFramework {
     }
     // A merged start's batch (MERGED_BATCH) stays recorded on the request
     // kept in its place, which then stands for it, as the start did.
-    // Copy the held wake and read the kept request's carry before marking
-    // it, and reconcile each mark as the scheduler's merge does.
+    // Copy the held request and read the kept one's carry before marking it.
     const into = mergedBatch(same);
     const batch = mergedBatch(request);
     if (into || batch) {
