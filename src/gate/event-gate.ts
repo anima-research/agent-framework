@@ -4040,14 +4040,9 @@ export class EventGate {
 
     // A judge rule's batch goes to the reply judge, which delivers it, or
     // doesn't, once it has decided (judgeBatch). Without a judge wired it's
-    // delivered below, as a debounce's batch is. One whose send to the judge
-    // throws is dropped, named in the log, as a delivery that throws is.
+    // delivered below, as a debounce's batch is.
     if (state.judge && this.judgeFn) {
-      try {
-        this.judgeBatch(policyName, events, state.judge);
-      } catch (err) {
-        this.logUnsent(policyName, events, 'sent to the judge', err);
-      }
+      this.judgeBatch(policyName, events, state.judge);
       return;
     }
 
@@ -4067,7 +4062,7 @@ export class EventGate {
     try {
       this.deliverEvents(events);
     } catch (err) {
-      this.logUnsent(policyName, events, 'delivered', err);
+      this.logUnsent(policyName, events, err);
       return;
     }
 
@@ -4078,10 +4073,10 @@ export class EventGate {
     });
   }
 
-  private logUnsent(policyName: string, events: PendingEvent[], as: string, err: unknown): void {
+  private logUnsent(policyName: string, events: PendingEvent[], err: unknown): void {
     const one = events.length === 1;
     console.error(
-      `[gate] Rule ${quotedValue(policyName)}: its pending batch of ${events.length} ${one ? 'event' : 'events'} couldn't be ${as} `
+      `[gate] Rule ${quotedValue(policyName)}: its pending batch of ${events.length} ${one ? 'event' : 'events'} couldn't be delivered `
       + `(${quotedValue(errorText(err))}), so the batch is dropped`,
     );
   }
@@ -4225,7 +4220,6 @@ export class EventGate {
    * batches at once.
    */
   private judgeBatch(policyName: string, events: PendingEvent[], judge: JudgeConfig): void {
-    const refusedWhenRead = this.judgeRefusing();
     if (this.disposed) return;
     const deciding = this.judging.get(policyName);
     if (deciding) {
@@ -4237,14 +4231,13 @@ export class EventGate {
       this.holdForJudge(policyName, events, judge);
       return;
     }
-    const refusing = refusedWhenRead && this.judgeRefusal !== null;
     const held = this.judgeHeld.get(policyName);
     if (held) {
       this.judgeHeld.delete(policyName);
       events = [...held.events, ...events];
       this.capJudgeEvents(events);
     }
-    if (refusing) {
+    if (this.judgeRefusing()) {
       if (this.judgeOnError === 'skip') this.holdForJudge(policyName, events, judge);
       else this.deliverOrBuffer(policyName, events);
       return;
@@ -4256,14 +4249,8 @@ export class EventGate {
       return;
     }
     const abort = new AbortController();
-    let agentNames: string[];
-    try {
-      agentNames = this.getAgentNamesFn();
-    } catch (err) {
-      this.logUnsent(policyName, events, 'sent to the judge', err);
-      return;
-    }
-    const state: JudgingState = { events, judge, started: Date.now(), abort, queued: [], ask: 0 };
+    const agentNames = this.getAgentNamesFn();
+    const state: JudgingState = { events, judge, started: Date.now(), abort, queued: [], ask: ++this.judgeAsks };
     this.judging.set(policyName, state);
     const timedOut = new Promise<never>((_, reject) => {
       state.timer = setTimeout(() => {
@@ -4283,10 +4270,8 @@ export class EventGate {
         upcomingWakes: this.upcomingWakesBut(agentNames, { batch: state }),
         signal: abort.signal,
       };
-      state.ask = ++this.judgeAsks;
       asked = fn(request);
     } catch (err) {
-      if (state.ask === 0) state.ask = ++this.judgeAsks;
       asked = Promise.reject(err);
     }
     Promise.race([asked, timedOut]).then(
@@ -4397,10 +4382,8 @@ export class EventGate {
       wakes.push({ at: this.sleepUntil, certain: true, what: 'the end of its sleep' });
     }
     const count = (n: number): string => `${n} ${n === 1 ? 'event' : 'events'}`;
-    const refusedWhenRead = this.judgeRefusing();
-    const holdersNow = (): string => [...(this.judgedTurnRunning() ? ['a turn'] : []), ...(this.quiesced ? ["the host's quiesce"] : [])].join(' or ');
-    const holders = holdersNow();
-    const statedEnd = refusedWhenRead ? this.judgeRefusal?.until : undefined;
+    const statedEnd = this.judgeRefusing() ? this.judgeRefusal?.until : undefined;
+    const holders = [...(this.judgedTurnRunning() ? ['a turn'] : []), ...(this.quiesced ? ["the host's quiesce"] : [])].join(' or ');
     const turnHolds = holders !== '';
     const pastEnd = turnHolds ? ` and, past the refusal's end, while ${holders} holds it` : '';
     for (const [name, state] of this.debounceTimers) {
@@ -4420,15 +4403,10 @@ export class EventGate {
         wakes.push({ at: statedEnd, certain: false, what: `${rule} batch of ${count(state.events.length)}${joins} held for the judge while its calls are refused${pastEnd}${reply}` });
       } else {
         const delivered = state.events.filter((e) => !this.heldNow(e)).length;
-        if (this.judgeRefusal === null) {
-          wakes.push(toTheJudge());
-          continue;
-        }
-        const holdingIt = holdersNow();
         const deciding = this.judging.has(name);
         const toJudge = [
           ...(deciding ? ['the judge answers WAIT when its calls are no longer refused'] : []),
-          ...(holdingIt !== '' ? [`${holdingIt} holds it past the refusal's end`] : []),
+          ...(turnHolds ? [`${holders} holds it past the refusal's end`] : []),
         ];
         const holdingNow = [...(this.quiesced ? ['the host is still quiesced'] : []), ...(this.inferring.size > 0 ? ['a turn is still running'] : [])];
         const once = holdingNow.length > 1 ? 'neither is' : this.quiesced ? "it isn't" : 'none is';
@@ -4571,39 +4549,24 @@ export class EventGate {
       return;
     }
     if (state.queued.length === 0) return;
-    try {
-      this.judgeBatch(policyName, state.queued, judge);
-    } catch (err) {
-      this.logUnsent(policyName, state.queued, 'sent to the judge', err);
-    }
+    this.judgeBatch(policyName, state.queued, judge);
   }
 
   private refusedJudging(policyName: string, state: JudgingState, err: unknown, durationMs: number): void {
     if (this.judgeFailStreak > 0) this.judgeStreakRefused = true;
     const hold = cutToFit(suppliedValue(errorText(err)), 300);
     const stated = (err as { retryAfterMs?: unknown }).retryAfterMs;
-    let newest = state.ask > this.judgeNewestOutcome;
+    const newest = state.ask > this.judgeNewestOutcome;
     const wakes = this.judgeOnError === 'wake';
-    let now: number | undefined;
-    if (typeof stated === 'number' || (!newest && !wakes && this.judgeRefusal?.until !== undefined)) {
-      try {
-        now = this.now();
-      } catch (clockErr) {
-        if (state.ask > this.judgeNewestOutcome) this.judgeNewestOutcome = state.ask;
-        this.logUnsent(policyName, [...state.events, ...state.queued], wakes ? 'delivered' : 'held for the judge', clockErr);
-        this.recordRefusal(policyName, state.events.length, hold, durationMs, false);
-        return;
-      }
-      newest = state.ask > this.judgeNewestOutcome;
-    }
-    const end = typeof stated === 'number' && now !== undefined ? now + Math.max(0, stated) : undefined;
+    const now = this.now();
+    const end = typeof stated === 'number' ? now + Math.max(0, stated) : undefined;
     const until = end !== undefined && end <= MAX_DATE_MS ? end : undefined;
     if (newest) {
       this.judgeNewestOutcome = state.ask;
-      this.judgeRefusal = { hold, ...(until === undefined || now === undefined ? {} : until > now ? { until } : { noTimeLeft: true }) };
+      this.judgeRefusal = { hold, ...(until === undefined ? {} : until > now ? { until } : { noTimeLeft: true }) };
     }
     const dropsBefore = this.droppedJudgeEvents;
-    if (!this.disposed && !wakes) {
+    if (!wakes) {
       this.holdForJudge(policyName, [...state.events, ...state.queued], state.judge);
       if (this.judgeRefusal) this.armJudgeRefusalTimer(now);
       else this.flushJudgeHeldIfClear();
@@ -4638,22 +4601,15 @@ export class EventGate {
     });
   }
 
-  private armJudgeRefusalTimer(now: number | undefined): void {
+  private armJudgeRefusalTimer(now: number): void {
     if (this.judgeRefusalTimer) clearTimeout(this.judgeRefusalTimer);
     this.judgeRefusalTimer = null;
     const until = this.judgeRefusal?.until;
     if (until === undefined || this.disposed) return;
-    const delay = Math.max(0, until - (now ?? this.now()));
+    const delay = Math.max(0, until - now);
     this.judgeRefusalTimer = setTimeout(() => {
       this.judgeRefusalTimer = null;
-      let at: number;
-      try {
-        at = this.now();
-      } catch (err) {
-        this.clearJudgeRefusal();
-        this.dropJudgeHeld(err);
-        return;
-      }
+      const at = this.now();
       if (this.judgeRefusing(at)) this.armJudgeRefusalTimer(at);
       else this.flushJudgeHeldIfClear();
     }, Math.min(delay, MAX_TIMER_MS));
@@ -4667,19 +4623,12 @@ export class EventGate {
   }
 
   private judgeRefusing(now?: number): boolean {
-    if (this.judgeRefusal?.until === undefined) return false;
-    const at = now ?? this.now();
     const until = this.judgeRefusal?.until;
-    return until !== undefined && until > at;
+    return until !== undefined && until > (now ?? this.now());
   }
 
   private judgeHeldForRefusal(now?: number): boolean {
     return this.judgeOnError === 'skip' && this.judgeRefusal !== null && (this.judgeRefusal.until === undefined || this.judgeRefusing(now));
-  }
-
-  private dropJudgeHeld(err: unknown): void {
-    for (const [policyName, held] of this.judgeHeld) this.logUnsent(policyName, held.events, 'sent to the judge', err);
-    this.judgeHeld.clear();
   }
 
   /**
@@ -4696,7 +4645,6 @@ export class EventGate {
   providerCallsReleased(): void {
     if (this.disposed) return;
     this.judgeNewestOutcome = this.judgeAsks;
-    if (this.judgeRefusal === null) return;
     this.clearJudgeRefusal();
     this.flushJudgeHeldIfClear();
   }
@@ -4713,7 +4661,7 @@ export class EventGate {
     try {
       this.deliverEvents(events);
     } catch (err) {
-      this.logUnsent(policyName, events, 'delivered', err);
+      this.logUnsent(policyName, events, err);
     }
   }
 
@@ -4740,22 +4688,12 @@ export class EventGate {
     // Deferred, as the inference buffer's flush is, to stay out of the
     // turn-end callback that called this.
     queueMicrotask(() => {
-      if (this.disposed) return;
-      try {
-        if (this.judgeHeldForRefusal()) return;
-      } catch (err) {
-        this.dropJudgeHeld(err);
-        return;
-      }
+      if (this.judgeHeldForRefusal()) return;
       for (const policyName of [...this.judgeHeld.keys()]) {
         const held = this.judgeHeld.get(policyName);
         if (!held) continue;
         this.judgeHeld.delete(policyName);
-        try {
-          this.judgeBatch(policyName, held.events, held.judge);
-        } catch (err) {
-          this.logUnsent(policyName, held.events, 'sent to the judge', err);
-        }
+        this.judgeBatch(policyName, held.events, held.judge);
       }
     });
   }
@@ -5291,9 +5229,8 @@ export class EventGate {
   }
 
   private judgeRefusalNotice(): string | null {
-    const now = this.judgeRefusal?.until !== undefined ? this.now() : undefined;
     const refusal = this.judgeRefusal;
-    if (refusal === null || (refusal.until !== undefined && (now === undefined || refusal.until <= now))) return null;
+    if (refusal === null || (refusal.until !== undefined && refusal.until <= this.now())) return null;
     let held = 0;
     for (const batch of this.judgeHeld.values()) held += batch.events.length;
     const wakes = this.judgeOnError === 'wake';

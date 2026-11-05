@@ -435,9 +435,9 @@ export class ReplyJudge {
   }
 
   private async build(
-    request: JudgeRequest, now: number | undefined, atRatio?: number, fresh = false, forAgent?: string,
+    request: JudgeRequest, now: number | undefined, atRatio?: number, fresh = false,
   ): Promise<{ request: NormalizedRequest; agentName: string; chars: number; ratio: number }> {
-    const agentName = forAgent ?? this.chooseAgent(request.agentNames);
+    const agentName = this.chooseAgent(request.agentNames);
     if (!agentName) throw new Error('no agent to judge for');
     if (request.signal.aborted) throw new Error('the judge was stopped before its request');
     const preview = await this.preview(agentName);
@@ -618,8 +618,7 @@ export class ReplyJudge {
       if ((err as { type?: unknown } | null)?.type !== 'context_length' || built.ratio <= MIN_CHARS_PER_TOKEN) throw err;
       this.anchors.delete(built.agentName);
       const refused = built;
-      if (request.signal.aborted) throw new Error('the judge was stopped before its request');
-      built = await this.build(request, undefined, MIN_CHARS_PER_TOKEN, true, refused.agentName);
+      built = await this.build(request, undefined, MIN_CHARS_PER_TOKEN, true);
       if (request.signal.aborted) throw new Error('the judge was stopped before its request');
       console.error(
         `[gate] the reply judge's request on rule ${quotedValue(request.policyName)}'s batch, for ${built.agentName}, of ${refused.chars} characters, built at ${refused.ratio.toFixed(2)} characters a token, `
