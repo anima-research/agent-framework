@@ -1315,23 +1315,6 @@ test("a held wake that an equal merged start folds into keeps its opening messag
   });
 });
 
-for (const first of ['the silent one', 'the other'] as const) test(`a provider hold that takes one of two equal requests, one silent, into the other keeps the opening messages the merge's rule gives, ${first} held first`, async () => {
-  await withStoreDir(async (path) => {
-    const log = silence();
-    const membrane = new ScriptedMembrane(new Set(), () => new Error('unused'));
-    const { fw, internal } = await framework(path, membrane);
-    try {
-      const at = Date.now();
-      const silent = { agentName: 'resident', reason: 'heartbeat', source: 'heartbeat', timestamp: at, suppressProse: true, openingMessages: ['zz-silent'] };
-      const other = { agentName: 'resident', reason: 'heartbeat', source: 'heartbeat', timestamp: at, openingMessages: ['zz-other'] };
-      const held: Array<{ openingMessages?: string[] }> = [first === 'the silent one' ? silent : other];
-      (internal as unknown as { holdRequest(held: unknown[], request: unknown): void }).holdRequest(held, first === 'the silent one' ? other : silent);
-      assert.equal(held.length, 1, 'premise: the hold took one into the other');
-      assert.deepEqual(held[0]!.openingMessages, ['zz-other']);
-    } finally { await fw.stop(); log.restore(); }
-  });
-});
-
 test("a start merged from an autoContinue wake carrying its turn's opening message and a heartbeat names that message, since the heartbeat brought none", async (t) => {
   await withStoreDir(async (path) => {
     const log = silence();

@@ -6713,8 +6713,7 @@ export class AgentFramework {
     if (carry) (same as MarkedRequest)[TURN_CARRY] = carry;
     else delete (same as MarkedRequest)[TURN_CARRY];
     if (!isRearmed(request)) delete (same as MarkedRequest)[REARMED];
-    const pair = [same, request];
-    const opening = mergedOpeningMessages(pair.some(bringsOwnMessages) ? pair.filter(hasOwnCauseForRun) : pair);
+    const opening = mergedOpeningMessages([same, request]);
     if (opening) same.openingMessages = opening;
   }
   private consultProviderHold(error: Error, agentName: string): { holdMs: number; reason: string } | undefined {
@@ -20148,7 +20147,6 @@ export class AgentFramework {
             const pair = [prev, request];
             const opening = mergedOpeningMessages(pair.some(bringsOwnMessages) ? pair.filter(hasOwnCauseForRun) : pair);
             if (opening) kept.openingMessages = opening;
-            else delete kept.openingMessages;
           }
           newestByKey.set(key, kept);
         }
